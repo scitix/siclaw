@@ -196,6 +196,8 @@ async function abortBrainBestEffort(
 
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
+  /** Per-session write chain so route-state persists land in call order. */
+  private _modelRouteStatePersists = new Map<string, Promise<void>>();
   private defaultSessionId = "default";
 
   /** Optional userId — set by LocalSpawner for per-user skill directory isolation */
@@ -677,6 +679,11 @@ export class AgentBoxSessionManager {
         let turnHadTool = false;
         const routePolicy = managed.modelRoutePolicy;
         const routeEnabled = shouldUseModelRouteRunner(routePolicy, managed.modelRouteState);
+        // Mirror the HTTP /prompt path: while the routing runner buffers brain
+        // events, suppress the SSE route's live brain subscription too —
+        // otherwise a client connected during a routed synthetic turn streams
+        // every failed attempt raw, the exact leak routing exists to prevent.
+        managed._routeBrainEventsThroughExtra = routeEnabled;
         let latestModelRouteSwitch: Extract<ModelRouteEvent, { type: "model_route_switch" }> | null = null;
         let currentModelRouteMetadata: Record<string, unknown> | null = null;
         const handleRouteEvent = (event: ModelRouteEvent): void => {
@@ -733,6 +740,7 @@ export class AgentBoxSessionManager {
                 emitEvent: handleRouteEvent,
                 emitBrainEvent: handleBrainEvent,
                 onStateChange: () => this.persistModelRouteState(managed.id, managed.modelRouteState),
+                shouldAbort: () => managed._aborted,
               },
             );
           } else {
@@ -742,6 +750,7 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
         } finally {
           managed._promptDone = true;
+          managed._routeBrainEventsThroughExtra = false;
           if (managed._bufferUnsub) { managed._bufferUnsub(); managed._bufferUnsub = null; }
           for (const cb of managed._promptDoneCallbacks) { try { cb(); } catch { /* ignore */ } }
           managed._promptDoneCallbacks.clear();
@@ -914,7 +923,12 @@ export class AgentBoxSessionManager {
     try {
       const raw = JSON.parse(fs.readFileSync(this.modelRouteStateFile(sessionId), "utf8"));
       return normalizeModelRouteState(raw);
-    } catch {
+    } catch (err) {
+      // Missing file is the normal first-run case; anything else (corrupt
+      // JSON, permissions) silently resetting cooldowns deserves a trace.
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        console.warn(`[agentbox-session] model-route state for ${sessionId} unreadable, starting fresh:`, err);
+      }
       return createModelRouteState();
     }
   }
@@ -927,15 +941,27 @@ export class AgentBoxSessionManager {
    */
   persistModelRouteState(sessionId: string, state: ModelRouteState): void {
     const file = this.modelRouteStateFile(sessionId);
-    const tmp = `${file}.${randomUUID()}.tmp`;
+    // Snapshot synchronously, then serialize writes per session: each write is
+    // atomic (tmp + rename), but without ordering a slow older write could
+    // rename over a newer one, leaving stale state on disk.
     const payload = `${JSON.stringify(normalizeModelRouteState(state), null, 2)}\n`;
-    void fs.promises
-      .writeFile(tmp, payload, "utf8")
-      .then(() => fs.promises.rename(tmp, file))
-      .catch((err) => {
+    const prev = this._modelRouteStatePersists.get(sessionId) ?? Promise.resolve();
+    const next = prev.then(async () => {
+      const tmp = `${file}.${randomUUID()}.tmp`;
+      try {
+        await fs.promises.writeFile(tmp, payload, "utf8");
+        await fs.promises.rename(tmp, file);
+      } catch (err) {
         console.warn(`[agentbox-session] model-route state persist failed for ${sessionId}:`, err);
         void fs.promises.unlink(tmp).catch(() => {});
-      });
+      }
+    });
+    this._modelRouteStatePersists.set(sessionId, next);
+    void next.finally(() => {
+      if (this._modelRouteStatePersists.get(sessionId) === next) {
+        this._modelRouteStatePersists.delete(sessionId);
+      }
+    });
   }
 
   /**

@@ -619,6 +619,7 @@ export function createHttpServer(
             // routed sessions still get token/cost stats.
             emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
             onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
+            shouldAbort: () => managed._aborted,
           },
         )
       : managed.brain.prompt(promptText);

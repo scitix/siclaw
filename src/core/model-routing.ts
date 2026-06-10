@@ -113,6 +113,12 @@ export type ModelRouteEvent =
       failureKind?: ModelRouteFailureKind;
       fallbackBlockedReason?: ModelRouteFallbackBlockedReason;
       errorMessage?: string;
+    }
+  | {
+      type: "model_route_aborted";
+      attempt: number;
+      candidateKey?: string;
+      errorMessage?: string;
     };
 
 export interface ModelRouteRunResult {
@@ -128,6 +134,8 @@ export interface RunPromptWithModelRoutingOptions {
   emitEvent?: (event: ModelRouteEvent) => void;
   emitBrainEvent?: (event: unknown) => void;
   onStateChange?: (state: ModelRouteState) => void;
+  /** Polled between attempts so a user Stop landing in the switch window halts the chain. */
+  shouldAbort?: () => boolean;
   now?: () => number;
 }
 
@@ -350,7 +358,13 @@ export function classifyModelRouteFailure(
   if (/\b401\b|unauthorized|invalid api key|no api key|missing api key|authentication failed|authentication/i.test(combined)) {
     return "auth";
   }
-  if (/content[_ -]?filter|finish_reason:\s*content_filter|safety|policy|blocked/.test(combined)) {
+  // Anchor on phrases real providers emit (OpenAI/Azure content filter,
+  // Anthropic usage policy, Gemini SAFETY blocks). Bare "policy" / "blocked" /
+  // "safety" intercepted unrelated errors here ("blocked by upstream proxy")
+  // and mislabeled them as content_policy, which is a no-fallback kind.
+  if (
+    /content[_ -]?(?:filter|policy|moderation)|finish_reason:\s*content_filter|content management policy|usage policy|policy violation|moderation|blocked (?:due to|by) (?:safety|content|policy)|safety (?:filter|system|setting|rating|violation)/.test(combined)
+  ) {
     return "content_policy";
   }
 
@@ -482,9 +496,16 @@ export async function runPromptWithModelRouting(
   const now = options.now ?? (() => Date.now());
   const attempted: ModelRouteAttempt[] = [];
 
-  pruneExpiredCooldowns(state, now());
-  let ordered = candidates.filter((candidate) => !isCandidateCooling(state, candidate, now()));
-  if (ordered.length === 0) ordered = candidates;
+  // Cooling candidates are deprioritized, not excluded: when every fresh
+  // candidate fails, trying a cooling one as a last resort still beats
+  // failing the whole turn with an untried candidate on the bench. Partition
+  // against a single timestamp so a cooldown expiring mid-evaluation cannot
+  // drop a candidate from both halves.
+  const orderingNow = now();
+  pruneExpiredCooldowns(state, orderingNow);
+  const freshCandidates = candidates.filter((candidate) => !isCandidateCooling(state, candidate, orderingNow));
+  const coolingCandidates = candidates.filter((candidate) => isCandidateCooling(state, candidate, orderingNow));
+  const ordered = [...freshCandidates, ...coolingCandidates];
 
   emitEvent({
     type: "model_route_start",
@@ -499,6 +520,31 @@ export async function runPromptWithModelRouting(
   let finalFailure: AttemptFailure | undefined;
   for (let i = 0; i < ordered.length; i++) {
     const candidate = ordered[i];
+    // A user Stop can land in the switch window (cooldown persist, checkpoint
+    // restore, setModel are all awaited) where no brain.prompt is in flight to
+    // absorb it — poll the abort signal so the cancelled prompt is not re-run
+    // on the next candidate.
+    if (i > 0 && options.shouldAbort?.()) {
+      const abortMessage = "Prompt aborted between fallback attempts.";
+      state.lastSwitchReason = "user_abort";
+      options.onStateChange?.(state);
+      // A user stop is not exhaustion — emit a dedicated event so a future
+      // consumer cannot render "all candidates failed" for a manual Stop.
+      emitEvent({
+        type: "model_route_aborted",
+        attempt: i,
+        candidateKey: attempted[attempted.length - 1]?.candidateKey,
+        errorMessage: abortMessage,
+      });
+      return {
+        success: false,
+        exhausted: false,
+        attempted,
+        activeCandidateKey: state.activeCandidateKey,
+        finalFailureKind: "user_abort",
+        finalErrorMessage: abortMessage,
+      };
+    }
     const key = candidateKey(candidate);
     const startedAt = now();
     const attempt: ModelRouteAttempt = {
@@ -528,8 +574,15 @@ export async function runPromptWithModelRouting(
       const recoveredFrom = previousActiveCandidateKey && previousActiveCandidateKey !== key && key === primaryCandidateKey
         ? findCandidateByKey(candidates, previousActiveCandidateKey)
         : undefined;
-      state.activeCandidateKey = key;
-      state.activeCandidateSource = "auto";
+      // A success proves the candidate healthy again — drop any cooldown left
+      // over from a run that used it as a last resort while still cooling.
+      delete state.cooldowns[key];
+      // A manual pin (PUT /model) can land while this runner is in flight;
+      // the run's outcome must not clobber that explicit user choice.
+      if (state.activeCandidateSource !== "user") {
+        state.activeCandidateKey = key;
+        state.activeCandidateSource = "auto";
+      }
       state.lastSuccessAt = attempt.finishedAt;
       recordAttempt(state, attempt);
       options.onStateChange?.(state);
@@ -576,12 +629,18 @@ export async function runPromptWithModelRouting(
     });
 
     const nextCandidate = ordered[i + 1];
-    if (attempt.fallbackBlockedReason && nextCandidate) {
-      const cooldownUntil = cooldownUntilForFailure(failure, policy, now());
-      if (cooldownUntil) state.cooldowns[key] = cooldownUntil;
-      else delete state.cooldowns[key];
-    }
-    if (!nextCandidate || attempt.fallbackBlockedReason || !shouldTryNextCandidateForFailure(failure, policy)) {
+    const willSwitch = Boolean(nextCandidate)
+      && !attempt.fallbackBlockedReason
+      && shouldTryNextCandidateForFailure(failure, policy);
+    // Record the cooldown for every failure that carries one, not only when
+    // switching: a terminal failure (last candidate, tool-blocked, or
+    // no-fallback kind) still marks the candidate unhealthy for the NEXT
+    // turn's ordering. Only the switch path clears a stale cooldown — a
+    // terminal zero-cooldown failure (e.g. user_abort) keeps what it had.
+    const cooldownUntil = cooldownUntilForFailure(failure, policy, now());
+    if (cooldownUntil) state.cooldowns[key] = cooldownUntil;
+    else if (willSwitch) delete state.cooldowns[key];
+    if (!willSwitch) {
       flushBrainEvents(attemptResult.events, emitBrainEvent);
       state.lastSwitchReason = failure.kind;
       options.onStateChange?.(state);
@@ -608,9 +667,6 @@ export async function runPromptWithModelRouting(
       };
     }
 
-    const cooldownUntil = cooldownUntilForFailure(failure, policy, now());
-    if (cooldownUntil) state.cooldowns[key] = cooldownUntil;
-    else delete state.cooldowns[key];
     state.lastSwitchReason = failure.kind;
     options.onStateChange?.(state);
     try {
@@ -821,8 +877,19 @@ function failureFromAssistantMessage(
     };
   }
   if (stopReason === "aborted") {
+    // Route through the classifier instead of hardcoding user_abort: it
+    // distinguishes a transport-level abort ("connection aborted") — which
+    // should fall back — from a genuine user stop.
     return {
-      kind: "user_abort",
+      kind: classifyModelRouteFailure({
+        errorMessage: messageError,
+        stopReason,
+        provider: typeof message.provider === "string" ? message.provider : candidate.provider,
+        modelId: typeof message.model === "string" ? message.model : candidate.modelId,
+        status: providerResponse?.status,
+        headers: providerResponse?.headers,
+        diagnostics: message.diagnostics,
+      }),
       source: "message_end",
       message: messageError,
       providerResponse,
@@ -1004,10 +1071,6 @@ function normalizeFailureKinds(kinds: unknown): ModelRouteFailureKind[] {
     normalized.push(kind);
   }
   return normalized;
-}
-
-function isModelRouteFailureKind(value: unknown): value is ModelRouteFailureKind {
-  return normalizeFailureKind(value) !== undefined;
 }
 
 function normalizeFailureKind(value: unknown): ModelRouteFailureKind | undefined {

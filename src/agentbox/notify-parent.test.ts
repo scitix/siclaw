@@ -34,6 +34,8 @@ function fakeManaged(id: string, brain: ReturnType<typeof fakeBrain>, promptDone
     _syntheticPromptQueue: null as Promise<void> | null,
     _promptDoneCallbacks: new Set<() => void>(),
     _backgroundWorkCount: 1, // >0 so runSyntheticPrompt's finally skips scheduleRelease (no timers)
+    _aborted: false,
+    _routeBrainEventsThroughExtra: false,
     _eventBuffer: [] as unknown[],
     _bufferUnsub: null as null | (() => void),
     _extraEventBuffer: [] as unknown[],
@@ -216,6 +218,7 @@ describe("notifyParent", () => {
     ];
     let currentModel = models[0];
     const seenModels: string[] = [];
+    const routeFlagDuringPrompt: boolean[] = [];
     const brain = {
       followUp: vi.fn(async () => {}),
       subscribe: vi.fn((fn: (e: any) => void) => {
@@ -224,6 +227,10 @@ describe("notifyParent", () => {
       }),
       prompt: vi.fn(async () => {
         seenModels.push(`${currentModel.provider}/${currentModel.id}`);
+        // The routed runner buffers brain events; the SSE route's live brain
+        // subscription must be suppressed for the whole turn or a connected
+        // client streams every failed attempt raw.
+        routeFlagDuringPrompt.push(managed._routeBrainEventsThroughExtra);
         if (currentModel.provider === "openai") {
           emit({
             type: "message_end",
@@ -273,6 +280,8 @@ describe("notifyParent", () => {
     await flushCoalesce();
 
     expect(seenModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+    expect(routeFlagDuringPrompt).toEqual([true, true]);
+    expect(managed._routeBrainEventsThroughExtra).toBe(false);
     expect(managed.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
     const events = send.mock.calls.map((c) => c[0]);
     const report = events

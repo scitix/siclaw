@@ -232,6 +232,12 @@ describe("model-routing classifier", () => {
     expect(classifyModelRouteFailure("context_length_exceeded: max context")).toBe("context_overflow");
     expect(classifyModelRouteFailure("cancelled by user", "aborted")).toBe("user_abort");
     expect(classifyModelRouteFailure("content filter blocked")).toBe("content_policy");
+    expect(classifyModelRouteFailure("response blocked due to safety")).toBe("content_policy");
+    expect(classifyModelRouteFailure("prompt triggering content management policy")).toBe("content_policy");
+    // Bare "blocked" / "policy" must not be mistaken for a content block —
+    // these were previously mislabeled content_policy (a no-fallback kind).
+    expect(classifyModelRouteFailure("request blocked by upstream proxy")).toBe("network");
+    expect(classifyModelRouteFailure("retry policy exceeded for request")).toBe("unknown");
     expect(classifyModelRouteFailure("401 invalid api key")).toBe("auth");
     expect(classifyModelRouteFailure("403 permission denied")).toBe("auth");
     expect(classifyModelRouteFailure("400 invalid parameter")).toBe("format_error");
@@ -928,6 +934,110 @@ describe("runPromptWithModelRouting", () => {
     await runPromptWithModelRouting(recoveredBrain, "hello", policy, state, { now: () => 6000 });
     expect(recoveredBrain.promptModels).toEqual(["openai/gpt-4"]);
     expect(state.activeCandidateKey).toBe("openai/gpt-4");
+  });
+
+  it("tries cooling candidates as a last resort when every fresh candidate fails", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+    state.cooldowns[candidateKey(policy.candidates![1])] = 5000;
+    state.cooldowns[candidateKey(policy.candidates![2])] = 5000;
+
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const result = await runPromptWithModelRouting(brain, "hello", policy, state, { now: () => 1000 });
+
+    expect(result.success).toBe(true);
+    expect(brain.promptModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+  });
+
+  it("records a cooldown when the final candidate fails too", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+
+    const brain = makeBrain(["rate_limit", "rate_limit", "rate_limit"]);
+    const result = await runPromptWithModelRouting(brain, "hello", policy, state, { now: () => 10_000 });
+
+    expect(result.exhausted).toBe(true);
+    expect(state.cooldowns[candidateKey(policy.candidates![0])]).toBe(11_000);
+    expect(state.cooldowns[candidateKey(policy.candidates![1])]).toBe(11_000);
+    expect(state.cooldowns[candidateKey(policy.candidates![2])]).toBe(11_000);
+  });
+
+  it("clears a candidate's cooldown when it succeeds while still cooling", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+    for (const candidate of policy.candidates!) {
+      state.cooldowns[candidateKey(candidate)] = 5000;
+    }
+
+    const brain = makeBrain(["ok"]);
+    await runPromptWithModelRouting(brain, "hello", policy, state, { now: () => 1000 });
+
+    expect(brain.promptModels).toEqual(["openai/gpt-4"]);
+    expect(state.cooldowns[candidateKey(policy.candidates![0])]).toBeUndefined();
+    expect(state.cooldowns[candidateKey(policy.candidates![1])]).toBe(5000);
+  });
+
+  it("preserves a manual pin that lands while the runner is in flight", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+    let pinned = false;
+
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const result = await runPromptWithModelRouting(brain, "hello", policy, state, {
+      now: () => 10_000,
+      onStateChange: () => {
+        if (!pinned) {
+          pinned = true;
+          markModelRouteUserSelection(state, { provider: "deepseek", modelId: "deepseek-chat" });
+        }
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(state.activeCandidateSource).toBe("user");
+    expect(state.activeCandidateKey).toBe("deepseek/deepseek-chat");
+  });
+
+  it("halts between attempts when shouldAbort reports a user stop", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+    const events: ModelRouteEvent[] = [];
+
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const result = await runPromptWithModelRouting(brain, "hello", policy, state, {
+      now: () => 10_000,
+      emitEvent: (event) => events.push(event),
+      shouldAbort: () => brain.promptModels.length >= 1,
+    });
+
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect(result.exhausted).toBe(false);
+    expect(result.finalFailureKind).toBe("user_abort");
+    // A user stop is reported as its own event, never as exhaustion.
+    const abortedEvent = events.find((event) => event.type === "model_route_aborted");
+    expect(abortedEvent).toMatchObject({ errorMessage: "Prompt aborted between fallback attempts." });
+    expect(events.some((event) => event.type === "model_route_exhausted")).toBe(false);
+  });
+
+  it("falls back on a transport-level abort but not on a genuine user stop", async () => {
+    const transportBrain = makeBrain([
+      { stopReason: "aborted", errorMessage: "connection aborted by remote host" },
+      "ok",
+    ]);
+    const transportResult = await runPromptWithModelRouting(
+      transportBrain, "hello", makePolicy(), createModelRouteState(), { now: () => 10_000 },
+    );
+    expect(transportResult.success).toBe(true);
+    expect(transportBrain.promptModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+
+    const userStopBrain = makeBrain([{ stopReason: "aborted" }]);
+    const userStopResult = await runPromptWithModelRouting(
+      userStopBrain, "hello", makePolicy(), createModelRouteState(), { now: () => 10_000 },
+    );
+    expect(userStopResult.success).toBe(false);
+    expect(userStopResult.finalFailureKind).toBe("user_abort");
+    expect(userStopBrain.prompt).toHaveBeenCalledTimes(1);
   });
 
   it("emits fallback and recovery telemetry on the success event", async () => {
