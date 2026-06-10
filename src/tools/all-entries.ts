@@ -20,7 +20,6 @@ import { registration as hostScript } from "./script-exec/host-script.js";
 // query
 import { registration as clusterList } from "./query/cluster-list.js";
 import { registration as clusterProbe } from "./query/cluster-probe.js";
-import { registration as clusterInfo } from "./query/cluster-info.js";
 import { registration as hostList } from "./query/host-list.js";
 // knowledge_search removed — replaced by LLM Wiki (Read tool + .siclaw/knowledge/)
 import { registration as resolvePodNetns } from "./query/resolve-pod-netns.js";
@@ -47,7 +46,7 @@ export const allToolEntries: ToolEntry[] = [
   // ── script-exec ──
   nodeScript, podScript, localScript, hostScript,
   // ── query ──
-  clusterList, clusterProbe, clusterInfo, hostList,
+  clusterList, clusterProbe, hostList,
   resolvePodNetns, memorySearch, memoryGet,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,

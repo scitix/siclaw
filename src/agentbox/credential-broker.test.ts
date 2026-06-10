@@ -375,6 +375,47 @@ describe("CredentialBroker — host pipeline", () => {
     await expect(broker.acquireHost("node-y", "test")).rejects.toThrow(/missing required metadata\.is_production/);
   });
 
+  it("parses metadata.meta on credential.get, filtering malformed entries", async () => {
+    transport.clusterPayloads.set("c1", {
+      credential: {
+        name: "c1",
+        type: "kubeconfig",
+        files: [{ name: "c1.kubeconfig", content: "apiVersion: v1\nkind: Config\nclusters: []", mode: 0o640 }],
+        metadata: {
+          is_production: true,
+          meta: [
+            { key: "rdma_type", display_name: "RDMA Type", value: "SR-IOV" },
+            { key: "scheduler", value: "volcano" },     // no display_name — still valid
+            { key: "missing_value", display_name: "X" }, // no value → filtered
+            { display_name: "no key", value: "v" },      // no key → filtered
+            "garbage",                                   // not an object → filtered
+          ],
+        },
+        ttl_seconds: 300,
+      },
+    });
+    await broker.acquireCluster("c1", "test");
+    const info = broker.getClusterLocalInfo("c1");
+    expect(info?.meta.meta).toEqual([
+      { key: "rdma_type", display_name: "RDMA Type", value: "SR-IOV" },
+      { key: "scheduler", value: "volcano" },
+    ]);
+  });
+
+  it("omits meta when credential.get carries no structured entries", async () => {
+    transport.clusterPayloads.set("c2", {
+      credential: {
+        name: "c2",
+        type: "kubeconfig",
+        files: [{ name: "c2.kubeconfig", content: "apiVersion: v1\nkind: Config\nclusters: []", mode: 0o640 }],
+        metadata: { is_production: false },
+        ttl_seconds: 300,
+      },
+    });
+    await broker.acquireCluster("c2", "test");
+    expect(broker.getClusterLocalInfo("c2")?.meta.meta).toBeUndefined();
+  });
+
   it("ensureHost throws when payload contains no files", async () => {
     transport.hostPayloads.set("node-x", {
       credential: {
