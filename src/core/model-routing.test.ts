@@ -1014,8 +1014,10 @@ describe("runPromptWithModelRouting", () => {
     expect(result.success).toBe(false);
     expect(result.exhausted).toBe(false);
     expect(result.finalFailureKind).toBe("user_abort");
-    const exhaustedEvent = events.find((event) => event.type === "model_route_exhausted");
-    expect(exhaustedEvent).toMatchObject({ failureKind: "user_abort" });
+    // A user stop is reported as its own event, never as exhaustion.
+    const abortedEvent = events.find((event) => event.type === "model_route_aborted");
+    expect(abortedEvent).toMatchObject({ errorMessage: "Prompt aborted between fallback attempts." });
+    expect(events.some((event) => event.type === "model_route_exhausted")).toBe(false);
   });
 
   it("falls back on a transport-level abort but not on a genuine user stop", async () => {

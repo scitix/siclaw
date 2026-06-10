@@ -113,6 +113,12 @@ export type ModelRouteEvent =
       failureKind?: ModelRouteFailureKind;
       fallbackBlockedReason?: ModelRouteFallbackBlockedReason;
       errorMessage?: string;
+    }
+  | {
+      type: "model_route_aborted";
+      attempt: number;
+      candidateKey?: string;
+      errorMessage?: string;
     };
 
 export interface ModelRouteRunResult {
@@ -490,12 +496,15 @@ export async function runPromptWithModelRouting(
   const now = options.now ?? (() => Date.now());
   const attempted: ModelRouteAttempt[] = [];
 
-  pruneExpiredCooldowns(state, now());
   // Cooling candidates are deprioritized, not excluded: when every fresh
   // candidate fails, trying a cooling one as a last resort still beats
-  // failing the whole turn with an untried candidate on the bench.
-  const freshCandidates = candidates.filter((candidate) => !isCandidateCooling(state, candidate, now()));
-  const coolingCandidates = candidates.filter((candidate) => isCandidateCooling(state, candidate, now()));
+  // failing the whole turn with an untried candidate on the bench. Partition
+  // against a single timestamp so a cooldown expiring mid-evaluation cannot
+  // drop a candidate from both halves.
+  const orderingNow = now();
+  pruneExpiredCooldowns(state, orderingNow);
+  const freshCandidates = candidates.filter((candidate) => !isCandidateCooling(state, candidate, orderingNow));
+  const coolingCandidates = candidates.filter((candidate) => isCandidateCooling(state, candidate, orderingNow));
   const ordered = [...freshCandidates, ...coolingCandidates];
 
   emitEvent({
@@ -519,11 +528,12 @@ export async function runPromptWithModelRouting(
       const abortMessage = "Prompt aborted between fallback attempts.";
       state.lastSwitchReason = "user_abort";
       options.onStateChange?.(state);
+      // A user stop is not exhaustion — emit a dedicated event so a future
+      // consumer cannot render "all candidates failed" for a manual Stop.
       emitEvent({
-        type: "model_route_exhausted",
+        type: "model_route_aborted",
         attempt: i,
         candidateKey: attempted[attempted.length - 1]?.candidateKey,
-        failureKind: "user_abort",
         errorMessage: abortMessage,
       });
       return {
