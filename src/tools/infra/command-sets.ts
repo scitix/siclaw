@@ -817,7 +817,7 @@ function applyContextPolicy(
   piped: boolean | undefined,
 ): string | null {
   if (!context) return null;
-  const def = COMMANDS[baseName];
+  const def = getCommandDef(baseName);
   if (!def) return null;
   const policy = CONTEXT_POLICIES[context];
   if (!policy) return null;
@@ -922,7 +922,7 @@ export function validateCommandRestrictions(
   if (args.length === 0) return null;
 
   const baseName = args[0].split("/").pop()?.toLowerCase() ?? "";
-  const def = COMMANDS[baseName];
+  const def = getCommandDef(baseName);
   if (!def) return null;
 
   // 1. Context policy constraints (pipeOnly, categoryBlockedFlags)
@@ -1329,12 +1329,54 @@ export const COMMANDS: Record<string, CommandDef> = {
   seq:    { category: "flow" },
 };
 
+// ── Extra commands (deployment-configured, additive-only) ───────
+//
+// Loaded from a JSON config at agent startup (see extra-commands.ts and
+// docs/design/2026-06-10-extra-command-whitelist.md). Stored SEPARATELY
+// from the built-in registry: lookups consult COMMANDS first, so an extra
+// entry can never replace or relax a built-in definition.
+
+let extraCommands: Record<string, CommandDef> = {};
+
+export interface SetExtraCommandsResult {
+  /** Extra command names now active. */
+  applied: string[];
+  /** Names dropped because they collide with built-in COMMANDS entries. */
+  skipped: string[];
+}
+
+/**
+ * Replace the active set of extra commands. Built-in collisions are skipped
+ * (additive-only contract). Invalidates the per-context allowed-set cache.
+ */
+export function setExtraCommands(extra: Record<string, CommandDef>): SetExtraCommandsResult {
+  const applied: string[] = [];
+  const skipped: string[] = [];
+  const accepted: Record<string, CommandDef> = {};
+  for (const [name, def] of Object.entries(extra)) {
+    if (name in COMMANDS) {
+      skipped.push(name);
+    } else {
+      accepted[name] = def;
+      applied.push(name);
+    }
+  }
+  extraCommands = accepted;
+  contextAllowedCache.clear();
+  return { applied, skipped };
+}
+
+/** Resolve a command definition: built-in registry first, then extras. */
+function getCommandDef(baseName: string): CommandDef | undefined {
+  return COMMANDS[baseName] ?? extraCommands[baseName];
+}
+
 // ── Context Policies (internal) ─────────────────────────────────
 //
 // Environment-level constraints. Not exported — only consumed by
 // validateCommandRestrictions() internally.
 
-const ALL_COMMAND_CATEGORIES: readonly CommandCategory[] = [
+export const ALL_COMMAND_CATEGORIES: readonly CommandCategory[] = [
   "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
   "process", "file", "diagnostic", "services", "container", "firewall",
   "inspection", "compressed", "activity", "stream", "general", "general-env",
@@ -1377,14 +1419,14 @@ export function getContextAllowedSet(context: string): ReadonlySet<string> {
   const policy = CONTEXT_POLICIES[context];
   if (!policy) {
     // Unknown context → all commands
-    const all = new Set(Object.keys(COMMANDS));
+    const all = new Set([...Object.keys(COMMANDS), ...Object.keys(extraCommands)]);
     contextAllowedCache.set(context, all);
     return all;
   }
 
   const categorySet = new Set<string>(policy.available);
   const cmds = new Set<string>();
-  for (const [cmd, def] of Object.entries(COMMANDS)) {
+  for (const [cmd, def] of [...Object.entries(COMMANDS), ...Object.entries(extraCommands)]) {
     if (categorySet.has(def.category)) cmds.add(cmd);
   }
 

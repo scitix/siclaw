@@ -20,6 +20,26 @@ Additionally, `restricted-bash` validates **shell operators** (see [Shell Operat
 
 ---
 
+## Deployment Extras (Configurable Whitelist Additions)
+
+Deployments can whitelist **additional** binaries through a JSON config file loaded once
+at agent startup — see `docs/design/2026-06-10-extra-command-whitelist.md` for the full
+contract. Summary:
+
+- Resolution: `SICLAW_EXTRA_COMMANDS_FILE` env var (mandatory if set), else
+  `/etc/siclaw/extra-commands.json` (optional; baked into the AgentBox image from
+  `docker/extra-commands.json`).
+- **Additive-only**: entries colliding with built-in commands are skipped — a config
+  file can never relax built-in restrictions.
+- **Declarative constraints only**: `category` + `allowedFlags` / `blockedFlags` /
+  `allowedSubcommands` / `positionals` / `requiredFlags`. No custom validators.
+- **Forbidden names**: shells, interpreters, `sed`/`awk`, `nc`/`wget`/`socat`,
+  `sudo`/`nsenter`, argument-executing wrappers (`xargs`, `timeout`, `watch`, …),
+  `ssh`/`scp`/`rsync`, and `kubectl` are rejected at load time.
+- Invalid config fails agent startup loudly; accepted/skipped names are logged.
+
+---
+
 ## Excluded Commands
 
 The following are intentionally **NOT** in the whitelist:
