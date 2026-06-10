@@ -136,6 +136,11 @@ async function main() {
   // the final state before the pod terminates.
   const shutdown = async () => {
     console.log("[agentbox] Shutting down...");
+    // Checkpoint live sessions FIRST (preStop / rolling update): closeAll()
+    // tears down session state, and the K8s grace period is ticking.
+    await sessionManager.checkpointAllSessions("sigterm").catch((err) => {
+      console.error("[agentbox] Shutdown checkpoint pass failed:", err);
+    });
     await debugPodCache.evictAll();
     await sessionManager.closeAll();
     server.close();

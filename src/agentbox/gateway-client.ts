@@ -37,6 +37,10 @@ export interface AgentTask {
   agentId?: string | null;
 }
 
+const DEFAULT_TIMEOUT_MS = 5_000;
+/** Checkpoint blobs are MBs and may cross a cross-region link — see saveSessionCheckpoint. */
+const CHECKPOINT_TIMEOUT_MS = 120_000;
+
 export class GatewayClient {
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
@@ -134,6 +138,39 @@ export class GatewayClient {
   }
 
   /**
+   * Upload a session checkpoint. MB-scale base64 bodies can cross a
+   * cross-region link (Gateway → central RPC server), so this call gets a
+   * much longer timeout than the metadata default.
+   * Contract: docs/design/2026-06-10-session-checkpoint-db.md §3.
+   */
+  async saveSessionCheckpoint(payload: {
+    session_id: string;
+    revision: number;
+    sha256: string;
+    size_bytes: number;
+    data_base64: string;
+  }): Promise<{ ok: boolean; revision?: number; error?: string; latest?: number }> {
+    return this.request("/api/internal/session-checkpoints", "POST", payload, CHECKPOINT_TIMEOUT_MS);
+  }
+
+  /** Fetch the latest (or pre-`beforeRevision`) checkpoint for a session. */
+  async loadSessionCheckpoint(
+    sessionId: string,
+    opts?: { beforeRevision?: number; metaOnly?: boolean },
+  ): Promise<{ found: boolean; revision?: number; sha256?: string; size_bytes?: number; data_base64?: string }> {
+    const qs = new URLSearchParams();
+    if (opts?.beforeRevision != null) qs.set("before_revision", String(opts.beforeRevision));
+    if (opts?.metaOnly) qs.set("meta_only", "true");
+    const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
+    return this.request(
+      `/api/internal/session-checkpoints/${encodeURIComponent(sessionId)}${suffix}`,
+      "GET",
+      undefined,
+      CHECKPOINT_TIMEOUT_MS,
+    );
+  }
+
+  /**
    * Return a GatewaySyncClientLike adapter for use with sync handlers.
    * Keeps `request()` private while exposing a minimal interface.
    */
@@ -146,7 +183,7 @@ export class GatewayClient {
   /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
-  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any): Promise<any> {
+  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any, timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<any> {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
@@ -192,7 +229,7 @@ export class GatewayClient {
         reject(new Error(`Gateway request failed: ${err.message}`));
       });
 
-      req.setTimeout(5000, () => {
+      req.setTimeout(timeoutMs, () => {
         req.destroy();
         reject(new Error("Gateway request timeout"));
       });

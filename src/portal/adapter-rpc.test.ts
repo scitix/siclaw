@@ -1539,9 +1539,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 44 handlers", () => {
+  it("registers exactly 46 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(44);
+    expect(handlers.size).toBe(46);
   });
 
   it("all expected handler names are registered", () => {
@@ -1559,6 +1559,7 @@ describe("buildAdapterRpcHandlers", () => {
       "channel.list", "channel.resolveBinding", "channel.pair",
       "agent.listForSkill", "agent.listForMcp", "agent.listForCluster", "agent.listForHost",
       "metrics.summary", "metrics.audit", "metrics.auditDetail",
+      "checkpoint.save", "checkpoint.load",
     ];
     for (const name of expected) {
       expect(handlers.has(name), `Missing handler: ${name}`).toBe(true);

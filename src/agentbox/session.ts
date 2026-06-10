@@ -35,6 +35,7 @@ import { buildNotificationBatch, type TaskNotification } from "../core/task-noti
 import { spawnBackgroundBash } from "../core/background-bash-runner.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
+import type { SessionCheckpointer } from "./session-checkpointer.js";
 import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
@@ -212,6 +213,21 @@ export class AgentBoxSessionManager {
    * and must persist delegation/audit rows through Runtime's internal API.
    */
   gatewayClient?: GatewayClient;
+
+  /**
+   * Optional durable session snapshots (set by http-server when
+   * SICLAW_SESSION_CHECKPOINT_ENABLED and a gatewayClient exist).
+   * Hydrates session dirs in getOrCreate() and uploads them on release/SIGTERM
+   * — see docs/design/2026-06-10-session-checkpoint-db.md.
+   */
+  checkpointer?: SessionCheckpointer;
+
+  /**
+   * Sessions eligible for checkpointing: only top-level sessions created via
+   * getOrCreate(). Delegated child sessions are one-shot and never restored,
+   * so checkpointing them would only accumulate dead rows.
+   */
+  private checkpointEligible = new Set<string>();
 
   /**
    * Optional override for the directory where the broker materializes credential
@@ -1343,6 +1359,15 @@ export class AgentBoxSessionManager {
 
     const sessionDir = this.getSessionDir(id);
     console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
+
+    // Restore the session dir from its durable checkpoint before pi-agent
+    // reads it (pod restarts wipe emptyDir). Never throws — hydration
+    // failure degrades to a fresh framework session; chat history is DB-backed.
+    this.checkpointEligible.add(id);
+    if (this.checkpointer) {
+      await this.checkpointer.hydrate(id, sessionDir);
+    }
+
     const modelRouteState = this.loadModelRouteState(id);
 
     if (isMemoryEnabled()) {
@@ -1727,7 +1752,19 @@ export class AgentBoxSessionManager {
       console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (memory disabled)`);
     }
 
-    // 2. Shutdown per-session MCP connections
+    // 2. Durable checkpoint — the workhorse trigger (fires 30s after each
+    // prompt completes, so it also covers the 5-min idle self-destruct, by
+    // which time every session has been released). Failures are logged and
+    // retried on the next trigger; they never block the release.
+    if (this.checkpointer && this.checkpointEligible.has(sessionId)) {
+      try {
+        await this.checkpointer.checkpoint(sessionId, this.getSessionDir(sessionId), "release");
+      } catch (err) {
+        console.error(`[agentbox-session] Session checkpoint failed for ${sessionId}:`, err);
+      }
+    }
+
+    // 3. Shutdown per-session MCP connections
     if (managed.mcpManager) {
       try {
         await managed.mcpManager.shutdown();
@@ -1736,14 +1773,14 @@ export class AgentBoxSessionManager {
       }
     }
 
-    // 3. Sync shared memory index to pick up the new summary file
+    // 4. Sync shared memory index to pick up the new summary file
     if (isMemoryEnabled() && this._sharedMemoryIndexer) {
       await this._sharedMemoryIndexer.sync().catch((err) => {
         console.warn(`[agentbox-session] Memory sync on release failed:`, err);
       });
     }
 
-    // 3. Remove session from map (shared components remain alive).
+    // 5. Remove session from map (shared components remain alive).
     // Guard: only delete if the map still holds the same instance — a new
     // getOrCreate() may have replaced it while release() was running async.
     if (this.sessions.get(sessionId) === managed) {
@@ -1826,6 +1863,10 @@ export class AgentBoxSessionManager {
         }
       }
       this.sessions.delete(sessionId);
+      // Permanent closure — stop tracking for checkpointing (the stored
+      // revisions remain server-side until their session is GC'd).
+      this.checkpointEligible.delete(sessionId);
+      this.checkpointer?.forget(sessionId);
       // Permanent closure — drop the in-memory ledger so it doesn't accumulate
       // (the durable snapshot + Portal task_events remain for history/recovery).
       const hideTimer = this.ledgerHideTimers.get(sessionId);
@@ -1836,6 +1877,29 @@ export class AgentBoxSessionManager {
       deleteLedger(sessionId);
       emitDiagnostic({ type: "session_released", sessionId });
     }
+  }
+
+  /**
+   * Checkpoint every eligible live session — the SIGTERM/preStop path.
+   * Sessions already released have already checkpointed; this covers the
+   * ones still active when the pod is told to terminate (rolling update).
+   * Best-effort with a loud log per failure: the pod is going down either
+   * way, and a failed upload only widens the loss window to the last
+   * release-time checkpoint.
+   */
+  async checkpointAllSessions(reason = "shutdown"): Promise<void> {
+    if (!this.checkpointer) return;
+    const ids = [...this.sessions.keys()].filter((id) => this.checkpointEligible.has(id));
+    if (ids.length === 0) return;
+    console.log(`[agentbox-session] Checkpointing ${ids.length} live session(s) (${reason})`);
+    const results = await Promise.allSettled(
+      ids.map((id) => this.checkpointer!.checkpoint(id, this.getSessionDir(id), reason)),
+    );
+    results.forEach((r, i) => {
+      if (r.status === "rejected") {
+        console.error(`[agentbox-session] Shutdown checkpoint failed for ${ids[i]}:`, r.reason);
+      }
+    });
   }
 
   /**

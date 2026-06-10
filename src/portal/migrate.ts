@@ -453,6 +453,22 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_kpe_repo FOREIGN KEY (repo_id) REFERENCES knowledge_repos(id) ON DELETE CASCADE
   )`,
+
+  // AgentBox session checkpoints (tar.gz of the session dir; replaces the
+  // shared RWX PVC — docs/design/2026-06-10-session-checkpoint-db.md).
+  // Keep-3 retention is enforced by the checkpoint.save handler. No FK:
+  // session ids include framework-internal sessions that have no
+  // chat_sessions row, and checkpoints must survive agent rebinds.
+  `CREATE TABLE IF NOT EXISTS session_checkpoints (
+    agent_id CHAR(36) NOT NULL,
+    session_id CHAR(36) NOT NULL,
+    revision INT NOT NULL,
+    sha256 CHAR(64) NOT NULL,
+    size_bytes INT NOT NULL,
+    data LONGBLOB NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (agent_id, session_id, revision)
+  )`,
 ];
 
 /** Secondary indexes — kept separate so both drivers can handle them idempotently. */

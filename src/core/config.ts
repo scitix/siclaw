@@ -89,6 +89,13 @@ export function isMemoryEnabled(): boolean {
   return parseBooleanEnv(process.env.SICLAW_MEMORY_ENABLED, false);
 }
 
+export function isSessionCheckpointEnabled(): boolean {
+  // Off by default — session checkpointing (durable session-dir snapshots via
+  // Gateway → DB; docs/design/2026-06-10-session-checkpoint-db.md) replaces the
+  // shared RWX PVC. Also requires SICLAW_GATEWAY_URL for the upload transport.
+  return parseBooleanEnv(process.env.SICLAW_SESSION_CHECKPOINT_ENABLED, false);
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------

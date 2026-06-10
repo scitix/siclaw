@@ -47,6 +47,8 @@ import {
   handleAgentTasksUpdate,
   handleAgentTasksDelete,
   handleDelegationEvents,
+  handleSessionCheckpointSave,
+  handleSessionCheckpointLoad,
 } from "./internal-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
@@ -635,6 +637,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/delegation-events" && method === "POST") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleDelegationEvents(req, res, identity, frontendClient);
+            return;
+          }
+
+          // Session checkpoints — durable session-dir snapshots (via RPC).
+          if (url.startsWith("/api/internal/session-checkpoints")) {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            const pathOnly = url.split("?")[0];
+            if (pathOnly === "/api/internal/session-checkpoints" && method === "POST") {
+              void handleSessionCheckpointSave(req, res, identity, frontendClient);
+              return;
+            }
+            const idMatch = pathOnly.match(/^\/api\/internal\/session-checkpoints\/([^/]+)$/);
+            if (idMatch && method === "GET") {
+              void handleSessionCheckpointLoad(req, res, identity, decodeURIComponent(idMatch[1]), frontendClient);
+              return;
+            }
+            res.writeHead(405, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Method not allowed" }));
             return;
           }
 

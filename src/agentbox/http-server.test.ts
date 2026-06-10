@@ -54,6 +54,7 @@ vi.mock("../core/config.js", () => ({
     modelRouting: mockConfigState.modelRouting,
   }),
   isMemoryEnabled: () => true,
+  isSessionCheckpointEnabled: () => false,
 }));
 
 // Make sync-handlers a no-op registry.

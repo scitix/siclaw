@@ -423,6 +423,88 @@ export async function handleAgentTasksDelete(
   }
 }
 
+/**
+ * POST /api/internal/session-checkpoints
+ *
+ * AgentBox uploads a session-dir checkpoint (tar.gz, base64). agent_id is
+ * taken from the mTLS identity — the body cannot attribute to another agent.
+ * Contract: docs/design/2026-06-10-session-checkpoint-db.md §3.
+ */
+export async function handleSessionCheckpointSave(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  frontendClient: FrontendWsClient,
+): Promise<void> {
+  try {
+    const body = await readJsonBody(req) as {
+      session_id?: string;
+      revision?: number;
+      sha256?: string;
+      size_bytes?: number;
+      data_base64?: string;
+    };
+    if (!body.session_id || !body.revision || !body.sha256 || !body.data_base64) {
+      sendJson(res, 400, { error: "session_id, revision, sha256, data_base64 are required" });
+      return;
+    }
+    if (!(await sessionBelongsToIdentity(body.session_id, identity))) {
+      sendJson(res, 403, { error: "session ownership mismatch" });
+      return;
+    }
+    const data = await frontendClient.request("checkpoint.save", {
+      agent_id: identity.agentId,
+      session_id: body.session_id,
+      revision: body.revision,
+      sha256: body.sha256,
+      size_bytes: body.size_bytes ?? null,
+      data_base64: body.data_base64,
+    });
+    if (data.ok === false && data.error === "revision_conflict") {
+      sendJson(res, 409, data);
+      return;
+    }
+    sendJson(res, 200, data);
+  } catch (err) {
+    console.error("[internal-api] session-checkpoint save error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
+ * GET /api/internal/session-checkpoints/:sessionId
+ *
+ * Query params: before_revision (integrity-fallback walk), meta_only
+ * (revision-counter re-sync without the blob). Always 200; absence is
+ * `{found:false}` so the client never treats "no checkpoint yet" as an error.
+ */
+export async function handleSessionCheckpointLoad(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  sessionId: string,
+  frontendClient: FrontendWsClient,
+): Promise<void> {
+  try {
+    if (!(await sessionBelongsToIdentity(sessionId, identity))) {
+      sendJson(res, 403, { error: "session ownership mismatch" });
+      return;
+    }
+    const query = new URL(req.url || "/", "http://_").searchParams;
+    const beforeRevision = query.get("before_revision");
+    const data = await frontendClient.request("checkpoint.load", {
+      agent_id: identity.agentId,
+      session_id: sessionId,
+      before_revision: beforeRevision != null ? Number(beforeRevision) : undefined,
+      meta_only: query.get("meta_only") === "true",
+    });
+    sendJson(res, 200, data);
+  } catch (err) {
+    console.error("[internal-api] session-checkpoint load error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
 function maybeJson(metadata: Record<string, unknown> | null | undefined): string | null {
   return metadata != null ? JSON.stringify(metadata) : null;
 }

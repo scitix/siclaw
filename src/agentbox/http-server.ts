@@ -12,10 +12,11 @@ import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
 import type { AgentMode } from "../core/tool-registry.js";
-import { isMemoryEnabled, loadConfig } from "../core/config.js";
+import { isMemoryEnabled, isSessionCheckpointEnabled, loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
+import { SessionCheckpointer } from "./session-checkpointer.js";
 import { CredentialBroker } from "./credential-broker.js";
 import { HttpTransport } from "./credential-transport.js";
 import { getSyncHandler, createClusterHandler, createHostHandler } from "./sync-handlers.js";
@@ -219,6 +220,10 @@ export function createHttpServer(
       const client = sessionManager.gatewayClient;
       sessionManager.credentialBroker = new CredentialBroker(new HttpTransport(client), credentialsDir);
       console.log(`[agentbox-http] Credential broker initialized (${gatewayUrl})`);
+    }
+    if (isSessionCheckpointEnabled() && sessionManager.gatewayClient && !sessionManager.checkpointer) {
+      sessionManager.checkpointer = new SessionCheckpointer(sessionManager.gatewayClient);
+      console.log(`[agentbox-http] Session checkpointing enabled (${gatewayUrl})`);
     }
   }
 

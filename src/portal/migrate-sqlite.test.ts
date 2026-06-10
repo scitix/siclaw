@@ -46,6 +46,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "model_entries",
       "model_providers",
       "notifications",
+      "session_checkpoints",
       "siclaw_users",
       "skill_import_history",
       "skill_reviews",

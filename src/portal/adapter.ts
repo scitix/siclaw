@@ -2552,5 +2552,86 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     };
   });
 
+  // --- checkpoint.* ---
+  // AgentBox session checkpoints (NFS removal). Contract:
+  // docs/design/2026-06-10-session-checkpoint-db.md §3. agent_id is injected
+  // by the Gateway from the caller's mTLS identity — never client-supplied.
+
+  handlers.set("checkpoint.save", async (params) => {
+    const agentId = typeof params.agent_id === "string" ? params.agent_id : "";
+    const sessionId = typeof params.session_id === "string" ? params.session_id : "";
+    const revision = Number(params.revision);
+    const sha256 = typeof params.sha256 === "string" ? params.sha256.toLowerCase() : "";
+    const dataBase64 = typeof params.data_base64 === "string" ? params.data_base64 : "";
+    if (!agentId || !sessionId || !Number.isInteger(revision) || revision < 1
+      || !/^[0-9a-f]{64}$/.test(sha256) || !dataBase64) {
+      throw new Error("checkpoint.save requires agent_id, session_id, revision >= 1, sha256, data_base64");
+    }
+    const data = Buffer.from(dataBase64, "base64");
+    // Recompute over the wire bytes — catches base64 truncation/corruption
+    // before a broken blob becomes the session's only durable copy.
+    const actualSha = crypto.createHash("sha256").update(data).digest("hex");
+    if (actualSha !== sha256) {
+      throw new Error(`checkpoint.save sha256 mismatch for session ${sessionId}`);
+    }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT MAX(revision) AS latest FROM session_checkpoints WHERE agent_id = ? AND session_id = ?`,
+      [agentId, sessionId],
+    ) as any;
+    const latest = rows?.[0]?.latest ?? null;
+    if (latest !== null && revision <= Number(latest)) {
+      // Structured conflict (not a throw): the client re-syncs once and
+      // retries; a second conflict means a competing writer — give up loudly.
+      return { ok: false, error: "revision_conflict", latest: Number(latest) };
+    }
+    await db.query(
+      `INSERT INTO session_checkpoints (agent_id, session_id, revision, sha256, size_bytes, data)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [agentId, sessionId, revision, sha256, data.length, data],
+    );
+    // Retention: keep the last 3 revisions (design §3) — GC ships with v1.
+    await db.query(
+      `DELETE FROM session_checkpoints WHERE agent_id = ? AND session_id = ? AND revision <= ?`,
+      [agentId, sessionId, revision - 3],
+    );
+    return { ok: true, revision };
+  });
+
+  handlers.set("checkpoint.load", async (params) => {
+    const agentId = typeof params.agent_id === "string" ? params.agent_id : "";
+    const sessionId = typeof params.session_id === "string" ? params.session_id : "";
+    if (!agentId || !sessionId) {
+      throw new Error("checkpoint.load requires agent_id and session_id");
+    }
+    const metaOnly = params.meta_only === true;
+    const beforeRevision = Number.isInteger(Number(params.before_revision))
+      ? Number(params.before_revision) : null;
+
+    const conds = ["agent_id = ?", "session_id = ?"];
+    const sqlParams: unknown[] = [agentId, sessionId];
+    if (beforeRevision !== null) {
+      conds.push("revision < ?");
+      sqlParams.push(beforeRevision);
+    }
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT revision, sha256, size_bytes${metaOnly ? "" : ", data"}
+       FROM session_checkpoints WHERE ${conds.join(" AND ")}
+       ORDER BY revision DESC LIMIT 1`,
+      sqlParams,
+    ) as any;
+    if (!rows || rows.length === 0) return { found: false };
+    const r = rows[0];
+    return {
+      found: true,
+      revision: Number(r.revision),
+      sha256: r.sha256,
+      size_bytes: Number(r.size_bytes),
+      ...(metaOnly ? {} : { data_base64: Buffer.from(r.data).toString("base64") }),
+    };
+  });
+
   return handlers;
 }
