@@ -439,7 +439,7 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 ### Platform Tool Exemption
 
 Tools with `platform: true` (`manage_schedule`, `credential_list`,
-`cluster_info`, `save_feedback`, `knowledge_search`) are exempt from workspace
+`cluster_list`, `save_feedback`) are exempt from workspace
 allow-list filtering — they must always be available regardless of workspace
 configuration. This is declared in each tool's registration, not in a central set.
 
