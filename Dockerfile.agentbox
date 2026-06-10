@@ -71,6 +71,10 @@ COPY skills/core/ ./skills/core/
 COPY skills/extension/ ./skills/extension/
 COPY skills/platform/ ./skills/platform/
 COPY docker/agentbox-entrypoint.sh /usr/local/bin/agentbox-entrypoint.sh
+# Deployment-specific extra command whitelist (additive-only; loaded at agent
+# startup — docs/design/2026-06-10-extra-command-whitelist.md). Replace the
+# file content before building to whitelist site-specific diagnostic binaries.
+COPY docker/extra-commands.json /etc/siclaw/extra-commands.json
 
 # Build every stdio MCP listed in mcp/MCP_LIST.txt and symlink each into PATH.
 # To add a new MCP: drop a new mcp/<name>/ directory (standalone npm package

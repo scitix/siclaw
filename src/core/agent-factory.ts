@@ -40,6 +40,7 @@ import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
+import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
@@ -287,6 +288,11 @@ export async function createSiclawSession(
   opts?: CreateSiclawSessionOpts,
 ): Promise<SiclawSessionResult> {
   const config = loadConfig();
+
+  // Register deployment-configured extra whitelist commands (idempotent,
+  // fail-loud on invalid config). Must run before any exec tool validates
+  // a command — all three exec tools share the merged registry.
+  initExtraCommands();
 
   const authStorage = AuthStorage.create();
 
