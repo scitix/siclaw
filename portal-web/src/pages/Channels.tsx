@@ -10,6 +10,7 @@ interface Channel {
 
 const CHANNEL_TYPES = [
   { value: "lark", label: "Lark / Feishu" },
+  { value: "dingtalk", label: "DingTalk 钉钉" },
   { value: "slack", label: "Slack" },
   { value: "discord", label: "Discord" },
   { value: "telegram", label: "Telegram" },
@@ -31,6 +32,10 @@ const CONFIG_FIELDS: Record<string, ConfigField[]> = {
     { key: "app_secret", label: "App Secret", type: "password", placeholder: "App secret from console", required: true },
     { key: "verification_token", label: "Verification Token", type: "text", placeholder: "Optional" },
     { key: "encrypt_key", label: "Encrypt Key", type: "text", placeholder: "Optional" },
+  ],
+  dingtalk: [
+    { key: "client_id", label: "Client ID (AppKey)", type: "text", placeholder: "dingxxxxxxxxxx", required: true },
+    { key: "client_secret", label: "Client Secret (AppSecret)", type: "password", placeholder: "App secret from console", required: true },
   ],
   slack: [
     { key: "bot_token", label: "Bot Token", type: "password", placeholder: "xoxb-...", required: true },

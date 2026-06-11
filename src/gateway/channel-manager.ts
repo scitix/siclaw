@@ -11,6 +11,7 @@
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { createLarkHandler } from "./channels/lark.js";
+import { createDingTalkHandler } from "./channels/dingtalk.js";
 
 export interface ChannelHandler {
   start(): Promise<void>;
@@ -133,6 +134,14 @@ export class ChannelManager {
     switch (channel.type) {
       case "lark":
         handler = createLarkHandler(
+          channel,
+          this.agentBoxManager,
+          this.agentBoxTlsOptions,
+          this.frontendClient,
+        );
+        break;
+      case "dingtalk":
+        handler = createDingTalkHandler(
           channel,
           this.agentBoxManager,
           this.agentBoxTlsOptions,
