@@ -1907,7 +1907,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const db = getDb();
     const placeholders = params.ids.map(() => "?").join(",");
     const [rows] = await db.query(
-      `SELECT name, transport, url, command, args, env, headers, enabled
+      `SELECT name, transport, url, command, args, env, headers, description, enabled
        FROM mcp_servers WHERE id IN (${placeholders}) AND enabled = 1`,
       params.ids,
     ) as any;
@@ -1920,6 +1920,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
         ...(row.args ? { args: safeParseJson(row.args, []) } : {}),
         ...(row.env ? { env: safeParseJson(row.env, {}) } : {}),
         ...(row.headers ? { headers: safeParseJson(row.headers, {}) } : {}),
+        ...(row.description ? { description: row.description } : {}),
       };
     }
     return { mcpServers };

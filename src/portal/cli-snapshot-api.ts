@@ -111,6 +111,7 @@ interface McpRow {
   args: string | null;
   env: string | null;
   headers: string | null;
+  description: string | null;
   enabled: number;
 }
 
@@ -295,7 +296,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     // MCP: scoped to agent via agent_mcp_servers when active, else all enabled.
     const [mcps] = activeAgentId
       ? await db.query<McpRow[]>(
-          `SELECT m.id, m.name, m.transport, m.url, m.command, m.args, m.env, m.headers, m.enabled
+          `SELECT m.id, m.name, m.transport, m.url, m.command, m.args, m.env, m.headers, m.description, m.enabled
            FROM mcp_servers m
            JOIN agent_mcp_servers ams ON ams.mcp_server_id = m.id
            WHERE m.enabled = 1 AND ams.agent_id = ?
@@ -303,7 +304,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           [activeAgentId],
         )
       : await db.query<McpRow[]>(
-          "SELECT id, name, transport, url, command, args, env, headers, enabled FROM mcp_servers WHERE enabled = 1 ORDER BY name",
+          "SELECT id, name, transport, url, command, args, env, headers, description, enabled FROM mcp_servers WHERE enabled = 1 ORDER BY name",
         );
     // Skills: with agent scope we filter via agent_skills; otherwise all
     // non-overlay skills in the default org. Overlay suppression applies in
@@ -438,6 +439,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
         ...(m.args ? { args: safeJson(m.args, []) } : {}),
         ...(m.env ? { env: safeJson(m.env, {}) } : {}),
         ...(m.headers ? { headers: safeJson(m.headers, {}) } : {}),
+        ...(m.description ? { description: m.description } : {}),
       };
     }
 
