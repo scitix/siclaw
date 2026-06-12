@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { jsonSchemaToTypebox, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, mcpContentToAgentContent } from "./mcp-client.js";
+import { jsonSchemaToTypebox, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, mcpContentToAgentContent, McpClientManager } from "./mcp-client.js";
 
 describe("jsonSchemaToTypebox", () => {
   it("converts string type", () => {
@@ -140,5 +140,31 @@ describe("mcpContentToAgentContent", () => {
     expect(result.content).toEqual([
       { type: "image", data: "aW1n", mimeType: "image/jpeg" },
     ]);
+  });
+});
+
+describe("createToolDefinition server description", () => {
+  const manager = new McpClientManager({ mcpServers: {} });
+  const makeDef = (serverDescription: string | undefined, toolDescription?: string) =>
+    (manager as any).createToolDefinition(
+      "grafana",
+      serverDescription,
+      { name: "query", description: toolDescription },
+      {},
+    );
+
+  it("prepends the admin-provided server description to the tool description", () => {
+    const def = makeDef("Monitoring tenant ID: t-123", "Run a PromQL query");
+    expect(def.description).toBe('[Server "grafana" context: Monitoring tenant ID: t-123]\nRun a PromQL query');
+  });
+
+  it("keeps the plain tool description when no server description is set", () => {
+    expect(makeDef(undefined, "Run a PromQL query").description).toBe("Run a PromQL query");
+    expect(makeDef("   ", "Run a PromQL query").description).toBe("Run a PromQL query");
+  });
+
+  it("applies the server context to the fallback description too", () => {
+    const def = makeDef("Monitoring tenant ID: t-123");
+    expect(def.description).toBe('[Server "grafana" context: Monitoring tenant ID: t-123]\nMCP tool query from grafana');
   });
 });

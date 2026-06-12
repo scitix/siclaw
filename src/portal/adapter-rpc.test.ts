@@ -315,6 +315,24 @@ describe("config.getMcpServers", () => {
     expect(result.mcpServers["stdio-server"].args).toEqual(["arg1", "arg2"]);
     expect(result.mcpServers["stdio-server"].env).toEqual({ KEY: "val" });
   });
+
+  it("includes the admin-provided description when present", async () => {
+    mockQuery([
+      { name: "grafana", transport: "sse", url: "https://mcp.example.com", command: null, args: null, env: null, headers: null, description: "Monitoring tenant ID: t-123" },
+    ]);
+
+    const result = await getHandler("config.getMcpServers")({ ids: ["id1"] }, "a1");
+    expect(result.mcpServers.grafana.description).toBe("Monitoring tenant ID: t-123");
+  });
+
+  it("omits description when null", async () => {
+    mockQuery([
+      { name: "plain", transport: "sse", url: "https://mcp.example.com", command: null, args: null, env: null, headers: null, description: null },
+    ]);
+
+    const result = await getHandler("config.getMcpServers")({ ids: ["id1"] }, "a1");
+    expect("description" in result.mcpServers.plain).toBe(false);
+  });
 });
 
 describe("config.getSkillBundle", () => {

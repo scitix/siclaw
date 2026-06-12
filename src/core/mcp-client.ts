@@ -19,18 +19,24 @@ export interface McpStdioServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  /** Admin-provided server context (e.g. tenant IDs) — surfaced to the model via tool descriptions. */
+  description?: string;
 }
 
 export interface McpSseServerConfig {
   transport: "sse";
   url: string;
   headers?: Record<string, string>;
+  /** Admin-provided server context (e.g. tenant IDs) — surfaced to the model via tool descriptions. */
+  description?: string;
 }
 
 export interface McpStreamableHttpServerConfig {
   transport: "streamable-http";
   url: string;
   headers?: Record<string, string>;
+  /** Admin-provided server context (e.g. tenant IDs) — surfaced to the model via tool descriptions. */
+  description?: string;
 }
 
 export type McpServerConfig =
@@ -225,7 +231,7 @@ export class McpClientManager {
         console.log(`[mcp-client] "${serverName}" provides ${mcpTools.length} tools: ${mcpTools.map((t: any) => t.name).join(", ")}`);
 
         for (const mcpTool of mcpTools) {
-          const toolDef = this.createToolDefinition(serverName, mcpTool, client);
+          const toolDef = this.createToolDefinition(serverName, cfg.description, mcpTool, client);
           this.tools.push(toolDef);
         }
 
@@ -273,6 +279,7 @@ export class McpClientManager {
    */
   private createToolDefinition(
     serverName: string,
+    serverDescription: string | undefined,
     mcpTool: { name: string; description?: string; inputSchema?: any },
     client: any,
   ): ToolDefinition {
@@ -280,10 +287,17 @@ export class McpClientManager {
     const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
     const parameters = jsonSchemaToTypebox(inputSchema);
 
+    // Prepend the admin-provided server description so the model sees server-level
+    // context (e.g. monitoring tenant IDs) on every tool from that server.
+    const serverContext = serverDescription?.trim()
+      ? `[Server "${serverName}" context: ${serverDescription.trim()}]\n`
+      : "";
+    const toolDescription = mcpTool.description ?? `MCP tool ${mcpTool.name} from ${serverName}`;
+
     return {
       name: fullName,
       label: `${serverName}/${mcpTool.name}`,
-      description: mcpTool.description ?? `MCP tool ${mcpTool.name} from ${serverName}`,
+      description: serverContext + toolDescription,
       parameters,
       execute: async (_toolCallId, args) => {
         try {
