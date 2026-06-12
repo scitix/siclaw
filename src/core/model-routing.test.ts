@@ -850,6 +850,75 @@ describe("runPromptWithModelRouting", () => {
     expect(messageEnds[0].message.stopReason).toBe("stop");
   });
 
+  it("synthesizes a visible assistant error event when every candidate fails during setup", async () => {
+    const brain = makeBrain(["ok"]);
+    brain.ensureContextForModelPrompt = vi.fn(async () => ({
+      ok: false,
+      compacted: false,
+      contextWindow: 0,
+      errorMessage: "Context preflight failed: invalid context window for openai/gpt-4",
+    }));
+    const state = createModelRouteState();
+    const emittedBrainEvents: unknown[] = [];
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitBrainEvent: (event) => emittedBrainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.exhausted).toBe(true);
+    expect(brain.prompt).not.toHaveBeenCalled();
+    // Setup failures emit no brain events of their own; without the
+    // synthesized terminal message the SSE consumer renders an empty turn
+    // (no answer, no error bubble) and the failure is invisible end-to-end.
+    const messageEnds = emittedBrainEvents.filter((event): event is any =>
+      typeof event === "object" && event !== null && (event as any).type === "message_end",
+    );
+    expect(messageEnds).toHaveLength(1);
+    expect(messageEnds[0].message.role).toBe("assistant");
+    expect(messageEnds[0].message.stopReason).toBe("error");
+    expect(messageEnds[0].message.errorMessage).toContain("Context preflight failed");
+  });
+
+  it("streams brain events live once a tool has executed (fallback is blocked from there)", async () => {
+    const brain = makeBrain([]);
+    const state = createModelRouteState();
+    const emittedBrainEvents: unknown[] = [];
+    let emittedWhilePromptRunning = 0;
+    brain.prompt = vi.fn(async () => {
+      brain.emitter.emit("event", { type: "agent_start" });
+      brain.emitter.emit("event", {
+        type: "tool_execution_start",
+        toolCallId: "call_1",
+        toolName: "read",
+        args: { path: "README.md" },
+      });
+      // The first tool execution blocks fallback, so from here the runner
+      // must pass events through live instead of holding them until the
+      // attempt resolves.
+      emittedWhilePromptRunning = emittedBrainEvents.length;
+      brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+      });
+    });
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitBrainEvent: (event) => emittedBrainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(true);
+    expect(emittedWhilePromptRunning).toBe(2);
+    // The success-path flush must not re-emit what already streamed live.
+    expect(emittedBrainEvents.map((event: any) => event?.type)).toEqual([
+      "agent_start",
+      "tool_execution_start",
+      "message_end",
+    ]);
+  });
+
   it("does not carry partial tool-use context into the fallback attempt after checkpoint restore", async () => {
     const brain = makeBrain([]);
     const state = createModelRouteState();

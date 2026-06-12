@@ -564,7 +564,7 @@ export async function runPromptWithModelRouting(
       status: "started",
     });
 
-    const attemptResult = await runAttempt(brain, text, candidate);
+    const attemptResult = await runAttempt(brain, text, candidate, emitBrainEvent);
     const failure = attemptResult.failure;
     attempt.finishedAt = now();
 
@@ -653,6 +653,26 @@ export async function runPromptWithModelRouting(
         errorMessage: failure.message,
       });
 
+      // A setup failure (model_not_found, context preflight, setModel throw)
+      // produced ZERO brain events, and this branch returns instead of
+      // throwing — the HTTP caller logs the turn as complete. Without a
+      // terminal brain event the chat client renders an empty turn: no
+      // answer, no error bubble (clients build error bubbles from an
+      // assistant message_end with stopReason "error", the same shape a
+      // failed LLM call emits in-band). Synthesize that message so the
+      // failure is visible end-to-end.
+      if (failure.source === "setup") {
+        emitBrainEvent({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: failure.message ?? `Model routing failed: all candidates exhausted (${failure.kind})`,
+          },
+        });
+      }
+
       if (failure.source === "prompt_error") {
         throw normalizeThrownError(failure);
       }
@@ -711,6 +731,7 @@ async function runAttempt(
   brain: BrainSession,
   text: string,
   candidate: ModelRouteCandidate,
+  emitBrainEvent: (event: unknown) => void,
 ): Promise<AttemptResult> {
   const checkpoint = brain.createPromptCheckpoint?.();
   let lastProviderResponse: BrainProviderResponse | undefined;
@@ -766,11 +787,25 @@ async function runAttempt(
   }
 
   let lastAssistantMessage: AssistantMessageLike | null = null;
+  // Brain events stay buffered (invisible to the SSE consumer) only while a
+  // fallback retry is still possible — a failed attempt's partial output must
+  // never reach the client. The first tool execution blocks fallback for good
+  // (side effects — see fallbackBlockedReason), so from that point buffering
+  // buys no atomicity and only delays the stream: flush the pending prefix
+  // and pass everything after it through live.
   const events: unknown[] = [];
   let hadToolExecution = false;
   const unsubscribe = brain.subscribe((event: unknown) => {
-    events.push(event);
-    if (isToolExecutionEvent(event)) hadToolExecution = true;
+    if (hadToolExecution) {
+      emitBrainEvent(event);
+    } else {
+      events.push(event);
+      if (isToolExecutionEvent(event)) {
+        hadToolExecution = true;
+        flushBrainEvents(events, emitBrainEvent);
+        events.length = 0;
+      }
+    }
     if (!isRecord(event) || event.type !== "message_end") return;
     const message = event.message;
     if (isRecord(message) && message.role === "assistant") {

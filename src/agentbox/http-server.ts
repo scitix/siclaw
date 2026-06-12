@@ -624,9 +624,17 @@ export function createHttpServer(
         )
       : managed.brain.prompt(promptText);
 
-    promptPromise.then(() => {
-      console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
-      promptOutcome = "completed";
+    promptPromise.then((result) => {
+      // The routing runner reports exhaustion (and user aborts) as a result,
+      // not a rejection — logging those as "completed" hid silent-failure
+      // turns during incident triage.
+      if (result && result.success === false) {
+        console.warn(`[agentbox-http] Prompt finished without success for session ${managed.id} (${result.finalFailureKind ?? "unknown"}: ${result.finalErrorMessage ?? "no error message"})`);
+        promptOutcome = "error";
+      } else {
+        console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
+        promptOutcome = "completed";
+      }
       onPromptFinish();
     }).catch((err) => {
       console.error(`[agentbox-http] Prompt error for session ${managed.id}:`, err);
@@ -698,7 +706,9 @@ export function createHttpServer(
     }
     // Replay extra (tool-pushed) events that arrived before SSE connected.
     // These are tagged events like { type: "subagent_event", ... } from
-    // the spawn_subagent bridge.
+    // the spawn_subagent bridge — and, for routed prompts, ALL brain events
+    // (routing replays them through the extra channel, bypassing _eventBuffer).
+    const extraReplayCount = managed._extraEventBuffer.length;
     for (const event of managed._extraEventBuffer) {
       writeEvent(event);
     }
@@ -706,7 +716,7 @@ export function createHttpServer(
 
     // If prompt already finished before SSE connected, close immediately
     if (managed._promptDone) {
-      console.log(`[agentbox-http] Prompt already done for session ${sessionId}, closing SSE after replay (${managed._eventBuffer.length} events)`);
+      console.log(`[agentbox-http] Prompt already done for session ${sessionId}, closing SSE after replay (${managed._eventBuffer.length} brain + ${extraReplayCount} extra events)`);
       closeSSE();
       return;
     }
