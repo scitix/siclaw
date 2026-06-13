@@ -383,6 +383,13 @@ export function createHttpServer(
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
     managed._aborted = false;
+    // Pre-spawn Stop: a /abort that arrived before this session existed recorded a pending abort.
+    // Consume it HERE — AFTER the unconditional `_aborted = false` reset above (placing it before
+    // would be wiped by that reset) — so the pre-prompt latch below short-circuits this turn.
+    if (sessionManager.consumePendingAbort(managed.id)) {
+      managed._aborted = true;
+      console.log(`[agentbox-http] Consumed pre-spawn pending abort for session ${managed.id}`);
+    }
     managed._routeBrainEventsThroughExtra = routeEnabled;
     // Acquire the brain.prompt mutex synchronously before any await so the
     // synth notify path (which polls _promptDone via waitForParentIdle)
@@ -604,6 +611,21 @@ export function createHttpServer(
     const emitRouteEvent = (event: ModelRouteEvent): void => {
       emitSessionExtraEvent({ ...event, sessionId: managed.id });
     };
+
+    // Pre-prompt latch: a Stop that landed during model setup (or a consumed pre-spawn pending
+    // abort) set `_aborted` true. Do NOT start the run — finish cleanly so the session unlocks
+    // and the SSE stream closes. Reset `_aborted` so the NEXT prompt isn't wrongly skipped.
+    if (managed._aborted) {
+      console.log(`[agentbox-http] Prompt for ${managed.id} aborted before start (pre-prompt latch)`);
+      managed._aborted = false;
+      // Use actuallyFinish (NOT onPromptFinish): no brain run started, so there is no
+      // agent_end/auto_*_end event coming. onPromptFinish would take its deferred branch and
+      // wait forever if isAgentActive/isCompacting/isRetrying were left stale-true by a prior
+      // abnormal turn — permanently locking the session at 409. actuallyFinish unlocks now.
+      actuallyFinish();
+      sendJson(res, 200, { ok: true, sessionId: managed.id, aborted: true });
+      return;
+    }
 
     const promptPromise = routeEnabled
       ? runPromptWithModelRouting(
@@ -876,13 +898,35 @@ export function createHttpServer(
     const managed = sessionManager.get(sessionId);
 
     if (!managed) {
-      sendJson(res, 404, { error: "Session not found" });
+      // Pre-spawn Stop: the session doesn't exist yet (Stop clicked before the prompt's
+      // getOrCreate ran). Record the intent so the imminent /api/prompt short-circuits instead
+      // of running the turn the user already cancelled. Return 200 (not 404) so the UI/gateway
+      // treats Stop as accepted. Consumed one-shot by the next /api/prompt (TTL backstop guards
+      // a Stop that never gets a following prompt).
+      sessionManager.markPendingAbort(sessionId);
+      console.log(`[agentbox-http] Abort for not-yet-created session ${sessionId}; recorded pending abort`);
+      sendJson(res, 200, { ok: true, pending: true, stoppedJobs: 0 });
       return;
     }
 
     console.log(`[agentbox-http] Aborting session ${sessionId} (abort endpoint called)`);
-    console.trace(`[agentbox-http] Abort stack trace for session ${sessionId}`);
     managed._aborted = true;
+
+    // Stop is terminal: drop any queued steer/followUp so it does NOT replay on the next prompt.
+    try {
+      const cleared = managed.brain.clearQueue();
+      if (cleared.steering.length || cleared.followUp.length) {
+        console.log(`[agentbox-http] Stop cleared queue for ${sessionId}: ${cleared.steering.length} steer, ${cleared.followUp.length} followUp`);
+      }
+    } catch (err) {
+      console.warn(`[agentbox-http] clearQueue on abort failed for ${sessionId}:`, err);
+    }
+
+    // Discard buffered background-job completion notifications + cancel the coalesce timer:
+    // a job that completed moments BEFORE Stop is already past the stopSessionJobs "running"
+    // filter, and its armed coalesce timer would otherwise fire flushPendingNotifications →
+    // runSyntheticPrompt → brain.prompt() AFTER the Stop = the model "comes back to life".
+    sessionManager.discardPendingNotifications(sessionId);
 
     // Foreground sub-agents are cancelled via the parent brain's abort signal
     // (threaded into runSpawnedSubagent). The user's Stop should also halt the session's
@@ -893,11 +937,22 @@ export function createHttpServer(
       console.log(`[agentbox-http] Stop also halted ${stoppedJobs} background job(s) for session ${sessionId}`);
     }
     const outcome = await abortBrainForHttp(managed.brain, sessionId);
+    // Re-sweep AFTER brain.abort() resolves: it resolves only once the run loop fully drains
+    // (every in-flight tool call returned), so a tool call that launched a background job DURING
+    // the drain registered it AFTER the first sweep. Catch it now — this is the fix for the
+    // "background job launched mid-abort escapes Stop" bug. (On a 2s-timeout outcome the run may
+    // not have drained; the per-launch _aborted latch in createBackgroundExecExecutor is the
+    // backstop there.)
+    const reSwept = sessionManager.stopSessionJobs(sessionId);
+    if (reSwept > 0) {
+      console.log(`[agentbox-http] Re-sweep after brain.abort halted ${reSwept} background job(s) for session ${sessionId}`);
+    }
+    const totalStopped = stoppedJobs + reSwept;
     if (outcome === "failed") {
-      sendJson(res, 500, { error: "Abort failed", stoppedJobs });
+      sendJson(res, 500, { error: "Abort failed", stoppedJobs: totalStopped });
       return;
     }
-    sendJson(res, 200, { ok: true, stoppedJobs, ...(outcome === "timeout" ? { pending: true } : {}) });
+    sendJson(res, 200, { ok: true, stoppedJobs: totalStopped, ...(outcome === "timeout" ? { pending: true } : {}) });
   });
 
   /**
