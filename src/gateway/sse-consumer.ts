@@ -336,6 +336,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     errorPersisted = false;
     streamErrorEmitted = false;
     errorMessage = "";
+    // The primary's deferred assistant op flipped firstAssistantPersisted when
+    // it was enqueued; we're now discarding that op, so undo the flip — else the
+    // surviving fallback reply, which becomes the turn's first persisted
+    // assistant, is wrongly gated out of ttft_ms (the turn anchor).
+    firstAssistantPersisted = false;
   };
   let lastToolName = "";
 
