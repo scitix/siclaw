@@ -829,15 +829,46 @@ describe("runPromptWithModelRouting", () => {
     expect(state.activeCandidateKey).toBe("anthropic/claude");
   });
 
-  it("restores the prompt checkpoint and only emits final attempt brain events after fallback", async () => {
+  it("streams the primary candidate live from the first event when it succeeds (no buffering, no rollback)", async () => {
+    const brain = makeBrain([]);
+    const state = createModelRouteState();
+    const emittedBrainEvents: unknown[] = [];
+    const routeEvents: ModelRouteEvent[] = [];
+    let emittedDuringPrompt = 0;
+    brain.prompt = vi.fn(async () => {
+      brain.emitter.emit("event", { type: "agent_start" });
+      brain.emitter.emit("event", { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } });
+      // The primary streams live: these events are already forwarded before
+      // prompt() resolves — a buffered candidate would forward nothing yet.
+      emittedDuringPrompt = emittedBrainEvents.length;
+      brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "hi" }], stopReason: "stop" },
+      });
+    });
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitEvent: (event) => routeEvents.push(event),
+      emitBrainEvent: (event) => emittedBrainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(true);
+    expect(emittedDuringPrompt).toBe(2);
+    expect(routeEvents.some((e) => e.type === "model_route_rollback")).toBe(false);
+  });
+
+  it("streams the primary live, rolls it back on failure, then streams the fallback's reply", async () => {
     const brain = makeBrain(["rate_limit", "ok"]);
     const state = createModelRouteState();
     const emittedBrainEvents: unknown[] = [];
+    const routeEvents: ModelRouteEvent[] = [];
     let checkpointSeq = 0;
     brain.createPromptCheckpoint = vi.fn(() => `leaf-${checkpointSeq++}`);
     brain.restorePromptCheckpoint = vi.fn(async () => {});
 
     await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitEvent: (event) => routeEvents.push(event),
       emitBrainEvent: (event) => emittedBrainEvents.push(event),
       now: () => 10_000,
     });
@@ -846,8 +877,86 @@ describe("runPromptWithModelRouting", () => {
     const messageEnds = emittedBrainEvents.filter((event): event is any =>
       typeof event === "object" && event !== null && (event as any).type === "message_end",
     );
+    // Primary streamed live and failed (rate_limit); the buffered fallback's
+    // successful reply streamed after the switch. Both reach the consumer.
+    expect(messageEnds).toHaveLength(2);
+    expect(messageEnds[0].message.stopReason).toBe("error");
+    expect(messageEnds[1].message.stopReason).toBe("stop");
+    // The live primary failure emits a rollback (so consumers drop it),
+    // sequenced before the switch to the fallback candidate.
+    const rollbackIdx = routeEvents.findIndex((e) => e.type === "model_route_rollback");
+    const switchIdx = routeEvents.findIndex((e) => e.type === "model_route_switch");
+    expect(rollbackIdx).toBeGreaterThanOrEqual(0);
+    expect(switchIdx).toBeGreaterThan(rollbackIdx);
+  });
+
+  it("synthesizes a visible assistant error event when every candidate fails during setup", async () => {
+    const brain = makeBrain(["ok"]);
+    brain.ensureContextForModelPrompt = vi.fn(async () => ({
+      ok: false,
+      compacted: false,
+      contextWindow: 0,
+      errorMessage: "Context preflight failed: invalid context window for openai/gpt-4",
+    }));
+    const state = createModelRouteState();
+    const emittedBrainEvents: unknown[] = [];
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitBrainEvent: (event) => emittedBrainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.exhausted).toBe(true);
+    expect(brain.prompt).not.toHaveBeenCalled();
+    // Setup failures emit no brain events of their own; without the
+    // synthesized terminal message the SSE consumer renders an empty turn
+    // (no answer, no error bubble) and the failure is invisible end-to-end.
+    const messageEnds = emittedBrainEvents.filter((event): event is any =>
+      typeof event === "object" && event !== null && (event as any).type === "message_end",
+    );
     expect(messageEnds).toHaveLength(1);
-    expect(messageEnds[0].message.stopReason).toBe("stop");
+    expect(messageEnds[0].message.role).toBe("assistant");
+    expect(messageEnds[0].message.stopReason).toBe("error");
+    expect(messageEnds[0].message.errorMessage).toContain("Context preflight failed");
+  });
+
+  it("streams brain events live once a tool has executed (fallback is blocked from there)", async () => {
+    const brain = makeBrain([]);
+    const state = createModelRouteState();
+    const emittedBrainEvents: unknown[] = [];
+    let emittedWhilePromptRunning = 0;
+    brain.prompt = vi.fn(async () => {
+      brain.emitter.emit("event", { type: "agent_start" });
+      brain.emitter.emit("event", {
+        type: "tool_execution_start",
+        toolCallId: "call_1",
+        toolName: "read",
+        args: { path: "README.md" },
+      });
+      // The first tool execution blocks fallback, so from here the runner
+      // must pass events through live instead of holding them until the
+      // attempt resolves.
+      emittedWhilePromptRunning = emittedBrainEvents.length;
+      brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+      });
+    });
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitBrainEvent: (event) => emittedBrainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(true);
+    expect(emittedWhilePromptRunning).toBe(2);
+    // The success-path flush must not re-emit what already streamed live.
+    expect(emittedBrainEvents.map((event: any) => event?.type)).toEqual([
+      "agent_start",
+      "tool_execution_start",
+      "message_end",
+    ]);
   });
 
   it("does not carry partial tool-use context into the fallback attempt after checkpoint restore", async () => {

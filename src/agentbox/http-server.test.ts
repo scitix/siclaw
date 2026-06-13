@@ -422,12 +422,19 @@ describe("http-server — model routing", () => {
     expect(s.modelRouteState.cooldowns["openai/gpt-4"]).toBeGreaterThan(0);
     expect(s._eventBuffer).toEqual([]);
     expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(true);
+    // The primary now streams live, so its failed error message_end IS relayed
+    // (the frontend renders it, then drops it on the rollback below).
     expect(s._extraEventBuffer.some((event) =>
       event.type === "message_end" && (event.message as any)?.stopReason === "error",
-    )).toBe(false);
-    expect(s._extraEventBuffer.some((event) =>
-      event.type === "message_end" && (event.message as any)?.content?.[0]?.text === "ok",
     )).toBe(true);
+    // A rollback tells consumers to discard the failed primary's live output
+    // before the fallback's reply arrives.
+    const rollbackIdx = s._extraEventBuffer.findIndex((event) => event.type === "model_route_rollback");
+    const okIdx = s._extraEventBuffer.findIndex((event) =>
+      event.type === "message_end" && (event.message as any)?.content?.[0]?.text === "ok",
+    );
+    expect(rollbackIdx).toBeGreaterThanOrEqual(0);
+    expect(okIdx).toBeGreaterThan(rollbackIdx);
     expect(sm.persistModelRouteState).toHaveBeenCalledWith("route-fallback", s.modelRouteState);
   });
 
