@@ -326,12 +326,16 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     await flushOps(pendingAssistantOps);
   };
   // model_route_rollback: the live primary failed and will be retried on the
-  // next candidate. Drop everything it buffered; re-arm errorPersisted so the
-  // next attempt can record its own error.
+  // next candidate. Drop everything it buffered and re-arm the per-attempt
+  // dedup flags so the next attempt can record (and surface live) its own
+  // error, and so the rolled-back attempt's error text doesn't leak into the
+  // returned run summary / notifications (mirrors commitRoutedTurn).
   const discardRoutedAttempt = () => {
     pendingAssistantOps.length = 0;
     pendingErrorOps.length = 0;
     errorPersisted = false;
+    streamErrorEmitted = false;
+    errorMessage = "";
   };
   let lastToolName = "";
 
@@ -762,8 +766,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
                 metadata: assistantRowMetadata,
               });
               await incrementMessageCount(sessionId);
-              firstAssistantPersisted = true;
             };
+            // Flip the first-assistant flag NOW (not inside the deferred op):
+            // ttft_ms is the turn anchor and is computed above from this flag, so
+            // a second assistant message_end in the same routed turn must already
+            // see it set, even though the op itself may not run until commit. The
+            // op-internal flip lagged and let a 2nd deferred row re-emit ttft.
+            firstAssistantPersisted = true;
             // On a routed turn the primary streams live before we know it won;
             // defer the durable write to the commit point so a failed primary's
             // reply isn't left in the DB after a fallback takes over.
