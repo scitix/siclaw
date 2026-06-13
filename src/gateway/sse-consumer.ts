@@ -296,6 +296,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let taskReportText = "";
   let errorMessage = "";
   let streamErrorEmitted = false;
+  let errorPersisted = false;
   let lastToolName = "";
 
   // Queued by toolName. pi-agent events do not always expose a stable call id,
@@ -592,6 +593,29 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               "stream_error",
               {},
             );
+          }
+          // Persist the error as its own DB row so it survives a page refresh
+          // or session re-open. The live frontend error bubble is client-only
+          // (role="error", no DB row) and is dropped once history reloads from
+          // the DB — without this row a failed turn reloads as just the user
+          // message. The motivating case is model-routing exhausting during
+          // setup: it emits a synthetic error message_end with EMPTY content,
+          // so the assistantContent persist path below skips it entirely and
+          // nothing about the failure reaches the database. Dedup per consume
+          // run (pi-agent can retry and emit several error message_ends).
+          if (persist && !errorPersisted) {
+            errorPersisted = true;
+            await appendMessage({
+              sessionId,
+              role: "assistant",
+              content: redactText(errorMessage, redactionConfig),
+              metadata: {
+                kind: "error_response",
+                error_code: ErrorCodes.MODEL_ERROR,
+                retriable: true,
+              },
+            });
+            await incrementMessageCount(sessionId);
           }
         }
 

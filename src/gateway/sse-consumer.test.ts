@@ -119,6 +119,40 @@ describe("consumeAgentSse — assistant message flow", () => {
     expect(result.errorMessage).toBe("API 429");
   });
 
+  it("persists a synthetic error row (metadata.kind=error_response) so a failed turn survives reload", async () => {
+    // The motivating case: model-routing exhausts during setup and emits an
+    // error message_end with EMPTY content. The assistantContent persist path
+    // skips it (no text), so without the error row nothing about the failure
+    // reaches the DB and a refresh shows only the user message.
+    const events = [
+      { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "Context preflight failed: invalid context window", content: [] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const errorRow = appendCalls.find((r) => r.metadata?.kind === "error_response");
+    expect(errorRow).toBeDefined();
+    expect(errorRow.role).toBe("assistant");
+    expect(errorRow.sessionId).toBe("sid");
+    expect(errorRow.content).toContain("Context preflight failed");
+    expect(errorRow.metadata.retriable).toBe(true);
+  });
+
+  it("persists the error row only once even when retries emit several error message_ends", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "API 429", content: [] } },
+      { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "API 429", content: [] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(1);
+  });
+
+  it("does not persist an error row when persistMessages is unset", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "API 429", content: [] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u" });
+    expect(appendCalls.find((r) => r.metadata?.kind === "error_response")).toBeUndefined();
+  });
+
   it("falls back to currentMsgText when no message_end provides content", async () => {
     const events = [
       { type: "message_start" },
