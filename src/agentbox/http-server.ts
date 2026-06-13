@@ -30,7 +30,7 @@ import {
   type ModelRouteEvent,
   type ModelRoutePolicy,
 } from "../core/model-routing.js";
-import type { BrainSession } from "../core/brain-session.js";
+import type { BrainSession, PromptImage } from "../core/brain-session.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -54,6 +54,31 @@ interface PromptRequestBody {
   systemPromptTemplate?: string;
   modelConfig?: Record<string, unknown>;
   modelRouting?: ModelRoutePolicy;
+  /** Image attachments forwarded as vision input (vision-capable models only). */
+  images?: PromptImage[];
+}
+
+// Defense-in-depth bound; the sicore proxy already caps attachments, but the
+// agentbox /prompt is also reachable directly so re-validate here.
+const MAX_PROMPT_IMAGES = 4;
+const MAX_PROMPT_IMAGE_BASE64_CHARS = 8 * 1024 * 1024;
+const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+/** Keep only well-formed, supported image parts; drop anything malformed. */
+function sanitizePromptImages(raw: unknown): PromptImage[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: PromptImage[] = [];
+  for (const item of raw) {
+    if (out.length >= MAX_PROMPT_IMAGES) break;
+    if (!item || typeof item !== "object") continue;
+    const mimeType = (item as { mimeType?: unknown }).mimeType;
+    const data = (item as { data?: unknown }).data;
+    if (typeof mimeType !== "string" || typeof data !== "string") continue;
+    if (!SUPPORTED_PROMPT_IMAGE_MIMES.has(mimeType.toLowerCase())) continue;
+    if (data.length === 0 || data.length > MAX_PROMPT_IMAGE_BASE64_CHARS) continue;
+    out.push({ mimeType: mimeType.toLowerCase(), data });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 /**
@@ -339,12 +364,16 @@ export function createHttpServer(
   addRoute("POST", "/api/prompt", async (req, res) => {
     const body = (await parseJsonBody(req)) as PromptRequestBody;
 
-    if (!body.text) {
+    const promptImages = sanitizePromptImages(body.images);
+
+    // An image-only message is valid (vision models read the picture directly);
+    // only reject when there is neither text nor a usable image.
+    if (!body.text && !promptImages) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
 
-    const activeMode = resolveActiveMode(body.text, body.sessionId, sessionManager);
+    const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, activeMode);
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
@@ -477,7 +506,11 @@ export function createHttpServer(
         }
       }
 
-      promptText = body.text;
+      // Image-only messages arrive with empty text; give the model a minimal
+      // default instruction so the turn isn't a bare image with no ask.
+      promptText = body.text && body.text.length > 0
+        ? body.text
+        : (promptImages ? "Please analyze the attached image." : "");
     } catch (err) {
       releasePromptLockOnSetupFailure(err);
       return;
@@ -487,7 +520,7 @@ export function createHttpServer(
     // IMPORTANT: append after DP markers, not prepend before them.
     // Prepending would break marker detection in pi-agent extension input handlers
     // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
-    const detectedLang = detectLanguage(body.text);
+    const detectedLang = detectLanguage(promptText);
     if (detectedLang !== "English" && isMemoryEnabled()) {
       // Only two DP markers remain after the refactor: activation and exit.
       const dpMarkers = [DP_ACTIVATION_MARKER, `${DP_EXIT_MARKER}\n`];
@@ -643,8 +676,9 @@ export function createHttpServer(
             onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
             shouldAbort: () => managed._aborted,
           },
+          promptImages,
         )
-      : managed.brain.prompt(promptText);
+      : managed.brain.prompt(promptText, promptImages);
 
     promptPromise.then((result) => {
       // The routing runner reports exhaustion (and user aborts) as a result,

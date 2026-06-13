@@ -171,6 +171,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     const modelConfig = params.modelConfig as PromptOptions["modelConfig"];
     const modelRouting = params.modelRouting as PromptOptions["modelRouting"];
+    const images = params.images as PromptOptions["images"];
     const promptOpts: PromptOptions = {
       sessionId,
       text,
@@ -181,6 +182,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       mode: params.mode as string | undefined,
       modelConfig,
       modelRouting,
+      images,
     };
 
     // Async-ack protocol: return { ok, sessionId } within milliseconds; do

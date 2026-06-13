@@ -72,6 +72,30 @@ describe("PiAgentBrain", () => {
     expect(session.prompt).toHaveBeenCalledTimes(1);
   });
 
+  it("prompt maps images to ImageContent and passes them to session.prompt", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string, _opts?: any) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("describe", [{ mimeType: "image/png", data: "aW1n" }]);
+    expect(session.prompt).toHaveBeenCalledWith("describe", {
+      images: [{ type: "image", data: "aW1n", mimeType: "image/png" }],
+    });
+  });
+
+  it("prompt passes no options when there are no images", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string, _opts?: any) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("hi");
+    expect(session.prompt).toHaveBeenCalledWith("hi", undefined);
+  });
+
   it("prompt skips retry when stopReason is aborted", async () => {
     const session = makeFakeSession();
     session.prompt = vi.fn(async (_text: string) => {
