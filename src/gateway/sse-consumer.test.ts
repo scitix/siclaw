@@ -440,6 +440,29 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     expect(withTtft).toHaveLength(1);
     expect(withTtft[0].content).toBe("first");
   });
+
+  it("keeps ttft_ms on the fallback reply when the primary streamed text then failed", async () => {
+    // Regression: the primary's enqueued assistant op flips firstAssistantPersisted;
+    // rollback discards that op, so without re-arming the flag the surviving
+    // fallback reply (the turn's real first assistant) loses its ttft anchor.
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "primary text" } },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "fallback answer" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fallback answer" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true, turnStartTime: Date.now() - 5000 });
+    const fallbackRow = appendCalls.find((r) => r.role === "assistant" && r.content === "fallback answer");
+    expect(fallbackRow).toBeDefined();
+    expect(fallbackRow.metadata?.timing?.ttft_ms).toBeDefined();
+    // The rolled-back primary text never persists.
+    expect(appendCalls.some((r) => r.content === "primary text")).toBe(false);
+  });
 });
 
 // ── Tool calls ──────────────────────────────────────────
