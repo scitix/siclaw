@@ -741,6 +741,10 @@ export class AgentBoxSessionManager {
                 emitBrainEvent: handleBrainEvent,
                 onStateChange: () => this.persistModelRouteState(managed.id, managed.modelRouteState),
                 shouldAbort: () => managed._aborted,
+                // Synthetic background turns persist by collecting brain events
+                // (turnMessages) and have no live viewer — buffer every attempt
+                // so a failed primary can't leak into the persisted turn.
+                optimisticPrimaryStream: false,
               },
             );
           } else {
