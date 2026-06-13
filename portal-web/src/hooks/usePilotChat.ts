@@ -339,6 +339,23 @@ function findLastMessageIndex<T>(items: T[], predicate: (item: T) => boolean): n
   return -1;
 }
 
+/**
+ * Drop the live output of a failed model-routing primary attempt: the streaming
+ * assistant bubble and any error bubble rendered after the latest visible user
+ * message. The user turn, earlier history, and hidden ledger rows are kept, so
+ * the fallback candidate's reply streams in cleanly instead of stacking under
+ * the rolled-back attempt's output. Matches the gateway's commit-gated
+ * persistence (a rolled-back attempt is never written to the DB).
+ */
+export function dropFailedAttemptOutput(messages: PilotMessage[]): PilotMessage[] {
+  const lastUserIdx = findLastMessageIndex(messages, (m) => m.role === "user" && !m.hidden);
+  if (lastUserIdx < 0) return messages;
+  const head = messages.slice(0, lastUserIdx + 1);
+  const tailHidden = messages.slice(lastUserIdx + 1).filter((m) => m.hidden);
+  if (tailHidden.length === messages.length - lastUserIdx - 1) return messages;
+  return [...head, ...tailHidden];
+}
+
 function extractTiming(metadata: Record<string, unknown> | undefined, durationMs: number | null | undefined): import("../components/chat/types").MessageTiming | undefined {
   // Tool rows: duration_ms (⚙️ exec) is its own column; pre_thinking_ms
   // (💭 model-thinking-before-this-tool) lives at metadata.pre_thinking_ms.
@@ -1029,6 +1046,14 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       switch (eventType) {
         case "model_route_start":
           currentModelRouteRef.current = null
+          break
+
+        case "model_route_rollback":
+          // The primary candidate streamed live, then failed. Drop what it
+          // rendered so the fallback's reply (streaming in next) replaces it
+          // rather than stacking under it. The upcoming model_route_switch
+          // still records that the model changed.
+          setMessages((prev) => dropFailedAttemptOutput(prev))
           break
 
         case "model_route_switch":
