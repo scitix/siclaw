@@ -36,7 +36,7 @@ import deepInvestigationExtension from "./extensions/deep-investigation.js";
 import setupExtension from "./extensions/setup.js";
 import lsExtension from "./extensions/ls.js";
 import agentExtension from "./extensions/agent.js";
-import { PiAgentBrain } from "./brains/pi-agent-brain.js";
+import { PiAgentBrain, SERVICE_TIER_PROP } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
@@ -689,6 +689,22 @@ export async function createSiclawSession(
   const contextWindow = configuredModel?.contextWindow ?? 128_000;
   const guardRegistry = createGuardRegistry(contextWindow);
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
+
+  // ── Per-call service_tier injection ──
+  // reasoning_effort rides the session thinking level (set via applyModelParams),
+  // but service_tier ("fast") is a provider-specific per-call option with no
+  // session setter. Wrap streamFn — the one place every provider request flows
+  // through — and stamp options.serviceTier from the value the brain stashed on
+  // the agent (PiAgentBrain.applyModelParams). Providers that ignore serviceTier
+  // (anthropic, deepseek, …) are unaffected; openai-codex-responses honours it.
+  const baseStreamFn = session.agent.streamFn;
+  session.agent.streamFn = (model: any, context: any, options: any) => {
+    const tier = (session.agent as any)[SERVICE_TIER_PROP];
+    if (tier && options && typeof options === "object" && options.serviceTier === undefined) {
+      options.serviceTier = tier;
+    }
+    return baseStreamFn(model, context, options);
+  };
 
   const brain: BrainSession = new PiAgentBrain(session);
   return { brain, session, services, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };

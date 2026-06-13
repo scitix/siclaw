@@ -9,12 +9,20 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type {
   BrainSession,
   BrainModelInfo,
+  BrainModelParams,
   BrainContextUsage,
   BrainSessionStats,
   BrainProviderResponse,
   BrainContextPreflightResult,
   PromptImage,
 } from "../brain-session.js";
+
+/** Valid pi thinking levels; guards reasoningEffort coming off the wire. */
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
+/** Property stashed on the pi agent so the agent-factory streamFn wrapper can read
+ *  the active service tier without a separate ref handoff. */
+export const SERVICE_TIER_PROP = "_siclawServiceTier";
 import { estimateMessagesTokens } from "../compaction.js";
 
 export class PiAgentBrain implements BrainSession {
@@ -245,6 +253,20 @@ export class PiAgentBrain implements BrainSession {
 
   registerProvider(name: string, config: Record<string, unknown>): void {
     this.session.modelRegistry.registerProvider(name, config as any);
+  }
+
+  applyModelParams(params: BrainModelParams): void {
+    // reasoningEffort → session thinking level. pi maps this to the provider's
+    // reasoning_effort / reasoning:{effort} per the provider's thinkingLevelMap.
+    const effort = params.reasoningEffort?.trim();
+    if (effort && THINKING_LEVELS.has(effort)) {
+      this.session.setThinkingLevel(effort as any);
+    }
+    // serviceTier → stashed on the agent for the streamFn wrapper to inject as a
+    // per-call option. Always (re)written — clearing it when absent so a previous
+    // turn's "fast" doesn't leak into a model that shouldn't use it.
+    const tier = params.serviceTier?.trim();
+    (this.session.agent as any)[SERVICE_TIER_PROP] = tier && tier !== "default" ? tier : undefined;
   }
 
   async ensureContextForModelPrompt(

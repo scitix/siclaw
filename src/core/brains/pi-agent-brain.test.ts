@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { PiAgentBrain } from "./pi-agent-brain.js";
+import { PiAgentBrain, SERVICE_TIER_PROP } from "./pi-agent-brain.js";
 
 /** Fake AgentSession providing only what PiAgentBrain touches. */
 function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
@@ -31,6 +31,7 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
       registerProvider: vi.fn(),
     },
     setModel: vi.fn(async () => {}),
+    setThinkingLevel: vi.fn(),
     __emit: emit,
     ...overrides,
   };
@@ -481,5 +482,36 @@ describe("PiAgentBrain", () => {
       provider: "anthropic",
       modelId: "claude",
     }]);
+  });
+
+  describe("applyModelParams", () => {
+    it("sets a valid reasoning effort as the thinking level", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ reasoningEffort: "xhigh" });
+      expect(session.setThinkingLevel).toHaveBeenCalledWith("xhigh");
+    });
+
+    it("ignores an invalid reasoning effort (no throw, no call)", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ reasoningEffort: "ultra" });
+      expect(session.setThinkingLevel).not.toHaveBeenCalled();
+    });
+
+    it("stashes 'fast' service tier on the agent for the streamFn wrapper", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ serviceTier: "fast" });
+      expect(session.agent[SERVICE_TIER_PROP]).toBe("fast");
+    });
+
+    it("clears service tier when absent or 'default' so it doesn't leak across turns", () => {
+      const session = makeFakeSession();
+      const brain = new PiAgentBrain(session);
+      brain.applyModelParams({ serviceTier: "fast" });
+      expect(session.agent[SERVICE_TIER_PROP]).toBe("fast");
+      brain.applyModelParams({});
+      expect(session.agent[SERVICE_TIER_PROP]).toBeUndefined();
+      brain.applyModelParams({ serviceTier: "default" });
+      expect(session.agent[SERVICE_TIER_PROP]).toBeUndefined();
+    });
   });
 });
