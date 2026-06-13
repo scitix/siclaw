@@ -138,6 +138,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── RPC Methods (chat only) ──────────────────────────────
   const rpcMethods = new Map<string, RpcHandler>();
 
+  // Per-session AbortController for the in-flight chat.send SSE consumer, keyed
+  // by sessionId. chat.abort looks this up to break the gateway's consumeAgentSse
+  // loop so its abort-finalization runs (in-flight tool rows → "stopped", partial
+  // text persisted). Without this the consumer ends only when the agentbox closes
+  // the stream NATURALLY (signal never aborted), the finalization is skipped, and
+  // the tool row stays persisted as "running" — so a page refresh re-paints the
+  // turn as still reasoning. Registered in chat.send, cleared on its settle.
+  const activeStreamAborts = new Map<string, AbortController>();
+
   rpcMethods.set("chat.send", async (params, context: RpcContext) => {
     const agentId = params.agentId as string;
     const userId = params.userId as string;
@@ -224,6 +233,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
         const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
         const abortCtrl = new AbortController();
+        // Register this turn's abort signal so chat.abort can break the consumer
+        // (see activeStreamAborts declaration). Placed AFTER prompt() succeeds, on
+        // the path that actually consumes: the concurrent-send "already running"
+        // branch early-returns above (steer) before this line, so it never clobbers
+        // the in-flight prompt's controller in the map. Keyed on the agentbox-echoed
+        // promptResult.sessionId — the same id chat.abort looks up.
+        activeStreamAborts.set(promptResult.sessionId, abortCtrl);
 
         try {
           await consumeAgentSse({
@@ -255,6 +271,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             });
           }
           context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+        } finally {
+          // Only clear if still ours — a fast re-send for the same session would
+          // have replaced the entry with a newer controller.
+          if (activeStreamAborts.get(promptResult.sessionId) === abortCtrl) {
+            activeStreamAborts.delete(promptResult.sessionId);
+          }
         }
       } catch (err) {
         // Failure before/during agentbox spawn or prompt() — surface as a
@@ -280,6 +302,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
+
+    // Break the gateway's SSE consumer FIRST, then stop the agentbox. Aborting the
+    // signal before abortSession ensures it is set before the agentbox's final
+    // agent_end/prompt_done events (or the natural stream close they cause) reach
+    // the consumer — so consumeAgentSse runs its abort-finalization (in-flight tool
+    // rows → "stopped", partial assistant text persisted) instead of exiting as a
+    // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
+    activeStreamAborts.get(sessionId)?.abort();
 
     const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
