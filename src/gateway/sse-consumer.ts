@@ -297,6 +297,42 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let errorMessage = "";
   let streamErrorEmitted = false;
   let errorPersisted = false;
+  // ── Routed-turn commit gating ──
+  // When model routing streams the primary candidate live, this consumer sees a
+  // candidate's events BEFORE we know whether it won. So the durable writes
+  // (assistant reply + error rows) are deferred to a commit point and dropped on
+  // a rollback — the live frontend already rendered them via the SSE relay, so
+  // this only governs what survives a reload. Tool rows are NOT deferred: the
+  // first tool execution blocks fallback for good (#312), so a tool row is
+  // already committed when it appears. Non-routed turns never set isRoutingTurn,
+  // so they persist inline exactly as before.
+  let isRoutingTurn = false;
+  let routingCommitted = false;
+  const pendingAssistantOps: Array<() => Promise<void>> = [];
+  const pendingErrorOps: Array<() => Promise<void>> = [];
+  const flushOps = async (ops: Array<() => Promise<void>>) => {
+    const drained = ops.splice(0);
+    for (const op of drained) await op();
+  };
+  // tool_start / model_route_success: the turn is committed. Flush the deferred
+  // assistant write; drop any error row buffered from a failed earlier attempt
+  // (the turn ultimately produced output / succeeded).
+  const commitRoutedTurn = async () => {
+    routingCommitted = true;
+    pendingErrorOps.length = 0;
+    // The turn produced committed output / succeeded — a failed earlier
+    // attempt's error must not leak into the returned run summary.
+    errorMessage = "";
+    await flushOps(pendingAssistantOps);
+  };
+  // model_route_rollback: the live primary failed and will be retried on the
+  // next candidate. Drop everything it buffered; re-arm errorPersisted so the
+  // next attempt can record its own error.
+  const discardRoutedAttempt = () => {
+    pendingAssistantOps.length = 0;
+    pendingErrorOps.length = 0;
+    errorPersisted = false;
+  };
   let lastToolName = "";
 
   // Queued by toolName. pi-agent events do not always expose a stable call id,
@@ -362,6 +398,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (eventType === "model_route_start") {
       latestModelRouteSwitch = null;
       currentModelRouteMetadata = null;
+      isRoutingTurn = true;
+      routingCommitted = false;
+      discardRoutedAttempt();
     }
 
     if (eventType === "model_route_switch") {
@@ -402,6 +441,19 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           await incrementMessageCount(sessionId);
         }
       }
+      if (isRoutingTurn) await commitRoutedTurn();
+    }
+
+    // ── Model route: exhausted commits the final attempt's output + error;
+    //    rollback discards a failed live primary before the next candidate. ──
+    if (eventType === "model_route_exhausted") {
+      routingCommitted = true;
+      await flushOps(pendingAssistantOps);
+      await flushOps(pendingErrorOps);
+    }
+    if (eventType === "model_route_rollback") {
+      discardRoutedAttempt();
+      routingCommitted = false;
     }
 
     // ── DB persistence: tool_execution_end ──────────
@@ -515,6 +567,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
 
     // ── tool_execution_start: capture input + start time ──
     if (eventType === "tool_execution_start" || eventType === "tool_start") {
+      // First tool execution commits the routed turn (fallback is now blocked):
+      // flush any assistant text deferred before this point so the tool row
+      // lands after it in the transcript.
+      if (isRoutingTurn && !routingCommitted) await commitRoutedTurn();
       const nowAtStart = Date.now();
       if (firstTokenTime === undefined) firstTokenTime = nowAtStart;
       const startToolName = (evt.toolName as string) || (evt.name as string) || "tool";
@@ -605,17 +661,26 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // run (pi-agent can retry and emit several error message_ends).
           if (persist && !errorPersisted) {
             errorPersisted = true;
-            await appendMessage({
-              sessionId,
-              role: "assistant",
-              content: redactText(errorMessage, redactionConfig),
-              metadata: {
-                kind: "error_response",
-                error_code: ErrorCodes.MODEL_ERROR,
-                retriable: true,
-              },
-            });
-            await incrementMessageCount(sessionId);
+            const errorContent = redactText(errorMessage, redactionConfig);
+            const persistError = async () => {
+              await appendMessage({
+                sessionId,
+                role: "assistant",
+                content: errorContent,
+                metadata: {
+                  kind: "error_response",
+                  error_code: ErrorCodes.MODEL_ERROR,
+                  retriable: true,
+                },
+              });
+              await incrementMessageCount(sessionId);
+            };
+            // On a routed turn this error belongs to a candidate that may yet be
+            // replaced by a successful fallback — defer it to the commit point
+            // (only an exhausted turn actually writes it; success/rollback drop
+            // it). Non-routed turns write inline.
+            if (isRoutingTurn && !routingCommitted) pendingErrorOps.push(persistError);
+            else await persistError();
           }
         }
 
@@ -684,17 +749,26 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         if (persist && assistantContent) {
           const cleaned = stripEmptyResponseMarkers(assistantContent);
           if (cleaned.length > 0) {
-            await appendMessage({
-              sessionId,
-              role: "assistant",
-              content: redactText(cleaned, redactionConfig),
-              metadata: {
-                timing,
-                ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
-              },
-            });
-            await incrementMessageCount(sessionId);
-            firstAssistantPersisted = true;
+            const assistantRowContent = redactText(cleaned, redactionConfig);
+            const assistantRowMetadata = {
+              timing,
+              ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
+            };
+            const persistAssistant = async () => {
+              await appendMessage({
+                sessionId,
+                role: "assistant",
+                content: assistantRowContent,
+                metadata: assistantRowMetadata,
+              });
+              await incrementMessageCount(sessionId);
+              firstAssistantPersisted = true;
+            };
+            // On a routed turn the primary streams live before we know it won;
+            // defer the durable write to the commit point so a failed primary's
+            // reply isn't left in the DB after a fallback takes over.
+            if (isRoutingTurn && !routingCommitted) pendingAssistantOps.push(persistAssistant);
+            else await persistAssistant();
           }
           assistantContent = "";
         }
@@ -789,6 +863,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   if (!resultText && currentMsgText) {
     resultText = currentMsgText;
   }
+
+  // Defensive: a routed turn normally ends on success / exhausted / rollback,
+  // which already flushed or dropped these. If the stream ends without one
+  // (transport drop), flush whatever is still pending so a real answer or a
+  // terminal error is not silently lost.
+  await flushOps(pendingAssistantOps);
+  await flushOps(pendingErrorOps);
 
   const durationMs = Date.now() - startTime;
   console.log(`[sse-consumer] ${userId} session=${sessionId}: ${eventCount} events, ${durationMs}ms`);

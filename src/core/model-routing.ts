@@ -119,6 +119,17 @@ export type ModelRouteEvent =
       attempt: number;
       candidateKey?: string;
       errorMessage?: string;
+    }
+  | {
+      // The primary candidate streamed live and then failed — tell consumers to
+      // discard whatever this attempt already rendered/buffered before the next
+      // candidate streams in. Only emitted when the failed attempt actually
+      // emitted visible output (a setup failure before the first token emits
+      // nothing, so no rollback is needed).
+      type: "model_route_rollback";
+      attempt: number;
+      candidateKey: string;
+      failureKind: ModelRouteFailureKind;
     };
 
 export interface ModelRouteRunResult {
@@ -136,6 +147,15 @@ export interface RunPromptWithModelRoutingOptions {
   onStateChange?: (state: ModelRouteState) => void;
   /** Polled between attempts so a user Stop landing in the switch window halts the chain. */
   shouldAbort?: () => boolean;
+  /**
+   * Stream the primary candidate's events live (vs. buffering every attempt
+   * until it wins). Defaults to true — an interactive turn should feel like no
+   * routing at all on the happy path, with a model_route_rollback recovering a
+   * failed live primary. Set false for background/synthetic turns that have no
+   * live viewer and persist by collecting brain events: there, a live failed
+   * attempt would leak into the persisted turn, and buffering costs nothing.
+   */
+  optimisticPrimaryStream?: boolean;
   now?: () => number;
 }
 
@@ -172,6 +192,10 @@ interface AttemptResult {
   checkpoint: unknown;
   events: unknown[];
   hadToolExecution: boolean;
+  // True when this attempt emitted at least one brain event live (rather than
+  // buffering it). A live attempt that then fails needs a rollback so the next
+  // candidate doesn't stack its output on top of the failed one's.
+  emittedLive: boolean;
 }
 
 const ATTEMPT_HISTORY_LIMIT = 20;
@@ -493,6 +517,7 @@ export async function runPromptWithModelRouting(
   const primaryCandidateKey = candidateKey(primaryCandidate);
   const emitEvent = options.emitEvent ?? (() => {});
   const emitBrainEvent = options.emitBrainEvent ?? (() => {});
+  const optimisticPrimaryStream = options.optimisticPrimaryStream !== false;
   const now = options.now ?? (() => Date.now());
   const attempted: ModelRouteAttempt[] = [];
 
@@ -564,7 +589,15 @@ export async function runPromptWithModelRouting(
       status: "started",
     });
 
-    const attemptResult = await runAttempt(brain, text, candidate, emitBrainEvent);
+    // The primary candidate (first ordered attempt) streams live so a healthy
+    // session feels identical to running without routing. Fallback candidates
+    // buffer (until their own first tool call) — once we've already had to
+    // switch once, replaying a clean attempt beats a second live-then-rollback
+    // flicker. Background/synthetic turns opt out (optimisticPrimaryStream) and
+    // buffer every attempt, since a live failed attempt would leak into the
+    // turn they persist from collected events.
+    const streamFromStart = optimisticPrimaryStream && i === 0;
+    const attemptResult = await runAttempt(brain, text, candidate, emitBrainEvent, streamFromStart);
     const failure = attemptResult.failure;
     attempt.finishedAt = now();
 
@@ -702,6 +735,19 @@ export async function runPromptWithModelRouting(
       });
       throw err;
     }
+    // The failed attempt streamed live output (a live primary, or a buffered
+    // candidate that went live after a tool call) — tell consumers to discard
+    // it before the next candidate streams in, so the transcript and DB don't
+    // stack the dead attempt under the winning one. A failure before the first
+    // token emitted nothing (emittedLive=false) and needs no rollback.
+    if (attemptResult.emittedLive) {
+      emitEvent({
+        type: "model_route_rollback",
+        attempt: attempt.attempt,
+        candidateKey: key,
+        failureKind: failure.kind,
+      });
+    }
     emitEvent({
       type: "model_route_switch",
       attempt: attempt.attempt,
@@ -732,6 +778,7 @@ async function runAttempt(
   text: string,
   candidate: ModelRouteCandidate,
   emitBrainEvent: (event: unknown) => void,
+  streamFromStart: boolean,
 ): Promise<AttemptResult> {
   const checkpoint = brain.createPromptCheckpoint?.();
   let lastProviderResponse: BrainProviderResponse | undefined;
@@ -752,6 +799,7 @@ async function runAttempt(
         checkpoint,
         events: [],
         hadToolExecution: false,
+        emittedLive: false,
         failure: {
           kind: "model_not_found",
           source: "setup",
@@ -770,6 +818,7 @@ async function runAttempt(
       checkpoint,
       events: [],
       hadToolExecution: false,
+      emittedLive: false,
       failure: {
         kind: classifyModelRouteFailure({
           errorMessage: message,
@@ -788,24 +837,32 @@ async function runAttempt(
 
   let lastAssistantMessage: AssistantMessageLike | null = null;
   // Brain events stay buffered (invisible to the SSE consumer) only while a
-  // fallback retry is still possible — a failed attempt's partial output must
-  // never reach the client. The first tool execution blocks fallback for good
-  // (side effects — see fallbackBlockedReason), so from that point buffering
-  // buys no atomicity and only delays the stream: flush the pending prefix
-  // and pass everything after it through live.
+  // fallback retry could still discard them silently. Buffering ends as soon as
+  // discarding is no longer free:
+  //   • streamFromStart — the PRIMARY candidate streams live from its first
+  //     event, so the common (success) path feels exactly like no routing at
+  //     all. A live primary that then fails is recovered by the caller with a
+  //     model_route_rollback telling consumers to drop what it rendered.
+  //   • the first tool execution — it blocks fallback for good (#312), so from
+  //     there buffering buys no atomicity. Flush the prefix and go live.
   const events: unknown[] = [];
+  let streaming = streamFromStart;
+  let emittedLive = false;
   let hadToolExecution = false;
   const unsubscribe = brain.subscribe((event: unknown) => {
-    if (hadToolExecution) {
+    if (streaming) {
       emitBrainEvent(event);
+      emittedLive = true;
     } else {
       events.push(event);
       if (isToolExecutionEvent(event)) {
-        hadToolExecution = true;
+        streaming = true;
         flushBrainEvents(events, emitBrainEvent);
         events.length = 0;
+        emittedLive = true;
       }
     }
+    if (isToolExecutionEvent(event)) hadToolExecution = true;
     if (!isRecord(event) || event.type !== "message_end") return;
     const message = event.message;
     if (isRecord(message) && message.role === "assistant") {
@@ -822,6 +879,7 @@ async function runAttempt(
         checkpoint,
         events,
         hadToolExecution,
+        emittedLive,
         failure: {
           kind: "context_overflow",
           source: "setup",
@@ -837,6 +895,7 @@ async function runAttempt(
       checkpoint,
       events,
       hadToolExecution,
+      emittedLive,
       failure: {
         kind: classifyModelRouteFailure({
           errorMessage: message,
@@ -860,6 +919,7 @@ async function runAttempt(
     checkpoint,
     events,
     hadToolExecution,
+    emittedLive,
     failure: failureFromAssistantMessage(lastAssistantMessage, candidate, lastProviderResponse),
   };
 }

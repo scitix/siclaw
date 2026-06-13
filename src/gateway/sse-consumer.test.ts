@@ -333,6 +333,56 @@ describe("consumeAgentSse — assistant message flow", () => {
   });
 });
 
+// ── Routed-turn commit gating (deferred persistence) ────
+
+describe("consumeAgentSse — routed turn commit gating", () => {
+  it("defers the primary candidate's assistant row until model_route_success commits it", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hello" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hello" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 1, candidateKey: "openai/gpt-4", provider: "openai", modelId: "gpt-4", isFallback: false, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    expect(appendCalls.filter((r) => r.role === "assistant" && r.content === "hello")).toHaveLength(1);
+  });
+
+  it("discards a failed primary's partial reply and error on rollback, persisting only the fallback's answer", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "half from primary" } },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "answer from fallback" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer from fallback" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    // The failed primary's partial text and its error row are both dropped.
+    expect(appendCalls.some((r) => r.content === "half from primary")).toBe(false);
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(0);
+    // Only the winning fallback's answer is persisted.
+    expect(appendCalls.some((r) => r.role === "assistant" && r.content === "answer from fallback")).toBe(true);
+    // The run summary must not leak the rolled-back attempt's error.
+    expect(result.errorMessage).toBe("");
+  });
+
+  it("persists the error row when a routed turn is exhausted (no fallback succeeded)", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "all candidates failed" } },
+      { type: "model_route_exhausted", attempt: 1, failureKind: "rate_limit", errorMessage: "all candidates failed" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const errorRows = appendCalls.filter((r) => r.metadata?.kind === "error_response");
+    expect(errorRows).toHaveLength(1);
+    expect(errorRows[0].content).toContain("all candidates failed");
+  });
+});
+
 // ── Tool calls ──────────────────────────────────────────
 
 describe("consumeAgentSse — tool execution", () => {

@@ -829,15 +829,46 @@ describe("runPromptWithModelRouting", () => {
     expect(state.activeCandidateKey).toBe("anthropic/claude");
   });
 
-  it("restores the prompt checkpoint and only emits final attempt brain events after fallback", async () => {
+  it("streams the primary candidate live from the first event when it succeeds (no buffering, no rollback)", async () => {
+    const brain = makeBrain([]);
+    const state = createModelRouteState();
+    const emittedBrainEvents: unknown[] = [];
+    const routeEvents: ModelRouteEvent[] = [];
+    let emittedDuringPrompt = 0;
+    brain.prompt = vi.fn(async () => {
+      brain.emitter.emit("event", { type: "agent_start" });
+      brain.emitter.emit("event", { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } });
+      // The primary streams live: these events are already forwarded before
+      // prompt() resolves — a buffered candidate would forward nothing yet.
+      emittedDuringPrompt = emittedBrainEvents.length;
+      brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "hi" }], stopReason: "stop" },
+      });
+    });
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitEvent: (event) => routeEvents.push(event),
+      emitBrainEvent: (event) => emittedBrainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(true);
+    expect(emittedDuringPrompt).toBe(2);
+    expect(routeEvents.some((e) => e.type === "model_route_rollback")).toBe(false);
+  });
+
+  it("streams the primary live, rolls it back on failure, then streams the fallback's reply", async () => {
     const brain = makeBrain(["rate_limit", "ok"]);
     const state = createModelRouteState();
     const emittedBrainEvents: unknown[] = [];
+    const routeEvents: ModelRouteEvent[] = [];
     let checkpointSeq = 0;
     brain.createPromptCheckpoint = vi.fn(() => `leaf-${checkpointSeq++}`);
     brain.restorePromptCheckpoint = vi.fn(async () => {});
 
     await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitEvent: (event) => routeEvents.push(event),
       emitBrainEvent: (event) => emittedBrainEvents.push(event),
       now: () => 10_000,
     });
@@ -846,8 +877,17 @@ describe("runPromptWithModelRouting", () => {
     const messageEnds = emittedBrainEvents.filter((event): event is any =>
       typeof event === "object" && event !== null && (event as any).type === "message_end",
     );
-    expect(messageEnds).toHaveLength(1);
-    expect(messageEnds[0].message.stopReason).toBe("stop");
+    // Primary streamed live and failed (rate_limit); the buffered fallback's
+    // successful reply streamed after the switch. Both reach the consumer.
+    expect(messageEnds).toHaveLength(2);
+    expect(messageEnds[0].message.stopReason).toBe("error");
+    expect(messageEnds[1].message.stopReason).toBe("stop");
+    // The live primary failure emits a rollback (so consumers drop it),
+    // sequenced before the switch to the fallback candidate.
+    const rollbackIdx = routeEvents.findIndex((e) => e.type === "model_route_rollback");
+    const switchIdx = routeEvents.findIndex((e) => e.type === "model_route_switch");
+    expect(rollbackIdx).toBeGreaterThanOrEqual(0);
+    expect(switchIdx).toBeGreaterThan(rollbackIdx);
   });
 
   it("synthesizes a visible assistant error event when every candidate fails during setup", async () => {
