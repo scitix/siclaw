@@ -26,6 +26,10 @@ export class PiAgentBrain implements BrainSession {
   /** Set during prompt(); abort() resolves this to cancel backoff sleep. */
   private abortRetry: (() => void) | null = null;
 
+  /** True from abort() until the next prompt() starts. Stops the empty-response retry loop from
+   *  firing a fresh (un-aborted) re-prompt when Stop lands during the backoff sleep. */
+  private aborted = false;
+
   constructor(readonly session: AgentSession) {}
 
   private static readonly MAX_EMPTY_RETRIES = 2;
@@ -47,6 +51,7 @@ export class PiAgentBrain implements BrainSession {
   }
 
   async prompt(text: string): Promise<void> {
+    this.aborted = false;
     let lastAssistantHadContent = false;
     let lastAssistantMessage: any = null;
 
@@ -85,6 +90,7 @@ export class PiAgentBrain implements BrainSession {
       let retries = 0;
       while (
         !lastAssistantHadContent &&
+        !this.aborted &&
         lastAssistantMessage?.stopReason !== "aborted" &&
         lastAssistantMessage?.stopReason !== "error" &&
         retries < PiAgentBrain.MAX_EMPTY_RETRIES
@@ -109,18 +115,22 @@ export class PiAgentBrain implements BrainSession {
         });
         try {
           await this.abortableSleep(delayMs);
+          // Stop landed during the backoff: do NOT fire a fresh, un-aborted re-prompt.
+          if (this.aborted) break;
           await this.session.prompt(text);
         } finally {
+          // A user Stop landing in the backoff is not an empty-response failure — don't label it
+          // one (telemetry/alerting could otherwise count Stops as model defects).
           this.emit({
             type: "auto_retry_end",
             attempt: retries,
             success: lastAssistantHadContent,
-            finalError: lastAssistantHadContent ? undefined : "Model returned empty response",
+            finalError: lastAssistantHadContent || this.aborted ? undefined : "Model returned empty response",
           });
         }
       }
 
-      if (!lastAssistantHadContent) {
+      if (!lastAssistantHadContent && !this.aborted) {
         const msg = lastAssistantMessage;
         console.error(
           `[pi-agent-brain] Empty response persisted after ${PiAgentBrain.MAX_EMPTY_RETRIES} retries, ` +
@@ -135,7 +145,15 @@ export class PiAgentBrain implements BrainSession {
   }
 
   async abort(): Promise<void> {
+    this.aborted = true;
     this.abortRetry?.();
+    // session.abort() (agent.abort + waitForIdle) aborts the RUN's controller — but auto-compaction
+    // and routing-preflight compaction use SEPARATE controllers it does not touch. Abort those too,
+    // so a Stop during compaction cancels the compaction LLM call AND lets waitForIdle() resolve
+    // promptly instead of blocking until compaction finishes. Defensive optional — older cores or
+    // a non-pi brain may not expose it.
+    try { (this.session as { abortCompaction?: () => void }).abortCompaction?.(); }
+    catch { /* best-effort */ }
     return this.session.abort();
   }
 

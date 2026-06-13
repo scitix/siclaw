@@ -579,3 +579,88 @@ describe("AgentBoxSessionManager — credentialsDir override (Local mode multi-A
     expect(call.kubeconfigRef.credentialsDir).toBe(path.resolve(process.cwd(), _cfgCredentialsDir));
   });
 });
+
+describe("AgentBoxSessionManager — Stop / abort latches", () => {
+  it("#3 background-exec executor latches on parent _aborted (registers stopped, no spawn)", () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    mgr.sessions.set("p1", { id: "p1", _aborted: true, _backgroundWorkCount: 0, _releaseTimer: null });
+    const exec = mgr.createBackgroundExecExecutor();
+    const res = exec({ jobId: "bg1", parentSessionId: "p1", description: "ping -c 100", jobType: "host", command: "ping" });
+    // Returns a normal launched handle (must NOT throw — a throw makes the tool fall back to foreground).
+    expect(res.jobId).toBe("bg1");
+    expect(typeof res.outputFile).toBe("string");
+    // Job is registered terminal "stopped" (a real spawn would be "running") and suppresses the wake turn.
+    const job = mgr.jobs.get("bg1");
+    expect(job.status).toBe("stopped");
+    expect(job.suppressNotifyTurn).toBe(true);
+  });
+
+  it("#4 startBackgroundSubagent latches on parent _aborted (registers stopped, never runs the child)", () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    mgr.sessions.set("p1", { id: "p1", _aborted: true });
+    const runSpy = vi.spyOn(mgr, "runSpawnedSubagent");
+    const res = mgr.startBackgroundSubagent({ spawnId: "sub1", parentSessionId: "p1", description: "d", prompt: "x", userId: "u" });
+    expect(res.status).toBe("launched");
+    expect(runSpy).not.toHaveBeenCalled();
+    const job = mgr.jobs.get("sub1");
+    expect(job.status).toBe("stopped");
+    expect(job.suppressNotifyTurn).toBe(true);
+  });
+
+  it("#1/#4 background sub-agent latch PERSISTS a terminal delegation event (card folds on reload)", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const sent: any[] = [];
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: async (e: any) => { sent.push(e); return { ok: true }; } };
+    mgr.agentId = "agent-1";
+    mgr.sessions.set("p1", { id: "p1", _aborted: true });
+    const res = mgr.startBackgroundSubagent({ spawnId: "sub1", parentSessionId: "p1", description: "d", prompt: "x", userId: "u" });
+    expect(res.status).toBe("launched");
+    expect(mgr.jobs.get("sub1").status).toBe("stopped");
+    await new Promise((r) => setTimeout(r, 5)); // let the fire-and-forget persist run
+    // The PERSISTED terminal delegation_event is what annotateSubagentCompletions reads on reload
+    // to fold the launch card — without it the card would re-paint "Running…" forever.
+    const terminal = sent.find((e) => e.type === "delegation.append_event");
+    expect(terminal).toBeDefined();
+    expect(terminal.event.status).toBe("partial");
+    expect(terminal.event.delegationId).toBe("sub1");
+  });
+
+  it("#9 background sub-agent bails when parent _aborted during setup (no child prompt)", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    // Parent already aborted by the time the child's setup (createSiclawSession) completes.
+    mgr.sessions.set("p1", { id: "p1", _aborted: true });
+    mgr.jobs.register({ jobId: "sub1", type: "subagent", parentSessionId: "p1", childSessionId: "c1", status: "running", description: "d", startedAt: 0, notified: false });
+    const promptSpy = vi.fn(async () => {});
+    (globalThis as any).__fakeBrainFactories.push(() => ({ prompt: promptSpy, abort: vi.fn(async () => {}) }));
+    // Call runSpawnedSubagent directly (bypassing #4's pre-launch latch) to exercise the
+    // post-setup parent-_aborted check — the window where job.abort isn't wired and the job
+    // status is still "running" (so a job-status check would never fire).
+    const res = await mgr.runSpawnedSubagent(
+      { spawnId: "sub1", parentSessionId: "p1", description: "d", prompt: "do x", userId: "u" },
+      { childSessionId: "c1", jobId: "sub1" },
+    );
+    expect(promptSpy).not.toHaveBeenCalled(); // child run never started
+    expect(res.status).toBe("partial");
+  });
+
+  it("#1 stopSessionJobs re-sweep catches a job registered after the first sweep", () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    mgr.jobs.register({ jobId: "j1", type: "bash", parentSessionId: "p1", status: "running", description: "d", startedAt: 0, notified: false, abort: () => {} });
+    expect(mgr.stopSessionJobs("p1")).toBe(1); // first sweep
+    // A tool call launched a new background job DURING the abort drain.
+    mgr.jobs.register({ jobId: "j2", type: "bash", parentSessionId: "p1", status: "running", description: "d2", startedAt: 0, notified: false, abort: () => {} });
+    expect(mgr.stopSessionJobs("p1")).toBe(1); // re-sweep catches it
+  });
+
+  it("markPendingAbort arms only for a never-created (pre-spawn) session, not a released one", () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    // Truly pre-spawn: no on-disk history dir → arms → consumable by the imminent first prompt.
+    mgr.markPendingAbort("never-created");
+    expect(mgr.consumePendingAbort("never-created")).toBe(true);
+    // Ran-before / released: a history dir exists → markPendingAbort is a NO-OP, so a Stop on a
+    // released-but-idle session can't poison the user's next prompt for that reused sessionId.
+    fs.mkdirSync(path.join(mgr.getBaseSessionDir(), "ran-before"), { recursive: true });
+    mgr.markPendingAbort("ran-before");
+    expect(mgr.consumePendingAbort("ran-before")).toBe(false);
+  });
+});

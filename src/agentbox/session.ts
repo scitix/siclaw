@@ -33,6 +33,7 @@ import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSuba
 import { JobRegistry, type JobStatus } from "../core/job-registry.js";
 import { buildNotificationBatch, type TaskNotification } from "../core/task-notification.js";
 import { spawnBackgroundBash } from "../core/background-bash-runner.js";
+import { DiskTaskOutput, getTaskOutputPath } from "../tools/cmd-exec/disk-output.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
 import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
@@ -333,6 +334,64 @@ export class AgentBoxSessionManager {
    */
   private jobs = new JobRegistry();
 
+  /**
+   * Sessions for which a Stop arrived BEFORE the session existed (pre-spawn). Consumed one-shot
+   * by the next getOrCreate-driven /api/prompt for that id (the prompt being cancelled — which is
+   * already in flight and cold-starting, so it consumes within the cold-start window). The TTL
+   * is only a leak backstop for an ORPHAN (a Stop whose paired prompt never arrives). Keep it
+   * tight: it must outlast a cold start (image pull / container start, "routinely exceeds 30s"
+   * per the runtime's async-ack comment) but no longer — a too-long TTL widens the window in
+   * which a stale orphan could wrongly short-circuit a brand-new, deliberate prompt for the same
+   * reused sessionId. 3 min covers cold start with margin while bounding that risk.
+   */
+  private _pendingAborts = new Map<string, ReturnType<typeof setTimeout>>();
+  private static readonly PENDING_ABORT_TTL_MS = 180_000;
+
+  /** Record a pre-spawn Stop so the imminent /api/prompt short-circuits (see _pendingAborts). */
+  markPendingAbort(sessionId: string): void {
+    // Only a TRUE pre-spawn Stop should arm a pending abort: one where the session was NEVER
+    // created, so no in-flight turn exists yet and the imminent first /api/prompt is the one to
+    // cancel. A genuine pre-spawn session has no on-disk history dir yet; a session that ran
+    // before and was merely RELEASED from memory (30s TTL) always does. Without this guard, a
+    // Stop on a released-but-idle session (e.g. the Stop button still live after a missed
+    // prompt_done) would arm a pending abort that silently cancels the user's NEXT prompt for
+    // the same reused sessionId. If the existence check throws, fall through and arm (best-effort).
+    try {
+      if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
+    } catch { /* fall through — arm */ }
+    const existing = this._pendingAborts.get(sessionId);
+    if (existing) clearTimeout(existing);
+    const t = setTimeout(() => this._pendingAborts.delete(sessionId), AgentBoxSessionManager.PENDING_ABORT_TTL_MS);
+    t.unref?.();
+    this._pendingAborts.set(sessionId, t);
+  }
+
+  /** Consume (one-shot) a pre-spawn Stop recorded by markPendingAbort. */
+  consumePendingAbort(sessionId: string): boolean {
+    const t = this._pendingAborts.get(sessionId);
+    if (!t) return false;
+    clearTimeout(t);
+    this._pendingAborts.delete(sessionId);
+    return true;
+  }
+
+  /**
+   * Discard buffered background-job completion notifications + cancel the coalesce timer for a
+   * session. Called from /abort: a job that completed moments before Stop already armed the
+   * coalesce timer, which would otherwise flush → runSyntheticPrompt → brain.prompt() AFTER Stop
+   * ("comes back to life"). The per-entry suppressNotifyTurn check still guards the flush path,
+   * but clearing here makes the resurrection impossible regardless.
+   */
+  discardPendingNotifications(sessionId: string): void {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+    managed._pendingNotifications.length = 0;
+    if (managed._coalesceTimer) {
+      clearTimeout(managed._coalesceTimer);
+      managed._coalesceTimer = null;
+    }
+  }
+
   private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
     return async (request, onProgress, signal) => {
       if (request.runInBackground) return this.startBackgroundSubagent(request);
@@ -403,6 +462,38 @@ export class AgentBoxSessionManager {
    */
   private createBackgroundExecExecutor(): BackgroundExecExecutor {
     return (req) => {
+      // Stop latch: the user pressed Stop on this session; do NOT spawn a new background job.
+      // Register a terminal "stopped" job and return a normal launched handle — NEVER throw,
+      // because every background-capable tool treats an executor throw as "fall back to a
+      // FOREGROUND run", which would re-introduce the escape this latch closes. The launching
+      // tool's card folds to stopped via the exec_job_done event from notifyParent below;
+      // suppressNotifyTurn keeps the model from waking on its own cancellation.
+      const aborting = this.sessions.get(req.parentSessionId);
+      if (aborting?._aborted) {
+        const outputFile = getTaskOutputPath(req.jobId);
+        const disk = new DiskTaskOutput(req.jobId);
+        void disk.ensureCreated().then(() => disk.markFinal()).catch(() => {});
+        this.jobs.register({
+          jobId: req.jobId,
+          type: req.jobType ?? "bash",
+          parentSessionId: req.parentSessionId,
+          description: req.description,
+          status: "stopped",
+          startedAt: Date.now(),
+          notified: false,
+          suppressNotifyTurn: true,
+          outputFile,
+        });
+        try { req.onComplete?.(); } catch { /* best-effort (e.g. node_exec debug-pod unpin) */ }
+        void this.notifyParent(req.parentSessionId, req.jobId, {
+          taskId: req.jobId,
+          outputFile,
+          status: "stopped",
+          summary: `Background command "${req.description}" was stopped`,
+        });
+        return { jobId: req.jobId, outputFile };
+      }
+
       const cap = getBackgroundBashConcurrency();
       // Cap counts ALL background exec jobs (bash/node/pod), not sub-agents.
       const running = this.jobs
@@ -459,6 +550,66 @@ export class AgentBoxSessionManager {
   private startBackgroundSubagent(request: SpawnSubagentRequest): SpawnSubagentResult {
     const childSessionId = randomUUID();
     const jobId = request.spawnId;
+    // Stop latch: the user pressed Stop before this sub-agent launched; register it terminal
+    // ("stopped") and skip runSpawnedSubagent so no child run/LLM work starts. suppressNotifyTurn
+    // keeps the model from waking on the cancellation.
+    if (this.sessions.get(request.parentSessionId)?._aborted) {
+      this.jobs.register({
+        jobId,
+        type: "subagent",
+        parentSessionId: request.parentSessionId,
+        childSessionId,
+        status: "stopped",
+        description: request.description,
+        startedAt: Date.now(),
+        notified: false,
+        suppressNotifyTurn: true,
+      });
+      // notifyParent gives the LIVE card fold (subagent_done). It is NOT persisted, so we ALSO
+      // write the terminal delegation_event + child session row that runSpawnedSubagent would
+      // have written — without these the launch card re-paints as "Running…" forever on reload
+      // (annotateSubagentCompletions reads the persisted delegation_event), and the
+      // "open transcript" deep-link 404s. Mirrors runSpawnedSubagent's terminal persistence.
+      const stoppedAgentId = request.parentAgentId ?? this.agentId ?? null;
+      if (this.gatewayClient && stoppedAgentId && request.userId) {
+        void (async () => {
+          try {
+            await this.persistEnsureChatSession(
+              childSessionId, stoppedAgentId, request.userId,
+              `Sub-agent: ${request.description}`,
+              "", "subagent",
+              { parentSessionId: request.parentSessionId, parentAgentId: stoppedAgentId, delegationId: jobId, targetAgentId: stoppedAgentId },
+            );
+          } catch { /* best-effort */ }
+          try {
+            await this.persistAppendDelegationEvent({
+              parentSessionId: request.parentSessionId,
+              parentAgentId: stoppedAgentId,
+              userId: request.userId,
+              delegationId: jobId,
+              childSessionId,
+              targetAgentId: stoppedAgentId,
+              // "partial" is the terminal status runSpawnedSubagent persists for a stopped
+              // sub-agent (the delegation status enum has no "stopped"); keep it consistent so
+              // the card folds the same way on reload.
+              status: "partial",
+              capsule: `Sub-agent "${request.description}" was stopped`,
+              fullSummary: `Sub-agent "${request.description}" was stopped before it started.`,
+              summaryTruncated: false,
+              scope: request.prompt,
+              toolCalls: 0,
+              durationMs: 0,
+            });
+          } catch { /* best-effort */ }
+        })();
+      }
+      void this.notifyParent(request.parentSessionId, jobId, {
+        taskId: jobId,
+        status: "stopped",
+        summary: `Sub-agent "${request.description}" was stopped`,
+      });
+      return { status: "launched", childSessionId, jobId };
+    }
     this.jobs.register({
       jobId,
       type: "subagent",
@@ -591,6 +742,13 @@ export class AgentBoxSessionManager {
       clearTimeout(managed._coalesceTimer);
       managed._coalesceTimer = null;
     }
+    // Stop is terminal: a Stop sets _aborted and stays true until the next REAL user prompt
+    // resets it. Do NOT flush a synthetic turn during the Stop window — that would wake the
+    // model on a completion it cancelled ("comes back to life after Stop").
+    if (managed._aborted) {
+      managed._pendingNotifications.length = 0;
+      return;
+    }
     if (!managed._promptDone) {
       // A turn is running — wait for it to finish, then deliver as a synthetic turn (where a
       // pure-ack reaction is suppressed). Re-arm rather than followUp: a followUp's ack rides
@@ -628,6 +786,10 @@ export class AgentBoxSessionManager {
     const run = (managed._syntheticPromptQueue ?? Promise.resolve())
       .catch(() => {})
       .then(async () => {
+        // Stop is terminal: if the user pressed Stop while this synthetic turn was queued, do
+        // NOT start it (and do NOT followUp — that would ride a turn too). _aborted stays true
+        // until the next real user prompt resets it. Checked under the queue, before the reset.
+        if (managed._aborted) return;
         // Re-check under the queue: an HTTP /prompt may have started since notifyParent
         // decided "idle". If so, degrade to followUp (delivered to that running turn).
         if (!managed._promptDone || managed._promptInflight) {
@@ -1114,6 +1276,15 @@ export class AgentBoxSessionManager {
       }
     }
 
+    // Setup-window Stop: if the user pressed Stop while we were awaiting createSiclawSession
+    // above (job.abort was not wired yet, so a /abort sweep's stopJob no-op'd with "starting up"
+    // and left the job "running"), honour it now before the child's run starts. The reliable
+    // signal is the PARENT session's _aborted (set at /abort, true for the whole Stop window) —
+    // NOT the job status, which stopJob never set to "stopped" in this window.
+    if (this.sessions.get(request.parentSessionId)?._aborted) {
+      requestStop(`parent stopped during sub-agent setup ${childSessionId}`);
+    }
+
     // ── Transcript persistence (design §13). Serialized via a promise queue so
     //    writes land in order; a write failure disables the trace but never the run. ──
     const delegationId = request.spawnId;
@@ -1235,6 +1406,10 @@ export class AgentBoxSessionManager {
 
     let interruptedTool: string | undefined;
     try {
+      // Stop landed before/during setup: requestStop already fired, but child.brain.abort() is a
+      // no-op with no active run — so DON'T start the prompt at all, or it would run a fresh,
+      // un-aborted turn. Throw straight into the stopRequested branch below.
+      if (stopRequested) throw new Error("stopped before sub-agent prompt started");
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
       );

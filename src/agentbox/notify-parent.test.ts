@@ -107,6 +107,31 @@ describe("notifyParent", () => {
     expect((brain.prompt.mock.calls[0][0] as string).match(/<task_notification>/g)?.length).toBe(1);
   });
 
+  // #7: a job that completed just BEFORE Stop has already buffered its notification + armed the
+  // coalesce timer. The Stop must not let that timer wake the model ("comes back to life").
+  it("#7 Stop: a buffered completion is NOT flushed as a synthetic turn while _aborted", async () => {
+    const { mgr, brain, managed } = setup(true); // idle, job completed
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "completed", summary: "done" });
+    expect(managed._pendingNotifications.length).toBe(1); // buffered, timer armed
+    managed._aborted = true; // user presses Stop before the coalesce flush
+    await flushCoalesce();
+    expect(brain.prompt).not.toHaveBeenCalled();           // no resurrection
+    expect(brain.followUp).not.toHaveBeenCalled();
+    expect(managed._pendingNotifications.length).toBe(0);  // drained, not delivered
+  });
+
+  it("#7 discardPendingNotifications clears the buffer + cancels the coalesce timer", async () => {
+    const { mgr, brain, managed } = setup(true);
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "completed", summary: "done" });
+    expect(managed._pendingNotifications.length).toBe(1);
+    expect(managed._coalesceTimer).not.toBeNull();
+    mgr.discardPendingNotifications("s1");
+    expect(managed._pendingNotifications.length).toBe(0);
+    expect(managed._coalesceTimer).toBeNull();
+    await flushCoalesce();
+    expect(brain.prompt).not.toHaveBeenCalled();
+  });
+
   it("restores _promptDone after a synthetic turn", async () => {
     const { mgr, managed } = setup(true);
     await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "completed", summary: "x" });

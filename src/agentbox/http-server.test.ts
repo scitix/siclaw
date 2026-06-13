@@ -156,6 +156,9 @@ function makeFakeSessionManager() {
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
     stopSessionJobs: vi.fn(() => 0),
+    markPendingAbort: vi.fn(),
+    consumePendingAbort: vi.fn(() => false),
+    discardPendingNotifications: vi.fn(),
     getOrCreate: async (id?: string, _mode?: unknown, _systemPromptTemplate?: unknown, activeMode?: unknown) => {
       getOrCreateCalls.push({ id, activeMode });
       const key = id ?? "default";
@@ -842,6 +845,35 @@ describe("http-server — steer / abort / clear-queue", () => {
     expect(r.status).toBe(200);
     expect(r.data).toEqual({ ok: true, stoppedJobs: 0, pending: true });
     expect(s._aborted).toBe(true);
+  });
+
+  it("Stop clears the steer queue, discards pending notifications, and re-sweeps jobs after brain.abort", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab2" });
+    const s = sm.sessions.get("ab2")!;
+    const r = await getJson(port, "/api/sessions/ab2/abort", "POST");
+    expect(r.status).toBe(200);
+    expect(s.brain.clearQueue).toHaveBeenCalled();          // #2 steer queue dropped
+    expect(sm.discardPendingNotifications).toHaveBeenCalledWith("ab2"); // #7 resurrection guard
+    // #1: stopSessionJobs swept once before brain.abort AND once after the run drains.
+    expect(sm.stopSessionJobs).toHaveBeenCalledTimes(2);
+  });
+
+  it("Stop before the session exists records a pending abort (200, not 404)", async () => {
+    const r = await getJson(port, "/api/sessions/ghost-bg/abort", "POST");
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ ok: true, pending: true });
+    expect(sm.markPendingAbort).toHaveBeenCalledWith("ghost-bg"); // #6 pre-spawn
+  });
+
+  it("a consumed pending abort short-circuits the next prompt (pre-prompt latch)", async () => {
+    sm.consumePendingAbort.mockReturnValueOnce(true);          // #6 consume → #5 latch
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab-pre" });
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ aborted: true });
+    const s = sm.sessions.get("ab-pre")!;
+    expect(s.brain.prompt).not.toHaveBeenCalled();             // never started the run
+    expect(s._promptDone).toBe(true);                          // session unlocked
+    expect(s._promptInflight).toBe(null);
   });
 
   it("POST /api/prompt returns 409 when _promptInflight is held even if _promptDone flipped back", async () => {
