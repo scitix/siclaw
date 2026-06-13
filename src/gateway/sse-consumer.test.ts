@@ -381,6 +381,65 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     expect(errorRows).toHaveLength(1);
     expect(errorRows[0].content).toContain("all candidates failed");
   });
+
+  it("re-arms stream_error after a rollback so a both-failed turn surfaces the final error live", async () => {
+    const streamErrors: string[] = [];
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "fallback 503" } },
+      { type: "model_route_exhausted", attempt: 2, failureKind: "server_error", errorMessage: "fallback 503" },
+    ];
+    await consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      onEvent: (evt, type) => {
+        if (type === "stream_error") streamErrors.push(String((evt as any).error?.message))
+      },
+    });
+    // The primary's stream_error fires (frontend drops it on rollback); without
+    // re-arming, the fallback's real failure would emit none. Both fire now.
+    expect(streamErrors).toEqual(["primary 429", "fallback 503"]);
+    // Still exactly one persisted error row — the final, exhausted failure.
+    const errorRows = appendCalls.filter((r) => r.metadata?.kind === "error_response");
+    expect(errorRows).toHaveLength(1);
+    expect(errorRows[0].content).toContain("fallback 503");
+  });
+
+  it("does not leak a rolled-back attempt's error into the run summary on a transport drop", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      // stream ends here without a fallback outcome (transport drop)
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    expect(result.errorMessage).toBe("");
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(0);
+  });
+
+  it("emits ttft_ms on only the first assistant row across two message_ends before commit", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "first" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first" }], stopReason: "stop" } },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "second" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "second" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 1, candidateKey: "openai/gpt-4", provider: "openai", modelId: "gpt-4", isFallback: false, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    // Anchor the turn start in the past so ttft is a positive, recorded value.
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true, turnStartTime: Date.now() - 5000 });
+    const rows = appendCalls.filter((r) => r.role === "assistant" && (r.content === "first" || r.content === "second"));
+    expect(rows).toHaveLength(2);
+    const withTtft = rows.filter((r) => r.metadata?.timing?.ttft_ms !== undefined);
+    expect(withTtft).toHaveLength(1);
+    expect(withTtft[0].content).toBe("first");
+  });
 });
 
 // ── Tool calls ──────────────────────────────────────────
