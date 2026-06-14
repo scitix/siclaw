@@ -177,25 +177,14 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
   // Pilot-style chat hook
   const pilot = usePilotChat({ agentId, sessionId: activeSessionId })
 
-  // Plan panel visibility. The backend auto-clears a fully-completed plan ~5s
-  // after completion and emits a `reset` task_event — but that reset fires after
-  // the turn's SSE stream has already closed, so the live client only picks it up
-  // on reload (hence "only disappears on refresh"). Mirror the 5s auto-hide on the
-  // client so the panel goes away live; the persisted reset keeps it hidden after
-  // a refresh, and a new (incomplete) plan reveals it again.
+  // Plan panel visibility. A completed plan stays visible until a NEW plan begins:
+  // the backend emits a `reset` task_event when task_create starts a fresh plan after
+  // the previous one fully completed (src/tools/workflow/task-tools.ts). That reset
+  // fires inside a live turn, so foldPlan drops the old plan live and swaps in the new
+  // one; the persisted reset keeps it cleared after a refresh too. No client-side timer.
   const plan = useMemo(() => foldPlan(pilot.messages), [pilot.messages])
   const planExists = plan.length > 0
-  const planDone = planExists && plan.every((t) => t.group === "completed")
-  const [planAutoHidden, setPlanAutoHidden] = useState(false)
-  useEffect(() => {
-    if (!planDone) {
-      setPlanAutoHidden(false) // no plan, or a fresh/incomplete one → keep it visible
-      return
-    }
-    const timer = window.setTimeout(() => setPlanAutoHidden(true), 5000)
-    return () => window.clearTimeout(timer)
-  }, [planDone])
-  const planActive = planExists && !planAutoHidden
+  const planActive = planExists
 
   // Fetch sessions
   useEffect(() => {

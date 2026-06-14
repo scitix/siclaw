@@ -168,8 +168,6 @@ const SESSION_RELEASE_TTL_MS = 30_000;
 const NOTIFICATION_COALESCE_MS = 600;
 /** One-time guard for the "synthetic turn can't persist" diagnostic (see runSyntheticPrompt). */
 let warnedNoPersist = false;
-/** Delay before auto-clearing a fully-completed plan (CC V2 parity: HIDE_DELAY_MS). */
-const LEDGER_AUTOCLEAR_MS = 5_000;
 const DELEGATED_AGENT_MAX_RUNTIME_MS = getSubagentMaxRuntimeMs();
 const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
 function delay(ms: number): Promise<void> {
@@ -317,9 +315,6 @@ export class AgentBoxSessionManager {
     }
     // MCP is initialized per-session inside createSiclawSession via loadConfig().mcpServers.
   }
-
-  /** Pending plan auto-clear timers, keyed by taskListId (all tasks completed → clear after delay). */
-  private ledgerHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
    * Bounds concurrent foreground sub-agent child sessions across this AgentBox
@@ -1160,32 +1155,6 @@ export class AgentBoxSessionManager {
     } catch { /* no snapshot (new session) — fine */ }
   }
 
-  /** CC V2 resetTaskList parity: when every task is completed, clear the plan after a
-   *  short delay; a new pending task before the timer fires cancels the clear. The
-   *  reset is emitted as a task_event so the UI/foldPlan + persistence reset too. The
-   *  ledger's id sequence is preserved so the next plan's ids never reuse cleared ones. */
-  private scheduleLedgerAutoClear(taskListId: string, emit: (event: Record<string, unknown>) => void): void {
-    const existing = this.ledgerHideTimers.get(taskListId);
-    if (getOrCreateLedger(taskListId).allCompleted()) {
-      if (existing) return; // already scheduled
-      const timer = setTimeout(() => {
-        this.ledgerHideTimers.delete(taskListId);
-        const ledger = getOrCreateLedger(taskListId);
-        if (!ledger.allCompleted()) return; // a new task arrived; abort the clear
-        // Only the parent touches the ledger (sub-agents have no task tools — see
-        // isSubagent gating), so allCompleted() reflects the whole plan and clearing
-        // here can't wipe anything out from under a child. No in-flight-child guard.
-        ledger.clear();
-        emit({ kind: "task_event", taskListId, action: "reset" });
-      }, LEDGER_AUTOCLEAR_MS);
-      timer.unref?.();
-      this.ledgerHideTimers.set(taskListId, timer);
-    } else if (existing) {
-      clearTimeout(existing);
-      this.ledgerHideTimers.delete(taskListId);
-    }
-  }
-
   private async persistUpdateMessage(message: DelegationUpdateMessagePayload): Promise<void> {
     await this.persistDelegationEvent({ type: "delegation.update_message", message });
   }
@@ -1599,9 +1568,6 @@ export class AgentBoxSessionManager {
         // survives a pod/process restart — keyed by the event's taskListId (the
         // parent's id, even when a sub-agent mutated a task it owns).
         this.persistLedgerSnapshot(event.taskListId ?? id);
-        // CC V2 parity: once the whole plan is completed, auto-clear it after a
-        // short delay (a new pending task before then cancels the clear).
-        if (event.action !== "reset") this.scheduleLedgerAutoClear(event.taskListId ?? id, emitExtraEvent);
       }
       if (extraEventSubs.size === 0) {
         extraEventBuffer.push(event);
@@ -2033,11 +1999,6 @@ export class AgentBoxSessionManager {
       this.sessions.delete(sessionId);
       // Permanent closure — drop the in-memory ledger so it doesn't accumulate
       // (the durable snapshot + Portal task_events remain for history/recovery).
-      const hideTimer = this.ledgerHideTimers.get(sessionId);
-      if (hideTimer) {
-        clearTimeout(hideTimer);
-        this.ledgerHideTimers.delete(sessionId);
-      }
       deleteLedger(sessionId);
       emitDiagnostic({ type: "session_released", sessionId });
     }

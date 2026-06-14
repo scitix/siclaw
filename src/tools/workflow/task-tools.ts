@@ -74,7 +74,18 @@ export function createTaskCreateTool(taskListId: string, emit?: SessionEventEmit
     async execute(_id, raw) {
       const p = raw as { subject: string; description: string; activeForm?: string; owner?: string };
       if (!p.subject?.trim()) return err("task_create requires a non-empty subject.");
-      const t = getOrCreateLedger(taskListId).create(p);
+      const ledger = getOrCreateLedger(taskListId);
+      // CC V2 resetTaskList parity: creating a task while the previous plan was fully
+      // completed starts a NEW plan — clear the old one first (and emit a reset task_event so
+      // the UI/foldPlan + persistence drop it) so the panel shows only current work. clear()
+      // keeps the id high-water-mark, so the new task's id never collides with a cleared one.
+      // This replaces the former time-based auto-clear (a completed plan now stays visible
+      // until the next plan begins, not 5s after completion).
+      if (ledger.allCompleted()) {
+        ledger.clear();
+        emit?.({ kind: "task_event", taskListId, action: "reset" } satisfies TaskEvent);
+      }
+      const t = ledger.create(p);
       emitUpsert(emit, taskListId, t);
       return ok(`Created task #${t.id}: ${t.subject}`);
     },
@@ -104,7 +115,8 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
       "Set ordering with addBlockedBy using the real ids from task_create / task_list, " +
       "e.g. {\"id\":\"2\",\"addBlockedBy\":[\"1\"]}. If unsure of a task's current state, task_get it first.\n" +
       "Remove a task that is no longer relevant or was created in error with status=deleted. " +
-      "(A fully-completed plan is auto-cleared after a short delay, so the list stays scoped to current work.)",
+      "(A fully-completed plan stays visible until you start a new plan with task_create, which clears " +
+      "it so the list stays scoped to current work.)",
     parameters: Type.Object({
       id: Type.String(),
       status: Type.Optional(Type.Union([

@@ -14,8 +14,8 @@ import type { LedgerTask } from "../core/task-ledger.js";
 /**
  * Discriminated by `action` so illegal states are unrepresentable: only an upsert
  * carries `task`, only a delete carries `taskId`, a reset carries neither. "reset"
- * clears the whole plan (emitted ~5s after every task completes — CC V2 parity,
- * see resetTaskList).
+ * clears the whole plan (emitted when a new plan starts via task_create after the
+ * previous one fully completed — CC V2 parity, see resetTaskList).
  */
 export type TaskEvent =
   | { kind: "task_event"; taskListId: string; action: "upsert"; task: LedgerTask }

@@ -73,6 +73,28 @@ describe("task tools", () => {
     expect(events[2]).toMatchObject({ action: "delete", taskId: "1" });
   });
 
+  it("starting a new plan after the previous one fully completed emits a reset before the new task", async () => {
+    const events: any[] = [];
+    const emit = (e: any) => events.push(e);
+    const create = createTaskCreateTool(TLID, emit);
+    await create.execute("c1", { subject: "step one", description: "" });        // upsert #1
+    await createTaskUpdateTool(TLID, emit).execute("u1", { id: "1", status: "completed" }); // upsert #1 completed
+    // Plan is now fully completed → the next create starts a NEW plan.
+    const r = await create.execute("c2", { subject: "step two", description: "" });
+    expect(events.map((e) => e.action)).toEqual(["upsert", "upsert", "reset", "upsert"]);
+    // clear() keeps the id high-water-mark, so the new task continues the sequence.
+    expect(events[3]).toMatchObject({ action: "upsert", task: { id: "2", subject: "step two" } });
+    expect(text(r)).toContain("#2");
+  });
+
+  it("creating a second task while the first is still incomplete does NOT emit a reset", async () => {
+    const events: any[] = [];
+    const create = createTaskCreateTool(TLID, (e) => events.push(e));
+    await create.execute("c1", { subject: "a", description: "" }); // pending
+    await create.execute("c2", { subject: "b", description: "" }); // plan not all-completed → no reset
+    expect(events.map((e) => e.action)).toEqual(["upsert", "upsert"]);
+  });
+
   it("task_list shows ready vs blocked with waiting-on ids (deps set via task_update)", async () => {
     const c = createTaskCreateTool(TLID);
     await c.execute("c1", { subject: "n", description: "" });               // #1
