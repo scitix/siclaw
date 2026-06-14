@@ -1091,7 +1091,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const db = getDb();
     const placeholders = body.ids.map(() => "?").join(",");
     const [rows] = await db.query(
-      `SELECT name, transport, url, command, args, env, headers, enabled
+      `SELECT name, transport, url, command, args, env, headers, description, enabled
        FROM mcp_servers WHERE id IN (${placeholders}) AND enabled = 1`,
       body.ids,
     ) as any;
@@ -1104,6 +1104,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
         ...(row.args ? { args: safeParseJson(row.args, []) } : {}),
         ...(row.env ? { env: safeParseJson(row.env, {}) } : {}),
         ...(row.headers ? { headers: safeParseJson(row.headers, {}) } : {}),
+        ...(row.description ? { description: row.description } : {}),
       };
     }
     sendJson(res, 200, { mcpServers });
