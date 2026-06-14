@@ -38,8 +38,6 @@ export interface BrainModelInfo {
 export interface BrainModelParams {
   /** Reasoning effort: off|minimal|low|medium|high|xhigh. */
   reasoningEffort?: string;
-  /** Provider service tier, e.g. "fast" (ChatGPT subscription). */
-  serviceTier?: string;
 }
 
 export interface BrainContextUsage {
@@ -133,8 +131,6 @@ export interface BrainSession {
    * → modelConfig.params). Called per-prompt after setModel. Brains map what they
    * can and ignore the rest:
    *   - reasoningEffort → the session thinking level (any reasoning model)
-   *   - serviceTier     → a per-call provider option, e.g. "fast" (OpenAI family)
-   * Absent fields reset to the brain's default so values never leak across turns.
    */
   applyModelParams?(params: BrainModelParams): void;
 

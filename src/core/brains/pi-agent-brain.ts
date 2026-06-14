@@ -16,14 +16,10 @@ import type {
   BrainContextPreflightResult,
   PromptImage,
 } from "../brain-session.js";
+import { estimateMessagesTokens } from "../compaction.js";
 
 /** Valid pi thinking levels; guards reasoningEffort coming off the wire. */
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
-
-/** Property stashed on the pi agent so the agent-factory streamFn wrapper can read
- *  the active service tier without a separate ref handoff. */
-export const SERVICE_TIER_PROP = "_siclawServiceTier";
-import { estimateMessagesTokens } from "../compaction.js";
 
 export class PiAgentBrain implements BrainSession {
   readonly brainType = "pi-agent" as const;
@@ -262,11 +258,6 @@ export class PiAgentBrain implements BrainSession {
     if (effort && THINKING_LEVELS.has(effort)) {
       this.session.setThinkingLevel(effort as any);
     }
-    // serviceTier → stashed on the agent for the streamFn wrapper to inject as a
-    // per-call option. Always (re)written — clearing it when absent so a previous
-    // turn's "fast" doesn't leak into a model that shouldn't use it.
-    const tier = params.serviceTier?.trim();
-    (this.session.agent as any)[SERVICE_TIER_PROP] = tier && tier !== "default" ? tier : undefined;
   }
 
   async ensureContextForModelPrompt(
