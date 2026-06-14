@@ -7,6 +7,7 @@ import {
   resetConversationSessionsForTest,
 } from "./dingtalk.js";
 import { sessionRegistry } from "../session-registry.js";
+import { buildMarkdownMessage, DINGTALK_TITLE, sanitizeMarkdownForDingTalk } from "./dingtalk-card.js";
 
 // ── Mocks ──────────────────────────────────────────────────────────
 
@@ -247,14 +248,17 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
     expect(promptArg).not.toHaveProperty("userId");
   });
 
-  it("replies with a plain-text error when the agent throws", async () => {
+  it("replies with a generic notice (not raw error detail) when the agent throws", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
-    promptMock.mockRejectedValue(new Error("AgentBox unreachable"));
+    promptMock.mockRejectedValue(new Error("AgentBox unreachable at https://internal-host:8443"));
     await handleDingTalkMessage(makeDownstream("hello"), "ch", makeAgentBoxManager("a1") as any, undefined, {} as any);
     const body = JSON.parse((fetchMock.mock.calls[0][1] as any).body);
     expect(body.msgtype).toBe("text");
     expect(body.text.content).toContain("\u274C");
-    expect(body.text.content).toContain("AgentBox unreachable");
+    expect(body.text.content).toContain("处理失败");
+    // The raw error (internal host) must NOT leak to the chat.
+    expect(body.text.content).not.toContain("internal-host");
+    expect(body.text.content).not.toContain("AgentBox unreachable");
   });
 
   it("replies with the empty-result notice when the agent returns no text", async () => {
@@ -293,6 +297,23 @@ describe("handleDingTalkMessage — conversation model", () => {
   it("group chat uses a fresh sessionId per message (ephemeral)", async () => {
     await handleDingTalkMessage(makeDownstream("first"), "ch", makeAgentBoxManager("a1") as any, undefined, {} as any);
     await handleDingTalkMessage(makeDownstream("second"), "ch", makeAgentBoxManager("a1") as any, undefined, {} as any);
+    const s1 = (promptMock.mock.calls[0][0] as any).sessionId;
+    const s2 = (promptMock.mock.calls[1][0] as any).sessionId;
+    expect(s1).not.toBe(s2);
+    sessionRegistry.forget(s1);
+    sessionRegistry.forget(s2);
+  });
+
+  it("an unknown/missing conversationType defaults to ephemeral (group) routing", async () => {
+    // No conversationType field at all → must NOT accumulate multi-turn context.
+    await handleDingTalkMessage(
+      makeDownstream("first", { conversationType: undefined, conversationId: "cidUNK" }),
+      "ch", makeAgentBoxManager("a1") as any, undefined, {} as any,
+    );
+    await handleDingTalkMessage(
+      makeDownstream("second", { conversationType: undefined, conversationId: "cidUNK" }),
+      "ch", makeAgentBoxManager("a1") as any, undefined, {} as any,
+    );
     const s1 = (promptMock.mock.calls[0][0] as any).sessionId;
     const s2 = (promptMock.mock.calls[1][0] as any).sessionId;
     expect(s1).not.toBe(s2);
@@ -392,5 +413,89 @@ describe("replyToDingTalk", () => {
   it("never throws when fetch rejects", async () => {
     fetchMock.mockRejectedValueOnce(new Error("network down"));
     await expect(replyToDingTalk(WEBHOOK, { msgtype: "text" })).resolves.toBeUndefined();
+  });
+
+  it("refuses to POST to a non-dingtalk host (SSRF guard) and does not fetch", async () => {
+    await replyToDingTalk("https://evil.example.com/exfil", { msgtype: "text" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a host that merely contains 'dingtalk.com' but is not a subdomain", async () => {
+    await replyToDingTalk("https://oapi.dingtalk.com.evil.com/x", { msgtype: "text" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a non-https webhook", async () => {
+    await replyToDingTalk("http://oapi.dingtalk.com/robot/send", { msgtype: "text" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a malformed webhook URL", async () => {
+    await replyToDingTalk("not a url", { msgtype: "text" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("allows api.dingtalk.com and *.dingtalk.com subdomains", async () => {
+    await replyToDingTalk("https://api.dingtalk.com/v1.0/robot/send", { msgtype: "text" });
+    await replyToDingTalk("https://anything.dingtalk.com/robot/send", { msgtype: "text" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── markdown title derivation (notification preview) ───────────────
+
+describe("buildMarkdownMessage — title derived from body", () => {
+  it("uses the first non-empty line, stripped of markdown decoration", () => {
+    const body = buildMarkdownMessage("# 巡检报告 — hke-prod-a-sh01\n\n全部正常。") as any;
+    expect(body.markdown.title).toBe("巡检报告 — hke-prod-a-sh01");
+  });
+
+  it("strips bold/inline-code markers and list bullets", () => {
+    const body = buildMarkdownMessage("- **节点**：`273` 个全部 Ready") as any;
+    expect(body.markdown.title).toBe("节点：273 个全部 Ready");
+  });
+
+  it("truncates long first lines with an ellipsis", () => {
+    const long = "A".repeat(80);
+    const body = buildMarkdownMessage(long) as any;
+    expect(body.markdown.title.length).toBeLessThanOrEqual(61);
+    expect(body.markdown.title.endsWith("…")).toBe(true);
+  });
+
+  it("falls back to the static title for empty/whitespace bodies", () => {
+    const body = buildMarkdownMessage("   \n  ") as any;
+    expect(body.markdown.title).toBe(DINGTALK_TITLE);
+  });
+
+  it("an explicit title overrides derivation", () => {
+    const body = buildMarkdownMessage("内容", "自定义标题") as any;
+    expect(body.markdown.title).toBe("自定义标题");
+  });
+});
+
+// ── sanitizeMarkdownForDingTalk — image neutralisation (exfil guard) ─
+
+describe("sanitizeMarkdownForDingTalk — strips images", () => {
+  it("replaces an image with its alt text so no auto-fetch fires", () => {
+    const out = sanitizeMarkdownForDingTalk("before ![diagram](https://evil.example/x.png) after");
+    expect(out).toBe("before diagram after");
+    expect(out).not.toContain("evil.example");
+    expect(out).not.toContain("![");
+  });
+
+  it("removes an image with empty alt text entirely", () => {
+    const out = sanitizeMarkdownForDingTalk("a ![](http://tracker/p.gif) b");
+    expect(out).toBe("a  b");
+    expect(out).not.toContain("tracker");
+  });
+
+  it("leaves image-like syntax inside fenced code blocks untouched", () => {
+    const src = "```md\n![x](http://example/y.png)\n```";
+    expect(sanitizeMarkdownForDingTalk(src)).toBe(src);
+  });
+
+  it("keeps ordinary links clickable (only images are neutralised)", () => {
+    const out = sanitizeMarkdownForDingTalk("[docs](https://oapi.dingtalk.com/help)");
+    expect(out).toBe("[docs](https://oapi.dingtalk.com/help)");
   });
 });

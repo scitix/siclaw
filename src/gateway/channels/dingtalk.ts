@@ -43,10 +43,36 @@ import {
   buildMarkdownMessage,
   buildTextMessage,
   EMPTY_RESULT_NOTICE,
+  AGENT_ERROR_NOTICE,
 } from "./dingtalk-card.js";
 
 /** Robot-message callback topic (see SDK `constants`). */
 const TOPIC_ROBOT = "/v1.0/im/bot/messages/get";
+
+/**
+ * Hosts we are willing to POST agent output to. DingTalk hands us a temporary
+ * `sessionWebhook` per inbound frame; the frame is authenticated, but this
+ * fetch is issued by the trusted Runtime process (inside the cluster), NOT the
+ * agent sandbox — so an unexpected host would be a ready-made internal SSRF /
+ * data-exfiltration channel. Pin replies to the DingTalk OpenAPI domains.
+ */
+const ALLOWED_WEBHOOK_HOSTS = new Set(["oapi.dingtalk.com", "api.dingtalk.com"]);
+
+function isAllowedWebhookHost(host: string): boolean {
+  return ALLOWED_WEBHOOK_HOSTS.has(host) || host.endsWith(".dingtalk.com");
+}
+
+/**
+ * Build a log-safe error string. The DingTalk SDK fetches its access token
+ * with the AppSecret in the URL query string (`gettoken?appkey=…&appsecret=…`),
+ * and an axios error object carries `config.url`, so dumping a whole error can
+ * leak the secret into log collectors. We log the message only, with any
+ * `appsecret`/`accessKey` query value redacted as a belt-and-braces measure.
+ */
+function safeErrorMessage(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.replace(/(appsecret|appkey|accessKey|access_token)=[^&\s]+/gi, "$1=***");
+}
 
 export interface DingTalkChannelConfig {
   /** ClientID — AppKey from the DingTalk developer console. */
@@ -144,17 +170,27 @@ export function createDingTalkHandler(
         client = dwClient;
         console.log(`[dingtalk] Channel started id=${channelId} client_id=${config.client_id}`);
       } catch (err) {
-        console.error(`[dingtalk] Failed to start channel ${channelId}:`, err);
+        // Log message only — never the whole error object: the SDK's token
+        // fetch puts the AppSecret in the request URL, which axios attaches to
+        // the error as `config.url`.
+        console.error(`[dingtalk] Failed to start channel ${channelId}: ${safeErrorMessage(err)}`);
       }
     },
 
     async stop() {
       if (client) {
         try { client.disconnect(); } catch (err) {
-          console.error(`[dingtalk] Error disconnecting channel ${channelId}:`, err);
+          console.error(`[dingtalk] Error disconnecting channel ${channelId}: ${safeErrorMessage(err)}`);
         }
       }
       client = null;
+      // Drop this channel's 1:1 session pointers so a stop/start cycle does not
+      // leak Map entries (one per active conversation). Entries are prefixed
+      // with `${channelId}:`.
+      const prefix = `${channelId}:`;
+      for (const key of conversationSessions.keys()) {
+        if (key.startsWith(prefix)) conversationSessions.delete(key);
+      }
       console.log(`[dingtalk] Channel stopped id=${channelId}`);
     },
   };
@@ -204,8 +240,11 @@ export async function handleDingTalkMessage(
   const sessionWebhook = message.sessionWebhook;
   if (!conversationId || !sessionWebhook) return;
 
-  // conversationType "2" = group chat; anything else (incl. "1") is 1:1.
-  const routeType: "group" | "user" = message.conversationType === "2" ? "group" : "user";
+  // conversationType "1" = 1:1 chat; "2" = group. Only an explicit "1" gets the
+  // persistent multi-turn (1:1) treatment — anything else, including a missing
+  // or future value, defaults to ephemeral group routing so an unknown type can
+  // never accumulate cross-message context.
+  const routeType: "group" | "user" = message.conversationType === "1" ? "user" : "group";
 
   let text = message.text?.content;
   if (!text || text.trim().length === 0) return;
@@ -260,7 +299,7 @@ export async function handleDingTalkMessage(
   let agentError: Error | null = null;
   try {
     const promptResult = await client.prompt(promptOpts);
-    resultText = await collectResponse(client, promptResult.sessionId);
+    resultText = await collectResponse(client, promptResult.sessionId, "dingtalk");
   } catch (err) {
     agentError = err instanceof Error ? err : new Error(String(err));
     console.error(`[dingtalk] Agent execution failed for session=${sessionId}:`, agentError);
@@ -275,8 +314,11 @@ export async function handleDingTalkMessage(
     return;
   }
 
+  // On failure, reply with a generic notice only — the raw error message can
+  // leak internal endpoints / infra details to everyone in the chat. The full
+  // error was already logged above for operators.
   const finalBody = agentError
-    ? `\u274C ${agentError.message.slice(0, 500)}`
+    ? AGENT_ERROR_NOTICE
     : (resultText || EMPTY_RESULT_NOTICE);
 
   // Errors and the empty-result notice go out as plain text; real answers as
@@ -336,7 +378,9 @@ async function handleNewCommand(
  * <status> <body>`, so we match on the status and the server's message text.
  */
 function isSessionBusyError(err: Error): boolean {
-  return /\b409\b/.test(err.message) || /already running/i.test(err.message);
+  // Anchor to the client's fixed "request failed: <status>" prefix so a bare
+  // "409" appearing elsewhere in an error body can't be misreported as busy.
+  return /request failed: 409\b/i.test(err.message) || /already running/i.test(err.message);
 }
 
 /**
@@ -360,6 +404,26 @@ export async function replyToDingTalk(
   sessionWebhook: string,
   body: Record<string, unknown>,
 ): Promise<void> {
+  // SSRF / exfil guard: this fetch runs in the trusted Runtime process (inside
+  // the cluster), so we only ever POST agent output to the DingTalk OpenAPI
+  // domains — never to an arbitrary host smuggled in via the downstream frame.
+  let host: string;
+  try {
+    const parsed = new URL(sessionWebhook);
+    if (parsed.protocol !== "https:") {
+      console.error(`[dingtalk] Refusing non-https sessionWebhook (protocol=${parsed.protocol})`);
+      return;
+    }
+    host = parsed.hostname;
+  } catch {
+    console.error("[dingtalk] Refusing to reply to a malformed sessionWebhook URL");
+    return;
+  }
+  if (!isAllowedWebhookHost(host)) {
+    console.error(`[dingtalk] Refusing to reply to an unexpected sessionWebhook host=${host}`);
+    return;
+  }
+
   try {
     const res = await fetch(sessionWebhook, {
       method: "POST",
@@ -370,6 +434,6 @@ export async function replyToDingTalk(
       console.error(`[dingtalk] sessionWebhook reply failed: HTTP ${res.status}`);
     }
   } catch (err) {
-    console.error("[dingtalk] Failed to reply via sessionWebhook:", err);
+    console.error(`[dingtalk] Failed to reply via sessionWebhook: ${safeErrorMessage(err)}`);
   }
 }
