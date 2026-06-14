@@ -350,6 +350,27 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, ...cleared };
   });
 
+  // chat.sessionStatus — explicit liveness of a session's in-progress turn, for the Portal
+  // reconnect-after-refresh flow. Uses getAsync (NON-spawning): checking liveness must never
+  // boot an AgentBox — no box means nothing is running. Any failure is fail-safe "not running"
+  // so a transient hiccup makes the page show static history rather than a stuck spinner.
+  rpcMethods.set("chat.sessionStatus", async (params) => {
+    const agentId = params.agentId as string;
+    const sessionId = params.sessionId as string;
+    if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
+
+    const handle = await agentBoxManager.getAsync(agentId);
+    if (!handle) return { ok: true, running: false };
+    try {
+      const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
+      const { running } = await client.sessionStatus(sessionId);
+      return { ok: true, running: !!running };
+    } catch (err: any) {
+      console.warn(`[rpc] chat.sessionStatus: agent=${agentId} session=${sessionId} probe failed: ${err?.message ?? err}`);
+      return { ok: true, running: false };
+    }
+  });
+
   rpcMethods.set("agent.clearMemory", async (params) => {
     const agentId = params.agentId as string;
     if (!agentId) throw new Error("agentId required");

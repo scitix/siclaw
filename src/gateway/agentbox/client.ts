@@ -236,6 +236,15 @@ export class AgentBoxClient {
   }
 
   /**
+   * Liveness of a session's in-progress turn (agentbox activity flags). Used by the Portal
+   * reconnect-after-refresh flow to decide whether to re-attach to the live event stream.
+   */
+  async sessionStatus(sessionId: string): Promise<{ running: boolean }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/status`);
+    return resp.json();
+  }
+
+  /**
    * List available models
    */
   async listModels(): Promise<{ models: ModelInfo[] }> {

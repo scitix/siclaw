@@ -384,6 +384,30 @@ function sseWrite(res: import("node:http").ServerResponse, event: string, data: 
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+/**
+ * Authorize that `userSub` may read a chat session's event/liveness channel: the session must
+ * belong to them. A not-yet-persisted (brand-new) session has no row → "ok" (nothing flows until
+ * the owner's own agent produces events). A row owned by someone else → "forbidden" (cross-tenant
+ * leak). A DB error → "error". Mirrors the user_id scoping every chat-session endpoint in
+ * siclaw-api.ts enforces; shared by the read-only /events and /status channels.
+ */
+async function authorizeSessionOwnership(
+  agentId: string,
+  sessionId: string,
+  userSub: string,
+): Promise<"ok" | "forbidden" | "error"> {
+  try {
+    const [rows] = await getDb().query(
+      "SELECT user_id FROM chat_sessions WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+      [sessionId, agentId],
+    ) as any;
+    if (rows.length > 0 && rows[0].user_id !== userSub) return "forbidden";
+    return "ok";
+  } catch {
+    return "error";
+  }
+}
+
 export function registerChatRoutes(
   router: RestRouter,
   connectionMap: RuntimeConnectionMap,
@@ -525,24 +549,11 @@ export function registerChatRoutes(
     const sessionId = params.sessionId;
 
     // Authorization: this is a read channel for the session's chat.event stream, so the
-    // caller MUST own it — mirror the user_id scoping every chat-session endpoint in
-    // siclaw-api.ts enforces. If the session row exists but belongs to another user, reject
-    // (cross-tenant leak). A not-yet-persisted (brand-new) session has no row: allow it
-    // (nothing flows until the owner's own agent produces events) so the frontend's
-    // EventSource doesn't 404-storm before the first message lands.
-    try {
-      const [rows] = await getDb().query(
-        "SELECT user_id FROM chat_sessions WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
-        [sessionId, agentId],
-      ) as any;
-      if (rows.length > 0 && rows[0].user_id !== payload.sub) {
-        sendJson(res, 403, { error: "Forbidden" });
-        return;
-      }
-    } catch {
-      sendJson(res, 500, { error: "Failed to authorize session" });
-      return;
-    }
+    // caller MUST own it. A brand-new (not-yet-persisted) session has no row → allowed, so the
+    // frontend's EventSource doesn't 404-storm before the first message lands.
+    const authz = await authorizeSessionOwnership(agentId, sessionId, payload.sub);
+    if (authz === "forbidden") { sendJson(res, 403, { error: "Forbidden" }); return; }
+    if (authz === "error") { sendJson(res, 500, { error: "Failed to authorize session" }); return; }
 
     writeSseHead(res);
 
@@ -575,6 +586,30 @@ export function registerChatRoutes(
       try { res.write(": keepalive\n\n"); } catch { cleanup(); }
     }, 25_000);
     keepalive.unref?.();
+  });
+
+  // GET /api/v1/siclaw/agents/:id/chat/sessions/:sessionId/status — explicit turn liveness.
+  //
+  // Read-only. The Portal frontend calls this right after loading history on a fresh page
+  // (hard refresh / reconnect): if the turn is still running it re-attaches to the live
+  // /events stream and keeps rendering, instead of showing a static snapshot. Liveness is the
+  // runtime/agentbox's own activity flags (chat.sessionStatus RPC → agentbox /status), never a
+  // chat-row inference. Any failure is fail-safe `{running:false}` — better a static page than
+  // a stuck spinner.
+  router.get("/api/v1/siclaw/agents/:id/chat/sessions/:sessionId/status", async (req, res, params) => {
+    const auth = requireAuth(req, jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+
+    const authz = await authorizeSessionOwnership(params.id, params.sessionId, auth.userId);
+    if (authz === "forbidden") { sendJson(res, 403, { error: "Forbidden" }); return; }
+    if (authz === "error") { sendJson(res, 500, { error: "Failed to authorize session" }); return; }
+
+    const result = await connectionMap.sendCommand(params.id, "chat.sessionStatus", {
+      agentId: params.id,
+      userId: auth.userId,
+      sessionId: params.sessionId,
+    });
+    sendJson(res, 200, { running: result.ok && !!(result.payload as Record<string, unknown> | undefined)?.running });
   });
 
   // POST /api/v1/siclaw/agents/:id/chat/steer — inject steer message

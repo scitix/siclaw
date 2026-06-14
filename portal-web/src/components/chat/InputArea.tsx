@@ -38,6 +38,10 @@ interface InputAreaProps {
   onAbort?: () => void
   disabled?: boolean
   isLoading?: boolean
+  /** Detached background work (bg exec job / bg sub-agent) still running after the turn ended.
+   *  Keeps the Stop button shown (clicking it sweeps the jobs via chat.abort) while still
+   *  letting the user type and send a NEW message (the turn itself is no longer streaming). */
+  hasBackgroundWork?: boolean
   contextUsage?: ContextUsage | null
   pendingMessages?: string[]
   onRemovePending?: (index: number) => void
@@ -101,6 +105,7 @@ export function InputArea({
   onAbort,
   disabled,
   isLoading,
+  hasBackgroundWork,
   contextUsage,
   pendingMessages,
   onRemovePending,
@@ -151,10 +156,11 @@ export function InputArea({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft, draftSeq])
 
-  // Reset aborting state when loading finishes
+  // Reset aborting state when all work (the turn AND any detached background job) finishes —
+  // not just when the turn ends, or a bg-only Stop would leave the button stuck "Stopping…".
   useEffect(() => {
-    if (!isLoading) setIsAborting(false)
-  }, [isLoading])
+    if (!isLoading && !hasBackgroundWork) setIsAborting(false)
+  }, [isLoading, hasBackgroundWork])
 
   const deepInvestigation = dpActive ?? false
   const setDeepInvestigation = onSetDpActive ?? (() => {})
@@ -521,7 +527,11 @@ export function InputArea({
               >
                 <ArrowUp className="w-5 h-5" />
               </button>
-            ) : isLoading ? (
+            ) : (isLoading || hasBackgroundWork) && !(value.trim() || attachments.length > 0 || activePrefix) ? (
+              // Stop is shown while the turn is streaming OR while a detached background job is
+              // still running after the turn ended (so the user can sweep it without a follow-up
+              // message). With text present and the turn done, the Send branch wins instead, so a
+              // new message is still sendable while a background job runs.
               <button
                 onClick={() => {
                   setIsAborting(true)
@@ -531,7 +541,7 @@ export function InputArea({
                   "absolute right-3 bottom-3 p-2 rounded-lg text-white shadow-md transition-all",
                   isAborting ? "bg-red-400 hover:bg-red-500/100" : "bg-red-500/100 hover:bg-red-600",
                 )}
-                title={isAborting ? "Stopping..." : "Stop generating"}
+                title={isAborting ? "Stopping..." : isLoading ? "Stop generating" : "Stop background task"}
               >
                 {isAborting ? <Loader2 className="w-5 h-5 animate-spin" /> : <Square className="w-5 h-5" />}
               </button>
