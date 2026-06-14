@@ -42,7 +42,6 @@
     "@anthropic-ai/sdk": "^0.71.2",
     "@clack/prompts": "^1.1.0",
     "@earendil-works/pi-agent-core": "^0.78.1",
-    "@earendil-works/pi-ai": "0.78.1",
     "@earendil-works/pi-coding-agent": "0.78.1",
     "@earendil-works/pi-tui": "^0.78.1",
     "@kubernetes/client-node": "^1.4.0",

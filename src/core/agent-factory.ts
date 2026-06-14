@@ -36,8 +36,7 @@ import deepInvestigationExtension from "./extensions/deep-investigation.js";
 import setupExtension from "./extensions/setup.js";
 import lsExtension from "./extensions/ls.js";
 import agentExtension from "./extensions/agent.js";
-import { clampThinkingLevel, streamOpenAICodexResponses } from "@earendil-works/pi-ai";
-import { PiAgentBrain, SERVICE_TIER_PROP } from "./brains/pi-agent-brain.js";
+import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
@@ -686,31 +685,7 @@ export async function createSiclawSession(
   // (dpActive=false) then restores from JSONL, so double-fire is idempotent.
   await session.bindExtensions({});
 
-  // ── Per-call service_tier injection (codex fast tier) ──
-  // reasoning_effort rides the session thinking level (applyModelParams →
-  // setThinkingLevel), but service_tier ("fast") cannot: pi 0.78.1's simple-stream
-  // path (streamSimple → buildBaseOptions) does not carry serviceTier, so setting
-  // options.serviceTier alone is silently dropped before the codex provider builds
-  // the request body. The codex simple + full streams BOTH delegate to the same
-  // streamOpenAICodexResponses; only the option preprocessing differs. So when a
-  // fast tier is active on a codex model we route to the full stream directly with
-  // the same reasoning effort the simple path would compute, plus serviceTier.
-  // Installed BEFORE the guard pipeline so output guards still wrap the stream.
-  // Non-codex (or non-fast) requests are untouched and use the normal path.
-  const baseStreamFn = session.agent.streamFn;
-  session.agent.streamFn = (model: any, context: any, options: any) => {
-    const tier = (session.agent as any)[SERVICE_TIER_PROP];
-    if (tier && model?.api === "openai-codex-responses") {
-      const level = options?.reasoning;
-      const reasoningEffort = level && level !== "off" ? clampThinkingLevel(model, level) : undefined;
-      return streamOpenAICodexResponses(model, context, { ...options, reasoningEffort, serviceTier: tier });
-    }
-    return baseStreamFn(model, context, options);
-  };
-
   // ── Guard pipeline: unified guard registration and installation ──
-  // Wraps the streamFn set above, so input/output guards apply to both the normal
-  // path and the codex-fast route.
   const contextWindow = configuredModel?.contextWindow ?? 128_000;
   const guardRegistry = createGuardRegistry(contextWindow);
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { PiAgentBrain, SERVICE_TIER_PROP } from "./pi-agent-brain.js";
+import { PiAgentBrain } from "./pi-agent-brain.js";
 
 /** Fake AgentSession providing only what PiAgentBrain touches. */
 function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
@@ -497,21 +497,10 @@ describe("PiAgentBrain", () => {
       expect(session.setThinkingLevel).not.toHaveBeenCalled();
     });
 
-    it("stashes 'fast' service tier on the agent for the streamFn wrapper", () => {
+    it("is a no-op when no effort is provided", () => {
       const session = makeFakeSession();
-      new PiAgentBrain(session).applyModelParams({ serviceTier: "fast" });
-      expect(session.agent[SERVICE_TIER_PROP]).toBe("fast");
-    });
-
-    it("clears service tier when absent or 'default' so it doesn't leak across turns", () => {
-      const session = makeFakeSession();
-      const brain = new PiAgentBrain(session);
-      brain.applyModelParams({ serviceTier: "fast" });
-      expect(session.agent[SERVICE_TIER_PROP]).toBe("fast");
-      brain.applyModelParams({});
-      expect(session.agent[SERVICE_TIER_PROP]).toBeUndefined();
-      brain.applyModelParams({ serviceTier: "default" });
-      expect(session.agent[SERVICE_TIER_PROP]).toBeUndefined();
+      new PiAgentBrain(session).applyModelParams({});
+      expect(session.setThinkingLevel).not.toHaveBeenCalled();
     });
   });
 });
