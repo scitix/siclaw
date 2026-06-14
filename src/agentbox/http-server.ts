@@ -874,6 +874,23 @@ export function createHttpServer(
   });
 
   /**
+   * GET /api/sessions/:sessionId/status — explicit liveness for the in-progress turn.
+   *
+   * Source of truth for "is this session's turn still running" used by the Portal
+   * reconnect-after-refresh flow. MUST be the agentbox's own activity flags, NOT inferred
+   * from persisted chat rows: siclaw is end-only persistence, so a turn that is thinking or
+   * streaming text with no tool in flight has no "running" row — a row heuristic would miss
+   * it and the page would stop following a live turn. A not-yet-created / already-released
+   * session has no managed entry → not running.
+   */
+  addRoute("GET", "/api/sessions/:sessionId/status", async (_req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+    const running = !!managed && (managed.isAgentActive || managed.isCompacting || managed.isRetrying);
+    sendJson(res, 200, { running });
+  });
+
+  /**
    * POST /api/sessions/:sessionId/clear-queue - clear queued steer/followUp messages
    */
   addRoute("POST", "/api/sessions/:sessionId/clear-queue", async (_req, res, params) => {

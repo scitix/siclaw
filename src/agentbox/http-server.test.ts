@@ -941,6 +941,35 @@ describe("http-server — dp-state", () => {
   });
 });
 
+describe("http-server — session status (liveness)", () => {
+  it("returns running:false for an idle loaded session", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st1" });
+    const s = sm.sessions.get("st1")!;
+    s.isAgentActive = false; s.isCompacting = false; s.isRetrying = false;
+    const r = await getJson(port, "/api/sessions/st1/status");
+    expect(r.status).toBe(200);
+    expect(r.data.running).toBe(false);
+  });
+
+  it("returns running:true when any activity flag is set", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st2" });
+    for (const flag of ["isAgentActive", "isCompacting", "isRetrying"] as const) {
+      const s = sm.sessions.get("st2")!;
+      s.isAgentActive = false; s.isCompacting = false; s.isRetrying = false;
+      s[flag] = true;
+      const r = await getJson(port, "/api/sessions/st2/status");
+      expect(r.status).toBe(200);
+      expect(r.data.running).toBe(true);
+    }
+  });
+
+  it("returns running:false for an unknown (never-created / released) session", async () => {
+    const r = await getJson(port, "/api/sessions/ghost/status");
+    expect(r.status).toBe(200);
+    expect(r.data.running).toBe(false);
+  });
+});
+
 describe("http-server — memory reset", () => {
   it("DELETE /api/memory calls sessionManager.resetMemory", async () => {
     const spy = vi.spyOn(sm, "resetMemory");

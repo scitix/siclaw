@@ -592,6 +592,47 @@ describe("chat-gateway routes", () => {
     });
   });
 
+  // ── chat.sessionStatus (liveness) ────────────────────────
+  describe("GET /api/v1/siclaw/agents/:id/chat/sessions/:sid/status", () => {
+    const url = "/api/v1/siclaw/agents/a1/chat/sessions/s1/status";
+
+    it("returns 401 without auth", async () => {
+      const res = await runRoute(router, fakeReq({ url, method: "GET" }));
+      expect(res._status).toBe(401);
+      expect(connMap.sendCommand).not.toHaveBeenCalled();
+    });
+
+    it("returns 403 when the session belongs to another user", async () => {
+      query.mockResolvedValue([[{ user_id: "someone-else" }], []]);
+      const res = await runRoute(router, fakeReq({
+        url, method: "GET", headers: { authorization: `Bearer ${USER_TOKEN}` },
+      }));
+      expect(res._status).toBe(403);
+      expect(connMap.sendCommand).not.toHaveBeenCalled();
+    });
+
+    it("maps payload.running to the response on a new (unowned) session", async () => {
+      query.mockResolvedValue([[], []]); // brand-new session → no row → allowed
+      connMap.sendCommand = vi.fn().mockResolvedValue({ ok: true, payload: { running: true } });
+      const res = await runRoute(router, fakeReq({
+        url, method: "GET", headers: { authorization: `Bearer ${USER_TOKEN}` },
+      }));
+      expect(res._status).toBe(200);
+      expect(JSON.parse(res._body)).toEqual({ running: true });
+      expect(connMap.sendCommand).toHaveBeenCalledWith("a1", "chat.sessionStatus", expect.objectContaining({ sessionId: "s1" }));
+    });
+
+    it("fails safe to running:false when the runtime RPC fails", async () => {
+      query.mockResolvedValue([[], []]);
+      connMap.sendCommand = vi.fn().mockResolvedValue({ ok: false, error: "disconnected" });
+      const res = await runRoute(router, fakeReq({
+        url, method: "GET", headers: { authorization: `Bearer ${USER_TOKEN}` },
+      }));
+      expect(res._status).toBe(200);
+      expect(JSON.parse(res._body)).toEqual({ running: false });
+    });
+  });
+
   // ── chat.clearQueue ──────────────────────────────────────
   describe("POST /api/v1/siclaw/agents/:id/chat/clear-queue", () => {
     it("returns 400 without session_id", async () => {

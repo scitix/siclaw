@@ -159,6 +159,12 @@ export async function chatAbort(agentId: string, sessionId: string): Promise<voi
   })
 }
 
+/** Explicit liveness of a session's in-progress turn. Used after loading history on a fresh
+ *  page to decide whether to re-attach to the live event stream (reconnect-after-refresh). */
+export async function chatSessionStatus(agentId: string, sessionId: string): Promise<{ running: boolean }> {
+  return api(`/siclaw/agents/${agentId}/chat/sessions/${sessionId}/status`)
+}
+
 export async function clearAgentMemory(agentId: string): Promise<{ deletedFiles: number }> {
   return api(`/siclaw/agents/${agentId}/clear-memory`, { method: "POST" })
 }

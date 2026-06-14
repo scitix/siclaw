@@ -290,6 +290,8 @@ const THINKING_TIPS = [
 export interface PilotAreaProps {
   messages: PilotMessage[]
   isLoading: boolean
+  /** Detached background work still running after the turn ended — keeps the Stop button shown. */
+  hasBackgroundWork?: boolean
   isLoadingHistory?: boolean
   hasMore?: boolean
   loadingMore?: boolean
@@ -311,6 +313,7 @@ export interface PilotAreaProps {
 export function PilotArea({
   messages,
   isLoading,
+  hasBackgroundWork,
   isLoadingHistory,
   hasMore,
   loadingMore,
@@ -810,6 +813,7 @@ export function PilotArea({
         onAbort={wrappedAbort}
         disabled={false}
         isLoading={isLoading}
+        hasBackgroundWork={hasBackgroundWork}
         contextUsage={contextUsage}
         pendingMessages={pendingMessages}
         onRemovePending={onRemovePending}
@@ -2290,7 +2294,10 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
   const bgRunning = isBackground && !bgStatus
   const bgFailed = bgStatus === "failed"
   const bgStopped = bgStatus === "stopped" || bgStatus === "killed"
-  const bgDone = isBackground && !!bgStatus && !bgFailed && !bgStopped
+  // Synthesized when a launch's completion was never persisted (crash) and the row aged out —
+  // the job is gone, so render it as a non-success terminal state, not a green "done".
+  const bgTimedOut = bgStatus === "timed_out"
+  const bgDone = isBackground && !!bgStatus && !bgFailed && !bgStopped && !bgTimedOut
   const bgExitLabel = typeof bgExitCode === "number" ? ` (exit ${bgExitCode})` : ""
   // The expanded body re-prints toolInput only when the single-line header can't
   // already show it in full: multi-line input (a heredoc / multi-statement command)
@@ -2376,7 +2383,7 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
                 {bgRunning && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />}
                 {bgDone && <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />}
                 {bgFailed && <XCircle className="w-3.5 h-3.5 text-red-500" />}
-                {bgStopped && <Ban className="w-3.5 h-3.5 text-amber-500" />}
+                {(bgStopped || bgTimedOut) && <Ban className="w-3.5 h-3.5 text-amber-500" />}
               </>
             ) : (
               <>
@@ -2407,7 +2414,9 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
                         ? `Background task failed${bgExitLabel}`
                         : bgStopped
                           ? "Background task stopped"
-                          : `Background task completed${bgExitLabel}`)
+                          : bgTimedOut
+                            ? "Background task did not report completion (timed out)"
+                            : `Background task completed${bgExitLabel}`)
                   : (message.content || (message.toolStatus === "aborted" ? "Aborted." : "Running..."))}
               </pre>
               {/* Output copy only for a real captured output — a background box's body is a
