@@ -13,7 +13,7 @@ const MAX_MERMAID_LINES = 160
 const MAX_MERMAID_EDGES = 80
 
 type MermaidValidation =
-  | { ok: true; source: string; kind: "flowchart" | "sequence" | "timeline" }
+  | { ok: true; source: string; kind: "flowchart" | "sequence" | "timeline" | "xychart" }
   | { ok: false; reason: string }
 
 type RenderState =
@@ -88,9 +88,12 @@ export function validateMermaidSource(raw: string): MermaidValidation {
   if (/^timeline\b/i.test(head)) {
     return { ok: true, source, kind: "timeline" }
   }
+  if (/^xychart-beta\b/i.test(head)) {
+    return { ok: true, source, kind: "xychart" }
+  }
   return {
     ok: false,
-    reason: "Only flowchart/graph, sequenceDiagram, and timeline diagrams are supported.",
+    reason: "Only flowchart/graph, sequenceDiagram, timeline, and xychart-beta diagrams are supported.",
   }
 }
 

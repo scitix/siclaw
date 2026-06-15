@@ -28,6 +28,9 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/READY_TO_PASTE/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/exactly/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/Do not rewrite, escape, quote/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/mermaid/i);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/data must be an object/i);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/never a JSON string/i);
   });
 });
 

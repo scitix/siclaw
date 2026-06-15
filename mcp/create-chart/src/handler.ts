@@ -17,7 +17,7 @@ export const RENDER_CHART_INPUT_SCHEMA = {
     data: {
       type: "object",
       description:
-        "Chart data. Pie: {slices:[{label,value}]}. Bar: {categories:[string], series:[{name,values:[number]}]}. Line: {series:[{name, points:[{x:number|string, y:number}]}]}. For time series pass x as epoch seconds (number) and y as the metric value.",
+        "Chart data as a real JSON object, never as a JSON string. Pie: {slices:[{label,value}]}. Bar: {categories:[string], series:[{name,values:[number]}]}. Line: {series:[{name, points:[{x:number|string, y:number}]}]}. Every value must be a finite number; do not use placeholders, variables, or references to earlier messages.",
     },
     title: { type: "string" },
     width: { type: "integer", minimum: 200, maximum: 2400 },
@@ -29,7 +29,12 @@ export const RENDER_CHART_INPUT_SCHEMA = {
 } as const;
 
 export const RENDER_CHART_DESCRIPTION =
-  "Render a pie/bar/line chart from structured data. The tool returns a READY_TO_PASTE chart block as plain markdown plus metadata. Use proactively when the user asks to visualize, plot, or 画图/出图/画饼图/柱状图/曲线/折线/趋势图, AND chartable data is already in context. Typical sources: status_counts (pie), category_summary anomaly/no_anomaly counts (bar), time-series samples (line, x=epoch seconds or display string, y=value). In your final reply, paste the READY_TO_PASTE block exactly as returned. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG.";
+  [
+    "Render a pie/bar/line chart only when finalized structured numeric data is already in context and can be passed as valid tool arguments.",
+    "For qualitative diagrams, workflows, topology, decision trees, rough summaries, or small category/count visuals where tool arguments might be uncertain, use a ```mermaid fenced block instead; xychart-beta is suitable for simple bar charts.",
+    "Arguments must be one JSON object. data must be an object, never a JSON string. Use only literal finite numbers; never use placeholders, expressions, previous-message references, or bare tokens.",
+    "The tool returns a READY_TO_PASTE chart block as plain markdown plus metadata. In your final reply, paste the READY_TO_PASTE block exactly as returned. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG.",
+  ].join(" ");
 
 function chartBaseDir(): string {
   const root =
