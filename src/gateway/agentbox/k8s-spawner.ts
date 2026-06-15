@@ -280,7 +280,6 @@ export class K8sSpawner implements BoxSpawner {
             },
             ports: [
               { containerPort: 3000, name: "https" },
-              { containerPort: 9090, name: "metrics" },
             ],
             env,
             volumeMounts: [

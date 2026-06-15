@@ -25,6 +25,10 @@ vi.mock("../shared/metrics.js", () => ({
     contentType: "text/plain",
     metrics: async () => "# HELP fake\n",
   },
+  processIncarnation: "test-incarnation",
+  getMetricsAsJSON: async () => [
+    { name: "siclaw_tokens_total", type: "counter", values: [{ labels: { type: "input" }, value: 3 }] },
+  ],
 }));
 
 vi.mock("../shared/local-collector.js", () => ({
@@ -919,10 +923,16 @@ describe("http-server — metrics endpoints", () => {
     expect(text).toContain("# HELP fake");
   });
 
-  it("GET /api/internal/metrics-snapshot returns a JSON snapshot", async () => {
+  it("GET /api/internal/metrics-snapshot returns a JSON snapshot augmented with federation fields", async () => {
     const r = await getJson(port, "/api/internal/metrics-snapshot");
     expect(r.status).toBe(200);
-    expect(r.data).toEqual({ cpu: 0 });
+    // base snapshot from LocalCollector (path ①) ...
+    expect(r.data.cpu).toBe(0);
+    // ... augmented in the route with federation fields (path ②)
+    expect(r.data.incarnation).toBe("test-incarnation");
+    expect(r.data.prom).toEqual([
+      { name: "siclaw_tokens_total", type: "counter", values: [{ labels: { type: "input" }, value: 3 }] },
+    ]);
   });
 });
 

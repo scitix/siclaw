@@ -171,11 +171,9 @@ metrics:
     namespace: ""
     namespaceSelector: {}
     additionalLabels: {}
-  podMonitor:
-    enabled: true
-    interval: 15s
-    namespace: ""
-    additionalLabels: {}
+  # NOTE: the agentbox PodMonitor was removed — agentbox metrics are now federated
+  # through the Gateway and exported from gateway:3001 (ServiceMonitor above), the
+  # single stable scrape target. See metrics-federation-DESIGN.md.
   grafanaDashboard:
     enabled: true
     namespace: ""

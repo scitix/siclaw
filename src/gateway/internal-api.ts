@@ -28,6 +28,7 @@ import type {
   DelegationToolUpdatePayload,
   DelegationUpdateMessagePayload,
 } from "../shared/delegation-persistence.js";
+import type { MetricsFlushPayload, PromSampleGroup } from "../shared/metrics-types.js";
 
 /** Read + JSON-parse an HTTP request body. */
 async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
@@ -583,6 +584,51 @@ export async function handleDelegationEvents(
     sendJson(res, 200, response);
   } catch (err) {
     console.error("[internal-api] delegation-events error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/** What the flush handler needs from the federation aggregator (decouples internal-api). */
+export interface MetricsFlushSink {
+  ingest(boxId: string, incarnation: string, groups: PromSampleGroup[]): void;
+}
+
+/** Flush self-monitoring counters (module 4); optional so callers can omit in tests. */
+export interface MetricsFlushCounters {
+  flushReceivedTotal: { inc(): void };
+  flushErrorsTotal: { inc(): void };
+}
+
+/**
+ * POST /api/internal/metrics-flush — SIGTERM final-flush from an AgentBox (module 5).
+ *
+ * 🔴 boxId comes from the mTLS certificate identity, NEVER from the body: the agentbox
+ * process doesn't know its own pod name, and trusting a body-supplied id would let
+ * agent A poison agent B's federated series. The body carries only the per-process
+ * incarnation and the cumulative prom snapshot, fed through the SAME idempotent
+ * `ingest()` entry point as the pull loop.
+ */
+export async function handleMetricsFlush(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  sink: MetricsFlushSink,
+  counters?: MetricsFlushCounters,
+): Promise<void> {
+  try {
+    counters?.flushReceivedTotal.inc();
+    const body = (await readJsonBody(req)) as MetricsFlushPayload;
+    if (!body || typeof body.incarnation !== "string" || !Array.isArray(body.prom)) {
+      counters?.flushErrorsTotal.inc();
+      sendJson(res, 400, { error: "metrics-flush requires { incarnation, prom }" });
+      return;
+    }
+    // boxId from the cert, not the body.
+    sink.ingest(identity.boxId, body.incarnation, body.prom);
+    sendJson(res, 200, { ok: true });
+  } catch (err) {
+    counters?.flushErrorsTotal.inc();
+    console.error("[internal-api] metrics-flush error:", err);
     sendJson(res, 500, { error: "Internal server error" });
   }
 }
