@@ -14,8 +14,8 @@ import {
   type ToolCallStats,
   type SkillCallStats,
   type MetricsSnapshot,
+  type PromSampleGroup,
 } from "../shared/metrics-types.js";
-import type { PromFederationAggregator } from "./prom-federation-aggregator.js";
 
 /** Interface for LocalCollector dependency injection (Local mode only) */
 export interface LocalCollectorRef {
@@ -32,6 +32,19 @@ export interface PodLister {
 /** Interface for making mTLS requests to AgentBox pods */
 export interface SnapshotFetcher {
   fetch(endpoint: string): Promise<MetricsSnapshot | null>;
+}
+
+/**
+ * What the pull loop needs from the Prometheus federation aggregator (module 2).
+ * Declared as a structural interface — not an import of PromFederationAggregator —
+ * so this file stays self-contained for the agentbox tsconfig/Docker build (which
+ * compiles metrics-aggregator.ts but does NOT ship the gateway-only federation code).
+ */
+export interface FederationSink {
+  ingest(boxId: string, incarnation: string, groups: PromSampleGroup[]): void;
+  retainInstances(liveBoxIds: Set<string>): void;
+  trackedInstanceCount(): number;
+  seriesCount(): number;
 }
 
 /**
@@ -76,7 +89,7 @@ export class MetricsAggregator {
      * K8s-only: the Prometheus federation aggregator. The pull loop feeds it each
      * pod's `prom` snapshot (path ②) in addition to the WebUI deltas (path ①).
      */
-    private promFederation?: PromFederationAggregator,
+    private promFederation?: FederationSink,
     /** K8s-only: federation self-monitoring metrics (module 4). */
     private selfMetrics?: FederationSelfMetrics,
   ) {
