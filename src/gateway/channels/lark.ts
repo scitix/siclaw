@@ -250,7 +250,11 @@ async function replyToLark(larkClient: any, messageId: string, text: string): Pr
 
 // ── SSE response collector ─────────────────────────────────────
 
-export async function collectResponse(client: AgentBoxClient, sessionId: string): Promise<string> {
+export async function collectResponse(
+  client: AgentBoxClient,
+  sessionId: string,
+  logPrefix = "lark",
+): Promise<string> {
   const parts: string[] = [];
   // Track the latest assistant turn so we only reply with the *final* text
   // (tool-use turns emit intermediate message_end events that aren't meant
@@ -273,7 +277,7 @@ export async function collectResponse(client: AgentBoxClient, sessionId: string)
       }
     }
   } catch (err) {
-    console.error(`[lark] SSE collect error for session=${sessionId}:`, err);
+    console.error(`[${logPrefix}] SSE collect error for session=${sessionId}:`, err);
   }
   // Prefer the last full assistant turn; fall back to streamed deltas if the
   // brain only emits content_block_delta events.
