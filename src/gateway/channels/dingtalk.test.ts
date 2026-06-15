@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
-  createDingTalkHandler,
   handleDingTalkMessage,
   replyToDingTalk,
   ackDingTalkCallback,
@@ -75,9 +74,6 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
-  // The DingTalk SDK is an installed optionalDependency, so the "SDK missing"
-  // fallback tests actually reach DWClient.connect(), which logs via
-  // console.info/warn and attempts a (failing) network call. Silence the noise.
   vi.spyOn(console, "info").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -86,23 +82,72 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-// ── Fallback when SDK missing / config parsing ──────────────────────
+// ── start()/stop() lifecycle + SDK-missing fallback ─────────────────
+//
+// These tests must stay HERMETIC: `dingtalk-stream-sdk-nodejs` is an installed
+// optionalDependency, so without mocking, `start()` reaches `DWClient.connect()`
+// — a real WSS call to the DingTalk gateway that hangs to the test timeout on a
+// network-restricted runner (CI/offline). We mock the SDK per-test via
+// `vi.doMock` + `vi.resetModules()` and a fresh dynamic import of the handler so
+// no socket is ever opened.
 
-describe("createDingTalkHandler — fallback when SDK is missing", () => {
-  it("start() resolves and does not throw when SDK import fails", async () => {
-    const handler = createDingTalkHandler(
+describe("createDingTalkHandler — start/stop lifecycle (hermetic, no network)", () => {
+  afterEach(() => {
+    vi.doUnmock("dingtalk-stream-sdk-nodejs");
+    vi.resetModules();
+  });
+
+  /** Load the handler module with the SDK mocked so connect() never networks. */
+  async function loadWithSdkMock() {
+    vi.resetModules();
+    const disconnect = vi.fn();
+    const connect = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("dingtalk-stream-sdk-nodejs", () => ({
+      DWClient: class {
+        registerCallbackListener() { return this; }
+        connect = connect;
+        disconnect = disconnect;
+        send() {}
+      },
+    }));
+    const mod = await import("./dingtalk.js");
+    return { createDingTalkHandler: mod.createDingTalkHandler, connect, disconnect };
+  }
+
+  it("start() connects and stop() disconnects without opening a socket", async () => {
+    const { createDingTalkHandler: create, connect, disconnect } = await loadWithSdkMock();
+    const handler = create(
       { id: "c1", config: { client_id: "x", client_secret: "y" } },
       {} as any,
     );
     await expect(handler.start()).resolves.toBeUndefined();
+    expect(connect).toHaveBeenCalledTimes(1);
     await expect(handler.stop()).resolves.toBeUndefined();
+    expect(disconnect).toHaveBeenCalledTimes(1);
   });
 
   it("accepts channel.config as a JSON string", async () => {
-    const handler = createDingTalkHandler(
+    const { createDingTalkHandler: create, connect } = await loadWithSdkMock();
+    const handler = create(
       { id: "c2", config: JSON.stringify({ client_id: "a", client_secret: "b" }) },
       {} as any,
     );
+    await expect(handler.start()).resolves.toBeUndefined();
+    expect(connect).toHaveBeenCalledTimes(1);
+    await expect(handler.stop()).resolves.toBeUndefined();
+  });
+
+  it("start() falls back gracefully when the SDK is not installed", async () => {
+    vi.resetModules();
+    vi.doMock("dingtalk-stream-sdk-nodejs", () => {
+      throw new Error("Cannot find package 'dingtalk-stream-sdk-nodejs'");
+    });
+    const mod = await import("./dingtalk.js");
+    const handler = mod.createDingTalkHandler(
+      { id: "c3", config: { client_id: "x", client_secret: "y" } },
+      {} as any,
+    );
+    // The import throws → start() swallows it and returns; stop() is a no-op.
     await expect(handler.start()).resolves.toBeUndefined();
     await expect(handler.stop()).resolves.toBeUndefined();
   });
