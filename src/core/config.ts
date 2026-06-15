@@ -264,6 +264,29 @@ export function loadConfig(): SiclawConfig {
     if (!isNaN(v) && v > 0) cached.debugPodStartupTimeout = v;
   }
 
+  // Embedding config via env — infrastructure override for K8s/AgentBox, where
+  // there is no settings.json `embedding` section and Portal does not serve one.
+  // Each field overrides the file value individually; missing fields keep the
+  // file value (or fall back to getEmbeddingConfig()'s defaults). The block is
+  // only constructed when at least one var is set, so non-memory deployments are
+  // unaffected. `getEmbeddingConfig()` still returns null when baseUrl is empty.
+  {
+    const envBaseUrl = process.env.SICLAW_EMBEDDING_BASE_URL;
+    const envModel = process.env.SICLAW_EMBEDDING_MODEL;
+    const envApiKey = process.env.SICLAW_EMBEDDING_API_KEY;
+    const envDimensions = process.env.SICLAW_EMBEDDING_DIMENSIONS;
+    if (envBaseUrl || envModel || envApiKey || envDimensions) {
+      const existing = cached.embedding;
+      const parsedDims = envDimensions !== undefined ? parseInt(envDimensions, 10) : NaN;
+      cached.embedding = {
+        baseUrl: envBaseUrl ?? existing?.baseUrl ?? "",
+        apiKey: envApiKey ?? existing?.apiKey ?? "",
+        model: envModel ?? existing?.model ?? "BAAI/bge-m3",
+        dimensions: !isNaN(parsedDims) && parsedDims > 0 ? parsedDims : existing?.dimensions ?? 1024,
+      };
+    }
+  }
+
   return cached;
 }
 

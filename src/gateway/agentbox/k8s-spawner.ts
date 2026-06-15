@@ -181,7 +181,17 @@ export class K8sSpawner implements BoxSpawner {
     // flag is read inside the agentbox (sub-agent fan-out limiter, design §3).
     // Curated allowlist only — never forward arbitrary env. Set the value on the
     // runtime deployment to control every agentbox it spawns.
-    const AGENTBOX_FORWARDED_ENV = ["SICLAW_SUBAGENT_CONCURRENCY"];
+    const AGENTBOX_FORWARDED_ENV = [
+      "SICLAW_SUBAGENT_CONCURRENCY",
+      // Embedding endpoint for the memory indexer. The agentbox reads these via
+      // loadConfig() env overrides (config.ts); set on the runtime deployment to
+      // configure every agentbox it spawns. API key is optional (TEI-style
+      // self-hosted endpoints are usually unauthenticated).
+      "SICLAW_EMBEDDING_BASE_URL",
+      "SICLAW_EMBEDDING_MODEL",
+      "SICLAW_EMBEDDING_DIMENSIONS",
+      "SICLAW_EMBEDDING_API_KEY",
+    ];
     for (const name of AGENTBOX_FORWARDED_ENV) {
       const value = process.env[name];
       if (value !== undefined && value !== "") {
