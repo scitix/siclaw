@@ -58,6 +58,20 @@ describe("Markdown Mermaid fences", () => {
       ok: true,
       kind: "timeline",
     })
+    expect(
+      validateMermaidSource(
+        [
+          "xychart-beta",
+          '  title "事故单AI可解决性分析"',
+          '  x-axis ["AI可解决", "AI不可解决", "有条件可解决"]',
+          '  y-axis "数量" 0 --> 2',
+          "  bar [1, 0, 2]",
+        ].join("\n"),
+      ),
+    ).toMatchObject({
+      ok: true,
+      kind: "xychart",
+    })
   })
 
   it("repairs leaked stream content prefixes inside Mermaid blocks", () => {
