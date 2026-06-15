@@ -60,9 +60,19 @@ interface PromptRequestBody {
 
 // Defense-in-depth bound; the sicore proxy already caps attachments, but the
 // agentbox /prompt is also reachable directly so re-validate here.
+// MUST stay consistent with MAX_BODY_SIZE (parseJsonBody, below): the whole JSON
+// body is rejected at MAX_BODY_SIZE *before* this runs, so MAX_PROMPT_IMAGES ×
+// MAX_PROMPT_IMAGE_BASE64_CHARS must fit under it with headroom for the JSON
+// envelope + text. 4 × 2MB = 8MB < 10MB MAX_BODY_SIZE → all advertised images
+// are actually deliverable (raising one without the other reintroduces the
+// "limit unreachable" mismatch).
 const MAX_PROMPT_IMAGES = 4;
-const MAX_PROMPT_IMAGE_BASE64_CHARS = 8 * 1024 * 1024;
+const MAX_PROMPT_IMAGE_BASE64_CHARS = 2 * 1024 * 1024;
 const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+// Standard base64 (optionally padded). PromptImage.data is raw base64 with no
+// `data:` URL prefix; a non-base64 string would only fail later at the provider.
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 /** Keep only well-formed, supported image parts; drop anything malformed. */
 function sanitizePromptImages(raw: unknown): PromptImage[] | undefined {
@@ -76,6 +86,7 @@ function sanitizePromptImages(raw: unknown): PromptImage[] | undefined {
     if (typeof mimeType !== "string" || typeof data !== "string") continue;
     if (!SUPPORTED_PROMPT_IMAGE_MIMES.has(mimeType.toLowerCase())) continue;
     if (data.length === 0 || data.length > MAX_PROMPT_IMAGE_BASE64_CHARS) continue;
+    if (data.length % 4 !== 0 || !BASE64_RE.test(data)) continue; // reject non-base64
     out.push({ mimeType: mimeType.toLowerCase(), data });
   }
   return out.length > 0 ? out : undefined;
