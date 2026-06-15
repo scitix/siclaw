@@ -18,8 +18,8 @@ interface FakeHandlerRecord {
 
 const fakeHandlerRegistry: FakeHandlerRecord[] = [];
 
-vi.mock("./channels/lark.js", () => ({
-  createLarkHandler: (channel: Record<string, any>) => {
+function makeFakeFactory() {
+  return (channel: Record<string, any>) => {
     const record: FakeHandlerRecord = { started: false, stopped: false, receivedChannel: channel };
     fakeHandlerRegistry.push(record);
     const handler: ChannelHandler = {
@@ -27,7 +27,15 @@ vi.mock("./channels/lark.js", () => ({
       async stop() { record.stopped = true; },
     };
     return handler;
-  },
+  };
+}
+
+vi.mock("./channels/lark.js", () => ({
+  createLarkHandler: makeFakeFactory(),
+}));
+
+vi.mock("./channels/dingtalk.js", () => ({
+  createDingTalkHandler: makeFakeFactory(),
 }));
 
 class FakeFrontendClient {
@@ -164,6 +172,13 @@ describe("ChannelManager.startChannel / stopChannel", () => {
   it("starts a channel and stores its handler", async () => {
     const mgr = new ChannelManager(fakeManager, undefined, frontend as unknown as FrontendWsClient);
     await mgr.startChannel({ id: "c1", type: "lark", config: { app_id: "a", app_secret: "s" } });
+    expect(mgr.size).toBe(1);
+    expect(fakeHandlerRegistry[0].started).toBe(true);
+  });
+
+  it("starts a dingtalk channel via its factory", async () => {
+    const mgr = new ChannelManager(fakeManager, undefined, frontend as unknown as FrontendWsClient);
+    await mgr.startChannel({ id: "d1", type: "dingtalk", config: { client_id: "k", client_secret: "s" } });
     expect(mgr.size).toBe(1);
     expect(fakeHandlerRegistry[0].started).toBe(true);
   });
