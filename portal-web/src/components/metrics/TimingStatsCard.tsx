@@ -16,13 +16,7 @@ import type { LatencyStats, TimingStats, ToolLatencyStats } from "../../hooks/us
 
 interface Props {
   data: TimingStats | null
-  period: "today" | "7d" | "30d"
-}
-
-const PERIOD_LABEL: Record<Props["period"], string> = {
-  today: "today",
-  "7d": "last 7 days",
-  "30d": "last 30 days",
+  rangeLabel: string
 }
 
 const TOP_OPTIONS = [3, 5, 10] as const
@@ -43,7 +37,7 @@ const MODEL_ROWS: Array<{ key: "ttft" | "thinking"; emoji: string; label: string
   { key: "thinking", emoji: "💭", label: "Thinking", hint: "boundary → first token" },
 ]
 
-export function TimingStatsCard({ data, period }: Props) {
+export function TimingStatsCard({ data, rangeLabel }: Props) {
   const [topN, setTopN] = useState<TopN>(3)
   const tools = data?.tools ?? []
   const visibleTools = tools.slice(0, topN)
@@ -54,7 +48,7 @@ export function TimingStatsCard({ data, period }: Props) {
         <div>
           <h3 className="text-sm font-semibold tracking-tight">Latency Breakdown</h3>
           <p className="text-[11px] text-muted-foreground mt-0.5">
-            avg · min · max · p90 · {PERIOD_LABEL[period]}
+            avg · min · max · p90 · {rangeLabel}
           </p>
         </div>
         {data?.truncated && (

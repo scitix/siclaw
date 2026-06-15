@@ -2805,11 +2805,32 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   // Metrics — summary + audit (admin-only, Portal owns the data)
   // ================================================================
 
-  const PERIODS: Record<string, number> = {
-    today: 86_400_000,
-    "7d": 7 * 86_400_000,
-    "30d": 30 * 86_400_000,
-  };
+  // Parse a single timestamp query param: unix-ms (all-digits → `new Date(Number)`)
+  // or any Date-parseable string (ISO, for manual curl/debug); the portal-web
+  // frontend always sends absolute ms. Returns null when absent or unparseable.
+  // Shared by resolveWindow and the audit handler so the two never drift.
+  function parseTs(v: string | undefined): Date | null {
+    if (!v) return null;
+    const d = /^\d+$/.test(v) ? new Date(Number(v)) : new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // Resolve a [from, to] window from query params, replacing the old `period`
+  // enum. Both missing → trailing 7d. Returns null on an unparseable value or
+  // `from >= to`, so the caller can fail-fast with 400 — no silent fallback to
+  // a default window on bad input.
+  function resolveWindow(query: Record<string, string>): { from: Date; to: Date } | null {
+    const fromRaw = query.from;
+    const toRaw = query.to;
+    if (!fromRaw && !toRaw) {
+      const now = Date.now();
+      return { from: new Date(now - 7 * 86_400_000), to: new Date(now) };
+    }
+    const from = parseTs(fromRaw);
+    const to = toRaw ? parseTs(toRaw) : new Date();
+    if (!from || !to || from.getTime() >= to.getTime()) return null;
+    return { from, to };
+  }
 
   // GET /api/v1/siclaw/metrics/summary
   router.get("/api/v1/siclaw/metrics/summary", async (req, res) => {
@@ -2817,24 +2838,23 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
     const query = parseQuery(req.url ?? "");
-    const period = query.period || "7d";
-    const rangeMs = PERIODS[period];
-    if (!rangeMs) { sendJson(res, 400, { error: "Invalid period" }); return; }
-    const cutoff = new Date(Date.now() - rangeMs);
+    const window = resolveWindow(query);
+    if (!window) { sendJson(res, 400, { error: "Invalid time range" }); return; }
+    const { from, to } = window;
     const userFilter = query.userId || null;
 
     const db = getDb();
 
-    const sessionParams: unknown[] = [cutoff];
-    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ? AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))";
+    const sessionParams: unknown[] = [from, to];
+    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ? AND created_at <= ? AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))";
     if (userFilter) { totalSessionsSql += " AND user_id = ?"; sessionParams.push(userFilter); }
     const [sRows] = await db.query(totalSessionsSql, sessionParams) as [Array<{ c: number }>, unknown];
     const totalSessions = Number(sRows[0]?.c ?? 0);
 
-    const pParams: unknown[] = [cutoff];
+    const pParams: unknown[] = [from, to];
     let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
-      WHERE m.role = 'user' AND m.created_at >= ?
+      WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
         AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
         AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
@@ -2845,10 +2865,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (!userFilter) {
       const [uRows] = await db.query(
         `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
-         FROM chat_sessions s WHERE s.created_at >= ?
+         FROM chat_sessions s WHERE s.created_at >= ? AND s.created_at <= ?
            AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
          GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
-        [cutoff],
+        [from, to],
       ) as any;
       byUser = uRows.map((r: any) => ({ userId: r.userId, sessions: Number(r.sessions), messages: Number(r.messages ?? 0) }));
     }
@@ -2873,10 +2893,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
     const query = parseQuery(req.url ?? "");
-    const period = query.period || "7d";
-    const rangeMs = PERIODS[period];
-    if (!rangeMs) { sendJson(res, 400, { error: "Invalid period" }); return; }
-    const cutoff = new Date(Date.now() - rangeMs);
+    const window = resolveWindow(query);
+    if (!window) { sendJson(res, 400, { error: "Invalid time range" }); return; }
+    const { from, to } = window;
     const userFilter = query.userId || null;
 
     const db = getDb();
@@ -2902,11 +2921,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // /metrics/summary stay responsive while this one is in flight.
 
     // Assistant rows: pull metadata JSON, parse client-side, harvest ttft/thinking.
-    const aParams: unknown[] = [cutoff];
+    const aParams: unknown[] = [from, to];
     let assistantSql = `SELECT m.metadata
       FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
-      WHERE m.role = 'assistant' AND m.created_at >= ? AND m.metadata IS NOT NULL
+      WHERE m.role = 'assistant' AND m.created_at >= ? AND m.created_at <= ? AND m.metadata IS NOT NULL
         AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
     if (userFilter) { assistantSql += " AND s.user_id = ?"; aParams.push(userFilter); }
     assistantSql += " ORDER BY m.created_at DESC LIMIT ?";
@@ -2916,12 +2935,12 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // just bash) so the dashboard can rank by invocation count — the actual
     // top-N filtering happens client-side so the user can flip 3↔5↔10
     // without re-querying.
-    const tParams: unknown[] = [cutoff];
+    const tParams: unknown[] = [from, to];
     let toolSql = `SELECT m.tool_name AS toolName, m.duration_ms AS durationMs
       FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
       WHERE m.role = 'tool' AND m.tool_name IS NOT NULL AND m.duration_ms IS NOT NULL
-        AND m.created_at >= ?
+        AND m.created_at >= ? AND m.created_at <= ?
         AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
     if (userFilter) { toolSql += " AND s.user_id = ?"; tParams.push(userFilter); }
     toolSql += " ORDER BY m.created_at DESC LIMIT ?";
@@ -2985,11 +3004,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const query = parseQuery(req.url ?? "");
     const limit = Math.min(200, Math.max(1, parseInt(query.limit || "50", 10)));
-    const startDate = query.startDate ? new Date(query.startDate) : new Date(Date.now() - 86_400_000);
-    const endDate = query.endDate ? new Date(query.endDate) : new Date();
+    // Audit uses the same from/to window contract as summary/timing, via the
+    // shared parseTs. It keeps a lenient trailing-24h default (and BETWEEN
+    // semantics) when a bound is absent — the frontend always sends an explicit,
+    // frozen window, so the lenient default is only hit by manual callers.
+    const from = parseTs(query.from) ?? new Date(Date.now() - 86_400_000);
+    const to = parseTs(query.to) ?? new Date();
 
     const conds: string[] = ["m.role = 'tool'", "m.created_at BETWEEN ? AND ?"];
-    const params: unknown[] = [startDate, endDate];
+    const params: unknown[] = [from, to];
     if (query.userId) { conds.push("s.user_id = ?"); params.push(query.userId); }
     if (query.toolName) { conds.push("m.tool_name = ?"); params.push(query.toolName); }
     if (query.outcome) { conds.push("m.outcome = ?"); params.push(query.outcome); }
