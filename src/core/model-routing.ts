@@ -1,4 +1,4 @@
-import type { BrainModelInfo, BrainProviderResponse, BrainSession } from "./brain-session.js";
+import type { BrainModelInfo, BrainProviderResponse, BrainSession, PromptImage } from "./brain-session.js";
 
 export type ModelRouteFailureKind =
   | "billing"
@@ -506,9 +506,10 @@ export async function runPromptWithModelRouting(
   policy: ModelRoutePolicy | undefined,
   state: ModelRouteState,
   options: RunPromptWithModelRoutingOptions = {},
+  images?: PromptImage[],
 ): Promise<ModelRouteRunResult> {
   if (!isModelRoutePolicyEnabled(policy)) {
-    await brain.prompt(text);
+    await brain.prompt(text, images);
     return { success: true, exhausted: false, attempted: [] };
   }
 
@@ -597,7 +598,7 @@ export async function runPromptWithModelRouting(
     // buffer every attempt, since a live failed attempt would leak into the
     // turn they persist from collected events.
     const streamFromStart = optimisticPrimaryStream && i === 0;
-    const attemptResult = await runAttempt(brain, text, candidate, emitBrainEvent, streamFromStart);
+    const attemptResult = await runAttempt(brain, text, candidate, emitBrainEvent, streamFromStart, images);
     const failure = attemptResult.failure;
     attempt.finishedAt = now();
 
@@ -779,6 +780,7 @@ async function runAttempt(
   candidate: ModelRouteCandidate,
   emitBrainEvent: (event: unknown) => void,
   streamFromStart: boolean,
+  images?: PromptImage[],
 ): Promise<AttemptResult> {
   const checkpoint = brain.createPromptCheckpoint?.();
   let lastProviderResponse: BrainProviderResponse | undefined;
@@ -888,7 +890,7 @@ async function runAttempt(
         },
       };
     }
-    await brain.prompt(text);
+    await brain.prompt(text, images);
   } catch (err) {
     const message = errorMessage(err);
     return {

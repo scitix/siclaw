@@ -50,6 +50,8 @@ export interface PromptOptions {
   };
   /** Optional ordered model fallback policy. Omitted means legacy single-model behavior. */
   modelRouting?: ModelRoutePolicy;
+  /** Image attachments (raw base64, no data: prefix) forwarded as vision input. */
+  images?: Array<{ mimeType: string; data: string }>;
 }
 
 export interface PromptResponse {

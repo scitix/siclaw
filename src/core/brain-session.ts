@@ -14,6 +14,17 @@
 
 export type BrainType = "pi-agent";
 
+/**
+ * An image attachment to send alongside a prompt. `data` is raw base64 (no
+ * `data:` URL prefix); the provider layer builds the data URL. Only carried
+ * through to vision-capable models — pi-ai downgrades images to a text
+ * placeholder when the model's `input` does not include "image".
+ */
+export interface PromptImage {
+  mimeType: string;
+  data: string;
+}
+
 export interface BrainModelInfo {
   id: string;
   name: string;
@@ -58,8 +69,9 @@ export interface BrainContextPreflightResult {
 export interface BrainSession {
   readonly brainType: BrainType;
 
-  /** Send a prompt to the agent. Resolves when the agent finishes responding. */
-  prompt(text: string): Promise<void>;
+  /** Send a prompt to the agent. Resolves when the agent finishes responding.
+   *  `images` are passed to the model as vision input (vision-capable models only). */
+  prompt(text: string, images?: PromptImage[]): Promise<void>;
 
   /** Abort the current agent run. */
   abort(): Promise<void>;

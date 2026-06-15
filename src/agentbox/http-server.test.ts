@@ -269,6 +269,49 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(r.data.error).toMatch(/Missing.*text/);
   });
 
+  it("POST /api/prompt forwards images to brain.prompt as vision input", async () => {
+    const session = await sm.getOrCreate("img-1");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "what is in this image?",
+      sessionId: "img-1",
+      images: [{ mimeType: "image/png", data: "aW1n" }],
+    });
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith(
+      "what is in this image?",
+      [{ mimeType: "image/png", data: "aW1n" }],
+    );
+  });
+
+  it("POST /api/prompt accepts an image-only message and defaults the text", async () => {
+    const session = await sm.getOrCreate("img-only");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "img-only",
+      images: [{ mimeType: "image/png", data: "aW1n" }],
+    });
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith(
+      "Please analyze the attached image.",
+      [{ mimeType: "image/png", data: "aW1n" }],
+    );
+  });
+
+  it("POST /api/prompt drops malformed images and rejects when nothing usable remains", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      images: [{ mimeType: "image/gif", data: "aW1n" }], // unsupported mime → dropped
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/Missing.*text/);
+  });
+
+  it("POST /api/prompt drops images whose data is not valid base64", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      images: [{ mimeType: "image/png", data: "not base64!!!" }], // bad base64 → dropped
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/Missing.*text/);
+  });
+
   it("resolves the active operating mode from DP markers and passes it to getOrCreate", async () => {
     const lastMode = () => sm.getOrCreateCalls[sm.getOrCreateCalls.length - 1].activeMode;
 

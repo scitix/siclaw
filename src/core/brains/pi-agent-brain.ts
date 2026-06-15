@@ -13,6 +13,7 @@ import type {
   BrainSessionStats,
   BrainProviderResponse,
   BrainContextPreflightResult,
+  PromptImage,
 } from "../brain-session.js";
 import { estimateMessagesTokens } from "../compaction.js";
 
@@ -50,10 +51,18 @@ export class PiAgentBrain implements BrainSession {
     });
   }
 
-  async prompt(text: string): Promise<void> {
+  async prompt(text: string, images?: PromptImage[]): Promise<void> {
     this.aborted = false;
     let lastAssistantHadContent = false;
     let lastAssistantMessage: any = null;
+
+    // pi-coding-agent appends these to the user message content; the
+    // openai-codex-responses provider serializes them to `input_image` data
+    // URLs. Dropped (replaced with a placeholder) by pi-ai when the active
+    // model's `input` lacks "image", so non-vision models degrade gracefully.
+    const promptOptions = images && images.length > 0
+      ? { images: images.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })) }
+      : undefined;
 
     const unsub = this.session.subscribe((event: any) => {
       if (event.type === "message_start" && event.message?.role === "assistant") {
@@ -70,7 +79,7 @@ export class PiAgentBrain implements BrainSession {
     });
 
     try {
-      await this.session.prompt(text);
+      await this.session.prompt(text, promptOptions);
 
       // Empty response guard: some models (e.g. Kimi-K2.5) occasionally return
       // a completely empty response (0 content blocks) on the final turn after
@@ -117,7 +126,7 @@ export class PiAgentBrain implements BrainSession {
           await this.abortableSleep(delayMs);
           // Stop landed during the backoff: do NOT fire a fresh, un-aborted re-prompt.
           if (this.aborted) break;
-          await this.session.prompt(text);
+          await this.session.prompt(text, promptOptions);
         } finally {
           // A user Stop landing in the backoff is not an empty-response failure — don't label it
           // one (telemetry/alerting could otherwise count Stops as model defects).
