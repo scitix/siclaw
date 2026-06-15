@@ -29,8 +29,17 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/exactly/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/Do not rewrite, escape, quote/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/mermaid/i);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/xychart-beta/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/画图/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/画饼图/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/柱状图/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/趋势图/);
+    expect(RENDER_CHART_DESCRIPTION).not.toMatch(/visual-card/);
+    expect(RENDER_CHART_DESCRIPTION).not.toMatch(/final_report/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/data must be an object/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/never a JSON string/i);
+    expect(RENDER_CHART_INPUT_SCHEMA.properties.data.description).toMatch(/Every numeric value must be finite/);
+    expect(RENDER_CHART_INPUT_SCHEMA.properties.data.description).toContain("x/category labels may be strings");
   });
 });
 

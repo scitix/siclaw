@@ -58,12 +58,14 @@ ChartRenderer  (portal-web/src/components/chat/ChartRenderer.tsx)
 
 Mermaid is a separate baseline Markdown capability, not a `ChartSpec` type and
 not an MCP requirement. The chat frontend recognises fenced Markdown blocks with
-the language tag `mermaid` and renders the initial supported diagram families:
+the language tag `mermaid` and renders these supported diagram families:
 
 - `flowchart` / `graph` for process, dependency, cause/effect, and remediation
   flows.
 - `sequenceDiagram` for cross-component request or event ordering.
 - `timeline` for task lifecycles, incidents, and investigation progress.
+- `xychart-beta` for lightweight x/y bars or trends when a full `chart` fence is
+  unnecessary.
 
 Mermaid blocks are rendered client-side with Mermaid's strict security mode and
 bounded text/edge limits. Init/config directives in chat-authored diagrams are
@@ -77,6 +79,10 @@ Mermaid diagrams share the frontend SVG export helpers used by charts:
   PNG download controls;
 - message/session rich-copy treats rendered Mermaid SVGs as images, matching the
   chart copy path.
+
+Use `chart` fences for finalized pie/bar/line data that should use Siclaw's
+native chart interactivity and validation. Use Mermaid `xychart-beta` for compact
+inline comparisons that are naturally authored as a diagram.
 
 ### Why the spinner, not a partial chart?
 
