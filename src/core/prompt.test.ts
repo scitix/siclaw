@@ -47,3 +47,30 @@ describe("buildSreSystemPrompt memory flag", () => {
     expect(prompt).not.toContain("remember context from previous sessions");
   });
 });
+
+describe("buildSreSystemPrompt visual output guidance", () => {
+  it("authorizes every Mermaid family supported by Sicore Web", () => {
+    const prompt = buildSreSystemPrompt("web");
+
+    expect(prompt).toContain("flowchart");
+    expect(prompt).toContain("sequenceDiagram");
+    expect(prompt).toContain("timeline");
+    expect(prompt).toContain("xychart-beta");
+  });
+
+  it("does not steer shared Siclaw surfaces to unsupported visual-card output", () => {
+    const prompt = buildSreSystemPrompt("web");
+
+    expect(prompt).not.toContain("```visual-card");
+    expect(prompt).not.toContain('type: "report"');
+    expect(prompt).not.toContain("final_report");
+    expect(prompt).not.toContain("health_check");
+    expect(prompt).not.toContain("incident_timeline");
+    expect(prompt).not.toContain("root_cause_chain");
+    expect(prompt).not.toContain("metric_snapshot");
+    expect(prompt).not.toContain("status_distribution");
+    expect(prompt).not.toContain("action_plan");
+    expect(prompt).toContain("Mermaid for diagrams");
+    expect(prompt).toContain("chart");
+  });
+});

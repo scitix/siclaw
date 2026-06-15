@@ -17,7 +17,7 @@ export const RENDER_CHART_INPUT_SCHEMA = {
     data: {
       type: "object",
       description:
-        "Chart data as a real JSON object, never as a JSON string. Pie: {slices:[{label,value}]}. Bar: {categories:[string], series:[{name,values:[number]}]}. Line: {series:[{name, points:[{x:number|string, y:number}]}]}. Every value must be a finite number; do not use placeholders, variables, or references to earlier messages.",
+        "Chart data as a real JSON object, never as a JSON string. Pie: {slices:[{label,value}]}. Bar: {categories:[string], series:[{name,values:[number]}]}. Line: {series:[{name, points:[{x:number|string, y:number}]}]}. Every numeric value must be finite; x/category labels may be strings. Do not use placeholders, variables, or references to earlier messages.",
     },
     title: { type: "string" },
     width: { type: "integer", minimum: 200, maximum: 2400 },
@@ -30,8 +30,8 @@ export const RENDER_CHART_INPUT_SCHEMA = {
 
 export const RENDER_CHART_DESCRIPTION =
   [
-    "Render a pie/bar/line chart only when finalized structured numeric data is already in context and can be passed as valid tool arguments.",
-    "For qualitative diagrams, workflows, topology, decision trees, rough summaries, or small category/count visuals where tool arguments might be uncertain, use a ```mermaid fenced block instead; xychart-beta is suitable for simple bar charts.",
+    "Render a pie/bar/line chart only when finalized structured numeric data is already in context and can be passed as valid tool arguments. This includes requests such as 画图, 画饼图, 柱状图, 趋势图 when the required numeric data is available.",
+    "For qualitative diagrams, workflows, topology, or decision trees, use a ```mermaid fenced block instead; xychart-beta is suitable for simple bar charts.",
     "Arguments must be one JSON object. data must be an object, never a JSON string. Use only literal finite numbers; never use placeholders, expressions, previous-message references, or bare tokens.",
     "The tool returns a READY_TO_PASTE chart block as plain markdown plus metadata. In your final reply, paste the READY_TO_PASTE block exactly as returned. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG.",
   ].join(" ");
