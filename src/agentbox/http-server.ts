@@ -517,6 +517,18 @@ export function createHttpServer(
         }
       }
 
+      // Apply per-model runtime tunables delivered on modelConfig.params
+      // (reasoning_effort). Re-applied every prompt so a model switch or a config
+      // change takes effect on the next turn. Snake_case on the wire → camelCase
+      // BrainModelParams.
+      if (body.modelConfig && managed.brain.applyModelParams) {
+        const rawParams = (body.modelConfig as Record<string, unknown>).params;
+        const p = (rawParams && typeof rawParams === "object" ? rawParams : {}) as Record<string, unknown>;
+        managed.brain.applyModelParams({
+          reasoningEffort: typeof p.reasoning_effort === "string" ? p.reasoning_effort : undefined,
+        });
+      }
+
       // Image-only messages arrive with empty text; give the model a minimal
       // default instruction so the turn isn't a bare image with no ask.
       promptText = body.text && body.text.length > 0

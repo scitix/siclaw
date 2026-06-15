@@ -9,6 +9,7 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type {
   BrainSession,
   BrainModelInfo,
+  BrainModelParams,
   BrainContextUsage,
   BrainSessionStats,
   BrainProviderResponse,
@@ -16,6 +17,9 @@ import type {
   PromptImage,
 } from "../brain-session.js";
 import { estimateMessagesTokens } from "../compaction.js";
+
+/** Valid pi thinking levels; guards reasoningEffort coming off the wire. */
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 export class PiAgentBrain implements BrainSession {
   readonly brainType = "pi-agent" as const;
@@ -245,6 +249,15 @@ export class PiAgentBrain implements BrainSession {
 
   registerProvider(name: string, config: Record<string, unknown>): void {
     this.session.modelRegistry.registerProvider(name, config as any);
+  }
+
+  applyModelParams(params: BrainModelParams): void {
+    // reasoningEffort → session thinking level. pi maps this to the provider's
+    // reasoning_effort / reasoning:{effort} per the provider's thinkingLevelMap.
+    const effort = params.reasoningEffort?.trim();
+    if (effort && THINKING_LEVELS.has(effort)) {
+      this.session.setThinkingLevel(effort as any);
+    }
   }
 
   async ensureContextForModelPrompt(

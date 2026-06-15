@@ -31,6 +31,7 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
       registerProvider: vi.fn(),
     },
     setModel: vi.fn(async () => {}),
+    setThinkingLevel: vi.fn(),
     __emit: emit,
     ...overrides,
   };
@@ -481,5 +482,25 @@ describe("PiAgentBrain", () => {
       provider: "anthropic",
       modelId: "claude",
     }]);
+  });
+
+  describe("applyModelParams", () => {
+    it("sets a valid reasoning effort as the thinking level", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ reasoningEffort: "xhigh" });
+      expect(session.setThinkingLevel).toHaveBeenCalledWith("xhigh");
+    });
+
+    it("ignores an invalid reasoning effort (no throw, no call)", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ reasoningEffort: "ultra" });
+      expect(session.setThinkingLevel).not.toHaveBeenCalled();
+    });
+
+    it("is a no-op when no effort is provided", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({});
+      expect(session.setThinkingLevel).not.toHaveBeenCalled();
+    });
   });
 });
