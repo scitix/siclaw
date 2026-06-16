@@ -49,6 +49,7 @@ export interface RenderChartResult {
   bytes: number;
   image_bytes: number;
   image_mime: "image/png";
+  renderer: "sicore-web";
   embed_instructions: string;
 }
 
