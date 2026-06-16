@@ -8,6 +8,7 @@ import {
   validate,
   handleRenderChart,
 } from "./handler.js";
+import { renderChartSvg } from "./render.js";
 
 describe("RENDER_CHART_INPUT_SCHEMA", () => {
   it("requires type and data, allows the common opts", () => {
@@ -28,6 +29,7 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/READY_TO_PASTE/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/exactly/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/PNG image artifact/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/Sicore Web-style PNG image artifact/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/Do not rewrite, escape, quote/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/mermaid/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/xychart-beta/);
@@ -41,6 +43,33 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/never a JSON string/i);
     expect(RENDER_CHART_INPUT_SCHEMA.properties.data.description).toMatch(/Every numeric value must be finite/);
     expect(RENDER_CHART_INPUT_SCHEMA.properties.data.description).toContain("x/category labels may be strings");
+  });
+});
+
+describe("renderChartSvg", () => {
+  it("uses the Sicore Web chart styling contract for bar charts", () => {
+    const svg = renderChartSvg({
+      type: "bar",
+      title: "任务状态分布",
+      x_label: "状态",
+      y_label: "数量",
+      data: {
+        categories: ["成功", "失败", "等待"],
+        series: [{ name: "任务统计", values: [12, 3, 7] }],
+      },
+    });
+
+    expect(svg).toContain('width="900" height="520"');
+    expect(svg).toContain('fill="#ffffff"');
+    expect(svg).toContain('text-anchor="middle" font-size="18" font-weight="600" fill="#1f2937">任务状态分布</text>');
+    expect(svg).toContain('fill="#4e79a7"');
+    expect(svg).toContain('stroke="#e5e7eb"');
+    expect(svg).toContain('fill="none" stroke-width="1" stroke="#9ca3af"');
+    expect(svg).toContain(">成功</text>");
+    expect(svg).toContain(">失败</text>");
+    expect(svg).toContain(">等待</text>");
+    expect(svg).not.toContain("#000000");
+    expect(svg).not.toContain("Generated from Siclaw response data");
   });
 });
 
@@ -250,7 +279,7 @@ describe("handleRenderChart", () => {
     const inner = ready.replace(/^```chart\n/, "").replace(/\n```$/, "");
     const spec = JSON.parse(inner);
     expect(spec.type).toBe("bar");
-    expect(spec.schema_version).toBe(1);
+    expect(spec).not.toHaveProperty("schema_version");
     expect(spec.data.series[0].values).toEqual([10, 20]);
     expect(spec.title).toBe("Demo");
     expect(spec).not.toHaveProperty("extra_garbage");
@@ -274,7 +303,7 @@ describe("handleRenderChart", () => {
     expect(existsSync(expectedFile)).toBe(true);
     expect(existsSync(meta.png_path as string)).toBe(true);
     const onDisk = JSON.parse(readFileSync(expectedFile, "utf8"));
-    expect(onDisk.schema_version).toBe(1);
+    expect(onDisk).not.toHaveProperty("schema_version");
     expect(onDisk.type).toBe("line");
     expect(onDisk.data.series[0].points).toEqual([{ x: 1, y: 2 }]);
     expect(readdirSync(expectedDir)).toContain(`${meta.chart_id as string}.json`);

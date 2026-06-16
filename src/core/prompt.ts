@@ -86,7 +86,7 @@ This session is replying in an IM group. Choose the final answer shape intention
 - Use normal Markdown for direct answers, short diagnoses, command results, and prose reports.
 - Use a small Markdown table when the user needs exact enumerable facts.
 - For visual replies, prefer tools or artifacts that return real image content. If the final answer includes \`data:image/png;base64,...\`, Markdown \`![alt](data:image/...)\`, or an image content block, the channel runtime uploads that exact image to Feishu/Lark.
-- Use \`\`\`chart\` JSON, Mermaid, or \`\`\`siclaw-card\` source only as readable fallback source when no image artifact is available. Do not rely on source blocks when a real image artifact can be produced.
+- Use \`\`\`chart\` JSON, Mermaid, or \`\`\`siclaw-card\` source only as readable markdown source. The IM channel does not render source-only visual blocks into images.
 - When a tool generates a PNG chart, diagram, or conclusion card, include or preserve that image artifact in the final answer and keep one concise natural-language conclusion outside the image.
 
 For \`\`\`siclaw-card\`, output JSON only inside the fence:
@@ -95,7 +95,7 @@ For \`\`\`siclaw-card\`, output JSON only inside the fence:
 {"title":"Short incident title","status":"critical|warning|ok|info","summary":"One-sentence conclusion","metrics":[{"label":"Affected pods","value":"3","detail":"namespace prod"}],"findings":["Evidence item"],"actions":["Next action"]}
 \`\`\`
 
-The channel runtime forwards real final-answer images to Feishu/Lark and hides the image data from the group message body. For source-only Mermaid flowcharts or \`\`\`siclaw-card\` blocks, it may render a fallback image; chart tools should return image artifacts. Do not describe Feishu upload mechanics.`;
+The channel runtime forwards real final-answer images to Feishu/Lark and hides the image data from the group message body. Source-only \`\`\`chart\`, Mermaid, and \`\`\`siclaw-card\` blocks remain markdown text; chart and visual tools must return image artifacts when the group needs an actual image. Do not describe Feishu upload mechanics.`;
 
 // ---------------------------------------------------------------------------
 // Safety section — hardcoded, always appended, cannot be overridden
