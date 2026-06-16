@@ -20,8 +20,13 @@ import {
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
 } from "./lark-card.js";
-import { maybeRenderChartPng } from "./chart-image.js";
+import { maybeRenderVisualImages, stripVisualBlocks } from "./chart-image.js";
 import { replyImageToLark } from "./lark-image.js";
+
+const VISUAL_ONLY_NOTICE_BY_LOCALE = {
+  "zh-CN": "已生成图片如下。",
+  "en-US": "Image generated below.",
+} as const;
 
 export interface LarkChannelConfig {
   domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
@@ -204,9 +209,10 @@ export async function handleLarkMessage(
   const finalBody = agentError
     ? `\u274C ${agentError.message.slice(0, 500)}`
     : (resultText || EMPTY_RESULT_NOTICE_BY_LOCALE[locale]);
+  const displayBody = stripVisualBlocks(finalBody) || VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
 
   if (cardSession) {
-    const ok = await finalizeCard(larkClient, cardSession, finalBody);
+    const ok = await finalizeCard(larkClient, cardSession, displayBody);
     if (!ok) {
       // Partial-failure path: the card is visible but stuck in streaming
       // state. We log but do NOT post a second reply — that would produce
@@ -216,10 +222,10 @@ export async function handleLarkMessage(
   } else if (resultText || agentError) {
     // Card could not be opened; fall back to a plain text reply with
     // whatever we have (final answer or error).
-    await replyToLark(larkClient, messageId, finalBody);
+    await replyToLark(larkClient, messageId, displayBody);
   }
 
-  await maybeReplyChartImage(larkClient, messageId, finalBody);
+  await maybeReplyVisualImages(larkClient, messageId, finalBody);
 }
 
 /**
@@ -252,16 +258,17 @@ async function replyToLark(larkClient: any, messageId: string, text: string): Pr
   }
 }
 
-async function maybeReplyChartImage(larkClient: any, messageId: string, finalBody: string): Promise<void> {
+async function maybeReplyVisualImages(larkClient: any, messageId: string, finalBody: string): Promise<void> {
   try {
-    const png = await maybeRenderChartPng(finalBody);
-    if (!png) return;
-    const ok = await replyImageToLark(larkClient, messageId, png);
-    if (!ok) {
-      console.warn(`[lark] Chart image reply failed for messageId=${messageId}; markdown card remains primary`);
+    const images = await maybeRenderVisualImages(finalBody);
+    for (const { kind, image } of images) {
+      const ok = await replyImageToLark(larkClient, messageId, image);
+      if (!ok) {
+        console.warn(`[lark] ${kind} image reply failed for messageId=${messageId}; markdown card remains primary`);
+      }
     }
   } catch (err) {
-    console.error(`[lark] Chart image rendering failed for messageId=${messageId}:`, err);
+    console.error(`[lark] Visual image rendering failed for messageId=${messageId}:`, err);
   }
 }
 
