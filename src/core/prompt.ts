@@ -49,6 +49,9 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", 
   if (mode === "task") {
     prompt += CRON_SECTION;
   }
+  if (mode === "channel") {
+    prompt += CHANNEL_SECTION;
+  }
 
   // Append hardcoded safety section — NOT overridable by agent templates
   prompt += SAFETY_SECTION(credentialsPath);
@@ -70,6 +73,29 @@ This is a NON-INTERACTIVE scheduled task. There is no user present.
 - **Fail fast**: If a tool fails with the same error on 2 consecutive attempts, STOP using that tool. Switch approach or report the failure.
 - **Budget awareness**: You have a strict time limit. Prefer lightweight commands (kubectl, bash) over heavy tools (node_exec, node_script) when possible. If a referenced skill does not exist, fall back to simple kubectl commands.
 - After completing your investigation, you MUST call the \`task_report\` tool with a structured summary of your findings. This is the ONLY output recorded and sent to the user. Even if all checks failed, call \`task_report\` to report the failures.`;
+
+// ---------------------------------------------------------------------------
+// Channel section — appended only for IM channel sessions
+// ---------------------------------------------------------------------------
+const CHANNEL_SECTION = `
+
+# Channel Reply Format
+
+This session is replying in an IM group. Choose the final answer shape intentionally:
+
+- Use normal Markdown for direct answers, short diagnoses, command results, and prose reports.
+- Use a small Markdown table when the user needs exact enumerable facts.
+- Use \`\`\`chart\` JSON for finalized numeric comparisons or when the user asks for statistics; prefer bar charts for category counts.
+- Use Mermaid flowcharts when the answer is a dependency, decision, request, or remediation flow.
+- Use a \`\`\`siclaw-card\` JSON block when the final troubleshooting result is best shown as a compact conclusion card with root cause, impact, key evidence, metrics, and next actions. Keep one concise natural-language conclusion outside the block.
+
+For \`\`\`siclaw-card\`, output JSON only inside the fence:
+
+\`\`\`siclaw-card
+{"title":"Short incident title","status":"critical|warning|ok|info","summary":"One-sentence conclusion","metrics":[{"label":"Affected pods","value":"3","detail":"namespace prod"}],"findings":["Evidence item"],"actions":["Next action"]}
+\`\`\`
+
+The channel runtime renders \`\`\`chart\`, Mermaid flowcharts, \`\`\`siclaw-card\`, and final-answer data images as Feishu images and hides the raw visual source from the group message body. Do not describe Feishu upload mechanics or expose raw JSON except inside these fences.`;
 
 // ---------------------------------------------------------------------------
 // Safety section — hardcoded, always appended, cannot be overridden

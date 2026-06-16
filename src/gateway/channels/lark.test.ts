@@ -571,6 +571,53 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.image.create).toHaveBeenCalledTimes(1);
   });
 
+  it("renders Siclaw conclusion cards as images and hides card JSON from the card", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-siclaw-card" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "结论：api pods 正在因配置变更反复重启。",
+              "",
+              "```siclaw-card",
+              JSON.stringify({
+                title: "CrashLoopBackOff in prod",
+                status: "critical",
+                summary: "api pods are restarting after the latest config rollout.",
+                metrics: [{ label: "Affected pods", value: "3", detail: "namespace prod" }],
+                findings: ["ConfigMap changed before the first restart"],
+                actions: ["Rollback the config change"],
+              }),
+              "```",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("api pods");
+    expect(cardContent).not.toContain("```siclaw-card");
+    expect(cardContent).not.toContain("CrashLoopBackOff in prod");
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+  });
+
   it("does not reply with an image when the final answer has no chart-worthy data", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-no-chart" });
