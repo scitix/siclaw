@@ -29,6 +29,7 @@ export function stripVisualBlocks(markdown: string, options: StripVisualBlocksOp
   if (options.stripSourceBlocks) {
     output = stripFences(output, "chart");
     output = stripFences(output, "mermaid");
+    output = stripFences(output, "visual-card");
     output = stripFences(output, "siclaw-card");
     output = stripFences(output, "conclusion-card");
   }

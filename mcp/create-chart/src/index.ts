@@ -28,7 +28,13 @@ import {
 import {
   RENDER_CHART_DESCRIPTION,
   RENDER_CHART_INPUT_SCHEMA,
+  RENDER_MERMAID_DESCRIPTION,
+  RENDER_MERMAID_INPUT_SCHEMA,
+  RENDER_VISUAL_CARD_DESCRIPTION,
+  RENDER_VISUAL_CARD_INPUT_SCHEMA,
   handleRenderChart,
+  handleRenderMermaid,
+  handleRenderVisualCard,
 } from "./handler.js";
 
 async function main(): Promise<void> {
@@ -44,6 +50,16 @@ async function main(): Promise<void> {
         description: RENDER_CHART_DESCRIPTION,
         inputSchema: RENDER_CHART_INPUT_SCHEMA,
       },
+      {
+        name: "render_mermaid",
+        description: RENDER_MERMAID_DESCRIPTION,
+        inputSchema: RENDER_MERMAID_INPUT_SCHEMA,
+      },
+      {
+        name: "render_visual_card",
+        description: RENDER_VISUAL_CARD_DESCRIPTION,
+        inputSchema: RENDER_VISUAL_CARD_INPUT_SCHEMA,
+      },
     ],
   }));
 
@@ -51,6 +67,12 @@ async function main(): Promise<void> {
     try {
       if (req.params.name === "render_chart") {
         return await handleRenderChart(req.params.arguments ?? {}) as any;
+      }
+      if (req.params.name === "render_mermaid") {
+        return await handleRenderMermaid(req.params.arguments ?? {}) as any;
+      }
+      if (req.params.name === "render_visual_card") {
+        return await handleRenderVisualCard(req.params.arguments ?? {}) as any;
       }
       throw new Error(`Unknown tool: ${req.params.name}`);
     } catch (err) {

@@ -5,7 +5,13 @@ import path from "node:path";
 import {
   RENDER_CHART_INPUT_SCHEMA,
   RENDER_CHART_DESCRIPTION,
+  RENDER_MERMAID_DESCRIPTION,
+  RENDER_MERMAID_INPUT_SCHEMA,
+  RENDER_VISUAL_CARD_DESCRIPTION,
+  RENDER_VISUAL_CARD_INPUT_SCHEMA,
   validate,
+  validateMermaid,
+  validateVisualCard,
   handleRenderChart,
 } from "./handler.js";
 import { renderChartSvg } from "./render.js";
@@ -43,6 +49,26 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/never a JSON string/i);
     expect(RENDER_CHART_INPUT_SCHEMA.properties.data.description).toMatch(/Every numeric value must be finite/);
     expect(RENDER_CHART_INPUT_SCHEMA.properties.data.description).toContain("x/category labels may be strings");
+  });
+});
+
+describe("visual image tool schemas", () => {
+  it("registers Mermaid export as a Sicore Web image artifact tool", () => {
+    expect(RENDER_MERMAID_INPUT_SCHEMA.required).toEqual(["source"]);
+    expect(RENDER_MERMAID_INPUT_SCHEMA.additionalProperties).toBe(false);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/Sicore Web's own Mermaid renderer\/export path/);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/image\/png/);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/READY_TO_PASTE/);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/```mermaid/);
+  });
+
+  it("registers visual-card export as a Sicore Web image artifact tool", () => {
+    expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.required).toEqual(["type", "title"]);
+    expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum).toContain("report");
+    expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum).toContain("root_cause_chain");
+    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/Sicore Web's own visual-card renderer\/export path/);
+    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/image\/png/);
+    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/```visual-card/);
   });
 });
 
@@ -209,6 +235,41 @@ describe("validate", () => {
       expect(pts[1]).toEqual({ x: "label", y: 2 });
       expect(pts[2]).toEqual({ x: "true", y: 3 });
     });
+  });
+});
+
+describe("validateMermaid", () => {
+  it("requires source and strips an accidental mermaid fence", () => {
+    expect(() => validateMermaid({})).toThrow(/source is required/);
+    expect(validateMermaid({
+      source: "```mermaid\nflowchart TD\nA --> B\n```",
+      title: "demo",
+    })).toEqual({ source: "flowchart TD\nA --> B", title: "demo" });
+  });
+});
+
+describe("validateVisualCard", () => {
+  it("keeps Sicore visual-card specs and strips unknown keys", () => {
+    const out = validateVisualCard({
+      type: "report",
+      title: "诊断结论",
+      tone: "danger",
+      conclusion: "api pods are restarting.",
+      items: [{ label: "Affected pods", status: "danger", value: "3" }],
+      extra: "drop",
+    });
+    expect(out).toMatchObject({
+      type: "report",
+      title: "诊断结论",
+      tone: "danger",
+      conclusion: "api pods are restarting.",
+    });
+    expect(out).not.toHaveProperty("extra");
+  });
+
+  it("rejects unsupported or empty visual-card specs", () => {
+    expect(() => validateVisualCard({ type: "unknown", title: "x", conclusion: "y" })).toThrow(/supported/);
+    expect(() => validateVisualCard({ type: "report", title: "x" })).toThrow(/provide conclusion/);
   });
 });
 
