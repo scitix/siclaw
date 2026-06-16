@@ -20,6 +20,8 @@ import {
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
 } from "./lark-card.js";
+import { maybeRenderChartPng } from "./chart-image.js";
+import { replyImageToLark } from "./lark-image.js";
 
 export interface LarkChannelConfig {
   domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
@@ -216,6 +218,8 @@ export async function handleLarkMessage(
     // whatever we have (final answer or error).
     await replyToLark(larkClient, messageId, finalBody);
   }
+
+  await maybeReplyChartImage(larkClient, messageId, finalBody);
 }
 
 /**
@@ -245,6 +249,19 @@ async function replyToLark(larkClient: any, messageId: string, text: string): Pr
     });
   } catch (err) {
     console.error(`[lark] Failed to reply to messageId=${messageId}:`, err);
+  }
+}
+
+async function maybeReplyChartImage(larkClient: any, messageId: string, finalBody: string): Promise<void> {
+  try {
+    const png = await maybeRenderChartPng(finalBody);
+    if (!png) return;
+    const ok = await replyImageToLark(larkClient, messageId, png);
+    if (!ok) {
+      console.warn(`[lark] Chart image reply failed for messageId=${messageId}; markdown card remains primary`);
+    }
+  } catch (err) {
+    console.error(`[lark] Chart image rendering failed for messageId=${messageId}:`, err);
   }
 }
 
