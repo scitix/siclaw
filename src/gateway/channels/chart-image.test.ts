@@ -57,6 +57,34 @@ describe("extractChartSpec", () => {
     });
   });
 
+  it("extracts Chart.js-style fenced bar chart JSON", () => {
+    const spec = extractChartSpec([
+      "```chart",
+      JSON.stringify({
+        type: "bar",
+        data: {
+          labels: ["1月", "2月", "3月"],
+          datasets: [{ label: "销售额", data: [120, 190, 150] }],
+        },
+        options: {
+          plugins: {
+            title: {
+              display: true,
+              text: "2026 上半年销售额",
+            },
+          },
+        },
+      }),
+      "```",
+    ].join("\n"));
+
+    expect(spec).toEqual({
+      title: "2026 上半年销售额",
+      labels: ["1月", "2月", "3月"],
+      values: [120, 190, 150],
+    });
+  });
+
   it("caps rows and clamps long labels", () => {
     const rows = Array.from({ length: 16 }, (_, i) =>
       `| Extremely long region label ${i} with extra suffix | ${i + 1} |`,
@@ -124,6 +152,30 @@ describe("maybeRenderVisualImages", () => {
             { name: "P0", values: [1, 2] },
             { name: "P1", values: [4, 3] },
           ],
+        },
+      }),
+      "```",
+    ].join("\n");
+
+    const images = await maybeRenderVisualImages(markdown);
+    expect(images).toHaveLength(1);
+    expect(images[0].kind).toBe("chart");
+    expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  });
+
+  it("renders Chart.js-style bar chart specs from fenced chart blocks", async () => {
+    const markdown = [
+      "```chart",
+      JSON.stringify({
+        type: "bar",
+        data: {
+          labels: ["1月", "2月", "3月"],
+          datasets: [{ label: "销售额", data: [120, 190, 150] }],
+        },
+        options: {
+          plugins: {
+            title: { display: true, text: "2026 上半年销售额" },
+          },
         },
       }),
       "```",
@@ -238,6 +290,40 @@ describe("stripVisualBlocks", () => {
       "",
       "保留普通正文。",
     ].join("\n"));
+  });
+
+  it("removes Chart.js-style chart JSON only when it can be rendered", () => {
+    const markdown = [
+      "```chart",
+      JSON.stringify({
+        type: "bar",
+        data: {
+          labels: ["1月", "2月"],
+          datasets: [{ label: "销售额", data: [120, 190] }],
+        },
+      }),
+      "```",
+      "",
+      "图表结论：2月更高。",
+    ].join("\n");
+
+    expect(stripVisualBlocks(markdown)).toBe("图表结论：2月更高。");
+  });
+
+  it("keeps unsupported chart source visible instead of swallowing the reply", () => {
+    const markdown = [
+      "```chart",
+      JSON.stringify({
+        type: "line",
+        data: {
+          labels: ["1月", "2月"],
+          datasets: [{ label: "销售额", data: [120, 190] }],
+        },
+      }),
+      "```",
+    ].join("\n");
+
+    expect(stripVisualBlocks(markdown)).toBe(markdown);
   });
 
   it("keeps readable markdown tables in the card body", () => {

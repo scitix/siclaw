@@ -492,6 +492,98 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.image.create).toHaveBeenCalledTimes(1);
   });
 
+  it("renders Chart.js-style bar chart specs as images and hides chart JSON from the card", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-chartjs-chart" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "```chart",
+              JSON.stringify({
+                type: "bar",
+                data: {
+                  labels: ["1月", "2月", "3月"],
+                  datasets: [{ label: "销售额", data: [120, 190, 150] }],
+                },
+                options: {
+                  plugins: {
+                    title: { display: true, text: "2026 上半年销售额" },
+                  },
+                },
+              }),
+              "```",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("已生成图片如下");
+    expect(cardContent).not.toContain("```chart");
+    expect(cardContent).not.toContain("datasets");
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps unsupported chart JSON visible and does not reply with an image", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-unsupported-chart" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "```chart",
+              JSON.stringify({
+                type: "line",
+                data: {
+                  labels: ["1月", "2月"],
+                  datasets: [{ label: "销售额", data: [120, 190] }],
+                },
+              }),
+              "```",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("```chart");
+    expect(cardContent).toContain("\"type\":\"line\"");
+    expect(lark.im.image.create).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+  });
+
   it("renders Mermaid flowcharts as images and hides Mermaid source from the card", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-mermaid" });
