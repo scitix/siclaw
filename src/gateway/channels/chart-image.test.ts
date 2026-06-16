@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   extractChartSpec,
   maybeRenderChartPng,
+  maybeRenderVisualImages,
   renderChartPng,
+  stripFencedChartBlocks,
+  stripVisualBlocks,
   type ChartSpec,
 } from "./chart-image.js";
 
@@ -103,5 +106,122 @@ describe("maybeRenderChartPng", () => {
 
     expect(png).not.toBeNull();
     expect([...png!.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  });
+});
+
+describe("maybeRenderVisualImages", () => {
+  it("renders MCP/Sicore bar chart specs from fenced chart blocks", async () => {
+    const markdown = [
+      "结论：East 增长最高。",
+      "",
+      "```chart",
+      JSON.stringify({
+        type: "bar",
+        title: "Incidents by Region",
+        data: {
+          categories: ["East", "West"],
+          series: [
+            { name: "P0", values: [1, 2] },
+            { name: "P1", values: [4, 3] },
+          ],
+        },
+      }),
+      "```",
+    ].join("\n");
+
+    const images = await maybeRenderVisualImages(markdown);
+    expect(images).toHaveLength(1);
+    expect(images[0].kind).toBe("chart");
+    expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  });
+
+  it("renders Mermaid flowcharts as PNG images", async () => {
+    const images = await maybeRenderVisualImages([
+      "```mermaid",
+      "flowchart TD",
+      "  A[Check pod] --> B{Ready?}",
+      "  B -->|No| C[Inspect events]",
+      "  B -->|Yes| D[Done]",
+      "```",
+    ].join("\n"));
+
+    expect(images).toHaveLength(1);
+    expect(images[0].kind).toBe("mermaid");
+    expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  });
+
+  it("forwards final-answer data URI images as image attachments", async () => {
+    const onePixelPng =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+    const images = await maybeRenderVisualImages(`结论卡片：\n\n![card](${onePixelPng})`);
+
+    expect(images).toHaveLength(1);
+    expect(images[0].kind).toBe("image");
+    expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  });
+});
+
+describe("stripFencedChartBlocks", () => {
+  it("removes fenced chart JSON from display markdown only", () => {
+    const markdown = [
+      "结论：P1 最多。",
+      "",
+      "```chart",
+      "{\"title\":\"Incidents\",\"labels\":[\"P0\",\"P1\"],\"values\":[1,4]}",
+      "```",
+      "",
+      "后续建议：优先处理 P1。",
+    ].join("\n");
+
+    expect(stripFencedChartBlocks(markdown)).toBe([
+      "结论：P1 最多。",
+      "",
+      "后续建议：优先处理 P1。",
+    ].join("\n"));
+  });
+});
+
+describe("stripVisualBlocks", () => {
+  it("removes visual source blocks and data images from display markdown", () => {
+    const onePixelPng =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    const markdown = [
+      "结论：需要扩容。",
+      "",
+      "```chart",
+      "{\"title\":\"Pods\",\"labels\":[\"ready\",\"pending\"],\"values\":[8,2]}",
+      "```",
+      "",
+      "```mermaid",
+      "flowchart LR",
+      "A[Check] --> B[Scale]",
+      "```",
+      "",
+      `![card](${onePixelPng})`,
+      "",
+      "保留普通正文。",
+    ].join("\n");
+
+    const display = stripVisualBlocks(markdown);
+
+    expect(display).toBe([
+      "结论：需要扩容。",
+      "",
+      "保留普通正文。",
+    ].join("\n"));
+  });
+
+  it("keeps readable markdown tables in the card body", () => {
+    const markdown = [
+      "统计如下：",
+      "",
+      "| Region | Count |",
+      "|---|---:|",
+      "| East | 12 |",
+      "| West | 7 |",
+    ].join("\n");
+
+    expect(stripVisualBlocks(markdown)).toBe(markdown);
   });
 });
