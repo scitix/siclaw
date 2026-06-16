@@ -7,7 +7,7 @@ export interface ChartSpec {
 }
 
 export interface RenderedReplyImage {
-  kind: "chart" | "mermaid" | "image";
+  kind: "card" | "chart" | "mermaid" | "image";
   image: Buffer;
 }
 
@@ -36,6 +36,15 @@ interface MermaidGraph {
   direction: "LR" | "TD";
   nodes: MermaidNode[];
   edges: MermaidEdge[];
+}
+
+interface ConclusionCardSpec {
+  title: string;
+  status: "ok" | "warning" | "critical" | "info";
+  summary?: string;
+  metrics: Array<{ label: string; value: string; detail?: string }>;
+  findings: string[];
+  actions: string[];
 }
 
 const MAX_CHART_ROWS = 12;
@@ -78,7 +87,8 @@ export function stripFencedChartBlocks(markdown: string): string {
 }
 
 export function stripVisualBlocks(markdown: string): string {
-  const withoutCharts = stripFences(markdown, "chart");
+  const withoutCards = stripFences(stripFences(markdown, "siclaw-card"), "conclusion-card");
+  const withoutCharts = stripFences(withoutCards, "chart");
   const withoutMermaid = stripFences(withoutCharts, "mermaid", (source) => parseMermaidFlowchart(source) !== null);
   const withoutDataImages = stripDataImages(withoutMermaid);
   return cleanupMarkdown(withoutDataImages);
@@ -90,6 +100,12 @@ export async function maybeRenderVisualImages(markdown: string): Promise<Rendere
   for (const dataUrl of extractDataImageUrls(markdown)) {
     const image = await imageFromDataUrl(dataUrl);
     if (image && withinFeishuLimit(image)) images.push({ kind: "image", image });
+    if (images.length >= MAX_REPLY_IMAGES) return images;
+  }
+
+  for (const spec of extractConclusionCardSpecs(markdown)) {
+    const png = await renderSvgPng(renderConclusionCardSvg(spec));
+    if (withinFeishuLimit(png)) images.push({ kind: "card", image: png });
     if (images.length >= MAX_REPLY_IMAGES) return images;
   }
 
@@ -114,6 +130,22 @@ export async function maybeRenderVisualImages(markdown: string): Promise<Rendere
   }
 
   return images;
+}
+
+function extractConclusionCardSpecs(markdown: string): ConclusionCardSpec[] {
+  const specs: ConclusionCardSpec[] = [];
+  for (const language of ["siclaw-card", "conclusion-card"]) {
+    for (const source of extractFenceBodies(markdown, language)) {
+      try {
+        const parsed = JSON.parse(source);
+        const spec = normalizeConclusionCardSpec(parsed);
+        if (spec) specs.push(spec);
+      } catch {
+        // Invalid card JSON should not break the primary markdown reply.
+      }
+    }
+  }
+  return specs;
 }
 
 function extractFencedChartSpecs(markdown: string): RenderableChartSpec[] {
@@ -384,10 +416,207 @@ function normalizeTitle(value: unknown): string | undefined {
   return title || undefined;
 }
 
+function normalizeConclusionCardSpec(value: unknown): ConclusionCardSpec | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as {
+    title?: unknown;
+    status?: unknown;
+    summary?: unknown;
+    metrics?: unknown;
+    findings?: unknown;
+    actions?: unknown;
+  };
+
+  const title = normalizeCardText(raw.title, 90) || "Siclaw conclusion";
+  const status = normalizeCardStatus(raw.status);
+  const summary = normalizeCardText(raw.summary, 180);
+  const metrics = normalizeCardMetrics(raw.metrics);
+  const findings = normalizeCardList(raw.findings, 4, 130);
+  const actions = normalizeCardList(raw.actions, 4, 130);
+
+  if (!summary && metrics.length === 0 && findings.length === 0 && actions.length === 0) return null;
+  return { title, status, summary, metrics, findings, actions };
+}
+
+function normalizeCardStatus(value: unknown): ConclusionCardSpec["status"] {
+  if (typeof value !== "string") return "info";
+  const status = value.trim().toLowerCase();
+  if (status === "ok" || status === "warning" || status === "critical" || status === "info") return status;
+  return "info";
+}
+
+function normalizeCardMetrics(value: unknown): ConclusionCardSpec["metrics"] {
+  if (!Array.isArray(value)) return [];
+  const metrics: ConclusionCardSpec["metrics"] = [];
+  for (const entry of value.slice(0, 4)) {
+    if (!entry || typeof entry !== "object") continue;
+    const row = entry as { label?: unknown; value?: unknown; detail?: unknown };
+    const label = normalizeCardText(row.label, 36);
+    const metricValue = normalizeCardText(row.value, 32);
+    if (!label || !metricValue) continue;
+    const detail = normalizeCardText(row.detail, 60);
+    metrics.push({ label, value: metricValue, detail });
+  }
+  return metrics;
+}
+
+function normalizeCardList(value: unknown, maxItems: number, maxLength: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .slice(0, maxItems)
+    .map((item) => normalizeCardText(item, maxLength))
+    .filter((item): item is string => Boolean(item));
+}
+
+function normalizeCardText(value: unknown, maxLength: number): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  const text = String(value).replace(/\s+/g, " ").trim();
+  if (!text) return undefined;
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+}
+
 function normalizeLabel(value: unknown): string {
   if (value === null || value === undefined) return "";
   const label = String(value).replace(/\s+/g, " ").trim();
   return label.length > MAX_LABEL_LENGTH ? `${label.slice(0, MAX_LABEL_LENGTH - 3)}...` : label;
+}
+
+function renderConclusionCardSvg(spec: ConclusionCardSpec): string {
+  const width = 960;
+  const marginX = 54;
+  const accent = cardAccent(spec.status);
+  let y = 58;
+  const body: string[] = [];
+
+  body.push(`<text x="${marginX}" y="${y}" class="title">${escapeXml(spec.title)}</text>`);
+  body.push(`
+    <rect x="${width - 190}" y="${y - 28}" width="136" height="34" rx="17" fill="${accent.bg}" stroke="${accent.stroke}"/>
+    <text x="${width - 122}" y="${y - 6}" text-anchor="middle" class="status" fill="${accent.text}">${escapeXml(statusLabel(spec.status))}</text>
+  `);
+  y += 36;
+
+  if (spec.summary) {
+    const lines = wrapText(spec.summary, 72, 3);
+    body.push(renderTextLines(lines, marginX, y, "summary", 24));
+    y += lines.length * 24 + 22;
+  }
+
+  if (spec.metrics.length > 0) {
+    const gap = 16;
+    const cardWidth = Math.floor((width - marginX * 2 - gap * (spec.metrics.length - 1)) / spec.metrics.length);
+    const metricY = y;
+    for (const [index, metric] of spec.metrics.entries()) {
+      const x = marginX + index * (cardWidth + gap);
+      body.push(`
+        <rect x="${x}" y="${metricY}" width="${cardWidth}" height="96" rx="16" fill="#f8fafc" stroke="#e2e8f0"/>
+        <text x="${x + 18}" y="${metricY + 30}" class="metricLabel">${escapeXml(metric.label)}</text>
+        <text x="${x + 18}" y="${metricY + 62}" class="metricValue">${escapeXml(metric.value)}</text>
+        ${metric.detail ? `<text x="${x + 18}" y="${metricY + 84}" class="metricDetail">${escapeXml(metric.detail)}</text>` : ""}
+      `);
+    }
+    y += 120;
+  }
+
+  if (spec.findings.length > 0) {
+    const section = renderCardSection("Key evidence", spec.findings, marginX, y, accent.stroke);
+    body.push(section.svg);
+    y = section.nextY + 18;
+  }
+
+  if (spec.actions.length > 0) {
+    const section = renderCardSection("Next actions", spec.actions, marginX, y, "#16a34a");
+    body.push(section.svg);
+    y = section.nextY + 12;
+  }
+
+  const height = Math.max(360, y + 34);
+  return `
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <style>
+    text { font-family: Arial, sans-serif; }
+    .title { font-size: 31px; font-weight: 800; fill: #0f172a; }
+    .status { font-size: 14px; font-weight: 800; letter-spacing: 0.5px; }
+    .summary { font-size: 18px; font-weight: 500; fill: #334155; }
+    .sectionTitle { font-size: 16px; font-weight: 800; fill: #0f172a; }
+    .item { font-size: 16px; font-weight: 500; fill: #334155; }
+    .metricLabel { font-size: 13px; font-weight: 700; fill: #64748b; }
+    .metricValue { font-size: 25px; font-weight: 800; fill: #0f172a; }
+    .metricDetail { font-size: 12px; font-weight: 600; fill: #64748b; }
+  </style>
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <rect x="0" y="0" width="14" height="${height}" fill="${accent.stroke}"/>
+  <rect x="30" y="28" width="${width - 60}" height="${height - 56}" rx="22" fill="#ffffff" stroke="#e2e8f0"/>
+  ${body.join("")}
+</svg>`;
+}
+
+function renderCardSection(title: string, items: string[], x: number, y: number, color: string): { svg: string; nextY: number } {
+  const parts: string[] = [];
+  let cursor = y;
+  parts.push(`<text x="${x}" y="${cursor}" class="sectionTitle">${escapeXml(title)}</text>`);
+  cursor += 28;
+  for (const item of items) {
+    const lines = wrapText(item, 78, 2);
+    parts.push(`<circle cx="${x + 7}" cy="${cursor - 6}" r="5" fill="${color}"/>`);
+    parts.push(renderTextLines(lines, x + 22, cursor, "item", 22));
+    cursor += lines.length * 22 + 8;
+  }
+  return { svg: parts.join(""), nextY: cursor };
+}
+
+function renderTextLines(lines: string[], x: number, y: number, className: string, lineHeight: number): string {
+  return lines
+    .map((line, i) => `<text x="${x}" y="${y + i * lineHeight}" class="${className}">${escapeXml(line)}</text>`)
+    .join("");
+}
+
+function wrapText(text: string, maxChars: number, maxLines: number): string[] {
+  const words = text.includes(" ") ? text.split(/\s+/) : text.split("");
+  const lines: string[] = [];
+  let current = "";
+  for (const word of words) {
+    const separator = text.includes(" ") && current ? " " : "";
+    const candidate = current ? `${current}${separator}${word}` : word;
+    if (candidate.length > maxChars && current) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = candidate;
+    }
+    if (lines.length >= maxLines) break;
+  }
+  if (current && lines.length < maxLines) lines.push(current);
+  if (lines.length === maxLines && (words.join(text.includes(" ") ? " " : "").length > lines.join("").length)) {
+    const last = lines[maxLines - 1];
+    lines[maxLines - 1] = last.length > 3 ? `${last.slice(0, Math.max(0, maxChars - 3))}...` : last;
+  }
+  return lines;
+}
+
+function cardAccent(status: ConclusionCardSpec["status"]): { bg: string; stroke: string; text: string } {
+  switch (status) {
+    case "critical":
+      return { bg: "#fef2f2", stroke: "#dc2626", text: "#991b1b" };
+    case "warning":
+      return { bg: "#fffbeb", stroke: "#f59e0b", text: "#92400e" };
+    case "ok":
+      return { bg: "#f0fdf4", stroke: "#16a34a", text: "#166534" };
+    default:
+      return { bg: "#eff6ff", stroke: "#2563eb", text: "#1d4ed8" };
+  }
+}
+
+function statusLabel(status: ConclusionCardSpec["status"]): string {
+  switch (status) {
+    case "critical":
+      return "CRITICAL";
+    case "warning":
+      return "WARNING";
+    case "ok":
+      return "OK";
+    default:
+      return "INFO";
+  }
 }
 
 function renderChartSvg(spec: RenderableChartSpec): string {
