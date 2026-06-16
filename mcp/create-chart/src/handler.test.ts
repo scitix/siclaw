@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { exportMarkdownVisualsWithSicoreWeb } from "./sicore-export.js";
 import {
   RENDER_CHART_INPUT_SCHEMA,
   RENDER_CHART_DESCRIPTION,
@@ -14,7 +15,21 @@ import {
   validateVisualCard,
   handleRenderChart,
 } from "./handler.js";
-import { renderChartSvg } from "./render.js";
+
+vi.mock("./sicore-export.js", () => {
+  const png =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+  return {
+    exportMarkdownVisualsWithSicoreWeb: vi.fn(async (markdown: string) => {
+      const kind = markdown.startsWith("```mermaid")
+        ? "mermaid"
+        : markdown.startsWith("```visual-card")
+          ? "visual-card"
+          : "chart";
+      return [{ kind, image: Buffer.from(png, "base64") }];
+    }),
+  };
+});
 
 describe("RENDER_CHART_INPUT_SCHEMA", () => {
   it("requires type and data, allows the common opts", () => {
@@ -35,7 +50,7 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/READY_TO_PASTE/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/exactly/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/PNG image artifact/);
-    expect(RENDER_CHART_DESCRIPTION).toMatch(/Sicore Web-style PNG image artifact/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/Sicore Web's own chart renderer\/export path/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/Do not rewrite, escape, quote/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/mermaid/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/xychart-beta/);
@@ -69,33 +84,6 @@ describe("visual image tool schemas", () => {
     expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/Sicore Web's own visual-card renderer\/export path/);
     expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/image\/png/);
     expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/```visual-card/);
-  });
-});
-
-describe("renderChartSvg", () => {
-  it("uses the Sicore Web chart styling contract for bar charts", () => {
-    const svg = renderChartSvg({
-      type: "bar",
-      title: "任务状态分布",
-      x_label: "状态",
-      y_label: "数量",
-      data: {
-        categories: ["成功", "失败", "等待"],
-        series: [{ name: "任务统计", values: [12, 3, 7] }],
-      },
-    });
-
-    expect(svg).toContain('width="900" height="520"');
-    expect(svg).toContain('fill="#ffffff"');
-    expect(svg).toContain('text-anchor="middle" font-size="18" font-weight="600" fill="#1f2937">任务状态分布</text>');
-    expect(svg).toContain('fill="#4e79a7"');
-    expect(svg).toContain('stroke="#e5e7eb"');
-    expect(svg).toContain('fill="none" stroke-width="1" stroke="#9ca3af"');
-    expect(svg).toContain(">成功</text>");
-    expect(svg).toContain(">失败</text>");
-    expect(svg).toContain(">等待</text>");
-    expect(svg).not.toContain("#000000");
-    expect(svg).not.toContain("Generated from Siclaw response data");
   });
 });
 
@@ -281,6 +269,7 @@ describe("handleRenderChart", () => {
     tmp = mkdtempSync(path.join(tmpdir(), "create-chart-test-"));
     originalEnv = process.env.CREATE_CHART_ARTIFACT_DIR;
     process.env.CREATE_CHART_ARTIFACT_DIR = tmp;
+    vi.mocked(exportMarkdownVisualsWithSicoreWeb).mockClear();
   });
 
   afterEach(() => {
@@ -321,9 +310,11 @@ describe("handleRenderChart", () => {
     expect((meta.chart_id as string).startsWith("pie-")).toBe(true);
     expect(typeof meta.bytes).toBe("number");
     expect(meta.bytes as number).toBeGreaterThan(0);
+    expect(meta.renderer).toBe("sicore-web");
     expect(meta).not.toHaveProperty("markdown_embed");
     expect(meta).not.toHaveProperty("markdown_embed_raw");
     expect(meta.embed_instructions).toMatch(/READY_TO_PASTE/);
+    expect(exportMarkdownVisualsWithSicoreWeb).toHaveBeenCalledWith(ready);
   });
 
   it("embeds the validated spec (not the raw input) inside the chart fence", async () => {

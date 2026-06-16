@@ -21,7 +21,6 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
-    "@resvg/resvg-js": "^2.6.2",
     "playwright-core": "^1.61.0"
   },
   "devDependencies": {

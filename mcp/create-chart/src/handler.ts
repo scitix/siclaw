@@ -1,6 +1,5 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { renderChartPng } from "./render.js";
 import { exportMarkdownVisualsWithSicoreWeb } from "./sicore-export.js";
 import type { RenderChartArgs, RenderChartResult, RenderChartToolResponse } from "./types.js";
 
@@ -36,7 +35,7 @@ export const RENDER_CHART_DESCRIPTION =
     "Render a pie/bar/line chart only when finalized structured numeric data is already in context and can be passed as valid tool arguments. This includes requests such as 画图, 画饼图, 柱状图, 趋势图 when the required numeric data is available.",
     "For qualitative diagrams, workflows, topology, or decision trees, use a ```mermaid fenced block instead; xychart-beta is suitable for simple bar charts.",
     "Arguments must be one JSON object. data must be an object, never a JSON string. Use only literal finite numbers; never use placeholders, expressions, previous-message references, or bare tokens.",
-    "The tool returns a READY_TO_PASTE chart block as plain markdown, metadata, and a Sicore Web-style PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels forward the PNG artifact.",
+    "The tool renders through Sicore Web's own chart renderer/export path and returns a READY_TO_PASTE chart block as plain markdown, metadata, and a PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels forward the PNG artifact.",
   ].join(" ");
 
 export const RENDER_MERMAID_INPUT_SCHEMA = {
@@ -132,7 +131,10 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
 
   const spec = JSON.stringify(args);
   const markdownEmbed = "```chart\n" + spec + "\n```";
-  const png = renderChartPng(args);
+  const exported = await exportMarkdownVisualsWithSicoreWeb(markdownEmbed);
+  const visual = exported.find((item) => item.kind === "chart") ?? exported[0];
+  if (!visual?.image) throw new Error("render_chart: Sicore Web export returned no chart image");
+  const png = visual.image;
 
   let specPath: string | undefined;
   let pngPath: string | undefined;
@@ -160,6 +162,7 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
     bytes: Buffer.byteLength(spec, "utf8"),
     image_bytes: png.byteLength,
     image_mime: "image/png",
+    renderer: "sicore-web",
     embed_instructions:
       "Paste the READY_TO_PASTE block above verbatim into your reply where the chart should appear, and preserve the returned image artifact. Do not modify the JSON, add backslashes, escape non-ASCII characters, convert to ```svg, or inline an <img>.",
   };
