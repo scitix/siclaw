@@ -299,7 +299,10 @@ describe("handleLarkMessage — routing to AgentBox", () => {
 describe("handleLarkMessage — streaming card flow", () => {
   function makeCardAwareLarkClient() {
     return {
-      im: { message: { reply: vi.fn().mockResolvedValue({}) } },
+      im: {
+        image: { create: vi.fn().mockResolvedValue({ image_key: "img-chart-1" }) },
+        message: { reply: vi.fn().mockResolvedValue({}) },
+      },
       cardkit: {
         v1: {
           card: {
@@ -353,6 +356,115 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.cardkit.v1.card.settings).toHaveBeenCalledTimes(1);
     const settingsPayload = JSON.parse(lark.cardkit.v1.card.settings.mock.calls[0][0].data.settings);
     expect(settingsPayload.config.streaming_mode).toBe(false);
+    expect(lark.im.image.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps the markdown card and also replies with one chart image for numeric tables", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-chart" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "统计如下：",
+              "",
+              "| Region | Count |",
+              "|---|---:|",
+              "| East | 12 |",
+              "| West | 7 |",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(lark.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(1);
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    const uploadArg = lark.im.image.create.mock.calls[0][0];
+    expect(uploadArg.data.image_type).toBe("message");
+    expect(Buffer.isBuffer(uploadArg.data.image)).toBe(true);
+
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+    expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
+    const imageReply = lark.im.message.reply.mock.calls[1][0];
+    expect(imageReply.path.message_id).toBe("mid-1");
+    expect(imageReply.data.msg_type).toBe("image");
+    expect(JSON.parse(imageReply.data.content)).toEqual({ image_key: "img-chart-1" });
+  });
+
+  it("does not reply with an image when the final answer has no chart-worthy data", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-no-chart" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "只是普通文本答复" }] } };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(lark.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(1);
+    expect(lark.im.image.create).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the markdown card successful when chart image upload returns no key", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-chart-fail" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "| Region | Count |",
+              "|---|---:|",
+              "| East | 12 |",
+              "| West | 7 |",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+    lark.im.image.create.mockResolvedValueOnce({});
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(lark.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(1);
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
   });
 
   it("falls back to plain text reply when card.create fails (preserves the pre-card UX)", async () => {

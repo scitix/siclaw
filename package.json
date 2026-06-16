@@ -46,6 +46,7 @@
     "@earendil-works/pi-tui": "^0.78.1",
     "@kubernetes/client-node": "^1.4.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "@resvg/resvg-js": "^2.6.2",
     "@sinclair/typebox": "^0.34.0",
     "adm-zip": "^0.5.17",
     "diff": "^8.0.3",
