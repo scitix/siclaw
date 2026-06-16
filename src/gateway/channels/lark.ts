@@ -20,7 +20,7 @@ import {
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
 } from "./lark-card.js";
-import { maybeRenderVisualImages, stripVisualBlocks, type RenderedReplyImage } from "./chart-image.js";
+import { extractReplyImages, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 import { replyImageToLark } from "./lark-image.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -262,12 +262,7 @@ async function replyToLark(larkClient: any, messageId: string, text: string): Pr
 
 async function collectReplyVisualImages(messageId: string, finalBody: string): Promise<RenderedReplyImage[]> {
   try {
-    const images = await maybeRenderVisualImages(finalBody);
-    if (images.length > 0) return images;
-    return await maybeRenderVisualImages(finalBody, {
-      renderConclusionCards: true,
-      renderMermaid: true,
-    });
+    return await extractReplyImages(finalBody);
   } catch (err) {
     console.error(`[lark] Visual image extraction failed for messageId=${messageId}:`, err);
     return [];

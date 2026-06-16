@@ -577,7 +577,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
-  it("renders Mermaid flowcharts as fallback images when no PNG artifact is available", async () => {
+  it("keeps Mermaid flowcharts as markdown when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-mermaid" });
     streamEventsMock.mockImplementation(async function* () {
@@ -613,11 +613,10 @@ describe("handleLarkMessage — streaming card flow", () => {
 
     const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
     expect(cardContent).toContain("排查路径如下");
-    expect(cardContent).not.toContain("```mermaid");
-    expect(cardContent).not.toContain("flowchart TD");
-    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
-    expect([...lark.im.image.create.mock.calls[0][0].data.image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
-    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+    expect(cardContent).toContain("```mermaid");
+    expect(cardContent).toContain("flowchart TD");
+    expect(lark.im.image.create).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
   it("forwards conclusion-card data URI images and hides data URLs from the card", async () => {
@@ -743,7 +742,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
   });
 
-  it("renders Siclaw conclusion cards as fallback images when no PNG artifact is available", async () => {
+  it("keeps Siclaw conclusion cards as markdown when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-siclaw-card" });
     streamEventsMock.mockImplementation(async function* () {
@@ -784,14 +783,13 @@ describe("handleLarkMessage — streaming card flow", () => {
 
     const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
     expect(cardContent).toContain("api pods");
-    expect(cardContent).not.toContain("```siclaw-card");
-    expect(cardContent).not.toContain("CrashLoopBackOff in prod");
-    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
-    expect([...lark.im.image.create.mock.calls[0][0].data.image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
-    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+    expect(cardContent).toContain("```siclaw-card");
+    expect(cardContent).toContain("CrashLoopBackOff in prod");
+    expect(lark.im.image.create).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
-  it("does not reply with an image when the final answer has no chart-worthy data", async () => {
+  it("does not reply with an image when the final answer has no image artifact", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-no-chart" });
     streamEventsMock.mockImplementation(async function* () {

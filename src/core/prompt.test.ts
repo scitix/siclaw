@@ -83,6 +83,10 @@ describe("buildSreSystemPrompt visual output guidance", () => {
     expect(prompt).toContain("real image content");
     expect(prompt).toContain("data:image/png");
     expect(prompt).toContain("forwards real final-answer images");
+    expect(prompt).toContain("does not render source-only visual blocks into images");
+    expect(prompt).toContain("Source-only ```chart`, Mermaid, and ```siclaw-card` blocks remain markdown text");
     expect(prompt).toContain("Use normal Markdown for direct answers");
+    expect(prompt).not.toContain("may render a fallback image");
+    expect(prompt).not.toContain("readable fallback source");
   });
 });

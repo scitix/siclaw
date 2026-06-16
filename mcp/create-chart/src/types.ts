@@ -19,7 +19,6 @@ export interface LineSeries {
 }
 
 export interface ChartCommonOpts {
-  schema_version?: 1;
   title?: string;
   width?: number;
   height?: number;

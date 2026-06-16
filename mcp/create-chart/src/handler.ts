@@ -34,7 +34,7 @@ export const RENDER_CHART_DESCRIPTION =
     "Render a pie/bar/line chart only when finalized structured numeric data is already in context and can be passed as valid tool arguments. This includes requests such as 画图, 画饼图, 柱状图, 趋势图 when the required numeric data is available.",
     "For qualitative diagrams, workflows, topology, or decision trees, use a ```mermaid fenced block instead; xychart-beta is suitable for simple bar charts.",
     "Arguments must be one JSON object. data must be an object, never a JSON string. Use only literal finite numbers; never use placeholders, expressions, previous-message references, or bare tokens.",
-    "The tool returns a READY_TO_PASTE chart block as plain markdown, metadata, and a PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels can forward the PNG artifact.",
+    "The tool returns a READY_TO_PASTE chart block as plain markdown, metadata, and a Sicore Web-style PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels forward the PNG artifact.",
   ].join(" ");
 
 function chartBaseDir(): string {
@@ -52,7 +52,7 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
   const args = validate(rawArgs);
   const id = newChartId(args.type);
 
-  const spec = JSON.stringify({ ...args, schema_version: CHART_SPEC_VERSION });
+  const spec = JSON.stringify(args);
   const markdownEmbed = "```chart\n" + spec + "\n```";
   const png = renderChartPng(args);
 
