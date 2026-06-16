@@ -138,7 +138,22 @@ describe("maybeRenderChartPng", () => {
 });
 
 describe("maybeRenderVisualImages", () => {
-  it("renders MCP/Sicore bar chart specs from fenced chart blocks", async () => {
+  it("does not redraw source-only chart or Mermaid blocks by default", async () => {
+    const markdown = [
+      "```chart",
+      "{\"title\":\"Incidents\",\"labels\":[\"P0\",\"P1\"],\"values\":[1,4]}",
+      "```",
+      "",
+      "```mermaid",
+      "flowchart TD",
+      "A[Check] --> B[Done]",
+      "```",
+    ].join("\n");
+
+    await expect(maybeRenderVisualImages(markdown)).resolves.toEqual([]);
+  });
+
+  it("can still render MCP/Sicore bar chart specs from fenced chart blocks when explicitly enabled", async () => {
     const markdown = [
       "结论：East 增长最高。",
       "",
@@ -157,13 +172,13 @@ describe("maybeRenderVisualImages", () => {
       "```",
     ].join("\n");
 
-    const images = await maybeRenderVisualImages(markdown);
+    const images = await maybeRenderVisualImages(markdown, { renderSourceBlocks: true });
     expect(images).toHaveLength(1);
     expect(images[0].kind).toBe("chart");
     expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
   });
 
-  it("renders Chart.js-style bar chart specs from fenced chart blocks", async () => {
+  it("can still render Chart.js-style bar chart specs from fenced chart blocks when explicitly enabled", async () => {
     const markdown = [
       "```chart",
       JSON.stringify({
@@ -181,13 +196,13 @@ describe("maybeRenderVisualImages", () => {
       "```",
     ].join("\n");
 
-    const images = await maybeRenderVisualImages(markdown);
+    const images = await maybeRenderVisualImages(markdown, { renderSourceBlocks: true });
     expect(images).toHaveLength(1);
     expect(images[0].kind).toBe("chart");
     expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
   });
 
-  it("renders Mermaid flowcharts as PNG images", async () => {
+  it("can still render Mermaid flowcharts as PNG images when explicitly enabled", async () => {
     const images = await maybeRenderVisualImages([
       "```mermaid",
       "flowchart TD",
@@ -195,7 +210,7 @@ describe("maybeRenderVisualImages", () => {
       "  B -->|No| C[Inspect events]",
       "  B -->|Yes| D[Done]",
       "```",
-    ].join("\n"));
+    ].join("\n"), { renderSourceBlocks: true });
 
     expect(images).toHaveLength(1);
     expect(images[0].kind).toBe("mermaid");
@@ -213,7 +228,7 @@ describe("maybeRenderVisualImages", () => {
     expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
   });
 
-  it("renders Siclaw conclusion cards as PNG images", async () => {
+  it("can still render Siclaw conclusion cards as PNG images when explicitly enabled", async () => {
     const images = await maybeRenderVisualImages([
       "结论：需要先处理 CrashLoopBackOff。",
       "",
@@ -230,7 +245,7 @@ describe("maybeRenderVisualImages", () => {
         actions: ["Rollback the config change", "Compare pod env against the last healthy replica"],
       }),
       "```",
-    ].join("\n"));
+    ].join("\n"), { renderSourceBlocks: true });
 
     expect(images).toHaveLength(1);
     expect(images[0].kind).toBe("card");
@@ -259,7 +274,7 @@ describe("stripFencedChartBlocks", () => {
 });
 
 describe("stripVisualBlocks", () => {
-  it("removes visual source blocks and data images from display markdown", () => {
+  it("removes only data images from display markdown by default", () => {
     const onePixelPng =
       "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
     const markdown = [
@@ -285,6 +300,39 @@ describe("stripVisualBlocks", () => {
 
     const display = stripVisualBlocks(markdown);
 
+    expect(display).toContain("```siclaw-card");
+    expect(display).toContain("```chart");
+    expect(display).toContain("```mermaid");
+    expect(display).not.toContain("data:image/png");
+    expect(display).toContain("保留普通正文。");
+  });
+
+  it("removes visual source blocks when a real image artifact is present", () => {
+    const onePixelPng =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    const markdown = [
+      "结论：需要扩容。",
+      "",
+      "```siclaw-card",
+      "{\"title\":\"Pod pressure\",\"status\":\"warning\",\"summary\":\"pending pods increased\"}",
+      "```",
+      "",
+      "```chart",
+      "{\"title\":\"Pods\",\"labels\":[\"ready\",\"pending\"],\"values\":[8,2]}",
+      "```",
+      "",
+      "```mermaid",
+      "flowchart LR",
+      "A[Check] --> B[Scale]",
+      "```",
+      "",
+      `![card](${onePixelPng})`,
+      "",
+      "保留普通正文。",
+    ].join("\n");
+
+    const display = stripVisualBlocks(markdown, { stripSourceBlocks: true });
+
     expect(display).toBe([
       "结论：需要扩容。",
       "",
@@ -292,7 +340,7 @@ describe("stripVisualBlocks", () => {
     ].join("\n"));
   });
 
-  it("removes Chart.js-style chart JSON only when it can be rendered", () => {
+  it("keeps Chart.js-style chart JSON visible when no image artifact exists", () => {
     const markdown = [
       "```chart",
       JSON.stringify({
@@ -307,7 +355,7 @@ describe("stripVisualBlocks", () => {
       "图表结论：2月更高。",
     ].join("\n");
 
-    expect(stripVisualBlocks(markdown)).toBe("图表结论：2月更高。");
+    expect(stripVisualBlocks(markdown)).toBe(markdown);
   });
 
   it("keeps unsupported chart source visible instead of swallowing the reply", () => {

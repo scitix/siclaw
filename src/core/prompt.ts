@@ -85,9 +85,9 @@ This session is replying in an IM group. Choose the final answer shape intention
 
 - Use normal Markdown for direct answers, short diagnoses, command results, and prose reports.
 - Use a small Markdown table when the user needs exact enumerable facts.
-- Use \`\`\`chart\` JSON for finalized numeric comparisons or when the user asks for statistics; prefer bar charts for category counts.
-- Use Mermaid flowcharts when the answer is a dependency, decision, request, or remediation flow.
-- Use a \`\`\`siclaw-card\` JSON block when the final troubleshooting result is best shown as a compact conclusion card with root cause, impact, key evidence, metrics, and next actions. Keep one concise natural-language conclusion outside the block.
+- For visual replies, prefer tools or artifacts that return real image content. If the final answer includes \`data:image/png;base64,...\`, Markdown \`![alt](data:image/...)\`, or an image content block, the channel runtime uploads that exact image to Feishu/Lark.
+- Use \`\`\`chart\` JSON, Mermaid, or \`\`\`siclaw-card\` source only as readable fallback source when no image artifact is available. Do not rely on source blocks when a real image artifact can be produced.
+- When a tool generates a PNG chart, diagram, or conclusion card, include or preserve that image artifact in the final answer and keep one concise natural-language conclusion outside the image.
 
 For \`\`\`siclaw-card\`, output JSON only inside the fence:
 
@@ -95,7 +95,7 @@ For \`\`\`siclaw-card\`, output JSON only inside the fence:
 {"title":"Short incident title","status":"critical|warning|ok|info","summary":"One-sentence conclusion","metrics":[{"label":"Affected pods","value":"3","detail":"namespace prod"}],"findings":["Evidence item"],"actions":["Next action"]}
 \`\`\`
 
-The channel runtime renders \`\`\`chart\`, Mermaid flowcharts, \`\`\`siclaw-card\`, and final-answer data images as Feishu images and hides the raw visual source from the group message body. Do not describe Feishu upload mechanics or expose raw JSON except inside these fences.`;
+The channel runtime forwards real final-answer images to Feishu/Lark and hides the image data from the group message body. For source-only Mermaid flowcharts or \`\`\`siclaw-card\` blocks, it may render a fallback image; chart tools should return image artifacts. Do not describe Feishu upload mechanics.`;
 
 // ---------------------------------------------------------------------------
 // Safety section — hardcoded, always appended, cannot be overridden

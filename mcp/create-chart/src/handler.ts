@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { RenderChartArgs, RenderChartResult } from "./types.js";
+import { renderChartPng } from "./render.js";
+import type { RenderChartArgs, RenderChartResult, RenderChartToolResponse } from "./types.js";
 
 const CHART_SPEC_VERSION = 1;
 
@@ -33,7 +34,7 @@ export const RENDER_CHART_DESCRIPTION =
     "Render a pie/bar/line chart only when finalized structured numeric data is already in context and can be passed as valid tool arguments. This includes requests such as 画图, 画饼图, 柱状图, 趋势图 when the required numeric data is available.",
     "For qualitative diagrams, workflows, topology, or decision trees, use a ```mermaid fenced block instead; xychart-beta is suitable for simple bar charts.",
     "Arguments must be one JSON object. data must be an object, never a JSON string. Use only literal finite numbers; never use placeholders, expressions, previous-message references, or bare tokens.",
-    "The tool returns a READY_TO_PASTE chart block as plain markdown plus metadata. In your final reply, paste the READY_TO_PASTE block exactly as returned. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG.",
+    "The tool returns a READY_TO_PASTE chart block as plain markdown, metadata, and a PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels can forward the PNG artifact.",
   ].join(" ");
 
 function chartBaseDir(): string {
@@ -47,23 +48,27 @@ function newChartId(type: string): string {
   return `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export async function handleRenderChart(rawArgs: unknown): Promise<{
-  content: Array<{ type: "text"; text: string }>;
-}> {
+export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartToolResponse> {
   const args = validate(rawArgs);
   const id = newChartId(args.type);
 
   const spec = JSON.stringify({ ...args, schema_version: CHART_SPEC_VERSION });
   const markdownEmbed = "```chart\n" + spec + "\n```";
+  const png = renderChartPng(args);
 
   let specPath: string | undefined;
+  let pngPath: string | undefined;
   try {
     const dir = chartBaseDir();
     await mkdir(dir, { recursive: true });
     specPath = path.join(dir, `${id}.json`);
+    pngPath = path.join(dir, `${id}.png`);
     await writeFile(specPath, spec, "utf8");
+    await writeFile(pngPath, png);
   } catch {
     /* swallow — disk persistence is best-effort */
+    specPath = undefined;
+    pngPath = undefined;
   }
 
   const result: RenderChartResult = {
@@ -73,9 +78,12 @@ export async function handleRenderChart(rawArgs: unknown): Promise<{
     artifact_kind: "chart_spec",
     spec_path: specPath ?? "",
     svg_path: "",
+    png_path: pngPath ?? "",
     bytes: Buffer.byteLength(spec, "utf8"),
+    image_bytes: png.byteLength,
+    image_mime: "image/png",
     embed_instructions:
-      "Paste the READY_TO_PASTE block above verbatim into your reply where the chart should appear. Do not modify the JSON, add backslashes, escape non-ASCII characters, convert to ```svg, or inline an <img>.",
+      "Paste the READY_TO_PASTE block above verbatim into your reply where the chart should appear, and preserve the returned image artifact. Do not modify the JSON, add backslashes, escape non-ASCII characters, convert to ```svg, or inline an <img>.",
   };
 
   return {
@@ -89,6 +97,11 @@ export async function handleRenderChart(rawArgs: unknown): Promise<{
           "METADATA_JSON:",
           JSON.stringify(result, null, 2),
         ].join("\n"),
+      },
+      {
+        type: "image",
+        mimeType: "image/png",
+        data: png.toString("base64"),
       },
     ],
   };

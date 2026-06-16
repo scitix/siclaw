@@ -11,6 +11,27 @@ export interface RenderedReplyImage {
   image: Buffer;
 }
 
+export interface StripVisualBlocksOptions {
+  /**
+   * Strip raw visual source fences only when a real image artifact accompanies
+   * the reply. By default we keep source blocks visible instead of pretending a
+   * PNG was produced.
+   */
+  stripSourceBlocks?: boolean;
+}
+
+export interface RenderVisualImagesOptions {
+  /**
+   * Legacy fallback for source-only replies. Lark keeps this disabled by
+   * default so it only forwards real image artifacts/data URLs.
+   */
+  renderSourceBlocks?: boolean;
+  renderConclusionCards?: boolean;
+  renderCharts?: boolean;
+  renderMermaid?: boolean;
+  renderTableCharts?: boolean;
+}
+
 interface RenderableChartSpec {
   title?: string;
   labels: string[];
@@ -86,19 +107,21 @@ export function stripFencedChartBlocks(markdown: string): string {
   return stripFences(markdown, "chart", isRenderableChartSource);
 }
 
-export function stripVisualBlocks(markdown: string): string {
-  const withoutCards = stripFences(
-    stripFences(markdown, "siclaw-card", isRenderableConclusionCardSource),
-    "conclusion-card",
-    isRenderableConclusionCardSource,
-  );
-  const withoutCharts = stripFences(withoutCards, "chart", isRenderableChartSource);
-  const withoutMermaid = stripFences(withoutCharts, "mermaid", (source) => parseMermaidFlowchart(source) !== null);
-  const withoutDataImages = stripDataImages(withoutMermaid);
+export function stripVisualBlocks(markdown: string, options: StripVisualBlocksOptions = {}): string {
+  let output = markdown;
+  if (options.stripSourceBlocks) {
+    output = stripFences(stripFences(output, "siclaw-card"), "conclusion-card");
+    output = stripFences(output, "chart");
+    output = stripFences(output, "mermaid");
+  }
+  const withoutDataImages = stripDataImages(output);
   return cleanupMarkdown(withoutDataImages);
 }
 
-export async function maybeRenderVisualImages(markdown: string): Promise<RenderedReplyImage[]> {
+export async function maybeRenderVisualImages(
+  markdown: string,
+  options: RenderVisualImagesOptions = {},
+): Promise<RenderedReplyImage[]> {
   const images: RenderedReplyImage[] = [];
 
   for (const dataUrl of extractDataImageUrls(markdown)) {
@@ -107,25 +130,37 @@ export async function maybeRenderVisualImages(markdown: string): Promise<Rendere
     if (images.length >= MAX_REPLY_IMAGES) return images;
   }
 
-  for (const spec of extractConclusionCardSpecs(markdown)) {
-    const png = await renderSvgPng(renderConclusionCardSvg(spec));
-    if (withinFeishuLimit(png)) images.push({ kind: "card", image: png });
-    if (images.length >= MAX_REPLY_IMAGES) return images;
+  const renderConclusionCards = options.renderSourceBlocks || options.renderConclusionCards;
+  const renderCharts = options.renderSourceBlocks || options.renderCharts;
+  const renderMermaid = options.renderSourceBlocks || options.renderMermaid;
+
+  if (!renderConclusionCards && !renderCharts && !renderMermaid && !options.renderTableCharts) return images;
+
+  if (renderConclusionCards) {
+    for (const spec of extractConclusionCardSpecs(markdown)) {
+      const png = await renderSvgPng(renderConclusionCardSvg(spec));
+      if (withinFeishuLimit(png)) images.push({ kind: "card", image: png });
+      if (images.length >= MAX_REPLY_IMAGES) return images;
+    }
   }
 
-  for (const spec of extractFencedChartSpecs(markdown)) {
-    const png = await renderSvgPng(renderChartSvg(spec));
-    if (withinFeishuLimit(png)) images.push({ kind: "chart", image: png });
-    if (images.length >= MAX_REPLY_IMAGES) return images;
+  if (renderCharts) {
+    for (const spec of extractFencedChartSpecs(markdown)) {
+      const png = await renderSvgPng(renderChartSvg(spec));
+      if (withinFeishuLimit(png)) images.push({ kind: "chart", image: png });
+      if (images.length >= MAX_REPLY_IMAGES) return images;
+    }
   }
 
-  for (const graph of extractMermaidGraphs(markdown)) {
-    const png = await renderSvgPng(renderMermaidSvg(graph));
-    if (withinFeishuLimit(png)) images.push({ kind: "mermaid", image: png });
-    if (images.length >= MAX_REPLY_IMAGES) return images;
+  if (renderMermaid) {
+    for (const graph of extractMermaidGraphs(markdown)) {
+      const png = await renderSvgPng(renderMermaidSvg(graph));
+      if (withinFeishuLimit(png)) images.push({ kind: "mermaid", image: png });
+      if (images.length >= MAX_REPLY_IMAGES) return images;
+    }
   }
 
-  if (images.length === 0) {
+  if (images.length === 0 && options.renderTableCharts) {
     const tableChart = extractTableChart(markdown);
     if (tableChart) {
       const png = await renderChartPng(tableChart);

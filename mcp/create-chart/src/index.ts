@@ -50,7 +50,7 @@ async function main(): Promise<void> {
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     try {
       if (req.params.name === "render_chart") {
-        return await handleRenderChart(req.params.arguments ?? {});
+        return await handleRenderChart(req.params.arguments ?? {}) as any;
       }
       throw new Error(`Unknown tool: ${req.params.name}`);
     } catch (err) {

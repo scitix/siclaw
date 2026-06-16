@@ -46,6 +46,20 @@ export interface RenderChartResult {
    * persists a JSON chart spec; the portal renders SVG client-side.
    */
   svg_path: string;
+  png_path: string;
   bytes: number;
+  image_bytes: number;
+  image_mime: "image/png";
   embed_instructions: string;
+}
+
+export type RenderChartToolContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: "image/png" };
+
+export interface RenderChartToolResponse {
+  content: [
+    { type: "text"; text: string },
+    { type: "image"; data: string; mimeType: "image/png" },
+  ];
 }
