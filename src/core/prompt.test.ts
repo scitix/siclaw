@@ -80,8 +80,9 @@ describe("buildSreSystemPrompt visual output guidance", () => {
 
     expect(prompt).toContain("# Channel Reply Format");
     expect(prompt).toContain("```siclaw-card");
-    expect(prompt).toContain("compact conclusion card");
-    expect(prompt).toContain("hides the raw visual source");
+    expect(prompt).toContain("real image content");
+    expect(prompt).toContain("data:image/png");
+    expect(prompt).toContain("forwards real final-answer images");
     expect(prompt).toContain("Use normal Markdown for direct answers");
   });
 });

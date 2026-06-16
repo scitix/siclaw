@@ -359,7 +359,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.image.create).not.toHaveBeenCalled();
   });
 
-  it("keeps the markdown card and also replies with one chart image for numeric tables", async () => {
+  it("keeps numeric tables in markdown and does not synthesize chart images", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-chart" });
     streamEventsMock.mockImplementation(async function* () {
@@ -393,20 +393,14 @@ describe("handleLarkMessage — streaming card flow", () => {
     );
 
     expect(lark.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(1);
-    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
-    const uploadArg = lark.im.image.create.mock.calls[0][0];
-    expect(uploadArg.data.image_type).toBe("message");
-    expect(Buffer.isBuffer(uploadArg.data.image)).toBe(true);
-
-    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("| Region | Count |");
+    expect(lark.im.image.create).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
     expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
-    const imageReply = lark.im.message.reply.mock.calls[1][0];
-    expect(imageReply.path.message_id).toBe("mid-1");
-    expect(imageReply.data.msg_type).toBe("image");
-    expect(JSON.parse(imageReply.data.content)).toEqual({ image_key: "img-chart-1" });
   });
 
-  it("uses fenced chart JSON only for image rendering and hides it from the card", async () => {
+  it("keeps fenced chart JSON visible when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-chart-json" });
     streamEventsMock.mockImplementation(async function* () {
@@ -440,13 +434,13 @@ describe("handleLarkMessage — streaming card flow", () => {
 
     const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
     expect(cardContent).toContain("结论：P1 事件最多。");
-    expect(cardContent).not.toContain("```chart");
-    expect(cardContent).not.toContain("\"labels\"");
-    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
-    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+    expect(cardContent).toContain("```chart");
+    expect(cardContent).toContain("\"labels\"");
+    expect(lark.im.image.create).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
-  it("renders MCP bar chart specs as images and hides chart JSON from the card", async () => {
+  it("keeps MCP bar chart specs visible when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-mcp-chart" });
     streamEventsMock.mockImplementation(async function* () {
@@ -487,12 +481,12 @@ describe("handleLarkMessage — streaming card flow", () => {
 
     const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
     expect(cardContent).toContain("统计结论");
-    expect(cardContent).not.toContain("```chart");
-    expect(cardContent).not.toContain("\"type\":\"bar\"");
-    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect(cardContent).toContain("```chart");
+    expect(cardContent).toContain("\"type\":\"bar\"");
+    expect(lark.im.image.create).not.toHaveBeenCalled();
   });
 
-  it("renders Chart.js-style bar chart specs as images and hides chart JSON from the card", async () => {
+  it("keeps Chart.js-style bar chart specs visible when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-chartjs-chart" });
     streamEventsMock.mockImplementation(async function* () {
@@ -534,11 +528,10 @@ describe("handleLarkMessage — streaming card flow", () => {
     );
 
     const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
-    expect(cardContent).toContain("已生成图片如下");
-    expect(cardContent).not.toContain("```chart");
-    expect(cardContent).not.toContain("datasets");
-    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
-    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+    expect(cardContent).toContain("```chart");
+    expect(cardContent).toContain("datasets");
+    expect(lark.im.image.create).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
   it("keeps unsupported chart JSON visible and does not reply with an image", async () => {
@@ -584,7 +577,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
-  it("renders Mermaid flowcharts as images and hides Mermaid source from the card", async () => {
+  it("renders Mermaid flowcharts as fallback images when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-mermaid" });
     streamEventsMock.mockImplementation(async function* () {
@@ -623,6 +616,8 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(cardContent).not.toContain("```mermaid");
     expect(cardContent).not.toContain("flowchart TD");
     expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect([...lark.im.image.create.mock.calls[0][0].data.image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
   });
 
   it("forwards conclusion-card data URI images and hides data URLs from the card", async () => {
@@ -663,7 +658,92 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.image.create).toHaveBeenCalledTimes(1);
   });
 
-  it("renders Siclaw conclusion cards as images and hides card JSON from the card", async () => {
+  it("forwards assistant image content blocks as Feishu images", async () => {
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-assistant-image" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "图片如下：" },
+            { type: "image", data: onePixelBase64, mimeType: "image/png" },
+          ],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("图片如下");
+    expect(cardContent).not.toContain("data:image/png");
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect([...lark.im.image.create.mock.calls[0][0].data.image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  });
+
+  it("forwards tool image artifacts and hides paired visual source blocks from the card", async () => {
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-tool-image" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_end",
+        toolName: "render_mermaid",
+        result: {
+          content: [{ type: "image", data: onePixelBase64, mimeType: "image/png" }],
+        },
+      };
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: [
+              "流程图如下：",
+              "",
+              "```mermaid",
+              "flowchart TD",
+              "A[Start] --> B[Done]",
+              "```",
+            ].join("\n"),
+          }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(cardContent).toContain("流程图如下");
+    expect(cardContent).not.toContain("```mermaid");
+    expect(cardContent).not.toContain("data:image/png");
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+  });
+
+  it("renders Siclaw conclusion cards as fallback images when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-siclaw-card" });
     streamEventsMock.mockImplementation(async function* () {
@@ -707,6 +787,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(cardContent).not.toContain("```siclaw-card");
     expect(cardContent).not.toContain("CrashLoopBackOff in prod");
     expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect([...lark.im.image.create.mock.calls[0][0].data.image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
     expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
   });
 
@@ -732,10 +813,12 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the markdown card successful when chart image upload returns no key", async () => {
+  it("keeps the markdown card successful when image upload returns no key", async () => {
+    const onePixelPng =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
     vi.spyOn(console, "warn").mockImplementation(() => {});
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
-    promptMock.mockResolvedValue({ sessionId: "s-chart-fail" });
+    promptMock.mockResolvedValue({ sessionId: "s-image-fail" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
         type: "message_end",
@@ -744,10 +827,9 @@ describe("handleLarkMessage — streaming card flow", () => {
           content: [{
             type: "text",
             text: [
-              "| Region | Count |",
-              "|---|---:|",
-              "| East | 12 |",
-              "| West | 7 |",
+              "图片如下：",
+              "",
+              `![chart](${onePixelPng})`,
             ].join("\n"),
           }],
         },
@@ -954,5 +1036,86 @@ describe("collectResponse — SSE event flattening", () => {
     ];
     const text = await collectResponse(fakeClient(events), "s5");
     expect(text).toBe("Here's what I found.");
+  });
+
+  it("captures assistant image blocks as data-image markdown when requested", async () => {
+    const events = [
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Generated image:" },
+            { type: "image", data: "aW1n", mimeType: "image/png" },
+          ],
+        },
+      },
+    ];
+    const text = await collectResponse(fakeClient(events), "s6", "lark", { includeImages: true });
+    expect(text).toBe("Generated image:![generated image](data:image/png;base64,aW1n)");
+  });
+
+  it("appends tool image artifacts to the final assistant text when requested", async () => {
+    const events = [
+      {
+        type: "tool_execution_end",
+        result: {
+          content: [
+            { type: "text", text: "rendered" },
+            { type: "image", data: "aW1n", mimeType: "image/png" },
+          ],
+        },
+      },
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Here is the chart." }],
+        },
+      },
+    ];
+    const text = await collectResponse(fakeClient(events), "s7", "lark", { includeImages: true });
+    expect(text).toBe("Here is the chart.\n\n![generated image](data:image/png;base64,aW1n)");
+  });
+
+  it("captures toolResult message image blocks when requested", async () => {
+    const events = [
+      {
+        type: "message_end",
+        message: {
+          role: "toolResult",
+          content: [
+            { type: "text", text: "rendered" },
+            { type: "image", data: "aW1n", mimeType: "image/png" },
+          ],
+        },
+      },
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Here is the chart." }],
+        },
+      },
+    ];
+    const text = await collectResponse(fakeClient(events), "s8", "lark", { includeImages: true });
+    expect(text).toBe("Here is the chart.\n\n![generated image](data:image/png;base64,aW1n)");
+  });
+
+  it("does not expose image blocks to non-image channel collectors by default", async () => {
+    const events = [
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Generated image:" },
+            { type: "image", data: "aW1n", mimeType: "image/png" },
+          ],
+        },
+      },
+    ];
+    const text = await collectResponse(fakeClient(events), "s9");
+    expect(text).toBe("Generated image:");
   });
 });

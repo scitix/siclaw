@@ -27,6 +27,7 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/```chart/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/READY_TO_PASTE/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/exactly/i);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/PNG image artifact/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/Do not rewrite, escape, quote/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/mermaid/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/xychart-beta/);
@@ -204,13 +205,16 @@ describe("handleRenderChart", () => {
     return { ready: m[1], meta: JSON.parse(m[2]) };
   }
 
-  it("returns a content array with a parseable result envelope", async () => {
+  it("returns a content array with a parseable result envelope and PNG image artifact", async () => {
     const res = await handleRenderChart({
       type: "pie",
       data: { slices: [{ label: "ok", value: 1 }] },
     });
-    expect(res.content).toHaveLength(1);
+    expect(res.content).toHaveLength(2);
     expect(res.content[0].type).toBe("text");
+    expect(res.content[1].type).toBe("image");
+    expect(res.content[1].mimeType).toBe("image/png");
+    expect([...Buffer.from(res.content[1].data, "base64").subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
     const { ready, meta } = splitEnvelope(res.content[0].text);
     expect(ready.startsWith("```chart\n")).toBe(true);
     expect(ready.endsWith("\n```")).toBe(true);
@@ -264,7 +268,11 @@ describe("handleRenderChart", () => {
     const expectedFile = path.join(expectedDir, `${meta.chart_id as string}.json`);
     expect(meta.svg_path).toBe("");
     expect(meta.spec_path).toBe(expectedFile);
+    expect(meta.png_path).toBe(path.join(expectedDir, `${meta.chart_id as string}.png`));
+    expect(meta.image_mime).toBe("image/png");
+    expect(meta.image_bytes as number).toBeGreaterThan(0);
     expect(existsSync(expectedFile)).toBe(true);
+    expect(existsSync(meta.png_path as string)).toBe(true);
     const onDisk = JSON.parse(readFileSync(expectedFile, "utf8"));
     expect(onDisk.schema_version).toBe(1);
     expect(onDisk.type).toBe("line");
@@ -287,7 +295,11 @@ describe("handleRenderChart", () => {
     const { ready, meta } = splitEnvelope(res.content[0].text);
     expect(meta.svg_path).toBe("");
     expect(meta.spec_path).toBe("");
+    expect(meta.png_path).toBe("");
+    expect(res.content[1].type).toBe("image");
+    expect([...Buffer.from(res.content[1].data, "base64").subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
     expect(meta.bytes as number).toBeGreaterThan(0);
+    expect(meta.image_bytes as number).toBeGreaterThan(0);
     expect(ready.startsWith("```chart\n")).toBe(true);
   });
 });
