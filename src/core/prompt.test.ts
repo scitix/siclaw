@@ -61,6 +61,7 @@ describe("buildSreSystemPrompt visual output guidance", () => {
   it("does not steer shared Siclaw surfaces to unsupported visual-card output", () => {
     const prompt = buildSreSystemPrompt("web");
 
+    expect(prompt).not.toContain("```siclaw-card");
     expect(prompt).not.toContain("```visual-card");
     expect(prompt).not.toContain('type: "report"');
     expect(prompt).not.toContain("final_report");
@@ -72,5 +73,15 @@ describe("buildSreSystemPrompt visual output guidance", () => {
     expect(prompt).not.toContain("action_plan");
     expect(prompt).toContain("Mermaid for diagrams");
     expect(prompt).toContain("chart");
+  });
+
+  it("adds channel-only guidance for visual Feishu replies and conclusion cards", () => {
+    const prompt = buildSreSystemPrompt("channel");
+
+    expect(prompt).toContain("# Channel Reply Format");
+    expect(prompt).toContain("```siclaw-card");
+    expect(prompt).toContain("compact conclusion card");
+    expect(prompt).toContain("hides the raw visual source");
+    expect(prompt).toContain("Use normal Markdown for direct answers");
   });
 });

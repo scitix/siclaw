@@ -160,6 +160,30 @@ describe("maybeRenderVisualImages", () => {
     expect(images[0].kind).toBe("image");
     expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
   });
+
+  it("renders Siclaw conclusion cards as PNG images", async () => {
+    const images = await maybeRenderVisualImages([
+      "结论：需要先处理 CrashLoopBackOff。",
+      "",
+      "```siclaw-card",
+      JSON.stringify({
+        title: "CrashLoopBackOff in prod",
+        status: "critical",
+        summary: "api pods are restarting after the latest config rollout.",
+        metrics: [
+          { label: "Affected pods", value: "3", detail: "namespace prod" },
+          { label: "Restarts", value: "27", detail: "last 30m" },
+        ],
+        findings: ["ConfigMap changed 12 minutes before the first restart", "Readiness probes fail on /healthz"],
+        actions: ["Rollback the config change", "Compare pod env against the last healthy replica"],
+      }),
+      "```",
+    ].join("\n"));
+
+    expect(images).toHaveLength(1);
+    expect(images[0].kind).toBe("card");
+    expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  });
 });
 
 describe("stripFencedChartBlocks", () => {
@@ -188,6 +212,10 @@ describe("stripVisualBlocks", () => {
       "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
     const markdown = [
       "结论：需要扩容。",
+      "",
+      "```siclaw-card",
+      "{\"title\":\"Pod pressure\",\"status\":\"warning\",\"summary\":\"pending pods increased\"}",
+      "```",
       "",
       "```chart",
       "{\"title\":\"Pods\",\"labels\":[\"ready\",\"pending\"],\"values\":[8,2]}",
