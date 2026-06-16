@@ -11,9 +11,14 @@
  *     locks to its terminal state.
  *
  * Design choices:
- *  - Markdown renders natively inside the card's `markdown` element;
- *    features Feishu doesn't support (H1-H3, GFM tables, blockquotes)
- *    are normalised to the closest supported syntax by `sanitizeMarkdownForFeishu`.
+ *  - The card uses CardKit schema "2.0" (see buildPlaceholderCard), whose
+ *    `markdown` element renders ATX headings (H1-H6) and GFM pipe tables
+ *    NATIVELY. We deliberately DO NOT down-convert those — the old
+ *    heading→bold / table→code-block normalisation caused rendering bugs
+ *    (literal `**`, table shown as a truncated monospace box) and must not
+ *    be reintroduced. `sanitizeMarkdownForFeishu` now only rewrites
+ *    blockquotes (`>` → `｜ `); everything else passes through. See that
+ *    function's doc comment for details.
  *  - All failures return `null` / `false` so the caller can fall back
  *    to the legacy plain-text reply — we never throw into the channel
  *    message loop.
@@ -65,10 +70,18 @@ export interface CardSession {
 /**
  * Convert markdown to the subset Feishu's card `markdown` element renders.
  *
- * Unsupported features handled here:
- *  - ATX headings (`#`, `##`, `###`, …) → bold on their own line.
- *  - GFM tables → fenced code block (preserves column alignment visually).
- *  - Blockquotes (`>`) → full-width vertical bar prefix `｜ `.
+ * This card uses CardKit schema "2.0" (see buildPlaceholderCard), whose
+ * `markdown` element renders ATX headings (`#`…`######`) and GFM pipe tables
+ * NATIVELY (Feishu docs: 标题/表格 仅支持 JSON 2.0 富文本组件). We no longer
+ * down-convert them — doing so was actively harmful:
+ *  - heading → `**…**` produced literal `**` when the bold marker ended up
+ *    wedged against adjacent CJK/emoji text (shown as raw asterisks).
+ *  - table → fenced code block rendered as a truncated, line-numbered,
+ *    horizontally-scrolling monospace box instead of a real table.
+ * Headings and tables now pass through unchanged for native rendering.
+ *
+ * Blockquotes (`>`) are still rewritten to a full-width vertical bar prefix
+ * `｜ ` (left as-is in this change).
  *
  * Everything else (bold, italic, strikethrough, lists, fenced code blocks,
  * inline code, links, horizontal rule, `<at>`, emoji shortcodes) is passed
@@ -85,18 +98,10 @@ export function sanitizeMarkdownForFeishu(input: string): string {
     return `\u0000CODEBLOCK${codeBlocks.length - 1}\u0000`;
   });
 
-  // Headings (including leading whitespace, 1-6 #'s) → bold line.
-  text = text.replace(/^\s*#{1,6}\s+(.+?)\s*$/gm, "**$1**");
-
-  // GFM tables: header + separator + rows. Detect the separator row (|---|---|)
-  // as the anchor, then gobble surrounding rows. Wrap the whole block in a
-  // fenced code block so columns stay aligned.
-  text = text.replace(
-    /((?:^\s*\|[^\n]*\|\s*\n)+)(\s*\|(?:\s*:?-+:?\s*\|)+\s*\n)((?:^\s*\|[^\n]*\|\s*\n?)*)/gm,
-    (_match, header: string, sep: string, rows: string) => {
-      return "```\n" + header + sep + rows + "```\n";
-    },
-  );
+  // NOTE: ATX headings (#/##/###) and GFM pipe tables are intentionally passed
+  // THROUGH — the schema-2.0 markdown element renders them natively. (They were
+  // previously down-converted here; that caused the literal-`**` and
+  // table-as-codeblock rendering bugs.)
 
   // Blockquotes → "｜ " prefix (full-width pipe keeps the indent visible
   // without relying on an unsupported tag).
