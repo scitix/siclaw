@@ -1,9 +1,11 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { renderChartPng } from "./render.js";
+import { exportMarkdownVisualsWithSicoreWeb } from "./sicore-export.js";
 import type { RenderChartArgs, RenderChartResult, RenderChartToolResponse } from "./types.js";
 
 const CHART_SPEC_VERSION = 1;
+const VISUAL_SPEC_VERSION = 1;
 
 export const RENDER_CHART_INPUT_SCHEMA = {
   type: "object",
@@ -37,11 +39,87 @@ export const RENDER_CHART_DESCRIPTION =
     "The tool returns a READY_TO_PASTE chart block as plain markdown, metadata, and a Sicore Web-style PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels forward the PNG artifact.",
   ].join(" ");
 
+export const RENDER_MERMAID_INPUT_SCHEMA = {
+  type: "object",
+  required: ["source"],
+  properties: {
+    source: {
+      type: "string",
+      description:
+        "The Mermaid source only, without ```mermaid fences. Sicore Web supports flowchart/graph, sequenceDiagram, timeline, and xychart-beta.",
+    },
+    title: {
+      type: "string",
+      description: "Optional title for metadata and persisted artifact names. It is not injected into the Mermaid source.",
+    },
+  },
+  additionalProperties: false,
+} as const;
+
+export const RENDER_MERMAID_DESCRIPTION = [
+  "Render a Mermaid diagram through Sicore Web's own Mermaid renderer/export path and return a PNG image artifact.",
+  "Use this in Feishu/Lark channel replies whenever the user asks for a flowchart, sequence diagram, timeline, topology, remediation flow, or Mermaid diagram image.",
+  "Arguments must contain Mermaid source only, not fenced markdown. The tool returns READY_TO_PASTE ```mermaid markdown plus an image/png content block. Paste READY_TO_PASTE exactly and preserve the image artifact.",
+].join(" ");
+
+export const RENDER_VISUAL_CARD_INPUT_SCHEMA = {
+  type: "object",
+  required: ["type", "title"],
+  properties: {
+    type: {
+      type: "string",
+      enum: [
+        "report",
+        "final_report",
+        "health_check",
+        "incident_timeline",
+        "root_cause_chain",
+        "metric_snapshot",
+        "status_distribution",
+        "action_plan",
+      ],
+      description: "Sicore Web visual-card type.",
+    },
+    title: { type: "string" },
+    label: { type: "string" },
+    subtitle: { type: "string" },
+    conclusion: { type: "string" },
+    summary: { type: "string", description: "Alias accepted by Sicore Web as conclusion." },
+    tone: { type: "string" },
+    status: { type: "string" },
+    footer: { type: "string" },
+    items: { type: "array" },
+    events: { type: "array" },
+    nodes: { type: "array" },
+    root_cause: { type: "string" },
+    rootCause: { type: "string" },
+    metrics: { type: "array" },
+    segments: { type: "array" },
+    total: { type: "number" },
+    actions: { type: "array" },
+    sections: { type: "array" },
+  },
+  additionalProperties: false,
+} as const;
+
+export const RENDER_VISUAL_CARD_DESCRIPTION = [
+  "Render a Sicore Web visual-card conclusion card through Sicore Web's own visual-card renderer/export path and return a PNG image artifact.",
+  "Use this for Feishu/Lark final diagnosis cards, health checks, root-cause summaries, incident timelines, metric snapshots, status distributions, and action plans when the group needs a conclusion-card image.",
+  "Arguments must be one visual-card JSON object, not Markdown and not a JSON string. The tool returns READY_TO_PASTE ```visual-card markdown plus an image/png content block. Paste READY_TO_PASTE exactly and preserve the image artifact.",
+].join(" ");
+
 function chartBaseDir(): string {
   const root =
     process.env.CREATE_CHART_ARTIFACT_DIR ??
     ".siclaw/user-data/tool-results/create-chart";
   return path.resolve(root, "chart-render");
+}
+
+function visualBaseDir(kind: "mermaid" | "visual-card"): string {
+  const root =
+    process.env.CREATE_CHART_ARTIFACT_DIR ??
+    ".siclaw/user-data/tool-results/create-chart";
+  return path.resolve(root, kind);
 }
 
 function newChartId(type: string): string {
@@ -104,6 +182,124 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
         data: png.toString("base64"),
       },
     ],
+  };
+}
+
+export async function handleRenderMermaid(rawArgs: unknown): Promise<RenderChartToolResponse> {
+  const args = validateMermaid(rawArgs);
+  const id = newChartId("mermaid");
+  const markdownEmbed = "```mermaid\n" + args.source + "\n```";
+  const exported = await exportMarkdownVisualsWithSicoreWeb(markdownEmbed);
+  const visual = exported.find((item) => item.kind === "mermaid") ?? exported[0];
+  if (!visual?.image) throw new Error("render_mermaid: Sicore Web export returned no Mermaid image");
+
+  const meta = await persistVisualArtifact({
+    id,
+    kind: "mermaid",
+    spec: args,
+    markdownEmbed,
+    image: visual.image,
+  });
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: [
+          "READY_TO_PASTE:",
+          markdownEmbed,
+          "",
+          "METADATA_JSON:",
+          JSON.stringify(meta, null, 2),
+        ].join("\n"),
+      },
+      {
+        type: "image",
+        mimeType: "image/png",
+        data: visual.image.toString("base64"),
+      },
+    ],
+  };
+}
+
+export async function handleRenderVisualCard(rawArgs: unknown): Promise<RenderChartToolResponse> {
+  const spec = validateVisualCard(rawArgs);
+  const id = newChartId("visual-card");
+  const specJson = JSON.stringify(spec);
+  const markdownEmbed = "```visual-card\n" + specJson + "\n```";
+  const exported = await exportMarkdownVisualsWithSicoreWeb(markdownEmbed);
+  const visual = exported.find((item) => item.kind === "visual-card") ?? exported[0];
+  if (!visual?.image) throw new Error("render_visual_card: Sicore Web export returned no visual-card image");
+
+  const meta = await persistVisualArtifact({
+    id,
+    kind: "visual-card",
+    spec,
+    markdownEmbed,
+    image: visual.image,
+  });
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: [
+          "READY_TO_PASTE:",
+          markdownEmbed,
+          "",
+          "METADATA_JSON:",
+          JSON.stringify(meta, null, 2),
+        ].join("\n"),
+      },
+      {
+        type: "image",
+        mimeType: "image/png",
+        data: visual.image.toString("base64"),
+      },
+    ],
+  };
+}
+
+async function persistVisualArtifact({
+  id,
+  kind,
+  spec,
+  markdownEmbed,
+  image,
+}: {
+  id: string;
+  kind: "mermaid" | "visual-card";
+  spec: unknown;
+  markdownEmbed: string;
+  image: Buffer;
+}): Promise<Record<string, unknown>> {
+  let specPath = "";
+  let pngPath = "";
+  try {
+    const dir = visualBaseDir(kind);
+    await mkdir(dir, { recursive: true });
+    specPath = path.join(dir, `${id}.json`);
+    pngPath = path.join(dir, `${id}.png`);
+    await writeFile(specPath, JSON.stringify(spec, null, 2), "utf8");
+    await writeFile(pngPath, image);
+  } catch {
+    specPath = "";
+    pngPath = "";
+  }
+
+  return {
+    schema_version: VISUAL_SPEC_VERSION,
+    visual_id: id,
+    type: kind,
+    artifact_kind: `${kind}_spec`,
+    spec_path: specPath,
+    png_path: pngPath,
+    bytes: Buffer.byteLength(markdownEmbed, "utf8"),
+    image_bytes: image.byteLength,
+    image_mime: "image/png",
+    renderer: "sicore-web",
+    embed_instructions:
+      "Paste the READY_TO_PASTE block above verbatim into your reply and preserve the returned image artifact. Do not expose escaped JSON or describe Feishu upload mechanics.",
   };
 }
 
@@ -201,4 +397,55 @@ export function validate(raw: unknown): RenderChartArgs {
     return { name: String(item.name ?? `series ${i}`), points };
   });
   return { type: "line", data: { series }, ...common };
+}
+
+export function validateMermaid(raw: unknown): { source: string; title?: string } {
+  if (!raw || typeof raw !== "object") {
+    throw new Error("render_mermaid: arguments must be an object");
+  }
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.source !== "string" || !obj.source.trim()) {
+    throw new Error("render_mermaid: source is required");
+  }
+  const source = stripFence(obj.source.trim(), "mermaid");
+  const out: { source: string; title?: string } = { source };
+  if (typeof obj.title === "string" && obj.title.trim()) out.title = obj.title.trim();
+  return out;
+}
+
+export function validateVisualCard(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("render_visual_card: arguments must be an object");
+  }
+  const obj = raw as Record<string, unknown>;
+  const type = typeof obj.type === "string" ? obj.type : "";
+  if (!RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum.includes(type as any)) {
+    throw new Error("render_visual_card: type is required and must be a supported Sicore visual-card type");
+  }
+  if (typeof obj.title !== "string" || !obj.title.trim()) {
+    throw new Error("render_visual_card: title is required");
+  }
+  if (!hasVisualCardBody(obj)) {
+    throw new Error("render_visual_card: provide conclusion, items, metrics, segments, events, nodes, actions, or sections");
+  }
+  const allowed = new Set(Object.keys(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties));
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (allowed.has(key)) out[key] = value;
+  }
+  return out;
+}
+
+function hasVisualCardBody(obj: Record<string, unknown>): boolean {
+  if (typeof obj.conclusion === "string" && obj.conclusion.trim()) return true;
+  if (typeof obj.summary === "string" && obj.summary.trim()) return true;
+  return ["items", "metrics", "segments", "events", "nodes", "actions", "sections"].some((key) => {
+    const value = obj[key];
+    return Array.isArray(value) && value.length > 0;
+  });
+}
+
+function stripFence(source: string, language: string): string {
+  const re = new RegExp(`^\\s*\`\`\`${language}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\`\`\`\\s*$`, "i");
+  return source.replace(re, "$1").trim();
 }

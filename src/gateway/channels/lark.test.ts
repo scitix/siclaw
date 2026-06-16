@@ -742,9 +742,9 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps Siclaw conclusion cards as markdown when no PNG artifact is available", async () => {
+  it("keeps Sicore visual-card source as markdown when no PNG artifact is available", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
-    promptMock.mockResolvedValue({ sessionId: "s-siclaw-card" });
+    promptMock.mockResolvedValue({ sessionId: "s-visual-card" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
         type: "message_end",
@@ -755,14 +755,14 @@ describe("handleLarkMessage — streaming card flow", () => {
             text: [
               "结论：api pods 正在因配置变更反复重启。",
               "",
-              "```siclaw-card",
+              "```visual-card",
               JSON.stringify({
+                type: "report",
                 title: "CrashLoopBackOff in prod",
-                status: "critical",
-                summary: "api pods are restarting after the latest config rollout.",
-                metrics: [{ label: "Affected pods", value: "3", detail: "namespace prod" }],
-                findings: ["ConfigMap changed before the first restart"],
-                actions: ["Rollback the config change"],
+                tone: "danger",
+                conclusion: "api pods are restarting after the latest config rollout.",
+                items: [{ label: "Affected pods", status: "danger", value: "3", note: "namespace prod" }],
+                sections: [{ type: "notes", title: "Evidence", items: ["ConfigMap changed before the first restart"] }],
               }),
               "```",
             ].join("\n"),
@@ -783,7 +783,7 @@ describe("handleLarkMessage — streaming card flow", () => {
 
     const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
     expect(cardContent).toContain("api pods");
-    expect(cardContent).toContain("```siclaw-card");
+    expect(cardContent).toContain("```visual-card");
     expect(cardContent).toContain("CrashLoopBackOff in prod");
     expect(lark.im.image.create).not.toHaveBeenCalled();
     expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
