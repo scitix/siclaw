@@ -11,6 +11,24 @@ export interface RenderedReplyImage {
   image: Buffer;
 }
 
+export interface StripVisualBlocksOptions {
+  /**
+   * Strip raw visual source fences only when a real image artifact accompanies
+   * the reply. By default we keep source blocks visible instead of pretending a
+   * PNG was produced.
+   */
+  stripSourceBlocks?: boolean;
+}
+
+export interface RenderVisualImagesOptions {
+  /**
+   * Legacy fallback for source-only replies. Lark keeps this disabled by
+   * default so it only forwards real image artifacts/data URLs.
+   */
+  renderSourceBlocks?: boolean;
+  renderTableCharts?: boolean;
+}
+
 interface RenderableChartSpec {
   title?: string;
   labels: string[];
@@ -86,19 +104,21 @@ export function stripFencedChartBlocks(markdown: string): string {
   return stripFences(markdown, "chart", isRenderableChartSource);
 }
 
-export function stripVisualBlocks(markdown: string): string {
-  const withoutCards = stripFences(
-    stripFences(markdown, "siclaw-card", isRenderableConclusionCardSource),
-    "conclusion-card",
-    isRenderableConclusionCardSource,
-  );
-  const withoutCharts = stripFences(withoutCards, "chart", isRenderableChartSource);
-  const withoutMermaid = stripFences(withoutCharts, "mermaid", (source) => parseMermaidFlowchart(source) !== null);
-  const withoutDataImages = stripDataImages(withoutMermaid);
+export function stripVisualBlocks(markdown: string, options: StripVisualBlocksOptions = {}): string {
+  let output = markdown;
+  if (options.stripSourceBlocks) {
+    output = stripFences(stripFences(output, "siclaw-card"), "conclusion-card");
+    output = stripFences(output, "chart");
+    output = stripFences(output, "mermaid");
+  }
+  const withoutDataImages = stripDataImages(output);
   return cleanupMarkdown(withoutDataImages);
 }
 
-export async function maybeRenderVisualImages(markdown: string): Promise<RenderedReplyImage[]> {
+export async function maybeRenderVisualImages(
+  markdown: string,
+  options: RenderVisualImagesOptions = {},
+): Promise<RenderedReplyImage[]> {
   const images: RenderedReplyImage[] = [];
 
   for (const dataUrl of extractDataImageUrls(markdown)) {
@@ -106,6 +126,8 @@ export async function maybeRenderVisualImages(markdown: string): Promise<Rendere
     if (image && withinFeishuLimit(image)) images.push({ kind: "image", image });
     if (images.length >= MAX_REPLY_IMAGES) return images;
   }
+
+  if (!options.renderSourceBlocks) return images;
 
   for (const spec of extractConclusionCardSpecs(markdown)) {
     const png = await renderSvgPng(renderConclusionCardSvg(spec));
@@ -125,7 +147,7 @@ export async function maybeRenderVisualImages(markdown: string): Promise<Rendere
     if (images.length >= MAX_REPLY_IMAGES) return images;
   }
 
-  if (images.length === 0) {
+  if (images.length === 0 && options.renderTableCharts) {
     const tableChart = extractTableChart(markdown);
     if (tableChart) {
       const png = await renderChartPng(tableChart);
