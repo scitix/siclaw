@@ -83,12 +83,16 @@ export async function maybeRenderChartPng(markdown: string): Promise<Buffer | nu
 }
 
 export function stripFencedChartBlocks(markdown: string): string {
-  return stripFences(markdown, "chart");
+  return stripFences(markdown, "chart", isRenderableChartSource);
 }
 
 export function stripVisualBlocks(markdown: string): string {
-  const withoutCards = stripFences(stripFences(markdown, "siclaw-card"), "conclusion-card");
-  const withoutCharts = stripFences(withoutCards, "chart");
+  const withoutCards = stripFences(
+    stripFences(markdown, "siclaw-card", isRenderableConclusionCardSource),
+    "conclusion-card",
+    isRenderableConclusionCardSource,
+  );
+  const withoutCharts = stripFences(withoutCards, "chart", isRenderableChartSource);
   const withoutMermaid = stripFences(withoutCharts, "mermaid", (source) => parseMermaidFlowchart(source) !== null);
   const withoutDataImages = stripDataImages(withoutMermaid);
   return cleanupMarkdown(withoutDataImages);
@@ -160,6 +164,22 @@ function extractFencedChartSpecs(markdown: string): RenderableChartSpec[] {
     }
   }
   return specs;
+}
+
+function isRenderableConclusionCardSource(source: string): boolean {
+  try {
+    return normalizeConclusionCardSpec(JSON.parse(source)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function isRenderableChartSource(source: string): boolean {
+  try {
+    return normalizeRenderableChartSpec(JSON.parse(source)) !== null;
+  } catch {
+    return false;
+  }
 }
 
 function extractMermaidGraphs(markdown: string): MermaidGraph[] {
@@ -258,10 +278,14 @@ function normalizeRenderableChartSpec(value: unknown): RenderableChartSpec | nul
     values?: unknown;
     type?: unknown;
     data?: unknown;
+    options?: unknown;
   };
 
   const simple = normalizeSimpleChartSpec(raw);
   if (simple) return simple;
+
+  const chartJs = normalizeChartJsBarSpec(raw);
+  if (chartJs) return chartJs;
 
   if (raw.type !== "bar" || !raw.data || typeof raw.data !== "object") return null;
   const data = raw.data as { categories?: unknown; series?: unknown };
@@ -278,8 +302,9 @@ function normalizeRenderableChartSpec(value: unknown): RenderableChartSpec | nul
     const row = entry as { name?: unknown; values?: unknown };
     if (!Array.isArray(row.values)) return [];
     const rowValues = row.values;
-    const values = labels.map((_, i) => parseNumber(rowValues[i]) ?? 0);
-    if (!values.some((n) => Number.isFinite(n))) return [];
+    const parsedValues = labels.map((_, i) => parseNumber(rowValues[i]));
+    if (!parsedValues.some((n) => n !== null)) return [];
+    const values = parsedValues.map((n) => n ?? 0);
     return [{
       name: typeof row.name === "string" ? normalizeLabel(row.name) : undefined,
       values,
@@ -289,6 +314,42 @@ function normalizeRenderableChartSpec(value: unknown): RenderableChartSpec | nul
 
   return {
     title: normalizeTitle(raw.title),
+    labels,
+    series,
+  };
+}
+
+function normalizeChartJsBarSpec(raw: { title?: unknown; type?: unknown; data?: unknown; options?: unknown }): RenderableChartSpec | null {
+  const type = typeof raw.type === "string" ? raw.type.trim().toLowerCase() : undefined;
+  if (type && type !== "bar") return null;
+  if (!raw.data || typeof raw.data !== "object") return null;
+
+  const data = raw.data as { labels?: unknown; datasets?: unknown };
+  if (!Array.isArray(data.labels) || !Array.isArray(data.datasets)) return null;
+
+  const labels = data.labels
+    .slice(0, MAX_CHART_ROWS)
+    .map((label) => normalizeLabel(label))
+    .filter(Boolean);
+  if (labels.length === 0) return null;
+
+  const series = data.datasets.slice(0, MAX_CHART_SERIES).flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const dataset = entry as { label?: unknown; data?: unknown };
+    const dataPoints = dataset.data;
+    if (!Array.isArray(dataPoints)) return [];
+    const parsedValues = labels.map((_, i) => parseChartJsNumber(dataPoints[i]));
+    if (!parsedValues.some((n) => n !== null)) return [];
+    const values = parsedValues.map((n) => n ?? 0);
+    return [{
+      name: typeof dataset.label === "string" ? normalizeLabel(dataset.label) : undefined,
+      values,
+    }];
+  });
+  if (series.length === 0) return null;
+
+  return {
+    title: normalizeTitle(raw.title) ?? normalizeTitle(extractChartJsTitle(raw.options)),
     labels,
     series,
   };
@@ -408,6 +469,23 @@ function parseNumber(value: unknown): number | null {
   if (!/^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(cleaned)) return null;
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : null;
+}
+
+function parseChartJsNumber(value: unknown): number | null {
+  const direct = parseNumber(value);
+  if (direct !== null) return direct;
+  if (!value || typeof value !== "object") return null;
+  const point = value as { y?: unknown };
+  return parseNumber(point.y);
+}
+
+function extractChartJsTitle(options: unknown): unknown {
+  if (!options || typeof options !== "object") return undefined;
+  const plugins = (options as { plugins?: unknown }).plugins;
+  if (!plugins || typeof plugins !== "object") return undefined;
+  const title = (plugins as { title?: unknown }).title;
+  if (!title || typeof title !== "object") return undefined;
+  return (title as { text?: unknown }).text;
 }
 
 function normalizeTitle(value: unknown): string | undefined {
