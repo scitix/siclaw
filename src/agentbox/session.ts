@@ -27,6 +27,7 @@ import type {
   JobStopExecutor,
   BackgroundExecExecutor,
   TaskOutputReader,
+  ChannelMessageExecutor,
   AgentMode,
 } from "../core/tool-registry.js";
 import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency } from "../core/subagent-registry.js";
@@ -435,6 +436,36 @@ export class AgentBoxSessionManager {
   private createTaskOutputReader(): TaskOutputReader {
     // Snapshot the job's live status so task_output can report running/terminal (same as TUI).
     return (jobId) => this.jobs.snapshot(jobId);
+  }
+
+  private createChannelMessageExecutor(): ChannelMessageExecutor {
+    return async (request) => {
+      if (!(this.gatewayClient && this.agentId)) {
+        return {
+          delivered: false,
+          message: "channel_update unavailable: gateway delivery is not configured for this AgentBox.",
+        };
+      }
+      const text = request.text.trim();
+      if (!text) {
+        return { delivered: false, message: "channel_update skipped: empty text." };
+      }
+      const response = await this.persistDelegationEvent({
+        type: "channel.deliver_message",
+        message: {
+          sessionId: request.sessionId,
+          kind: request.kind,
+          text,
+          fromAgentId: this.agentId,
+        },
+      });
+      return {
+        delivered: response.ok,
+        message: response.ok
+          ? `channel_update ${request.kind} accepted by Gateway.`
+          : `channel_update ${request.kind} was not delivered.`,
+      };
+    };
   }
 
   /**
@@ -1639,6 +1670,7 @@ export class AgentBoxSessionManager {
       jobStopExecutor: this.createJobStopExecutor(),
       backgroundExecExecutor: this.createBackgroundExecExecutor(),
       taskOutputReader: this.createTaskOutputReader(),
+      channelMessageExecutor: this.createChannelMessageExecutor(),
     });
 
     // Populate sessionIdRef so skill_call events can associate with this session

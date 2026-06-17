@@ -500,7 +500,7 @@ describe("handleDelegationEvents", () => {
     sessionRegistry.remember("channel-1", "lark:oc_1", "agent-1");
     const delivered: string[] = [];
     registerBackgroundChannelDelivery("channel-1", async (message) => {
-      delivered.push(message.content);
+      if ("content" in message) delivered.push(message.content);
       return true;
     });
     frontend.nextError = new Error("chat session not found");
@@ -527,6 +527,66 @@ describe("handleDelegationEvents", () => {
     expect(delivered).toEqual(["最终报告"]);
     expect(frontend.calls[0].method).toBe("chat.appendMessage");
     warnSpy.mockRestore();
+  });
+
+  it("delivers explicit channel messages through the registered channel callback without Portal writes", async () => {
+    sessionRegistry.remember("channel-1", "lark:oc_1", "agent-1");
+    const delivered: Array<{ kind: string; text: string }> = [];
+    registerBackgroundChannelDelivery("channel-1", async (message) => {
+      if ("text" in message) delivered.push({ kind: message.kind, text: message.text });
+      return true;
+    });
+    const res = new FakeRes();
+
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "channel.deliver_message",
+        message: {
+          sessionId: "channel-1",
+          kind: "milestone",
+          text: "已完成节点列表检查。",
+          fromAgentId: "agent-1",
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+    expect(delivered).toEqual([{ kind: "milestone", text: "已完成节点列表检查。" }]);
+    expect(frontend.calls).toHaveLength(0);
+  });
+
+  it("rejects explicit channel messages from another agent identity", async () => {
+    sessionRegistry.remember("channel-1", "lark:oc_1", "agent-1");
+    const delivered: string[] = [];
+    registerBackgroundChannelDelivery("channel-1", async (message) => {
+      if ("text" in message) delivered.push(message.text);
+      return true;
+    });
+    const res = new FakeRes();
+
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "channel.deliver_message",
+        message: {
+          sessionId: "channel-1",
+          kind: "milestone",
+          text: "should not deliver",
+          fromAgentId: "agent-2",
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toContain("source agent mismatch");
+    expect(delivered).toHaveLength(0);
+    expect(frontend.calls).toHaveLength(0);
   });
 });
 

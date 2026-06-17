@@ -119,6 +119,8 @@ export interface CreateSiclawSessionOpts {
   backgroundExecExecutor?: import("./tool-registry.js").BackgroundExecExecutor;
   /** Runtime bridge that reads a background job's live status. Injected by agentbox / TUI host. */
   taskOutputReader?: import("./tool-registry.js").TaskOutputReader;
+  /** Runtime bridge for explicit IM-channel visible updates. Injected by agentbox. */
+  channelMessageExecutor?: import("./tool-registry.js").ChannelMessageExecutor;
 }
 
 export interface SiclawSessionResult {
@@ -403,6 +405,7 @@ export async function createSiclawSession(
       jobStopExecutor: opts?.jobStopExecutor,
       backgroundExecExecutor: opts?.backgroundExecExecutor,
       taskOutputReader: opts?.taskOutputReader,
+      channelMessageExecutor: opts?.channelMessageExecutor,
     },
     allowedTools,
     activeMode: opts?.activeMode ?? "normal",

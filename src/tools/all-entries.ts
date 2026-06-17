@@ -33,6 +33,7 @@ import { registration as saveFeedback } from "./workflow/save-feedback.js";
 import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
 import { registration as skillPreview } from "./workflow/skill-preview.js";
+import { registration as channelUpdate } from "./workflow/channel-update.js";
 import {
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
 } from "./workflow/task-tools.js";
@@ -50,6 +51,7 @@ export const allToolEntries: ToolEntry[] = [
   resolvePodNetns, memorySearch, memoryGet,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
+  channelUpdate,
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
   spawnSubagent, jobStop, taskOutput,
 ];

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   sanitizeMarkdownForFeishu,
   openTypingCard,
+  updateCardContent,
   finalizeCard,
   DEFAULT_PLACEHOLDER,
   EMPTY_RESULT_NOTICE,
@@ -214,6 +215,22 @@ describe("openTypingCard", () => {
 // ── finalizeCard ───────────────────────────────────────────────
 
 describe("finalizeCard", () => {
+  it("updateCardContent refreshes markdown without disabling streaming", async () => {
+    const { client, contentSpy, settingsSpy } = makeLarkClient();
+    const session = { cardId: "CARD-1", elementId: "md_main", sequence: 0 };
+
+    const ok = await updateCardContent(client as any, session, "> milestone");
+    expect(ok).toBe(true);
+
+    expect(contentSpy).toHaveBeenCalledTimes(1);
+    expect(contentSpy.mock.calls[0][0]).toMatchObject({
+      path: { card_id: "CARD-1", element_id: "md_main" },
+      data: { content: "｜ milestone", sequence: 1 },
+    });
+    expect(settingsSpy).not.toHaveBeenCalled();
+    expect(session.sequence).toBe(1);
+  });
+
   it("updates element content with sanitized markdown, then disables streaming_mode; increments sequence", async () => {
     const { client, contentSpy, settingsSpy } = makeLarkClient();
     const session = { cardId: "CARD-1", elementId: "md_main", sequence: 0 };

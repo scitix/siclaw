@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createLarkHandler, handleLarkMessage, collectResponse, collectChannelResponse } from "./lark.js";
-import { clearBackgroundChannelDelivery, deliverBackgroundChannelMessage } from "./background-delivery.js";
+import {
+  clearBackgroundChannelDelivery,
+  deliverBackgroundChannelMessage,
+  deliverChannelVisibleMessage,
+} from "./background-delivery.js";
 import { sessionRegistry } from "../session-registry.js";
 
 // ── Mocks ──────────────────────────────────────────────────────────
@@ -89,6 +93,20 @@ function makeTextEvent(text: string, overrides: Record<string, unknown> = {}) {
       ...overrides,
     },
   };
+}
+
+async function waitForExpect(assertion: () => void): Promise<void> {
+  let lastError: unknown;
+  for (let i = 0; i < 30; i += 1) {
+    try {
+      assertion();
+      return;
+    } catch (err) {
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+  throw lastError;
 }
 
 beforeEach(() => {
@@ -409,6 +427,72 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(contentCalls.at(-1)[0].data.content).toContain("GPFS");
     expect(contentCalls).toHaveLength(2);
     clearBackgroundChannelDelivery(sessionId);
+  });
+
+  it("lets the agent explicitly update the visible card, while Gateway caps non-final updates", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-explicit-channel" });
+    let releaseStream: () => void = () => {};
+    const streamGate = new Promise<void>((resolve) => { releaseStream = resolve; });
+    streamEventsMock.mockImplementation(async function* () {
+      await streamGate;
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "最终结论：检查完成。" }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    const handlePromise = handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(1));
+    const sessionId = promptMock.mock.calls[0][0].sessionId;
+
+    try {
+      await expect(deliverChannelVisibleMessage({
+        sessionId,
+        kind: "milestone",
+        text: "里程碑 1：已拿到节点列表。",
+      })).resolves.toBe(true);
+      await expect(deliverChannelVisibleMessage({
+        sessionId,
+        kind: "artifact",
+        text: "产物提示：已生成诊断草稿。",
+      })).resolves.toBe(true);
+      await expect(deliverChannelVisibleMessage({
+        sessionId,
+        kind: "milestone",
+        text: "这条应该被 Gateway 策略压掉。",
+      })).resolves.toBe(true);
+
+      const inFlightContentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
+      expect(inFlightContentCalls).toHaveLength(2);
+      expect(inFlightContentCalls[0][0].data.content).toContain("里程碑 1");
+      expect(inFlightContentCalls[1][0].data.content).toContain("产物提示");
+      expect(inFlightContentCalls[1][0].data.content).not.toContain("压掉");
+      expect(lark.cardkit.v1.card.settings).not.toHaveBeenCalled();
+      expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+      expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
+    } finally {
+      releaseStream();
+      await handlePromise;
+      clearBackgroundChannelDelivery(sessionId);
+    }
+
+    const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
+    expect(contentCalls).toHaveLength(3);
+    expect(contentCalls.at(-1)[0].data.content).toContain("最终结论");
+    expect(lark.cardkit.v1.card.settings).toHaveBeenCalledTimes(1);
   });
 
   it("keeps numeric tables in markdown and does not synthesize chart images", async () => {
