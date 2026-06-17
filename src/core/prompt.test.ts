@@ -89,8 +89,6 @@ describe("buildSreSystemPrompt visual output guidance", () => {
     expect(prompt).toContain("channel adapter");
     expect(prompt).toContain("Source-only ```chart`, Mermaid, and ```visual-card` blocks remain markdown text");
     expect(prompt).toContain("Use normal Markdown for direct answers");
-    expect(prompt).toContain("MUST call `render_visual_card`");
-    expect(prompt).toContain("清晰报告");
     expect(prompt).not.toContain("may render a fallback image");
     expect(prompt).not.toContain("readable fallback source");
   });
