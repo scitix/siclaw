@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /**
- * create-chart MCP server — stdio transport, exposes a single `render_chart`
- * tool that emits a JSON chart spec wrapped in a ```chart fenced markdown
- * code block. The Portal frontend detects that block and renders an SVG
- * client-side via React (theme-aware, dark-mode-aware).
+ * create-chart MCP server — stdio transport, exposes Sicore Web-backed visual
+ * tools. Each tool returns a READY_TO_PASTE source block plus a structured PNG
+ * image content block; channel adapters own platform-specific delivery.
  *
  * Packaged as a standalone npm package; Dockerfile.agentbox builds it via
  * mcp/MCP_LIST.txt and symlinks dist/index.js to /usr/local/bin/mcp-create-chart.
@@ -15,9 +14,6 @@
  *       "command": "mcp-create-chart"
  *     }
  *   }
- *
- * CREATE_CHART_ARTIFACT_DIR (optional) controls where the JSON spec is
- * persisted as a best-effort debugging artifact.
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";

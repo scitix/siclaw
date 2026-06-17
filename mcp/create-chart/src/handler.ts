@@ -1,5 +1,3 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { exportMarkdownVisualsWithSicoreWeb } from "./sicore-export.js";
 import type { RenderChartArgs, RenderChartResult, RenderChartToolResponse } from "./types.js";
 
@@ -49,7 +47,7 @@ export const RENDER_MERMAID_INPUT_SCHEMA = {
     },
     title: {
       type: "string",
-      description: "Optional title for metadata and persisted artifact names. It is not injected into the Mermaid source.",
+      description: "Optional title for metadata. It is not injected into the Mermaid source.",
     },
   },
   additionalProperties: false,
@@ -107,20 +105,6 @@ export const RENDER_VISUAL_CARD_DESCRIPTION = [
   "Arguments must be one visual-card JSON object, not Markdown and not a JSON string. The tool returns READY_TO_PASTE ```visual-card markdown plus an image/png content block. Paste READY_TO_PASTE exactly and preserve the image artifact.",
 ].join(" ");
 
-function chartBaseDir(): string {
-  const root =
-    process.env.CREATE_CHART_ARTIFACT_DIR ??
-    ".siclaw/user-data/tool-results/create-chart";
-  return path.resolve(root, "chart-render");
-}
-
-function visualBaseDir(kind: "mermaid" | "visual-card"): string {
-  const root =
-    process.env.CREATE_CHART_ARTIFACT_DIR ??
-    ".siclaw/user-data/tool-results/create-chart";
-  return path.resolve(root, kind);
-}
-
 function newChartId(type: string): string {
   return `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -136,29 +120,14 @@ export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartTo
   if (!visual?.image) throw new Error("render_chart: Sicore Web export returned no chart image");
   const png = visual.image;
 
-  let specPath: string | undefined;
-  let pngPath: string | undefined;
-  try {
-    const dir = chartBaseDir();
-    await mkdir(dir, { recursive: true });
-    specPath = path.join(dir, `${id}.json`);
-    pngPath = path.join(dir, `${id}.png`);
-    await writeFile(specPath, spec, "utf8");
-    await writeFile(pngPath, png);
-  } catch {
-    /* swallow — disk persistence is best-effort */
-    specPath = undefined;
-    pngPath = undefined;
-  }
-
   const result: RenderChartResult = {
     schema_version: CHART_SPEC_VERSION,
     chart_id: id,
     type: args.type,
     artifact_kind: "chart_spec",
-    spec_path: specPath ?? "",
+    spec_path: "",
     svg_path: "",
-    png_path: pngPath ?? "",
+    png_path: "",
     bytes: Buffer.byteLength(spec, "utf8"),
     image_bytes: png.byteLength,
     image_mime: "image/png",
@@ -196,13 +165,7 @@ export async function handleRenderMermaid(rawArgs: unknown): Promise<RenderChart
   const visual = exported.find((item) => item.kind === "mermaid") ?? exported[0];
   if (!visual?.image) throw new Error("render_mermaid: Sicore Web export returned no Mermaid image");
 
-  const meta = await persistVisualArtifact({
-    id,
-    kind: "mermaid",
-    spec: args,
-    markdownEmbed,
-    image: visual.image,
-  });
+  const meta = visualMetadata(id, "mermaid", markdownEmbed, visual.image);
 
   return {
     content: [
@@ -234,13 +197,7 @@ export async function handleRenderVisualCard(rawArgs: unknown): Promise<RenderCh
   const visual = exported.find((item) => item.kind === "visual-card") ?? exported[0];
   if (!visual?.image) throw new Error("render_visual_card: Sicore Web export returned no visual-card image");
 
-  const meta = await persistVisualArtifact({
-    id,
-    kind: "visual-card",
-    spec,
-    markdownEmbed,
-    image: visual.image,
-  });
+  const meta = visualMetadata(id, "visual-card", markdownEmbed, visual.image);
 
   return {
     content: [
@@ -263,40 +220,19 @@ export async function handleRenderVisualCard(rawArgs: unknown): Promise<RenderCh
   };
 }
 
-async function persistVisualArtifact({
-  id,
-  kind,
-  spec,
-  markdownEmbed,
-  image,
-}: {
-  id: string;
-  kind: "mermaid" | "visual-card";
-  spec: unknown;
-  markdownEmbed: string;
-  image: Buffer;
-}): Promise<Record<string, unknown>> {
-  let specPath = "";
-  let pngPath = "";
-  try {
-    const dir = visualBaseDir(kind);
-    await mkdir(dir, { recursive: true });
-    specPath = path.join(dir, `${id}.json`);
-    pngPath = path.join(dir, `${id}.png`);
-    await writeFile(specPath, JSON.stringify(spec, null, 2), "utf8");
-    await writeFile(pngPath, image);
-  } catch {
-    specPath = "";
-    pngPath = "";
-  }
-
+function visualMetadata(
+  id: string,
+  kind: "mermaid" | "visual-card",
+  markdownEmbed: string,
+  image: Buffer,
+): Record<string, unknown> {
   return {
     schema_version: VISUAL_SPEC_VERSION,
     visual_id: id,
     type: kind,
     artifact_kind: `${kind}_spec`,
-    spec_path: specPath,
-    png_path: pngPath,
+    spec_path: "",
+    png_path: "",
     bytes: Buffer.byteLength(markdownEmbed, "utf8"),
     image_bytes: image.byteLength,
     image_mime: "image/png",

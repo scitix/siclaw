@@ -39,11 +39,11 @@ export interface RenderChartResult {
   chart_id: string;
   type: "pie" | "bar" | "line";
   artifact_kind: "chart_spec";
-  spec_path: string;
   /**
-   * Kept for backwards-compatible metadata shape. Empty because render_chart
-   * persists a JSON chart spec; the portal renders SVG client-side.
+   * Kept for backwards-compatible metadata shape. Empty because delivery uses
+   * the returned structured image content block, not AgentBox-local files.
    */
+  spec_path: string;
   svg_path: string;
   png_path: string;
   bytes: number;

@@ -1,7 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { exportMarkdownVisualsWithSicoreWeb } from "./sicore-export.js";
 import {
   RENDER_CHART_INPUT_SCHEMA,
@@ -262,21 +259,11 @@ describe("validateVisualCard", () => {
 });
 
 describe("handleRenderChart", () => {
-  let tmp: string;
-  let originalEnv: string | undefined;
-
   beforeEach(() => {
-    tmp = mkdtempSync(path.join(tmpdir(), "create-chart-test-"));
-    originalEnv = process.env.CREATE_CHART_ARTIFACT_DIR;
-    process.env.CREATE_CHART_ARTIFACT_DIR = tmp;
     vi.mocked(exportMarkdownVisualsWithSicoreWeb).mockClear();
   });
 
-  afterEach(() => {
-    if (originalEnv === undefined) delete process.env.CREATE_CHART_ARTIFACT_DIR;
-    else process.env.CREATE_CHART_ARTIFACT_DIR = originalEnv;
-    rmSync(tmp, { recursive: true, force: true });
-  });
+  afterEach(() => vi.restoreAllMocks());
 
   function splitEnvelope(text: string): { ready: string; meta: Record<string, unknown> } {
     const m = text.match(/^READY_TO_PASTE:\n([\s\S]*?)\n\nMETADATA_JSON:\n([\s\S]*)$/);
@@ -338,49 +325,20 @@ describe("handleRenderChart", () => {
     expect(meta).not.toHaveProperty("markdown_embed");
   });
 
-  it("persists the spec to CREATE_CHART_ARTIFACT_DIR/chart-render/", async () => {
+  it("does not rely on local AgentBox files for artifact delivery", async () => {
     const res = await handleRenderChart({
       type: "line",
       data: { series: [{ name: "s", points: [{ x: 1, y: 2 }] }] },
-    });
-    const { meta } = splitEnvelope(res.content[0].text);
-    const expectedDir = path.resolve(tmp, "chart-render");
-    expect(existsSync(expectedDir)).toBe(true);
-    const expectedFile = path.join(expectedDir, `${meta.chart_id as string}.json`);
-    expect(meta.svg_path).toBe("");
-    expect(meta.spec_path).toBe(expectedFile);
-    expect(meta.png_path).toBe(path.join(expectedDir, `${meta.chart_id as string}.png`));
-    expect(meta.image_mime).toBe("image/png");
-    expect(meta.image_bytes as number).toBeGreaterThan(0);
-    expect(existsSync(expectedFile)).toBe(true);
-    expect(existsSync(meta.png_path as string)).toBe(true);
-    const onDisk = JSON.parse(readFileSync(expectedFile, "utf8"));
-    expect(onDisk).not.toHaveProperty("schema_version");
-    expect(onDisk.type).toBe("line");
-    expect(onDisk.data.series[0].points).toEqual([{ x: 1, y: 2 }]);
-    expect(readdirSync(expectedDir)).toContain(`${meta.chart_id as string}.json`);
-  });
-
-  it("still returns a usable result when disk persistence fails", async () => {
-    // Point the artifact dir at a path whose parent is a regular file —
-    // mkdir({recursive:true}) will reject with ENOTDIR, exercising the
-    // best-effort catch in handleRenderChart.
-    const blocker = path.join(tmp, "blocker");
-    writeFileSync(blocker, "x");
-    process.env.CREATE_CHART_ARTIFACT_DIR = path.join(blocker, "nested");
-
-    const res = await handleRenderChart({
-      type: "pie",
-      data: { slices: [{ label: "a", value: 1 }] },
     });
     const { ready, meta } = splitEnvelope(res.content[0].text);
     expect(meta.svg_path).toBe("");
     expect(meta.spec_path).toBe("");
     expect(meta.png_path).toBe("");
+    expect(meta.image_mime).toBe("image/png");
+    expect(meta.image_bytes as number).toBeGreaterThan(0);
     expect(res.content[1].type).toBe("image");
     expect([...Buffer.from(res.content[1].data, "base64").subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
     expect(meta.bytes as number).toBeGreaterThan(0);
-    expect(meta.image_bytes as number).toBeGreaterThan(0);
     expect(ready.startsWith("```chart\n")).toBe(true);
   });
 });

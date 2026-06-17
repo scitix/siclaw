@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createLarkHandler, handleLarkMessage, collectResponse } from "./lark.js";
+import { createLarkHandler, handleLarkMessage, collectResponse, collectChannelResponse } from "./lark.js";
 import { sessionRegistry } from "../session-registry.js";
 
 // ── Mocks ──────────────────────────────────────────────────────────
@@ -619,7 +619,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
   });
 
-  it("forwards conclusion-card data URI images and hides data URLs from the card", async () => {
+  it("strips markdown data URI payloads from cards without treating them as sendable attachments", async () => {
     const onePixelPng =
       "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
@@ -654,7 +654,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     const cardContent = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
     expect(cardContent).toContain("结论卡片如下");
     expect(cardContent).not.toContain("data:image/png");
-    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect(lark.im.image.create).not.toHaveBeenCalled();
   });
 
   it("forwards assistant image content blocks as Feishu images", async () => {
@@ -812,8 +812,8 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("keeps the markdown card successful when image upload returns no key", async () => {
-    const onePixelPng =
-      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
     vi.spyOn(console, "warn").mockImplementation(() => {});
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-image-fail" });
@@ -822,14 +822,10 @@ describe("handleLarkMessage — streaming card flow", () => {
         type: "message_end",
         message: {
           role: "assistant",
-          content: [{
-            type: "text",
-            text: [
-              "图片如下：",
-              "",
-              `![chart](${onePixelPng})`,
-            ].join("\n"),
-          }],
+          content: [
+            { type: "text", text: "图片如下：" },
+            { type: "image", data: onePixelBase64, mimeType: "image/png" },
+          ],
         },
       };
     });
@@ -1036,7 +1032,7 @@ describe("collectResponse — SSE event flattening", () => {
     expect(text).toBe("Here's what I found.");
   });
 
-  it("captures assistant image blocks as data-image markdown when requested", async () => {
+  it("captures assistant image blocks as structured attachments when requested", async () => {
     const events = [
       {
         type: "message_end",
@@ -1049,11 +1045,14 @@ describe("collectResponse — SSE event flattening", () => {
         },
       },
     ];
-    const text = await collectResponse(fakeClient(events), "s6", "lark", { includeImages: true });
-    expect(text).toBe("Generated image:![generated image](data:image/png;base64,aW1n)");
+    const collected = await collectChannelResponse(fakeClient(events), "s6", "lark", { includeImages: true });
+    expect(collected.text).toBe("Generated image:");
+    expect(collected.images).toHaveLength(1);
+    expect(collected.images[0].mimeType).toBe("image/png");
+    expect(collected.images[0].image.toString("base64")).toBe("aW1n");
   });
 
-  it("appends tool image artifacts to the final assistant text when requested", async () => {
+  it("collects tool image artifacts separately from the final assistant text", async () => {
     const events = [
       {
         type: "tool_execution_end",
@@ -1072,11 +1071,13 @@ describe("collectResponse — SSE event flattening", () => {
         },
       },
     ];
-    const text = await collectResponse(fakeClient(events), "s7", "lark", { includeImages: true });
-    expect(text).toBe("Here is the chart.\n\n![generated image](data:image/png;base64,aW1n)");
+    const collected = await collectChannelResponse(fakeClient(events), "s7", "lark", { includeImages: true });
+    expect(collected.text).toBe("Here is the chart.");
+    expect(collected.images).toHaveLength(1);
+    expect(collected.images[0].image.toString("base64")).toBe("aW1n");
   });
 
-  it("captures toolResult message image blocks when requested", async () => {
+  it("captures toolResult message image blocks as structured attachments", async () => {
     const events = [
       {
         type: "message_end",
@@ -1096,8 +1097,10 @@ describe("collectResponse — SSE event flattening", () => {
         },
       },
     ];
-    const text = await collectResponse(fakeClient(events), "s8", "lark", { includeImages: true });
-    expect(text).toBe("Here is the chart.\n\n![generated image](data:image/png;base64,aW1n)");
+    const collected = await collectChannelResponse(fakeClient(events), "s8", "lark", { includeImages: true });
+    expect(collected.text).toBe("Here is the chart.");
+    expect(collected.images).toHaveLength(1);
+    expect(collected.images[0].image.toString("base64")).toBe("aW1n");
   });
 
   it("does not expose image blocks to non-image channel collectors by default", async () => {

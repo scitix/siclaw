@@ -1,31 +1,40 @@
 import { describe, expect, it } from "vitest";
-import { extractReplyImages, stripVisualBlocks } from "./visual-image.js";
+import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 
-const onePixelPng =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+const onePixelBase64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+const onePixelPng = `data:image/png;base64,${onePixelBase64}`;
 
-describe("extractReplyImages", () => {
-  it("forwards final-answer PNG data URI images as image attachments", async () => {
-    const images = await extractReplyImages(`Chart:\n\n![chart](${onePixelPng})`);
+describe("collectImageAttachments", () => {
+  it("collects structured PNG image content blocks as attachments", () => {
+    const images: RenderedReplyImage[] = [];
+    collectImageAttachments([{ type: "image", data: onePixelBase64, mimeType: "image/png" }], images, new Set());
 
     expect(images).toHaveLength(1);
     expect(images[0].kind).toBe("image");
+    expect(images[0].mimeType).toBe("image/png");
     expect([...images[0].image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
   });
 
-  it("does not render source-only chart or Mermaid blocks", async () => {
-    const images = await extractReplyImages([
-      "```chart",
-      "{\"type\":\"bar\",\"data\":{\"categories\":[\"a\"],\"series\":[{\"name\":\"s\",\"values\":[1]}]}}",
-      "```",
-      "",
-      "```mermaid",
-      "flowchart TD",
-      "A --> B",
-      "```",
-    ].join("\n"));
+  it("does not collect images from source-only chart or Mermaid text blocks", () => {
+    const images: RenderedReplyImage[] = [];
+    collectImageAttachments([
+      { type: "text", text: "```chart\n{\"type\":\"bar\"}\n```" },
+      { type: "text", text: "```mermaid\nflowchart TD\nA --> B\n```" },
+    ], images, new Set());
 
     expect(images).toEqual([]);
+  });
+
+  it("deduplicates repeated image artifacts", () => {
+    const images: RenderedReplyImage[] = [];
+    const seen = new Set<string>();
+    collectImageAttachments([
+      { type: "image", data: onePixelBase64, mimeType: "image/png" },
+      { type: "image", data: onePixelBase64, mime_type: "image/png" },
+    ], images, seen);
+
+    expect(images).toHaveLength(1);
   });
 });
 

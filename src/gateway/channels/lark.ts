@@ -20,7 +20,7 @@ import {
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
 } from "./lark-card.js";
-import { extractReplyImages, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
+import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 import { replyImageToLark } from "./lark-image.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -195,10 +195,13 @@ export async function handleLarkMessage(
 
   const promptOpts: PromptOptions = { text, agentId, mode: "channel", sessionId };
   let resultText = "";
+  let replyImages: RenderedReplyImage[] = [];
   let agentError: Error | null = null;
   try {
     const promptResult = await client.prompt(promptOpts);
-    resultText = await collectResponse(client, promptResult.sessionId, "lark", { includeImages: true });
+    const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", { includeImages: true });
+    resultText = collected.text;
+    replyImages = collected.images;
   } catch (err) {
     agentError = err instanceof Error ? err : new Error(String(err));
     console.error(`[lark] Agent execution failed for session=${sessionId}:`, agentError);
@@ -209,7 +212,7 @@ export async function handleLarkMessage(
   const finalBody = agentError
     ? `\u274C ${agentError.message.slice(0, 500)}`
     : (resultText || EMPTY_RESULT_NOTICE_BY_LOCALE[locale]);
-  const replyImages = agentError ? [] : await collectReplyVisualImages(messageId, finalBody);
+  if (agentError) replyImages = [];
   const displayBody = stripVisualBlocks(finalBody, { stripSourceBlocks: replyImages.length > 0 })
     || VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
 
@@ -260,15 +263,6 @@ async function replyToLark(larkClient: any, messageId: string, text: string): Pr
   }
 }
 
-async function collectReplyVisualImages(messageId: string, finalBody: string): Promise<RenderedReplyImage[]> {
-  try {
-    return await extractReplyImages(finalBody);
-  } catch (err) {
-    console.error(`[lark] Visual image extraction failed for messageId=${messageId}:`, err);
-    return [];
-  }
-}
-
 async function replyVisualImages(larkClient: any, messageId: string, images: RenderedReplyImage[]): Promise<void> {
   for (const { kind, image } of images) {
     const ok = await replyImageToLark(larkClient, messageId, image);
@@ -280,15 +274,28 @@ async function replyVisualImages(larkClient: any, messageId: string, images: Ren
 
 // ── SSE response collector ─────────────────────────────────────
 
+export interface CollectedChannelResponse {
+  text: string;
+  images: RenderedReplyImage[];
+}
+
 export async function collectResponse(
   client: AgentBoxClient,
   sessionId: string,
   logPrefix = "lark",
-  options: { includeImages?: boolean } = {},
 ): Promise<string> {
+  return (await collectChannelResponse(client, sessionId, logPrefix)).text;
+}
+
+export async function collectChannelResponse(
+  client: AgentBoxClient,
+  sessionId: string,
+  logPrefix = "lark",
+  options: { includeImages?: boolean } = {},
+): Promise<CollectedChannelResponse> {
   const parts: string[] = [];
-  const imageParts: string[] = [];
-  const seenImageUrls = new Set<string>();
+  const images: RenderedReplyImage[] = [];
+  const seenImageKeys = new Set<string>();
   // Track the latest assistant turn so we only reply with the *final* text
   // (tool-use turns emit intermediate message_end events that aren't meant
   // for the user). pi-agent's agent_end signals the last turn is complete.
@@ -299,16 +306,17 @@ export async function collectResponse(
       if (ev.type === "content_block_delta" && ev.delta?.text) parts.push(ev.delta.text);
       if (ev.type === "text" && typeof ev.text === "string") parts.push(ev.text);
       if (options.includeImages && (ev.type === "tool_execution_end" || ev.type === "tool_end")) {
-        collectImageMarkdown(ev.result?.content, imageParts, seenImageUrls);
+        collectImageAttachments(ev.result?.content, images, seenImageKeys);
       }
       if (options.includeImages && ev.type === "message_end" && (ev.message?.role === "toolResult" || ev.message?.role === "tool")) {
-        collectImageMarkdown(ev.message?.content, imageParts, seenImageUrls);
+        collectImageAttachments(ev.message?.content, images, seenImageKeys);
       }
       // pi-agent-brain emits the final assistant reply as message_end with
       // a content array of blocks; collect the text blocks only.
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-        const turnText = contentBlocksToMarkdown(blocks, options.includeImages ? seenImageUrls : undefined);
+        if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
+        const turnText = contentBlocksToMarkdown(blocks);
         if (turnText) lastAssistantText = turnText;
       }
     }
@@ -318,71 +326,14 @@ export async function collectResponse(
   // Prefer the last full assistant turn; fall back to streamed deltas if the
   // brain only emits content_block_delta events.
   const text = lastAssistantText || parts.join("");
-  return [text, ...imageParts].filter((part) => part.trim()).join("\n\n");
+  return { text, images };
 }
 
-function contentBlocksToMarkdown(blocks: unknown[], seenImageUrls?: Set<string>): string {
+function contentBlocksToMarkdown(blocks: unknown[]): string {
   return blocks.map((block) => {
     if (!block || typeof block !== "object") return "";
     const rec = block as { type?: unknown; text?: unknown };
     if (rec.type === "text" && typeof rec.text === "string") return rec.text;
-    if (!seenImageUrls) return "";
-    return imageBlockToMarkdown(rec, seenImageUrls);
+    return "";
   }).join("");
-}
-
-function collectImageMarkdown(content: unknown, target: string[], seenImageUrls: Set<string>): void {
-  if (!Array.isArray(content)) return;
-  for (const block of content) {
-    if (!block || typeof block !== "object") continue;
-    const markdown = imageBlockToMarkdown(block as Record<string, unknown>, seenImageUrls);
-    if (markdown) target.push(markdown);
-  }
-}
-
-function imageBlockToMarkdown(block: Record<string, unknown>, seenImageUrls: Set<string>): string {
-  const dataUrl = imageBlockToDataUrl(block);
-  if (!dataUrl || seenImageUrls.has(dataUrl)) return "";
-  seenImageUrls.add(dataUrl);
-  return `![generated image](${dataUrl})`;
-}
-
-function imageBlockToDataUrl(block: Record<string, unknown>): string | null {
-  const type = typeof block.type === "string" ? block.type : "";
-  if (type === "image") {
-    const data = block.data;
-    const mimeType = block.mimeType ?? block.mime_type;
-    if (typeof data === "string" && typeof mimeType === "string" && isSupportedInlineImageMime(mimeType)) {
-      return `data:${mimeType.toLowerCase()};base64,${data.replace(/\s+/g, "")}`;
-    }
-
-    const source = block.source;
-    if (source && typeof source === "object") {
-      const raw = source as Record<string, unknown>;
-      const sourceType = typeof raw.type === "string" ? raw.type : "";
-      const sourceData = raw.data;
-      const sourceMime = raw.media_type ?? raw.mimeType ?? raw.mime_type;
-      if (sourceType === "base64" && typeof sourceData === "string" && typeof sourceMime === "string" && isSupportedInlineImageMime(sourceMime)) {
-        return `data:${sourceMime.toLowerCase()};base64,${sourceData.replace(/\s+/g, "")}`;
-      }
-    }
-  }
-
-  if (type === "image_url" || type === "input_image" || type === "output_image") {
-    const imageUrl = block.image_url;
-    const url = typeof imageUrl === "string"
-      ? imageUrl
-      : imageUrl && typeof imageUrl === "object"
-        ? (imageUrl as Record<string, unknown>).url
-        : block.url;
-    if (typeof url === "string" && /^data:image\/(?:png|jpe?g|webp|svg\+xml)(?:;charset=[^;,]+)?(?:;base64)?,/i.test(url)) {
-      return url;
-    }
-  }
-
-  return null;
-}
-
-function isSupportedInlineImageMime(mimeType: string): boolean {
-  return /^image\/(?:png|jpe?g|webp|svg\+xml)$/i.test(mimeType);
 }

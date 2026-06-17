@@ -85,10 +85,11 @@ This session is replying in an IM group. Choose the final answer shape intention
 
 - Use normal Markdown for direct answers, short diagnoses, command results, and prose reports.
 - Use a small Markdown table when the user needs exact enumerable facts.
-- For visual replies, prefer tools or artifacts that return real image content. If the final answer includes \`data:image/png;base64,...\`, Markdown \`![alt](data:image/...)\`, or an image content block, the channel runtime uploads that exact image to Feishu/Lark.
-- Use \`render_chart\` for numeric charts, \`render_mermaid\` for Mermaid diagrams, and \`render_visual_card\` for conclusion-card images. These tools return PNG image artifacts for the channel to forward.
+- For visual replies, use tools or artifacts that return structured image content blocks. The channel runtime uploads those image attachments to Feishu/Lark.
+- Use \`render_chart\` for numeric charts, \`render_mermaid\` for Mermaid diagrams, and \`render_visual_card\` for conclusion-card images. These tools return PNG image artifacts for the channel adapter to forward.
 - Use source-only \`\`\`chart\`, Mermaid, or \`\`\`visual-card\` blocks only when the user wants readable source instead of an image.
 - When a tool generates a PNG chart, diagram, or conclusion card, include or preserve that image artifact in the final answer and keep one concise natural-language conclusion outside the image.
+- Do not inline \`data:image/...\` URLs or base64 image data in Markdown. Image delivery is an attachment responsibility of the channel adapter, not the final text body.
 
 For \`\`\`visual-card\`, output JSON only inside the fence:
 
@@ -96,7 +97,7 @@ For \`\`\`visual-card\`, output JSON only inside the fence:
 {"type":"report","title":"Short incident title","tone":"danger|warning|success|info|neutral","conclusion":"One-sentence conclusion","items":[{"label":"Impact","status":"danger","value":"3 pods","note":"namespace prod"}],"sections":[{"type":"actions","title":"Next actions","actions":[{"title":"Restart after config fix","priority":"P1","status":"info"}]}]}
 \`\`\`
 
-The channel runtime forwards real final-answer images to Feishu/Lark and hides the image data from the group message body. Source-only \`\`\`chart\`, Mermaid, and \`\`\`visual-card\` blocks remain markdown text unless paired with a real image artifact; visual tools must return image artifacts when the group needs an actual image. Do not describe Feishu upload mechanics.`;
+The channel runtime forwards structured image artifacts to Feishu/Lark and hides paired visual source blocks from the group message body. Source-only \`\`\`chart\`, Mermaid, and \`\`\`visual-card\` blocks remain markdown text unless paired with a real image artifact; visual tools must return image artifacts when the group needs an actual image. Do not describe Feishu upload mechanics.`;
 
 // ---------------------------------------------------------------------------
 // Safety section — hardcoded, always appended, cannot be overridden
