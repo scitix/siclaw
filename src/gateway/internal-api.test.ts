@@ -15,6 +15,10 @@ import {
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 import { sessionRegistry } from "./session-registry.js";
+import {
+  clearBackgroundChannelDelivery,
+  registerBackgroundChannelDelivery,
+} from "./channels/background-delivery.js";
 
 // ── fakes ─────────────────────────────────────────────────
 
@@ -85,6 +89,8 @@ beforeEach(() => {
   sessionRegistry.forget("parent-1");
   sessionRegistry.forget("parent-other");
   sessionRegistry.forget("child-1");
+  sessionRegistry.forget("channel-1");
+  clearBackgroundChannelDelivery("channel-1");
 });
 
 // ── handleSettings ────────────────────────────────────────
@@ -485,5 +491,39 @@ describe("handleDelegationEvents", () => {
 
     expect(res.statusCode).toBe(403);
     expect(frontend.calls).toHaveLength(0);
+  });
+
+  it("delivers background assistant messages to a registered channel even when Portal has no chat session", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    sessionRegistry.remember("channel-1", "lark:oc_1", "agent-1");
+    const delivered: string[] = [];
+    registerBackgroundChannelDelivery("channel-1", async (message) => {
+      delivered.push(message.content);
+      return true;
+    });
+    frontend.nextError = new Error("chat session not found");
+    const res = new FakeRes();
+
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.append_message",
+        message: {
+          sessionId: "channel-1",
+          role: "assistant",
+          content: "最终报告",
+          fromAgentId: "agent-1",
+          targetAgentId: "agent-1",
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+    expect(delivered).toEqual(["最终报告"]);
+    expect(frontend.calls[0].method).toBe("chat.appendMessage");
+    warnSpy.mockRestore();
   });
 });
