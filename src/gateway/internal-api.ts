@@ -21,6 +21,7 @@ import type { CertificateIdentity } from "./security/cert-manager.js";
 import { sessionRegistry } from "./session-registry.js";
 import {
   deliverBackgroundChannelMessage,
+  deliverChannelVisibleMessage,
   hasBackgroundChannelDelivery,
 } from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
@@ -123,6 +124,11 @@ async function validateDelegationEventActor(
     }
     case "delegation.emit_chat_event": {
       if (!(await sessionBelongsToIdentity(event.sessionId, identity))) return { status: 403, error: "delegation session mismatch" };
+      return null;
+    }
+    case "channel.deliver_message": {
+      if (!agentMatchesIdentity(event.message.fromAgentId, identity)) return { status: 403, error: "channel source agent mismatch" };
+      if (!(await sessionBelongsToIdentity(event.message.sessionId, identity))) return { status: 403, error: "channel session mismatch" };
       return null;
     }
     default:
@@ -587,6 +593,10 @@ export async function handleDelegationEvents(
       }
       case "delegation.emit_chat_event": {
         frontendClient.emitEvent("chat.event", { sessionId: event.sessionId, event: event.event });
+        break;
+      }
+      case "channel.deliver_message": {
+        response = { ok: await deliverChannelVisibleMessage(event.message) };
         break;
       }
       default: {

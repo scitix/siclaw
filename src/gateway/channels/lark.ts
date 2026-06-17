@@ -15,6 +15,7 @@ import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import {
   openTypingCard,
+  updateCardContent,
   finalizeCard,
   PLACEHOLDER_BY_LOCALE,
   EMPTY_RESULT_NOTICE_BY_LOCALE,
@@ -28,6 +29,7 @@ const VISUAL_ONLY_NOTICE_BY_LOCALE = {
   "zh-CN": "已生成图片如下。",
   "en-US": "Image generated below.",
 } as const;
+const MAX_AGENT_SELECTED_UPDATES = 2;
 
 export interface LarkChannelConfig {
   domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
@@ -190,7 +192,18 @@ export async function handleLarkMessage(
   // once the agent is done (preserves the pre-card behaviour).
   const cardSession = await openTypingCard(larkClient, messageId, PLACEHOLDER_BY_LOCALE[locale]);
   let deliveredTextChars = 0;
+  let deliveredAgentUpdates = 0;
   registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
+    if ("text" in backgroundMessage) {
+      const display = stripVisualBlocks(backgroundMessage.text) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
+      if (!shouldDeliverAgentSelectedUpdate(backgroundMessage.kind, display, deliveredAgentUpdates)) return true;
+      if (backgroundMessage.kind !== "final") deliveredAgentUpdates += 1;
+      const terminal = backgroundMessage.kind === "final";
+      const delivered = await deliverVisibleChannelText(larkClient, messageId, cardSession, display, terminal);
+      if (delivered) deliveredTextChars = display.length;
+      return delivered;
+    }
+
     const display = stripVisualBlocks(backgroundMessage.content) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
     if (!shouldDeliverBackgroundReply(display, deliveredTextChars)) return true;
     if (cardSession) {
@@ -286,6 +299,30 @@ function shouldDeliverBackgroundReply(text: string, previousChars: number): bool
   const chars = text.trim().length;
   if (chars === 0) return false;
   return !(previousChars > 80 && chars < 120 && chars < previousChars * 0.75);
+}
+
+function shouldDeliverAgentSelectedUpdate(kind: "milestone" | "final" | "artifact", text: string, deliveredUpdates: number): boolean {
+  if (!text.trim()) return false;
+  if (kind !== "final" && deliveredUpdates >= MAX_AGENT_SELECTED_UPDATES) return false;
+  return true;
+}
+
+async function deliverVisibleChannelText(
+  larkClient: any,
+  messageId: string,
+  cardSession: Awaited<ReturnType<typeof openTypingCard>>,
+  text: string,
+  terminal: boolean,
+): Promise<boolean> {
+  if (cardSession) {
+    const ok = terminal
+      ? await finalizeCard(larkClient, cardSession, text)
+      : await updateCardContent(larkClient, cardSession, text);
+    if (ok) return true;
+    console.warn(`[lark] Channel-visible card update failed for messageId=${messageId}; falling back to text reply`);
+  }
+  await replyToLark(larkClient, messageId, text);
+  return true;
 }
 
 async function replyVisualImages(larkClient: any, messageId: string, images: RenderedReplyImage[]): Promise<void> {

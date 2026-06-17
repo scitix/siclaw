@@ -1,6 +1,10 @@
-import type { DelegationAppendMessagePayload } from "../../shared/delegation-persistence.js";
+import type {
+  ChannelDeliverMessagePayload,
+  DelegationAppendMessagePayload,
+} from "../../shared/delegation-persistence.js";
 
-export type BackgroundChannelDelivery = (message: DelegationAppendMessagePayload) => Promise<boolean>;
+export type ChannelDeliveryPayload = DelegationAppendMessagePayload | ChannelDeliverMessagePayload;
+export type BackgroundChannelDelivery = (message: ChannelDeliveryPayload) => Promise<boolean>;
 
 interface DeliveryEntry {
   deliver: BackgroundChannelDelivery;
@@ -38,6 +42,15 @@ export async function deliverBackgroundChannelMessage(
   message: DelegationAppendMessagePayload,
 ): Promise<boolean> {
   if (message.role !== "assistant" || !message.content.trim()) return false;
+  const entry = getEntry(message.sessionId);
+  if (!entry) return false;
+  return entry.deliver(message);
+}
+
+export async function deliverChannelVisibleMessage(
+  message: ChannelDeliverMessagePayload,
+): Promise<boolean> {
+  if (!message.text.trim()) return false;
   const entry = getEntry(message.sessionId);
   if (!entry) return false;
   return entry.deliver(message);
