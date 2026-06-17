@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createLarkHandler, handleLarkMessage, collectResponse, collectChannelResponse } from "./lark.js";
+import { clearBackgroundChannelDelivery, deliverBackgroundChannelMessage } from "./background-delivery.js";
 import { sessionRegistry } from "../session-registry.js";
 
 // ── Mocks ──────────────────────────────────────────────────────────
@@ -357,6 +358,57 @@ describe("handleLarkMessage — streaming card flow", () => {
     const settingsPayload = JSON.parse(lark.cardkit.v1.card.settings.mock.calls[0][0].data.settings);
     expect(settingsPayload.config.streaming_mode).toBe(false);
     expect(lark.im.image.create).not.toHaveBeenCalled();
+  });
+
+  it("updates the Lark card when a background channel report arrives after the first SSE turn", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-background" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "已经启动检查，完成后汇总。" }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+    const sessionId = promptMock.mock.calls[0][0].sessionId;
+
+    const finalReport = [
+      "# 集群节点健康报告",
+      "",
+      "所有节点 Ready，但 nodepool-061 存在 GPFS 访问 Warning，需要排查存储挂载。",
+      "",
+      "| 节点 | 状态 | 结论 |",
+      "| --- | --- | --- |",
+      "| nodepool-061 | Ready | 有 GPFS Warning |",
+    ].join("\n");
+    await deliverBackgroundChannelMessage({
+      sessionId,
+      role: "assistant",
+      content: finalReport,
+    });
+    await deliverBackgroundChannelMessage({
+      sessionId,
+      role: "assistant",
+      content: "Worker 子代理没有新发现，无需补充。",
+    });
+
+    const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
+    expect(contentCalls.at(-1)[0].data.content).toContain("集群节点健康报告");
+    expect(contentCalls.at(-1)[0].data.content).toContain("GPFS");
+    expect(contentCalls).toHaveLength(2);
+    clearBackgroundChannelDelivery(sessionId);
   });
 
   it("keeps numeric tables in markdown and does not synthesize chart images", async () => {

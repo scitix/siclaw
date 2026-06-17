@@ -22,6 +22,7 @@ import {
 } from "./lark-card.js";
 import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 import { replyImageToLark } from "./lark-image.js";
+import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
   "zh-CN": "已生成图片如下。",
@@ -188,6 +189,22 @@ export async function handleLarkMessage(
   // If the CardKit APIs fail we fall back to posting a plain text reply
   // once the agent is done (preserves the pre-card behaviour).
   const cardSession = await openTypingCard(larkClient, messageId, PLACEHOLDER_BY_LOCALE[locale]);
+  let deliveredTextChars = 0;
+  registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
+    const display = stripVisualBlocks(backgroundMessage.content) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
+    if (!shouldDeliverBackgroundReply(display, deliveredTextChars)) return true;
+    if (cardSession) {
+      const ok = await finalizeCard(larkClient, cardSession, display);
+      if (ok) {
+        deliveredTextChars = display.length;
+        return true;
+      }
+      console.warn(`[lark] Background card update failed for session=${sessionId}; falling back to text reply`);
+    }
+    await replyToLark(larkClient, messageId, display);
+    deliveredTextChars = display.length;
+    return true;
+  });
 
   // Get or create AgentBox for this agent (shared across all callers).
   const handle = await agentBoxManager.getOrCreate(agentId);
@@ -218,6 +235,7 @@ export async function handleLarkMessage(
 
   if (cardSession) {
     const ok = await finalizeCard(larkClient, cardSession, displayBody);
+    deliveredTextChars = displayBody.length;
     if (!ok) {
       // Partial-failure path: the card is visible but stuck in streaming
       // state. We log but do NOT post a second reply — that would produce
@@ -228,6 +246,7 @@ export async function handleLarkMessage(
     // Card could not be opened; fall back to a plain text reply with
     // whatever we have (final answer or error).
     await replyToLark(larkClient, messageId, displayBody);
+    deliveredTextChars = displayBody.length;
   }
 
   await replyVisualImages(larkClient, messageId, replyImages);
@@ -261,6 +280,12 @@ async function replyToLark(larkClient: any, messageId: string, text: string): Pr
   } catch (err) {
     console.error(`[lark] Failed to reply to messageId=${messageId}:`, err);
   }
+}
+
+function shouldDeliverBackgroundReply(text: string, previousChars: number): boolean {
+  const chars = text.trim().length;
+  if (chars === 0) return false;
+  return !(previousChars > 80 && chars < 120 && chars < previousChars * 0.75);
 }
 
 async function replyVisualImages(larkClient: any, messageId: string, images: RenderedReplyImage[]): Promise<void> {

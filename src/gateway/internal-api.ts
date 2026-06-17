@@ -19,6 +19,10 @@ import { randomUUID } from "node:crypto";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 import { sessionRegistry } from "./session-registry.js";
+import {
+  deliverBackgroundChannelMessage,
+  hasBackgroundChannelDelivery,
+} from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import type {
   DelegationAppendMessagePayload,
@@ -556,7 +560,18 @@ export async function handleDelegationEvents(
         break;
       }
       case "delegation.append_message": {
-        response = { ok: true, id: await appendDelegationMessage(frontendClient, event.message) };
+        const deliveredToChannel = await deliverBackgroundChannelMessage(event.message);
+        const channelRegistered = hasBackgroundChannelDelivery(event.message.sessionId);
+        try {
+          response = { ok: true, id: await appendDelegationMessage(frontendClient, event.message) };
+        } catch (err) {
+          if (!deliveredToChannel && !channelRegistered) throw err;
+          console.warn(
+            `[internal-api] Portal append failed for channel background session=${event.message.sessionId} delivered=${deliveredToChannel}:`,
+            err,
+          );
+          response = { ok: true };
+        }
         break;
       }
       case "delegation.update_message": {
