@@ -411,6 +411,50 @@ describe("handleLarkMessage — streaming card flow", () => {
     clearBackgroundChannelDelivery(sessionId);
   });
 
+  it("forwards background tool image metadata as a Feishu image without posting tool text", async () => {
+    const onePixelBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-background-image" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "已经启动检查，完成后汇总。" }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+    const sessionId = promptMock.mock.calls[0][0].sessionId;
+
+    const delivered = await deliverBackgroundChannelMessage({
+      sessionId,
+      role: "tool",
+      content: "READY_TO_PASTE:\n```visual-card\n{}\n```",
+      metadata: { images: [{ mimeType: "image/png", data: onePixelBase64 }] },
+    });
+
+    expect(delivered).toBe(true);
+    expect(lark.im.image.create).toHaveBeenCalledTimes(1);
+    expect([...lark.im.image.create.mock.calls[0][0].data.image.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+    expect(lark.im.message.reply.mock.calls[1][0].data.msg_type).toBe("image");
+    const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
+    expect(contentCalls).toHaveLength(1);
+    expect(contentCalls[0][0].data.content).not.toContain("READY_TO_PASTE");
+    clearBackgroundChannelDelivery(sessionId);
+  });
+
   it("keeps numeric tables in markdown and does not synthesize chart images", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s-chart" });

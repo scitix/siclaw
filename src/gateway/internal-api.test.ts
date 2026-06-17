@@ -528,6 +528,40 @@ describe("handleDelegationEvents", () => {
     expect(frontend.calls[0].method).toBe("chat.appendMessage");
     warnSpy.mockRestore();
   });
+
+  it("delivers background image metadata from tool messages to a registered channel", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    sessionRegistry.remember("channel-1", "lark:oc_1", "agent-1");
+    const delivered: Array<{ role: string; images: unknown }> = [];
+    registerBackgroundChannelDelivery("channel-1", async (message) => {
+      delivered.push({ role: message.role, images: message.metadata?.images });
+      return true;
+    });
+    frontend.nextError = new Error("chat session not found");
+    const res = new FakeRes();
+
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.append_message",
+        message: {
+          sessionId: "channel-1",
+          role: "tool",
+          content: "READY_TO_PASTE:\n```visual-card\n{}\n```",
+          metadata: { images: [{ mimeType: "image/png", data: "abc" }] },
+          fromAgentId: "agent-1",
+          targetAgentId: "agent-1",
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+    expect(delivered).toEqual([{ role: "tool", images: [{ mimeType: "image/png", data: "abc" }] }]);
+    warnSpy.mockRestore();
+  });
 });
 
 // ── handleMetricsFlush (module 5) ─────────────────────────
