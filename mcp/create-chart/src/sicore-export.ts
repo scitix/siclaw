@@ -1,3 +1,6 @@
+import { mkdir } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { chromium, type Browser } from "playwright-core";
 
 export interface SicoreExportedVisual {
@@ -80,13 +83,31 @@ async function launchBrowser(): Promise<Browser> {
     process.env.SICORE_VISUAL_EXPORT_CHROMIUM ??
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ??
     "/usr/bin/chromium";
+  const runtimeDir = path.join(os.tmpdir(), "siclaw-chromium");
+  const homeDir = path.join(runtimeDir, "home");
+  const configDir = path.join(runtimeDir, "config");
+  const cacheDir = path.join(runtimeDir, "cache");
+  const crashDir = path.join(runtimeDir, "crash");
+  await Promise.all([
+    mkdir(homeDir, { recursive: true }),
+    mkdir(configDir, { recursive: true }),
+    mkdir(cacheDir, { recursive: true }),
+    mkdir(crashDir, { recursive: true }),
+  ]);
   return await chromium.launch({
     executablePath,
     headless: true,
+    env: {
+      ...process.env,
+      HOME: homeDir,
+      XDG_CONFIG_HOME: configDir,
+      XDG_CACHE_HOME: cacheDir,
+    },
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
+      `--crash-dumps-dir=${crashDir}`,
       "--font-render-hinting=none",
     ],
   });
