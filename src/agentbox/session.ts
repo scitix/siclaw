@@ -68,47 +68,6 @@ import {
 import type { GatewayClient } from "./gateway-client.js";
 // topic-consolidator import removed — consolidation disabled
 
-function serializeImageContentBlocks(content: unknown): Array<{ mimeType: string; data: string }> {
-  if (!Array.isArray(content)) return [];
-  const images: Array<{ mimeType: string; data: string }> = [];
-  for (const block of content) {
-    if (!block || typeof block !== "object") continue;
-    const rec = block as Record<string, unknown>;
-    if (rec.type !== "image") continue;
-
-    const direct = serializeBase64Image(rec.data, rec.mimeType ?? rec.mime_type);
-    if (direct) {
-      images.push(direct);
-      continue;
-    }
-
-    const source = rec.source;
-    if (source && typeof source === "object") {
-      const raw = source as Record<string, unknown>;
-      if (raw.type === "base64") {
-        const sourced = serializeBase64Image(raw.data, raw.media_type ?? raw.mimeType ?? raw.mime_type);
-        if (sourced) images.push(sourced);
-      }
-    }
-  }
-  return images;
-}
-
-function serializeBase64Image(data: unknown, mimeType: unknown): { mimeType: string; data: string } | null {
-  if (typeof data !== "string" || typeof mimeType !== "string") return null;
-  const normalized = normalizeImageMimeType(mimeType);
-  if (!normalized) return null;
-  const compact = data.replace(/\s+/g, "");
-  return compact.length > 0 ? { mimeType: normalized, data: compact } : null;
-}
-
-function normalizeImageMimeType(mimeType: string): string | null {
-  const normalized = mimeType.toLowerCase();
-  if (normalized === "image/png" || normalized === "image/webp") return normalized;
-  if (normalized === "image/jpeg" || normalized === "image/jpg") return "image/jpeg";
-  return null;
-}
-
 export interface ManagedSession {
   id: string;
   brain: BrainSession;
@@ -1058,13 +1017,6 @@ export class AgentBoxSessionManager {
       : typeof message.content === "string" ? message.content : "";
     if (role === "assistant" && !content.trim()) return; // skip empty (pure tool-call) assistant frames
     const isNotification = role === "user" && content.trimStart().startsWith("<task_notification>");
-    const metadata: Record<string, unknown> = isNotification
-      ? { kind: "task_notification" }
-      : role === "assistant" && modelRouteMetadata
-        ? { model_route: modelRouteMetadata }
-        : {};
-    const images = serializeImageContentBlocks(message.content);
-    if (images.length > 0) metadata.images = images;
     await this.persistAppendMessage({
       sessionId,
       parentSessionId: sessionId,
@@ -1073,7 +1025,11 @@ export class AgentBoxSessionManager {
       role,
       content,
       toolName: message.toolName ?? null,
-      metadata: Object.keys(metadata).length > 0 ? metadata : null,
+      metadata: isNotification
+        ? { kind: "task_notification" }
+        : role === "assistant" && modelRouteMetadata
+          ? { model_route: modelRouteMetadata }
+          : null,
       // A COMPLETED tool row must persist a terminal outcome. Without this a successful tool call
       // in a synthetic (background-completion) turn was written with outcome=null, which the
       // frontend maps to "running" → a spinner that never resolves and a recovered-run poller stuck

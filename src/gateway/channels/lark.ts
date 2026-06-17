@@ -20,13 +20,7 @@ import {
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
 } from "./lark-card.js";
-import {
-  collectImageAttachments,
-  collectImageAttachmentsFromMetadata,
-  imageAttachmentKey,
-  stripVisualBlocks,
-  type RenderedReplyImage,
-} from "./visual-image.js";
+import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 import { replyImageToLark } from "./lark-image.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
@@ -196,42 +190,19 @@ export async function handleLarkMessage(
   // once the agent is done (preserves the pre-card behaviour).
   const cardSession = await openTypingCard(larkClient, messageId, PLACEHOLDER_BY_LOCALE[locale]);
   let deliveredTextChars = 0;
-  let initialReplyCompleted = false;
-  const deliveredImageKeys = new Set<string>();
-  const pendingBackgroundImages: RenderedReplyImage[] = [];
   registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
-    const backgroundImages: RenderedReplyImage[] = [];
-    collectImageAttachmentsFromMetadata(backgroundMessage.metadata, backgroundImages, new Set());
-    if (backgroundMessage.role !== "assistant") {
-      if (initialReplyCompleted) {
-        await replyVisualImages(larkClient, messageId, backgroundImages, deliveredImageKeys);
-      } else {
-        pendingBackgroundImages.push(...backgroundImages);
-      }
-      return backgroundImages.length > 0;
-    }
     const display = stripVisualBlocks(backgroundMessage.content) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
     if (!shouldDeliverBackgroundReply(display, deliveredTextChars)) return true;
     if (cardSession) {
       const ok = await finalizeCard(larkClient, cardSession, display);
       if (ok) {
         deliveredTextChars = display.length;
-        if (initialReplyCompleted) {
-          await replyVisualImages(larkClient, messageId, backgroundImages, deliveredImageKeys);
-        } else {
-          pendingBackgroundImages.push(...backgroundImages);
-        }
         return true;
       }
       console.warn(`[lark] Background card update failed for session=${sessionId}; falling back to text reply`);
     }
     await replyToLark(larkClient, messageId, display);
     deliveredTextChars = display.length;
-    if (initialReplyCompleted) {
-      await replyVisualImages(larkClient, messageId, backgroundImages, deliveredImageKeys);
-    } else {
-      pendingBackgroundImages.push(...backgroundImages);
-    }
     return true;
   });
 
@@ -278,8 +249,7 @@ export async function handleLarkMessage(
     deliveredTextChars = displayBody.length;
   }
 
-  initialReplyCompleted = true;
-  await replyVisualImages(larkClient, messageId, [...pendingBackgroundImages, ...replyImages], deliveredImageKeys);
+  await replyVisualImages(larkClient, messageId, replyImages);
 }
 
 /**
@@ -318,19 +288,11 @@ function shouldDeliverBackgroundReply(text: string, previousChars: number): bool
   return !(previousChars > 80 && chars < 120 && chars < previousChars * 0.75);
 }
 
-async function replyVisualImages(
-  larkClient: any,
-  messageId: string,
-  images: RenderedReplyImage[],
-  deliveredImageKeys: Set<string> = new Set(),
-): Promise<void> {
-  for (const imageAttachment of images) {
-    const key = imageAttachmentKey(imageAttachment);
-    if (deliveredImageKeys.has(key)) continue;
-    deliveredImageKeys.add(key);
-    const ok = await replyImageToLark(larkClient, messageId, imageAttachment.image);
+async function replyVisualImages(larkClient: any, messageId: string, images: RenderedReplyImage[]): Promise<void> {
+  for (const { kind, image } of images) {
+    const ok = await replyImageToLark(larkClient, messageId, image);
     if (!ok) {
-      console.warn(`[lark] ${imageAttachment.kind} image reply failed for messageId=${messageId}; markdown card remains primary`);
+      console.warn(`[lark] ${kind} image reply failed for messageId=${messageId}; markdown card remains primary`);
     }
   }
 }

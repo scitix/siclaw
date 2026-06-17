@@ -1,5 +1,4 @@
 import type { DelegationAppendMessagePayload } from "../../shared/delegation-persistence.js";
-import { hasImageAttachmentsInMetadata } from "./visual-image.js";
 
 export type BackgroundChannelDelivery = (message: DelegationAppendMessagePayload) => Promise<boolean>;
 
@@ -38,9 +37,7 @@ export function hasBackgroundChannelDelivery(sessionId: string | undefined): boo
 export async function deliverBackgroundChannelMessage(
   message: DelegationAppendMessagePayload,
 ): Promise<boolean> {
-  const hasAssistantText = message.role === "assistant" && message.content.trim().length > 0;
-  const hasImages = hasImageAttachmentsInMetadata(message.metadata);
-  if (!hasAssistantText && !hasImages) return false;
+  if (message.role !== "assistant" || !message.content.trim()) return false;
   const entry = getEntry(message.sessionId);
   if (!entry) return false;
   return entry.deliver(message);

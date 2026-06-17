@@ -4,11 +4,6 @@ export interface RenderedReplyImage {
   image: Buffer;
 }
 
-export interface SerializedReplyImage {
-  mimeType: RenderedReplyImage["mimeType"];
-  data: string;
-}
-
 export interface StripVisualBlocksOptions {
   stripSourceBlocks?: boolean;
 }
@@ -36,36 +31,6 @@ export function collectImageAttachments(
     seenImageKeys.add(key);
     target.push(image);
   }
-}
-
-export function imageAttachmentKey(image: RenderedReplyImage): string {
-  return `${image.mimeType}:${image.image.toString("base64")}`;
-}
-
-export function collectImageAttachmentsFromMetadata(
-  metadata: unknown,
-  target: RenderedReplyImage[],
-  seenImageKeys: Set<string>,
-): void {
-  if (!metadata || typeof metadata !== "object") return;
-  const images = (metadata as Record<string, unknown>).images;
-  if (!Array.isArray(images)) return;
-  for (const raw of images) {
-    if (!raw || typeof raw !== "object") continue;
-    const rec = raw as Record<string, unknown>;
-    const image = imageFromBase64(rec.data, rec.mimeType ?? rec.mime_type);
-    if (!image) continue;
-    const key = imageAttachmentKey(image);
-    if (seenImageKeys.has(key)) continue;
-    seenImageKeys.add(key);
-    target.push(image);
-  }
-}
-
-export function hasImageAttachmentsInMetadata(metadata: unknown): boolean {
-  if (!metadata || typeof metadata !== "object") return false;
-  const images = (metadata as Record<string, unknown>).images;
-  return Array.isArray(images) && images.length > 0;
 }
 
 export function stripVisualBlocks(markdown: string, options: StripVisualBlocksOptions = {}): string {
