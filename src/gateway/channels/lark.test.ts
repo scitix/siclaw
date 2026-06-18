@@ -263,6 +263,33 @@ describe("handleLarkMessage — PAIR command", () => {
     expect(handlePairingCodeMock.mock.calls[0][0]).toBe("ABC123");
   });
 
+  it("uses group_channel_id for group PAIR when the same handler also has a personal bot", async () => {
+    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
+    await handleLarkMessage(
+      makeTextEvent("PAIR ABC123"),
+      makeLarkClient(),
+      "lark-runtime",
+      makeAgentBoxManager() as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      {
+        app_id: "cli_shared",
+        app_secret: "secret",
+        group_channel_id: "lark",
+        personal_bot: {
+          channel_id: "pb-1",
+          agent_id: "a1",
+          access_mode: "open",
+          owner_user_id: "owner-1",
+        },
+      },
+    );
+
+    expect(handlePairingCodeMock).toHaveBeenCalledWith("ABC123", "lark", "oc_abc123", "group", expect.anything());
+    expect(handlePersonalPairingCodeMock).not.toHaveBeenCalled();
+  });
+
   it("PAIR success reply is Chinese for zh-CN (feishu domain)", async () => {
     handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
     const lark = makeLarkClient();
@@ -306,6 +333,42 @@ describe("handleLarkMessage — PAIR command", () => {
 });
 
 describe("handleLarkMessage — personal bot p2p", () => {
+  it("uses personal_bot.channel_id for p2p binding inside a shared Feishu app handler", async () => {
+    resolvePersonalBindingMock.mockResolvedValue(makeBinding({
+      bindingId: "pb-1",
+      sessionId: "session-open-ou1",
+      sessionKey: "open_id:ou_user_1",
+      routeType: "user",
+      createdBy: "owner-1",
+    }));
+    promptMock.mockResolvedValue({ sessionId: "session-open-ou1" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makeTextEvent("hello personal", { chat_type: "p2p" }),
+      makeLarkClient(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      {
+        app_id: "cli_shared",
+        app_secret: "secret",
+        group_channel_id: "lark",
+        personal_bot: {
+          channel_id: "pb-1",
+          agent_id: "a1",
+          access_mode: "open",
+          owner_user_id: "owner-1",
+        },
+      },
+    );
+
+    expect(resolvePersonalBindingMock.mock.calls.map((call) => call[0])).toEqual(["pb-1", "pb-1"]);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
   it("open mode resolves a p2p sender and uses the returned per-openid session", async () => {
     resolvePersonalBindingMock.mockResolvedValue(makeBinding({
       bindingId: "personal-bot-1",
@@ -417,6 +480,23 @@ describe("handleLarkMessage — personal bot p2p", () => {
     expect(closeSessionMock).toHaveBeenCalledWith("old-personal");
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
   });
+
+  it("ignores group messages received by a personal-only handler", async () => {
+    await handleLarkMessage(
+      makeTextEvent("PAIR ABC123"),
+      makeLarkClient(),
+      "lark:personal:pb-1",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      makePersonalConfig("open"),
+    );
+
+    expect(handlePairingCodeMock).not.toHaveBeenCalled();
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+    expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("handleLarkMessage — routing to AgentBox", () => {
@@ -427,6 +507,33 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1");
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("uses group_channel_id for normal group messages in a shared Feishu app handler", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      makeLarkClient(),
+      "lark-runtime",
+      makeAgentBoxManager() as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      {
+        app_id: "cli_shared",
+        app_secret: "secret",
+        group_channel_id: "lark",
+        personal_bot: {
+          channel_id: "pb-1",
+          agent_id: "a1",
+          access_mode: "open",
+          owner_user_id: "owner-1",
+        },
+      },
+    );
+
+    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1");
+    expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
   });
 
   it("with binding → getOrCreate uses agentId alone, and registers the durable channel session owner", async () => {

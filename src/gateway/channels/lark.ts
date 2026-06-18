@@ -73,9 +73,11 @@ export interface LarkChannelConfig {
   domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
   app_id: string;
   app_secret: string;
+  group_channel_id?: string;
   verification_token?: string;
   encrypt_key?: string;
   personal_bot?: {
+    channel_id?: string;
     agent_id: string;
     access_mode: "open" | "sicore_authorized";
     owner_user_id?: string;
@@ -276,6 +278,8 @@ export async function handleLarkMessage(
   if (text.length === 0) return;
 
   const personalBot = channelConfig?.personal_bot;
+  const personalChannelId = personalBot?.channel_id ?? channelId;
+  const groupChannelId = channelConfig?.group_channel_id ?? (personalBot ? null : channelId);
   if (chatType === "p2p") {
     if (!personalBot) {
       console.log(`[lark] Ignoring p2p message for non-personal channel=${channelId}`);
@@ -294,12 +298,12 @@ export async function handleLarkMessage(
         return;
       }
       const code = pairMatch[1].toUpperCase();
-      const result = await handlePersonalPairingCode(code, channelId, senderOpenId, frontendClient!);
+      const result = await handlePersonalPairingCode(code, personalChannelId, senderOpenId, frontendClient!);
       await replyToLark(larkClient, messageId, formatPersonalPairReply(result, locale));
       return;
     }
 
-    const binding = await resolvePersonalBinding(channelId, senderOpenId, frontendClient!);
+    const binding = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient!);
     if (!binding) {
       if (personalBot.access_mode === "sicore_authorized") {
         await replyToLark(larkClient, messageId, PERSONAL_BIND_REQUIRED_NOTICE_BY_LOCALE[locale]);
@@ -317,7 +321,7 @@ export async function handleLarkMessage(
       chatId,
       senderOpenId,
       sessionKey: personalSessionKey,
-      channelId,
+      channelId: personalChannelId,
       route: "personal",
       larkClient,
       agentBoxManager,
@@ -333,11 +337,16 @@ export async function handleLarkMessage(
     return;
   }
 
+  if (!groupChannelId) {
+    console.log(`[lark] Ignoring group message for personal-only channel=${channelId}`);
+    return;
+  }
+
   // Check for PAIR command
   const pairMatch = text.match(/^PAIR\s+([A-Z0-9]{6})$/i);
   if (pairMatch) {
     const code = pairMatch[1].toUpperCase();
-    const result = await handlePairingCode(code, channelId, chatId, "group", frontendClient!);
+    const result = await handlePairingCode(code, groupChannelId, chatId, "group", frontendClient!);
 
     const replyText = formatPairReply(result, locale);
     await replyToLark(larkClient, messageId, replyText);
@@ -345,9 +354,9 @@ export async function handleLarkMessage(
   }
 
   // Look up binding for this chat
-  const binding = await resolveBinding(channelId, chatId, frontendClient!, sessionKey);
+  const binding = await resolveBinding(groupChannelId, chatId, frontendClient!, sessionKey);
   if (!binding) {
-    console.log(`[lark] No binding for channel=${channelId} chat=${chatId} — ignoring`);
+    console.log(`[lark] No binding for channel=${groupChannelId} chat=${chatId} — ignoring`);
     // Don't spam the group with "not paired" for every message.
     // Only reply if the message looks like it's directed at the bot (@mention).
     return;
@@ -360,7 +369,7 @@ export async function handleLarkMessage(
     chatId,
     senderOpenId,
     sessionKey,
-    channelId,
+    channelId: groupChannelId,
     route: "group",
     larkClient,
     agentBoxManager,
