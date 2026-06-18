@@ -18,6 +18,18 @@ export interface ChannelHandler {
   stop(): Promise<void>;
 }
 
+interface RunningChannel {
+  handler: ChannelHandler;
+  fingerprint: string;
+}
+
+export interface ChannelReloadResult {
+  started: number;
+  restarted: number;
+  stopped: number;
+  unchanged: number;
+}
+
 export interface ResolvedChannelBinding {
   agentId: string;
   bindingId: string;
@@ -116,7 +128,7 @@ export interface ChannelManagerOptions {
 }
 
 export class ChannelManager {
-  private handlers = new Map<string, ChannelHandler>();
+  private handlers = new Map<string, RunningChannel>();
   private readonly bootRetryAttempts: number;
   private readonly bootRetryBaseMs: number;
 
@@ -160,17 +172,9 @@ export class ChannelManager {
       }
 
       try {
-        const result = await this.frontendClient.request("channel.list") as { data: Record<string, any>[] };
-        const channels = result.data;
+        const channels = await this.fetchChannels();
         console.log(`[channel-manager] Found ${channels.length} active channel(s)`);
-
-        for (const ch of channels) {
-          try {
-            await this.startChannel(ch);
-          } catch (err) {
-            console.error(`[channel-manager] Failed to start channel id=${ch.id} type=${ch.type}:`, err);
-          }
-        }
+        await this.reconcileChannels(channels);
         return;
       } catch (err) {
         if (attempt === maxAttempts) {
@@ -184,10 +188,72 @@ export class ChannelManager {
     }
   }
 
-  async startChannel(channel: Record<string, any>): Promise<void> {
+  async reloadFromDb(): Promise<ChannelReloadResult> {
+    if (!this.frontendClient?.connected) {
+      throw new Error("FrontendWsClient is not connected");
+    }
+    const channels = await this.fetchChannels();
+    const result = await this.reconcileChannels(channels);
+    console.log(
+      `[channel-manager] Reloaded channels started=${result.started} restarted=${result.restarted} stopped=${result.stopped} unchanged=${result.unchanged}`,
+    );
+    return result;
+  }
+
+  private async fetchChannels(): Promise<Record<string, any>[]> {
+    const result = await this.frontendClient!.request("channel.list") as { data?: Record<string, any>[] };
+    return Array.isArray(result.data) ? result.data : [];
+  }
+
+  private async reconcileChannels(channels: Record<string, any>[]): Promise<ChannelReloadResult> {
+    const result: ChannelReloadResult = { started: 0, restarted: 0, stopped: 0, unchanged: 0 };
+    const desired = new Map<string, { channel: Record<string, any>; fingerprint: string }>();
+    for (const channel of channels) {
+      if (typeof channel.id !== "string" || channel.id.length === 0) {
+        console.warn("[channel-manager] Skipping channel without id");
+        continue;
+      }
+      desired.set(channel.id, { channel, fingerprint: channelFingerprint(channel) });
+    }
+
+    for (const [id, running] of [...this.handlers.entries()]) {
+      const next = desired.get(id);
+      if (!next) {
+        await this.stopChannel(id);
+        result.stopped += 1;
+        continue;
+      }
+      if (next.fingerprint === running.fingerprint) {
+        result.unchanged += 1;
+        desired.delete(id);
+        continue;
+      }
+      await this.stopChannel(id);
+      result.stopped += 1;
+      try {
+        await this.startChannel(next.channel, next.fingerprint);
+        result.restarted += 1;
+      } catch (err) {
+        console.error(`[channel-manager] Failed to restart channel id=${next.channel.id} type=${next.channel.type}:`, err);
+      }
+      desired.delete(id);
+    }
+
+    for (const { channel, fingerprint } of desired.values()) {
+      try {
+        const started = await this.startChannel(channel, fingerprint);
+        if (started) result.started += 1;
+      } catch (err) {
+        console.error(`[channel-manager] Failed to start channel id=${channel.id} type=${channel.type}:`, err);
+      }
+    }
+    return result;
+  }
+
+  async startChannel(channel: Record<string, any>, fingerprint = channelFingerprint(channel)): Promise<boolean> {
     if (this.handlers.has(channel.id)) {
       console.warn(`[channel-manager] Channel id=${channel.id} already running — skipping`);
-      return;
+      return false;
     }
 
     let handler: ChannelHandler;
@@ -211,17 +277,18 @@ export class ChannelManager {
         break;
       default:
         console.warn(`[channel-manager] Unsupported channel type="${channel.type}" — skipping id=${channel.id}`);
-        return;
+        return false;
     }
 
     await handler.start();
-    this.handlers.set(channel.id, handler);
+    this.handlers.set(channel.id, { handler, fingerprint });
+    return true;
   }
 
   async stopChannel(channelId: string): Promise<void> {
-    const handler = this.handlers.get(channelId);
-    if (!handler) return;
-    try { await handler.stop(); } catch (err) {
+    const running = this.handlers.get(channelId);
+    if (!running) return;
+    try { await running.handler.stop(); } catch (err) {
       console.error(`[channel-manager] Error stopping channel id=${channelId}:`, err);
     }
     this.handlers.delete(channelId);
@@ -234,4 +301,31 @@ export class ChannelManager {
   }
 
   get size(): number { return this.handlers.size; }
+}
+
+function channelFingerprint(channel: Record<string, any>): string {
+  return stableStringify({
+    id: channel.id,
+    type: channel.type,
+    config: typeof channel.config === "string" ? safeParseJson(channel.config) ?? channel.config : channel.config,
+  });
+}
+
+function safeParseJson(input: string): unknown | null {
+  try {
+    return JSON.parse(input);
+  } catch {
+    return null;
+  }
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    return `{${Object.keys(obj).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(obj[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
 }

@@ -233,6 +233,54 @@ describe("ChannelManager.bootFromDb", () => {
     warnSpy.mockRestore();
   });
 
+  it("reloadFromDb starts newly added channels without touching unchanged handlers", async () => {
+    frontend.responses.set("channel.list", {
+      data: [{ id: "c1", type: "lark", config: { app_id: "a", app_secret: "s" } }],
+    });
+    const mgr = new ChannelManager(fakeManager, undefined, frontend as unknown as FrontendWsClient);
+    await mgr.bootFromDb();
+    const first = fakeHandlerRegistry[0];
+
+    frontend.responses.set("channel.list", {
+      data: [
+        { id: "c1", type: "lark", config: { app_id: "a", app_secret: "s" } },
+        { id: "c2", type: "lark", config: { app_id: "b", app_secret: "s2" } },
+      ],
+    });
+    const result = await mgr.reloadFromDb();
+
+    expect(result).toEqual({ started: 1, restarted: 0, stopped: 0, unchanged: 1 });
+    expect(first.stopped).toBe(false);
+    expect(fakeHandlerRegistry).toHaveLength(2);
+    expect(fakeHandlerRegistry[1].started).toBe(true);
+    expect(mgr.size).toBe(2);
+  });
+
+  it("reloadFromDb restarts changed channels and stops removed channels", async () => {
+    frontend.responses.set("channel.list", {
+      data: [
+        { id: "c1", type: "lark", config: { app_id: "a", app_secret: "s" } },
+        { id: "c2", type: "lark", config: { app_id: "b", app_secret: "s2" } },
+      ],
+    });
+    const mgr = new ChannelManager(fakeManager, undefined, frontend as unknown as FrontendWsClient);
+    await mgr.bootFromDb();
+    const first = fakeHandlerRegistry[0];
+    const removed = fakeHandlerRegistry[1];
+
+    frontend.responses.set("channel.list", {
+      data: [{ id: "c1", type: "lark", config: { app_id: "a", app_secret: "rotated" } }],
+    });
+    const result = await mgr.reloadFromDb();
+
+    expect(result).toEqual({ started: 0, restarted: 1, stopped: 2, unchanged: 0 });
+    expect(first.stopped).toBe(true);
+    expect(removed.stopped).toBe(true);
+    expect(fakeHandlerRegistry).toHaveLength(3);
+    expect(fakeHandlerRegistry[2].started).toBe(true);
+    expect(mgr.size).toBe(1);
+  });
+
 });
 
 describe("ChannelManager.startChannel / stopChannel", () => {
