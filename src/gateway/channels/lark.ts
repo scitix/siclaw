@@ -30,12 +30,12 @@ const VISUAL_ONLY_NOTICE_BY_LOCALE = {
   "en-US": "Image generated below.",
 } as const;
 const QUEUE_FULL_NOTICE_BY_LOCALE = {
-  "zh-CN": "⏳ 当前群组还有较多消息排队处理中，请稍后再发。",
-  "en-US": "⏳ This group already has several messages queued. Please try again later.",
+  "zh-CN": "⏳ 当前会话还有较多消息排队处理中，请稍后再发。",
+  "en-US": "⏳ This channel session already has several messages queued. Please try again later.",
 } as const;
 const NEW_SESSION_NOTICE_BY_LOCALE = {
-  "zh-CN": "✅ 已开启新会话，之前的群聊上下文已清空。",
-  "en-US": "✅ Started a new session for this group. Previous group context has been cleared.",
+  "zh-CN": "✅ 已开启新会话，你在此群中的历史上下文已清空。",
+  "en-US": "✅ Started a new session for you in this group. Your previous group context has been cleared.",
 } as const;
 const MISSING_OWNER_NOTICE_BY_LOCALE = {
   "zh-CN": "❌ 当前群绑定缺少会话归属信息，请在 Agent 页面重新生成 PAIR code 并在群里重新绑定。",
@@ -193,6 +193,16 @@ function drainBindingQueue(bindingId: string): void {
   })();
 }
 
+function getLarkSenderOpenId(data: any): string | null {
+  const senderId = data?.sender?.sender_id ?? data?.event?.sender?.sender_id;
+  const openId = senderId?.open_id;
+  return typeof openId === "string" && openId.trim() ? openId.trim() : null;
+}
+
+function buildLarkSessionKey(senderOpenId: string | null, chatId: string): string {
+  return senderOpenId ? `open_id:${senderOpenId}` : `chat:${chatId}`;
+}
+
 export function buildChannelTurnPrompt(text: string): string {
   return [
     "<channel-turn>",
@@ -231,6 +241,8 @@ export async function handleLarkMessage(
   const messageId: string = message.message_id;
   const chatId: string = message.chat_id;
   const msgType: string = message.message_type;
+  const senderOpenId = getLarkSenderOpenId(data);
+  const sessionKey = buildLarkSessionKey(senderOpenId, chatId);
 
   if (msgType !== "text") return;
 
@@ -256,7 +268,7 @@ export async function handleLarkMessage(
   }
 
   // Look up binding for this chat
-  const binding = await resolveBinding(channelId, chatId, frontendClient!);
+  const binding = await resolveBinding(channelId, chatId, frontendClient!, sessionKey);
   if (!binding) {
     console.log(`[lark] No binding for channel=${channelId} chat=${chatId} — ignoring`);
     // Don't spam the group with "not paired" for every message.
@@ -264,10 +276,13 @@ export async function handleLarkMessage(
     return;
   }
 
-  const queued = enqueueBindingTask(binding.bindingId, () => processQueuedLarkMessage({
+  const queueKey = `${binding.bindingId}:${binding.sessionKey ?? sessionKey}`;
+  const queued = enqueueBindingTask(queueKey, () => processQueuedLarkMessage({
     text,
     messageId,
     chatId,
+    senderOpenId,
+    sessionKey,
     channelId,
     larkClient,
     agentBoxManager,
@@ -286,6 +301,8 @@ interface QueuedLarkMessageContext {
   text: string;
   messageId: string;
   chatId: string;
+  senderOpenId: string | null;
+  sessionKey: string;
   channelId: string;
   larkClient: any;
   agentBoxManager: AgentBoxManager;
@@ -299,6 +316,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     text,
     messageId,
     chatId,
+    senderOpenId,
+    sessionKey,
     channelId,
     larkClient,
     agentBoxManager,
@@ -308,11 +327,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   } = ctx;
 
   if (/^\/new$/i.test(text)) {
-    await handleNewCommand(channelId, chatId, messageId, larkClient, agentBoxManager, tlsOptions, frontendClient, locale);
+    await handleNewCommand(channelId, chatId, sessionKey, messageId, larkClient, agentBoxManager, tlsOptions, frontendClient, locale);
     return;
   }
 
-  const binding = await resolveBinding(channelId, chatId, frontendClient!);
+  const binding = await resolveBinding(channelId, chatId, frontendClient!, sessionKey);
   if (!binding) {
     console.log(`[lark] Binding disappeared before queued run channel=${channelId} chat=${chatId}`);
     return;
@@ -326,7 +345,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const sessionId = binding.sessionId;
   sessionRegistry.remember(sessionId, binding.createdBy, agentId);
 
-  console.log(`[lark] Message channel=${channelId} chat=${chatId} → agent=${agentId} session=${sessionId}: "${text.slice(0, 80)}"`);
+  console.log(`[lark] Message channel=${channelId} chat=${chatId} sender=${senderOpenId ?? "unknown"} → agent=${agentId} session=${sessionId}: "${text.slice(0, 80)}"`);
 
   try {
     await ensureChatSession(sessionId, agentId, binding.createdBy, text, text, "channel");
@@ -334,7 +353,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       sessionId,
       role: "user",
       content: text,
-      metadata: { source: "lark", channelId, chatId, messageId, bindingId: binding.bindingId },
+      metadata: { source: "lark", channelId, chatId, messageId, bindingId: binding.bindingId, senderOpenId, sessionKey },
     });
   } catch (err) {
     console.error(`[lark] Failed to persist channel user message session=${sessionId}:`, err);
@@ -423,6 +442,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
 async function handleNewCommand(
   channelId: string,
   chatId: string,
+  sessionKey: string,
   messageId: string,
   larkClient: any,
   agentBoxManager: AgentBoxManager,
@@ -430,7 +450,7 @@ async function handleNewCommand(
   frontendClient?: FrontendWsClient,
   locale: "zh-CN" | "en-US" = "zh-CN",
 ): Promise<void> {
-  const reset = await resetBindingSession(channelId, chatId, frontendClient!);
+  const reset = await resetBindingSession(channelId, chatId, frontendClient!, sessionKey);
   if (!reset.success || !reset.sessionId || !reset.agentId) {
     await replyToLark(larkClient, messageId, `❌ ${reset.error ?? "Failed to reset session"}`);
     return;

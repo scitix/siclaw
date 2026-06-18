@@ -22,6 +22,7 @@ export interface ResolvedChannelBinding {
   agentId: string;
   bindingId: string;
   sessionId: string;
+  sessionKey?: string | null;
   createdBy: string | null;
   routeType: "group" | "user";
 }
@@ -31,10 +32,12 @@ export async function resolveBinding(
   channelId: string,
   routeKey: string,
   frontendClient: FrontendWsClient,
+  sessionKey?: string,
 ): Promise<ResolvedChannelBinding | null> {
   const data = await frontendClient.request("channel.resolveBinding", {
     channel_id: channelId,
     route_key: routeKey,
+    ...(sessionKey ? { session_key: sessionKey } : {}),
   });
   return data.binding ?? null;
 }
@@ -60,10 +63,12 @@ export async function resetBindingSession(
   channelId: string,
   routeKey: string,
   frontendClient: FrontendWsClient,
+  sessionKey?: string,
 ): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
   return frontendClient.request("channel.resetSession", {
     channel_id: channelId,
     route_key: routeKey,
+    ...(sessionKey ? { session_key: sessionKey } : {}),
   });
 }
 

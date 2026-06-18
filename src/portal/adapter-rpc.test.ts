@@ -1356,6 +1356,36 @@ describe("channel.resolveBinding", () => {
     expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s-new", createdBy: "u1", routeType: "group" });
   });
 
+  it("lazily creates a participant session when session_key is provided", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "shared-session", route_type: "group", created_by: "u1" }],
+      [],
+      [],
+      [{ session_id: "sender-session" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123", session_key: "open_id:ou_1" }, "a1",
+    );
+
+    expect(query.mock.calls[1][0]).toContain("FROM channel_binding_sessions");
+    expect(query.mock.calls[2][0]).toContain("INTO channel_binding_sessions");
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "open_id:ou_1",
+      expect.any(String),
+    ]);
+    expect(result.binding).toEqual({
+      agentId: "a1",
+      bindingId: "b1",
+      sessionId: "sender-session",
+      sessionKey: "open_id:ou_1",
+      createdBy: "u1",
+      routeType: "group",
+    });
+  });
+
   it("returns null binding when not found", async () => {
     mockQuery([]);
 
@@ -1370,7 +1400,10 @@ describe("channel.pair", () => {
   it("creates binding from valid pairing code", async () => {
     const query = mockQuery(
       [{ agent_id: "a1", created_by: "u1" }],  // pairing code lookup
+      [],                                         // existing binding lookup
       [],                                         // insert binding
+      [{ id: "b-new", agent_id: "a1", session_id: "binding-session", route_type: "group", created_by: "u1" }],
+      [],                                         // clear participant sessions
       [],                                         // delete code
       [{ name: "My Agent" }],                     // agent name lookup
     );
@@ -1380,8 +1413,8 @@ describe("channel.pair", () => {
     );
     expect(result.success).toBe(true);
     expect(result.agentName).toBe("My Agent");
-    expect(query.mock.calls[1][0]).toContain("session_id");
-    expect(query.mock.calls[1][1]).toEqual([
+    expect(query.mock.calls[2][0]).toContain("session_id");
+    expect(query.mock.calls[2][1]).toEqual([
       expect.any(String),
       "ch1",
       "a1",
@@ -1390,6 +1423,7 @@ describe("channel.pair", () => {
       "group",
       "u1",
     ]);
+    expect(query.mock.calls[4][0]).toContain("DELETE FROM channel_binding_sessions");
   });
 
   it("returns error for invalid pairing code", async () => {
@@ -1405,6 +1439,7 @@ describe("channel.pair", () => {
   it("returns error when binding insert fails", async () => {
     const query = vi.fn()
       .mockResolvedValueOnce([[{ agent_id: "a1", created_by: "u1" }], []])
+      .mockResolvedValueOnce([[], []])
       .mockRejectedValueOnce(new Error("Duplicate entry"));
     (getDb as any).mockReturnValue({ query });
 
@@ -1432,6 +1467,30 @@ describe("channel.resetSession", () => {
     expect(result.oldSessionId).toBe("old-session");
     expect(result.sessionId).toEqual(expect.any(String));
     expect(query.mock.calls[1][0]).toContain("UPDATE channel_bindings SET session_id");
+  });
+
+  it("replaces only the participant session when session_key is provided", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "shared-session", route_type: "group", created_by: "u1" }],
+      [{ session_id: "old-sender-session" }],
+      [],
+    );
+
+    const result = await getHandler("channel.resetSession")(
+      { channel_id: "ch1", route_key: "group-1", session_key: "open_id:ou_1" }, "a1",
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.agentId).toBe("a1");
+    expect(result.oldSessionId).toBe("old-sender-session");
+    expect(result.sessionId).toEqual(expect.any(String));
+    expect(query.mock.calls[2][0]).toContain("channel_binding_sessions");
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "open_id:ou_1",
+      expect.any(String),
+    ]);
   });
 
   it("returns an error when the binding is missing", async () => {
