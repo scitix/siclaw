@@ -360,6 +360,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     id CHAR(36) PRIMARY KEY,
     channel_id CHAR(36) NOT NULL,
     agent_id CHAR(36) NOT NULL,
+    session_id CHAR(36) DEFAULT NULL,
     route_key VARCHAR(255) NOT NULL,
     route_type VARCHAR(20) NOT NULL DEFAULT 'group',
     created_by CHAR(36),
@@ -515,6 +516,7 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_sessions", "parent_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "delegation_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "target_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "channel_bindings", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "from_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "parent_session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "delegation_id", "CHAR(36) DEFAULT NULL");

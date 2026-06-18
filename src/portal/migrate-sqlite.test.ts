@@ -178,6 +178,13 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(rows.map((r) => r.name)).toContain("model_routing");
   });
 
+  it("channel_bindings.session_id column exists after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(channel_bindings)");
+    expect(rows.map((r) => r.name)).toContain("session_id");
+  });
+
   it("skills and skill_versions files columns exist after migration", async () => {
     await runPortalMigrations();
     const db = getDb();

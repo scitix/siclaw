@@ -3,6 +3,7 @@ import {
   ChannelManager,
   resolveBinding,
   handlePairingCode,
+  resetBindingSession,
   type ChannelHandler,
 } from "./channel-manager.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
@@ -65,9 +66,10 @@ beforeEach(() => {
 
 describe("resolveBinding", () => {
   it("returns the binding object from channel.resolveBinding RPC", async () => {
-    frontend.responses.set("channel.resolveBinding", { binding: { agentId: "a1", bindingId: "b1" } });
+    const binding = { agentId: "a1", bindingId: "b1", sessionId: "s1", createdBy: "u1", routeType: "group" };
+    frontend.responses.set("channel.resolveBinding", { binding });
     const b = await resolveBinding("ch", "key", frontend as unknown as FrontendWsClient);
-    expect(b).toEqual({ agentId: "a1", bindingId: "b1" });
+    expect(b).toEqual(binding);
     expect(frontend.calls[0].method).toBe("channel.resolveBinding");
     expect(frontend.calls[0].params).toEqual({ channel_id: "ch", route_key: "key" });
   });
@@ -75,6 +77,18 @@ describe("resolveBinding", () => {
   it("returns null when RPC returns no binding", async () => {
     frontend.responses.set("channel.resolveBinding", {});
     expect(await resolveBinding("ch", "key", frontend as unknown as FrontendWsClient)).toBeNull();
+  });
+});
+
+describe("resetBindingSession", () => {
+  it("passes channel route info to channel.resetSession RPC", async () => {
+    frontend.responses.set("channel.resetSession", { success: true, agentId: "a1", oldSessionId: "old", sessionId: "new" });
+    const result = await resetBindingSession("ch", "chat-1", frontend as unknown as FrontendWsClient);
+    expect(result).toEqual({ success: true, agentId: "a1", oldSessionId: "old", sessionId: "new" });
+    expect(frontend.calls[0]).toEqual({
+      method: "channel.resetSession",
+      params: { channel_id: "ch", route_key: "chat-1" },
+    });
   });
 });
 

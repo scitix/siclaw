@@ -18,12 +18,20 @@ export interface ChannelHandler {
   stop(): Promise<void>;
 }
 
+export interface ResolvedChannelBinding {
+  agentId: string;
+  bindingId: string;
+  sessionId: string;
+  createdBy: string | null;
+  routeType: "group" | "user";
+}
+
 /** Resolve agent_id for a (channel_id, route_key) pair via RPC. */
 export async function resolveBinding(
   channelId: string,
   routeKey: string,
   frontendClient: FrontendWsClient,
-): Promise<{ agentId: string; bindingId: string } | null> {
+): Promise<ResolvedChannelBinding | null> {
   const data = await frontendClient.request("channel.resolveBinding", {
     channel_id: channelId,
     route_key: routeKey,
@@ -44,6 +52,18 @@ export async function handlePairingCode(
     channel_id: channelId,
     route_key: routeKey,
     route_type: routeType,
+  });
+}
+
+/** Reset the durable session attached to a channel binding. */
+export async function resetBindingSession(
+  channelId: string,
+  routeKey: string,
+  frontendClient: FrontendWsClient,
+): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
+  return frontendClient.request("channel.resetSession", {
+    channel_id: channelId,
+    route_key: routeKey,
   });
 }
 

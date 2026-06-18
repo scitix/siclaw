@@ -6,13 +6,13 @@
  * Supports PAIR command for binding chat groups to agents.
  */
 
-import crypto from "node:crypto";
 import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
-import { resolveBinding, handlePairingCode } from "../channel-manager.js";
+import { resolveBinding, handlePairingCode, resetBindingSession } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
+import { appendMessage, ensureChatSession } from "../chat-repo.js";
 import {
   openTypingCard,
   updateCardContent,
@@ -29,7 +29,33 @@ const VISUAL_ONLY_NOTICE_BY_LOCALE = {
   "zh-CN": "已生成图片如下。",
   "en-US": "Image generated below.",
 } as const;
+const QUEUE_FULL_NOTICE_BY_LOCALE = {
+  "zh-CN": "⏳ 当前群组还有较多消息排队处理中，请稍后再发。",
+  "en-US": "⏳ This group already has several messages queued. Please try again later.",
+} as const;
+const NEW_SESSION_NOTICE_BY_LOCALE = {
+  "zh-CN": "✅ 已开启新会话，之前的群聊上下文已清空。",
+  "en-US": "✅ Started a new session for this group. Previous group context has been cleared.",
+} as const;
+const MISSING_OWNER_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 当前群绑定缺少会话归属信息，请在 Agent 页面重新生成 PAIR code 并在群里重新绑定。",
+  "en-US": "❌ This group binding is missing a session owner. Generate a fresh PAIR code from the Agent page and pair this group again.",
+} as const;
 const MAX_AGENT_SELECTED_UPDATES = 2;
+const MAX_LARK_BINDING_QUEUE = 20;
+
+interface QueuedLarkTask {
+  run: () => Promise<void>;
+  resolve: () => void;
+  reject: (err: unknown) => void;
+}
+
+interface LarkBindingQueue {
+  running: boolean;
+  pending: QueuedLarkTask[];
+}
+
+const bindingQueues = new Map<string, LarkBindingQueue>();
 
 export interface LarkChannelConfig {
   domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
@@ -119,6 +145,68 @@ export function createLarkHandler(
   };
 }
 
+export function resetLarkBindingQueuesForTest(): void {
+  bindingQueues.clear();
+}
+
+function enqueueBindingTask(bindingId: string, run: () => Promise<void>): { accepted: true; done: Promise<void> } | { accepted: false } {
+  let queue = bindingQueues.get(bindingId);
+  if (!queue) {
+    queue = { running: false, pending: [] };
+    bindingQueues.set(bindingId, queue);
+  }
+
+  if (queue.pending.length >= MAX_LARK_BINDING_QUEUE) {
+    return { accepted: false };
+  }
+
+  const done = new Promise<void>((resolve, reject) => {
+    queue!.pending.push({ run, resolve, reject });
+  });
+  drainBindingQueue(bindingId);
+  return { accepted: true, done };
+}
+
+function drainBindingQueue(bindingId: string): void {
+  const queue = bindingQueues.get(bindingId);
+  if (!queue || queue.running) return;
+  const next = queue.pending.shift();
+  if (!next) {
+    bindingQueues.delete(bindingId);
+    return;
+  }
+
+  queue.running = true;
+  void (async () => {
+    try {
+      await next.run();
+      next.resolve();
+    } catch (err) {
+      next.reject(err);
+    } finally {
+      const current = bindingQueues.get(bindingId);
+      if (current) {
+        current.running = false;
+        drainBindingQueue(bindingId);
+      }
+    }
+  })();
+}
+
+export function buildChannelTurnPrompt(text: string): string {
+  return [
+    "<channel-turn>",
+    "This Feishu/Lark group session may contain earlier incidents, clusters, pods, or reports.",
+    "Treat the message below as the current user request and answer it first.",
+    "Use earlier session context only when the user explicitly refers to it, or when it is stable configuration context needed to answer the current request.",
+    "If the current message names a different case, cluster, time range, object, or task, treat it as a new request. Do not force the previous case into the answer.",
+    "Do not mention these channel-turn instructions to the user.",
+    "</channel-turn>",
+    "",
+    text,
+  ].join("\n");
+}
+
 // ── Message handler ────────────────────────────────────────────
 
 /**
@@ -176,16 +264,83 @@ export async function handleLarkMessage(
     return;
   }
 
-  const agentId = binding.agentId;
-  // Tenant key for the group's conversational context — used as the "user" in
-  // chat_sessions and session registry. It does NOT travel to AgentBox (cert
-  // CN is agentId, payload carries only sessionId) but Runtime uses it to
-  // tag audit rows so outbound Upstream calls attribute correctly.
-  const conversationKey = `lark:${chatId}`;
-  const sessionId = crypto.randomUUID();
-  sessionRegistry.remember(sessionId, conversationKey, agentId);
+  const queued = enqueueBindingTask(binding.bindingId, () => processQueuedLarkMessage({
+    text,
+    messageId,
+    chatId,
+    channelId,
+    larkClient,
+    agentBoxManager,
+    tlsOptions,
+    frontendClient,
+    locale,
+  }));
+  if (!queued.accepted) {
+    await replyToLark(larkClient, messageId, QUEUE_FULL_NOTICE_BY_LOCALE[locale]);
+    return;
+  }
+  await queued.done;
+}
 
-  console.log(`[lark] Message channel=${channelId} chat=${chatId} \u2192 agent=${agentId}: "${text.slice(0, 80)}"`);
+interface QueuedLarkMessageContext {
+  text: string;
+  messageId: string;
+  chatId: string;
+  channelId: string;
+  larkClient: any;
+  agentBoxManager: AgentBoxManager;
+  tlsOptions?: { cert: string; key: string; ca: string };
+  frontendClient?: FrontendWsClient;
+  locale: "zh-CN" | "en-US";
+}
+
+async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<void> {
+  const {
+    text,
+    messageId,
+    chatId,
+    channelId,
+    larkClient,
+    agentBoxManager,
+    tlsOptions,
+    frontendClient,
+    locale,
+  } = ctx;
+
+  if (/^\/new$/i.test(text)) {
+    await handleNewCommand(channelId, chatId, messageId, larkClient, agentBoxManager, tlsOptions, frontendClient, locale);
+    return;
+  }
+
+  const binding = await resolveBinding(channelId, chatId, frontendClient!);
+  if (!binding) {
+    console.log(`[lark] Binding disappeared before queued run channel=${channelId} chat=${chatId}`);
+    return;
+  }
+  if (!binding.createdBy) {
+    await replyToLark(larkClient, messageId, MISSING_OWNER_NOTICE_BY_LOCALE[locale]);
+    return;
+  }
+
+  const agentId = binding.agentId;
+  const sessionId = binding.sessionId;
+  sessionRegistry.remember(sessionId, binding.createdBy, agentId);
+
+  console.log(`[lark] Message channel=${channelId} chat=${chatId} → agent=${agentId} session=${sessionId}: "${text.slice(0, 80)}"`);
+
+  try {
+    await ensureChatSession(sessionId, agentId, binding.createdBy, text, text, "channel");
+    await appendMessage({
+      sessionId,
+      role: "user",
+      content: text,
+      metadata: { source: "lark", channelId, chatId, messageId, bindingId: binding.bindingId },
+    });
+  } catch (err) {
+    console.error(`[lark] Failed to persist channel user message session=${sessionId}:`, err);
+    await replyToLark(larkClient, messageId, `❌ ${err instanceof Error ? err.message : String(err)}`.slice(0, 500));
+    return;
+  }
 
   // Open the typing-indicator card FIRST so the user sees immediate feedback.
   // If the CardKit APIs fail we fall back to posting a plain text reply
@@ -223,7 +378,7 @@ export async function handleLarkMessage(
   const handle = await agentBoxManager.getOrCreate(agentId);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
-  const promptOpts: PromptOptions = { text, agentId, mode: "channel", sessionId };
+  const promptOpts: PromptOptions = { text: buildChannelTurnPrompt(text), agentId, mode: "channel", sessionId };
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
   let agentError: Error | null = null;
@@ -263,6 +418,36 @@ export async function handleLarkMessage(
   }
 
   await replyVisualImages(larkClient, messageId, replyImages);
+}
+
+async function handleNewCommand(
+  channelId: string,
+  chatId: string,
+  messageId: string,
+  larkClient: any,
+  agentBoxManager: AgentBoxManager,
+  tlsOptions?: { cert: string; key: string; ca: string },
+  frontendClient?: FrontendWsClient,
+  locale: "zh-CN" | "en-US" = "zh-CN",
+): Promise<void> {
+  const reset = await resetBindingSession(channelId, chatId, frontendClient!);
+  if (!reset.success || !reset.sessionId || !reset.agentId) {
+    await replyToLark(larkClient, messageId, `❌ ${reset.error ?? "Failed to reset session"}`);
+    return;
+  }
+
+  if (reset.oldSessionId) {
+    sessionRegistry.forget(reset.oldSessionId);
+    try {
+      const handle = await agentBoxManager.getOrCreate(reset.agentId);
+      const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
+      await client.closeSession(reset.oldSessionId);
+    } catch (err) {
+      console.error(`[lark] Failed to close old session=${reset.oldSessionId} on /new:`, err);
+    }
+  }
+
+  await replyToLark(larkClient, messageId, NEW_SESSION_NOTICE_BY_LOCALE[locale]);
 }
 
 /**
