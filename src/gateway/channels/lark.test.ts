@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createLarkHandler, handleLarkMessage, collectResponse, collectChannelResponse } from "./lark.js";
+import {
+  buildChannelTurnPrompt,
+  createLarkHandler,
+  handleLarkMessage,
+  collectResponse,
+  collectChannelResponse,
+  resetLarkBindingQueuesForTest,
+} from "./lark.js";
 import {
   clearBackgroundChannelDelivery,
   deliverBackgroundChannelMessage,
@@ -12,21 +19,33 @@ import { sessionRegistry } from "../session-registry.js";
 // Stub AgentBoxClient so tests don't open real HTTPS sockets.
 const promptMock = vi.fn();
 const streamEventsMock = vi.fn();
+const closeSessionMock = vi.fn();
 
 vi.mock("../agentbox/client.js", () => ({
   AgentBoxClient: class {
     prompt = promptMock;
     streamEvents = streamEventsMock;
+    closeSession = closeSessionMock;
   },
 }));
 
 // Stub channel-manager RPCs so we don't hit frontend-ws in unit tests.
 const resolveBindingMock = vi.fn();
 const handlePairingCodeMock = vi.fn();
+const resetBindingSessionMock = vi.fn();
 
 vi.mock("../channel-manager.js", () => ({
   resolveBinding: (...args: unknown[]) => resolveBindingMock(...args),
   handlePairingCode: (...args: unknown[]) => handlePairingCodeMock(...args),
+  resetBindingSession: (...args: unknown[]) => resetBindingSessionMock(...args),
+}));
+
+const ensureChatSessionMock = vi.fn();
+const appendMessageMock = vi.fn();
+
+vi.mock("../chat-repo.js", () => ({
+  ensureChatSession: (...args: unknown[]) => ensureChatSessionMock(...args),
+  appendMessage: (...args: unknown[]) => appendMessageMock(...args),
 }));
 
 // ── Existing behaviour: degraded boot when SDK missing (kept from old suite) ─
@@ -95,6 +114,17 @@ function makeTextEvent(text: string, overrides: Record<string, unknown> = {}) {
   };
 }
 
+function makeBinding(overrides: Record<string, unknown> = {}) {
+  return {
+    agentId: "a1",
+    bindingId: "b",
+    sessionId: "session-fixed",
+    createdBy: "user-1",
+    routeType: "group",
+    ...overrides,
+  };
+}
+
 async function waitForExpect(assertion: () => void): Promise<void> {
   let lastError: unknown;
   for (let i = 0; i < 30; i += 1) {
@@ -112,8 +142,17 @@ async function waitForExpect(assertion: () => void): Promise<void> {
 beforeEach(() => {
   promptMock.mockReset();
   streamEventsMock.mockReset();
+  closeSessionMock.mockReset();
   resolveBindingMock.mockReset();
   handlePairingCodeMock.mockReset();
+  resetBindingSessionMock.mockReset();
+  ensureChatSessionMock.mockReset();
+  appendMessageMock.mockReset();
+  ensureChatSessionMock.mockResolvedValue(undefined);
+  appendMessageMock.mockResolvedValue("msg-db-1");
+  resetLarkBindingQueuesForTest();
+  clearBackgroundChannelDelivery("session-fixed");
+  clearBackgroundChannelDelivery("session-agent-7");
   // Silence info logs that would otherwise clutter vitest output.
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -250,8 +289,8 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(promptMock).not.toHaveBeenCalled();
   });
 
-  it("with binding → getOrCreate uses agentId alone, and registers (sessionId → conversationKey) in registry", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "agent-7", bindingId: "b1" });
+  it("with binding → getOrCreate uses agentId alone, and registers the durable channel session owner", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "agent-7", bindingId: "b1", sessionId: "session-agent-7" }));
     promptMock.mockResolvedValue({ sessionId: "remote-session-42" });
     streamEventsMock.mockImplementation(async function* () { /* empty */ });
     const mgr = makeAgentBoxManager("agent-7");
@@ -273,27 +312,26 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(mgr.getOrCreate.mock.calls[0]).toHaveLength(1);
 
     expect(rememberSpy).toHaveBeenCalledTimes(1);
-    const [sessionId, conversationKey, agentId] = rememberSpy.mock.calls[0];
-    expect(typeof sessionId).toBe("string");
-    expect(sessionId.length).toBeGreaterThan(0);
-    expect(conversationKey).toBe("lark:oc_abc123");
+    const [sessionId, ownerUserId, agentId] = rememberSpy.mock.calls[0];
+    expect(sessionId).toBe("session-agent-7");
+    expect(ownerUserId).toBe("user-1");
     expect(agentId).toBe("agent-7");
 
     // Sanity — prompt receives the session id we just registered.
     expect(promptMock).toHaveBeenCalledWith(expect.objectContaining({
-      text: "hi there",
+      text: expect.stringContaining("hi there"),
       agentId: "agent-7",
       mode: "channel",
-      sessionId,
+      sessionId: "session-agent-7",
     }));
 
     rememberSpy.mockRestore();
-    sessionRegistry.forget(sessionId as string);
+    sessionRegistry.forget("session-agent-7");
   });
 
   it("does not pass userId into the AgentBox prompt payload", async () => {
     // (keep this one near the bottom — it's the same shape as above)
-    resolveBindingMock.mockResolvedValue({ agentId: "a", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a" }));
     promptMock.mockResolvedValue({ sessionId: "s" });
     streamEventsMock.mockImplementation(async function* () { /* empty */ });
 
@@ -308,6 +346,169 @@ describe("handleLarkMessage — routing to AgentBox", () => {
 
     const promptArg = promptMock.mock.calls[0][0];
     expect(promptArg).not.toHaveProperty("userId");
+  });
+
+  it("persists channel sessions/messages before prompting and wraps the current request", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makeTextEvent("检查当前集群"),
+      makeLarkClient(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(ensureChatSessionMock).toHaveBeenCalledWith(
+      "session-fixed",
+      "a1",
+      "user-1",
+      "检查当前集群",
+      "检查当前集群",
+      "channel",
+    );
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "session-fixed",
+      role: "user",
+      content: "检查当前集群",
+      metadata: expect.objectContaining({
+        source: "lark",
+        channelId: "lark",
+        chatId: "oc_abc123",
+        messageId: "mid-1",
+        bindingId: "b",
+      }),
+    }));
+    expect(promptMock.mock.calls[0][0]).toMatchObject({
+      sessionId: "session-fixed",
+      mode: "channel",
+      agentId: "a1",
+    });
+    expect(promptMock.mock.calls[0][0].text).toContain("<channel-turn>");
+    expect(promptMock.mock.calls[0][0].text).toContain("检查当前集群");
+  });
+
+  it("reuses the same durable session for multiple messages in the same group", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "same-session" }));
+    promptMock.mockResolvedValue({ sessionId: "same-session" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(makeTextEvent("第一条"), makeLarkClient(), "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+    await handleLarkMessage(makeTextEvent("第二条"), makeLarkClient(), "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    expect(promptMock).toHaveBeenCalledTimes(2);
+    expect(promptMock.mock.calls.map((call) => call[0].sessionId)).toEqual(["same-session", "same-session"]);
+  });
+
+  it("rejects legacy bindings without an owner instead of writing lark chat ids as users", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ createdBy: null }));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(ensureChatSessionMock).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+    const replyArg = lark.im.message.reply.mock.calls[0][0];
+    expect(replyArg.data.content).toContain("重新生成 PAIR code");
+  });
+
+  it("/new resets the binding session and closes the old AgentBox session best-effort", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "old-session" }));
+    resetBindingSessionMock.mockResolvedValue({ success: true, agentId: "a1", oldSessionId: "old-session", sessionId: "new-session" });
+    const mgr = makeAgentBoxManager("a1");
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("/new"),
+      lark,
+      "lark",
+      mgr as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything());
+    expect(mgr.getOrCreate).toHaveBeenCalledWith("a1");
+    expect(closeSessionMock).toHaveBeenCalledWith("old-session");
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
+  });
+
+  it("queues concurrent messages for the same binding instead of starting a second prompt", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "queued-session" }));
+    let releaseFirst!: () => void;
+    promptMock
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        releaseFirst = () => resolve({ sessionId: "queued-session" });
+      }))
+      .mockResolvedValueOnce({ sessionId: "queued-session" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const mgr = makeAgentBoxManager("a1");
+
+    const first = handleLarkMessage(makeTextEvent("first"), makeLarkClient(), "lark", mgr as any, undefined, {} as any);
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(1));
+
+    const second = handleLarkMessage(makeTextEvent("second"), makeLarkClient(), "lark", mgr as any, undefined, {} as any);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(promptMock).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(2));
+    await Promise.all([first, second]);
+    expect(promptMock.mock.calls.map((call) => call[0].text)).toEqual([
+      expect.stringContaining("first"),
+      expect.stringContaining("second"),
+    ]);
+  });
+
+  it("replies with a queue-full notice when one binding already has 20 pending messages", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "full-session" }));
+    let releaseFirst!: () => void;
+    promptMock
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        releaseFirst = () => resolve({ sessionId: "full-session" });
+      }))
+      .mockResolvedValue({ sessionId: "full-session" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const lark = makeLarkClient();
+    const mgr = makeAgentBoxManager("a1");
+
+    const first = handleLarkMessage(makeTextEvent("first"), lark, "lark", mgr as any, undefined, {} as any);
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(1));
+
+    const queued = Array.from({ length: 21 }, (_, i) =>
+      handleLarkMessage(makeTextEvent(`queued-${i}`), lark, "lark", mgr as any, undefined, {} as any),
+    );
+    await waitForExpect(() => {
+      expect(lark.im.message.reply).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ content: expect.stringContaining("排队") }),
+      }));
+    });
+
+    releaseFirst();
+    await Promise.all([first, ...queued]);
+    expect(promptMock).toHaveBeenCalledTimes(21);
+  });
+});
+
+describe("buildChannelTurnPrompt", () => {
+  it("wraps the current channel message with context-focus instructions", () => {
+    const prompt = buildChannelTurnPrompt("画一个新集群的报告");
+    expect(prompt).toContain("<channel-turn>");
+    expect(prompt).toContain("current user request");
+    expect(prompt).toContain("Do not force the previous case");
+    expect(prompt).toContain("画一个新集群的报告");
   });
 });
 
@@ -337,7 +538,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   }
 
   it("opens typing card before agent runs, then finalizes with the final assistant text", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-int" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -379,7 +580,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("updates the Lark card when a background channel report arrives after the first SSE turn", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-background" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -430,7 +631,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("lets the agent explicitly update the visible card, while Gateway caps non-final updates", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-explicit-channel" });
     let releaseStream: () => void = () => {};
     const streamGate = new Promise<void>((resolve) => { releaseStream = resolve; });
@@ -496,7 +697,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("keeps numeric tables in markdown and does not synthesize chart images", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-chart" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -537,7 +738,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("keeps fenced chart JSON visible when no PNG artifact is available", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-chart-json" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -577,7 +778,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("keeps MCP bar chart specs visible when no PNG artifact is available", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-mcp-chart" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -623,7 +824,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("keeps Chart.js-style bar chart specs visible when no PNG artifact is available", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-chartjs-chart" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -671,7 +872,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("keeps unsupported chart JSON visible and does not reply with an image", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-unsupported-chart" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -714,7 +915,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("keeps Mermaid flowcharts as markdown when no PNG artifact is available", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-mermaid" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -758,7 +959,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   it("strips markdown data URI payloads from cards without treating them as sendable attachments", async () => {
     const onePixelPng =
       "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-card-image" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -796,7 +997,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   it("forwards assistant image content blocks as Feishu images", async () => {
     const onePixelBase64 =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-assistant-image" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -831,7 +1032,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   it("forwards tool image artifacts and hides paired visual source blocks from the card", async () => {
     const onePixelBase64 =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-tool-image" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -879,7 +1080,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("keeps Sicore visual-card source as markdown when no PNG artifact is available", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-visual-card" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -926,7 +1127,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("does not reply with an image when the final answer has no image artifact", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-no-chart" });
     streamEventsMock.mockImplementation(async function* () {
       yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "只是普通文本答复" }] } };
@@ -951,7 +1152,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     const onePixelBase64 =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
     vi.spyOn(console, "warn").mockImplementation(() => {});
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-image-fail" });
     streamEventsMock.mockImplementation(async function* () {
       yield {
@@ -984,7 +1185,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("falls back to plain text reply when card.create fails (preserves the pre-card UX)", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-fb" });
     streamEventsMock.mockImplementation(async function* () {
       yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "答复" }] } };
@@ -1012,7 +1213,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("shows an error message in the card when the agent throws", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockRejectedValue(new Error("AgentBox unreachable"));
     const lark = makeCardAwareLarkClient();
 
@@ -1032,7 +1233,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("renders English placeholder when the channel domain is 'lark' (global)", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-en" });
     streamEventsMock.mockImplementation(async function* () {
       yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } };
@@ -1055,7 +1256,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("renders English empty-result notice when agent returns nothing and locale is en-US", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-en-empty" });
     streamEventsMock.mockImplementation(async function* () { /* empty */ });
     const lark = makeCardAwareLarkClient();
@@ -1075,7 +1276,7 @@ describe("handleLarkMessage — streaming card flow", () => {
   });
 
   it("shows the empty-result notice when the agent returns no text", async () => {
-    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-empty" });
     streamEventsMock.mockImplementation(async function* () { /* no assistant messages */ });
     const lark = makeCardAwareLarkClient();

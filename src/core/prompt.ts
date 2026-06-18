@@ -83,6 +83,9 @@ const CHANNEL_SECTION = `
 
 This session is replying in an IM group. Choose the final answer shape intentionally:
 
+- Treat the latest channel message as the current request. Earlier group context is background only; use it when the user explicitly says they are continuing, refers to "above/earlier/that/this", or when stable configuration facts are needed.
+- If the latest message names a different case, cluster, node, pod, namespace, time range, or task, treat it as a new request. Do not force details from a previous incident into the new answer.
+- If context is ambiguous, answer the current message directly and ask one concise clarifying question instead of assuming an older case still applies.
 - Use normal Markdown for direct answers, short diagnoses, command results, and prose reports.
 - Use a small Markdown table when the user needs exact enumerable facts.
 - For visual replies, use tools or artifacts that return structured image content blocks. The channel runtime uploads those image attachments to Feishu/Lark.
