@@ -4,6 +4,9 @@ import {
   resolveBinding,
   handlePairingCode,
   resetBindingSession,
+  resolvePersonalBinding,
+  handlePersonalPairingCode,
+  resetPersonalSession,
   type ChannelHandler,
 } from "./channel-manager.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
@@ -119,6 +122,39 @@ describe("handlePairingCode", () => {
       channel_id: "ch",
       route_key: "chat-1",
       route_type: "group",
+    });
+  });
+});
+
+describe("personal binding RPC wrappers", () => {
+  it("resolves a personal binding by sender open_id", async () => {
+    const binding = { agentId: "a1", bindingId: "pb1", sessionId: "s1", sessionKey: "open_id:ou_1", createdBy: "owner", routeType: "user" };
+    frontend.responses.set("channel.resolvePersonalBinding", { binding });
+    const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+    expect(result).toEqual(binding);
+    expect(frontend.calls[0]).toEqual({
+      method: "channel.resolvePersonalBinding",
+      params: { channel_id: "pb1", sender_open_id: "ou_1" },
+    });
+  });
+
+  it("pairs a personal Sicore user binding", async () => {
+    frontend.responses.set("channel.pairPersonal", { success: true, agentName: "Agent" });
+    const result = await handlePersonalPairingCode("ABC123", "pb1", "ou_1", frontend as unknown as FrontendWsClient);
+    expect(result).toEqual({ success: true, agentName: "Agent" });
+    expect(frontend.calls[0]).toEqual({
+      method: "channel.pairPersonal",
+      params: { code: "ABC123", channel_id: "pb1", sender_open_id: "ou_1" },
+    });
+  });
+
+  it("resets a personal session by session_key", async () => {
+    frontend.responses.set("channel.resetPersonalSession", { success: true, agentId: "a1", oldSessionId: "old", sessionId: "new" });
+    const result = await resetPersonalSession("pb1", "sicore_user:u1", frontend as unknown as FrontendWsClient);
+    expect(result).toEqual({ success: true, agentId: "a1", oldSessionId: "old", sessionId: "new" });
+    expect(frontend.calls[0]).toEqual({
+      method: "channel.resetPersonalSession",
+      params: { channel_id: "pb1", session_key: "sicore_user:u1" },
     });
   });
 });

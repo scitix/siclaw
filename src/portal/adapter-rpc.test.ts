@@ -1652,9 +1652,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 45 handlers", () => {
+  it("registers exactly 48 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(45);
+    expect(handlers.size).toBe(48);
   });
 
   it("all expected handler names are registered", () => {
@@ -1670,6 +1670,7 @@ describe("buildAdapterRpcHandlers", () => {
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",
       "channel.list", "channel.resolveBinding", "channel.pair", "channel.resetSession",
+      "channel.resolvePersonalBinding", "channel.pairPersonal", "channel.resetPersonalSession",
       "agent.listForSkill", "agent.listForMcp", "agent.listForCluster", "agent.listForHost",
       "metrics.summary", "metrics.audit", "metrics.auditDetail",
     ];

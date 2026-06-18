@@ -246,6 +246,82 @@ async function resetChannelBindingSession(
   };
 }
 
+interface PersonalChannelConfig {
+  personal_bot?: {
+    agent_id?: string;
+    access_mode?: "open" | "sicore_authorized";
+    owner_user_id?: string;
+  };
+}
+
+async function selectPersonalChannel(
+  db: Db,
+  channelId: string,
+): Promise<{ id: string; created_by: string | null; config: PersonalChannelConfig } | null> {
+  const [rows] = await db.query(
+    "SELECT id, created_by, config FROM channels WHERE id = ? AND status = 'active'",
+    [channelId],
+  ) as any;
+  if (rows.length === 0) return null;
+  const row = rows[0];
+  return {
+    id: row.id,
+    created_by: row.created_by ?? null,
+    config: safeParseJson(row.config, {}) as PersonalChannelConfig,
+  };
+}
+
+async function resolvePersonalChannelBinding(
+  db: Db,
+  channelId: string,
+  senderOpenId: string,
+): Promise<ResolvedChannelBinding | null> {
+  const channel = await selectPersonalChannel(db, channelId);
+  const personalBot = channel?.config.personal_bot;
+  if (!channel || !personalBot?.agent_id || !senderOpenId.trim()) return null;
+  if (personalBot.access_mode !== "open") {
+    return null;
+  }
+  const sessionKey = `open_id:${senderOpenId.trim()}`;
+  const session = await resolveChannelBindingParticipantSession(db, channel.id, sessionKey);
+  return {
+    agentId: personalBot.agent_id,
+    bindingId: channel.id,
+    sessionId: session.sessionId,
+    sessionKey: session.sessionKey,
+    createdBy: personalBot.owner_user_id ?? channel.created_by,
+    routeType: "user",
+  };
+}
+
+async function resetPersonalChannelSession(
+  db: Db,
+  channelId: string,
+  sessionKey: string,
+): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
+  const channel = await selectPersonalChannel(db, channelId);
+  const personalBot = channel?.config.personal_bot;
+  if (!channel || !personalBot?.agent_id) return { success: false, error: "Personal bot not found" };
+  const normalizedKey = normalizeChannelSessionKey(sessionKey);
+  const oldSessionId = await selectChannelBindingParticipantSession(db, channel.id, normalizedKey);
+  const sessionId = crypto.randomUUID();
+  const upsert = buildUpsert(
+    db,
+    "channel_binding_sessions",
+    ["id", "binding_id", "session_key", "session_id"],
+    [crypto.randomUUID(), channel.id, normalizedKey, sessionId],
+    ["binding_id", "session_key"],
+    ["session_id", { col: "updated_at", expr: "CURRENT_TIMESTAMP" }],
+  );
+  await db.query(upsert.sql, upsert.params);
+  return {
+    success: true,
+    agentId: personalBot.agent_id,
+    oldSessionId,
+    sessionId,
+  };
+}
+
 // ── SSH jump-host (ProxyJump) helpers ───────────────────────────────
 // Shared by the HTTP routes (registerAdapterRoutes) and the WS-RPC handlers
 // (buildAdapterRpcHandlers) so the two transports can't drift.
@@ -2561,6 +2637,21 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const db = getDb();
     return resetChannelBindingSession(db, params.channel_id, params.route_key, params.session_key);
   });
+
+  handlers.set("channel.resolvePersonalBinding", async (params) => {
+    const db = getDb();
+    return { binding: await resolvePersonalChannelBinding(db, params.channel_id, params.sender_open_id) };
+  });
+
+  handlers.set("channel.resetPersonalSession", async (params) => {
+    const db = getDb();
+    return resetPersonalChannelSession(db, params.channel_id, params.session_key);
+  });
+
+  handlers.set("channel.pairPersonal", async () => ({
+    success: false,
+    error: "Sicore authorization is only available through the Sicore adapter",
+  }));
 
   // --- agent.* ---
 
