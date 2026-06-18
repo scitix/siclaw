@@ -136,7 +136,10 @@ function makeBinding(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function makePersonalConfig(accessMode: "open" | "sicore_authorized" = "open") {
+function makePersonalConfig(
+  accessMode: "open" | "sicore_authorized" = "open",
+  overrides: Record<string, unknown> = {},
+) {
   return {
     app_id: "cli_personal",
     app_secret: "secret",
@@ -144,6 +147,7 @@ function makePersonalConfig(accessMode: "open" | "sicore_authorized" = "open") {
       agent_id: "a1",
       access_mode: accessMode,
       owner_user_id: "owner-1",
+      ...overrides,
     },
   };
 }
@@ -408,7 +412,7 @@ describe("handleLarkMessage — personal bot p2p", () => {
     }));
   });
 
-  it("authorized mode prompts for PAIR when the open_id is not bound to a Sicore user", async () => {
+  it("authorized mode prompts for Sicore OAuth authorization when the open_id is not bound", async () => {
     resolvePersonalBindingMock.mockResolvedValue(null);
     const lark = makeLarkClient();
 
@@ -420,11 +424,12 @@ describe("handleLarkMessage — personal bot p2p", () => {
       undefined,
       {} as any,
       "zh-CN",
-      makePersonalConfig("sicore_authorized"),
+      makePersonalConfig("sicore_authorized", { authorize_url: "https://sicore.example/siclaw/a1?tab=channels" }),
     );
 
     expect(promptMock).not.toHaveBeenCalled();
-    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("PAIR");
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("授权飞书账号");
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("https://sicore.example/siclaw/a1?tab=channels");
   });
 
   it("authorized p2p PAIR consumes the personal pairing code instead of group binding", async () => {

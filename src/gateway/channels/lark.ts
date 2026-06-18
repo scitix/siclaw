@@ -50,8 +50,8 @@ const MISSING_OWNER_NOTICE_BY_LOCALE = {
   "en-US": "❌ This group binding is missing a session owner. Generate a fresh PAIR code from the Agent page and pair this group again.",
 } as const;
 const PERSONAL_BIND_REQUIRED_NOTICE_BY_LOCALE = {
-  "zh-CN": "❌ 这个个人机器人需要先绑定 Sicore 账号。请在 Agent 页面生成个人 PAIR code 后，在这里发送 PAIR ABC123。",
-  "en-US": "❌ This personal bot requires Sicore authorization. Generate a personal PAIR code from the Agent page, then send PAIR ABC123 here.",
+  "zh-CN": "❌ 这个个人机器人需要先绑定 Sicore 账号。请打开 Sicore 的 Agent Channels 页面，点击“授权飞书账号”后再回来私聊。",
+  "en-US": "❌ This personal bot requires Sicore authorization. Open the Sicore Agent Channels page, click “Authorize Feishu account”, then come back to this chat.",
 } as const;
 const MAX_AGENT_SELECTED_UPDATES = 2;
 const MAX_LARK_BINDING_QUEUE = 20;
@@ -81,6 +81,7 @@ export interface LarkChannelConfig {
     agent_id: string;
     access_mode: "open" | "sicore_authorized";
     owner_user_id?: string;
+    authorize_url?: string;
   };
 }
 
@@ -306,7 +307,7 @@ export async function handleLarkMessage(
     const binding = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient!);
     if (!binding) {
       if (personalBot.access_mode === "sicore_authorized") {
-        await replyToLark(larkClient, messageId, PERSONAL_BIND_REQUIRED_NOTICE_BY_LOCALE[locale]);
+        await replyToLark(larkClient, messageId, formatPersonalBindRequiredReply(personalBot.authorize_url, locale));
       } else {
         console.log(`[lark] No personal binding for open channel=${channelId} sender=${senderOpenId}`);
       }
@@ -594,6 +595,17 @@ function formatPairReply(
   return locale === "en-US"
     ? `\u274C Pairing failed: ${result.error}`
     : `\u274C 绑定失败: ${result.error}`;
+}
+
+function formatPersonalBindRequiredReply(
+  authorizeUrl: string | undefined,
+  locale: "zh-CN" | "en-US",
+): string {
+  const base = PERSONAL_BIND_REQUIRED_NOTICE_BY_LOCALE[locale];
+  if (!authorizeUrl) return base;
+  return locale === "en-US"
+    ? `${base}\n${authorizeUrl}`
+    : `${base}\n${authorizeUrl}`;
 }
 
 function formatPersonalPairReply(
