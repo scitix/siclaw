@@ -8,7 +8,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { getDb, type Db } from "../gateway/db.js";
-import { buildUpsert, safeParseJson, toSqlTimestamp } from "../gateway/dialect-helpers.js";
+import { buildUpsert, insertIgnorePrefix, safeParseJson, toSqlTimestamp } from "../gateway/dialect-helpers.js";
 import { createTaskNotification } from "./notification-api.js";
 import {
   sendJson,
@@ -44,6 +44,7 @@ interface ResolvedChannelBinding {
   agentId: string;
   bindingId: string;
   sessionId: string;
+  sessionKey?: string | null;
   createdBy: string | null;
   routeType: "group" | "user";
 }
@@ -72,31 +73,88 @@ async function resolveChannelBinding(
   db: Db,
   channelId: string,
   routeKey: string,
+  sessionKey?: string | null,
 ): Promise<ResolvedChannelBinding | null> {
-  let row = await selectChannelBinding(db, channelId, routeKey);
+  const row = await selectChannelBinding(db, channelId, routeKey);
   if (!row) return null;
 
-  if (!row.session_id) {
-    const sessionId = crypto.randomUUID();
-    await db.query(
-      "UPDATE channel_bindings SET session_id = ? WHERE id = ? AND (session_id IS NULL OR session_id = '')",
-      [sessionId, row.id],
-    );
-    row = await selectChannelBinding(db, channelId, routeKey);
-    if (!row) return null;
-  }
-
-  if (!row.session_id) {
-    throw new Error("Failed to allocate channel binding session");
-  }
+  const session = sessionKey
+    ? await resolveChannelBindingParticipantSession(db, row.id, sessionKey)
+    : await resolveLegacyChannelBindingSession(db, row, channelId, routeKey);
 
   return {
     agentId: row.agent_id,
     bindingId: row.id,
-    sessionId: row.session_id,
+    sessionId: session.sessionId,
+    ...(session.sessionKey ? { sessionKey: session.sessionKey } : {}),
     createdBy: row.created_by ?? row.channel_created_by ?? null,
     routeType: normalizeRouteType(row.route_type),
   };
+}
+
+async function resolveLegacyChannelBindingSession(
+  db: Db,
+  row: ChannelBindingRow,
+  channelId: string,
+  routeKey: string,
+): Promise<{ sessionId: string; sessionKey: null }> {
+  let current = row;
+  if (!current.session_id) {
+    const sessionId = crypto.randomUUID();
+    await db.query(
+      "UPDATE channel_bindings SET session_id = ? WHERE id = ? AND (session_id IS NULL OR session_id = '')",
+      [sessionId, current.id],
+    );
+    const refreshed = await selectChannelBinding(db, channelId, routeKey);
+    if (!refreshed) throw new Error("Channel binding disappeared while allocating session");
+    current = refreshed;
+  }
+
+  if (!current.session_id) {
+    throw new Error("Failed to allocate channel binding session");
+  }
+  return { sessionId: current.session_id, sessionKey: null };
+}
+
+async function resolveChannelBindingParticipantSession(
+  db: Db,
+  bindingId: string,
+  sessionKey: string,
+): Promise<{ sessionId: string; sessionKey: string }> {
+  const normalizedKey = normalizeChannelSessionKey(sessionKey);
+  const existing = await selectChannelBindingParticipantSession(db, bindingId, normalizedKey);
+  if (existing) return { sessionId: existing, sessionKey: normalizedKey };
+
+  const sessionId = crypto.randomUUID();
+  await db.query(
+    `${insertIgnorePrefix(db)} INTO channel_binding_sessions (id, binding_id, session_key, session_id) VALUES (?, ?, ?, ?)`,
+    [crypto.randomUUID(), bindingId, normalizedKey, sessionId],
+  );
+
+  const selected = await selectChannelBindingParticipantSession(db, bindingId, normalizedKey);
+  if (!selected) {
+    throw new Error("Failed to allocate channel binding participant session");
+  }
+  return { sessionId: selected, sessionKey: normalizedKey };
+}
+
+async function selectChannelBindingParticipantSession(
+  db: Db,
+  bindingId: string,
+  sessionKey: string,
+): Promise<string | null> {
+  const [rows] = await db.query(
+    "SELECT session_id FROM channel_binding_sessions WHERE binding_id = ? AND session_key = ?",
+    [bindingId, sessionKey],
+  ) as any;
+  return rows.length > 0 ? rows[0].session_id : null;
+}
+
+function normalizeChannelSessionKey(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error("channel session_key must not be empty");
+  if (trimmed.length > 255) throw new Error("channel session_key is too long");
+  return trimmed;
 }
 
 async function pairChannelBinding(
@@ -113,7 +171,8 @@ async function pairChannelBinding(
   }
 
   const pairingCode = codeRows[0];
-  const bindingId = crypto.randomUUID();
+  const existingBinding = await selectChannelBinding(db, params.channel_id, params.route_key);
+  const bindingId = existingBinding?.id ?? crypto.randomUUID();
   const sessionId = crypto.randomUUID();
   try {
     const upsert = buildUpsert(
@@ -125,6 +184,10 @@ async function pairChannelBinding(
       ["agent_id", "session_id", "route_type", "created_by"],
     );
     await db.query(upsert.sql, upsert.params);
+    const row = await selectChannelBinding(db, params.channel_id, params.route_key);
+    if (row) {
+      await db.query("DELETE FROM channel_binding_sessions WHERE binding_id = ?", [row.id]);
+    }
   } catch (err: any) {
     return { success: false, error: `Failed to create binding: ${err.message}` };
   }
@@ -145,11 +208,32 @@ async function resetChannelBindingSession(
   db: Db,
   channelId: string,
   routeKey: string,
+  sessionKey?: string | null,
 ): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
   const row = await selectChannelBinding(db, channelId, routeKey);
   if (!row) return { success: false, error: "Binding not found" };
 
   const sessionId = crypto.randomUUID();
+  if (sessionKey) {
+    const normalizedKey = normalizeChannelSessionKey(sessionKey);
+    const oldSessionId = await selectChannelBindingParticipantSession(db, row.id, normalizedKey);
+    const upsert = buildUpsert(
+      db,
+      "channel_binding_sessions",
+      ["id", "binding_id", "session_key", "session_id"],
+      [crypto.randomUUID(), row.id, normalizedKey, sessionId],
+      ["binding_id", "session_key"],
+      ["session_id", { col: "updated_at", expr: "CURRENT_TIMESTAMP" }],
+    );
+    await db.query(upsert.sql, upsert.params);
+    return {
+      success: true,
+      agentId: row.agent_id,
+      oldSessionId,
+      sessionId,
+    };
+  }
+
   await db.query(
     "UPDATE channel_bindings SET session_id = ? WHERE id = ?",
     [sessionId, row.id],
@@ -1324,9 +1408,9 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
     }
-    const body = await parseBody<{ channel_id: string; route_key: string }>(req);
+    const body = await parseBody<{ channel_id: string; route_key: string; session_key?: string }>(req);
     const db = getDb();
-    const binding = await resolveChannelBinding(db, body.channel_id, body.route_key);
+    const binding = await resolveChannelBinding(db, body.channel_id, body.route_key, body.session_key);
     sendJson(res, 200, { binding });
   });
 
@@ -1350,9 +1434,9 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
     }
-    const body = await parseBody<{ channel_id: string; route_key: string }>(req);
+    const body = await parseBody<{ channel_id: string; route_key: string; session_key?: string }>(req);
     const db = getDb();
-    sendJson(res, 200, await resetChannelBindingSession(db, body.channel_id, body.route_key));
+    sendJson(res, 200, await resetChannelBindingSession(db, body.channel_id, body.route_key, body.session_key));
   });
 
   // ================================================================
@@ -2465,7 +2549,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("channel.resolveBinding", async (params) => {
     const db = getDb();
-    return { binding: await resolveChannelBinding(db, params.channel_id, params.route_key) };
+    return { binding: await resolveChannelBinding(db, params.channel_id, params.route_key, params.session_key) };
   });
 
   handlers.set("channel.pair", async (params) => {
@@ -2475,7 +2559,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("channel.resetSession", async (params) => {
     const db = getDb();
-    return resetChannelBindingSession(db, params.channel_id, params.route_key);
+    return resetChannelBindingSession(db, params.channel_id, params.route_key, params.session_key);
   });
 
   // --- agent.* ---

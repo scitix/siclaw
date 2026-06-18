@@ -78,6 +78,14 @@ describe("resolveBinding", () => {
     frontend.responses.set("channel.resolveBinding", {});
     expect(await resolveBinding("ch", "key", frontend as unknown as FrontendWsClient)).toBeNull();
   });
+
+  it("passes session_key when resolving a participant-scoped binding session", async () => {
+    const binding = { agentId: "a1", bindingId: "b1", sessionId: "s1", sessionKey: "open_id:ou_1", createdBy: "u1", routeType: "group" };
+    frontend.responses.set("channel.resolveBinding", { binding });
+    const b = await resolveBinding("ch", "key", frontend as unknown as FrontendWsClient, "open_id:ou_1");
+    expect(b).toEqual(binding);
+    expect(frontend.calls[0].params).toEqual({ channel_id: "ch", route_key: "key", session_key: "open_id:ou_1" });
+  });
 });
 
 describe("resetBindingSession", () => {
@@ -88,6 +96,15 @@ describe("resetBindingSession", () => {
     expect(frontend.calls[0]).toEqual({
       method: "channel.resetSession",
       params: { channel_id: "ch", route_key: "chat-1" },
+    });
+  });
+
+  it("passes session_key when resetting a participant-scoped binding session", async () => {
+    frontend.responses.set("channel.resetSession", { success: true, agentId: "a1", oldSessionId: "old", sessionId: "new" });
+    await resetBindingSession("ch", "chat-1", frontend as unknown as FrontendWsClient, "open_id:ou_1");
+    expect(frontend.calls[0]).toEqual({
+      method: "channel.resetSession",
+      params: { channel_id: "ch", route_key: "chat-1", session_key: "open_id:ou_1" },
     });
   });
 });

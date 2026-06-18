@@ -101,9 +101,14 @@ function makeAgentBoxManager(agentId = "agent-7") {
   };
 }
 
-function makeTextEvent(text: string, overrides: Record<string, unknown> = {}) {
+function makeTextEvent(text: string, overrides: Record<string, unknown> = {}, senderOpenId = "ou_user_1") {
   return {
     // EventDispatcher has already spread event.* onto the top level here.
+    sender: {
+      sender_id: {
+        open_id: senderOpenId,
+      },
+    },
     message: {
       message_id: "mid-1",
       chat_id: "oc_abc123",
@@ -284,7 +289,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     resolveBindingMock.mockResolvedValue(null);
     const mgr = makeAgentBoxManager();
     await handleLarkMessage(makeTextEvent("hello"), makeLarkClient(), "lark", mgr as any, undefined, {} as any);
-    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything());
+    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1");
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
   });
@@ -380,6 +385,8 @@ describe("handleLarkMessage — routing to AgentBox", () => {
         chatId: "oc_abc123",
         messageId: "mid-1",
         bindingId: "b",
+        senderOpenId: "ou_user_1",
+        sessionKey: "open_id:ou_user_1",
       }),
     }));
     expect(promptMock.mock.calls[0][0]).toMatchObject({
@@ -391,7 +398,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(promptMock.mock.calls[0][0].text).toContain("检查当前集群");
   });
 
-  it("reuses the same durable session for multiple messages in the same group", async () => {
+  it("reuses the same durable session for multiple messages from the same sender in the same group", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "same-session" }));
     promptMock.mockResolvedValue({ sessionId: "same-session" });
     streamEventsMock.mockImplementation(async function* () { /* empty */ });
@@ -401,6 +408,27 @@ describe("handleLarkMessage — routing to AgentBox", () => {
 
     expect(promptMock).toHaveBeenCalledTimes(2);
     expect(promptMock.mock.calls.map((call) => call[0].sessionId)).toEqual(["same-session", "same-session"]);
+  });
+
+  it("uses separate durable sessions for different senders in the same group", async () => {
+    resolveBindingMock.mockImplementation((_channelId, _routeKey, _frontend, sessionKey) => {
+      const suffix = sessionKey === "open_id:ou_user_2" ? "user-2" : "user-1";
+      return Promise.resolve(makeBinding({ sessionId: `session-${suffix}`, sessionKey }));
+    });
+    promptMock.mockResolvedValue({ sessionId: "ignored" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(makeTextEvent("第一人"), makeLarkClient(), "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+    await handleLarkMessage(makeTextEvent("第二人", { message_id: "mid-2" }, "ou_user_2"), makeLarkClient(), "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    expect(promptMock).toHaveBeenCalledTimes(2);
+    expect(promptMock.mock.calls.map((call) => call[0].sessionId)).toEqual(["session-user-1", "session-user-2"]);
+    expect(resolveBindingMock.mock.calls.map((call) => call[3])).toEqual([
+      "open_id:ou_user_1",
+      "open_id:ou_user_1",
+      "open_id:ou_user_2",
+      "open_id:ou_user_2",
+    ]);
   });
 
   it("rejects legacy bindings without an owner instead of writing lark chat ids as users", async () => {
@@ -438,14 +466,14 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       {} as any,
     );
 
-    expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything());
+    expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1");
     expect(mgr.getOrCreate).toHaveBeenCalledWith("a1");
     expect(closeSessionMock).toHaveBeenCalledWith("old-session");
     expect(promptMock).not.toHaveBeenCalled();
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
   });
 
-  it("queues concurrent messages for the same binding instead of starting a second prompt", async () => {
+  it("queues concurrent messages for the same sender instead of starting a second prompt", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "queued-session" }));
     let releaseFirst!: () => void;
     promptMock
@@ -470,6 +498,31 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       expect.stringContaining("first"),
       expect.stringContaining("second"),
     ]);
+  });
+
+  it("does not queue different senders in the same group behind each other", async () => {
+    resolveBindingMock.mockImplementation((_channelId, _routeKey, _frontend, sessionKey) => {
+      const suffix = sessionKey === "open_id:ou_user_2" ? "user-2" : "user-1";
+      return Promise.resolve(makeBinding({ sessionId: `session-${suffix}`, sessionKey }));
+    });
+    let releaseFirst!: () => void;
+    promptMock
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        releaseFirst = () => resolve({ sessionId: "session-user-1" });
+      }))
+      .mockResolvedValueOnce({ sessionId: "session-user-2" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const mgr = makeAgentBoxManager("a1");
+
+    const first = handleLarkMessage(makeTextEvent("first"), makeLarkClient(), "lark", mgr as any, undefined, {} as any);
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(1));
+
+    const second = handleLarkMessage(makeTextEvent("second", { message_id: "mid-2" }, "ou_user_2"), makeLarkClient(), "lark", mgr as any, undefined, {} as any);
+    await waitForExpect(() => expect(promptMock).toHaveBeenCalledTimes(2));
+
+    expect(promptMock.mock.calls.map((call) => call[0].sessionId)).toEqual(["session-user-1", "session-user-2"]);
+    releaseFirst();
+    await Promise.all([first, second]);
   });
 
   it("replies with a queue-full notice when one binding already has 20 pending messages", async () => {
