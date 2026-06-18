@@ -33,11 +33,17 @@ vi.mock("../agentbox/client.js", () => ({
 const resolveBindingMock = vi.fn();
 const handlePairingCodeMock = vi.fn();
 const resetBindingSessionMock = vi.fn();
+const resolvePersonalBindingMock = vi.fn();
+const handlePersonalPairingCodeMock = vi.fn();
+const resetPersonalSessionMock = vi.fn();
 
 vi.mock("../channel-manager.js", () => ({
   resolveBinding: (...args: unknown[]) => resolveBindingMock(...args),
   handlePairingCode: (...args: unknown[]) => handlePairingCodeMock(...args),
   resetBindingSession: (...args: unknown[]) => resetBindingSessionMock(...args),
+  resolvePersonalBinding: (...args: unknown[]) => resolvePersonalBindingMock(...args),
+  handlePersonalPairingCode: (...args: unknown[]) => handlePersonalPairingCodeMock(...args),
+  resetPersonalSession: (...args: unknown[]) => resetPersonalSessionMock(...args),
 }));
 
 const ensureChatSessionMock = vi.fn();
@@ -130,6 +136,18 @@ function makeBinding(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function makePersonalConfig(accessMode: "open" | "sicore_authorized" = "open") {
+  return {
+    app_id: "cli_personal",
+    app_secret: "secret",
+    personal_bot: {
+      agent_id: "a1",
+      access_mode: accessMode,
+      owner_user_id: "owner-1",
+    },
+  };
+}
+
 async function waitForExpect(assertion: () => void): Promise<void> {
   let lastError: unknown;
   for (let i = 0; i < 30; i += 1) {
@@ -151,6 +169,9 @@ beforeEach(() => {
   resolveBindingMock.mockReset();
   handlePairingCodeMock.mockReset();
   resetBindingSessionMock.mockReset();
+  resolvePersonalBindingMock.mockReset();
+  handlePersonalPairingCodeMock.mockReset();
+  resetPersonalSessionMock.mockReset();
   ensureChatSessionMock.mockReset();
   appendMessageMock.mockReset();
   ensureChatSessionMock.mockResolvedValue(undefined);
@@ -281,6 +302,120 @@ describe("handleLarkMessage — PAIR command", () => {
     await handleLarkMessage(data5, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, {} as any);
     await handleLarkMessage(data7, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, {} as any);
     expect(handlePairingCodeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("handleLarkMessage — personal bot p2p", () => {
+  it("open mode resolves a p2p sender and uses the returned per-openid session", async () => {
+    resolvePersonalBindingMock.mockResolvedValue(makeBinding({
+      bindingId: "personal-bot-1",
+      sessionId: "session-open-ou1",
+      sessionKey: "open_id:ou_user_1",
+      routeType: "user",
+      createdBy: "owner-1",
+    }));
+    promptMock.mockResolvedValue({ sessionId: "session-open-ou1" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makeTextEvent("hello personal", { chat_type: "p2p" }),
+      makeLarkClient(),
+      "personal-bot-1",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      makePersonalConfig("open"),
+    );
+
+    expect(resolvePersonalBindingMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything());
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+    expect(ensureChatSessionMock).toHaveBeenCalledWith(
+      "session-open-ou1",
+      "a1",
+      "owner-1",
+      "hello personal",
+      "hello personal",
+      "channel",
+    );
+    expect(promptMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "session-open-ou1",
+      agentId: "a1",
+      mode: "channel",
+    }));
+  });
+
+  it("authorized mode prompts for PAIR when the open_id is not bound to a Sicore user", async () => {
+    resolvePersonalBindingMock.mockResolvedValue(null);
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("查一下集群", { chat_type: "p2p" }),
+      lark,
+      "personal-bot-1",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      makePersonalConfig("sicore_authorized"),
+    );
+
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("PAIR");
+  });
+
+  it("authorized p2p PAIR consumes the personal pairing code instead of group binding", async () => {
+    handlePersonalPairingCodeMock.mockResolvedValue({ success: true, agentName: "Secure Agent" });
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("PAIR abc123", { chat_type: "p2p" }),
+      lark,
+      "personal-bot-1",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      makePersonalConfig("sicore_authorized"),
+    );
+
+    expect(handlePersonalPairingCodeMock).toHaveBeenCalledWith("ABC123", "personal-bot-1", "ou_user_1", expect.anything());
+    expect(handlePairingCodeMock).not.toHaveBeenCalled();
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("授权成功");
+  });
+
+  it("p2p /new resets only the current personal session", async () => {
+    resolvePersonalBindingMock.mockResolvedValue(makeBinding({
+      bindingId: "personal-bot-1",
+      sessionId: "old-personal",
+      sessionKey: "sicore_user:user-1",
+      routeType: "user",
+      createdBy: "user-1",
+    }));
+    resetPersonalSessionMock.mockResolvedValue({
+      success: true,
+      agentId: "a1",
+      oldSessionId: "old-personal",
+      sessionId: "new-personal",
+    });
+    const lark = makeLarkClient();
+    const mgr = makeAgentBoxManager("a1");
+
+    await handleLarkMessage(
+      makeTextEvent("/new", { chat_type: "p2p" }),
+      lark,
+      "personal-bot-1",
+      mgr as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      makePersonalConfig("sicore_authorized"),
+    );
+
+    expect(resetPersonalSessionMock).toHaveBeenCalledWith("personal-bot-1", "sicore_user:user-1", expect.anything());
+    expect(resetBindingSessionMock).not.toHaveBeenCalled();
+    expect(closeSessionMock).toHaveBeenCalledWith("old-personal");
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
   });
 });
 

@@ -72,6 +72,42 @@ export async function resetBindingSession(
   });
 }
 
+export async function resolvePersonalBinding(
+  channelId: string,
+  senderOpenId: string,
+  frontendClient: FrontendWsClient,
+): Promise<ResolvedChannelBinding | null> {
+  const data = await frontendClient.request("channel.resolvePersonalBinding", {
+    channel_id: channelId,
+    sender_open_id: senderOpenId,
+  });
+  return data.binding ?? null;
+}
+
+export async function handlePersonalPairingCode(
+  code: string,
+  channelId: string,
+  senderOpenId: string,
+  frontendClient: FrontendWsClient,
+): Promise<{ success: boolean; agentName?: string; error?: string }> {
+  return frontendClient.request("channel.pairPersonal", {
+    code,
+    channel_id: channelId,
+    sender_open_id: senderOpenId,
+  });
+}
+
+export async function resetPersonalSession(
+  channelId: string,
+  sessionKey: string,
+  frontendClient: FrontendWsClient,
+): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
+  return frontendClient.request("channel.resetPersonalSession", {
+    channel_id: channelId,
+    session_key: sessionKey,
+  });
+}
+
 export interface ChannelManagerOptions {
   /** Max retry attempts for bootFromDb when channel.list races with WS connect. */
   bootRetryAttempts?: number;

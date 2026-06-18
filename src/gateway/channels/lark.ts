@@ -9,7 +9,15 @@
 import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
-import { resolveBinding, handlePairingCode, resetBindingSession } from "../channel-manager.js";
+import {
+  resolveBinding,
+  handlePairingCode,
+  resetBindingSession,
+  resolvePersonalBinding,
+  handlePersonalPairingCode,
+  resetPersonalSession,
+  type ResolvedChannelBinding,
+} from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { appendMessage, ensureChatSession } from "../chat-repo.js";
@@ -34,12 +42,16 @@ const QUEUE_FULL_NOTICE_BY_LOCALE = {
   "en-US": "⏳ This channel session already has several messages queued. Please try again later.",
 } as const;
 const NEW_SESSION_NOTICE_BY_LOCALE = {
-  "zh-CN": "✅ 已开启新会话，你在此群中的历史上下文已清空。",
-  "en-US": "✅ Started a new session for you in this group. Your previous group context has been cleared.",
+  "zh-CN": "✅ 已开启新会话，此入口中的历史上下文已清空。",
+  "en-US": "✅ Started a new session. Previous context for this channel entry has been cleared.",
 } as const;
 const MISSING_OWNER_NOTICE_BY_LOCALE = {
   "zh-CN": "❌ 当前群绑定缺少会话归属信息，请在 Agent 页面重新生成 PAIR code 并在群里重新绑定。",
   "en-US": "❌ This group binding is missing a session owner. Generate a fresh PAIR code from the Agent page and pair this group again.",
+} as const;
+const PERSONAL_BIND_REQUIRED_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 这个个人机器人需要先绑定 Sicore 账号。请在 Agent 页面生成个人 PAIR code 后，在这里发送 PAIR ABC123。",
+  "en-US": "❌ This personal bot requires Sicore authorization. Generate a personal PAIR code from the Agent page, then send PAIR ABC123 here.",
 } as const;
 const MAX_AGENT_SELECTED_UPDATES = 2;
 const MAX_LARK_BINDING_QUEUE = 20;
@@ -63,6 +75,11 @@ export interface LarkChannelConfig {
   app_secret: string;
   verification_token?: string;
   encrypt_key?: string;
+  personal_bot?: {
+    agent_id: string;
+    access_mode: "open" | "sicore_authorized";
+    owner_user_id?: string;
+  };
 }
 
 /**
@@ -114,7 +131,7 @@ export function createLarkHandler(
         // ACK ships in <1ms and redelivery never triggers.
         "im.message.receive_v1": (data: any) => {
           setImmediate(() => {
-            handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions, frontendClient, localeForDomain(config.domain))
+            handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions, frontendClient, localeForDomain(config.domain), config)
               .catch((err) => {
                 console.error(`[lark] Error handling message for channel=${channelId}:`, err);
               });
@@ -206,7 +223,7 @@ function buildLarkSessionKey(senderOpenId: string | null, chatId: string): strin
 export function buildChannelTurnPrompt(text: string): string {
   return [
     "<channel-turn>",
-    "This Feishu/Lark group session may contain earlier incidents, clusters, pods, or reports.",
+    "This Feishu/Lark channel session may contain earlier incidents, clusters, pods, or reports.",
     "Treat the message below as the current user request and answer it first.",
     "Use earlier session context only when the user explicitly refers to it, or when it is stable configuration context needed to answer the current request.",
     "If the current message names a different case, cluster, time range, object, or task, treat it as a new request. Do not force the previous case into the answer.",
@@ -231,6 +248,7 @@ export async function handleLarkMessage(
   tlsOptions?: { cert: string; key: string; ca: string },
   frontendClient?: FrontendWsClient,
   locale: "zh-CN" | "en-US" = "zh-CN",
+  channelConfig?: LarkChannelConfig,
 ): Promise<void> {
   // @larksuiteoapi/node-sdk EventDispatcher flattens the event payload before
   // dispatching: `event.*` fields land on the top level and `data.event`
@@ -241,6 +259,7 @@ export async function handleLarkMessage(
   const messageId: string = message.message_id;
   const chatId: string = message.chat_id;
   const msgType: string = message.message_type;
+  const chatType: string | undefined = message.chat_type;
   const senderOpenId = getLarkSenderOpenId(data);
   const sessionKey = buildLarkSessionKey(senderOpenId, chatId);
 
@@ -255,6 +274,64 @@ export async function handleLarkMessage(
   if (!text || text.trim().length === 0) return;
   text = text.replace(/@_user_\d+/g, "").trim();
   if (text.length === 0) return;
+
+  const personalBot = channelConfig?.personal_bot;
+  if (chatType === "p2p") {
+    if (!personalBot) {
+      console.log(`[lark] Ignoring p2p message for non-personal channel=${channelId}`);
+      return;
+    }
+    if (!senderOpenId) {
+      await replyToLark(larkClient, messageId, "❌ Missing Feishu sender open_id.");
+      return;
+    }
+    const pairMatch = text.match(/^PAIR\s+([A-Z0-9]{6})$/i);
+    if (pairMatch) {
+      if (personalBot.access_mode !== "sicore_authorized") {
+        await replyToLark(larkClient, messageId, locale === "en-US"
+          ? "This open personal bot does not require PAIR."
+          : "这个公开个人机器人不需要 PAIR。");
+        return;
+      }
+      const code = pairMatch[1].toUpperCase();
+      const result = await handlePersonalPairingCode(code, channelId, senderOpenId, frontendClient!);
+      await replyToLark(larkClient, messageId, formatPersonalPairReply(result, locale));
+      return;
+    }
+
+    const binding = await resolvePersonalBinding(channelId, senderOpenId, frontendClient!);
+    if (!binding) {
+      if (personalBot.access_mode === "sicore_authorized") {
+        await replyToLark(larkClient, messageId, PERSONAL_BIND_REQUIRED_NOTICE_BY_LOCALE[locale]);
+      } else {
+        console.log(`[lark] No personal binding for open channel=${channelId} sender=${senderOpenId}`);
+      }
+      return;
+    }
+
+    const personalSessionKey = binding.sessionKey ?? `open_id:${senderOpenId}`;
+    const queueKey = `${binding.bindingId}:${personalSessionKey}`;
+    const queued = enqueueBindingTask(queueKey, () => processQueuedLarkMessage({
+      text,
+      messageId,
+      chatId,
+      senderOpenId,
+      sessionKey: personalSessionKey,
+      channelId,
+      route: "personal",
+      larkClient,
+      agentBoxManager,
+      tlsOptions,
+      frontendClient,
+      locale,
+    }));
+    if (!queued.accepted) {
+      await replyToLark(larkClient, messageId, QUEUE_FULL_NOTICE_BY_LOCALE[locale]);
+      return;
+    }
+    await queued.done;
+    return;
+  }
 
   // Check for PAIR command
   const pairMatch = text.match(/^PAIR\s+([A-Z0-9]{6})$/i);
@@ -284,6 +361,7 @@ export async function handleLarkMessage(
     senderOpenId,
     sessionKey,
     channelId,
+    route: "group",
     larkClient,
     agentBoxManager,
     tlsOptions,
@@ -304,6 +382,7 @@ interface QueuedLarkMessageContext {
   senderOpenId: string | null;
   sessionKey: string;
   channelId: string;
+  route: "group" | "personal";
   larkClient: any;
   agentBoxManager: AgentBoxManager;
   tlsOptions?: { cert: string; key: string; ca: string };
@@ -319,6 +398,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     senderOpenId,
     sessionKey,
     channelId,
+    route,
     larkClient,
     agentBoxManager,
     tlsOptions,
@@ -327,13 +407,13 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   } = ctx;
 
   if (/^\/new$/i.test(text)) {
-    await handleNewCommand(channelId, chatId, sessionKey, messageId, larkClient, agentBoxManager, tlsOptions, frontendClient, locale);
+    await handleNewCommand(route, channelId, chatId, sessionKey, messageId, larkClient, agentBoxManager, tlsOptions, frontendClient, locale);
     return;
   }
 
-  const binding = await resolveBinding(channelId, chatId, frontendClient!, sessionKey);
+  const binding = await resolveQueuedBinding(route, channelId, chatId, senderOpenId, frontendClient!, sessionKey);
   if (!binding) {
-    console.log(`[lark] Binding disappeared before queued run channel=${channelId} chat=${chatId}`);
+    console.log(`[lark] Binding disappeared before queued run channel=${channelId} chat=${chatId} route=${route}`);
     return;
   }
   if (!binding.createdBy) {
@@ -353,7 +433,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       sessionId,
       role: "user",
       content: text,
-      metadata: { source: "lark", channelId, chatId, messageId, bindingId: binding.bindingId, senderOpenId, sessionKey },
+      metadata: { source: "lark", channelId, chatId, messageId, bindingId: binding.bindingId, senderOpenId, sessionKey, route },
     });
   } catch (err) {
     console.error(`[lark] Failed to persist channel user message session=${sessionId}:`, err);
@@ -439,7 +519,23 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   await replyVisualImages(larkClient, messageId, replyImages);
 }
 
+async function resolveQueuedBinding(
+  route: "group" | "personal",
+  channelId: string,
+  chatId: string,
+  senderOpenId: string | null,
+  frontendClient: FrontendWsClient,
+  sessionKey: string,
+): Promise<ResolvedChannelBinding | null> {
+  if (route === "personal") {
+    if (!senderOpenId) return null;
+    return resolvePersonalBinding(channelId, senderOpenId, frontendClient);
+  }
+  return resolveBinding(channelId, chatId, frontendClient, sessionKey);
+}
+
 async function handleNewCommand(
+  route: "group" | "personal",
   channelId: string,
   chatId: string,
   sessionKey: string,
@@ -450,7 +546,9 @@ async function handleNewCommand(
   frontendClient?: FrontendWsClient,
   locale: "zh-CN" | "en-US" = "zh-CN",
 ): Promise<void> {
-  const reset = await resetBindingSession(channelId, chatId, frontendClient!, sessionKey);
+  const reset = route === "personal"
+    ? await resetPersonalSession(channelId, sessionKey, frontendClient!)
+    : await resetBindingSession(channelId, chatId, frontendClient!, sessionKey);
   if (!reset.success || !reset.sessionId || !reset.agentId) {
     await replyToLark(larkClient, messageId, `❌ ${reset.error ?? "Failed to reset session"}`);
     return;
@@ -487,6 +585,20 @@ function formatPairReply(
   return locale === "en-US"
     ? `\u274C Pairing failed: ${result.error}`
     : `\u274C 绑定失败: ${result.error}`;
+}
+
+function formatPersonalPairReply(
+  result: { success: boolean; agentName?: string; error?: string },
+  locale: "zh-CN" | "en-US",
+): string {
+  if (result.success) {
+    return locale === "en-US"
+      ? `\u2705 Authorized! This personal bot is now connected to agent "${result.agentName}".`
+      : `\u2705 授权成功！这个个人机器人已连接到 Agent "${result.agentName}"。`;
+  }
+  return locale === "en-US"
+    ? `\u274C Authorization failed: ${result.error}`
+    : `\u274C 授权失败: ${result.error}`;
 }
 
 async function replyToLark(larkClient: any, messageId: string, text: string): Promise<void> {
