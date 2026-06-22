@@ -609,7 +609,12 @@ export function registerChatRoutes(
       userId: auth.userId,
       sessionId: params.sessionId,
     });
-    sendJson(res, 200, { running: result.ok && !!(result.payload as Record<string, unknown> | undefined)?.running });
+    const payload = result.payload as Record<string, unknown> | undefined;
+    const running = result.ok && !!payload?.running;
+    sendJson(res, 200, {
+      running,
+      canSteer: result.ok && !!(payload?.canSteer ?? running),
+    });
   });
 
   // POST /api/v1/siclaw/agents/:id/chat/steer — inject steer message
@@ -629,7 +634,11 @@ export function registerChatRoutes(
       text: promptText,
     });
 
-    sendJson(res, result.ok ? 200 : 502, result);
+    const payload = result.payload as Record<string, unknown> | undefined;
+    const payloadError = payload?.error as Record<string, unknown> | undefined;
+    const idle = result.ok && payload?.ok === false && payloadError?.code === "SESSION_IDLE";
+    const thrownIdle = !result.ok && typeof result.error === "string" && result.error.includes("SESSION_IDLE");
+    sendJson(res, idle || thrownIdle ? 409 : result.ok ? 200 : 502, result);
   });
 
   // POST /api/v1/siclaw/agents/:id/chat/abort — abort current execution

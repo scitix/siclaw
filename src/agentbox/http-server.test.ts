@@ -866,9 +866,25 @@ describe("http-server — steer / abort / clear-queue", () => {
   it("POST /api/sessions/:id/steer calls brain.steer", async () => {
     await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st2" });
     const s = sm.sessions.get("st2")!;
+    s.isAgentActive = true;
     const r = await getJson(port, "/api/sessions/st2/steer", "POST", { text: "stop" });
     expect(r.status).toBe(200);
     expect(s.brain.steer).toHaveBeenCalledWith("stop");
+  });
+
+  it("POST /api/sessions/:id/steer rejects idle sessions without queueing", async () => {
+    const s = await sm.getOrCreate("idle-steer");
+    s._promptDone = true;
+    s._promptInflight = null;
+    s.isAgentActive = false;
+    s.isCompacting = false;
+    s.isRetrying = false;
+
+    const r = await getJson(port, "/api/sessions/idle-steer/steer", "POST", { text: "late" });
+
+    expect(r.status).toBe(409);
+    expect(r.data.error.code).toBe("SESSION_IDLE");
+    expect(s.brain.steer).not.toHaveBeenCalled();
   });
 
   it("POST /api/sessions/:id/abort calls brain.abort AND stops the session's background jobs", async () => {
@@ -996,6 +1012,7 @@ describe("http-server — session status (liveness)", () => {
     const r = await getJson(port, "/api/sessions/st1/status");
     expect(r.status).toBe(200);
     expect(r.data.running).toBe(false);
+    expect(r.data.canSteer).toBe(false);
   });
 
   it("returns running:true when any activity flag is set", async () => {
@@ -1007,13 +1024,29 @@ describe("http-server — session status (liveness)", () => {
       const r = await getJson(port, "/api/sessions/st2/status");
       expect(r.status).toBe(200);
       expect(r.data.running).toBe(true);
+      expect(r.data.canSteer).toBe(true);
     }
+  });
+
+  it("returns canSteer:true while the prompt mutex is held before agent_start", async () => {
+    const s = await sm.getOrCreate("prompt-lock");
+    s._promptDone = true;
+    s._promptInflight = new Promise<void>(() => {});
+    s.isAgentActive = false;
+    s.isCompacting = false;
+    s.isRetrying = false;
+
+    const r = await getJson(port, "/api/sessions/prompt-lock/status");
+
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ running: true, canSteer: true });
   });
 
   it("returns running:false for an unknown (never-created / released) session", async () => {
     const r = await getJson(port, "/api/sessions/ghost/status");
     expect(r.status).toBe(200);
     expect(r.data.running).toBe(false);
+    expect(r.data.canSteer).toBe(false);
   });
 });
 

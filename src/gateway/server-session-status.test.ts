@@ -21,18 +21,23 @@ vi.mock("./sse-consumer.js", () => ({
   consumeAgentSse: vi.fn(async () => ({ resultText: "", taskReportText: "", errorMessage: "", eventCount: 0, durationMs: 0 })),
 }));
 
-// sessionStatus behaviour is swapped per-test via this hook.
-let statusImpl: (sessionId: string) => Promise<{ running: boolean }>;
+// sessionStatus / steer behaviour is swapped per-test via these hooks.
+let statusImpl: (sessionId: string) => Promise<{ running: boolean; canSteer?: boolean }>;
+const steerSessionCalls: Array<{ sessionId: string; text: string }> = [];
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     endpoint: string;
     constructor(endpoint: string) { this.endpoint = endpoint; }
     sessionStatus = vi.fn((sessionId: string) => statusImpl(sessionId));
+    steerSession = vi.fn(async (sessionId: string, text: string) => {
+      steerSessionCalls.push({ sessionId, text });
+    });
     streamEvents = async function* () {};
   },
 }));
 
 const { startRuntime } = await import("./server.js");
+const chatRepo = await import("./chat-repo.js");
 
 function fakeFrontendClient() {
   return { request: vi.fn(async () => ({ found: false })), onCommand: vi.fn(), emitEvent: vi.fn(), close: vi.fn() } as any;
@@ -64,6 +69,7 @@ afterEach(async () => {
   if (server) await server.close();
   server = undefined;
   nextHandle = null;
+  steerSessionCalls.length = 0;
   vi.clearAllMocks();
 });
 
@@ -73,16 +79,16 @@ describe("startRuntime — chat.sessionStatus", () => {
     server = await bootRuntime();
     const status = server.rpcMethods.get("chat.sessionStatus")!;
     const res = await status({ agentId: "a", sessionId: "S" });
-    expect(res).toMatchObject({ ok: true, running: false });
+    expect(res).toMatchObject({ ok: true, running: false, canSteer: false });
   });
 
   it("returns the agentbox running flag when a box exists", async () => {
     nextHandle = { endpoint: "https://fake.internal" };
-    statusImpl = async () => ({ running: true });
+    statusImpl = async () => ({ running: true, canSteer: true });
     server = await bootRuntime();
     const status = server.rpcMethods.get("chat.sessionStatus")!;
     const res = await status({ agentId: "a", sessionId: "S" });
-    expect(res).toMatchObject({ ok: true, running: true });
+    expect(res).toMatchObject({ ok: true, running: true, canSteer: true });
   });
 
   it("fails safe to running:false when the agentbox probe throws", async () => {
@@ -91,12 +97,57 @@ describe("startRuntime — chat.sessionStatus", () => {
     server = await bootRuntime();
     const status = server.rpcMethods.get("chat.sessionStatus")!;
     const res = await status({ agentId: "a", sessionId: "S" });
-    expect(res).toMatchObject({ ok: true, running: false });
+    expect(res).toMatchObject({ ok: true, running: false, canSteer: false });
   });
 
   it("rejects when agentId/sessionId are missing", async () => {
     server = await bootRuntime();
     const status = server.rpcMethods.get("chat.sessionStatus")!;
     await expect(status({ agentId: "a" })).rejects.toThrow(/required/);
+  });
+});
+
+describe("startRuntime — chat.steer liveness", () => {
+  it("returns SESSION_IDLE without spawning or persisting when no box exists", async () => {
+    nextHandle = null;
+    server = await bootRuntime();
+    const steer = server.rpcMethods.get("chat.steer")!;
+
+    const res = await steer({ agentId: "a", sessionId: "S", text: "late" });
+
+    expect(res).toMatchObject({ ok: false, error: { code: "SESSION_IDLE" } });
+    expect(chatRepo.appendMessage).not.toHaveBeenCalled();
+    expect(steerSessionCalls).toHaveLength(0);
+  });
+
+  it("returns SESSION_IDLE without persisting when the session cannot be steered", async () => {
+    nextHandle = { endpoint: "https://fake.internal" };
+    statusImpl = async () => ({ running: false, canSteer: false });
+    server = await bootRuntime();
+    const steer = server.rpcMethods.get("chat.steer")!;
+
+    const res = await steer({ agentId: "a", sessionId: "S", text: "late" });
+
+    expect(res).toMatchObject({ ok: false, error: { code: "SESSION_IDLE" } });
+    expect(chatRepo.appendMessage).not.toHaveBeenCalled();
+    expect(steerSessionCalls).toHaveLength(0);
+  });
+
+  it("accepts steer before persisting and falls back to running for old status payloads", async () => {
+    nextHandle = { endpoint: "https://fake.internal" };
+    statusImpl = async () => ({ running: true });
+    server = await bootRuntime();
+    const steer = server.rpcMethods.get("chat.steer")!;
+
+    const res = await steer({ agentId: "a", sessionId: "S", text: "interrupt" });
+
+    expect(res).toMatchObject({ ok: true });
+    expect(steerSessionCalls).toEqual([{ sessionId: "S", text: "interrupt" }]);
+    expect(chatRepo.appendMessage).toHaveBeenCalledWith({
+      sessionId: "S",
+      role: "user",
+      content: "interrupt",
+      metadata: { kind: "steer" },
+    });
   });
 });

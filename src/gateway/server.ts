@@ -327,19 +327,33 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const text = params.text as string;
     if (!agentId || !sessionId || !text) throw new Error("agentId, sessionId, text required");
 
-    // Persist the steer as a user message BEFORE injecting it, mirroring
-    // chat.send (L198). Without this the steer only rides the running prompt's
-    // SSE stream and is rendered optimistically by the frontend, but never lands
-    // in chat_messages — so it vanishes on the next history reload. metadata.kind
-    // = "steer" lets the frontend render it as a steer bubble, not a plain user
-    // message. No ensureChatSession: a steer always targets an already-running
-    // session, so the row exists and we must not clobber its title/preview.
+    const handle = await agentBoxManager.getAsync(agentId);
+    if (!handle) {
+      return {
+        ok: false,
+        error: { code: "SESSION_IDLE", message: "Session is not running; send a new prompt instead.", retriable: false },
+      };
+    }
+    const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
+    const status = await client.sessionStatus(sessionId);
+    const canSteer = status.canSteer ?? status.running;
+    if (!canSteer) {
+      return {
+        ok: false,
+        error: { code: "SESSION_IDLE", message: "Session is not running; send a new prompt instead.", retriable: false },
+      };
+    }
+
+    await client.steerSession(sessionId, text);
+
+    // Persist only after Runtime accepts the steer. This keeps an idle/raced steer
+    // from becoming a dangling final user row in chat_messages. metadata.kind =
+    // "steer" lets the frontend render it as a steer bubble, not a plain user
+    // message. No ensureChatSession: a steer targets an existing session, so the
+    // row exists and we must not clobber its title/preview.
     await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
     await incrementMessageCount(sessionId);
 
-    const handle = await agentBoxManager.getOrCreate(agentId);
-    const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
-    await client.steerSession(sessionId, text);
     return { ok: true };
   });
 
@@ -364,14 +378,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
 
     const handle = await agentBoxManager.getAsync(agentId);
-    if (!handle) return { ok: true, running: false };
+    if (!handle) return { ok: true, running: false, canSteer: false };
     try {
       const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
-      const { running } = await client.sessionStatus(sessionId);
-      return { ok: true, running: !!running };
+      const { running, canSteer } = await client.sessionStatus(sessionId);
+      return { ok: true, running: !!running, canSteer: !!(canSteer ?? running) };
     } catch (err: any) {
       console.warn(`[rpc] chat.sessionStatus: agent=${agentId} session=${sessionId} probe failed: ${err?.message ?? err}`);
-      return { ok: true, running: false };
+      return { ok: true, running: false, canSteer: false };
     }
   });
 

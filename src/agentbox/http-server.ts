@@ -194,6 +194,18 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
   res.end(JSON.stringify(data));
 }
 
+function sessionActivity(managed: {
+  isAgentActive: boolean;
+  isCompacting: boolean;
+  isRetrying: boolean;
+  _promptDone: boolean;
+  _promptInflight: Promise<void> | null;
+} | undefined): { running: boolean; canSteer: boolean } {
+  const activity = !!managed && (managed.isAgentActive || managed.isCompacting || managed.isRetrying);
+  const promptBusy = !!managed && (!managed._promptDone || !!managed._promptInflight);
+  return { running: activity || promptBusy, canSteer: activity || promptBusy };
+}
+
 const ABORT_ENDPOINT_TIMEOUT_MS = 2_000;
 
 function waitMs(ms: number): Promise<void> {
@@ -902,6 +914,19 @@ export function createHttpServer(
       return;
     }
 
+    const { canSteer } = sessionActivity(managed);
+    if (!canSteer) {
+      sendJson(res, 409, {
+        ok: false,
+        error: {
+          code: "SESSION_IDLE",
+          message: "Session is not running; send a new prompt instead of steering.",
+          retriable: false,
+        },
+      });
+      return;
+    }
+
     console.log(`[agentbox-http] Steering session ${sessionId}: ${body.text.slice(0, 80)}`);
     try {
       await managed.brain.steer(body.text);
@@ -944,17 +969,17 @@ export function createHttpServer(
    * GET /api/sessions/:sessionId/status — explicit liveness for the in-progress turn.
    *
    * Source of truth for "is this session's turn still running" used by the Portal
-   * reconnect-after-refresh flow. MUST be the agentbox's own activity flags, NOT inferred
+   * reconnect-after-refresh flow and for "can this request be a steer". MUST be the
+   * agentbox's own prompt/activity flags, NOT inferred
    * from persisted chat rows: siclaw is end-only persistence, so a turn that is thinking or
    * streaming text with no tool in flight has no "running" row — a row heuristic would miss
    * it and the page would stop following a live turn. A not-yet-created / already-released
-   * session has no managed entry → not running.
+   * session has no managed entry → not running and cannot be steered.
    */
   addRoute("GET", "/api/sessions/:sessionId/status", async (_req, res, params) => {
     const { sessionId } = params;
     const managed = sessionManager.get(sessionId);
-    const running = !!managed && (managed.isAgentActive || managed.isCompacting || managed.isRetrying);
-    sendJson(res, 200, { running });
+    sendJson(res, 200, sessionActivity(managed));
   });
 
   /**

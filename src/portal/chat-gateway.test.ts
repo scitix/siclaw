@@ -567,6 +567,31 @@ describe("chat-gateway routes", () => {
       }));
       expect(res._status).toBe(502);
     });
+
+    it("returns 409 when runtime reports an idle steer", async () => {
+      connMap.sendCommand = vi.fn().mockResolvedValue({
+        ok: true,
+        payload: { ok: false, error: { code: "SESSION_IDLE", message: "idle" } },
+      });
+      const res = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/steer",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: { session_id: "s1", text: "x" },
+      }));
+      expect(res._status).toBe(409);
+    });
+
+    it("returns 409 when runtime throws an idle steer error", async () => {
+      connMap.sendCommand = vi.fn().mockResolvedValue({ ok: false, error: "SESSION_IDLE: idle" });
+      const res = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/steer",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: { session_id: "s1", text: "x" },
+      }));
+      expect(res._status).toBe(409);
+    });
   });
 
   // ── chat.abort ───────────────────────────────────────────
@@ -613,13 +638,23 @@ describe("chat-gateway routes", () => {
 
     it("maps payload.running to the response on a new (unowned) session", async () => {
       query.mockResolvedValue([[], []]); // brand-new session → no row → allowed
+      connMap.sendCommand = vi.fn().mockResolvedValue({ ok: true, payload: { running: true, canSteer: true } });
+      const res = await runRoute(router, fakeReq({
+        url, method: "GET", headers: { authorization: `Bearer ${USER_TOKEN}` },
+      }));
+      expect(res._status).toBe(200);
+      expect(JSON.parse(res._body)).toEqual({ running: true, canSteer: true });
+      expect(connMap.sendCommand).toHaveBeenCalledWith("a1", "chat.sessionStatus", expect.objectContaining({ sessionId: "s1" }));
+    });
+
+    it("defaults canSteer from running for older runtime payloads", async () => {
+      query.mockResolvedValue([[], []]);
       connMap.sendCommand = vi.fn().mockResolvedValue({ ok: true, payload: { running: true } });
       const res = await runRoute(router, fakeReq({
         url, method: "GET", headers: { authorization: `Bearer ${USER_TOKEN}` },
       }));
       expect(res._status).toBe(200);
-      expect(JSON.parse(res._body)).toEqual({ running: true });
-      expect(connMap.sendCommand).toHaveBeenCalledWith("a1", "chat.sessionStatus", expect.objectContaining({ sessionId: "s1" }));
+      expect(JSON.parse(res._body)).toEqual({ running: true, canSteer: true });
     });
 
     it("fails safe to running:false when the runtime RPC fails", async () => {
@@ -629,7 +664,7 @@ describe("chat-gateway routes", () => {
         url, method: "GET", headers: { authorization: `Bearer ${USER_TOKEN}` },
       }));
       expect(res._status).toBe(200);
-      expect(JSON.parse(res._body)).toEqual({ running: false });
+      expect(JSON.parse(res._body)).toEqual({ running: false, canSteer: false });
     });
   });
 
