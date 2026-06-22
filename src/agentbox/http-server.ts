@@ -98,54 +98,153 @@ function enrichAgentEndEvent(brain: BrainSession, event: any): any {
 /**
  * Parse JSON body
  */
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_PROMPT_MEDIA_ITEMS = 4;
+const MAX_PROMPT_MEDIA_BASE64_CHARS = 8 * 1024 * 1024;
+const MAX_BODY_SIZE = MAX_PROMPT_MEDIA_ITEMS * MAX_PROMPT_MEDIA_BASE64_CHARS + 512 * 1024;
 const BODY_TIMEOUT_MS = 30_000; // 30s
 const DP_ACTIVATION_MARKER = "[Deep Investigation]\n";
 const DP_EXIT_MARKER = "[DP_EXIT]";
-const MAX_PROMPT_IMAGES = 4;
-const MAX_PROMPT_IMAGE_BASE64_CHARS = 2 * 1024 * 1024;
+const MAX_PROMPT_IMAGES = MAX_PROMPT_MEDIA_ITEMS;
+const MAX_PROMPT_IMAGE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
 const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
-const MAX_PROMPT_FILES = 4;
-const MAX_PROMPT_FILE_BASE64_CHARS = 8 * 1024 * 1024;
+const MAX_PROMPT_FILES = MAX_PROMPT_MEDIA_ITEMS;
+const MAX_PROMPT_FILE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
 const SUPPORTED_PROMPT_FILE_MIMES = new Set(["application/pdf"]);
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
-function sanitizePromptImages(raw: unknown): PromptImage[] | undefined {
-  if (!Array.isArray(raw)) return undefined;
-  const out: PromptImage[] = [];
-  for (const item of raw) {
-    if (out.length >= MAX_PROMPT_IMAGES) break;
-    if (!item || typeof item !== "object") continue;
-    const mimeType = (item as { mimeType?: unknown }).mimeType;
-    const data = (item as { data?: unknown }).data;
-    if (typeof mimeType !== "string" || typeof data !== "string") continue;
-    const normalizedMime = mimeType.toLowerCase();
-    if (!SUPPORTED_PROMPT_IMAGE_MIMES.has(normalizedMime)) continue;
-    if (data.length === 0 || data.length > MAX_PROMPT_IMAGE_BASE64_CHARS) continue;
-    if (data.length % 4 !== 0 || !BASE64_RE.test(data)) continue;
-    out.push({ mimeType: normalizedMime, data });
+class HttpRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpRequestError";
   }
-  return out.length > 0 ? out : undefined;
 }
 
-function sanitizePromptFiles(raw: unknown): PromptFile[] | undefined {
-  if (!Array.isArray(raw)) return undefined;
+interface PromptMediaValidationResult<T> {
+  items?: T[];
+  error?: string;
+}
+
+interface PromptMediaValidation {
+  images?: PromptImage[];
+  files?: PromptFile[];
+  error?: string;
+}
+
+function validatePromptMedia(imagesRaw: unknown, filesRaw: unknown): PromptMediaValidation {
+  const imagesResult = validatePromptImages(imagesRaw);
+  if (imagesResult.error) return { error: imagesResult.error };
+
+  const filesResult = validatePromptFiles(filesRaw);
+  if (filesResult.error) return { error: filesResult.error };
+
+  const totalItems = (imagesResult.items?.length ?? 0) + (filesResult.items?.length ?? 0);
+  if (totalItems > MAX_PROMPT_MEDIA_ITEMS) {
+    return { error: `prompt media supports at most ${MAX_PROMPT_MEDIA_ITEMS} item(s)` };
+  }
+
+  return {
+    images: imagesResult.items,
+    files: filesResult.items,
+  };
+}
+
+function validatePromptImages(raw: unknown): PromptMediaValidationResult<PromptImage> {
+  if (raw === undefined || raw === null) return {};
+  if (!Array.isArray(raw)) return { error: "images must be an array" };
+  if (raw.length > MAX_PROMPT_IMAGES) {
+    return { error: `images supports at most ${MAX_PROMPT_IMAGES} item(s)` };
+  }
+
+  const out: PromptImage[] = [];
+  for (const [index, item] of raw.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { error: `images[${index}] must be an object` };
+    }
+
+    const mimeType = (item as { mimeType?: unknown }).mimeType;
+    const data = (item as { data?: unknown }).data;
+    if (typeof mimeType !== "string") {
+      return { error: `images[${index}].mimeType must be a string` };
+    }
+    if (typeof data !== "string") {
+      return { error: `images[${index}].data must be a base64 string` };
+    }
+
+    const normalizedMime = normalizePromptImageMime(mimeType);
+    if (!SUPPORTED_PROMPT_IMAGE_MIMES.has(normalizedMime)) {
+      return { error: `images[${index}].mimeType must be one of: image/png, image/jpeg, image/webp` };
+    }
+    const dataError = validateBase64Data(`images[${index}].data`, data, MAX_PROMPT_IMAGE_BASE64_CHARS);
+    if (dataError) return { error: dataError };
+
+    out.push({ mimeType: normalizedMime, data });
+  }
+  return out.length > 0 ? { items: out } : {};
+}
+
+function validatePromptFiles(raw: unknown): PromptMediaValidationResult<PromptFile> {
+  if (raw === undefined || raw === null) return {};
+  if (!Array.isArray(raw)) return { error: "files must be an array" };
+  if (raw.length > MAX_PROMPT_FILES) {
+    return { error: `files supports at most ${MAX_PROMPT_FILES} item(s)` };
+  }
+
   const out: PromptFile[] = [];
-  for (const item of raw) {
-    if (out.length >= MAX_PROMPT_FILES) break;
-    if (!item || typeof item !== "object") continue;
+  for (const [index, item] of raw.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { error: `files[${index}] must be an object` };
+    }
+
     const mimeType = (item as { mimeType?: unknown }).mimeType;
     const filename = (item as { filename?: unknown }).filename;
     const data = (item as { data?: unknown }).data;
-    if (typeof mimeType !== "string" || typeof filename !== "string" || typeof data !== "string") continue;
-    const normalizedMime = mimeType.toLowerCase();
-    if (!SUPPORTED_PROMPT_FILE_MIMES.has(normalizedMime)) continue;
-    if (filename.trim() === "") continue;
-    if (data.length === 0 || data.length > MAX_PROMPT_FILE_BASE64_CHARS) continue;
-    if (data.length % 4 !== 0 || !BASE64_RE.test(data)) continue;
+    if (typeof mimeType !== "string") {
+      return { error: `files[${index}].mimeType must be a string` };
+    }
+    if (typeof filename !== "string") {
+      return { error: `files[${index}].filename must be a string` };
+    }
+    if (typeof data !== "string") {
+      return { error: `files[${index}].data must be a base64 string` };
+    }
+
+    const normalizedMime = mimeType.trim().toLowerCase();
+    if (!SUPPORTED_PROMPT_FILE_MIMES.has(normalizedMime)) {
+      return { error: `files[${index}].mimeType must be application/pdf` };
+    }
+    if (filename.trim() === "") {
+      return { error: `files[${index}].filename must not be empty` };
+    }
+    const dataError = validateBase64Data(`files[${index}].data`, data, MAX_PROMPT_FILE_BASE64_CHARS);
+    if (dataError) return { error: dataError };
+
     out.push({ mimeType: normalizedMime, filename: sanitizePromptFilename(filename), data });
   }
-  return out.length > 0 ? out : undefined;
+  return out.length > 0 ? { items: out } : {};
+}
+
+function normalizePromptImageMime(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "image/jpg" ? "image/jpeg" : normalized;
+}
+
+function validateBase64Data(field: string, data: string, maxChars: number): string | undefined {
+  if (data.length === 0) return `${field} must not be empty`;
+  if (data.length > maxChars) {
+    return `${field} exceeds ${formatBytes(maxChars)} base64 character limit`;
+  }
+  if (data.length % 4 !== 0 || !BASE64_RE.test(data)) {
+    return `${field} must be valid base64`;
+  }
+  return undefined;
+}
+
+function formatBytes(value: number): string {
+  const mib = value / (1024 * 1024);
+  return `${Number.isInteger(mib) ? mib : mib.toFixed(1)} MiB`;
 }
 
 function sanitizePromptFilename(value: string): string {
@@ -212,7 +311,7 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
     const timer = setTimeout(() => {
       timedOut = true;
       req.destroy();
-      reject(new Error("Body read timeout"));
+      reject(new HttpRequestError(408, "Body read timeout"));
     }, BODY_TIMEOUT_MS);
 
     req.on("data", (chunk: Buffer | string) => {
@@ -221,7 +320,7 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
       if (size > MAX_BODY_SIZE) {
         clearTimeout(timer);
         req.destroy();
-        reject(new Error(`Body exceeds ${MAX_BODY_SIZE} byte limit`));
+        reject(new HttpRequestError(413, `Body exceeds ${formatBytes(MAX_BODY_SIZE)} limit`));
         return;
       }
       body += chunk;
@@ -232,7 +331,7 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
       try {
         resolve(body ? JSON.parse(body) : {});
       } catch (e) {
-        reject(new Error("Invalid JSON"));
+        reject(new HttpRequestError(400, "Invalid JSON"));
       }
     });
     req.on("error", (err) => {
@@ -441,9 +540,12 @@ export function createHttpServer(
   addRoute("POST", "/api/prompt", async (req, res) => {
     const body = (await parseJsonBody(req)) as PromptRequestBody;
 
-    const promptImages = sanitizePromptImages(body.images);
-    const promptFiles = sanitizePromptFiles(body.files);
-    const promptMedia = buildPromptMedia(promptImages, promptFiles);
+    const promptMediaValidation = validatePromptMedia(body.images, body.files);
+    if (promptMediaValidation.error) {
+      sendJson(res, 400, { error: promptMediaValidation.error });
+      return;
+    }
+    const promptMedia = buildPromptMedia(promptMediaValidation.images, promptMediaValidation.files);
 
     // Media-only messages are valid; reject only when there is neither text nor
     // usable image/PDF media after validation.
@@ -967,9 +1069,12 @@ export function createHttpServer(
     }
 
     const body = (await parseJsonBody(req)) as { text?: string; images?: PromptImage[]; files?: PromptFile[] };
-    const promptImages = sanitizePromptImages(body.images);
-    const promptFiles = sanitizePromptFiles(body.files);
-    const promptMedia = buildPromptMedia(promptImages, promptFiles);
+    const promptMediaValidation = validatePromptMedia(body.images, body.files);
+    if (promptMediaValidation.error) {
+      sendJson(res, 400, { error: promptMediaValidation.error });
+      return;
+    }
+    const promptMedia = buildPromptMedia(promptMediaValidation.images, promptMediaValidation.files);
     if (!body.text && !promptMedia) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
@@ -1371,6 +1476,14 @@ export function createHttpServer(
       try {
         await route.handler(req, res, params);
       } catch (err) {
+        if (err instanceof HttpRequestError) {
+          console.warn(`[agentbox-http] Rejected ${method} ${pathname}: ${err.message}`);
+          if (!res.headersSent) {
+            sendJson(res, err.status, { error: err.message });
+          }
+          return;
+        }
+
         console.error(`[agentbox-http] Error handling ${method} ${pathname}:`, err);
         if (!res.headersSent) {
           sendJson(res, 500, { error: "Internal server error" });
