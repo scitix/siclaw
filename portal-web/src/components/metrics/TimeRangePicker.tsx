@@ -44,9 +44,15 @@ export function buildMonthGrid(year: number, month: number): MonthCell[] {
   return cells
 }
 
-/** Pull a trailing `HH:mm` out of a draft like "2026-06-15 10:30", else "". */
-function extractTime(v: string): string {
-  const m = /(\d{1,2}:\d{2})\s*$/.exec(v.trim())
+/** Pull the time-of-day `HH:mm` out of a draft like "2026-06-15 10:30",
+ *  "2026-06-15 10:30:45", or an ISO "2026-06-15T10:30:45Z" (seconds and timezone
+ *  are dropped), else "". Split on the date/time separator first so the segment
+ *  match never picks up the seconds field — a trailing-anchored regex on
+ *  "10:30:45" would otherwise yield "30:45" and corrupt the field. Exported for
+ *  unit tests. */
+export function extractTime(v: string): string {
+  const seg = v.trim().split(/[ T]+/)[1] ?? ""
+  const m = /^(\d{1,2}:\d{2})/.exec(seg)
   return m ? m[1] : ""
 }
 

@@ -1,7 +1,34 @@
 import { describe, it, expect } from "vitest"
-import { buildMonthGrid } from "./TimeRangePicker"
+import { buildMonthGrid, extractTime } from "./TimeRangePicker"
 
 const daysInMonth = (y: number, m: number) => new Date(y, m + 1, 0).getDate()
+
+describe("extractTime", () => {
+  it("pulls HH:mm from a `date HH:mm` draft", () => {
+    expect(extractTime("2026-06-15 10:30")).toBe("10:30")
+  })
+
+  it("drops the seconds field instead of matching it", () => {
+    // Regression: a trailing-anchored regex matched "30:45" out of "10:30:45".
+    expect(extractTime("2026-06-15 10:30:45")).toBe("10:30")
+  })
+
+  it("handles an ISO `T`-separated draft, dropping seconds/timezone", () => {
+    expect(extractTime("2026-06-15T10:30:45Z")).toBe("10:30")
+    expect(extractTime("2026-06-15T08:05")).toBe("08:05")
+  })
+
+  it("keeps single-digit hours intact", () => {
+    expect(extractTime("2026-06-15 9:30:45")).toBe("9:30")
+  })
+
+  it("returns '' when there is no time-of-day", () => {
+    expect(extractTime("now-7d")).toBe("")
+    expect(extractTime("now")).toBe("")
+    expect(extractTime("2026-06-15")).toBe("")
+    expect(extractTime("")).toBe("")
+  })
+})
 
 describe("buildMonthGrid", () => {
   it("always returns a 42-cell (6×7) grid", () => {
