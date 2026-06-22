@@ -487,10 +487,14 @@ async function setTaskState(
 
 async function setTaskArtifact(taskId: string, artifactText: string): Promise<void> {
   const db = getDb();
+  // Terminal-guarded like setTaskState: a late event (e.g. a stream_error after the task
+  // already settled) must not overwrite a finished task's artifact text. The artifact is
+  // written before the terminal state transition, so on the normal completion path the task
+  // is still non-terminal here and this passes.
   await db.query(
     `UPDATE a2a_tasks
         SET artifact_text = ?, updated_at = CURRENT_TIMESTAMP, last_event_at = CURRENT_TIMESTAMP
-      WHERE id = ?`,
+      WHERE id = ? AND state NOT IN (${TERMINAL_STATES_SQL})`,
     [artifactText, taskId],
   );
 }
@@ -669,8 +673,9 @@ async function handleTrackedEvent(
   if (evt.type === "stream_error") {
     // Mirror prompt_done: if the task already reached a terminal state (e.g. the user
     // canceled and the runtime then emitted stream_error as part of aborting), do not
-    // overwrite it or emit a spurious FAILED. setTaskState is terminal-immutable too,
-    // so this is belt-and-suspenders against the same race.
+    // overwrite it or emit a spurious FAILED. setTaskState/setTaskArtifact are now both
+    // terminal-guarded too, so the DB row is protected either way — but this early return
+    // also avoids the redundant writes and the spurious FAILED emit.
     const latest = await loadTaskRecordById(task.id);
     if (latest && isTerminalState(latest.state)) {
       stopTaskTracker(task.id);
