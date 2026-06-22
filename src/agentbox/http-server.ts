@@ -776,7 +776,7 @@ export function createHttpServer(
     // (which emit multiple agent_start/end pairs) stay inside one ROOT. Placed
     // after model setup so a setModel switch is not captured as prompt activity;
     // closed in actuallyFinish, which every terminal path funnels through.
-    tracingRecorder.startPrompt(managed.id);
+    tracingRecorder.startPrompt(managed.id, promptText);
 
     const actuallyFinish = () => {
       managed._promptDone = true;

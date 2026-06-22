@@ -62,6 +62,12 @@ export interface TokenDelta {
   total: number;
 }
 
+/**
+ * Hard ceiling on any single content attribute, in characters. Caps trace bloat
+ * (a 100KB tool result or pasted log would otherwise choke the backend's UI).
+ */
+const MAX_CONTENT_CHARS = 8000;
+
 /** JSON-serialise non-string values without ever throwing (circular/BigInt/etc.). */
 function safeStringify(value: unknown): string {
   try {
@@ -69,6 +75,16 @@ function safeStringify(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/**
+ * Truncate to MAX_CONTENT_CHARS with a visible marker. MUST be applied only
+ * AFTER redaction: capping first could slice through the middle of a secret and
+ * defeat the pattern matcher, leaking a partial credential.
+ */
+function capContent(text: string): string {
+  if (text.length <= MAX_CONTENT_CHARS) return text;
+  return `${text.slice(0, MAX_CONTENT_CHARS)}… [+${text.length - MAX_CONTENT_CHARS} chars]`;
 }
 
 /**
@@ -81,11 +97,15 @@ function safeStringify(value: unknown): string {
  * `tool_result` is NOT re-redacted: the value handed to us is already the
  * model-side sanitized output (the "model never reads unsanitized output"
  * invariant), so re-running redaction would be redundant.
+ *
+ * Every return path is length-capped (capContent) as the LAST step — after any
+ * redaction — so no path can emit unbounded content and capping never bisects a
+ * secret.
  */
 export function redactForExport(value: unknown, kind: ContentKind): string {
   const text = typeof value === "string" ? value : safeStringify(value);
-  if (kind === "tool_result") return text;
-  return redactSensitiveContent(text);
+  if (kind === "tool_result") return capContent(text);
+  return capContent(redactSensitiveContent(text));
 }
 
 /**

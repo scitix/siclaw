@@ -357,3 +357,148 @@ describe("sendContent gate", () => {
     expect(llm.attributes[Attr.outputValue]).toBe("plain answer");
   });
 });
+
+// ── 9. Per-call token/cost on the LLM span (from message.usage) ──────────────
+
+describe("per-call token/cost on LLM span", () => {
+  const usage = { input: 42, output: 17, totalTokens: 59, cost: { total: 0.0033 } };
+
+  it("attaches llm.token_count.* + llm.cost.total from message.usage, independent of sendContent", () => {
+    cfg.sendContent = false; // tokens are metadata, NOT gated by sendContent
+    const brain = makeBrain();
+    tracingRecorder.attach(SID, brain, {});
+    tracingRecorder.startPrompt(SID);
+    tracingRecorder.handleEvent(SID, { type: "message_start", message: { role: "assistant", content: [] } });
+    tracingRecorder.handleEvent(SID, {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "endTurn", usage },
+    });
+    tracingRecorder.endPrompt(SID, "completed");
+
+    const llm = byKind(SpanKind.LLM)[0];
+    expect(llm.attributes[Attr.tokenPrompt]).toBe(42);
+    expect(llm.attributes[Attr.tokenCompletion]).toBe(17);
+    expect(llm.attributes[Attr.tokenTotal]).toBe(59);
+    expect(llm.attributes[Attr.cost]).toBeCloseTo(0.0033, 6);
+  });
+
+  it("attaches per-call token when message_end arrives via the routing extra channel (recorder is source-agnostic)", () => {
+    const brain = makeBrain();
+    tracingRecorder.attach(SID, brain, {});
+    tracingRecorder.startPrompt(SID);
+    // Simulate the routing replay: model_route_* + the winning attempt's message_*
+    // all arrive through the same handleEvent entry.
+    tracingRecorder.handleEvent(SID, { type: "model_route_start", strategy: "ordered_fallback", candidateCount: 1 });
+    tracingRecorder.handleEvent(SID, { type: "message_start", message: { role: "assistant", content: [] } });
+    tracingRecorder.handleEvent(SID, {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "endTurn", usage },
+    });
+    tracingRecorder.handleEvent(SID, { type: "model_route_success", attempt: 1, provider: "openai", modelId: "gpt-x" });
+    tracingRecorder.endPrompt(SID, "completed");
+
+    const llm = byKind(SpanKind.LLM)[0];
+    expect(llm.attributes[Attr.tokenPrompt]).toBe(42);
+    expect(llm.attributes[Attr.tokenCompletion]).toBe(17);
+    expect(llm.attributes[Attr.tokenTotal]).toBe(59);
+    expect(llm.attributes[Attr.cost]).toBeCloseTo(0.0033, 6);
+  });
+
+  it("skips fields that are missing or non-numeric, never writing wrong data", () => {
+    const brain = makeBrain();
+    tracingRecorder.attach(SID, brain, {});
+    tracingRecorder.startPrompt(SID);
+    tracingRecorder.handleEvent(SID, { type: "message_start", message: { role: "assistant", content: [] } });
+    // Only `input` is a valid number; output is a string, totalTokens absent, cost.total missing.
+    tracingRecorder.handleEvent(SID, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "endTurn",
+        usage: { input: 7, output: "nope", cost: {} },
+      },
+    });
+    tracingRecorder.endPrompt(SID, "completed");
+
+    const llm = byKind(SpanKind.LLM)[0];
+    expect(llm.attributes[Attr.tokenPrompt]).toBe(7);
+    expect(llm.attributes[Attr.tokenCompletion]).toBeUndefined();
+    expect(llm.attributes[Attr.tokenTotal]).toBeUndefined();
+    expect(llm.attributes[Attr.cost]).toBeUndefined();
+  });
+});
+
+// ── 10. ROOT input.value = the user prompt (gated by sendContent) ─────────────
+
+describe("ROOT input.value", () => {
+  it("omits input.value when sendContent=false", () => {
+    cfg.sendContent = false;
+    const brain = makeBrain();
+    tracingRecorder.attach(SID, brain, {});
+    tracingRecorder.startPrompt(SID, "what pods are crashing?");
+    tracingRecorder.endPrompt(SID, "completed");
+    expect(root().attributes[Attr.inputValue]).toBeUndefined();
+  });
+
+  it("records the redacted prompt as input.value when sendContent=true", () => {
+    cfg.sendContent = true;
+    const brain = makeBrain();
+    tracingRecorder.attach(SID, brain, {});
+    tracingRecorder.startPrompt(SID, "connect to postgres://admin:hunter2@db:5432 and check");
+    tracingRecorder.endPrompt(SID, "completed");
+
+    const input = String(root().attributes[Attr.inputValue]);
+    expect(input).not.toContain("hunter2");
+    expect(input).toContain("REDACTED");
+  });
+
+  it("writes no input.value when promptText is absent, even with sendContent=true", () => {
+    cfg.sendContent = true;
+    const brain = makeBrain();
+    tracingRecorder.attach(SID, brain, {});
+    tracingRecorder.startPrompt(SID); // no promptText
+    tracingRecorder.endPrompt(SID, "completed");
+    expect(root().attributes[Attr.inputValue]).toBeUndefined();
+  });
+});
+
+// ── 11. Content length cap (bloat hygiene) ────────────────────────────────────
+
+describe("content length cap", () => {
+  it("truncates over-long content with a visible marker", () => {
+    cfg.sendContent = true;
+    const brain = makeBrain();
+    const big = "x".repeat(20000);
+    tracingRecorder.attach(SID, brain, {});
+    tracingRecorder.startPrompt(SID);
+    tracingRecorder.handleEvent(SID, { type: "message_start", message: { role: "assistant", content: [] } });
+    tracingRecorder.handleEvent(SID, {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: big }], stopReason: "endTurn" },
+    });
+    tracingRecorder.endPrompt(SID, "completed");
+
+    const out = String(byKind(SpanKind.LLM)[0].attributes[Attr.outputValue]);
+    expect(out.length).toBeLessThan(big.length);
+    expect(out).toContain("[+12000 chars]");
+  });
+});
+
+// ── 12. tool_execution_start writes tool.parameters but NOT input.value ───────
+
+describe("tool args use tool.parameters only", () => {
+  it("sets tool.parameters and leaves input.value unset on the TOOL span", () => {
+    cfg.sendContent = true;
+    const brain = makeBrain();
+    tracingRecorder.attach(SID, brain, {});
+    tracingRecorder.startPrompt(SID);
+    tracingRecorder.handleEvent(SID, { type: "tool_execution_start", toolCallId: "t", toolName: "bash", args: { cmd: "ls" } });
+    tracingRecorder.handleEvent(SID, { type: "tool_execution_end", toolCallId: "t", toolName: "bash", result: ["ok"], isError: false });
+    tracingRecorder.endPrompt(SID, "completed");
+
+    const tool = byKind(SpanKind.TOOL)[0];
+    expect(String(tool.attributes[Attr.toolParameters])).toContain("ls");
+    expect(tool.attributes[Attr.inputValue]).toBeUndefined();
+  });
+});

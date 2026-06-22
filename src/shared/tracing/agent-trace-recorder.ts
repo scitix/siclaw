@@ -17,8 +17,10 @@
  * an agent_start-rooted trace would be shredded into fragments.
  *
  * Authoritative token/cost: ROOT carries `getSessionStats()` deltas computed at
- * endPrompt (cumulative post − pre). Per-call message.usage is intentionally not
- * trusted (the pi package is not installed; field names are unverifiable).
+ * endPrompt (cumulative post − pre) — this is the trusted accounting. Per-call
+ * message.usage is ALSO read defensively onto each LLM span as supplementary
+ * per-call granularity (typeof-guarded, skipped when absent); it never replaces
+ * the ROOT deltas.
  *
  * Fault isolation: every public method is wrapped in try/catch and only ever
  * console.warn — a recorder fault must never disturb the brain-event main flow
@@ -310,6 +312,12 @@ function dispatch(sessionId: string, trace: SessionTrace, event: Record<string, 
       span.setAttributes(flatAttrs({ [Attr.llmFinishReason]: stopReason }));
       const text = extractAssistantText(message);
       span.setAttributes(contentAttribute(Attr.outputValue, text, "llm_output", sendContent));
+      // Per-call token/cost: supplementary granularity read defensively off
+      // message.usage. This is metadata (NOT content) so it bypasses the
+      // sendContent gate. The ROOT getSessionStats() delta remains the
+      // authoritative accounting — this only adds per-LLM-span detail, and is
+      // skipped silently whenever a field is missing or non-numeric.
+      span.setAttributes(perCallTokenAttributes(message.usage));
       const isError = stopReason === "error";
       endSpanSafe(span, isError
         ? { code: SpanStatusCode.ERROR, message: str(message.errorMessage) ?? "error" }
@@ -330,8 +338,9 @@ function dispatch(sessionId: string, trace: SessionTrace, event: Record<string, 
         },
         parentContext(trace),
       );
+      // tool.parameters is OpenInference's canonical key for tool args; do NOT
+      // also mirror them onto input.value (redundant, doubles content bloat).
       span.setAttributes(contentAttribute(Attr.toolParameters, event.args, "tool_args", sendContent));
-      span.setAttributes(contentAttribute(Attr.inputValue, event.args, "tool_args", sendContent));
       // Defensive: a duplicate start for the same callId closes the prior span.
       const existing = trace.tools.get(callId);
       if (existing) endSpanSafe(existing);
@@ -360,6 +369,23 @@ function dispatch(sessionId: string, trace: SessionTrace, event: Record<string, 
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Read per-call token/cost off a `message.usage` object onto an LLM span.
+ * Every field is typeof-guarded — a missing or non-numeric field is skipped,
+ * never written as wrong data. Mirrors bench's phoenix-tracer usage read.
+ */
+function perCallTokenAttributes(usage: unknown): Attributes {
+  if (!isRecord(usage)) return {};
+  const attrs: Attributes = {};
+  if (typeof usage.input === "number") attrs[Attr.tokenPrompt] = usage.input;
+  if (typeof usage.output === "number") attrs[Attr.tokenCompletion] = usage.output;
+  if (typeof usage.totalTokens === "number") attrs[Attr.tokenTotal] = usage.totalTokens;
+  if (isRecord(usage.cost) && typeof usage.cost.total === "number") {
+    attrs[Attr.cost] = usage.cost.total;
+  }
+  return attrs;
+}
 
 function computeTokenDelta(prev: BrainSessionStats, curr: BrainSessionStats): TokenDelta {
   return {
@@ -397,7 +423,7 @@ export const tracingRecorder = {
   },
 
   /** Open the ROOT span for one user prompt and snapshot cumulative stats. */
-  startPrompt(sessionId: string): void {
+  startPrompt(sessionId: string, promptText?: string): void {
     if (!isTracingEnabled()) return;
     try {
       const attachment = attachments.get(sessionId);
@@ -424,6 +450,9 @@ export const tracingRecorder = {
               : undefined,
             [Attr.llmModelName]: model?.id,
             [Attr.llmProvider]: model?.provider,
+            // User prompt as ROOT input — content, so gated by sendContent +
+            // redacted. Empty/absent promptText yields no key (contentAttribute).
+            ...contentAttribute(Attr.inputValue, promptText, "llm_input", sendContentEnabled()),
           }),
         },
         ROOT_CONTEXT,
