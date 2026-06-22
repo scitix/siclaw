@@ -489,10 +489,12 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "chat_messages", "idx_chat_messages_audit", "role, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_parent", "parent_session_id, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_delegation", "delegation_id");
-  // a2a_tasks
-  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_agent", "agent_id, created_at");
+  // a2a_tasks — every A2A query is scoped by (agent_id, api_key_id), so keep that as the
+  // leading prefix: idx_..._agent serves listTaskRecords (… ORDER BY created_at), idx_..._context
+  // serves loadSessionIdForContext (… AND context_id = ? ORDER BY created_at).
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_agent", "agent_id, api_key_id, created_at");
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_session", "session_id");
-  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_context", "context_id, created_at");
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_context", "agent_id, api_key_id, context_id, created_at");
   // notifications
   await ensureIndex(db, "notifications", "idx_notifications_user", "user_id, read_at, created_at");
   // agent_api_keys

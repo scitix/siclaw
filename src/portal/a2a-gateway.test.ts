@@ -510,4 +510,50 @@ describe("registerA2aRoutes", () => {
     expect(taskIdx).toBe(0);
     expect(artIdx).toBeGreaterThan(taskIdx);
   });
+
+  it("terminal state is immutable: a cancel cannot overwrite an already-failed task", async () => {
+    const { router, conn } = await makeRouter();
+    // Gate chat.abort so the cancel parks mid-abort while a runtime stream_error commits first.
+    let releaseAbort: () => void = () => {};
+    const abortGate = new Promise<void>((resolve) => { releaseAbort = resolve; });
+    (conn.map.sendCommand as any).mockImplementation(async (_a: string, method: string, params: any) => {
+      if (method === "chat.send") return { ok: true, payload: { sessionId: params.sessionId } };
+      if (method === "chat.abort") { await abortGate; return { ok: true, payload: { ok: true } }; }
+      if (method === "chat.sessionStatus") return { ok: true, payload: { running: false } };
+      return { ok: false, error: `unexpected ${method}` };
+    });
+
+    const createRes = await runRoute(router, fakeReq({
+      url: "/api/v1/a2a/agents/a1/message:send",
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: { message: { role: "ROLE_USER", parts: [{ text: "cancel vs error" }] } },
+    }));
+    const taskId = parseJsonBody(createRes).task.id;
+    const sessionId = (conn.map.sendCommand as any).mock.calls.find((c: any[]) => c[1] === "chat.send")[2].sessionId;
+
+    // Start the cancel; it loads the WORKING task, then parks on the gated chat.abort.
+    const cancelP = runRoute(router, fakeReq({
+      url: `/api/v1/a2a/agents/a1/tasks/${taskId}:cancel`,
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: {},
+    }));
+    for (let i = 0; i < 50; i++) {
+      if ((conn.map.sendCommand as any).mock.calls.some((c: any[]) => c[1] === "chat.abort")) break;
+      await new Promise((r) => setImmediate(r));
+    }
+
+    // Runtime emits stream_error while the cancel is parked → the task commits FAILED first.
+    conn.emit({ sessionId, event: { type: "stream_error", error: { message: "boom" } } });
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    // Let the cancel finish; its CANCELED write must NOT overwrite the committed FAILED.
+    releaseAbort();
+    const cancelRes = await cancelP;
+
+    expect(parseJsonBody(cancelRes).task.status.state).toBe("TASK_STATE_FAILED");
+    const [rows] = await getDb().query<Array<{ state: string }>>("SELECT state FROM a2a_tasks WHERE id = ?", [taskId]);
+    expect(rows[0].state).toBe("TASK_STATE_FAILED");
+  });
 });

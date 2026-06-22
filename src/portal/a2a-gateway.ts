@@ -98,6 +98,15 @@ function isTerminalState(state: A2aTaskState): boolean {
     || state === "TASK_STATE_REJECTED";
 }
 
+// Terminal states as a SQL literal list, for the terminal-immutable guard in setTaskState.
+// Constant enum values (not user input), safe to inline; portable across SQLite and MySQL.
+const TERMINAL_STATES_SQL = [
+  "TASK_STATE_COMPLETED",
+  "TASK_STATE_FAILED",
+  "TASK_STATE_CANCELED",
+  "TASK_STATE_REJECTED",
+].map((s) => `'${s}'`).join(", ");
+
 function sendA2aJson(res: http.ServerResponse, status: number, data: unknown): void {
   const body = JSON.stringify(data);
   res.writeHead(status, {
@@ -459,15 +468,20 @@ async function setTaskState(
 ): Promise<void> {
   const terminal = isTerminalState(state);
   const db = getDb();
+  // Terminal state is immutable: the first terminal write wins. The `AND state NOT IN
+  // (terminal…)` guard makes every transition idempotent against races — e.g. a cancel
+  // and a runtime stream_error landing together, or a late tool_execution_* event trying
+  // to flip a CANCELED task back to WORKING. Without it the last writer would win and
+  // mislabel the task (user clicked cancel, DB ends up FAILED).
   const sql = terminal
     ? `UPDATE a2a_tasks
           SET state = ?, status_message = ?, error = ?, updated_at = CURRENT_TIMESTAMP,
               last_event_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP
-        WHERE id = ?`
+        WHERE id = ? AND state NOT IN (${TERMINAL_STATES_SQL})`
     : `UPDATE a2a_tasks
           SET state = ?, status_message = ?, error = ?, updated_at = CURRENT_TIMESTAMP,
               last_event_at = CURRENT_TIMESTAMP
-        WHERE id = ?`;
+        WHERE id = ? AND state NOT IN (${TERMINAL_STATES_SQL})`;
   await db.query(sql, [state, statusMessage, error ?? null, taskId]);
 }
 
@@ -608,7 +622,10 @@ function ensureTaskTracker(task: A2aTaskRecord, connectionMap: RuntimeConnection
   tracker.unsubscribe = connectionMap.subscribe(task.agentId, "chat.event", (data: unknown) => {
     const envelope = data as { sessionId?: string; event?: Record<string, unknown> } | undefined;
     if (!envelope?.event) return;
-    if (envelope.sessionId && envelope.sessionId !== task.sessionId) return;
+    // Strict session match: chat.event is broadcast to every tracker on this agent, and
+    // the A2A path persists artifact text, so a sessionId-less event must NOT fall through
+    // to all sessions (that would cross-contaminate artifacts). Runtime always sets it.
+    if (envelope.sessionId !== task.sessionId) return;
     void handleTrackedEvent(task, tracker, envelope.event).catch((err) => {
       console.error(`[a2a-gateway] tracked-event handling failed for task ${task.id}:`, err);
     });
@@ -650,6 +667,15 @@ async function handleTrackedEvent(
   }
 
   if (evt.type === "stream_error") {
+    // Mirror prompt_done: if the task already reached a terminal state (e.g. the user
+    // canceled and the runtime then emitted stream_error as part of aborting), do not
+    // overwrite it or emit a spurious FAILED. setTaskState is terminal-immutable too,
+    // so this is belt-and-suspenders against the same race.
+    const latest = await loadTaskRecordById(task.id);
+    if (latest && isTerminalState(latest.state)) {
+      stopTaskTracker(task.id);
+      return;
+    }
     const message = streamErrorMessage(evt);
     await setTaskArtifact(task.id, tracker.artifactText);
     await setTaskState(task.id, "TASK_STATE_FAILED", message, message);
