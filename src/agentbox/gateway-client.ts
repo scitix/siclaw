@@ -10,6 +10,7 @@ import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
+import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 
 export interface GatewayClientOptions {
   gatewayUrl: string;
@@ -131,6 +132,19 @@ export class GatewayClient {
    */
   async sendDelegationPersistenceEvent(event: DelegationPersistenceEvent): Promise<DelegationPersistenceResponse> {
     return this.request("/api/internal/delegation-events", "POST", event);
+  }
+
+  /**
+   * SIGTERM final flush: push this process's cumulative prom snapshot to the Gateway
+   * so the last <pull-interval of increments isn't lost when the pod is recycled
+   * (metrics-federation-DESIGN.md module 5). The Gateway derives boxId from our mTLS
+   * cert — we send only the incarnation + prom snapshot.
+   *
+   * Best-effort: callers must not let this block pod shutdown (the underlying request
+   * already has a 5s timeout); a dropped final frame is better than a stuck pod.
+   */
+  async sendMetricsFlush(payload: MetricsFlushPayload): Promise<void> {
+    await this.request("/api/internal/metrics-flush", "POST", payload);
   }
 
   /**

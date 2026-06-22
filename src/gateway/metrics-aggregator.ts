@@ -14,6 +14,7 @@ import {
   type ToolCallStats,
   type SkillCallStats,
   type MetricsSnapshot,
+  type PromSampleGroup,
 } from "../shared/metrics-types.js";
 
 /** Interface for LocalCollector dependency injection (Local mode only) */
@@ -31,6 +32,32 @@ export interface PodLister {
 /** Interface for making mTLS requests to AgentBox pods */
 export interface SnapshotFetcher {
   fetch(endpoint: string): Promise<MetricsSnapshot | null>;
+}
+
+/**
+ * What the pull loop needs from the Prometheus federation aggregator (module 2).
+ * Declared as a structural interface — not an import of PromFederationAggregator —
+ * so this file stays self-contained for the agentbox tsconfig/Docker build (which
+ * compiles metrics-aggregator.ts but does NOT ship the gateway-only federation code).
+ */
+export interface FederationSink {
+  ingest(boxId: string, incarnation: string, groups: PromSampleGroup[]): void;
+  retainInstances(liveBoxIds: Set<string>): void;
+  trackedInstanceCount(): number;
+  seriesCount(): number;
+}
+
+/**
+ * Federation self-monitoring hooks used by the pull loop (module 4). The concrete
+ * implementation is the prom-client metrics in federation-self-metrics.ts; injected
+ * (not imported) so the aggregator stays free of global counter state in tests.
+ */
+export interface FederationSelfMetrics {
+  pullFailuresTotal: { inc(labels: { box_id: string }): void };
+  pullDurationMs: { observe(ms: number): void };
+  lastSuccessTimestampSeconds: { set(seconds: number): void };
+  trackedInstances: { set(n: number): void };
+  seriesCount: { set(n: number): void };
 }
 
 function tnKey(userId: string, agentId: string | null, name: string): string {
@@ -58,6 +85,13 @@ export class MetricsAggregator {
     private localRef?: LocalCollectorRef,
     private podLister?: PodLister,
     private snapshotFetcher?: SnapshotFetcher,
+    /**
+     * K8s-only: the Prometheus federation aggregator. The pull loop feeds it each
+     * pod's `prom` snapshot (path ②) in addition to the WebUI deltas (path ①).
+     */
+    private promFederation?: FederationSink,
+    /** K8s-only: federation self-monitoring metrics (module 4). */
+    private selfMetrics?: FederationSelfMetrics,
   ) {
     onDiagnostic((event) => {
       if (event.type === "ws_connected") this.wsConnections++;
@@ -106,21 +140,55 @@ export class MetricsAggregator {
 
   private async pullAll(): Promise<void> {
     if (!this.podLister || !this.snapshotFetcher) return;
+    const startedAt = Date.now();
     const pods = await this.podLister.list();
     const activePods = pods.filter((p) => p.status === "running" && p.endpoint);
-    const results = await Promise.allSettled(
-      activePods.map((p) => this.snapshotFetcher!.fetch(p.endpoint)),
+    // Keep the boxId paired with each fetch (even on failure) so federation can key on
+    // (boxId, incarnation) and self-monitoring can attribute failures to a box.
+    const results = await Promise.all(
+      activePods.map(async (p) => {
+        try {
+          return { boxId: p.boxId, snapshot: await this.snapshotFetcher!.fetch(p.endpoint) };
+        } catch {
+          return { boxId: p.boxId, snapshot: null as MetricsSnapshot | null };
+        }
+      }),
     );
 
     // Reset per-pull cluster counter, then accumulate from fulfilled snapshots
     let active = 0;
-    for (const result of results) {
-      if (result.status === "fulfilled" && result.value) {
-        this.mergeSnapshot(result.value);
-        active += result.value.activeSessions;
+    let fetched = 0;
+    for (const { boxId, snapshot } of results) {
+      if (!snapshot) {
+        this.selfMetrics?.pullFailuresTotal.inc({ box_id: boxId });
+        continue;
+      }
+      fetched++;
+      this.mergeSnapshot(snapshot); // path ① (WebUI dashboard)
+      active += snapshot.activeSessions;
+      // path ② (Prometheus federation): only when this build of the snapshot carries
+      // the federation fields (incarnation + prom).
+      if (this.promFederation && snapshot.incarnation && snapshot.prom) {
+        this.promFederation.ingest(boxId, snapshot.incarnation, snapshot.prom);
       }
     }
     this.clusterActiveSessions = active;
+
+    // Reconcile federation tracking against the running pod set (grace eviction).
+    // Liveness is the K8s pod list, independent of per-pod fetch success.
+    if (this.promFederation) {
+      const liveBoxIds = new Set(pods.filter((p) => p.status === "running").map((p) => p.boxId));
+      this.promFederation.retainInstances(liveBoxIds);
+
+      // Self-monitoring (module 4): without this the federator's failures are
+      // indistinguishable from "no activity" once 9090 is gone.
+      if (this.selfMetrics) {
+        this.selfMetrics.pullDurationMs.observe(Date.now() - startedAt);
+        if (fetched > 0) this.selfMetrics.lastSuccessTimestampSeconds.set(Math.floor(Date.now() / 1000));
+        this.selfMetrics.trackedInstances.set(this.promFederation.trackedInstanceCount());
+        this.selfMetrics.seriesCount.set(this.promFederation.seriesCount());
+      }
+    }
   }
 
   private mergeSnapshot(snapshot: MetricsSnapshot): void {

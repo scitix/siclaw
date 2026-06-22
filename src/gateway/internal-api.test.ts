@@ -11,10 +11,12 @@ import {
   handleAgentTasksUpdate,
   handleAgentTasksDelete,
   handleDelegationEvents,
+  handleMetricsFlush,
 } from "./internal-api.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 import { sessionRegistry } from "./session-registry.js";
+import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 
 // ── fakes ─────────────────────────────────────────────────
 
@@ -485,5 +487,88 @@ describe("handleDelegationEvents", () => {
 
     expect(res.statusCode).toBe(403);
     expect(frontend.calls).toHaveLength(0);
+  });
+});
+
+// ── handleMetricsFlush (module 5) ─────────────────────────
+
+describe("handleMetricsFlush", () => {
+  function counterFrame(value: number) {
+    return [{ name: "siclaw_tokens_total", type: "counter" as const, values: [{ labels: { type: "input" }, value }] }];
+  }
+  function counterVal(fed: PromFederationAggregator) {
+    const fam = fed.exportGroups().find((g) => g.name === "siclaw_tokens_total");
+    return fam?.values.find((v) => String(v.labels.type) === "input")?.value;
+  }
+
+  it("ingests using boxId from the cert identity — NOT from the body", async () => {
+    const fed = new PromFederationAggregator();
+    const res = new FakeRes();
+    // body tries to spoof a different box; handler must ignore it and use identity.boxId.
+    await handleMetricsFlush(
+      asReq(new FakeReq(JSON.stringify({ boxId: "spoofed-box", incarnation: "inc-1", prom: counterFrame(50) }))),
+      asRes(res),
+      identity, // identity.boxId === "box-1"
+      fed,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(counterVal(fed)).toBe(50);
+
+    // A subsequent pull from the REAL box-1 / inc-1 must be idempotent (delta 0),
+    // proving the flush was keyed under box-1 (the cert), not "spoofed-box".
+    fed.ingest("box-1", "inc-1", counterFrame(50));
+    expect(counterVal(fed)).toBe(50);
+
+    // Whereas the spoofed boxId was never used as a key:
+    fed.ingest("spoofed-box", "inc-1", counterFrame(50));
+    expect(counterVal(fed)).toBe(100); // counted as a fresh instance → +50
+  });
+
+  it("is idempotent: flush then pull of the same frame adds nothing", async () => {
+    const fed = new PromFederationAggregator();
+    const res = new FakeRes();
+    await handleMetricsFlush(
+      asReq(new FakeReq(JSON.stringify({ incarnation: "inc-9", prom: counterFrame(42) }))),
+      asRes(res),
+      identity,
+      fed,
+    );
+    expect(counterVal(fed)).toBe(42);
+    fed.ingest(identity.boxId, "inc-9", counterFrame(42)); // pull collision / retry
+    expect(counterVal(fed)).toBe(42);
+  });
+
+  it("400 on malformed body (missing incarnation/prom)", async () => {
+    const fed = new PromFederationAggregator();
+    const res = new FakeRes();
+    await handleMetricsFlush(
+      asReq(new FakeReq(JSON.stringify({ prom: [] }))),
+      asRes(res),
+      identity,
+      fed,
+    );
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("increments flush self-monitoring counters", async () => {
+    const fed = new PromFederationAggregator();
+    let received = 0, errors = 0;
+    const counters = {
+      flushReceivedTotal: { inc: () => { received++; } },
+      flushErrorsTotal: { inc: () => { errors++; } },
+    };
+    await handleMetricsFlush(
+      asReq(new FakeReq(JSON.stringify({ incarnation: "inc-1", prom: counterFrame(5) }))),
+      asRes(new FakeRes()), identity, fed, counters,
+    );
+    expect(received).toBe(1);
+    expect(errors).toBe(0);
+
+    await handleMetricsFlush(
+      asReq(new FakeReq(JSON.stringify({ bad: true }))),
+      asRes(new FakeRes()), identity, fed, counters,
+    );
+    expect(received).toBe(2);
+    expect(errors).toBe(1);
   });
 });

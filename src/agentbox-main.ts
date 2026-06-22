@@ -7,7 +7,6 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import http from "node:http";
 import https from "node:https";
 import { createHttpServer } from "./agentbox/http-server.js";
 import { AgentBoxSessionManager } from "./agentbox/session.js";
@@ -19,6 +18,7 @@ import { debugPodCache } from "./tools/infra/debug-pod.js";
 // Side-effect: register metrics subscriber. Also imported in http-server.ts,
 // but ESM guarantees single module evaluation — the subscriber registers only once.
 import "./shared/metrics.js";
+import { getMetricsAsJSON, processIncarnation } from "./shared/metrics.js";
 import "./shared/local-collector.js"; // side-effect: register monitoring collector
 
 const config = loadConfig();
@@ -87,59 +87,46 @@ async function main() {
     console.log(`[agentbox] Health check: ${protocol}://localhost:${PORT}/health`);
   });
 
-  // In K8s mode (HTTPS / mTLS), the main port requires Gateway client certs.
-  // Prometheus cannot present those certs, so we start a separate plain HTTP
-  // server on port 9090 that serves only /metrics.
-  let metricsServer: http.Server | null = null;
+  // In K8s mode (HTTPS / mTLS), apply the metrics config fetched from the Gateway.
+  // The agentbox no longer exposes its own plaintext :9090 /metrics scrape target —
+  // its prom-client registry is collected by the Gateway via federation (30s pull +
+  // SIGTERM final flush) and re-exported from the stable gateway:3001/metrics. See
+  // metrics-federation-DESIGN.md.
   if (server instanceof https.Server) {
-    // Read metrics config from settings.json (fetched from Gateway), fall back to env vars
     const latestConfig = loadConfig();
-    const metricsPort = latestConfig.metrics?.port ?? parseInt(process.env.SICLAW_METRICS_PORT || "9090", 10);
-    const metricsToken = latestConfig.metrics?.token ?? process.env.SICLAW_METRICS_TOKEN;
-    const { checkMetricsAuth, setIncludeUserId } = await import("./shared/metrics.js");
+    const { setIncludeUserId } = await import("./shared/metrics.js");
     if (latestConfig.metrics?.includeUserId !== undefined) {
+      // Controls the user_id label on token/cost metrics; still honoured because
+      // those metrics now flow through federation rather than a local scrape.
       setIncludeUserId(latestConfig.metrics.includeUserId);
     }
-
-    metricsServer = http.createServer(async (req, res) => {
-      if (req.method === "GET" && req.url === "/metrics") {
-        if (!checkMetricsAuth(req, res, metricsToken)) return;
-        try {
-          const { metricsRegistry } = await import("./shared/metrics.js");
-          const body = await metricsRegistry.metrics();
-          res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
-          res.end(body);
-        } catch (err) {
-          console.error("[agentbox] /metrics error:", err);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-        return;
-      }
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Not found" }));
-    });
-
-    metricsServer.on("error", (err) => {
-      console.error("[agentbox] Metrics server error:", err);
-    });
-
-    metricsServer.listen(metricsPort, () => {
-      console.log(`[agentbox] Metrics HTTP server listening on port ${metricsPort} (Prometheus scrape target)`);
-      if (!metricsToken) {
-        console.warn("[agentbox] WARNING: No metrics token configured — /metrics endpoint is unauthenticated");
-      }
-    });
   }
 
-  // Graceful shutdown — close metrics server last so Prometheus can scrape
-  // the final state before the pod terminates.
+  // K8s-only: whether to push a final metrics flush to the Gateway on shutdown.
+  // Gated identically to the 9090 metrics server (mTLS/https) plus a configured
+  // gatewayUrl to push to.
+  const federationFlushEnabled = server instanceof https.Server && !!config.server.gatewayUrl;
+
+  // Graceful shutdown.
   const shutdown = async () => {
     console.log("[agentbox] Shutting down...");
+    // Final metrics flush FIRST: capture the last <pull-interval of increments before
+    // the pod is recycled, and before the (possibly slow) closeAll() risks hitting the
+    // K8s SIGKILL grace deadline. Best-effort — never let it block shutdown. This
+    // replaces the old "close :9090 last so Prometheus can scrape the final state"
+    // window, which is gone now that the scrape target is removed.
+    if (federationFlushEnabled) {
+      try {
+        const client = new GatewayClient({ gatewayUrl: config.server.gatewayUrl });
+        await client.sendMetricsFlush({ incarnation: processIncarnation, prom: await getMetricsAsJSON() });
+        console.log("[agentbox] Final metrics flush sent to Gateway");
+      } catch (err) {
+        console.warn("[agentbox] Final metrics flush failed (continuing shutdown):", err);
+      }
+    }
     await debugPodCache.evictAll();
     await sessionManager.closeAll();
     server.close();
-    if (metricsServer) metricsServer.close();
     process.exit(0);
   };
 

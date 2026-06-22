@@ -47,12 +47,14 @@ import {
   handleAgentTasksUpdate,
   handleAgentTasksDelete,
   handleDelegationEvents,
+  handleMetricsFlush,
 } from "./internal-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
+import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
 
@@ -506,7 +508,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── MetricsAggregator (K8s: pull loop; Local: proxy to in-process localCollector) ──
   const isK8sMode = !(spawner instanceof LocalSpawner);
   let metricsAggregator: MetricsAggregator;
+  // K8s only: application-layer Prometheus federation. The gateway process emits no
+  // business events in K8s mode (they fire inside agentbox pods), so its own
+  // metricsRegistry is empty of them; federation provides those series instead.
+  let promFederation: PromFederationAggregator | null = null;
+  // The federation self-monitoring registry/counters (module 4), resolved once in
+  // K8s mode and reused by the /metrics handler and the flush route — avoids a
+  // per-request dynamic import whose rejection could escape a route handler.
+  let federationSelfMetrics: typeof import("./federation-self-metrics.js") | null = null;
   if (isK8sMode) {
+    promFederation = new PromFederationAggregator();
+    federationSelfMetrics = await import("./federation-self-metrics.js");
     metricsAggregator = new MetricsAggregator("k8s", undefined, agentBoxManager, {
       async fetch(endpoint: string) {
         try {
@@ -516,7 +528,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           return null;
         }
       },
-    });
+    }, promFederation, federationSelfMetrics);
   } else {
     const { localCollector } = await import("../shared/local-collector.js");
     metricsAggregator = new MetricsAggregator("local", localCollector);
@@ -557,8 +569,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       (async () => {
         try {
           const { metricsRegistry } = await import("../shared/metrics.js");
-          res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
-          res.end(await metricsRegistry.metrics());
+          if (promFederation && federationSelfMetrics) {
+            // K8s mode: business metrics come from federation. The gateway's own
+            // metricsRegistry holds the same metric *names* with empty values, so we
+            // must NOT emit it here (it would duplicate # TYPE lines). Instead we
+            // append only the dedicated self-monitoring registry, whose metric names
+            // (siclaw_federation_*) have zero overlap with the federated business
+            // metrics — two non-overlapping exposition texts concatenate safely.
+            const { federationSelfRegistry } = federationSelfMetrics;
+            const federated = promFederation.metrics();
+            const selfMon = await federationSelfRegistry.metrics();
+            res.writeHead(200, { "Content-Type": federationSelfRegistry.contentType });
+            res.end(selfMon ? `${federated}${selfMon}` : federated);
+          } else {
+            // Local mode: gateway emits business events in-process — serve them directly.
+            res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
+            res.end(await metricsRegistry.metrics());
+          }
         } catch (err) {
           console.error("[runtime] /metrics error:", err);
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -688,6 +715,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/delegation-events" && method === "POST") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleDelegationEvents(req, res, identity, frontendClient);
+            return;
+          }
+
+          // SIGTERM final-flush of an AgentBox's prom snapshot (K8s federation, module 5).
+          if (url === "/api/internal/metrics-flush" && method === "POST") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            if (!promFederation || !federationSelfMetrics) { res.writeHead(404, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Federation not enabled" })); return; }
+            // handleMetricsFlush has its own try/catch and always responds; selfMetrics
+            // is the already-resolved module reference (no per-request import to escape).
+            void handleMetricsFlush(req, res, identity, promFederation, federationSelfMetrics);
             return;
           }
 

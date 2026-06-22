@@ -15,16 +15,16 @@ Integrated Prometheus metrics via a decoupled event bus architecture. Business c
 **New Components:**
 - `diagnostic-events.ts` — zero-dependency event bus (`emitDiagnostic()` / `onDiagnostic()`)
 - `metrics.ts` — prom-client subscriber, the only file that depends on prom-client
-- Dedicated metrics HTTP server on port 9090 for AgentBox (K8s mode only, bypasses mTLS)
+- `prom-federation-aggregator.ts` — Gateway-side federation: pulls each AgentBox's prom-client snapshot and delta-accumulates it into one stable series re-exported from `gateway:3001/metrics`. AgentBox metrics are NOT scraped directly (see below).
 
 **Helm Chart:**
-- ServiceMonitor for Gateway, PodMonitor for AgentBox (cross-namespace discovery)
+- ServiceMonitor for Gateway (`gateway:3001/metrics`) — the single, stable scrape target. AgentBox metrics reach Prometheus via Gateway federation, so there is no AgentBox PodMonitor.
 - Grafana dashboard auto-import via ConfigMap with `grafana_dashboard: "1"` label
 - PrometheusRule with preset alerts (opt-in)
 
 **Breaking Changes:**
 - AgentBox container port name changed from `http` to `https` in K8s manifests and `k8s-spawner.ts`. If you have external configurations (NetworkPolicies, custom Services, Istio VirtualServices) that reference the AgentBox port by name `http`, update them to `https`.
-- New container port `metrics` (9090) added to AgentBox pods.
+- AgentBox metrics are collected by Gateway federation (30s pull + SIGTERM final flush), not by Prometheus scraping the pod directly. There is no AgentBox `:9090` metrics server, no `metrics` container port, and no AgentBox PodMonitor.
 
 **Dependencies:**
 - Added `prom-client` for Prometheus metrics
