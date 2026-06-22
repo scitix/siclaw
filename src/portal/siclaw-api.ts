@@ -2819,6 +2819,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   // enum. Both missing → trailing 7d. Returns null on an unparseable value or
   // `from >= to`, so the caller can fail-fast with 400 — no silent fallback to
   // a default window on bad input.
+  //
+  // Single open bound is intentionally asymmetric: missing `to` → now (a natural
+  // trailing window), but missing `from` (with `to` present) → null/400 rather
+  // than guessing a start for an otherwise-unbounded window. The portal-web
+  // frontend always sends both bounds, so this only constrains manual callers.
   function resolveWindow(query: Record<string, string>): { from: Date; to: Date } | null {
     const fromRaw = query.from;
     const toRaw = query.to;
@@ -3007,9 +3012,12 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // Audit uses the same from/to window contract as summary/timing, via the
     // shared parseTs. It keeps a lenient trailing-24h default (and BETWEEN
     // semantics) when a bound is absent — the frontend always sends an explicit,
-    // frozen window, so the lenient default is only hit by manual callers.
+    // frozen window, so the lenient default is only hit by manual callers. The
+    // reversed-window check below matches summary/timing's 400 so the same
+    // malformed input fails the same way everywhere (no silent empty list).
     const from = parseTs(query.from) ?? new Date(Date.now() - 86_400_000);
     const to = parseTs(query.to) ?? new Date();
+    if (from.getTime() >= to.getTime()) { sendJson(res, 400, { error: "Invalid time range" }); return; }
 
     const conds: string[] = ["m.role = 'tool'", "m.created_at BETWEEN ? AND ?"];
     const params: unknown[] = [from, to];
