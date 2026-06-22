@@ -1,9 +1,8 @@
 import { useCallback, useMemo, useState } from "react"
 import { Loader2, RefreshCw } from "lucide-react"
-import { useLive, useSummary, useTimingStats, useUsers, rangeLabel, DEFAULT_RANGE, type TimeRange } from "../hooks/useMetrics"
+import { useSummary, useUsers, rangeLabel, DEFAULT_RANGE, type TimeRange } from "../hooks/useMetrics"
 import { KpiCards } from "../components/metrics/KpiCards"
-import { RankedTable } from "../components/metrics/RankedTable"
-import { TimingStatsCard } from "../components/metrics/TimingStatsCard"
+import { TrendChart } from "../components/metrics/TrendChart"
 import { AuditTable } from "../components/metrics/AuditTable"
 import { GrafanaFrame } from "../components/metrics/GrafanaFrame"
 import { TimeRangePicker } from "../components/metrics/TimeRangePicker"
@@ -12,24 +11,24 @@ type TabKey = "dashboard" | "audit" | "grafana"
 
 export function Metrics() {
   const [tab, setTab] = useState<TabKey>("dashboard")
-  const [userId, setUserId] = useState<string>("")         // "" = All Users
+  const [userId, setUserId] = useState<string>("")         // "" = All Users (Audit filter only)
   const [timeRange, setTimeRange] = useState<TimeRange>(DEFAULT_RANGE)
 
   const filterUserId = userId || null
   const rLabel = rangeLabel(timeRange)
 
   const { users } = useUsers()
-  const { data: live, loading: liveLoading, refresh: refreshLive } = useLive(filterUserId)
-  const { data: summary, loading: summaryLoading, refresh: refreshSummary } = useSummary(timeRange, filterUserId)
-  const { data: timing, refresh: refreshTiming } = useTimingStats(timeRange, filterUserId)
+  // Dashboard is an external-facing showcase: aggregate only, never scoped to
+  // an individual — so summary is fetched without a user filter.
+  const { data: summary, loading: summaryLoading, refresh: refreshSummary } = useSummary(timeRange, null)
 
   const [spinning, setSpinning] = useState(false)
   const handleRefresh = useCallback(() => {
     setSpinning(true)
-    Promise.all([refreshLive(), refreshSummary(), refreshTiming()]).finally(() => {
+    Promise.resolve(refreshSummary()).finally(() => {
       setTimeout(() => setSpinning(false), 600)
     })
-  }, [refreshLive, refreshSummary, refreshTiming])
+  }, [refreshSummary])
 
   const selectedUsername = useMemo(() => {
     if (!userId) return null
@@ -44,34 +43,33 @@ export function Metrics() {
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-lg font-semibold tracking-tight">Metrics</h2>
-              <p className="text-[12px] text-muted-foreground mt-0.5">Runtime telemetry · admin-only</p>
+              <p className="text-[12px] text-muted-foreground mt-0.5">Adoption &amp; impact · admin-only</p>
             </div>
             <div className="flex items-center gap-2">
-              <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse"></span>
-                live · auto-refresh 30s
-              </div>
               {tab === "dashboard" && (
-                <button
-                  onClick={handleRefresh}
-                  title="Sync now"
-                  className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground transition"
-                >
-                  <RefreshCw className={`h-3.5 w-3.5 transition-transform duration-500 ${spinning ? "animate-spin" : ""}`} />
-                </button>
+                <>
+                  <button
+                    onClick={handleRefresh}
+                    title="Sync now"
+                    className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground transition"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 transition-transform duration-500 ${spinning ? "animate-spin" : ""}`} />
+                  </button>
+                  <TimeRangePicker value={timeRange} onChange={setTimeRange} />
+                </>
               )}
-              <div className="w-px h-4 bg-border mx-2"></div>
-              <select
-                value={userId}
-                onChange={(e) => setUserId(e.target.value)}
-                className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
-              >
-                <option value="">All Users</option>
-                {users.map((u) => (
-                  <option key={u.id} value={u.id}>{u.username}</option>
-                ))}
-              </select>
-              <TimeRangePicker value={timeRange} onChange={setTimeRange} />
+              {tab === "audit" && (
+                <select
+                  value={userId}
+                  onChange={(e) => setUserId(e.target.value)}
+                  className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
+                >
+                  <option value="">All Users</option>
+                  {users.map((u) => (
+                    <option key={u.id} value={u.id}>{u.username}</option>
+                  ))}
+                </select>
+              )}
             </div>
           </div>
 
@@ -97,61 +95,42 @@ export function Metrics() {
       <div className="flex-1 overflow-y-auto">
         {tab === "dashboard" && (
           <section className="px-6 py-6 space-y-6">
-            {liveLoading || summaryLoading ? (
+            {summaryLoading ? (
               <div className="flex items-center justify-center py-12"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
             ) : (
               <>
                 <KpiCards
+                  rangeLabel={rLabel}
+                  distinctUsers={summary?.distinctUsers ?? 0}
                   totalSessions={summary?.totalSessions ?? 0}
                   totalPrompts={summary?.totalPrompts ?? 0}
-                  activeSessions={live?.snapshot.activeSessions ?? 0}
-                  wsConnections={live?.snapshot.wsConnections ?? 0}
-                  toolCallsTotal={(live?.topTools ?? []).reduce((s, t) => s + t.total, 0)}
-                  rangeLabel={rLabel}
+                  toolCalls={summary?.toolCalls ?? 0}
+                  skillsUsed={summary?.skillsUsed ?? 0}
+                  skillsUsedApprox={summary?.skillsUsedApprox}
+                  inventory={summary?.inventory ?? { clusters: 0, hosts: 0, skills: 0, knowledgeRepos: 0, agents: 0, mcpServers: 0 }}
                 />
 
-                <TimingStatsCard data={timing} rangeLabel={rLabel} />
-
-                <div className="grid grid-cols-2 gap-4">
-                  <RankedTable
-                    title="Top Tools"
-                    subtitle="by invocation count"
-                    items={(live?.topTools ?? []).map((t) => ({
-                      name: t.toolName,
-                      subtitle: t.agentId ? `agent · ${t.agentId}` : undefined,
-                      total: t.total,
-                      success: t.success,
-                      error: t.error,
-                    }))}
-                  />
-                  <RankedTable
-                    title="Top Skills"
-                    subtitle="by invocation count · avg ms"
-                    items={(live?.topSkills ?? []).map((s) => ({
-                      name: s.skillName,
-                      subtitle: `${s.scope} · avg ${s.avgDurationMs}ms`,
-                      total: s.total,
-                      success: s.success,
-                      error: s.error,
-                    }))}
-                  />
-                </div>
-
-                {!filterUserId && summary && summary.byUser.length > 0 && (
-                  <RankedTable
-                    title="By User"
-                    subtitle={`sessions · messages (${rLabel})`}
-                    items={summary.byUser.map((u) => {
-                      const username = users.find((x) => x.id === u.userId)?.username ?? u.userId
-                      return {
-                        name: username,
-                        subtitle: `${u.messages} messages`,
-                        total: u.sessions,
-                        success: u.sessions,
-                        error: 0,
-                      }
-                    })}
-                  />
+                {/* Daily trend — hidden for sub-day windows that yield a single point. */}
+                {summary && summary.dailySeries.length > 1 && (
+                  <div>
+                    <h3 className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-2">
+                      Usage trend · daily · {rLabel}
+                    </h3>
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                      <TrendChart
+                        title="Prompts"
+                        subtitle="user messages per day"
+                        color="#34d399"
+                        data={summary.dailySeries.map((d) => ({ date: d.date, value: d.prompts }))}
+                      />
+                      <TrendChart
+                        title="Tool Calls"
+                        subtitle="tool executions per day"
+                        color="#a78bfa"
+                        data={summary.dailySeries.map((d) => ({ date: d.date, value: d.toolCalls }))}
+                      />
+                    </div>
+                  </div>
                 )}
               </>
             )}

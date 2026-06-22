@@ -32,7 +32,15 @@ export interface LiveData {
 export interface SummaryData {
   totalSessions: number
   totalPrompts: number
-  byUser: Array<{ userId: string; sessions: number; messages: number }>
+  // —— 对外展示新增,随时间窗 ——
+  distinctUsers: number
+  toolCalls: number
+  skillsUsed: number
+  skillsUsedApprox?: boolean
+  // —— 当前快照,不随时间窗 ——
+  inventory: { clusters: number; hosts: number; skills: number; knowledgeRepos: number; agents: number; mcpServers: number }
+  // —— 日级趋势(随时间窗)——
+  dailySeries: Array<{ date: string; prompts: number; toolCalls: number }>
 }
 
 /**

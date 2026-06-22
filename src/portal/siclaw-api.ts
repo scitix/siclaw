@@ -257,6 +257,25 @@ export interface SiclawApiContext {
   notifyMcpAgents?: (mcpId: string, resources: string[]) => void;
 }
 
+/**
+ * Day-bucket key ('YYYY-MM-DD') for a value returned by SQL `DATE(...)`.
+ * SQLite (and mysql2 with dateStrings) hand back a 'YYYY-MM-DD' string — used
+ * verbatim. mysql2's default returns a JS Date at the connection-local midnight;
+ * we read LOCAL components, NOT toISOString() — the latter is UTC and would
+ * shift the day by one under a non-UTC DB (the prod clusters are UTC+8),
+ * dropping edge rows. The same function keys both the DB buckets and the
+ * gap-fill range, so they never disagree and the series always sums to the
+ * scalar COUNT.
+ */
+export function sqlDayKey(raw: unknown): string | null {
+  if (typeof raw === "string") return raw.length >= 10 ? raw.slice(0, 10) : null;
+  if (raw instanceof Date) {
+    if (Number.isNaN(raw.getTime())) return null;
+    return `${raw.getFullYear()}-${String(raw.getMonth() + 1).padStart(2, "0")}-${String(raw.getDate()).padStart(2, "0")}`;
+  }
+  return null;
+}
+
 export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, ctx?: SiclawApiContext): void {
   const P = "/api/v1/siclaw";
 
@@ -2866,19 +2885,134 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const [pRows] = await db.query(totalPromptsSql, pParams) as [Array<{ c: number }>, unknown];
     const totalPrompts = Number(pRows[0]?.c ?? 0);
 
-    let byUser: Array<{ userId: string; sessions: number; messages: number }> = [];
-    if (!userFilter) {
-      const [uRows] = await db.query(
-        `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
-         FROM chat_sessions s WHERE s.created_at >= ? AND s.created_at <= ?
-           AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
-         GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
-        [from, to],
-      ) as any;
-      byUser = uRows.map((r: any) => ({ userId: r.userId, sessions: Number(r.sessions), messages: Number(r.messages ?? 0) }));
-    }
+    // ── distinctUsers (window) ──
+    const duParams: unknown[] = [from, to];
+    let distinctUsersSql = `SELECT COUNT(DISTINCT user_id) AS c FROM chat_sessions
+      WHERE created_at >= ? AND created_at <= ? AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))`;
+    if (userFilter) { distinctUsersSql += " AND user_id = ?"; duParams.push(userFilter); }
+    const [duRows] = await db.query(distinctUsersSql, duParams) as [Array<{ c: number }>, unknown];
+    const distinctUsers = Number(duRows[0]?.c ?? 0);
 
-    sendJson(res, 200, { totalSessions, totalPrompts, byUser });
+    // ── toolCalls: total tool-row count (window) ──
+    const tcParams: unknown[] = [from, to];
+    let toolCallsSql = `SELECT COUNT(*) AS c FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'tool' AND m.created_at >= ? AND m.created_at <= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
+    if (userFilter) { toolCallsSql += " AND s.user_id = ?"; tcParams.push(userFilter); }
+    const [tcRows] = await db.query(toolCallsSql, tcParams) as [Array<{ c: number }>, unknown];
+    const toolCalls = Number(tcRows[0]?.c ?? 0);
+
+    // ── skillsUsed: distinct skills parsed from tool_input JSON (window) ──
+    // The skill name lives inside tool_input (tool_name is the script-exec
+    // tool's own name). role='tool' hits idx_chat_messages_audit; the cap mirrors
+    // /metrics/timing — skill cardinality is tiny so it ~never bites.
+    const SKILL_ROW_LIMIT = 50_000;
+    const suParams: unknown[] = [from, to];
+    let skillsSql = `SELECT m.tool_input AS toolInput FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'tool'
+        AND m.tool_name IN ('local_script', 'host_script', 'pod_script', 'node_script')
+        AND m.created_at >= ? AND m.created_at <= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
+    if (userFilter) { skillsSql += " AND s.user_id = ?"; suParams.push(userFilter); }
+    skillsSql += " ORDER BY m.created_at DESC LIMIT ?";
+    suParams.push(SKILL_ROW_LIMIT + 1);
+    const [suRows] = await db.query(skillsSql, suParams) as [Array<{ toolInput: string | null }>, unknown];
+    const skillsUsedApprox = suRows.length > SKILL_ROW_LIMIT;
+    const suSlice = skillsUsedApprox ? suRows.slice(0, SKILL_ROW_LIMIT) : suRows;
+    const skillSet = new Set<string>();
+    for (const r of suSlice) {
+      if (!r.toolInput) continue;
+      let skill: unknown;
+      const parsed = safeParseJson<Record<string, unknown> | null>(r.toolInput, null);
+      if (parsed) {
+        skill = parsed.skill;
+      } else {
+        // tool_input is redacted JSON; fall back to a regex if it failed to parse.
+        const match = /"skill"\s*:\s*"([^"]+)"/.exec(r.toolInput);
+        if (match) skill = match[1];
+      }
+      // skill is Optional on host/pod/node_script (user scripts omit it) — only
+      // count real skill names so a missing field can't inflate the set.
+      if (typeof skill === "string" && skill) skillSet.add(skill);
+    }
+    const skillsUsed = skillSet.size;
+
+    // ── inventory: current-snapshot managed scale, NOT windowed ──
+    const [[invClusters], [invHosts], [invSkills], [invKnowledge], [invAgents], [invMcp]] = await Promise.all([
+      db.query("SELECT COUNT(*) AS c FROM clusters") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM hosts") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM skills WHERE overlay_of IS NULL") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM knowledge_repos") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM agents") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM mcp_servers") as Promise<[Array<{ c: number }>, unknown]>,
+    ]);
+    const inventory = {
+      clusters: Number(invClusters[0]?.c ?? 0),
+      hosts: Number(invHosts[0]?.c ?? 0),
+      skills: Number(invSkills[0]?.c ?? 0),
+      knowledgeRepos: Number(invKnowledge[0]?.c ?? 0),
+      agents: Number(invAgents[0]?.c ?? 0),
+      mcpServers: Number(invMcp[0]?.c ?? 0),
+    };
+
+    // ── dailySeries: per-day prompts & tool calls across [from, to]. Same WHERE
+    // as the scalar cards → each chart's summed Total equals its KPI card. Keyed
+    // by sqlDayKey (local day) and union'd with the gap-fill range so no count is
+    // dropped under a non-UTC DB; capped at ~400 days for pathological windows.
+    const dpParams: unknown[] = [from, to];
+    let dailyPromptsSql = `SELECT DATE(m.created_at) AS day, COUNT(*) AS c FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
+        AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
+    if (userFilter) { dailyPromptsSql += " AND s.user_id = ?"; dpParams.push(userFilter); }
+    dailyPromptsSql += " GROUP BY DATE(m.created_at)";
+
+    const dtParams: unknown[] = [from, to];
+    let dailyToolsSql = `SELECT DATE(m.created_at) AS day, COUNT(*) AS c FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'tool' AND m.created_at >= ? AND m.created_at <= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
+    if (userFilter) { dailyToolsSql += " AND s.user_id = ?"; dtParams.push(userFilter); }
+    dailyToolsSql += " GROUP BY DATE(m.created_at)";
+
+    const [dpRes, dtRes] = await Promise.all([
+      db.query(dailyPromptsSql, dpParams) as Promise<[Array<{ day: unknown; c: number }>, unknown]>,
+      db.query(dailyToolsSql, dtParams) as Promise<[Array<{ day: unknown; c: number }>, unknown]>,
+    ]);
+    const bucketByDay = (rows: Array<{ day: unknown; c: number }>): Map<string, number> => {
+      const m = new Map<string, number>();
+      for (const r of rows) {
+        const key = sqlDayKey(r.day);
+        if (key) m.set(key, Number(r.c));
+      }
+      return m;
+    };
+    const promptByDay = bucketByDay(dpRes[0]);
+    const toolByDay = bucketByDay(dtRes[0]);
+
+    const dayKeys = new Set<string>();
+    const cursor = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+    const lastDay = new Date(to.getFullYear(), to.getMonth(), to.getDate());
+    for (let guard = 0; cursor <= lastDay && guard < 400; guard++) {
+      const key = sqlDayKey(cursor);
+      if (key) dayKeys.add(key);
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    for (const k of promptByDay.keys()) dayKeys.add(k);
+    for (const k of toolByDay.keys()) dayKeys.add(k);
+    const dailySeries = [...dayKeys].sort().map((date) => ({
+      date,
+      prompts: promptByDay.get(date) ?? 0,
+      toolCalls: toolByDay.get(date) ?? 0,
+    }));
+
+    sendJson(res, 200, {
+      totalSessions, totalPrompts,
+      distinctUsers, toolCalls, skillsUsed, skillsUsedApprox, inventory, dailySeries,
+    });
   });
 
   // GET /api/v1/siclaw/metrics/timing
