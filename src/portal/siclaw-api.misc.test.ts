@@ -323,16 +323,18 @@ describe("siclaw-api misc routes", () => {
       expect([401, 403]).toContain(status);
     });
 
-    it("rejects invalid period (admin)", async () => {
+    it("rejects invalid window (admin)", async () => {
+      // from >= to is rejected by resolveWindow — the from/to contract replaced
+      // the old `period` enum; 4-digit values are read as unix-ms (2000 > 1000).
       const { status } = await runRoute(router, fakeReq({
-        url: "/api/v1/siclaw/metrics/summary?period=bogus",
+        url: "/api/v1/siclaw/metrics/summary?from=2000&to=1000",
         method: "GET",
         headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
       }));
       expect(status).toBe(400);
     });
 
-    it("returns summary for admin with valid period", async () => {
+    it("returns summary for admin with default window", async () => {
       query
         .mockResolvedValueOnce([[{ c: 1 }], []])
         .mockResolvedValueOnce([[{ c: 5 }], []])
@@ -345,6 +347,40 @@ describe("siclaw-api misc routes", () => {
       expect(status).toBe(200);
       expect(body.totalSessions).toBe(1);
       expect(query.mock.calls[1][0]).toContain('metadata NOT LIKE \'%"kind":"delegation_event"%\'');
+    });
+  });
+
+  // ── Metrics audit ────────────────────────────────────────
+  describe("GET /api/v1/siclaw/metrics/audit", () => {
+    it("rejects non-admin", async () => {
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/audit",
+        method: "GET",
+      }));
+      expect([401, 403]).toContain(status);
+    });
+
+    it("rejects a reversed window with 400, matching summary/timing", async () => {
+      // Regression: audit used `parseTs(...) ?? default` with no `from >= to`
+      // check, so a reversed window silently returned an empty list via BETWEEN
+      // instead of failing the way summary/timing do.
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/audit?from=2000&to=1000",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(400);
+    });
+
+    it("returns logs for admin within a valid window", async () => {
+      query.mockResolvedValueOnce([[], []]);
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/audit?from=1000&to=2000",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(200);
+      expect(Array.isArray(body.logs)).toBe(true);
     });
   });
 

@@ -6,7 +6,7 @@ interface Props {
   activeSessions: number
   wsConnections: number
   toolCallsTotal: number
-  period: "today" | "7d" | "30d"
+  rangeLabel: string
 }
 
 function fmt(n: number): string {
@@ -15,14 +15,8 @@ function fmt(n: number): string {
   return String(n)
 }
 
-const periodLabel: Record<Props["period"], string> = {
-  today: "today",
-  "7d": "7d",
-  "30d": "30d",
-}
-
 export function KpiCards(p: Props) {
-  const plabel = periodLabel[p.period]
+  const plabel = p.rangeLabel
   return (
     <div className="grid grid-cols-4 gap-4">
       <KpiCard

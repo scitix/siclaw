@@ -1,17 +1,10 @@
 import { useMemo, useState } from "react"
 import { ChevronDown, ChevronRight, CheckCircle, XCircle, Ban, Loader2 } from "lucide-react"
-import { useAudit, useUsers, type AuditLog } from "../../hooks/useMetrics"
+import { useAudit, useUsers, resolveRange, type AuditLog, type TimeRange } from "../../hooks/useMetrics"
 import { AuditDetailPanel } from "./AuditDetailPanel"
 
 const TOOL_OPTIONS = ["All", "restricted_bash", "local_script", "pod_exec", "kubectl", "cluster_probe", "cluster_list"]
 const STATUS_OPTIONS = ["All", "success", "error", "blocked"]
-const RANGE_OPTIONS = [
-  { label: "Last 1h", value: 3_600_000 },
-  { label: "Last 6h", value: 21_600_000 },
-  { label: "Last 24h", value: 86_400_000 },
-  { label: "Last 7d", value: 7 * 86_400_000 },
-  { label: "Last 30d", value: 30 * 86_400_000 },
-]
 
 function formatDuration(ms: number | null): string {
   if (ms == null) return "—"
@@ -54,10 +47,9 @@ function OutcomeIcon({ outcome }: { outcome: string | null }) {
   }
 }
 
-export function AuditTable({ userFilterId, usernameHint }: { userFilterId: string | null; usernameHint: string | null }) {
+export function AuditTable({ userFilterId, usernameHint, timeRange }: { userFilterId: string | null; usernameHint: string | null; timeRange: TimeRange }) {
   const [tool, setTool] = useState("All")
   const [status, setStatus] = useState("All")
-  const [rangeMs, setRangeMs] = useState(86_400_000)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const { users } = useUsers()
   const userMap = useMemo(() => {
@@ -66,16 +58,19 @@ export function AuditTable({ userFilterId, usernameHint }: { userFilterId: strin
     return m
   }, [users])
 
+  // Resolve the header window ONCE per filter change and freeze it. The deps are
+  // primitives (the relative expressions, not Date.now()), so paginating a
+  // sliding relative range can't move the window mid-scroll and drift the cursor.
   const params = useMemo(() => {
-    const now = Date.now()
+    const { fromMs, toMs } = resolveRange(timeRange)
     return {
       userId: userFilterId ?? undefined,
       toolName: tool === "All" ? undefined : tool,
       outcome: status === "All" ? undefined : status,
-      startDate: new Date(now - rangeMs).toISOString(),
-      endDate: new Date(now).toISOString(),
+      from: String(fromMs),
+      to: String(toMs),
     }
-  }, [tool, status, rangeMs, userFilterId])
+  }, [tool, status, timeRange.from, timeRange.to, userFilterId])
 
   const { logs, hasMore, loading, loadMore } = useAudit(params)
 
@@ -102,13 +97,6 @@ export function AuditTable({ userFilterId, usernameHint }: { userFilterId: strin
           className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
         >
           {STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s === "All" ? "All Status" : s}</option>)}
-        </select>
-        <select
-          value={rangeMs}
-          onChange={(e) => setRangeMs(parseInt(e.target.value, 10))}
-          className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
-        >
-          {RANGE_OPTIONS.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
         </select>
         <div className="flex-1"></div>
         <div className="text-[11px] text-muted-foreground font-mono">{logs.length} entries{hasMore ? "+" : ""}</div>

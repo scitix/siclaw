@@ -1,25 +1,27 @@
 import { useCallback, useMemo, useState } from "react"
 import { Loader2, RefreshCw } from "lucide-react"
-import { useLive, useSummary, useTimingStats, useUsers } from "../hooks/useMetrics"
+import { useLive, useSummary, useTimingStats, useUsers, rangeLabel, DEFAULT_RANGE, type TimeRange } from "../hooks/useMetrics"
 import { KpiCards } from "../components/metrics/KpiCards"
 import { RankedTable } from "../components/metrics/RankedTable"
 import { TimingStatsCard } from "../components/metrics/TimingStatsCard"
 import { AuditTable } from "../components/metrics/AuditTable"
 import { GrafanaFrame } from "../components/metrics/GrafanaFrame"
+import { TimeRangePicker } from "../components/metrics/TimeRangePicker"
 
 type TabKey = "dashboard" | "audit" | "grafana"
 
 export function Metrics() {
   const [tab, setTab] = useState<TabKey>("dashboard")
   const [userId, setUserId] = useState<string>("")         // "" = All Users
-  const [period, setPeriod] = useState<"today" | "7d" | "30d">("7d")
+  const [timeRange, setTimeRange] = useState<TimeRange>(DEFAULT_RANGE)
 
   const filterUserId = userId || null
+  const rLabel = rangeLabel(timeRange)
 
   const { users } = useUsers()
   const { data: live, loading: liveLoading, refresh: refreshLive } = useLive(filterUserId)
-  const { data: summary, loading: summaryLoading, refresh: refreshSummary } = useSummary(period, filterUserId)
-  const { data: timing, refresh: refreshTiming } = useTimingStats(period, filterUserId)
+  const { data: summary, loading: summaryLoading, refresh: refreshSummary } = useSummary(timeRange, filterUserId)
+  const { data: timing, refresh: refreshTiming } = useTimingStats(timeRange, filterUserId)
 
   const [spinning, setSpinning] = useState(false)
   const handleRefresh = useCallback(() => {
@@ -69,15 +71,7 @@ export function Metrics() {
                   <option key={u.id} value={u.id}>{u.username}</option>
                 ))}
               </select>
-              <select
-                value={period}
-                onChange={(e) => setPeriod(e.target.value as "today" | "7d" | "30d")}
-                className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
-              >
-                <option value="today">Today</option>
-                <option value="7d">Last 7 days</option>
-                <option value="30d">Last 30 days</option>
-              </select>
+              <TimeRangePicker value={timeRange} onChange={setTimeRange} />
             </div>
           </div>
 
@@ -113,10 +107,10 @@ export function Metrics() {
                   activeSessions={live?.snapshot.activeSessions ?? 0}
                   wsConnections={live?.snapshot.wsConnections ?? 0}
                   toolCallsTotal={(live?.topTools ?? []).reduce((s, t) => s + t.total, 0)}
-                  period={period}
+                  rangeLabel={rLabel}
                 />
 
-                <TimingStatsCard data={timing} period={period} />
+                <TimingStatsCard data={timing} rangeLabel={rLabel} />
 
                 <div className="grid grid-cols-2 gap-4">
                   <RankedTable
@@ -146,7 +140,7 @@ export function Metrics() {
                 {!filterUserId && summary && summary.byUser.length > 0 && (
                   <RankedTable
                     title="By User"
-                    subtitle={`sessions · messages (period: ${period})`}
+                    subtitle={`sessions · messages (${rLabel})`}
                     items={summary.byUser.map((u) => {
                       const username = users.find((x) => x.id === u.userId)?.username ?? u.userId
                       return {
@@ -165,7 +159,7 @@ export function Metrics() {
         )}
 
         {tab === "audit" && (
-          <AuditTable userFilterId={filterUserId} usernameHint={selectedUsername} />
+          <AuditTable userFilterId={filterUserId} usernameHint={selectedUsername} timeRange={timeRange} />
         )}
 
         {tab === "grafana" && <GrafanaFrame />}
