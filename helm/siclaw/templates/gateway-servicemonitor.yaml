@@ -25,4 +25,12 @@ spec:
     - port: http
       path: /metrics
       interval: {{ .Values.metrics.serviceMonitor.interval | default "15s" }}
+      {{- with .Values.metrics.serviceMonitor.bearerTokenSecret }}
+      # Sent as `Authorization: Bearer <secret>` so scrapes pass the gateway's
+      # checkMetricsAuth when SICLAW_METRICS_TOKEN is set. The secret value MUST equal
+      # that token, or every scrape (federation AND self-monitoring) 401s — which on
+      # this single scrape path means total metric loss.
+      bearerTokenSecret:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
 {{- end }}

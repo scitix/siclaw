@@ -102,21 +102,65 @@ describe("PromFederationAggregator", () => {
     expect(counterVal(agg, "siclaw_tokens_total", { type: "output" })).toBe(42);
   });
 
-  it("(5) grace race: a flush arriving after the instance left the live set still computes a correct delta (no recount)", () => {
+  it("(5) a late/flush frame after the instance left the live set still computes a correct delta (no recount)", () => {
     const agg = new PromFederationAggregator();
     // round 1: pulled at 70
     agg.ingest("box-a", "inc-1", [counter("siclaw_tokens_total", [[{ type: "input" }, 70]])]);
-    // pod disappears from the pod list this round → first absence → grace
+    // pod disappears from the pod list across two reconciliations.
     agg.retainInstances(new Set<string>());
-    // SIGTERM flush arrives with final value 90 (within grace, lastSeen still present)
+    agg.retainInstances(new Set<string>());
+    // A late SIGTERM flush / reordered pull arrives with final value 90. The counter
+    // baseline is retained (LRU), so delta = 20 — NOT a full recount of 90.
     agg.ingest("box-a", "inc-1", [counter("siclaw_tokens_total", [[{ type: "input" }, 90]])]);
-    // delta should be 20, not a full recount of 90
     expect(counterVal(agg, "siclaw_tokens_total", { type: "input" })).toBe(90);
+  });
 
-    // second reconciliation still absent → evicted now; cumulative stays settled.
+  it("(②) a late frame after eviction is NOT re-counted in full (counter baseline retained)", () => {
+    const agg = new PromFederationAggregator();
+    agg.ingest("box-a", "inc-1", [counter("siclaw_tokens_total", [[{ type: "input" }, 50]])]);
+    expect(counterVal(agg, "siclaw_tokens_total", { type: "input" })).toBe(50);
+    // pod leaves; two reconciliations would have dropped a naive baseline.
     agg.retainInstances(new Set<string>());
-    expect(counterVal(agg, "siclaw_tokens_total", { type: "input" })).toBe(90);
-    expect(agg.trackedInstanceCount()).toBe(0);
+    agg.retainInstances(new Set<string>());
+    // late frame of 100 → delta 50 → total 100 (the pod's true cumulative), not 150.
+    agg.ingest("box-a", "inc-1", [counter("siclaw_tokens_total", [[{ type: "input" }, 100]])]);
+    expect(counterVal(agg, "siclaw_tokens_total", { type: "input" })).toBe(100);
+  });
+
+  it("(③) a reordered stale-incarnation frame computes a correct delta, not a full recount", () => {
+    const agg = new PromFederationAggregator();
+    agg.ingest("box-a", "inc-1", [counter("siclaw_tokens_total", [[{ type: "input" }, 100]])]);
+    // pod rebuilt: new incarnation reports 10 → supersedes inc-1, +10 = 110
+    agg.ingest("box-a", "inc-2", [counter("siclaw_tokens_total", [[{ type: "input" }, 10]])]);
+    expect(counterVal(agg, "siclaw_tokens_total", { type: "input" })).toBe(110);
+    // a reordered old-incarnation frame (inc-1 grew 100 → 120 before it died) arrives
+    // late. With the baseline retained, delta = 20 → 130 (inc-1 final 120 + inc-2 10),
+    // NOT a full recount of 120 (which would give 230).
+    agg.ingest("box-a", "inc-1", [counter("siclaw_tokens_total", [[{ type: "input" }, 120]])]);
+    expect(counterVal(agg, "siclaw_tokens_total", { type: "input" })).toBe(130);
+  });
+
+  it("(①) label values containing ',' or '=' do NOT collapse into one series", () => {
+    const agg = new PromFederationAggregator();
+    agg.ingest("box-a", "inc-1", [
+      { name: "siclaw_tokens_total", type: "counter", values: [
+        { labels: { a: "1,b=2" }, value: 5 },
+        { labels: { a: "1", b: "2" }, value: 7 },
+      ] },
+    ]);
+    const fam = agg.exportGroups().find((g) => g.name === "siclaw_tokens_total");
+    // two DISTINCT series, not one merged-and-summed series of 12
+    expect(fam!.values.length).toBe(2);
+    expect(fam!.values.some((v) => v.value === 12)).toBe(false);
+  });
+
+  it("LRU caps retained baselines so memory is bounded under churn", () => {
+    const agg = new PromFederationAggregator();
+    // ingest far more distinct instances than the cap; tracked count must stay bounded.
+    for (let i = 0; i < 5000; i++) {
+      agg.ingest(`box-${i}`, "inc-1", [counter("siclaw_tokens_total", [[{ type: "input" }, 1]])]);
+    }
+    expect(agg.trackedInstanceCount()).toBeLessThanOrEqual(4096);
   });
 
   it("(6) gauge whitelist: sessions_active is summed across live pods; non-whitelisted gauges are skipped", () => {

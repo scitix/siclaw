@@ -171,6 +171,13 @@ metrics:
     namespace: ""
     namespaceSelector: {}
     additionalLabels: {}
+    # gateway:3001/metrics is the ONLY scrape target (agentbox federation re-exports
+    # here). The gateway's checkMetricsAuth fails OPEN when SICLAW_METRICS_TOKEN is
+    # unset (the default — rely on NetworkPolicy), so leave this empty in that case.
+    # If you DO set SICLAW_METRICS_TOKEN, you MUST point bearerTokenSecret at a Secret
+    # holding the same token, otherwise every scrape 401s and all metrics go dark.
+    # Example: { name: siclaw-metrics-token, key: token }
+    bearerTokenSecret: {}
   # NOTE: the agentbox PodMonitor was removed — agentbox metrics are now federated
   # through the Gateway and exported from gateway:3001 (ServiceMonitor above), the
   # single stable scrape target. See metrics-federation-DESIGN.md.
