@@ -320,7 +320,7 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
       if (size > MAX_BODY_SIZE) {
         clearTimeout(timer);
         req.destroy();
-        reject(new HttpRequestError(413, `Body exceeds ${formatBytes(MAX_BODY_SIZE)} byte limit`));
+        reject(new HttpRequestError(413, `Body exceeds ${formatBytes(MAX_BODY_SIZE)} limit`));
         return;
       }
       body += chunk;
