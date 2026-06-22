@@ -174,6 +174,29 @@ export async function openTypingCard(
 }
 
 /**
+ * Update the visible markdown while keeping the card in streaming mode.
+ * Used for sparse channel-visible milestones; final answers should still use
+ * `finalizeCard` so the card locks to its terminal state.
+ */
+export async function updateCardContent(
+  larkClient: any,
+  session: CardSession,
+  text: string,
+): Promise<boolean> {
+  const sanitized = sanitizeMarkdownForFeishu(text);
+  try {
+    await larkClient.cardkit.v1.cardElement.content({
+      path: { card_id: session.cardId, element_id: session.elementId },
+      data: { content: sanitized, sequence: ++session.sequence },
+    });
+    return true;
+  } catch (err) {
+    console.error(`[lark-card] element.content failed for cardId=${session.cardId}:`, err);
+    return false;
+  }
+}
+
+/**
  * Replace the card's markdown body with `finalText` and disable streaming
  * mode. Returns `true` iff both the content update and the settings flip
  * succeeded; `false` if either step failed (caller should log — at this

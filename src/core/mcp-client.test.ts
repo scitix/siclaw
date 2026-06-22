@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { jsonSchemaToTypebox, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX } from "./mcp-client.js";
+import { jsonSchemaToTypebox, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, mcpContentToAgentContent } from "./mcp-client.js";
 
 describe("jsonSchemaToTypebox", () => {
   it("converts string type", () => {
@@ -117,3 +117,28 @@ describe("isMcpTool", () => {
   });
 });
 
+describe("mcpContentToAgentContent", () => {
+  it("preserves MCP image content blocks for downstream channel forwarding", () => {
+    const result = mcpContentToAgentContent([
+      { type: "text", text: "chart rendered" },
+      { type: "image", data: "aW1n", mimeType: "image/png" },
+    ]);
+
+    expect(result.text).toBe("chart rendered");
+    expect(result.content).toEqual([
+      { type: "text", text: "chart rendered" },
+      { type: "image", data: "aW1n", mimeType: "image/png" },
+    ]);
+  });
+
+  it("supports MCP snake_case image mime_type", () => {
+    const result = mcpContentToAgentContent([
+      { type: "image", data: "aW1n", mime_type: "image/jpeg" },
+    ]);
+
+    expect(result.text).toBe("(no output)");
+    expect(result.content).toEqual([
+      { type: "image", data: "aW1n", mimeType: "image/jpeg" },
+    ]);
+  });
+});

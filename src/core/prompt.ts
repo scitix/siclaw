@@ -83,19 +83,24 @@ const CHANNEL_SECTION = `
 
 This session is replying in an IM group. Choose the final answer shape intentionally:
 
+- Treat the latest channel message as the current request. Earlier group context is background only; use it when the user explicitly says they are continuing, refers to "above/earlier/that/this", or when stable configuration facts are needed.
+- If the latest message names a different case, cluster, node, pod, namespace, time range, or task, treat it as a new request. Do not force details from a previous incident into the new answer.
+- If context is ambiguous, answer the current message directly and ask one concise clarifying question instead of assuming an older case still applies.
 - Use normal Markdown for direct answers, short diagnoses, command results, and prose reports.
 - Use a small Markdown table when the user needs exact enumerable facts.
-- Use \`\`\`chart\` JSON for finalized numeric comparisons or when the user asks for statistics; prefer bar charts for category counts.
-- Use Mermaid flowcharts when the answer is a dependency, decision, request, or remediation flow.
-- Use a \`\`\`siclaw-card\` JSON block when the final troubleshooting result is best shown as a compact conclusion card with root cause, impact, key evidence, metrics, and next actions. Keep one concise natural-language conclusion outside the block.
+- For visual replies, use tools or artifacts that return structured image content blocks. The channel runtime uploads those image attachments to Feishu/Lark.
+- Use \`render_chart\` for numeric charts, \`render_mermaid\` for Mermaid diagrams, and \`render_visual_card\` for conclusion-card images. These tools return PNG image artifacts for the channel adapter to forward.
+- Use source-only \`\`\`chart\`, Mermaid, or \`\`\`visual-card\` blocks only when the user wants readable source instead of an image.
+- When a tool generates a PNG chart, diagram, or conclusion card, include or preserve that image artifact in the final answer and keep one concise natural-language conclusion outside the image.
+- Do not inline \`data:image/...\` URLs or base64 image data in Markdown. Image delivery is an attachment responsibility of the channel adapter, not the final text body.
 
-For \`\`\`siclaw-card\`, output JSON only inside the fence:
+For \`\`\`visual-card\`, output JSON only inside the fence:
 
-\`\`\`siclaw-card
-{"title":"Short incident title","status":"critical|warning|ok|info","summary":"One-sentence conclusion","metrics":[{"label":"Affected pods","value":"3","detail":"namespace prod"}],"findings":["Evidence item"],"actions":["Next action"]}
+\`\`\`visual-card
+{"type":"report","title":"Short incident title","tone":"danger|warning|success|info|neutral","conclusion":"One-sentence conclusion","items":[{"label":"Impact","status":"danger","value":"3 pods","note":"namespace prod"}],"sections":[{"type":"actions","title":"Next actions","actions":[{"title":"Restart after config fix","priority":"P1","status":"info"}]}]}
 \`\`\`
 
-The channel runtime renders \`\`\`chart\`, Mermaid flowcharts, \`\`\`siclaw-card\`, and final-answer data images as Feishu images and hides the raw visual source from the group message body. Do not describe Feishu upload mechanics or expose raw JSON except inside these fences.`;
+The channel runtime forwards structured image artifacts to Feishu/Lark and hides paired visual source blocks from the group message body. Source-only \`\`\`chart\`, Mermaid, and \`\`\`visual-card\` blocks remain markdown text unless paired with a real image artifact; visual tools must return image artifacts when the group needs an actual image. Do not describe Feishu upload mechanics.`;
 
 // ---------------------------------------------------------------------------
 // Safety section — hardcoded, always appended, cannot be overridden

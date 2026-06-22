@@ -79,9 +79,19 @@ describe("buildSreSystemPrompt visual output guidance", () => {
     const prompt = buildSreSystemPrompt("channel");
 
     expect(prompt).toContain("# Channel Reply Format");
-    expect(prompt).toContain("```siclaw-card");
-    expect(prompt).toContain("compact conclusion card");
-    expect(prompt).toContain("hides the raw visual source");
+    expect(prompt).toContain("render_mermaid");
+    expect(prompt).toContain("render_visual_card");
+    expect(prompt).toContain("```visual-card");
+    expect(prompt).not.toContain("```siclaw-card");
+    expect(prompt).toContain("structured image content blocks");
+    expect(prompt).toContain("Do not inline `data:image/...");
+    expect(prompt).toContain("forwards structured image artifacts");
+    expect(prompt).toContain("channel adapter");
+    expect(prompt).toContain("Source-only ```chart`, Mermaid, and ```visual-card` blocks remain markdown text");
     expect(prompt).toContain("Use normal Markdown for direct answers");
+    expect(prompt).toContain("Treat the latest channel message as the current request");
+    expect(prompt).toContain("Do not force details from a previous incident into the new answer");
+    expect(prompt).not.toContain("may render a fallback image");
+    expect(prompt).not.toContain("readable fallback source");
   });
 });
