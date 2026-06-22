@@ -325,20 +325,45 @@ describe("http-server — prompt + session lifecycle", () => {
     );
   });
 
-  it("POST /api/prompt drops malformed images and rejects when nothing usable remains", async () => {
+  it("POST /api/prompt forwards large valid images to brain.prompt", async () => {
+    const session = await sm.getOrCreate("img-large");
+    const data = "A".repeat(3 * 1024 * 1024);
     const r = await getJson(port, "/api/prompt", "POST", {
-      images: [{ mimeType: "image/gif", data: "aW1n" }], // unsupported mime → dropped
+      sessionId: "img-large",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text", "image"]),
+      images: [{ mimeType: "image/jpeg", data }],
     });
-    expect(r.status).toBe(400);
-    expect(r.data.error).toMatch(/Missing.*text/);
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith(
+      "Please analyze the attached image.",
+      { images: [{ mimeType: "image/jpeg", data }] },
+    );
   });
 
-  it("POST /api/prompt drops images whose data is not valid base64", async () => {
+  it("POST /api/prompt rejects malformed images instead of dropping them", async () => {
     const r = await getJson(port, "/api/prompt", "POST", {
-      images: [{ mimeType: "image/png", data: "not base64!!!" }], // bad base64 → dropped
+      images: [{ mimeType: "image/gif", data: "aW1n" }],
     });
     expect(r.status).toBe(400);
-    expect(r.data.error).toMatch(/Missing.*text/);
+    expect(r.data.error).toMatch(/images\[0\]\.mimeType/);
+  });
+
+  it("POST /api/prompt rejects images whose data is not valid base64", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      images: [{ mimeType: "image/png", data: "not base64!!!" }],
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/images\[0\]\.data.*base64/);
+  });
+
+  it("POST /api/prompt rejects images that exceed the media item limit", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      images: [{ mimeType: "image/png", data: "A".repeat(8 * 1024 * 1024 + 4) }],
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/images\[0\]\.data exceeds 8 MiB/);
   });
 
   it("POST /api/prompt accepts PDF-only prompts and forwards files to the brain", async () => {
@@ -924,6 +949,17 @@ describe("http-server — steer / abort / clear-queue", () => {
     expect(s.brain.steer).toHaveBeenCalledWith("这个呢", {
       images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
     });
+  });
+
+  it("POST /api/sessions/:id/steer rejects invalid images instead of dropping them", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st-img-invalid" });
+    const s = sm.sessions.get("st-img-invalid")!;
+    const r = await getJson(port, "/api/sessions/st-img-invalid/steer", "POST", {
+      images: [{ mimeType: "image/png", data: "not base64!!!" }],
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/images\[0\]\.data.*base64/);
+    expect(s.brain.steer).not.toHaveBeenCalled();
   });
 
   it("POST /api/sessions/:id/steer forwards PDF files to brain.steer", async () => {
