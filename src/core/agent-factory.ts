@@ -38,6 +38,7 @@ import lsExtension from "./extensions/ls.js";
 import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
+import { convertOpenAIPdfPayload } from "./openai-file-payload.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
@@ -684,6 +685,17 @@ export async function createSiclawSession(
   // session_start fires again — but the DP handler resets state first
   // (dpActive=false) then restores from JSONL, so double-fire is idempotent.
   await session.bindExtensions({});
+
+  const agentWithPayloadHook = session.agent as unknown as {
+    onPayload?: (payload: unknown, model: unknown) => unknown | Promise<unknown>;
+  };
+  const previousOnPayload = agentWithPayloadHook.onPayload;
+  agentWithPayloadHook.onPayload = async (payload, model) => {
+    const converted = convertOpenAIPdfPayload(payload);
+    if (!previousOnPayload) return converted;
+    const next = await previousOnPayload(converted, model);
+    return convertOpenAIPdfPayload(next ?? converted);
+  };
 
   // ── Guard pipeline: unified guard registration and installation ──
   const contextWindow = configuredModel?.contextWindow ?? 128_000;

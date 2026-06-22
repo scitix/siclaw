@@ -139,6 +139,19 @@ describe("AgentBoxClient — prompt + session CRUD", () => {
     });
   });
 
+  it("prompt() preserves native PDF files", async () => {
+    await client.prompt({
+      text: "read this",
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+
+    const req = srv.captures[srv.captures.length - 1];
+    expect(req.url).toBe("/api/prompt");
+    expect(JSON.parse(req.body).files).toEqual([
+      { mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" },
+    ]);
+  });
+
   it("listSessions() returns the parsed sessions array", async () => {
     const r = await client.listSessions();
     expect(r.sessions).toHaveLength(1);
@@ -157,6 +170,20 @@ describe("AgentBoxClient — prompt + session CRUD", () => {
     const req = srv.captures.find((c) => c.url === "/api/sessions/s1/steer")!;
     expect(req.method).toBe("POST");
     expect(JSON.parse(req.body)).toEqual({ text: "stop the pod" });
+  });
+
+  it("steerSession() preserves media payloads", async () => {
+    await client.steerSession("s1", "inspect these", {
+      images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    const req = srv.captures[srv.captures.length - 1];
+    expect(req.url).toBe("/api/sessions/s1/steer");
+    expect(JSON.parse(req.body)).toEqual({
+      text: "inspect these",
+      images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
   });
 
   it("abortSession() posts to the abort endpoint", async () => {

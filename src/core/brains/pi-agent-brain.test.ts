@@ -80,7 +80,7 @@ describe("PiAgentBrain", () => {
       session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
     });
     const brain = new PiAgentBrain(session);
-    await brain.prompt("describe", [{ mimeType: "image/png", data: "aW1n" }]);
+    await brain.prompt("describe", { images: [{ mimeType: "image/png", data: "aW1n" }] });
     expect(session.prompt).toHaveBeenCalledWith("describe", {
       images: [{ type: "image", data: "aW1n", mimeType: "image/png" }],
     });
@@ -222,6 +222,45 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
     await brain.steer("steer me");
     expect(session.steer).toHaveBeenCalledWith("steer me");
+  });
+
+  it("steer forwards images through prompt streaming steer", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    await brain.steer("steer image", { images: [{ mimeType: "image/png", data: "aGVsbG8=" }] });
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.prompt).toHaveBeenCalledWith("steer image", {
+      streamingBehavior: "steer",
+      images: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }],
+    });
+  });
+
+  it("prompt forwards PDF files through pi-agent content options", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("read pdf", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    expect(session.prompt).toHaveBeenCalledWith("read pdf", {
+      images: [{ type: "file", mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+  });
+
+  it("steer forwards PDF files through prompt streaming steer", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    await brain.steer("steer pdf", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.prompt).toHaveBeenCalledWith("steer pdf", {
+      streamingBehavior: "steer",
+      images: [{ type: "file", mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
   });
 
   it("clearQueue delegates", () => {

@@ -199,6 +199,25 @@ async function flushAsync(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+function modelConfigWithInput(input: string[]) {
+  return {
+    name: "test-provider",
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "sk-test",
+    api: "openai-completions",
+    authHeader: false,
+    models: [{
+      id: "gpt-4",
+      name: "GPT-4",
+      reasoning: false,
+      input,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 4096,
+    }],
+  };
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 let server: http.Server | https.Server;
@@ -274,12 +293,15 @@ describe("http-server — prompt + session lifecycle", () => {
     const r = await getJson(port, "/api/prompt", "POST", {
       text: "what is in this image?",
       sessionId: "img-1",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text", "image"]),
       images: [{ mimeType: "image/png", data: "aW1n" }],
     });
     expect(r.status).toBe(200);
     expect(session.brain.prompt).toHaveBeenCalledWith(
       "what is in this image?",
-      [{ mimeType: "image/png", data: "aW1n" }],
+      { images: [{ mimeType: "image/png", data: "aW1n" }] },
     );
   });
 
@@ -287,12 +309,15 @@ describe("http-server — prompt + session lifecycle", () => {
     const session = await sm.getOrCreate("img-only");
     const r = await getJson(port, "/api/prompt", "POST", {
       sessionId: "img-only",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text", "image"]),
       images: [{ mimeType: "image/png", data: "aW1n" }],
     });
     expect(r.status).toBe(200);
     expect(session.brain.prompt).toHaveBeenCalledWith(
       "Please analyze the attached image.",
-      [{ mimeType: "image/png", data: "aW1n" }],
+      { images: [{ mimeType: "image/png", data: "aW1n" }] },
     );
   });
 
@@ -310,6 +335,23 @@ describe("http-server — prompt + session lifecycle", () => {
     });
     expect(r.status).toBe(400);
     expect(r.data.error).toMatch(/Missing.*text/);
+  });
+
+  it("POST /api/prompt accepts PDF-only prompts and forwards files to the brain", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "pdf1",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text", "pdf"]),
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    const s = sm.sessions.get("pdf1")!;
+    expect(s.brain.prompt).toHaveBeenCalledWith("Please analyze the attached PDF.", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
   });
 
   it("resolves the active operating mode from DP markers and passes it to getOrCreate", async () => {
@@ -865,6 +907,31 @@ describe("http-server — steer / abort / clear-queue", () => {
     const r = await getJson(port, "/api/sessions/st2/steer", "POST", { text: "stop" });
     expect(r.status).toBe(200);
     expect(s.brain.steer).toHaveBeenCalledWith("stop");
+  });
+
+  it("POST /api/sessions/:id/steer forwards images to brain.steer", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st-img" });
+    const s = sm.sessions.get("st-img")!;
+    const r = await getJson(port, "/api/sessions/st-img/steer", "POST", {
+      text: "这个呢",
+      images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
+    });
+    expect(r.status).toBe(200);
+    expect(s.brain.steer).toHaveBeenCalledWith("这个呢", {
+      images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
+    });
+  });
+
+  it("POST /api/sessions/:id/steer forwards PDF files to brain.steer", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st-pdf" });
+    const s = sm.sessions.get("st-pdf")!;
+    const r = await getJson(port, "/api/sessions/st-pdf/steer", "POST", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    expect(r.status).toBe(200);
+    expect(s.brain.steer).toHaveBeenCalledWith("Please analyze the attached PDF.", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
   });
 
   it("POST /api/sessions/:id/abort calls brain.abort AND stops the session's background jobs", async () => {
