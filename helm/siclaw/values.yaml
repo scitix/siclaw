@@ -71,6 +71,10 @@ runtime:
 # -- Portal (standalone web UI, replaces Upstream)
 portal:
   enabled: true
+  # Keep at 1. Live chat/A2A SSE streaming and the in-process A2A task trackers
+  # (src/portal/a2a-gateway.ts) are process-local, and a Runtime phone-homes to a
+  # single Portal instance — so >1 replica would scatter streams across pods that
+  # don't hold the Runtime connection. Horizontal scale needs a shared pub/sub first.
   replicas: 1
   jwtSecret: ""         # Portal's JWT signing key (Portal is the auth boundary)
   portalSecret: ""      # shared with Runtime; verifies Runtime phone-home X-Auth-Token
