@@ -29,12 +29,18 @@ interface CompiledRoute {
   handler: RouteHandler;
 }
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function compilePath(path: string): { pattern: RegExp; paramNames: string[] } {
   const paramNames: string[] = [];
-  const patternStr = path.replace(/:([a-zA-Z_][a-zA-Z0-9_]*)/g, (_match, name) => {
-    paramNames.push(name);
-    return "([^/]+)";
-  });
+  const patternStr = path.split("/").map((segment) => {
+    const match = segment.match(/^:([a-zA-Z_][a-zA-Z0-9_]*)(.*)$/);
+    if (!match) return escapeRegex(segment);
+    paramNames.push(match[1]);
+    return `([^/]+)${escapeRegex(match[2])}`;
+  }).join("/");
   return { pattern: new RegExp(`^${patternStr}$`), paramNames };
 }
 
