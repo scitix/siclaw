@@ -7,6 +7,7 @@ import {
   type SnapshotFetcher,
 } from "./metrics-aggregator.js";
 import type { MetricsSnapshot, ToolCallStats, SkillCallStats } from "../shared/metrics-types.js";
+import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 
 function snap(
   tools: Partial<ToolCallStats>[] = [],
@@ -211,5 +212,67 @@ describe("MetricsAggregator (k8s mode)", () => {
     aggr.destroy();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── Federation wiring (path ②) ──
+  it("pull loop feeds prom snapshots into the federation aggregator keyed by (boxId, incarnation)", async () => {
+    const fed = new PromFederationAggregator();
+    aggr.destroy();
+    aggr = new MetricsAggregator("k8s", undefined, lister, fetcher, fed);
+
+    pods.push({ boxId: "box-p1", endpoint: "https://p1", status: "running" });
+    pods.push({ boxId: "box-p2", endpoint: "https://p2", status: "running" });
+    fetchMap.set("https://p1", {
+      ...snap([], [], 1),
+      incarnation: "inc-1",
+      prom: [{ name: "siclaw_tokens_total", type: "counter", values: [{ labels: { type: "input" }, value: 40 }] }],
+    });
+    fetchMap.set("https://p2", {
+      ...snap([], [], 1),
+      incarnation: "inc-1",
+      prom: [{ name: "siclaw_tokens_total", type: "counter", values: [{ labels: { type: "input" }, value: 60 }] }],
+    });
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Two pods, same business labels → one federated series summed to 100.
+    const text = fed.metrics();
+    expect(text).toContain('siclaw_tokens_total{type="input"} 100');
+    expect(fed.trackedInstanceCount()).toBe(2);
+  });
+
+  it("when a pod leaves the running set, its gauge contribution is grace-evicted while its counter stays settled", async () => {
+    const fed = new PromFederationAggregator();
+    aggr.destroy();
+    aggr = new MetricsAggregator("k8s", undefined, lister, fetcher, fed);
+
+    pods.push({ boxId: "box-p1", endpoint: "https://p1", status: "running" });
+    fetchMap.set("https://p1", {
+      ...snap([], [], 1),
+      incarnation: "inc-1",
+      prom: [
+        { name: "siclaw_tokens_total", type: "counter", values: [{ labels: { type: "input" }, value: 10 }] },
+        { name: "siclaw_sessions_active", type: "gauge", values: [{ labels: {}, value: 3 }] },
+      ],
+    });
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    await Promise.resolve(); await Promise.resolve();
+    expect(fed.metrics()).toContain("siclaw_sessions_active 3");
+
+    // Pod disappears from the list → two reconciliation rounds → gauge evicted.
+    pods.length = 0;
+    await vi.advanceTimersByTimeAsync(30_000);
+    await Promise.resolve(); await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await Promise.resolve(); await Promise.resolve();
+
+    const out = fed.metrics();
+    // Gauge contribution dropped from the cross-pod sum...
+    expect(out).not.toContain("siclaw_sessions_active 3");
+    // ...but the monotonic counter stays settled (never goes down).
+    expect(out).toContain('siclaw_tokens_total{type="input"} 10');
   });
 });
