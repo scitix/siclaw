@@ -22,15 +22,21 @@ import { getSyncHandler, createClusterHandler, createHostHandler } from "./sync-
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
 import {
+  candidateSupportsPromptMedia,
   clearModelRouteUserSelectionIfDifferent,
+  filterCandidatesForPromptMedia,
   markModelRouteUserSelection,
+  normalizeCandidates,
   normalizeModelRoutePolicy,
+  requiredInputsForPromptMedia,
   runPromptWithModelRouting,
   shouldUseModelRouteRunner,
+  unsupportedPromptMediaMessage,
+  type ModelRouteCandidate,
   type ModelRouteEvent,
   type ModelRoutePolicy,
 } from "../core/model-routing.js";
-import type { BrainSession, PromptImage } from "../core/brain-session.js";
+import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -56,40 +62,8 @@ interface PromptRequestBody {
   modelRouting?: ModelRoutePolicy;
   /** Image attachments forwarded as vision input (vision-capable models only). */
   images?: PromptImage[];
-}
-
-// Defense-in-depth bound; the sicore proxy already caps attachments, but the
-// agentbox /prompt is also reachable directly so re-validate here.
-// MUST stay consistent with MAX_BODY_SIZE (parseJsonBody, below): the whole JSON
-// body is rejected at MAX_BODY_SIZE *before* this runs, so MAX_PROMPT_IMAGES ×
-// MAX_PROMPT_IMAGE_BASE64_CHARS must fit under it with headroom for the JSON
-// envelope + text. 4 × 2MB = 8MB < 10MB MAX_BODY_SIZE → all advertised images
-// are actually deliverable (raising one without the other reintroduces the
-// "limit unreachable" mismatch).
-const MAX_PROMPT_IMAGES = 4;
-const MAX_PROMPT_IMAGE_BASE64_CHARS = 2 * 1024 * 1024;
-const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
-
-// Standard base64 (optionally padded). PromptImage.data is raw base64 with no
-// `data:` URL prefix; a non-base64 string would only fail later at the provider.
-const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
-
-/** Keep only well-formed, supported image parts; drop anything malformed. */
-function sanitizePromptImages(raw: unknown): PromptImage[] | undefined {
-  if (!Array.isArray(raw)) return undefined;
-  const out: PromptImage[] = [];
-  for (const item of raw) {
-    if (out.length >= MAX_PROMPT_IMAGES) break;
-    if (!item || typeof item !== "object") continue;
-    const mimeType = (item as { mimeType?: unknown }).mimeType;
-    const data = (item as { data?: unknown }).data;
-    if (typeof mimeType !== "string" || typeof data !== "string") continue;
-    if (!SUPPORTED_PROMPT_IMAGE_MIMES.has(mimeType.toLowerCase())) continue;
-    if (data.length === 0 || data.length > MAX_PROMPT_IMAGE_BASE64_CHARS) continue;
-    if (data.length % 4 !== 0 || !BASE64_RE.test(data)) continue; // reject non-base64
-    out.push({ mimeType: mimeType.toLowerCase(), data });
-  }
-  return out.length > 0 ? out : undefined;
+  /** PDF attachments forwarded as native file input (PDF-capable models only). */
+  files?: PromptFile[];
 }
 
 /**
@@ -128,6 +102,88 @@ const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 const BODY_TIMEOUT_MS = 30_000; // 30s
 const DP_ACTIVATION_MARKER = "[Deep Investigation]\n";
 const DP_EXIT_MARKER = "[DP_EXIT]";
+const MAX_PROMPT_IMAGES = 4;
+const MAX_PROMPT_IMAGE_BASE64_CHARS = 2 * 1024 * 1024;
+const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const MAX_PROMPT_FILES = 4;
+const MAX_PROMPT_FILE_BASE64_CHARS = 8 * 1024 * 1024;
+const SUPPORTED_PROMPT_FILE_MIMES = new Set(["application/pdf"]);
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function sanitizePromptImages(raw: unknown): PromptImage[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: PromptImage[] = [];
+  for (const item of raw) {
+    if (out.length >= MAX_PROMPT_IMAGES) break;
+    if (!item || typeof item !== "object") continue;
+    const mimeType = (item as { mimeType?: unknown }).mimeType;
+    const data = (item as { data?: unknown }).data;
+    if (typeof mimeType !== "string" || typeof data !== "string") continue;
+    const normalizedMime = mimeType.toLowerCase();
+    if (!SUPPORTED_PROMPT_IMAGE_MIMES.has(normalizedMime)) continue;
+    if (data.length === 0 || data.length > MAX_PROMPT_IMAGE_BASE64_CHARS) continue;
+    if (data.length % 4 !== 0 || !BASE64_RE.test(data)) continue;
+    out.push({ mimeType: normalizedMime, data });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function sanitizePromptFiles(raw: unknown): PromptFile[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: PromptFile[] = [];
+  for (const item of raw) {
+    if (out.length >= MAX_PROMPT_FILES) break;
+    if (!item || typeof item !== "object") continue;
+    const mimeType = (item as { mimeType?: unknown }).mimeType;
+    const filename = (item as { filename?: unknown }).filename;
+    const data = (item as { data?: unknown }).data;
+    if (typeof mimeType !== "string" || typeof filename !== "string" || typeof data !== "string") continue;
+    const normalizedMime = mimeType.toLowerCase();
+    if (!SUPPORTED_PROMPT_FILE_MIMES.has(normalizedMime)) continue;
+    if (filename.trim() === "") continue;
+    if (data.length === 0 || data.length > MAX_PROMPT_FILE_BASE64_CHARS) continue;
+    if (data.length % 4 !== 0 || !BASE64_RE.test(data)) continue;
+    out.push({ mimeType: normalizedMime, filename: sanitizePromptFilename(filename), data });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function sanitizePromptFilename(value: string): string {
+  const basename = value.split(/[\\/]/).filter(Boolean).pop()?.trim() || "attachment.pdf";
+  return basename.replace(/[\r\n\t]/g, "_").slice(0, 160) || "attachment.pdf";
+}
+
+function buildPromptMedia(images?: PromptImage[], files?: PromptFile[]): PromptMedia | undefined {
+  if ((!images || images.length === 0) && (!files || files.length === 0)) return undefined;
+  return {
+    ...(images && images.length > 0 ? { images } : {}),
+    ...(files && files.length > 0 ? { files } : {}),
+  };
+}
+
+function defaultPromptTextForMedia(media?: PromptMedia): string {
+  const hasImages = !!media?.images?.length;
+  const hasFiles = !!media?.files?.length;
+  if (hasImages && hasFiles) return "Please analyze the attached image and PDF.";
+  if (hasFiles) return "Please analyze the attached PDF.";
+  if (hasImages) return "Please analyze the attached image.";
+  return "";
+}
+
+function singleCandidateForMediaPreflight(
+  body: PromptRequestBody,
+  policy: ModelRoutePolicy | undefined,
+): ModelRouteCandidate | undefined {
+  if (body.modelProvider && body.modelId) {
+    return {
+      provider: body.modelProvider,
+      modelId: body.modelId,
+      modelConfig: body.modelConfig,
+    };
+  }
+  const candidates = normalizeCandidates(policy?.candidates);
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
 
 /**
  * Resolve the session's active operating mode for this prompt, so getOrCreate can
@@ -386,10 +442,12 @@ export function createHttpServer(
     const body = (await parseJsonBody(req)) as PromptRequestBody;
 
     const promptImages = sanitizePromptImages(body.images);
+    const promptFiles = sanitizePromptFiles(body.files);
+    const promptMedia = buildPromptMedia(promptImages, promptFiles);
 
-    // An image-only message is valid (vision models read the picture directly);
-    // only reject when there is neither text nor a usable image.
-    if (!body.text && !promptImages) {
+    // Media-only messages are valid; reject only when there is neither text nor
+    // usable image/PDF media after validation.
+    if (!body.text && !promptMedia) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
@@ -539,11 +597,23 @@ export function createHttpServer(
         });
       }
 
-      // Image-only messages arrive with empty text; give the model a minimal
-      // default instruction so the turn isn't a bare image with no ask.
+      if (requiredInputsForPromptMedia(promptMedia).length > 0) {
+        if (routeEnabled) {
+          const candidates = normalizeCandidates(configuredModelRouting?.candidates);
+          if (filterCandidatesForPromptMedia(candidates, promptMedia).length === 0) {
+            throw new Error(unsupportedPromptMediaMessage(promptMedia));
+          }
+        } else {
+          const candidate = singleCandidateForMediaPreflight(body, configuredModelRouting);
+          if (!candidate || !candidateSupportsPromptMedia(candidate, promptMedia)) {
+            throw new Error(unsupportedPromptMediaMessage(promptMedia));
+          }
+        }
+      }
+
       promptText = body.text && body.text.length > 0
         ? body.text
-        : (promptImages ? "Please analyze the attached image." : "");
+        : defaultPromptTextForMedia(promptMedia);
     } catch (err) {
       releasePromptLockOnSetupFailure(err);
       return;
@@ -709,9 +779,9 @@ export function createHttpServer(
             onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
             shouldAbort: () => managed._aborted,
           },
-          promptImages,
+          promptMedia,
         )
-      : managed.brain.prompt(promptText, promptImages);
+      : managed.brain.prompt(promptText, promptMedia);
 
     promptPromise.then((result) => {
       // The routing runner reports exhaustion (and user aborts) as a result,
@@ -896,15 +966,25 @@ export function createHttpServer(
       return;
     }
 
-    const body = (await parseJsonBody(req)) as { text?: string };
-    if (!body.text) {
+    const body = (await parseJsonBody(req)) as { text?: string; images?: PromptImage[]; files?: PromptFile[] };
+    const promptImages = sanitizePromptImages(body.images);
+    const promptFiles = sanitizePromptFiles(body.files);
+    const promptMedia = buildPromptMedia(promptImages, promptFiles);
+    if (!body.text && !promptMedia) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
 
-    console.log(`[agentbox-http] Steering session ${sessionId}: ${body.text.slice(0, 80)}`);
+    const steerText = body.text && body.text.length > 0
+      ? body.text
+      : defaultPromptTextForMedia(promptMedia);
+    console.log(`[agentbox-http] Steering session ${sessionId}: ${steerText.slice(0, 80)}`);
     try {
-      await managed.brain.steer(body.text);
+      if (promptMedia) {
+        await managed.brain.steer(steerText, promptMedia);
+      } else {
+        await managed.brain.steer(steerText);
+      }
       sendJson(res, 200, { ok: true });
     } catch (err) {
       console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);

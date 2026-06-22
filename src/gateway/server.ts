@@ -174,6 +174,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const modelConfig = params.modelConfig as PromptOptions["modelConfig"];
     const modelRouting = params.modelRouting as PromptOptions["modelRouting"];
     const images = params.images as PromptOptions["images"];
+    const files = params.files as PromptOptions["files"];
     const promptOpts: PromptOptions = {
       sessionId,
       text,
@@ -185,6 +186,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       modelConfig,
       modelRouting,
       images,
+      files,
     };
 
     // Async-ack protocol: return { ok, sessionId } within milliseconds; do
@@ -229,7 +231,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // prompt will fire its own when it actually finishes, and an
           // extra one would close the frontend stream prematurely.
           if (err instanceof Error && err.message.includes("Session is already running")) {
-            await client.steerSession(sessionId, text);
+            await client.steerSession(sessionId, text, { images, files });
             return;
           }
           throw err;
@@ -325,6 +327,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
     const text = params.text as string;
+    const images = params.images as PromptOptions["images"];
+    const files = params.files as PromptOptions["files"];
     if (!agentId || !sessionId || !text) throw new Error("agentId, sessionId, text required");
 
     // Persist the steer as a user message BEFORE injecting it, mirroring
@@ -339,7 +343,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
-    await client.steerSession(sessionId, text);
+    await client.steerSession(sessionId, text, { images, files });
     return { ok: true };
   });
 

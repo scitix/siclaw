@@ -14,9 +14,10 @@ import type {
   BrainSessionStats,
   BrainProviderResponse,
   BrainContextPreflightResult,
-  PromptImage,
+  PromptMedia,
 } from "../brain-session.js";
 import { estimateMessagesTokens } from "../compaction.js";
+import { rememberPromptFiles } from "../openai-file-payload.js";
 
 /** Valid pi thinking levels; guards reasoningEffort coming off the wire. */
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
@@ -38,6 +39,23 @@ export class PiAgentBrain implements BrainSession {
   constructor(readonly session: AgentSession) {}
 
   private static readonly MAX_EMPTY_RETRIES = 2;
+
+  private promptOptionsForMedia(media?: PromptMedia): any | undefined {
+    const content: Array<Record<string, string>> = [];
+    if (media?.images && media.images.length > 0) {
+      content.push(...media.images.map((img) => ({ type: "image", data: img.data, mimeType: img.mimeType })));
+    }
+    if (media?.files && media.files.length > 0) {
+      rememberPromptFiles(media.files);
+      content.push(...media.files.map((file) => ({
+        type: "file",
+        data: file.data,
+        mimeType: file.mimeType,
+        filename: file.filename,
+      })));
+    }
+    return content.length > 0 ? { images: content } : undefined;
+  }
   private static readonly RETRY_DELAY_MS = 2000;
   private static readonly PROMPT_PREFLIGHT_SAFETY_TOKENS = 2048;
 
@@ -55,18 +73,12 @@ export class PiAgentBrain implements BrainSession {
     });
   }
 
-  async prompt(text: string, images?: PromptImage[]): Promise<void> {
+  async prompt(text: string, media?: PromptMedia): Promise<void> {
     this.aborted = false;
     let lastAssistantHadContent = false;
     let lastAssistantMessage: any = null;
 
-    // pi-coding-agent appends these to the user message content; the
-    // openai-codex-responses provider serializes them to `input_image` data
-    // URLs. Dropped (replaced with a placeholder) by pi-ai when the active
-    // model's `input` lacks "image", so non-vision models degrade gracefully.
-    const promptOptions = images && images.length > 0
-      ? { images: images.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })) }
-      : undefined;
+    const promptOptions = this.promptOptionsForMedia(media);
 
     const unsub = this.session.subscribe((event: any) => {
       if (event.type === "message_start" && event.message?.role === "assistant") {
@@ -184,8 +196,12 @@ export class PiAgentBrain implements BrainSession {
     return this.session.reload();
   }
 
-  steer(text: string): Promise<void> {
-    return this.session.steer(text);
+  steer(text: string, media?: PromptMedia): Promise<void> {
+    const promptOptions = this.promptOptionsForMedia(media);
+    if (!promptOptions) {
+      return this.session.steer(text);
+    }
+    return this.session.prompt(text, { ...promptOptions, streamingBehavior: "steer" });
   }
 
   followUp(text: string): Promise<void> {

@@ -52,7 +52,11 @@ export interface PromptOptions {
   modelRouting?: ModelRoutePolicy;
   /** Image attachments (raw base64, no data: prefix) forwarded as vision input. */
   images?: Array<{ mimeType: string; data: string }>;
+  /** File attachments forwarded as native model file input. */
+  files?: Array<{ mimeType: string; filename: string; data: string }>;
 }
+
+export type PromptMediaOptions = Pick<PromptOptions, "images" | "files">;
 
 export interface PromptResponse {
   ok: boolean;
@@ -181,11 +185,17 @@ export class AgentBoxClient {
   /**
    * Send a steer instruction (inserts a user message after interrupting the current tool)
    */
-  async steerSession(sessionId: string, text: string): Promise<void> {
+  async steerSession(sessionId: string, text: string, media?: PromptMediaOptions): Promise<void> {
+    const images = media?.images;
+    const files = media?.files;
     await this.fetch(`/api/sessions/${sessionId}/steer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        ...(images && images.length > 0 ? { images } : {}),
+        ...(files && files.length > 0 ? { files } : {}),
+      }),
     });
   }
 

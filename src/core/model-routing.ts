@@ -1,4 +1,4 @@
-import type { BrainModelInfo, BrainProviderResponse, BrainSession, PromptImage } from "./brain-session.js";
+import type { BrainModelInfo, BrainProviderResponse, BrainSession, PromptMedia } from "./brain-session.js";
 
 export type ModelRouteFailureKind =
   | "billing"
@@ -331,6 +331,41 @@ export function normalizeCandidates(candidates: unknown): ModelRouteCandidate[] 
   return normalized;
 }
 
+function candidateInputSet(candidate: ModelRouteCandidate): Set<string> {
+  const models = candidate.modelConfig?.models;
+  if (!Array.isArray(models)) return new Set();
+  const exactModel = models.find((model) => isRecord(model) && model.id === candidate.modelId);
+  const model = exactModel ?? models.find(isRecord);
+  if (!isRecord(model) || !Array.isArray(model.input)) return new Set();
+  return new Set(model.input.filter((input): input is string => typeof input === "string"));
+}
+
+export function requiredInputsForPromptMedia(media?: PromptMedia): string[] {
+  const required: string[] = [];
+  if (media?.images && media.images.length > 0) required.push("image");
+  if (media?.files && media.files.length > 0) required.push("pdf");
+  return required;
+}
+
+export function candidateSupportsPromptMedia(candidate: ModelRouteCandidate, media?: PromptMedia): boolean {
+  const required = requiredInputsForPromptMedia(media);
+  if (required.length === 0) return true;
+  const inputs = candidateInputSet(candidate);
+  return required.every((input) => inputs.has(input));
+}
+
+export function filterCandidatesForPromptMedia(candidates: ModelRouteCandidate[], media?: PromptMedia): ModelRouteCandidate[] {
+  const required = requiredInputsForPromptMedia(media);
+  if (required.length === 0) return candidates;
+  return candidates.filter((candidate) => candidateSupportsPromptMedia(candidate, media));
+}
+
+export function unsupportedPromptMediaMessage(media?: PromptMedia): string {
+  const required = requiredInputsForPromptMedia(media);
+  if (required.length === 0) return "No model route candidate is available for this prompt.";
+  return `No ${required.join("+")}-capable model route candidate is available for this input.`;
+}
+
 export function markModelRouteUserSelection(
   state: ModelRouteState,
   candidate: Pick<ModelRouteCandidate, "provider" | "modelId">,
@@ -506,14 +541,24 @@ export async function runPromptWithModelRouting(
   policy: ModelRoutePolicy | undefined,
   state: ModelRouteState,
   options: RunPromptWithModelRoutingOptions = {},
-  images?: PromptImage[],
+  media?: PromptMedia,
 ): Promise<ModelRouteRunResult> {
   if (!isModelRoutePolicyEnabled(policy)) {
-    await brain.prompt(text, images);
+    await brain.prompt(text, media);
     return { success: true, exhausted: false, attempted: [] };
   }
 
-  const candidates = normalizeCandidates(policy.candidates);
+  const candidates = filterCandidatesForPromptMedia(normalizeCandidates(policy.candidates), media);
+  if (requiredInputsForPromptMedia(media).length > 0 && candidates.length === 0) {
+    return {
+      success: false,
+      exhausted: true,
+      attempted: [],
+      activeCandidateKey: state.activeCandidateKey,
+      finalFailureKind: "format_error",
+      finalErrorMessage: unsupportedPromptMediaMessage(media),
+    };
+  }
   const primaryCandidate = candidates[0]!;
   const primaryCandidateKey = candidateKey(primaryCandidate);
   const emitEvent = options.emitEvent ?? (() => {});
@@ -598,7 +643,7 @@ export async function runPromptWithModelRouting(
     // buffer every attempt, since a live failed attempt would leak into the
     // turn they persist from collected events.
     const streamFromStart = optimisticPrimaryStream && i === 0;
-    const attemptResult = await runAttempt(brain, text, candidate, emitBrainEvent, streamFromStart, images);
+    const attemptResult = await runAttempt(brain, text, candidate, emitBrainEvent, streamFromStart, media);
     const failure = attemptResult.failure;
     attempt.finishedAt = now();
 
@@ -780,7 +825,7 @@ async function runAttempt(
   candidate: ModelRouteCandidate,
   emitBrainEvent: (event: unknown) => void,
   streamFromStart: boolean,
-  images?: PromptImage[],
+  media?: PromptMedia,
 ): Promise<AttemptResult> {
   const checkpoint = brain.createPromptCheckpoint?.();
   let lastProviderResponse: BrainProviderResponse | undefined;
@@ -890,7 +935,7 @@ async function runAttempt(
         },
       };
     }
-    await brain.prompt(text, images);
+    await brain.prompt(text, media);
   } catch (err) {
     const message = errorMessage(err);
     return {

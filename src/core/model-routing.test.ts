@@ -46,6 +46,24 @@ function makePolicy(): ModelRoutePolicy {
   };
 }
 
+function candidateWithInput(provider: string, modelId: string, input: string[]): NonNullable<ModelRoutePolicy["candidates"]>[number] {
+  return {
+    provider,
+    modelId,
+    modelConfig: {
+      models: [{
+        id: modelId,
+        name: modelId,
+        reasoning: false,
+        input,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128000,
+        maxTokens: 4096,
+      }],
+    },
+  };
+}
+
 type BrainOutcome =
   | "ok"
   | "rate_limit"
@@ -727,6 +745,102 @@ describe("runPromptWithModelRouting", () => {
     });
     expect(brain.promptModels).toEqual(["anthropic/claude"]);
     expect(state.activeCandidateKey).toBe("anthropic/claude");
+  });
+
+  it("skips non-image-capable fallback candidates when images are present", async () => {
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const state = createModelRouteState();
+    const policy: ModelRoutePolicy = {
+      ...makePolicy(),
+      candidates: [
+        candidateWithInput("openai", "gpt-4", ["text", "image"]),
+        candidateWithInput("anthropic", "claude", ["text"]),
+        candidateWithInput("deepseek", "deepseek-chat", ["text", "image"]),
+      ],
+    };
+    const images = [{ mimeType: "image/png", data: "aGVsbG8=" }];
+    const media = { images };
+
+    const result = await runPromptWithModelRouting(brain, "what is in this image?", policy, state, { now: () => 10_000 }, media);
+
+    expect(result.success).toBe(true);
+    expect(brain.promptModels).toEqual(["openai/gpt-4", "deepseek/deepseek-chat"]);
+    expect(brain.prompt).toHaveBeenNthCalledWith(1, "what is in this image?", media);
+    expect(brain.prompt).toHaveBeenNthCalledWith(2, "what is in this image?", media);
+    expect(state.activeCandidateKey).toBe("deepseek/deepseek-chat");
+  });
+
+  it("returns a clear failure when an image prompt has no image-capable candidates", async () => {
+    const brain = makeBrain(["ok"]);
+    const state = createModelRouteState();
+    const policy: ModelRoutePolicy = {
+      ...makePolicy(),
+      candidates: [
+        candidateWithInput("openai", "gpt-4", ["text"]),
+        candidateWithInput("anthropic", "claude", ["text"]),
+      ],
+    };
+
+    const result = await runPromptWithModelRouting(
+      brain,
+      "what is in this image?",
+      policy,
+      state,
+      { now: () => 10_000 },
+      { images: [{ mimeType: "image/png", data: "aGVsbG8=" }] },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.exhausted).toBe(true);
+    expect(result.finalFailureKind).toBe("format_error");
+    expect(result.finalErrorMessage).toContain("No image-capable model route candidate");
+    expect(brain.prompt).not.toHaveBeenCalled();
+  });
+
+  it("skips non-PDF-capable fallback candidates when PDF files are present", async () => {
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const state = createModelRouteState();
+    const policy: ModelRoutePolicy = {
+      ...makePolicy(),
+      candidates: [
+        candidateWithInput("openai", "gpt-4", ["text", "pdf"]),
+        candidateWithInput("anthropic", "claude", ["text", "image"]),
+        candidateWithInput("deepseek", "deepseek-chat", ["text", "pdf"]),
+      ],
+    };
+    const media = { files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }] };
+
+    const result = await runPromptWithModelRouting(brain, "summarize this PDF", policy, state, { now: () => 10_000 }, media);
+
+    expect(result.success).toBe(true);
+    expect(brain.promptModels).toEqual(["openai/gpt-4", "deepseek/deepseek-chat"]);
+    expect(brain.prompt).toHaveBeenNthCalledWith(1, "summarize this PDF", media);
+    expect(brain.prompt).toHaveBeenNthCalledWith(2, "summarize this PDF", media);
+    expect(state.activeCandidateKey).toBe("deepseek/deepseek-chat");
+  });
+
+  it("requires both image and PDF capability for mixed media prompts", async () => {
+    const brain = makeBrain(["ok"]);
+    const state = createModelRouteState();
+    const policy: ModelRoutePolicy = {
+      ...makePolicy(),
+      candidates: [
+        candidateWithInput("openai", "gpt-4", ["text", "image"]),
+        candidateWithInput("anthropic", "claude", ["text", "pdf"]),
+        candidateWithInput("deepseek", "deepseek-chat", ["text", "image", "pdf"]),
+      ],
+    };
+    const media = {
+      images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    };
+
+    const result = await runPromptWithModelRouting(brain, "compare these", policy, state, { now: () => 10_000 }, media);
+
+    expect(result.success).toBe(true);
+    expect(brain.promptModels).toEqual(["deepseek/deepseek-chat"]);
+    expect(brain.prompt).toHaveBeenCalledWith("compare these", media);
+    expect(state.activeCandidateKey).toBe("deepseek/deepseek-chat");
   });
 
   it("returns exhausted instead of throwing when every candidate is missing from the model registry", async () => {
