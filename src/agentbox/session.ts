@@ -60,7 +60,7 @@ import {
   createModelRouteState,
   normalizeModelRouteState,
   runPromptWithModelRouting,
-  shouldUseModelRouteRunner,
+  resolveEffectivePolicy,
   type ModelRouteEvent,
   type ModelRoutePolicy,
   type ModelRouteState,
@@ -840,12 +840,13 @@ export class AgentBoxSessionManager {
         const turnMessages: any[] = [];
         let turnHadTool = false;
         const routePolicy = managed.modelRoutePolicy;
-        const routeEnabled = shouldUseModelRouteRunner(routePolicy, managed.modelRouteState);
-        // Mirror the HTTP /prompt path: while the routing runner buffers brain
-        // events, suppress the SSE route's live brain subscription too —
-        // otherwise a client connected during a routed synthetic turn streams
-        // every failed attempt raw, the exact leak routing exists to prevent.
-        managed._routeBrainEventsThroughExtra = routeEnabled;
+        // Single entry: every synthetic turn runs through the routing runner —
+        // real routing when a fallback target exists, otherwise a lone candidate
+        // built from the current model. The runner's emitBrainEvent is the sole
+        // event source whenever a policy resolves; only the no-current-model edge
+        // falls back to a bare prompt collected via the subscription below.
+        const effectivePolicy = resolveEffectivePolicy(routePolicy, managed.modelRouteState, managed.brain.getModel?.());
+        managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
         let latestModelRouteSwitch: Extract<ModelRouteEvent, { type: "model_route_switch" }> | null = null;
         let currentModelRouteMetadata: Record<string, unknown> | null = null;
         const handleRouteEvent = (event: ModelRouteEvent): void => {
@@ -888,30 +889,26 @@ export class AgentBoxSessionManager {
           }
         };
         const brainUnsub = managed.brain.subscribe((event: any) => {
-          if (!routeEnabled) handleBrainEvent(event);
+          if (effectivePolicy === undefined) handleBrainEvent(event);
         });
         managed._bufferUnsub = () => brainUnsub();
         try {
-          if (routeEnabled) {
-            await runPromptWithModelRouting(
-              managed.brain,
-              text,
-              routePolicy,
-              managed.modelRouteState,
-              {
-                emitEvent: handleRouteEvent,
-                emitBrainEvent: handleBrainEvent,
-                onStateChange: () => this.persistModelRouteState(managed.id, managed.modelRouteState),
-                shouldAbort: () => managed._aborted,
-                // Synthetic background turns persist by collecting brain events
-                // (turnMessages) and have no live viewer — buffer every attempt
-                // so a failed primary can't leak into the persisted turn.
-                optimisticPrimaryStream: false,
-              },
-            );
-          } else {
-            await managed.brain.prompt(text);
-          }
+          await runPromptWithModelRouting(
+            managed.brain,
+            text,
+            effectivePolicy,
+            managed.modelRouteState,
+            {
+              emitEvent: handleRouteEvent,
+              emitBrainEvent: handleBrainEvent,
+              onStateChange: () => this.persistModelRouteState(managed.id, managed.modelRouteState),
+              shouldAbort: () => managed._aborted,
+              // Synthetic background turns persist by collecting brain events
+              // (turnMessages) and have no live viewer — buffer every attempt
+              // so a failed primary can't leak into the persisted turn.
+              optimisticPrimaryStream: false,
+            },
+          );
         } catch (err) {
           console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
         } finally {
