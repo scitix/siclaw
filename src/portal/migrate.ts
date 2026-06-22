@@ -312,6 +312,26 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
   )`,
 
+  // A2A task projection. This is protocol state for external agent clients,
+  // not an AgentBox/pi-agent checkpoint.
+  `CREATE TABLE IF NOT EXISTS a2a_tasks (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    user_id CHAR(36) NOT NULL,
+    api_key_id CHAR(36) DEFAULT NULL,
+    context_id VARCHAR(255) NOT NULL,
+    session_id CHAR(36) NOT NULL,
+    state VARCHAR(40) NOT NULL,
+    status_message TEXT,
+    artifact_text TEXT,
+    error TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_event_at TIMESTAMP NULL DEFAULT NULL,
+    completed_at TIMESTAMP NULL DEFAULT NULL,
+    CONSTRAINT fk_a2a_tasks_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+  )`,
+
   // Model Providers
   `CREATE TABLE IF NOT EXISTS model_providers (
     id CHAR(36) PRIMARY KEY,
@@ -469,6 +489,10 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "chat_messages", "idx_chat_messages_audit", "role, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_parent", "parent_session_id, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_delegation", "delegation_id");
+  // a2a_tasks
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_agent", "agent_id, created_at");
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_session", "session_id");
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_context", "context_id, created_at");
   // notifications
   await ensureIndex(db, "notifications", "idx_notifications_user", "user_id, read_at, created_at");
   // agent_api_keys

@@ -63,6 +63,30 @@ describe("createRestRouter.handle", () => {
     expect(got).toEqual({ name: "hello world" });
   });
 
+  it("keeps colon operation suffixes literal", async () => {
+    const router = createRestRouter();
+    const called = vi.fn();
+    router.post("/message:send", called);
+
+    const handled = router.handle(makeReq("POST", "/message:send"), asHttpRes(new FakeRes()));
+
+    expect(handled).toBe(true);
+    await new Promise((r) => setImmediate(r));
+    expect(called).toHaveBeenCalledTimes(1);
+  });
+
+  it("supports params with colon operation suffixes", async () => {
+    const router = createRestRouter();
+    let got: Record<string, string> | undefined;
+    router.post("/tasks/:id:cancel", (_req, _res, params) => { got = params; });
+
+    const handled = router.handle(makeReq("POST", "/tasks/task-123:cancel"), asHttpRes(new FakeRes()));
+
+    expect(handled).toBe(true);
+    await new Promise((r) => setImmediate(r));
+    expect(got).toEqual({ id: "task-123" });
+  });
+
   it("returns false when no route matches", () => {
     const router = createRestRouter();
     router.get("/a", () => {});
