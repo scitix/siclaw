@@ -1,13 +1,32 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { exportMarkdownVisualsWithSicoreWeb } from "./sicore-export.js";
 import {
   RENDER_CHART_INPUT_SCHEMA,
   RENDER_CHART_DESCRIPTION,
+  RENDER_MERMAID_DESCRIPTION,
+  RENDER_MERMAID_INPUT_SCHEMA,
+  RENDER_VISUAL_CARD_DESCRIPTION,
+  RENDER_VISUAL_CARD_INPUT_SCHEMA,
   validate,
+  validateMermaid,
+  validateVisualCard,
   handleRenderChart,
 } from "./handler.js";
+
+vi.mock("./sicore-export.js", () => {
+  const png =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+  return {
+    exportMarkdownVisualsWithSicoreWeb: vi.fn(async (markdown: string) => {
+      const kind = markdown.startsWith("```mermaid")
+        ? "mermaid"
+        : markdown.startsWith("```visual-card")
+          ? "visual-card"
+          : "chart";
+      return [{ kind, image: Buffer.from(png, "base64") }];
+    }),
+  };
+});
 
 describe("RENDER_CHART_INPUT_SCHEMA", () => {
   it("requires type and data, allows the common opts", () => {
@@ -27,6 +46,8 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/```chart/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/READY_TO_PASTE/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/exactly/i);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/PNG image artifact/);
+    expect(RENDER_CHART_DESCRIPTION).toMatch(/Sicore Web's own chart renderer\/export path/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/Do not rewrite, escape, quote/);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/mermaid/i);
     expect(RENDER_CHART_DESCRIPTION).toMatch(/xychart-beta/);
@@ -40,6 +61,26 @@ describe("RENDER_CHART_INPUT_SCHEMA", () => {
     expect(RENDER_CHART_DESCRIPTION).toMatch(/never a JSON string/i);
     expect(RENDER_CHART_INPUT_SCHEMA.properties.data.description).toMatch(/Every numeric value must be finite/);
     expect(RENDER_CHART_INPUT_SCHEMA.properties.data.description).toContain("x/category labels may be strings");
+  });
+});
+
+describe("visual image tool schemas", () => {
+  it("registers Mermaid export as a Sicore Web image artifact tool", () => {
+    expect(RENDER_MERMAID_INPUT_SCHEMA.required).toEqual(["source"]);
+    expect(RENDER_MERMAID_INPUT_SCHEMA.additionalProperties).toBe(false);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/Sicore Web's own Mermaid renderer\/export path/);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/image\/png/);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/READY_TO_PASTE/);
+    expect(RENDER_MERMAID_DESCRIPTION).toMatch(/```mermaid/);
+  });
+
+  it("registers visual-card export as a Sicore Web image artifact tool", () => {
+    expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.required).toEqual(["type", "title"]);
+    expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum).toContain("report");
+    expect(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum).toContain("root_cause_chain");
+    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/Sicore Web's own visual-card renderer\/export path/);
+    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/image\/png/);
+    expect(RENDER_VISUAL_CARD_DESCRIPTION).toMatch(/```visual-card/);
   });
 });
 
@@ -182,21 +223,47 @@ describe("validate", () => {
   });
 });
 
+describe("validateMermaid", () => {
+  it("requires source and strips an accidental mermaid fence", () => {
+    expect(() => validateMermaid({})).toThrow(/source is required/);
+    expect(validateMermaid({
+      source: "```mermaid\nflowchart TD\nA --> B\n```",
+      title: "demo",
+    })).toEqual({ source: "flowchart TD\nA --> B", title: "demo" });
+  });
+});
+
+describe("validateVisualCard", () => {
+  it("keeps Sicore visual-card specs and strips unknown keys", () => {
+    const out = validateVisualCard({
+      type: "report",
+      title: "诊断结论",
+      tone: "danger",
+      conclusion: "api pods are restarting.",
+      items: [{ label: "Affected pods", status: "danger", value: "3" }],
+      extra: "drop",
+    });
+    expect(out).toMatchObject({
+      type: "report",
+      title: "诊断结论",
+      tone: "danger",
+      conclusion: "api pods are restarting.",
+    });
+    expect(out).not.toHaveProperty("extra");
+  });
+
+  it("rejects unsupported or empty visual-card specs", () => {
+    expect(() => validateVisualCard({ type: "unknown", title: "x", conclusion: "y" })).toThrow(/supported/);
+    expect(() => validateVisualCard({ type: "report", title: "x" })).toThrow(/provide conclusion/);
+  });
+});
+
 describe("handleRenderChart", () => {
-  let tmp: string;
-  let originalEnv: string | undefined;
-
   beforeEach(() => {
-    tmp = mkdtempSync(path.join(tmpdir(), "create-chart-test-"));
-    originalEnv = process.env.CREATE_CHART_ARTIFACT_DIR;
-    process.env.CREATE_CHART_ARTIFACT_DIR = tmp;
+    vi.mocked(exportMarkdownVisualsWithSicoreWeb).mockClear();
   });
 
-  afterEach(() => {
-    if (originalEnv === undefined) delete process.env.CREATE_CHART_ARTIFACT_DIR;
-    else process.env.CREATE_CHART_ARTIFACT_DIR = originalEnv;
-    rmSync(tmp, { recursive: true, force: true });
-  });
+  afterEach(() => vi.restoreAllMocks());
 
   function splitEnvelope(text: string): { ready: string; meta: Record<string, unknown> } {
     const m = text.match(/^READY_TO_PASTE:\n([\s\S]*?)\n\nMETADATA_JSON:\n([\s\S]*)$/);
@@ -204,13 +271,16 @@ describe("handleRenderChart", () => {
     return { ready: m[1], meta: JSON.parse(m[2]) };
   }
 
-  it("returns a content array with a parseable result envelope", async () => {
+  it("returns a content array with a parseable result envelope and PNG image artifact", async () => {
     const res = await handleRenderChart({
       type: "pie",
       data: { slices: [{ label: "ok", value: 1 }] },
     });
-    expect(res.content).toHaveLength(1);
+    expect(res.content).toHaveLength(2);
     expect(res.content[0].type).toBe("text");
+    expect(res.content[1].type).toBe("image");
+    expect(res.content[1].mimeType).toBe("image/png");
+    expect([...Buffer.from(res.content[1].data, "base64").subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
     const { ready, meta } = splitEnvelope(res.content[0].text);
     expect(ready.startsWith("```chart\n")).toBe(true);
     expect(ready.endsWith("\n```")).toBe(true);
@@ -227,9 +297,11 @@ describe("handleRenderChart", () => {
     expect((meta.chart_id as string).startsWith("pie-")).toBe(true);
     expect(typeof meta.bytes).toBe("number");
     expect(meta.bytes as number).toBeGreaterThan(0);
+    expect(meta.renderer).toBe("sicore-web");
     expect(meta).not.toHaveProperty("markdown_embed");
     expect(meta).not.toHaveProperty("markdown_embed_raw");
     expect(meta.embed_instructions).toMatch(/READY_TO_PASTE/);
+    expect(exportMarkdownVisualsWithSicoreWeb).toHaveBeenCalledWith(ready);
   });
 
   it("embeds the validated spec (not the raw input) inside the chart fence", async () => {
@@ -246,47 +318,26 @@ describe("handleRenderChart", () => {
     const inner = ready.replace(/^```chart\n/, "").replace(/\n```$/, "");
     const spec = JSON.parse(inner);
     expect(spec.type).toBe("bar");
-    expect(spec.schema_version).toBe(1);
+    expect(spec).not.toHaveProperty("schema_version");
     expect(spec.data.series[0].values).toEqual([10, 20]);
     expect(spec.title).toBe("Demo");
     expect(spec).not.toHaveProperty("extra_garbage");
     expect(meta).not.toHaveProperty("markdown_embed");
   });
 
-  it("persists the spec to CREATE_CHART_ARTIFACT_DIR/chart-render/", async () => {
+  it("does not rely on local AgentBox files for artifact delivery", async () => {
     const res = await handleRenderChart({
       type: "line",
       data: { series: [{ name: "s", points: [{ x: 1, y: 2 }] }] },
     });
-    const { meta } = splitEnvelope(res.content[0].text);
-    const expectedDir = path.resolve(tmp, "chart-render");
-    expect(existsSync(expectedDir)).toBe(true);
-    const expectedFile = path.join(expectedDir, `${meta.chart_id as string}.json`);
-    expect(meta.svg_path).toBe("");
-    expect(meta.spec_path).toBe(expectedFile);
-    expect(existsSync(expectedFile)).toBe(true);
-    const onDisk = JSON.parse(readFileSync(expectedFile, "utf8"));
-    expect(onDisk.schema_version).toBe(1);
-    expect(onDisk.type).toBe("line");
-    expect(onDisk.data.series[0].points).toEqual([{ x: 1, y: 2 }]);
-    expect(readdirSync(expectedDir)).toContain(`${meta.chart_id as string}.json`);
-  });
-
-  it("still returns a usable result when disk persistence fails", async () => {
-    // Point the artifact dir at a path whose parent is a regular file —
-    // mkdir({recursive:true}) will reject with ENOTDIR, exercising the
-    // best-effort catch in handleRenderChart.
-    const blocker = path.join(tmp, "blocker");
-    writeFileSync(blocker, "x");
-    process.env.CREATE_CHART_ARTIFACT_DIR = path.join(blocker, "nested");
-
-    const res = await handleRenderChart({
-      type: "pie",
-      data: { slices: [{ label: "a", value: 1 }] },
-    });
     const { ready, meta } = splitEnvelope(res.content[0].text);
     expect(meta.svg_path).toBe("");
     expect(meta.spec_path).toBe("");
+    expect(meta.png_path).toBe("");
+    expect(meta.image_mime).toBe("image/png");
+    expect(meta.image_bytes as number).toBeGreaterThan(0);
+    expect(res.content[1].type).toBe("image");
+    expect([...Buffer.from(res.content[1].data, "base64").subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
     expect(meta.bytes as number).toBeGreaterThan(0);
     expect(ready.startsWith("```chart\n")).toBe(true);
   });

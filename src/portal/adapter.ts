@@ -8,7 +8,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { getDb, type Db } from "../gateway/db.js";
-import { buildUpsert, safeParseJson, toSqlTimestamp } from "../gateway/dialect-helpers.js";
+import { buildUpsert, insertIgnorePrefix, safeParseJson, toSqlTimestamp } from "../gateway/dialect-helpers.js";
 import { createTaskNotification } from "./notification-api.js";
 import {
   sendJson,
@@ -29,6 +29,297 @@ function requireInternalAuth(req: http.IncomingMessage, internalSecret: string):
 function jsonParam(value: unknown): string | null {
   if (value === null || value === undefined || value === "") return null;
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+interface ChannelBindingRow {
+  id: string;
+  agent_id: string;
+  session_id?: string | null;
+  route_type?: "group" | "user" | string | null;
+  created_by?: string | null;
+  channel_created_by?: string | null;
+}
+
+interface ResolvedChannelBinding {
+  agentId: string;
+  bindingId: string;
+  sessionId: string;
+  sessionKey?: string | null;
+  createdBy: string | null;
+  routeType: "group" | "user";
+}
+
+function normalizeRouteType(value: unknown): "group" | "user" {
+  return value === "user" ? "user" : "group";
+}
+
+async function selectChannelBinding(
+  db: Db,
+  channelId: string,
+  routeKey: string,
+): Promise<ChannelBindingRow | null> {
+  const [rows] = await db.query(
+    `SELECT cb.id, cb.agent_id, cb.session_id, cb.route_type, cb.created_by,
+            c.created_by AS channel_created_by
+     FROM channel_bindings cb
+     LEFT JOIN channels c ON cb.channel_id = c.id
+     WHERE cb.channel_id = ? AND cb.route_key = ?`,
+    [channelId, routeKey],
+  ) as any;
+  return rows.length > 0 ? rows[0] : null;
+}
+
+async function resolveChannelBinding(
+  db: Db,
+  channelId: string,
+  routeKey: string,
+  sessionKey?: string | null,
+): Promise<ResolvedChannelBinding | null> {
+  const row = await selectChannelBinding(db, channelId, routeKey);
+  if (!row) return null;
+
+  const session = sessionKey
+    ? await resolveChannelBindingParticipantSession(db, row.id, sessionKey)
+    : await resolveLegacyChannelBindingSession(db, row, channelId, routeKey);
+
+  return {
+    agentId: row.agent_id,
+    bindingId: row.id,
+    sessionId: session.sessionId,
+    ...(session.sessionKey ? { sessionKey: session.sessionKey } : {}),
+    createdBy: row.created_by ?? row.channel_created_by ?? null,
+    routeType: normalizeRouteType(row.route_type),
+  };
+}
+
+async function resolveLegacyChannelBindingSession(
+  db: Db,
+  row: ChannelBindingRow,
+  channelId: string,
+  routeKey: string,
+): Promise<{ sessionId: string; sessionKey: null }> {
+  let current = row;
+  if (!current.session_id) {
+    const sessionId = crypto.randomUUID();
+    await db.query(
+      "UPDATE channel_bindings SET session_id = ? WHERE id = ? AND (session_id IS NULL OR session_id = '')",
+      [sessionId, current.id],
+    );
+    const refreshed = await selectChannelBinding(db, channelId, routeKey);
+    if (!refreshed) throw new Error("Channel binding disappeared while allocating session");
+    current = refreshed;
+  }
+
+  if (!current.session_id) {
+    throw new Error("Failed to allocate channel binding session");
+  }
+  return { sessionId: current.session_id, sessionKey: null };
+}
+
+async function resolveChannelBindingParticipantSession(
+  db: Db,
+  bindingId: string,
+  sessionKey: string,
+): Promise<{ sessionId: string; sessionKey: string }> {
+  const normalizedKey = normalizeChannelSessionKey(sessionKey);
+  const existing = await selectChannelBindingParticipantSession(db, bindingId, normalizedKey);
+  if (existing) return { sessionId: existing, sessionKey: normalizedKey };
+
+  const sessionId = crypto.randomUUID();
+  await db.query(
+    `${insertIgnorePrefix(db)} INTO channel_binding_sessions (id, binding_id, session_key, session_id) VALUES (?, ?, ?, ?)`,
+    [crypto.randomUUID(), bindingId, normalizedKey, sessionId],
+  );
+
+  const selected = await selectChannelBindingParticipantSession(db, bindingId, normalizedKey);
+  if (!selected) {
+    throw new Error("Failed to allocate channel binding participant session");
+  }
+  return { sessionId: selected, sessionKey: normalizedKey };
+}
+
+async function selectChannelBindingParticipantSession(
+  db: Db,
+  bindingId: string,
+  sessionKey: string,
+): Promise<string | null> {
+  const [rows] = await db.query(
+    "SELECT session_id FROM channel_binding_sessions WHERE binding_id = ? AND session_key = ?",
+    [bindingId, sessionKey],
+  ) as any;
+  return rows.length > 0 ? rows[0].session_id : null;
+}
+
+function normalizeChannelSessionKey(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error("channel session_key must not be empty");
+  if (trimmed.length > 255) throw new Error("channel session_key is too long");
+  return trimmed;
+}
+
+async function pairChannelBinding(
+  db: Db,
+  params: { code: string; channel_id: string; route_key: string; route_type: "group" | "user" },
+): Promise<{ success: boolean; agentName?: string; error?: string }> {
+  const now = toSqlTimestamp(new Date());
+  const [codeRows] = await db.query(
+    "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > ?",
+    [params.code, params.channel_id, now],
+  ) as any;
+  if (codeRows.length === 0) {
+    return { success: false, error: "Invalid or expired pairing code" };
+  }
+
+  const pairingCode = codeRows[0];
+  const existingBinding = await selectChannelBinding(db, params.channel_id, params.route_key);
+  const bindingId = existingBinding?.id ?? crypto.randomUUID();
+  const sessionId = crypto.randomUUID();
+  try {
+    const upsert = buildUpsert(
+      db,
+      "channel_bindings",
+      ["id", "channel_id", "agent_id", "session_id", "route_key", "route_type", "created_by"],
+      [bindingId, params.channel_id, pairingCode.agent_id, sessionId, params.route_key, params.route_type, pairingCode.created_by],
+      ["channel_id", "route_key"],
+      ["agent_id", "session_id", "route_type", "created_by"],
+    );
+    await db.query(upsert.sql, upsert.params);
+    const row = await selectChannelBinding(db, params.channel_id, params.route_key);
+    if (row) {
+      await db.query("DELETE FROM channel_binding_sessions WHERE binding_id = ?", [row.id]);
+    }
+  } catch (err: any) {
+    return { success: false, error: `Failed to create binding: ${err.message}` };
+  }
+
+  await db.query("DELETE FROM channel_pairing_codes WHERE code = ?", [params.code]);
+  let agentName = pairingCode.agent_id;
+  try {
+    const [agentRows] = await db.query(
+      "SELECT name FROM agents WHERE id = ?",
+      [pairingCode.agent_id],
+    ) as any;
+    if (agentRows.length > 0) agentName = agentRows[0].name;
+  } catch { /* ignore */ }
+  return { success: true, agentName };
+}
+
+async function resetChannelBindingSession(
+  db: Db,
+  channelId: string,
+  routeKey: string,
+  sessionKey?: string | null,
+): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
+  const row = await selectChannelBinding(db, channelId, routeKey);
+  if (!row) return { success: false, error: "Binding not found" };
+
+  const sessionId = crypto.randomUUID();
+  if (sessionKey) {
+    const normalizedKey = normalizeChannelSessionKey(sessionKey);
+    const oldSessionId = await selectChannelBindingParticipantSession(db, row.id, normalizedKey);
+    const upsert = buildUpsert(
+      db,
+      "channel_binding_sessions",
+      ["id", "binding_id", "session_key", "session_id"],
+      [crypto.randomUUID(), row.id, normalizedKey, sessionId],
+      ["binding_id", "session_key"],
+      ["session_id", { col: "updated_at", expr: "CURRENT_TIMESTAMP" }],
+    );
+    await db.query(upsert.sql, upsert.params);
+    return {
+      success: true,
+      agentId: row.agent_id,
+      oldSessionId,
+      sessionId,
+    };
+  }
+
+  await db.query(
+    "UPDATE channel_bindings SET session_id = ? WHERE id = ?",
+    [sessionId, row.id],
+  );
+  return {
+    success: true,
+    agentId: row.agent_id,
+    oldSessionId: row.session_id ?? null,
+    sessionId,
+  };
+}
+
+interface PersonalChannelConfig {
+  personal_bot?: {
+    agent_id?: string;
+    access_mode?: "open" | "sicore_authorized";
+    owner_user_id?: string;
+  };
+}
+
+async function selectPersonalChannel(
+  db: Db,
+  channelId: string,
+): Promise<{ id: string; created_by: string | null; config: PersonalChannelConfig } | null> {
+  const [rows] = await db.query(
+    "SELECT id, created_by, config FROM channels WHERE id = ? AND status = 'active'",
+    [channelId],
+  ) as any;
+  if (rows.length === 0) return null;
+  const row = rows[0];
+  return {
+    id: row.id,
+    created_by: row.created_by ?? null,
+    config: safeParseJson(row.config, {}) as PersonalChannelConfig,
+  };
+}
+
+async function resolvePersonalChannelBinding(
+  db: Db,
+  channelId: string,
+  senderOpenId: string,
+): Promise<ResolvedChannelBinding | null> {
+  const channel = await selectPersonalChannel(db, channelId);
+  const personalBot = channel?.config.personal_bot;
+  if (!channel || !personalBot?.agent_id || !senderOpenId.trim()) return null;
+  if (personalBot.access_mode !== "open") {
+    return null;
+  }
+  const sessionKey = `open_id:${senderOpenId.trim()}`;
+  const session = await resolveChannelBindingParticipantSession(db, channel.id, sessionKey);
+  return {
+    agentId: personalBot.agent_id,
+    bindingId: channel.id,
+    sessionId: session.sessionId,
+    sessionKey: session.sessionKey,
+    createdBy: personalBot.owner_user_id ?? channel.created_by,
+    routeType: "user",
+  };
+}
+
+async function resetPersonalChannelSession(
+  db: Db,
+  channelId: string,
+  sessionKey: string,
+): Promise<{ success: boolean; agentId?: string; oldSessionId?: string | null; sessionId?: string; error?: string }> {
+  const channel = await selectPersonalChannel(db, channelId);
+  const personalBot = channel?.config.personal_bot;
+  if (!channel || !personalBot?.agent_id) return { success: false, error: "Personal bot not found" };
+  const normalizedKey = normalizeChannelSessionKey(sessionKey);
+  const oldSessionId = await selectChannelBindingParticipantSession(db, channel.id, normalizedKey);
+  const sessionId = crypto.randomUUID();
+  const upsert = buildUpsert(
+    db,
+    "channel_binding_sessions",
+    ["id", "binding_id", "session_key", "session_id"],
+    [crypto.randomUUID(), channel.id, normalizedKey, sessionId],
+    ["binding_id", "session_key"],
+    ["session_id", { col: "updated_at", expr: "CURRENT_TIMESTAMP" }],
+  );
+  await db.query(upsert.sql, upsert.params);
+  return {
+    success: true,
+    agentId: personalBot.agent_id,
+    oldSessionId,
+    sessionId,
+  };
 }
 
 // ── SSH jump-host (ProxyJump) helpers ───────────────────────────────
@@ -1193,17 +1484,10 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
     }
-    const body = await parseBody<{ channel_id: string; route_key: string }>(req);
+    const body = await parseBody<{ channel_id: string; route_key: string; session_key?: string }>(req);
     const db = getDb();
-    const [rows] = await db.query(
-      "SELECT id, agent_id FROM channel_bindings WHERE channel_id = ? AND route_key = ?",
-      [body.channel_id, body.route_key],
-    ) as any;
-    if (rows.length === 0) {
-      sendJson(res, 200, { binding: null });
-      return;
-    }
-    sendJson(res, 200, { binding: { agentId: rows[0].agent_id, bindingId: rows[0].id } });
+    const binding = await resolveChannelBinding(db, body.channel_id, body.route_key, body.session_key);
+    sendJson(res, 200, { binding });
   });
 
   // POST /api/internal/siclaw/channel/pair
@@ -1217,41 +1501,18 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       route_type: "group" | "user";
     }>(req);
     const db = getDb();
-    const now = toSqlTimestamp(new Date());
-    const [codeRows] = await db.query(
-      "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > ?",
-      [body.code, body.channel_id, now],
-    ) as any;
-    if (codeRows.length === 0) {
-      sendJson(res, 200, { success: false, error: "Invalid or expired pairing code" });
+    sendJson(res, 200, await pairChannelBinding(db, body));
+  });
+
+  // POST /api/internal/siclaw/channel/reset-session
+  router.post("/api/internal/siclaw/channel/reset-session", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
       return;
     }
-    const pairingCode = codeRows[0];
-    const bindingId = crypto.randomUUID();
-    try {
-      const upsert = buildUpsert(
-        db,
-        "channel_bindings",
-        ["id", "channel_id", "agent_id", "route_key", "route_type", "created_by"],
-        [bindingId, body.channel_id, pairingCode.agent_id, body.route_key, body.route_type, pairingCode.created_by],
-        ["channel_id", "route_key"],
-        ["agent_id", "route_type", "created_by"],
-      );
-      await db.query(upsert.sql, upsert.params);
-    } catch (err: any) {
-      sendJson(res, 200, { success: false, error: `Failed to create binding: ${err.message}` });
-      return;
-    }
-    await db.query("DELETE FROM channel_pairing_codes WHERE code = ?", [body.code]);
-    let agentName = pairingCode.agent_id;
-    try {
-      const [agentRows] = await db.query(
-        "SELECT name FROM agents WHERE id = ?",
-        [pairingCode.agent_id],
-      ) as any;
-      if (agentRows.length > 0) agentName = agentRows[0].name;
-    } catch { /* ignore */ }
-    sendJson(res, 200, { success: true, agentName });
+    const body = await parseBody<{ channel_id: string; route_key: string; session_key?: string }>(req);
+    const db = getDb();
+    sendJson(res, 200, await resetChannelBindingSession(db, body.channel_id, body.route_key, body.session_key));
   });
 
   // ================================================================
@@ -2353,52 +2614,33 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("channel.resolveBinding", async (params) => {
     const db = getDb();
-    const [rows] = await db.query(
-      "SELECT id, agent_id FROM channel_bindings WHERE channel_id = ? AND route_key = ?",
-      [params.channel_id, params.route_key],
-    ) as any;
-    if (rows.length === 0) {
-      return { binding: null };
-    }
-    return { binding: { agentId: rows[0].agent_id, bindingId: rows[0].id } };
+    return { binding: await resolveChannelBinding(db, params.channel_id, params.route_key, params.session_key) };
   });
 
   handlers.set("channel.pair", async (params) => {
     const db = getDb();
-    const now = toSqlTimestamp(new Date());
-    const [codeRows] = await db.query(
-      "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > ?",
-      [params.code, params.channel_id, now],
-    ) as any;
-    if (codeRows.length === 0) {
-      return { success: false, error: "Invalid or expired pairing code" };
-    }
-    const pairingCode = codeRows[0];
-    const bindingId = crypto.randomUUID();
-    try {
-      const upsert = buildUpsert(
-        db,
-        "channel_bindings",
-        ["id", "channel_id", "agent_id", "route_key", "route_type", "created_by"],
-        [bindingId, params.channel_id, pairingCode.agent_id, params.route_key, params.route_type, pairingCode.created_by],
-        ["channel_id", "route_key"],
-        ["agent_id", "route_type", "created_by"],
-      );
-      await db.query(upsert.sql, upsert.params);
-    } catch (err: any) {
-      return { success: false, error: `Failed to create binding: ${err.message}` };
-    }
-    await db.query("DELETE FROM channel_pairing_codes WHERE code = ?", [params.code]);
-    let agentName = pairingCode.agent_id;
-    try {
-      const [agentRows] = await db.query(
-        "SELECT name FROM agents WHERE id = ?",
-        [pairingCode.agent_id],
-      ) as any;
-      if (agentRows.length > 0) agentName = agentRows[0].name;
-    } catch { /* ignore */ }
-    return { success: true, agentName };
+    return pairChannelBinding(db, params);
   });
+
+  handlers.set("channel.resetSession", async (params) => {
+    const db = getDb();
+    return resetChannelBindingSession(db, params.channel_id, params.route_key, params.session_key);
+  });
+
+  handlers.set("channel.resolvePersonalBinding", async (params) => {
+    const db = getDb();
+    return { binding: await resolvePersonalChannelBinding(db, params.channel_id, params.sender_open_id) };
+  });
+
+  handlers.set("channel.resetPersonalSession", async (params) => {
+    const db = getDb();
+    return resetPersonalChannelSession(db, params.channel_id, params.session_key);
+  });
+
+  handlers.set("channel.pairPersonal", async () => ({
+    success: false,
+    error: "Sicore authorization is only available through the Sicore adapter",
+  }));
 
   // --- agent.* ---
 

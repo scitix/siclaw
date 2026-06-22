@@ -1333,12 +1333,57 @@ describe("channel.list", () => {
 
 describe("channel.resolveBinding", () => {
   it("returns binding when found", async () => {
-    mockQuery([{ id: "b1", agent_id: "a1" }]);
+    mockQuery([{ id: "b1", agent_id: "a1", session_id: "s1", route_type: "group", created_by: "u1" }]);
 
     const result = await getHandler("channel.resolveBinding")(
       { channel_id: "ch1", route_key: "group-123" }, "a1",
     );
-    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1" });
+    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s1", createdBy: "u1", routeType: "group" });
+  });
+
+  it("lazily creates a session for legacy bindings", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: null, route_type: "group", created_by: "u1" }],
+      [],
+      [{ id: "b1", agent_id: "a1", session_id: "s-new", route_type: "group", created_by: "u1" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123" }, "a1",
+    );
+
+    expect(query.mock.calls[1][0]).toContain("UPDATE channel_bindings SET session_id");
+    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s-new", createdBy: "u1", routeType: "group" });
+  });
+
+  it("lazily creates a participant session when session_key is provided", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "shared-session", route_type: "group", created_by: "u1" }],
+      [],
+      [],
+      [{ session_id: "sender-session" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123", session_key: "open_id:ou_1" }, "a1",
+    );
+
+    expect(query.mock.calls[1][0]).toContain("FROM channel_binding_sessions");
+    expect(query.mock.calls[2][0]).toContain("INTO channel_binding_sessions");
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "open_id:ou_1",
+      expect.any(String),
+    ]);
+    expect(result.binding).toEqual({
+      agentId: "a1",
+      bindingId: "b1",
+      sessionId: "sender-session",
+      sessionKey: "open_id:ou_1",
+      createdBy: "u1",
+      routeType: "group",
+    });
   });
 
   it("returns null binding when not found", async () => {
@@ -1353,9 +1398,12 @@ describe("channel.resolveBinding", () => {
 
 describe("channel.pair", () => {
   it("creates binding from valid pairing code", async () => {
-    mockQuery(
+    const query = mockQuery(
       [{ agent_id: "a1", created_by: "u1" }],  // pairing code lookup
+      [],                                         // existing binding lookup
       [],                                         // insert binding
+      [{ id: "b-new", agent_id: "a1", session_id: "binding-session", route_type: "group", created_by: "u1" }],
+      [],                                         // clear participant sessions
       [],                                         // delete code
       [{ name: "My Agent" }],                     // agent name lookup
     );
@@ -1365,6 +1413,17 @@ describe("channel.pair", () => {
     );
     expect(result.success).toBe(true);
     expect(result.agentName).toBe("My Agent");
+    expect(query.mock.calls[2][0]).toContain("session_id");
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "ch1",
+      "a1",
+      expect.any(String),
+      "group-1",
+      "group",
+      "u1",
+    ]);
+    expect(query.mock.calls[4][0]).toContain("DELETE FROM channel_binding_sessions");
   });
 
   it("returns error for invalid pairing code", async () => {
@@ -1380,6 +1439,7 @@ describe("channel.pair", () => {
   it("returns error when binding insert fails", async () => {
     const query = vi.fn()
       .mockResolvedValueOnce([[{ agent_id: "a1", created_by: "u1" }], []])
+      .mockResolvedValueOnce([[], []])
       .mockRejectedValueOnce(new Error("Duplicate entry"));
     (getDb as any).mockReturnValue({ query });
 
@@ -1388,6 +1448,59 @@ describe("channel.pair", () => {
     );
     expect(result.success).toBe(false);
     expect(result.error).toContain("Failed to create binding");
+  });
+});
+
+describe("channel.resetSession", () => {
+  it("replaces the binding session id", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "old-session", route_type: "group", created_by: "u1" }],
+      [],
+    );
+
+    const result = await getHandler("channel.resetSession")(
+      { channel_id: "ch1", route_key: "group-1" }, "a1",
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.agentId).toBe("a1");
+    expect(result.oldSessionId).toBe("old-session");
+    expect(result.sessionId).toEqual(expect.any(String));
+    expect(query.mock.calls[1][0]).toContain("UPDATE channel_bindings SET session_id");
+  });
+
+  it("replaces only the participant session when session_key is provided", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "shared-session", route_type: "group", created_by: "u1" }],
+      [{ session_id: "old-sender-session" }],
+      [],
+    );
+
+    const result = await getHandler("channel.resetSession")(
+      { channel_id: "ch1", route_key: "group-1", session_key: "open_id:ou_1" }, "a1",
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.agentId).toBe("a1");
+    expect(result.oldSessionId).toBe("old-sender-session");
+    expect(result.sessionId).toEqual(expect.any(String));
+    expect(query.mock.calls[2][0]).toContain("channel_binding_sessions");
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "open_id:ou_1",
+      expect.any(String),
+    ]);
+  });
+
+  it("returns an error when the binding is missing", async () => {
+    mockQuery([]);
+
+    const result = await getHandler("channel.resetSession")(
+      { channel_id: "ch1", route_key: "group-missing" }, "a1",
+    );
+
+    expect(result).toEqual({ success: false, error: "Binding not found" });
   });
 });
 
@@ -1539,9 +1652,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 44 handlers", () => {
+  it("registers exactly 48 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(44);
+    expect(handlers.size).toBe(48);
   });
 
   it("all expected handler names are registered", () => {
@@ -1556,7 +1669,8 @@ describe("buildAdapterRpcHandlers", () => {
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",
-      "channel.list", "channel.resolveBinding", "channel.pair",
+      "channel.list", "channel.resolveBinding", "channel.pair", "channel.resetSession",
+      "channel.resolvePersonalBinding", "channel.pairPersonal", "channel.resetPersonalSession",
       "agent.listForSkill", "agent.listForMcp", "agent.listForCluster", "agent.listForHost",
       "metrics.summary", "metrics.audit", "metrics.auditDetail",
     ];

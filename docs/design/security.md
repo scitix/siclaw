@@ -58,6 +58,32 @@ will attempt — intentionally or via prompt injection — to:
 | Environment vars | Process memory | Token leakage via /proc | `sanitizeEnv()` strips secrets before child spawn |
 | K8s service account | Pod metadata API | Cluster API access | `automountServiceAccountToken: false` |
 
+### 1.4 Browser-Engine Attack Surface (visual export)
+
+The `mcp/create-chart` tools (`render_chart`, `render_mermaid`, `render_visual_card`)
+launch headless Chromium **inside the AgentBox container** (`Dockerfile.agentbox`
+installs `chromium`) to rasterize LLM-generated markdown — chart JSON, Mermaid
+source, and visual-card JSON — into PNGs for IM channel replies.
+
+Chromium runs with `--no-sandbox --disable-setuid-sandbox`
+(`mcp/create-chart/src/sicore-export.ts`). This is the standard workaround for
+running Chromium in a container without `CAP_SYS_ADMIN` or a custom seccomp
+profile, but it disables Chromium's own process sandbox — so a Chromium 0-day
+reached via crafted render input would get **process-level access at sandbox-user
+privileges inside one AgentBox pod**.
+
+This is a deliberate trust-boundary expansion: the AgentBox sandbox previously only
+had to contain tool *output* going wrong; it now also has to contain LLM *content*
+driving a browser engine. It is acceptable because Chromium runs as the **sandbox
+user** (Layer 1) and the container drops ALL capabilities, uses `RuntimeDefault`
+seccomp, and runs `readOnlyRootFilesystem` (Layer 3) — so the blast radius stays
+"one pod, sandbox-user privileges, no credential access."
+
+**Invariant**: the AgentBox Pod Security Standard must stay *restricted*
+(`allowPrivilegeEscalation: false`, no added capabilities, no host networking).
+Relaxing it would turn this browser surface from contained into dangerous. See
+[§5 Layer 3: Container Hardening](#5-layer-3-container-hardening).
+
 ---
 
 ## 2. Defense-in-Depth Overview

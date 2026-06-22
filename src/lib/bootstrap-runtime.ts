@@ -141,6 +141,8 @@ export async function bootstrapRuntime(opts: BootstrapRuntimeOptions): Promise<R
     return taskCoordinator.fireNow(taskId);
   });
 
+  runtime.rpcMethods.set("channel.reload", async () => channelManager.reloadFromDb());
+
   return {
     runtime,
     async close() {

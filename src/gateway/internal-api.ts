@@ -19,6 +19,11 @@ import { randomUUID } from "node:crypto";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 import { sessionRegistry } from "./session-registry.js";
+import {
+  deliverBackgroundChannelMessage,
+  deliverChannelVisibleMessage,
+  hasBackgroundChannelDelivery,
+} from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import type {
   DelegationAppendMessagePayload,
@@ -120,6 +125,11 @@ async function validateDelegationEventActor(
     }
     case "delegation.emit_chat_event": {
       if (!(await sessionBelongsToIdentity(event.sessionId, identity))) return { status: 403, error: "delegation session mismatch" };
+      return null;
+    }
+    case "channel.deliver_message": {
+      if (!agentMatchesIdentity(event.message.fromAgentId, identity)) return { status: 403, error: "channel source agent mismatch" };
+      if (!(await sessionBelongsToIdentity(event.message.sessionId, identity))) return { status: 403, error: "channel session mismatch" };
       return null;
     }
     default:
@@ -556,7 +566,18 @@ export async function handleDelegationEvents(
         break;
       }
       case "delegation.append_message": {
-        response = { ok: true, id: await appendDelegationMessage(frontendClient, event.message) };
+        const deliveredToChannel = await deliverBackgroundChannelMessage(event.message);
+        const channelRegistered = hasBackgroundChannelDelivery(event.message.sessionId);
+        try {
+          response = { ok: true, id: await appendDelegationMessage(frontendClient, event.message) };
+        } catch (err) {
+          if (!deliveredToChannel && !channelRegistered) throw err;
+          console.warn(
+            `[internal-api] Portal append failed for channel background session=${event.message.sessionId} delivered=${deliveredToChannel}:`,
+            err,
+          );
+          response = { ok: true };
+        }
         break;
       }
       case "delegation.update_message": {
@@ -573,6 +594,10 @@ export async function handleDelegationEvents(
       }
       case "delegation.emit_chat_event": {
         frontendClient.emitEvent("chat.event", { sessionId: event.sessionId, event: event.event });
+        break;
+      }
+      case "channel.deliver_message": {
+        response = { ok: await deliverChannelVisibleMessage(event.message) };
         break;
       }
       default: {

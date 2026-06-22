@@ -136,6 +136,19 @@ export interface TaskOutputSnapshot {
  */
 export type TaskOutputReader = (jobId: string) => TaskOutputSnapshot;
 
+export interface ChannelMessageRequest {
+  sessionId: string;
+  kind: "milestone" | "final" | "artifact";
+  text: string;
+}
+
+export interface ChannelMessageResult {
+  delivered: boolean;
+  message: string;
+}
+
+export type ChannelMessageExecutor = (request: ChannelMessageRequest) => Promise<ChannelMessageResult>;
+
 // ── background exec (run_in_background on bash / node_exec / pod_exec) ──────
 
 /**
@@ -263,6 +276,8 @@ export interface ToolRefs {
   backgroundExecExecutor?: BackgroundExecExecutor;
   /** Reads a background job's live status from the runtime's JobRegistry. Enables task_output. */
   taskOutputReader?: TaskOutputReader;
+  /** Sends an agent-selected visible update to the active IM channel; Gateway owns delivery policy. */
+  channelMessageExecutor?: ChannelMessageExecutor;
 }
 
 /** Declarative registration for a single tool. */

@@ -380,11 +380,23 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     id CHAR(36) PRIMARY KEY,
     channel_id CHAR(36) NOT NULL,
     agent_id CHAR(36) NOT NULL,
+    session_id CHAR(36) DEFAULT NULL,
     route_key VARCHAR(255) NOT NULL,
     route_type VARCHAR(20) NOT NULL DEFAULT 'group',
     created_by CHAR(36),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (channel_id, route_key)
+  )`,
+
+  // Channel Binding Sessions (maps one channel binding + participant key → session)
+  `CREATE TABLE IF NOT EXISTS channel_binding_sessions (
+    id CHAR(36) PRIMARY KEY,
+    binding_id CHAR(36) NOT NULL,
+    session_key VARCHAR(255) NOT NULL,
+    session_id CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (binding_id, session_key)
   )`,
 
   // Channel Pairing Codes (ephemeral, 5-min TTL)
@@ -509,6 +521,8 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "agent_task_runs", "idx_agent_task_runs_session", "session_id");
   // channel_bindings
   await ensureIndex(db, "channel_bindings", "idx_channel_bindings_agent", "agent_id");
+  // channel_binding_sessions
+  await ensureIndex(db, "channel_binding_sessions", "idx_channel_binding_sessions_session", "session_id");
   // knowledge_publish_events
   await ensureIndex(db, "knowledge_publish_events", "idx_kpe_created", "created_at");
   await ensureIndex(db, "knowledge_publish_events", "idx_kpe_repo", "repo_id, created_at");
@@ -546,6 +560,7 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_sessions", "parent_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "delegation_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "target_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "channel_bindings", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "from_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "parent_session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "delegation_id", "CHAR(36) DEFAULT NULL");

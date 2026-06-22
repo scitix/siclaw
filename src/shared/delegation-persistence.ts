@@ -62,6 +62,13 @@ export interface DelegationEventPayload {
   interruptedTool?: string;
 }
 
+export interface ChannelDeliverMessagePayload {
+  sessionId: string;
+  kind: "milestone" | "final" | "artifact";
+  text: string;
+  fromAgentId?: string | null;
+}
+
 export type DelegationPersistenceEvent =
   | {
       type: "delegation.ensure_session";
@@ -77,7 +84,8 @@ export type DelegationPersistenceEvent =
   | { type: "delegation.update_message"; message: DelegationUpdateMessagePayload }
   | { type: "delegation.update_tool_message"; message: DelegationToolUpdatePayload }
   | { type: "delegation.append_event"; event: DelegationEventPayload }
-  | { type: "delegation.emit_chat_event"; sessionId: string; event: Record<string, unknown> };
+  | { type: "delegation.emit_chat_event"; sessionId: string; event: Record<string, unknown> }
+  | { type: "channel.deliver_message"; message: ChannelDeliverMessagePayload };
 
 export interface DelegationPersistenceResponse {
   ok: boolean;

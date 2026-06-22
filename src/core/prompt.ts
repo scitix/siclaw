@@ -49,6 +49,9 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", 
   if (mode === "task") {
     prompt += CRON_SECTION;
   }
+  if (mode === "channel") {
+    prompt += CHANNEL_SECTION;
+  }
 
   // Append hardcoded safety section — NOT overridable by agent templates
   prompt += SAFETY_SECTION(credentialsPath);
@@ -70,6 +73,34 @@ This is a NON-INTERACTIVE scheduled task. There is no user present.
 - **Fail fast**: If a tool fails with the same error on 2 consecutive attempts, STOP using that tool. Switch approach or report the failure.
 - **Budget awareness**: You have a strict time limit. Prefer lightweight commands (kubectl, bash) over heavy tools (node_exec, node_script) when possible. If a referenced skill does not exist, fall back to simple kubectl commands.
 - After completing your investigation, you MUST call the \`task_report\` tool with a structured summary of your findings. This is the ONLY output recorded and sent to the user. Even if all checks failed, call \`task_report\` to report the failures.`;
+
+// ---------------------------------------------------------------------------
+// Channel section — appended only for IM channel sessions
+// ---------------------------------------------------------------------------
+const CHANNEL_SECTION = `
+
+# Channel Reply Format
+
+This session is replying in an IM group. Choose the final answer shape intentionally:
+
+- Treat the latest channel message as the current request. Earlier group context is background only; use it when the user explicitly says they are continuing, refers to "above/earlier/that/this", or when stable configuration facts are needed.
+- If the latest message names a different case, cluster, node, pod, namespace, time range, or task, treat it as a new request. Do not force details from a previous incident into the new answer.
+- If context is ambiguous, answer the current message directly and ask one concise clarifying question instead of assuming an older case still applies.
+- Use normal Markdown for direct answers, short diagnoses, command results, and prose reports.
+- Use a small Markdown table when the user needs exact enumerable facts.
+- For visual replies, use tools or artifacts that return structured image content blocks. The channel runtime uploads those image attachments to Feishu/Lark.
+- Use \`render_chart\` for numeric charts, \`render_mermaid\` for Mermaid diagrams, and \`render_visual_card\` for conclusion-card images. These tools return PNG image artifacts for the channel adapter to forward.
+- Use source-only \`\`\`chart\`, Mermaid, or \`\`\`visual-card\` blocks only when the user wants readable source instead of an image.
+- When a tool generates a PNG chart, diagram, or conclusion card, include or preserve that image artifact in the final answer and keep one concise natural-language conclusion outside the image.
+- Do not inline \`data:image/...\` URLs or base64 image data in Markdown. Image delivery is an attachment responsibility of the channel adapter, not the final text body.
+
+For \`\`\`visual-card\`, output JSON only inside the fence:
+
+\`\`\`visual-card
+{"type":"report","title":"Short incident title","tone":"danger|warning|success|info|neutral","conclusion":"One-sentence conclusion","items":[{"label":"Impact","status":"danger","value":"3 pods","note":"namespace prod"}],"sections":[{"type":"actions","title":"Next actions","actions":[{"title":"Restart after config fix","priority":"P1","status":"info"}]}]}
+\`\`\`
+
+The channel runtime forwards structured image artifacts to Feishu/Lark and hides paired visual source blocks from the group message body. Source-only \`\`\`chart\`, Mermaid, and \`\`\`visual-card\` blocks remain markdown text unless paired with a real image artifact; visual tools must return image artifacts when the group needs an actual image. Do not describe Feishu upload mechanics.`;
 
 // ---------------------------------------------------------------------------
 // Safety section — hardcoded, always appended, cannot be overridden

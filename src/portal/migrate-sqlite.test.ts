@@ -85,6 +85,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_agent_task_runs_task",
       "idx_agent_task_runs_session",
       "idx_channel_bindings_agent",
+      "idx_channel_binding_sessions_session",
       "idx_kpe_created",
       "idx_kpe_repo",
       "idx_skills_overlay",
@@ -180,6 +181,23 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     const db = getDb();
     const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(agents)");
     expect(rows.map((r) => r.name)).toContain("model_routing");
+  });
+
+  it("channel_bindings.session_id column exists after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(channel_bindings)");
+    expect(rows.map((r) => r.name)).toContain("session_id");
+  });
+
+  it("channel_binding_sessions table exists after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(channel_binding_sessions)");
+    const cols = rows.map((r) => r.name);
+    expect(cols).toContain("binding_id");
+    expect(cols).toContain("session_key");
+    expect(cols).toContain("session_id");
   });
 
   it("skills and skill_versions files columns exist after migration", async () => {

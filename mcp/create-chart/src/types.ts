@@ -19,7 +19,6 @@ export interface LineSeries {
 }
 
 export interface ChartCommonOpts {
-  schema_version?: 1;
   title?: string;
   width?: number;
   height?: number;
@@ -40,12 +39,27 @@ export interface RenderChartResult {
   chart_id: string;
   type: "pie" | "bar" | "line";
   artifact_kind: "chart_spec";
-  spec_path: string;
   /**
-   * Kept for backwards-compatible metadata shape. Empty because render_chart
-   * persists a JSON chart spec; the portal renders SVG client-side.
+   * Kept for backwards-compatible metadata shape. Empty because delivery uses
+   * the returned structured image content block, not AgentBox-local files.
    */
+  spec_path: string;
   svg_path: string;
+  png_path: string;
   bytes: number;
+  image_bytes: number;
+  image_mime: "image/png";
+  renderer: "sicore-web";
   embed_instructions: string;
+}
+
+export type RenderChartToolContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: "image/png" };
+
+export interface RenderChartToolResponse {
+  content: [
+    { type: "text"; text: string },
+    { type: "image"; data: string; mimeType: "image/png" },
+  ];
 }

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   sanitizeMarkdownForFeishu,
   openTypingCard,
+  updateCardContent,
   finalizeCard,
   DEFAULT_PLACEHOLDER,
   EMPTY_RESULT_NOTICE,
@@ -29,13 +30,16 @@ describe("sanitizeMarkdownForFeishu", () => {
     expect(sanitizeMarkdownForFeishu(md)).toBe(md);
   });
 
-  it("turns ATX headings into bold lines", () => {
-    expect(sanitizeMarkdownForFeishu("# Title")).toBe("**Title**");
-    expect(sanitizeMarkdownForFeishu("## Subtitle\nbody")).toBe("**Subtitle**\nbody");
-    expect(sanitizeMarkdownForFeishu("### Sec\n### Sec2")).toBe("**Sec**\n**Sec2**");
+  it("passes ATX headings through unchanged (schema-2.0 markdown renders them natively)", () => {
+    expect(sanitizeMarkdownForFeishu("# Title")).toBe("# Title");
+    expect(sanitizeMarkdownForFeishu("## Subtitle\nbody")).toBe("## Subtitle\nbody");
+    expect(sanitizeMarkdownForFeishu("### Sec\n### Sec2")).toBe("### Sec\n### Sec2");
+    // A heading with a leading emoji must NOT become `**…**` (that produced
+    // literal asterisks when the bold marker glued onto the emoji).
+    expect(sanitizeMarkdownForFeishu("### 🔴 Issue 1: disk full")).toBe("### 🔴 Issue 1: disk full");
   });
 
-  it("wraps GFM tables in a fenced code block so columns stay aligned", () => {
+  it("passes GFM tables through unchanged (schema-2.0 markdown renders them natively)", () => {
     const input = [
       "| col1 | col2 |",
       "|------|------|",
@@ -43,11 +47,10 @@ describe("sanitizeMarkdownForFeishu", () => {
       "| c    | d    |",
     ].join("\n") + "\n";
     const out = sanitizeMarkdownForFeishu(input);
-    expect(out.startsWith("```\n")).toBe(true);
-    expect(out).toContain("| col1 | col2 |");
-    expect(out).toContain("|------|------|");
-    expect(out).toContain("| a    | b    |");
-    expect(out.trim().endsWith("```")).toBe(true);
+    // No longer wrapped in a fenced code block — passed through verbatim so the
+    // 2.0 markdown element renders a real table (not a monospace code box).
+    expect(out).toBe(input);
+    expect(out.startsWith("```")).toBe(false);
   });
 
   it("prefixes blockquotes with a full-width pipe", () => {
@@ -68,9 +71,11 @@ describe("sanitizeMarkdownForFeishu", () => {
       "```",
     ].join("\n");
     const out = sanitizeMarkdownForFeishu(md);
-    // Outside transformed
-    expect(out).toContain("**outside**");
-    // Inside preserved verbatim
+    // Outside heading passes through unchanged (rendered natively by 2.0).
+    expect(out).toContain("# outside");
+    expect(out).not.toContain("**outside**");
+    // Inside the fenced code block, everything is preserved verbatim — the
+    // carve-out/restore must still protect code contents.
     expect(out).toContain("# inside code block — MUST be left alone");
     expect(out).toContain("| col | col |");
     expect(out).toContain("> not a real quote");
@@ -210,6 +215,22 @@ describe("openTypingCard", () => {
 // ── finalizeCard ───────────────────────────────────────────────
 
 describe("finalizeCard", () => {
+  it("updateCardContent refreshes markdown without disabling streaming", async () => {
+    const { client, contentSpy, settingsSpy } = makeLarkClient();
+    const session = { cardId: "CARD-1", elementId: "md_main", sequence: 0 };
+
+    const ok = await updateCardContent(client as any, session, "> milestone");
+    expect(ok).toBe(true);
+
+    expect(contentSpy).toHaveBeenCalledTimes(1);
+    expect(contentSpy.mock.calls[0][0]).toMatchObject({
+      path: { card_id: "CARD-1", element_id: "md_main" },
+      data: { content: "｜ milestone", sequence: 1 },
+    });
+    expect(settingsSpy).not.toHaveBeenCalled();
+    expect(session.sequence).toBe(1);
+  });
+
   it("updates element content with sanitized markdown, then disables streaming_mode; increments sequence", async () => {
     const { client, contentSpy, settingsSpy } = makeLarkClient();
     const session = { cardId: "CARD-1", elementId: "md_main", sequence: 0 };
@@ -217,10 +238,10 @@ describe("finalizeCard", () => {
     const ok = await finalizeCard(client as any, session, "# Heading\ntext **bold**");
     expect(ok).toBe(true);
 
-    // content call gets sanitized text (heading → bold line)
+    // content call gets sanitized text (heading passes through unchanged now)
     const contentArg = contentSpy.mock.calls[0][0];
     expect(contentArg.path).toEqual({ card_id: "CARD-1", element_id: "md_main" });
-    expect(contentArg.data.content).toBe("**Heading**\ntext **bold**");
+    expect(contentArg.data.content).toBe("# Heading\ntext **bold**");
     expect(contentArg.data.sequence).toBe(1);
 
     // settings flips streaming_mode off with a later sequence

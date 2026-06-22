@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /**
- * create-chart MCP server — stdio transport, exposes a single `render_chart`
- * tool that emits a JSON chart spec wrapped in a ```chart fenced markdown
- * code block. The Portal frontend detects that block and renders an SVG
- * client-side via React (theme-aware, dark-mode-aware).
+ * create-chart MCP server — stdio transport, exposes Sicore Web-backed visual
+ * tools. Each tool returns a READY_TO_PASTE source block plus a structured PNG
+ * image content block; channel adapters own platform-specific delivery.
  *
  * Packaged as a standalone npm package; Dockerfile.agentbox builds it via
  * mcp/MCP_LIST.txt and symlinks dist/index.js to /usr/local/bin/mcp-create-chart.
@@ -15,9 +14,6 @@
  *       "command": "mcp-create-chart"
  *     }
  *   }
- *
- * CREATE_CHART_ARTIFACT_DIR (optional) controls where the JSON spec is
- * persisted as a best-effort debugging artifact.
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -28,7 +24,13 @@ import {
 import {
   RENDER_CHART_DESCRIPTION,
   RENDER_CHART_INPUT_SCHEMA,
+  RENDER_MERMAID_DESCRIPTION,
+  RENDER_MERMAID_INPUT_SCHEMA,
+  RENDER_VISUAL_CARD_DESCRIPTION,
+  RENDER_VISUAL_CARD_INPUT_SCHEMA,
   handleRenderChart,
+  handleRenderMermaid,
+  handleRenderVisualCard,
 } from "./handler.js";
 
 async function main(): Promise<void> {
@@ -44,13 +46,29 @@ async function main(): Promise<void> {
         description: RENDER_CHART_DESCRIPTION,
         inputSchema: RENDER_CHART_INPUT_SCHEMA,
       },
+      {
+        name: "render_mermaid",
+        description: RENDER_MERMAID_DESCRIPTION,
+        inputSchema: RENDER_MERMAID_INPUT_SCHEMA,
+      },
+      {
+        name: "render_visual_card",
+        description: RENDER_VISUAL_CARD_DESCRIPTION,
+        inputSchema: RENDER_VISUAL_CARD_INPUT_SCHEMA,
+      },
     ],
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     try {
       if (req.params.name === "render_chart") {
-        return await handleRenderChart(req.params.arguments ?? {});
+        return await handleRenderChart(req.params.arguments ?? {}) as any;
+      }
+      if (req.params.name === "render_mermaid") {
+        return await handleRenderMermaid(req.params.arguments ?? {}) as any;
+      }
+      if (req.params.name === "render_visual_card") {
+        return await handleRenderVisualCard(req.params.arguments ?? {}) as any;
       }
       throw new Error(`Unknown tool: ${req.params.name}`);
     } catch (err) {
