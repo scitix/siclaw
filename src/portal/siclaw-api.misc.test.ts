@@ -14,7 +14,7 @@ vi.mock("../gateway/db.js", () => ({
 import { getDb } from "../gateway/db.js";
 import { createRestRouter } from "../gateway/rest-router.js";
 import { signToken } from "./auth.js";
-import { registerSiclawRoutes } from "./siclaw-api.js";
+import { registerSiclawRoutes, sqlDayKey } from "./siclaw-api.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 const JWT_SECRET = "test-siclaw-misc";
@@ -335,10 +335,12 @@ describe("siclaw-api misc routes", () => {
     });
 
     it("returns summary for admin with default window", async () => {
+      // Default for distinctUsers / toolCalls / skillsUsed / inventory / series;
+      // the two Once values are the asserted scalar totals (byUser is gone).
+      query.mockResolvedValue([[{ c: 0 }], []]);
       query
         .mockResolvedValueOnce([[{ c: 1 }], []])
-        .mockResolvedValueOnce([[{ c: 5 }], []])
-        .mockResolvedValueOnce([[], []]);
+        .mockResolvedValueOnce([[{ c: 5 }], []]);
       const { status, body } = await runRoute(router, fakeReq({
         url: "/api/v1/siclaw/metrics/summary",
         method: "GET",
@@ -347,6 +349,104 @@ describe("siclaw-api misc routes", () => {
       expect(status).toBe(200);
       expect(body.totalSessions).toBe(1);
       expect(query.mock.calls[1][0]).toContain('metadata NOT LIKE \'%"kind":"delegation_event"%\'');
+      // Desensitized: no raw per-user data on the wire.
+      expect(body).not.toHaveProperty("byUser");
+      // External-showcase fields present.
+      expect(body).toHaveProperty("distinctUsers");
+      expect(body).toHaveProperty("toolCalls");
+      expect(body).toHaveProperty("skillsUsed");
+      expect(body.inventory).toMatchObject({ clusters: 0, hosts: 0, skills: 0, knowledgeRepos: 0, agents: 0, mcpServers: 0 });
+      // Daily trend series: default 7d window → 8 gap-filled points, each shaped.
+      expect(Array.isArray(body.dailySeries)).toBe(true);
+      expect(body.dailySeries).toHaveLength(8);
+      expect(body.dailySeries[0]).toMatchObject({ prompts: 0, toolCalls: 0 });
+      expect(typeof body.dailySeries[0].date).toBe("string");
+    });
+
+    it("counts distinct skills from tool_input (parse, regex fallback, dedup, skip missing)", async () => {
+      query.mockResolvedValue([[{ c: 0 }], []]); // inventory fall-through
+      query
+        .mockResolvedValueOnce([[{ c: 2 }], []])   // totalSessions
+        .mockResolvedValueOnce([[{ c: 9 }], []])   // totalPrompts
+        .mockResolvedValueOnce([[{ c: 3 }], []])   // distinctUsers
+        .mockResolvedValueOnce([[{ c: 42 }], []])  // toolCalls
+        .mockResolvedValueOnce([[                   // skillsUsed rows
+          { toolInput: JSON.stringify({ skill: "volcano-queue-diagnose", script: "x.sh" }) },
+          { toolInput: JSON.stringify({ skill: "volcano-queue-diagnose", script: "y.sh" }) }, // dup
+          { toolInput: JSON.stringify({ skill: "roce-perftest", script: "z.sh" }) },
+          { toolInput: JSON.stringify({ script: "user-script.sh" }) },                        // no skill → skip
+          { toolInput: 'broken json "skill":"regex-only" trailing' },                          // parse fail → regex
+          { toolInput: null },                                                                 // null → skip
+        ], []]);
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/summary",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(200);
+      expect(body.distinctUsers).toBe(3);
+      expect(body.toolCalls).toBe(42);
+      expect(body.skillsUsed).toBe(3); // volcano + roce + regex-only, deduped, missing/null skipped
+      expect(body.skillsUsedApprox).toBe(false);
+      // Lock decision #3: inventory.skills excludes per-agent overlay shadows.
+      expect(query.mock.calls.some((c: unknown[]) => typeof c[0] === "string" && c[0].includes("overlay_of IS NULL"))).toBe(true);
+    });
+
+    it("daily series gap-fills the window and sums to the period totals", async () => {
+      // Inject two days of buckets within the default 7-day window, computed
+      // relative to now so the test is date-agnostic. Use the SAME local-day
+      // derivation as the handler's sqlDayKey (NOT toISOString) so keys match.
+      const dayKey = (back: number) => {
+        const d = new Date();
+        d.setDate(d.getDate() - back);
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      };
+      const kA = dayKey(2);
+      const kB = dayKey(5);
+      query.mockResolvedValue([[{ c: 0 }], []]);
+      query
+        .mockResolvedValueOnce([[{ c: 4 }], []])   // totalSessions
+        .mockResolvedValueOnce([[{ c: 14 }], []])  // totalPrompts
+        .mockResolvedValueOnce([[{ c: 1 }], []])   // distinctUsers
+        .mockResolvedValueOnce([[{ c: 20 }], []])  // toolCalls
+        .mockResolvedValueOnce([[], []])           // skillsUsed rows
+        .mockResolvedValueOnce([[{ c: 3 }], []])   // inv clusters
+        .mockResolvedValueOnce([[{ c: 4 }], []])   // inv hosts
+        .mockResolvedValueOnce([[{ c: 1 }], []])   // inv skills
+        .mockResolvedValueOnce([[{ c: 0 }], []])   // inv knowledge
+        .mockResolvedValueOnce([[{ c: 1 }], []])   // inv agents
+        .mockResolvedValueOnce([[{ c: 1 }], []])   // inv mcp
+        .mockResolvedValueOnce([[{ day: kA, c: 6 }, { day: kB, c: 8 }], []])   // dailyPrompts
+        .mockResolvedValueOnce([[{ day: kA, c: 9 }, { day: kB, c: 11 }], []]); // dailyTools
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/summary",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(200);
+      expect(body.inventory).toMatchObject({ agents: 1, mcpServers: 1 });
+      expect(body.dailySeries.reduce((s: number, d: { prompts: number }) => s + d.prompts, 0)).toBe(14);
+      expect(body.dailySeries.reduce((s: number, d: { toolCalls: number }) => s + d.toolCalls, 0)).toBe(20);
+    });
+
+    it("flags skillsUsedApprox when the skill-row cap is exceeded", async () => {
+      const ROW_LIMIT = 50_000; // mirrors SKILL_ROW_LIMIT in the handler
+      query.mockResolvedValue([[{ c: 0 }], []]);
+      query
+        .mockResolvedValueOnce([[{ c: 1 }], []])   // totalSessions
+        .mockResolvedValueOnce([[{ c: 1 }], []])   // totalPrompts
+        .mockResolvedValueOnce([[{ c: 1 }], []])   // distinctUsers
+        .mockResolvedValueOnce([[{ c: 1 }], []])   // toolCalls
+        // skillsUsed: one row over the cap (handler LIMITs at ROW_LIMIT+1), all same skill
+        .mockResolvedValueOnce([Array.from({ length: ROW_LIMIT + 1 }, () => ({ toolInput: '{"skill":"s"}' })), []]);
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/summary",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(200);
+      expect(body.skillsUsedApprox).toBe(true);
+      expect(body.skillsUsed).toBe(1); // capped slice still de-dupes
     });
   });
 
@@ -448,5 +548,26 @@ describe("siclaw-api misc routes", () => {
       }));
       expect([401, 403]).toContain(status);
     });
+  });
+});
+
+describe("sqlDayKey", () => {
+  it("reads LOCAL day components from a Date (mysql2 default), not UTC", () => {
+    // A Date built from local components keys to that same local day on any
+    // machine TZ — the old toISOString() path shifted this under a non-UTC DB
+    // (prod is UTC+8), which dropped edge rows and broke chart Total == KPI.
+    expect(sqlDayKey(new Date(2026, 5, 15, 0, 30))).toBe("2026-06-15"); // month is 0-based → June
+    expect(sqlDayKey(new Date(2026, 0, 5))).toBe("2026-01-05");          // zero-pads
+  });
+  it("takes the date part verbatim from a string (SQLite / mysql2 dateStrings)", () => {
+    expect(sqlDayKey("2026-06-15")).toBe("2026-06-15");
+    expect(sqlDayKey("2026-06-15 23:59:59")).toBe("2026-06-15");
+  });
+  it("returns null for unparseable / too-short / non-date input", () => {
+    expect(sqlDayKey(new Date("nope"))).toBeNull();
+    expect(sqlDayKey("2026")).toBeNull();
+    expect(sqlDayKey(null)).toBeNull();
+    expect(sqlDayKey(undefined)).toBeNull();
+    expect(sqlDayKey(12345)).toBeNull();
   });
 });

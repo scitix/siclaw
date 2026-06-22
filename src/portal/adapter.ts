@@ -1393,18 +1393,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const [pRows] = await db.query(totalPromptsSql, pParams) as any;
     const totalPrompts = Number(pRows[0]?.c ?? 0);
 
-    let byUser: Array<{ userId: string; sessions: number; messages: number }> = [];
-    if (!userFilter) {
-      const [uRows] = await db.query(
-        `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
-         FROM chat_sessions s WHERE s.created_at >= ?
-           AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
-         GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
-        [cutoff],
-      ) as any;
-      byUser = uRows.map((r: any) => ({ userId: r.userId, sessions: Number(r.sessions), messages: Number(r.messages ?? 0) }));
-    }
-    sendJson(res, 200, { totalSessions, totalPrompts, byUser });
+    sendJson(res, 200, { totalSessions, totalPrompts });
   });
 
   // GET /api/internal/siclaw/metrics/audit
@@ -2478,18 +2467,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const [pRows] = await db.query(totalPromptsSql, pParams) as any;
     const totalPrompts = Number(pRows[0]?.c ?? 0);
 
-    let byUser: Array<{ userId: string; sessions: number; messages: number }> = [];
-    if (!userFilter) {
-      const [uRows] = await db.query(
-        `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
-         FROM chat_sessions s WHERE s.created_at >= ?
-           AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
-         GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
-        [cutoff],
-      ) as any;
-      byUser = uRows.map((r: any) => ({ userId: r.userId, sessions: Number(r.sessions), messages: Number(r.messages ?? 0) }));
-    }
-    return { totalSessions, totalPrompts, byUser };
+    return { totalSessions, totalPrompts };
   });
 
   handlers.set("metrics.audit", async (params) => {

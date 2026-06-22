@@ -1445,21 +1445,21 @@ describe("agent.listForHost", () => {
 // ================================================================
 
 describe("metrics.summary", () => {
-  it("returns summary with default 7d period", async () => {
+  it("returns summary with default 7d period (no per-user breakdown)", async () => {
     const query = mockQuery(
       [{ c: 10 }],   // total sessions
       [{ c: 50 }],   // total prompts
-      [{ userId: "u1", sessions: 5, messages: 30 }],  // by user
     );
 
     const result = await getHandler("metrics.summary")({}, "a1");
     expect(result.totalSessions).toBe(10);
     expect(result.totalPrompts).toBe(50);
-    expect(result.byUser).toEqual([{ userId: "u1", sessions: 5, messages: 30 }]);
+    // byUser was dropped — this mirror must not ship raw per-user data.
+    expect(result).not.toHaveProperty("byUser");
     expect(query.mock.calls[1][0]).toContain('metadata NOT LIKE \'%"kind":"delegation_event"%\'');
   });
 
-  it("skips byUser query when userId filter is set", async () => {
+  it("runs only the two scalar queries (no byUser) with a userId filter", async () => {
     const query = mockQuery(
       [{ c: 3 }],
       [{ c: 15 }],
@@ -1468,8 +1468,8 @@ describe("metrics.summary", () => {
     const result = await getHandler("metrics.summary")({ period: "today", userId: "u1" }, "a1");
     expect(result.totalSessions).toBe(3);
     expect(result.totalPrompts).toBe(15);
-    expect(result.byUser).toEqual([]);
-    expect(query).toHaveBeenCalledTimes(2);  // no third call for byUser
+    expect(result).not.toHaveProperty("byUser");
+    expect(query).toHaveBeenCalledTimes(2);
   });
 
   it("throws for invalid period", async () => {
