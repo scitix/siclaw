@@ -14,6 +14,7 @@ import type { SessionMode } from "../core/types.js";
 import type { AgentMode } from "../core/tool-registry.js";
 import { isMemoryEnabled, loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
 import { CredentialBroker } from "./credential-broker.js";
@@ -770,6 +771,13 @@ export function createHttpServer(
     const promptStartTime = Date.now();
     let promptOutcome: "completed" | "error" = "completed";
 
+    // Open the trace ROOT for this user prompt (no-op when tracing disabled).
+    // Explicit prompt boundary — NOT agent_start — so auto-retry / model-routing
+    // (which emit multiple agent_start/end pairs) stay inside one ROOT. Placed
+    // after model setup so a setModel switch is not captured as prompt activity;
+    // closed in actuallyFinish, which every terminal path funnels through.
+    tracingRecorder.startPrompt(managed.id);
+
     const actuallyFinish = () => {
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
@@ -803,6 +811,10 @@ export function createHttpServer(
       // per spec — re-calling on an already-resolved promise is a no-op.
       managed._promptInflight = null;
       releasePromptInflight();
+
+      // Close the trace ROOT, attaching authoritative token/cost deltas
+      // (getSessionStats post − pre). No-op when tracing disabled.
+      tracingRecorder.endPrompt(managed.id, promptOutcome);
 
       // Schedule delayed release — gives frontend time to query context/model
       // after SSE closes. If a new prompt arrives before the TTL, the timer is
@@ -838,6 +850,10 @@ export function createHttpServer(
         event && typeof event === "object" && !Array.isArray(event)
           ? event as Record<string, unknown>
           : { type: "model_route_event", value: event };
+      // Feed the trace recorder before the SSE fan-out, and unconditionally —
+      // this is the routing path's brain-event + model_route_* source, and it
+      // must reach the recorder even when no SSE client is connected yet.
+      tracingRecorder.handleEvent(managed.id, payload);
       if (managed._extraEventSubs.size === 0) {
         managed._extraEventBuffer.push(payload);
         return;

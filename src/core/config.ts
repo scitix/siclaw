@@ -49,6 +49,36 @@ export interface EmbeddingConfig {
   dimensions: number;
 }
 
+export interface TracingExporterConfig {
+  /**
+   * Full OTLP traces endpoint URL (including path).
+   *   Phoenix:  http://phoenix:6006/v1/traces
+   *   Langfuse: http://langfuse:3000/api/public/otel/v1/traces
+   */
+  url: string;
+  /**
+   * Static auth headers (the secret rides along in settings.json, delivered by
+   * the Gateway within the same trust domain — handled like the existing
+   * providers.apiKey).
+   *   Phoenix:  { authorization: "Bearer <key>", "x-project-name": "siclaw" }
+   *   Langfuse: { Authorization: "Basic <base64(pk:sk)>" }
+   */
+  headers?: Record<string, string>;
+}
+
+export interface TracingConfig {
+  /** Master switch. Defaults to false — tracing is fully no-op unless explicitly enabled. */
+  enabled?: boolean;
+  /** OpenTelemetry service.name resource attribute. Defaults to "siclaw-agentbox". */
+  serviceName?: string;
+  /** PII gate. When false (default), content attributes are never written to spans. */
+  sendContent?: boolean;
+  /** Trust-premise declaration. Defaults to true — exported content is treated like internal logs. */
+  requiresTrustedBackend?: boolean;
+  /** OTLP fan-out targets — one BatchSpanProcessor per entry. */
+  exporters?: TracingExporterConfig[];
+}
+
 export interface SiclawConfig {
   providers: Record<string, ProviderConfig>;
   default?: { provider: string; modelId: string };
@@ -66,6 +96,7 @@ export interface SiclawConfig {
   allowedTools: string[] | null;
   mcpServers: Record<string, unknown>;
   metrics?: { port?: number; token?: string; includeUserId?: boolean };
+  tracing?: TracingConfig;
   debug: boolean;
   userId: string;
 }

@@ -44,6 +44,8 @@ import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
+import { isTracingEnabled } from "../shared/tracing/otel-provider.js";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
 import { detectLanguage } from "../shared/detect-language.js";
 import type {
@@ -152,6 +154,8 @@ export interface ManagedSession {
    */
   _pendingNotifications: TaskNotification[];
   _coalesceTimer: ReturnType<typeof setTimeout> | null;
+  /** Unsubscribe for the gated tracing brain.subscribe; called + nulled on detach. */
+  _tracingUnsub: (() => void) | null;
 }
 
 export interface PersistedDpStateSnapshot {
@@ -1715,10 +1719,30 @@ export class AgentBoxSessionManager {
       _extraEventBuffer: extraEventBuffer,
       _pendingNotifications: [],
       _coalesceTimer: null,
+      _tracingUnsub: null,
     };
 
     this.sessions.set(id, managed);
     emitDiagnostic({ type: "session_created", sessionId: id });
+
+    // OpenTelemetry trace recorder. Gated on isTracingEnabled() so that when
+    // tracing is disabled there is ZERO per-event overhead — no attach, no
+    // brain subscription, no closure on the hot path. initTracing() runs in
+    // main() before any session is built, so the flag is settled here.
+    // When disabled, _tracingUnsub stays null and teardownTracing tolerates it.
+    //
+    // The subscription is GATED to mirror the SSE consumer: brain events flow to
+    // the recorder only when routing is NOT rewriting them through the extra-event
+    // channel (same _routeBrainEventsThroughExtra gate as http-server.ts). During
+    // routing, brain events + model_route_* events reach the recorder via
+    // emitSessionExtraEvent → handleEvent instead.
+    if (isTracingEnabled()) {
+      tracingRecorder.attach(id, result.brain, { userId: this.userId, agentId: this.agentId });
+      managed._tracingUnsub = result.brain.subscribe((event: any) => {
+        if (managed._routeBrainEventsThroughExtra) return;
+        tracingRecorder.handleEvent(id, event);
+      });
+    }
 
     // Tool execution timing (for tool_call diagnostic events).
     // NOTE: tool_execution_start/end events depend on pi-agent's event stream —
@@ -1932,6 +1956,17 @@ export class AgentBoxSessionManager {
    *
    * The session can be transparently restored from JSONL on the next getOrCreate().
    */
+  /**
+   * Tear down the tracing recorder for a session: unsubscribe the gated brain
+   * listener and force-end any in-flight span tree. Idempotent — safe to call
+   * from release / close / closeAll (a session passes through at most one).
+   */
+  private teardownTracing(sessionId: string, managed: ManagedSession): void {
+    try { managed._tracingUnsub?.(); } catch { /* best-effort */ }
+    managed._tracingUnsub = null;
+    tracingRecorder.detach(sessionId);
+  }
+
   async release(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId);
     if (!managed) return;
@@ -1983,6 +2018,7 @@ export class AgentBoxSessionManager {
     if (this.sessions.get(sessionId) === managed) {
       if (managed._coalesceTimer) { clearTimeout(managed._coalesceTimer); managed._coalesceTimer = null; }
       this.sessions.delete(sessionId);
+      this.teardownTracing(sessionId, managed);
       emitDiagnostic({ type: "session_released", sessionId });
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
       // Notify http-server to check idle status
@@ -2068,6 +2104,7 @@ export class AgentBoxSessionManager {
         this.ledgerHideTimers.delete(sessionId);
       }
       deleteLedger(sessionId);
+      this.teardownTracing(sessionId, managed);
       emitDiagnostic({ type: "session_released", sessionId });
     }
   }
@@ -2096,6 +2133,7 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] MCP shutdown failed for ${id} during closeAll:`, err);
         }
       }
+      this.teardownTracing(id, managed);
       emitDiagnostic({ type: "session_released", sessionId: id });
     }
 

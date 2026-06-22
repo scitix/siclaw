@@ -14,6 +14,7 @@ import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
 import { syncAllResources } from "./agentbox/resource-sync.js";
 import { debugPodCache } from "./tools/infra/debug-pod.js";
+import { initTracing, shutdownTracing } from "./shared/tracing/otel-provider.js";
 
 // Side-effect: register metrics subscriber. Also imported in http-server.ts,
 // but ESM guarantees single module evaluation — the subscriber registers only once.
@@ -54,6 +55,12 @@ async function main() {
       console.error(`[agentbox] Resource sync failed:`, err);
     }
   }
+
+  // Initialise OpenTelemetry agent-behaviour tracing. Placed in main() proper —
+  // independent of the Gateway branch above and the HTTPS metrics branch below —
+  // so it covers both LocalSpawner and K8sSpawner deployments. loadConfig() reads
+  // the (possibly Gateway-reloaded) settings; disabled config is a clean no-op.
+  initTracing(loadConfig());
 
   // Orphaned debug pods self-clean via their Job's ttlSecondsAfterFinished — no GC needed.
 
@@ -127,6 +134,9 @@ async function main() {
     await debugPodCache.evictAll();
     await sessionManager.closeAll();
     server.close();
+    // Flush + shut down tracing last (forceFlush is capped at 3s internally so a
+    // dead in-network backend cannot stall SIGTERM past the K8s grace period).
+    await shutdownTracing();
     process.exit(0);
   };
 
