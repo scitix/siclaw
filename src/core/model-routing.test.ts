@@ -11,6 +11,7 @@ import {
   normalizeCandidates,
   normalizeModelRoutePolicy,
   normalizeModelRouteState,
+  resolveEffectivePolicy,
   runPromptWithModelRouting,
   shouldFallbackForKind,
   type ModelRouteEvent,
@@ -387,6 +388,40 @@ describe("model-routing policy", () => {
     expect(state.activeCandidateKey).toBeUndefined();
     expect(state.activeCandidateSource).toBeUndefined();
     expect(state.lastSwitchReason).toBe("request_model_override");
+  });
+});
+
+describe("resolveEffectivePolicy (single routing entry)", () => {
+  const multi: ModelRoutePolicy = {
+    enabled: true,
+    strategy: "ordered_fallback",
+    candidates: [
+      { provider: "openai", modelId: "gpt-4" },
+      { provider: "anthropic", modelId: "claude" },
+    ],
+  };
+  const currentModel = { provider: "openai", id: "gpt-4" };
+
+  it("returns the configured policy unchanged when real multi-candidate routing applies", () => {
+    expect(resolveEffectivePolicy(multi, createModelRouteState(), currentModel)).toBe(multi);
+  });
+
+  it("builds a single-candidate policy from the current model when routing is off", () => {
+    expect(resolveEffectivePolicy(undefined, createModelRouteState(), currentModel)).toEqual({
+      enabled: true,
+      strategy: "ordered_fallback",
+      candidates: [{ provider: "openai", modelId: "gpt-4" }],
+    });
+  });
+
+  it("uses the pinned model as the lone candidate, ignoring configured fallbacks, when the user pinned a model", () => {
+    const state = { ...createModelRouteState(), activeCandidateSource: "user" as const };
+    const eff = resolveEffectivePolicy(multi, state, { provider: "anthropic", id: "claude" });
+    expect(eff?.candidates).toEqual([{ provider: "anthropic", modelId: "claude" }]);
+  });
+
+  it("returns undefined when there is no current model (runner falls back to a bare prompt)", () => {
+    expect(resolveEffectivePolicy(undefined, createModelRouteState(), undefined)).toBeUndefined();
   });
 });
 

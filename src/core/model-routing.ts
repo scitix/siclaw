@@ -288,6 +288,40 @@ export function shouldUseModelRouteRunner(policy: unknown, state: ModelRouteStat
   return normalizeCandidates(policy.candidates).length > 1 && state.activeCandidateSource !== "user";
 }
 
+/**
+ * Resolve the policy actually handed to {@link runPromptWithModelRouting} so that
+ * EVERY prompt flows through one entry (no separate `brain.prompt()` path).
+ *
+ * - Real multi-candidate routing (`shouldUseModelRouteRunner`) → the configured
+ *   policy, unchanged.
+ * - Otherwise (routing off, single candidate, or a user-pinned model) → a
+ *   single-candidate policy built from the CURRENT model. The runner then streams
+ *   that one candidate live (optimistic primary), never falls back, and still
+ *   emits `model_route_start` + `model_route_success(isFallback:false)` — so every
+ *   turn carries its model identity on one event channel for downstream
+ *   collection, while the UX is identical to a bare prompt.
+ *
+ * The single candidate intentionally omits `modelConfig`: the model is already
+ * pinned by the caller's setup, so `runAttempt`'s `modelNeedsUpdate` guard skips
+ * a redundant `setModel` (which would otherwise drop applied runtime params).
+ *
+ * Returns `undefined` only when there is no current model — the runner's own
+ * guard then falls back to a bare `brain.prompt`.
+ */
+export function resolveEffectivePolicy(
+  configured: ModelRoutePolicy | undefined,
+  state: ModelRouteState,
+  currentModel: { provider: string; id: string } | undefined,
+): ModelRoutePolicy | undefined {
+  if (shouldUseModelRouteRunner(configured, state)) return configured;
+  if (!currentModel) return undefined;
+  return {
+    enabled: true,
+    strategy: "ordered_fallback",
+    candidates: [{ provider: currentModel.provider, modelId: currentModel.id }],
+  };
+}
+
 export function normalizeModelRoutePolicy(policy: unknown): ModelRoutePolicy | undefined {
   if (!isRecord(policy)) return undefined;
   if (policy.enabled !== true && policy.enabled !== false) return undefined;
@@ -548,7 +582,16 @@ export async function runPromptWithModelRouting(
     return { success: true, exhausted: false, attempted: [] };
   }
 
-  const candidates = filterCandidatesForPromptMedia(normalizeCandidates(policy.candidates), media);
+  // Media-capability filtering narrows a genuine CHOICE: with ≥2 candidates, drop
+  // those that can't take the prompt's media so a fallback never lands on one. A
+  // single candidate has nothing to choose between — run it and let the provider
+  // (and the caller's media preflight) decide, matching the pre-unification
+  // bare-prompt path. A candidate synthesized from the current model carries no
+  // modelConfig, so it would otherwise be filtered out for lack of declared inputs.
+  const allCandidates = normalizeCandidates(policy.candidates);
+  const candidates = allCandidates.length > 1
+    ? filterCandidatesForPromptMedia(allCandidates, media)
+    : allCandidates;
   if (requiredInputsForPromptMedia(media).length > 0 && candidates.length === 0) {
     return {
       success: false,

@@ -30,6 +30,7 @@ import {
   normalizeModelRoutePolicy,
   requiredInputsForPromptMedia,
   runPromptWithModelRouting,
+  resolveEffectivePolicy,
   shouldUseModelRouteRunner,
   unsupportedPromptMediaMessage,
   type ModelRouteCandidate,
@@ -580,15 +581,12 @@ export function createHttpServer(
         sessionManager.persistModelRouteState(managed.id, managed.modelRouteState);
       }
     }
-    // Only engage the buffered routing runner when a real fallback target
-    // exists (≥2 distinct candidates). With a single candidate there is nothing
-    // to fall back to, so buffering every brain event until the attempt
-    // completes would kill live streaming for zero resilience gain — run the
-    // prompt live instead. (Upstream always co-sends modelProvider/modelId with
-    // modelRouting, and candidates[0] is that same primary, so the model-setup
-    // block below still pins the right model on the live path.)
+    // Every prompt flows through the single routing-runner entry below (see
+    // resolveEffectivePolicy): real multi-candidate routing when a fallback
+    // target exists, otherwise a single-candidate run built from the current
+    // model. Both stream the primary live and emit model_route_* on the extra
+    // event channel, so brain events route through it for every turn.
     managed.modelRoutePolicy = configuredModelRouting;
-    const routeEnabled = shouldUseModelRouteRunner(configuredModelRouting, managed.modelRouteState);
     // Mark the session busy before model setup so a refresh, second tab, or
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
@@ -600,7 +598,10 @@ export function createHttpServer(
       managed._aborted = true;
       console.log(`[agentbox-http] Consumed pre-spawn pending abort for session ${managed.id}`);
     }
-    managed._routeBrainEventsThroughExtra = routeEnabled;
+    // Default to the extra channel; refined to false only for the no-current-model
+    // edge before the run kicks off (see effectivePolicy below). No brain prompt
+    // events fire during model setup, so this default is never observed wrongly.
+    managed._routeBrainEventsThroughExtra = true;
     // Acquire the brain.prompt mutex synchronously before any await so the
     // synth notify path (which polls _promptDone via waitForParentIdle)
     // cannot race in and call brain.prompt() concurrently — see jacoblee
@@ -700,7 +701,7 @@ export function createHttpServer(
       }
 
       if (requiredInputsForPromptMedia(promptMedia).length > 0) {
-        if (routeEnabled) {
+        if (shouldUseModelRouteRunner(configuredModelRouting, managed.modelRouteState)) {
           const candidates = normalizeCandidates(configuredModelRouting?.candidates);
           if (filterCandidatesForPromptMedia(candidates, promptMedia).length === 0) {
             throw new Error(unsupportedPromptMediaMessage(promptMedia));
@@ -865,25 +866,35 @@ export function createHttpServer(
       return;
     }
 
-    const promptPromise = routeEnabled
-      ? runPromptWithModelRouting(
-          managed.brain,
-          promptText,
-          configuredModelRouting,
-          managed.modelRouteState,
-          {
-            emitEvent: emitRouteEvent,
-            // Routing buffers brain events and replays them here after the
-            // winning attempt, bypassing the live SSE subscription that would
-            // otherwise enrich agent_end — re-apply the same enrichment so
-            // routed sessions still get token/cost stats.
-            emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
-            onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
-            shouldAbort: () => managed._aborted,
-          },
-          promptMedia,
-        )
-      : managed.brain.prompt(promptText, promptMedia);
+    // Single entry: every prompt goes through the routing runner. With no real
+    // fallback target it runs one candidate (the current model) live — identical
+    // UX to a bare prompt, but still emitting model_route_* so every turn carries
+    // its model identity on one channel. effectivePolicy is read AFTER model setup
+    // so the single candidate reflects the model just pinned for this turn.
+    const effectivePolicy = resolveEffectivePolicy(
+      configuredModelRouting,
+      managed.modelRouteState,
+      managed.brain.getModel?.(),
+    );
+    // Only the no-current-model edge falls back to a bare brain.prompt (runner
+    // guard) whose events flow through the live _eventBuffer subscription.
+    managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
+    const promptPromise = runPromptWithModelRouting(
+      managed.brain,
+      promptText,
+      effectivePolicy,
+      managed.modelRouteState,
+      {
+        emitEvent: emitRouteEvent,
+        // The runner streams/replays brain events through this callback instead
+        // of the live SSE subscription that enriches agent_end — re-apply the
+        // same enrichment so token/cost stats survive on every turn.
+        emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
+        onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
+        shouldAbort: () => managed._aborted,
+      },
+      promptMedia,
+    );
 
     promptPromise.then((result) => {
       // The routing runner reports exhaustion (and user aborts) as a result,
