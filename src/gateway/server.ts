@@ -51,7 +51,6 @@ import {
 } from "./internal-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
-import { getDb } from "./db.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
@@ -143,17 +142,19 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   // Resolve the per-agent spawn env. Currently only the idle self-destruct
   // window (agents.idle_timeout_sec → SICLAW_AGENTBOX_IDLE_TIMEOUT), which the
-  // AgentBox reads at startup (config.server.idleTimeoutSec). Best-effort: any
-  // DB hiccup falls back to the AgentBox's own default rather than failing the
-  // spawn. The env only takes effect on a cold spawn — K8sSpawner ignores it
-  // when a pod is already running, so a changed timeout applies on next restart.
+  // AgentBox reads at startup (config.server.idleTimeoutSec). The Runtime is
+  // DB-free, so the value comes from Portal via the `config.getAgent` RPC (the
+  // same channel other agent config flows through) — NOT a direct DB read.
+  // Best-effort: any RPC failure falls back to the AgentBox's own default
+  // rather than failing the spawn. The env only takes effect on a cold spawn —
+  // K8sSpawner ignores it when a pod is already running, so a changed timeout
+  // applies on the agent's next restart.
   const resolveAgentSpawnEnv = async (agentId: string): Promise<Record<string, string> | undefined> => {
     try {
-      const [rows] = await getDb().query(
-        "SELECT idle_timeout_sec FROM agents WHERE id = ?",
-        [agentId],
-      ) as any;
-      const sec = rows?.[0]?.idle_timeout_sec;
+      const agent = await frontendClient.request("config.getAgent", { agentId }) as
+        | { idle_timeout_sec?: number | null }
+        | null;
+      const sec = agent?.idle_timeout_sec;
       if (sec !== undefined && sec !== null) {
         return { SICLAW_AGENTBOX_IDLE_TIMEOUT: String(sec) };
       }
