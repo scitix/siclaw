@@ -10,6 +10,7 @@ interface Agent {
   model_provider: string; model_id: string; is_production: boolean
   system_prompt: string; icon: string; color: string; created_at: string
   model_routing?: unknown
+  idle_timeout_sec?: number
 }
 
 const statusColors: Record<string, string> = {

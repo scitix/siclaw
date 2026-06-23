@@ -39,6 +39,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     model_routing TEXT,
     system_prompt TEXT,
     is_production TINYINT(1) NOT NULL DEFAULT 1,
+    idle_timeout_sec INT NOT NULL DEFAULT 300,
     icon VARCHAR(50),
     color VARCHAR(50),
     created_by CHAR(36),
@@ -544,6 +545,7 @@ export async function runPortalMigrations(): Promise<void> {
   // which was added in a later migration than the CREATE TABLE).
   await safeAlterTable(db, "clusters", "debug_image", "VARCHAR(500) DEFAULT NULL");
   await safeAlterTable(db, "agents", "model_routing", "TEXT DEFAULT NULL");
+  await safeAlterTable(db, "agents", "idle_timeout_sec", "INT NOT NULL DEFAULT 300");
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");

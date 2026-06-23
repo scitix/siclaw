@@ -380,12 +380,28 @@ async function abortBrainForHttp(
 
 export interface CreateHttpServerOptions {
   /**
-   * If true, skip the 5-minute idle self-destruct. Intended for LocalSpawner,
-   * which runs AgentBox in-process with the Portal — `process.exit(0)` from
+   * If true, skip the idle self-destruct entirely. Intended for LocalSpawner,
+   * which runs AgentBox in-process with the Portal — shutting down from
    * the idle timer would take the whole `siclaw local` process down with it.
    * K8s mode must keep the default so idle pods get recycled.
    */
   disableIdleShutdown?: boolean;
+
+  /**
+   * Idle self-destruct window in milliseconds. When omitted, resolved from
+   * `config.server.idleTimeoutSec` (env: SICLAW_AGENTBOX_IDLE_TIMEOUT),
+   * defaulting to 5 minutes. A value ≤ 0 makes the pod resident (never
+   * auto-destroy) — equivalent to `disableIdleShutdown`.
+   */
+  idleTimeoutMs?: number;
+
+  /**
+   * Invoked instead of `process.exit(0)` when the idle window elapses. Lets
+   * the caller route idle teardown through the same graceful shutdown as
+   * SIGTERM (flush metrics, evict debug pods, close sessions) rather than a
+   * raw exit that orphans those resources. Defaults to `process.exit(0)`.
+   */
+  onIdleShutdown?: () => void;
 }
 
 /**
@@ -426,8 +442,13 @@ export function createHttpServer(
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
   }
 
-  // ── Idle self-destruct: exit when no SSE connections and no sessions for 5 min ──
-  const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+  // ── Idle self-destruct: shut down when no SSE connections and no sessions ──
+  // Window is configurable (config.server.idleTimeoutSec / SICLAW_AGENTBOX_IDLE_TIMEOUT).
+  // A non-positive window (or disableIdleShutdown) makes the pod resident.
+  const resolvedIdleMs =
+    options.idleTimeoutMs ?? (loadConfig().server?.idleTimeoutSec ?? 300) * 1000;
+  const idleDisabled = options.disableIdleShutdown || resolvedIdleMs <= 0;
+  const triggerIdleShutdown = options.onIdleShutdown ?? (() => process.exit(0));
   let activeSseCount = 0;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -439,19 +460,25 @@ export function createHttpServer(
   }
 
   function checkIdle(): void {
-    if (options.disableIdleShutdown) return;
+    if (idleDisabled) return;
     if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
       if (idleTimer) return; // already scheduled
       idleTimer = setTimeout(() => {
-        // Re-check before exiting (new connection may have arrived)
-        if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
-          console.log("[agentbox] No connections for 5 min, shutting down");
-          process.exit(0);
-        }
         idleTimer = null;
-      }, IDLE_TIMEOUT_MS);
-      console.log(`[agentbox] Idle detected, will shut down in ${IDLE_TIMEOUT_MS / 1000}s if no activity`);
+        // Re-check before tearing down (new connection may have arrived)
+        if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
+          console.log(`[agentbox] No connections for ${resolvedIdleMs / 1000}s, shutting down`);
+          triggerIdleShutdown();
+        }
+      }, resolvedIdleMs);
+      // Don't let the idle timer alone keep the event loop alive.
+      idleTimer.unref?.();
+      console.log(`[agentbox] Idle detected, will shut down in ${resolvedIdleMs / 1000}s if no activity`);
     }
+  }
+
+  if (idleDisabled) {
+    console.log("[agentbox] Idle self-destruct disabled — pod is resident");
   }
 
   // Start initial idle check (pod may never receive any connections)

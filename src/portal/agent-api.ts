@@ -51,7 +51,7 @@ export function registerAgentRoutes(
 
     const listParams = [...params, pageSize, offset];
     const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id, a.model_routing,
-        a.is_production, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
+        a.is_production, a.idle_timeout_sec, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
         (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
@@ -87,8 +87,8 @@ export function registerAgentRoutes(
     }
 
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, system_prompt, is_production, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, system_prompt, is_production, idle_timeout_sec, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -99,6 +99,7 @@ export function registerAgentRoutes(
         modelRouting ?? null,
         body.system_prompt ?? null,
         body.is_production ?? 1,
+        body.idle_timeout_sec ?? 300,
         body.icon ?? null,
         body.color ?? null,
         auth.userId,
@@ -153,7 +154,7 @@ export function registerAgentRoutes(
     // Build dynamic SET clause
     const fields = [
       "name", "description", "status", "model_provider",
-      "model_id", "system_prompt", "is_production", "icon", "color",
+      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "icon", "color",
     ];
     const setClauses: string[] = [];
     const values: unknown[] = [];
