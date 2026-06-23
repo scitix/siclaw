@@ -34,6 +34,13 @@ export interface AgentBoxInfo {
   endpoint: string;
   createdAt: Date;
   lastActiveAt: Date;
+  /**
+   * Fingerprint of the CA that signed this pod's mTLS cert, read from the
+   * pod's `<prefix>/ca-fp` label (K8s only; undefined for spawners that don't
+   * stamp it). The manager refuses to reuse a pod whose fingerprint no longer
+   * matches the runtime's current CA — see AgentBoxManager.getOrCreateK8s.
+   */
+  caFingerprint?: string;
 }
 
 /** AgentBox handle, used for subsequent operations */

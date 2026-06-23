@@ -50,8 +50,9 @@ TUI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired
 - The `global/`, `skillset/`, and `user/` skill subdirectories in a pod are managed by resource sync — wiped and rebuilt on every sync. `core/` and `extension/` are baked into the image.
 - Core skills ARE baked into the Docker image (`COPY skills/core/ ./skills/core/` in Dockerfile.agentbox). They are NOT delivered via the skill bundle — see §2.1.
 - Pod self-destructs after 5 minutes of idle (no SSE connections, no sessions)
+- **CA-fingerprint self-heal**: each pod (and its `-cert` Secret) is stamped with a `<prefix>/ca-fp` label = a fingerprint of the CA that signed its mTLS cert. The runtime reuses a running pod ONLY if that label matches its current CA fingerprint; a mismatch (or a legacy pod with no label) means the CA rotated and the pod can no longer complete mTLS in either direction, so it is deleted and respawned with a fresh cert. This makes "runtime/agentbox cert mismatch after a CA change" self-healing instead of a stuck 403. The CA itself should still be kept stable (persisted Secret); the fingerprint check is the safety net for when it isn't.
 
-**Source**: `src/gateway/agentbox/k8s-spawner.ts`, `src/agentbox/http-server.ts` (IDLE_TIMEOUT_MS)
+**Source**: `src/gateway/agentbox/k8s-spawner.ts` (label stamp + stale recycle), `src/gateway/agentbox/manager.ts` (`isCertFresh` reuse gate), `src/gateway/security/cert-manager.ts` (`caFingerprint`), `src/agentbox/http-server.ts` (IDLE_TIMEOUT_MS)
 
 ### 1.4 TUI + Local Portal: Read-Only Snapshot Contract
 
