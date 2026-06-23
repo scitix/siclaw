@@ -284,6 +284,45 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
     sessionRegistry.forget(sessionId as string);
   });
 
+  it("passes the agent's custom system prompt (config.getAgent) into the prompt payload", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "agent-sp", bindingId: "b1" });
+    promptMock.mockResolvedValue({ sessionId: "s-sp" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const frontend = { request: vi.fn().mockResolvedValue({ system_prompt: "你是一个 SRE 专家。" }) };
+
+    await handleDingTalkMessage(makeDownstream("hi"), "ch", makeAgentBoxManager("agent-sp") as any, undefined, frontend as any);
+
+    expect(frontend.request).toHaveBeenCalledWith("config.getAgent", { agentId: "agent-sp" });
+    const promptArg = promptMock.mock.calls[0][0] as any;
+    expect(promptArg.systemPromptTemplate).toBe("你是一个 SRE 专家。");
+    sessionRegistry.forget(promptArg.sessionId);
+  });
+
+  it("omits the system prompt when the config.getAgent RPC fails (best-effort)", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "agent-sp", bindingId: "b1" });
+    promptMock.mockResolvedValue({ sessionId: "s-sp" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const frontend = { request: vi.fn().mockRejectedValue(new Error("portal down")) };
+
+    await handleDingTalkMessage(makeDownstream("hi"), "ch", makeAgentBoxManager("agent-sp") as any, undefined, frontend as any);
+
+    const promptArg = promptMock.mock.calls[0][0] as any;
+    expect(promptArg.systemPromptTemplate).toBeUndefined();
+    sessionRegistry.forget(promptArg.sessionId);
+  });
+
+  it("omits the system prompt when frontendClient has no request method", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "agent-sp", bindingId: "b1" });
+    promptMock.mockResolvedValue({ sessionId: "s-sp" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleDingTalkMessage(makeDownstream("hi"), "ch", makeAgentBoxManager("agent-sp") as any, undefined, {} as any);
+
+    const promptArg = promptMock.mock.calls[0][0] as any;
+    expect(promptArg.systemPromptTemplate).toBeUndefined();
+    sessionRegistry.forget(promptArg.sessionId);
+  });
+
   it("does not pass userId into the AgentBox prompt payload", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s" });

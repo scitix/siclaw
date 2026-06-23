@@ -1851,10 +1851,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("config.getModelBinding", async (params) => {
     const db = getDb();
     const [agentRows] = await db.query(
-      "SELECT model_provider, model_id, model_routing FROM agents WHERE id = ?",
+      "SELECT model_provider, model_id, model_routing, system_prompt FROM agents WHERE id = ?",
       [params.agentId],
     ) as any;
-    const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown } | undefined;
+    const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; system_prompt?: string | null } | undefined;
     if (!agent?.model_provider || !agent?.model_id) {
       return { binding: null };
     }
@@ -1897,6 +1897,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
           models,
         },
         ...(modelRouting ? { modelRouting } : {}),
+        systemPrompt: agent.system_prompt ?? null,
       },
     };
   });

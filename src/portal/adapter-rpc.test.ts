@@ -197,7 +197,7 @@ describe("config.getSettings", () => {
 describe("config.getModelBinding", () => {
   it("returns binding when agent has valid provider", async () => {
     mockQuery(
-      [{ model_provider: "openai", model_id: "gpt-4" }],
+      [{ model_provider: "openai", model_id: "gpt-4", system_prompt: "You are an ops bot." }],
       [{ id: "p1", name: "openai", base_url: "https://api.openai.com", api_key: "sk-key", api_type: "openai" }],
       [{ model_id: "gpt-4", name: "GPT-4", reasoning: 1, context_window: 128000, max_tokens: 4096 }],
     );
@@ -206,6 +206,7 @@ describe("config.getModelBinding", () => {
     expect(result.binding).toBeDefined();
     expect(result.binding.modelProvider).toBe("openai");
     expect(result.binding.modelId).toBe("gpt-4");
+    expect(result.binding.systemPrompt).toBe("You are an ops bot.");
     expect(result.binding.modelConfig.name).toBe("openai");
     expect(result.binding.modelConfig.authHeader).toBe(true);
     expect(result.binding.modelConfig.models[0].reasoning).toBe(true);

@@ -151,7 +151,7 @@ describe("chat-gateway routes", () => {
 
     it("opens SSE stream and sends chat.send command when model is configured", async () => {
       query
-        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4" }], []])
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4", system_prompt: "You are an ops bot." }], []])
         .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
         .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []]);
 
@@ -178,6 +178,7 @@ describe("chat-gateway routes", () => {
         userId: "u1",
         text: "hi",
         sessionId: "s1",
+        systemPrompt: "You are an ops bot.",
       }));
     });
 

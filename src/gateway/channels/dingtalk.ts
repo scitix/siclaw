@@ -36,6 +36,7 @@ import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
 import { resolveBinding, handlePairingCode } from "../channel-manager.js";
+import { resolveAgentSystemPrompt } from "../agent-model-binding.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { collectResponse } from "./lark.js";
@@ -294,7 +295,13 @@ export async function handleDingTalkMessage(
   const handle = await agentBoxManager.getOrCreate(agentId);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
-  const promptOpts: PromptOptions = { text, agentId, mode: "channel", sessionId };
+  // Apply the agent's custom system prompt (best-effort — undefined falls back
+  // to the built-in default template). Note: AgentBox only applies the template
+  // at session creation, so an existing 1:1 multi-turn session keeps the prompt
+  // it was created with until /new.
+  const systemPromptTemplate = await resolveAgentSystemPrompt(agentId, frontendClient);
+
+  const promptOpts: PromptOptions = { text, agentId, mode: "channel", sessionId, systemPromptTemplate };
   let resultText = "";
   let agentError: Error | null = null;
   try {

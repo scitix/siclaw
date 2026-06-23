@@ -29,6 +29,8 @@ export interface ResolvedModelBinding {
     }>;
   };
   modelRouting?: ModelRoutePolicy;
+  /** Agent's custom system prompt template (agents.system_prompt). Null/absent = built-in default. */
+  systemPrompt?: string | null;
 }
 
 export async function resolveAgentModelBinding(
@@ -41,5 +43,27 @@ export async function resolveAgentModelBinding(
   } catch (err) {
     console.error(`[agent-model-binding] RPC error:`, err);
     return null;
+  }
+}
+
+/**
+ * Resolve an agent's custom system prompt via Portal RPC (config.getAgent).
+ *
+ * Best-effort: callers (channel handlers) must never fail a user message just
+ * because the prompt lookup failed — on any error this returns undefined and
+ * the AgentBox session falls back to the built-in default template.
+ */
+export async function resolveAgentSystemPrompt(
+  agentId: string,
+  frontendClient?: FrontendWsClient,
+): Promise<string | undefined> {
+  if (typeof frontendClient?.request !== "function") return undefined;
+  try {
+    const agent = await frontendClient.request("config.getAgent", { agentId }) as { system_prompt?: string | null } | undefined;
+    const prompt = agent?.system_prompt?.trim();
+    return prompt || undefined;
+  } catch (err) {
+    console.error(`[agent-model-binding] config.getAgent RPC error:`, err);
+    return undefined;
   }
 }

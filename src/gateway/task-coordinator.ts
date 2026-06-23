@@ -283,6 +283,7 @@ export class TaskCoordinator {
         modelId: binding.modelId,
         modelConfig: binding.modelConfig,
         modelRouting: binding.modelRouting,
+        systemPromptTemplate: binding.systemPrompt ?? undefined,
       };
       await client.prompt(promptOpts);
 
