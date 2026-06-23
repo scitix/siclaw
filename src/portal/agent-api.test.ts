@@ -135,6 +135,36 @@ describe("registerAgentRoutes", () => {
     });
   });
 
+  // ── JSON-in-TEXT decoding on agent responses ─────────────
+  describe("agent response decodes JSON-in-TEXT columns", () => {
+    it("GET /:id decodes model_routing + tool_capabilities to object/array (not raw strings)", async () => {
+      query.mockResolvedValueOnce([[{
+        id: "a1", name: "A",
+        model_routing: '{"enabled":true,"strategy":"ordered_fallback"}',
+        tool_capabilities: '["read_files","inspect_infra"]',
+      }], []]);
+      const { status, body } = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "GET" }));
+      expect(status).toBe(200);
+      expect(body.model_routing).toEqual({ enabled: true, strategy: "ordered_fallback" });
+      expect(body.tool_capabilities).toEqual(["read_files", "inspect_infra"]);
+    });
+
+    it("decodes null columns to null (not the literal string)", async () => {
+      query.mockResolvedValueOnce([[{ id: "a1", name: "A", model_routing: null, tool_capabilities: null }], []]);
+      const { body } = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "GET" }));
+      expect(body.model_routing).toBeNull();
+      expect(body.tool_capabilities).toBeNull();
+    });
+
+    it("tolerates malformed JSON by falling back to null (no crash)", async () => {
+      query.mockResolvedValueOnce([[{ id: "a1", name: "A", model_routing: "{not json", tool_capabilities: "oops" }], []]);
+      const { status, body } = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "GET" }));
+      expect(status).toBe(200);
+      expect(body.model_routing).toBeNull();
+      expect(body.tool_capabilities).toBeNull();
+    });
+  });
+
   // ── POST /api/v1/agents ──────────────────────────────────
   describe("POST /api/v1/agents", () => {
     it("rejects non-admin", async () => {
@@ -343,6 +373,72 @@ describe("registerAgentRoutes", () => {
         cooldownMsByKind: { rate_limit: 0 },
         candidates: [{ provider: "openai", modelId: "gpt-4" }],
       });
+    });
+
+    it("stores tool_capabilities and pushes a tools reload on change", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { tool_capabilities: ["read_files", "run_commands", "read_files"] },
+      }));
+
+      expect(status).toBe(200);
+      expect(query.mock.calls[0][0]).toContain("tool_capabilities = ?");
+      // Deduped JSON array of group keys.
+      expect(JSON.parse(query.mock.calls[0][1][0])).toEqual(["read_files", "run_commands"]);
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("clears tool_capabilities (empty array → null) and still pushes a reload", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { tool_capabilities: [] },
+      }));
+
+      expect(status).toBe(200);
+      expect(query.mock.calls[0][0]).toContain("tool_capabilities = ?");
+      expect(query.mock.calls[0][1][0]).toBeNull();
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("does not push a tools reload when tool_capabilities is absent", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { name: "rename-only" },
+      }));
+
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("rejects a non-array tool_capabilities with 400", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { tool_capabilities: "read_files" },
+      }));
+
+      expect(status).toBe(400);
+      expect(body.error).toContain("tool_capabilities");
     });
   });
 

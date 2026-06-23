@@ -2,7 +2,7 @@
  * Tool Registry — declarative tool registration and resolution.
  *
  * Each tool file exports a `registration: ToolEntry` that declares its
- * metadata (category, modes, platform exemption, availability guard).
+ * metadata (category, modes, availability guard).
  * The registry collects all entries and resolves the final tool list
  * in one pass: mode filter → available check → instantiate → allowedTools filter.
  */
@@ -299,9 +299,6 @@ export interface ToolEntry {
    */
   modes?: SessionMode[];
 
-  /** Platform tool — exempt from allowedTools workspace filtering. */
-  platform?: boolean;
-
   /**
    * Runtime permission metadata.
    *
@@ -353,7 +350,7 @@ export class ToolRegistry {
    * Resolve the final tool list in one pass:
    * 1. Filter by mode + available guard (zero cost — create not called)
    * 2. Instantiate only the tools that passed filtering
-   * 3. Apply allowedTools whitelist (platform tools exempt)
+   * 3. Apply allowedTools whitelist (sole availability axis; no exemptions)
    */
   resolve(opts: {
     mode: SessionMode;
@@ -378,20 +375,15 @@ export class ToolRegistry {
       if (e.requiresUserApproval) {
         def.requiresUserApproval = true;
       }
-      return {
-        def,
-        platform: e.platform ?? false,
-      };
+      return def;
     });
 
-    // 3. allowedTools whitelist (platform tools exempt)
+    // 3. allowedTools whitelist (sole availability axis; no exemptions)
     if (Array.isArray(allowedTools)) {
       const allowed = new Set(allowedTools);
-      return tools
-        .filter((t) => t.platform || allowed.has(t.def.name))
-        .map((t) => t.def);
+      return tools.filter((d) => allowed.has(d.name));
     }
 
-    return tools.map((t) => t.def);
+    return tools;
   }
 }

@@ -63,5 +63,4 @@ Returns { name, reachable, server_version?, probe_error? }.`,
 export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createClusterProbeTool(refs.kubeconfigRef),
-  platform: true,
 };

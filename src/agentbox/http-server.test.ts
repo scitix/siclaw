@@ -65,6 +65,15 @@ vi.mock("./sync-handlers.js", () => ({
   getSyncHandler: () => undefined,
   createClusterHandler: () => ({ type: "cluster", fetch: async () => 0, materialize: async (n: number) => n }),
   createHostHandler: () => ({ type: "host", fetch: async () => 0, materialize: async (n: number) => n }),
+  createToolsHandler: (target: { allowedToolsState: string[] | null }) => ({
+    type: "tools",
+    fetch: async () => ({ allowedTools: null }),
+    materialize: async (p: { allowedTools: string[] | null }) => {
+      target.allowedToolsState = Array.isArray(p?.allowedTools) ? p.allowedTools : null;
+      return target.allowedToolsState ? target.allowedToolsState.length : 0;
+    },
+    postReload: async () => {},
+  }),
 }));
 
 vi.mock("./credential-broker.js", () => ({
@@ -1200,6 +1209,14 @@ describe("http-server — reload routes delegate to handlers", () => {
     // falls through to 500 (no handler). We accept either, as long as the
     // route is wired.
     expect([200, 500]).toContain(r.status);
+  });
+
+  it("POST /api/reload-tools is wired (descriptor loop) and short-circuits without a gateway URL", async () => {
+    const r = await getJson(port, "/api/reload-tools", "POST");
+    // tools is requiresGatewayClient:true; with no SICLAW_GATEWAY_URL the route
+    // short-circuits to 200 count:0 before ever calling the per-box handler.
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ ok: true, count: 0, type: "tools" });
   });
 });
 

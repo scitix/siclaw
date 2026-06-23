@@ -15,7 +15,7 @@
 // ── Scalar types ──────────────────────────────────────────────────────
 
 /** Every syncable type is identified by a well-known key. */
-export type GatewaySyncType = "mcp" | "skills" | "cluster" | "host" | "knowledge";
+export type GatewaySyncType = "mcp" | "skills" | "cluster" | "host" | "knowledge" | "tools";
 
 // ── Config / descriptor interfaces ────────────────────────────────────
 
@@ -165,5 +165,23 @@ export const GATEWAY_SYNC_DESCRIPTORS: Record<GatewaySyncType, GatewaySyncDescri
     retry: { maxRetries: 3, baseDelayMs: 1000 },
     requiresGatewayClient: true,
     initialSync: true,
+  },
+  tools: {
+    type: "tools",
+    gatewayPath: "/api/internal/tool-capabilities",
+    reloadPath: "/api/reload-tools",
+    retry: { maxRetries: 3, baseDelayMs: 1000 },
+    requiresGatewayClient: true,
+    // initialSync:false — like cluster/host, the tools handler is per-box
+    // (closes over THIS server's sessionManager + GatewayClient) and is NOT in
+    // the module-level registry that syncAllResources() walks. It also needs the
+    // sessionManager to exist, which it does not at the syncAllResources() call
+    // site in agentbox-main.ts. The initial value is therefore filled out-of-band:
+    //   • K8s   — an explicit per-pod fetch in agentbox-main.ts after the
+    //             sessionManager + httpServer are constructed.
+    //   • Local — LocalSpawner resolves capabilities and injects directly at spawn.
+    // The reload PUSH path (POST /api/reload-tools) still routes through the
+    // per-box handler regardless of this flag.
+    initialSync: false,
   },
 };

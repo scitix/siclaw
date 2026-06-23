@@ -414,6 +414,77 @@ export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler
   };
 }
 
+// ── Tools handler (factory, per-box session-manager-bound) ────────────
+
+/**
+ * Payload shape returned by the Gateway's /api/internal/tool-capabilities:
+ * the already-resolved concrete allowedTools list (null = no restriction).
+ */
+interface ToolsPayload {
+  allowedTools: string[] | null;
+}
+
+/**
+ * Minimal structural target the tools handler writes to. Deliberately NOT the
+ * concrete AgentBoxSessionManager: importing session.ts here would drag in
+ * agent-factory's transitive ssh2 dependency and break this module's vitest
+ * suite. Structural typing keeps sync-handlers.ts a leaf module.
+ */
+export interface ToolsStateTarget {
+  allowedToolsState: string[] | null;
+}
+
+/**
+ * tools handler — per-box, like cluster/host (NOT in the module-level registry).
+ *
+ * Why per-box and not a module singleton: the AgentBoxSessionManager is the
+ * per-agent state holder (K8s = one pod; Local = one manager per agent). The
+ * handler writes the resolved allowedTools into THIS box's manager, and fetches
+ * with THIS box's GatewayClient so the mTLS cert resolves to the correct
+ * agentId. The route loop's lazily-built reload client re-reads
+ * SICLAW_CERT_PATH (last-spawn-wins in Local mode) and would fetch the wrong
+ * agent's list — hence we close over the box client and ignore the passed one.
+ *
+ * materialize() is a PURE in-memory no-op w.r.t. the filesystem: it writes only
+ * `target.allowedToolsState`. It must never touch loadConfig/writeConfig/
+ * process.env (process-global shared state under LocalSpawner's multi-spawn).
+ */
+export function createToolsHandler(
+  target: ToolsStateTarget,
+  boxClient: GatewaySyncClientLike | null,
+): AgentBoxSyncHandler<ToolsPayload> {
+  return {
+    type: "tools",
+
+    async fetch(client: GatewaySyncClientLike | null): Promise<ToolsPayload> {
+      // Prefer the per-box client (correct cert → correct agentId).
+      const c = boxClient ?? client;
+      if (!c) throw new Error("[tools] GatewaySyncClientLike required but missing");
+      const data = await c.request(GATEWAY_SYNC_DESCRIPTORS.tools.gatewayPath, "GET");
+      return (data ?? { allowedTools: null }) as ToolsPayload;
+    },
+
+    async materialize(payload: ToolsPayload): Promise<number> {
+      // null / non-array → no restriction (whitelist off). Mirrors
+      // resolveCapabilities(null) === null and agent-factory's null=all-tools.
+      const allowed = Array.isArray(payload?.allowedTools) ? payload.allowedTools : null;
+      target.allowedToolsState = allowed;
+      return allowed ? allowed.length : 0;
+    },
+
+    async postReload(context: ReloadContext): Promise<void> {
+      // Identical contract to mcpHandler: the tool-set is baked into each
+      // session at creation time, so a live session must be rebuilt to pick up
+      // a new whitelist. invalidate() defers the release until any in-flight
+      // prompt completes, so tool execution is not torn down mid-turn.
+      if (!context.sessions?.length) return;
+      for (const session of context.sessions) {
+        session.invalidate?.();
+      }
+    },
+  };
+}
+
 // ── Registry ──────────────────────────────────────────────────────────
 
 const handlers = new Map<GatewaySyncType, AgentBoxSyncHandler<any>>([

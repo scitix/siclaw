@@ -25,6 +25,7 @@ import {
   hasBackgroundChannelDelivery,
 } from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
+import { resolveCapabilities } from "../core/tool-capabilities.js";
 import type {
   DelegationAppendMessagePayload,
   DelegationEventPayload,
@@ -224,6 +225,41 @@ export async function handleMcpServers(
     sendJson(res, 200, { mcpServers: data.mcpServers });
   } catch (err) {
     console.error("[internal-api] mcp-servers error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
+ * GET /api/internal/tool-capabilities
+ *
+ * Returns the agent's resolved tool whitelist (the concrete allowedTools list).
+ * The Gateway resolves capability group keys → tool names at this boundary so
+ * the AgentBox stays oblivious to capability groups (mirrors ssh jump_host_id→
+ * name and MCP boundary resolution).
+ *
+ * `{ allowedTools: null }` means "no restriction" — the agent never selected
+ * any capability groups, so it keeps the global default tool set. The agentId
+ * comes from the mTLS cert identity (never the request body) so a box cannot
+ * read another agent's whitelist.
+ */
+export async function handleToolCapabilities(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  frontendClient: FrontendWsClient,
+): Promise<void> {
+  try {
+    const agent = await frontendClient.request("config.getAgent", {
+      agentId: identity.agentId,
+    });
+    // tool_capabilities is the stored group-key array (null/empty = unrestricted).
+    // resolveCapabilities(null/[]) === null keeps the backward-compatible default.
+    const allowedTools = resolveCapabilities(
+      (agent?.tool_capabilities ?? null) as string[] | null,
+    );
+    sendJson(res, 200, { allowedTools });
+  } catch (err) {
+    console.error("[internal-api] tool-capabilities error:", err);
     sendJson(res, 500, { error: "Internal server error" });
   }
 }

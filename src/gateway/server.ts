@@ -40,6 +40,7 @@ import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
   handleMcpServers,
+  handleToolCapabilities,
   handleSkillsBundle,
   handleKnowledgeBundle,
   handleAgentTasksList,
@@ -702,6 +703,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/mcp-servers" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleMcpServers(req, res, identity, frontendClient);
+            return;
+          }
+
+          // Tool capabilities — resolved allowedTools for the agent (via RPC)
+          if (url === "/api/internal/tool-capabilities" && method === "GET") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            handleToolCapabilities(req, res, identity, frontendClient);
             return;
           }
 

@@ -1756,6 +1756,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       icon: agent.icon,
       color: agent.color,
       idle_timeout_sec: agent.idle_timeout_sec,
+      // Per-agent tool capability group keys (JSON array; null/empty = no
+      // restriction). Parsed defensively across the three JSON-column states
+      // (legacy MySQL JSON, new MySQL TEXT, SQLite TEXT). The Gateway resolves
+      // these group keys → concrete allowedTools at its boundary.
+      tool_capabilities: safeParseJson<string[] | null>(agent.tool_capabilities, null),
     };
   });
 

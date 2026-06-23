@@ -7,13 +7,7 @@
     "src/cron/**/*.ts",
     "src/memory/**/*.ts",
     "src/shared/**/*.ts",
-    "src/tools/**/*.ts",
-    "src/gateway/agentbox/**/*.ts",
-    "src/gateway/security/**/*.ts",
-    "src/gateway/config.ts",
-    "src/gateway/jwt.ts",
-    "src/gateway/metrics-aggregator.ts",
-    "src/gateway/ws-protocol.ts"
+    "src/tools/**/*.ts"
   ],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }

@@ -214,6 +214,9 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   // When the snapshot is scoped to an agent that carries a custom
   // system_prompt, swap out siclaw's default SRE prompt for the agent's.
   systemPromptTemplate: portalSnapshot?.activeAgent?.systemPrompt ?? undefined,
+  // Per-agent tool whitelist (resolved from capability groups by the snapshot).
+  // Absent/null = unrestricted → agent-factory falls back to config.allowedTools.
+  allowedTools: portalSnapshot?.activeAgent?.allowedTools ?? null,
   portalActiveAgent: portalSnapshot?.activeAgent ?? null,
   portalAvailableAgents: portalSnapshot?.availableAgents ?? [],
   portalUrl: portalSnapshot?.portalUrl,

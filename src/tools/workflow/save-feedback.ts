@@ -146,5 +146,4 @@ The report includes overall rating, decision point evaluations, strengths, impro
 export const registration: ToolEntry = {
   category: "workflow",
   create: (refs) => createSaveFeedbackTool(refs.sessionIdRef),
-  platform: true,
 };

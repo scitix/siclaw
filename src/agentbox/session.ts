@@ -225,6 +225,22 @@ export class AgentBoxSessionManager {
    */
   credentialsDir?: string;
 
+  /**
+   * Per-agent tool capability whitelist — the resolved `allowedTools` list for
+   * this AgentBox's agent (see core/tool-capabilities.ts).
+   *
+   * `null` (the default) = no restriction: createSiclawSession falls back to the
+   * global `config.allowedTools`, i.e. exactly the behaviour before this feature
+   * existed. A non-null array restricts the agent to those tool names.
+   *
+   * This state is PER-AGENT by construction: one AgentBoxSessionManager instance
+   * per agent (K8s = one pod; LocalSpawner = one `new AgentBoxSessionManager()`
+   * per agent). It is filled at startup (K8s: explicit fetch in agentbox-main;
+   * Local: LocalSpawner injection) and refreshed on POST /api/reload-tools via a
+   * per-box handler that writes here — never via loadConfig/writeConfig/process.env.
+   */
+  allowedToolsState: string[] | null = null;
+
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
 
@@ -1263,6 +1279,12 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId,
+      // A spawned sub-agent must never be broader than its parent: inherit the
+      // parent's per-agent tool whitelist. Without this, a restricted agent that
+      // has the `spawn_subagents` capability could escalate by spawning a child
+      // that falls back to the global config.allowedTools (all tools). null
+      // (unrestricted parent) stays null — identical to pre-feature behaviour.
+      allowedTools: this.allowedToolsState,
       // The plan is parent-owned: sub-agents have no task tools (isSubagent hides
       // them), so the child neither reads nor writes the ledger — the parent marks
       // tasks complete as children report back. The parent's taskListId is therefore
@@ -1656,6 +1678,10 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId: this.agentId ?? null,
+      // Per-agent tool capability whitelist. null = unrestricted (falls back to
+      // global config.allowedTools in agent-factory — today's behaviour for any
+      // agent that never set tool_capabilities).
+      allowedTools: this.allowedToolsState,
       systemPromptTemplate,
       // Stable per-session ledger key so the plan survives release/rebuild
       // (a fresh random id would orphan the prior in-memory ledger every turn).

@@ -18,7 +18,7 @@ import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metri
 import { GatewayClient } from "./gateway-client.js";
 import { CredentialBroker } from "./credential-broker.js";
 import { HttpTransport } from "./credential-transport.js";
-import { getSyncHandler, createClusterHandler, createHostHandler } from "./sync-handlers.js";
+import { getSyncHandler, createClusterHandler, createHostHandler, createToolsHandler } from "./sync-handlers.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
 import {
@@ -441,6 +441,16 @@ export function createHttpServer(
     perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
   }
+  // tools handler — same per-box rationale as cluster/host. It writes the
+  // resolved allowedTools into THIS box's sessionManager and fetches with THIS
+  // box's GatewayClient (correct mTLS cert → correct agentId), avoiding the
+  // route loop's last-spawn-wins SICLAW_CERT_PATH client. Bound even when
+  // gatewayClient is absent (TUI/no-gateway): the reload route gates on
+  // requiresGatewayClient and skips before fetch in that case.
+  perServerHandlers.tools = createToolsHandler(
+    sessionManager,
+    sessionManager.gatewayClient ? sessionManager.gatewayClient.toClientLike() : null,
+  );
 
   // ── Idle self-destruct: shut down when no SSE connections and no sessions ──
   // Window is configurable (config.server.idleTimeoutSec / SICLAW_AGENTBOX_IDLE_TIMEOUT).

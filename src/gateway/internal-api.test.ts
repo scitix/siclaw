@@ -4,6 +4,7 @@ import http from "node:http";
 import {
   handleSettings,
   handleMcpServers,
+  handleToolCapabilities,
   handleSkillsBundle,
   handleKnowledgeBundle,
   handleAgentTasksList,
@@ -162,6 +163,47 @@ describe("handleMcpServers", () => {
     }) as typeof frontend.request;
     const res = new FakeRes();
     await handleMcpServers(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(500);
+    errSpy.mockRestore();
+  });
+});
+
+// ── handleToolCapabilities ────────────────────────────────
+
+describe("handleToolCapabilities", () => {
+  it("resolves the agent's capability groups to a concrete allowedTools list", async () => {
+    frontend.responses.set("config.getAgent", { tool_capabilities: ["read_files", "search_memory"] });
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(new Set(body.allowedTools)).toEqual(
+      new Set(["read", "grep", "find", "ls", "memory_search", "memory_get"]),
+    );
+    // agentId comes from the cert identity, never the body.
+    expect(frontend.calls[0]).toEqual({ method: "config.getAgent", params: { agentId: "agent-1" } });
+  });
+
+  it("returns allowedTools:null for an agent with no capability selection (backward compat)", async () => {
+    frontend.responses.set("config.getAgent", { tool_capabilities: null });
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ allowedTools: null });
+  });
+
+  it("treats an empty selection as null (whitelist off)", async () => {
+    frontend.responses.set("config.getAgent", { tool_capabilities: [] });
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(JSON.parse(res.body)).toEqual({ allowedTools: null });
+  });
+
+  it("500 when the agent lookup fails", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    frontend.nextError = new Error("agent lookup down");
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
     expect(res.statusCode).toBe(500);
     errSpy.mockRestore();
   });

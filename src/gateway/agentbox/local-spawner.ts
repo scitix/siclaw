@@ -16,6 +16,9 @@ import { AgentBoxSessionManager } from "../../agentbox/session.js";
 import { GatewayClient } from "../../agentbox/gateway-client.js";
 import { syncResource } from "../../agentbox/resource-sync.js";
 import type { CertificateManager } from "../security/cert-manager.js";
+import { getDb } from "../db.js";
+import { safeParseJson } from "../dialect-helpers.js";
+import { resolveCapabilities } from "../../core/tool-capabilities.js";
 
 interface LocalBox {
   agentId: string;
@@ -85,6 +88,34 @@ export class LocalSpawner implements BoxSpawner {
       ".siclaw/credentials",
       agentId,
     );
+
+    // Inject the resolved tool whitelist at spawn time. The tools sync type is
+    // initialSync:false, so the framework's syncAllResources never pulls it
+    // (and isn't even run in Local mode). LocalSpawner lives inside the Gateway
+    // process with direct DB access, so it resolves capabilities here — before
+    // createHttpServer + the first session — so a restricted agent is restricted
+    // from its very first turn (not unrestricted-until-next-reload). This also
+    // avoids a GET round-trip and the Local-mode cert last-spawn-wins hazard.
+    // null/empty selection → null = unrestricted (today's behaviour).
+    try {
+      const db = getDb();
+      const [rows] = await db.query(
+        "SELECT tool_capabilities FROM agents WHERE id = ?",
+        [agentId],
+      ) as [Array<{ tool_capabilities?: unknown }>, unknown];
+      const groupKeys = rows.length > 0
+        ? safeParseJson<string[] | null>(rows[0].tool_capabilities, null)
+        : null;
+      sessionManager.allowedToolsState = resolveCapabilities(groupKeys);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Fail safe-open: an agent that can't resolve its whitelist starts
+      // unrestricted rather than failing to spawn. The next reload push will
+      // correct it.
+      console.warn(`[local-spawner] tool-capabilities resolve failed for agent=${agentId} (starting unrestricted): ${msg}`);
+      sessionManager.allowedToolsState = null;
+    }
+
     // disableIdleShutdown: LocalSpawner runs AgentBox in the same process as
     // the Portal — the 5-min idle timer's `process.exit(0)` would take the
     // whole `siclaw local` down and strand the web UI.
@@ -160,7 +191,7 @@ export class LocalSpawner implements BoxSpawner {
       boxId,
       agentId: box.agentId,
       status: "running",
-      endpoint: `http://127.0.0.1:${box.port}`,
+      endpoint: `https://127.0.0.1:${box.port}`,
       createdAt: box.createdAt,
       lastActiveAt: box.createdAt,
     };
@@ -173,7 +204,7 @@ export class LocalSpawner implements BoxSpawner {
         boxId,
         agentId: box.agentId,
         status: "running",
-        endpoint: `http://127.0.0.1:${box.port}`,
+        endpoint: `https://127.0.0.1:${box.port}`,
         createdAt: box.createdAt,
         lastActiveAt: box.createdAt,
       });

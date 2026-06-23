@@ -27,6 +27,7 @@ import {
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { ToolRegistry, type AgentMode } from "./tool-registry.js";
+import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
 import { buildSreSystemPrompt } from "./prompt.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
@@ -443,15 +444,13 @@ export async function createSiclawSession(
   } else {
     console.log(`[agent-factory] No MCP config found, skipping MCP tools`);
   }
-  // MCP tools subject to allowedTools (original behavior: MCP appended before filter)
-  if (mcpTools.length > 0) {
-    if (Array.isArray(allowedTools)) {
-      const allowed = new Set(allowedTools);
-      customTools.push(...mcpTools.filter(t => allowed.has(t.name)));
-    } else {
-      customTools.push(...mcpTools);
-    }
-  }
+  // MCP tools are EXEMPT from the per-agent `allowedTools` capability whitelist.
+  // MCP availability is governed by an orthogonal axis — the `agent_mcp_servers`
+  // binding — so a capability group selection must not gate them. (Dynamic MCP
+  // tool names can't be statically enumerated into a capability group anyway.)
+  // The whole `mcpTools` array is MCP by construction, so an unconditional push
+  // is simpler than and equivalent to skipping by an `mcp__` name prefix.
+  customTools.push(...mcpTools);
 
   // -- Path-restricted file I/O tools --
   // Whitelist: only skills directories + user-data + reports + repos + docs (no credentials, no config)
@@ -519,8 +518,24 @@ export async function createSiclawSession(
       },
     }),
   ];
-  // Push into customTools so they override framework defaults via extension mechanism
-  customTools.push(...restrictedFileTools);
+  // Push into customTools so they override framework defaults via extension mechanism.
+  // Subject to allowedTools (same chokepoint as MCP append above): file tools are
+  // created outside the registry, so the shared name-based whitelist is applied here.
+  appendAllowedTools(customTools, restrictedFileTools, allowedTools);
+
+  // Final model-visible tool set (registry-resolved + MCP + file tools, after the
+  // whitelist is applied at every chokepoint). Logged by NAME when restricted so a
+  // capability-group change is verifiable straight from the box log — this is the
+  // ground truth the model is given as function schemas. It deliberately differs
+  // from any tool list the model recites in chat: a session restored from JSONL
+  // carries earlier turns where it held more tools, and the model may parrot those
+  // stale names even though they are no longer in this list and cannot be invoked.
+  if (Array.isArray(allowedTools)) {
+    console.log(
+      `[agent-factory] Restricted tools visible to model (${customTools.length}): ` +
+      `${customTools.map((t) => t.name).join(", ") || "(none)"}`,
+    );
+  }
 
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).

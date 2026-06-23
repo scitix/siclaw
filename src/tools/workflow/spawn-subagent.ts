@@ -182,9 +182,6 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: (refs) => createSpawnSubagentTool(refs),
   modes: ["web", "channel", "cli"],
-  // platform: a core capability — exempt from allowedTools workspace filtering
-  // (like task_*), so it's never silently hidden when an agent has a whitelist.
-  platform: true,
   available: (refs) => Boolean(refs.spawnSubagentExecutor),
   requiresUserApproval: true,
 };

@@ -46,7 +46,6 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: (refs) => createJobStopTool(refs),
   modes: ["web", "channel", "cli"],
-  platform: true,
   // Available once either background mode is on AND the runtime injected a stop executor
   // (so a job_id can actually exist). Hidden otherwise.
   available: (refs) =>

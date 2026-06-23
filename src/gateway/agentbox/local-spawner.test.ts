@@ -46,9 +46,17 @@ vi.mock("../../agentbox/session.js", () => ({
     userId?: string;
     agentId?: string;
     credentialsDir?: string;
+    allowedToolsState: string[] | null = null;
     credentialBroker = { dispose: () => { sessionManagerShutdownCalls.push("broker.dispose"); } };
     async closeAll(): Promise<void> { sessionManagerShutdownCalls.push("closeAll"); }
   },
+}));
+
+// DB mock — LocalSpawner reads agents.tool_capabilities at spawn time to resolve
+// the agent's tool whitelist. Tests set `dbToolCapabilitiesRow` to control it.
+let dbQueryImpl: (sql: string, params: unknown[]) => Promise<[unknown[], unknown]>;
+vi.mock("../db.js", () => ({
+  getDb: () => ({ query: (sql: string, params: unknown[]) => dbQueryImpl(sql, params) }),
 }));
 
 // Import the SUT after mocks.
@@ -71,6 +79,8 @@ beforeEach(() => {
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   sessionManagerShutdownCalls.length = 0;
+  // Default: agent has no tool_capabilities row value → unrestricted.
+  dbQueryImpl = async () => [[{ tool_capabilities: null }], undefined];
 
   origCwd = process.cwd();
   tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "local-spawner-")));
@@ -181,6 +191,37 @@ describe("LocalSpawner — per-agent credential isolation", () => {
     expect(b1.sessionManager.credentialsDir).toContain(path.join(".siclaw", "credentials", "a1"));
     expect(b2.sessionManager.credentialsDir).toContain(path.join(".siclaw", "credentials", "a2"));
     expect(b1.sessionManager.credentialsDir).not.toBe(b2.sessionManager.credentialsDir);
+  });
+});
+
+describe("LocalSpawner — tool-capabilities injection", () => {
+  it("resolves a restricted agent's capabilities into allowedToolsState at spawn", async () => {
+    dbQueryImpl = async (_sql, params) => {
+      expect(params).toEqual(["a1"]);
+      return [[{ tool_capabilities: JSON.stringify(["read_files", "search_memory"]) }], undefined];
+    };
+    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
+    const handle = await spawner.spawn({ agentId: "a1" });
+    const box = (spawner as any).boxes.get(handle.boxId);
+    expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
+      new Set(["read", "grep", "find", "ls", "memory_search", "memory_get"]),
+    );
+  });
+
+  it("leaves allowedToolsState null for an agent with no selection (unrestricted)", async () => {
+    dbQueryImpl = async () => [[{ tool_capabilities: null }], undefined];
+    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
+    const handle = await spawner.spawn({ agentId: "a1" });
+    const box = (spawner as any).boxes.get(handle.boxId);
+    expect(box.sessionManager.allowedToolsState).toBeNull();
+  });
+
+  it("fails safe-open (null) when the DB lookup throws", async () => {
+    dbQueryImpl = async () => { throw new Error("db down"); };
+    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
+    const handle = await spawner.spawn({ agentId: "a1" });
+    const box = (spawner as any).boxes.get(handle.boxId);
+    expect(box.sessionManager.allowedToolsState).toBeNull();
   });
 });
 

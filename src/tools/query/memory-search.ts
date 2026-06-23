@@ -111,6 +111,5 @@ Returns matching memory chunks with file path, heading context, content snippet,
 export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createMemorySearchTool(refs.memoryIndexer!),
-  platform: true,
   available: (refs) => isMemoryEnabled() && !!refs.memoryIndexer,
 };
