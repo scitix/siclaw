@@ -51,6 +51,7 @@ import {
 } from "./internal-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
+import { getDb } from "./db.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
@@ -140,6 +141,34 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── RPC Methods (chat only) ──────────────────────────────
   const rpcMethods = new Map<string, RpcHandler>();
 
+  // Resolve the per-agent spawn env. Currently only the idle self-destruct
+  // window (agents.idle_timeout_sec → SICLAW_AGENTBOX_IDLE_TIMEOUT), which the
+  // AgentBox reads at startup (config.server.idleTimeoutSec). Best-effort: any
+  // DB hiccup falls back to the AgentBox's own default rather than failing the
+  // spawn. The env only takes effect on a cold spawn — K8sSpawner ignores it
+  // when a pod is already running, so a changed timeout applies on next restart.
+  const resolveAgentSpawnEnv = async (agentId: string): Promise<Record<string, string> | undefined> => {
+    try {
+      const [rows] = await getDb().query(
+        "SELECT idle_timeout_sec FROM agents WHERE id = ?",
+        [agentId],
+      ) as any;
+      const sec = rows?.[0]?.idle_timeout_sec;
+      if (sec !== undefined && sec !== null) {
+        return { SICLAW_AGENTBOX_IDLE_TIMEOUT: String(sec) };
+      }
+    } catch (err) {
+      console.warn(`[gateway] Failed to resolve idle timeout for agent ${agentId}:`, err);
+    }
+    return undefined;
+  };
+
+  // Spawn (or reuse) the AgentBox for an agent, threading its per-agent spawn env.
+  const getOrCreateAgentBox = async (agentId: string) => {
+    const env = await resolveAgentSpawnEnv(agentId);
+    return agentBoxManager.getOrCreate(agentId, env ? { env } : undefined);
+  };
+
   // Per-session AbortController for the in-flight chat.send SSE consumer, keyed
   // by sessionId. chat.abort looks this up to break the gateway's consumeAgentSse
   // loop so its abort-finalization runs (in-flight tool rows → "stopped", partial
@@ -215,7 +244,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
 
-        const handle = await agentBoxManager.getOrCreate(agentId);
+        const handle = await getOrCreateAgentBox(agentId);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
@@ -317,7 +346,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
     activeStreamAborts.get(sessionId)?.abort();
 
-    const handle = await agentBoxManager.getOrCreate(agentId);
+    const handle = await getOrCreateAgentBox(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.abortSession(sessionId);
     return { ok: true };
@@ -341,7 +370,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
     await incrementMessageCount(sessionId);
 
-    const handle = await agentBoxManager.getOrCreate(agentId);
+    const handle = await getOrCreateAgentBox(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.steerSession(sessionId, text, { images, files });
     return { ok: true };
@@ -352,7 +381,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const sessionId = params.sessionId as string;
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
 
-    const handle = await agentBoxManager.getOrCreate(agentId);
+    const handle = await getOrCreateAgentBox(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     const cleared = await client.clearQueue(sessionId);
     return { ok: true, ...cleared };

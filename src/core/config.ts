@@ -55,7 +55,18 @@ export interface SiclawConfig {
   modelRouting?: ModelRoutePolicy;
   embedding?: EmbeddingConfig;
   paths: { userDataDir: string; skillsDir: string; credentialsDir: string; reposDir: string; docsDir: string; knowledgeDir: string };
-  server: { port: number; gatewayUrl: string };
+  server: {
+    port: number;
+    gatewayUrl: string;
+    /**
+     * Idle self-destruct window for an AgentBox pod, in seconds. When no SSE
+     * connections and no active sessions remain for this long, the pod shuts
+     * itself down (K8s mode). Default 300 (5 min). Set to 0 (or negative) to
+     * make the pod resident — never auto-destroy. Overridable via
+     * SICLAW_AGENTBOX_IDLE_TIMEOUT.
+     */
+    idleTimeoutSec: number;
+  };
   debugImage: string;
   debugNamespace: string;
   debugPodTTL: number;
@@ -103,7 +114,7 @@ const DEFAULTS: SiclawConfig = {
     docsDir: ".siclaw/docs",
     knowledgeDir: ".siclaw/knowledge",
   },
-  server: { port: 3000, gatewayUrl: "" },
+  server: { port: 3000, gatewayUrl: "", idleTimeoutSec: 300 },
   debugImage: "busybox:1.36",
   debugNamespace: "default",
   debugPodTTL: 600,
@@ -227,6 +238,12 @@ export function loadConfig(): SiclawConfig {
   // Environment variable overrides (deployment/infrastructure only — NOT LLM config)
   if (process.env.SICLAW_AGENTBOX_PORT) {
     cached.server.port = parseInt(process.env.SICLAW_AGENTBOX_PORT, 10);
+  }
+  // AgentBox idle self-destruct window, in seconds. 0 or negative ⇒ resident
+  // (never auto-destroy). Invalid values keep the default.
+  if (process.env.SICLAW_AGENTBOX_IDLE_TIMEOUT) {
+    const v = parseInt(process.env.SICLAW_AGENTBOX_IDLE_TIMEOUT, 10);
+    if (!isNaN(v)) cached.server.idleTimeoutSec = v;
   }
   if (process.env.SICLAW_USER_DATA_DIR) {
     cached.paths.userDataDir = process.env.SICLAW_USER_DATA_DIR;
