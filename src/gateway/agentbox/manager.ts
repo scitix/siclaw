@@ -39,6 +39,7 @@ export class AgentBoxManager {
   private boxes = new Map<string, ManagedBox>();
   private healthCheckTimer?: ReturnType<typeof setInterval>;
   private readonly isK8s: boolean;
+  private spawnEnvResolver?: (agentId: string) => Promise<Record<string, string> | undefined>;
 
   constructor(spawner: BoxSpawner, config?: AgentBoxManagerConfig) {
     this.spawner = spawner;
@@ -51,6 +52,19 @@ export class AgentBoxManager {
     if ('setCertManager' in this.spawner) {
       (this.spawner as any).setCertManager(cm);
     }
+  }
+
+  /**
+   * Inject a resolver for per-agent spawn env. Applied on EVERY cold spawn from
+   * any entry point — chat RPCs, channel webhooks (Lark/DingTalk), cron tasks —
+   * because they all share this single manager instance (bootstrap-runtime).
+   * Without it, whichever entry point cold-spawns the (one-per-agent) pod first
+   * would otherwise win the pod's env, silently ignoring the configured value.
+   * Invoked lazily — only when a pod is actually created — so warm-pod reuse
+   * pays nothing. Currently supplies SICLAW_AGENTBOX_IDLE_TIMEOUT.
+   */
+  setSpawnEnvResolver(fn: (agentId: string) => Promise<Record<string, string> | undefined>): void {
+    this.spawnEnvResolver = fn;
   }
 
   startHealthCheck(): void {
@@ -85,6 +99,12 @@ export class AgentBoxManager {
     }
   }
 
+  /**
+   * Get a running AgentBox for the agent, or spawn one. On a cold spawn the
+   * injected `spawnEnvResolver` (if any) is consulted for per-agent env — never
+   * on warm-pod reuse, so the chat hot path and channel/cron paths pay nothing
+   * when the pod already exists.
+   */
   async getOrCreate(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
     if (this.isK8s) {
@@ -106,7 +126,7 @@ export class AgentBoxManager {
 
     console.log(`[agentbox-manager] Creating new AgentBox for agent=${agentId}`);
 
-    const resolvedEnv = this.resolveEnv(config?.env);
+    const resolvedEnv = await this.resolveEnv(agentId, config?.env);
     const handle = await this.spawner.spawn({
       ...config,
       agentId,
@@ -130,7 +150,7 @@ export class AgentBoxManager {
 
     console.log(`[agentbox-manager] Creating new AgentBox for agent=${agentId}`);
 
-    const resolvedEnv = this.resolveEnv(config?.env);
+    const resolvedEnv = await this.resolveEnv(agentId, config?.env);
     const handle = await this.spawner.spawn({
       ...config,
       agentId,
@@ -141,8 +161,14 @@ export class AgentBoxManager {
     return handle;
   }
 
-  private resolveEnv(configEnv?: Record<string, string>): Record<string, string> {
-    return configEnv ?? {};
+  /**
+   * Merge static config env with the lazily-resolved per-agent env from the
+   * injected resolver. Only called on a cold spawn. Static `config.env` wins on
+   * key collisions.
+   */
+  private async resolveEnv(agentId: string, configEnv?: Record<string, string>): Promise<Record<string, string>> {
+    const lazy = this.spawnEnvResolver ? (await this.spawnEnvResolver(agentId)) ?? {} : {};
+    return { ...lazy, ...(configEnv ?? {}) };
   }
 
   /**
