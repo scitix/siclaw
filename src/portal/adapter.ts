@@ -1744,34 +1744,39 @@ interface TracingExporterRow {
 }
 
 /**
- * Assemble the global {@link TracingConfig} from the database: the three
- * `tracing.*` scalars in `system_config` plus every enabled row in
- * `tracing_exporters`. This is the SINGLE source of truth for tracing config
- * now that the SICLAW_TRACING env channel is gone — used both at startup
- * (rides along in `config.getSettings`) and on hot-reload (`config.getTracingConfig`).
+ * Assemble the global {@link TracingConfig} from the database: the
+ * `tracing.serviceName` / `tracing.sendContent` scalars in `system_config` plus
+ * every enabled row in `tracing_exporters`. This is the SINGLE source of truth
+ * for tracing config now that the SICLAW_TRACING env channel is gone — used both
+ * at startup (rides along in `config.getSettings`) and on hot-reload
+ * (`config.getTracingConfig`).
+ *
+ * There is NO global master switch: tracing is enabled iff at least one platform
+ * is enabled. An empty enabled-exporter set yields `{ enabled: false }` so
+ * initTracing() cleanly no-ops.
  *
  * Secrets are emitted in PLAINTEXT here: the result is consumed only inside the
- * trust domain (delivered to AgentBox like providers.apiKey). Disabled, or no
- * enabled exporter, yields `{ enabled: false }` so initTracing() cleanly no-ops.
+ * trust domain (delivered to AgentBox like providers.apiKey).
  * The two queries run concurrently (avoids serial latency on getSettings).
  */
 export async function buildTracingConfig(): Promise<TracingConfig> {
   const db = getDb();
   const [[cfgRows], [exporterRows]] = await Promise.all([
     db.query(
-      "SELECT config_key, config_value FROM system_config WHERE config_key IN ('tracing.enabled', 'tracing.serviceName', 'tracing.sendContent')",
+      "SELECT config_key, config_value FROM system_config WHERE config_key IN ('tracing.serviceName', 'tracing.sendContent')",
     ),
     db.query(
       "SELECT platform_type, url, auth FROM tracing_exporters WHERE enabled = 1 ORDER BY sort_order, created_at",
     ),
   ]) as [[{ config_key: string; config_value: string | null }[], unknown], [TracingExporterRow[], unknown]];
 
+  // No master switch — an empty enabled-exporter set means tracing is off.
+  if (exporterRows.length === 0) return { enabled: false };
+
   const scalars: Record<string, string> = {};
   for (const row of cfgRows) {
     if (row.config_value != null) scalars[row.config_key] = row.config_value;
   }
-  const enabled = scalars["tracing.enabled"] === "true";
-  if (!enabled) return { enabled: false };
 
   const exporters = exporterRows.map((row) => {
     const auth = safeParseJson<ExporterAuth>(row.auth, {});

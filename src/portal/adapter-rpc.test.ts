@@ -207,8 +207,8 @@ describe("config.getSettings", () => {
       [{ model_provider: "openai", model_id: "gpt-4" }],
       [{ id: "p1", name: "openai", base_url: "https://api.openai.com", api_key: "sk-key", api_type: "openai" }],
       [{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }],
-      [ // buildTracingConfig: system_config scalars
-        { config_key: "tracing.enabled", config_value: "true" },
+      [ // buildTracingConfig: system_config scalars (no master switch — enabled
+        // is derived from the presence of an enabled platform below)
         { config_key: "tracing.serviceName", config_value: "siclaw-tc" },
         { config_key: "tracing.sendContent", config_value: "true" },
       ],
@@ -225,15 +225,15 @@ describe("config.getSettings", () => {
     });
   });
 
-  it("rides a disabled tracing config along when the DB has no tracing scalars", async () => {
-    // buildTracingConfig() returns { enabled: false } when off — always present
-    // so initTracing() treats it as a clean no-op (not omitted).
+  it("rides a disabled tracing config along when no platform is enabled", async () => {
+    // buildTracingConfig() returns { enabled: false } when no platform is enabled
+    // — always present so initTracing() treats it as a clean no-op (not omitted).
     mockQuery(
       [{ model_provider: "openai", model_id: "gpt-4" }],
       [{ id: "p1", name: "openai", base_url: "https://api.openai.com", api_key: "sk-key", api_type: "openai" }],
       [{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }],
-      [], // buildTracingConfig: system_config (no tracing scalars)
-      [], // buildTracingConfig: tracing_exporters
+      [], // buildTracingConfig: system_config scalars
+      [], // buildTracingConfig: no enabled tracing_exporters
     );
     const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
     expect(result.tracing).toEqual({ enabled: false });
@@ -244,8 +244,7 @@ describe("config.getTracingConfig", () => {
   it("assembles the GLOBAL tracing config from the DB (no agentId)", async () => {
     const bearer = "Bearer px-key";
     mockQuery(
-      [ // system_config scalars
-        { config_key: "tracing.enabled", config_value: "true" },
+      [ // system_config scalars (no master switch)
         { config_key: "tracing.sendContent", config_value: "false" },
       ],
       [ // enabled tracing_exporters (phoenix → Bearer + x-project-name)
@@ -260,10 +259,10 @@ describe("config.getTracingConfig", () => {
     });
   });
 
-  it("returns { enabled: false } when tracing is disabled in the DB", async () => {
+  it("returns { enabled: false } when no platform is enabled", async () => {
     mockQuery(
-      [{ config_key: "tracing.enabled", config_value: "false" }],
-      [],
+      [{ config_key: "tracing.sendContent", config_value: "true" }], // scalars present…
+      [], // …but no enabled exporters → tracing off
     );
     const result = await getHandler("config.getTracingConfig")({}, "");
     expect(result).toEqual({ enabled: false });

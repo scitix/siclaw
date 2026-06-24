@@ -3560,6 +3560,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       await db.query(upsert.sql, upsert.params);
     }
     sendJson(res, 200, { ok: true });
+    // Global tracing scalars (tracing.enabled / serviceName / sendContent) feed
+    // buildTracingConfig, so a change here must hot-reload every active AgentBox
+    // — otherwise the master switch / sendContent only takes effect on the next
+    // respawn (running agents keep their old provider). Mirrors the exporter
+    // CRUD handlers, which already call triggerTracingReload.
+    if (Object.keys(values).some((k) => k.startsWith("tracing."))) {
+      triggerTracingReload();
+    }
   });
 
   // ================================================================

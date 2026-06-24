@@ -133,7 +133,7 @@ export function TracingPlatforms() {
 
   // Global tracing scalars, mirrored from system_config. serviceName uses a
   // local buffer (saved on blur) so typing doesn't fire a write per keystroke.
-  const master = config["tracing.enabled"] === "true"
+  // No master enable switch — tracing is on iff at least one platform is enabled.
   const sendContent = config["tracing.sendContent"] === "true"
   const [serviceName, setServiceName] = useState("")
   useEffect(() => { setServiceName(config["tracing.serviceName"] ?? "") }, [config])
@@ -238,17 +238,15 @@ export function TracingPlatforms() {
     <section className="px-6 py-6 space-y-6 max-w-4xl">
       {/* Global tracing settings */}
       <div className="border border-border rounded-lg bg-card p-5">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-[13px] font-semibold">Agent behaviour tracing</h3>
-            <p className="text-[11px] text-muted-foreground mt-0.5">
-              Records agent runs (LLM calls, tools, tokens) and fans out to every enabled platform below.
-            </p>
-          </div>
-          <Toggle on={master} onChange={() => saveScalar("tracing.enabled", master ? "false" : "true")} />
+        <div>
+          <h3 className="text-[13px] font-semibold">Agent behaviour tracing</h3>
+          <p className="text-[11px] text-muted-foreground mt-0.5">
+            Records agent runs (LLM calls, tools, tokens) and fans out to every enabled platform below.
+            Tracing is active whenever at least one platform is enabled.
+          </p>
         </div>
 
-        <div className={`grid grid-cols-1 sm:grid-cols-2 gap-4 mt-5 transition-opacity ${master ? "" : "opacity-40 pointer-events-none"}`}>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-5">
           <label className="block">
             <span className="text-[11px] text-muted-foreground">service.name</span>
             <input
