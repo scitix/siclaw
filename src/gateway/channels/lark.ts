@@ -23,6 +23,7 @@ import {
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { appendMessage, ensureChatSession } from "../chat-repo.js";
+import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
 import {
   openTypingCard,
   updateCardContent,
@@ -638,6 +639,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", {
       includeImages: true,
       onMilestone: addMilestone,
+      // Audit: persist assistant + tool rows so the channel transcript matches
+      // web/api/a2a (origin="channel" set on the session above). Tool output on
+      // this stream is already sanitized at the agentbox boundary.
+      persist: { agentId },
     });
     resultText = collected.text;
     replyImages = collected.images;
@@ -855,15 +860,29 @@ export async function collectResponse(
   client: AgentBoxClient,
   sessionId: string,
   logPrefix = "lark",
+  options: { persist?: ChannelPersistContext } = {},
 ): Promise<string> {
-  return (await collectChannelResponse(client, sessionId, logPrefix)).text;
+  return (await collectChannelResponse(client, sessionId, logPrefix, { persist: options.persist })).text;
+}
+
+/**
+ * Opt-in audit persistence for the channel path. When set, collectChannelResponse
+ * writes the same user/assistant/tool transcript that web/api/a2a get via the
+ * runtime's sse-consumer, so IM-channel sessions are fully auditable (not just
+ * the inbound user message). `modelConfig` drives the same apiKey/baseUrl
+ * redaction the sse-consumer applies. The caller has already persisted the user
+ * message + ensured the session row (origin="channel").
+ */
+export interface ChannelPersistContext {
+  agentId: string;
+  modelConfig?: { apiKey?: string; baseUrl?: string };
 }
 
 export async function collectChannelResponse(
   client: AgentBoxClient,
   sessionId: string,
   logPrefix = "lark",
-  options: { includeImages?: boolean; onMilestone?: (text: string) => void } = {},
+  options: { includeImages?: boolean; onMilestone?: (text: string) => void; persist?: ChannelPersistContext } = {},
 ): Promise<CollectedChannelResponse> {
   const parts: string[] = [];
   const images: RenderedReplyImage[] = [];
@@ -872,14 +891,63 @@ export async function collectChannelResponse(
   // (tool-use turns emit intermediate message_end events that aren't meant
   // for the user). pi-agent's agent_end signals the last turn is complete.
   let lastAssistantText = "";
+
+  // ── Audit persistence (opt-in) ──────────────────────────────────────────
+  // Mirrors the field mapping in sse-consumer.ts so a channel transcript looks
+  // like a web/api/a2a one. Tool content + input are redacted with the same
+  // model-config redactor. Best-effort: a persist failure must never break the
+  // user-facing reply, so each write is wrapped and swallowed-with-log.
+  const persist = options.persist;
+  const redaction = persist ? buildRedactionConfigForModelConfig(persist.modelConfig) : null;
+  const redact = (s: string): string => (redaction ? redactText(s, redaction) : s);
+  // FIFO per-tool queues so parallel tool calls pair start↔end correctly
+  // (same approach as sse-consumer's pendingTool* maps).
+  const toolInputs = new Map<string, string[]>();
+  const toolStarts = new Map<string, number[]>();
+  const pushQ = <T,>(m: Map<string, T[]>, k: string, v: T): void => { const a = m.get(k) ?? []; a.push(v); m.set(k, a); };
+  const shiftQ = <T,>(m: Map<string, T[]>, k: string): T | undefined => m.get(k)?.shift();
+  const persistRow = async (msg: Parameters<typeof appendMessage>[0]): Promise<void> => {
+    try { await appendMessage(msg); }
+    catch (err) { console.warn(`[${logPrefix}] audit persist failed session=${sessionId}:`, err); }
+  };
+
   try {
     for await (const event of client.streamEvents(sessionId)) {
       const ev = event as Record<string, any>;
       if (ev.type === "content_block_delta" && ev.delta?.text) parts.push(ev.delta.text);
       if (ev.type === "text" && typeof ev.text === "string") parts.push(ev.text);
-      if (options.includeImages && (ev.type === "tool_execution_end" || ev.type === "tool_end")) {
-        collectImageAttachments(ev.result?.content, images, seenImageKeys);
+
+      // Capture tool input + start time for the matching tool_execution_end.
+      if (persist && (ev.type === "tool_execution_start" || ev.type === "tool_start")) {
+        const name = (ev.toolName as string) || (ev.name as string) || "tool";
+        pushQ(toolInputs, name, ev.args ? JSON.stringify(ev.args) : "");
+        pushQ(toolStarts, name, Date.now());
       }
+
+      if (ev.type === "tool_execution_end" || ev.type === "tool_end") {
+        if (options.includeImages) collectImageAttachments(ev.result?.content, images, seenImageKeys);
+        if (persist) {
+          const name = (ev.toolName as string) || (ev.name as string) || "tool";
+          const resultText = Array.isArray(ev.result?.content)
+            ? ev.result.content.filter((c: any) => c?.type === "text").map((c: any) => c.text ?? "").join("")
+            : "";
+          let outcome: "success" | "error" | "blocked" = "success";
+          if (ev.result?.details?.blocked) outcome = "blocked";
+          else if (ev.result?.details?.error) outcome = "error";
+          const input = shiftQ(toolInputs, name) || "";
+          const startedAt = shiftQ(toolStarts, name);
+          await persistRow({
+            sessionId,
+            role: "tool",
+            content: redact(resultText),
+            toolName: name,
+            toolInput: input ? redact(input) : null,
+            outcome,
+            durationMs: startedAt != null ? Date.now() - startedAt : null,
+          });
+        }
+      }
+
       if (options.includeImages && ev.type === "message_end" && (ev.message?.role === "toolResult" || ev.message?.role === "tool")) {
         collectImageAttachments(ev.message?.content, images, seenImageKeys);
       }
@@ -899,6 +967,10 @@ export async function collectChannelResponse(
             if (m) options.onMilestone(m);
           }
           lastAssistantText = turnText;
+          // Persist every assistant turn (intermediate narration + final answer),
+          // mirroring sse-consumer. Awaited so its created_at precedes the next
+          // tool row in the transcript.
+          if (persist) await persistRow({ sessionId, role: "assistant", content: redact(turnText) });
         }
       }
     }

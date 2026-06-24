@@ -749,6 +749,7 @@ async function submitA2aTask(params: {
     text,
     sessionId,
     mode: "a2a",
+    origin: "a2a", // audit category: agent-to-agent sessions
     modelProvider: modelBinding.modelProvider,
     modelId: modelBinding.modelId,
     modelConfig: modelBinding.modelConfig,

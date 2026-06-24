@@ -3015,6 +3015,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (query.userId) { conds.push("s.user_id = ?"); params.push(query.userId); }
     if (query.toolName) { conds.push("m.tool_name = ?"); params.push(query.toolName); }
     if (query.outcome) { conds.push("m.outcome = ?"); params.push(query.outcome); }
+    // Entry-form filter (chat_sessions.origin). "web" matches the NULL/"web"
+    // default; everything else is an exact origin match.
+    if (query.origin === "web") { conds.push("(s.origin IS NULL OR s.origin = 'web')"); }
+    else if (query.origin) { conds.push("s.origin = ?"); params.push(query.origin); }
     if (query.cursorTs && query.cursorId) {
       const cursorDate = new Date(parseInt(query.cursorTs, 10));
       conds.push("(m.created_at < ? OR (m.created_at = ? AND m.id < ?))");
@@ -3027,7 +3031,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
               SUBSTR(m.tool_input, 1, 500) AS toolInput,
               m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
-              s.user_id AS userId, s.agent_id AS agentId
+              s.user_id AS userId, s.agent_id AS agentId, s.origin AS origin
        FROM chat_messages m
        LEFT JOIN chat_sessions s ON m.session_id = s.id
        WHERE ${conds.join(" AND ")}
@@ -3040,7 +3044,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const logs = rows.slice(0, limit).map((r: any) => ({
       id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
       toolName: r.toolName, toolInput: r.toolInput, outcome: r.outcome,
-      durationMs: r.durationMs,
+      durationMs: r.durationMs, origin: r.origin ?? null,
       timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
     }));
 

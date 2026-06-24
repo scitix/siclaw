@@ -34,6 +34,16 @@ vi.mock("../channel-manager.js", () => ({
     v !== null && typeof v === "object" && (v as { walled?: unknown }).walled === true,
 }));
 
+// chat-repo: DingTalk now persists the session + user message + (via the shared
+// collectResponse) assistant/tool rows for audit. Mock it to assert the writes.
+const ensureChatSessionMock = vi.fn();
+const appendMessageMock = vi.fn();
+vi.mock("../chat-repo.js", () => ({
+  ensureChatSession: (...args: unknown[]) => ensureChatSessionMock(...args),
+  appendMessage: (...args: unknown[]) => appendMessageMock(...args),
+  incrementMessageCount: () => Promise.resolve(),
+}));
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 const WEBHOOK = "https://oapi.dingtalk.com/robot/sendBySession?session=tok";
@@ -71,6 +81,10 @@ beforeEach(() => {
   closeSessionMock.mockResolvedValue(undefined);
   resolveBindingMock.mockReset();
   handlePairingCodeMock.mockReset();
+  ensureChatSessionMock.mockReset();
+  ensureChatSessionMock.mockResolvedValue(undefined);
+  appendMessageMock.mockReset();
+  appendMessageMock.mockResolvedValue("msg-db-1");
   resetConversationSessionsForTest();
   fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
   vi.stubGlobal("fetch", fetchMock);
@@ -284,6 +298,45 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
 
     rememberSpy.mockRestore();
     sessionRegistry.forget(sessionId as string);
+  });
+
+  it("audits the session: persists origin=channel + user/assistant/tool rows when the binding has an owner", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "agent-7", bindingId: "b1", createdBy: "owner-1" });
+    promptMock.mockResolvedValue({ sessionId: "remote-7" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get pods" } };
+      yield { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "pods ok" }], details: {} } };
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done." }] } };
+    });
+
+    await handleDingTalkMessage(makeDownstream("查一下 pod"), "ch", makeAgentBoxManager("agent-7") as any, undefined, {} as any);
+
+    // Session row created with origin="channel" (6th arg), owner as user_id.
+    expect(ensureChatSessionMock).toHaveBeenCalledTimes(1);
+    const ecArgs = ensureChatSessionMock.mock.calls[0];
+    expect(ecArgs[1]).toBe("agent-7");     // agentId
+    expect(ecArgs[2]).toBe("owner-1");     // user_id = binding owner
+    expect(ecArgs[5]).toBe("channel");     // origin
+
+    const rows = appendMessageMock.mock.calls.map((c) => c[0] as any);
+    expect(rows.find((m) => m.role === "user")?.content).toBe("查一下 pod");
+    expect(rows.find((m) => m.role === "user")?.metadata?.source).toBe("dingtalk");
+    expect(rows.filter((m) => m.role === "tool")).toHaveLength(1);
+    expect(rows.find((m) => m.role === "tool")).toMatchObject({ toolName: "bash", outcome: "success" });
+    expect(rows.find((m) => m.role === "assistant")?.content).toBe("done.");
+  });
+
+  it("does NOT persist when the binding has no owner (no false user_id)", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "agent-7", bindingId: "b1" }); // no createdBy
+    promptMock.mockResolvedValue({ sessionId: "remote-7" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } };
+    });
+
+    await handleDingTalkMessage(makeDownstream("hi"), "ch", makeAgentBoxManager("agent-7") as any, undefined, {} as any);
+
+    expect(ensureChatSessionMock).not.toHaveBeenCalled();
+    expect(appendMessageMock).not.toHaveBeenCalled();
   });
 
   it("passes the agent's custom system prompt (config.getAgent) into the prompt payload", async () => {

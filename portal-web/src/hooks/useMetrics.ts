@@ -26,6 +26,9 @@ export interface AuditLog {
   toolInput: string | null
   outcome: string | null
   durationMs: number | null
+  // Session entry-form for categorization: null/"web" → Web, "api", "a2a",
+  // "channel" (IM: Feishu/DingTalk), "task" → Scheduled, "delegation".
+  origin: string | null
   timestamp: string
 }
 
@@ -158,6 +161,8 @@ interface AuditParams {
   userId?: string
   toolName?: string
   outcome?: string
+  /** Session entry-form filter (chat_sessions.origin). "web" matches NULL/"web". */
+  origin?: string
   /** Absolute window bounds (unix ms as strings), already resolved + frozen by
    *  the caller so pagination cursors don't drift on a sliding relative range. */
   from?: string
@@ -187,6 +192,7 @@ export function useAudit(params: AuditParams): {
     if (p.userId) q.set("userId", p.userId)
     if (p.toolName) q.set("toolName", p.toolName)
     if (p.outcome) q.set("outcome", p.outcome)
+    if (p.origin) q.set("origin", p.origin)
     if (p.from) q.set("from", p.from)
     if (p.to) q.set("to", p.to)
     q.set("limit", "50")
@@ -214,7 +220,7 @@ export function useAudit(params: AuditParams): {
     setLogs([])
     doFetch(false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params.userId, params.toolName, params.outcome, params.from, params.to])
+  }, [params.userId, params.toolName, params.outcome, params.origin, params.from, params.to])
 
   return { logs, hasMore, loading, loadMore: () => doFetch(true), refresh: () => doFetch(false) }
 }

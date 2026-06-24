@@ -215,6 +215,7 @@ describe("registerA2aRoutes", () => {
       text: "diagnose kube-system",
       sessionId: expect.stringMatching(/^[0-9a-f-]{36}$/),
       mode: "a2a",
+      origin: "a2a", // audit category
     }));
 
     const [rows] = await getDb().query<Array<{ state: string; context_id: string; session_id: string }>>(
