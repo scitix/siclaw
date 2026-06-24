@@ -398,6 +398,77 @@ describe("registerAgentRoutes", () => {
       expect(connMap.notify).not.toHaveBeenCalled();
     });
 
+    it("does NOT terminate when switching finite → Resident (300 → 0)", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 300 }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 0 },
+      }));
+
+      // Going resident needs no recycle: the box self-destructs on its current
+      // finite window, and the next spawn comes up resident.
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("terminates when the stored idle is a stringified \"0\" (driver coercion)", async () => {
+      // Defends the Number() coercion: a string old value must still read as
+      // resident, otherwise the 0→finite recycle would silently not fire.
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: "0" }], []]) // string, not number
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 300 },
+      }));
+
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.terminate", { agentId: "a1" });
+    });
+
+    it("does NOT terminate when the old idle row is missing/null (no false 0)", async () => {
+      // Guards Number(null) === 0: a missing/null old value must NOT be treated
+      // as resident → no spurious terminate.
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: null }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 300 },
+      }));
+
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("terminates on 0 → sub-300 and persists the floored value (300)", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 0 }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 100 }, // positive but below the 300 floor
+      }));
+
+      // 0 → positive (even pre-floor) is the stuck transition → terminate.
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.terminate", { agentId: "a1" });
+      // The UPDATE (2nd query) persists the normalized/floored value, proving the
+      // converged single-normalize path feeds the SET clause.
+      const updateValues = query.mock.calls[1][1] as unknown[];
+      expect(updateValues[0]).toBe(300);
+    });
+
     it("updates model_routing as a standalone field", async () => {
       query
         .mockResolvedValueOnce([undefined, []])

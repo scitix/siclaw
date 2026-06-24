@@ -376,7 +376,7 @@ function IdleTimeoutField({ value, onChange }: { value: number; onChange: (v: nu
         <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[12px] text-muted-foreground pointer-events-none">sec</span>
       </div>
       <p className="text-[12px] text-muted-foreground/80 leading-relaxed">
-        The running instance self-destructs after this long with no active sessions (default 300s, minimum 300 — a smaller positive value is raised to 300, since a shorter window churns instances); choose Resident (0s) to keep it alive. Switching off Resident applies immediately; other changes take effect on the agent's next restart.
+        The running instance self-destructs after this long with no active sessions (default 300s, minimum 300 — a smaller positive value is raised to 300, since a shorter window churns instances); choose Resident (0s) to keep it alive. Switching off Resident applies immediately — it restarts the running instance, which may interrupt an in-progress reply; other changes take effect on the agent's next restart.
       </p>
     </div>
   )

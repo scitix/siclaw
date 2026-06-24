@@ -184,12 +184,20 @@ export function registerAgentRoutes(
     // cold-spawns to pick up the new SICLAW_AGENTBOX_IDLE_TIMEOUT. We terminate
     // the running box below to force that cold spawn.
     let oldIdleTimeoutSec: number | null = null;
+    let newIdleTimeoutSec: number | null = null;
     if ("idle_timeout_sec" in body) {
       const [cur] = await db.query(
         "SELECT idle_timeout_sec FROM agents WHERE id = ?",
         [params.id],
       ) as any;
-      oldIdleTimeoutSec = cur[0]?.idle_timeout_sec ?? null;
+      // Coerce to a number: the column is INT (drivers return a number), but a
+      // stringified "0" would silently dodge the `=== 0` resident check below.
+      // Keep null as null so a missing row can't read as 0 (Number(null) === 0).
+      const raw = cur[0]?.idle_timeout_sec;
+      oldIdleTimeoutSec = raw == null ? null : Number(raw);
+      // Normalize once here and reuse for both the SET clause and the
+      // resident→finite terminate decision below.
+      newIdleTimeoutSec = normalizeIdleTimeoutSec(body.idle_timeout_sec);
     }
 
     // Build dynamic SET clause
@@ -203,7 +211,9 @@ export function registerAgentRoutes(
     for (const field of fields) {
       if (field in body) {
         setClauses.push(`${field} = ?`);
-        values.push(field === "idle_timeout_sec" ? normalizeIdleTimeoutSec(body[field]) : body[field]);
+        // newIdleTimeoutSec is non-null here: field === "idle_timeout_sec" implies
+        // "idle_timeout_sec" in body, which is exactly when it was computed above.
+        values.push(field === "idle_timeout_sec" ? newIdleTimeoutSec! : body[field]);
       }
     }
     if ("model_routing" in body) {
@@ -273,11 +283,8 @@ export function registerAgentRoutes(
     // SICLAW_AGENTBOX_IDLE_TIMEOUT. Other transitions (finite→finite, →0) need
     // no action: the box self-destructs on its current window and the next
     // spawn reads the new value, so we don't disrupt a live box for them.
-    if ("idle_timeout_sec" in body) {
-      const newIdleTimeoutSec = normalizeIdleTimeoutSec(body.idle_timeout_sec);
-      if (oldIdleTimeoutSec === 0 && newIdleTimeoutSec > 0) {
-        connectionMap.notify(params.id, "agent.terminate", { agentId: params.id });
-      }
+    if ("idle_timeout_sec" in body && oldIdleTimeoutSec === 0 && (newIdleTimeoutSec ?? 0) > 0) {
+      connectionMap.notify(params.id, "agent.terminate", { agentId: params.id });
     }
   });
 
