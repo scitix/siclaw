@@ -186,6 +186,11 @@ describe("routing path (extra channel)", () => {
     expect(successEvt?.attributes?.provider).toBe("anthropic");
     expect(successEvt?.attributes?.attempt).toBe(2);
 
+    // ROOT model identity reflects the WINNING model (claude) from
+    // model_route_success, NOT the primary (gpt-x) pinned at startPrompt.
+    expect(r.attributes[Attr.llmModelName]).toBe("claude");
+    expect(r.attributes[Attr.llmProvider]).toBe("anthropic");
+
     // Exactly one LLM span — the winning attempt. No failed-attempt span leaked.
     expect(byKind(SpanKind.LLM).length).toBe(1);
   });

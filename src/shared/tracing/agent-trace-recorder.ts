@@ -243,6 +243,17 @@ function dispatch(sessionId: string, trace: SessionTrace, event: Record<string, 
   // model routing + auto retry/compaction → ROOT annotations (ROOT always exists here)
   if (type.startsWith("model_route_")) {
     trace.root.addEvent(type, flatAttrs(routeEventAttributes(type, event)));
+    // model_route_success fires on EVERY turn under the unified runner entry and
+    // carries the winning model — write it onto the ROOT so the AGENT span shows
+    // the model that actually answered, not the one pinned at startPrompt (stale
+    // after a fallback switch). Authoritative + uniform; no ROOT-label patch off
+    // getModel() needed.
+    if (type === "model_route_success") {
+      trace.root.setAttributes(flatAttrs({
+        [Attr.llmModelName]: str(event.modelId),
+        [Attr.llmProvider]: str(event.provider),
+      }));
+    }
     return;
   }
   if (type.startsWith("auto_retry_") || type.startsWith("auto_compaction_")) {
