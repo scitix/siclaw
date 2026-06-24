@@ -39,14 +39,14 @@ describe("config.getAgent", () => {
     mockQuery([{
       id: "a1", name: "Agent 1", description: "desc", status: "active",
       model_provider: "openai", model_id: "gpt-4", system_prompt: "You are helpful",
-      icon: "bot", color: "#fff",
+      icon: "bot", color: "#fff", idle_timeout_sec: 300,
     }]);
 
     const result = await getHandler("config.getAgent")({ agentId: "a1" }, "a1");
     expect(result).toEqual({
       id: "a1", name: "Agent 1", description: "desc", status: "active",
       model_provider: "openai", model_id: "gpt-4", system_prompt: "You are helpful",
-      icon: "bot", color: "#fff",
+      icon: "bot", color: "#fff", idle_timeout_sec: 300,
     });
   });
 

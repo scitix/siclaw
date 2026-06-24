@@ -140,6 +140,36 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── RPC Methods (chat only) ──────────────────────────────
   const rpcMethods = new Map<string, RpcHandler>();
 
+  // Resolve the per-agent spawn env. Currently only the idle self-destruct
+  // window (agents.idle_timeout_sec → SICLAW_AGENTBOX_IDLE_TIMEOUT), which the
+  // AgentBox reads at startup (config.server.idleTimeoutSec). The Runtime is
+  // DB-free, so the value comes from Portal via the `config.getAgent` RPC (the
+  // same channel other agent config flows through) — NOT a direct DB read.
+  // Best-effort: any RPC failure falls back to the AgentBox's own default
+  // rather than failing the spawn. The env only takes effect on a cold spawn —
+  // K8sSpawner ignores it when a pod is already running, so a changed timeout
+  // applies on the agent's next restart.
+  //
+  // Registered on the AgentBoxManager (not wired per-call) so EVERY cold-spawn
+  // entry point — chat RPCs here, plus channel webhooks and cron tasks that
+  // share this manager — honours the per-agent window. The manager invokes it
+  // lazily, only on an actual spawn, so warm-pod reuse pays no RPC.
+  const resolveAgentSpawnEnv = async (agentId: string): Promise<Record<string, string> | undefined> => {
+    try {
+      const agent = await frontendClient.request("config.getAgent", { agentId }) as
+        | { idle_timeout_sec?: number | null }
+        | null;
+      const sec = agent?.idle_timeout_sec;
+      if (sec !== undefined && sec !== null) {
+        return { SICLAW_AGENTBOX_IDLE_TIMEOUT: String(sec) };
+      }
+    } catch (err) {
+      console.warn(`[gateway] Failed to resolve idle timeout for agent ${agentId}:`, err);
+    }
+    return undefined;
+  };
+  agentBoxManager.setSpawnEnvResolver(resolveAgentSpawnEnv);
+
   // Per-session AbortController for the in-flight chat.send SSE consumer, keyed
   // by sessionId. chat.abort looks this up to break the gateway's consumeAgentSse
   // loop so its abort-finalization runs (in-flight tool rows → "stopped", partial

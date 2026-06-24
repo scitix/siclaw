@@ -78,8 +78,47 @@ async function main() {
   if (process.env.USER_ID) sessionManager.userId = process.env.USER_ID;
   if (process.env.SICLAW_AGENT_ID) sessionManager.agentId = process.env.SICLAW_AGENT_ID;
 
-  // Start HTTP server
-  const server = createHttpServer(sessionManager);
+  // Graceful shutdown — defined before the server so the idle self-destruct
+  // timer can route through it (see onIdleShutdown below). Idempotent: the idle
+  // timer firing and a SIGTERM racing must not run the teardown twice.
+  //
+  // ⚠️ This closure forward-references `server` and `federationFlushEnabled`,
+  // declared below. That is only safe because `onIdleShutdown` is invoked
+  // ASYNCHRONOUSLY (from the setTimeout in createHttpServer's checkIdle), never
+  // synchronously during createHttpServer — by the time it fires, both consts
+  // are initialized. A future refactor that calls onIdleShutdown synchronously
+  // would turn these into TDZ ReferenceErrors; don't.
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log("[agentbox] Shutting down...");
+    // Final metrics flush FIRST: capture the last <pull-interval of increments before
+    // the pod is recycled, and before the (possibly slow) closeAll() risks hitting the
+    // K8s SIGKILL grace deadline. Best-effort — never let it block shutdown. This
+    // replaces the old "close :9090 last so Prometheus can scrape the final state"
+    // window, which is gone now that the scrape target is removed.
+    if (federationFlushEnabled) {
+      try {
+        const client = new GatewayClient({ gatewayUrl: config.server.gatewayUrl });
+        await client.sendMetricsFlush({ incarnation: processIncarnation, prom: await getMetricsAsJSON() });
+        console.log("[agentbox] Final metrics flush sent to Gateway");
+      } catch (err) {
+        console.warn("[agentbox] Final metrics flush failed (continuing shutdown):", err);
+      }
+    }
+    await debugPodCache.evictAll();
+    await sessionManager.closeAll();
+    server.close();
+    process.exit(0);
+  };
+
+  // Start HTTP server. The idle self-destruct (K8s mode) routes through the same
+  // graceful shutdown as SIGTERM rather than a raw process.exit(0), so debug pods
+  // get evicted and trailing metrics flushed instead of orphaned.
+  const server = createHttpServer(sessionManager, {
+    onIdleShutdown: () => { void shutdown(); },
+  });
 
   const protocol = server instanceof https.Server ? "https" : "http";
   server.listen(PORT, () => {
@@ -106,29 +145,6 @@ async function main() {
   // Gated identically to the 9090 metrics server (mTLS/https) plus a configured
   // gatewayUrl to push to.
   const federationFlushEnabled = server instanceof https.Server && !!config.server.gatewayUrl;
-
-  // Graceful shutdown.
-  const shutdown = async () => {
-    console.log("[agentbox] Shutting down...");
-    // Final metrics flush FIRST: capture the last <pull-interval of increments before
-    // the pod is recycled, and before the (possibly slow) closeAll() risks hitting the
-    // K8s SIGKILL grace deadline. Best-effort — never let it block shutdown. This
-    // replaces the old "close :9090 last so Prometheus can scrape the final state"
-    // window, which is gone now that the scrape target is removed.
-    if (federationFlushEnabled) {
-      try {
-        const client = new GatewayClient({ gatewayUrl: config.server.gatewayUrl });
-        await client.sendMetricsFlush({ incarnation: processIncarnation, prom: await getMetricsAsJSON() });
-        console.log("[agentbox] Final metrics flush sent to Gateway");
-      } catch (err) {
-        console.warn("[agentbox] Final metrics flush failed (continuing shutdown):", err);
-      }
-    }
-    await debugPodCache.evictAll();
-    await sessionManager.closeAll();
-    server.close();
-    process.exit(0);
-  };
 
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

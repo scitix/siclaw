@@ -1755,6 +1755,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       system_prompt: agent.system_prompt,
       icon: agent.icon,
       color: agent.color,
+      idle_timeout_sec: agent.idle_timeout_sec,
     };
   });
 

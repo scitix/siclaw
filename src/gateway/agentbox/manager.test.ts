@@ -314,3 +314,56 @@ describe("AgentBoxManager — K8s CA-fingerprint self-heal", () => {
     expect(spawner.spawnCalls).toHaveLength(0);
   });
 });
+
+describe("AgentBoxManager — injected spawnEnvResolver", () => {
+  it("does NOT call the resolver when a running pod is reused (warm path → no RPC)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", {
+      boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    let calls = 0;
+    mgr.setSpawnEnvResolver(async () => { calls++; return { SICLAW_AGENTBOX_IDLE_TIMEOUT: "150" }; });
+
+    await mgr.getOrCreate("agent-a");
+    expect(calls).toBe(0);
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("calls the resolver with the agentId and injects its env on a cold spawn", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    const seen: string[] = [];
+    mgr.setSpawnEnvResolver(async (agentId) => { seen.push(agentId); return { SICLAW_AGENTBOX_IDLE_TIMEOUT: "150" }; });
+
+    await mgr.getOrCreate("agent-a");
+    expect(seen).toEqual(["agent-a"]);
+    expect(spawner.spawnCalls[0].env).toEqual({ SICLAW_AGENTBOX_IDLE_TIMEOUT: "150" });
+  });
+
+  it("applies to every entry point, not just one call site (cold spawn always resolves)", async () => {
+    // The resolver is owned by the manager, so a channel/cron path that calls
+    // getOrCreate(agentId) with no extra args still gets the env.
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setSpawnEnvResolver(async () => ({ SICLAW_AGENTBOX_IDLE_TIMEOUT: "0" }));
+    await mgr.getOrCreate("agent-from-channel");
+    expect(spawner.spawnCalls[0].env).toEqual({ SICLAW_AGENTBOX_IDLE_TIMEOUT: "0" });
+  });
+
+  it("spawns with no env when no resolver is set", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls[0].env).toBeUndefined();
+  });
+
+  it("spawns with no env when the resolver yields undefined", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setSpawnEnvResolver(async () => undefined);
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls[0].env).toBeUndefined();
+  });
+});

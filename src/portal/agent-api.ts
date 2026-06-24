@@ -19,6 +19,16 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 
+/**
+ * Coerce an idle-timeout request value to a non-negative integer (seconds).
+ * Mirrors the Portal UI input handler. Non-numeric / missing → default 300.
+ * 0 (or negative, clamped to 0) means "resident" (never auto-destroy).
+ */
+function clampIdleTimeoutSec(v: unknown): number {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) ? Math.max(0, n) : 300;
+}
+
 export function registerAgentRoutes(
   router: RestRouter,
   jwtSecret: string,
@@ -51,7 +61,7 @@ export function registerAgentRoutes(
 
     const listParams = [...params, pageSize, offset];
     const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id, a.model_routing,
-        a.is_production, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
+        a.is_production, a.idle_timeout_sec, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
         (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
@@ -87,8 +97,8 @@ export function registerAgentRoutes(
     }
 
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, system_prompt, is_production, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, system_prompt, is_production, idle_timeout_sec, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -99,6 +109,7 @@ export function registerAgentRoutes(
         modelRouting ?? null,
         body.system_prompt ?? null,
         body.is_production ?? 1,
+        clampIdleTimeoutSec(body.idle_timeout_sec),
         body.icon ?? null,
         body.color ?? null,
         auth.userId,
@@ -153,7 +164,7 @@ export function registerAgentRoutes(
     // Build dynamic SET clause
     const fields = [
       "name", "description", "status", "model_provider",
-      "model_id", "system_prompt", "is_production", "icon", "color",
+      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "icon", "color",
     ];
     const setClauses: string[] = [];
     const values: unknown[] = [];
@@ -161,7 +172,7 @@ export function registerAgentRoutes(
     for (const field of fields) {
       if (field in body) {
         setClauses.push(`${field} = ?`);
-        values.push(body[field]);
+        values.push(field === "idle_timeout_sec" ? clampIdleTimeoutSec(body[field]) : body[field]);
       }
     }
     if ("model_routing" in body) {

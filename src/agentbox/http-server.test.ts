@@ -1202,3 +1202,78 @@ describe("http-server — reload routes delegate to handlers", () => {
     expect([200, 500]).toContain(r.status);
   });
 });
+
+// ── Idle self-destruct ────────────────────────────────────────────────
+//
+// createHttpServer arms an idle timer at construction time and tears the pod
+// down when no SSE connections / sessions remain for the configured window.
+// We drive it with fake timers and a spied onIdleShutdown callback (so nothing
+// actually calls process.exit), and a fresh fake session manager per test so
+// the global listening server doesn't interfere.
+describe("http-server — idle self-destruct", () => {
+  let idleServer: http.Server | https.Server | undefined;
+
+  afterEach(() => {
+    // createHttpServer doesn't listen here, but close defensively + restore timers.
+    try { (idleServer as http.Server | undefined)?.close(); } catch { /* not listening */ }
+    idleServer = undefined;
+    vi.useRealTimers();
+  });
+
+  function arm(opts: { idleTimeoutMs?: number; disableIdleShutdown?: boolean }) {
+    const onIdleShutdown = vi.fn();
+    const sm2 = makeFakeSessionManager();
+    vi.useFakeTimers();
+    idleServer = createHttpServer(sm2 as any, { ...opts, onIdleShutdown });
+    return { onIdleShutdown, sm: sm2 };
+  }
+
+  it("fires onIdleShutdown after the configured window when idle", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: 1000 });
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1000);
+    expect(onIdleShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("respects the configured window exactly (not before)", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: 5000 });
+    vi.advanceTimersByTime(4999);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(onIdleShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the 5-minute default when no window is provided", () => {
+    const { onIdleShutdown } = arm({});
+    vi.advanceTimersByTime(5 * 60 * 1000 - 1);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(onIdleShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT fire when a session is active before the window elapses (re-check guard)", () => {
+    const { onIdleShutdown, sm: sm2 } = arm({ idleTimeoutMs: 1000 });
+    // A session becomes active after the timer was armed but before it fires.
+    sm2.sessions.set("live", makeFakeSession("live"));
+    vi.advanceTimersByTime(1000);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+  });
+
+  it("is resident (never fires) when the window is 0", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: 0 });
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+  });
+
+  it("is resident (never fires) when the window is negative", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: -1 });
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+  });
+
+  it("never fires when disableIdleShutdown is set", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: 1000, disableIdleShutdown: true });
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+  });
+});
