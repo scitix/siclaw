@@ -19,6 +19,7 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
+import { normalizeIdleTimeoutSec } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
 
 /**
@@ -41,15 +42,6 @@ function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
   };
 }
 
-/**
- * Coerce an idle-timeout request value to a non-negative integer (seconds).
- * Mirrors the Portal UI input handler. Non-numeric / missing → default 300.
- * 0 (or negative, clamped to 0) means "resident" (never auto-destroy).
- */
-function clampIdleTimeoutSec(v: unknown): number {
-  const n = Math.floor(Number(v));
-  return Number.isFinite(n) ? Math.max(0, n) : 300;
-}
 
 export function registerAgentRoutes(
   router: RestRouter,
@@ -134,7 +126,7 @@ export function registerAgentRoutes(
         toolCapabilities ?? null,
         body.system_prompt ?? null,
         body.is_production ?? 1,
-        clampIdleTimeoutSec(body.idle_timeout_sec),
+        normalizeIdleTimeoutSec(body.idle_timeout_sec),
         body.icon ?? null,
         body.color ?? null,
         auth.userId,
@@ -197,7 +189,7 @@ export function registerAgentRoutes(
     for (const field of fields) {
       if (field in body) {
         setClauses.push(`${field} = ?`);
-        values.push(field === "idle_timeout_sec" ? clampIdleTimeoutSec(body[field]) : body[field]);
+        values.push(field === "idle_timeout_sec" ? normalizeIdleTimeoutSec(body[field]) : body[field]);
       }
     }
     if ("model_routing" in body) {

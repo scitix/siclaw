@@ -63,7 +63,9 @@ export interface SiclawConfig {
      * connections and no active sessions remain for this long, the pod shuts
      * itself down (K8s mode). Default 300 (5 min). Set to 0 (or negative) to
      * make the pod resident — never auto-destroy. Overridable via
-     * SICLAW_AGENTBOX_IDLE_TIMEOUT.
+     * SICLAW_AGENTBOX_IDLE_TIMEOUT. Always normalized via normalizeIdleTimeoutSec
+     * — positive values below MIN_AGENTBOX_IDLE_SEC (300) are floored to 300; 0
+     * stays resident.
      */
     idleTimeoutSec: number;
   };
@@ -90,6 +92,36 @@ function parseBooleanEnv(value: string | undefined, defaultValue: boolean): bool
   if (TRUE_VALUES.has(normalized)) return true;
   if (FALSE_VALUES.has(normalized)) return false;
   return defaultValue;
+}
+
+/**
+ * Minimum AgentBox idle self-destruct window, in seconds. A positive window
+ * below this floor would churn pods (cold-start + JSONL session restore) every
+ * time a user pauses for more than the window between turns. `0` (resident) is
+ * the deliberate escape hatch and is NOT floored.
+ */
+export const MIN_AGENTBOX_IDLE_SEC = 300;
+
+/**
+ * Normalize an idle-timeout value (seconds) to the supported range:
+ *  - `<= 0`      → `0`   (resident — never auto-destroy; intentional escape hatch)
+ *  - `1`..`299`  → `300` (enforce the floor)
+ *  - `>= 300`    → itself (floored to an integer)
+ *  - invalid / missing → `300` (the default)
+ *
+ * Applied both where the value is authored (agent-api write) and where it is
+ * consumed (loadConfig), so a sub-floor value from ANY source — env var,
+ * settings.json, or a legacy DB row written before this floor existed — still
+ * resolves to a safe window.
+ */
+export function normalizeIdleTimeoutSec(v: unknown): number {
+  // Unset (null/undefined/"") → default, NOT resident: only an explicit numeric
+  // <= 0 opts into resident, so a client that omits the field gets 300.
+  if (v === null || v === undefined || v === "") return MIN_AGENTBOX_IDLE_SEC;
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n)) return MIN_AGENTBOX_IDLE_SEC; // invalid → default
+  if (n <= 0) return 0;                                   // resident (escape hatch)
+  return Math.max(MIN_AGENTBOX_IDLE_SEC, n);              // floor
 }
 
 export function isMemoryEnabled(): boolean {
@@ -245,6 +277,9 @@ export function loadConfig(): SiclawConfig {
     const v = parseInt(process.env.SICLAW_AGENTBOX_IDLE_TIMEOUT, 10);
     if (!isNaN(v)) cached.server.idleTimeoutSec = v;
   }
+  // Enforce the floor on the FINAL value (default / settings.json / env / a
+  // sub-300 value injected from a legacy agent row), keeping 0 = resident.
+  cached.server.idleTimeoutSec = normalizeIdleTimeoutSec(cached.server.idleTimeoutSec);
   if (process.env.SICLAW_USER_DATA_DIR) {
     cached.paths.userDataDir = process.env.SICLAW_USER_DATA_DIR;
   }

@@ -364,7 +364,7 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
           className="w-full h-8 px-3 text-[13px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
         />
         <p className="text-[11px] text-muted-foreground/70 leading-relaxed">
-          Idle agent pods self-destruct after this many seconds with no active sessions (default 300). Set to 0 to keep the agent resident — it never auto-destroys. Applies on the agent's next restart.
+          Idle agent pods self-destruct after this many seconds with no active sessions (default 300). Minimum 300 — a smaller positive value is raised to 300 (a shorter window churns pods on every brief pause). Set to 0 to keep the agent resident — it never auto-destroys. Applies on the agent's next restart.
         </p>
       </div>
       <div className="space-y-2 pt-2">
