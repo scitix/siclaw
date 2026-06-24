@@ -30,6 +30,8 @@ const handlePairingCodeMock = vi.fn();
 vi.mock("../channel-manager.js", () => ({
   resolveBinding: (...args: unknown[]) => resolveBindingMock(...args),
   handlePairingCode: (...args: unknown[]) => handlePairingCodeMock(...args),
+  isChannelAccessDenied: (v: unknown) =>
+    v !== null && typeof v === "object" && (v as { walled?: unknown }).walled === true,
 }));
 
 // ── Helpers ─────────────────────────────────────────────────────────

@@ -39,17 +39,44 @@ export interface ResolvedChannelBinding {
   routeType: "group" | "user";
 }
 
-/** Resolve agent_id for a (channel_id, route_key) pair via RPC. */
+/**
+ * Non-binding result from `channel.resolveBinding`: the Portal recognised the
+ * channel but turned the sender away (sicore_authorized group, sender unbound or
+ * without read access to the agent). The Runtime should reply a short hint
+ * rather than silently ignore. Distinct from `null` (ignore: no binding at all).
+ */
+export interface ChannelAccessDenied {
+  walled: true;
+  reason?: string;
+  authorizeUrl?: string;
+}
+
+export function isChannelAccessDenied(
+  value: ResolvedChannelBinding | ChannelAccessDenied | null,
+): value is ChannelAccessDenied {
+  return value !== null && (value as ChannelAccessDenied).walled === true;
+}
+
+/**
+ * Resolve agent_id for a (channel_id, route_key) pair via RPC.
+ *
+ * `senderOpenId` is threaded so the Portal can resolve a per-sender identity
+ * for authorized group bots and choose the effective session key server-side
+ * (open groups → shared chat session; authorized → per-user). It is separate
+ * from `sessionKey` because the server may override the session key it returns.
+ */
 export async function resolveBinding(
   channelId: string,
   routeKey: string,
   frontendClient: FrontendWsClient,
   sessionKey?: string,
-): Promise<ResolvedChannelBinding | null> {
+  senderOpenId?: string,
+): Promise<ResolvedChannelBinding | ChannelAccessDenied | null> {
   const data = await frontendClient.request("channel.resolveBinding", {
     channel_id: channelId,
     route_key: routeKey,
     ...(sessionKey ? { session_key: sessionKey } : {}),
+    ...(senderOpenId ? { sender_open_id: senderOpenId } : {}),
   });
   return data.binding ?? null;
 }

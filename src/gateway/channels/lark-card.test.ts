@@ -4,6 +4,7 @@ import {
   openTypingCard,
   updateCardContent,
   finalizeCard,
+  buildMilestoneCardMarkdown,
   DEFAULT_PLACEHOLDER,
   EMPTY_RESULT_NOTICE,
   PLACEHOLDER_BY_LOCALE,
@@ -279,5 +280,46 @@ describe("finalizeCard", () => {
     const { client, contentSpy } = makeLarkClient();
     await finalizeCard(client as any, { cardId: "C", elementId: "md_main", sequence: 0 }, EMPTY_RESULT_NOTICE);
     expect(contentSpy.mock.calls[0][0].data.content).toBe(EMPTY_RESULT_NOTICE);
+  });
+});
+
+describe("buildMilestoneCardMarkdown", () => {
+  it("marks earlier milestones done (✅) and the latest in progress (⏳) while streaming", () => {
+    const md = buildMilestoneCardMarkdown({ milestones: ["pulled diff", "queried datadog", "writing summary"] });
+    const lines = md.split("\n");
+    expect(lines).toEqual([
+      "✅ pulled diff",
+      "✅ queried datadog",
+      "⏳ writing summary",
+    ]);
+  });
+
+  it("renders all milestones done + a blank line + the conclusion when final", () => {
+    const md = buildMilestoneCardMarkdown({ milestones: ["step 1", "step 2"], finalText: "Root cause: X. Roll back #4821." });
+    expect(md).toBe("✅ step 1\n✅ step 2\n\nRoot cause: X. Roll back #4821.");
+  });
+
+  it("is just the conclusion when there are no milestones (legacy behavior)", () => {
+    expect(buildMilestoneCardMarkdown({ milestones: [], finalText: "done." })).toBe("done.");
+  });
+
+  it("ignores blank milestone entries", () => {
+    const md = buildMilestoneCardMarkdown({ milestones: ["  ", "real step", ""] });
+    expect(md).toBe("⏳ real step");
+  });
+
+  it("preserves inline code so chips render", () => {
+    const md = buildMilestoneCardMarkdown({ milestones: ["502s isolated to `cart-service`"] });
+    expect(md).toContain("`cart-service`");
+  });
+
+  it("caps to the most recent maxVisible with a (+k) overflow prefix", () => {
+    const milestones = Array.from({ length: 14 }, (_, i) => `step ${i + 1}`);
+    const md = buildMilestoneCardMarkdown({ milestones, maxVisible: 10 });
+    const lines = md.split("\n");
+    expect(lines[0]).toBe("… (+4)"); // 14 - 10 hidden
+    expect(lines).toHaveLength(11); // overflow line + 10 shown
+    expect(md).toContain("step 14"); // newest kept
+    expect(md).not.toContain("✅ step 1\n"); // oldest dropped
   });
 });

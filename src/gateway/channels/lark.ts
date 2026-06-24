@@ -16,7 +16,9 @@ import {
   resolvePersonalBinding,
   handlePersonalPairingCode,
   resetPersonalSession,
+  isChannelAccessDenied,
   type ResolvedChannelBinding,
+  type ChannelAccessDenied,
 } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
@@ -25,6 +27,7 @@ import {
   openTypingCard,
   updateCardContent,
   finalizeCard,
+  buildMilestoneCardMarkdown,
   PLACEHOLDER_BY_LOCALE,
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
@@ -53,7 +56,20 @@ const PERSONAL_BIND_REQUIRED_NOTICE_BY_LOCALE = {
   "zh-CN": "❌ 这个个人机器人需要先绑定 Sicore 账号。请打开 Sicore 的 Agent Channels 页面，点击“授权飞书账号”后再回来私聊。",
   "en-US": "❌ This personal bot requires Sicore authorization. Open the Sicore Agent Channels page, click “Authorize Feishu account”, then come back to this chat.",
 } as const;
-const MAX_AGENT_SELECTED_UPDATES = 2;
+// sicore_authorized group: sender hasn't linked their Feishu account to Sicore.
+const GROUP_ACCESS_UNBOUND_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 你的飞书账号还没绑定 Sicore，无法在群里使用这个助手。请打开 Sicore 的 Agent Channels 页面授权飞书账号后再试。",
+  "en-US": "❌ Your Feishu account isn't linked to Sicore yet, so you can't use this assistant here. Open the Sicore Agent Channels page to authorize, then try again.",
+} as const;
+// sicore_authorized group: sender is linked but lacks read access to the agent.
+const GROUP_ACCESS_DENIED_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 你没有这个助手的访问权限，请联系管理员授权。",
+  "en-US": "❌ You don't have access to this assistant. Ask an admin to grant access.",
+} as const;
+// Max milestones kept in the accumulating Claude-tag checklist. channel_update
+// milestones are meant to be sparse; if an agent over-emits we drop the oldest
+// so the card stays within Feishu's element size limits.
+const MILESTONE_CAP = 20;
 const MAX_LARK_BINDING_QUEUE = 20;
 
 interface QueuedLarkTask {
@@ -82,6 +98,7 @@ export interface LarkChannelConfig {
     access_mode: "open" | "sicore_authorized";
     owner_user_id?: string;
     authorize_url?: string;
+    group_auto_bind?: boolean;
   };
 }
 
@@ -120,6 +137,25 @@ export function createLarkHandler(
         domain,
       });
 
+      // Fetch the bot's own open_id once at start. Group-message handling needs
+      // it to tell an individual "@bot" from "@所有人": Feishu delivers @所有人
+      // to an @bot-scoped app too (it mentions everyone, the bot included), so
+      // at the event layer an @所有人 announcement is indistinguishable from a
+      // real @bot unless we match the bot's own open_id. Best-effort: on
+      // failure we fall back to @_all-exclusion (see isBotMentioned).
+      let botOpenId: string | undefined;
+      try {
+        const botInfo: any = await (larkClient as any).request({
+          method: "GET",
+          url: "/open-apis/bot/v3/info",
+        });
+        botOpenId = botInfo?.bot?.open_id ?? botInfo?.data?.bot?.open_id;
+        console.log(`[lark] Channel ${channelId} bot open_id=${botOpenId ?? "(unknown)"}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[lark] Could not fetch bot info for channel ${channelId}; group @-mention gating falls back to @_all-exclusion: ${msg}`);
+      }
+
       const dispatcher = new lark.EventDispatcher({
         verificationToken: config.verification_token,
         encryptKey: config.encrypt_key,
@@ -134,7 +170,7 @@ export function createLarkHandler(
         // ACK ships in <1ms and redelivery never triggers.
         "im.message.receive_v1": (data: any) => {
           setImmediate(() => {
-            handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions, frontendClient, localeForDomain(config.domain), config)
+            handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions, frontendClient, localeForDomain(config.domain), config, botOpenId)
               .catch((err) => {
                 console.error(`[lark] Error handling message for channel=${channelId}:`, err);
               });
@@ -223,6 +259,30 @@ function buildLarkSessionKey(senderOpenId: string | null, chatId: string): strin
   return senderOpenId ? `open_id:${senderOpenId}` : `chat:${chatId}`;
 }
 
+/**
+ * Whether a group message is actually directed at THIS bot.
+ *
+ * Feishu delivers a group message to an app scoped to "receive @bot messages"
+ * whenever the bot is mentioned — but "@所有人" (@all) mentions *everyone*, the
+ * bot included, so an @所有人 announcement is delivered too and looks identical
+ * to a real @bot at the event layer. We must match the bot's own open_id:
+ * "@所有人" carries key "@_all" and never the bot's open_id, so a strict
+ * open_id match excludes it (and any "@someone-else").
+ *
+ * Degraded path — bot-info fetch failed, so `botOpenId` is unknown: we can't
+ * positively identify the bot, but we can still drop "@所有人" explicitly by
+ * its "@_all" key. This kills the reported announcement-spam case without
+ * muting the bot when its open_id couldn't be resolved.
+ */
+function isBotMentioned(message: any, botOpenId?: string): boolean {
+  const mentions = message?.mentions as
+    | Array<{ id?: { open_id?: string }; key?: string }>
+    | undefined;
+  if (!mentions || mentions.length === 0) return false;
+  if (botOpenId) return mentions.some((m) => m.id?.open_id === botOpenId);
+  return mentions.some((m) => m.key !== "@_all");
+}
+
 export function buildChannelTurnPrompt(text: string): string {
   return [
     "<channel-turn>",
@@ -252,6 +312,7 @@ export async function handleLarkMessage(
   frontendClient?: FrontendWsClient,
   locale: "zh-CN" | "en-US" = "zh-CN",
   channelConfig?: LarkChannelConfig,
+  botOpenId?: string,
 ): Promise<void> {
   // @larksuiteoapi/node-sdk EventDispatcher flattens the event payload before
   // dispatching: `event.*` fields land on the top level and `data.event`
@@ -265,6 +326,11 @@ export async function handleLarkMessage(
   const chatType: string | undefined = message.chat_type;
   const senderOpenId = getLarkSenderOpenId(data);
   const sessionKey = buildLarkSessionKey(senderOpenId, chatId);
+
+  // Raw receipt log: fires for EVERY delivered event before any drop, so a
+  // group message that arrives but is filtered (non-text, empty after @-strip)
+  // is still visible. Lets us tell "never delivered" from "silently dropped".
+  console.log(`[lark] recv event chat=${chatId} chat_type=${chatType} msg_type=${msgType} sender=${senderOpenId ?? "?"} channelCfg=${channelId}`);
 
   if (msgType !== "text") return;
 
@@ -354,8 +420,28 @@ export async function handleLarkMessage(
     return;
   }
 
-  // Look up binding for this chat
-  const binding = await resolveBinding(groupChannelId, chatId, frontendClient!, sessionKey);
+  // Only respond when THIS bot is individually @-mentioned. Feishu also
+  // delivers "@所有人" to an @bot-scoped app (it mentions everyone, the bot
+  // included), so an @所有人 announcement arrives looking just like a real
+  // @bot — without this gate the bot replies to group-wide announcements that
+  // were never aimed at it. Skips "@所有人" and "@someone-else"; PAIR above is
+  // exempt (explicit command). Gated on chat_type==="group" so the binding/
+  // access checks below stay reachable only for messages aimed at the bot.
+  if (chatType === "group" && !isBotMentioned(message, botOpenId)) {
+    console.log(`[lark] Group message not directed at bot (chat=${chatId}) — ignoring (@所有人 / @others / no @bot)`);
+    return;
+  }
+
+  // Look up binding for this chat. Pass sender_open_id so the Portal can
+  // auto-bind / per-sender resolve group bots and pick the session key.
+  const binding = await resolveBinding(groupChannelId, chatId, frontendClient!, sessionKey, senderOpenId ?? undefined);
+  if (isChannelAccessDenied(binding)) {
+    // sicore_authorized group: this sender isn't allowed. Feishu only delivers
+    // @-mentioned group messages, so the message is already directed at the bot
+    // — a single short hint is fine, not spam.
+    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale));
+    return;
+  }
   if (!binding) {
     console.log(`[lark] No binding for channel=${groupChannelId} chat=${chatId} — ignoring`);
     // Don't spam the group with "not paired" for every message.
@@ -363,13 +449,20 @@ export async function handleLarkMessage(
     return;
   }
 
-  const queueKey = `${binding.bindingId}:${binding.sessionKey ?? sessionKey}`;
+  // Use the SERVER-authoritative session key (not the local open_id default) for
+  // both the queue and the queued context, so the two-path contract holds:
+  //   - open group     → open_id:<sender>  (per-sender: concurrent + isolated)
+  //   - authorized group → sicore_user:<id> (per-user)
+  //   - legacy single binding session → "" (binding-level queue + /new reset)
+  // /new then resets the right session, and same-session senders serialize.
+  const effectiveSessionKey = binding.sessionKey ?? "";
+  const queueKey = `${binding.bindingId}:${binding.sessionKey ?? "__binding__"}`;
   const queued = enqueueBindingTask(queueKey, () => processQueuedLarkMessage({
     text,
     messageId,
     chatId,
     senderOpenId,
-    sessionKey,
+    sessionKey: effectiveSessionKey,
     channelId: groupChannelId,
     route: "group",
     larkClient,
@@ -456,30 +549,75 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // once the agent is done (preserves the pre-card behaviour).
   const cardSession = await openTypingCard(larkClient, messageId, PLACEHOLDER_BY_LOCALE[locale]);
   let deliveredTextChars = 0;
-  let deliveredAgentUpdates = 0;
+  // Accumulating Claude-tag checklist. Two milestone sources feed one list:
+  // explicit channel_update tool calls (agent-curated) AND auto-derived first
+  // lines of intermediate assistant turns (collectChannelResponse.onMilestone).
+  // Card re-renders are coalesced (never concurrent) to respect Feishu's update
+  // rate; earlier steps render ✅, the latest ⏳, then the answer on finalize.
+  const milestones: string[] = [];
+  let cardFlushInflight = false;
+  let cardFlushDirty = false;
+  let cardFinalizing = false;
+  let cardFlushPromise: Promise<void> | null = null;
+  const flushMilestoneCard = (): Promise<void> => {
+    if (!cardSession || cardFinalizing) return Promise.resolve();
+    if (cardFlushInflight) { cardFlushDirty = true; return cardFlushPromise ?? Promise.resolve(); }
+    cardFlushInflight = true;
+    cardFlushPromise = (async () => {
+      try {
+        do {
+          cardFlushDirty = false;
+          const md = buildMilestoneCardMarkdown({ milestones });
+          if (md.trim()) await updateCardContent(larkClient, cardSession, md);
+        } while (cardFlushDirty && !cardFinalizing);
+      } catch (err) {
+        console.warn(`[lark] milestone card flush failed for session=${sessionId}:`, err);
+      } finally {
+        cardFlushInflight = false;
+      }
+    })();
+    return cardFlushPromise;
+  };
+  // Returns a promise the channel_update path awaits (deterministic delivered
+  // bool); the narration onMilestone path ignores it (must not block the SSE
+  // loop). Bursts coalesce — a flush in flight just marks the card dirty.
+  const addMilestone = (text: string): Promise<void> => {
+    const t = (text ?? "").trim();
+    if (!t || milestones[milestones.length - 1] === t) return Promise.resolve(); // skip empty/dup
+    milestones.push(t);
+    if (milestones.length > MILESTONE_CAP) milestones.shift();
+    return flushMilestoneCard();
+  };
   registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
     if ("text" in backgroundMessage) {
-      const display = stripVisualBlocks(backgroundMessage.text) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
-      if (!shouldDeliverAgentSelectedUpdate(backgroundMessage.kind, display, deliveredAgentUpdates)) return true;
-      if (backgroundMessage.kind !== "final") deliveredAgentUpdates += 1;
-      const terminal = backgroundMessage.kind === "final";
-      const delivered = await deliverVisibleChannelText(larkClient, messageId, cardSession, display, terminal);
-      if (delivered) deliveredTextChars = display.length;
-      return delivered;
+      const display = stripVisualBlocks(backgroundMessage.text);
+      if (!display || !display.trim()) return true;
+
+      if (backgroundMessage.kind === "final") {
+        const md = buildMilestoneCardMarkdown({ milestones, finalText: display });
+        const delivered = await deliverVisibleChannelText(larkClient, messageId, cardSession, md, true);
+        if (delivered) deliveredTextChars = md.length;
+        return delivered;
+      }
+
+      // milestone / artifact → accumulate into the checklist (coalesced render).
+      await addMilestone(display);
+      return true;
     }
 
     const display = stripVisualBlocks(backgroundMessage.content) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
     if (!shouldDeliverBackgroundReply(display, deliveredTextChars)) return true;
+    const md = buildMilestoneCardMarkdown({ milestones, finalText: display });
     if (cardSession) {
-      const ok = await finalizeCard(larkClient, cardSession, display);
+      const ok = await finalizeCard(larkClient, cardSession, md);
       if (ok) {
-        deliveredTextChars = display.length;
+        deliveredTextChars = md.length;
         return true;
       }
       console.warn(`[lark] Background card update failed for session=${sessionId}; falling back to text reply`);
     }
-    await replyToLark(larkClient, messageId, display);
-    deliveredTextChars = display.length;
+    await replyToLark(larkClient, messageId, md);
+    deliveredTextChars = md.length;
     return true;
   });
 
@@ -493,7 +631,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   let agentError: Error | null = null;
   try {
     const promptResult = await client.prompt(promptOpts);
-    const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", { includeImages: true });
+    const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", {
+      includeImages: true,
+      onMilestone: addMilestone,
+    });
     resultText = collected.text;
     replyImages = collected.images;
   } catch (err) {
@@ -509,10 +650,20 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   if (agentError) replyImages = [];
   const displayBody = stripVisualBlocks(finalBody, { stripSourceBlocks: replyImages.length > 0 })
     || VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
+  // Render the accumulated milestone checklist (✅) followed by the conclusion,
+  // so the final card preserves the visible investigation trail. With no
+  // milestones this is just the conclusion (legacy behavior).
+  const finalCardBody = buildMilestoneCardMarkdown({ milestones, finalText: displayBody });
+
+  // Stop any further coalesced milestone renders and let the in-flight one
+  // settle, so finalizeCard isn't overwritten by a later (higher-sequence)
+  // milestone-only update.
+  cardFinalizing = true;
+  if (cardFlushPromise) { try { await cardFlushPromise; } catch { /* logged in flush */ } }
 
   if (cardSession) {
-    const ok = await finalizeCard(larkClient, cardSession, displayBody);
-    deliveredTextChars = displayBody.length;
+    const ok = await finalizeCard(larkClient, cardSession, finalCardBody);
+    deliveredTextChars = finalCardBody.length;
     if (!ok) {
       // Partial-failure path: the card is visible but stuck in streaming
       // state. We log but do NOT post a second reply — that would produce
@@ -521,9 +672,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     }
   } else if (resultText || agentError) {
     // Card could not be opened; fall back to a plain text reply with
-    // whatever we have (final answer or error).
-    await replyToLark(larkClient, messageId, displayBody);
-    deliveredTextChars = displayBody.length;
+    // whatever we have (final answer or error) + any accumulated milestones.
+    await replyToLark(larkClient, messageId, finalCardBody);
+    deliveredTextChars = finalCardBody.length;
   }
 
   await replyVisualImages(larkClient, messageId, replyImages);
@@ -541,7 +692,25 @@ async function resolveQueuedBinding(
     if (!senderOpenId) return null;
     return resolvePersonalBinding(channelId, senderOpenId, frontendClient);
   }
-  return resolveBinding(channelId, chatId, frontendClient, sessionKey);
+  const result = await resolveBinding(channelId, chatId, frontendClient, sessionKey, senderOpenId ?? undefined);
+  // If access was revoked between enqueue and run, treat as gone (the queued
+  // task then skips). The pre-enqueue check already replied any access hint.
+  return isChannelAccessDenied(result) ? null : result;
+}
+
+/**
+ * Build the access-denied reply for a sicore_authorized group, in the channel's
+ * locale. Appends the authorize URL for the "unbound" case.
+ */
+function formatGroupAccessDeniedReply(
+  denied: ChannelAccessDenied,
+  locale: "zh-CN" | "en-US",
+): string {
+  if (denied.reason === "denied") {
+    return GROUP_ACCESS_DENIED_NOTICE_BY_LOCALE[locale];
+  }
+  const base = GROUP_ACCESS_UNBOUND_NOTICE_BY_LOCALE[locale];
+  return denied.authorizeUrl ? `${base}\n${denied.authorizeUrl}` : base;
 }
 
 async function handleNewCommand(
@@ -624,10 +793,16 @@ function formatPersonalPairReply(
 
 async function replyToLark(larkClient: any, messageId: string, text: string): Promise<void> {
   try {
-    await larkClient.im.message.reply({
+    // Feishu's SDK does NOT throw on a non-zero API code (e.g. missing
+    // im:message send scope) — it returns {code,msg} in the body. Surface it,
+    // otherwise a permission failure looks like a silent no-op.
+    const resp = await larkClient.im.message.reply({
       path: { message_id: messageId },
       data: { content: JSON.stringify({ text }), msg_type: "text" },
     });
+    if (resp && typeof resp.code === "number" && resp.code !== 0) {
+      console.error(`[lark] reply API returned non-zero code for messageId=${messageId}: code=${resp.code} msg=${resp.msg}`);
+    }
   } catch (err) {
     console.error(`[lark] Failed to reply to messageId=${messageId}:`, err);
   }
@@ -637,12 +812,6 @@ function shouldDeliverBackgroundReply(text: string, previousChars: number): bool
   const chars = text.trim().length;
   if (chars === 0) return false;
   return !(previousChars > 80 && chars < 120 && chars < previousChars * 0.75);
-}
-
-function shouldDeliverAgentSelectedUpdate(kind: "milestone" | "final" | "artifact", text: string, deliveredUpdates: number): boolean {
-  if (!text.trim()) return false;
-  if (kind !== "final" && deliveredUpdates >= MAX_AGENT_SELECTED_UPDATES) return false;
-  return true;
 }
 
 async function deliverVisibleChannelText(
@@ -691,7 +860,7 @@ export async function collectChannelResponse(
   client: AgentBoxClient,
   sessionId: string,
   logPrefix = "lark",
-  options: { includeImages?: boolean } = {},
+  options: { includeImages?: boolean; onMilestone?: (text: string) => void } = {},
 ): Promise<CollectedChannelResponse> {
   const parts: string[] = [];
   const images: RenderedReplyImage[] = [];
@@ -717,7 +886,17 @@ export async function collectChannelResponse(
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
         if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
         const turnText = contentBlocksToMarkdown(blocks);
-        if (turnText) lastAssistantText = turnText;
+        if (turnText) {
+          // A NEW assistant turn means the PREVIOUS one was an intermediate
+          // step (the agent narrated, then called a tool) — surface its first
+          // line as a progress milestone. The final turn is never followed by
+          // another, so it stays the answer, not a milestone.
+          if (lastAssistantText && options.onMilestone) {
+            const m = condenseMilestone(lastAssistantText);
+            if (m) options.onMilestone(m);
+          }
+          lastAssistantText = turnText;
+        }
       }
     }
   } catch (err) {
@@ -727,6 +906,18 @@ export async function collectChannelResponse(
   // brain only emits content_block_delta events.
   const text = lastAssistantText || parts.join("");
   return { text, images };
+}
+
+/**
+ * Condense an intermediate assistant turn into a one-line progress milestone:
+ * first non-empty line, strip a leading heading marker, cap length. Inline
+ * code/bold pass through so chips still render.
+ */
+function condenseMilestone(text: string): string {
+  const firstLine = text.split("\n").map((s) => s.trim()).find(Boolean) ?? "";
+  const clean = firstLine.replace(/^#{1,6}\s+/, "").trim();
+  if (!clean) return "";
+  return clean.length > 90 ? `${clean.slice(0, 88)}…` : clean;
 }
 
 function contentBlocksToMarkdown(blocks: unknown[]): string {

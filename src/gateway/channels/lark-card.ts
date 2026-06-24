@@ -59,6 +59,45 @@ export function localeForDomain(domain: string | undefined): LarkLocale {
 /** Primary markdown element id — shared between create and patch calls. */
 const MD_ELEMENT_ID = "md_main";
 
+/**
+ * Render the Claude-tag style progress body: accumulated `channel_update`
+ * milestones as a checklist, then the final conclusion on completion.
+ *
+ * - Streaming (finalText == null): earlier milestones render ✅ (done), the
+ *   latest renders ⏳ (the current step), giving the live "✓ done / ✱ doing"
+ *   look without needing a separate current-step signal.
+ * - Final (finalText set): all milestones render ✅, a blank line, then the
+ *   conclusion. With no milestones this is just the conclusion (legacy behavior).
+ *
+ * Only the most recent `maxVisible` milestones are shown (with a `…(+k)` prefix
+ * for the rest) so a long SRE investigation stays within the card's size limits.
+ * Milestone text passes through verbatim, so an agent writing inline code
+ * (`` `cart-service` ``) gets rendered chips for free.
+ */
+export function buildMilestoneCardMarkdown(opts: {
+  milestones: string[];
+  finalText?: string | null;
+  maxVisible?: number;
+}): string {
+  const all = opts.milestones.map((m) => (m ?? "").trim()).filter(Boolean);
+  const isFinal = opts.finalText != null;
+  const maxVisible = opts.maxVisible ?? 10;
+  const hidden = Math.max(0, all.length - maxVisible);
+  const shown = hidden > 0 ? all.slice(all.length - maxVisible) : all;
+  const lines: string[] = [];
+  if (hidden > 0) lines.push(`… (+${hidden})`);
+  shown.forEach((m, i) => {
+    const inProgress = !isFinal && i === shown.length - 1;
+    lines.push(`${inProgress ? "⏳" : "✅"} ${m}`);
+  });
+  if (isFinal) {
+    const final = opts.finalText!.trim();
+    if (lines.length && final) lines.push("");
+    if (final) lines.push(final);
+  }
+  return lines.join("\n");
+}
+
 /** Handle returned by `openTypingCard` and consumed by `finalizeCard`. */
 export interface CardSession {
   cardId: string;
@@ -159,13 +198,21 @@ export async function openTypingCard(
       return null;
     }
 
-    await larkClient.im.message.reply({
+    // Posting the card into the chat. The SDK does NOT throw on a non-zero API
+    // code (e.g. the app lacks the im:message send scope) — the card would be
+    // created in CardKit but never appear in the chat, with no error. Surface
+    // the code and fall back to a plain-text reply so the failure is visible.
+    const replyRes = await larkClient.im.message.reply({
       path: { message_id: messageId },
       data: {
         msg_type: "interactive",
         content: JSON.stringify({ type: "card", data: { card_id: cardId } }),
       },
     });
+    if (replyRes && typeof replyRes.code === "number" && replyRes.code !== 0) {
+      console.error(`[lark-card] posting card to chat failed for messageId=${messageId}: code=${replyRes.code} msg=${replyRes.msg} (does the app have the im:message send scope?)`);
+      return null;
+    }
     return { cardId, elementId: MD_ELEMENT_ID, sequence: 0 };
   } catch (err) {
     console.error(`[lark-card] openTypingCard failed for messageId=${messageId}:`, err);

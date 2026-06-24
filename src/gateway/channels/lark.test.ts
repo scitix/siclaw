@@ -44,6 +44,8 @@ vi.mock("../channel-manager.js", () => ({
   resolvePersonalBinding: (...args: unknown[]) => resolvePersonalBindingMock(...args),
   handlePersonalPairingCode: (...args: unknown[]) => handlePersonalPairingCodeMock(...args),
   resetPersonalSession: (...args: unknown[]) => resetPersonalSessionMock(...args),
+  isChannelAccessDenied: (v: unknown) =>
+    v !== null && typeof v === "object" && (v as { walled?: unknown }).walled === true,
 }));
 
 const ensureChatSessionMock = vi.fn();
@@ -130,6 +132,9 @@ function makeBinding(overrides: Record<string, unknown> = {}) {
     agentId: "a1",
     bindingId: "b",
     sessionId: "session-fixed",
+    // Server-authoritative per-sender session key (open group → open_id:<sender>);
+    // the Runtime uses this for queueing + /new, not the local default.
+    sessionKey: "open_id:ou_user_1",
     createdBy: "user-1",
     routeType: "group",
     ...overrides,
@@ -509,7 +514,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     resolveBindingMock.mockResolvedValue(null);
     const mgr = makeAgentBoxManager();
     await handleLarkMessage(makeTextEvent("hello"), makeLarkClient(), "lark", mgr as any, undefined, {} as any);
-    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1");
+    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1", "ou_user_1");
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
   });
@@ -537,8 +542,35 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       },
     );
 
-    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1");
+    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1", "ou_user_1");
     expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("authorized group: a walled sender gets a hint and no agent runs", async () => {
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", authorizeUrl: "https://sicore.example/auth" });
+    const lark = makeLarkClient();
+    const mgr = makeAgentBoxManager();
+    await handleLarkMessage(
+      makeTextEvent("hi"),
+      lark,
+      "lark-runtime",
+      mgr as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      {
+        app_id: "cli_x",
+        app_secret: "secret",
+        group_channel_id: "lark:personal:pb-1",
+        personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: "sicore_authorized", owner_user_id: "owner-1" },
+      },
+    );
+
+    const replyArg = lark.im.message.reply.mock.calls[0][0];
+    const text = JSON.parse(replyArg.data.content).text as string;
+    expect(text).toContain("https://sicore.example/auth");
+    expect(mgr.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
   });
 
   it("with binding → getOrCreate uses agentId alone, and registers the durable channel session owner", async () => {
@@ -720,6 +752,26 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
   });
 
+  it("/new resets the SERVER session key (authorized group → sicore_user:<id>), not the local open_id", async () => {
+    // Contract: the Runtime must reset whatever session key the resolver
+    // returned, so an authorized group resets the sender's sicore_user session
+    // and an open group resets open_id:<sender> — never the local default.
+    resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "old-session", sessionKey: "sicore_user:u42" }));
+    resetBindingSessionMock.mockResolvedValue({ success: true, agentId: "a1", oldSessionId: "old-session", sessionId: "new-session" });
+    const mgr = makeAgentBoxManager("a1");
+
+    await handleLarkMessage(
+      makeTextEvent("/new"),
+      makeLarkClient(),
+      "lark",
+      mgr as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "sicore_user:u42");
+  });
+
   it("queues concurrent messages for the same sender instead of starting a second prompt", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "queued-session" }));
     let releaseFirst!: () => void;
@@ -799,6 +851,73 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     releaseFirst();
     await Promise.all([first, ...queued]);
     expect(promptMock).toHaveBeenCalledTimes(21);
+  });
+});
+
+describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => {
+  const BOT = "ou_bot_self";
+
+  // A realistic group event carries chat_type:"group" + a mentions[] array.
+  function groupEvent(text: string, mentions: any[]) {
+    return makeTextEvent(text, { chat_type: "group", mentions });
+  }
+
+  it("routes when THIS bot is individually @-mentioned (open_id match)", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const data = groupEvent("@_user_1 查一下集群", [
+      { key: "@_user_1", id: { open_id: BOT } },
+    ]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).toHaveBeenCalled();
+  });
+
+  it("IGNORES @所有人 announcements (key @_all, not the bot's open_id)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    const data = groupEvent("@_all 基础功能都搞过来了", [
+      { key: "@_all", id: {} },
+    ]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("IGNORES a message that @-mentions someone else (not the bot)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    const data = groupEvent("@_user_2 你看下", [
+      { key: "@_user_2", id: { open_id: "ou_someone_else" } },
+    ]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("IGNORES a plain group message with no mention at all", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    const data = groupEvent("随便聊两句", []);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("degraded (botOpenId unknown): still drops @所有人 by its @_all key", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    const data = groupEvent("@_all 通知一下", [{ key: "@_all", id: {} }]);
+    // No botOpenId passed (bot-info fetch failed at start).
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("degraded (botOpenId unknown): a non-@_all mention still routes", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const data = groupEvent("@_user_1 帮我查", [{ key: "@_user_1", id: { open_id: "ou_whoever" } }]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any);
+    expect(resolveBindingMock).toHaveBeenCalled();
+  });
+
+  it("does NOT gate p2p messages — DMs never carry an @bot mention", async () => {
+    // p2p path is personal-bot only; with no personal_bot config it bails
+    // *before* resolveBinding, but it must NOT be dropped by the group gate.
+    const data = makeTextEvent("私聊问个问题", { chat_type: "p2p" });
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    // group resolveBinding is never reached on the p2p branch
+    expect(resolveBindingMock).not.toHaveBeenCalled();
   });
 });
 
@@ -930,7 +1049,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     clearBackgroundChannelDelivery(sessionId);
   });
 
-  it("lets the agent explicitly update the visible card, while Gateway caps non-final updates", async () => {
+  it("accumulates agent milestones into a Claude-tag checklist on the card", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-explicit-channel" });
     let releaseStream: () => void = () => {};
@@ -977,10 +1096,15 @@ describe("handleLarkMessage — streaming card flow", () => {
       })).resolves.toBe(true);
 
       const inFlightContentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
-      expect(inFlightContentCalls).toHaveLength(2);
-      expect(inFlightContentCalls[0][0].data.content).toContain("里程碑 1");
-      expect(inFlightContentCalls[1][0].data.content).toContain("产物提示");
-      expect(inFlightContentCalls[1][0].data.content).not.toContain("压掉");
+      // New behavior: milestones accumulate into a checklist (no 2-cap). Each
+      // update re-renders the whole list; earlier steps render ✅, the latest ⏳.
+      expect(inFlightContentCalls).toHaveLength(3);
+      const latest = inFlightContentCalls[2][0].data.content as string;
+      expect(latest).toContain("里程碑 1");
+      expect(latest).toContain("产物提示");
+      expect(latest).toContain("压掉"); // no longer suppressed — it accumulates
+      expect(latest).toContain("✅"); // earlier steps marked done
+      expect(latest).toContain("⏳"); // latest step in progress
       expect(lark.cardkit.v1.card.settings).not.toHaveBeenCalled();
       expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
       expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
@@ -991,8 +1115,13 @@ describe("handleLarkMessage — streaming card flow", () => {
     }
 
     const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
-    expect(contentCalls).toHaveLength(3);
-    expect(contentCalls.at(-1)[0].data.content).toContain("最终结论");
+    // 3 milestone updates + 1 final = 4 content writes.
+    expect(contentCalls).toHaveLength(4);
+    const finalContent = contentCalls.at(-1)[0].data.content as string;
+    expect(finalContent).toContain("最终结论");
+    // final card preserves the accumulated checklist (all milestones done).
+    expect(finalContent).toContain("里程碑 1");
+    expect(finalContent).toContain("压掉");
     expect(lark.cardkit.v1.card.settings).toHaveBeenCalledTimes(1);
   });
 
@@ -1650,6 +1779,24 @@ describe("collectResponse — SSE event flattening", () => {
     ];
     const text = await collectResponse(fakeClient(events), "s4");
     expect(text).toBe("");
+  });
+
+  it("surfaces intermediate assistant turns as milestones (first line), keeping the last as the answer", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "## 先看 node 状态\n详细…" }] } },
+      { type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "{...}" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "node 正常,继续查 `sichek`" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "结论:GPU#3 fatal,建议换卡。" }] } },
+    ];
+    const milestones: string[] = [];
+    const collected = await collectChannelResponse(fakeClient(events), "s-ms", "lark", {
+      onMilestone: (m) => milestones.push(m),
+    });
+    // Only the two NON-final assistant turns become milestones; heading marker
+    // stripped, first line only, inline code kept.
+    expect(milestones).toEqual(["先看 node 状态", "node 正常,继续查 `sichek`"]);
+    // The final turn is the answer, not a milestone.
+    expect(collected.text).toBe("结论:GPU#3 fatal,建议换卡。");
   });
 
   it("ignores non-text blocks (e.g. tool_use blocks) inside an assistant message", async () => {
