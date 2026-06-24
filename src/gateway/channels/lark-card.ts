@@ -59,6 +59,45 @@ export function localeForDomain(domain: string | undefined): LarkLocale {
 /** Primary markdown element id — shared between create and patch calls. */
 const MD_ELEMENT_ID = "md_main";
 
+/**
+ * Render the Claude-tag style progress body: accumulated `channel_update`
+ * milestones as a checklist, then the final conclusion on completion.
+ *
+ * - Streaming (finalText == null): earlier milestones render ✅ (done), the
+ *   latest renders ⏳ (the current step), giving the live "✓ done / ✱ doing"
+ *   look without needing a separate current-step signal.
+ * - Final (finalText set): all milestones render ✅, a blank line, then the
+ *   conclusion. With no milestones this is just the conclusion (legacy behavior).
+ *
+ * Only the most recent `maxVisible` milestones are shown (with a `…(+k)` prefix
+ * for the rest) so a long SRE investigation stays within the card's size limits.
+ * Milestone text passes through verbatim, so an agent writing inline code
+ * (`` `cart-service` ``) gets rendered chips for free.
+ */
+export function buildMilestoneCardMarkdown(opts: {
+  milestones: string[];
+  finalText?: string | null;
+  maxVisible?: number;
+}): string {
+  const all = opts.milestones.map((m) => (m ?? "").trim()).filter(Boolean);
+  const isFinal = opts.finalText != null;
+  const maxVisible = opts.maxVisible ?? 10;
+  const hidden = Math.max(0, all.length - maxVisible);
+  const shown = hidden > 0 ? all.slice(all.length - maxVisible) : all;
+  const lines: string[] = [];
+  if (hidden > 0) lines.push(`… (+${hidden})`);
+  shown.forEach((m, i) => {
+    const inProgress = !isFinal && i === shown.length - 1;
+    lines.push(`${inProgress ? "⏳" : "✅"} ${m}`);
+  });
+  if (isFinal) {
+    const final = opts.finalText!.trim();
+    if (lines.length && final) lines.push("");
+    if (final) lines.push(final);
+  }
+  return lines.join("\n");
+}
+
 /** Handle returned by `openTypingCard` and consumed by `finalizeCard`. */
 export interface CardSession {
   cardId: string;

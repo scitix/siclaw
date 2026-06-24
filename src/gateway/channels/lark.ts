@@ -27,6 +27,7 @@ import {
   openTypingCard,
   updateCardContent,
   finalizeCard,
+  buildMilestoneCardMarkdown,
   PLACEHOLDER_BY_LOCALE,
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
@@ -65,7 +66,10 @@ const GROUP_ACCESS_DENIED_NOTICE_BY_LOCALE = {
   "zh-CN": "❌ 你没有这个助手的访问权限，请联系管理员授权。",
   "en-US": "❌ You don't have access to this assistant. Ask an admin to grant access.",
 } as const;
-const MAX_AGENT_SELECTED_UPDATES = 2;
+// Max milestones kept in the accumulating Claude-tag checklist. channel_update
+// milestones are meant to be sparse; if an agent over-emits we drop the oldest
+// so the card stays within Feishu's element size limits.
+const MILESTONE_CAP = 20;
 const MAX_LARK_BINDING_QUEUE = 20;
 
 interface QueuedLarkTask {
@@ -279,6 +283,11 @@ export async function handleLarkMessage(
   const senderOpenId = getLarkSenderOpenId(data);
   const sessionKey = buildLarkSessionKey(senderOpenId, chatId);
 
+  // Raw receipt log: fires for EVERY delivered event before any drop, so a
+  // group message that arrives but is filtered (non-text, empty after @-strip)
+  // is still visible. Lets us tell "never delivered" from "silently dropped".
+  console.log(`[lark] recv event chat=${chatId} chat_type=${chatType} msg_type=${msgType} sender=${senderOpenId ?? "?"} channelCfg=${channelId}`);
+
   if (msgType !== "text") return;
 
   let text: string;
@@ -477,30 +486,75 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // once the agent is done (preserves the pre-card behaviour).
   const cardSession = await openTypingCard(larkClient, messageId, PLACEHOLDER_BY_LOCALE[locale]);
   let deliveredTextChars = 0;
-  let deliveredAgentUpdates = 0;
+  // Accumulating Claude-tag checklist. Two milestone sources feed one list:
+  // explicit channel_update tool calls (agent-curated) AND auto-derived first
+  // lines of intermediate assistant turns (collectChannelResponse.onMilestone).
+  // Card re-renders are coalesced (never concurrent) to respect Feishu's update
+  // rate; earlier steps render ✅, the latest ⏳, then the answer on finalize.
+  const milestones: string[] = [];
+  let cardFlushInflight = false;
+  let cardFlushDirty = false;
+  let cardFinalizing = false;
+  let cardFlushPromise: Promise<void> | null = null;
+  const flushMilestoneCard = (): Promise<void> => {
+    if (!cardSession || cardFinalizing) return Promise.resolve();
+    if (cardFlushInflight) { cardFlushDirty = true; return cardFlushPromise ?? Promise.resolve(); }
+    cardFlushInflight = true;
+    cardFlushPromise = (async () => {
+      try {
+        do {
+          cardFlushDirty = false;
+          const md = buildMilestoneCardMarkdown({ milestones });
+          if (md.trim()) await updateCardContent(larkClient, cardSession, md);
+        } while (cardFlushDirty && !cardFinalizing);
+      } catch (err) {
+        console.warn(`[lark] milestone card flush failed for session=${sessionId}:`, err);
+      } finally {
+        cardFlushInflight = false;
+      }
+    })();
+    return cardFlushPromise;
+  };
+  // Returns a promise the channel_update path awaits (deterministic delivered
+  // bool); the narration onMilestone path ignores it (must not block the SSE
+  // loop). Bursts coalesce — a flush in flight just marks the card dirty.
+  const addMilestone = (text: string): Promise<void> => {
+    const t = (text ?? "").trim();
+    if (!t || milestones[milestones.length - 1] === t) return Promise.resolve(); // skip empty/dup
+    milestones.push(t);
+    if (milestones.length > MILESTONE_CAP) milestones.shift();
+    return flushMilestoneCard();
+  };
   registerBackgroundChannelDelivery(sessionId, async (backgroundMessage) => {
     if ("text" in backgroundMessage) {
-      const display = stripVisualBlocks(backgroundMessage.text) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
-      if (!shouldDeliverAgentSelectedUpdate(backgroundMessage.kind, display, deliveredAgentUpdates)) return true;
-      if (backgroundMessage.kind !== "final") deliveredAgentUpdates += 1;
-      const terminal = backgroundMessage.kind === "final";
-      const delivered = await deliverVisibleChannelText(larkClient, messageId, cardSession, display, terminal);
-      if (delivered) deliveredTextChars = display.length;
-      return delivered;
+      const display = stripVisualBlocks(backgroundMessage.text);
+      if (!display || !display.trim()) return true;
+
+      if (backgroundMessage.kind === "final") {
+        const md = buildMilestoneCardMarkdown({ milestones, finalText: display });
+        const delivered = await deliverVisibleChannelText(larkClient, messageId, cardSession, md, true);
+        if (delivered) deliveredTextChars = md.length;
+        return delivered;
+      }
+
+      // milestone / artifact → accumulate into the checklist (coalesced render).
+      await addMilestone(display);
+      return true;
     }
 
     const display = stripVisualBlocks(backgroundMessage.content) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
     if (!shouldDeliverBackgroundReply(display, deliveredTextChars)) return true;
+    const md = buildMilestoneCardMarkdown({ milestones, finalText: display });
     if (cardSession) {
-      const ok = await finalizeCard(larkClient, cardSession, display);
+      const ok = await finalizeCard(larkClient, cardSession, md);
       if (ok) {
-        deliveredTextChars = display.length;
+        deliveredTextChars = md.length;
         return true;
       }
       console.warn(`[lark] Background card update failed for session=${sessionId}; falling back to text reply`);
     }
-    await replyToLark(larkClient, messageId, display);
-    deliveredTextChars = display.length;
+    await replyToLark(larkClient, messageId, md);
+    deliveredTextChars = md.length;
     return true;
   });
 
@@ -514,7 +568,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   let agentError: Error | null = null;
   try {
     const promptResult = await client.prompt(promptOpts);
-    const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", { includeImages: true });
+    const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", {
+      includeImages: true,
+      onMilestone: addMilestone,
+    });
     resultText = collected.text;
     replyImages = collected.images;
   } catch (err) {
@@ -530,10 +587,20 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   if (agentError) replyImages = [];
   const displayBody = stripVisualBlocks(finalBody, { stripSourceBlocks: replyImages.length > 0 })
     || VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
+  // Render the accumulated milestone checklist (✅) followed by the conclusion,
+  // so the final card preserves the visible investigation trail. With no
+  // milestones this is just the conclusion (legacy behavior).
+  const finalCardBody = buildMilestoneCardMarkdown({ milestones, finalText: displayBody });
+
+  // Stop any further coalesced milestone renders and let the in-flight one
+  // settle, so finalizeCard isn't overwritten by a later (higher-sequence)
+  // milestone-only update.
+  cardFinalizing = true;
+  if (cardFlushPromise) { try { await cardFlushPromise; } catch { /* logged in flush */ } }
 
   if (cardSession) {
-    const ok = await finalizeCard(larkClient, cardSession, displayBody);
-    deliveredTextChars = displayBody.length;
+    const ok = await finalizeCard(larkClient, cardSession, finalCardBody);
+    deliveredTextChars = finalCardBody.length;
     if (!ok) {
       // Partial-failure path: the card is visible but stuck in streaming
       // state. We log but do NOT post a second reply — that would produce
@@ -542,9 +609,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     }
   } else if (resultText || agentError) {
     // Card could not be opened; fall back to a plain text reply with
-    // whatever we have (final answer or error).
-    await replyToLark(larkClient, messageId, displayBody);
-    deliveredTextChars = displayBody.length;
+    // whatever we have (final answer or error) + any accumulated milestones.
+    await replyToLark(larkClient, messageId, finalCardBody);
+    deliveredTextChars = finalCardBody.length;
   }
 
   await replyVisualImages(larkClient, messageId, replyImages);
@@ -684,12 +751,6 @@ function shouldDeliverBackgroundReply(text: string, previousChars: number): bool
   return !(previousChars > 80 && chars < 120 && chars < previousChars * 0.75);
 }
 
-function shouldDeliverAgentSelectedUpdate(kind: "milestone" | "final" | "artifact", text: string, deliveredUpdates: number): boolean {
-  if (!text.trim()) return false;
-  if (kind !== "final" && deliveredUpdates >= MAX_AGENT_SELECTED_UPDATES) return false;
-  return true;
-}
-
 async function deliverVisibleChannelText(
   larkClient: any,
   messageId: string,
@@ -736,7 +797,7 @@ export async function collectChannelResponse(
   client: AgentBoxClient,
   sessionId: string,
   logPrefix = "lark",
-  options: { includeImages?: boolean } = {},
+  options: { includeImages?: boolean; onMilestone?: (text: string) => void } = {},
 ): Promise<CollectedChannelResponse> {
   const parts: string[] = [];
   const images: RenderedReplyImage[] = [];
@@ -762,7 +823,17 @@ export async function collectChannelResponse(
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
         if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
         const turnText = contentBlocksToMarkdown(blocks);
-        if (turnText) lastAssistantText = turnText;
+        if (turnText) {
+          // A NEW assistant turn means the PREVIOUS one was an intermediate
+          // step (the agent narrated, then called a tool) — surface its first
+          // line as a progress milestone. The final turn is never followed by
+          // another, so it stays the answer, not a milestone.
+          if (lastAssistantText && options.onMilestone) {
+            const m = condenseMilestone(lastAssistantText);
+            if (m) options.onMilestone(m);
+          }
+          lastAssistantText = turnText;
+        }
       }
     }
   } catch (err) {
@@ -772,6 +843,18 @@ export async function collectChannelResponse(
   // brain only emits content_block_delta events.
   const text = lastAssistantText || parts.join("");
   return { text, images };
+}
+
+/**
+ * Condense an intermediate assistant turn into a one-line progress milestone:
+ * first non-empty line, strip a leading heading marker, cap length. Inline
+ * code/bold pass through so chips still render.
+ */
+function condenseMilestone(text: string): string {
+  const firstLine = text.split("\n").map((s) => s.trim()).find(Boolean) ?? "";
+  const clean = firstLine.replace(/^#{1,6}\s+/, "").trim();
+  if (!clean) return "";
+  return clean.length > 90 ? `${clean.slice(0, 88)}…` : clean;
 }
 
 function contentBlocksToMarkdown(blocks: unknown[]): string {

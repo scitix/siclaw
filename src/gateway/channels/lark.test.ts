@@ -959,7 +959,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     clearBackgroundChannelDelivery(sessionId);
   });
 
-  it("lets the agent explicitly update the visible card, while Gateway caps non-final updates", async () => {
+  it("accumulates agent milestones into a Claude-tag checklist on the card", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-explicit-channel" });
     let releaseStream: () => void = () => {};
@@ -1006,10 +1006,15 @@ describe("handleLarkMessage — streaming card flow", () => {
       })).resolves.toBe(true);
 
       const inFlightContentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
-      expect(inFlightContentCalls).toHaveLength(2);
-      expect(inFlightContentCalls[0][0].data.content).toContain("里程碑 1");
-      expect(inFlightContentCalls[1][0].data.content).toContain("产物提示");
-      expect(inFlightContentCalls[1][0].data.content).not.toContain("压掉");
+      // New behavior: milestones accumulate into a checklist (no 2-cap). Each
+      // update re-renders the whole list; earlier steps render ✅, the latest ⏳.
+      expect(inFlightContentCalls).toHaveLength(3);
+      const latest = inFlightContentCalls[2][0].data.content as string;
+      expect(latest).toContain("里程碑 1");
+      expect(latest).toContain("产物提示");
+      expect(latest).toContain("压掉"); // no longer suppressed — it accumulates
+      expect(latest).toContain("✅"); // earlier steps marked done
+      expect(latest).toContain("⏳"); // latest step in progress
       expect(lark.cardkit.v1.card.settings).not.toHaveBeenCalled();
       expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
       expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
@@ -1020,8 +1025,13 @@ describe("handleLarkMessage — streaming card flow", () => {
     }
 
     const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
-    expect(contentCalls).toHaveLength(3);
-    expect(contentCalls.at(-1)[0].data.content).toContain("最终结论");
+    // 3 milestone updates + 1 final = 4 content writes.
+    expect(contentCalls).toHaveLength(4);
+    const finalContent = contentCalls.at(-1)[0].data.content as string;
+    expect(finalContent).toContain("最终结论");
+    // final card preserves the accumulated checklist (all milestones done).
+    expect(finalContent).toContain("里程碑 1");
+    expect(finalContent).toContain("压掉");
     expect(lark.cardkit.v1.card.settings).toHaveBeenCalledTimes(1);
   });
 
@@ -1679,6 +1689,24 @@ describe("collectResponse — SSE event flattening", () => {
     ];
     const text = await collectResponse(fakeClient(events), "s4");
     expect(text).toBe("");
+  });
+
+  it("surfaces intermediate assistant turns as milestones (first line), keeping the last as the answer", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "## 先看 node 状态\n详细…" }] } },
+      { type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "{...}" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "node 正常,继续查 `sichek`" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "结论:GPU#3 fatal,建议换卡。" }] } },
+    ];
+    const milestones: string[] = [];
+    const collected = await collectChannelResponse(fakeClient(events), "s-ms", "lark", {
+      onMilestone: (m) => milestones.push(m),
+    });
+    // Only the two NON-final assistant turns become milestones; heading marker
+    // stripped, first line only, inline code kept.
+    expect(milestones).toEqual(["先看 node 状态", "node 正常,继续查 `sichek`"]);
+    // The final turn is the answer, not a milestone.
+    expect(collected.text).toBe("结论:GPU#3 fatal,建议换卡。");
   });
 
   it("ignores non-text blocks (e.g. tool_use blocks) inside an assistant message", async () => {
