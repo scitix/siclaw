@@ -335,6 +335,53 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
 // ── Tab Components ──────────────────────────────────────
 
+// Quick-pick windows for the idle self-destruct timer. Resident = 0 (the pod
+// never auto-destroys). Values are seconds; the backend floors any positive
+// value below 300 up to 300 (a shorter window churns instances).
+const IDLE_TIMEOUT_PRESETS: { label: string; value: number }[] = [
+  { label: "∞ Resident", value: 0 },
+  { label: "5 min", value: 300 },
+  { label: "15 min", value: 900 },
+  { label: "30 min", value: 1800 },
+  { label: "1 h", value: 3600 },
+]
+
+function IdleTimeoutField({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  return (
+    <div className="space-y-2">
+      <label className="text-[13px] font-medium text-foreground">Idle Timeout</label>
+      <div className="flex flex-wrap gap-2">
+        {IDLE_TIMEOUT_PRESETS.map(p => {
+          const active = value === p.value
+          return (
+            <button
+              key={p.value}
+              type="button"
+              onClick={() => onChange(p.value)}
+              className={`h-9 px-3 text-[13px] rounded-md border transition-colors ${active ? "border-primary bg-primary/10 text-foreground" : "border-border text-muted-foreground hover:text-foreground hover:bg-secondary/40"}`}
+            >
+              {p.label}
+            </button>
+          )
+        })}
+      </div>
+      <div className="relative w-44">
+        <input
+          type="number"
+          min={0}
+          value={value}
+          onChange={e => onChange(e.target.value === "" ? 0 : Math.max(0, Math.floor(Number(e.target.value))))}
+          className="w-full h-10 pl-3 pr-12 text-[15px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[12px] text-muted-foreground pointer-events-none">sec</span>
+      </div>
+      <p className="text-[12px] text-muted-foreground/80 leading-relaxed">
+        The running instance self-destructs after this long with no active sessions (default 300s, minimum 300 — a smaller positive value is raised to 300, since a shorter window churns instances); choose Resident (0s) to keep it alive. Switching off Resident applies immediately — it restarts the running instance, which may interrupt an in-progress reply; other changes take effect on the agent's next restart.
+      </p>
+    </div>
+  )
+}
+
 function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec }: {
   name: string; setName: (v: string) => void; description: string; setDescription: (v: string) => void
   systemPrompt: string; setSystemPrompt: (v: string) => void; isProduction: boolean; setIsProduction: (v: boolean) => void
@@ -354,19 +401,7 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
         <label className="text-[12px] text-muted-foreground">System Prompt</label>
         <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional system prompt..." />
       </div>
-      <div className="space-y-1.5">
-        <label className="text-[12px] text-muted-foreground">Idle Timeout (seconds)</label>
-        <input
-          type="number"
-          min={0}
-          value={idleTimeoutSec}
-          onChange={e => setIdleTimeoutSec(e.target.value === "" ? 0 : Math.max(0, Math.floor(Number(e.target.value))))}
-          className="w-full h-8 px-3 text-[13px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
-        />
-        <p className="text-[11px] text-muted-foreground/70 leading-relaxed">
-          Idle agent pods self-destruct after this many seconds with no active sessions (default 300). Minimum 300 — a smaller positive value is raised to 300 (a shorter window churns pods on every brief pause). Set to 0 to keep the agent resident — it never auto-destroys. Applies on the agent's next restart.
-        </p>
-      </div>
+      <IdleTimeoutField value={idleTimeoutSec} onChange={setIdleTimeoutSec} />
       <div className="space-y-2 pt-2">
         <div className="flex items-center gap-3">
           <button
