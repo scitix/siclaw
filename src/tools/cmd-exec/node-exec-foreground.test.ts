@@ -37,7 +37,8 @@ describe("node_exec foreground: killable session + abort reap", () => {
     const cmd = (runInDebugPod.mock.calls[0][0] as { command: string[] }).command;
     expect(cmd.slice(0, 3)).toEqual(["nsenter", "-t", "1"]); // host namespace
     const joined = cmd.join(" ");
-    expect(joined).toContain("setsid -w sh -c");
+    expect(joined).toContain("setsid sh -c");
+    expect(joined).not.toContain("setsid -w");   // portable: no util-linux >= 2.24 dependency
     expect(joined).toContain("timeout 90 ");
     expect(joined).toMatch(/\.pgid/);
     expect(joined).toContain("ib_write_bw -D 60 -F");

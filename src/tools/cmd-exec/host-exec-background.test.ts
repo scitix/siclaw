@@ -87,7 +87,8 @@ describe("host_exec — one-step pod netns", () => {
     // Foreground now runs as a killable, timeout-bounded setsid session (so Stop can reap the
     // remote process group), with the user command still inside `ip netns exec <netns> sh -c`.
     const fgCmd = vi.mocked(sshExec).mock.calls.find((c) => String(c[1]).includes("show_gids"))![1] as string;
-    expect(fgCmd).toContain("setsid -w sh -c");
+    expect(fgCmd).toContain("setsid sh -c");
+    expect(fgCmd).not.toContain("setsid -w");   // portable: no util-linux >= 2.24 dependency
     expect(fgCmd).toContain("timeout 30 ");
     expect(fgCmd).toContain(".pgid");
     expect(fgCmd).toContain("ip netns exec cni-x sh -c '\\''show_gids'\\''");
