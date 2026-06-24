@@ -663,10 +663,16 @@ function formatPersonalPairReply(
 
 async function replyToLark(larkClient: any, messageId: string, text: string): Promise<void> {
   try {
-    await larkClient.im.message.reply({
+    // Feishu's SDK does NOT throw on a non-zero API code (e.g. missing
+    // im:message send scope) — it returns {code,msg} in the body. Surface it,
+    // otherwise a permission failure looks like a silent no-op.
+    const resp = await larkClient.im.message.reply({
       path: { message_id: messageId },
       data: { content: JSON.stringify({ text }), msg_type: "text" },
     });
+    if (resp && typeof resp.code === "number" && resp.code !== 0) {
+      console.error(`[lark] reply API returned non-zero code for messageId=${messageId}: code=${resp.code} msg=${resp.msg}`);
+    }
   } catch (err) {
     console.error(`[lark] Failed to reply to messageId=${messageId}:`, err);
   }

@@ -159,13 +159,21 @@ export async function openTypingCard(
       return null;
     }
 
-    await larkClient.im.message.reply({
+    // Posting the card into the chat. The SDK does NOT throw on a non-zero API
+    // code (e.g. the app lacks the im:message send scope) — the card would be
+    // created in CardKit but never appear in the chat, with no error. Surface
+    // the code and fall back to a plain-text reply so the failure is visible.
+    const replyRes = await larkClient.im.message.reply({
       path: { message_id: messageId },
       data: {
         msg_type: "interactive",
         content: JSON.stringify({ type: "card", data: { card_id: cardId } }),
       },
     });
+    if (replyRes && typeof replyRes.code === "number" && replyRes.code !== 0) {
+      console.error(`[lark-card] posting card to chat failed for messageId=${messageId}: code=${replyRes.code} msg=${replyRes.msg} (does the app have the im:message send scope?)`);
+      return null;
+    }
     return { cardId, elementId: MD_ELEMENT_ID, sequence: 0 };
   } catch (err) {
     console.error(`[lark-card] openTypingCard failed for messageId=${messageId}:`, err);
