@@ -112,7 +112,8 @@ describe("host_script — one-step pod netns", () => {
     // Foreground now runs as a killable, timeout-bounded setsid session; the netns'd interpreter
     // command lives inside that wrapper (so the abort reap can kill the whole remote group).
     const remoteCmd = vi.mocked(sshExec).mock.calls[0][1] as string;
-    expect(remoteCmd).toContain("setsid -w sh -c");
+    expect(remoteCmd).toContain("setsid sh -c");
+    expect(remoteCmd).not.toContain("setsid -w");   // portable: no util-linux >= 2.24 dependency
     expect(remoteCmd).toContain("timeout ");
     expect(remoteCmd).toContain("ip netns exec cni-x ");
     expect(remoteCmd).toContain("bash -s");

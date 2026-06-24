@@ -24,7 +24,9 @@ describe("bg-session", () => {
 
   it("wraps a command as a setsid session that records its session id and cleans up", () => {
     const wrapped = wrapBackgroundSession("timeout 600 sh -c 'do work'", "/tmp/x.pgid");
-    expect(wrapped.startsWith("setsid -w sh -c ")).toBe(true);
+    expect(wrapped.startsWith("setsid sh -c ")).toBe(true);
+    expect(wrapped).not.toContain("setsid -w");            // no util-linux >= 2.24 dependency
+    expect(wrapped.endsWith("; exit $?")).toBe(true);      // forces a forked (non-leader) setsid child
     expect(wrapped).toContain("echo $$ > /tmp/x.pgid");   // record session id
     expect(wrapped).toContain("timeout 600 sh -c");        // inner command preserved
     expect(wrapped).toContain("rm -f /tmp/x.pgid");        // cleanup on normal exit

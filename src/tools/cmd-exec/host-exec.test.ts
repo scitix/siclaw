@@ -88,7 +88,8 @@ describe("host_exec", () => {
 
     // (1) The foreground command ran as a setsid session, `timeout`-bounded at the cap, recording a .pgid.
     const fgCmd = vi.mocked(sshExec).mock.calls[0][1] as string;
-    expect(fgCmd).toContain("setsid -w sh -c");
+    expect(fgCmd).toContain("setsid sh -c");
+    expect(fgCmd).not.toContain("setsid -w");   // portable: no util-linux >= 2.24 dependency
     expect(fgCmd).toContain("timeout 90 ");
     expect(fgCmd).toMatch(/\.pgid/);
     expect(fgCmd).toContain("ib_write_bw -D 60 -F");
