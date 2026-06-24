@@ -730,7 +730,9 @@ describe("http-server — model routing", () => {
     expect(seenModels).toEqual(["anthropic/claude"]);
     expect(s.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
     expect(s.modelRouteState.activeCandidateSource).toBe("user");
-    expect(s._extraEventBuffer.some((event) => String(event.type).startsWith("model_route"))).toBe(false);
+    // Single entry: the pinned model runs through the runner as a lone candidate
+    // (model_route_start/success appear), but automatic fallback never engages.
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(false);
   });
 
   it("clears manual strict selection when the next prompt explicitly targets a different primary model", async () => {
@@ -850,7 +852,7 @@ describe("http-server — model routing", () => {
     expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(true);
   });
 
-  it("streams live (skips the buffered routing runner) when only one candidate is configured", async () => {
+  it("runs a lone candidate through the routing runner (single entry) with live streaming and no fallback", async () => {
     const s = await sm.getOrCreate("route-single");
     const singleCandidatePolicy = {
       enabled: true,
@@ -876,14 +878,41 @@ describe("http-server — model routing", () => {
 
     expect(r.status).toBe(200);
     expect(seenModels).toEqual(["openai/gpt-4"]);
-    // A lone candidate has nothing to fall back to, so the runner must not
-    // engage: no model_route_* telemetry, no state persistence, and brain
-    // events flow through the live buffer (not the routing extra bus) so
-    // streaming is preserved.
-    expect(s._extraEventBuffer.some((event) => String(event.type).startsWith("model_route"))).toBe(false);
-    expect(sm.persistModelRouteState).not.toHaveBeenCalled();
-    expect(s._routeBrainEventsThroughExtra).toBe(false);
-    expect(s._eventBuffer.some((event: any) => event.type === "message_end")).toBe(true);
+    // Single entry: a lone candidate still runs through the runner. It streams
+    // live (optimistic primary) on the extra channel and emits model_route_*
+    // carrying the model identity, but never switches / falls back.
+    // (_routeBrainEventsThroughExtra is transient — actuallyFinish resets it on
+    // completion — so assert on the durable extra-channel buffer instead.)
+    expect(s._extraEventBuffer.some((event: any) => event.type === "model_route_success")).toBe(true);
+    expect(s._extraEventBuffer.some((event: any) => event.type === "model_route_switch")).toBe(false);
+    expect(s._extraEventBuffer.some((event: any) => event.type === "message_end")).toBe(true);
+  });
+
+  it("single entry: a plain turn with routing disabled still emits model_route_* carrying the model identity (no switch)", async () => {
+    const s = await sm.getOrCreate("route-plain");
+    s.brain.prompt.mockImplementation(async () => {
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "plain turn",
+      sessionId: "route-plain",
+      modelRouting: { enabled: false },
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    // Every turn runs through the runner as a lone candidate built from the
+    // current model, so downstream collection (Langfuse) always sees the model
+    // identity — but a non-fallback success carries isFallback:false and no switch.
+    const success = s._extraEventBuffer.find((event: any) => event.type === "model_route_success") as any;
+    expect(success).toBeTruthy();
+    expect(success.isFallback).toBe(false);
+    expect(success.modelId).toBe("gpt-4");
+    expect(s._extraEventBuffer.some((event: any) => event.type === "model_route_switch")).toBe(false);
   });
 
   it("enriches agent_end with token stats on the routed (buffered) flush path", async () => {
