@@ -165,6 +165,26 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     UNIQUE (org_id, name)
   )`,
 
+  // Tracing exporters (admin-managed third-party analysis platforms).
+  // Global — NO org_id (tracing is one fan-out set shared by every agent),
+  // so there is also no UNIQUE(org_id, name). `auth` holds type-specific
+  // credential material as a TEXT JSON blob (langfuse {publicKey,secretKey},
+  // phoenix {apiKey,projectName}, otlp {headers}); the OTLP headers are
+  // assembled at read time in buildTracingConfig(). Mirrors mcp_servers'
+  // double-driver-safe style: no JSON column / TIMESTAMP(3) / ON UPDATE.
+  `CREATE TABLE IF NOT EXISTS tracing_exporters (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    platform_type VARCHAR(30) NOT NULL,
+    url VARCHAR(500) NOT NULL,
+    auth TEXT,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_by CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
   // Agent <-> Skill junction
   `CREATE TABLE IF NOT EXISTS agent_skills (
     agent_id CHAR(36) NOT NULL,

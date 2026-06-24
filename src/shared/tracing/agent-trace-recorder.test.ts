@@ -3,11 +3,12 @@
  *
  * Strategy: install a NodeTracerProvider wired to an InMemorySpanExporter via a
  * SimpleSpanProcessor (synchronous export on span.end()) through the recorder's
- * test seam, then assert the exported span tree. config.tracing.sendContent is
- * controlled via a hoisted mock of core/config.js.
+ * test seam, then assert the exported span tree. The PII gate
+ * (config.tracing.sendContent) lives in otel-provider module state and is
+ * controlled via setSendContent() (re-installs the provider with the flag).
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   NodeTracerProvider,
   InMemorySpanExporter,
@@ -16,14 +17,15 @@ import {
 } from "@opentelemetry/sdk-trace-node";
 import { SpanStatusCode } from "@opentelemetry/api";
 
-// Mutable PII gate, flipped per test. vi.hoisted runs before the mock factory.
-const cfg = vi.hoisted(() => ({ sendContent: false }));
-vi.mock("../../core/config.js", () => ({
-  loadConfig: () => ({ tracing: { sendContent: cfg.sendContent } }),
-}));
-
 import { tracingRecorder, __resetRecorderForTest } from "./agent-trace-recorder.js";
 import { __installTracerProviderForTest } from "./otel-provider.js";
+
+// The PII gate now lives in otel-provider module state (set on init/reinit), not
+// loadConfig — the recorder reads isSendContentEnabled(). Drive it per test by
+// re-installing the same provider with the desired flag through the test seam.
+function setSendContent(value: boolean): void {
+  __installTracerProviderForTest(provider, value);
+}
 import { Attr, SpanKind } from "./openinference-attrs.js";
 import type { BrainSession, BrainSessionStats } from "../../core/brain-session.js";
 
@@ -82,10 +84,9 @@ function eventNames(s: ReadableSpan): string[] {
 }
 
 beforeEach(() => {
-  cfg.sendContent = false;
   exporter = new InMemorySpanExporter();
   provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
-  __installTracerProviderForTest(provider);
+  __installTracerProviderForTest(provider, false);
   __resetRecorderForTest();
 });
 
@@ -323,7 +324,7 @@ describe("fault isolation", () => {
 
 describe("sendContent gate", () => {
   it("writes NO content attributes when sendContent=false (default)", () => {
-    cfg.sendContent = false;
+    setSendContent(false);
     const brain = makeBrain();
     tracingRecorder.attach(SID, brain, {});
     tracingRecorder.startPrompt(SID);
@@ -339,7 +340,7 @@ describe("sendContent gate", () => {
   });
 
   it("writes redacted content when sendContent=true, but records tool_result as-is", () => {
-    cfg.sendContent = true;
+    setSendContent(true);
     const brain = makeBrain();
     tracingRecorder.attach(SID, brain, {});
     tracingRecorder.startPrompt(SID);
@@ -369,7 +370,7 @@ describe("per-call token/cost on LLM span", () => {
   const usage = { input: 42, output: 17, totalTokens: 59, cost: { total: 0.0033 } };
 
   it("attaches llm.token_count.* + llm.cost.total from message.usage, independent of sendContent", () => {
-    cfg.sendContent = false; // tokens are metadata, NOT gated by sendContent
+    setSendContent(false); // tokens are metadata, NOT gated by sendContent
     const brain = makeBrain();
     tracingRecorder.attach(SID, brain, {});
     tracingRecorder.startPrompt(SID);
@@ -438,7 +439,7 @@ describe("per-call token/cost on LLM span", () => {
 
 describe("ROOT input.value", () => {
   it("omits input.value when sendContent=false", () => {
-    cfg.sendContent = false;
+    setSendContent(false);
     const brain = makeBrain();
     tracingRecorder.attach(SID, brain, {});
     tracingRecorder.startPrompt(SID, "what pods are crashing?");
@@ -447,7 +448,7 @@ describe("ROOT input.value", () => {
   });
 
   it("records the redacted prompt as input.value when sendContent=true", () => {
-    cfg.sendContent = true;
+    setSendContent(true);
     const brain = makeBrain();
     tracingRecorder.attach(SID, brain, {});
     tracingRecorder.startPrompt(SID, "connect to postgres://admin:hunter2@db:5432 and check");
@@ -459,7 +460,7 @@ describe("ROOT input.value", () => {
   });
 
   it("writes no input.value when promptText is absent, even with sendContent=true", () => {
-    cfg.sendContent = true;
+    setSendContent(true);
     const brain = makeBrain();
     tracingRecorder.attach(SID, brain, {});
     tracingRecorder.startPrompt(SID); // no promptText
@@ -472,7 +473,7 @@ describe("ROOT input.value", () => {
 
 describe("content length cap", () => {
   it("truncates over-long content with a visible marker", () => {
-    cfg.sendContent = true;
+    setSendContent(true);
     const brain = makeBrain();
     const big = "x".repeat(20000);
     tracingRecorder.attach(SID, brain, {});
@@ -494,7 +495,7 @@ describe("content length cap", () => {
 
 describe("tool args use tool.parameters only", () => {
   it("sets tool.parameters and leaves input.value unset on the TOOL span", () => {
-    cfg.sendContent = true;
+    setSendContent(true);
     const brain = makeBrain();
     tracingRecorder.attach(SID, brain, {});
     tracingRecorder.startPrompt(SID);

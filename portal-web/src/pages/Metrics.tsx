@@ -5,9 +5,10 @@ import { KpiCards } from "../components/metrics/KpiCards"
 import { TrendChart } from "../components/metrics/TrendChart"
 import { AuditTable } from "../components/metrics/AuditTable"
 import { GrafanaFrame } from "../components/metrics/GrafanaFrame"
+import { TracingPlatforms } from "../components/metrics/TracingPlatforms"
 import { TimeRangePicker } from "../components/metrics/TimeRangePicker"
 
-type TabKey = "dashboard" | "audit" | "grafana"
+type TabKey = "dashboard" | "audit" | "grafana" | "tracing"
 
 export function Metrics() {
   const [tab, setTab] = useState<TabKey>("dashboard")
@@ -74,7 +75,7 @@ export function Metrics() {
           </div>
 
           <div className="flex items-center gap-6 mt-4 -mb-px">
-            {(["dashboard", "audit", "grafana"] as TabKey[]).map((t) => (
+            {(["dashboard", "audit", "grafana", "tracing"] as TabKey[]).map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
@@ -84,7 +85,7 @@ export function Metrics() {
                     : "text-muted-foreground hover:text-foreground border-transparent"
                 }`}
               >
-                {t === "dashboard" ? "Dashboard" : t === "audit" ? "Audit" : "Grafana"}
+                {t === "dashboard" ? "Dashboard" : t === "audit" ? "Audit" : t === "grafana" ? "Grafana" : "Tracing"}
               </button>
             ))}
           </div>
@@ -142,6 +143,8 @@ export function Metrics() {
         )}
 
         {tab === "grafana" && <GrafanaFrame />}
+
+        {tab === "tracing" && <TracingPlatforms />}
       </div>
     </div>
   )

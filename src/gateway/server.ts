@@ -39,6 +39,7 @@ import { checkMetricsAuth } from "../shared/metrics.js";
 import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
+  handleTracingConfig,
   handleMcpServers,
   handleSkillsBundle,
   handleKnowledgeBundle,
@@ -479,6 +480,41 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
+  // tracing.reloadAll — GLOBAL tracing hot-reload. Unlike agent.reload, tracing
+  // is a single fan-out set shared by every agent, so this enumerates ALL
+  // running boxes (no agentId filter) and POSTs /api/reload-tracing to each.
+  // Uses the generic AgentBoxClient.post (NOT reloadResource) because tracing
+  // config never lands on disk — see DESIGN module 3. Each box is contained in
+  // its own try/catch so one unreachable/slow box cannot block the rest.
+  rpcMethods.set("tracing.reloadAll", async () => {
+    const boxes = await agentBoxManager.list();
+    // Only "running" boxes are reachable; Pending/Terminating pods have no/stale
+    // podIP and would ETIMEDOUT (same rationale as agent.reload).
+    const targets = boxes.filter((b) => b.status === "running");
+
+    if (targets.length === 0) {
+      console.log("[rpc] tracing.reloadAll: no running boxes, skipping");
+      return { ok: true, reloaded: 0, failed: [], boxes: 0 };
+    }
+
+    const failed: string[] = [];
+    await Promise.all(
+      targets.map(async (box) => {
+        try {
+          const client = new AgentBoxClient(box.endpoint, 15_000, agentBoxTlsOptions);
+          await client.post("/api/reload-tracing");
+        } catch (err: any) {
+          console.warn(`[rpc] tracing.reloadAll: box=${box.boxId} failed: ${err.message}`);
+          failed.push(box.boxId);
+        }
+      }),
+    );
+
+    const reloaded = targets.length - failed.length;
+    console.log(`[rpc] tracing.reloadAll: boxes=${targets.length} reloaded=${reloaded} failed=[${failed}]`);
+    return { ok: true, reloaded, failed, boxes: targets.length };
+  });
+
   // metrics.live — delayed ref to metricsAggregator (created after rpcMethods)
   let metricsAggregatorRef: MetricsAggregator | null = null;
   rpcMethods.set("metrics.live", async (params) => {
@@ -665,6 +701,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/settings" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleSettings(req, res, identity, frontendClient);
+            return;
+          }
+
+          // Global tracing config (no agentId) — hot-reload source via RPC
+          if (url === "/api/internal/tracing-config" && method === "GET") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            handleTracingConfig(req, res, identity, frontendClient);
             return;
           }
 

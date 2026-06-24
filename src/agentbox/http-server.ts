@@ -13,8 +13,10 @@ import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
 import type { AgentMode } from "../core/tool-registry.js";
 import { isMemoryEnabled, loadConfig } from "../core/config.js";
+import type { SiclawConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
+import { reinitTracing } from "../shared/tracing/otel-provider.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
 import { CredentialBroker } from "./credential-broker.js";
@@ -1332,6 +1334,36 @@ export function createHttpServer(
       }
     });
   }
+
+  /**
+   * POST /api/reload-tracing — GLOBAL tracing hot-reload.
+   *
+   * Deliberately registered standalone, OUTSIDE the GATEWAY_SYNC_DESCRIPTORS
+   * loop above: tracing config never lands on disk, so the generic
+   * fetch→materialize→postReload contract does not apply. Instead we pull the
+   * latest TracingConfig from the Gateway (config.getTracingConfig, no agentId)
+   * and rebuild the in-process OTel provider via reinitTracing (serialised so
+   * concurrent local-mode boxes can't interleave shutdown+init).
+   */
+  addRoute("POST", "/api/reload-tracing", async (_req, res) => {
+    const client = getReloadGatewayClient();
+    if (!client) {
+      // Local mode without a Gateway URL: tracing is config-file driven, there
+      // is nothing to pull. Treat as a clean no-op rather than an error.
+      console.warn("[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping tracing reload");
+      sendJson(res, 200, { ok: true, skipped: true });
+      return;
+    }
+    try {
+      const tracing = await client.fetchTracingConfig();
+      await reinitTracing({ tracing } as SiclawConfig);
+      console.log("[agentbox-http] tracing config reloaded");
+      sendJson(res, 200, { ok: true });
+    } catch (err: any) {
+      console.error(`[agentbox-http] Failed to reload tracing: ${err.message}`);
+      sendJson(res, 500, { error: `tracing reload failed: ${err.message}` });
+    }
+  });
 
   /**
    * GET /api/models - list available models (read from settings.json)

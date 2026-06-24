@@ -37,8 +37,7 @@ import {
   type Attributes,
 } from "@opentelemetry/api";
 import type { BrainSession, BrainSessionStats } from "../../core/brain-session.js";
-import { loadConfig } from "../../core/config.js";
-import { getTracer, isTracingEnabled } from "./otel-provider.js";
+import { getTracer, isTracingEnabled, isSendContentEnabled } from "./otel-provider.js";
 import {
   Attr,
   SpanKind,
@@ -115,13 +114,13 @@ function flatAttrs(obj: Record<string, unknown>): Attributes {
   return out;
 }
 
-/** Read the PII gate lazily so a sendContent toggle is honoured per-prompt. */
+/**
+ * Read the PII gate from otel-provider module state (set on init/reinit). This
+ * is the authoritative source — reading loadConfig() here would cache the
+ * on-disk value and never observe a DB-driven hot-reload (reinitTracing).
+ */
 function sendContentEnabled(): boolean {
-  try {
-    return loadConfig().tracing?.sendContent === true;
-  } catch {
-    return false;
-  }
+  return isSendContentEnabled();
 }
 
 // ── span helpers ────────────────────────────────────────────────────────────

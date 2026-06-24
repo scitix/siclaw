@@ -31,6 +31,18 @@ const FORCE_FLUSH_TIMEOUT_MS = 3000;
 let provider: BasicTracerProvider | null = null;
 let enabled = false;
 
+/**
+ * Authoritative source for the PII gate (config.tracing.sendContent), kept as
+ * module state and refreshed on every initTracing/reinitTracing. The recorder
+ * reads it via isSendContentEnabled() instead of loadConfig() so a hot-reload
+ * toggle flips the gate atomically — loadConfig() would cache the on-disk value
+ * and never observe a DB-driven reinit.
+ */
+let activeSendContent = false;
+
+/** Process-level serial lock for reinitTracing — see reinitTracing() below. */
+let reinitInFlight: Promise<void> | null = null;
+
 function timeout(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -82,8 +94,13 @@ function buildSpanProcessors(exporters: TracingExporterConfig[] | undefined): Sp
  * second call while a provider is live returns immediately.
  */
 export function initTracing(config: SiclawConfig): void {
-  if (provider) return; // idempotent
   const tracing = config.tracing;
+  // Refresh the PII gate FIRST — before the idempotent early-return below — so
+  // isSendContentEnabled() always reflects the latest config, even when a
+  // provider is already live and on the disabled paths (e.g. a reinit that
+  // turns tracing off).
+  activeSendContent = tracing?.sendContent === true;
+  if (provider) return; // idempotent
   if (!tracing || tracing.enabled !== true) return;
 
   const processors = buildSpanProcessors(tracing.exporters);
@@ -135,11 +152,47 @@ export async function shutdownTracing(): Promise<void> {
 }
 
 /**
+ * Hot-reload the provider at runtime: flush + tear down the current provider,
+ * then build a fresh one from the new config (new exporters / serviceName /
+ * sendContent all take effect). Distinct from initTracing(), which is idempotent
+ * (`if (provider) return`) and would no-op against a live provider.
+ *
+ * Serialised on a process-level in-flight Promise: in local mode several
+ * in-process AgentBoxes share this single provider singleton, so concurrent
+ * reloads must not interleave shutdown+init. Each call chains after the previous
+ * (errors swallowed so one failed reinit doesn't poison the chain), guaranteeing
+ * shutdownTracing() fully completes before the next initTracing() runs.
+ */
+export function reinitTracing(config: SiclawConfig): Promise<void> {
+  reinitInFlight = (reinitInFlight ?? Promise.resolve())
+    .catch(() => {})
+    .then(async () => {
+      await shutdownTracing();
+      initTracing(config);
+    });
+  return reinitInFlight;
+}
+
+/**
+ * The PII gate honoured by the recorder. True only when config.tracing.sendContent
+ * was true at the last initTracing/reinitTracing — kept as module state so a
+ * hot-reload toggle is observed atomically (see activeSendContent).
+ */
+export function isSendContentEnabled(): boolean {
+  return activeSendContent;
+}
+
+/**
  * Test-only seam: install a tracer provider (e.g. one wired to InMemorySpanExporter)
  * and flip the enabled flag, bypassing the OTLP exporter build. Pass null to reset.
- * NOT a production code path — the prod entry is initTracing().
+ * Optionally set the sendContent gate. NOT a production code path — the prod entry
+ * is initTracing().
  */
-export function __installTracerProviderForTest(testProvider: BasicTracerProvider | null): void {
+export function __installTracerProviderForTest(
+  testProvider: BasicTracerProvider | null,
+  sendContent = false,
+): void {
   provider = testProvider;
   enabled = testProvider != null;
+  activeSendContent = sendContent;
 }

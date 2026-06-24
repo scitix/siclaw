@@ -100,6 +100,8 @@ describe("config.getSettings", () => {
       [{ model_provider: "openai", model_id: "gpt-4" }],
       [{ id: "p1", name: "openai", base_url: "https://api.openai.com", api_key: "sk-key", api_type: "openai" }],
       [{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }],
+      [], // buildTracingConfig: system_config (no tracing scalars)
+      [], // buildTracingConfig: tracing_exporters
     );
 
     const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
@@ -130,6 +132,8 @@ describe("config.getSettings", () => {
         api_type: "openai-completions",
       }],
       [{ model_id: "compatible-chat", name: "Compatible Chat", reasoning: 0, context_window: 128000, max_tokens: 8192 }],
+      [], // buildTracingConfig: system_config
+      [], // buildTracingConfig: tracing_exporters
     );
 
     const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
@@ -157,6 +161,8 @@ describe("config.getSettings", () => {
       [{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }],
       [{ id: "p-anthropic", name: "anthropic", base_url: "https://api.anthropic.com", api_key: "sk-anthropic", api_type: "anthropic" }],
       [{ model_id: "claude", name: "Claude", reasoning: 1, context_window: 200000, max_tokens: 8192 }],
+      [], // buildTracingConfig: system_config
+      [], // buildTracingConfig: tracing_exporters
     );
 
     const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
@@ -191,6 +197,76 @@ describe("config.getSettings", () => {
     );
     const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
     expect(result).toEqual({ providers: {} });
+  });
+
+  it("rides the DB-assembled tracing config along on the provider-bound path", async () => {
+    // Tracing now comes from the DB (system_config scalars + tracing_exporters),
+    // assembled by buildTracingConfig() — the SICLAW_TRACING env channel is gone.
+    const basic = "Basic " + Buffer.from("pk:sk").toString("base64");
+    mockQuery(
+      [{ model_provider: "openai", model_id: "gpt-4" }],
+      [{ id: "p1", name: "openai", base_url: "https://api.openai.com", api_key: "sk-key", api_type: "openai" }],
+      [{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }],
+      [ // buildTracingConfig: system_config scalars
+        { config_key: "tracing.enabled", config_value: "true" },
+        { config_key: "tracing.serviceName", config_value: "siclaw-tc" },
+        { config_key: "tracing.sendContent", config_value: "true" },
+      ],
+      [ // buildTracingConfig: enabled tracing_exporters (langfuse → Basic header)
+        { platform_type: "langfuse", url: "https://lf/api/public/otel/v1/traces", auth: JSON.stringify({ publicKey: "pk", secretKey: "sk" }) },
+      ],
+    );
+    const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
+    expect(result.tracing).toEqual({
+      enabled: true,
+      serviceName: "siclaw-tc",
+      sendContent: true,
+      exporters: [{ url: "https://lf/api/public/otel/v1/traces", headers: { Authorization: basic } }],
+    });
+  });
+
+  it("rides a disabled tracing config along when the DB has no tracing scalars", async () => {
+    // buildTracingConfig() returns { enabled: false } when off — always present
+    // so initTracing() treats it as a clean no-op (not omitted).
+    mockQuery(
+      [{ model_provider: "openai", model_id: "gpt-4" }],
+      [{ id: "p1", name: "openai", base_url: "https://api.openai.com", api_key: "sk-key", api_type: "openai" }],
+      [{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }],
+      [], // buildTracingConfig: system_config (no tracing scalars)
+      [], // buildTracingConfig: tracing_exporters
+    );
+    const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
+    expect(result.tracing).toEqual({ enabled: false });
+  });
+});
+
+describe("config.getTracingConfig", () => {
+  it("assembles the GLOBAL tracing config from the DB (no agentId)", async () => {
+    const bearer = "Bearer px-key";
+    mockQuery(
+      [ // system_config scalars
+        { config_key: "tracing.enabled", config_value: "true" },
+        { config_key: "tracing.sendContent", config_value: "false" },
+      ],
+      [ // enabled tracing_exporters (phoenix → Bearer + x-project-name)
+        { platform_type: "phoenix", url: "http://phoenix:6006/v1/traces", auth: JSON.stringify({ apiKey: "px-key", projectName: "siclaw" }) },
+      ],
+    );
+    const result = await getHandler("config.getTracingConfig")({}, "");
+    expect(result).toEqual({
+      enabled: true,
+      sendContent: false,
+      exporters: [{ url: "http://phoenix:6006/v1/traces", headers: { authorization: bearer, "x-project-name": "siclaw" } }],
+    });
+  });
+
+  it("returns { enabled: false } when tracing is disabled in the DB", async () => {
+    mockQuery(
+      [{ config_key: "tracing.enabled", config_value: "false" }],
+      [],
+    );
+    const result = await getHandler("config.getTracingConfig")({}, "");
+    expect(result).toEqual({ enabled: false });
   });
 });
 
@@ -1671,9 +1747,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 48 handlers", () => {
+  it("registers exactly 49 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(48);
+    expect(handlers.size).toBe(49);
   });
 
   it("all expected handler names are registered", () => {
@@ -1681,7 +1757,7 @@ describe("buildAdapterRpcHandlers", () => {
     const expected = [
       "config.getAgent", "config.getResources", "config.getSettings",
       "config.getModelBinding", "config.getMcpServers", "config.getSkillBundle", "config.getKnowledgeBundle",
-      "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel",
+      "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel", "config.getTracingConfig",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
       "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",

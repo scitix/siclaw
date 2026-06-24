@@ -1201,4 +1201,13 @@ describe("http-server — reload routes delegate to handlers", () => {
     // route is wired.
     expect([200, 500]).toContain(r.status);
   });
+
+  it("POST /api/reload-tracing is wired standalone and is a clean no-op without a gateway URL", async () => {
+    // The tracing reload route is registered OUTSIDE the GATEWAY_SYNC_DESCRIPTORS
+    // loop (tracing never lands on disk). With no SICLAW_GATEWAY_URL there is
+    // nothing to pull, so it short-circuits to a 200 skip rather than erroring.
+    const r = await getJson(port, "/api/reload-tracing", "POST");
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ ok: true, skipped: true });
+  });
 });

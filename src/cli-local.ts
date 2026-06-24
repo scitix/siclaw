@@ -11,6 +11,8 @@ import { spawn } from "node:child_process";
 import { bootstrapPortal } from "./lib/bootstrap-portal.js";
 import { bootstrapRuntime } from "./lib/bootstrap-runtime.js";
 import { loadOrGenerateLocalSecrets } from "./lib/local-secrets.js";
+import { loadConfig } from "./core/config.js";
+import { initTracing, shutdownTracing } from "./shared/tracing/otel-provider.js";
 
 const SHOULD_OPEN_BROWSER = process.argv.includes("--open");
 
@@ -22,6 +24,13 @@ const DATABASE_URL = process.env.DATABASE_URL || "sqlite:./.siclaw/data/portal.d
 
 const secretsPath = path.resolve(".siclaw/local-secrets.json");
 const secrets = loadOrGenerateLocalSecrets(secretsPath);
+
+// Initialise OpenTelemetry agent-behaviour tracing for local mode. LocalSpawner
+// runs the AgentBox in-process (it never goes through agentbox-main.ts, which is
+// where K8s/Process spawners init tracing), so without this call `siclaw local`
+// would leave isTracingEnabled() false and emit no spans. Disabled config is a
+// clean no-op. loadConfig() reads .siclaw/config/settings.json.
+initTracing(loadConfig());
 
 const runtimeUrl = `http://127.0.0.1:${RUNTIME_PORT}`;
 const portalUrl = `http://127.0.0.1:${PORTAL_PORT}`;
@@ -77,6 +86,10 @@ async function shutdown() {
   console.log("\n[local] Shutting down...");
   await runtimeHandle.close();
   await portalHandle.close();
+  // Flush + shut down tracing last so spans from in-flight sessions are exported
+  // before exit. forceFlush is capped at 3s internally so a dead backend cannot
+  // stall shutdown.
+  await shutdownTracing();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);

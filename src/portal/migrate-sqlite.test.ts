@@ -11,7 +11,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     await closeDb();
   });
 
-  it("creates all 33 tables without error", async () => {
+  it("creates all 34 tables without error", async () => {
     await runPortalMigrations();
     const db = getDb();
     const [rows] = await db.query<Array<{ name: string }>>(
@@ -53,6 +53,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "skill_versions",
       "skills",
       "system_config",
+      "tracing_exporters",
     ];
     for (const name of expected) {
       expect(tableNames).toContain(name);

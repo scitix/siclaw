@@ -16,6 +16,8 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { defaultProviderModelCompat } from "../core/model-compat.js";
+import type { TracingConfig } from "../core/config.js";
+import { assembleExporterHeaders, type ExporterAuth } from "./tracing-exporters.js";
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { safeParseSkillFiles } from "../shared/skill-package.js";
 import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
@@ -1732,6 +1734,60 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
 }
 
 // ================================================================
+// Tracing config assembly (DB → TracingConfig)
+// ================================================================
+
+interface TracingExporterRow {
+  platform_type: string;
+  url: string;
+  auth: string | null;
+}
+
+/**
+ * Assemble the global {@link TracingConfig} from the database: the three
+ * `tracing.*` scalars in `system_config` plus every enabled row in
+ * `tracing_exporters`. This is the SINGLE source of truth for tracing config
+ * now that the SICLAW_TRACING env channel is gone — used both at startup
+ * (rides along in `config.getSettings`) and on hot-reload (`config.getTracingConfig`).
+ *
+ * Secrets are emitted in PLAINTEXT here: the result is consumed only inside the
+ * trust domain (delivered to AgentBox like providers.apiKey). Disabled, or no
+ * enabled exporter, yields `{ enabled: false }` so initTracing() cleanly no-ops.
+ * The two queries run concurrently (avoids serial latency on getSettings).
+ */
+export async function buildTracingConfig(): Promise<TracingConfig> {
+  const db = getDb();
+  const [[cfgRows], [exporterRows]] = await Promise.all([
+    db.query(
+      "SELECT config_key, config_value FROM system_config WHERE config_key IN ('tracing.enabled', 'tracing.serviceName', 'tracing.sendContent')",
+    ),
+    db.query(
+      "SELECT platform_type, url, auth FROM tracing_exporters WHERE enabled = 1 ORDER BY sort_order, created_at",
+    ),
+  ]) as [[{ config_key: string; config_value: string | null }[], unknown], [TracingExporterRow[], unknown]];
+
+  const scalars: Record<string, string> = {};
+  for (const row of cfgRows) {
+    if (row.config_value != null) scalars[row.config_key] = row.config_value;
+  }
+  const enabled = scalars["tracing.enabled"] === "true";
+  if (!enabled) return { enabled: false };
+
+  const exporters = exporterRows.map((row) => {
+    const auth = safeParseJson<ExporterAuth>(row.auth, {});
+    const headers = assembleExporterHeaders(row.platform_type, auth);
+    return Object.keys(headers).length > 0 ? { url: row.url, headers } : { url: row.url };
+  });
+
+  return {
+    enabled: true,
+    ...(scalars["tracing.serviceName"] ? { serviceName: scalars["tracing.serviceName"] } : {}),
+    sendContent: scalars["tracing.sendContent"] === "true",
+    exporters,
+  };
+}
+
+// ================================================================
 // WS RPC handler registry — parallel dispatch layer for phone-home
 // ================================================================
 
@@ -1827,6 +1883,12 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       provider: agent.model_provider,
       modelId: agent.model_id,
     });
+    // Tracing delivery: AgentBox pods overwrite their settings.json with this
+    // response, so the (global) tracing config has to ride along here — now
+    // sourced from the DB (system_config + tracing_exporters) via
+    // buildTracingConfig(). Only the provider-bound path carries it: an agent
+    // with no provider never runs, so it needs no trace.
+    const tracing = await buildTracingConfig();
     return {
       providers: {
         [p.name]: {
@@ -1845,7 +1907,18 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       },
       default: { provider: agent.model_provider, modelId: agent.model_id },
       ...(modelRouting ? { modelRouting } : {}),
+      // Always present (buildTracingConfig returns {enabled:false} when off,
+      // which initTracing treats as a clean no-op).
+      tracing,
     };
+  });
+
+  // Global tracing config (no agentId — tracing is a single fan-out set shared
+  // by every agent). The dedicated RPC exists because config.getSettings is
+  // agentId-scoped and returns {providers:{}} for an agent with no provider,
+  // which would silently drop tracing. Used by the Gateway hot-reload path.
+  handlers.set("config.getTracingConfig", async () => {
+    return buildTracingConfig();
   });
 
   handlers.set("config.getModelBinding", async (params) => {

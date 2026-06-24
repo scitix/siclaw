@@ -195,6 +195,30 @@ export async function handleSettings(
 }
 
 /**
+ * GET /api/internal/tracing-config
+ *
+ * Proxies to Portal's config.getTracingConfig RPC — the GLOBAL tracing config
+ * (TracingConfig). No agentId is passed: tracing is a single fan-out set shared
+ * by every agent, so it must not be resolved through the agent-scoped
+ * config.getSettings (which drops tracing for agents without a bound provider).
+ * Used by the AgentBox hot-reload path (POST /api/reload-tracing).
+ */
+export async function handleTracingConfig(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  _identity: CertificateIdentity,
+  frontendClient: FrontendWsClient,
+): Promise<void> {
+  try {
+    const data = await frontendClient.request("config.getTracingConfig", {});
+    sendJson(res, 200, data);
+  } catch (err) {
+    console.error("[internal-api] tracing-config error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
  * GET /api/internal/mcp-servers
  *
  * Returns MCP server configs bound to the agent.
