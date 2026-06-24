@@ -18,6 +18,9 @@ class FakeSpawner implements BoxSpawner {
   getReturns = new Map<string, AgentBoxInfo | null>();
   listReturns: AgentBoxInfo[] = [];
   cleanupCalls = 0;
+  /** When set, the manager enforces CA-fingerprint matching for pod reuse. */
+  fingerprint: string | undefined = undefined;
+  caFingerprint(): string | undefined { return this.fingerprint; }
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
     this.spawnCalls.push(config);
@@ -259,5 +262,55 @@ describe("AgentBoxManager — cleanup", () => {
     expect(spawner.stopCalls.sort()).toEqual(["box-agent-a", "box-agent-b"]);
     expect(spawner.cleanupCalls).toBe(1);
     expect(mgr.stats().total).toBe(0);
+  });
+});
+
+describe("AgentBoxManager — K8s CA-fingerprint self-heal", () => {
+  const runningPod = (caFingerprint?: string): AgentBoxInfo => ({
+    boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
+    endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    caFingerprint,
+  });
+
+  it("reuses a running pod whose CA fingerprint matches the spawner's current CA", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", runningPod("ca-v2"));
+
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0); // reused, not recreated
+  });
+
+  it("recreates a running pod whose CA fingerprint is stale (rotated CA)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", runningPod("ca-v1-old"));
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls).toHaveLength(1); // stale → respawn with current CA
+  });
+
+  it("recreates a running pod with no fingerprint label (legacy pod)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", runningPod(undefined));
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
+  it("ignores fingerprint and reuses on running when the spawner reports no CA (non-mTLS)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = undefined; // spawner can't report a CA → nothing to validate
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", runningPod("whatever"));
+
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0);
   });
 });

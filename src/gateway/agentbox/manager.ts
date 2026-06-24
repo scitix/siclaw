@@ -97,8 +97,11 @@ export class AgentBoxManager {
     const name = this.podName(agentId);
 
     const info = await this.spawner.get(name);
-    if (info && info.status === "running" && info.endpoint) {
+    if (info && info.status === "running" && info.endpoint && this.isCertFresh(info)) {
       return { boxId: name, endpoint: info.endpoint, agentId };
+    }
+    if (info && info.status === "running" && !this.isCertFresh(info)) {
+      console.log(`[agentbox-manager] Pod for agent=${agentId} has a stale CA cert; recreating to restore mTLS`);
     }
 
     console.log(`[agentbox-manager] Creating new AgentBox for agent=${agentId}`);
@@ -140,6 +143,22 @@ export class AgentBoxManager {
 
   private resolveEnv(configEnv?: Record<string, string>): Record<string, string> {
     return configEnv ?? {};
+  }
+
+  /**
+   * Whether a running pod's mTLS cert still chains to the runtime's current CA.
+   *
+   * If the spawner can't report a CA fingerprint (non-mTLS spawner, or cert
+   * manager not yet set), there's nothing to validate → treat as fresh. A
+   * running pod whose stamped fingerprint differs (or is absent on a pod
+   * spawned before this label existed) is stale: the runtime can no longer
+   * complete mTLS with it, so getOrCreate falls through to spawn(), which
+   * deletes and recreates it with a cert signed by the current CA.
+   */
+  private isCertFresh(info: AgentBoxInfo): boolean {
+    const want = this.spawner.caFingerprint?.();
+    if (!want) return true;
+    return info.caFingerprint === want;
   }
 
   get(agentId: string): AgentBoxHandle | undefined {

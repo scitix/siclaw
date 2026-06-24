@@ -37,4 +37,11 @@ export interface BoxSpawner {
    * Clean up resources
    */
   cleanup(): Promise<void>;
+
+  /**
+   * Fingerprint of the CA the spawner currently issues mTLS certs from, if the
+   * spawner uses mTLS (K8s). Lets the manager detect AgentBox pods signed by a
+   * rotated CA and recycle them. Spawners without mTLS (local/process) omit it.
+   */
+  caFingerprint?(): string | undefined;
 }
