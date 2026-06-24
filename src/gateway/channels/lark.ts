@@ -137,6 +137,25 @@ export function createLarkHandler(
         domain,
       });
 
+      // Fetch the bot's own open_id once at start. Group-message handling needs
+      // it to tell an individual "@bot" from "@所有人": Feishu delivers @所有人
+      // to an @bot-scoped app too (it mentions everyone, the bot included), so
+      // at the event layer an @所有人 announcement is indistinguishable from a
+      // real @bot unless we match the bot's own open_id. Best-effort: on
+      // failure we fall back to @_all-exclusion (see isBotMentioned).
+      let botOpenId: string | undefined;
+      try {
+        const botInfo: any = await (larkClient as any).request({
+          method: "GET",
+          url: "/open-apis/bot/v3/info",
+        });
+        botOpenId = botInfo?.bot?.open_id ?? botInfo?.data?.bot?.open_id;
+        console.log(`[lark] Channel ${channelId} bot open_id=${botOpenId ?? "(unknown)"}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[lark] Could not fetch bot info for channel ${channelId}; group @-mention gating falls back to @_all-exclusion: ${msg}`);
+      }
+
       const dispatcher = new lark.EventDispatcher({
         verificationToken: config.verification_token,
         encryptKey: config.encrypt_key,
@@ -151,7 +170,7 @@ export function createLarkHandler(
         // ACK ships in <1ms and redelivery never triggers.
         "im.message.receive_v1": (data: any) => {
           setImmediate(() => {
-            handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions, frontendClient, localeForDomain(config.domain), config)
+            handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions, frontendClient, localeForDomain(config.domain), config, botOpenId)
               .catch((err) => {
                 console.error(`[lark] Error handling message for channel=${channelId}:`, err);
               });
@@ -240,6 +259,30 @@ function buildLarkSessionKey(senderOpenId: string | null, chatId: string): strin
   return senderOpenId ? `open_id:${senderOpenId}` : `chat:${chatId}`;
 }
 
+/**
+ * Whether a group message is actually directed at THIS bot.
+ *
+ * Feishu delivers a group message to an app scoped to "receive @bot messages"
+ * whenever the bot is mentioned — but "@所有人" (@all) mentions *everyone*, the
+ * bot included, so an @所有人 announcement is delivered too and looks identical
+ * to a real @bot at the event layer. We must match the bot's own open_id:
+ * "@所有人" carries key "@_all" and never the bot's open_id, so a strict
+ * open_id match excludes it (and any "@someone-else").
+ *
+ * Degraded path — bot-info fetch failed, so `botOpenId` is unknown: we can't
+ * positively identify the bot, but we can still drop "@所有人" explicitly by
+ * its "@_all" key. This kills the reported announcement-spam case without
+ * muting the bot when its open_id couldn't be resolved.
+ */
+function isBotMentioned(message: any, botOpenId?: string): boolean {
+  const mentions = message?.mentions as
+    | Array<{ id?: { open_id?: string }; key?: string }>
+    | undefined;
+  if (!mentions || mentions.length === 0) return false;
+  if (botOpenId) return mentions.some((m) => m.id?.open_id === botOpenId);
+  return mentions.some((m) => m.key !== "@_all");
+}
+
 export function buildChannelTurnPrompt(text: string): string {
   return [
     "<channel-turn>",
@@ -269,6 +312,7 @@ export async function handleLarkMessage(
   frontendClient?: FrontendWsClient,
   locale: "zh-CN" | "en-US" = "zh-CN",
   channelConfig?: LarkChannelConfig,
+  botOpenId?: string,
 ): Promise<void> {
   // @larksuiteoapi/node-sdk EventDispatcher flattens the event payload before
   // dispatching: `event.*` fields land on the top level and `data.event`
@@ -376,6 +420,18 @@ export async function handleLarkMessage(
     return;
   }
 
+  // Only respond when THIS bot is individually @-mentioned. Feishu also
+  // delivers "@所有人" to an @bot-scoped app (it mentions everyone, the bot
+  // included), so an @所有人 announcement arrives looking just like a real
+  // @bot — without this gate the bot replies to group-wide announcements that
+  // were never aimed at it. Skips "@所有人" and "@someone-else"; PAIR above is
+  // exempt (explicit command). Gated on chat_type==="group" so the binding/
+  // access checks below stay reachable only for messages aimed at the bot.
+  if (chatType === "group" && !isBotMentioned(message, botOpenId)) {
+    console.log(`[lark] Group message not directed at bot (chat=${chatId}) — ignoring (@所有人 / @others / no @bot)`);
+    return;
+  }
+
   // Look up binding for this chat. Pass sender_open_id so the Portal can
   // auto-bind / per-sender resolve group bots and pick the session key.
   const binding = await resolveBinding(groupChannelId, chatId, frontendClient!, sessionKey, senderOpenId ?? undefined);
@@ -393,13 +449,20 @@ export async function handleLarkMessage(
     return;
   }
 
-  const queueKey = `${binding.bindingId}:${binding.sessionKey ?? sessionKey}`;
+  // Use the SERVER-authoritative session key (not the local open_id default) for
+  // both the queue and the queued context, so the two-path contract holds:
+  //   - open group     → open_id:<sender>  (per-sender: concurrent + isolated)
+  //   - authorized group → sicore_user:<id> (per-user)
+  //   - legacy single binding session → "" (binding-level queue + /new reset)
+  // /new then resets the right session, and same-session senders serialize.
+  const effectiveSessionKey = binding.sessionKey ?? "";
+  const queueKey = `${binding.bindingId}:${binding.sessionKey ?? "__binding__"}`;
   const queued = enqueueBindingTask(queueKey, () => processQueuedLarkMessage({
     text,
     messageId,
     chatId,
     senderOpenId,
-    sessionKey,
+    sessionKey: effectiveSessionKey,
     channelId: groupChannelId,
     route: "group",
     larkClient,

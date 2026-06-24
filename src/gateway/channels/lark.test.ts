@@ -132,6 +132,9 @@ function makeBinding(overrides: Record<string, unknown> = {}) {
     agentId: "a1",
     bindingId: "b",
     sessionId: "session-fixed",
+    // Server-authoritative per-sender session key (open group → open_id:<sender>);
+    // the Runtime uses this for queueing + /new, not the local default.
+    sessionKey: "open_id:ou_user_1",
     createdBy: "user-1",
     routeType: "group",
     ...overrides,
@@ -749,6 +752,26 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");
   });
 
+  it("/new resets the SERVER session key (authorized group → sicore_user:<id>), not the local open_id", async () => {
+    // Contract: the Runtime must reset whatever session key the resolver
+    // returned, so an authorized group resets the sender's sicore_user session
+    // and an open group resets open_id:<sender> — never the local default.
+    resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "old-session", sessionKey: "sicore_user:u42" }));
+    resetBindingSessionMock.mockResolvedValue({ success: true, agentId: "a1", oldSessionId: "old-session", sessionId: "new-session" });
+    const mgr = makeAgentBoxManager("a1");
+
+    await handleLarkMessage(
+      makeTextEvent("/new"),
+      makeLarkClient(),
+      "lark",
+      mgr as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "sicore_user:u42");
+  });
+
   it("queues concurrent messages for the same sender instead of starting a second prompt", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "queued-session" }));
     let releaseFirst!: () => void;
@@ -828,6 +851,73 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     releaseFirst();
     await Promise.all([first, ...queued]);
     expect(promptMock).toHaveBeenCalledTimes(21);
+  });
+});
+
+describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => {
+  const BOT = "ou_bot_self";
+
+  // A realistic group event carries chat_type:"group" + a mentions[] array.
+  function groupEvent(text: string, mentions: any[]) {
+    return makeTextEvent(text, { chat_type: "group", mentions });
+  }
+
+  it("routes when THIS bot is individually @-mentioned (open_id match)", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const data = groupEvent("@_user_1 查一下集群", [
+      { key: "@_user_1", id: { open_id: BOT } },
+    ]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).toHaveBeenCalled();
+  });
+
+  it("IGNORES @所有人 announcements (key @_all, not the bot's open_id)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    const data = groupEvent("@_all 基础功能都搞过来了", [
+      { key: "@_all", id: {} },
+    ]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("IGNORES a message that @-mentions someone else (not the bot)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    const data = groupEvent("@_user_2 你看下", [
+      { key: "@_user_2", id: { open_id: "ou_someone_else" } },
+    ]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("IGNORES a plain group message with no mention at all", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    const data = groupEvent("随便聊两句", []);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("degraded (botOpenId unknown): still drops @所有人 by its @_all key", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    const data = groupEvent("@_all 通知一下", [{ key: "@_all", id: {} }]);
+    // No botOpenId passed (bot-info fetch failed at start).
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("degraded (botOpenId unknown): a non-@_all mention still routes", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const data = groupEvent("@_user_1 帮我查", [{ key: "@_user_1", id: { open_id: "ou_whoever" } }]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any);
+    expect(resolveBindingMock).toHaveBeenCalled();
+  });
+
+  it("does NOT gate p2p messages — DMs never carry an @bot mention", async () => {
+    // p2p path is personal-bot only; with no personal_bot config it bails
+    // *before* resolveBinding, but it must NOT be dropped by the group gate.
+    const data = makeTextEvent("私聊问个问题", { chat_type: "p2p" });
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    // group resolveBinding is never reached on the p2p branch
+    expect(resolveBindingMock).not.toHaveBeenCalled();
   });
 });
 
