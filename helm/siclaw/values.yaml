@@ -61,6 +61,17 @@ runtime:
     # Disabled by default for integrated production deployments. Enabling
     # this re-exposes memory_search/memory_get and session memory auto-save.
     enabled: false
+  # Embedding endpoint for memory's hybrid vector search. Only used when
+  # memory.enabled=true. When baseUrl is empty, memory falls back to FTS
+  # (keyword) search only — no semantic vector recall. The endpoint must be
+  # OpenAI-compatible (POST {baseUrl}/embeddings); e.g. a self-hosted TEI /
+  # vLLM / Ollama service. Forwarded to each AgentBox pod via the runtime
+  # spawner (SICLAW_EMBEDDING_* env). dimensions MUST match the model's output.
+  embedding:
+    baseUrl: ""           # e.g. http://tei-embedding.<ns>.svc.cluster.local/v1
+    model: ""             # e.g. Qwen/Qwen3-Embedding-4B (empty → BAAI/bge-m3)
+    dimensions: 0         # e.g. 2560 (0/empty → 1024). Must match the model.
+    apiKey: ""            # optional; empty for unauthenticated self-hosted endpoints
   # Max sub-agent child sessions a single AgentBox runs concurrently. A wide
   # spawn_subagent fan-out queues past this instead of starting one child agent +
   # one LLM stream per target at once (avoids provider 429s / pod pressure).

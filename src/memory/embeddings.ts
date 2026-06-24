@@ -18,8 +18,13 @@ const TIMEOUT_MS = 30_000;
 const MAX_RETRY_DELAY_MS = 8000;
 /** Max estimated tokens per embedding API batch */
 const BATCH_MAX_TOKENS = 8000;
-/** Max number of texts per embedding API batch (guards against many short texts) */
-const BATCH_MAX_ITEMS = 100;
+/**
+ * Max number of texts per embedding API batch. Kept conservative because some
+ * OpenAI-compatible embedding endpoints cap the `input[]` array length (observed:
+ * a managed Qwen endpoint silently hangs — no 4xx — when input length > 10),
+ * which surfaces as a client-side request timeout rather than a clear error.
+ */
+const BATCH_MAX_ITEMS = 8;
 
 export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider {
   const baseUrl = (opts?.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
