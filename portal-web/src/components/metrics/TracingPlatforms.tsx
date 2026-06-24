@@ -64,10 +64,10 @@ function Toggle({ on, onChange, disabled }: { on: boolean; onChange: () => void;
       onClick={onChange}
       disabled={disabled}
       className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-40 ${
-        on ? "bg-blue-500" : "bg-secondary border border-border"
+        on ? "bg-blue-500" : "bg-gray-300 dark:bg-gray-600"
       }`}
     >
-      <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${on ? "translate-x-[18px]" : "translate-x-[3px]"}`} />
+      <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm transition-transform ${on ? "translate-x-[18px]" : "translate-x-[3px]"}`} />
     </button>
   )
 }
