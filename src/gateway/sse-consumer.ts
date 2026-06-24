@@ -87,8 +87,7 @@ const NOISE_FLOOR_MS = 50;
  * cross-process anchors (e.g. portal POST timestamp passed to runtime via
  * RPC) can briefly produce negatives if the two pods' NTP clocks have drifted
  * apart. We treat negatives as "unknown" rather than persist them — downstream
- * (frontend formatter, /metrics/timing aggregation) interprets absence as
- * unmeasured, which is correct.
+ * (the chat timing badge) interprets absence as unmeasured, which is correct.
  */
 function nonNegative(ms: number): number | undefined {
   return Number.isFinite(ms) && ms >= 0 ? ms : undefined;

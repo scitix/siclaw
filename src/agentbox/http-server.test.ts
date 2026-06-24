@@ -31,10 +31,6 @@ vi.mock("../shared/metrics.js", () => ({
   ],
 }));
 
-vi.mock("../shared/local-collector.js", () => ({
-  localCollector: { exportSnapshot: () => ({ cpu: 0 }) },
-}));
-
 vi.mock("../shared/diagnostic-events.js", () => ({ emitDiagnostic: () => {} }));
 
 vi.mock("../shared/detect-language.js", () => ({
@@ -1175,12 +1171,9 @@ describe("http-server — metrics endpoints", () => {
     expect(text).toContain("# HELP fake");
   });
 
-  it("GET /api/internal/metrics-snapshot returns a JSON snapshot augmented with federation fields", async () => {
+  it("GET /api/internal/metrics-snapshot returns { incarnation, prom }", async () => {
     const r = await getJson(port, "/api/internal/metrics-snapshot");
     expect(r.status).toBe(200);
-    // base snapshot from LocalCollector (path ①) ...
-    expect(r.data.cpu).toBe(0);
-    // ... augmented in the route with federation fields (path ②)
     expect(r.data.incarnation).toBe("test-incarnation");
     expect(r.data.prom).toEqual([
       { name: "siclaw_tokens_total", type: "counter", values: [{ labels: { type: "input" }, value: 3 }] },

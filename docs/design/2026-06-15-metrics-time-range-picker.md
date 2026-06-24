@@ -7,13 +7,13 @@
 ## Background & goal
 
 The Metrics dashboard (`portal-web/src/pages/Metrics.tsx`) filters time with a 3-option
-`<select>` — Today / Last 7 days / Last 30 days — driving `summary` and `timing`. The Audit
+`<select>` — Today / Last 7 days / Last 30 days — driving `summary`. The Audit
 tab carries its **own, independent** range `<select>` (Last 1h/6h/24h/7d/30d), so the header
 period and the audit window can silently disagree. Neither path can express an **absolute**
 window ("2026-06-10 09:00 → 12:00").
 
 Goal: replace the period enum with a **Grafana-style time picker** — quick relative ranges
-plus an absolute From/To — and unify the backend `live`/`summary`/`timing`/`audit` endpoints
+plus an absolute From/To — and unify the backend `summary`/`audit` endpoints
 on a single `from`/`to` timestamp contract, matching what audit already half-did with
 `startDate`/`endDate`. Clean break, no compatibility shim.
 
@@ -48,26 +48,20 @@ TypeScript backend):
    a button showing the current label, opening a popover with quick ranges (right) and an
    absolute From/To editor (left).
 3. **Backend `from`/`to`** — `resolveWindow()` reads `from`/`to` (unix-ms or ISO), defaults to a
-   trailing 7d window, 400 on invalid / `from>=to`. `summary` and `timing` gain a `created_at <= to`
+   trailing 7d window, 400 on invalid / `from>=to`. `summary` gains a `created_at <= to`
    upper bound; `audit` renames `startDate`/`endDate` → `from`/`to` (keeps its `BETWEEN`).
 
 ### Refresh semantics — relative slides / absolute fixed
 
-Precise behavior (corrected per peer review — only `useLive` owns a timer):
-
-- **`useLive`** owns the single 30s `setInterval`. Each tick re-runs `resolveRange`, so a
-  **relative** live window re-bases on `now` (slides); an **absolute** one is constant (fixed).
-  The KPI live fields (active sessions, WS connections, tool-calls total) and Top Tools/Skills
-  ride this tick.
-- **`useSummary` / `useTimingStats`** have **no timer**. They refetch only when their deps
+- **`useSummary`** has **no timer**. It refetches only when its deps
   change — `[range.from, range.to, userId]` — or on the manual Refresh button. Because a
   relative range's strings (`"now-7d"`) are constant across renders, the cards do **not** silently
-  slide every 30s; they re-resolve to the current `now` the next time the user changes the range
-  or hits Refresh. This preserves the existing summary/timing refresh behavior — we are only
+  slide; they re-resolve to the current `now` the next time the user changes the range
+  or hits Refresh. This preserves the existing summary refresh behavior — we are only
   swapping the window contract, not adding a ticking slide.
 - The **Audit** list resolves the window **once per filter change and freezes it**, reusing the
   snapshot while paginating — a relative window must not slide mid-pagination or the cursor
-  drifts (rows duplicate / skip). Audit therefore does **not** auto-refresh with the header tick.
+  drifts (rows duplicate / skip). Audit therefore does **not** auto-refresh.
 
 ## Detailed design
 
@@ -85,11 +79,9 @@ Precise behavior (corrected per peer review — only `useLive` owns a timer):
 - `summary`: drop `PERIODS`/`period`/`cutoff`; use `from` as the `created_at >= ?` lower bound
   and add `AND ... created_at <= ?` upper bound to **all three** windowed queries (totalSessions,
   totalPrompts, byUser).
-- `timing`: same swap; add the upper bound to both the assistant-rows and tool-rows SELECTs.
 - `audit`: rename `startDate`/`endDate` → `from`/`to` (the `BETWEEN ? AND ?` already bounds both
   ends). Default window unchanged (trailing 24h when both absent — but the frontend will always
   send an explicit window).
-- `live`: unchanged — it has no period (live snapshot, `userId` only).
 - Dialect: `from`/`to` are passed as `Date` objects into parameterized queries exactly like the
   current `cutoff`/`startDate`, so MySQL + SQLite behavior is unchanged (invariants.md §5).
 
@@ -109,10 +101,9 @@ export function rangeLabel(r: TimeRange): string
   **local timezone** (`YYYY-MM-DD HH:mm` or ISO). The picker's Apply button is gated on
   `resolveRange` yielding a valid `from < to`, so unknown units (`now-3M`) are rejected at the UI
   rather than silently becoming `NaN` → backend 400.
-- `useSummary` / `useTimingStats`: signature `period: string` → `range: TimeRange`; `fetchOnce`
+- `useSummary`: signature `period: string` → `range: TimeRange`; `fetchOnce`
   reads `rangeRef.current`, `resolveRange` → `from`/`to` ms query params; effect deps become
   `[range.from, range.to, userId]` (primitives, not the object).
-- `useLive`: still `userId`-only + 30s interval — unchanged.
 - `useAudit`: `AuditParams.startDate/endDate` → `from/to`.
 
 ### Module 3 — `TimeRangePicker` (`portal-web/src/components/metrics/TimeRangePicker.tsx`, new)
@@ -147,14 +138,14 @@ absolute-positioned panel + a `mousedown` outside-click listener):
 ### Module 4 — wiring
 
 - `Metrics.tsx`: `period` state → `timeRange: TimeRange`; header `<select>` → `<TimeRangePicker>`;
-  pass `timeRange` to `useSummary`/`useTimingStats`/`AuditTable` and `rangeLabel(timeRange)` to the
+  pass `timeRange` to `useSummary`/`AuditTable` and `rangeLabel(timeRange)` to the
   cards.
 - `AuditTable.tsx`: accept `timeRange` from the page header and **drop its own `rangeMs`
   `<select>`** + `RANGE_OPTIONS` (decision #2 — unify). Resolve to `{fromMs,toMs}` in a `useMemo`
   keyed on `[timeRange.from, timeRange.to, tool, status, userFilterId]` (primitives only, **never
   `Date.now()`**), and feed the **resolved ms** into `useAudit`'s `from`/`to` params — this is the
   freeze that keeps pagination cursors stable.
-- `KpiCards.tsx` / `TimingStatsCard.tsx`: `period` prop → `rangeLabel: string`; drop local period maps.
+- `KpiCards.tsx`: `period` prop → `rangeLabel: string`; drop local period maps.
 - `Metrics.tsx`: also update the **"By User" subtitle** at line ~149 (`(period: ${period})`) which
   references the deleted `period` state — becomes `rangeLabel(timeRange)`; this is a hard compile
   dependency, not cosmetic.
@@ -174,19 +165,19 @@ absolute-positioned panel + a `mousedown` outside-click listener):
 - **Invalid absolute input** — Apply is gated on `resolveRange` producing a valid `from < to`;
   backend independently 400s on bad params (fail-fast, no silent fallback).
 - **byUser session-vs-message timestamp asymmetry** — `byUser` filters `s.created_at` while
-  `totalPrompts`/timing filter `m.created_at`. With an upper bound, a session created before `to`
+  `totalPrompts` filters `m.created_at`. With an upper bound, a session created before `to`
   whose messages land after `to` counts its session but not those messages (can read sessions=1,
   messages=0 in a tight absolute window). Pre-existing semantics the upper bound merely surfaces;
   not changed here.
 - **Test migration** — `siclaw-api.misc.test.ts` `summary?period=bogus → 400` becomes
-  `summary?from=2000&to=1000 → 400`. Verify `timing` had no separate invalid-period test to migrate,
-  and that the summary happy-path assertion on `query.mock.calls[1][0]` still holds (the added
+  `summary?from=2000&to=1000 → 400`. Verify the summary happy-path assertion on
+  `query.mock.calls[1][0]` still holds (the added
   `created_at <= ?` keeps the `delegation_event` LIKE clause and adds no extra query call).
 
 ## Estimate
 
-- Files: ~7 (`useMetrics.ts`, `TimeRangePicker.tsx` [new], `Metrics.tsx`, `AuditTable.tsx`,
-  `KpiCards.tsx`, `TimingStatsCard.tsx`, `siclaw-api.ts`) + 1 test.
+- Files: ~6 (`useMetrics.ts`, `TimeRangePicker.tsx` [new], `Metrics.tsx`, `AuditTable.tsx`,
+  `KpiCards.tsx`, `siclaw-api.ts`) + 1 test.
 - Lines: ~450–650 (main-agent execution; under the 1000-line threshold).
 
 ## Decision Record
