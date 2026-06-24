@@ -348,6 +348,56 @@ describe("registerAgentRoutes", () => {
       expect(connMap.notify).not.toHaveBeenCalled();
     });
 
+    it("terminates the running box when idle_timeout_sec changes resident(0) → finite", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 0 }], []]) // pre-read old idle (resident)
+        .mockResolvedValueOnce([undefined, []])                  // UPDATE
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);            // SELECT *
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 300 },
+      }));
+
+      expect(status).toBe(200);
+      // A resident pod never self-destructs, so it must be terminated to cold-spawn
+      // with the new window — agentId is in the payload (agent.reload requires it).
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.terminate", { agentId: "a1" });
+    });
+
+    it("does NOT terminate on a finite → finite idle change (self-heals)", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 300 }], []]) // pre-read old idle (finite)
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 600 },
+      }));
+
+      // 300→600 self-heals: the box self-destructs on its current 300s window and
+      // the next spawn reads 600 — no need to disrupt a live box.
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("does NOT terminate when staying resident (0 → 0)", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 0 }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 0 },
+      }));
+
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
     it("updates model_routing as a standalone field", async () => {
       query
         .mockResolvedValueOnce([undefined, []])

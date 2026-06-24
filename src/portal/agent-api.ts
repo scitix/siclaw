@@ -178,6 +178,20 @@ export function registerAgentRoutes(
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
+    // Capture the current idle window before the update — needed to detect the
+    // resident(0) → finite transition, which (unlike every other transition)
+    // does NOT self-heal: a resident pod never self-destructs, so it never
+    // cold-spawns to pick up the new SICLAW_AGENTBOX_IDLE_TIMEOUT. We terminate
+    // the running box below to force that cold spawn.
+    let oldIdleTimeoutSec: number | null = null;
+    if ("idle_timeout_sec" in body) {
+      const [cur] = await db.query(
+        "SELECT idle_timeout_sec FROM agents WHERE id = ?",
+        [params.id],
+      ) as any;
+      oldIdleTimeoutSec = cur[0]?.idle_timeout_sec ?? null;
+    }
+
     // Build dynamic SET clause
     const fields = [
       "name", "description", "status", "model_provider",
@@ -250,6 +264,20 @@ export function registerAgentRoutes(
     // re-fetches its whitelist and invalidates live sessions (mid-turn-safe).
     if (toolCapabilitiesChanged) {
       connectionMap.notify(params.id, "agent.reload", { agentId: params.id, resources: ["tools"] });
+    }
+
+    // Idle window changed from resident (0) → finite: the running box is
+    // resident and will never self-destruct, so it would never cold-spawn to
+    // pick up the new window — the change would silently never take effect.
+    // Terminate the running box so the next message cold-spawns with the new
+    // SICLAW_AGENTBOX_IDLE_TIMEOUT. Other transitions (finite→finite, →0) need
+    // no action: the box self-destructs on its current window and the next
+    // spawn reads the new value, so we don't disrupt a live box for them.
+    if ("idle_timeout_sec" in body) {
+      const newIdleTimeoutSec = normalizeIdleTimeoutSec(body.idle_timeout_sec);
+      if (oldIdleTimeoutSec === 0 && newIdleTimeoutSec > 0) {
+        connectionMap.notify(params.id, "agent.terminate", { agentId: params.id });
+      }
     }
   });
 
