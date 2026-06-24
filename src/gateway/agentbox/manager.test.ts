@@ -18,6 +18,9 @@ class FakeSpawner implements BoxSpawner {
   getReturns = new Map<string, AgentBoxInfo | null>();
   listReturns: AgentBoxInfo[] = [];
   cleanupCalls = 0;
+  /** When set, the manager enforces CA-fingerprint matching for pod reuse. */
+  fingerprint: string | undefined = undefined;
+  caFingerprint(): string | undefined { return this.fingerprint; }
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
     this.spawnCalls.push(config);
@@ -212,6 +215,114 @@ describe("AgentBoxManager — K8s mode", () => {
   });
 });
 
+// ── Per-agent persistence is anchored at cold spawn ────────────────────
+//
+// chat.send carries `persistence` per request, but the volume mode is fixed
+// when the pod is created (K8s cannot hot-change a running pod's mounts). A
+// warm pod is reused by agentId WITHOUT spawning, so a changed persistence
+// value must NOT recycle it or reach a new pod spec — it only applies on the
+// next cold spawn. These tests pin that contract. (Cold-spawn volume selection
+// from boxConfig.persistence is covered by k8s-spawner.test.ts.)
+
+describe("AgentBoxManager — persistence anchored at cold spawn (warm reuse ignores it)", () => {
+  it("K8s: a running pod is reused without re-spawning when persistence flips", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", {
+      boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+
+    // Pod already running: neither a true nor a (changed) false value spawns.
+    await mgr.getOrCreate("agent-a", { persistence: true });
+    await mgr.getOrCreate("agent-a", { persistence: false });
+
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("Local: cached running box is reused without re-spawning when persistence flips", async () => {
+    const spawner = new FakeSpawner("local");
+    const mgr = new AgentBoxManager(spawner);
+
+    // Cold spawn anchors the value; the spawner records exactly one spawn.
+    await mgr.getOrCreate("agent-a", { persistence: true });
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].persistence).toBe(true);
+
+    // Cached box still running → reused; the new false value never re-spawns.
+    spawner.getReturns.set("box-agent-a", {
+      boxId: "box-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "x", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    await mgr.getOrCreate("agent-a", { persistence: false });
+
+    expect(spawner.spawnCalls).toHaveLength(1); // still just the cold spawn
+  });
+});
+
+// ── Per-agent persistence resolved by agentId (entry-point independent) ─
+//
+// The injected persistenceResolver makes persistence a true agent property:
+// any cold-spawn entry point (chat, channel, cron, abort) that passes NO
+// per-request value still gets the agent's resolved mode. An explicit config
+// value (e.g. task-coordinator's binding.persistence) wins; the resolver is
+// consulted only on a cold spawn, never on warm reuse.
+
+describe("AgentBoxManager — persistence resolved by agentId via resolver", () => {
+  it("K8s: cold spawn with no config uses the resolver's value", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPersistenceResolver(async () => true);
+
+    await mgr.getOrCreate("agent-a"); // no config — mirrors lark/dingtalk/abort
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].persistence).toBe(true);
+  });
+
+  it("Local: cold spawn with no config uses the resolver's value", async () => {
+    const spawner = new FakeSpawner("local");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPersistenceResolver(async () => true);
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls[0].persistence).toBe(true);
+  });
+
+  it("explicit config.persistence wins over the resolver", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPersistenceResolver(async () => false);
+
+    await mgr.getOrCreate("agent-a", { persistence: true });
+    expect(spawner.spawnCalls[0].persistence).toBe(true);
+  });
+
+  it("no resolver and no config → persistence undefined (global fallback)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls[0].persistence).toBeUndefined();
+  });
+
+  it("resolver is NOT consulted on warm reuse (only cold spawn)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    let resolverCalls = 0;
+    mgr.setPersistenceResolver(async () => { resolverCalls++; return true; });
+
+    // Pod already running → warm reuse, resolver must not fire.
+    spawner.getReturns.set("agentbox-agent-a", {
+      boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    await mgr.getOrCreate("agent-a");
+
+    expect(spawner.spawnCalls).toHaveLength(0);
+    expect(resolverCalls).toBe(0);
+  });
+});
+
 // ── Health-check timer (local only) ────────────────────────────────────
 
 describe("AgentBoxManager — health check timer", () => {
@@ -259,5 +370,108 @@ describe("AgentBoxManager — cleanup", () => {
     expect(spawner.stopCalls.sort()).toEqual(["box-agent-a", "box-agent-b"]);
     expect(spawner.cleanupCalls).toBe(1);
     expect(mgr.stats().total).toBe(0);
+  });
+});
+
+describe("AgentBoxManager — K8s CA-fingerprint self-heal", () => {
+  const runningPod = (caFingerprint?: string): AgentBoxInfo => ({
+    boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
+    endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    caFingerprint,
+  });
+
+  it("reuses a running pod whose CA fingerprint matches the spawner's current CA", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", runningPod("ca-v2"));
+
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0); // reused, not recreated
+  });
+
+  it("recreates a running pod whose CA fingerprint is stale (rotated CA)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", runningPod("ca-v1-old"));
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls).toHaveLength(1); // stale → respawn with current CA
+  });
+
+  it("recreates a running pod with no fingerprint label (legacy pod)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = "ca-v2";
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", runningPod(undefined));
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls).toHaveLength(1);
+  });
+
+  it("ignores fingerprint and reuses on running when the spawner reports no CA (non-mTLS)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    spawner.fingerprint = undefined; // spawner can't report a CA → nothing to validate
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", runningPod("whatever"));
+
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.endpoint).toBe("https://10.0.0.1:3000");
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+});
+
+describe("AgentBoxManager — injected spawnEnvResolver", () => {
+  it("does NOT call the resolver when a running pod is reused (warm path → no RPC)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", {
+      boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    let calls = 0;
+    mgr.setSpawnEnvResolver(async () => { calls++; return { SICLAW_AGENTBOX_IDLE_TIMEOUT: "150" }; });
+
+    await mgr.getOrCreate("agent-a");
+    expect(calls).toBe(0);
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("calls the resolver with the agentId and injects its env on a cold spawn", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    const seen: string[] = [];
+    mgr.setSpawnEnvResolver(async (agentId) => { seen.push(agentId); return { SICLAW_AGENTBOX_IDLE_TIMEOUT: "150" }; });
+
+    await mgr.getOrCreate("agent-a");
+    expect(seen).toEqual(["agent-a"]);
+    expect(spawner.spawnCalls[0].env).toEqual({ SICLAW_AGENTBOX_IDLE_TIMEOUT: "150" });
+  });
+
+  it("applies to every entry point, not just one call site (cold spawn always resolves)", async () => {
+    // The resolver is owned by the manager, so a channel/cron path that calls
+    // getOrCreate(agentId) with no extra args still gets the env.
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setSpawnEnvResolver(async () => ({ SICLAW_AGENTBOX_IDLE_TIMEOUT: "0" }));
+    await mgr.getOrCreate("agent-from-channel");
+    expect(spawner.spawnCalls[0].env).toEqual({ SICLAW_AGENTBOX_IDLE_TIMEOUT: "0" });
+  });
+
+  it("spawns with no env when no resolver is set", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls[0].env).toBeUndefined();
+  });
+
+  it("spawns with no env when the resolver yields undefined", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setSpawnEnvResolver(async () => undefined);
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls[0].env).toBeUndefined();
   });
 });

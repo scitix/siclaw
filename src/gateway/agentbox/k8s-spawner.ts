@@ -94,6 +94,14 @@ export class K8sSpawner implements BoxSpawner {
 
     console.log(`[k8s-spawner] Creating pod: ${podName} for agent: ${agentId}`);
 
+    // Stamp the pod + its cert Secret with the CA fingerprint. The runtime uses
+    // it to detect pods whose mTLS cert was signed by a rotated CA (those can no
+    // longer complete mTLS in either direction) and recycle them — see the reuse
+    // branch below and AgentBoxManager.getOrCreateK8s.
+    if (!this.certManager) throw new Error("CertificateManager not initialized — call setCertManager() first");
+    const caFp = this.certManager.caFingerprint();
+    const caFpLabel = `${labelPrefix}/ca-fp`;
+
     // Clean up any existing pod in non-running state (Failed, Succeeded, Error)
     // so we can recreate with the same name
     try {
@@ -105,9 +113,18 @@ export class K8sSpawner implements BoxSpawner {
         // Wait for pod to be fully deleted
         await this.waitForPodDeleted(podName, namespace);
       } else if (phase === "Running" || phase === "Pending") {
-        console.log(`[k8s-spawner] Pod ${podName} already exists (phase: ${phase}), reusing`);
-        const endpoint = await this.waitForPodReady(podName, namespace);
-        return { boxId: podName, agentId, endpoint };
+        const podFp = existing.metadata?.labels?.[caFpLabel];
+        if (podFp === caFp) {
+          console.log(`[k8s-spawner] Pod ${podName} already exists (phase: ${phase}), reusing`);
+          const endpoint = await this.waitForPodReady(podName, namespace);
+          return { boxId: podName, agentId, endpoint };
+        }
+        // CA fingerprint mismatch (or an unlabeled legacy pod): the pod's mTLS
+        // cert was signed by a different/rotated CA, so the runtime can no
+        // longer talk to it. Recycle it instead of returning a dead endpoint.
+        console.log(`[k8s-spawner] Pod ${podName} has stale CA (pod=${podFp ?? "none"}, current=${caFp}); recreating`);
+        await this.coreApi.deleteNamespacedPod({ name: podName, namespace });
+        await this.waitForPodDeleted(podName, namespace);
       }
     } catch (err: any) {
       if (err.code !== 404 && err.statusCode !== 404) {
@@ -117,7 +134,6 @@ export class K8sSpawner implements BoxSpawner {
     }
 
     // Issue client certificate for mTLS authentication.
-    if (!this.certManager) throw new Error("CertificateManager not initialized — call setCertManager() first");
     const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, podName);
     const certSecretName = `${podName}-cert`;
 
@@ -125,6 +141,7 @@ export class K8sSpawner implements BoxSpawner {
     const secretLabels = {
       [`${labelPrefix}/app`]: "agentbox",
       [`${labelPrefix}/agent`]: agentId,
+      [caFpLabel]: caFp,
     };
     try {
       await this.coreApi.createNamespacedSecret({
@@ -209,11 +226,32 @@ export class K8sSpawner implements BoxSpawner {
     // Shared PVC is now scoped per-agent only — all users of the agent share
     // this subdirectory (memory is agent-shared per the 2026-04-18 spec).
     const safeAgentId = this.sanitizePathSegment(agentId);
-    if (this.config.persistence?.enabled) {
+
+    // Persistence decision is per-agent: boxConfig.persistence overrides the
+    // spawner's global config (undefined → fall back to global). Mounting the
+    // PVC requires a claimName, so an agent that requests persistence on a
+    // runtime with no shared PVC configured falls back to emptyDir (with a
+    // warning) rather than spawning a pod that can never mount.
+    const persistenceClaimName = this.config.persistence?.claimName;
+    const wantsPersistence = boxConfig.persistence ?? !!this.config.persistence?.enabled;
+    const persistenceEnabled = wantsPersistence && !!persistenceClaimName;
+    if (wantsPersistence && !persistenceClaimName) {
+      console.warn(
+        `[k8s-spawner] Agent ${agentId} requests persistence but no shared PVC claimName is configured; ` +
+        `falling back to emptyDir (session/memory will NOT survive pod restarts)`,
+      );
+    }
+    if (persistenceEnabled) {
       const subDir = `agents/${safeAgentId}`;
-      console.log(`[k8s-spawner] Persistence enabled: shared PVC "${this.config.persistence.claimName}", subPath "${subDir}"`);
+      console.log(`[k8s-spawner] Persistence enabled for agent ${agentId}: shared PVC "${persistenceClaimName}", subPath "${subDir}"`);
       this.ensureAgentDir(safeAgentId);
     }
+
+    // user-data volume: shared PVC when persistence resolved on (claimName is
+    // narrowed to string by the && below), otherwise an ephemeral emptyDir.
+    const userDataVolume: k8s.V1Volume = persistenceEnabled && persistenceClaimName
+      ? { name: "user-data", persistentVolumeClaim: { claimName: persistenceClaimName } }
+      : { name: "user-data", emptyDir: {} };
 
     // Pod definition
     const pod: k8s.V1Pod = {
@@ -225,6 +263,7 @@ export class K8sSpawner implements BoxSpawner {
         labels: {
           [`${labelPrefix}/app`]: "agentbox",
           [`${labelPrefix}/agent`]: agentId,
+          [caFpLabel]: caFp,
         },
       },
       spec: {
@@ -258,15 +297,7 @@ export class K8sSpawner implements BoxSpawner {
             name: "knowledge-local",
             emptyDir: {},
           },
-          this.config.persistence?.enabled
-            ? {
-                name: "user-data",
-                persistentVolumeClaim: { claimName: this.config.persistence.claimName },
-              }
-            : {
-                name: "user-data",
-                emptyDir: {},
-              },
+          userDataVolume,
           {
             name: "client-cert",
             secret: { secretName: certSecretName },
@@ -290,7 +321,6 @@ export class K8sSpawner implements BoxSpawner {
             },
             ports: [
               { containerPort: 3000, name: "https" },
-              { containerPort: 9090, name: "metrics" },
             ],
             env,
             volumeMounts: [
@@ -313,7 +343,7 @@ export class K8sSpawner implements BoxSpawner {
               {
                 name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
-                ...(this.config.persistence?.enabled
+                ...(persistenceEnabled
                   ? { subPath: `agents/${safeAgentId}` }
                   : {}),
               },
@@ -480,6 +510,15 @@ export class K8sSpawner implements BoxSpawner {
   /**
    * Get AgentBox information
    */
+  /**
+   * Fingerprint of the CA this spawner currently signs AgentBox certs with.
+   * Undefined before setCertManager() runs. The manager compares it to a pod's
+   * stamped `ca-fp` label to decide whether the pod is still reachable over mTLS.
+   */
+  caFingerprint(): string | undefined {
+    return this.certManager?.caFingerprint();
+  }
+
   async get(boxId: string): Promise<AgentBoxInfo | null> {
     const { namespace, labelPrefix } = this.config;
 
@@ -499,6 +538,7 @@ export class K8sSpawner implements BoxSpawner {
           ? new Date(pod.metadata.creationTimestamp)
           : new Date(),
         lastActiveAt: new Date(),
+        caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
       };
     } catch (err: any) {
       if (err.code === 404 || err.statusCode === 404) {

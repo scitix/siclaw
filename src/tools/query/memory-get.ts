@@ -117,6 +117,5 @@ Parameters:
 export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createMemoryGetTool(refs.memoryDir!),
-  platform: true,
   available: (refs) => isMemoryEnabled() && !!refs.memoryIndexer && !!refs.memoryDir,
 };

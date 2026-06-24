@@ -19,18 +19,24 @@ export interface McpStdioServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  /** Admin-provided server context (e.g. tenant IDs) — surfaced to the model via tool descriptions. */
+  description?: string;
 }
 
 export interface McpSseServerConfig {
   transport: "sse";
   url: string;
   headers?: Record<string, string>;
+  /** Admin-provided server context (e.g. tenant IDs) — surfaced to the model via tool descriptions. */
+  description?: string;
 }
 
 export interface McpStreamableHttpServerConfig {
   transport: "streamable-http";
   url: string;
   headers?: Record<string, string>;
+  /** Admin-provided server context (e.g. tenant IDs) — surfaced to the model via tool descriptions. */
+  description?: string;
 }
 
 export type McpServerConfig =
@@ -126,6 +132,31 @@ export function isMcpTool(toolName: string): boolean {
   return toolName.startsWith(MCP_TOOL_PREFIX);
 }
 
+export function mcpContentToAgentContent(mcpContent: any[] | undefined): { content: any[]; text: string } {
+  const content: any[] = [];
+  const textParts: string[] = [];
+  for (const item of mcpContent ?? []) {
+    if (item?.type === "text") {
+      const text = item.text ?? "";
+      textParts.push(text);
+      content.push({ type: "text" as const, text });
+      continue;
+    }
+    if (item?.type === "image") {
+      const data = item.data;
+      const mimeType = item.mimeType ?? item.mime_type;
+      if (typeof data === "string" && typeof mimeType === "string" && /^image\/(?:png|jpe?g|webp|svg\+xml)$/i.test(mimeType)) {
+        content.push({ type: "image" as const, data, mimeType });
+      }
+    }
+  }
+  const text = textParts.join("\n") || "(no output)";
+  return {
+    content: content.length > 0 ? content : [{ type: "text" as const, text }],
+    text,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // McpClientManager
 // ---------------------------------------------------------------------------
@@ -200,7 +231,7 @@ export class McpClientManager {
         console.log(`[mcp-client] "${serverName}" provides ${mcpTools.length} tools: ${mcpTools.map((t: any) => t.name).join(", ")}`);
 
         for (const mcpTool of mcpTools) {
-          const toolDef = this.createToolDefinition(serverName, mcpTool, client);
+          const toolDef = this.createToolDefinition(serverName, cfg.description, mcpTool, client);
           this.tools.push(toolDef);
         }
 
@@ -248,6 +279,7 @@ export class McpClientManager {
    */
   private createToolDefinition(
     serverName: string,
+    serverDescription: string | undefined,
     mcpTool: { name: string; description?: string; inputSchema?: any },
     client: any,
   ): ToolDefinition {
@@ -255,10 +287,17 @@ export class McpClientManager {
     const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
     const parameters = jsonSchemaToTypebox(inputSchema);
 
+    // Prepend the admin-provided server description so the model sees server-level
+    // context (e.g. monitoring tenant IDs) on every tool from that server.
+    const serverContext = serverDescription?.trim()
+      ? `[Server "${serverName}" context: ${serverDescription.trim()}]\n`
+      : "";
+    const toolDescription = mcpTool.description ?? `MCP tool ${mcpTool.name} from ${serverName}`;
+
     return {
       name: fullName,
       label: `${serverName}/${mcpTool.name}`,
-      description: mcpTool.description ?? `MCP tool ${mcpTool.name} from ${serverName}`,
+      description: serverContext + toolDescription,
       parameters,
       execute: async (_toolCallId, args) => {
         try {
@@ -268,13 +307,10 @@ export class McpClientManager {
           });
 
           const isError = !!result.isError;
-          const textParts = (result.content ?? [])
-            .filter((c: any) => c.type === "text")
-            .map((c: any) => c.text ?? "");
-          const text = textParts.join("\n") || "(no output)";
+          const { content, text } = mcpContentToAgentContent(result.content);
 
           return {
-            content: [{ type: "text" as const, text }],
+            content,
             details: isError ? { error: text } : {},
           };
         } catch (err: any) {

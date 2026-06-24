@@ -100,6 +100,32 @@ describe("consumeAgentSse — assistant message flow", () => {
     expect(assistantRow.sessionId).toBe("sid");
   });
 
+  it("merges the agent_end context-usage snapshot onto the last assistant row's metadata", async () => {
+    // Lets the frontend restore the context meter on session reopen/refresh.
+    const cu = { tokens: 24144, contextWindow: 100000, percent: 24.1, inputTokens: 24118, outputTokens: 26 };
+    const events = [
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Hi" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hi" }] } },
+      { type: "agent_end", contextUsage: cu },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const upd = updateCalls.find((u) => u.metadata?.context_usage);
+    expect(upd).toBeDefined();
+    expect(upd.metadata.context_usage).toEqual(cu);
+    expect(upd.messageId).toBe("msg-1"); // the assistant row's id
+    expect(upd.content).toBe("Hi"); // original content re-sent (handler does content ?? "" → must not wipe)
+  });
+
+  it("does not update on agent_end when no contextUsage is present", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hi" }] } },
+      { type: "agent_end" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    expect(updateCalls.find((u) => u.metadata?.context_usage)).toBeUndefined();
+  });
+
   it("skips assistant persistence when cleaned text is empty (pi-agent diagnostic)", async () => {
     const events = [
       { type: "message_start" },
@@ -117,6 +143,40 @@ describe("consumeAgentSse — assistant message flow", () => {
     ];
     const result = await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u" });
     expect(result.errorMessage).toBe("API 429");
+  });
+
+  it("persists a synthetic error row (metadata.kind=error_response) so a failed turn survives reload", async () => {
+    // The motivating case: model-routing exhausts during setup and emits an
+    // error message_end with EMPTY content. The assistantContent persist path
+    // skips it (no text), so without the error row nothing about the failure
+    // reaches the DB and a refresh shows only the user message.
+    const events = [
+      { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "Context preflight failed: invalid context window", content: [] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const errorRow = appendCalls.find((r) => r.metadata?.kind === "error_response");
+    expect(errorRow).toBeDefined();
+    expect(errorRow.role).toBe("assistant");
+    expect(errorRow.sessionId).toBe("sid");
+    expect(errorRow.content).toContain("Context preflight failed");
+    expect(errorRow.metadata.retriable).toBe(true);
+  });
+
+  it("persists the error row only once even when retries emit several error message_ends", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "API 429", content: [] } },
+      { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "API 429", content: [] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(1);
+  });
+
+  it("does not persist an error row when persistMessages is unset", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "API 429", content: [] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u" });
+    expect(appendCalls.find((r) => r.metadata?.kind === "error_response")).toBeUndefined();
   });
 
   it("falls back to currentMsgText when no message_end provides content", async () => {
@@ -296,6 +356,159 @@ describe("consumeAgentSse — assistant message flow", () => {
       switched_from_provider: "openai",
       failure_kind: "rate_limit",
     });
+  });
+});
+
+// ── Routed-turn commit gating (deferred persistence) ────
+
+describe("consumeAgentSse — routed turn commit gating", () => {
+  it("defers the primary candidate's assistant row until model_route_success commits it", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hello" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hello" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 1, candidateKey: "openai/gpt-4", provider: "openai", modelId: "gpt-4", isFallback: false, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    expect(appendCalls.filter((r) => r.role === "assistant" && r.content === "hello")).toHaveLength(1);
+  });
+
+  it("folds the context-usage snapshot into the deferred assistant row (agent_end precedes commit)", async () => {
+    // Real ordering: agent_end fires BEFORE model_route_success, and the assistant
+    // persist is deferred to the commit — so the snapshot must ride the append, not
+    // a post-hoc updateMessage (the row doesn't exist yet at agent_end).
+    const cu = { tokens: 24252, contextWindow: 100000, percent: 24.25, inputTokens: 24230, outputTokens: 22 };
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }], stopReason: "stop" } },
+      { type: "agent_end", contextUsage: cu },
+      { type: "model_route_success", attempt: 1, candidateKey: "openai/gpt-4", provider: "openai", modelId: "gpt-4", isFallback: false, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const row = appendCalls.find((r) => r.role === "assistant" && r.content === "hi");
+    expect(row).toBeDefined();
+    expect(row.metadata.context_usage).toEqual(cu);
+    // No post-hoc patch needed on the routed path.
+    expect(updateCalls.find((u) => u.metadata?.context_usage)).toBeUndefined();
+  });
+
+  it("discards a failed primary's partial reply and error on rollback, persisting only the fallback's answer", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "half from primary" } },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "answer from fallback" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer from fallback" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    // The failed primary's partial text and its error row are both dropped.
+    expect(appendCalls.some((r) => r.content === "half from primary")).toBe(false);
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(0);
+    // Only the winning fallback's answer is persisted.
+    expect(appendCalls.some((r) => r.role === "assistant" && r.content === "answer from fallback")).toBe(true);
+    // The run summary must not leak the rolled-back attempt's error.
+    expect(result.errorMessage).toBe("");
+  });
+
+  it("persists the error row when a routed turn is exhausted (no fallback succeeded)", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "all candidates failed" } },
+      { type: "model_route_exhausted", attempt: 1, failureKind: "rate_limit", errorMessage: "all candidates failed" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const errorRows = appendCalls.filter((r) => r.metadata?.kind === "error_response");
+    expect(errorRows).toHaveLength(1);
+    expect(errorRows[0].content).toContain("all candidates failed");
+  });
+
+  it("re-arms stream_error after a rollback so a both-failed turn surfaces the final error live", async () => {
+    const streamErrors: string[] = [];
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "fallback 503" } },
+      { type: "model_route_exhausted", attempt: 2, failureKind: "server_error", errorMessage: "fallback 503" },
+    ];
+    await consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      onEvent: (evt, type) => {
+        if (type === "stream_error") streamErrors.push(String((evt as any).error?.message))
+      },
+    });
+    // The primary's stream_error fires (frontend drops it on rollback); without
+    // re-arming, the fallback's real failure would emit none. Both fire now.
+    expect(streamErrors).toEqual(["primary 429", "fallback 503"]);
+    // Still exactly one persisted error row — the final, exhausted failure.
+    const errorRows = appendCalls.filter((r) => r.metadata?.kind === "error_response");
+    expect(errorRows).toHaveLength(1);
+    expect(errorRows[0].content).toContain("fallback 503");
+  });
+
+  it("does not leak a rolled-back attempt's error into the run summary on a transport drop", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      // stream ends here without a fallback outcome (transport drop)
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    expect(result.errorMessage).toBe("");
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(0);
+  });
+
+  it("emits ttft_ms on only the first assistant row across two message_ends before commit", async () => {
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "first" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first" }], stopReason: "stop" } },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "second" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "second" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 1, candidateKey: "openai/gpt-4", provider: "openai", modelId: "gpt-4", isFallback: false, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    // Anchor the turn start in the past so ttft is a positive, recorded value.
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true, turnStartTime: Date.now() - 5000 });
+    const rows = appendCalls.filter((r) => r.role === "assistant" && (r.content === "first" || r.content === "second"));
+    expect(rows).toHaveLength(2);
+    const withTtft = rows.filter((r) => r.metadata?.timing?.ttft_ms !== undefined);
+    expect(withTtft).toHaveLength(1);
+    expect(withTtft[0].content).toBe("first");
+  });
+
+  it("keeps ttft_ms on the fallback reply when the primary streamed text then failed", async () => {
+    // Regression: the primary's enqueued assistant op flips firstAssistantPersisted;
+    // rollback discards that op, so without re-arming the flag the surviving
+    // fallback reply (the turn's real first assistant) loses its ttft anchor.
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "primary text" } },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "fallback answer" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fallback answer" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true, turnStartTime: Date.now() - 5000 });
+    const fallbackRow = appendCalls.find((r) => r.role === "assistant" && r.content === "fallback answer");
+    expect(fallbackRow).toBeDefined();
+    expect(fallbackRow.metadata?.timing?.ttft_ms).toBeDefined();
+    // The rolled-back primary text never persists.
+    expect(appendCalls.some((r) => r.content === "primary text")).toBe(false);
   });
 });
 

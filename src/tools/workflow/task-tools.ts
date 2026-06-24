@@ -205,28 +205,24 @@ const plannerOnly = (refs: ToolRefs) => !refs.isSubagent;
 export const taskCreateRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskCreateTool(refs.taskListId, refs.sessionEventEmitter),
-  platform: true,
   availableModes: ["normal"],
   available: plannerOnly,
 };
 export const taskUpdateRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskUpdateTool(refs.taskListId, refs.sessionEventEmitter),
-  platform: true,
   availableModes: ["normal"],
   available: plannerOnly,
 };
 export const taskListRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskListTool(refs.taskListId),
-  platform: true,
   availableModes: ["normal"],
   available: plannerOnly,
 };
 export const taskGetRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskGetTool(refs.taskListId),
-  platform: true,
   availableModes: ["normal"],
   available: plannerOnly,
 };

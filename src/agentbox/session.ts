@@ -27,12 +27,14 @@ import type {
   JobStopExecutor,
   BackgroundExecExecutor,
   TaskOutputReader,
+  ChannelMessageExecutor,
   AgentMode,
 } from "../core/tool-registry.js";
 import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency } from "../core/subagent-registry.js";
 import { JobRegistry, type JobStatus } from "../core/job-registry.js";
 import { buildNotificationBatch, type TaskNotification } from "../core/task-notification.js";
 import { spawnBackgroundBash } from "../core/background-bash-runner.js";
+import { DiskTaskOutput, getTaskOutputPath } from "../tools/cmd-exec/disk-output.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
 import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
@@ -59,7 +61,7 @@ import {
   createModelRouteState,
   normalizeModelRouteState,
   runPromptWithModelRouting,
-  shouldUseModelRouteRunner,
+  resolveEffectivePolicy,
   type ModelRouteEvent,
   type ModelRoutePolicy,
   type ModelRouteState,
@@ -196,6 +198,8 @@ async function abortBrainBestEffort(
 
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
+  /** Per-session write chain so route-state persists land in call order. */
+  private _modelRouteStatePersists = new Map<string, Promise<void>>();
   private defaultSessionId = "default";
 
   /** Optional userId — set by LocalSpawner for per-user skill directory isolation */
@@ -220,6 +224,22 @@ export class AgentBoxSessionManager {
    * broker falls back to `<cwd>/.siclaw/credentials`.
    */
   credentialsDir?: string;
+
+  /**
+   * Per-agent tool capability whitelist — the resolved `allowedTools` list for
+   * this AgentBox's agent (see core/tool-capabilities.ts).
+   *
+   * `null` (the default) = no restriction: createSiclawSession falls back to the
+   * global `config.allowedTools`, i.e. exactly the behaviour before this feature
+   * existed. A non-null array restricts the agent to those tool names.
+   *
+   * This state is PER-AGENT by construction: one AgentBoxSessionManager instance
+   * per agent (K8s = one pod; LocalSpawner = one `new AgentBoxSessionManager()`
+   * per agent). It is filled at startup (K8s: explicit fetch in agentbox-main;
+   * Local: LocalSpawner injection) and refreshed on POST /api/reload-tools via a
+   * per-box handler that writes here — never via loadConfig/writeConfig/process.env.
+   */
+  allowedToolsState: string[] | null = null;
 
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
@@ -331,6 +351,64 @@ export class AgentBoxSessionManager {
    */
   private jobs = new JobRegistry();
 
+  /**
+   * Sessions for which a Stop arrived BEFORE the session existed (pre-spawn). Consumed one-shot
+   * by the next getOrCreate-driven /api/prompt for that id (the prompt being cancelled — which is
+   * already in flight and cold-starting, so it consumes within the cold-start window). The TTL
+   * is only a leak backstop for an ORPHAN (a Stop whose paired prompt never arrives). Keep it
+   * tight: it must outlast a cold start (image pull / container start, "routinely exceeds 30s"
+   * per the runtime's async-ack comment) but no longer — a too-long TTL widens the window in
+   * which a stale orphan could wrongly short-circuit a brand-new, deliberate prompt for the same
+   * reused sessionId. 3 min covers cold start with margin while bounding that risk.
+   */
+  private _pendingAborts = new Map<string, ReturnType<typeof setTimeout>>();
+  private static readonly PENDING_ABORT_TTL_MS = 180_000;
+
+  /** Record a pre-spawn Stop so the imminent /api/prompt short-circuits (see _pendingAborts). */
+  markPendingAbort(sessionId: string): void {
+    // Only a TRUE pre-spawn Stop should arm a pending abort: one where the session was NEVER
+    // created, so no in-flight turn exists yet and the imminent first /api/prompt is the one to
+    // cancel. A genuine pre-spawn session has no on-disk history dir yet; a session that ran
+    // before and was merely RELEASED from memory (30s TTL) always does. Without this guard, a
+    // Stop on a released-but-idle session (e.g. the Stop button still live after a missed
+    // prompt_done) would arm a pending abort that silently cancels the user's NEXT prompt for
+    // the same reused sessionId. If the existence check throws, fall through and arm (best-effort).
+    try {
+      if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
+    } catch { /* fall through — arm */ }
+    const existing = this._pendingAborts.get(sessionId);
+    if (existing) clearTimeout(existing);
+    const t = setTimeout(() => this._pendingAborts.delete(sessionId), AgentBoxSessionManager.PENDING_ABORT_TTL_MS);
+    t.unref?.();
+    this._pendingAborts.set(sessionId, t);
+  }
+
+  /** Consume (one-shot) a pre-spawn Stop recorded by markPendingAbort. */
+  consumePendingAbort(sessionId: string): boolean {
+    const t = this._pendingAborts.get(sessionId);
+    if (!t) return false;
+    clearTimeout(t);
+    this._pendingAborts.delete(sessionId);
+    return true;
+  }
+
+  /**
+   * Discard buffered background-job completion notifications + cancel the coalesce timer for a
+   * session. Called from /abort: a job that completed moments before Stop already armed the
+   * coalesce timer, which would otherwise flush → runSyntheticPrompt → brain.prompt() AFTER Stop
+   * ("comes back to life"). The per-entry suppressNotifyTurn check still guards the flush path,
+   * but clearing here makes the resurrection impossible regardless.
+   */
+  discardPendingNotifications(sessionId: string): void {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+    managed._pendingNotifications.length = 0;
+    if (managed._coalesceTimer) {
+      clearTimeout(managed._coalesceTimer);
+      managed._coalesceTimer = null;
+    }
+  }
+
   private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
     return async (request, onProgress, signal) => {
       if (request.runInBackground) return this.startBackgroundSubagent(request);
@@ -376,6 +454,36 @@ export class AgentBoxSessionManager {
     return (jobId) => this.jobs.snapshot(jobId);
   }
 
+  private createChannelMessageExecutor(): ChannelMessageExecutor {
+    return async (request) => {
+      if (!(this.gatewayClient && this.agentId)) {
+        return {
+          delivered: false,
+          message: "channel_update unavailable: gateway delivery is not configured for this AgentBox.",
+        };
+      }
+      const text = request.text.trim();
+      if (!text) {
+        return { delivered: false, message: "channel_update skipped: empty text." };
+      }
+      const response = await this.persistDelegationEvent({
+        type: "channel.deliver_message",
+        message: {
+          sessionId: request.sessionId,
+          kind: request.kind,
+          text,
+          fromAgentId: this.agentId,
+        },
+      });
+      return {
+        delivered: response.ok,
+        message: response.ok
+          ? `channel_update ${request.kind} accepted by Gateway.`
+          : `channel_update ${request.kind} was not delivered.`,
+      };
+    };
+  }
+
   /**
    * Stop ALL running background jobs (background exec + background sub-agents) of a session.
    * Called from the /abort handler so the user's "Stop" button halts everything the session is
@@ -401,6 +509,38 @@ export class AgentBoxSessionManager {
    */
   private createBackgroundExecExecutor(): BackgroundExecExecutor {
     return (req) => {
+      // Stop latch: the user pressed Stop on this session; do NOT spawn a new background job.
+      // Register a terminal "stopped" job and return a normal launched handle — NEVER throw,
+      // because every background-capable tool treats an executor throw as "fall back to a
+      // FOREGROUND run", which would re-introduce the escape this latch closes. The launching
+      // tool's card folds to stopped via the exec_job_done event from notifyParent below;
+      // suppressNotifyTurn keeps the model from waking on its own cancellation.
+      const aborting = this.sessions.get(req.parentSessionId);
+      if (aborting?._aborted) {
+        const outputFile = getTaskOutputPath(req.jobId);
+        const disk = new DiskTaskOutput(req.jobId);
+        void disk.ensureCreated().then(() => disk.markFinal()).catch(() => {});
+        this.jobs.register({
+          jobId: req.jobId,
+          type: req.jobType ?? "bash",
+          parentSessionId: req.parentSessionId,
+          description: req.description,
+          status: "stopped",
+          startedAt: Date.now(),
+          notified: false,
+          suppressNotifyTurn: true,
+          outputFile,
+        });
+        try { req.onComplete?.(); } catch { /* best-effort (e.g. node_exec debug-pod unpin) */ }
+        void this.notifyParent(req.parentSessionId, req.jobId, {
+          taskId: req.jobId,
+          outputFile,
+          status: "stopped",
+          summary: `Background command "${req.description}" was stopped`,
+        });
+        return { jobId: req.jobId, outputFile };
+      }
+
       const cap = getBackgroundBashConcurrency();
       // Cap counts ALL background exec jobs (bash/node/pod), not sub-agents.
       const running = this.jobs
@@ -457,6 +597,66 @@ export class AgentBoxSessionManager {
   private startBackgroundSubagent(request: SpawnSubagentRequest): SpawnSubagentResult {
     const childSessionId = randomUUID();
     const jobId = request.spawnId;
+    // Stop latch: the user pressed Stop before this sub-agent launched; register it terminal
+    // ("stopped") and skip runSpawnedSubagent so no child run/LLM work starts. suppressNotifyTurn
+    // keeps the model from waking on the cancellation.
+    if (this.sessions.get(request.parentSessionId)?._aborted) {
+      this.jobs.register({
+        jobId,
+        type: "subagent",
+        parentSessionId: request.parentSessionId,
+        childSessionId,
+        status: "stopped",
+        description: request.description,
+        startedAt: Date.now(),
+        notified: false,
+        suppressNotifyTurn: true,
+      });
+      // notifyParent gives the LIVE card fold (subagent_done). It is NOT persisted, so we ALSO
+      // write the terminal delegation_event + child session row that runSpawnedSubagent would
+      // have written — without these the launch card re-paints as "Running…" forever on reload
+      // (annotateSubagentCompletions reads the persisted delegation_event), and the
+      // "open transcript" deep-link 404s. Mirrors runSpawnedSubagent's terminal persistence.
+      const stoppedAgentId = request.parentAgentId ?? this.agentId ?? null;
+      if (this.gatewayClient && stoppedAgentId && request.userId) {
+        void (async () => {
+          try {
+            await this.persistEnsureChatSession(
+              childSessionId, stoppedAgentId, request.userId,
+              `Sub-agent: ${request.description}`,
+              "", "subagent",
+              { parentSessionId: request.parentSessionId, parentAgentId: stoppedAgentId, delegationId: jobId, targetAgentId: stoppedAgentId },
+            );
+          } catch { /* best-effort */ }
+          try {
+            await this.persistAppendDelegationEvent({
+              parentSessionId: request.parentSessionId,
+              parentAgentId: stoppedAgentId,
+              userId: request.userId,
+              delegationId: jobId,
+              childSessionId,
+              targetAgentId: stoppedAgentId,
+              // "partial" is the terminal status runSpawnedSubagent persists for a stopped
+              // sub-agent (the delegation status enum has no "stopped"); keep it consistent so
+              // the card folds the same way on reload.
+              status: "partial",
+              capsule: `Sub-agent "${request.description}" was stopped`,
+              fullSummary: `Sub-agent "${request.description}" was stopped before it started.`,
+              summaryTruncated: false,
+              scope: request.prompt,
+              toolCalls: 0,
+              durationMs: 0,
+            });
+          } catch { /* best-effort */ }
+        })();
+      }
+      void this.notifyParent(request.parentSessionId, jobId, {
+        taskId: jobId,
+        status: "stopped",
+        summary: `Sub-agent "${request.description}" was stopped`,
+      });
+      return { status: "launched", childSessionId, jobId };
+    }
     this.jobs.register({
       jobId,
       type: "subagent",
@@ -589,6 +789,13 @@ export class AgentBoxSessionManager {
       clearTimeout(managed._coalesceTimer);
       managed._coalesceTimer = null;
     }
+    // Stop is terminal: a Stop sets _aborted and stays true until the next REAL user prompt
+    // resets it. Do NOT flush a synthetic turn during the Stop window — that would wake the
+    // model on a completion it cancelled ("comes back to life after Stop").
+    if (managed._aborted) {
+      managed._pendingNotifications.length = 0;
+      return;
+    }
     if (!managed._promptDone) {
       // A turn is running — wait for it to finish, then deliver as a synthetic turn (where a
       // pure-ack reaction is suppressed). Re-arm rather than followUp: a followUp's ack rides
@@ -626,6 +833,10 @@ export class AgentBoxSessionManager {
     const run = (managed._syntheticPromptQueue ?? Promise.resolve())
       .catch(() => {})
       .then(async () => {
+        // Stop is terminal: if the user pressed Stop while this synthetic turn was queued, do
+        // NOT start it (and do NOT followUp — that would ride a turn too). _aborted stays true
+        // until the next real user prompt resets it. Checked under the queue, before the reset.
+        if (managed._aborted) return;
         // Re-check under the queue: an HTTP /prompt may have started since notifyParent
         // decided "idle". If so, degrade to followUp (delivered to that running turn).
         if (!managed._promptDone || managed._promptInflight) {
@@ -676,7 +887,13 @@ export class AgentBoxSessionManager {
         const turnMessages: any[] = [];
         let turnHadTool = false;
         const routePolicy = managed.modelRoutePolicy;
-        const routeEnabled = shouldUseModelRouteRunner(routePolicy, managed.modelRouteState);
+        // Single entry: every synthetic turn runs through the routing runner —
+        // real routing when a fallback target exists, otherwise a lone candidate
+        // built from the current model. The runner's emitBrainEvent is the sole
+        // event source whenever a policy resolves; only the no-current-model edge
+        // falls back to a bare prompt collected via the subscription below.
+        const effectivePolicy = resolveEffectivePolicy(routePolicy, managed.modelRouteState, managed.brain.getModel?.());
+        managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
         let latestModelRouteSwitch: Extract<ModelRouteEvent, { type: "model_route_switch" }> | null = null;
         let currentModelRouteMetadata: Record<string, unknown> | null = null;
         const handleRouteEvent = (event: ModelRouteEvent): void => {
@@ -719,29 +936,31 @@ export class AgentBoxSessionManager {
           }
         };
         const brainUnsub = managed.brain.subscribe((event: any) => {
-          if (!routeEnabled) handleBrainEvent(event);
+          if (effectivePolicy === undefined) handleBrainEvent(event);
         });
         managed._bufferUnsub = () => brainUnsub();
         try {
-          if (routeEnabled) {
-            await runPromptWithModelRouting(
-              managed.brain,
-              text,
-              routePolicy,
-              managed.modelRouteState,
-              {
-                emitEvent: handleRouteEvent,
-                emitBrainEvent: handleBrainEvent,
-                onStateChange: () => this.persistModelRouteState(managed.id, managed.modelRouteState),
-              },
-            );
-          } else {
-            await managed.brain.prompt(text);
-          }
+          await runPromptWithModelRouting(
+            managed.brain,
+            text,
+            effectivePolicy,
+            managed.modelRouteState,
+            {
+              emitEvent: handleRouteEvent,
+              emitBrainEvent: handleBrainEvent,
+              onStateChange: () => this.persistModelRouteState(managed.id, managed.modelRouteState),
+              shouldAbort: () => managed._aborted,
+              // Synthetic background turns persist by collecting brain events
+              // (turnMessages) and have no live viewer — buffer every attempt
+              // so a failed primary can't leak into the persisted turn.
+              optimisticPrimaryStream: false,
+            },
+          );
         } catch (err) {
           console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
         } finally {
           managed._promptDone = true;
+          managed._routeBrainEventsThroughExtra = false;
           if (managed._bufferUnsub) { managed._bufferUnsub(); managed._bufferUnsub = null; }
           for (const cb of managed._promptDoneCallbacks) { try { cb(); } catch { /* ignore */ } }
           managed._promptDoneCallbacks.clear();
@@ -914,7 +1133,12 @@ export class AgentBoxSessionManager {
     try {
       const raw = JSON.parse(fs.readFileSync(this.modelRouteStateFile(sessionId), "utf8"));
       return normalizeModelRouteState(raw);
-    } catch {
+    } catch (err) {
+      // Missing file is the normal first-run case; anything else (corrupt
+      // JSON, permissions) silently resetting cooldowns deserves a trace.
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        console.warn(`[agentbox-session] model-route state for ${sessionId} unreadable, starting fresh:`, err);
+      }
       return createModelRouteState();
     }
   }
@@ -927,15 +1151,27 @@ export class AgentBoxSessionManager {
    */
   persistModelRouteState(sessionId: string, state: ModelRouteState): void {
     const file = this.modelRouteStateFile(sessionId);
-    const tmp = `${file}.${randomUUID()}.tmp`;
+    // Snapshot synchronously, then serialize writes per session: each write is
+    // atomic (tmp + rename), but without ordering a slow older write could
+    // rename over a newer one, leaving stale state on disk.
     const payload = `${JSON.stringify(normalizeModelRouteState(state), null, 2)}\n`;
-    void fs.promises
-      .writeFile(tmp, payload, "utf8")
-      .then(() => fs.promises.rename(tmp, file))
-      .catch((err) => {
+    const prev = this._modelRouteStatePersists.get(sessionId) ?? Promise.resolve();
+    const next = prev.then(async () => {
+      const tmp = `${file}.${randomUUID()}.tmp`;
+      try {
+        await fs.promises.writeFile(tmp, payload, "utf8");
+        await fs.promises.rename(tmp, file);
+      } catch (err) {
         console.warn(`[agentbox-session] model-route state persist failed for ${sessionId}:`, err);
         void fs.promises.unlink(tmp).catch(() => {});
-      });
+      }
+    });
+    this._modelRouteStatePersists.set(sessionId, next);
+    void next.finally(() => {
+      if (this._modelRouteStatePersists.get(sessionId) === next) {
+        this._modelRouteStatePersists.delete(sessionId);
+      }
+    });
   }
 
   /**
@@ -1043,6 +1279,12 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId,
+      // A spawned sub-agent must never be broader than its parent: inherit the
+      // parent's per-agent tool whitelist. Without this, a restricted agent that
+      // has the `spawn_subagents` capability could escalate by spawning a child
+      // that falls back to the global config.allowedTools (all tools). null
+      // (unrestricted parent) stays null — identical to pre-feature behaviour.
+      allowedTools: this.allowedToolsState,
       // The plan is parent-owned: sub-agents have no task tools (isSubagent hides
       // them), so the child neither reads nor writes the ledger — the parent marks
       // tasks complete as children report back. The parent's taskListId is therefore
@@ -1082,6 +1324,15 @@ export class AgentBoxSessionManager {
         job.childSessionId = childSessionId;
         job.abort = () => requestStop(`job_stop ${childSessionId}`);
       }
+    }
+
+    // Setup-window Stop: if the user pressed Stop while we were awaiting createSiclawSession
+    // above (job.abort was not wired yet, so a /abort sweep's stopJob no-op'd with "starting up"
+    // and left the job "running"), honour it now before the child's run starts. The reliable
+    // signal is the PARENT session's _aborted (set at /abort, true for the whole Stop window) —
+    // NOT the job status, which stopJob never set to "stopped" in this window.
+    if (this.sessions.get(request.parentSessionId)?._aborted) {
+      requestStop(`parent stopped during sub-agent setup ${childSessionId}`);
     }
 
     // ── Transcript persistence (design §13). Serialized via a promise queue so
@@ -1205,6 +1456,10 @@ export class AgentBoxSessionManager {
 
     let interruptedTool: string | undefined;
     try {
+      // Stop landed before/during setup: requestStop already fired, but child.brain.abort() is a
+      // no-op with no active run — so DON'T start the prompt at all, or it would run a fresh,
+      // un-aborted turn. Throw straight into the stopRequested branch below.
+      if (stopRequested) throw new Error("stopped before sub-agent prompt started");
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
       );
@@ -1423,6 +1678,10 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId: this.agentId ?? null,
+      // Per-agent tool capability whitelist. null = unrestricted (falls back to
+      // global config.allowedTools in agent-factory — today's behaviour for any
+      // agent that never set tool_capabilities).
+      allowedTools: this.allowedToolsState,
       systemPromptTemplate,
       // Stable per-session ledger key so the plan survives release/rebuild
       // (a fresh random id would orphan the prior in-memory ledger every turn).
@@ -1434,6 +1693,7 @@ export class AgentBoxSessionManager {
       jobStopExecutor: this.createJobStopExecutor(),
       backgroundExecExecutor: this.createBackgroundExecExecutor(),
       taskOutputReader: this.createTaskOutputReader(),
+      channelMessageExecutor: this.createChannelMessageExecutor(),
     });
 
     // Populate sessionIdRef so skill_call events can associate with this session

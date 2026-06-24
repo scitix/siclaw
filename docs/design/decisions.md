@@ -503,3 +503,41 @@ readable `~/.ssh/id_*` off the bastion at dial time and uses it for the final ho
 host **requires a jump host**; the key is **not** broker-materialized (it lives on
 the bastion and transits agentbox memory) — an explicit, documented tradeoff vs.
 explicit per-hop credentials. Mechanism: read the first readable `~/.ssh/id_*` off the bastion for the final hop.
+
+---
+
+## ADR-014: Metrics — Prometheus Federation Only (Removed In-Memory Live-Counter Path)
+
+**Status**: Active
+
+**Context**:
+The metrics surface had two parallel paths. Path ①: an in-memory live-counter / top-N
+pipeline (per-process `LocalCollector` → gateway `MetricsAggregator` counter maps → the
+`metrics.live` RPC → the Portal "live" and "timing" dashboard widgets). Path ②: Prometheus
+federation (each agentbox's prom-client snapshot → gateway federation aggregator →
+`GET /metrics` → external Grafana). The path-① widgets (`RankedTable`, `TimingStatsCard`,
+`useLive`, `useTimingStats`) and their endpoints (`/metrics/live`, `/metrics/timing`) had
+no remaining frontend consumer — the dashboard never mounted them.
+
+**Decision**:
+Remove path ① entirely across all layers — frontend widgets, the Portal `/metrics/live`
+and `/metrics/timing` endpoints, the gateway `metrics.live` RPC, the aggregator's counter
+maps, and the whole `LocalCollector`. `MetricsAggregator` is now a federation-only pull
+loop. The agentbox `/api/internal/metrics-snapshot` pull and the SIGTERM
+`/api/internal/metrics-flush` push share one `MetricsFlushPayload { incarnation, prom }`.
+Per-message `ttft_ms` (still consumed by the chat timing badge) is kept.
+
+**Consequences**:
+- ✅ One metrics path instead of two; no in-memory counter state on the gateway
+- ✅ External Grafana unaffected — every federated `siclaw_*` series is unchanged
+  (`sessions_active` / `tool_calls_total` / `skill_calls_total` come from prom-client, not LocalCollector)
+- ⚠️ Lost the per-user/per-agent top-N tool/skill breakdown — but it only ever fed the
+  now-removed in-app dashboard, never external Prometheus
+- ⚠️ **Rolling-upgrade ordering**: the agentbox snapshot payload slimmed from
+  `{activeSessions, toolCallDeltas, skillCallDeltas, incarnation, prom}` to `{incarnation, prom}`.
+  An OLD gateway pulling a NEW agentbox throws a caught, transient `TypeError` in its pull
+  loop (skips that 30s federation cycle, self-heals on the next pull, no data loss). **Roll
+  the gateway Deployment before agentboxes** to avoid it entirely; a new gateway tolerates
+  the old (richer) payload by ignoring the extra fields.
+
+**Files**: `src/gateway/metrics-aggregator.ts`, `src/shared/metrics-types.ts`, `src/agentbox/http-server.ts`, `src/gateway/server.ts`, `src/portal/siclaw-api.ts`, `portal-web/src/hooks/useMetrics.ts`

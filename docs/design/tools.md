@@ -421,7 +421,6 @@ interface ToolEntry {
   category: "cmd-exec" | "script-exec" | "query" | "workflow";
   create: (refs: ToolRefs) => ToolDefinition;
   modes?: SessionMode[];      // omit = all modes
-  platform?: boolean;          // exempt from allowedTools filtering
   available?: (refs: ToolRefs) => boolean;  // runtime guard
 }
 ```
@@ -436,14 +435,41 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | `skill_preview` | `modes` | `["web", "channel"]` | Reads draft files from disk, renders side panel |
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
 
-### Platform Tool Exemption
+### allowedTools — Sole Availability Axis
 
-Tools with `platform: true` (`manage_schedule`, `credential_list`,
-`cluster_info`, `save_feedback`, `knowledge_search`) are exempt from workspace
-allow-list filtering — they must always be available regardless of workspace
-configuration. This is declared in each tool's registration, not in a central set.
+`allowedTools` is the only control over tool availability after mode/`available`
+filtering — there are no exemptions. A `null`/omitted `allowedTools` passes every
+tool through (the default); a non-null array passes only the tools it names.
+
+**Per-agent source**: `allowedTools` is resolved from the agent's selected
+capability groups (`agents.tool_capabilities`) at the Gateway boundary
+(`resolveCapabilities`); null/empty selection → `null` = unrestricted. Every tool
+in the registry must belong to some `CAPABILITY_GROUPS` entry, otherwise a
+restricted agent can never reach it — enforced by `tool-capabilities-coverage.test.ts`.
+
+**Global-whitelist caveat**: when a per-agent selection is null, agent-factory
+falls back to the global `config.allowedTools`. With the `platform` exemption
+removed, a deployment that set a *non-null* global whitelist no longer gets the
+former always-on tools (task/memory/schedule/spawn) for free — they are filtered
+unless explicitly listed. The default global is `null`, so existing agents are
+unaffected; only a deployment that opted into a global whitelist must revisit it.
+
+**Initial-fetch failure is fail-open (reviewed policy)**: the per-pod
+tool-capabilities fetch (K8s `agentbox-main.ts`, awaited before `listen` with
+retries) and the spawn-time DB read (Local `local-spawner.ts`) both start the box
+**unrestricted** on unrecoverable error, with a loud warn. Rationale: a fresh box
+has no prior whitelist to preserve, and a failed fetch usually signals broader
+gateway unreachability (skills/MCP can't sync either), so failing open keeps the
+box serviceable rather than bricking it. The reload-PUSH path is *not* fail-open —
+it preserves the prior whitelist on failure. Fail-closed hardening (refuse first
+turn until resolved) is tracked as a separate follow-up.
 
 ### Tools Not in Registry
+
+Both categories are appended after `resolve()` but are still subject to the same
+`allowedTools` name-based whitelist (a non-null `allowedTools` filters them; `null`
+passes all). They carry no `mode`/`available` metadata, so `allowedTools` is their
+sole availability gate.
 
 - **MCP tools**: dynamically discovered at runtime, appended after resolve
 - **File I/O tools** (read/edit/write/grep/find/ls): framework tools with

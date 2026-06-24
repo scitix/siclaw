@@ -419,6 +419,7 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
                 agentId={agentId}
                 messages={pilot.messages}
                 isLoading={pilot.streaming}
+                hasBackgroundWork={pilot.hasBackgroundWork}
                 hasMore={pilot.hasMore}
                 loadingMore={pilot.loadingMore}
                 onLoadMore={pilot.loadMore}

@@ -50,7 +50,13 @@ export interface PromptOptions {
   };
   /** Optional ordered model fallback policy. Omitted means legacy single-model behavior. */
   modelRouting?: ModelRoutePolicy;
+  /** Image attachments (raw base64, no data: prefix) forwarded as vision input. */
+  images?: Array<{ mimeType: string; data: string }>;
+  /** File attachments forwarded as native model file input. */
+  files?: Array<{ mimeType: string; filename: string; data: string }>;
 }
+
+export type PromptMediaOptions = Pick<PromptOptions, "images" | "files">;
 
 export interface PromptResponse {
   ok: boolean;
@@ -179,11 +185,17 @@ export class AgentBoxClient {
   /**
    * Send a steer instruction (inserts a user message after interrupting the current tool)
    */
-  async steerSession(sessionId: string, text: string): Promise<void> {
+  async steerSession(sessionId: string, text: string, media?: PromptMediaOptions): Promise<void> {
+    const images = media?.images;
+    const files = media?.files;
     await this.fetch(`/api/sessions/${sessionId}/steer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        ...(images && images.length > 0 ? { images } : {}),
+        ...(files && files.length > 0 ? { files } : {}),
+      }),
     });
   }
 
@@ -232,6 +244,15 @@ export class AgentBoxClient {
    */
   async getDpState(sessionId: string): Promise<{ active: boolean }> {
     const resp = await this.fetch(`/api/sessions/${sessionId}/dp-state`);
+    return resp.json();
+  }
+
+  /**
+   * Liveness of a session's in-progress turn (agentbox activity flags). Used by the Portal
+   * reconnect-after-refresh flow to decide whether to re-attach to the live event stream.
+   */
+  async sessionStatus(sessionId: string): Promise<{ running: boolean }> {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/status`);
     return resp.json();
   }
 

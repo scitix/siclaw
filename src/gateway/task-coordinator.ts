@@ -271,7 +271,7 @@ export class TaskCoordinator {
       // One pod per agent — shared across users who call the agent.
       // Caller/task-owner attribution flows to Upstream via the session registry.
       sessionRegistry.remember(sessionId, userId, agentId);
-      const handle = await this.manager.getOrCreate(agentId);
+      const handle = await this.manager.getOrCreate(agentId, { persistence: binding.persistence });
       const client = new AgentBoxClient(handle.endpoint, 30_000, this.tlsOptions);
 
       const promptOpts: PromptOptions = {
@@ -283,6 +283,7 @@ export class TaskCoordinator {
         modelId: binding.modelId,
         modelConfig: binding.modelConfig,
         modelRouting: binding.modelRouting,
+        systemPromptTemplate: binding.systemPrompt ?? undefined,
       };
       await client.prompt(promptOpts);
 

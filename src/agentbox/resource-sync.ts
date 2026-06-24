@@ -6,7 +6,7 @@
  * resource-type-agnostic implementation.
  */
 
-import type { GatewaySyncClientLike, GatewaySyncType } from "../shared/gateway-sync.js";
+import type { GatewaySyncClientLike, GatewaySyncType, AgentBoxSyncHandler } from "../shared/gateway-sync.js";
 import { GATEWAY_SYNC_DESCRIPTORS } from "../shared/gateway-sync.js";
 import { getSyncHandler } from "./sync-handlers.js";
 
@@ -16,15 +16,20 @@ import { getSyncHandler } from "./sync-handlers.js";
  * Uses exponential backoff as configured in the resource descriptor:
  *   delay = baseDelayMs * 2^attempt  (0-indexed)
  *
+ * @param handlerOverride  Optional per-box handler. Pass this for sync types
+ *   whose handler is NOT in the module-level registry (e.g. `tools`, which is
+ *   per-box like cluster/host) so they can still reuse this retry/backoff loop.
+ *   Defaults to the module-level `getSyncHandler(type)`.
  * @returns The count returned by the handler's materialize() (e.g. server count).
  * @throws  If all retry attempts are exhausted.
  */
 export async function syncResource(
   type: GatewaySyncType,
   client: GatewaySyncClientLike,
+  handlerOverride?: AgentBoxSyncHandler,
 ): Promise<number> {
   const descriptor = GATEWAY_SYNC_DESCRIPTORS[type];
-  const handler = getSyncHandler(type);
+  const handler = handlerOverride ?? getSyncHandler(type);
   if (!handler) {
     throw new Error(`[gateway-sync] No handler registered for sync type "${type}"`);
   }

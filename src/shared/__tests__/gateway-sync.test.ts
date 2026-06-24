@@ -6,9 +6,9 @@ import {
 } from "../gateway-sync.js";
 
 describe("GATEWAY_SYNC_DESCRIPTORS", () => {
-  const expectedTypes: GatewaySyncType[] = ["mcp", "skills", "cluster", "host", "knowledge"];
+  const expectedTypes: GatewaySyncType[] = ["mcp", "skills", "cluster", "host", "knowledge", "tools"];
 
-  it("contains exactly the five expected syncable types", () => {
+  it("contains exactly the six expected syncable types", () => {
     const actual = Object.keys(GATEWAY_SYNC_DESCRIPTORS).sort();
     expect(actual).toEqual([...expectedTypes].sort());
   });
@@ -76,6 +76,14 @@ describe("GATEWAY_SYNC_DESCRIPTORS", () => {
     expect(d.requiresGatewayClient).toBe(true);
     expect(d.initialSync).toBe(true);
     expect(d.gatewayPath).toBe("/api/internal/knowledge/bundle");
+  });
+
+  it("tools: requires Gateway client but skips initial sync (per-box handler, K8s fetches out-of-band)", () => {
+    const d = GATEWAY_SYNC_DESCRIPTORS.tools;
+    expect(d.requiresGatewayClient).toBe(true);
+    expect(d.initialSync).toBe(false);
+    expect(d.gatewayPath).toBe("/api/internal/tool-capabilities");
+    expect(d.reloadPath).toBe("/api/reload-tools");
   });
 
   it("all reload paths are unique", () => {

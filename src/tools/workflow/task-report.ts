@@ -47,5 +47,4 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: (_refs) => createTaskReportTool(),
   modes: ["task"],
-  platform: true,
 };

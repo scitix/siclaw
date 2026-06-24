@@ -30,7 +30,9 @@ import { timingSafeEqual } from "node:crypto";
 import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
 import { getDb, type Db } from "../gateway/db.js";
+import { safeParseJson } from "../gateway/dialect-helpers.js";
 import { defaultProviderModelCompat } from "../core/model-compat.js";
+import { resolveCapabilities } from "../core/tool-capabilities.js";
 import type {
   CliSnapshotKnowledgeRepo,
   CliSnapshotClusterCredential,
@@ -111,6 +113,7 @@ interface McpRow {
   args: string | null;
   env: string | null;
   headers: string | null;
+  description: string | null;
   enabled: number;
 }
 
@@ -195,6 +198,7 @@ interface AgentRow {
   model_provider: string | null;
   model_id: string | null;
   model_routing: unknown;
+  tool_capabilities: unknown;
   system_prompt: string | null;
   icon: string | null;
   color: string | null;
@@ -264,7 +268,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     // the request is scoped, so the TUI can render its picker without a
     // second round-trip.
     const [allAgents] = await db.query<AgentRow[]>(
-      "SELECT id, name, description, status, model_provider, model_id, model_routing, system_prompt, icon, color FROM agents WHERE status = 'active' ORDER BY name",
+      "SELECT id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, system_prompt, icon, color FROM agents WHERE status = 'active' ORDER BY name",
     );
 
     // Resolve the scoping agent (if any). Return 404 early so the client
@@ -295,7 +299,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     // MCP: scoped to agent via agent_mcp_servers when active, else all enabled.
     const [mcps] = activeAgentId
       ? await db.query<McpRow[]>(
-          `SELECT m.id, m.name, m.transport, m.url, m.command, m.args, m.env, m.headers, m.enabled
+          `SELECT m.id, m.name, m.transport, m.url, m.command, m.args, m.env, m.headers, m.description, m.enabled
            FROM mcp_servers m
            JOIN agent_mcp_servers ams ON ams.mcp_server_id = m.id
            WHERE m.enabled = 1 AND ams.agent_id = ?
@@ -303,7 +307,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           [activeAgentId],
         )
       : await db.query<McpRow[]>(
-          "SELECT id, name, transport, url, command, args, env, headers, enabled FROM mcp_servers WHERE enabled = 1 ORDER BY name",
+          "SELECT id, name, transport, url, command, args, env, headers, description, enabled FROM mcp_servers WHERE enabled = 1 ORDER BY name",
         );
     // Skills: with agent scope we filter via agent_skills; otherwise all
     // non-overlay skills in the default org. Overlay suppression applies in
@@ -438,6 +442,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
         ...(m.args ? { args: safeJson(m.args, []) } : {}),
         ...(m.env ? { env: safeJson(m.env, {}) } : {}),
         ...(m.headers ? { headers: safeJson(m.headers, {}) } : {}),
+        ...(m.description ? { description: m.description } : {}),
       };
     }
 
@@ -528,6 +533,14 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       color: a.color,
     }));
 
+    // Resolve the agent's capability groups → concrete allowedTools at this
+    // boundary (the AgentBox/TUI stays oblivious to group keys). null/empty =
+    // unrestricted; we only emit the field when non-null to keep the payload
+    // compact (TUI treats absent as null).
+    const allowedToolsOut = activeAgent
+      ? resolveCapabilities(safeParseJson<string[] | null>(activeAgent.tool_capabilities, null))
+      : null;
+
     const activeAgentOut: CliSnapshotActiveAgent | null = activeAgent
       ? {
           name: activeAgent.name,
@@ -536,6 +549,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           modelProvider: activeAgent.model_provider,
           modelId: activeAgent.model_id,
           ...(modelRoutingOut ? { modelRouting: modelRoutingOut } : {}),
+          ...(allowedToolsOut ? { allowedTools: allowedToolsOut } : {}),
         }
       : null;
 

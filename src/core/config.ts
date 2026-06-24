@@ -55,7 +55,20 @@ export interface SiclawConfig {
   modelRouting?: ModelRoutePolicy;
   embedding?: EmbeddingConfig;
   paths: { userDataDir: string; skillsDir: string; credentialsDir: string; reposDir: string; docsDir: string; knowledgeDir: string };
-  server: { port: number; gatewayUrl: string };
+  server: {
+    port: number;
+    gatewayUrl: string;
+    /**
+     * Idle self-destruct window for an AgentBox pod, in seconds. When no SSE
+     * connections and no active sessions remain for this long, the pod shuts
+     * itself down (K8s mode). Default 300 (5 min). Set to 0 (or negative) to
+     * make the pod resident — never auto-destroy. Overridable via
+     * SICLAW_AGENTBOX_IDLE_TIMEOUT. Always normalized via normalizeIdleTimeoutSec
+     * — positive values below MIN_AGENTBOX_IDLE_SEC (300) are floored to 300; 0
+     * stays resident.
+     */
+    idleTimeoutSec: number;
+  };
   debugImage: string;
   debugNamespace: string;
   debugPodTTL: number;
@@ -81,6 +94,36 @@ function parseBooleanEnv(value: string | undefined, defaultValue: boolean): bool
   return defaultValue;
 }
 
+/**
+ * Minimum AgentBox idle self-destruct window, in seconds. A positive window
+ * below this floor would churn pods (cold-start + JSONL session restore) every
+ * time a user pauses for more than the window between turns. `0` (resident) is
+ * the deliberate escape hatch and is NOT floored.
+ */
+export const MIN_AGENTBOX_IDLE_SEC = 300;
+
+/**
+ * Normalize an idle-timeout value (seconds) to the supported range:
+ *  - `<= 0`      → `0`   (resident — never auto-destroy; intentional escape hatch)
+ *  - `1`..`299`  → `300` (enforce the floor)
+ *  - `>= 300`    → itself (floored to an integer)
+ *  - invalid / missing → `300` (the default)
+ *
+ * Applied both where the value is authored (agent-api write) and where it is
+ * consumed (loadConfig), so a sub-floor value from ANY source — env var,
+ * settings.json, or a legacy DB row written before this floor existed — still
+ * resolves to a safe window.
+ */
+export function normalizeIdleTimeoutSec(v: unknown): number {
+  // Unset (null/undefined/"") → default, NOT resident: only an explicit numeric
+  // <= 0 opts into resident, so a client that omits the field gets 300.
+  if (v === null || v === undefined || v === "") return MIN_AGENTBOX_IDLE_SEC;
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n)) return MIN_AGENTBOX_IDLE_SEC; // invalid → default
+  if (n <= 0) return 0;                                   // resident (escape hatch)
+  return Math.max(MIN_AGENTBOX_IDLE_SEC, n);              // floor
+}
+
 export function isMemoryEnabled(): boolean {
   // Off by default — memory (memory_search/memory_get + session auto-save) is an
   // opt-in feature. Enable explicitly via SICLAW_MEMORY_ENABLED=true (helm:
@@ -103,7 +146,7 @@ const DEFAULTS: SiclawConfig = {
     docsDir: ".siclaw/docs",
     knowledgeDir: ".siclaw/knowledge",
   },
-  server: { port: 3000, gatewayUrl: "" },
+  server: { port: 3000, gatewayUrl: "", idleTimeoutSec: 300 },
   debugImage: "busybox:1.36",
   debugNamespace: "default",
   debugPodTTL: 600,
@@ -228,6 +271,15 @@ export function loadConfig(): SiclawConfig {
   if (process.env.SICLAW_AGENTBOX_PORT) {
     cached.server.port = parseInt(process.env.SICLAW_AGENTBOX_PORT, 10);
   }
+  // AgentBox idle self-destruct window, in seconds. 0 or negative ⇒ resident
+  // (never auto-destroy). Invalid values keep the default.
+  if (process.env.SICLAW_AGENTBOX_IDLE_TIMEOUT) {
+    const v = parseInt(process.env.SICLAW_AGENTBOX_IDLE_TIMEOUT, 10);
+    if (!isNaN(v)) cached.server.idleTimeoutSec = v;
+  }
+  // Enforce the floor on the FINAL value (default / settings.json / env / a
+  // sub-300 value injected from a legacy agent row), keeping 0 = resident.
+  cached.server.idleTimeoutSec = normalizeIdleTimeoutSec(cached.server.idleTimeoutSec);
   if (process.env.SICLAW_USER_DATA_DIR) {
     cached.paths.userDataDir = process.env.SICLAW_USER_DATA_DIR;
   }

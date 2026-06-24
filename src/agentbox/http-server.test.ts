@@ -25,10 +25,10 @@ vi.mock("../shared/metrics.js", () => ({
     contentType: "text/plain",
     metrics: async () => "# HELP fake\n",
   },
-}));
-
-vi.mock("../shared/local-collector.js", () => ({
-  localCollector: { exportSnapshot: () => ({ cpu: 0 }) },
+  processIncarnation: "test-incarnation",
+  getMetricsAsJSON: async () => [
+    { name: "siclaw_tokens_total", type: "counter", values: [{ labels: { type: "input" }, value: 3 }] },
+  ],
 }));
 
 vi.mock("../shared/diagnostic-events.js", () => ({ emitDiagnostic: () => {} }));
@@ -61,6 +61,15 @@ vi.mock("./sync-handlers.js", () => ({
   getSyncHandler: () => undefined,
   createClusterHandler: () => ({ type: "cluster", fetch: async () => 0, materialize: async (n: number) => n }),
   createHostHandler: () => ({ type: "host", fetch: async () => 0, materialize: async (n: number) => n }),
+  createToolsHandler: (target: { allowedToolsState: string[] | null }) => ({
+    type: "tools",
+    fetch: async () => ({ allowedTools: null }),
+    materialize: async (p: { allowedTools: string[] | null }) => {
+      target.allowedToolsState = Array.isArray(p?.allowedTools) ? p.allowedTools : null;
+      return target.allowedToolsState ? target.allowedToolsState.length : 0;
+    },
+    postReload: async () => {},
+  }),
 }));
 
 vi.mock("./credential-broker.js", () => ({
@@ -156,6 +165,9 @@ function makeFakeSessionManager() {
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
     stopSessionJobs: vi.fn(() => 0),
+    markPendingAbort: vi.fn(),
+    consumePendingAbort: vi.fn(() => false),
+    discardPendingNotifications: vi.fn(),
     getOrCreate: async (id?: string, _mode?: unknown, _systemPromptTemplate?: unknown, activeMode?: unknown) => {
       getOrCreateCalls.push({ id, activeMode });
       const key = id ?? "default";
@@ -194,6 +206,25 @@ async function getJson(port: number, path: string, method = "GET", body?: unknow
 async function flushAsync(): Promise<void> {
   await Promise.resolve();
   await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function modelConfigWithInput(input: string[]) {
+  return {
+    name: "test-provider",
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "sk-test",
+    api: "openai-completions",
+    authHeader: false,
+    models: [{
+      id: "gpt-4",
+      name: "GPT-4",
+      reasoning: false,
+      input,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 4096,
+    }],
+  };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -264,6 +295,97 @@ describe("http-server — prompt + session lifecycle", () => {
     const r = await getJson(port, "/api/prompt", "POST", {});
     expect(r.status).toBe(400);
     expect(r.data.error).toMatch(/Missing.*text/);
+  });
+
+  it("POST /api/prompt forwards images to brain.prompt as vision input", async () => {
+    const session = await sm.getOrCreate("img-1");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "what is in this image?",
+      sessionId: "img-1",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text", "image"]),
+      images: [{ mimeType: "image/png", data: "aW1n" }],
+    });
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith(
+      "what is in this image?",
+      { images: [{ mimeType: "image/png", data: "aW1n" }] },
+    );
+  });
+
+  it("POST /api/prompt accepts an image-only message and defaults the text", async () => {
+    const session = await sm.getOrCreate("img-only");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "img-only",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text", "image"]),
+      images: [{ mimeType: "image/png", data: "aW1n" }],
+    });
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith(
+      "Please analyze the attached image.",
+      { images: [{ mimeType: "image/png", data: "aW1n" }] },
+    );
+  });
+
+  it("POST /api/prompt forwards large valid images to brain.prompt", async () => {
+    const session = await sm.getOrCreate("img-large");
+    const data = "A".repeat(3 * 1024 * 1024);
+    const r = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "img-large",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text", "image"]),
+      images: [{ mimeType: "image/jpeg", data }],
+    });
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith(
+      "Please analyze the attached image.",
+      { images: [{ mimeType: "image/jpeg", data }] },
+    );
+  });
+
+  it("POST /api/prompt rejects malformed images instead of dropping them", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      images: [{ mimeType: "image/gif", data: "aW1n" }],
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/images\[0\]\.mimeType/);
+  });
+
+  it("POST /api/prompt rejects images whose data is not valid base64", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      images: [{ mimeType: "image/png", data: "not base64!!!" }],
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/images\[0\]\.data.*base64/);
+  });
+
+  it("POST /api/prompt rejects images that exceed the media item limit", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      images: [{ mimeType: "image/png", data: "A".repeat(8 * 1024 * 1024 + 4) }],
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/images\[0\]\.data exceeds 8 MiB/);
+  });
+
+  it("POST /api/prompt accepts PDF-only prompts and forwards files to the brain", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "pdf1",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text", "pdf"]),
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    const s = sm.sessions.get("pdf1")!;
+    expect(s.brain.prompt).toHaveBeenCalledWith("Please analyze the attached PDF.", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
   });
 
   it("resolves the active operating mode from DP markers and passes it to getOrCreate", async () => {
@@ -422,12 +544,19 @@ describe("http-server — model routing", () => {
     expect(s.modelRouteState.cooldowns["openai/gpt-4"]).toBeGreaterThan(0);
     expect(s._eventBuffer).toEqual([]);
     expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(true);
+    // The primary now streams live, so its failed error message_end IS relayed
+    // (the frontend renders it, then drops it on the rollback below).
     expect(s._extraEventBuffer.some((event) =>
       event.type === "message_end" && (event.message as any)?.stopReason === "error",
-    )).toBe(false);
-    expect(s._extraEventBuffer.some((event) =>
-      event.type === "message_end" && (event.message as any)?.content?.[0]?.text === "ok",
     )).toBe(true);
+    // A rollback tells consumers to discard the failed primary's live output
+    // before the fallback's reply arrives.
+    const rollbackIdx = s._extraEventBuffer.findIndex((event) => event.type === "model_route_rollback");
+    const okIdx = s._extraEventBuffer.findIndex((event) =>
+      event.type === "message_end" && (event.message as any)?.content?.[0]?.text === "ok",
+    );
+    expect(rollbackIdx).toBeGreaterThanOrEqual(0);
+    expect(okIdx).toBeGreaterThan(rollbackIdx);
     expect(sm.persistModelRouteState).toHaveBeenCalledWith("route-fallback", s.modelRouteState);
   });
 
@@ -606,7 +735,9 @@ describe("http-server — model routing", () => {
     expect(seenModels).toEqual(["anthropic/claude"]);
     expect(s.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
     expect(s.modelRouteState.activeCandidateSource).toBe("user");
-    expect(s._extraEventBuffer.some((event) => String(event.type).startsWith("model_route"))).toBe(false);
+    // Single entry: the pinned model runs through the runner as a lone candidate
+    // (model_route_start/success appear), but automatic fallback never engages.
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(false);
   });
 
   it("clears manual strict selection when the next prompt explicitly targets a different primary model", async () => {
@@ -726,7 +857,7 @@ describe("http-server — model routing", () => {
     expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(true);
   });
 
-  it("streams live (skips the buffered routing runner) when only one candidate is configured", async () => {
+  it("runs a lone candidate through the routing runner (single entry) with live streaming and no fallback", async () => {
     const s = await sm.getOrCreate("route-single");
     const singleCandidatePolicy = {
       enabled: true,
@@ -752,14 +883,41 @@ describe("http-server — model routing", () => {
 
     expect(r.status).toBe(200);
     expect(seenModels).toEqual(["openai/gpt-4"]);
-    // A lone candidate has nothing to fall back to, so the runner must not
-    // engage: no model_route_* telemetry, no state persistence, and brain
-    // events flow through the live buffer (not the routing extra bus) so
-    // streaming is preserved.
-    expect(s._extraEventBuffer.some((event) => String(event.type).startsWith("model_route"))).toBe(false);
-    expect(sm.persistModelRouteState).not.toHaveBeenCalled();
-    expect(s._routeBrainEventsThroughExtra).toBe(false);
-    expect(s._eventBuffer.some((event: any) => event.type === "message_end")).toBe(true);
+    // Single entry: a lone candidate still runs through the runner. It streams
+    // live (optimistic primary) on the extra channel and emits model_route_*
+    // carrying the model identity, but never switches / falls back.
+    // (_routeBrainEventsThroughExtra is transient — actuallyFinish resets it on
+    // completion — so assert on the durable extra-channel buffer instead.)
+    expect(s._extraEventBuffer.some((event: any) => event.type === "model_route_success")).toBe(true);
+    expect(s._extraEventBuffer.some((event: any) => event.type === "model_route_switch")).toBe(false);
+    expect(s._extraEventBuffer.some((event: any) => event.type === "message_end")).toBe(true);
+  });
+
+  it("single entry: a plain turn with routing disabled still emits model_route_* carrying the model identity (no switch)", async () => {
+    const s = await sm.getOrCreate("route-plain");
+    s.brain.prompt.mockImplementation(async () => {
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "plain turn",
+      sessionId: "route-plain",
+      modelRouting: { enabled: false },
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    // Every turn runs through the runner as a lone candidate built from the
+    // current model, so downstream collection (Langfuse) always sees the model
+    // identity — but a non-fallback success carries isFallback:false and no switch.
+    const success = s._extraEventBuffer.find((event: any) => event.type === "model_route_success") as any;
+    expect(success).toBeTruthy();
+    expect(success.isFallback).toBe(false);
+    expect(success.modelId).toBe("gpt-4");
+    expect(s._extraEventBuffer.some((event: any) => event.type === "model_route_switch")).toBe(false);
   });
 
   it("enriches agent_end with token stats on the routed (buffered) flush path", async () => {
@@ -814,6 +972,42 @@ describe("http-server — steer / abort / clear-queue", () => {
     expect(s.brain.steer).toHaveBeenCalledWith("stop");
   });
 
+  it("POST /api/sessions/:id/steer forwards images to brain.steer", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st-img" });
+    const s = sm.sessions.get("st-img")!;
+    const r = await getJson(port, "/api/sessions/st-img/steer", "POST", {
+      text: "这个呢",
+      images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
+    });
+    expect(r.status).toBe(200);
+    expect(s.brain.steer).toHaveBeenCalledWith("这个呢", {
+      images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
+    });
+  });
+
+  it("POST /api/sessions/:id/steer rejects invalid images instead of dropping them", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st-img-invalid" });
+    const s = sm.sessions.get("st-img-invalid")!;
+    const r = await getJson(port, "/api/sessions/st-img-invalid/steer", "POST", {
+      images: [{ mimeType: "image/png", data: "not base64!!!" }],
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/images\[0\]\.data.*base64/);
+    expect(s.brain.steer).not.toHaveBeenCalled();
+  });
+
+  it("POST /api/sessions/:id/steer forwards PDF files to brain.steer", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st-pdf" });
+    const s = sm.sessions.get("st-pdf")!;
+    const r = await getJson(port, "/api/sessions/st-pdf/steer", "POST", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    expect(r.status).toBe(200);
+    expect(s.brain.steer).toHaveBeenCalledWith("Please analyze the attached PDF.", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+  });
+
   it("POST /api/sessions/:id/abort calls brain.abort AND stops the session's background jobs", async () => {
     await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab1" });
     const s = sm.sessions.get("ab1")!;
@@ -835,6 +1029,35 @@ describe("http-server — steer / abort / clear-queue", () => {
     expect(r.status).toBe(200);
     expect(r.data).toEqual({ ok: true, stoppedJobs: 0, pending: true });
     expect(s._aborted).toBe(true);
+  });
+
+  it("Stop clears the steer queue, discards pending notifications, and re-sweeps jobs after brain.abort", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab2" });
+    const s = sm.sessions.get("ab2")!;
+    const r = await getJson(port, "/api/sessions/ab2/abort", "POST");
+    expect(r.status).toBe(200);
+    expect(s.brain.clearQueue).toHaveBeenCalled();          // #2 steer queue dropped
+    expect(sm.discardPendingNotifications).toHaveBeenCalledWith("ab2"); // #7 resurrection guard
+    // #1: stopSessionJobs swept once before brain.abort AND once after the run drains.
+    expect(sm.stopSessionJobs).toHaveBeenCalledTimes(2);
+  });
+
+  it("Stop before the session exists records a pending abort (200, not 404)", async () => {
+    const r = await getJson(port, "/api/sessions/ghost-bg/abort", "POST");
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ ok: true, pending: true });
+    expect(sm.markPendingAbort).toHaveBeenCalledWith("ghost-bg"); // #6 pre-spawn
+  });
+
+  it("a consumed pending abort short-circuits the next prompt (pre-prompt latch)", async () => {
+    sm.consumePendingAbort.mockReturnValueOnce(true);          // #6 consume → #5 latch
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab-pre" });
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ aborted: true });
+    const s = sm.sessions.get("ab-pre")!;
+    expect(s.brain.prompt).not.toHaveBeenCalled();             // never started the run
+    expect(s._promptDone).toBe(true);                          // session unlocked
+    expect(s._promptInflight).toBe(null);
   });
 
   it("POST /api/prompt returns 409 when _promptInflight is held even if _promptDone flipped back", async () => {
@@ -902,6 +1125,35 @@ describe("http-server — dp-state", () => {
   });
 });
 
+describe("http-server — session status (liveness)", () => {
+  it("returns running:false for an idle loaded session", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st1" });
+    const s = sm.sessions.get("st1")!;
+    s.isAgentActive = false; s.isCompacting = false; s.isRetrying = false;
+    const r = await getJson(port, "/api/sessions/st1/status");
+    expect(r.status).toBe(200);
+    expect(r.data.running).toBe(false);
+  });
+
+  it("returns running:true when any activity flag is set", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st2" });
+    for (const flag of ["isAgentActive", "isCompacting", "isRetrying"] as const) {
+      const s = sm.sessions.get("st2")!;
+      s.isAgentActive = false; s.isCompacting = false; s.isRetrying = false;
+      s[flag] = true;
+      const r = await getJson(port, "/api/sessions/st2/status");
+      expect(r.status).toBe(200);
+      expect(r.data.running).toBe(true);
+    }
+  });
+
+  it("returns running:false for an unknown (never-created / released) session", async () => {
+    const r = await getJson(port, "/api/sessions/ghost/status");
+    expect(r.status).toBe(200);
+    expect(r.data.running).toBe(false);
+  });
+});
+
 describe("http-server — memory reset", () => {
   it("DELETE /api/memory calls sessionManager.resetMemory", async () => {
     const spy = vi.spyOn(sm, "resetMemory");
@@ -919,10 +1171,13 @@ describe("http-server — metrics endpoints", () => {
     expect(text).toContain("# HELP fake");
   });
 
-  it("GET /api/internal/metrics-snapshot returns a JSON snapshot", async () => {
+  it("GET /api/internal/metrics-snapshot returns { incarnation, prom }", async () => {
     const r = await getJson(port, "/api/internal/metrics-snapshot");
     expect(r.status).toBe(200);
-    expect(r.data).toEqual({ cpu: 0 });
+    expect(r.data.incarnation).toBe("test-incarnation");
+    expect(r.data.prom).toEqual([
+      { name: "siclaw_tokens_total", type: "counter", values: [{ labels: { type: "input" }, value: 3 }] },
+    ]);
   });
 });
 
@@ -947,5 +1202,88 @@ describe("http-server — reload routes delegate to handlers", () => {
     // falls through to 500 (no handler). We accept either, as long as the
     // route is wired.
     expect([200, 500]).toContain(r.status);
+  });
+
+  it("POST /api/reload-tools is wired (descriptor loop) and short-circuits without a gateway URL", async () => {
+    const r = await getJson(port, "/api/reload-tools", "POST");
+    // tools is requiresGatewayClient:true; with no SICLAW_GATEWAY_URL the route
+    // short-circuits to 200 count:0 before ever calling the per-box handler.
+    expect(r.status).toBe(200);
+    expect(r.data).toMatchObject({ ok: true, count: 0, type: "tools" });
+  });
+});
+
+// ── Idle self-destruct ────────────────────────────────────────────────
+//
+// createHttpServer arms an idle timer at construction time and tears the pod
+// down when no SSE connections / sessions remain for the configured window.
+// We drive it with fake timers and a spied onIdleShutdown callback (so nothing
+// actually calls process.exit), and a fresh fake session manager per test so
+// the global listening server doesn't interfere.
+describe("http-server — idle self-destruct", () => {
+  let idleServer: http.Server | https.Server | undefined;
+
+  afterEach(() => {
+    // createHttpServer doesn't listen here, but close defensively + restore timers.
+    try { (idleServer as http.Server | undefined)?.close(); } catch { /* not listening */ }
+    idleServer = undefined;
+    vi.useRealTimers();
+  });
+
+  function arm(opts: { idleTimeoutMs?: number; disableIdleShutdown?: boolean }) {
+    const onIdleShutdown = vi.fn();
+    const sm2 = makeFakeSessionManager();
+    vi.useFakeTimers();
+    idleServer = createHttpServer(sm2 as any, { ...opts, onIdleShutdown });
+    return { onIdleShutdown, sm: sm2 };
+  }
+
+  it("fires onIdleShutdown after the configured window when idle", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: 1000 });
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1000);
+    expect(onIdleShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("respects the configured window exactly (not before)", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: 5000 });
+    vi.advanceTimersByTime(4999);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(onIdleShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the 5-minute default when no window is provided", () => {
+    const { onIdleShutdown } = arm({});
+    vi.advanceTimersByTime(5 * 60 * 1000 - 1);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(onIdleShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT fire when a session is active before the window elapses (re-check guard)", () => {
+    const { onIdleShutdown, sm: sm2 } = arm({ idleTimeoutMs: 1000 });
+    // A session becomes active after the timer was armed but before it fires.
+    sm2.sessions.set("live", makeFakeSession("live"));
+    vi.advanceTimersByTime(1000);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+  });
+
+  it("is resident (never fires) when the window is 0", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: 0 });
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+  });
+
+  it("is resident (never fires) when the window is negative", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: -1 });
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
+  });
+
+  it("never fires when disableIdleShutdown is set", () => {
+    const { onIdleShutdown } = arm({ idleTimeoutMs: 1000, disableIdleShutdown: true });
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(onIdleShutdown).not.toHaveBeenCalled();
   });
 });

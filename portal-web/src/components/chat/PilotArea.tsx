@@ -124,14 +124,6 @@ function ModelTimeLabel({ timing }: { timing: MessageTiming | undefined }) {
   )
 }
 
-function stringMeta(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined
-}
-
-function numberMeta(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined
-}
-
 function modelRouteMetadata(message: PilotMessage): ModelRouteMetadata | null {
   const route = message.metadata?.model_route
   if (!route || typeof route !== "object" || Array.isArray(route)) return null
@@ -146,22 +138,10 @@ function isVisibleChatMessage(message: PilotMessage): boolean {
   return !message.hidden && !isModelRouteNoticeMessage(message)
 }
 
-function routeModelLabel(provider?: string, modelId?: string): string {
-  return provider && modelId ? `${provider}/${modelId}` : provider || modelId || "unknown"
-}
-
 function routeModelDisplayName(modelId?: string, provider?: string): string {
   if (!modelId) return provider || "unknown"
   const parts = modelId.split("/").filter(Boolean)
   return parts[parts.length - 1] || modelId
-}
-
-function formatCooldown(until: unknown): string | undefined {
-  const value = numberMeta(until)
-  if (value == null) return undefined
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return undefined
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
 
 function ModelRouteIndicator({ route }: { route: ModelRouteMetadata | null }) {
@@ -310,6 +290,8 @@ const THINKING_TIPS = [
 export interface PilotAreaProps {
   messages: PilotMessage[]
   isLoading: boolean
+  /** Detached background work still running after the turn ended — keeps the Stop button shown. */
+  hasBackgroundWork?: boolean
   isLoadingHistory?: boolean
   hasMore?: boolean
   loadingMore?: boolean
@@ -326,11 +308,15 @@ export interface PilotAreaProps {
   onOpenSchedulePanel?: (msg: PilotMessage) => void
   onOpenSubagent?: (childSessionId: string, status?: string, label?: string) => void
   agentId?: string
+  /** Read-only transcript: hides the composer and edit/steer/dig-deeper affordances.
+   *  Used by the admin session-snapshot view. Message rendering is unchanged. */
+  readOnly?: boolean
 }
 
 export function PilotArea({
   messages,
   isLoading,
+  hasBackgroundWork,
   isLoadingHistory,
   hasMore,
   loadingMore,
@@ -347,6 +333,7 @@ export function PilotArea({
   onOpenSchedulePanel,
   onOpenSubagent,
   agentId,
+  readOnly = false,
 }: PilotAreaProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -674,7 +661,7 @@ export function PilotArea({
           ) : !hasVisibleMessages ? (
             <div className="flex flex-col items-center justify-center py-20 text-muted-foreground/70">
               <MessageSquare className="w-12 h-12 text-gray-200 mb-4" />
-              <p className="text-sm text-muted-foreground">Send a message to start the conversation</p>
+              <p className="text-sm text-muted-foreground">{readOnly ? "No messages in this session" : "Send a message to start the conversation"}</p>
             </div>
           ) : (
             <>
@@ -762,9 +749,9 @@ export function PilotArea({
                         <MessageItem
                           message={msg}
                           sendMessage={wrappedSendMessage}
-                          showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
+                          showSuggestedReplies={!readOnly && msg.id === lastAssistantMsgId && !isLoading}
                           dpActive={dpActive}
-                          canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
+                          canEditMessage={!readOnly && msg.id === latestEditableUserMessageId && !isLoading}
                           editingContent={editingMessageId === msg.id ? editingDraft : null}
                           onStartEditMessage={startEditingMessage}
                           onEditMessageChange={setEditingDraft}
@@ -805,7 +792,7 @@ export function PilotArea({
 
               {/* Dig deeper — shown when agent produced a conclusion and user may want
                   to trace the root cause upstream. Hidden while a prefix chip is active. */}
-              {showTraceButton && !activePrefix && (
+              {!readOnly && showTraceButton && !activePrefix && (
                 <div className="flex justify-start pl-12 my-2">
                   <button
                     type="button"
@@ -825,23 +812,26 @@ export function PilotArea({
           <div ref={scrollRef} />
         </div>
       </div>
-      <InputArea
-        onSend={wrappedSendMessage}
-        onAbort={wrappedAbort}
-        disabled={false}
-        isLoading={isLoading}
-        contextUsage={contextUsage}
-        pendingMessages={pendingMessages}
-        onRemovePending={onRemovePending}
-        dpActive={dpActive}
-        onSetDpActive={onSetDpActive}
-        hasMessages={hasVisibleMessages}
-        draft={chipDraft}
-        draftSeq={chipSeq}
-        historyMessages={userMessageHistory}
-        activePrefix={activePrefix}
-        onClearPrefix={() => setActivePrefix(null)}
-      />
+      {!readOnly && (
+        <InputArea
+          onSend={wrappedSendMessage}
+          onAbort={wrappedAbort}
+          disabled={false}
+          isLoading={isLoading}
+          hasBackgroundWork={hasBackgroundWork}
+          contextUsage={contextUsage}
+          pendingMessages={pendingMessages}
+          onRemovePending={onRemovePending}
+          dpActive={dpActive}
+          onSetDpActive={onSetDpActive}
+          hasMessages={hasVisibleMessages}
+          draft={chipDraft}
+          draftSeq={chipSeq}
+          historyMessages={userMessageHistory}
+          activePrefix={activePrefix}
+          onClearPrefix={() => setActivePrefix(null)}
+        />
+      )}
     </div>
   )
 }
@@ -1502,10 +1492,6 @@ function MessageItem({
     return <DelegationStatusNotice content={message.content} />
   }
 
-  if (message.metadata?.kind === "model_route_notice") {
-    return <ModelRouteNotice message={message} />
-  }
-
   if (isTool) {
     if (message.toolName === "delegate_to_agents") {
       return <AgentWorkBatchCard message={message} />
@@ -1681,39 +1667,6 @@ function DelegationStatusNotice({ content }: { content: string }) {
         <span className="font-medium">{headline}</span>
         {detail && <span className="text-blue-300/70">·</span>}
         {detail && <span className="truncate">{detail}</span>}
-      </div>
-    </div>
-  )
-}
-
-function ModelRouteNotice({ message }: { message: PilotMessage }) {
-  const metadata = message.metadata ?? {}
-  const eventType = stringMeta(metadata.event_type)
-  const from = routeModelLabel(stringMeta(metadata.from_provider), stringMeta(metadata.from_model_id))
-  const to = routeModelLabel(stringMeta(metadata.to_provider), stringMeta(metadata.to_model_id))
-  const failureKind = stringMeta(metadata.failure_kind)
-  const cooldown = formatCooldown(metadata.cooldown_until)
-  const isRecovery = eventType === "model_route.recovered"
-  const title = [
-    isRecovery ? `Recovered to ${to}` : `Switched from ${from} to ${to}`,
-    failureKind ? `Reason: ${failureKind}` : undefined,
-    stringMeta(metadata.error_message),
-    cooldown ? `Primary cooldown until ${cooldown}` : undefined,
-  ].filter(Boolean).join("\n")
-
-  return (
-    <div className="pl-12 min-w-0" data-copy-ignore>
-      <div
-        title={title}
-        className={cn(
-          "inline-flex max-w-3xl items-center gap-2 rounded-full border px-3 py-1.5 text-xs shadow-sm shadow-black/10",
-          isRecovery
-            ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700"
-            : "border-amber-500/30 bg-amber-500/10 text-amber-700",
-        )}
-      >
-        <ArrowRight className="h-3.5 w-3.5 shrink-0" />
-        <span className="font-medium truncate">{message.content}</span>
       </div>
     </div>
   )
@@ -2347,7 +2300,10 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
   const bgRunning = isBackground && !bgStatus
   const bgFailed = bgStatus === "failed"
   const bgStopped = bgStatus === "stopped" || bgStatus === "killed"
-  const bgDone = isBackground && !!bgStatus && !bgFailed && !bgStopped
+  // Synthesized when a launch's completion was never persisted (crash) and the row aged out —
+  // the job is gone, so render it as a non-success terminal state, not a green "done".
+  const bgTimedOut = bgStatus === "timed_out"
+  const bgDone = isBackground && !!bgStatus && !bgFailed && !bgStopped && !bgTimedOut
   const bgExitLabel = typeof bgExitCode === "number" ? ` (exit ${bgExitCode})` : ""
   // The expanded body re-prints toolInput only when the single-line header can't
   // already show it in full: multi-line input (a heredoc / multi-statement command)
@@ -2433,7 +2389,7 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
                 {bgRunning && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />}
                 {bgDone && <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />}
                 {bgFailed && <XCircle className="w-3.5 h-3.5 text-red-500" />}
-                {bgStopped && <Ban className="w-3.5 h-3.5 text-amber-500" />}
+                {(bgStopped || bgTimedOut) && <Ban className="w-3.5 h-3.5 text-amber-500" />}
               </>
             ) : (
               <>
@@ -2464,7 +2420,9 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
                         ? `Background task failed${bgExitLabel}`
                         : bgStopped
                           ? "Background task stopped"
-                          : `Background task completed${bgExitLabel}`)
+                          : bgTimedOut
+                            ? "Background task did not report completion (timed out)"
+                            : `Background task completed${bgExitLabel}`)
                   : (message.content || (message.toolStatus === "aborted" ? "Aborted." : "Running..."))}
               </pre>
               {/* Output copy only for a real captured output — a background box's body is a

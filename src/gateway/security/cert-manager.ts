@@ -231,6 +231,18 @@ export class CertificateManager {
     return this.caCert;
   }
 
+  /**
+   * Short, stable fingerprint of the current CA certificate (sha256 of the PEM,
+   * first 16 hex chars). Used to stamp AgentBox pods so the runtime can detect
+   * pods whose mTLS certs were signed by a now-rotated CA — those pods can no
+   * longer complete mTLS in either direction and must be recycled. Two managers
+   * loading the same CA PEM produce the same fingerprint; a regenerated CA
+   * produces a different one.
+   */
+  caFingerprint(): string {
+    return crypto.createHash("sha256").update(this.caCert).digest("hex").slice(0, 16);
+  }
+
   private static generateCA(): { cert: string; key: string } {
     const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
       modulusLength: 4096,

@@ -54,31 +54,11 @@ import {
   normalizeChatSessionTitle,
   truncateChatSessionTitle,
 } from "./chat-session-fields.js";
+import { normalizeEntry, entrySessionPredicate, entryMessagePredicate } from "./metrics-entry.js";
+import { summariseLatency, extractTimingMs } from "./metrics-timing.js";
 
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
-
-/**
- * Summarise a vector of millisecond latency samples into avg / min / max / p90.
- * Empty input → `count: 0` and the rest 0; the frontend renders a "no data"
- * state in that case. p90 uses nearest-rank: index = ceil(n * 0.9) - 1.
- */
-function summariseLatency(values: number[]): {
-  count: number; avg: number; min: number; max: number; p90: number;
-} {
-  if (values.length === 0) return { count: 0, avg: 0, min: 0, max: 0, p90: 0 };
-  const sorted = [...values].sort((a, b) => a - b);
-  const n = sorted.length;
-  const sum = sorted.reduce((a, b) => a + b, 0);
-  const p90Index = Math.max(0, Math.ceil(n * 0.9) - 1);
-  return {
-    count: n,
-    avg: Math.round(sum / n),
-    min: sorted[0],
-    max: sorted[n - 1],
-    p90: sorted[p90Index],
-  };
-}
 
 // ── MCP config import / export ────────────────────────────────
 
@@ -255,6 +235,25 @@ export interface SiclawApiContext {
   notifySkillDevAgents?: (skillId: string, resources: string[]) => void;
   /** Notify agents bound to an MCP server to reload. */
   notifyMcpAgents?: (mcpId: string, resources: string[]) => void;
+}
+
+/**
+ * Day-bucket key ('YYYY-MM-DD') for a value returned by SQL `DATE(...)`.
+ * SQLite (and mysql2 with dateStrings) hand back a 'YYYY-MM-DD' string — used
+ * verbatim. mysql2's default returns a JS Date at the connection-local midnight;
+ * we read LOCAL components, NOT toISOString() — the latter is UTC and would
+ * shift the day by one under a non-UTC DB (the prod clusters are UTC+8),
+ * dropping edge rows. The same function keys both the DB buckets and the
+ * gap-fill range, so they never disagree and the series always sums to the
+ * scalar COUNT.
+ */
+export function sqlDayKey(raw: unknown): string | null {
+  if (typeof raw === "string") return raw.length >= 10 ? raw.slice(0, 10) : null;
+  if (raw instanceof Date) {
+    if (Number.isNaN(raw.getTime())) return null;
+    return `${raw.getFullYear()}-${String(raw.getMonth() + 1).padStart(2, "0")}-${String(raw.getDate()).padStart(2, "0")}`;
+  }
+  return null;
 }
 
 export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, ctx?: SiclawApiContext): void {
@@ -2805,11 +2804,37 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   // Metrics — summary + audit (admin-only, Portal owns the data)
   // ================================================================
 
-  const PERIODS: Record<string, number> = {
-    today: 86_400_000,
-    "7d": 7 * 86_400_000,
-    "30d": 30 * 86_400_000,
-  };
+  // Parse a single timestamp query param: unix-ms (all-digits → `new Date(Number)`)
+  // or any Date-parseable string (ISO, for manual curl/debug); the portal-web
+  // frontend always sends absolute ms. Returns null when absent or unparseable.
+  // Shared by resolveWindow and the audit handler so the two never drift.
+  function parseTs(v: string | undefined): Date | null {
+    if (!v) return null;
+    const d = /^\d+$/.test(v) ? new Date(Number(v)) : new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // Resolve a [from, to] window from query params, replacing the old `period`
+  // enum. Both missing → trailing 7d. Returns null on an unparseable value or
+  // `from >= to`, so the caller can fail-fast with 400 — no silent fallback to
+  // a default window on bad input.
+  //
+  // Single open bound is intentionally asymmetric: missing `to` → now (a natural
+  // trailing window), but missing `from` (with `to` present) → null/400 rather
+  // than guessing a start for an otherwise-unbounded window. The portal-web
+  // frontend always sends both bounds, so this only constrains manual callers.
+  function resolveWindow(query: Record<string, string>): { from: Date; to: Date } | null {
+    const fromRaw = query.from;
+    const toRaw = query.to;
+    if (!fromRaw && !toRaw) {
+      const now = Date.now();
+      return { from: new Date(now - 7 * 86_400_000), to: new Date(now) };
+    }
+    const from = parseTs(fromRaw);
+    const to = toRaw ? parseTs(toRaw) : new Date();
+    if (!from || !to || from.getTime() >= to.getTime()) return null;
+    return { from, to };
+  }
 
   // GET /api/v1/siclaw/metrics/summary
   router.get("/api/v1/siclaw/metrics/summary", async (req, res) => {
@@ -2817,164 +2842,168 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
     const query = parseQuery(req.url ?? "");
-    const period = query.period || "7d";
-    const rangeMs = PERIODS[period];
-    if (!rangeMs) { sendJson(res, 400, { error: "Invalid period" }); return; }
-    const cutoff = new Date(Date.now() - rangeMs);
+    const window = resolveWindow(query);
+    if (!window) { sendJson(res, 400, { error: "Invalid time range" }); return; }
+    const { from, to } = window;
     const userFilter = query.userId || null;
+    // Entry-form axis: overview (all) / web / api / a2a / channel / scheduled.
+    const entry = normalizeEntry(query.entry ?? query.source);
+    // Session-level (per-session counts): delegation traces excluded.
+    const tablePred = entrySessionPredicate(entry, "chat_sessions");
+    // Message/tool-level: count a delegation child's rows under its PARENT's
+    // entry so sub-agent tool calls stay auditable. msg.join adds the parent LEFT JOIN.
+    const msg = entryMessagePredicate(entry);
 
     const db = getDb();
 
-    const sessionParams: unknown[] = [cutoff];
-    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ? AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))";
+    const sessionParams: unknown[] = [from, to];
+    let totalSessionsSql = `SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ? AND created_at <= ? AND ${tablePred}`;
     if (userFilter) { totalSessionsSql += " AND user_id = ?"; sessionParams.push(userFilter); }
     const [sRows] = await db.query(totalSessionsSql, sessionParams) as [Array<{ c: number }>, unknown];
     const totalSessions = Number(sRows[0]?.c ?? 0);
 
-    const pParams: unknown[] = [cutoff];
+    const pParams: unknown[] = [from, to];
     let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
-      WHERE m.role = 'user' AND m.created_at >= ?
-        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
+      ${msg.join}
+      WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
+        AND ${msg.predicate}
         AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
     const [pRows] = await db.query(totalPromptsSql, pParams) as [Array<{ c: number }>, unknown];
     const totalPrompts = Number(pRows[0]?.c ?? 0);
 
-    let byUser: Array<{ userId: string; sessions: number; messages: number }> = [];
-    if (!userFilter) {
-      const [uRows] = await db.query(
-        `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
-         FROM chat_sessions s WHERE s.created_at >= ?
-           AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
-         GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
-        [cutoff],
-      ) as any;
-      byUser = uRows.map((r: any) => ({ userId: r.userId, sessions: Number(r.sessions), messages: Number(r.messages ?? 0) }));
+    // ── distinctUsers (window) ──
+    const duParams: unknown[] = [from, to];
+    let distinctUsersSql = `SELECT COUNT(DISTINCT user_id) AS c FROM chat_sessions
+      WHERE created_at >= ? AND created_at <= ? AND ${tablePred}`;
+    if (userFilter) { distinctUsersSql += " AND user_id = ?"; duParams.push(userFilter); }
+    const [duRows] = await db.query(distinctUsersSql, duParams) as [Array<{ c: number }>, unknown];
+    const distinctUsers = Number(duRows[0]?.c ?? 0);
+
+    // ── toolCalls: total tool-row count (window) ──
+    const tcParams: unknown[] = [from, to];
+    let toolCallsSql = `SELECT COUNT(*) AS c FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      ${msg.join}
+      WHERE m.role = 'tool' AND m.created_at >= ? AND m.created_at <= ?
+        AND ${msg.predicate}`;
+    if (userFilter) { toolCallsSql += " AND s.user_id = ?"; tcParams.push(userFilter); }
+    const [tcRows] = await db.query(toolCallsSql, tcParams) as [Array<{ c: number }>, unknown];
+    const toolCalls = Number(tcRows[0]?.c ?? 0);
+
+    // ── skillsUsed: distinct skills parsed from tool_input JSON (window) ──
+    // The skill name lives inside tool_input (tool_name is the script-exec
+    // tool's own name). role='tool' hits idx_chat_messages_audit; the 50k cap
+    // bounds a pathological window — skill cardinality is tiny so it ~never bites.
+    const SKILL_ROW_LIMIT = 50_000;
+    const suParams: unknown[] = [from, to];
+    let skillsSql = `SELECT m.tool_input AS toolInput FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      ${msg.join}
+      WHERE m.role = 'tool'
+        AND m.tool_name IN ('local_script', 'host_script', 'pod_script', 'node_script')
+        AND m.created_at >= ? AND m.created_at <= ?
+        AND ${msg.predicate}`;
+    if (userFilter) { skillsSql += " AND s.user_id = ?"; suParams.push(userFilter); }
+    skillsSql += " ORDER BY m.created_at DESC LIMIT ?";
+    suParams.push(SKILL_ROW_LIMIT + 1);
+    const [suRows] = await db.query(skillsSql, suParams) as [Array<{ toolInput: string | null }>, unknown];
+    const skillsUsedApprox = suRows.length > SKILL_ROW_LIMIT;
+    const suSlice = skillsUsedApprox ? suRows.slice(0, SKILL_ROW_LIMIT) : suRows;
+    const skillSet = new Set<string>();
+    for (const r of suSlice) {
+      if (!r.toolInput) continue;
+      let skill: unknown;
+      const parsed = safeParseJson<Record<string, unknown> | null>(r.toolInput, null);
+      if (parsed) {
+        skill = parsed.skill;
+      } else {
+        // tool_input is redacted JSON; fall back to a regex if it failed to parse.
+        const match = /"skill"\s*:\s*"([^"]+)"/.exec(r.toolInput);
+        if (match) skill = match[1];
+      }
+      // skill is Optional on host/pod/node_script (user scripts omit it) — only
+      // count real skill names so a missing field can't inflate the set.
+      if (typeof skill === "string" && skill) skillSet.add(skill);
     }
+    const skillsUsed = skillSet.size;
 
-    sendJson(res, 200, { totalSessions, totalPrompts, byUser });
-  });
-
-  // GET /api/v1/siclaw/metrics/timing
-  // Aggregates per-message timing telemetry stamped by sse-consumer:
-  //   ⏳ ttft     — chat_messages.metadata.timing.ttft_ms (assistant rows)
-  //   💭 thinking — chat_messages.metadata.timing.thinking_ms (assistant)
-  //   ⚙️ tools   — chat_messages.duration_ms grouped by tool_name (top-N
-  //                 by invocation count, sorted DESC). Returned as an array
-  //                 so the dashboard can show top 3 / 5 / 10 client-side.
-  //
-  // Aggregation is done in JS rather than via JSON_EXTRACT/GROUP BY so the
-  // same code path works under MySQL and SQLite without the dialect-helpers
-  // dance — we only read the columns we need (`metadata` / `tool_name` /
-  // `duration_ms`) and bucket in memory.
-  router.get("/api/v1/siclaw/metrics/timing", async (req, res) => {
-    const admin = requireAdmin(req, config.jwtSecret);
-    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
-
-    const query = parseQuery(req.url ?? "");
-    const period = query.period || "7d";
-    const rangeMs = PERIODS[period];
-    if (!rangeMs) { sendJson(res, 400, { error: "Invalid period" }); return; }
-    const cutoff = new Date(Date.now() - rangeMs);
-    const userFilter = query.userId || null;
-
-    const db = getDb();
-
-    // Hard cap on rows scanned per query. Each chat_messages.metadata can be
-    // multi-KB JSON (timing + tool details + delegation state); a busy tenant
-    // over a 30-day window can produce hundreds of thousands of rows, and
-    // pulling them all would risk OOM-ing the Portal process. ORDER BY DESC +
-    // LIMIT keeps the most-recent slice when the window is too dense; the
-    // response carries `truncated: true` so the dashboard can show a hint
-    // ("sampled view") rather than the call silently lying.
-    //
-    // TODO(metrics): replace this with a nightly batch job that materialises
-    // a `metrics_timing_daily` table (avg/p90 pre-aggregated per day). The
-    // endpoint then SELECTs <30 rows and the limit becomes irrelevant.
-    const ROW_LIMIT = 50_000;
-
-    // Build the two SELECTs and fire them in parallel — they're independent
-    // and read-only, so awaiting sequentially would just double the response
-    // time without buying anything. On SQLite a long-running JSON-pulling
-    // query can also block other read paths in the same process; Promise.all
-    // returns control to the event loop sooner so /metrics/live and
-    // /metrics/summary stay responsive while this one is in flight.
-
-    // Assistant rows: pull metadata JSON, parse client-side, harvest ttft/thinking.
-    const aParams: unknown[] = [cutoff];
-    let assistantSql = `SELECT m.metadata
-      FROM chat_messages m
-      JOIN chat_sessions s ON m.session_id = s.id
-      WHERE m.role = 'assistant' AND m.created_at >= ? AND m.metadata IS NOT NULL
-        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
-    if (userFilter) { assistantSql += " AND s.user_id = ?"; aParams.push(userFilter); }
-    assistantSql += " ORDER BY m.created_at DESC LIMIT ?";
-    aParams.push(ROW_LIMIT + 1);
-
-    // Tool rows: bucket duration_ms by tool_name. We pull all tools (not
-    // just bash) so the dashboard can rank by invocation count — the actual
-    // top-N filtering happens client-side so the user can flip 3↔5↔10
-    // without re-querying.
-    const tParams: unknown[] = [cutoff];
-    let toolSql = `SELECT m.tool_name AS toolName, m.duration_ms AS durationMs
-      FROM chat_messages m
-      JOIN chat_sessions s ON m.session_id = s.id
-      WHERE m.role = 'tool' AND m.tool_name IS NOT NULL AND m.duration_ms IS NOT NULL
-        AND m.created_at >= ?
-        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
-    if (userFilter) { toolSql += " AND s.user_id = ?"; tParams.push(userFilter); }
-    toolSql += " ORDER BY m.created_at DESC LIMIT ?";
-    tParams.push(ROW_LIMIT + 1);
-
-    const [aResult, tResult] = await Promise.all([
-      db.query(assistantSql, aParams) as Promise<[Array<{ metadata: unknown }>, unknown]>,
-      db.query(toolSql, tParams) as Promise<[Array<{ toolName: string; durationMs: number | null }>, unknown]>,
+    // ── inventory: current-snapshot managed scale, NOT windowed ──
+    const [[invClusters], [invHosts], [invSkills], [invKnowledge], [invAgents], [invMcp]] = await Promise.all([
+      db.query("SELECT COUNT(*) AS c FROM clusters") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM hosts") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM skills WHERE overlay_of IS NULL") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM knowledge_repos") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM agents") as Promise<[Array<{ c: number }>, unknown]>,
+      db.query("SELECT COUNT(*) AS c FROM mcp_servers") as Promise<[Array<{ c: number }>, unknown]>,
     ]);
-    const [aRows] = aResult;
-    const [tRows] = tResult;
-    const assistantTruncated = aRows.length > ROW_LIMIT;
-    const aSlice = assistantTruncated ? aRows.slice(0, ROW_LIMIT) : aRows;
+    const inventory = {
+      clusters: Number(invClusters[0]?.c ?? 0),
+      hosts: Number(invHosts[0]?.c ?? 0),
+      skills: Number(invSkills[0]?.c ?? 0),
+      knowledgeRepos: Number(invKnowledge[0]?.c ?? 0),
+      agents: Number(invAgents[0]?.c ?? 0),
+      mcpServers: Number(invMcp[0]?.c ?? 0),
+    };
 
-    const ttftValues: number[] = [];
-    const thinkingValues: number[] = [];
-    for (const r of aSlice) {
-      const meta = safeParseJson<Record<string, unknown> | null>(r.metadata, null);
-      const timing = meta?.timing as Record<string, unknown> | undefined;
-      if (!timing) continue;
-      // Filter ≥0: historical rows from before the source-side clamp may
-      // carry negatives produced by cross-process clock drift; this matches
-      // the tool-branch filter below.
-      if (typeof timing.ttft_ms === "number" && timing.ttft_ms >= 0) ttftValues.push(timing.ttft_ms);
-      if (typeof timing.thinking_ms === "number" && timing.thinking_ms >= 0) thinkingValues.push(timing.thinking_ms);
+    // ── dailySeries: per-day prompts & tool calls across [from, to]. Same WHERE
+    // as the scalar cards → each chart's summed Total equals its KPI card. Keyed
+    // by sqlDayKey (local day) and union'd with the gap-fill range so no count is
+    // dropped under a non-UTC DB; capped at ~400 days for pathological windows.
+    const dpParams: unknown[] = [from, to];
+    let dailyPromptsSql = `SELECT DATE(m.created_at) AS day, COUNT(*) AS c FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      ${msg.join}
+      WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
+        AND ${msg.predicate}
+        AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
+    if (userFilter) { dailyPromptsSql += " AND s.user_id = ?"; dpParams.push(userFilter); }
+    dailyPromptsSql += " GROUP BY DATE(m.created_at)";
+
+    const dtParams: unknown[] = [from, to];
+    let dailyToolsSql = `SELECT DATE(m.created_at) AS day, COUNT(*) AS c FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      ${msg.join}
+      WHERE m.role = 'tool' AND m.created_at >= ? AND m.created_at <= ?
+        AND ${msg.predicate}`;
+    if (userFilter) { dailyToolsSql += " AND s.user_id = ?"; dtParams.push(userFilter); }
+    dailyToolsSql += " GROUP BY DATE(m.created_at)";
+
+    const [dpRes, dtRes] = await Promise.all([
+      db.query(dailyPromptsSql, dpParams) as Promise<[Array<{ day: unknown; c: number }>, unknown]>,
+      db.query(dailyToolsSql, dtParams) as Promise<[Array<{ day: unknown; c: number }>, unknown]>,
+    ]);
+    const bucketByDay = (rows: Array<{ day: unknown; c: number }>): Map<string, number> => {
+      const m = new Map<string, number>();
+      for (const r of rows) {
+        const key = sqlDayKey(r.day);
+        if (key) m.set(key, Number(r.c));
+      }
+      return m;
+    };
+    const promptByDay = bucketByDay(dpRes[0]);
+    const toolByDay = bucketByDay(dtRes[0]);
+
+    const dayKeys = new Set<string>();
+    const cursor = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+    const lastDay = new Date(to.getFullYear(), to.getMonth(), to.getDate());
+    for (let guard = 0; cursor <= lastDay && guard < 400; guard++) {
+      const key = sqlDayKey(cursor);
+      if (key) dayKeys.add(key);
+      cursor.setDate(cursor.getDate() + 1);
     }
-
-    const toolsTruncated = tRows.length > ROW_LIMIT;
-    const tSlice = toolsTruncated ? tRows.slice(0, ROW_LIMIT) : tRows;
-
-    // Bucket per tool_name; same negative-value filter as before.
-    const toolBuckets = new Map<string, number[]>();
-    for (const r of tSlice) {
-      const dur = Number(r.durationMs);
-      if (!Number.isFinite(dur) || dur < 0) continue;
-      const bucket = toolBuckets.get(r.toolName);
-      if (bucket) bucket.push(dur);
-      else toolBuckets.set(r.toolName, [dur]);
-    }
-    const tools = Array.from(toolBuckets.entries())
-      .map(([toolName, values]) => ({ toolName, ...summariseLatency(values) }))
-      // Rank by invocation count DESC — matches the "Top Tools" widget below
-      // so the same tool-of-the-day shows up consistently across cards.
-      .sort((a, b) => b.count - a.count);
+    for (const k of promptByDay.keys()) dayKeys.add(k);
+    for (const k of toolByDay.keys()) dayKeys.add(k);
+    const dailySeries = [...dayKeys].sort().map((date) => ({
+      date,
+      prompts: promptByDay.get(date) ?? 0,
+      toolCalls: toolByDay.get(date) ?? 0,
+    }));
 
     sendJson(res, 200, {
-      ttft: summariseLatency(ttftValues),
-      thinking: summariseLatency(thinkingValues),
-      tools,
-      // Tells callers the window was too dense to scan in full and the
-      // figures above reflect a recency-biased sample. Frontend can show a
-      // "sampled view" badge rather than failing the request.
-      truncated: assistantTruncated || toolsTruncated,
+      totalSessions, totalPrompts,
+      distinctUsers, toolCalls, skillsUsed, skillsUsedApprox, inventory, dailySeries,
     });
   });
 
@@ -2985,11 +3014,23 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const query = parseQuery(req.url ?? "");
     const limit = Math.min(200, Math.max(1, parseInt(query.limit || "50", 10)));
-    const startDate = query.startDate ? new Date(query.startDate) : new Date(Date.now() - 86_400_000);
-    const endDate = query.endDate ? new Date(query.endDate) : new Date();
+    // Audit uses the same from/to window contract as summary/timing, via the
+    // shared parseTs. It keeps a lenient trailing-24h default (and BETWEEN
+    // semantics) when a bound is absent — the frontend always sends an explicit,
+    // frozen window, so the lenient default is only hit by manual callers. The
+    // reversed-window check below matches summary/timing's 400 so the same
+    // malformed input fails the same way everywhere (no silent empty list).
+    const from = parseTs(query.from) ?? new Date(Date.now() - 86_400_000);
+    const to = parseTs(query.to) ?? new Date();
+    if (from.getTime() >= to.getTime()) { sendJson(res, 400, { error: "Invalid time range" }); return; }
 
-    const conds: string[] = ["m.role = 'tool'", "m.created_at BETWEEN ? AND ?"];
-    const params: unknown[] = [startDate, endDate];
+    // Entry-form axis (overview / web / api / a2a / channel / scheduled), with
+    // delegation inheritance so sub-agent tool calls count under their parent's
+    // entry. `msg.join` adds the parent-session LEFT JOIN.
+    const entry = normalizeEntry(query.entry ?? query.source ?? query.origin);
+    const msg = entryMessagePredicate(entry);
+    const conds: string[] = ["m.role = 'tool'", "m.created_at BETWEEN ? AND ?", msg.predicate];
+    const params: unknown[] = [from, to];
     if (query.userId) { conds.push("s.user_id = ?"); params.push(query.userId); }
     if (query.toolName) { conds.push("m.tool_name = ?"); params.push(query.toolName); }
     if (query.outcome) { conds.push("m.outcome = ?"); params.push(query.outcome); }
@@ -3005,9 +3046,12 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
               SUBSTR(m.tool_input, 1, 500) AS toolInput,
               m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
-              s.user_id AS userId, s.agent_id AS agentId
+              s.user_id AS userId, s.agent_id AS agentId, s.origin AS origin,
+              a.name AS agentName
        FROM chat_messages m
        LEFT JOIN chat_sessions s ON m.session_id = s.id
+       ${msg.join}
+       LEFT JOIN agents a ON s.agent_id = a.id
        WHERE ${conds.join(" AND ")}
        ORDER BY m.created_at DESC, m.id DESC
        LIMIT ?`,
@@ -3017,8 +3061,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const hasMore = rows.length > limit;
     const logs = rows.slice(0, limit).map((r: any) => ({
       id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
+      agentName: r.agentName ?? null,
       toolName: r.toolName, toolInput: r.toolInput, outcome: r.outcome,
-      durationMs: r.durationMs,
+      durationMs: r.durationMs, origin: r.origin ?? null,
       timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
     }));
 
@@ -3050,28 +3095,184 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     });
   });
 
-  // ================================================================
-  // Metrics live — proxied to Runtime (in-memory MetricsAggregator)
-  // ================================================================
-
-  // GET /api/v1/siclaw/metrics/live — via phone-home WS RPC to Runtime
-  router.get("/api/v1/siclaw/metrics/live", async (req, res) => {
+  // GET /api/v1/siclaw/metrics/timing — TTFT / thinking / per-tool latency, entry-filtered.
+  router.get("/api/v1/siclaw/metrics/timing", async (req, res) => {
     const admin = requireAdmin(req, config.jwtSecret);
     if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
     const query = parseQuery(req.url ?? "");
-    const agentIds = config.connectionMap.connectedAgentIds();
-    if (agentIds.length === 0) {
-      sendJson(res, 502, { error: "Runtime not connected" });
-      return;
+    const window = resolveWindow(query);
+    if (!window) { sendJson(res, 400, { error: "Invalid time range" }); return; }
+    const { from, to } = window;
+    const userFilter = query.userId || null;
+    const entry = normalizeEntry(query.entry ?? query.source);
+    const msg = entryMessagePredicate(entry); // delegation-inherited (sub-agent tool latency counts)
+    const TIMING_ROW_LIMIT = 50_000;
+    const db = getDb();
+
+    // ── TTFT / thinking from assistant metadata.timing.{ttft_ms,thinking_ms} ──
+    const aParams: unknown[] = [from, to];
+    let aSql = `SELECT m.metadata AS metadata FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      ${msg.join}
+      WHERE m.role = 'assistant' AND m.created_at >= ? AND m.created_at <= ?
+        AND m.metadata IS NOT NULL AND ${msg.predicate}`;
+    if (userFilter) { aSql += " AND s.user_id = ?"; aParams.push(userFilter); }
+    aSql += " ORDER BY m.created_at DESC LIMIT ?";
+    aParams.push(TIMING_ROW_LIMIT + 1);
+    const [aRows] = await db.query(aSql, aParams) as [Array<{ metadata: string | null }>, unknown];
+    const ttftValues: number[] = [];
+    const thinkingValues: number[] = [];
+    for (const r of aRows.slice(0, TIMING_ROW_LIMIT)) {
+      const t = extractTimingMs(r.metadata, "ttft_ms");
+      if (t !== undefined) ttftValues.push(t);
+      const th = extractTimingMs(r.metadata, "thinking_ms");
+      if (th !== undefined) thinkingValues.push(th);
     }
-    // Use first connected agent (Runtime registers as "system" or any agentId)
-    const result = await config.connectionMap.sendCommand(agentIds[0], "metrics.live", { userId: query.userId });
-    if (!result.ok) {
-      sendJson(res, 502, { error: result.error ?? "Runtime metrics unavailable" });
-      return;
+
+    // ── Per-tool latency from tool rows' duration_ms ──
+    const tParams: unknown[] = [from, to];
+    let tSql = `SELECT m.tool_name AS toolName, m.duration_ms AS durationMs FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      ${msg.join}
+      WHERE m.role = 'tool' AND m.tool_name IS NOT NULL AND m.duration_ms IS NOT NULL
+        AND m.created_at >= ? AND m.created_at <= ? AND ${msg.predicate}`;
+    if (userFilter) { tSql += " AND s.user_id = ?"; tParams.push(userFilter); }
+    tSql += " ORDER BY m.created_at DESC LIMIT ?";
+    tParams.push(TIMING_ROW_LIMIT + 1);
+    const [tRows] = await db.query(tSql, tParams) as [Array<{ toolName: string; durationMs: number }>, unknown];
+    const byTool = new Map<string, number[]>();
+    for (const r of tRows.slice(0, TIMING_ROW_LIMIT)) {
+      const arr = byTool.get(r.toolName) ?? [];
+      arr.push(Number(r.durationMs));
+      byTool.set(r.toolName, arr);
     }
-    sendJson(res, 200, result.payload);
+    const tools = [...byTool.entries()]
+      .map(([toolName, vals]) => ({ toolName, ...summariseLatency(vals) }))
+      .sort((a, b) => b.count - a.count);
+
+    sendJson(res, 200, {
+      ttft: summariseLatency(ttftValues),
+      thinking: summariseLatency(thinkingValues),
+      tools,
+      truncated: aRows.length > TIMING_ROW_LIMIT || tRows.length > TIMING_ROW_LIMIT,
+    });
+  });
+
+  // GET /api/v1/siclaw/audit/sessions — per-session audit rows (counts + agent), entry-filtered.
+  router.get("/api/v1/siclaw/audit/sessions", async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const query = parseQuery(req.url ?? "");
+    const limit = Math.min(200, Math.max(1, parseInt(query.limit || "50", 10)));
+    const from = parseTs(query.from) ?? new Date(Date.now() - 86_400_000);
+    const to = parseTs(query.to) ?? new Date();
+    if (from.getTime() >= to.getTime()) { sendJson(res, 400, { error: "Invalid time range" }); return; }
+    const entry = normalizeEntry(query.entry ?? query.source);
+    // Session-level: delegation traces are not standalone sessions.
+    const sPred = entrySessionPredicate(entry, "s");
+
+    // Window + ordering by activity (last_active_at, falling back to created_at).
+    const conds: string[] = ["COALESCE(s.last_active_at, s.created_at) BETWEEN ? AND ?", sPred, "s.deleted_at IS NULL"];
+    const params: unknown[] = [from, to];
+    if (query.userId) { conds.push("s.user_id = ?"); params.push(query.userId); }
+    if (query.agentId) { conds.push("s.agent_id = ?"); params.push(query.agentId); }
+    if (query.cursorTs && query.cursorId) {
+      const cursorDate = new Date(parseInt(query.cursorTs, 10));
+      conds.push("(COALESCE(s.last_active_at, s.created_at) < ? OR (COALESCE(s.last_active_at, s.created_at) = ? AND s.id < ?))");
+      params.push(cursorDate, cursorDate, query.cursorId);
+    }
+    params.push(limit + 1);
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT s.id AS sessionId, s.user_id AS userId, s.agent_id AS agentId, a.name AS agentName,
+              s.title AS title, s.preview AS preview, s.origin AS origin, s.message_count AS messageCount,
+              s.created_at AS createdAt, s.last_active_at AS lastActiveAt,
+              (SELECT COUNT(*) FROM chat_messages cm WHERE cm.session_id = s.id AND cm.role = 'tool') AS toolCallCount,
+              (SELECT COUNT(*) FROM chat_messages cm WHERE cm.session_id = s.id AND cm.role = 'tool' AND cm.outcome = 'error') AS errorToolCallCount
+       FROM chat_sessions s
+       LEFT JOIN agents a ON s.agent_id = a.id
+       WHERE ${conds.join(" AND ")}
+       ORDER BY COALESCE(s.last_active_at, s.created_at) DESC, s.id DESC
+       LIMIT ?`,
+      params,
+    ) as any;
+
+    const hasMore = rows.length > limit;
+    const toIso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null));
+    const sessions = rows.slice(0, limit).map((r: any) => ({
+      sessionId: r.sessionId, userId: r.userId, agentId: r.agentId, agentName: r.agentName ?? null,
+      agentGroupName: null, // siclaw has no agent groups
+      title: r.title ?? null, preview: r.preview ?? null,
+      origin: r.origin ?? null,
+      source: r.origin === "task" ? "scheduled" : "interactive",
+      messageCount: Number(r.messageCount ?? 0),
+      toolCallCount: Number(r.toolCallCount ?? 0),
+      errorToolCallCount: Number(r.errorToolCallCount ?? 0),
+      createdAt: toIso(r.createdAt),
+      lastActiveAt: toIso(r.lastActiveAt),
+      activityAt: toIso(r.lastActiveAt) ?? toIso(r.createdAt),
+    }));
+
+    sendJson(res, 200, { sessions, hasMore });
+  });
+
+  // GET /api/v1/siclaw/audit/sessions/:id/messages — admin-only, READ-ONLY
+  // transcript snapshot of ANY session (NOT scoped to the requesting user, unlike
+  // the user-facing /agents/:id/chat/sessions/:sid/messages path). The Metrics
+  // Sessions tab lists every user's sessions, so opening one must not route
+  // through the owner-scoped chat endpoint (which 404s on other users').
+  router.get("/api/v1/siclaw/audit/sessions/:id/messages", async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const sessionId = params.id;
+    const MSG_CAP = 1000; // bounded snapshot — admin audit sessions are small
+    const db = getDb();
+
+    const [sRows] = await db.query(
+      `SELECT s.id AS sessionId, s.user_id AS userId, s.agent_id AS agentId, a.name AS agentName,
+              s.title AS title, s.preview AS preview, s.origin AS origin, s.message_count AS messageCount,
+              s.created_at AS createdAt, s.last_active_at AS lastActiveAt
+       FROM chat_sessions s LEFT JOIN agents a ON s.agent_id = a.id
+       WHERE s.id = ? AND s.deleted_at IS NULL`,
+      [sessionId],
+    ) as any;
+    if (sRows.length === 0) { sendJson(res, 404, { error: "Session not found" }); return; }
+    const s = sRows[0];
+    const toIso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null));
+
+    // Return RAW chat_messages rows (same shape the user-facing chat endpoint
+    // returns) so the frontend can map them through the SAME toPilotMessage /
+    // buildPilotMessages pipeline and render identically to the live chat. Order
+    // chronological (oldest first) — buildPilotMessages expects that.
+    const [mRows] = await db.query(
+      `SELECT id, role, content, tool_name, tool_input, outcome, duration_ms, metadata,
+              from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
+       FROM chat_messages WHERE session_id = ?
+       ORDER BY created_at ASC, id ASC LIMIT ?`,
+      [sessionId, MSG_CAP + 1],
+    ) as any;
+    const truncated = mRows.length > MSG_CAP;
+    const data = (mRows as any[]).slice(0, MSG_CAP).map((r) => ({
+      ...r,
+      // Parse JSON metadata to an object (legacy MySQL JSON, new TEXT, SQLite TEXT).
+      metadata: safeParseJson(r.metadata, null),
+      created_at: toIso(r.created_at),
+    }));
+
+    sendJson(res, 200, {
+      session: {
+        sessionId: s.sessionId, userId: s.userId, agentId: s.agentId, agentName: s.agentName ?? null,
+        title: s.title ?? null, preview: s.preview ?? null, origin: s.origin ?? null,
+        messageCount: Number(s.messageCount ?? 0),
+        createdAt: toIso(s.createdAt), lastActiveAt: toIso(s.lastActiveAt),
+      },
+      data,
+      truncated,
+    });
   });
 
   // ================================================================

@@ -278,6 +278,20 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(Object.keys(body.mcpServers)).toEqual(["enabled-one"]);
   });
 
+  it("includes the admin-provided MCP server description", async () => {
+    const db = getDb();
+    await db.query(
+      "INSERT INTO mcp_servers (id, org_id, name, transport, url, command, args, env, headers, enabled, description, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["x1", "default", "grafana", "http", "https://a.example", null, null, null, null, 1, "Monitoring tenant ID: t-123", "system"],
+    );
+
+    const { body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
+    );
+    expect(body.mcpServers.grafana.description).toBe("Monitoring tenant ID: t-123");
+  });
+
   it("surfaces custom skills with their specs + scripts", async () => {
     const db = getDb();
     const specs = "---\nname: my-custom-skill\ndescription: test\n---\n# Body\n";
@@ -536,6 +550,40 @@ describe("GET /api/v1/cli-snapshot", () => {
     ]);
     expect(body.modelRouting.candidates[1].modelConfig.apiKey).toBe("sk-anthropic");
     expect(body.activeAgent.modelRouting.candidates[0].provider).toBe("openai");
+  });
+
+  it("resolves a scoped agent's tool_capabilities into activeAgent.allowedTools", async () => {
+    const db = getDb();
+    await db.query(
+      "INSERT INTO agents (id, name, status, tool_capabilities, is_production, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+      ["ag-tools", "tools-agent", "active", JSON.stringify(["read_files", "scheduling"]), 1, "u"],
+    );
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot?agent=tools-agent", headers: authedHeaders() }),
+    );
+
+    expect(status).toBe(200);
+    expect(new Set(body.activeAgent.allowedTools)).toEqual(
+      new Set(["read", "grep", "find", "ls", "manage_schedule"]),
+    );
+  });
+
+  it("omits allowedTools for an agent with no tool_capabilities (unrestricted)", async () => {
+    const db = getDb();
+    await db.query(
+      "INSERT INTO agents (id, name, status, is_production, created_by) VALUES (?, ?, ?, ?, ?)",
+      ["ag-plain", "plain-agent", "active", 1, "u"],
+    );
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot?agent=plain-agent", headers: authedHeaders() }),
+    );
+
+    expect(status).toBe(200);
+    expect(body.activeAgent.allowedTools).toBeUndefined();
   });
 
   it("suppresses builtin skills that have an overlay", async () => {

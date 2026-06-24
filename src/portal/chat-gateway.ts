@@ -26,6 +26,7 @@ import {
 } from "../lib/error-envelope.js";
 import { defaultProviderModelCompat } from "../core/model-compat.js";
 import { resolveAgentModelRouting } from "./model-routing-config.js";
+import { authenticateApiKey } from "./api-key-auth.js";
 
 interface ChatAttachment {
   kind?: string;
@@ -277,13 +278,13 @@ async function parseChatRequestBody(
 }
 
 /** Resolve model binding directly from Portal's own DB. */
-async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelBinding | null> {
+export async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelBinding | null> {
   const db = getDb();
   const [agentRows] = await db.query(
-    "SELECT model_provider, model_id, model_routing FROM agents WHERE id = ?",
+    "SELECT model_provider, model_id, model_routing, system_prompt FROM agents WHERE id = ?",
     [agentId],
   ) as any;
-  const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown } | undefined;
+  const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; system_prompt?: string | null } | undefined;
   if (!agent?.model_provider || !agent?.model_id) return null;
 
   const [providerRows] = await db.query(
@@ -327,41 +328,10 @@ async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelB
       models,
     },
     ...(modelRouting ? { modelRouting } : {}),
+    systemPrompt: agent.system_prompt ?? null,
   };
 }
 
-// ── API key authentication ──────────────────────────────────
-
-interface ApiKeyAuthResult {
-  agentId: string;
-  keyId: string;
-  keyName: string;
-  createdBy: string;
-}
-
-async function authenticateApiKey(req: http.IncomingMessage): Promise<ApiKeyAuthResult | null> {
-  const auth = req.headers.authorization;
-  if (!auth?.startsWith("Bearer sk-")) return null;
-
-  const plaintext = auth.slice(7);
-  const keyHash = crypto.createHash("sha256").update(plaintext).digest("hex");
-
-  const db = getDb();
-  const [rows] = await db.query(
-    `SELECT id, agent_id, name, expires_at, created_by
-     FROM agent_api_keys WHERE key_hash = ? LIMIT 1`,
-    [keyHash],
-  ) as any;
-
-  if (rows.length === 0) return null;
-  const key = rows[0];
-
-  if (key.expires_at && new Date(key.expires_at) < new Date()) return null;
-
-  db.query("UPDATE agent_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?", [key.id]).catch(() => {});
-
-  return { agentId: key.agent_id, keyId: key.id, keyName: key.name, createdBy: key.created_by };
-}
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 /**
@@ -382,6 +352,30 @@ function writeSseHead(res: import("node:http").ServerResponse): void {
 function sseWrite(res: import("node:http").ServerResponse, event: string, data: unknown): void {
   if (res.writableEnded || res.destroyed) return;
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+/**
+ * Authorize that `userSub` may read a chat session's event/liveness channel: the session must
+ * belong to them. A not-yet-persisted (brand-new) session has no row → "ok" (nothing flows until
+ * the owner's own agent produces events). A row owned by someone else → "forbidden" (cross-tenant
+ * leak). A DB error → "error". Mirrors the user_id scoping every chat-session endpoint in
+ * siclaw-api.ts enforces; shared by the read-only /events and /status channels.
+ */
+async function authorizeSessionOwnership(
+  agentId: string,
+  sessionId: string,
+  userSub: string,
+): Promise<"ok" | "forbidden" | "error"> {
+  try {
+    const [rows] = await getDb().query(
+      "SELECT user_id FROM chat_sessions WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+      [sessionId, agentId],
+    ) as any;
+    if (rows.length > 0 && rows[0].user_id !== userSub) return "forbidden";
+    return "ok";
+  } catch {
+    return "error";
+  }
 }
 
 export function registerChatRoutes(
@@ -486,6 +480,7 @@ export function registerChatRoutes(
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,
       modelRouting: modelBinding.modelRouting,
+      systemPrompt: modelBinding.systemPrompt ?? undefined,
       turnStartMs,
     });
 
@@ -525,24 +520,11 @@ export function registerChatRoutes(
     const sessionId = params.sessionId;
 
     // Authorization: this is a read channel for the session's chat.event stream, so the
-    // caller MUST own it — mirror the user_id scoping every chat-session endpoint in
-    // siclaw-api.ts enforces. If the session row exists but belongs to another user, reject
-    // (cross-tenant leak). A not-yet-persisted (brand-new) session has no row: allow it
-    // (nothing flows until the owner's own agent produces events) so the frontend's
-    // EventSource doesn't 404-storm before the first message lands.
-    try {
-      const [rows] = await getDb().query(
-        "SELECT user_id FROM chat_sessions WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
-        [sessionId, agentId],
-      ) as any;
-      if (rows.length > 0 && rows[0].user_id !== payload.sub) {
-        sendJson(res, 403, { error: "Forbidden" });
-        return;
-      }
-    } catch {
-      sendJson(res, 500, { error: "Failed to authorize session" });
-      return;
-    }
+    // caller MUST own it. A brand-new (not-yet-persisted) session has no row → allowed, so the
+    // frontend's EventSource doesn't 404-storm before the first message lands.
+    const authz = await authorizeSessionOwnership(agentId, sessionId, payload.sub);
+    if (authz === "forbidden") { sendJson(res, 403, { error: "Forbidden" }); return; }
+    if (authz === "error") { sendJson(res, 500, { error: "Failed to authorize session" }); return; }
 
     writeSseHead(res);
 
@@ -575,6 +557,30 @@ export function registerChatRoutes(
       try { res.write(": keepalive\n\n"); } catch { cleanup(); }
     }, 25_000);
     keepalive.unref?.();
+  });
+
+  // GET /api/v1/siclaw/agents/:id/chat/sessions/:sessionId/status — explicit turn liveness.
+  //
+  // Read-only. The Portal frontend calls this right after loading history on a fresh page
+  // (hard refresh / reconnect): if the turn is still running it re-attaches to the live
+  // /events stream and keeps rendering, instead of showing a static snapshot. Liveness is the
+  // runtime/agentbox's own activity flags (chat.sessionStatus RPC → agentbox /status), never a
+  // chat-row inference. Any failure is fail-safe `{running:false}` — better a static page than
+  // a stuck spinner.
+  router.get("/api/v1/siclaw/agents/:id/chat/sessions/:sessionId/status", async (req, res, params) => {
+    const auth = requireAuth(req, jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+
+    const authz = await authorizeSessionOwnership(params.id, params.sessionId, auth.userId);
+    if (authz === "forbidden") { sendJson(res, 403, { error: "Forbidden" }); return; }
+    if (authz === "error") { sendJson(res, 500, { error: "Failed to authorize session" }); return; }
+
+    const result = await connectionMap.sendCommand(params.id, "chat.sessionStatus", {
+      agentId: params.id,
+      userId: auth.userId,
+      sessionId: params.sessionId,
+    });
+    sendJson(res, 200, { running: result.ok && !!(result.payload as Record<string, unknown> | undefined)?.running });
   });
 
   // POST /api/v1/siclaw/agents/:id/chat/steer — inject steer message
@@ -725,10 +731,12 @@ export function registerChatRoutes(
       text: body.text,
       sessionId,
       mode: "api",
+      origin: "api", // audit category: external API-key sessions (/api/v1/run)
       modelProvider: modelBinding.modelProvider,
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,
       modelRouting: modelBinding.modelRouting,
+      systemPrompt: modelBinding.systemPrompt ?? undefined,
     });
 
     if (!result.ok && !resolved) {

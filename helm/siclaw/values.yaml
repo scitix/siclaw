@@ -82,6 +82,10 @@ runtime:
 # -- Portal (standalone web UI, replaces Upstream)
 portal:
   enabled: true
+  # Keep at 1. Live chat/A2A SSE streaming and the in-process A2A task trackers
+  # (src/portal/a2a-gateway.ts) are process-local, and a Runtime phone-homes to a
+  # single Portal instance — so >1 replica would scatter streams across pods that
+  # don't hold the Runtime connection. Horizontal scale needs a shared pub/sub first.
   replicas: 1
   jwtSecret: ""         # Portal's JWT signing key (Portal is the auth boundary)
   portalSecret: ""      # shared with Runtime; verifies Runtime phone-home X-Auth-Token
@@ -164,12 +168,29 @@ ocr:
 agentbox:
   debugImage: ""
   persistence:
+    # PVC persistence has two independent concepts:
+    #   1. PVC availability (infrastructure) — is a shared RWX PVC present that
+    #      agents can mount? Controlled by `enabled` (chart provisions one) OR
+    #      `claimName` (reference one you created out-of-band).
+    #   2. Global default policy — should callers that DON'T set a per-agent
+    #      persistence value use the PVC? Controlled by `enabled` only.
+    # A per-agent opt-in (chat.send persistence:true, e.g. from a product portal)
+    # mounts the PVC whenever it is *available*, regardless of the global default.
+
+    # Global default policy. true ⇒ also chart-provision + mount the PVC below.
     enabled: false
-    # Override the shared PVC name. Empty → "<release-fullname>-data".
+    # Reference a PRE-EXISTING RWX PVC by name. Set this (with enabled:false) to
+    # make the PVC available for per-agent opt-in while keeping the global default
+    # OFF. REQUIRED and has NO default on this path — the name differs per
+    # deployment and must match a PVC you already created; empty ⇒ no PVC to
+    # mount, all agents fall back to emptyDir.
+    # When enabled:true this just overrides the chart-managed PVC name
+    # (empty → "<release-fullname>-data").
     claimName: ""
-    # REQUIRED when enabled: true. Must support ReadWriteMany.
+    # REQUIRED when enabled: true (chart-provisioned PVC). Must support ReadWriteMany.
     # Examples: nfs, efs-sc, csi-cephfs, longhorn (with RWX).
     # Leaving this empty while enabled keeps the PVC in Pending state.
+    # Ignored when referencing an existing PVC via claimName (enabled:false).
     storageClassName: ""
     size: "10Gi"
 
@@ -182,11 +203,16 @@ metrics:
     namespace: ""
     namespaceSelector: {}
     additionalLabels: {}
-  podMonitor:
-    enabled: true
-    interval: 15s
-    namespace: ""
-    additionalLabels: {}
+    # gateway:3001/metrics is the ONLY scrape target (agentbox federation re-exports
+    # here). The gateway's checkMetricsAuth fails OPEN when SICLAW_METRICS_TOKEN is
+    # unset (the default — rely on NetworkPolicy), so leave this empty in that case.
+    # If you DO set SICLAW_METRICS_TOKEN, you MUST point bearerTokenSecret at a Secret
+    # holding the same token, otherwise every scrape 401s and all metrics go dark.
+    # Example: { name: siclaw-metrics-token, key: token }
+    bearerTokenSecret: {}
+  # NOTE: the agentbox PodMonitor was removed — agentbox metrics are now federated
+  # through the Gateway and exported from gateway:3001 (ServiceMonitor above), the
+  # single stable scrape target. See metrics-federation-DESIGN.md.
   grafanaDashboard:
     enabled: true
     namespace: ""

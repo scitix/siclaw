@@ -141,6 +141,8 @@ export async function bootstrapRuntime(opts: BootstrapRuntimeOptions): Promise<R
     return taskCoordinator.fireNow(taskId);
   });
 
+  runtime.rpcMethods.set("channel.reload", async () => channelManager.reloadFromDb());
+
   return {
     runtime,
     async close() {
@@ -160,15 +162,32 @@ function createSpawner(
   if (kind === "k8s") {
     const image = opts.k8sImage ?? process.env.SICLAW_AGENTBOX_IMAGE ?? "siclaw-agentbox:latest";
     const namespace = opts.k8sNamespace ?? process.env.SICLAW_K8S_NAMESPACE ?? "default";
-    const claimName =
-      opts.k8sPersistenceClaimName ?? process.env.SICLAW_PERSISTENCE_CLAIM_NAME ?? "siclaw-data";
+    // claimName identifies the shared PVC the deployer actually created — its name
+    // differs per deployment, so there is NO hardcoded default. It is "available"
+    // only when explicitly configured (helm opt or SICLAW_PERSISTENCE_CLAIM_NAME).
+    const claimName = opts.k8sPersistenceClaimName ?? process.env.SICLAW_PERSISTENCE_CLAIM_NAME;
+    const globalEnabled = process.env.SICLAW_PERSISTENCE_ENABLED === "true";
+    // Behaviour change vs the old hardcoded "siclaw-data" default: a raw-env
+    // deploy that set only SICLAW_PERSISTENCE_ENABLED=true (no claim name) now
+    // silently degrades to emptyDir instead of binding a PVC named "siclaw-data".
+    // Warn once at startup so that regression is visible (Helm always injects the
+    // claim name when a PVC is available, so chart users never hit this).
+    if (globalEnabled && !claimName) {
+      console.warn(
+        "[runtime] SICLAW_PERSISTENCE_ENABLED=true but SICLAW_PERSISTENCE_CLAIM_NAME is unset — " +
+        "persistence falls back to emptyDir (no shared PVC mounted; session/memory will NOT survive pod restarts)",
+      );
+    }
+    // Decouple infrastructure (claimName: is a shared PVC available?) from policy
+    // (enabled: the global default for callers that don't specify per-agent).
+    // Pass claimName whenever it's configured — so a per-agent opt-in
+    // (boxConfig.persistence, e.g. from an external portal) can mount the PVC even
+    // when the global flag is off. The spawner gates the actual mount on claimName,
+    // so when it's absent persistence simply degrades to emptyDir.
     return new K8sSpawner({
       namespace,
       image,
-      persistence:
-        process.env.SICLAW_PERSISTENCE_ENABLED === "true"
-          ? { enabled: true, claimName }
-          : undefined,
+      persistence: claimName ? { enabled: globalEnabled, claimName } : undefined,
     });
   }
   if (kind === "process") return new ProcessSpawner();

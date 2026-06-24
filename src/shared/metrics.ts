@@ -5,11 +5,21 @@
  * Business code never imports this module directly — it only calls emitDiagnostic().
  *
  * Importing this module (side-effect import) registers the subscriber automatically.
+ *
+ * ⚠️ FEDERATION CARDINALITY: in K8s mode every `siclaw_`-prefixed counter/histogram
+ * registered here is pulled by the Gateway and federated into a single long-lived
+ * Prometheus series (see docs metrics-federation-DESIGN.md). Unlike the old direct
+ * scrape — where a short-lived pod's series disappeared on pod GC — federated series
+ * accumulate on the Gateway indefinitely. Adding a metric with an unbounded label
+ * (session_id, request_id, …) therefore grows the Gateway's series set permanently.
+ * Keep new label sets low-cardinality, or they will not be a problem you can GC away.
  */
 
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { Counter, Gauge, Histogram, Registry } from "prom-client";
 import { onDiagnostic, type DiagnosticEvent } from "./diagnostic-events.js";
+import type { PromSampleGroup } from "./metrics-types.js";
 
 /**
  * Check bearer token authentication for /metrics endpoints.
@@ -27,6 +37,30 @@ export function checkMetricsAuth(req: http.IncomingMessage, res: http.ServerResp
 }
 
 export const metricsRegistry = new Registry();
+
+/**
+ * Per-process start nonce. Generated once when this module is first imported
+ * (which happens once per process). Reported alongside the federation snapshot so
+ * the Gateway aggregator can tell two process incarnations apart even when they
+ * share the same boxId (boxId is derived from agentId and is reused across pod
+ * rebuilds). See metrics-federation-DESIGN.md module 1.
+ */
+export const processIncarnation = randomUUID();
+
+/**
+ * Federation snapshot: the raw cumulative current values of this process's
+ * prom-client registry, for the Gateway to pull and delta-accumulate (K8s mode,
+ * path ②).
+ *
+ * The returned values are CUMULATIVE and must never be cleared by callers.
+ */
+export async function getMetricsAsJSON(): Promise<PromSampleGroup[]> {
+  // prom-client's .d.ts types `type` as the numeric MetricType enum, but the
+  // runtime emits the lowercase string ("counter"/"gauge"/"histogram"/"summary")
+  // that PromSampleGroup expects. The extra fields (aggregator/exemplar) are
+  // harmless on the wire and ignored by the aggregator. Cast over the known gap.
+  return (await metricsRegistry.getMetricsAsJSON()) as unknown as PromSampleGroup[];
+}
 
 /** Whether to include user_id label on token/cost metrics (dynamic, refreshable) */
 let includeUserId = process.env.SICLAW_METRICS_USER_ID !== "false";

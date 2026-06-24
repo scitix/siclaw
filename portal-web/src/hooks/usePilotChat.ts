@@ -7,7 +7,7 @@
  */
 
 import { useState, useCallback, useEffect, useMemo, useRef } from "react"
-import { api, chatSteer, chatAbort } from "../api"
+import { api, chatSteer, chatAbort, chatSessionStatus } from "../api"
 import type {
   PilotMessage,
   ContextUsage,
@@ -64,7 +64,7 @@ interface ChatSession {
   updated_at?: string
 }
 
-interface ChatMessage {
+export interface ChatMessage {
   id: string
   role: "user" | "assistant" | "tool"
   content: string
@@ -96,6 +96,9 @@ interface UsePilotChatReturn {
   pendingMessages: string[]
   hasMore: boolean
   loadingMore: boolean
+  /** Detached background work (bg exec job / bg sub-agent) still running after the turn ended —
+   *  drives the input's Stop button so it stays available to sweep these jobs. */
+  hasBackgroundWork: boolean
   send: (text: string, attachments?: ChatAttachment[]) => void
   steer: (text: string, attachments?: ChatAttachment[]) => void
   abort: () => void
@@ -339,6 +342,23 @@ function findLastMessageIndex<T>(items: T[], predicate: (item: T) => boolean): n
   return -1;
 }
 
+/**
+ * Drop the live output of a failed model-routing primary attempt: the streaming
+ * assistant bubble and any error bubble rendered after the latest visible user
+ * message. The user turn, earlier history, and hidden ledger rows are kept, so
+ * the fallback candidate's reply streams in cleanly instead of stacking under
+ * the rolled-back attempt's output. Matches the gateway's commit-gated
+ * persistence (a rolled-back attempt is never written to the DB).
+ */
+export function dropFailedAttemptOutput(messages: PilotMessage[]): PilotMessage[] {
+  const lastUserIdx = findLastMessageIndex(messages, (m) => m.role === "user" && !m.hidden);
+  if (lastUserIdx < 0) return messages;
+  const head = messages.slice(0, lastUserIdx + 1);
+  const tailHidden = messages.slice(lastUserIdx + 1).filter((m) => m.hidden);
+  if (tailHidden.length === messages.length - lastUserIdx - 1) return messages;
+  return [...head, ...tailHidden];
+}
+
 function extractTiming(metadata: Record<string, unknown> | undefined, durationMs: number | null | undefined): import("../components/chat/types").MessageTiming | undefined {
   // Tool rows: duration_ms (⚙️ exec) is its own column; pre_thinking_ms
   // (💭 model-thinking-before-this-tool) lives at metadata.pre_thinking_ms.
@@ -378,7 +398,37 @@ async function fetchSessionPage1(
     `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
   )
   const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-  return { items, pilotMsgs: annotateSubagentCompletions(annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage)))) }
+  return { items, pilotMsgs: buildPilotMessages(items) }
+}
+
+/**
+ * Map raw chat_messages rows → rendered PilotMessages with the full annotation
+ * pipeline (delegation synthesis, exec-job + sub-agent completion folding). This
+ * is the exact transform the live chat applies, so any read-only consumer (e.g.
+ * the admin session-snapshot view) renders identically. Input must be in
+ * chronological order (oldest first).
+ */
+export function buildPilotMessages(items: ChatMessage[]): PilotMessage[] {
+  return annotateSubagentCompletions(annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage))))
+}
+
+/**
+ * Recover the most recent persisted context-usage snapshot from loaded history.
+ * The Runtime stores it on the latest assistant row's `metadata.context_usage`
+ * (see sse-consumer.ts agent_end handling), so the context meter can render on
+ * session open/refresh instead of staying blank until the next live turn.
+ * Items are chronological (oldest first), so scan from the end.
+ */
+function latestContextUsageFromItems(items: ChatMessage[]): ContextUsage | null {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const md = normalizeMetadata(items[i]?.metadata)
+    const cu = md?.context_usage as ContextUsage | undefined
+    // Require percent > 0 to match the meter's render guard (InputArea), so a
+    // zero-percent snapshot (e.g. usage-less turn) doesn't shadow an earlier
+    // real one and leave the meter blank.
+    if (cu && typeof cu === "object" && typeof cu.percent === "number" && cu.percent > 0) return cu
+  }
+  return null
 }
 
 export function toPilotMessage(m: ChatMessage): PilotMessage {
@@ -397,13 +447,27 @@ export function toPilotMessage(m: ChatMessage): PilotMessage {
   const staleRunning = isStaleRunningTool(m)
   const toolIsDelegation = isDelegationTool(m.tool_name)
   const toolStatus = toolStatusFromMessage(m)
-  const recoveredMetadata = staleRunning
+  // A background-exec launch whose completion was never persisted (e.g. an agentbox/gateway
+  // crash mid-job) would read as "still running" forever after a refresh — stranding the input's
+  // Stop button (hasBackgroundWork) on a job that no longer exists. Past the stale window with no
+  // folded bgStatus, mark it timed_out. Order-safe: a real completion in annotateExecJobCompletions
+  // overwrites this, so it only bites the never-completed case. (NaN age compares false → no synth.)
+  const bgTaskId = metadata?.backgroundTaskId
+  const bgLaunchStale =
+    m.role === "tool" &&
+    typeof bgTaskId === "string" &&
+    !metadata?.bgStatus &&
+    Date.now() - parsePortalTimestamp(m.created_at) > NON_DELEGATION_TOOL_STALE_MS
+  let recoveredMetadata = staleRunning
     ? {
         ...(metadata ?? {}),
         status: "timed_out",
         recovery_reason: toolIsDelegation ? "stale_delegation_tool" : "stale_running_tool",
       }
     : metadata
+  if (bgLaunchStale) {
+    recoveredMetadata = { ...(recoveredMetadata ?? {}), bgStatus: "timed_out" }
+  }
   const timing = extractTiming(metadata, m.duration_ms)
   return {
     id: m.id,
@@ -635,6 +699,23 @@ function hasActiveBackgroundSubagent(messages: PilotMessage[]): boolean {
   return messages.some((m) => isBackgroundSpawnLaunch(m) && !m.metadata?.subBgStatus)
 }
 
+/** A background exec job (host_exec/node_exec/pod_exec/bash run_in_background) that launched
+ *  but hasn't reported completion yet. The launch tool row carries metadata.backgroundTaskId
+ *  (set in background-launch.ts); bgStatus is attached when exec_job_done folds it in. */
+function isActiveBackgroundExecJob(m: PilotMessage): boolean {
+  if (m.role !== "tool") return false
+  const meta = m.metadata as Record<string, unknown> | undefined
+  return typeof meta?.backgroundTaskId === "string" && !meta?.bgStatus
+}
+
+/** Any detached background work still running after the turn ended — background exec jobs or
+ *  background sub-agents. (Async delegate_to_agents already keeps `streaming` true via its own
+ *  poller, so it's covered by isLoading and not counted here.) Used to keep the input's Stop
+ *  button available so the user can sweep these via chat.abort without a follow-up message. */
+export function hasActiveBackgroundWork(messages: PilotMessage[]): boolean {
+  return messages.some((m) => isActiveBackgroundExecJob(m)) || hasActiveBackgroundSubagent(messages)
+}
+
 function hasPendingDelegationSynthesis(messages: PilotMessage[]): boolean {
   return messages.some((message) => message.metadata?.ui_state === "synthesizing")
 }
@@ -657,6 +738,14 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const abortControllerRef = useRef<AbortController | null>(null)
   const streamingRef = useRef(false)
   const recoveredStreamingRef = useRef(false)
+  // True after a fresh page load (hard refresh / reconnect) finds the turn still running per the
+  // explicit liveness signal: the persistent /events EventSource then renders its chat.event
+  // frames LIVE via handleChatEvent (vs. the DB-poll fallback in recoveredStreamingRef). Cleared
+  // on prompt_done/done, on a new send/abort, and on session switch.
+  const recoveredLiveRef = useRef(false)
+  // Latest handleChatEvent, reachable from the persistent EventSource effect (which is declared
+  // BEFORE handleChatEvent — TDZ) without adding it to that effect's deps.
+  const handleChatEventRef = useRef<((evt: Record<string, unknown>) => void) | null>(null)
   const isAbortingRef = useRef(false)
   // Timestamp until which history refetches stay suppressed AFTER chatAbort resolves. The gateway
   // finalizes the stopped tool rows asynchronously (decoupled from the abort RPC), so a refetch in
@@ -668,6 +757,9 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const [isCompacting, setIsCompacting] = useState(false)
   const hasActiveAsyncDelegation = hasActiveAsyncDelegationSurface(messages)
   const hasActiveBgSubagent = hasActiveBackgroundSubagent(messages)
+  // Detached background work still running (bg exec job or bg sub-agent) — keeps the input's
+  // Stop button available after the turn ends so the user can sweep it via chat.abort.
+  const hasBackgroundWork = hasActiveBackgroundWork(messages)
 
   // Per-session state cache: preserves ALL state across session switches so each
   // agent's conversation feels independent — like browser tabs.
@@ -711,6 +803,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setStreaming(false)
       streamingRef.current = false
       recoveredStreamingRef.current = false
+      recoveredLiveRef.current = false
       setContextUsage(null)
       setHasMore(true)
       pageRef.current = 1
@@ -727,6 +820,12 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setStreaming(true)
       streamingRef.current = true
       recoveredStreamingRef.current = false
+      // If a live /send reader still owns this session (abortControllerRef set, the isActive
+      // soft-switch path), it finalizes the turn — keep the /events live feed OFF to avoid
+      // double-rendering. Otherwise (no reader: a reconnected turn we switched away from and
+      // back to) re-enable the live feed + safety-net so the turn can still finalize; without
+      // this the spinner would hang until reload.
+      recoveredLiveRef.current = abortControllerRef.current === null
       setDpActive(cached.dpActive)
       setContextUsage(cached.contextUsage)
       setHasMore(true)
@@ -748,13 +847,30 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         pageRef.current = 1
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
-        const hasRunning = hasRunningPersistedMessages(pilotMsgs)
-        const recoveredActive = hasRunning || hasPendingDelegationSynthesis(pilotMsgs)
         setMessages(pilotMsgs)
+        // Restore the context meter from persisted history so it shows on open/
+        // refresh — without it the meter stays blank until the next live
+        // agent_end. Only set when a snapshot is found: never blank an existing
+        // value (a cache-hit restore at line ~833, or a live agent_end that
+        // landed while this fetch was in flight).
+        const restoredUsage = latestContextUsageFromItems(items)
+        if (restoredUsage) setContextUsage(restoredUsage)
+        setHasMore(items.length >= PAGE_SIZE)
+        const hasRunning = hasRunningPersistedMessages(pilotMsgs)
+
+        // Explicit liveness (agentbox isAgentActive/isCompacting/isRetrying) is authoritative for
+        // "is this turn still running" — unlike the hasRunning row-heuristic it also catches a turn
+        // that is thinking / streaming text with no tool in flight (end-only persistence has no row
+        // for that state). When live, re-attach to the /events stream and render it live below
+        // (recoveredLiveRef); the DB poller is the fallback only when liveness is unavailable/false.
+        let live = false
+        try { live = (await chatSessionStatus(agentId, sessionId!)).running } catch { /* fail-safe: static */ }
+        if (cancelled) return
+        const recoveredActive = live || hasRunning || hasPendingDelegationSynthesis(pilotMsgs)
         setStreaming(recoveredActive)
         streamingRef.current = recoveredActive
-        recoveredStreamingRef.current = hasRunning
-        setHasMore(items.length >= PAGE_SIZE)
+        recoveredLiveRef.current = live
+        recoveredStreamingRef.current = hasRunning && !live
       } catch (err) {
         console.error("[usePilotChat] Failed to load messages:", err)
         if (!cancelled) {
@@ -762,6 +878,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           setStreaming(false)
           streamingRef.current = false
           recoveredStreamingRef.current = false
+          recoveredLiveRef.current = false
           setHasMore(false)
         }
       }
@@ -814,7 +931,9 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
         // While an abort is in flight the gateway is still finalizing the stopped tool rows;
         // don't let this poll re-paint them as "running" over the optimistic "aborted" state.
-        if (!refetchSuppressedByAbort()) setMessages(pilotMsgs)
+        // Also stand down while the /events live feed owns the message list (recoveredLiveRef) —
+        // a wholesale DB replace would clobber live-streamed assistant text not yet persisted.
+        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages(pilotMsgs)
         setHasMore(items.length >= PAGE_SIZE)
 
         if (hasRunning) {
@@ -846,6 +965,48 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     }
   }, [agentId, sessionId, streaming])
 
+  // Terminal safety-net for the live-reconnect feed. While we render a recovered live turn off
+  // the /events stream (recoveredLiveRef), prompt_done is the fast finalizer — but if the
+  // EventSource dropped and missed it, the spinner would hang. Slow-poll the explicit liveness
+  // signal; once the turn is no longer running, finalize and do one authoritative refetch.
+  useEffect(() => {
+    if (!sessionId || !streaming || !recoveredLiveRef.current) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    async function check() {
+      try {
+        const { running } = await chatSessionStatus(agentId, sessionId!)
+        if (cancelled) return
+        if (!running) {
+          recoveredLiveRef.current = false
+          setStreaming(false)
+          streamingRef.current = false
+          recoveredStreamingRef.current = false
+          setPendingSteers([])
+          try {
+            const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
+            if (!cancelled && pageRef.current === 1 && !refetchSuppressedByAbort()) {
+              setMessages(pilotMsgs)
+              setHasMore(items.length >= PAGE_SIZE)
+            }
+          } catch { /* keep last live state on refetch failure */ }
+          return
+        }
+      } catch { /* transient liveness probe failure — keep watching */ }
+      if (!cancelled) timer = setTimeout(check, 6000)
+    }
+
+    // First check soon (bounds the race where a short turn's prompt_done landed during the
+    // liveness-probe window, before recoveredLiveRef was set, so the live feed never saw it),
+    // then back off to a slow heartbeat.
+    timer = setTimeout(check, 2000)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [agentId, sessionId, streaming])
+
   // Async delegation is intentionally detached from the parent prompt, so the
   // normal SSE request may be closed while sub-agents continue in the
   // background. Poll persisted history while an async batch card is running or
@@ -861,14 +1022,18 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
         const pendingSynthesis = hasPendingDelegationSynthesis(pilotMsgs)
-        if (!refetchSuppressedByAbort()) setMessages(pilotMsgs)
+        // Stand down while the /events live feed owns the message list — a wholesale DB replace
+        // would clobber live-streamed text not yet persisted.
+        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages(pilotMsgs)
         setHasMore(items.length >= PAGE_SIZE)
         if (pendingSynthesis) {
           setStreaming(true)
           streamingRef.current = true
         }
         if (!hasActiveAsyncDelegationSurface(pilotMsgs)) {
-          if (!recoveredStreamingRef.current && !abortControllerRef.current) {
+          // Don't end streaming if a recovered live turn is still in flight (its own finalizers
+          // — prompt_done / the liveness safety-net — own that transition).
+          if (!recoveredStreamingRef.current && !recoveredLiveRef.current && !abortControllerRef.current) {
             setStreaming(false)
             streamingRef.current = false
           }
@@ -914,12 +1079,15 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     return () => { cancelled = true; if (timer) clearTimeout(timer) }
   }, [agentId, sessionId, hasActiveBgSubagent])
 
-  // Persistent per-session SSE: receives server-pushed turns that land while the user is
-  // idle — e.g. a background job's completion turn, generated AFTER the /send stream closed.
-  // We do NOT render events live off this channel (the synthetic turn's body isn't streamed
-  // here — message_update text deltas are intentionally not emitted). Instead, a
-  // `background_turn_done` signal triggers a silent history refetch, so the completed turn
-  // appears without a manual reload. EventSource can't set headers → JWT via ?token=.
+  // Persistent per-session SSE. Two jobs:
+  //  1. Idle: receives server-pushed turns that land while no /send stream is open — a background
+  //     job's completion turn (background_turn_done → silent refetch), exec_job_done / subagent_done
+  //     card folds.
+  //  2. Reconnect-after-refresh: when liveness (recoveredLiveRef) says the turn is still running,
+  //     this channel's full event stream (it carries message_update text deltas, tool lifecycle,
+  //     prompt_done — the runtime broadcasts every consumed event) is fed LIVE into handleChatEvent
+  //     so a freshly-loaded page keeps streaming instead of showing a static snapshot.
+  // EventSource can't set headers → JWT via ?token=.
   useEffect(() => {
     if (!sessionId) return
     const token = localStorage.getItem("token")
@@ -992,6 +1160,21 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             }),
           )
         }
+
+        // Reconnect-after-refresh: when liveness said the turn is still running (recoveredLiveRef),
+        // render this channel's events LIVE through the same path /send uses, so streaming text and
+        // tool transitions appear without a manual reload. On prompt_done/done, stop live-feeding and
+        // do one authoritative refetch — end-only persistence means text streamed before we attached
+        // isn't in our buffer, so the DB reconcile heals the reconnect-window gap.
+        if (recoveredLiveRef.current) {
+          // Via ref: handleChatEvent is declared later in the component (TDZ), and routing through
+          // a ref also keeps it out of this effect's deps so the EventSource isn't re-subscribed.
+          handleChatEventRef.current?.(evt)
+          if (evt?.type === "prompt_done" || evt?.type === "done") {
+            recoveredLiveRef.current = false
+            scheduleRefetch()
+          }
+        }
       } catch { /* ignore malformed frame */ }
     })
     // EventSource auto-reconnects on transient errors; nothing to do here.
@@ -1027,15 +1210,41 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       }
 
       switch (eventType) {
+        // Runtime stream error. On the /send path this is translated to a canonical SSE `error`
+        // frame and handled by the reader loop — handleChatEvent never sees it there. But the
+        // /events reconnect feed forwards stream_error verbatim, so without this case a stream
+        // error during a recovered live turn would render no bubble. Surface it the same way.
+        case "stream_error": {
+          const detail = parseErrorDetail((evt as { error?: unknown }).error)
+          setMessages((prev) => [...prev, makeErrorMessage(detail)])
+          setStreaming(false)
+          streamingRef.current = false
+          recoveredStreamingRef.current = false
+          break
+        }
+
         case "model_route_start":
           currentModelRouteRef.current = null
+          break
+
+        case "model_route_rollback":
+          // The primary candidate streamed live, then failed. Drop what it
+          // rendered so the fallback's reply (streaming in next) replaces it
+          // rather than stacking under it. The upcoming model_route_switch
+          // still records that the model changed.
+          setMessages((prev) => dropFailedAttemptOutput(prev))
           break
 
         case "model_route_switch":
           break
 
         case "model_route_success": {
-          currentModelRouteRef.current = modelRouteFromEvent(evt)
+          // Match the gateway's persistence predicate (sse-consumer): route
+          // metadata is kept only for fallback/recovery replies. Tagging every
+          // routed reply live would make the model label vanish on reload.
+          const route = modelRouteFromEvent(evt)
+          currentModelRouteRef.current =
+            route && (route.is_fallback || route.recovered_from_candidate_key) ? route : null
           break
         }
 
@@ -1407,6 +1616,9 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     },
     [resetDpState],
   )
+  // Keep the ref pointed at the latest handleChatEvent so the persistent EventSource effect
+  // (declared earlier) can render reconnect-after-refresh events live without a stale closure.
+  handleChatEventRef.current = handleChatEvent
 
   // --- Load more (older) messages ---
   const loadMore = useCallback(async () => {
@@ -1470,6 +1682,9 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setStreaming(true)
       streamingRef.current = true
       recoveredStreamingRef.current = false
+      // A fresh /send stream is now the live source — stop feeding the /events channel into the
+      // renderer (would double-render the same turn).
+      recoveredLiveRef.current = false
       setStreamText("")
 
       // Start SSE
@@ -1675,6 +1890,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     setStreaming(false)
     streamingRef.current = false
     recoveredStreamingRef.current = false
+    recoveredLiveRef.current = false
   }, [agentId, sessionId])
 
   // --- Remove pending ---
@@ -1705,6 +1921,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     pendingMessages,
     hasMore,
     loadingMore,
+    hasBackgroundWork,
     send,
     steer,
     abort,

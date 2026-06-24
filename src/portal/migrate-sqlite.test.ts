@@ -11,7 +11,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     await closeDb();
   });
 
-  it("creates all 27 tables without error", async () => {
+  it("creates all 33 tables without error", async () => {
     await runPortalMigrations();
     const db = getDb();
     const [rows] = await db.query<Array<{ name: string }>>(
@@ -20,6 +20,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     const tableNames = rows.map((r) => r.name);
 
     const expected = [
+      "a2a_tasks",
       "agent_api_keys",
       "agent_channel_auth",
       "agent_clusters",
@@ -76,11 +77,15 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_chat_messages_audit",
       "idx_chat_messages_parent",
       "idx_chat_messages_delegation",
+      "idx_a2a_tasks_agent_key",
+      "idx_a2a_tasks_session",
+      "idx_a2a_tasks_context_key",
       "idx_notifications_user",
       "idx_api_keys_hash",
       "idx_agent_task_runs_task",
       "idx_agent_task_runs_session",
       "idx_channel_bindings_agent",
+      "idx_channel_binding_sessions_session",
       "idx_kpe_created",
       "idx_kpe_repo",
       "idx_skills_overlay",
@@ -176,6 +181,30 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     const db = getDb();
     const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(agents)");
     expect(rows.map((r) => r.name)).toContain("model_routing");
+  });
+
+  it("channel_bindings.session_id column exists after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(channel_bindings)");
+    expect(rows.map((r) => r.name)).toContain("session_id");
+  });
+
+  it("channel_binding_sessions table exists after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(channel_binding_sessions)");
+    const cols = rows.map((r) => r.name);
+    expect(cols).toContain("binding_id");
+    expect(cols).toContain("session_key");
+    expect(cols).toContain("session_id");
+  });
+
+  it("agents.tool_capabilities column exists after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(agents)");
+    expect(rows.map((r) => r.name)).toContain("tool_capabilities");
   });
 
   it("skills and skill_versions files columns exist after migration", async () => {

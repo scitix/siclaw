@@ -6,6 +6,7 @@ import { useToast } from "../components/toast"
 import { Tooltip } from "../components/tooltip"
 import { useConfirm } from "../components/confirm-dialog"
 import { buildChatPath, chatSessionForAgent } from "../lib/chatSelection"
+import { CapabilityGroupSelector } from "../components/CapabilityGroupSelector"
 
 interface Agent {
   id: string; name: string; description: string; status: string
@@ -26,7 +27,8 @@ export function Agents() {
   const [providers, setProviders] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
   const [showCreate, setShowCreate] = useState(false)
-  const [form, setForm] = useState({ name: "", description: "", model_provider: "", model_id: "", is_production: true })
+  const [form, setForm] = useState({ name: "", description: "", model_provider: "", model_id: "", is_production: true, tool_capabilities: [] as string[] })
+  const [restrictTools, setRestrictTools] = useState(false)
   const [creating, setCreating] = useState(false)
   const navigate = useNavigate()
   const toast = useToast()
@@ -49,7 +51,8 @@ export function Agents() {
       const a = await api<Agent>("/agents", { method: "POST", body: form })
       setAgents((prev) => [...prev, a])
       setShowCreate(false)
-      setForm({ name: "", description: "", model_provider: "", model_id: "", is_production: true })
+      setRestrictTools(false)
+      setForm({ name: "", description: "", model_provider: "", model_id: "", is_production: true, tool_capabilities: [] })
     } catch (err: any) { toast.error(err.message) } finally { setCreating(false) }
   }
 
@@ -102,7 +105,8 @@ export function Agents() {
       </div>
 
       {showCreate && (
-        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-4">
+        <div className="mx-6 my-4 rounded-lg border border-border bg-card flex flex-col max-h-[calc(100vh-120px)]">
+          <div className="p-4 space-y-4 overflow-y-auto">
           <div>
             <label className="block text-sm font-medium mb-1">Agent Name</label>
             <input placeholder="e.g. sre-copilot" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
@@ -152,9 +156,36 @@ export function Agents() {
               <p className="text-xs text-muted-foreground">Production agents only receive approved skills and can only access production clusters/hosts. Dev agents see draft skills and dev resources.</p>
             </div>
           </div>
-          <div className="flex gap-2">
+          <div>
+            <div className="flex items-start gap-3">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={restrictTools}
+                onClick={() => {
+                  const next = !restrictTools
+                  setRestrictTools(next)
+                  if (!next) setForm({ ...form, tool_capabilities: [] })
+                }}
+                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors mt-0.5 ${restrictTools ? "bg-primary" : "bg-muted"}`}
+              >
+                <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${restrictTools ? "translate-x-4" : "translate-x-0"}`} />
+              </button>
+              <div>
+                <label className="block text-sm font-medium">Restrict tool access</label>
+                <p className="text-xs text-muted-foreground">Off = full access to all built-in tools (default). On = pick capability groups. Editable later under the agent's Tools tab.</p>
+              </div>
+            </div>
+            {restrictTools && (
+              <div className="mt-3">
+                <CapabilityGroupSelector selected={new Set(form.tool_capabilities)} onChange={(next) => setForm({ ...form, tool_capabilities: Array.from(next) })} />
+              </div>
+            )}
+          </div>
+          </div>
+          <div className="flex gap-2 p-4 border-t border-border shrink-0">
             <button onClick={handleCreate} disabled={creating || !form.name} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "..." : "Create"}</button>
-            <button onClick={() => setShowCreate(false)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
+            <button onClick={() => { setShowCreate(false); setRestrictTools(false); setForm({ ...form, tool_capabilities: [] }) }} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
           </div>
         </div>
       )}

@@ -4,12 +4,19 @@ import { api } from "../api"
 import { useToast } from "./toast"
 import { AgentTasks } from "./AgentTasks"
 import { AgentApiKeys } from "./AgentApiKeys"
+import { CapabilityGroupSelector } from "./CapabilityGroupSelector"
+import { toCapabilitySet } from "../lib/toolCapabilities"
 
 interface Agent {
   id: string; name: string; description: string; status: string
   model_provider: string; model_id: string; system_prompt: string
   is_production: boolean; icon: string; color: string; created_at: string
   model_routing?: unknown
+  idle_timeout_sec?: number
+  // Wire form: the raw `agents` TEXT column — a JSON string ('["read_files"]')
+  // or null, not a decoded array (mirrors model_routing). toCapabilitySet
+  // coerces both forms.
+  tool_capabilities?: string | string[] | null
 }
 
 interface AgentResources {
@@ -40,6 +47,7 @@ const ROUTE_COOLDOWN_LABEL = "by condition"
 const TABS = [
   { key: "basic", label: "Basic" },
   { key: "model", label: "Model" },
+  { key: "tools", label: "Tools" },
   { key: "skills", label: "Skills" },
   { key: "mcp", label: "MCP" },
   { key: "knowledge", label: "Knowledge" },
@@ -163,6 +171,8 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [fallbackCandidates, setFallbackCandidates] = useState<ModelRouteCandidateForm[]>([])
   const [systemPrompt, setSystemPrompt] = useState(agent.system_prompt || "")
   const [isProduction, setIsProduction] = useState(agent.is_production)
+  const [idleTimeoutSec, setIdleTimeoutSec] = useState<number>(agent.idle_timeout_sec ?? 300)
+  const [selectedCapabilities, setSelectedCapabilities] = useState<Set<string>>(toCapabilitySet(agent.tool_capabilities))
 
   // ── Data ──
   const [providers, setProviders] = useState<Provider[]>([])
@@ -193,6 +203,8 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     setRoutingEnabled(modelRouting?.enabled === true)
     setFallbackCandidates(normalizeRouteCandidates(modelRouting, agent.model_provider || "", agent.model_id || ""))
     setSystemPrompt(agent.system_prompt || ""); setIsProduction(agent.is_production)
+    setIdleTimeoutSec(agent.idle_timeout_sec ?? 300)
+    setSelectedCapabilities(toCapabilitySet(agent.tool_capabilities))
   }, [agent])
 
   // Load data
@@ -248,7 +260,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     try {
       const updated = await api<Agent>(`/agents/${agent.id}`, {
         method: "PUT",
-        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction },
+        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, tool_capabilities: Array.from(selectedCapabilities) },
       })
       await api(`/agents/${agent.id}/resources`, {
         method: "PUT",
@@ -262,7 +274,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   }
 
   // Tabs that need the Save button
-  const saveTabs: TabKey[] = ["basic", "model", "skills", "mcp", "knowledge", "resources", "channels"]
+  const saveTabs: TabKey[] = ["basic", "model", "tools", "skills", "mcp", "knowledge", "resources", "channels"]
   const showSave = saveTabs.includes(activeTab)
 
   return (
@@ -298,8 +310,17 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
       {/* Tab content */}
       <div className="flex-1 overflow-auto">
-        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} />}
+        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} />}
         {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} routingEnabled={routingEnabled} setRoutingEnabled={setRoutingEnabled} fallbackCandidates={fallbackCandidates} setFallbackCandidates={setFallbackCandidates} />}
+        {activeTab === "tools" && (
+          <div className="px-6 py-6 space-y-4 max-w-2xl">
+            <div>
+              <h3 className="text-[13px] font-medium text-foreground">Tool capabilities</h3>
+              <p className="text-[12px] text-muted-foreground mt-0.5">Restrict which built-in tools this agent can use. Changes apply live — the running agent reloads on save.</p>
+            </div>
+            <CapabilityGroupSelector selected={selectedCapabilities} onChange={setSelectedCapabilities} />
+          </div>
+        )}
         {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} isProduction={isProduction} loading={loadingSkills || loadingResources} />}
         {activeTab === "mcp" && <McpTab allMcpServers={allMcpServers} selectedMcpIds={selectedMcpIds} setSelectedMcpIds={setSelectedMcpIds} loading={loadingMcp || loadingResources} />}
         {activeTab === "knowledge" && <KnowledgeTab allRepos={allKnowledgeRepos} selectedIds={selectedKnowledgeRepoIds} setSelectedIds={setSelectedKnowledgeRepoIds} loading={loadingKnowledge || loadingResources} />}
@@ -314,9 +335,57 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
 // ── Tab Components ──────────────────────────────────────
 
-function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction }: {
+// Quick-pick windows for the idle self-destruct timer. Resident = 0 (the pod
+// never auto-destroys). Values are seconds; the backend floors any positive
+// value below 300 up to 300 (a shorter window churns instances).
+const IDLE_TIMEOUT_PRESETS: { label: string; value: number }[] = [
+  { label: "∞ Resident", value: 0 },
+  { label: "5 min", value: 300 },
+  { label: "15 min", value: 900 },
+  { label: "30 min", value: 1800 },
+  { label: "1 h", value: 3600 },
+]
+
+function IdleTimeoutField({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  return (
+    <div className="space-y-2">
+      <label className="text-[13px] font-medium text-foreground">Idle Timeout</label>
+      <div className="flex flex-wrap gap-2">
+        {IDLE_TIMEOUT_PRESETS.map(p => {
+          const active = value === p.value
+          return (
+            <button
+              key={p.value}
+              type="button"
+              onClick={() => onChange(p.value)}
+              className={`h-9 px-3 text-[13px] rounded-md border transition-colors ${active ? "border-primary bg-primary/10 text-foreground" : "border-border text-muted-foreground hover:text-foreground hover:bg-secondary/40"}`}
+            >
+              {p.label}
+            </button>
+          )
+        })}
+      </div>
+      <div className="relative w-44">
+        <input
+          type="number"
+          min={0}
+          value={value}
+          onChange={e => onChange(e.target.value === "" ? 0 : Math.max(0, Math.floor(Number(e.target.value))))}
+          className="w-full h-10 pl-3 pr-12 text-[15px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[12px] text-muted-foreground pointer-events-none">sec</span>
+      </div>
+      <p className="text-[12px] text-muted-foreground/80 leading-relaxed">
+        The running instance self-destructs after this long with no active sessions (default 300s, minimum 300 — a smaller positive value is raised to 300, since a shorter window churns instances); choose Resident (0s) to keep it alive. Switching off Resident applies immediately — it restarts the running instance, which may interrupt an in-progress reply; other changes take effect on the agent's next restart.
+      </p>
+    </div>
+  )
+}
+
+function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec }: {
   name: string; setName: (v: string) => void; description: string; setDescription: (v: string) => void
   systemPrompt: string; setSystemPrompt: (v: string) => void; isProduction: boolean; setIsProduction: (v: boolean) => void
+  idleTimeoutSec: number; setIdleTimeoutSec: (v: number) => void
 }) {
   return (
     <div className="px-6 py-6 space-y-5 max-w-2xl">
@@ -332,6 +401,7 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
         <label className="text-[12px] text-muted-foreground">System Prompt</label>
         <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional system prompt..." />
       </div>
+      <IdleTimeoutField value={idleTimeoutSec} onChange={setIdleTimeoutSec} />
       <div className="space-y-2 pt-2">
         <div className="flex items-center gap-3">
           <button

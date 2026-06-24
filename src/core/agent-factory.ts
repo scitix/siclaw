@@ -27,6 +27,7 @@ import {
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { ToolRegistry, type AgentMode } from "./tool-registry.js";
+import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
 import { buildSreSystemPrompt } from "./prompt.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
@@ -38,8 +39,10 @@ import lsExtension from "./extensions/ls.js";
 import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
+import { convertOpenAIPdfPayload } from "./openai-file-payload.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
+import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
@@ -117,6 +120,8 @@ export interface CreateSiclawSessionOpts {
   backgroundExecExecutor?: import("./tool-registry.js").BackgroundExecExecutor;
   /** Runtime bridge that reads a background job's live status. Injected by agentbox / TUI host. */
   taskOutputReader?: import("./tool-registry.js").TaskOutputReader;
+  /** Runtime bridge for explicit IM-channel visible updates. Injected by agentbox. */
+  channelMessageExecutor?: import("./tool-registry.js").ChannelMessageExecutor;
 }
 
 export interface SiclawSessionResult {
@@ -288,6 +293,11 @@ export async function createSiclawSession(
 ): Promise<SiclawSessionResult> {
   const config = loadConfig();
 
+  // Register deployment-configured extra whitelist commands (idempotent,
+  // fail-loud on invalid config). Must run before any exec tool validates
+  // a command — all three exec tools share the merged registry.
+  initExtraCommands();
+
   const authStorage = AuthStorage.create();
 
   // Bridge Siclaw-configured apiKey into pi-agent's credential chain (highest priority)
@@ -396,6 +406,7 @@ export async function createSiclawSession(
       jobStopExecutor: opts?.jobStopExecutor,
       backgroundExecExecutor: opts?.backgroundExecExecutor,
       taskOutputReader: opts?.taskOutputReader,
+      channelMessageExecutor: opts?.channelMessageExecutor,
     },
     allowedTools,
     activeMode: opts?.activeMode ?? "normal",
@@ -433,15 +444,13 @@ export async function createSiclawSession(
   } else {
     console.log(`[agent-factory] No MCP config found, skipping MCP tools`);
   }
-  // MCP tools subject to allowedTools (original behavior: MCP appended before filter)
-  if (mcpTools.length > 0) {
-    if (Array.isArray(allowedTools)) {
-      const allowed = new Set(allowedTools);
-      customTools.push(...mcpTools.filter(t => allowed.has(t.name)));
-    } else {
-      customTools.push(...mcpTools);
-    }
-  }
+  // MCP tools are EXEMPT from the per-agent `allowedTools` capability whitelist.
+  // MCP availability is governed by an orthogonal axis — the `agent_mcp_servers`
+  // binding — so a capability group selection must not gate them. (Dynamic MCP
+  // tool names can't be statically enumerated into a capability group anyway.)
+  // The whole `mcpTools` array is MCP by construction, so an unconditional push
+  // is simpler than and equivalent to skipping by an `mcp__` name prefix.
+  customTools.push(...mcpTools);
 
   // -- Path-restricted file I/O tools --
   // Whitelist: only skills directories + user-data + reports + repos + docs (no credentials, no config)
@@ -509,8 +518,24 @@ export async function createSiclawSession(
       },
     }),
   ];
-  // Push into customTools so they override framework defaults via extension mechanism
-  customTools.push(...restrictedFileTools);
+  // Push into customTools so they override framework defaults via extension mechanism.
+  // Subject to allowedTools (same chokepoint as MCP append above): file tools are
+  // created outside the registry, so the shared name-based whitelist is applied here.
+  appendAllowedTools(customTools, restrictedFileTools, allowedTools);
+
+  // Final model-visible tool set (registry-resolved + MCP + file tools, after the
+  // whitelist is applied at every chokepoint). Logged by NAME when restricted so a
+  // capability-group change is verifiable straight from the box log — this is the
+  // ground truth the model is given as function schemas. It deliberately differs
+  // from any tool list the model recites in chat: a session restored from JSONL
+  // carries earlier turns where it held more tools, and the model may parrot those
+  // stale names even though they are no longer in this list and cannot be invoked.
+  if (Array.isArray(allowedTools)) {
+    console.log(
+      `[agent-factory] Restricted tools visible to model (${customTools.length}): ` +
+      `${customTools.map((t) => t.name).join(", ") || "(none)"}`,
+    );
+  }
 
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
@@ -678,6 +703,17 @@ export async function createSiclawSession(
   // session_start fires again — but the DP handler resets state first
   // (dpActive=false) then restores from JSONL, so double-fire is idempotent.
   await session.bindExtensions({});
+
+  const agentWithPayloadHook = session.agent as unknown as {
+    onPayload?: (payload: unknown, model: unknown) => unknown | Promise<unknown>;
+  };
+  const previousOnPayload = agentWithPayloadHook.onPayload;
+  agentWithPayloadHook.onPayload = async (payload, model) => {
+    const converted = convertOpenAIPdfPayload(payload);
+    if (!previousOnPayload) return converted;
+    const next = await previousOnPayload(converted, model);
+    return convertOpenAIPdfPayload(next ?? converted);
+  };
 
   // ── Guard pipeline: unified guard registration and installation ──
   const contextWindow = configuredModel?.contextWindow ?? 128_000;

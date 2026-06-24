@@ -9,12 +9,18 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type {
   BrainSession,
   BrainModelInfo,
+  BrainModelParams,
   BrainContextUsage,
   BrainSessionStats,
   BrainProviderResponse,
   BrainContextPreflightResult,
+  PromptMedia,
 } from "../brain-session.js";
 import { estimateMessagesTokens } from "../compaction.js";
+import { rememberPromptFiles } from "../openai-file-payload.js";
+
+/** Valid pi thinking levels; guards reasoningEffort coming off the wire. */
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 export class PiAgentBrain implements BrainSession {
   readonly brainType = "pi-agent" as const;
@@ -26,9 +32,30 @@ export class PiAgentBrain implements BrainSession {
   /** Set during prompt(); abort() resolves this to cancel backoff sleep. */
   private abortRetry: (() => void) | null = null;
 
+  /** True from abort() until the next prompt() starts. Stops the empty-response retry loop from
+   *  firing a fresh (un-aborted) re-prompt when Stop lands during the backoff sleep. */
+  private aborted = false;
+
   constructor(readonly session: AgentSession) {}
 
   private static readonly MAX_EMPTY_RETRIES = 2;
+
+  private promptOptionsForMedia(media?: PromptMedia): any | undefined {
+    const content: Array<Record<string, string>> = [];
+    if (media?.images && media.images.length > 0) {
+      content.push(...media.images.map((img) => ({ type: "image", data: img.data, mimeType: img.mimeType })));
+    }
+    if (media?.files && media.files.length > 0) {
+      rememberPromptFiles(media.files);
+      content.push(...media.files.map((file) => ({
+        type: "file",
+        data: file.data,
+        mimeType: file.mimeType,
+        filename: file.filename,
+      })));
+    }
+    return content.length > 0 ? { images: content } : undefined;
+  }
   private static readonly RETRY_DELAY_MS = 2000;
   private static readonly PROMPT_PREFLIGHT_SAFETY_TOKENS = 2048;
 
@@ -46,9 +73,12 @@ export class PiAgentBrain implements BrainSession {
     });
   }
 
-  async prompt(text: string): Promise<void> {
+  async prompt(text: string, media?: PromptMedia): Promise<void> {
+    this.aborted = false;
     let lastAssistantHadContent = false;
     let lastAssistantMessage: any = null;
+
+    const promptOptions = this.promptOptionsForMedia(media);
 
     const unsub = this.session.subscribe((event: any) => {
       if (event.type === "message_start" && event.message?.role === "assistant") {
@@ -65,7 +95,7 @@ export class PiAgentBrain implements BrainSession {
     });
 
     try {
-      await this.session.prompt(text);
+      await this.session.prompt(text, promptOptions);
 
       // Empty response guard: some models (e.g. Kimi-K2.5) occasionally return
       // a completely empty response (0 content blocks) on the final turn after
@@ -85,6 +115,7 @@ export class PiAgentBrain implements BrainSession {
       let retries = 0;
       while (
         !lastAssistantHadContent &&
+        !this.aborted &&
         lastAssistantMessage?.stopReason !== "aborted" &&
         lastAssistantMessage?.stopReason !== "error" &&
         retries < PiAgentBrain.MAX_EMPTY_RETRIES
@@ -109,18 +140,22 @@ export class PiAgentBrain implements BrainSession {
         });
         try {
           await this.abortableSleep(delayMs);
-          await this.session.prompt(text);
+          // Stop landed during the backoff: do NOT fire a fresh, un-aborted re-prompt.
+          if (this.aborted) break;
+          await this.session.prompt(text, promptOptions);
         } finally {
+          // A user Stop landing in the backoff is not an empty-response failure — don't label it
+          // one (telemetry/alerting could otherwise count Stops as model defects).
           this.emit({
             type: "auto_retry_end",
             attempt: retries,
             success: lastAssistantHadContent,
-            finalError: lastAssistantHadContent ? undefined : "Model returned empty response",
+            finalError: lastAssistantHadContent || this.aborted ? undefined : "Model returned empty response",
           });
         }
       }
 
-      if (!lastAssistantHadContent) {
+      if (!lastAssistantHadContent && !this.aborted) {
         const msg = lastAssistantMessage;
         console.error(
           `[pi-agent-brain] Empty response persisted after ${PiAgentBrain.MAX_EMPTY_RETRIES} retries, ` +
@@ -135,7 +170,15 @@ export class PiAgentBrain implements BrainSession {
   }
 
   async abort(): Promise<void> {
+    this.aborted = true;
     this.abortRetry?.();
+    // session.abort() (agent.abort + waitForIdle) aborts the RUN's controller — but auto-compaction
+    // and routing-preflight compaction use SEPARATE controllers it does not touch. Abort those too,
+    // so a Stop during compaction cancels the compaction LLM call AND lets waitForIdle() resolve
+    // promptly instead of blocking until compaction finishes. Defensive optional — older cores or
+    // a non-pi brain may not expose it.
+    try { (this.session as { abortCompaction?: () => void }).abortCompaction?.(); }
+    catch { /* best-effort */ }
     return this.session.abort();
   }
 
@@ -153,8 +196,12 @@ export class PiAgentBrain implements BrainSession {
     return this.session.reload();
   }
 
-  steer(text: string): Promise<void> {
-    return this.session.steer(text);
+  steer(text: string, media?: PromptMedia): Promise<void> {
+    const promptOptions = this.promptOptionsForMedia(media);
+    if (!promptOptions) {
+      return this.session.steer(text);
+    }
+    return this.session.prompt(text, { ...promptOptions, streamingBehavior: "steer" });
   }
 
   followUp(text: string): Promise<void> {
@@ -218,6 +265,15 @@ export class PiAgentBrain implements BrainSession {
 
   registerProvider(name: string, config: Record<string, unknown>): void {
     this.session.modelRegistry.registerProvider(name, config as any);
+  }
+
+  applyModelParams(params: BrainModelParams): void {
+    // reasoningEffort → session thinking level. pi maps this to the provider's
+    // reasoning_effort / reasoning:{effort} per the provider's thinkingLevelMap.
+    const effort = params.reasoningEffort?.trim();
+    if (effort && THINKING_LEVELS.has(effort)) {
+      this.session.setThinkingLevel(effort as any);
+    }
   }
 
   async ensureContextForModelPrompt(

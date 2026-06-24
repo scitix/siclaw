@@ -1,17 +1,10 @@
 import { useMemo, useState } from "react"
 import { ChevronDown, ChevronRight, CheckCircle, XCircle, Ban, Loader2 } from "lucide-react"
-import { useAudit, useUsers, type AuditLog } from "../../hooks/useMetrics"
+import { useAudit, useUsers, resolveRange, originLabel, type AuditLog, type EntryMode, type TimeRange } from "../../hooks/useMetrics"
 import { AuditDetailPanel } from "./AuditDetailPanel"
 
 const TOOL_OPTIONS = ["All", "restricted_bash", "local_script", "pod_exec", "kubectl", "cluster_probe", "cluster_list"]
 const STATUS_OPTIONS = ["All", "success", "error", "blocked"]
-const RANGE_OPTIONS = [
-  { label: "Last 1h", value: 3_600_000 },
-  { label: "Last 6h", value: 21_600_000 },
-  { label: "Last 24h", value: 86_400_000 },
-  { label: "Last 7d", value: 7 * 86_400_000 },
-  { label: "Last 30d", value: 30 * 86_400_000 },
-]
 
 function formatDuration(ms: number | null): string {
   if (ms == null) return "—"
@@ -54,10 +47,9 @@ function OutcomeIcon({ outcome }: { outcome: string | null }) {
   }
 }
 
-export function AuditTable({ userFilterId, usernameHint }: { userFilterId: string | null; usernameHint: string | null }) {
+export function AuditTable({ userFilterId, usernameHint, entry, timeRange }: { userFilterId: string | null; usernameHint: string | null; entry: EntryMode; timeRange: TimeRange }) {
   const [tool, setTool] = useState("All")
   const [status, setStatus] = useState("All")
-  const [rangeMs, setRangeMs] = useState(86_400_000)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const { users } = useUsers()
   const userMap = useMemo(() => {
@@ -66,16 +58,20 @@ export function AuditTable({ userFilterId, usernameHint }: { userFilterId: strin
     return m
   }, [users])
 
+  // Resolve the header window ONCE per filter change and freeze it. The deps are
+  // primitives (the relative expressions, not Date.now()), so paginating a
+  // sliding relative range can't move the window mid-scroll and drift the cursor.
   const params = useMemo(() => {
-    const now = Date.now()
+    const { fromMs, toMs } = resolveRange(timeRange)
     return {
       userId: userFilterId ?? undefined,
       toolName: tool === "All" ? undefined : tool,
       outcome: status === "All" ? undefined : status,
-      startDate: new Date(now - rangeMs).toISOString(),
-      endDate: new Date(now).toISOString(),
+      entry,
+      from: String(fromMs),
+      to: String(toMs),
     }
-  }, [tool, status, rangeMs, userFilterId])
+  }, [tool, status, entry, timeRange.from, timeRange.to, userFilterId])
 
   const { logs, hasMore, loading, loadMore } = useAudit(params)
 
@@ -103,13 +99,6 @@ export function AuditTable({ userFilterId, usernameHint }: { userFilterId: strin
         >
           {STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s === "All" ? "All Status" : s}</option>)}
         </select>
-        <select
-          value={rangeMs}
-          onChange={(e) => setRangeMs(parseInt(e.target.value, 10))}
-          className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
-        >
-          {RANGE_OPTIONS.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
-        </select>
         <div className="flex-1"></div>
         <div className="text-[11px] text-muted-foreground font-mono">{logs.length} entries{hasMore ? "+" : ""}</div>
       </div>
@@ -121,6 +110,7 @@ export function AuditTable({ userFilterId, usernameHint }: { userFilterId: strin
               <th className="w-8"></th>
               <th className="text-left px-3 py-2.5 font-medium">Time</th>
               <th className="text-left px-3 py-2.5 font-medium">User</th>
+              <th className="text-left px-3 py-2.5 font-medium">Entry</th>
               <th className="text-left px-3 py-2.5 font-medium">Agent</th>
               <th className="text-left px-3 py-2.5 font-medium">Tool</th>
               <th className="text-left px-3 py-2.5 font-medium">Command</th>
@@ -130,7 +120,7 @@ export function AuditTable({ userFilterId, usernameHint }: { userFilterId: strin
           </thead>
           <tbody className="divide-y divide-border/60">
             {logs.length === 0 && !loading ? (
-              <tr><td colSpan={8} className="text-center py-12 text-muted-foreground text-[12px]">No entries found</td></tr>
+              <tr><td colSpan={9} className="text-center py-12 text-muted-foreground text-[12px]">No entries found</td></tr>
             ) : logs.map((log: AuditLog) => (
               <AuditRow
                 key={log.id}
@@ -174,7 +164,10 @@ function AuditRow({ log, username, expanded, onToggle }: { log: AuditLog; userna
           <span className="mr-1">{formatDate(log.timestamp)}</span>{formatTime(log.timestamp)}
         </td>
         <td className="px-3 py-2.5">{username}</td>
-        <td className="px-3 py-2.5 text-muted-foreground">{log.agentId ?? "—"}</td>
+        <td className="px-3 py-2.5">
+          <span className="px-1.5 py-0.5 rounded text-[10px] bg-secondary text-muted-foreground">{originLabel(log.origin)}</span>
+        </td>
+        <td className="px-3 py-2.5 text-muted-foreground">{log.agentName ?? log.agentId ?? "—"}</td>
         <td className="px-3 py-2.5">
           <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-secondary text-muted-foreground">{log.toolName ?? "—"}</span>
         </td>
@@ -184,7 +177,7 @@ function AuditRow({ log, username, expanded, onToggle }: { log: AuditLog; userna
       </tr>
       {expanded && (
         <tr className="bg-secondary/20">
-          <td colSpan={8} className="px-6 py-4"><AuditDetailPanel log={log} /></td>
+          <td colSpan={9} className="px-6 py-4"><AuditDetailPanel log={log} /></td>
         </tr>
       )}
     </>

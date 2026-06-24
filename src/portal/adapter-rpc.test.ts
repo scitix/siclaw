@@ -39,15 +39,29 @@ describe("config.getAgent", () => {
     mockQuery([{
       id: "a1", name: "Agent 1", description: "desc", status: "active",
       model_provider: "openai", model_id: "gpt-4", system_prompt: "You are helpful",
-      icon: "bot", color: "#fff",
+      icon: "bot", color: "#fff", idle_timeout_sec: 300,
     }]);
 
     const result = await getHandler("config.getAgent")({ agentId: "a1" }, "a1");
     expect(result).toEqual({
       id: "a1", name: "Agent 1", description: "desc", status: "active",
       model_provider: "openai", model_id: "gpt-4", system_prompt: "You are helpful",
-      icon: "bot", color: "#fff",
+      icon: "bot", color: "#fff", idle_timeout_sec: 300,
+      // No tool_capabilities column on this row → unrestricted (null).
+      tool_capabilities: null,
     });
+  });
+
+  it("parses a stored tool_capabilities JSON array (TEXT column)", async () => {
+    mockQuery([{
+      id: "a1", name: "Agent 1", description: "desc", status: "active",
+      model_provider: "openai", model_id: "gpt-4", system_prompt: "p",
+      icon: "bot", color: "#fff",
+      tool_capabilities: JSON.stringify(["read_files", "run_commands"]),
+    }]);
+
+    const result = await getHandler("config.getAgent")({ agentId: "a1" }, "a1") as { tool_capabilities: unknown };
+    expect(result.tool_capabilities).toEqual(["read_files", "run_commands"]);
   });
 
   it("throws when agent not found", async () => {
@@ -197,7 +211,7 @@ describe("config.getSettings", () => {
 describe("config.getModelBinding", () => {
   it("returns binding when agent has valid provider", async () => {
     mockQuery(
-      [{ model_provider: "openai", model_id: "gpt-4" }],
+      [{ model_provider: "openai", model_id: "gpt-4", system_prompt: "You are an ops bot." }],
       [{ id: "p1", name: "openai", base_url: "https://api.openai.com", api_key: "sk-key", api_type: "openai" }],
       [{ model_id: "gpt-4", name: "GPT-4", reasoning: 1, context_window: 128000, max_tokens: 4096 }],
     );
@@ -206,6 +220,7 @@ describe("config.getModelBinding", () => {
     expect(result.binding).toBeDefined();
     expect(result.binding.modelProvider).toBe("openai");
     expect(result.binding.modelId).toBe("gpt-4");
+    expect(result.binding.systemPrompt).toBe("You are an ops bot.");
     expect(result.binding.modelConfig.name).toBe("openai");
     expect(result.binding.modelConfig.authHeader).toBe(true);
     expect(result.binding.modelConfig.models[0].reasoning).toBe(true);
@@ -314,6 +329,24 @@ describe("config.getMcpServers", () => {
     expect(result.mcpServers["stdio-server"].command).toBe("npx");
     expect(result.mcpServers["stdio-server"].args).toEqual(["arg1", "arg2"]);
     expect(result.mcpServers["stdio-server"].env).toEqual({ KEY: "val" });
+  });
+
+  it("includes the admin-provided description when present", async () => {
+    mockQuery([
+      { name: "grafana", transport: "sse", url: "https://mcp.example.com", command: null, args: null, env: null, headers: null, description: "Monitoring tenant ID: t-123" },
+    ]);
+
+    const result = await getHandler("config.getMcpServers")({ ids: ["id1"] }, "a1");
+    expect(result.mcpServers.grafana.description).toBe("Monitoring tenant ID: t-123");
+  });
+
+  it("omits description when null", async () => {
+    mockQuery([
+      { name: "plain", transport: "sse", url: "https://mcp.example.com", command: null, args: null, env: null, headers: null, description: null },
+    ]);
+
+    const result = await getHandler("config.getMcpServers")({ ids: ["id1"] }, "a1");
+    expect("description" in result.mcpServers.plain).toBe(false);
   });
 });
 
@@ -1329,23 +1362,122 @@ describe("channel.list", () => {
     expect(result.data).toHaveLength(1);
     expect(result.data[0].id).toBe("ch1");
   });
+
+  it("injects group_channel_id for an open personal-bot channel", async () => {
+    mockQuery([{
+      id: "ch-personal", name: "bot", status: "active", created_at: "2024-01-01",
+      config: JSON.stringify({ app_id: "x", personal_bot: { agent_id: "a1", access_mode: "open" } }),
+    }]);
+    const result = await getHandler("channel.list")({}, "a1");
+    expect(result.data[0].config.group_channel_id).toBe("ch-personal");
+  });
+
+  it("does not inject group_channel_id when group_auto_bind is false", async () => {
+    mockQuery([{
+      id: "ch-personal", name: "bot", status: "active", created_at: "2024-01-01",
+      config: JSON.stringify({ app_id: "x", personal_bot: { agent_id: "a1", access_mode: "open", group_auto_bind: false } }),
+    }]);
+    const result = await getHandler("channel.list")({}, "a1");
+    expect(result.data[0].config.group_channel_id).toBeUndefined();
+  });
 });
 
 describe("channel.resolveBinding", () => {
   it("returns binding when found", async () => {
-    mockQuery([{ id: "b1", agent_id: "a1" }]);
+    mockQuery([{ id: "b1", agent_id: "a1", session_id: "s1", route_type: "group", created_by: "u1" }]);
 
     const result = await getHandler("channel.resolveBinding")(
       { channel_id: "ch1", route_key: "group-123" }, "a1",
     );
-    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1" });
+    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s1", createdBy: "u1", routeType: "group" });
+  });
+
+  it("lazily creates a session for legacy bindings", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: null, route_type: "group", created_by: "u1" }],
+      [],
+      [{ id: "b1", agent_id: "a1", session_id: "s-new", route_type: "group", created_by: "u1" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123" }, "a1",
+    );
+
+    expect(query.mock.calls[1][0]).toContain("UPDATE channel_bindings SET session_id");
+    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s-new", createdBy: "u1", routeType: "group" });
+  });
+
+  it("lazily creates a participant session when session_key is provided", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "shared-session", route_type: "group", created_by: "u1" }],
+      [],
+      [],
+      [{ session_id: "sender-session" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123", session_key: "open_id:ou_1" }, "a1",
+    );
+
+    expect(query.mock.calls[1][0]).toContain("FROM channel_binding_sessions");
+    expect(query.mock.calls[2][0]).toContain("INTO channel_binding_sessions");
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "open_id:ou_1",
+      expect.any(String),
+    ]);
+    expect(result.binding).toEqual({
+      agentId: "a1",
+      bindingId: "b1",
+      sessionId: "sender-session",
+      sessionKey: "open_id:ou_1",
+      createdBy: "u1",
+      routeType: "group",
+    });
   });
 
   it("returns null binding when not found", async () => {
-    mockQuery([]);
+    // No explicit binding, and the channel is not a personal-bot channel
+    // (selectPersonalChannel → none), so the open-group fallback also yields null.
+    mockQuery([], []);
 
     const result = await getHandler("channel.resolveBinding")(
       { channel_id: "ch1", route_key: "group-999" }, "a1",
+    );
+    expect(result).toEqual({ binding: null });
+  });
+
+  it("open personal-bot auto-binds a group with a shared per-chat session", async () => {
+    mockQuery(
+      [],                                                                  // selectChannelBinding → none
+      [{ id: "ch1", created_by: "owner-1", config: JSON.stringify({ personal_bot: { agent_id: "a1", access_mode: "open" } }) }], // selectPersonalChannel
+      [],                                                                  // participant session lookup → none
+      [],                                                                  // insert participant session
+      [{ session_id: "chat-session" }],                                    // participant session reload
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123", session_key: "open_id:ou_1", sender_open_id: "ou_1" }, "a1",
+    );
+    expect(result.binding).toEqual({
+      agentId: "a1",
+      bindingId: "ch1",
+      sessionId: "chat-session",
+      sessionKey: "chat:group-123",
+      createdBy: "owner-1",
+      routeType: "group",
+    });
+  });
+
+  it("punts (null) on a sicore_authorized personal bot in standalone", async () => {
+    mockQuery(
+      [],                                                                  // selectChannelBinding → none
+      [{ id: "ch1", created_by: "owner-1", config: JSON.stringify({ personal_bot: { agent_id: "a1", access_mode: "sicore_authorized" } }) }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123", sender_open_id: "ou_1" }, "a1",
     );
     expect(result).toEqual({ binding: null });
   });
@@ -1353,9 +1485,12 @@ describe("channel.resolveBinding", () => {
 
 describe("channel.pair", () => {
   it("creates binding from valid pairing code", async () => {
-    mockQuery(
+    const query = mockQuery(
       [{ agent_id: "a1", created_by: "u1" }],  // pairing code lookup
+      [],                                         // existing binding lookup
       [],                                         // insert binding
+      [{ id: "b-new", agent_id: "a1", session_id: "binding-session", route_type: "group", created_by: "u1" }],
+      [],                                         // clear participant sessions
       [],                                         // delete code
       [{ name: "My Agent" }],                     // agent name lookup
     );
@@ -1365,6 +1500,17 @@ describe("channel.pair", () => {
     );
     expect(result.success).toBe(true);
     expect(result.agentName).toBe("My Agent");
+    expect(query.mock.calls[2][0]).toContain("session_id");
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "ch1",
+      "a1",
+      expect.any(String),
+      "group-1",
+      "group",
+      "u1",
+    ]);
+    expect(query.mock.calls[4][0]).toContain("DELETE FROM channel_binding_sessions");
   });
 
   it("returns error for invalid pairing code", async () => {
@@ -1380,6 +1526,7 @@ describe("channel.pair", () => {
   it("returns error when binding insert fails", async () => {
     const query = vi.fn()
       .mockResolvedValueOnce([[{ agent_id: "a1", created_by: "u1" }], []])
+      .mockResolvedValueOnce([[], []])
       .mockRejectedValueOnce(new Error("Duplicate entry"));
     (getDb as any).mockReturnValue({ query });
 
@@ -1388,6 +1535,59 @@ describe("channel.pair", () => {
     );
     expect(result.success).toBe(false);
     expect(result.error).toContain("Failed to create binding");
+  });
+});
+
+describe("channel.resetSession", () => {
+  it("replaces the binding session id", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "old-session", route_type: "group", created_by: "u1" }],
+      [],
+    );
+
+    const result = await getHandler("channel.resetSession")(
+      { channel_id: "ch1", route_key: "group-1" }, "a1",
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.agentId).toBe("a1");
+    expect(result.oldSessionId).toBe("old-session");
+    expect(result.sessionId).toEqual(expect.any(String));
+    expect(query.mock.calls[1][0]).toContain("UPDATE channel_bindings SET session_id");
+  });
+
+  it("replaces only the participant session when session_key is provided", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "shared-session", route_type: "group", created_by: "u1" }],
+      [{ session_id: "old-sender-session" }],
+      [],
+    );
+
+    const result = await getHandler("channel.resetSession")(
+      { channel_id: "ch1", route_key: "group-1", session_key: "open_id:ou_1" }, "a1",
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.agentId).toBe("a1");
+    expect(result.oldSessionId).toBe("old-sender-session");
+    expect(result.sessionId).toEqual(expect.any(String));
+    expect(query.mock.calls[2][0]).toContain("channel_binding_sessions");
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "open_id:ou_1",
+      expect.any(String),
+    ]);
+  });
+
+  it("returns an error when the binding is missing", async () => {
+    mockQuery([]);
+
+    const result = await getHandler("channel.resetSession")(
+      { channel_id: "ch1", route_key: "group-missing" }, "a1",
+    );
+
+    expect(result).toEqual({ success: false, error: "Binding not found" });
   });
 });
 
@@ -1445,21 +1645,21 @@ describe("agent.listForHost", () => {
 // ================================================================
 
 describe("metrics.summary", () => {
-  it("returns summary with default 7d period", async () => {
+  it("returns summary with default 7d period (no per-user breakdown)", async () => {
     const query = mockQuery(
       [{ c: 10 }],   // total sessions
       [{ c: 50 }],   // total prompts
-      [{ userId: "u1", sessions: 5, messages: 30 }],  // by user
     );
 
     const result = await getHandler("metrics.summary")({}, "a1");
     expect(result.totalSessions).toBe(10);
     expect(result.totalPrompts).toBe(50);
-    expect(result.byUser).toEqual([{ userId: "u1", sessions: 5, messages: 30 }]);
+    // byUser was dropped — this mirror must not ship raw per-user data.
+    expect(result).not.toHaveProperty("byUser");
     expect(query.mock.calls[1][0]).toContain('metadata NOT LIKE \'%"kind":"delegation_event"%\'');
   });
 
-  it("skips byUser query when userId filter is set", async () => {
+  it("runs only the two scalar queries (no byUser) with a userId filter", async () => {
     const query = mockQuery(
       [{ c: 3 }],
       [{ c: 15 }],
@@ -1468,8 +1668,8 @@ describe("metrics.summary", () => {
     const result = await getHandler("metrics.summary")({ period: "today", userId: "u1" }, "a1");
     expect(result.totalSessions).toBe(3);
     expect(result.totalPrompts).toBe(15);
-    expect(result.byUser).toEqual([]);
-    expect(query).toHaveBeenCalledTimes(2);  // no third call for byUser
+    expect(result).not.toHaveProperty("byUser");
+    expect(query).toHaveBeenCalledTimes(2);
   });
 
   it("throws for invalid period", async () => {
@@ -1539,9 +1739,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 44 handlers", () => {
+  it("registers exactly 48 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(44);
+    expect(handlers.size).toBe(48);
   });
 
   it("all expected handler names are registered", () => {
@@ -1556,7 +1756,8 @@ describe("buildAdapterRpcHandlers", () => {
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",
-      "channel.list", "channel.resolveBinding", "channel.pair",
+      "channel.list", "channel.resolveBinding", "channel.pair", "channel.resetSession",
+      "channel.resolvePersonalBinding", "channel.pairPersonal", "channel.resetPersonalSession",
       "agent.listForSkill", "agent.listForMcp", "agent.listForCluster", "agent.listForHost",
       "metrics.summary", "metrics.audit", "metrics.auditDetail",
     ];

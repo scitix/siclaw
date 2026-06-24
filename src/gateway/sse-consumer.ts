@@ -87,8 +87,7 @@ const NOISE_FLOOR_MS = 50;
  * cross-process anchors (e.g. portal POST timestamp passed to runtime via
  * RPC) can briefly produce negatives if the two pods' NTP clocks have drifted
  * apart. We treat negatives as "unknown" rather than persist them — downstream
- * (frontend formatter, /metrics/timing aggregation) interprets absence as
- * unmeasured, which is correct.
+ * (the chat timing badge) interprets absence as unmeasured, which is correct.
  */
 function nonNegative(ms: number): number | undefined {
   return Number.isFinite(ms) && ms >= 0 ? ms : undefined;
@@ -296,6 +295,52 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let taskReportText = "";
   let errorMessage = "";
   let streamErrorEmitted = false;
+  let errorPersisted = false;
+  // ── Routed-turn commit gating ──
+  // When model routing streams the primary candidate live, this consumer sees a
+  // candidate's events BEFORE we know whether it won. So the durable writes
+  // (assistant reply + error rows) are deferred to a commit point and dropped on
+  // a rollback — the live frontend already rendered them via the SSE relay, so
+  // this only governs what survives a reload. Tool rows are NOT deferred: the
+  // first tool execution blocks fallback for good (#312), so a tool row is
+  // already committed when it appears. Non-routed turns never set isRoutingTurn,
+  // so they persist inline exactly as before.
+  let isRoutingTurn = false;
+  let routingCommitted = false;
+  const pendingAssistantOps: Array<() => Promise<void>> = [];
+  const pendingErrorOps: Array<() => Promise<void>> = [];
+  const flushOps = async (ops: Array<() => Promise<void>>) => {
+    const drained = ops.splice(0);
+    for (const op of drained) await op();
+  };
+  // tool_start / model_route_success: the turn is committed. Flush the deferred
+  // assistant write; drop any error row buffered from a failed earlier attempt
+  // (the turn ultimately produced output / succeeded).
+  const commitRoutedTurn = async () => {
+    routingCommitted = true;
+    pendingErrorOps.length = 0;
+    // The turn produced committed output / succeeded — a failed earlier
+    // attempt's error must not leak into the returned run summary.
+    errorMessage = "";
+    await flushOps(pendingAssistantOps);
+  };
+  // model_route_rollback: the live primary failed and will be retried on the
+  // next candidate. Drop everything it buffered and re-arm the per-attempt
+  // dedup flags so the next attempt can record (and surface live) its own
+  // error, and so the rolled-back attempt's error text doesn't leak into the
+  // returned run summary / notifications (mirrors commitRoutedTurn).
+  const discardRoutedAttempt = () => {
+    pendingAssistantOps.length = 0;
+    pendingErrorOps.length = 0;
+    errorPersisted = false;
+    streamErrorEmitted = false;
+    errorMessage = "";
+    // The primary's deferred assistant op flipped firstAssistantPersisted when
+    // it was enqueued; we're now discarding that op, so undo the flip — else the
+    // surviving fallback reply, which becomes the turn's first persisted
+    // assistant, is wrongly gated out of ttft_ms (the turn anchor).
+    firstAssistantPersisted = false;
+  };
   let lastToolName = "";
 
   // Queued by toolName. pi-agent events do not always expose a stable call id,
@@ -333,6 +378,21 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // make a naive UI sum double-count the same interval N times. Tracked
   // and only emitted once.
   let firstAssistantPersisted = false;
+  // Latest persisted assistant message of the turn — so the `agent_end`
+  // context-usage snapshot can be merged onto its metadata. Persisting the
+  // snapshot lets the frontend restore the context meter when a session is
+  // reopened/refreshed (it otherwise only has it from a live agent_end, which a
+  // cold session never replays). Overwritten on each assistant message_end, so
+  // by agent_end these point at the turn's final assistant message.
+  let lastAssistantDbMessageId: string | undefined;
+  let lastAssistantContent: string | undefined;
+  let lastAssistantMetadata: Record<string, unknown> | undefined;
+  // Latest agent_end context-usage snapshot of the turn. agent_end fires BEFORE
+  // model_route_success (the commit point that runs the deferred assistant
+  // persist on routed turns — i.e. every turn), so the assistant row usually
+  // isn't written yet when agent_end arrives. We therefore stash the snapshot
+  // here and let the deferred persistAssistant fold it into the row's metadata.
+  let capturedContextUsage: Record<string, unknown> | undefined;
   let latestModelRouteSwitch: Record<string, unknown> | null = null;
   let currentModelRouteMetadata: Record<string, unknown> | null = null;
 
@@ -357,10 +417,42 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
 
     let dbMessageId: string | undefined;
 
+    // ── Capture context-usage snapshot from agent_end ──────────────────────
+    // The brain computes {tokens, contextWindow, percent, inputTokens, ...} and
+    // attaches it to agent_end (enrichAgentEndEvent in agentbox/http-server.ts).
+    // Persisting it in the last assistant row's metadata lets the frontend
+    // restore the context meter on session reopen/refresh (otherwise it's blank
+    // until the next live turn). Two delivery orders:
+    //   • routed turn (default): agent_end precedes the deferred persist, so the
+    //     row isn't written yet — persistAssistant folds capturedContextUsage in.
+    //   • immediate persist (non-routed): the row already exists, so patch it now.
+    // Best-effort: a persistence failure must never break the SSE stream.
+    if (eventType === "agent_end" && persist) {
+      const contextUsage = (evt as Record<string, unknown>).contextUsage;
+      if (contextUsage && typeof contextUsage === "object") {
+        capturedContextUsage = contextUsage as Record<string, unknown>;
+        if (lastAssistantDbMessageId) {
+          try {
+            await updateMessage({
+              messageId: lastAssistantDbMessageId,
+              sessionId,
+              content: lastAssistantContent ?? "",
+              metadata: { ...(lastAssistantMetadata ?? {}), context_usage: capturedContextUsage },
+            });
+          } catch (err) {
+            console.warn(`[sse-consumer] ${userId}: failed to persist context_usage:`, err);
+          }
+        }
+      }
+    }
+
     // ── Model route audit + UI notices ──────────────
     if (eventType === "model_route_start") {
       latestModelRouteSwitch = null;
       currentModelRouteMetadata = null;
+      isRoutingTurn = true;
+      routingCommitted = false;
+      discardRoutedAttempt();
     }
 
     if (eventType === "model_route_switch") {
@@ -401,6 +493,19 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           await incrementMessageCount(sessionId);
         }
       }
+      if (isRoutingTurn) await commitRoutedTurn();
+    }
+
+    // ── Model route: exhausted commits the final attempt's output + error;
+    //    rollback discards a failed live primary before the next candidate. ──
+    if (eventType === "model_route_exhausted") {
+      routingCommitted = true;
+      await flushOps(pendingAssistantOps);
+      await flushOps(pendingErrorOps);
+    }
+    if (eventType === "model_route_rollback") {
+      discardRoutedAttempt();
+      routingCommitted = false;
     }
 
     // ── DB persistence: tool_execution_end ──────────
@@ -514,6 +619,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
 
     // ── tool_execution_start: capture input + start time ──
     if (eventType === "tool_execution_start" || eventType === "tool_start") {
+      // First tool execution commits the routed turn (fallback is now blocked):
+      // flush any assistant text deferred before this point so the tool row
+      // lands after it in the transcript.
+      if (isRoutingTurn && !routingCommitted) await commitRoutedTurn();
       const nowAtStart = Date.now();
       if (firstTokenTime === undefined) firstTokenTime = nowAtStart;
       const startToolName = (evt.toolName as string) || (evt.name as string) || "tool";
@@ -593,6 +702,38 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               {},
             );
           }
+          // Persist the error as its own DB row so it survives a page refresh
+          // or session re-open. The live frontend error bubble is client-only
+          // (role="error", no DB row) and is dropped once history reloads from
+          // the DB — without this row a failed turn reloads as just the user
+          // message. The motivating case is model-routing exhausting during
+          // setup: it emits a synthetic error message_end with EMPTY content,
+          // so the assistantContent persist path below skips it entirely and
+          // nothing about the failure reaches the database. Dedup per consume
+          // run (pi-agent can retry and emit several error message_ends).
+          if (persist && !errorPersisted) {
+            errorPersisted = true;
+            const errorContent = redactText(errorMessage, redactionConfig);
+            const persistError = async () => {
+              await appendMessage({
+                sessionId,
+                role: "assistant",
+                content: errorContent,
+                metadata: {
+                  kind: "error_response",
+                  error_code: ErrorCodes.MODEL_ERROR,
+                  retriable: true,
+                },
+              });
+              await incrementMessageCount(sessionId);
+            };
+            // On a routed turn this error belongs to a candidate that may yet be
+            // replaced by a successful fallback — defer it to the commit point
+            // (only an exhausted turn actually writes it; success/rollback drop
+            // it). Non-routed turns write inline.
+            if (isRoutingTurn && !routingCommitted) pendingErrorOps.push(persistError);
+            else await persistError();
+          }
         }
 
         // Extract text for resultText
@@ -660,17 +801,42 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         if (persist && assistantContent) {
           const cleaned = stripEmptyResponseMarkers(assistantContent);
           if (cleaned.length > 0) {
-            await appendMessage({
-              sessionId,
-              role: "assistant",
-              content: redactText(cleaned, redactionConfig),
-              metadata: {
-                timing,
-                ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
-              },
-            });
-            await incrementMessageCount(sessionId);
+            const assistantRowContent = redactText(cleaned, redactionConfig);
+            const assistantRowMetadata = {
+              timing,
+              ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
+            };
+            const persistAssistant = async () => {
+              // Fold in the context-usage snapshot if agent_end already arrived
+              // (the routed/default order — agent_end precedes this commit). The
+              // closure reads capturedContextUsage at RUN time, not definition time.
+              const rowMetadata = capturedContextUsage
+                ? { ...assistantRowMetadata, context_usage: capturedContextUsage }
+                : assistantRowMetadata;
+              const id = await appendMessage({
+                sessionId,
+                role: "assistant",
+                content: assistantRowContent,
+                metadata: rowMetadata,
+              });
+              // Remember the turn's latest assistant row so a later agent_end (the
+              // immediate/non-routed order) can patch the snapshot onto its metadata.
+              lastAssistantDbMessageId = id;
+              lastAssistantContent = assistantRowContent;
+              lastAssistantMetadata = rowMetadata;
+              await incrementMessageCount(sessionId);
+            };
+            // Flip the first-assistant flag NOW (not inside the deferred op):
+            // ttft_ms is the turn anchor and is computed above from this flag, so
+            // a second assistant message_end in the same routed turn must already
+            // see it set, even though the op itself may not run until commit. The
+            // op-internal flip lagged and let a 2nd deferred row re-emit ttft.
             firstAssistantPersisted = true;
+            // On a routed turn the primary streams live before we know it won;
+            // defer the durable write to the commit point so a failed primary's
+            // reply isn't left in the DB after a fallback takes over.
+            if (isRoutingTurn && !routingCommitted) pendingAssistantOps.push(persistAssistant);
+            else await persistAssistant();
           }
           assistantContent = "";
         }
@@ -765,6 +931,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   if (!resultText && currentMsgText) {
     resultText = currentMsgText;
   }
+
+  // Defensive: a routed turn normally ends on success / exhausted / rollback,
+  // which already flushed or dropped these. If the stream ends without one
+  // (transport drop), flush whatever is still pending so a real answer or a
+  // terminal error is not silently lost.
+  await flushOps(pendingAssistantOps);
+  await flushOps(pendingErrorOps);
 
   const durationMs = Date.now() - startTime;
   console.log(`[sse-consumer] ${userId} session=${sessionId}: ${eventCount} events, ${durationMs}ms`);

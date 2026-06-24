@@ -2,7 +2,7 @@
  * Tool Registry — declarative tool registration and resolution.
  *
  * Each tool file exports a `registration: ToolEntry` that declares its
- * metadata (category, modes, platform exemption, availability guard).
+ * metadata (category, modes, availability guard).
  * The registry collects all entries and resolves the final tool list
  * in one pass: mode filter → available check → instantiate → allowedTools filter.
  */
@@ -136,6 +136,19 @@ export interface TaskOutputSnapshot {
  */
 export type TaskOutputReader = (jobId: string) => TaskOutputSnapshot;
 
+export interface ChannelMessageRequest {
+  sessionId: string;
+  kind: "milestone" | "final" | "artifact";
+  text: string;
+}
+
+export interface ChannelMessageResult {
+  delivered: boolean;
+  message: string;
+}
+
+export type ChannelMessageExecutor = (request: ChannelMessageRequest) => Promise<ChannelMessageResult>;
+
 // ── background exec (run_in_background on bash / node_exec / pod_exec) ──────
 
 /**
@@ -263,6 +276,8 @@ export interface ToolRefs {
   backgroundExecExecutor?: BackgroundExecExecutor;
   /** Reads a background job's live status from the runtime's JobRegistry. Enables task_output. */
   taskOutputReader?: TaskOutputReader;
+  /** Sends an agent-selected visible update to the active IM channel; Gateway owns delivery policy. */
+  channelMessageExecutor?: ChannelMessageExecutor;
 }
 
 /** Declarative registration for a single tool. */
@@ -283,9 +298,6 @@ export interface ToolEntry {
    * Replaces the scattered `if (mode === "web")` logic in agent-factory.
    */
   modes?: SessionMode[];
-
-  /** Platform tool — exempt from allowedTools workspace filtering. */
-  platform?: boolean;
 
   /**
    * Runtime permission metadata.
@@ -338,7 +350,7 @@ export class ToolRegistry {
    * Resolve the final tool list in one pass:
    * 1. Filter by mode + available guard (zero cost — create not called)
    * 2. Instantiate only the tools that passed filtering
-   * 3. Apply allowedTools whitelist (platform tools exempt)
+   * 3. Apply allowedTools whitelist (sole availability axis; no exemptions)
    */
   resolve(opts: {
     mode: SessionMode;
@@ -363,20 +375,15 @@ export class ToolRegistry {
       if (e.requiresUserApproval) {
         def.requiresUserApproval = true;
       }
-      return {
-        def,
-        platform: e.platform ?? false,
-      };
+      return def;
     });
 
-    // 3. allowedTools whitelist (platform tools exempt)
+    // 3. allowedTools whitelist (sole availability axis; no exemptions)
     if (Array.isArray(allowedTools)) {
       const allowed = new Set(allowedTools);
-      return tools
-        .filter((t) => t.platform || allowed.has(t.def.name))
-        .map((t) => t.def);
+      return tools.filter((d) => allowed.has(d.name));
     }
 
-    return tools.map((t) => t.def);
+    return tools;
   }
 }

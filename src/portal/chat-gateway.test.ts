@@ -151,7 +151,7 @@ describe("chat-gateway routes", () => {
 
     it("opens SSE stream and sends chat.send command when model is configured", async () => {
       query
-        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4" }], []])
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4", system_prompt: "You are an ops bot." }], []])
         .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
         .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []]);
 
@@ -178,6 +178,7 @@ describe("chat-gateway routes", () => {
         userId: "u1",
         text: "hi",
         sessionId: "s1",
+        systemPrompt: "You are an ops bot.",
       }));
     });
 
@@ -589,6 +590,47 @@ describe("chat-gateway routes", () => {
         body: { session_id: "s1" },
       }));
       expect(connMap.sendCommand).toHaveBeenCalledWith("a1", "chat.abort", expect.objectContaining({ sessionId: "s1" }));
+    });
+  });
+
+  // ── chat.sessionStatus (liveness) ────────────────────────
+  describe("GET /api/v1/siclaw/agents/:id/chat/sessions/:sid/status", () => {
+    const url = "/api/v1/siclaw/agents/a1/chat/sessions/s1/status";
+
+    it("returns 401 without auth", async () => {
+      const res = await runRoute(router, fakeReq({ url, method: "GET" }));
+      expect(res._status).toBe(401);
+      expect(connMap.sendCommand).not.toHaveBeenCalled();
+    });
+
+    it("returns 403 when the session belongs to another user", async () => {
+      query.mockResolvedValue([[{ user_id: "someone-else" }], []]);
+      const res = await runRoute(router, fakeReq({
+        url, method: "GET", headers: { authorization: `Bearer ${USER_TOKEN}` },
+      }));
+      expect(res._status).toBe(403);
+      expect(connMap.sendCommand).not.toHaveBeenCalled();
+    });
+
+    it("maps payload.running to the response on a new (unowned) session", async () => {
+      query.mockResolvedValue([[], []]); // brand-new session → no row → allowed
+      connMap.sendCommand = vi.fn().mockResolvedValue({ ok: true, payload: { running: true } });
+      const res = await runRoute(router, fakeReq({
+        url, method: "GET", headers: { authorization: `Bearer ${USER_TOKEN}` },
+      }));
+      expect(res._status).toBe(200);
+      expect(JSON.parse(res._body)).toEqual({ running: true });
+      expect(connMap.sendCommand).toHaveBeenCalledWith("a1", "chat.sessionStatus", expect.objectContaining({ sessionId: "s1" }));
+    });
+
+    it("fails safe to running:false when the runtime RPC fails", async () => {
+      query.mockResolvedValue([[], []]);
+      connMap.sendCommand = vi.fn().mockResolvedValue({ ok: false, error: "disconnected" });
+      const res = await runRoute(router, fakeReq({
+        url, method: "GET", headers: { authorization: `Bearer ${USER_TOKEN}` },
+      }));
+      expect(res._status).toBe(200);
+      expect(JSON.parse(res._body)).toEqual({ running: false });
     });
   });
 

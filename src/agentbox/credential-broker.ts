@@ -36,7 +36,7 @@ import type {
   CredentialPayload,
   HostListResult,
 } from "./credential-transport.js";
-import type { ChainHop, ChainHopMeta } from "../shared/credential-types.js";
+import type { ChainHop, ChainHopMeta, ClusterMetaEntry } from "../shared/credential-types.js";
 
 export type { ClusterMeta, HostMeta, CredentialPayload, HostListResult };
 
@@ -675,6 +675,15 @@ function inferClusterMetaFromResponse(response: CredentialResponse): ClusterMeta
   if (typeof metadata.debug_image === "string") meta.debug_image = metadata.debug_image;
   if (Array.isArray(metadata.contexts)) meta.contexts = metadata.contexts as ClusterMeta["contexts"];
   if (typeof metadata.current_context === "string") meta.current_context = metadata.current_context;
+  if (Array.isArray(metadata.meta)) {
+    const entries = (metadata.meta as unknown[]).filter(
+      (e): e is ClusterMetaEntry =>
+        !!e && typeof e === "object" &&
+        typeof (e as ClusterMetaEntry).key === "string" &&
+        typeof (e as ClusterMetaEntry).value === "string",
+    );
+    if (entries.length > 0) meta.meta = entries;
+  }
   return meta;
 }
 

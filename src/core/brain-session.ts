@@ -14,6 +14,27 @@
 
 export type BrainType = "pi-agent";
 
+/**
+ * An image attachment to send alongside a prompt. `data` is raw base64 (no
+ * `data:` URL prefix); the provider layer builds the data URL. Only carried
+ * through to vision-capable models.
+ */
+export interface PromptImage {
+  mimeType: string;
+  data: string;
+}
+
+export interface PromptFile {
+  mimeType: string;
+  filename: string;
+  data: string;
+}
+
+export interface PromptMedia {
+  images?: PromptImage[];
+  files?: PromptFile[];
+}
+
 export interface BrainModelInfo {
   id: string;
   name: string;
@@ -21,6 +42,12 @@ export interface BrainModelInfo {
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
+}
+
+/** Per-model runtime tunables forwarded from the control plane's modelConfig.params. */
+export interface BrainModelParams {
+  /** Reasoning effort: off|minimal|low|medium|high|xhigh. */
+  reasoningEffort?: string;
 }
 
 export interface BrainContextUsage {
@@ -59,7 +86,7 @@ export interface BrainSession {
   readonly brainType: BrainType;
 
   /** Send a prompt to the agent. Resolves when the agent finishes responding. */
-  prompt(text: string): Promise<void>;
+  prompt(text: string, media?: PromptMedia): Promise<void>;
 
   /** Abort the current agent run. */
   abort(): Promise<void>;
@@ -71,7 +98,7 @@ export interface BrainSession {
   reload(): Promise<void>;
 
   /** Interrupt mid-run and inject a user message. */
-  steer(text: string): Promise<void>;
+  steer(text: string, media?: PromptMedia): Promise<void>;
 
   /**
    * Queue a message delivered only after the agent finishes its current run (no
@@ -107,6 +134,14 @@ export interface BrainSession {
 
   /** Register a provider dynamically (from gateway DB config). */
   registerProvider?(name: string, config: Record<string, unknown>): void;
+
+  /**
+   * Apply per-model runtime tunables delivered on the modelConfig (control plane
+   * → modelConfig.params). Called per-prompt after setModel. Brains map what they
+   * can and ignore the rest:
+   *   - reasoningEffort → the session thinking level (any reasoning model)
+   */
+  applyModelParams?(params: BrainModelParams): void;
 
   /**
    * Optional provider-response tap. pi-agent exposes HTTP status/headers through

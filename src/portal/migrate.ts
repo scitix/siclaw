@@ -37,8 +37,10 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     model_provider VARCHAR(100),
     model_id VARCHAR(255),
     model_routing TEXT,
+    tool_capabilities TEXT,
     system_prompt TEXT,
     is_production TINYINT(1) NOT NULL DEFAULT 1,
+    idle_timeout_sec INT NOT NULL DEFAULT 300,
     icon VARCHAR(50),
     color VARCHAR(50),
     created_by CHAR(36),
@@ -312,6 +314,26 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
   )`,
 
+  // A2A task projection. This is protocol state for external agent clients,
+  // not an AgentBox/pi-agent checkpoint.
+  `CREATE TABLE IF NOT EXISTS a2a_tasks (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    user_id CHAR(36) NOT NULL,
+    api_key_id CHAR(36) DEFAULT NULL,
+    context_id VARCHAR(255) NOT NULL,
+    session_id CHAR(36) NOT NULL,
+    state VARCHAR(40) NOT NULL,
+    status_message TEXT,
+    artifact_text TEXT,
+    error TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_event_at TIMESTAMP NULL DEFAULT NULL,
+    completed_at TIMESTAMP NULL DEFAULT NULL,
+    CONSTRAINT fk_a2a_tasks_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+  )`,
+
   // Model Providers
   `CREATE TABLE IF NOT EXISTS model_providers (
     id CHAR(36) PRIMARY KEY,
@@ -360,11 +382,23 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     id CHAR(36) PRIMARY KEY,
     channel_id CHAR(36) NOT NULL,
     agent_id CHAR(36) NOT NULL,
+    session_id CHAR(36) DEFAULT NULL,
     route_key VARCHAR(255) NOT NULL,
     route_type VARCHAR(20) NOT NULL DEFAULT 'group',
     created_by CHAR(36),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (channel_id, route_key)
+  )`,
+
+  // Channel Binding Sessions (maps one channel binding + participant key → session)
+  `CREATE TABLE IF NOT EXISTS channel_binding_sessions (
+    id CHAR(36) PRIMARY KEY,
+    binding_id CHAR(36) NOT NULL,
+    session_key VARCHAR(255) NOT NULL,
+    session_id CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (binding_id, session_key)
   )`,
 
   // Channel Pairing Codes (ephemeral, 5-min TTL)
@@ -469,6 +503,17 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "chat_messages", "idx_chat_messages_audit", "role, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_parent", "parent_session_id, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_delegation", "delegation_id");
+  // a2a_tasks — every A2A query is scoped by (agent_id, api_key_id), so lead the composite
+  // indexes with that prefix. #340 already created idx_a2a_tasks_agent/_context (older column
+  // lists) on every deployed DB, and ensureIndex is name-only — so we must drop those and
+  // recreate under NEW names, or the new prefixes never apply on existing DBs (mirrors the
+  // skills uq_skills_org_name → idx_skills_org_name precedent below). Drop+rename is one-time
+  // idempotent: once the old names are gone dropIndexIfExists is a no-op.
+  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_agent");
+  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_context");
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_agent_key", "agent_id, api_key_id, created_at");
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_session", "session_id");
+  await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_context_key", "agent_id, api_key_id, context_id, created_at");
   // notifications
   await ensureIndex(db, "notifications", "idx_notifications_user", "user_id, read_at, created_at");
   // agent_api_keys
@@ -478,6 +523,8 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "agent_task_runs", "idx_agent_task_runs_session", "session_id");
   // channel_bindings
   await ensureIndex(db, "channel_bindings", "idx_channel_bindings_agent", "agent_id");
+  // channel_binding_sessions
+  await ensureIndex(db, "channel_binding_sessions", "idx_channel_binding_sessions_session", "session_id");
   // knowledge_publish_events
   await ensureIndex(db, "knowledge_publish_events", "idx_kpe_created", "created_at");
   await ensureIndex(db, "knowledge_publish_events", "idx_kpe_repo", "repo_id, created_at");
@@ -499,6 +546,11 @@ export async function runPortalMigrations(): Promise<void> {
   // which was added in a later migration than the CREATE TABLE).
   await safeAlterTable(db, "clusters", "debug_image", "VARCHAR(500) DEFAULT NULL");
   await safeAlterTable(db, "agents", "model_routing", "TEXT DEFAULT NULL");
+  await safeAlterTable(db, "agents", "idle_timeout_sec", "INT NOT NULL DEFAULT 300");
+  // Per-agent tool capability groups (JSON array of group keys). TEXT (not a
+  // JSON column type) for MySQL+SQLite dual-compat. NULL = no selection = all
+  // tools (backward-compatible with agents predating this feature).
+  await safeAlterTable(db, "agents", "tool_capabilities", "TEXT DEFAULT NULL");
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
@@ -515,6 +567,7 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_sessions", "parent_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "delegation_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "target_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "channel_bindings", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "from_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "parent_session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "delegation_id", "CHAR(36) DEFAULT NULL");

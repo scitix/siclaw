@@ -31,6 +31,7 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
       registerProvider: vi.fn(),
     },
     setModel: vi.fn(async () => {}),
+    setThinkingLevel: vi.fn(),
     __emit: emit,
     ...overrides,
   };
@@ -70,6 +71,30 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
     await brain.prompt("ask something");
     expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("prompt maps images to ImageContent and passes them to session.prompt", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string, _opts?: any) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("describe", { images: [{ mimeType: "image/png", data: "aW1n" }] });
+    expect(session.prompt).toHaveBeenCalledWith("describe", {
+      images: [{ type: "image", data: "aW1n", mimeType: "image/png" }],
+    });
+  });
+
+  it("prompt passes no options when there are no images", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string, _opts?: any) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("hi");
+    expect(session.prompt).toHaveBeenCalledWith("hi", undefined);
   });
 
   it("prompt skips retry when stopReason is aborted", async () => {
@@ -145,32 +170,45 @@ describe("PiAgentBrain", () => {
     expect(starts[1].attempt).toBe(2);
   });
 
-  it("abort cancels retry sleep and calls session.abort", async () => {
+  it("#10 abort cancels the retry sleep AND does not fire a fresh re-prompt after Stop", async () => {
     const session = makeFakeSession();
     let callCount = 0;
     session.prompt = vi.fn(async () => {
       callCount++;
       session.__emit({ type: "message_start", message: { role: "assistant" } });
-      // First call: empty → triggers retry
-      // Second call (after abort): emit aborted stopReason so while-loop exits
-      if (callCount === 1) {
-        session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "end_turn" } });
-      } else {
-        session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "aborted" } });
-      }
+      // Empty response → enters the retry backoff.
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "end_turn" } });
     });
     // Large delay so abort() resolves the sleep early.
     (PiAgentBrain as any).RETRY_DELAY_MS = 60000;
     const brain = new PiAgentBrain(session);
     const p = brain.prompt("q");
-    // Wait briefly for first prompt to complete, retry to begin sleeping
+    // Wait briefly for the first prompt to complete and the retry to begin sleeping.
     await new Promise((r) => setTimeout(r, 10));
     await brain.abort();
     expect(session.abort).toHaveBeenCalled();
     await p;
-    // Two prompts: initial + one retry cancelled by abort
-    expect(callCount).toBe(2);
+    // ONLY the initial prompt ran — the retry must NOT re-prompt after Stop (pre-fix this was 2,
+    // an un-aborted re-prompt firing after the user clicked Stop).
+    expect(callCount).toBe(1);
   }, 3000);
+
+  it("#8 abort also cancels in-flight compaction via session.abortCompaction", async () => {
+    const abortCompaction = vi.fn();
+    const session = makeFakeSession({ abortCompaction });
+    const brain = new PiAgentBrain(session);
+    await brain.abort();
+    expect(abortCompaction).toHaveBeenCalled();
+    expect(session.abort).toHaveBeenCalled();
+  });
+
+  it("#8 abort is safe when the session has no abortCompaction (optional)", async () => {
+    const session = makeFakeSession();
+    delete (session as any).abortCompaction;
+    const brain = new PiAgentBrain(session);
+    await expect(brain.abort()).resolves.toBeUndefined();
+    expect(session.abort).toHaveBeenCalled();
+  });
 
   it("reload delegates", async () => {
     const session = makeFakeSession();
@@ -184,6 +222,45 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
     await brain.steer("steer me");
     expect(session.steer).toHaveBeenCalledWith("steer me");
+  });
+
+  it("steer forwards images through prompt streaming steer", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    await brain.steer("steer image", { images: [{ mimeType: "image/png", data: "aGVsbG8=" }] });
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.prompt).toHaveBeenCalledWith("steer image", {
+      streamingBehavior: "steer",
+      images: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }],
+    });
+  });
+
+  it("prompt forwards PDF files through pi-agent content options", async () => {
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("read pdf", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    expect(session.prompt).toHaveBeenCalledWith("read pdf", {
+      images: [{ type: "file", mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+  });
+
+  it("steer forwards PDF files through prompt streaming steer", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+    await brain.steer("steer pdf", {
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.prompt).toHaveBeenCalledWith("steer pdf", {
+      streamingBehavior: "steer",
+      images: [{ type: "file", mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    });
   });
 
   it("clearQueue delegates", () => {
@@ -444,5 +521,25 @@ describe("PiAgentBrain", () => {
       provider: "anthropic",
       modelId: "claude",
     }]);
+  });
+
+  describe("applyModelParams", () => {
+    it("sets a valid reasoning effort as the thinking level", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ reasoningEffort: "xhigh" });
+      expect(session.setThinkingLevel).toHaveBeenCalledWith("xhigh");
+    });
+
+    it("ignores an invalid reasoning effort (no throw, no call)", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({ reasoningEffort: "ultra" });
+      expect(session.setThinkingLevel).not.toHaveBeenCalled();
+    });
+
+    it("is a no-op when no effort is provided", () => {
+      const session = makeFakeSession();
+      new PiAgentBrain(session).applyModelParams({});
+      expect(session.setThinkingLevel).not.toHaveBeenCalled();
+    });
   });
 });

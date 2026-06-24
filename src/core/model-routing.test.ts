@@ -11,6 +11,7 @@ import {
   normalizeCandidates,
   normalizeModelRoutePolicy,
   normalizeModelRouteState,
+  resolveEffectivePolicy,
   runPromptWithModelRouting,
   shouldFallbackForKind,
   type ModelRouteEvent,
@@ -43,6 +44,24 @@ function makePolicy(): ModelRoutePolicy {
       { provider: "anthropic", modelId: "claude" },
       { provider: "deepseek", modelId: "deepseek-chat" },
     ],
+  };
+}
+
+function candidateWithInput(provider: string, modelId: string, input: string[]): NonNullable<ModelRoutePolicy["candidates"]>[number] {
+  return {
+    provider,
+    modelId,
+    modelConfig: {
+      models: [{
+        id: modelId,
+        name: modelId,
+        reasoning: false,
+        input,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128000,
+        maxTokens: 4096,
+      }],
+    },
   };
 }
 
@@ -232,6 +251,12 @@ describe("model-routing classifier", () => {
     expect(classifyModelRouteFailure("context_length_exceeded: max context")).toBe("context_overflow");
     expect(classifyModelRouteFailure("cancelled by user", "aborted")).toBe("user_abort");
     expect(classifyModelRouteFailure("content filter blocked")).toBe("content_policy");
+    expect(classifyModelRouteFailure("response blocked due to safety")).toBe("content_policy");
+    expect(classifyModelRouteFailure("prompt triggering content management policy")).toBe("content_policy");
+    // Bare "blocked" / "policy" must not be mistaken for a content block —
+    // these were previously mislabeled content_policy (a no-fallback kind).
+    expect(classifyModelRouteFailure("request blocked by upstream proxy")).toBe("network");
+    expect(classifyModelRouteFailure("retry policy exceeded for request")).toBe("unknown");
     expect(classifyModelRouteFailure("401 invalid api key")).toBe("auth");
     expect(classifyModelRouteFailure("403 permission denied")).toBe("auth");
     expect(classifyModelRouteFailure("400 invalid parameter")).toBe("format_error");
@@ -363,6 +388,40 @@ describe("model-routing policy", () => {
     expect(state.activeCandidateKey).toBeUndefined();
     expect(state.activeCandidateSource).toBeUndefined();
     expect(state.lastSwitchReason).toBe("request_model_override");
+  });
+});
+
+describe("resolveEffectivePolicy (single routing entry)", () => {
+  const multi: ModelRoutePolicy = {
+    enabled: true,
+    strategy: "ordered_fallback",
+    candidates: [
+      { provider: "openai", modelId: "gpt-4" },
+      { provider: "anthropic", modelId: "claude" },
+    ],
+  };
+  const currentModel = { provider: "openai", id: "gpt-4" };
+
+  it("returns the configured policy unchanged when real multi-candidate routing applies", () => {
+    expect(resolveEffectivePolicy(multi, createModelRouteState(), currentModel)).toBe(multi);
+  });
+
+  it("builds a single-candidate policy from the current model when routing is off", () => {
+    expect(resolveEffectivePolicy(undefined, createModelRouteState(), currentModel)).toEqual({
+      enabled: true,
+      strategy: "ordered_fallback",
+      candidates: [{ provider: "openai", modelId: "gpt-4" }],
+    });
+  });
+
+  it("uses the pinned model as the lone candidate, ignoring configured fallbacks, when the user pinned a model", () => {
+    const state = { ...createModelRouteState(), activeCandidateSource: "user" as const };
+    const eff = resolveEffectivePolicy(multi, state, { provider: "anthropic", id: "claude" });
+    expect(eff?.candidates).toEqual([{ provider: "anthropic", modelId: "claude" }]);
+  });
+
+  it("returns undefined when there is no current model (runner falls back to a bare prompt)", () => {
+    expect(resolveEffectivePolicy(undefined, createModelRouteState(), undefined)).toBeUndefined();
   });
 });
 
@@ -723,6 +782,102 @@ describe("runPromptWithModelRouting", () => {
     expect(state.activeCandidateKey).toBe("anthropic/claude");
   });
 
+  it("skips non-image-capable fallback candidates when images are present", async () => {
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const state = createModelRouteState();
+    const policy: ModelRoutePolicy = {
+      ...makePolicy(),
+      candidates: [
+        candidateWithInput("openai", "gpt-4", ["text", "image"]),
+        candidateWithInput("anthropic", "claude", ["text"]),
+        candidateWithInput("deepseek", "deepseek-chat", ["text", "image"]),
+      ],
+    };
+    const images = [{ mimeType: "image/png", data: "aGVsbG8=" }];
+    const media = { images };
+
+    const result = await runPromptWithModelRouting(brain, "what is in this image?", policy, state, { now: () => 10_000 }, media);
+
+    expect(result.success).toBe(true);
+    expect(brain.promptModels).toEqual(["openai/gpt-4", "deepseek/deepseek-chat"]);
+    expect(brain.prompt).toHaveBeenNthCalledWith(1, "what is in this image?", media);
+    expect(brain.prompt).toHaveBeenNthCalledWith(2, "what is in this image?", media);
+    expect(state.activeCandidateKey).toBe("deepseek/deepseek-chat");
+  });
+
+  it("returns a clear failure when an image prompt has no image-capable candidates", async () => {
+    const brain = makeBrain(["ok"]);
+    const state = createModelRouteState();
+    const policy: ModelRoutePolicy = {
+      ...makePolicy(),
+      candidates: [
+        candidateWithInput("openai", "gpt-4", ["text"]),
+        candidateWithInput("anthropic", "claude", ["text"]),
+      ],
+    };
+
+    const result = await runPromptWithModelRouting(
+      brain,
+      "what is in this image?",
+      policy,
+      state,
+      { now: () => 10_000 },
+      { images: [{ mimeType: "image/png", data: "aGVsbG8=" }] },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.exhausted).toBe(true);
+    expect(result.finalFailureKind).toBe("format_error");
+    expect(result.finalErrorMessage).toContain("No image-capable model route candidate");
+    expect(brain.prompt).not.toHaveBeenCalled();
+  });
+
+  it("skips non-PDF-capable fallback candidates when PDF files are present", async () => {
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const state = createModelRouteState();
+    const policy: ModelRoutePolicy = {
+      ...makePolicy(),
+      candidates: [
+        candidateWithInput("openai", "gpt-4", ["text", "pdf"]),
+        candidateWithInput("anthropic", "claude", ["text", "image"]),
+        candidateWithInput("deepseek", "deepseek-chat", ["text", "pdf"]),
+      ],
+    };
+    const media = { files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }] };
+
+    const result = await runPromptWithModelRouting(brain, "summarize this PDF", policy, state, { now: () => 10_000 }, media);
+
+    expect(result.success).toBe(true);
+    expect(brain.promptModels).toEqual(["openai/gpt-4", "deepseek/deepseek-chat"]);
+    expect(brain.prompt).toHaveBeenNthCalledWith(1, "summarize this PDF", media);
+    expect(brain.prompt).toHaveBeenNthCalledWith(2, "summarize this PDF", media);
+    expect(state.activeCandidateKey).toBe("deepseek/deepseek-chat");
+  });
+
+  it("requires both image and PDF capability for mixed media prompts", async () => {
+    const brain = makeBrain(["ok"]);
+    const state = createModelRouteState();
+    const policy: ModelRoutePolicy = {
+      ...makePolicy(),
+      candidates: [
+        candidateWithInput("openai", "gpt-4", ["text", "image"]),
+        candidateWithInput("anthropic", "claude", ["text", "pdf"]),
+        candidateWithInput("deepseek", "deepseek-chat", ["text", "image", "pdf"]),
+      ],
+    };
+    const media = {
+      images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
+      files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
+    };
+
+    const result = await runPromptWithModelRouting(brain, "compare these", policy, state, { now: () => 10_000 }, media);
+
+    expect(result.success).toBe(true);
+    expect(brain.promptModels).toEqual(["deepseek/deepseek-chat"]);
+    expect(brain.prompt).toHaveBeenCalledWith("compare these", media);
+    expect(state.activeCandidateKey).toBe("deepseek/deepseek-chat");
+  });
+
   it("returns exhausted instead of throwing when every candidate is missing from the model registry", async () => {
     const brain = makeBrain(["ok"]);
     const state = createModelRouteState();
@@ -823,15 +978,46 @@ describe("runPromptWithModelRouting", () => {
     expect(state.activeCandidateKey).toBe("anthropic/claude");
   });
 
-  it("restores the prompt checkpoint and only emits final attempt brain events after fallback", async () => {
+  it("streams the primary candidate live from the first event when it succeeds (no buffering, no rollback)", async () => {
+    const brain = makeBrain([]);
+    const state = createModelRouteState();
+    const emittedBrainEvents: unknown[] = [];
+    const routeEvents: ModelRouteEvent[] = [];
+    let emittedDuringPrompt = 0;
+    brain.prompt = vi.fn(async () => {
+      brain.emitter.emit("event", { type: "agent_start" });
+      brain.emitter.emit("event", { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } });
+      // The primary streams live: these events are already forwarded before
+      // prompt() resolves — a buffered candidate would forward nothing yet.
+      emittedDuringPrompt = emittedBrainEvents.length;
+      brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "hi" }], stopReason: "stop" },
+      });
+    });
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitEvent: (event) => routeEvents.push(event),
+      emitBrainEvent: (event) => emittedBrainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(true);
+    expect(emittedDuringPrompt).toBe(2);
+    expect(routeEvents.some((e) => e.type === "model_route_rollback")).toBe(false);
+  });
+
+  it("streams the primary live, rolls it back on failure, then streams the fallback's reply", async () => {
     const brain = makeBrain(["rate_limit", "ok"]);
     const state = createModelRouteState();
     const emittedBrainEvents: unknown[] = [];
+    const routeEvents: ModelRouteEvent[] = [];
     let checkpointSeq = 0;
     brain.createPromptCheckpoint = vi.fn(() => `leaf-${checkpointSeq++}`);
     brain.restorePromptCheckpoint = vi.fn(async () => {});
 
     await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitEvent: (event) => routeEvents.push(event),
       emitBrainEvent: (event) => emittedBrainEvents.push(event),
       now: () => 10_000,
     });
@@ -840,8 +1026,86 @@ describe("runPromptWithModelRouting", () => {
     const messageEnds = emittedBrainEvents.filter((event): event is any =>
       typeof event === "object" && event !== null && (event as any).type === "message_end",
     );
+    // Primary streamed live and failed (rate_limit); the buffered fallback's
+    // successful reply streamed after the switch. Both reach the consumer.
+    expect(messageEnds).toHaveLength(2);
+    expect(messageEnds[0].message.stopReason).toBe("error");
+    expect(messageEnds[1].message.stopReason).toBe("stop");
+    // The live primary failure emits a rollback (so consumers drop it),
+    // sequenced before the switch to the fallback candidate.
+    const rollbackIdx = routeEvents.findIndex((e) => e.type === "model_route_rollback");
+    const switchIdx = routeEvents.findIndex((e) => e.type === "model_route_switch");
+    expect(rollbackIdx).toBeGreaterThanOrEqual(0);
+    expect(switchIdx).toBeGreaterThan(rollbackIdx);
+  });
+
+  it("synthesizes a visible assistant error event when every candidate fails during setup", async () => {
+    const brain = makeBrain(["ok"]);
+    brain.ensureContextForModelPrompt = vi.fn(async () => ({
+      ok: false,
+      compacted: false,
+      contextWindow: 0,
+      errorMessage: "Context preflight failed: invalid context window for openai/gpt-4",
+    }));
+    const state = createModelRouteState();
+    const emittedBrainEvents: unknown[] = [];
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitBrainEvent: (event) => emittedBrainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.exhausted).toBe(true);
+    expect(brain.prompt).not.toHaveBeenCalled();
+    // Setup failures emit no brain events of their own; without the
+    // synthesized terminal message the SSE consumer renders an empty turn
+    // (no answer, no error bubble) and the failure is invisible end-to-end.
+    const messageEnds = emittedBrainEvents.filter((event): event is any =>
+      typeof event === "object" && event !== null && (event as any).type === "message_end",
+    );
     expect(messageEnds).toHaveLength(1);
-    expect(messageEnds[0].message.stopReason).toBe("stop");
+    expect(messageEnds[0].message.role).toBe("assistant");
+    expect(messageEnds[0].message.stopReason).toBe("error");
+    expect(messageEnds[0].message.errorMessage).toContain("Context preflight failed");
+  });
+
+  it("streams brain events live once a tool has executed (fallback is blocked from there)", async () => {
+    const brain = makeBrain([]);
+    const state = createModelRouteState();
+    const emittedBrainEvents: unknown[] = [];
+    let emittedWhilePromptRunning = 0;
+    brain.prompt = vi.fn(async () => {
+      brain.emitter.emit("event", { type: "agent_start" });
+      brain.emitter.emit("event", {
+        type: "tool_execution_start",
+        toolCallId: "call_1",
+        toolName: "read",
+        args: { path: "README.md" },
+      });
+      // The first tool execution blocks fallback, so from here the runner
+      // must pass events through live instead of holding them until the
+      // attempt resolves.
+      emittedWhilePromptRunning = emittedBrainEvents.length;
+      brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" },
+      });
+    });
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      emitBrainEvent: (event) => emittedBrainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(true);
+    expect(emittedWhilePromptRunning).toBe(2);
+    // The success-path flush must not re-emit what already streamed live.
+    expect(emittedBrainEvents.map((event: any) => event?.type)).toEqual([
+      "agent_start",
+      "tool_execution_start",
+      "message_end",
+    ]);
   });
 
   it("does not carry partial tool-use context into the fallback attempt after checkpoint restore", async () => {
@@ -928,6 +1192,110 @@ describe("runPromptWithModelRouting", () => {
     await runPromptWithModelRouting(recoveredBrain, "hello", policy, state, { now: () => 6000 });
     expect(recoveredBrain.promptModels).toEqual(["openai/gpt-4"]);
     expect(state.activeCandidateKey).toBe("openai/gpt-4");
+  });
+
+  it("tries cooling candidates as a last resort when every fresh candidate fails", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+    state.cooldowns[candidateKey(policy.candidates![1])] = 5000;
+    state.cooldowns[candidateKey(policy.candidates![2])] = 5000;
+
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const result = await runPromptWithModelRouting(brain, "hello", policy, state, { now: () => 1000 });
+
+    expect(result.success).toBe(true);
+    expect(brain.promptModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+  });
+
+  it("records a cooldown when the final candidate fails too", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+
+    const brain = makeBrain(["rate_limit", "rate_limit", "rate_limit"]);
+    const result = await runPromptWithModelRouting(brain, "hello", policy, state, { now: () => 10_000 });
+
+    expect(result.exhausted).toBe(true);
+    expect(state.cooldowns[candidateKey(policy.candidates![0])]).toBe(11_000);
+    expect(state.cooldowns[candidateKey(policy.candidates![1])]).toBe(11_000);
+    expect(state.cooldowns[candidateKey(policy.candidates![2])]).toBe(11_000);
+  });
+
+  it("clears a candidate's cooldown when it succeeds while still cooling", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+    for (const candidate of policy.candidates!) {
+      state.cooldowns[candidateKey(candidate)] = 5000;
+    }
+
+    const brain = makeBrain(["ok"]);
+    await runPromptWithModelRouting(brain, "hello", policy, state, { now: () => 1000 });
+
+    expect(brain.promptModels).toEqual(["openai/gpt-4"]);
+    expect(state.cooldowns[candidateKey(policy.candidates![0])]).toBeUndefined();
+    expect(state.cooldowns[candidateKey(policy.candidates![1])]).toBe(5000);
+  });
+
+  it("preserves a manual pin that lands while the runner is in flight", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+    let pinned = false;
+
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const result = await runPromptWithModelRouting(brain, "hello", policy, state, {
+      now: () => 10_000,
+      onStateChange: () => {
+        if (!pinned) {
+          pinned = true;
+          markModelRouteUserSelection(state, { provider: "deepseek", modelId: "deepseek-chat" });
+        }
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(state.activeCandidateSource).toBe("user");
+    expect(state.activeCandidateKey).toBe("deepseek/deepseek-chat");
+  });
+
+  it("halts between attempts when shouldAbort reports a user stop", async () => {
+    const policy = makePolicy();
+    const state = createModelRouteState();
+    const events: ModelRouteEvent[] = [];
+
+    const brain = makeBrain(["rate_limit", "ok"]);
+    const result = await runPromptWithModelRouting(brain, "hello", policy, state, {
+      now: () => 10_000,
+      emitEvent: (event) => events.push(event),
+      shouldAbort: () => brain.promptModels.length >= 1,
+    });
+
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect(result.exhausted).toBe(false);
+    expect(result.finalFailureKind).toBe("user_abort");
+    // A user stop is reported as its own event, never as exhaustion.
+    const abortedEvent = events.find((event) => event.type === "model_route_aborted");
+    expect(abortedEvent).toMatchObject({ errorMessage: "Prompt aborted between fallback attempts." });
+    expect(events.some((event) => event.type === "model_route_exhausted")).toBe(false);
+  });
+
+  it("falls back on a transport-level abort but not on a genuine user stop", async () => {
+    const transportBrain = makeBrain([
+      { stopReason: "aborted", errorMessage: "connection aborted by remote host" },
+      "ok",
+    ]);
+    const transportResult = await runPromptWithModelRouting(
+      transportBrain, "hello", makePolicy(), createModelRouteState(), { now: () => 10_000 },
+    );
+    expect(transportResult.success).toBe(true);
+    expect(transportBrain.promptModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+
+    const userStopBrain = makeBrain([{ stopReason: "aborted" }]);
+    const userStopResult = await runPromptWithModelRouting(
+      userStopBrain, "hello", makePolicy(), createModelRouteState(), { now: () => 10_000 },
+    );
+    expect(userStopResult.success).toBe(false);
+    expect(userStopResult.finalFailureKind).toBe("user_abort");
+    expect(userStopBrain.prompt).toHaveBeenCalledTimes(1);
   });
 
   it("emits fallback and recovery telemetry on the success event", async () => {

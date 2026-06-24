@@ -135,6 +135,36 @@ describe("registerAgentRoutes", () => {
     });
   });
 
+  // ── JSON-in-TEXT decoding on agent responses ─────────────
+  describe("agent response decodes JSON-in-TEXT columns", () => {
+    it("GET /:id decodes model_routing + tool_capabilities to object/array (not raw strings)", async () => {
+      query.mockResolvedValueOnce([[{
+        id: "a1", name: "A",
+        model_routing: '{"enabled":true,"strategy":"ordered_fallback"}',
+        tool_capabilities: '["read_files","inspect_infra"]',
+      }], []]);
+      const { status, body } = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "GET" }));
+      expect(status).toBe(200);
+      expect(body.model_routing).toEqual({ enabled: true, strategy: "ordered_fallback" });
+      expect(body.tool_capabilities).toEqual(["read_files", "inspect_infra"]);
+    });
+
+    it("decodes null columns to null (not the literal string)", async () => {
+      query.mockResolvedValueOnce([[{ id: "a1", name: "A", model_routing: null, tool_capabilities: null }], []]);
+      const { body } = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "GET" }));
+      expect(body.model_routing).toBeNull();
+      expect(body.tool_capabilities).toBeNull();
+    });
+
+    it("tolerates malformed JSON by falling back to null (no crash)", async () => {
+      query.mockResolvedValueOnce([[{ id: "a1", name: "A", model_routing: "{not json", tool_capabilities: "oops" }], []]);
+      const { status, body } = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "GET" }));
+      expect(status).toBe(200);
+      expect(body.model_routing).toBeNull();
+      expect(body.tool_capabilities).toBeNull();
+    });
+  });
+
   // ── POST /api/v1/agents ──────────────────────────────────
   describe("POST /api/v1/agents", () => {
     it("rejects non-admin", async () => {
@@ -318,6 +348,127 @@ describe("registerAgentRoutes", () => {
       expect(connMap.notify).not.toHaveBeenCalled();
     });
 
+    it("terminates the running box when idle_timeout_sec changes resident(0) → finite", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 0 }], []]) // pre-read old idle (resident)
+        .mockResolvedValueOnce([undefined, []])                  // UPDATE
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);            // SELECT *
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 300 },
+      }));
+
+      expect(status).toBe(200);
+      // A resident pod never self-destructs, so it must be terminated to cold-spawn
+      // with the new window — agentId is in the payload (agent.reload requires it).
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.terminate", { agentId: "a1" });
+    });
+
+    it("does NOT terminate on a finite → finite idle change (self-heals)", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 300 }], []]) // pre-read old idle (finite)
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 600 },
+      }));
+
+      // 300→600 self-heals: the box self-destructs on its current 300s window and
+      // the next spawn reads 600 — no need to disrupt a live box.
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("does NOT terminate when staying resident (0 → 0)", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 0 }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 0 },
+      }));
+
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("does NOT terminate when switching finite → Resident (300 → 0)", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 300 }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 0 },
+      }));
+
+      // Going resident needs no recycle: the box self-destructs on its current
+      // finite window, and the next spawn comes up resident.
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("terminates when the stored idle is a stringified \"0\" (driver coercion)", async () => {
+      // Defends the Number() coercion: a string old value must still read as
+      // resident, otherwise the 0→finite recycle would silently not fire.
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: "0" }], []]) // string, not number
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 300 },
+      }));
+
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.terminate", { agentId: "a1" });
+    });
+
+    it("does NOT terminate when the old idle row is missing/null (no false 0)", async () => {
+      // Guards Number(null) === 0: a missing/null old value must NOT be treated
+      // as resident → no spurious terminate.
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: null }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 300 },
+      }));
+
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("terminates on 0 → sub-300 and persists the floored value (300)", async () => {
+      query
+        .mockResolvedValueOnce([[{ idle_timeout_sec: 0 }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { idle_timeout_sec: 100 }, // positive but below the 300 floor
+      }));
+
+      // 0 → positive (even pre-floor) is the stuck transition → terminate.
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.terminate", { agentId: "a1" });
+      // The UPDATE (2nd query) persists the normalized/floored value, proving the
+      // converged single-normalize path feeds the SET clause.
+      const updateValues = query.mock.calls[1][1] as unknown[];
+      expect(updateValues[0]).toBe(300);
+    });
+
     it("updates model_routing as a standalone field", async () => {
       query
         .mockResolvedValueOnce([undefined, []])
@@ -343,6 +494,72 @@ describe("registerAgentRoutes", () => {
         cooldownMsByKind: { rate_limit: 0 },
         candidates: [{ provider: "openai", modelId: "gpt-4" }],
       });
+    });
+
+    it("stores tool_capabilities and pushes a tools reload on change", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { tool_capabilities: ["read_files", "run_commands", "read_files"] },
+      }));
+
+      expect(status).toBe(200);
+      expect(query.mock.calls[0][0]).toContain("tool_capabilities = ?");
+      // Deduped JSON array of group keys.
+      expect(JSON.parse(query.mock.calls[0][1][0])).toEqual(["read_files", "run_commands"]);
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("clears tool_capabilities (empty array → null) and still pushes a reload", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { tool_capabilities: [] },
+      }));
+
+      expect(status).toBe(200);
+      expect(query.mock.calls[0][0]).toContain("tool_capabilities = ?");
+      expect(query.mock.calls[0][1][0]).toBeNull();
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["tools"],
+      });
+    });
+
+    it("does not push a tools reload when tool_capabilities is absent", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { name: "rename-only" },
+      }));
+
+      expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("rejects a non-array tool_capabilities with 400", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { tool_capabilities: "read_files" },
+      }));
+
+      expect(status).toBe(400);
+      expect(body.error).toContain("tool_capabilities");
     });
   });
 

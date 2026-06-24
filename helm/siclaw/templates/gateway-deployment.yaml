@@ -79,8 +79,14 @@ spec:
               value: {{ .Values.runtime.subagentConcurrency | quote }}
             {{- end }}
             {{- if .Values.agentbox.persistence.enabled }}
+            # Global default policy: callers that omit per-agent persistence use the PVC.
             - name: SICLAW_PERSISTENCE_ENABLED
               value: "true"
+            {{- end }}
+            {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
+            # PVC availability (infra): present whenever the chart provisions a PVC
+            # OR a pre-existing claim is referenced — independent of the global
+            # default above, so a per-agent persistence:true can mount it.
             - name: SICLAW_PERSISTENCE_CLAIM_NAME
               value: {{ include "siclaw.dataPvcName" . | quote }}
             {{- end }}
@@ -128,7 +134,7 @@ spec:
           volumeMounts:
             - name: skills
               mountPath: /app/.siclaw/skills
-            {{- if .Values.agentbox.persistence.enabled }}
+            {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
             - name: user-data
               mountPath: /app/.siclaw/user-data
             {{- end }}
@@ -147,7 +153,7 @@ spec:
       volumes:
         - name: skills
           emptyDir: {}
-        {{- if .Values.agentbox.persistence.enabled }}
+        {{- if eq (include "siclaw.persistence.pvcAvailable" .) "true" }}
         - name: user-data
           persistentVolumeClaim:
             claimName: {{ include "siclaw.dataPvcName" . }}

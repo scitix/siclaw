@@ -40,6 +40,7 @@ import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
   handleMcpServers,
+  handleToolCapabilities,
   handleSkillsBundle,
   handleKnowledgeBundle,
   handleAgentTasksList,
@@ -47,14 +48,17 @@ import {
   handleAgentTasksUpdate,
   handleAgentTasksDelete,
   handleDelegationEvents,
+  handleMetricsFlush,
 } from "./internal-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
+import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
+import { resolveAgentModelBinding } from "./agent-model-binding.js";
 
 export interface RuntimeServer {
   httpServer: http.Server;
@@ -138,12 +142,68 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── RPC Methods (chat only) ──────────────────────────────
   const rpcMethods = new Map<string, RpcHandler>();
 
+  // Resolve the per-agent spawn env. Currently only the idle self-destruct
+  // window (agents.idle_timeout_sec → SICLAW_AGENTBOX_IDLE_TIMEOUT), which the
+  // AgentBox reads at startup (config.server.idleTimeoutSec). The Runtime is
+  // DB-free, so the value comes from Portal via the `config.getAgent` RPC (the
+  // same channel other agent config flows through) — NOT a direct DB read.
+  // Best-effort: any RPC failure falls back to the AgentBox's own default
+  // rather than failing the spawn. The env only takes effect on a cold spawn —
+  // K8sSpawner ignores it when a pod is already running, so a changed timeout
+  // applies on the agent's next restart.
+  //
+  // Registered on the AgentBoxManager (not wired per-call) so EVERY cold-spawn
+  // entry point — chat RPCs here, plus channel webhooks and cron tasks that
+  // share this manager — honours the per-agent window. The manager invokes it
+  // lazily, only on an actual spawn, so warm-pod reuse pays no RPC.
+  const resolveAgentSpawnEnv = async (agentId: string): Promise<Record<string, string> | undefined> => {
+    try {
+      const agent = await frontendClient.request("config.getAgent", { agentId }) as
+        | { idle_timeout_sec?: number | null }
+        | null;
+      const sec = agent?.idle_timeout_sec;
+      if (sec !== undefined && sec !== null) {
+        return { SICLAW_AGENTBOX_IDLE_TIMEOUT: String(sec) };
+      }
+    } catch (err) {
+      console.warn(`[gateway] Failed to resolve idle timeout for agent ${agentId}:`, err);
+    }
+    return undefined;
+  };
+  agentBoxManager.setSpawnEnvResolver(resolveAgentSpawnEnv);
+
+  // Per-agent PVC persistence is an AGENT property, not a per-request flag:
+  // resolve it server-side by agentId so every cold-spawn entry point (chat,
+  // channel webhooks, cron, abort/steer) lands the same mode for the same agent
+  // — not whichever caller happens to spawn the pod first. Registered on the
+  // shared manager and consulted only on a cold spawn. siclaw core leaves
+  // binding.persistence undefined → global fallback (behaviour identical to
+  // upstream); a product portal fills it in its config.getModelBinding handler.
+  agentBoxManager.setPersistenceResolver(async (agentId) => {
+    const binding = await resolveAgentModelBinding(agentId, frontendClient);
+    return binding?.persistence;
+  });
+
+  // Per-session AbortController for the in-flight chat.send SSE consumer, keyed
+  // by sessionId. chat.abort looks this up to break the gateway's consumeAgentSse
+  // loop so its abort-finalization runs (in-flight tool rows → "stopped", partial
+  // text persisted). Without this the consumer ends only when the agentbox closes
+  // the stream NATURALLY (signal never aborted), the finalization is skipped, and
+  // the tool row stays persisted as "running" — so a page refresh re-paints the
+  // turn as still reasoning. Registered in chat.send, cleared on its settle.
+  const activeStreamAborts = new Map<string, AbortController>();
+
   rpcMethods.set("chat.send", async (params, context: RpcContext) => {
     const agentId = params.agentId as string;
     const userId = params.userId as string;
     const orgId = params.orgId as string | undefined;
     const text = params.text as string;
     const incomingSessionId = params.sessionId as string | undefined;
+    // Session entry-form for audit categorization (Web / API / A2A). null =
+    // web (default). Portal call sites stamp "api" (/api/v1/run) and "a2a";
+    // channels stamp "channel" via their own ensureChatSession. Only consumed
+    // when THIS handler creates the session row.
+    const origin = params.origin as string | undefined;
     // Portal stamps turnStartMs at POST receipt — closer to user click than
     // the runtime's loop start. Use it as the canonical turn anchor when
     // present; fall back gracefully so direct callers (tests, /run path)
@@ -162,6 +222,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     const modelConfig = params.modelConfig as PromptOptions["modelConfig"];
     const modelRouting = params.modelRouting as PromptOptions["modelRouting"];
+    const images = params.images as PromptOptions["images"];
+    const files = params.files as PromptOptions["files"];
     const promptOpts: PromptOptions = {
       sessionId,
       text,
@@ -172,6 +234,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       mode: params.mode as string | undefined,
       modelConfig,
       modelRouting,
+      images,
+      files,
     };
 
     // Async-ack protocol: return { ok, sessionId } within milliseconds; do
@@ -196,10 +260,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // Persist user message + ensure session row before any agent events
         // could land. consumeAgentSse writes assistant/tool rows with FK
         // referencing chat_sessions, so the row has to exist first.
-        await ensureChatSession(sessionId, agentId, userId, text);
+        await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
         await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
 
+        // Persistence is resolved by agentId in the manager's persistenceResolver
+        // (registered in startRuntime), not from per-request params — so every
+        // entry point lands the same mode for the same agent.
         const handle = await agentBoxManager.getOrCreate(agentId);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
@@ -216,7 +283,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // prompt will fire its own when it actually finishes, and an
           // extra one would close the frontend stream prematurely.
           if (err instanceof Error && err.message.includes("Session is already running")) {
-            await client.steerSession(sessionId, text);
+            await client.steerSession(sessionId, text, { images, files });
             return;
           }
           throw err;
@@ -224,6 +291,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
         const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
         const abortCtrl = new AbortController();
+        // Register this turn's abort signal so chat.abort can break the consumer
+        // (see activeStreamAborts declaration). Placed AFTER prompt() succeeds, on
+        // the path that actually consumes: the concurrent-send "already running"
+        // branch early-returns above (steer) before this line, so it never clobbers
+        // the in-flight prompt's controller in the map. Keyed on the agentbox-echoed
+        // promptResult.sessionId — the same id chat.abort looks up.
+        activeStreamAborts.set(promptResult.sessionId, abortCtrl);
 
         try {
           await consumeAgentSse({
@@ -255,6 +329,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             });
           }
           context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+        } finally {
+          // Only clear if still ours — a fast re-send for the same session would
+          // have replaced the entry with a newer controller.
+          if (activeStreamAborts.get(promptResult.sessionId) === abortCtrl) {
+            activeStreamAborts.delete(promptResult.sessionId);
+          }
         }
       } catch (err) {
         // Failure before/during agentbox spawn or prompt() — surface as a
@@ -281,6 +361,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const sessionId = params.sessionId as string;
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
 
+    // Break the gateway's SSE consumer FIRST, then stop the agentbox. Aborting the
+    // signal before abortSession ensures it is set before the agentbox's final
+    // agent_end/prompt_done events (or the natural stream close they cause) reach
+    // the consumer — so consumeAgentSse runs its abort-finalization (in-flight tool
+    // rows → "stopped", partial assistant text persisted) instead of exiting as a
+    // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
+    activeStreamAborts.get(sessionId)?.abort();
+
     const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.abortSession(sessionId);
@@ -291,6 +379,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
     const text = params.text as string;
+    const images = params.images as PromptOptions["images"];
+    const files = params.files as PromptOptions["files"];
     if (!agentId || !sessionId || !text) throw new Error("agentId, sessionId, text required");
 
     // Persist the steer as a user message BEFORE injecting it, mirroring
@@ -305,7 +395,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
-    await client.steerSession(sessionId, text);
+    await client.steerSession(sessionId, text, { images, files });
     return { ok: true };
   });
 
@@ -318,6 +408,27 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     const cleared = await client.clearQueue(sessionId);
     return { ok: true, ...cleared };
+  });
+
+  // chat.sessionStatus — explicit liveness of a session's in-progress turn, for the Portal
+  // reconnect-after-refresh flow. Uses getAsync (NON-spawning): checking liveness must never
+  // boot an AgentBox — no box means nothing is running. Any failure is fail-safe "not running"
+  // so a transient hiccup makes the page show static history rather than a stuck spinner.
+  rpcMethods.set("chat.sessionStatus", async (params) => {
+    const agentId = params.agentId as string;
+    const sessionId = params.sessionId as string;
+    if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
+
+    const handle = await agentBoxManager.getAsync(agentId);
+    if (!handle) return { ok: true, running: false };
+    try {
+      const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
+      const { running } = await client.sessionStatus(sessionId);
+      return { ok: true, running: !!running };
+    } catch (err: any) {
+      console.warn(`[rpc] chat.sessionStatus: agent=${agentId} session=${sessionId} probe failed: ${err?.message ?? err}`);
+      return { ok: true, running: false };
+    }
   });
 
   rpcMethods.set("agent.clearMemory", async (params) => {
@@ -420,18 +531,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
-  // metrics.live — delayed ref to metricsAggregator (created after rpcMethods)
-  let metricsAggregatorRef: MetricsAggregator | null = null;
-  rpcMethods.set("metrics.live", async (params) => {
-    if (!metricsAggregatorRef) throw new Error("MetricsAggregator not ready");
-    const userId = (params as any)?.userId || undefined;
-    return {
-      snapshot: metricsAggregatorRef.snapshot(),
-      topTools: metricsAggregatorRef.topTools(10, userId),
-      topSkills: metricsAggregatorRef.topSkills(10, userId),
-    };
-  });
-
   // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──
   // Portal sends commands (e.g. chat.send, agent.reload, task.fireNow) to
   // Runtime over the persistent WS connection. We route them through the
@@ -450,11 +549,21 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return handler(params, context);
   });
 
-  // ── MetricsAggregator (K8s: pull loop; Local: proxy to in-process localCollector) ──
+  // ── MetricsAggregator (K8s only: Prometheus federation pull loop) ──
   const isK8sMode = !(spawner instanceof LocalSpawner);
-  let metricsAggregator: MetricsAggregator;
+  let metricsAggregator: MetricsAggregator | undefined;
+  // K8s only: application-layer Prometheus federation. The gateway process emits no
+  // business events in K8s mode (they fire inside agentbox pods), so its own
+  // metricsRegistry is empty of them; federation provides those series instead.
+  let promFederation: PromFederationAggregator | null = null;
+  // The federation self-monitoring registry/counters (module 4), resolved once in
+  // K8s mode and reused by the /metrics handler and the flush route — avoids a
+  // per-request dynamic import whose rejection could escape a route handler.
+  let federationSelfMetrics: typeof import("./federation-self-metrics.js") | null = null;
   if (isK8sMode) {
-    metricsAggregator = new MetricsAggregator("k8s", undefined, agentBoxManager, {
+    promFederation = new PromFederationAggregator();
+    federationSelfMetrics = await import("./federation-self-metrics.js");
+    metricsAggregator = new MetricsAggregator(agentBoxManager, {
       async fetch(endpoint: string) {
         try {
           const client = new AgentBoxClient(endpoint, 3000, agentBoxTlsOptions);
@@ -463,13 +572,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           return null;
         }
       },
-    });
-  } else {
-    const { localCollector } = await import("../shared/local-collector.js");
-    metricsAggregator = new MetricsAggregator("local", localCollector);
+    }, promFederation, federationSelfMetrics);
   }
-
-  metricsAggregatorRef = metricsAggregator;
 
   // ── Metrics config ───────────────────────────────────────
   const cachedMetricsToken = process.env.SICLAW_METRICS_TOKEN;
@@ -504,8 +608,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       (async () => {
         try {
           const { metricsRegistry } = await import("../shared/metrics.js");
-          res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
-          res.end(await metricsRegistry.metrics());
+          if (promFederation && federationSelfMetrics) {
+            // K8s mode: business metrics come from federation. The gateway's own
+            // metricsRegistry holds the same metric *names* with empty values, so we
+            // must NOT emit it here (it would duplicate # TYPE lines). Instead we
+            // append only the dedicated self-monitoring registry, whose metric names
+            // (siclaw_federation_*) have zero overlap with the federated business
+            // metrics — two non-overlapping exposition texts concatenate safely.
+            const { federationSelfRegistry } = federationSelfMetrics;
+            const federated = promFederation.metrics();
+            const selfMon = await federationSelfRegistry.metrics();
+            res.writeHead(200, { "Content-Type": federationSelfRegistry.contentType });
+            res.end(selfMon ? `${federated}${selfMon}` : federated);
+          } else {
+            // Local mode: gateway emits business events in-process — serve them directly.
+            res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
+            res.end(await metricsRegistry.metrics());
+          }
         } catch (err) {
           console.error("[runtime] /metrics error:", err);
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -591,6 +710,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             return;
           }
 
+          // Tool capabilities — resolved allowedTools for the agent (via RPC)
+          if (url === "/api/internal/tool-capabilities" && method === "GET") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            handleToolCapabilities(req, res, identity, frontendClient);
+            return;
+          }
+
           // Skills bundle — filtered by agent binding (via RPC)
           if (url === "/api/internal/skills/bundle" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
@@ -638,6 +764,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             return;
           }
 
+          // SIGTERM final-flush of an AgentBox's prom snapshot (K8s federation, module 5).
+          if (url === "/api/internal/metrics-flush" && method === "POST") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            if (!promFederation || !federationSelfMetrics) { res.writeHead(404, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Federation not enabled" })); return; }
+            // handleMetricsFlush has its own try/catch and always responds; selfMetrics
+            // is the already-resolved module reference (no per-request import to escape).
+            void handleMetricsFlush(req, res, identity, promFederation, federationSelfMetrics);
+            return;
+          }
+
           // Feedback endpoint
           if (url === "/api/internal/feedback" && method === "POST") {
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -668,7 +804,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     agentBoxTlsOptions,
     credentialService,
     async close() {
-      metricsAggregator.destroy();
+      metricsAggregator?.destroy();
       frontendClient.close();
       await agentBoxManager.cleanup();
       httpServer.close();

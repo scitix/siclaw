@@ -19,6 +19,7 @@ import { registerChannelRoutes } from "./channel-api.js";
 import { registerNotificationRoutes, registerNotificationWs } from "./notification-api.js";
 import { registerSiclawRoutes } from "./siclaw-api.js";
 import { registerRuntimeWs } from "./runtime-connection.js";
+import { registerA2aRoutes } from "./a2a-gateway.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -180,6 +181,7 @@ export function startPortal(config: PortalConfig): http.Server {
   registerClusterRoutes(router, config.jwtSecret, connectionMap);
   registerHostRoutes(router, config.jwtSecret, connectionMap);
   registerChatRoutes(router, connectionMap, config.jwtSecret);
+  registerA2aRoutes(router, connectionMap);
   registerSiclawRoutes(router, {
     jwtSecret: config.jwtSecret,
     portalSecret: config.portalSecret,

@@ -1,8 +1,8 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import path from "node:path";
-import type { RenderChartArgs, RenderChartResult } from "./types.js";
+import { exportMarkdownVisualsWithSicoreWeb } from "./sicore-export.js";
+import type { RenderChartArgs, RenderChartResult, RenderChartToolResponse } from "./types.js";
 
 const CHART_SPEC_VERSION = 1;
+const VISUAL_SPEC_VERSION = 1;
 
 export const RENDER_CHART_INPUT_SCHEMA = {
   type: "object",
@@ -17,7 +17,7 @@ export const RENDER_CHART_INPUT_SCHEMA = {
     data: {
       type: "object",
       description:
-        "Chart data. Pie: {slices:[{label,value}]}. Bar: {categories:[string], series:[{name,values:[number]}]}. Line: {series:[{name, points:[{x:number|string, y:number}]}]}. For time series pass x as epoch seconds (number) and y as the metric value.",
+        "Chart data as a real JSON object, never as a JSON string. Pie: {slices:[{label,value}]}. Bar: {categories:[string], series:[{name,values:[number]}]}. Line: {series:[{name, points:[{x:number|string, y:number}]}]}. Every numeric value must be finite; x/category labels may be strings. Do not use placeholders, variables, or references to earlier messages.",
     },
     title: { type: "string" },
     width: { type: "integer", minimum: 200, maximum: 2400 },
@@ -29,48 +29,111 @@ export const RENDER_CHART_INPUT_SCHEMA = {
 } as const;
 
 export const RENDER_CHART_DESCRIPTION =
-  "Render a pie/bar/line chart from structured data. The tool returns a READY_TO_PASTE chart block as plain markdown plus metadata. Use proactively when the user asks to visualize, plot, or 画图/出图/画饼图/柱状图/曲线/折线/趋势图, AND chartable data is already in context. Typical sources: status_counts (pie), category_summary anomaly/no_anomaly counts (bar), time-series samples (line, x=epoch seconds or display string, y=value). In your final reply, paste the READY_TO_PASTE block exactly as returned. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG.";
+  [
+    "Render a pie/bar/line chart only when finalized structured numeric data is already in context and can be passed as valid tool arguments. This includes requests such as 画图, 画饼图, 柱状图, 趋势图 when the required numeric data is available.",
+    "For qualitative diagrams, workflows, topology, or decision trees, use a ```mermaid fenced block instead; xychart-beta is suitable for simple bar charts.",
+    "Arguments must be one JSON object. data must be an object, never a JSON string. Use only literal finite numbers; never use placeholders, expressions, previous-message references, or bare tokens.",
+    "The tool renders through Sicore Web's own chart renderer/export path and returns a READY_TO_PASTE chart block as plain markdown, metadata, and a PNG image artifact. In your final reply, paste the READY_TO_PASTE block exactly as returned and preserve the image artifact. Do not rewrite, escape, quote, or wrap the chart JSON; the frontend renders ```chart fenced JSON blocks as SVG, while IM channels forward the PNG artifact.",
+  ].join(" ");
 
-function chartBaseDir(): string {
-  const root =
-    process.env.CREATE_CHART_ARTIFACT_DIR ??
-    ".siclaw/user-data/tool-results/create-chart";
-  return path.resolve(root, "chart-render");
-}
+export const RENDER_MERMAID_INPUT_SCHEMA = {
+  type: "object",
+  required: ["source"],
+  properties: {
+    source: {
+      type: "string",
+      description:
+        "The Mermaid source only, without ```mermaid fences. Sicore Web supports flowchart/graph, sequenceDiagram, timeline, and xychart-beta.",
+    },
+    title: {
+      type: "string",
+      description: "Optional title for metadata. It is not injected into the Mermaid source.",
+    },
+  },
+  additionalProperties: false,
+} as const;
+
+export const RENDER_MERMAID_DESCRIPTION = [
+  "Render a Mermaid diagram through Sicore Web's own Mermaid renderer/export path and return a PNG image artifact.",
+  "Use this in Feishu/Lark channel replies whenever the user asks for a flowchart, sequence diagram, timeline, topology, remediation flow, or Mermaid diagram image.",
+  "Arguments must contain Mermaid source only, not fenced markdown. The tool returns READY_TO_PASTE ```mermaid markdown plus an image/png content block. Paste READY_TO_PASTE exactly and preserve the image artifact.",
+].join(" ");
+
+export const RENDER_VISUAL_CARD_INPUT_SCHEMA = {
+  type: "object",
+  required: ["type", "title"],
+  properties: {
+    type: {
+      type: "string",
+      enum: [
+        "report",
+        "final_report",
+        "health_check",
+        "incident_timeline",
+        "root_cause_chain",
+        "metric_snapshot",
+        "status_distribution",
+        "action_plan",
+      ],
+      description: "Sicore Web visual-card type.",
+    },
+    title: { type: "string" },
+    label: { type: "string" },
+    subtitle: { type: "string" },
+    conclusion: { type: "string" },
+    summary: { type: "string", description: "Alias accepted by Sicore Web as conclusion." },
+    tone: { type: "string" },
+    status: { type: "string" },
+    footer: { type: "string" },
+    items: { type: "array" },
+    events: { type: "array" },
+    nodes: { type: "array" },
+    root_cause: { type: "string" },
+    rootCause: { type: "string" },
+    metrics: { type: "array" },
+    segments: { type: "array" },
+    total: { type: "number" },
+    actions: { type: "array" },
+    sections: { type: "array" },
+  },
+  additionalProperties: false,
+} as const;
+
+export const RENDER_VISUAL_CARD_DESCRIPTION = [
+  "Render a Sicore Web visual-card conclusion card through Sicore Web's own visual-card renderer/export path and return a PNG image artifact.",
+  "Use this for Feishu/Lark final diagnosis cards, health checks, root-cause summaries, incident timelines, metric snapshots, status distributions, and action plans when the group needs a conclusion-card image.",
+  "Arguments must be one visual-card JSON object, not Markdown and not a JSON string. The tool returns READY_TO_PASTE ```visual-card markdown plus an image/png content block. Paste READY_TO_PASTE exactly and preserve the image artifact.",
+].join(" ");
 
 function newChartId(type: string): string {
   return `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export async function handleRenderChart(rawArgs: unknown): Promise<{
-  content: Array<{ type: "text"; text: string }>;
-}> {
+export async function handleRenderChart(rawArgs: unknown): Promise<RenderChartToolResponse> {
   const args = validate(rawArgs);
   const id = newChartId(args.type);
 
-  const spec = JSON.stringify({ ...args, schema_version: CHART_SPEC_VERSION });
+  const spec = JSON.stringify(args);
   const markdownEmbed = "```chart\n" + spec + "\n```";
-
-  let specPath: string | undefined;
-  try {
-    const dir = chartBaseDir();
-    await mkdir(dir, { recursive: true });
-    specPath = path.join(dir, `${id}.json`);
-    await writeFile(specPath, spec, "utf8");
-  } catch {
-    /* swallow — disk persistence is best-effort */
-  }
+  const exported = await exportMarkdownVisualsWithSicoreWeb(markdownEmbed);
+  const visual = exported.find((item) => item.kind === "chart") ?? exported[0];
+  if (!visual?.image) throw new Error("render_chart: Sicore Web export returned no chart image");
+  const png = visual.image;
 
   const result: RenderChartResult = {
     schema_version: CHART_SPEC_VERSION,
     chart_id: id,
     type: args.type,
     artifact_kind: "chart_spec",
-    spec_path: specPath ?? "",
+    spec_path: "",
     svg_path: "",
+    png_path: "",
     bytes: Buffer.byteLength(spec, "utf8"),
+    image_bytes: png.byteLength,
+    image_mime: "image/png",
+    renderer: "sicore-web",
     embed_instructions:
-      "Paste the READY_TO_PASTE block above verbatim into your reply where the chart should appear. Do not modify the JSON, add backslashes, escape non-ASCII characters, convert to ```svg, or inline an <img>.",
+      "Paste the READY_TO_PASTE block above verbatim into your reply where the chart should appear, and preserve the returned image artifact. Do not modify the JSON, add backslashes, escape non-ASCII characters, convert to ```svg, or inline an <img>.",
   };
 
   return {
@@ -85,7 +148,97 @@ export async function handleRenderChart(rawArgs: unknown): Promise<{
           JSON.stringify(result, null, 2),
         ].join("\n"),
       },
+      {
+        type: "image",
+        mimeType: "image/png",
+        data: png.toString("base64"),
+      },
     ],
+  };
+}
+
+export async function handleRenderMermaid(rawArgs: unknown): Promise<RenderChartToolResponse> {
+  const args = validateMermaid(rawArgs);
+  const id = newChartId("mermaid");
+  const markdownEmbed = "```mermaid\n" + args.source + "\n```";
+  const exported = await exportMarkdownVisualsWithSicoreWeb(markdownEmbed);
+  const visual = exported.find((item) => item.kind === "mermaid") ?? exported[0];
+  if (!visual?.image) throw new Error("render_mermaid: Sicore Web export returned no Mermaid image");
+
+  const meta = visualMetadata(id, "mermaid", markdownEmbed, visual.image);
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: [
+          "READY_TO_PASTE:",
+          markdownEmbed,
+          "",
+          "METADATA_JSON:",
+          JSON.stringify(meta, null, 2),
+        ].join("\n"),
+      },
+      {
+        type: "image",
+        mimeType: "image/png",
+        data: visual.image.toString("base64"),
+      },
+    ],
+  };
+}
+
+export async function handleRenderVisualCard(rawArgs: unknown): Promise<RenderChartToolResponse> {
+  const spec = validateVisualCard(rawArgs);
+  const id = newChartId("visual-card");
+  const specJson = JSON.stringify(spec);
+  const markdownEmbed = "```visual-card\n" + specJson + "\n```";
+  const exported = await exportMarkdownVisualsWithSicoreWeb(markdownEmbed);
+  const visual = exported.find((item) => item.kind === "visual-card") ?? exported[0];
+  if (!visual?.image) throw new Error("render_visual_card: Sicore Web export returned no visual-card image");
+
+  const meta = visualMetadata(id, "visual-card", markdownEmbed, visual.image);
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: [
+          "READY_TO_PASTE:",
+          markdownEmbed,
+          "",
+          "METADATA_JSON:",
+          JSON.stringify(meta, null, 2),
+        ].join("\n"),
+      },
+      {
+        type: "image",
+        mimeType: "image/png",
+        data: visual.image.toString("base64"),
+      },
+    ],
+  };
+}
+
+function visualMetadata(
+  id: string,
+  kind: "mermaid" | "visual-card",
+  markdownEmbed: string,
+  image: Buffer,
+): Record<string, unknown> {
+  return {
+    schema_version: VISUAL_SPEC_VERSION,
+    visual_id: id,
+    type: kind,
+    artifact_kind: `${kind}_spec`,
+    spec_path: "",
+    png_path: "",
+    bytes: Buffer.byteLength(markdownEmbed, "utf8"),
+    image_bytes: image.byteLength,
+    image_mime: "image/png",
+    renderer: "sicore-web",
+    embed_instructions:
+      "Paste the READY_TO_PASTE block above verbatim into your reply and preserve the returned image artifact. Do not expose escaped JSON or describe Feishu upload mechanics.",
   };
 }
 
@@ -183,4 +336,55 @@ export function validate(raw: unknown): RenderChartArgs {
     return { name: String(item.name ?? `series ${i}`), points };
   });
   return { type: "line", data: { series }, ...common };
+}
+
+export function validateMermaid(raw: unknown): { source: string; title?: string } {
+  if (!raw || typeof raw !== "object") {
+    throw new Error("render_mermaid: arguments must be an object");
+  }
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.source !== "string" || !obj.source.trim()) {
+    throw new Error("render_mermaid: source is required");
+  }
+  const source = stripFence(obj.source.trim(), "mermaid");
+  const out: { source: string; title?: string } = { source };
+  if (typeof obj.title === "string" && obj.title.trim()) out.title = obj.title.trim();
+  return out;
+}
+
+export function validateVisualCard(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("render_visual_card: arguments must be an object");
+  }
+  const obj = raw as Record<string, unknown>;
+  const type = typeof obj.type === "string" ? obj.type : "";
+  if (!RENDER_VISUAL_CARD_INPUT_SCHEMA.properties.type.enum.includes(type as any)) {
+    throw new Error("render_visual_card: type is required and must be a supported Sicore visual-card type");
+  }
+  if (typeof obj.title !== "string" || !obj.title.trim()) {
+    throw new Error("render_visual_card: title is required");
+  }
+  if (!hasVisualCardBody(obj)) {
+    throw new Error("render_visual_card: provide conclusion, items, metrics, segments, events, nodes, actions, or sections");
+  }
+  const allowed = new Set(Object.keys(RENDER_VISUAL_CARD_INPUT_SCHEMA.properties));
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (allowed.has(key)) out[key] = value;
+  }
+  return out;
+}
+
+function hasVisualCardBody(obj: Record<string, unknown>): boolean {
+  if (typeof obj.conclusion === "string" && obj.conclusion.trim()) return true;
+  if (typeof obj.summary === "string" && obj.summary.trim()) return true;
+  return ["items", "metrics", "segments", "events", "nodes", "actions", "sections"].some((key) => {
+    const value = obj[key];
+    return Array.isArray(value) && value.length > 0;
+  });
+}
+
+function stripFence(source: string, language: string): string {
+  const re = new RegExp(`^\\s*\`\`\`${language}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\`\`\`\\s*$`, "i");
+  return source.replace(re, "$1").trim();
 }

@@ -34,6 +34,8 @@ function fakeManaged(id: string, brain: ReturnType<typeof fakeBrain>, promptDone
     _syntheticPromptQueue: null as Promise<void> | null,
     _promptDoneCallbacks: new Set<() => void>(),
     _backgroundWorkCount: 1, // >0 so runSyntheticPrompt's finally skips scheduleRelease (no timers)
+    _aborted: false,
+    _routeBrainEventsThroughExtra: false,
     _eventBuffer: [] as unknown[],
     _bufferUnsub: null as null | (() => void),
     _extraEventBuffer: [] as unknown[],
@@ -103,6 +105,31 @@ describe("notifyParent", () => {
     await flushCoalesce();
     expect(brain.prompt).toHaveBeenCalledTimes(1); // one synthetic turn for j1, not two
     expect((brain.prompt.mock.calls[0][0] as string).match(/<task_notification>/g)?.length).toBe(1);
+  });
+
+  // #7: a job that completed just BEFORE Stop has already buffered its notification + armed the
+  // coalesce timer. The Stop must not let that timer wake the model ("comes back to life").
+  it("#7 Stop: a buffered completion is NOT flushed as a synthetic turn while _aborted", async () => {
+    const { mgr, brain, managed } = setup(true); // idle, job completed
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "completed", summary: "done" });
+    expect(managed._pendingNotifications.length).toBe(1); // buffered, timer armed
+    managed._aborted = true; // user presses Stop before the coalesce flush
+    await flushCoalesce();
+    expect(brain.prompt).not.toHaveBeenCalled();           // no resurrection
+    expect(brain.followUp).not.toHaveBeenCalled();
+    expect(managed._pendingNotifications.length).toBe(0);  // drained, not delivered
+  });
+
+  it("#7 discardPendingNotifications clears the buffer + cancels the coalesce timer", async () => {
+    const { mgr, brain, managed } = setup(true);
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "completed", summary: "done" });
+    expect(managed._pendingNotifications.length).toBe(1);
+    expect(managed._coalesceTimer).not.toBeNull();
+    mgr.discardPendingNotifications("s1");
+    expect(managed._pendingNotifications.length).toBe(0);
+    expect(managed._coalesceTimer).toBeNull();
+    await flushCoalesce();
+    expect(brain.prompt).not.toHaveBeenCalled();
   });
 
   it("restores _promptDone after a synthetic turn", async () => {
@@ -216,6 +243,7 @@ describe("notifyParent", () => {
     ];
     let currentModel = models[0];
     const seenModels: string[] = [];
+    const routeFlagDuringPrompt: boolean[] = [];
     const brain = {
       followUp: vi.fn(async () => {}),
       subscribe: vi.fn((fn: (e: any) => void) => {
@@ -224,6 +252,10 @@ describe("notifyParent", () => {
       }),
       prompt: vi.fn(async () => {
         seenModels.push(`${currentModel.provider}/${currentModel.id}`);
+        // The routed runner buffers brain events; the SSE route's live brain
+        // subscription must be suppressed for the whole turn or a connected
+        // client streams every failed attempt raw.
+        routeFlagDuringPrompt.push(managed._routeBrainEventsThroughExtra);
         if (currentModel.provider === "openai") {
           emit({
             type: "message_end",
@@ -273,6 +305,8 @@ describe("notifyParent", () => {
     await flushCoalesce();
 
     expect(seenModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+    expect(routeFlagDuringPrompt).toEqual([true, true]);
+    expect(managed._routeBrainEventsThroughExtra).toBe(false);
     expect(managed.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
     const events = send.mock.calls.map((c) => c[0]);
     const report = events

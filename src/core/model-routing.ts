@@ -1,4 +1,4 @@
-import type { BrainModelInfo, BrainProviderResponse, BrainSession } from "./brain-session.js";
+import type { BrainModelInfo, BrainProviderResponse, BrainSession, PromptMedia } from "./brain-session.js";
 
 export type ModelRouteFailureKind =
   | "billing"
@@ -113,6 +113,23 @@ export type ModelRouteEvent =
       failureKind?: ModelRouteFailureKind;
       fallbackBlockedReason?: ModelRouteFallbackBlockedReason;
       errorMessage?: string;
+    }
+  | {
+      type: "model_route_aborted";
+      attempt: number;
+      candidateKey?: string;
+      errorMessage?: string;
+    }
+  | {
+      // The primary candidate streamed live and then failed — tell consumers to
+      // discard whatever this attempt already rendered/buffered before the next
+      // candidate streams in. Only emitted when the failed attempt actually
+      // emitted visible output (a setup failure before the first token emits
+      // nothing, so no rollback is needed).
+      type: "model_route_rollback";
+      attempt: number;
+      candidateKey: string;
+      failureKind: ModelRouteFailureKind;
     };
 
 export interface ModelRouteRunResult {
@@ -128,6 +145,17 @@ export interface RunPromptWithModelRoutingOptions {
   emitEvent?: (event: ModelRouteEvent) => void;
   emitBrainEvent?: (event: unknown) => void;
   onStateChange?: (state: ModelRouteState) => void;
+  /** Polled between attempts so a user Stop landing in the switch window halts the chain. */
+  shouldAbort?: () => boolean;
+  /**
+   * Stream the primary candidate's events live (vs. buffering every attempt
+   * until it wins). Defaults to true — an interactive turn should feel like no
+   * routing at all on the happy path, with a model_route_rollback recovering a
+   * failed live primary. Set false for background/synthetic turns that have no
+   * live viewer and persist by collecting brain events: there, a live failed
+   * attempt would leak into the persisted turn, and buffering costs nothing.
+   */
+  optimisticPrimaryStream?: boolean;
   now?: () => number;
 }
 
@@ -164,6 +192,10 @@ interface AttemptResult {
   checkpoint: unknown;
   events: unknown[];
   hadToolExecution: boolean;
+  // True when this attempt emitted at least one brain event live (rather than
+  // buffering it). A live attempt that then fails needs a rollback so the next
+  // candidate doesn't stack its output on top of the failed one's.
+  emittedLive: boolean;
 }
 
 const ATTEMPT_HISTORY_LIMIT = 20;
@@ -256,6 +288,40 @@ export function shouldUseModelRouteRunner(policy: unknown, state: ModelRouteStat
   return normalizeCandidates(policy.candidates).length > 1 && state.activeCandidateSource !== "user";
 }
 
+/**
+ * Resolve the policy actually handed to {@link runPromptWithModelRouting} so that
+ * EVERY prompt flows through one entry (no separate `brain.prompt()` path).
+ *
+ * - Real multi-candidate routing (`shouldUseModelRouteRunner`) → the configured
+ *   policy, unchanged.
+ * - Otherwise (routing off, single candidate, or a user-pinned model) → a
+ *   single-candidate policy built from the CURRENT model. The runner then streams
+ *   that one candidate live (optimistic primary), never falls back, and still
+ *   emits `model_route_start` + `model_route_success(isFallback:false)` — so every
+ *   turn carries its model identity on one event channel for downstream
+ *   collection, while the UX is identical to a bare prompt.
+ *
+ * The single candidate intentionally omits `modelConfig`: the model is already
+ * pinned by the caller's setup, so `runAttempt`'s `modelNeedsUpdate` guard skips
+ * a redundant `setModel` (which would otherwise drop applied runtime params).
+ *
+ * Returns `undefined` only when there is no current model — the runner's own
+ * guard then falls back to a bare `brain.prompt`.
+ */
+export function resolveEffectivePolicy(
+  configured: ModelRoutePolicy | undefined,
+  state: ModelRouteState,
+  currentModel: { provider: string; id: string } | undefined,
+): ModelRoutePolicy | undefined {
+  if (shouldUseModelRouteRunner(configured, state)) return configured;
+  if (!currentModel) return undefined;
+  return {
+    enabled: true,
+    strategy: "ordered_fallback",
+    candidates: [{ provider: currentModel.provider, modelId: currentModel.id }],
+  };
+}
+
 export function normalizeModelRoutePolicy(policy: unknown): ModelRoutePolicy | undefined {
   if (!isRecord(policy)) return undefined;
   if (policy.enabled !== true && policy.enabled !== false) return undefined;
@@ -297,6 +363,41 @@ export function normalizeCandidates(candidates: unknown): ModelRouteCandidate[] 
     normalized.push(next);
   }
   return normalized;
+}
+
+function candidateInputSet(candidate: ModelRouteCandidate): Set<string> {
+  const models = candidate.modelConfig?.models;
+  if (!Array.isArray(models)) return new Set();
+  const exactModel = models.find((model) => isRecord(model) && model.id === candidate.modelId);
+  const model = exactModel ?? models.find(isRecord);
+  if (!isRecord(model) || !Array.isArray(model.input)) return new Set();
+  return new Set(model.input.filter((input): input is string => typeof input === "string"));
+}
+
+export function requiredInputsForPromptMedia(media?: PromptMedia): string[] {
+  const required: string[] = [];
+  if (media?.images && media.images.length > 0) required.push("image");
+  if (media?.files && media.files.length > 0) required.push("pdf");
+  return required;
+}
+
+export function candidateSupportsPromptMedia(candidate: ModelRouteCandidate, media?: PromptMedia): boolean {
+  const required = requiredInputsForPromptMedia(media);
+  if (required.length === 0) return true;
+  const inputs = candidateInputSet(candidate);
+  return required.every((input) => inputs.has(input));
+}
+
+export function filterCandidatesForPromptMedia(candidates: ModelRouteCandidate[], media?: PromptMedia): ModelRouteCandidate[] {
+  const required = requiredInputsForPromptMedia(media);
+  if (required.length === 0) return candidates;
+  return candidates.filter((candidate) => candidateSupportsPromptMedia(candidate, media));
+}
+
+export function unsupportedPromptMediaMessage(media?: PromptMedia): string {
+  const required = requiredInputsForPromptMedia(media);
+  if (required.length === 0) return "No model route candidate is available for this prompt.";
+  return `No ${required.join("+")}-capable model route candidate is available for this input.`;
 }
 
 export function markModelRouteUserSelection(
@@ -350,7 +451,13 @@ export function classifyModelRouteFailure(
   if (/\b401\b|unauthorized|invalid api key|no api key|missing api key|authentication failed|authentication/i.test(combined)) {
     return "auth";
   }
-  if (/content[_ -]?filter|finish_reason:\s*content_filter|safety|policy|blocked/.test(combined)) {
+  // Anchor on phrases real providers emit (OpenAI/Azure content filter,
+  // Anthropic usage policy, Gemini SAFETY blocks). Bare "policy" / "blocked" /
+  // "safety" intercepted unrelated errors here ("blocked by upstream proxy")
+  // and mislabeled them as content_policy, which is a no-fallback kind.
+  if (
+    /content[_ -]?(?:filter|policy|moderation)|finish_reason:\s*content_filter|content management policy|usage policy|policy violation|moderation|blocked (?:due to|by) (?:safety|content|policy)|safety (?:filter|system|setting|rating|violation)/.test(combined)
+  ) {
     return "content_policy";
   }
 
@@ -468,23 +575,51 @@ export async function runPromptWithModelRouting(
   policy: ModelRoutePolicy | undefined,
   state: ModelRouteState,
   options: RunPromptWithModelRoutingOptions = {},
+  media?: PromptMedia,
 ): Promise<ModelRouteRunResult> {
   if (!isModelRoutePolicyEnabled(policy)) {
-    await brain.prompt(text);
+    await brain.prompt(text, media);
     return { success: true, exhausted: false, attempted: [] };
   }
 
-  const candidates = normalizeCandidates(policy.candidates);
+  // Media-capability filtering narrows a genuine CHOICE: with ≥2 candidates, drop
+  // those that can't take the prompt's media so a fallback never lands on one. A
+  // single candidate has nothing to choose between — run it and let the provider
+  // (and the caller's media preflight) decide, matching the pre-unification
+  // bare-prompt path. A candidate synthesized from the current model carries no
+  // modelConfig, so it would otherwise be filtered out for lack of declared inputs.
+  const allCandidates = normalizeCandidates(policy.candidates);
+  const candidates = allCandidates.length > 1
+    ? filterCandidatesForPromptMedia(allCandidates, media)
+    : allCandidates;
+  if (requiredInputsForPromptMedia(media).length > 0 && candidates.length === 0) {
+    return {
+      success: false,
+      exhausted: true,
+      attempted: [],
+      activeCandidateKey: state.activeCandidateKey,
+      finalFailureKind: "format_error",
+      finalErrorMessage: unsupportedPromptMediaMessage(media),
+    };
+  }
   const primaryCandidate = candidates[0]!;
   const primaryCandidateKey = candidateKey(primaryCandidate);
   const emitEvent = options.emitEvent ?? (() => {});
   const emitBrainEvent = options.emitBrainEvent ?? (() => {});
+  const optimisticPrimaryStream = options.optimisticPrimaryStream !== false;
   const now = options.now ?? (() => Date.now());
   const attempted: ModelRouteAttempt[] = [];
 
-  pruneExpiredCooldowns(state, now());
-  let ordered = candidates.filter((candidate) => !isCandidateCooling(state, candidate, now()));
-  if (ordered.length === 0) ordered = candidates;
+  // Cooling candidates are deprioritized, not excluded: when every fresh
+  // candidate fails, trying a cooling one as a last resort still beats
+  // failing the whole turn with an untried candidate on the bench. Partition
+  // against a single timestamp so a cooldown expiring mid-evaluation cannot
+  // drop a candidate from both halves.
+  const orderingNow = now();
+  pruneExpiredCooldowns(state, orderingNow);
+  const freshCandidates = candidates.filter((candidate) => !isCandidateCooling(state, candidate, orderingNow));
+  const coolingCandidates = candidates.filter((candidate) => isCandidateCooling(state, candidate, orderingNow));
+  const ordered = [...freshCandidates, ...coolingCandidates];
 
   emitEvent({
     type: "model_route_start",
@@ -499,6 +634,31 @@ export async function runPromptWithModelRouting(
   let finalFailure: AttemptFailure | undefined;
   for (let i = 0; i < ordered.length; i++) {
     const candidate = ordered[i];
+    // A user Stop can land in the switch window (cooldown persist, checkpoint
+    // restore, setModel are all awaited) where no brain.prompt is in flight to
+    // absorb it — poll the abort signal so the cancelled prompt is not re-run
+    // on the next candidate.
+    if (i > 0 && options.shouldAbort?.()) {
+      const abortMessage = "Prompt aborted between fallback attempts.";
+      state.lastSwitchReason = "user_abort";
+      options.onStateChange?.(state);
+      // A user stop is not exhaustion — emit a dedicated event so a future
+      // consumer cannot render "all candidates failed" for a manual Stop.
+      emitEvent({
+        type: "model_route_aborted",
+        attempt: i,
+        candidateKey: attempted[attempted.length - 1]?.candidateKey,
+        errorMessage: abortMessage,
+      });
+      return {
+        success: false,
+        exhausted: false,
+        attempted,
+        activeCandidateKey: state.activeCandidateKey,
+        finalFailureKind: "user_abort",
+        finalErrorMessage: abortMessage,
+      };
+    }
     const key = candidateKey(candidate);
     const startedAt = now();
     const attempt: ModelRouteAttempt = {
@@ -518,7 +678,15 @@ export async function runPromptWithModelRouting(
       status: "started",
     });
 
-    const attemptResult = await runAttempt(brain, text, candidate);
+    // The primary candidate (first ordered attempt) streams live so a healthy
+    // session feels identical to running without routing. Fallback candidates
+    // buffer (until their own first tool call) — once we've already had to
+    // switch once, replaying a clean attempt beats a second live-then-rollback
+    // flicker. Background/synthetic turns opt out (optimisticPrimaryStream) and
+    // buffer every attempt, since a live failed attempt would leak into the
+    // turn they persist from collected events.
+    const streamFromStart = optimisticPrimaryStream && i === 0;
+    const attemptResult = await runAttempt(brain, text, candidate, emitBrainEvent, streamFromStart, media);
     const failure = attemptResult.failure;
     attempt.finishedAt = now();
 
@@ -528,8 +696,15 @@ export async function runPromptWithModelRouting(
       const recoveredFrom = previousActiveCandidateKey && previousActiveCandidateKey !== key && key === primaryCandidateKey
         ? findCandidateByKey(candidates, previousActiveCandidateKey)
         : undefined;
-      state.activeCandidateKey = key;
-      state.activeCandidateSource = "auto";
+      // A success proves the candidate healthy again — drop any cooldown left
+      // over from a run that used it as a last resort while still cooling.
+      delete state.cooldowns[key];
+      // A manual pin (PUT /model) can land while this runner is in flight;
+      // the run's outcome must not clobber that explicit user choice.
+      if (state.activeCandidateSource !== "user") {
+        state.activeCandidateKey = key;
+        state.activeCandidateSource = "auto";
+      }
       state.lastSuccessAt = attempt.finishedAt;
       recordAttempt(state, attempt);
       options.onStateChange?.(state);
@@ -576,12 +751,18 @@ export async function runPromptWithModelRouting(
     });
 
     const nextCandidate = ordered[i + 1];
-    if (attempt.fallbackBlockedReason && nextCandidate) {
-      const cooldownUntil = cooldownUntilForFailure(failure, policy, now());
-      if (cooldownUntil) state.cooldowns[key] = cooldownUntil;
-      else delete state.cooldowns[key];
-    }
-    if (!nextCandidate || attempt.fallbackBlockedReason || !shouldTryNextCandidateForFailure(failure, policy)) {
+    const willSwitch = Boolean(nextCandidate)
+      && !attempt.fallbackBlockedReason
+      && shouldTryNextCandidateForFailure(failure, policy);
+    // Record the cooldown for every failure that carries one, not only when
+    // switching: a terminal failure (last candidate, tool-blocked, or
+    // no-fallback kind) still marks the candidate unhealthy for the NEXT
+    // turn's ordering. Only the switch path clears a stale cooldown — a
+    // terminal zero-cooldown failure (e.g. user_abort) keeps what it had.
+    const cooldownUntil = cooldownUntilForFailure(failure, policy, now());
+    if (cooldownUntil) state.cooldowns[key] = cooldownUntil;
+    else if (willSwitch) delete state.cooldowns[key];
+    if (!willSwitch) {
       flushBrainEvents(attemptResult.events, emitBrainEvent);
       state.lastSwitchReason = failure.kind;
       options.onStateChange?.(state);
@@ -593,6 +774,26 @@ export async function runPromptWithModelRouting(
         fallbackBlockedReason: attempt.fallbackBlockedReason,
         errorMessage: failure.message,
       });
+
+      // A setup failure (model_not_found, context preflight, setModel throw)
+      // produced ZERO brain events, and this branch returns instead of
+      // throwing — the HTTP caller logs the turn as complete. Without a
+      // terminal brain event the chat client renders an empty turn: no
+      // answer, no error bubble (clients build error bubbles from an
+      // assistant message_end with stopReason "error", the same shape a
+      // failed LLM call emits in-band). Synthesize that message so the
+      // failure is visible end-to-end.
+      if (failure.source === "setup") {
+        emitBrainEvent({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: failure.message ?? `Model routing failed: all candidates exhausted (${failure.kind})`,
+          },
+        });
+      }
 
       if (failure.source === "prompt_error") {
         throw normalizeThrownError(failure);
@@ -608,9 +809,6 @@ export async function runPromptWithModelRouting(
       };
     }
 
-    const cooldownUntil = cooldownUntilForFailure(failure, policy, now());
-    if (cooldownUntil) state.cooldowns[key] = cooldownUntil;
-    else delete state.cooldowns[key];
     state.lastSwitchReason = failure.kind;
     options.onStateChange?.(state);
     try {
@@ -625,6 +823,19 @@ export async function runPromptWithModelRouting(
         errorMessage: `Failed to restore prompt checkpoint before fallback: ${message}`,
       });
       throw err;
+    }
+    // The failed attempt streamed live output (a live primary, or a buffered
+    // candidate that went live after a tool call) — tell consumers to discard
+    // it before the next candidate streams in, so the transcript and DB don't
+    // stack the dead attempt under the winning one. A failure before the first
+    // token emitted nothing (emittedLive=false) and needs no rollback.
+    if (attemptResult.emittedLive) {
+      emitEvent({
+        type: "model_route_rollback",
+        attempt: attempt.attempt,
+        candidateKey: key,
+        failureKind: failure.kind,
+      });
     }
     emitEvent({
       type: "model_route_switch",
@@ -655,6 +866,9 @@ async function runAttempt(
   brain: BrainSession,
   text: string,
   candidate: ModelRouteCandidate,
+  emitBrainEvent: (event: unknown) => void,
+  streamFromStart: boolean,
+  media?: PromptMedia,
 ): Promise<AttemptResult> {
   const checkpoint = brain.createPromptCheckpoint?.();
   let lastProviderResponse: BrainProviderResponse | undefined;
@@ -675,6 +889,7 @@ async function runAttempt(
         checkpoint,
         events: [],
         hadToolExecution: false,
+        emittedLive: false,
         failure: {
           kind: "model_not_found",
           source: "setup",
@@ -693,6 +908,7 @@ async function runAttempt(
       checkpoint,
       events: [],
       hadToolExecution: false,
+      emittedLive: false,
       failure: {
         kind: classifyModelRouteFailure({
           errorMessage: message,
@@ -710,10 +926,32 @@ async function runAttempt(
   }
 
   let lastAssistantMessage: AssistantMessageLike | null = null;
+  // Brain events stay buffered (invisible to the SSE consumer) only while a
+  // fallback retry could still discard them silently. Buffering ends as soon as
+  // discarding is no longer free:
+  //   • streamFromStart — the PRIMARY candidate streams live from its first
+  //     event, so the common (success) path feels exactly like no routing at
+  //     all. A live primary that then fails is recovered by the caller with a
+  //     model_route_rollback telling consumers to drop what it rendered.
+  //   • the first tool execution — it blocks fallback for good (#312), so from
+  //     there buffering buys no atomicity. Flush the prefix and go live.
   const events: unknown[] = [];
+  let streaming = streamFromStart;
+  let emittedLive = false;
   let hadToolExecution = false;
   const unsubscribe = brain.subscribe((event: unknown) => {
-    events.push(event);
+    if (streaming) {
+      emitBrainEvent(event);
+      emittedLive = true;
+    } else {
+      events.push(event);
+      if (isToolExecutionEvent(event)) {
+        streaming = true;
+        flushBrainEvents(events, emitBrainEvent);
+        events.length = 0;
+        emittedLive = true;
+      }
+    }
     if (isToolExecutionEvent(event)) hadToolExecution = true;
     if (!isRecord(event) || event.type !== "message_end") return;
     const message = event.message;
@@ -731,6 +969,7 @@ async function runAttempt(
         checkpoint,
         events,
         hadToolExecution,
+        emittedLive,
         failure: {
           kind: "context_overflow",
           source: "setup",
@@ -739,13 +978,14 @@ async function runAttempt(
         },
       };
     }
-    await brain.prompt(text);
+    await brain.prompt(text, media);
   } catch (err) {
     const message = errorMessage(err);
     return {
       checkpoint,
       events,
       hadToolExecution,
+      emittedLive,
       failure: {
         kind: classifyModelRouteFailure({
           errorMessage: message,
@@ -769,6 +1009,7 @@ async function runAttempt(
     checkpoint,
     events,
     hadToolExecution,
+    emittedLive,
     failure: failureFromAssistantMessage(lastAssistantMessage, candidate, lastProviderResponse),
   };
 }
@@ -821,8 +1062,19 @@ function failureFromAssistantMessage(
     };
   }
   if (stopReason === "aborted") {
+    // Route through the classifier instead of hardcoding user_abort: it
+    // distinguishes a transport-level abort ("connection aborted") — which
+    // should fall back — from a genuine user stop.
     return {
-      kind: "user_abort",
+      kind: classifyModelRouteFailure({
+        errorMessage: messageError,
+        stopReason,
+        provider: typeof message.provider === "string" ? message.provider : candidate.provider,
+        modelId: typeof message.model === "string" ? message.model : candidate.modelId,
+        status: providerResponse?.status,
+        headers: providerResponse?.headers,
+        diagnostics: message.diagnostics,
+      }),
       source: "message_end",
       message: messageError,
       providerResponse,
@@ -1004,10 +1256,6 @@ function normalizeFailureKinds(kinds: unknown): ModelRouteFailureKind[] {
     normalized.push(kind);
   }
   return normalized;
-}
-
-function isModelRouteFailureKind(value: unknown): value is ModelRouteFailureKind {
-  return normalizeFailureKind(value) !== undefined;
 }
 
 function normalizeFailureKind(value: unknown): ModelRouteFailureKind | undefined {

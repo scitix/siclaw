@@ -358,6 +358,32 @@ describe("TaskCoordinator execution", () => {
     expect(lastFakeClient?.promptCalls[0].modelRouting).toEqual(bindingResponder.result.modelRouting);
   });
 
+  it("passes the agent's custom system prompt from the binding to AgentBox prompt", async () => {
+    const { coord, frontend } = makeCoord();
+    bindingResponder.result = {
+      modelProvider: "p", modelId: "m",
+      modelConfig: { name: "n", baseUrl: "u", apiKey: "k", api: "x", authHeader: false, models: [] },
+      systemPrompt: "You are a scheduled ops bot.",
+    };
+    sseResponder.result = { resultText: "done", taskReportText: "", errorMessage: "", eventCount: 1, durationMs: 5 };
+    frontend.responses.set("task.fireNow", {
+      outcome: "ok",
+      task: {
+        id: "t1", agent_id: "a", name: "Prompt Task", description: null,
+        schedule: "*/5 * * * *", prompt: "p", status: "active",
+        created_by: "u1", last_run_at: null, last_result: null, last_manual_run_at: null,
+      },
+    });
+    frontend.responses.set("task.runStart", { ok: true });
+    frontend.responses.set("task.runFinalize", { ok: true });
+    frontend.responses.set("task.updateMeta", { ok: true });
+
+    await coord.fireNow("t1");
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(lastFakeClient?.promptCalls[0].systemPromptTemplate).toBe("You are a scheduled ops bot.");
+  });
+
   it("propagates SSE-layer errorMessage as failure", async () => {
     const { coord, frontend } = makeCoord();
     bindingResponder.result = {

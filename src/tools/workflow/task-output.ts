@@ -102,7 +102,6 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskOutputTool(refs),
   modes: ["web", "channel", "cli"],
-  platform: true,
   // Available once a background mode is on AND the runtime injected the reader (so a task_id
   // can exist and be looked up). Hidden otherwise.
   available: (refs) =>

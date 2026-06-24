@@ -17,7 +17,10 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
-# Copy backend source only (AgentBox + core + tools + minimal gateway modules)
+# Copy backend source only (AgentBox runtime graph: agentbox-main + core + tools).
+# Gateway code (spawners, security, db) is intentionally NOT built here — the
+# agentbox image runs only agentbox-main.ts, which never imports src/gateway/*.
+# Those modules are compiled in the runtime/portal images instead.
 COPY tsconfig.json tsconfig.agentbox.json ./
 COPY src/agentbox-main.ts ./src/
 COPY src/agentbox/ ./src/agentbox/
@@ -26,10 +29,6 @@ COPY src/cron/ ./src/cron/
 COPY src/memory/ ./src/memory/
 COPY src/shared/ ./src/shared/
 COPY src/tools/ ./src/tools/
-COPY src/gateway/config.ts src/gateway/jwt.ts \
-     src/gateway/metrics-aggregator.ts src/gateway/ws-protocol.ts ./src/gateway/
-COPY src/gateway/agentbox/ ./src/gateway/agentbox/
-COPY src/gateway/security/ ./src/gateway/security/
 # Type-only file consumed by core/agent-factory.ts and core/extensions/* —
 # keeps Portal runtime code (db, rest-router) out of the agentbox tsc graph.
 COPY src/portal/cli-snapshot-types.ts ./src/portal/
@@ -42,7 +41,7 @@ FROM node:22.19-slim
 
 # System deps + kubectl in one layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl jq python3 ca-certificates sudo \
+    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium \
     && curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
     && chmod +x kubectl && mv kubectl /usr/local/bin/ \
     && rm -rf /var/lib/apt/lists/*
@@ -71,6 +70,10 @@ COPY skills/core/ ./skills/core/
 COPY skills/extension/ ./skills/extension/
 COPY skills/platform/ ./skills/platform/
 COPY docker/agentbox-entrypoint.sh /usr/local/bin/agentbox-entrypoint.sh
+# Deployment-specific extra command whitelist (additive-only; loaded at agent
+# startup — docs/design/2026-06-10-extra-command-whitelist.md). Replace the
+# file content before building to whitelist site-specific diagnostic binaries.
+COPY docker/extra-commands.json /etc/siclaw/extra-commands.json
 
 # Build every stdio MCP listed in mcp/MCP_LIST.txt and symlink each into PATH.
 # To add a new MCP: drop a new mcp/<name>/ directory (standalone npm package

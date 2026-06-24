@@ -308,7 +308,8 @@ describe("registerAdapterRoutes — auth + routing", () => {
   // ── Channel RPC endpoints ───────────────────────────────────────────
 
   it("POST channel/resolve-binding returns null shape when no match", async () => {
-    query.mockResolvedValueOnce([[], []]);
+    query.mockResolvedValueOnce([[], []]); // selectChannelBinding → none
+    query.mockResolvedValueOnce([[], []]); // open-group fallback selectPersonalChannel → none
     const { status, body } = await runRoute(router, fakeReq({
       url: "/api/internal/siclaw/channel/resolve-binding",
       method: "POST",

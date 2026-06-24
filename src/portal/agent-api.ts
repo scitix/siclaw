@@ -18,6 +18,30 @@ import {
 import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
+import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
+import { normalizeIdleTimeoutSec } from "../core/config.js";
+import { safeParseJson } from "../gateway/dialect-helpers.js";
+
+/**
+ * Decode an `agents` row's JSON-in-TEXT columns so the REST response carries
+ * real objects/arrays, not raw JSON strings. These columns (`model_routing`,
+ * `tool_capabilities`) are stored as TEXT-of-JSON (no JSON column type); a raw
+ * `SELECT *` returns the undecoded string, which every Web client then has to
+ * remember to JSON.parse — a forgotten parse silently mis-renders (see the
+ * tool_capabilities echo bug). Decoding here is the single boundary that keeps
+ * the wire honest. `safeParseJson` tolerates null / TEXT-string / pre-parsed
+ * object, so this is safe across MySQL + SQLite and non-breaking for the
+ * already-tolerant frontend coercers.
+ */
+function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
+  if (!row) return row;
+  return {
+    ...row,
+    model_routing: safeParseJson(row.model_routing, null),
+    tool_capabilities: safeParseJson(row.tool_capabilities, null),
+  };
+}
+
 
 export function registerAgentRoutes(
   router: RestRouter,
@@ -51,7 +75,7 @@ export function registerAgentRoutes(
 
     const listParams = [...params, pageSize, offset];
     const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id, a.model_routing,
-        a.is_production, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
+        a.is_production, a.idle_timeout_sec, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
         (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
@@ -79,16 +103,18 @@ export function registerAgentRoutes(
     const id = crypto.randomUUID();
     const db = getDb();
     let modelRouting: string | null | undefined;
+    let toolCapabilities: string | null | undefined;
     try {
       modelRouting = encodeModelRoutingForDb(body.model_routing);
+      toolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
     } catch (err) {
       sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
       return;
     }
 
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, system_prompt, is_production, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, system_prompt, is_production, idle_timeout_sec, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -97,8 +123,10 @@ export function registerAgentRoutes(
         body.model_provider ?? null,
         body.model_id ?? null,
         modelRouting ?? null,
+        toolCapabilities ?? null,
         body.system_prompt ?? null,
         body.is_production ?? 1,
+        normalizeIdleTimeoutSec(body.idle_timeout_sec),
         body.icon ?? null,
         body.color ?? null,
         auth.userId,
@@ -123,7 +151,7 @@ export function registerAgentRoutes(
     }
 
     const [rows] = await db.query("SELECT * FROM agents WHERE id = ?", [id]) as any;
-    sendJson(res, 201, rows[0]);
+    sendJson(res, 201, decodeAgentRow(rows[0]));
   });
 
   // GET /api/v1/agents/:id — get by id
@@ -139,7 +167,7 @@ export function registerAgentRoutes(
       return;
     }
 
-    sendJson(res, 200, rows[0]);
+    sendJson(res, 200, decodeAgentRow(rows[0]));
   });
 
   // PUT /api/v1/agents/:id — update (admin only)
@@ -150,10 +178,32 @@ export function registerAgentRoutes(
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
+    // Capture the current idle window before the update — needed to detect the
+    // resident(0) → finite transition, which (unlike every other transition)
+    // does NOT self-heal: a resident pod never self-destructs, so it never
+    // cold-spawns to pick up the new SICLAW_AGENTBOX_IDLE_TIMEOUT. We terminate
+    // the running box below to force that cold spawn.
+    let oldIdleTimeoutSec: number | null = null;
+    let newIdleTimeoutSec: number | null = null;
+    if ("idle_timeout_sec" in body) {
+      const [cur] = await db.query(
+        "SELECT idle_timeout_sec FROM agents WHERE id = ?",
+        [params.id],
+      ) as any;
+      // Coerce to a number: the column is INT (drivers return a number), but a
+      // stringified "0" would silently dodge the `=== 0` resident check below.
+      // Keep null as null so a missing row can't read as 0 (Number(null) === 0).
+      const raw = cur[0]?.idle_timeout_sec;
+      oldIdleTimeoutSec = raw == null ? null : Number(raw);
+      // Normalize once here and reuse for both the SET clause and the
+      // resident→finite terminate decision below.
+      newIdleTimeoutSec = normalizeIdleTimeoutSec(body.idle_timeout_sec);
+    }
+
     // Build dynamic SET clause
     const fields = [
       "name", "description", "status", "model_provider",
-      "model_id", "system_prompt", "is_production", "icon", "color",
+      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "icon", "color",
     ];
     const setClauses: string[] = [];
     const values: unknown[] = [];
@@ -161,7 +211,9 @@ export function registerAgentRoutes(
     for (const field of fields) {
       if (field in body) {
         setClauses.push(`${field} = ?`);
-        values.push(body[field]);
+        // newIdleTimeoutSec is non-null here: field === "idle_timeout_sec" implies
+        // "idle_timeout_sec" in body, which is exactly when it was computed above.
+        values.push(field === "idle_timeout_sec" ? newIdleTimeoutSec! : body[field]);
       }
     }
     if ("model_routing" in body) {
@@ -170,6 +222,21 @@ export function registerAgentRoutes(
         if (modelRouting !== undefined) {
           setClauses.push("model_routing = ?");
           values.push(modelRouting);
+        }
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+
+    let toolCapabilitiesChanged = false;
+    if ("tool_capabilities" in body) {
+      try {
+        const toolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
+        if (toolCapabilities !== undefined) {
+          setClauses.push("tool_capabilities = ?");
+          values.push(toolCapabilities);
+          toolCapabilitiesChanged = true;
         }
       } catch (err) {
         sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -194,13 +261,30 @@ export function registerAgentRoutes(
       return;
     }
 
-    sendJson(res, 200, rows[0]);
+    sendJson(res, 200, decodeAgentRow(rows[0]));
 
     // is_production change affects skills bundle (prod=approved only, dev=all)
     // and also the visible cluster/host set — credential-list filters out
     // cross-env bindings, so the AgentBox must drop its cached list.
     if ("is_production" in body) {
       connectionMap.notify(params.id, "agent.reload", { resources: ["skills", "cluster", "host"] });
+    }
+
+    // tool_capabilities change → push a tools reload so the active AgentBox
+    // re-fetches its whitelist and invalidates live sessions (mid-turn-safe).
+    if (toolCapabilitiesChanged) {
+      connectionMap.notify(params.id, "agent.reload", { agentId: params.id, resources: ["tools"] });
+    }
+
+    // Idle window changed from resident (0) → finite: the running box is
+    // resident and will never self-destruct, so it would never cold-spawn to
+    // pick up the new window — the change would silently never take effect.
+    // Terminate the running box so the next message cold-spawns with the new
+    // SICLAW_AGENTBOX_IDLE_TIMEOUT. Other transitions (finite→finite, →0) need
+    // no action: the box self-destructs on its current window and the next
+    // spawn reads the new value, so we don't disrupt a live box for them.
+    if ("idle_timeout_sec" in body && oldIdleTimeoutSec === 0 && (newIdleTimeoutSec ?? 0) > 0) {
+      connectionMap.notify(params.id, "agent.terminate", { agentId: params.id });
     }
   });
 
@@ -482,7 +566,7 @@ export function registerAgentRoutes(
     }
 
     const [newRows] = await db.query("SELECT * FROM agents WHERE id = ?", [newId]) as any;
-    sendJson(res, 201, newRows[0]);
+    sendJson(res, 201, decodeAgentRow(newRows[0]));
   });
 
   // ================================================================

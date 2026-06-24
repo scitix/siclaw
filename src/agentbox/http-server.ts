@@ -18,19 +18,26 @@ import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metri
 import { GatewayClient } from "./gateway-client.js";
 import { CredentialBroker } from "./credential-broker.js";
 import { HttpTransport } from "./credential-transport.js";
-import { getSyncHandler, createClusterHandler, createHostHandler } from "./sync-handlers.js";
+import { getSyncHandler, createClusterHandler, createHostHandler, createToolsHandler } from "./sync-handlers.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
 import {
+  candidateSupportsPromptMedia,
   clearModelRouteUserSelectionIfDifferent,
+  filterCandidatesForPromptMedia,
   markModelRouteUserSelection,
+  normalizeCandidates,
   normalizeModelRoutePolicy,
+  requiredInputsForPromptMedia,
   runPromptWithModelRouting,
+  resolveEffectivePolicy,
   shouldUseModelRouteRunner,
+  unsupportedPromptMediaMessage,
+  type ModelRouteCandidate,
   type ModelRouteEvent,
   type ModelRoutePolicy,
 } from "../core/model-routing.js";
-import type { BrainSession } from "../core/brain-session.js";
+import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -54,6 +61,10 @@ interface PromptRequestBody {
   systemPromptTemplate?: string;
   modelConfig?: Record<string, unknown>;
   modelRouting?: ModelRoutePolicy;
+  /** Image attachments forwarded as vision input (vision-capable models only). */
+  images?: PromptImage[];
+  /** PDF attachments forwarded as native file input (PDF-capable models only). */
+  files?: PromptFile[];
 }
 
 /**
@@ -88,10 +99,191 @@ function enrichAgentEndEvent(brain: BrainSession, event: any): any {
 /**
  * Parse JSON body
  */
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_PROMPT_MEDIA_ITEMS = 4;
+const MAX_PROMPT_MEDIA_BASE64_CHARS = 8 * 1024 * 1024;
+const MAX_BODY_SIZE = MAX_PROMPT_MEDIA_ITEMS * MAX_PROMPT_MEDIA_BASE64_CHARS + 512 * 1024;
 const BODY_TIMEOUT_MS = 30_000; // 30s
 const DP_ACTIVATION_MARKER = "[Deep Investigation]\n";
 const DP_EXIT_MARKER = "[DP_EXIT]";
+const MAX_PROMPT_IMAGES = MAX_PROMPT_MEDIA_ITEMS;
+const MAX_PROMPT_IMAGE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
+const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const MAX_PROMPT_FILES = MAX_PROMPT_MEDIA_ITEMS;
+const MAX_PROMPT_FILE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
+const SUPPORTED_PROMPT_FILE_MIMES = new Set(["application/pdf"]);
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+class HttpRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpRequestError";
+  }
+}
+
+interface PromptMediaValidationResult<T> {
+  items?: T[];
+  error?: string;
+}
+
+interface PromptMediaValidation {
+  images?: PromptImage[];
+  files?: PromptFile[];
+  error?: string;
+}
+
+function validatePromptMedia(imagesRaw: unknown, filesRaw: unknown): PromptMediaValidation {
+  const imagesResult = validatePromptImages(imagesRaw);
+  if (imagesResult.error) return { error: imagesResult.error };
+
+  const filesResult = validatePromptFiles(filesRaw);
+  if (filesResult.error) return { error: filesResult.error };
+
+  const totalItems = (imagesResult.items?.length ?? 0) + (filesResult.items?.length ?? 0);
+  if (totalItems > MAX_PROMPT_MEDIA_ITEMS) {
+    return { error: `prompt media supports at most ${MAX_PROMPT_MEDIA_ITEMS} item(s)` };
+  }
+
+  return {
+    images: imagesResult.items,
+    files: filesResult.items,
+  };
+}
+
+function validatePromptImages(raw: unknown): PromptMediaValidationResult<PromptImage> {
+  if (raw === undefined || raw === null) return {};
+  if (!Array.isArray(raw)) return { error: "images must be an array" };
+  if (raw.length > MAX_PROMPT_IMAGES) {
+    return { error: `images supports at most ${MAX_PROMPT_IMAGES} item(s)` };
+  }
+
+  const out: PromptImage[] = [];
+  for (const [index, item] of raw.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { error: `images[${index}] must be an object` };
+    }
+
+    const mimeType = (item as { mimeType?: unknown }).mimeType;
+    const data = (item as { data?: unknown }).data;
+    if (typeof mimeType !== "string") {
+      return { error: `images[${index}].mimeType must be a string` };
+    }
+    if (typeof data !== "string") {
+      return { error: `images[${index}].data must be a base64 string` };
+    }
+
+    const normalizedMime = normalizePromptImageMime(mimeType);
+    if (!SUPPORTED_PROMPT_IMAGE_MIMES.has(normalizedMime)) {
+      return { error: `images[${index}].mimeType must be one of: image/png, image/jpeg, image/webp` };
+    }
+    const dataError = validateBase64Data(`images[${index}].data`, data, MAX_PROMPT_IMAGE_BASE64_CHARS);
+    if (dataError) return { error: dataError };
+
+    out.push({ mimeType: normalizedMime, data });
+  }
+  return out.length > 0 ? { items: out } : {};
+}
+
+function validatePromptFiles(raw: unknown): PromptMediaValidationResult<PromptFile> {
+  if (raw === undefined || raw === null) return {};
+  if (!Array.isArray(raw)) return { error: "files must be an array" };
+  if (raw.length > MAX_PROMPT_FILES) {
+    return { error: `files supports at most ${MAX_PROMPT_FILES} item(s)` };
+  }
+
+  const out: PromptFile[] = [];
+  for (const [index, item] of raw.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { error: `files[${index}] must be an object` };
+    }
+
+    const mimeType = (item as { mimeType?: unknown }).mimeType;
+    const filename = (item as { filename?: unknown }).filename;
+    const data = (item as { data?: unknown }).data;
+    if (typeof mimeType !== "string") {
+      return { error: `files[${index}].mimeType must be a string` };
+    }
+    if (typeof filename !== "string") {
+      return { error: `files[${index}].filename must be a string` };
+    }
+    if (typeof data !== "string") {
+      return { error: `files[${index}].data must be a base64 string` };
+    }
+
+    const normalizedMime = mimeType.trim().toLowerCase();
+    if (!SUPPORTED_PROMPT_FILE_MIMES.has(normalizedMime)) {
+      return { error: `files[${index}].mimeType must be application/pdf` };
+    }
+    if (filename.trim() === "") {
+      return { error: `files[${index}].filename must not be empty` };
+    }
+    const dataError = validateBase64Data(`files[${index}].data`, data, MAX_PROMPT_FILE_BASE64_CHARS);
+    if (dataError) return { error: dataError };
+
+    out.push({ mimeType: normalizedMime, filename: sanitizePromptFilename(filename), data });
+  }
+  return out.length > 0 ? { items: out } : {};
+}
+
+function normalizePromptImageMime(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "image/jpg" ? "image/jpeg" : normalized;
+}
+
+function validateBase64Data(field: string, data: string, maxChars: number): string | undefined {
+  if (data.length === 0) return `${field} must not be empty`;
+  if (data.length > maxChars) {
+    return `${field} exceeds ${formatBytes(maxChars)} base64 character limit`;
+  }
+  if (data.length % 4 !== 0 || !BASE64_RE.test(data)) {
+    return `${field} must be valid base64`;
+  }
+  return undefined;
+}
+
+function formatBytes(value: number): string {
+  const mib = value / (1024 * 1024);
+  return `${Number.isInteger(mib) ? mib : mib.toFixed(1)} MiB`;
+}
+
+function sanitizePromptFilename(value: string): string {
+  const basename = value.split(/[\\/]/).filter(Boolean).pop()?.trim() || "attachment.pdf";
+  return basename.replace(/[\r\n\t]/g, "_").slice(0, 160) || "attachment.pdf";
+}
+
+function buildPromptMedia(images?: PromptImage[], files?: PromptFile[]): PromptMedia | undefined {
+  if ((!images || images.length === 0) && (!files || files.length === 0)) return undefined;
+  return {
+    ...(images && images.length > 0 ? { images } : {}),
+    ...(files && files.length > 0 ? { files } : {}),
+  };
+}
+
+function defaultPromptTextForMedia(media?: PromptMedia): string {
+  const hasImages = !!media?.images?.length;
+  const hasFiles = !!media?.files?.length;
+  if (hasImages && hasFiles) return "Please analyze the attached image and PDF.";
+  if (hasFiles) return "Please analyze the attached PDF.";
+  if (hasImages) return "Please analyze the attached image.";
+  return "";
+}
+
+function singleCandidateForMediaPreflight(
+  body: PromptRequestBody,
+  policy: ModelRoutePolicy | undefined,
+): ModelRouteCandidate | undefined {
+  if (body.modelProvider && body.modelId) {
+    return {
+      provider: body.modelProvider,
+      modelId: body.modelId,
+      modelConfig: body.modelConfig,
+    };
+  }
+  const candidates = normalizeCandidates(policy?.candidates);
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
 
 /**
  * Resolve the session's active operating mode for this prompt, so getOrCreate can
@@ -120,7 +312,7 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
     const timer = setTimeout(() => {
       timedOut = true;
       req.destroy();
-      reject(new Error("Body read timeout"));
+      reject(new HttpRequestError(408, "Body read timeout"));
     }, BODY_TIMEOUT_MS);
 
     req.on("data", (chunk: Buffer | string) => {
@@ -129,7 +321,7 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
       if (size > MAX_BODY_SIZE) {
         clearTimeout(timer);
         req.destroy();
-        reject(new Error(`Body exceeds ${MAX_BODY_SIZE} byte limit`));
+        reject(new HttpRequestError(413, `Body exceeds ${formatBytes(MAX_BODY_SIZE)} limit`));
         return;
       }
       body += chunk;
@@ -140,7 +332,7 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
       try {
         resolve(body ? JSON.parse(body) : {});
       } catch (e) {
-        reject(new Error("Invalid JSON"));
+        reject(new HttpRequestError(400, "Invalid JSON"));
       }
     });
     req.on("error", (err) => {
@@ -188,12 +380,28 @@ async function abortBrainForHttp(
 
 export interface CreateHttpServerOptions {
   /**
-   * If true, skip the 5-minute idle self-destruct. Intended for LocalSpawner,
-   * which runs AgentBox in-process with the Portal — `process.exit(0)` from
+   * If true, skip the idle self-destruct entirely. Intended for LocalSpawner,
+   * which runs AgentBox in-process with the Portal — shutting down from
    * the idle timer would take the whole `siclaw local` process down with it.
    * K8s mode must keep the default so idle pods get recycled.
    */
   disableIdleShutdown?: boolean;
+
+  /**
+   * Idle self-destruct window in milliseconds. When omitted, resolved from
+   * `config.server.idleTimeoutSec` (env: SICLAW_AGENTBOX_IDLE_TIMEOUT),
+   * defaulting to 5 minutes. A value ≤ 0 makes the pod resident (never
+   * auto-destroy) — equivalent to `disableIdleShutdown`.
+   */
+  idleTimeoutMs?: number;
+
+  /**
+   * Invoked instead of `process.exit(0)` when the idle window elapses. Lets
+   * the caller route idle teardown through the same graceful shutdown as
+   * SIGTERM (flush metrics, evict debug pods, close sessions) rather than a
+   * raw exit that orphans those resources. Defaults to `process.exit(0)`.
+   */
+  onIdleShutdown?: () => void;
 }
 
 /**
@@ -233,9 +441,24 @@ export function createHttpServer(
     perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
   }
+  // tools handler — same per-box rationale as cluster/host. It writes the
+  // resolved allowedTools into THIS box's sessionManager and fetches with THIS
+  // box's GatewayClient (correct mTLS cert → correct agentId), avoiding the
+  // route loop's last-spawn-wins SICLAW_CERT_PATH client. Bound even when
+  // gatewayClient is absent (TUI/no-gateway): the reload route gates on
+  // requiresGatewayClient and skips before fetch in that case.
+  perServerHandlers.tools = createToolsHandler(
+    sessionManager,
+    sessionManager.gatewayClient ? sessionManager.gatewayClient.toClientLike() : null,
+  );
 
-  // ── Idle self-destruct: exit when no SSE connections and no sessions for 5 min ──
-  const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+  // ── Idle self-destruct: shut down when no SSE connections and no sessions ──
+  // Window is configurable (config.server.idleTimeoutSec / SICLAW_AGENTBOX_IDLE_TIMEOUT).
+  // A non-positive window (or disableIdleShutdown) makes the pod resident.
+  const resolvedIdleMs =
+    options.idleTimeoutMs ?? (loadConfig().server?.idleTimeoutSec ?? 300) * 1000;
+  const idleDisabled = options.disableIdleShutdown || resolvedIdleMs <= 0;
+  const triggerIdleShutdown = options.onIdleShutdown ?? (() => process.exit(0));
   let activeSseCount = 0;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -247,19 +470,25 @@ export function createHttpServer(
   }
 
   function checkIdle(): void {
-    if (options.disableIdleShutdown) return;
+    if (idleDisabled) return;
     if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
       if (idleTimer) return; // already scheduled
       idleTimer = setTimeout(() => {
-        // Re-check before exiting (new connection may have arrived)
-        if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
-          console.log("[agentbox] No connections for 5 min, shutting down");
-          process.exit(0);
-        }
         idleTimer = null;
-      }, IDLE_TIMEOUT_MS);
-      console.log(`[agentbox] Idle detected, will shut down in ${IDLE_TIMEOUT_MS / 1000}s if no activity`);
+        // Re-check before tearing down (new connection may have arrived)
+        if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
+          console.log(`[agentbox] No connections for ${resolvedIdleMs / 1000}s, shutting down`);
+          triggerIdleShutdown();
+        }
+      }, resolvedIdleMs);
+      // Don't let the idle timer alone keep the event loop alive.
+      idleTimer.unref?.();
+      console.log(`[agentbox] Idle detected, will shut down in ${resolvedIdleMs / 1000}s if no activity`);
     }
+  }
+
+  if (idleDisabled) {
+    console.log("[agentbox] Idle self-destruct disabled — pod is resident");
   }
 
   // Start initial idle check (pod may never receive any connections)
@@ -298,11 +527,13 @@ export function createHttpServer(
   });
 
   /**
-   * GET /api/internal/metrics-snapshot - export metrics snapshot for Gateway pull (K8s mode)
+   * GET /api/internal/metrics-snapshot - export this process's cumulative prom-client
+   * snapshot for the Gateway's 30s federation pull (K8s mode). Mirrors the SIGTERM
+   * /api/internal/metrics-flush push: both carry { incarnation, prom }.
    */
   addRoute("GET", "/api/internal/metrics-snapshot", async (_req, res) => {
-    const { localCollector } = await import("../shared/local-collector.js");
-    sendJson(res, 200, localCollector.exportSnapshot());
+    const { getMetricsAsJSON, processIncarnation } = await import("../shared/metrics.js");
+    sendJson(res, 200, { incarnation: processIncarnation, prom: await getMetricsAsJSON() });
   });
 
   /**
@@ -339,12 +570,21 @@ export function createHttpServer(
   addRoute("POST", "/api/prompt", async (req, res) => {
     const body = (await parseJsonBody(req)) as PromptRequestBody;
 
-    if (!body.text) {
+    const promptMediaValidation = validatePromptMedia(body.images, body.files);
+    if (promptMediaValidation.error) {
+      sendJson(res, 400, { error: promptMediaValidation.error });
+      return;
+    }
+    const promptMedia = buildPromptMedia(promptMediaValidation.images, promptMediaValidation.files);
+
+    // Media-only messages are valid; reject only when there is neither text nor
+    // usable image/PDF media after validation.
+    if (!body.text && !promptMedia) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
 
-    const activeMode = resolveActiveMode(body.text, body.sessionId, sessionManager);
+    const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, activeMode);
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
@@ -370,20 +610,27 @@ export function createHttpServer(
         sessionManager.persistModelRouteState(managed.id, managed.modelRouteState);
       }
     }
-    // Only engage the buffered routing runner when a real fallback target
-    // exists (≥2 distinct candidates). With a single candidate there is nothing
-    // to fall back to, so buffering every brain event until the attempt
-    // completes would kill live streaming for zero resilience gain — run the
-    // prompt live instead. (Upstream always co-sends modelProvider/modelId with
-    // modelRouting, and candidates[0] is that same primary, so the model-setup
-    // block below still pins the right model on the live path.)
+    // Every prompt flows through the single routing-runner entry below (see
+    // resolveEffectivePolicy): real multi-candidate routing when a fallback
+    // target exists, otherwise a single-candidate run built from the current
+    // model. Both stream the primary live and emit model_route_* on the extra
+    // event channel, so brain events route through it for every turn.
     managed.modelRoutePolicy = configuredModelRouting;
-    const routeEnabled = shouldUseModelRouteRunner(configuredModelRouting, managed.modelRouteState);
     // Mark the session busy before model setup so a refresh, second tab, or
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
     managed._aborted = false;
-    managed._routeBrainEventsThroughExtra = routeEnabled;
+    // Pre-spawn Stop: a /abort that arrived before this session existed recorded a pending abort.
+    // Consume it HERE — AFTER the unconditional `_aborted = false` reset above (placing it before
+    // would be wiped by that reset) — so the pre-prompt latch below short-circuits this turn.
+    if (sessionManager.consumePendingAbort(managed.id)) {
+      managed._aborted = true;
+      console.log(`[agentbox-http] Consumed pre-spawn pending abort for session ${managed.id}`);
+    }
+    // Default to the extra channel; refined to false only for the no-current-model
+    // edge before the run kicks off (see effectivePolicy below). No brain prompt
+    // events fire during model setup, so this default is never observed wrongly.
+    managed._routeBrainEventsThroughExtra = true;
     // Acquire the brain.prompt mutex synchronously before any await so the
     // synth notify path (which polls _promptDone via waitForParentIdle)
     // cannot race in and call brain.prompt() concurrently — see jacoblee
@@ -470,7 +717,35 @@ export function createHttpServer(
         }
       }
 
-      promptText = body.text;
+      // Apply per-model runtime tunables delivered on modelConfig.params
+      // (reasoning_effort). Re-applied every prompt so a model switch or a config
+      // change takes effect on the next turn. Snake_case on the wire → camelCase
+      // BrainModelParams.
+      if (body.modelConfig && managed.brain.applyModelParams) {
+        const rawParams = (body.modelConfig as Record<string, unknown>).params;
+        const p = (rawParams && typeof rawParams === "object" ? rawParams : {}) as Record<string, unknown>;
+        managed.brain.applyModelParams({
+          reasoningEffort: typeof p.reasoning_effort === "string" ? p.reasoning_effort : undefined,
+        });
+      }
+
+      if (requiredInputsForPromptMedia(promptMedia).length > 0) {
+        if (shouldUseModelRouteRunner(configuredModelRouting, managed.modelRouteState)) {
+          const candidates = normalizeCandidates(configuredModelRouting?.candidates);
+          if (filterCandidatesForPromptMedia(candidates, promptMedia).length === 0) {
+            throw new Error(unsupportedPromptMediaMessage(promptMedia));
+          }
+        } else {
+          const candidate = singleCandidateForMediaPreflight(body, configuredModelRouting);
+          if (!candidate || !candidateSupportsPromptMedia(candidate, promptMedia)) {
+            throw new Error(unsupportedPromptMediaMessage(promptMedia));
+          }
+        }
+      }
+
+      promptText = body.text && body.text.length > 0
+        ? body.text
+        : defaultPromptTextForMedia(promptMedia);
     } catch (err) {
       releasePromptLockOnSetupFailure(err);
       return;
@@ -480,7 +755,7 @@ export function createHttpServer(
     // IMPORTANT: append after DP markers, not prepend before them.
     // Prepending would break marker detection in pi-agent extension input handlers
     // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
-    const detectedLang = detectLanguage(body.text);
+    const detectedLang = detectLanguage(promptText);
     if (detectedLang !== "English" && isMemoryEnabled()) {
       // Only two DP markers remain after the refactor: activation and exit.
       const dpMarkers = [DP_ACTIVATION_MARKER, `${DP_EXIT_MARKER}\n`];
@@ -605,27 +880,62 @@ export function createHttpServer(
       emitSessionExtraEvent({ ...event, sessionId: managed.id });
     };
 
-    const promptPromise = routeEnabled
-      ? runPromptWithModelRouting(
-          managed.brain,
-          promptText,
-          configuredModelRouting,
-          managed.modelRouteState,
-          {
-            emitEvent: emitRouteEvent,
-            // Routing buffers brain events and replays them here after the
-            // winning attempt, bypassing the live SSE subscription that would
-            // otherwise enrich agent_end — re-apply the same enrichment so
-            // routed sessions still get token/cost stats.
-            emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
-            onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
-          },
-        )
-      : managed.brain.prompt(promptText);
+    // Pre-prompt latch: a Stop that landed during model setup (or a consumed pre-spawn pending
+    // abort) set `_aborted` true. Do NOT start the run — finish cleanly so the session unlocks
+    // and the SSE stream closes. Reset `_aborted` so the NEXT prompt isn't wrongly skipped.
+    if (managed._aborted) {
+      console.log(`[agentbox-http] Prompt for ${managed.id} aborted before start (pre-prompt latch)`);
+      managed._aborted = false;
+      // Use actuallyFinish (NOT onPromptFinish): no brain run started, so there is no
+      // agent_end/auto_*_end event coming. onPromptFinish would take its deferred branch and
+      // wait forever if isAgentActive/isCompacting/isRetrying were left stale-true by a prior
+      // abnormal turn — permanently locking the session at 409. actuallyFinish unlocks now.
+      actuallyFinish();
+      sendJson(res, 200, { ok: true, sessionId: managed.id, aborted: true });
+      return;
+    }
 
-    promptPromise.then(() => {
-      console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
-      promptOutcome = "completed";
+    // Single entry: every prompt goes through the routing runner. With no real
+    // fallback target it runs one candidate (the current model) live — identical
+    // UX to a bare prompt, but still emitting model_route_* so every turn carries
+    // its model identity on one channel. effectivePolicy is read AFTER model setup
+    // so the single candidate reflects the model just pinned for this turn.
+    const effectivePolicy = resolveEffectivePolicy(
+      configuredModelRouting,
+      managed.modelRouteState,
+      managed.brain.getModel?.(),
+    );
+    // Only the no-current-model edge falls back to a bare brain.prompt (runner
+    // guard) whose events flow through the live _eventBuffer subscription.
+    managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
+    const promptPromise = runPromptWithModelRouting(
+      managed.brain,
+      promptText,
+      effectivePolicy,
+      managed.modelRouteState,
+      {
+        emitEvent: emitRouteEvent,
+        // The runner streams/replays brain events through this callback instead
+        // of the live SSE subscription that enriches agent_end — re-apply the
+        // same enrichment so token/cost stats survive on every turn.
+        emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
+        onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
+        shouldAbort: () => managed._aborted,
+      },
+      promptMedia,
+    );
+
+    promptPromise.then((result) => {
+      // The routing runner reports exhaustion (and user aborts) as a result,
+      // not a rejection — logging those as "completed" hid silent-failure
+      // turns during incident triage.
+      if (result && result.success === false) {
+        console.warn(`[agentbox-http] Prompt finished without success for session ${managed.id} (${result.finalFailureKind ?? "unknown"}: ${result.finalErrorMessage ?? "no error message"})`);
+        promptOutcome = "error";
+      } else {
+        console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
+        promptOutcome = "completed";
+      }
       onPromptFinish();
     }).catch((err) => {
       console.error(`[agentbox-http] Prompt error for session ${managed.id}:`, err);
@@ -697,7 +1007,9 @@ export function createHttpServer(
     }
     // Replay extra (tool-pushed) events that arrived before SSE connected.
     // These are tagged events like { type: "subagent_event", ... } from
-    // the spawn_subagent bridge.
+    // the spawn_subagent bridge — and, for routed prompts, ALL brain events
+    // (routing replays them through the extra channel, bypassing _eventBuffer).
+    const extraReplayCount = managed._extraEventBuffer.length;
     for (const event of managed._extraEventBuffer) {
       writeEvent(event);
     }
@@ -705,7 +1017,7 @@ export function createHttpServer(
 
     // If prompt already finished before SSE connected, close immediately
     if (managed._promptDone) {
-      console.log(`[agentbox-http] Prompt already done for session ${sessionId}, closing SSE after replay (${managed._eventBuffer.length} events)`);
+      console.log(`[agentbox-http] Prompt already done for session ${sessionId}, closing SSE after replay (${managed._eventBuffer.length} brain + ${extraReplayCount} extra events)`);
       closeSSE();
       return;
     }
@@ -796,15 +1108,28 @@ export function createHttpServer(
       return;
     }
 
-    const body = (await parseJsonBody(req)) as { text?: string };
-    if (!body.text) {
+    const body = (await parseJsonBody(req)) as { text?: string; images?: PromptImage[]; files?: PromptFile[] };
+    const promptMediaValidation = validatePromptMedia(body.images, body.files);
+    if (promptMediaValidation.error) {
+      sendJson(res, 400, { error: promptMediaValidation.error });
+      return;
+    }
+    const promptMedia = buildPromptMedia(promptMediaValidation.images, promptMediaValidation.files);
+    if (!body.text && !promptMedia) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
 
-    console.log(`[agentbox-http] Steering session ${sessionId}: ${body.text.slice(0, 80)}`);
+    const steerText = body.text && body.text.length > 0
+      ? body.text
+      : defaultPromptTextForMedia(promptMedia);
+    console.log(`[agentbox-http] Steering session ${sessionId}: ${steerText.slice(0, 80)}`);
     try {
-      await managed.brain.steer(body.text);
+      if (promptMedia) {
+        await managed.brain.steer(steerText, promptMedia);
+      } else {
+        await managed.brain.steer(steerText);
+      }
       sendJson(res, 200, { ok: true });
     } catch (err) {
       console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);
@@ -841,6 +1166,23 @@ export function createHttpServer(
   });
 
   /**
+   * GET /api/sessions/:sessionId/status — explicit liveness for the in-progress turn.
+   *
+   * Source of truth for "is this session's turn still running" used by the Portal
+   * reconnect-after-refresh flow. MUST be the agentbox's own activity flags, NOT inferred
+   * from persisted chat rows: siclaw is end-only persistence, so a turn that is thinking or
+   * streaming text with no tool in flight has no "running" row — a row heuristic would miss
+   * it and the page would stop following a live turn. A not-yet-created / already-released
+   * session has no managed entry → not running.
+   */
+  addRoute("GET", "/api/sessions/:sessionId/status", async (_req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+    const running = !!managed && (managed.isAgentActive || managed.isCompacting || managed.isRetrying);
+    sendJson(res, 200, { running });
+  });
+
+  /**
    * POST /api/sessions/:sessionId/clear-queue - clear queued steer/followUp messages
    */
   addRoute("POST", "/api/sessions/:sessionId/clear-queue", async (_req, res, params) => {
@@ -865,13 +1207,35 @@ export function createHttpServer(
     const managed = sessionManager.get(sessionId);
 
     if (!managed) {
-      sendJson(res, 404, { error: "Session not found" });
+      // Pre-spawn Stop: the session doesn't exist yet (Stop clicked before the prompt's
+      // getOrCreate ran). Record the intent so the imminent /api/prompt short-circuits instead
+      // of running the turn the user already cancelled. Return 200 (not 404) so the UI/gateway
+      // treats Stop as accepted. Consumed one-shot by the next /api/prompt (TTL backstop guards
+      // a Stop that never gets a following prompt).
+      sessionManager.markPendingAbort(sessionId);
+      console.log(`[agentbox-http] Abort for not-yet-created session ${sessionId}; recorded pending abort`);
+      sendJson(res, 200, { ok: true, pending: true, stoppedJobs: 0 });
       return;
     }
 
     console.log(`[agentbox-http] Aborting session ${sessionId} (abort endpoint called)`);
-    console.trace(`[agentbox-http] Abort stack trace for session ${sessionId}`);
     managed._aborted = true;
+
+    // Stop is terminal: drop any queued steer/followUp so it does NOT replay on the next prompt.
+    try {
+      const cleared = managed.brain.clearQueue();
+      if (cleared.steering.length || cleared.followUp.length) {
+        console.log(`[agentbox-http] Stop cleared queue for ${sessionId}: ${cleared.steering.length} steer, ${cleared.followUp.length} followUp`);
+      }
+    } catch (err) {
+      console.warn(`[agentbox-http] clearQueue on abort failed for ${sessionId}:`, err);
+    }
+
+    // Discard buffered background-job completion notifications + cancel the coalesce timer:
+    // a job that completed moments BEFORE Stop is already past the stopSessionJobs "running"
+    // filter, and its armed coalesce timer would otherwise fire flushPendingNotifications →
+    // runSyntheticPrompt → brain.prompt() AFTER the Stop = the model "comes back to life".
+    sessionManager.discardPendingNotifications(sessionId);
 
     // Foreground sub-agents are cancelled via the parent brain's abort signal
     // (threaded into runSpawnedSubagent). The user's Stop should also halt the session's
@@ -882,11 +1246,22 @@ export function createHttpServer(
       console.log(`[agentbox-http] Stop also halted ${stoppedJobs} background job(s) for session ${sessionId}`);
     }
     const outcome = await abortBrainForHttp(managed.brain, sessionId);
+    // Re-sweep AFTER brain.abort() resolves: it resolves only once the run loop fully drains
+    // (every in-flight tool call returned), so a tool call that launched a background job DURING
+    // the drain registered it AFTER the first sweep. Catch it now — this is the fix for the
+    // "background job launched mid-abort escapes Stop" bug. (On a 2s-timeout outcome the run may
+    // not have drained; the per-launch _aborted latch in createBackgroundExecExecutor is the
+    // backstop there.)
+    const reSwept = sessionManager.stopSessionJobs(sessionId);
+    if (reSwept > 0) {
+      console.log(`[agentbox-http] Re-sweep after brain.abort halted ${reSwept} background job(s) for session ${sessionId}`);
+    }
+    const totalStopped = stoppedJobs + reSwept;
     if (outcome === "failed") {
-      sendJson(res, 500, { error: "Abort failed", stoppedJobs });
+      sendJson(res, 500, { error: "Abort failed", stoppedJobs: totalStopped });
       return;
     }
-    sendJson(res, 200, { ok: true, stoppedJobs, ...(outcome === "timeout" ? { pending: true } : {}) });
+    sendJson(res, 200, { ok: true, stoppedJobs: totalStopped, ...(outcome === "timeout" ? { pending: true } : {}) });
   });
 
   /**
@@ -1141,6 +1516,14 @@ export function createHttpServer(
       try {
         await route.handler(req, res, params);
       } catch (err) {
+        if (err instanceof HttpRequestError) {
+          console.warn(`[agentbox-http] Rejected ${method} ${pathname}: ${err.message}`);
+          if (!res.headersSent) {
+            sendJson(res, err.status, { error: err.message });
+          }
+          return;
+        }
+
         console.error(`[agentbox-http] Error handling ${method} ${pathname}:`, err);
         if (!res.headersSent) {
           sendJson(res, 500, { error: "Internal server error" });

@@ -91,12 +91,16 @@ import { K8sSpawner } from "./k8s-spawner.js";
 
 // ── Fake cert manager ─────────────────────────────────────────────────
 
+const FAKE_CA_FP = "fakecafp00000000";
+
 class FakeCertManager {
   issuedCalls: any[] = [];
+  fp = FAKE_CA_FP;
   issueAgentBoxCertificate(...args: any[]) {
     this.issuedCalls.push(args);
     return { cert: "CERT", key: "KEY", ca: "CA" };
   }
+  caFingerprint() { return this.fp; }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -310,20 +314,91 @@ describe("K8sSpawner — spawn branches", () => {
     });
   });
 
-  it("reuses a Running pod without creating a new one", async () => {
+  it("reuses a Running pod whose CA fingerprint matches, without creating a new one", async () => {
     const cm = new FakeCertManager();
     const s = new K8sSpawner();
     s.setCertManager(cm as any);
 
     readPodImpl.fn = async () => ({
       status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
-      metadata: { labels: {} },
+      metadata: { labels: { "siclaw.io/ca-fp": FAKE_CA_FP } },
     });
 
     const handle = await s.spawn({ agentId: "default" });
     expect(handle.endpoint).toBe("https://10.9.9.9:3000");
     expect(calls.createNamespacedPod).toHaveLength(0);
     expect(calls.createNamespacedSecret).toHaveLength(0);
+    expect(calls.deleteNamespacedPod).toHaveLength(0);
+  });
+
+  it("recreates a Running pod whose CA fingerprint is stale (CA rotated)", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      // 1st read: existing Running pod stamped with an OLD CA fingerprint.
+      if (reads === 1) {
+        return {
+          status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
+          metadata: { labels: { "siclaw.io/ca-fp": "stale-old-ca-fp" } },
+        };
+      }
+      // 2nd read: waitForPodDeleted sees it gone.
+      if (reads === 2) throw Object.assign(new Error("nf"), { code: 404 });
+      // Subsequent: the freshly recreated pod.
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: { "siclaw.io/ca-fp": FAKE_CA_FP } } };
+    };
+
+    const handle = await s.spawn({ agentId: "default" });
+    expect(calls.deleteNamespacedPod).toHaveLength(1); // stale pod recycled
+    expect(calls.createNamespacedPod).toHaveLength(1); // recreated with current CA
+    expect(handle.endpoint).toBe("https://10.0.0.9:3000");
+  });
+
+  it("recreates a Running pod with no ca-fp label (legacy pod predating the feature)", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) {
+        return { status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+      }
+      if (reads === 2) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: { "siclaw.io/ca-fp": FAKE_CA_FP } } };
+    };
+
+    await s.spawn({ agentId: "default" });
+    expect(calls.deleteNamespacedPod).toHaveLength(1);
+    expect(calls.createNamespacedPod).toHaveLength(1);
+  });
+
+  it("stamps the pod and its cert Secret with the current CA fingerprint", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.8", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "default" });
+    expect(calls.createNamespacedPod[0].body.metadata.labels["siclaw.io/ca-fp"]).toBe(FAKE_CA_FP);
+    expect(calls.createNamespacedSecret[0].body.metadata.labels["siclaw.io/ca-fp"]).toBe(FAKE_CA_FP);
+  });
+
+  it("caFingerprint() reflects the cert manager (undefined before setCertManager)", () => {
+    const s = new K8sSpawner();
+    expect(s.caFingerprint()).toBeUndefined();
+    s.setCertManager(new FakeCertManager() as any);
+    expect(s.caFingerprint()).toBe(FAKE_CA_FP);
   });
 
   it("removes stale Failed pod before recreating", async () => {
@@ -536,5 +611,97 @@ describe("K8sSpawner — list + cleanup", () => {
     expect(calls.deleteCollectionNamespacedPod).toHaveLength(1);
     expect(calls.deleteCollectionNamespacedSecret).toHaveLength(1);
     expect(calls.deleteCollectionNamespacedPod[0].labelSelector).toBe("siclaw.io/app=agentbox");
+  });
+});
+
+describe("K8sSpawner — per-agent persistence (PVC override)", () => {
+  // Drive readNamespacedPod: first call 404 (new pod), then a Running pod so
+  // spawn() resolves. Lets us inspect the createNamespacedPod body.
+  function readReturnsRunningAfter404() {
+    let r = 0;
+    readPodImpl.fn = async () => {
+      r++;
+      if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { name: "agentbox-default", labels: {} },
+      };
+    };
+  }
+
+  function userDataVolume() {
+    const body = calls.createNamespacedPod[0].body;
+    const vols = body.spec.volumes as any[];
+    return vols.find((v) => v.name === "user-data");
+  }
+
+  function userDataMount() {
+    const body = calls.createNamespacedPod[0].body;
+    const mounts = body.spec.containers[0].volumeMounts as any[];
+    return mounts.find((m) => m.name === "user-data");
+  }
+
+  it("boxConfig.persistence=true mounts the shared PVC with a per-agent subPath", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ persistence: { enabled: false, claimName: "siclaw-data" } });
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "diagnose-1", persistence: true });
+
+    expect(userDataVolume().persistentVolumeClaim).toEqual({ claimName: "siclaw-data" });
+    expect(userDataVolume().emptyDir).toBeUndefined();
+    expect(userDataMount().subPath).toBe("agents/diagnose-1");
+  });
+
+  it("boxConfig.persistence=false uses emptyDir even when global persistence is enabled", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ persistence: { enabled: true, claimName: "siclaw-data" } });
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "shopping-1", persistence: false });
+
+    expect(userDataVolume().emptyDir).toEqual({});
+    expect(userDataVolume().persistentVolumeClaim).toBeUndefined();
+    expect(userDataMount().subPath).toBeUndefined();
+  });
+
+  it("undefined boxConfig.persistence falls back to the spawner's global config (enabled)", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ persistence: { enabled: true, claimName: "siclaw-data" } });
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "legacy-1" });
+
+    expect(userDataVolume().persistentVolumeClaim).toEqual({ claimName: "siclaw-data" });
+    expect(userDataMount().subPath).toBe("agents/legacy-1");
+  });
+
+  it("undefined boxConfig.persistence falls back to the spawner's global config (disabled)", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner(); // no persistence config at all
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "legacy-2" });
+
+    expect(userDataVolume().emptyDir).toEqual({});
+    expect(userDataMount().subPath).toBeUndefined();
+  });
+
+  it("persistence requested but no claimName configured → falls back to emptyDir (no broken mount)", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner(); // global persistence undefined → no claimName
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "diagnose-2", persistence: true });
+
+    // Must not emit a PVC volume that can never bind.
+    expect(userDataVolume().persistentVolumeClaim).toBeUndefined();
+    expect(userDataVolume().emptyDir).toEqual({});
+    expect(userDataMount().subPath).toBeUndefined();
   });
 });
