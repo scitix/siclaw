@@ -482,6 +482,88 @@ describe("siclaw-api misc routes", () => {
       expect(status).toBe(200);
       expect(Array.isArray(body.logs)).toBe(true);
     });
+
+    it("entry=api filters by origin (with delegation inheritance) + joins agents", async () => {
+      query.mockResolvedValueOnce([[], []]);
+      await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/audit?from=1000&to=2000&entry=api",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      const sql: string = query.mock.calls[0][0];
+      expect(sql).toContain("s.origin = 'api'");
+      expect(sql).toContain("s.origin = 'delegation' AND parent_s.origin = 'api'"); // inheritance
+      expect(sql).toContain("LEFT JOIN agents a ON s.agent_id = a.id");             // agentName
+    });
+  });
+
+  describe("GET /api/v1/siclaw/metrics/timing", () => {
+    it("summarises ttft/thinking from assistant metadata + per-tool latency", async () => {
+      query
+        .mockResolvedValueOnce([[ // assistant metadata rows
+          { metadata: JSON.stringify({ timing: { ttft_ms: 100, thinking_ms: 20 } }) },
+          { metadata: JSON.stringify({ timing: { ttft_ms: 300 } }) },
+        ], []])
+        .mockResolvedValueOnce([[ // tool duration rows
+          { toolName: "bash", durationMs: 500 },
+          { toolName: "bash", durationMs: 300 },
+          { toolName: "read", durationMs: 50 },
+        ], []]);
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/timing?from=1000&to=2000",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(200);
+      expect(body.ttft).toMatchObject({ count: 2, min: 100, max: 300, avg: 200 });
+      expect(body.thinking).toMatchObject({ count: 1, avg: 20 });
+      const bash = body.tools.find((t: any) => t.toolName === "bash");
+      expect(bash).toMatchObject({ count: 2, min: 300, max: 500 });
+      // tools sorted by count desc → bash (2) before read (1)
+      expect(body.tools[0].toolName).toBe("bash");
+    });
+
+    it("rejects non-admin", async () => {
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/timing?from=1000&to=2000", method: "GET",
+      }));
+      expect([401, 403]).toContain(status);
+    });
+  });
+
+  describe("GET /api/v1/siclaw/audit/sessions", () => {
+    it("returns per-session rows with tool/error counts + agentName, entry-filtered", async () => {
+      query.mockResolvedValueOnce([[
+        {
+          sessionId: "s1", userId: "u1", agentId: "a1", agentName: "Ops Agent",
+          title: "t", preview: "p", origin: "channel", messageCount: 8,
+          createdAt: new Date(1000), lastActiveAt: new Date(2000),
+          toolCallCount: 5, errorToolCallCount: 2,
+        },
+      ], []]);
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/audit/sessions?from=500&to=3000&entry=channel",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(200);
+      const sql: string = query.mock.calls[0][0];
+      expect(sql).toContain("s.origin = 'channel'");
+      expect(body.sessions).toHaveLength(1);
+      expect(body.sessions[0]).toMatchObject({
+        sessionId: "s1", agentName: "Ops Agent", agentGroupName: null,
+        origin: "channel", messageCount: 8, toolCallCount: 5, errorToolCallCount: 2,
+      });
+    });
+
+    it("rejects a reversed window with 400", async () => {
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/audit/sessions?from=2000&to=1000",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(400);
+    });
   });
 
   // ── System config ────────────────────────────────────────
