@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { api } from "../api"
+import type { ChatMessage } from "./usePilotChat"
 
 // ── Entry-form axis ──────────────────────────────────────
 //
@@ -119,6 +120,31 @@ export interface SessionListItem {
 export interface SessionListResponse {
   sessions: SessionListItem[]
   hasMore: boolean
+}
+
+// ── Read-only session snapshot (admin audit view) ────────
+//
+// Returns RAW chat_messages rows (same shape the chat endpoint returns) so the
+// snapshot view can map them through the same buildPilotMessages pipeline and
+// render identically to the live chat.
+
+export interface SessionSnapshotHeader {
+  sessionId: string
+  userId: string | null
+  agentId: string
+  agentName: string | null
+  title: string | null
+  preview: string | null
+  origin: string | null
+  messageCount: number
+  createdAt: string
+  lastActiveAt: string | null
+}
+
+export interface SessionSnapshot {
+  session: SessionSnapshotHeader
+  data: ChatMessage[]
+  truncated: boolean
 }
 
 export interface AuditDetail extends AuditLog {
@@ -399,6 +425,27 @@ export function useSessions(params: SessionParams): {
   }, [params.userId, params.agentId, params.entry, params.from, params.to])
 
   return { sessions, hasMore, loading, loadMore: () => doFetch(true), refresh: () => doFetch(false) }
+}
+
+/** Read-only transcript of ANY session (admin audit). null id closes/clears. */
+export function useSessionSnapshot(sessionId: string | null): { data: SessionSnapshot | null; loading: boolean; error: boolean } {
+  const [data, setData] = useState<SessionSnapshot | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(false)
+
+  useEffect(() => {
+    if (!sessionId) { setData(null); setError(false); setLoading(false); return }
+    let cancelled = false
+    setLoading(true)
+    setError(false)
+    setData(null)
+    api<SessionSnapshot>(`/siclaw/audit/sessions/${sessionId}/messages`)
+      .then((d) => { if (!cancelled) { setData(d); setLoading(false) } })
+      .catch(() => { if (!cancelled) { setError(true); setLoading(false) } })
+    return () => { cancelled = true }
+  }, [sessionId])
+
+  return { data, loading, error }
 }
 
 export function useAuditDetail(id: string | null): { detail: AuditDetail | null; loading: boolean } {

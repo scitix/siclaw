@@ -566,6 +566,55 @@ describe("siclaw-api misc routes", () => {
     });
   });
 
+  describe("GET /api/v1/siclaw/audit/sessions/:id/messages", () => {
+    it("returns ANY session's transcript (admin, NOT owner-scoped)", async () => {
+      query
+        .mockResolvedValueOnce([[ // session header — note: a session owned by some other user
+          {
+            sessionId: "s9", userId: "someone-else", agentId: "a1", agentName: "Ops Agent",
+            title: "Prod incident", preview: "p", origin: "api", messageCount: 3,
+            createdAt: new Date(1000), lastActiveAt: new Date(5000),
+          },
+        ], []])
+        .mockResolvedValueOnce([[ // messages — RAW chat_messages rows (snake_case)
+          { id: "m1", role: "user", content: "what broke?", tool_name: null, tool_input: null, outcome: null, duration_ms: null, metadata: null, created_at: new Date(1000) },
+          { id: "m2", role: "tool", content: "logs…", tool_name: "restricted_bash", tool_input: "{\"command\":\"kubectl get po\"}", outcome: "success", duration_ms: 120, metadata: null, created_at: new Date(2000) },
+        ], []]);
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/audit/sessions/s9/messages",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(200);
+      // The header query must NOT filter by user_id (admin audit reads any owner's session).
+      const headerSql: string = query.mock.calls[0][0];
+      expect(headerSql).not.toContain("user_id = ?");
+      expect(headerSql).toContain("deleted_at IS NULL");
+      expect(body.session).toMatchObject({ sessionId: "s9", userId: "someone-else", agentName: "Ops Agent", origin: "api" });
+      // Raw rows (same shape the chat endpoint returns) so the UI maps them with toPilotMessage.
+      expect(body.data).toHaveLength(2);
+      expect(body.data[1]).toMatchObject({ role: "tool", tool_name: "restricted_bash", outcome: "success", duration_ms: 120 });
+      expect(body.truncated).toBe(false);
+    });
+
+    it("404s when the session is missing or deleted", async () => {
+      query.mockResolvedValueOnce([[], []]);
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/audit/sessions/nope/messages",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      expect(status).toBe(404);
+    });
+
+    it("rejects non-admin", async () => {
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/audit/sessions/s9/messages", method: "GET",
+      }));
+      expect([401, 403]).toContain(status);
+    });
+  });
+
   // ── System config ────────────────────────────────────────
   describe("GET /api/v1/siclaw/system/config", () => {
     it("rejects non-admin", async () => {

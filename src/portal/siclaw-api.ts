@@ -3219,6 +3219,62 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     sendJson(res, 200, { sessions, hasMore });
   });
 
+  // GET /api/v1/siclaw/audit/sessions/:id/messages — admin-only, READ-ONLY
+  // transcript snapshot of ANY session (NOT scoped to the requesting user, unlike
+  // the user-facing /agents/:id/chat/sessions/:sid/messages path). The Metrics
+  // Sessions tab lists every user's sessions, so opening one must not route
+  // through the owner-scoped chat endpoint (which 404s on other users').
+  router.get("/api/v1/siclaw/audit/sessions/:id/messages", async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const sessionId = params.id;
+    const MSG_CAP = 1000; // bounded snapshot — admin audit sessions are small
+    const db = getDb();
+
+    const [sRows] = await db.query(
+      `SELECT s.id AS sessionId, s.user_id AS userId, s.agent_id AS agentId, a.name AS agentName,
+              s.title AS title, s.preview AS preview, s.origin AS origin, s.message_count AS messageCount,
+              s.created_at AS createdAt, s.last_active_at AS lastActiveAt
+       FROM chat_sessions s LEFT JOIN agents a ON s.agent_id = a.id
+       WHERE s.id = ? AND s.deleted_at IS NULL`,
+      [sessionId],
+    ) as any;
+    if (sRows.length === 0) { sendJson(res, 404, { error: "Session not found" }); return; }
+    const s = sRows[0];
+    const toIso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null));
+
+    // Return RAW chat_messages rows (same shape the user-facing chat endpoint
+    // returns) so the frontend can map them through the SAME toPilotMessage /
+    // buildPilotMessages pipeline and render identically to the live chat. Order
+    // chronological (oldest first) — buildPilotMessages expects that.
+    const [mRows] = await db.query(
+      `SELECT id, role, content, tool_name, tool_input, outcome, duration_ms, metadata,
+              from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
+       FROM chat_messages WHERE session_id = ?
+       ORDER BY created_at ASC, id ASC LIMIT ?`,
+      [sessionId, MSG_CAP + 1],
+    ) as any;
+    const truncated = mRows.length > MSG_CAP;
+    const data = (mRows as any[]).slice(0, MSG_CAP).map((r) => ({
+      ...r,
+      // Parse JSON metadata to an object (legacy MySQL JSON, new TEXT, SQLite TEXT).
+      metadata: safeParseJson(r.metadata, null),
+      created_at: toIso(r.created_at),
+    }));
+
+    sendJson(res, 200, {
+      session: {
+        sessionId: s.sessionId, userId: s.userId, agentId: s.agentId, agentName: s.agentName ?? null,
+        title: s.title ?? null, preview: s.preview ?? null, origin: s.origin ?? null,
+        messageCount: Number(s.messageCount ?? 0),
+        createdAt: toIso(s.createdAt), lastActiveAt: toIso(s.lastActiveAt),
+      },
+      data,
+      truncated,
+    });
+  });
+
   // ================================================================
   // System config — admin-managed key-value store
   // ================================================================

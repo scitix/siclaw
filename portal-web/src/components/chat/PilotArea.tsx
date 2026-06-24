@@ -308,6 +308,9 @@ export interface PilotAreaProps {
   onOpenSchedulePanel?: (msg: PilotMessage) => void
   onOpenSubagent?: (childSessionId: string, status?: string, label?: string) => void
   agentId?: string
+  /** Read-only transcript: hides the composer and edit/steer/dig-deeper affordances.
+   *  Used by the admin session-snapshot view. Message rendering is unchanged. */
+  readOnly?: boolean
 }
 
 export function PilotArea({
@@ -330,6 +333,7 @@ export function PilotArea({
   onOpenSchedulePanel,
   onOpenSubagent,
   agentId,
+  readOnly = false,
 }: PilotAreaProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -657,7 +661,7 @@ export function PilotArea({
           ) : !hasVisibleMessages ? (
             <div className="flex flex-col items-center justify-center py-20 text-muted-foreground/70">
               <MessageSquare className="w-12 h-12 text-gray-200 mb-4" />
-              <p className="text-sm text-muted-foreground">Send a message to start the conversation</p>
+              <p className="text-sm text-muted-foreground">{readOnly ? "No messages in this session" : "Send a message to start the conversation"}</p>
             </div>
           ) : (
             <>
@@ -745,9 +749,9 @@ export function PilotArea({
                         <MessageItem
                           message={msg}
                           sendMessage={wrappedSendMessage}
-                          showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
+                          showSuggestedReplies={!readOnly && msg.id === lastAssistantMsgId && !isLoading}
                           dpActive={dpActive}
-                          canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
+                          canEditMessage={!readOnly && msg.id === latestEditableUserMessageId && !isLoading}
                           editingContent={editingMessageId === msg.id ? editingDraft : null}
                           onStartEditMessage={startEditingMessage}
                           onEditMessageChange={setEditingDraft}
@@ -788,7 +792,7 @@ export function PilotArea({
 
               {/* Dig deeper — shown when agent produced a conclusion and user may want
                   to trace the root cause upstream. Hidden while a prefix chip is active. */}
-              {showTraceButton && !activePrefix && (
+              {!readOnly && showTraceButton && !activePrefix && (
                 <div className="flex justify-start pl-12 my-2">
                   <button
                     type="button"
@@ -808,24 +812,26 @@ export function PilotArea({
           <div ref={scrollRef} />
         </div>
       </div>
-      <InputArea
-        onSend={wrappedSendMessage}
-        onAbort={wrappedAbort}
-        disabled={false}
-        isLoading={isLoading}
-        hasBackgroundWork={hasBackgroundWork}
-        contextUsage={contextUsage}
-        pendingMessages={pendingMessages}
-        onRemovePending={onRemovePending}
-        dpActive={dpActive}
-        onSetDpActive={onSetDpActive}
-        hasMessages={hasVisibleMessages}
-        draft={chipDraft}
-        draftSeq={chipSeq}
-        historyMessages={userMessageHistory}
-        activePrefix={activePrefix}
-        onClearPrefix={() => setActivePrefix(null)}
-      />
+      {!readOnly && (
+        <InputArea
+          onSend={wrappedSendMessage}
+          onAbort={wrappedAbort}
+          disabled={false}
+          isLoading={isLoading}
+          hasBackgroundWork={hasBackgroundWork}
+          contextUsage={contextUsage}
+          pendingMessages={pendingMessages}
+          onRemovePending={onRemovePending}
+          dpActive={dpActive}
+          onSetDpActive={onSetDpActive}
+          hasMessages={hasVisibleMessages}
+          draft={chipDraft}
+          draftSeq={chipSeq}
+          historyMessages={userMessageHistory}
+          activePrefix={activePrefix}
+          onClearPrefix={() => setActivePrefix(null)}
+        />
+      )}
     </div>
   )
 }

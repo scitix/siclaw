@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react"
-import { useNavigate } from "react-router-dom"
 import { AlertTriangle, ChevronDown, ChevronRight, Eye, Loader2, MessageSquare, Wrench } from "lucide-react"
 import {
   resolveRange,
@@ -11,6 +10,7 @@ import {
   type TimeRange,
 } from "../../hooks/useMetrics"
 import { api } from "../../api"
+import { SessionSnapshot } from "./SessionSnapshot"
 
 function formatTime(ts: string): string {
   const d = new Date(ts)
@@ -37,11 +37,11 @@ export function SessionTable({
   entry: EntryMode
   timeRange: TimeRange
 }) {
-  const navigate = useNavigate()
   const [agentId, setAgentId] = useState("")
   const [agents, setAgents] = useState<AgentOption[]>([])
   const [expandedAgents, setExpandedAgents] = useState<Set<string>>(new Set())
   const [visibleCounts, setVisibleCounts] = useState<Record<string, number>>({})
+  const [snapshotId, setSnapshotId] = useState<string | null>(null)  // open read-only transcript
   const { users } = useUsers()
   const userMap = useMemo(() => {
     const m = new Map<string, string>()
@@ -124,7 +124,7 @@ export function SessionTable({
       return g ? { ...prev, [key]: g.sessions.length } : prev
     })
 
-  const openSession = (s: SessionListItem) => navigate(`/chat?agent=${s.agentId}&session=${s.sessionId}`)
+  const openSession = (s: SessionListItem) => setSnapshotId(s.sessionId)
   const usernameFor = (s: SessionListItem) => (s.userId ? userMap.get(s.userId) ?? s.userId : "—")
 
   return (
@@ -198,6 +198,8 @@ export function SessionTable({
           )}
         </div>
       </div>
+
+      {snapshotId && <SessionSnapshot sessionId={snapshotId} onClose={() => setSnapshotId(null)} />}
     </section>
   )
 }
@@ -294,7 +296,7 @@ function SessionRow({ session, username, onOpen }: { session: SessionListItem; u
         </span>
       </td>
       <td className="px-4 py-2.5 text-right">
-        <button onClick={onOpen} title="Open in Chat" className="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-border hover:bg-secondary text-foreground">
+        <button onClick={onOpen} title="View transcript" className="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-border hover:bg-secondary text-foreground">
           <Eye className="h-3.5 w-3.5" />
         </button>
       </td>
