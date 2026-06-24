@@ -149,6 +149,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // rather than failing the spawn. The env only takes effect on a cold spawn —
   // K8sSpawner ignores it when a pod is already running, so a changed timeout
   // applies on the agent's next restart.
+  //
+  // Registered on the AgentBoxManager (not wired per-call) so EVERY cold-spawn
+  // entry point — chat RPCs here, plus channel webhooks and cron tasks that
+  // share this manager — honours the per-agent window. The manager invokes it
+  // lazily, only on an actual spawn, so warm-pod reuse pays no RPC.
   const resolveAgentSpawnEnv = async (agentId: string): Promise<Record<string, string> | undefined> => {
     try {
       const agent = await frontendClient.request("config.getAgent", { agentId }) as
@@ -163,14 +168,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
     return undefined;
   };
-
-  // Spawn (or reuse) the AgentBox for an agent. The per-agent env resolver is
-  // passed as a lazy thunk: the manager invokes it ONLY on a cold spawn, so a
-  // warm-pod reuse (the common case on chat.send, and always the case on
-  // abort/steer/clearQueue which target a live session) pays no config.getAgent
-  // RPC.
-  const getOrCreateAgentBox = (agentId: string) =>
-    agentBoxManager.getOrCreate(agentId, undefined, () => resolveAgentSpawnEnv(agentId));
+  agentBoxManager.setSpawnEnvResolver(resolveAgentSpawnEnv);
 
   // Per-session AbortController for the in-flight chat.send SSE consumer, keyed
   // by sessionId. chat.abort looks this up to break the gateway's consumeAgentSse
@@ -247,7 +245,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
 
-        const handle = await getOrCreateAgentBox(agentId);
+        const handle = await agentBoxManager.getOrCreate(agentId);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
@@ -349,7 +347,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
     activeStreamAborts.get(sessionId)?.abort();
 
-    const handle = await getOrCreateAgentBox(agentId);
+    const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.abortSession(sessionId);
     return { ok: true };
@@ -373,7 +371,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
     await incrementMessageCount(sessionId);
 
-    const handle = await getOrCreateAgentBox(agentId);
+    const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.steerSession(sessionId, text, { images, files });
     return { ok: true };
@@ -384,7 +382,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const sessionId = params.sessionId as string;
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
 
-    const handle = await getOrCreateAgentBox(agentId);
+    const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     const cleared = await client.clearQueue(sessionId);
     return { ok: true, ...cleared };
