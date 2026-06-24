@@ -1,0 +1,88 @@
+---
+title: "Agent Tracing"
+sidebarTitle: "Tracing"
+description: "Export agent behavior to Langfuse, Phoenix, or any OTLP backend for observability and evaluation."
+---
+
+## Overview
+
+Siclaw can record what every agent does — the prompt, each LLM call, every tool
+invocation, token usage, the model that answered, and latency — and stream it to
+one or more third-party analysis platforms using **OpenTelemetry**.
+
+Each user prompt becomes one trace: a root `agent.prompt` span with the LLM and
+tool calls nested underneath, tagged with the model name and per-call token
+counts. This is the same data you'd use to debug a slow investigation, audit what
+an agent did, or evaluate prompt/model changes over time.
+
+Tracing is **off by default**, **admin-managed from the web UI**, and **global** —
+one configuration is shared by every agent.
+
+## Supported platforms
+
+| Platform | OTLP endpoint | Credentials |
+|----------|---------------|-------------|
+| **Langfuse** | `https://<host>/api/public/otel/v1/traces` | Public key + Secret key (sent as HTTP Basic) |
+| **Phoenix** | `http://<host>:6006/v1/traces` | API key (Bearer) + project name |
+| **Generic OTLP** | any OTLP/HTTP traces endpoint | Arbitrary headers (JSON) |
+
+You can configure **several platforms at once** — every agent run fans out to
+each enabled platform from a single recording path.
+
+## Configure
+
+Open the web UI as an admin and go to **Metrics → Tracing**.
+
+1. Click **Add platform**, pick the type (Langfuse / Phoenix / Generic OTLP).
+2. Enter the **OTLP endpoint URL** — for Langfuse this must include the full path
+   `…/api/public/otel/v1/traces`, not just the host.
+3. Enter the credentials (Siclaw assembles the auth header for you — e.g. it
+   base64-encodes the Langfuse key pair into a Basic header).
+4. Make sure the platform's toggle is **on**.
+
+Tracing is active whenever **at least one platform is enabled** — there is no
+separate master switch. To pause tracing, disable every platform.
+
+### Global settings
+
+- **`service.name`** — the OpenTelemetry service identifier stamped on every
+  trace. Defaults to `siclaw-agentbox`. Set distinct names (e.g. `siclaw-prod`,
+  `siclaw-staging`) when several Siclaw deployments report to the same backend so
+  you can tell them apart.
+- **Send content** — a privacy gate. When **off** (default) only metadata and the
+  call tree are exported (model, tokens, tool names, latency). When **on**, the
+  actual LLM prompts/responses and tool arguments are exported too — far more
+  useful for debugging, but it sends conversation content to the platform.
+
+<Warning>
+  Turn **Send content** on only for a backend inside your trust domain (e.g. a
+  self-hosted Langfuse on your internal network). Tool **output** is always
+  sanitized; Send content additionally releases LLM input/output and tool
+  arguments.
+</Warning>
+
+## Changes take effect live
+
+Adding, editing, toggling, or deleting a platform — and changing the global
+settings — **hot-reloads every running agent** without a restart or redeploy.
+Behind the scenes the change is broadcast to all active AgentBoxes, which rebuild
+their exporters in place. New agents pick up the current configuration when they
+start.
+
+## Test a platform
+
+Each platform row has a **Test** button. It fires an empty OTLP request to the
+configured endpoint with the stored credentials and reports the real HTTP status,
+so you can confirm the URL and auth are correct before relying on it. The probe
+is restricted to `http`/`https` and blocks cloud-metadata and link-local
+addresses.
+
+## Notes
+
+- Credentials are stored server-side and **masked** in the API and UI (only a
+  prefix is shown); editing a platform without re-entering the secret keeps the
+  stored value.
+- Tracing covers agents running in Kubernetes (one pod per user), local server
+  mode, and the standalone CLI.
+- This is **Plane A** observability (online agent-behavior traces). It is separate
+  from the Prometheus/Grafana metrics on the other Metrics tabs.
