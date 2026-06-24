@@ -76,7 +76,11 @@ async function resolveChannelBinding(
   sessionKey?: string | null,
 ): Promise<ResolvedChannelBinding | null> {
   const row = await selectChannelBinding(db, channelId, routeKey);
-  if (!row) return null;
+  if (!row) {
+    // No explicit binding. A per-agent open bot auto-serves any group it joins
+    // (standalone supports open only — authorized requires Sicore's im_bindings).
+    return resolveOpenGroupBinding(db, channelId, routeKey);
+  }
 
   const session = sessionKey
     ? await resolveChannelBindingParticipantSession(db, row.id, sessionKey)
@@ -251,6 +255,9 @@ interface PersonalChannelConfig {
     agent_id?: string;
     access_mode?: "open" | "sicore_authorized";
     owner_user_id?: string;
+    // When not explicitly false, an open per-agent bot also auto-serves any
+    // group it is added to (no PAIR). Mirrors Sicore's group_auto_bind.
+    group_auto_bind?: boolean;
   };
 }
 
@@ -291,6 +298,34 @@ async function resolvePersonalChannelBinding(
     sessionKey: session.sessionKey,
     createdBy: personalBot.owner_user_id ?? channel.created_by,
     routeType: "user",
+  };
+}
+
+/**
+ * Open-mode group fallback: a per-agent open bot answers in any group it joins
+ * without a PAIR. All senders in one group share a single session (keyed by
+ * chat id, distinct from the DM `open_id:` keys), and every turn runs as the
+ * fixed owner. Authorized mode is punted here (Sicore-only).
+ */
+async function resolveOpenGroupBinding(
+  db: Db,
+  channelId: string,
+  routeKey: string,
+): Promise<ResolvedChannelBinding | null> {
+  const channel = await selectPersonalChannel(db, channelId);
+  const personalBot = channel?.config.personal_bot;
+  if (!channel || !personalBot?.agent_id) return null;
+  if (personalBot.access_mode !== "open") return null;
+  if (personalBot.group_auto_bind === false) return null;
+  const sessionKey = `chat:${routeKey}`;
+  const session = await resolveChannelBindingParticipantSession(db, channel.id, sessionKey);
+  return {
+    agentId: personalBot.agent_id,
+    bindingId: channel.id,
+    sessionId: session.sessionId,
+    sessionKey: session.sessionKey,
+    createdBy: personalBot.owner_user_id ?? channel.created_by,
+    routeType: "group",
   };
 }
 
@@ -2611,6 +2646,18 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     ) as any;
     for (const row of rows as any[]) {
       if (row.config !== undefined) row.config = safeParseJson(row.config, null);
+      // A per-agent open bot also serves the groups it joins. Advertise
+      // group_channel_id so the Runtime stops ignoring group messages (lark.ts
+      // gates the group path on it). DM-only bots set group_auto_bind:false.
+      const cfg = row.config;
+      if (
+        cfg && typeof cfg === "object" &&
+        cfg.personal_bot && typeof cfg.personal_bot === "object" &&
+        cfg.personal_bot.group_auto_bind !== false &&
+        !cfg.group_channel_id
+      ) {
+        cfg.group_channel_id = row.id;
+      }
     }
     return { data: rows };
   });

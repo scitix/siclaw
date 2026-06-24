@@ -1348,6 +1348,24 @@ describe("channel.list", () => {
     expect(result.data).toHaveLength(1);
     expect(result.data[0].id).toBe("ch1");
   });
+
+  it("injects group_channel_id for an open personal-bot channel", async () => {
+    mockQuery([{
+      id: "ch-personal", name: "bot", status: "active", created_at: "2024-01-01",
+      config: JSON.stringify({ app_id: "x", personal_bot: { agent_id: "a1", access_mode: "open" } }),
+    }]);
+    const result = await getHandler("channel.list")({}, "a1");
+    expect(result.data[0].config.group_channel_id).toBe("ch-personal");
+  });
+
+  it("does not inject group_channel_id when group_auto_bind is false", async () => {
+    mockQuery([{
+      id: "ch-personal", name: "bot", status: "active", created_at: "2024-01-01",
+      config: JSON.stringify({ app_id: "x", personal_bot: { agent_id: "a1", access_mode: "open", group_auto_bind: false } }),
+    }]);
+    const result = await getHandler("channel.list")({}, "a1");
+    expect(result.data[0].config.group_channel_id).toBeUndefined();
+  });
 });
 
 describe("channel.resolveBinding", () => {
@@ -1406,10 +1424,46 @@ describe("channel.resolveBinding", () => {
   });
 
   it("returns null binding when not found", async () => {
-    mockQuery([]);
+    // No explicit binding, and the channel is not a personal-bot channel
+    // (selectPersonalChannel → none), so the open-group fallback also yields null.
+    mockQuery([], []);
 
     const result = await getHandler("channel.resolveBinding")(
       { channel_id: "ch1", route_key: "group-999" }, "a1",
+    );
+    expect(result).toEqual({ binding: null });
+  });
+
+  it("open personal-bot auto-binds a group with a shared per-chat session", async () => {
+    mockQuery(
+      [],                                                                  // selectChannelBinding → none
+      [{ id: "ch1", created_by: "owner-1", config: JSON.stringify({ personal_bot: { agent_id: "a1", access_mode: "open" } }) }], // selectPersonalChannel
+      [],                                                                  // participant session lookup → none
+      [],                                                                  // insert participant session
+      [{ session_id: "chat-session" }],                                    // participant session reload
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123", session_key: "open_id:ou_1", sender_open_id: "ou_1" }, "a1",
+    );
+    expect(result.binding).toEqual({
+      agentId: "a1",
+      bindingId: "ch1",
+      sessionId: "chat-session",
+      sessionKey: "chat:group-123",
+      createdBy: "owner-1",
+      routeType: "group",
+    });
+  });
+
+  it("punts (null) on a sicore_authorized personal bot in standalone", async () => {
+    mockQuery(
+      [],                                                                  // selectChannelBinding → none
+      [{ id: "ch1", created_by: "owner-1", config: JSON.stringify({ personal_bot: { agent_id: "a1", access_mode: "sicore_authorized" } }) }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123", sender_open_id: "ou_1" }, "a1",
     );
     expect(result).toEqual({ binding: null });
   });

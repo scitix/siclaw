@@ -16,7 +16,9 @@ import {
   resolvePersonalBinding,
   handlePersonalPairingCode,
   resetPersonalSession,
+  isChannelAccessDenied,
   type ResolvedChannelBinding,
+  type ChannelAccessDenied,
 } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
@@ -53,6 +55,16 @@ const PERSONAL_BIND_REQUIRED_NOTICE_BY_LOCALE = {
   "zh-CN": "❌ 这个个人机器人需要先绑定 Sicore 账号。请打开 Sicore 的 Agent Channels 页面，点击“授权飞书账号”后再回来私聊。",
   "en-US": "❌ This personal bot requires Sicore authorization. Open the Sicore Agent Channels page, click “Authorize Feishu account”, then come back to this chat.",
 } as const;
+// sicore_authorized group: sender hasn't linked their Feishu account to Sicore.
+const GROUP_ACCESS_UNBOUND_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 你的飞书账号还没绑定 Sicore，无法在群里使用这个助手。请打开 Sicore 的 Agent Channels 页面授权飞书账号后再试。",
+  "en-US": "❌ Your Feishu account isn't linked to Sicore yet, so you can't use this assistant here. Open the Sicore Agent Channels page to authorize, then try again.",
+} as const;
+// sicore_authorized group: sender is linked but lacks read access to the agent.
+const GROUP_ACCESS_DENIED_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 你没有这个助手的访问权限，请联系管理员授权。",
+  "en-US": "❌ You don't have access to this assistant. Ask an admin to grant access.",
+} as const;
 const MAX_AGENT_SELECTED_UPDATES = 2;
 const MAX_LARK_BINDING_QUEUE = 20;
 
@@ -82,6 +94,7 @@ export interface LarkChannelConfig {
     access_mode: "open" | "sicore_authorized";
     owner_user_id?: string;
     authorize_url?: string;
+    group_auto_bind?: boolean;
   };
 }
 
@@ -354,8 +367,16 @@ export async function handleLarkMessage(
     return;
   }
 
-  // Look up binding for this chat
-  const binding = await resolveBinding(groupChannelId, chatId, frontendClient!, sessionKey);
+  // Look up binding for this chat. Pass sender_open_id so the Portal can
+  // auto-bind / per-sender resolve group bots and pick the session key.
+  const binding = await resolveBinding(groupChannelId, chatId, frontendClient!, sessionKey, senderOpenId ?? undefined);
+  if (isChannelAccessDenied(binding)) {
+    // sicore_authorized group: this sender isn't allowed. Feishu only delivers
+    // @-mentioned group messages, so the message is already directed at the bot
+    // — a single short hint is fine, not spam.
+    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale));
+    return;
+  }
   if (!binding) {
     console.log(`[lark] No binding for channel=${groupChannelId} chat=${chatId} — ignoring`);
     // Don't spam the group with "not paired" for every message.
@@ -541,7 +562,25 @@ async function resolveQueuedBinding(
     if (!senderOpenId) return null;
     return resolvePersonalBinding(channelId, senderOpenId, frontendClient);
   }
-  return resolveBinding(channelId, chatId, frontendClient, sessionKey);
+  const result = await resolveBinding(channelId, chatId, frontendClient, sessionKey, senderOpenId ?? undefined);
+  // If access was revoked between enqueue and run, treat as gone (the queued
+  // task then skips). The pre-enqueue check already replied any access hint.
+  return isChannelAccessDenied(result) ? null : result;
+}
+
+/**
+ * Build the access-denied reply for a sicore_authorized group, in the channel's
+ * locale. Appends the authorize URL for the "unbound" case.
+ */
+function formatGroupAccessDeniedReply(
+  denied: ChannelAccessDenied,
+  locale: "zh-CN" | "en-US",
+): string {
+  if (denied.reason === "denied") {
+    return GROUP_ACCESS_DENIED_NOTICE_BY_LOCALE[locale];
+  }
+  const base = GROUP_ACCESS_UNBOUND_NOTICE_BY_LOCALE[locale];
+  return denied.authorizeUrl ? `${base}\n${denied.authorizeUrl}` : base;
 }
 
 async function handleNewCommand(

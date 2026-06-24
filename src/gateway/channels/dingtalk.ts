@@ -35,7 +35,7 @@ import crypto from "node:crypto";
 import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
-import { resolveBinding, handlePairingCode } from "../channel-manager.js";
+import { resolveBinding, handlePairingCode, isChannelAccessDenied } from "../channel-manager.js";
 import { resolveAgentSystemPrompt } from "../agent-model-binding.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
@@ -268,7 +268,7 @@ export async function handleDingTalkMessage(
 
   // Look up binding for this conversation.
   const binding = await resolveBinding(channelId, conversationId, frontendClient!);
-  if (!binding) {
+  if (!binding || isChannelAccessDenied(binding)) {
     console.log(`[dingtalk] No binding for channel=${channelId} conversation=${conversationId} — ignoring`);
     return;
   }
@@ -366,7 +366,7 @@ async function handleNewCommand(
     // are released. Needs the bound agent to locate the right AgentBox.
     try {
       const binding = await resolveBinding(channelId, conversationId, frontendClient!);
-      if (binding) {
+      if (binding && !isChannelAccessDenied(binding)) {
         const handle = await agentBoxManager.getOrCreate(binding.agentId);
         const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
         await client.closeSession(oldSessionId);

@@ -44,6 +44,8 @@ vi.mock("../channel-manager.js", () => ({
   resolvePersonalBinding: (...args: unknown[]) => resolvePersonalBindingMock(...args),
   handlePersonalPairingCode: (...args: unknown[]) => handlePersonalPairingCodeMock(...args),
   resetPersonalSession: (...args: unknown[]) => resetPersonalSessionMock(...args),
+  isChannelAccessDenied: (v: unknown) =>
+    v !== null && typeof v === "object" && (v as { walled?: unknown }).walled === true,
 }));
 
 const ensureChatSessionMock = vi.fn();
@@ -509,7 +511,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     resolveBindingMock.mockResolvedValue(null);
     const mgr = makeAgentBoxManager();
     await handleLarkMessage(makeTextEvent("hello"), makeLarkClient(), "lark", mgr as any, undefined, {} as any);
-    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1");
+    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1", "ou_user_1");
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
   });
@@ -537,8 +539,35 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       },
     );
 
-    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1");
+    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1", "ou_user_1");
     expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("authorized group: a walled sender gets a hint and no agent runs", async () => {
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", authorizeUrl: "https://sicore.example/auth" });
+    const lark = makeLarkClient();
+    const mgr = makeAgentBoxManager();
+    await handleLarkMessage(
+      makeTextEvent("hi"),
+      lark,
+      "lark-runtime",
+      mgr as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      {
+        app_id: "cli_x",
+        app_secret: "secret",
+        group_channel_id: "lark:personal:pb-1",
+        personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: "sicore_authorized", owner_user_id: "owner-1" },
+      },
+    );
+
+    const replyArg = lark.im.message.reply.mock.calls[0][0];
+    const text = JSON.parse(replyArg.data.content).text as string;
+    expect(text).toContain("https://sicore.example/auth");
+    expect(mgr.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
   });
 
   it("with binding → getOrCreate uses agentId alone, and registers the durable channel session owner", async () => {
