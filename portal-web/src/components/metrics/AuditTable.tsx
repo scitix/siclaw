@@ -1,19 +1,10 @@
 import { useMemo, useState } from "react"
 import { ChevronDown, ChevronRight, CheckCircle, XCircle, Ban, Loader2 } from "lucide-react"
-import { useAudit, useUsers, resolveRange, type AuditLog, type TimeRange } from "../../hooks/useMetrics"
+import { useAudit, useUsers, resolveRange, originLabel, type AuditLog, type EntryMode, type TimeRange } from "../../hooks/useMetrics"
 import { AuditDetailPanel } from "./AuditDetailPanel"
 
 const TOOL_OPTIONS = ["All", "restricted_bash", "local_script", "pod_exec", "kubectl", "cluster_probe", "cluster_list"]
 const STATUS_OPTIONS = ["All", "success", "error", "blocked"]
-// Session entry-form categories. "web" maps the NULL/"web" origin; "channel"
-// covers IM channels (Feishu/DingTalk). Mirrors chat_sessions.origin.
-const ENTRY_OPTIONS = ["All", "web", "api", "a2a", "channel", "task"]
-const ENTRY_LABELS: Record<string, string> = {
-  web: "Web", api: "API", a2a: "A2A", channel: "Channel", task: "Scheduled", delegation: "Delegation",
-}
-function entryLabel(origin: string | null): string {
-  return ENTRY_LABELS[origin ?? "web"] ?? "Web"
-}
 
 function formatDuration(ms: number | null): string {
   if (ms == null) return "—"
@@ -56,10 +47,9 @@ function OutcomeIcon({ outcome }: { outcome: string | null }) {
   }
 }
 
-export function AuditTable({ userFilterId, usernameHint, timeRange }: { userFilterId: string | null; usernameHint: string | null; timeRange: TimeRange }) {
+export function AuditTable({ userFilterId, usernameHint, entry, timeRange }: { userFilterId: string | null; usernameHint: string | null; entry: EntryMode; timeRange: TimeRange }) {
   const [tool, setTool] = useState("All")
   const [status, setStatus] = useState("All")
-  const [entry, setEntry] = useState("All")
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const { users } = useUsers()
   const userMap = useMemo(() => {
@@ -77,7 +67,7 @@ export function AuditTable({ userFilterId, usernameHint, timeRange }: { userFilt
       userId: userFilterId ?? undefined,
       toolName: tool === "All" ? undefined : tool,
       outcome: status === "All" ? undefined : status,
-      origin: entry === "All" ? undefined : entry,
+      entry,
       from: String(fromMs),
       to: String(toMs),
     }
@@ -108,13 +98,6 @@ export function AuditTable({ userFilterId, usernameHint, timeRange }: { userFilt
           className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
         >
           {STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s === "All" ? "All Status" : s}</option>)}
-        </select>
-        <select
-          value={entry}
-          onChange={(e) => setEntry(e.target.value)}
-          className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
-        >
-          {ENTRY_OPTIONS.map((o) => <option key={o} value={o}>{o === "All" ? "All Entries" : entryLabel(o)}</option>)}
         </select>
         <div className="flex-1"></div>
         <div className="text-[11px] text-muted-foreground font-mono">{logs.length} entries{hasMore ? "+" : ""}</div>
@@ -182,9 +165,9 @@ function AuditRow({ log, username, expanded, onToggle }: { log: AuditLog; userna
         </td>
         <td className="px-3 py-2.5">{username}</td>
         <td className="px-3 py-2.5">
-          <span className="px-1.5 py-0.5 rounded text-[10px] bg-secondary text-muted-foreground">{entryLabel(log.origin)}</span>
+          <span className="px-1.5 py-0.5 rounded text-[10px] bg-secondary text-muted-foreground">{originLabel(log.origin)}</span>
         </td>
-        <td className="px-3 py-2.5 text-muted-foreground">{log.agentId ?? "—"}</td>
+        <td className="px-3 py-2.5 text-muted-foreground">{log.agentName ?? log.agentId ?? "—"}</td>
         <td className="px-3 py-2.5">
           <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-secondary text-muted-foreground">{log.toolName ?? "—"}</span>
         </td>

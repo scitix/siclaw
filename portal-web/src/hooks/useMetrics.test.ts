@@ -1,5 +1,36 @@
 import { describe, it, expect } from "vitest"
-import { isRelativeExpr, resolveRange, isValidRange, rangeLabel } from "./useMetrics"
+import { isRelativeExpr, resolveRange, isValidRange, rangeLabel, ENTRY_MODES, ENTRY_LABELS, originLabel } from "./useMetrics"
+
+describe("entry axis", () => {
+  it("exposes the overview + four entry forms + scheduled", () => {
+    expect(ENTRY_MODES).toEqual(["all", "web", "api", "a2a", "channel", "scheduled"])
+  })
+
+  it("labels every mode (Overview for the combined view)", () => {
+    expect(ENTRY_LABELS.all).toBe("Overview")
+    expect(ENTRY_LABELS.web).toBe("Web")
+    expect(ENTRY_LABELS.scheduled).toBe("Scheduled")
+    for (const m of ENTRY_MODES) expect(ENTRY_LABELS[m]).toBeTruthy()
+  })
+})
+
+describe("originLabel", () => {
+  it("maps null/empty/'web' origin to Web", () => {
+    expect(originLabel(null)).toBe("Web")
+    expect(originLabel("")).toBe("Web")
+    expect(originLabel("web")).toBe("Web")
+  })
+  it("maps the raw origin values to display labels", () => {
+    expect(originLabel("api")).toBe("API")
+    expect(originLabel("a2a")).toBe("A2A")
+    expect(originLabel("channel")).toBe("Channel")
+    expect(originLabel("task")).toBe("Scheduled")
+    expect(originLabel("delegation")).toBe("Delegation")
+  })
+  it("passes through an unknown origin verbatim", () => {
+    expect(originLabel("future-mode")).toBe("future-mode")
+  })
+})
 
 describe("isRelativeExpr", () => {
   it("accepts `now` and `now-<n><unit>`", () => {

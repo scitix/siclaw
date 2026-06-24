@@ -1,34 +1,44 @@
 import { useCallback, useMemo, useState } from "react"
 import { Loader2, RefreshCw } from "lucide-react"
-import { useSummary, useUsers, rangeLabel, DEFAULT_RANGE, type TimeRange } from "../hooks/useMetrics"
+import { useSummary, useTiming, useUsers, rangeLabel, ENTRY_LABELS, DEFAULT_RANGE, type EntryMode, type TimeRange } from "../hooks/useMetrics"
 import { KpiCards } from "../components/metrics/KpiCards"
 import { TrendChart } from "../components/metrics/TrendChart"
+import { TimingStatsCard } from "../components/metrics/TimingStatsCard"
 import { AuditTable } from "../components/metrics/AuditTable"
+import { SessionTable } from "../components/metrics/SessionTable"
 import { GrafanaFrame } from "../components/metrics/GrafanaFrame"
 import { TimeRangePicker } from "../components/metrics/TimeRangePicker"
+import { EntrySelector } from "../components/metrics/EntrySelector"
 
-type TabKey = "dashboard" | "audit" | "grafana"
+type TabKey = "dashboard" | "sessions" | "tools" | "grafana"
+
+const TAB_ORDER: TabKey[] = ["dashboard", "sessions", "tools", "grafana"]
+const TAB_LABEL: Record<TabKey, string> = { dashboard: "Dashboard", sessions: "Sessions", tools: "Tools", grafana: "Grafana" }
 
 export function Metrics() {
   const [tab, setTab] = useState<TabKey>("dashboard")
-  const [userId, setUserId] = useState<string>("")         // "" = All Users (Audit filter only)
+  const [userId, setUserId] = useState<string>("")         // "" = All Users (Sessions/Tools filter only)
   const [timeRange, setTimeRange] = useState<TimeRange>(DEFAULT_RANGE)
+  const [entry, setEntry] = useState<EntryMode>("all")     // entry-form axis, shared across tabs
 
   const filterUserId = userId || null
   const rLabel = rangeLabel(timeRange)
+  const isAudit = tab === "sessions" || tab === "tools"
+  const showControls = tab !== "grafana"
 
   const { users } = useUsers()
   // Dashboard is an external-facing showcase: aggregate only, never scoped to
-  // an individual — so summary is fetched without a user filter.
-  const { data: summary, loading: summaryLoading, refresh: refreshSummary } = useSummary(timeRange, null)
+  // an individual — so summary/timing are fetched without a user filter.
+  const { data: summary, loading: summaryLoading, refresh: refreshSummary } = useSummary(timeRange, null, entry)
+  const { data: timing, loading: timingLoading, refresh: refreshTiming } = useTiming(timeRange, null, entry)
 
   const [spinning, setSpinning] = useState(false)
   const handleRefresh = useCallback(() => {
     setSpinning(true)
-    Promise.resolve(refreshSummary()).finally(() => {
+    Promise.all([Promise.resolve(refreshSummary()), Promise.resolve(refreshTiming())]).finally(() => {
       setTimeout(() => setSpinning(false), 600)
     })
-  }, [refreshSummary])
+  }, [refreshSummary, refreshTiming])
 
   const selectedUsername = useMemo(() => {
     if (!userId) return null
@@ -47,18 +57,17 @@ export function Metrics() {
             </div>
             <div className="flex items-center gap-2">
               {tab === "dashboard" && (
-                <>
-                  <button
-                    onClick={handleRefresh}
-                    title="Sync now"
-                    className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground transition"
-                  >
-                    <RefreshCw className={`h-3.5 w-3.5 transition-transform duration-500 ${spinning ? "animate-spin" : ""}`} />
-                  </button>
-                  <TimeRangePicker value={timeRange} onChange={setTimeRange} />
-                </>
+                <button
+                  onClick={handleRefresh}
+                  title="Sync now"
+                  className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground transition"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 transition-transform duration-500 ${spinning ? "animate-spin" : ""}`} />
+                </button>
               )}
-              {tab === "audit" && (
+              {/* User filter — audit tabs only (the Dashboard is an outward-facing
+                  board and does not drill down by user). */}
+              {isAudit && (
                 <select
                   value={userId}
                   onChange={(e) => setUserId(e.target.value)}
@@ -70,11 +79,14 @@ export function Metrics() {
                   ))}
                 </select>
               )}
+              {/* Entry-form axis + time window — shared by Dashboard/Sessions/Tools. */}
+              {showControls && <EntrySelector value={entry} onChange={setEntry} />}
+              {showControls && <TimeRangePicker value={timeRange} onChange={setTimeRange} />}
             </div>
           </div>
 
           <div className="flex items-center gap-6 mt-4 -mb-px">
-            {(["dashboard", "audit", "grafana"] as TabKey[]).map((t) => (
+            {TAB_ORDER.map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
@@ -84,7 +96,7 @@ export function Metrics() {
                     : "text-muted-foreground hover:text-foreground border-transparent"
                 }`}
               >
-                {t === "dashboard" ? "Dashboard" : t === "audit" ? "Audit" : "Grafana"}
+                {TAB_LABEL[t]}
               </button>
             ))}
           </div>
@@ -100,7 +112,7 @@ export function Metrics() {
             ) : (
               <>
                 <KpiCards
-                  rangeLabel={rLabel}
+                  rangeLabel={`${ENTRY_LABELS[entry]} · ${rLabel}`}
                   distinctUsers={summary?.distinctUsers ?? 0}
                   totalSessions={summary?.totalSessions ?? 0}
                   totalPrompts={summary?.totalPrompts ?? 0}
@@ -132,13 +144,24 @@ export function Metrics() {
                     </div>
                   </div>
                 )}
+
+                {/* Response timing — TTFT / thinking / per-tool latency (entry-aware). */}
+                {timingLoading ? (
+                  <div className="flex items-center justify-center py-6"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+                ) : (
+                  <TimingStatsCard data={timing} rangeLabel={rLabel} entryLabel={ENTRY_LABELS[entry]} />
+                )}
               </>
             )}
           </section>
         )}
 
-        {tab === "audit" && (
-          <AuditTable userFilterId={filterUserId} usernameHint={selectedUsername} timeRange={timeRange} />
+        {tab === "sessions" && (
+          <SessionTable userFilterId={filterUserId} usernameHint={selectedUsername} entry={entry} timeRange={timeRange} />
+        )}
+
+        {tab === "tools" && (
+          <AuditTable userFilterId={filterUserId} usernameHint={selectedUsername} entry={entry} timeRange={timeRange} />
         )}
 
         {tab === "grafana" && <GrafanaFrame />}
