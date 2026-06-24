@@ -50,7 +50,7 @@ export const processIncarnation = randomUUID();
 /**
  * Federation snapshot: the raw cumulative current values of this process's
  * prom-client registry, for the Gateway to pull and delta-accumulate (K8s mode,
- * path ②). Distinct from the WebUI dashboard path (LocalCollector, clear-on-read).
+ * path ②).
  *
  * The returned values are CUMULATIVE and must never be cleared by callers.
  */

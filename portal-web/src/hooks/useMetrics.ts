@@ -3,32 +3,6 @@ import { api } from "../api"
 
 // ── Types ────────────────────────────────────────────────
 
-export interface ToolStats {
-  toolName: string
-  userId: string
-  agentId: string | null
-  success: number
-  error: number
-  total: number
-}
-
-export interface SkillStats {
-  skillName: string
-  scope: "builtin" | "global"
-  userId: string
-  agentId: string | null
-  success: number
-  error: number
-  total: number
-  avgDurationMs: number
-}
-
-export interface LiveData {
-  snapshot: { activeSessions: number; wsConnections: number }
-  topTools: ToolStats[]
-  topSkills: SkillStats[]
-}
-
 export interface SummaryData {
   totalSessions: number
   totalPrompts: number
@@ -41,34 +15,6 @@ export interface SummaryData {
   inventory: { clusters: number; hosts: number; skills: number; knowledgeRepos: number; agents: number; mcpServers: number }
   // —— 日级趋势(随时间窗)——
   dailySeries: Array<{ date: string; prompts: number; toolCalls: number }>
-}
-
-/**
- * Aggregate stats for one timing series (ttft, thinking, bash). All ms.
- * `count = 0` signals "no data" — the card should render an empty-state hint
- * rather than a row of zeros.
- */
-export interface LatencyStats {
-  count: number
-  avg: number
-  min: number
-  max: number
-  p90: number
-}
-
-/** One tool's stats — `toolName` plus the standard latency summary. */
-export interface ToolLatencyStats extends LatencyStats {
-  toolName: string
-}
-
-export interface TimingStats {
-  ttft: LatencyStats
-  thinking: LatencyStats
-  /** All tools with at least one duration sample, sorted by `count` DESC.
-   *  The card slices client-side to the user-chosen top 3 / 5 / 10. */
-  tools: ToolLatencyStats[]
-  /** True when the backend hit ROW_LIMIT and the figures are a recent-only sample. */
-  truncated?: boolean
 }
 
 export interface AuditLog {
@@ -185,52 +131,6 @@ export function rangeLabel(r: TimeRange): string {
 }
 
 // ── Hooks ────────────────────────────────────────────────
-
-export function useLive(userId: string | null): { data: LiveData | null; loading: boolean; error: Error | null; refresh: () => void } {
-  const [data, setData] = useState<LiveData | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<Error | null>(null)
-  const userIdRef = useRef(userId)
-  userIdRef.current = userId
-
-  const fetchOnce = useCallback(() => {
-    const uid = userIdRef.current
-    const q = uid ? `?userId=${encodeURIComponent(uid)}` : ""
-    return api<LiveData>(`/siclaw/metrics/live${q}`)
-      .then((d) => { setData(d); setError(null); setLoading(false) })
-      .catch((e: Error) => { setError(e); setLoading(false) })
-  }, [])
-
-  useEffect(() => {
-    fetchOnce()
-    const interval = setInterval(fetchOnce, 30_000)
-    return () => { clearInterval(interval) }
-  }, [userId, fetchOnce])
-
-  return { data, loading, error, refresh: fetchOnce }
-}
-
-export function useTimingStats(range: TimeRange, userId: string | null): { data: TimingStats | null; loading: boolean; refresh: () => void } {
-  const [data, setData] = useState<TimingStats | null>(null)
-  const [loading, setLoading] = useState(true)
-  const paramsRef = useRef({ range, userId })
-  paramsRef.current = { range, userId }
-
-  const fetchOnce = useCallback(() => {
-    setLoading(true)
-    const { range: r, userId: uid } = paramsRef.current
-    const { fromMs, toMs } = resolveRange(r)
-    const q = new URLSearchParams({ from: String(fromMs), to: String(toMs) })
-    if (uid) q.set("userId", uid)
-    return api<TimingStats>(`/siclaw/metrics/timing?${q.toString()}`)
-      .then((d) => { setData(d); setLoading(false) })
-      .catch(() => setLoading(false))
-  }, [])
-
-  useEffect(() => { fetchOnce() }, [range.from, range.to, userId, fetchOnce])
-
-  return { data, loading, refresh: fetchOnce }
-}
 
 export function useSummary(range: TimeRange, userId: string | null): { data: SummaryData | null; loading: boolean; refresh: () => void } {
   const [data, setData] = useState<SummaryData | null>(null)

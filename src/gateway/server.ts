@@ -479,18 +479,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
-  // metrics.live — delayed ref to metricsAggregator (created after rpcMethods)
-  let metricsAggregatorRef: MetricsAggregator | null = null;
-  rpcMethods.set("metrics.live", async (params) => {
-    if (!metricsAggregatorRef) throw new Error("MetricsAggregator not ready");
-    const userId = (params as any)?.userId || undefined;
-    return {
-      snapshot: metricsAggregatorRef.snapshot(),
-      topTools: metricsAggregatorRef.topTools(10, userId),
-      topSkills: metricsAggregatorRef.topSkills(10, userId),
-    };
-  });
-
   // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──
   // Portal sends commands (e.g. chat.send, agent.reload, task.fireNow) to
   // Runtime over the persistent WS connection. We route them through the
@@ -509,9 +497,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return handler(params, context);
   });
 
-  // ── MetricsAggregator (K8s: pull loop; Local: proxy to in-process localCollector) ──
+  // ── MetricsAggregator (K8s only: Prometheus federation pull loop) ──
   const isK8sMode = !(spawner instanceof LocalSpawner);
-  let metricsAggregator: MetricsAggregator;
+  let metricsAggregator: MetricsAggregator | undefined;
   // K8s only: application-layer Prometheus federation. The gateway process emits no
   // business events in K8s mode (they fire inside agentbox pods), so its own
   // metricsRegistry is empty of them; federation provides those series instead.
@@ -523,7 +511,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   if (isK8sMode) {
     promFederation = new PromFederationAggregator();
     federationSelfMetrics = await import("./federation-self-metrics.js");
-    metricsAggregator = new MetricsAggregator("k8s", undefined, agentBoxManager, {
+    metricsAggregator = new MetricsAggregator(agentBoxManager, {
       async fetch(endpoint: string) {
         try {
           const client = new AgentBoxClient(endpoint, 3000, agentBoxTlsOptions);
@@ -533,12 +521,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         }
       },
     }, promFederation, federationSelfMetrics);
-  } else {
-    const { localCollector } = await import("../shared/local-collector.js");
-    metricsAggregator = new MetricsAggregator("local", localCollector);
   }
-
-  metricsAggregatorRef = metricsAggregator;
 
   // ── Metrics config ───────────────────────────────────────
   const cachedMetricsToken = process.env.SICLAW_METRICS_TOKEN;
@@ -762,7 +745,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     agentBoxTlsOptions,
     credentialService,
     async close() {
-      metricsAggregator.destroy();
+      metricsAggregator?.destroy();
       frontendClient.close();
       await agentBoxManager.cleanup();
       httpServer.close();

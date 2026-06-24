@@ -2,17 +2,13 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { emitDiagnostic } from "../diagnostic-events.js";
 import { metricsRegistry, getMetricsAsJSON, processIncarnation } from "../metrics.js";
 
-// Side-effect: register LocalCollector on the event bus so exportSnapshot works.
-import "../local-collector.js";
-import { localCollector } from "../local-collector.js";
-
 /**
  * Step 1 acceptance: the federation snapshot contract.
  * - getMetricsAsJSON() returns the prom-client family shape the aggregator expects
  * - histogram families expand into _bucket{le}/_sum/_count sub-samples with metricName
  * - plain counter/gauge samples carry no metricName
  * - processIncarnation is a stable, non-empty per-process nonce
- * - prom snapshot is CUMULATIVE (never cleared on read), unlike toolCallDeltas
+ * - prom snapshot is CUMULATIVE (never cleared on read)
  */
 describe("federation snapshot (getMetricsAsJSON + incarnation)", () => {
   beforeEach(() => {
@@ -61,7 +57,7 @@ describe("federation snapshot (getMetricsAsJSON + incarnation)", () => {
     expect(again).toBe(processIncarnation);
   });
 
-  it("prom snapshot is cumulative — NOT cleared on read (unlike toolCallDeltas)", async () => {
+  it("prom snapshot is cumulative — NOT cleared on read", async () => {
     emitDiagnostic({
       type: "prompt_complete",
       prev: { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 },
@@ -82,16 +78,5 @@ describe("federation snapshot (getMetricsAsJSON + incarnation)", () => {
     const secondTokens = second.find((g) => g.name === "siclaw_tokens_total");
     const secondInput = secondTokens!.values.find((v) => v.labels.type === "input")!.value;
     expect(secondInput).toBe(50);
-  });
-
-  it("toolCallDeltas (path ①) clears on read while prom (path ②) does not", async () => {
-    emitDiagnostic({ type: "tool_call", toolName: "t-fed", outcome: "success", durationMs: 10, userId: "u-fed-3", agentId: "a1" });
-
-    const snap1 = localCollector.exportSnapshot();
-    expect(snap1.toolCallDeltas.some((t) => t.toolName === "t-fed")).toBe(true);
-
-    // exportSnapshot cleared the tool map → second call has no t-fed delta.
-    const snap2 = localCollector.exportSnapshot();
-    expect(snap2.toolCallDeltas.some((t) => t.toolName === "t-fed")).toBe(false);
   });
 });

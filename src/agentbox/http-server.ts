@@ -489,21 +489,13 @@ export function createHttpServer(
   });
 
   /**
-   * GET /api/internal/metrics-snapshot - export metrics snapshot for Gateway pull (K8s mode)
-   *
-   * Two parallel paths share this single response:
-   *  ① WebUI dashboard — toolCallDeltas/skillCallDeltas from LocalCollector (clear-on-read)
-   *  ② Prometheus federation — prom (cumulative getMetricsAsJSON) + incarnation
-   * The prom snapshot is assembled HERE (not in LocalCollector) so that LocalCollector
-   * stays free of any prom-client dependency.
+   * GET /api/internal/metrics-snapshot - export this process's cumulative prom-client
+   * snapshot for the Gateway's 30s federation pull (K8s mode). Mirrors the SIGTERM
+   * /api/internal/metrics-flush push: both carry { incarnation, prom }.
    */
   addRoute("GET", "/api/internal/metrics-snapshot", async (_req, res) => {
-    const { localCollector } = await import("../shared/local-collector.js");
     const { getMetricsAsJSON, processIncarnation } = await import("../shared/metrics.js");
-    const snapshot = localCollector.exportSnapshot();
-    snapshot.incarnation = processIncarnation;
-    snapshot.prom = await getMetricsAsJSON();
-    sendJson(res, 200, snapshot);
+    sendJson(res, 200, { incarnation: processIncarnation, prom: await getMetricsAsJSON() });
   });
 
   /**

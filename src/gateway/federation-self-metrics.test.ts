@@ -1,18 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { MetricsAggregator, type PodLister, type SnapshotFetcher, type FederationSelfMetrics } from "./metrics-aggregator.js";
 import { PromFederationAggregator } from "./prom-federation-aggregator.js";
-import type { MetricsSnapshot } from "../shared/metrics-types.js";
+import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 
 /**
  * Step 4 acceptance: the federator's self-monitoring. After 9090 is removed the
  * federator is the only Prometheus entry point, so its failures must be observable.
  */
 
-function fedSnap(incarnation: string, value: number): MetricsSnapshot {
+function fedSnap(incarnation: string, value: number): MetricsFlushPayload {
   return {
-    activeSessions: 1,
-    toolCallDeltas: [],
-    skillCallDeltas: [],
     incarnation,
     prom: [{ name: "siclaw_tokens_total", type: "counter", values: [{ labels: { type: "input" }, value }] }],
   };
@@ -41,7 +38,7 @@ describe("federation self-monitoring", () => {
   let lister: PodLister;
   let fetcher: SnapshotFetcher;
   let pods: Array<{ boxId: string; endpoint: string; status: string }>;
-  let fetchMap: Map<string, MetricsSnapshot | null>;
+  let fetchMap: Map<string, MetricsFlushPayload | null>;
   let aggr: MetricsAggregator;
 
   beforeEach(() => {
@@ -60,7 +57,7 @@ describe("federation self-monitoring", () => {
   it("counts pull failures per box and does not advance last_success when all fail", async () => {
     const { self, state } = makeSelfMetrics();
     const fed = new PromFederationAggregator();
-    aggr = new MetricsAggregator("k8s", undefined, lister, fetcher, fed, self);
+    aggr = new MetricsAggregator(lister, fetcher, fed, self);
 
     pods.push({ boxId: "box-x", endpoint: "https://x", status: "running" });
     fetchMap.set("https://x", null); // fetch returns null → failure
@@ -77,7 +74,7 @@ describe("federation self-monitoring", () => {
   it("advances last_success and reports tracked/series counts on a successful pull", async () => {
     const { self, state } = makeSelfMetrics();
     const fed = new PromFederationAggregator();
-    aggr = new MetricsAggregator("k8s", undefined, lister, fetcher, fed, self);
+    aggr = new MetricsAggregator(lister, fetcher, fed, self);
 
     pods.push({ boxId: "box-a", endpoint: "https://a", status: "running" });
     pods.push({ boxId: "box-b", endpoint: "https://b", status: "running" });
