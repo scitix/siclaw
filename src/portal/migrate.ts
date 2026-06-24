@@ -527,11 +527,17 @@ async function createIndexes(): Promise<void> {
   // recreate under NEW names, or the new prefixes never apply on existing DBs (mirrors the
   // skills uq_skills_org_name → idx_skills_org_name precedent below). Drop+rename is one-time
   // idempotent: once the old names are gone dropIndexIfExists is a no-op.
-  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_agent");
-  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_context");
+  //
+  // ORDER MATTERS on MySQL: idx_a2a_tasks_agent (single agent_id column) backs the FK
+  // fk_a2a_tasks_agent, and InnoDB refuses to DROP an index still needed by a foreign key
+  // (ER_DROP_INDEX_FK 1553). So create the (agent_id, …)-leading composites FIRST — once
+  // idx_a2a_tasks_agent_key exists InnoDB uses it as the FK's backing index — THEN drop the
+  // old single-column index. (SQLite has no such restriction; the order is harmless there.)
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_agent_key", "agent_id, api_key_id, created_at");
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_session", "session_id");
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_context_key", "agent_id, api_key_id, context_id, created_at");
+  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_agent");
+  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_context");
   // notifications
   await ensureIndex(db, "notifications", "idx_notifications_user", "user_id, read_at, created_at");
   // agent_api_keys
