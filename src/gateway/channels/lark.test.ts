@@ -1049,7 +1049,7 @@ describe("handleLarkMessage — streaming card flow", () => {
     clearBackgroundChannelDelivery(sessionId);
   });
 
-  it("accumulates agent milestones into a Claude-tag checklist on the card", async () => {
+  it("shows only the latest step on the card and replaces it with the conclusion on finalize", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-explicit-channel" });
     let releaseStream: () => void = () => {};
@@ -1096,15 +1096,15 @@ describe("handleLarkMessage — streaming card flow", () => {
       })).resolves.toBe(true);
 
       const inFlightContentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
-      // New behavior: milestones accumulate into a checklist (no 2-cap). Each
-      // update re-renders the whole list; earlier steps render ✅, the latest ⏳.
+      // The card shows ONLY the single latest step — no accumulating checklist.
+      // Each delivery replaces the previous step in place.
       expect(inFlightContentCalls).toHaveLength(3);
       const latest = inFlightContentCalls[2][0].data.content as string;
-      expect(latest).toContain("里程碑 1");
-      expect(latest).toContain("产物提示");
-      expect(latest).toContain("压掉"); // no longer suppressed — it accumulates
-      expect(latest).toContain("✅"); // earlier steps marked done
-      expect(latest).toContain("⏳"); // latest step in progress
+      expect(latest).toContain("压掉"); // only the latest step is shown
+      expect(latest).toContain("⏳"); // marked in progress
+      expect(latest).not.toContain("里程碑 1"); // earlier steps are gone
+      expect(latest).not.toContain("产物提示");
+      expect(latest).not.toContain("✅"); // no done-checklist
       expect(lark.cardkit.v1.card.settings).not.toHaveBeenCalled();
       expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
       expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
@@ -1115,13 +1115,14 @@ describe("handleLarkMessage — streaming card flow", () => {
     }
 
     const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls;
-    // 3 milestone updates + 1 final = 4 content writes.
+    // 3 step updates + 1 final = 4 content writes.
     expect(contentCalls).toHaveLength(4);
     const finalContent = contentCalls.at(-1)[0].data.content as string;
+    // The final card is JUST the conclusion — the step trail is gone.
     expect(finalContent).toContain("最终结论");
-    // final card preserves the accumulated checklist (all milestones done).
-    expect(finalContent).toContain("里程碑 1");
-    expect(finalContent).toContain("压掉");
+    expect(finalContent).not.toContain("里程碑 1");
+    expect(finalContent).not.toContain("压掉");
+    expect(finalContent).not.toContain("⏳");
     expect(lark.cardkit.v1.card.settings).toHaveBeenCalledTimes(1);
   });
 
