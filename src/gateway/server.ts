@@ -164,11 +164,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return undefined;
   };
 
-  // Spawn (or reuse) the AgentBox for an agent, threading its per-agent spawn env.
-  const getOrCreateAgentBox = async (agentId: string) => {
-    const env = await resolveAgentSpawnEnv(agentId);
-    return agentBoxManager.getOrCreate(agentId, env ? { env } : undefined);
-  };
+  // Spawn (or reuse) the AgentBox for an agent. The per-agent env resolver is
+  // passed as a lazy thunk: the manager invokes it ONLY on a cold spawn, so a
+  // warm-pod reuse (the common case on chat.send, and always the case on
+  // abort/steer/clearQueue which target a live session) pays no config.getAgent
+  // RPC.
+  const getOrCreateAgentBox = (agentId: string) =>
+    agentBoxManager.getOrCreate(agentId, undefined, () => resolveAgentSpawnEnv(agentId));
 
   // Per-session AbortController for the in-flight chat.send SSE consumer, keyed
   // by sessionId. chat.abort looks this up to break the gateway's consumeAgentSse

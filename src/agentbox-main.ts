@@ -81,6 +81,13 @@ async function main() {
   // Graceful shutdown — defined before the server so the idle self-destruct
   // timer can route through it (see onIdleShutdown below). Idempotent: the idle
   // timer firing and a SIGTERM racing must not run the teardown twice.
+  //
+  // ⚠️ This closure forward-references `server` and `federationFlushEnabled`,
+  // declared below. That is only safe because `onIdleShutdown` is invoked
+  // ASYNCHRONOUSLY (from the setTimeout in createHttpServer's checkIdle), never
+  // synchronously during createHttpServer — by the time it fires, both consts
+  // are initialized. A future refactor that calls onIdleShutdown synchronously
+  // would turn these into TDZ ReferenceErrors; don't.
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;

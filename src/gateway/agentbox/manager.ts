@@ -85,15 +85,31 @@ export class AgentBoxManager {
     }
   }
 
-  async getOrCreate(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+  /**
+   * Get a running AgentBox for the agent, or spawn one.
+   *
+   * `spawnEnvResolver`, when given, is invoked ONLY on the cold-spawn path —
+   * never when an existing pod is reused. Per-spawn env (e.g. the idle-timeout
+   * lookup, which costs a Portal RPC) is therefore resolved lazily, so warm-pod
+   * reuse on the chat hot path pays nothing.
+   */
+  async getOrCreate(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+    spawnEnvResolver?: () => Promise<Record<string, string> | undefined>,
+  ): Promise<AgentBoxHandle> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
     if (this.isK8s) {
-      return this.getOrCreateK8s(agentId, config);
+      return this.getOrCreateK8s(agentId, config, spawnEnvResolver);
     }
-    return this.getOrCreateLocal(agentId, config);
+    return this.getOrCreateLocal(agentId, config, spawnEnvResolver);
   }
 
-  private async getOrCreateK8s(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+  private async getOrCreateK8s(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+    spawnEnvResolver?: () => Promise<Record<string, string> | undefined>,
+  ): Promise<AgentBoxHandle> {
     const name = this.podName(agentId);
 
     const info = await this.spawner.get(name);
@@ -106,7 +122,7 @@ export class AgentBoxManager {
 
     console.log(`[agentbox-manager] Creating new AgentBox for agent=${agentId}`);
 
-    const resolvedEnv = this.resolveEnv(config?.env);
+    const resolvedEnv = await this.resolveEnv(config?.env, spawnEnvResolver);
     const handle = await this.spawner.spawn({
       ...config,
       agentId,
@@ -117,7 +133,11 @@ export class AgentBoxManager {
     return handle;
   }
 
-  private async getOrCreateLocal(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+  private async getOrCreateLocal(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+    spawnEnvResolver?: () => Promise<Record<string, string> | undefined>,
+  ): Promise<AgentBoxHandle> {
     const existing = this.boxes.get(agentId);
     if (existing) {
       existing.lastActiveAt = new Date();
@@ -130,7 +150,7 @@ export class AgentBoxManager {
 
     console.log(`[agentbox-manager] Creating new AgentBox for agent=${agentId}`);
 
-    const resolvedEnv = this.resolveEnv(config?.env);
+    const resolvedEnv = await this.resolveEnv(config?.env, spawnEnvResolver);
     const handle = await this.spawner.spawn({
       ...config,
       agentId,
@@ -141,8 +161,16 @@ export class AgentBoxManager {
     return handle;
   }
 
-  private resolveEnv(configEnv?: Record<string, string>): Record<string, string> {
-    return configEnv ?? {};
+  /**
+   * Merge static config env with the lazily-resolved per-spawn env. Only called
+   * on a cold spawn. Static `config.env` wins on key collisions.
+   */
+  private async resolveEnv(
+    configEnv?: Record<string, string>,
+    spawnEnvResolver?: () => Promise<Record<string, string> | undefined>,
+  ): Promise<Record<string, string>> {
+    const lazy = spawnEnvResolver ? (await spawnEnvResolver()) ?? {} : {};
+    return { ...lazy, ...(configEnv ?? {}) };
   }
 
   /**

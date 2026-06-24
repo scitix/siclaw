@@ -314,3 +314,38 @@ describe("AgentBoxManager — K8s CA-fingerprint self-heal", () => {
     expect(spawner.spawnCalls).toHaveLength(0);
   });
 });
+
+describe("AgentBoxManager — lazy spawnEnvResolver", () => {
+  it("does NOT call the resolver when a running pod is reused (K8s warm path)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", {
+      boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    let calls = 0;
+    const resolver = async () => { calls++; return { SICLAW_AGENTBOX_IDLE_TIMEOUT: "150" }; };
+
+    await mgr.getOrCreate("agent-a", undefined, resolver);
+    expect(calls).toBe(0);              // warm pod → no RPC
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("calls the resolver once and injects its env on a cold spawn (K8s)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    let calls = 0;
+    const resolver = async () => { calls++; return { SICLAW_AGENTBOX_IDLE_TIMEOUT: "150" }; };
+
+    await mgr.getOrCreate("agent-a", undefined, resolver);
+    expect(calls).toBe(1);
+    expect(spawner.spawnCalls[0].env).toEqual({ SICLAW_AGENTBOX_IDLE_TIMEOUT: "150" });
+  });
+
+  it("spawns with no env when the resolver yields undefined", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.getOrCreate("agent-a", undefined, async () => undefined);
+    expect(spawner.spawnCalls[0].env).toBeUndefined();
+  });
+});
