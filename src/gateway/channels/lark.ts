@@ -66,9 +66,9 @@ const GROUP_ACCESS_DENIED_NOTICE_BY_LOCALE = {
   "zh-CN": "❌ 你没有这个助手的访问权限，请联系管理员授权。",
   "en-US": "❌ You don't have access to this assistant. Ask an admin to grant access.",
 } as const;
-// Max milestones kept in the accumulating Claude-tag checklist. channel_update
-// milestones are meant to be sparse; if an agent over-emits we drop the oldest
-// so the card stays within Feishu's element size limits.
+// The card only ever shows the single latest step, so the milestone list is
+// just an internal buffer for dedup against the previous step. Bound it anyway
+// to keep memory flat if an agent over-emits.
 const MILESTONE_CAP = 20;
 const MAX_LARK_BINDING_QUEUE = 20;
 
@@ -549,11 +549,14 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // once the agent is done (preserves the pre-card behaviour).
   const cardSession = await openTypingCard(larkClient, messageId, PLACEHOLDER_BY_LOCALE[locale]);
   let deliveredTextChars = 0;
-  // Accumulating Claude-tag checklist. Two milestone sources feed one list:
-  // explicit channel_update tool calls (agent-curated) AND auto-derived first
-  // lines of intermediate assistant turns (collectChannelResponse.onMilestone).
-  // Card re-renders are coalesced (never concurrent) to respect Feishu's update
-  // rate; earlier steps render ✅, the latest ⏳, then the answer on finalize.
+  // Live "current step" indicator. Two milestone sources feed it: explicit
+  // channel_update tool calls (agent-curated) AND auto-derived first lines of
+  // intermediate assistant turns (collectChannelResponse.onMilestone). The card
+  // shows ONLY the single latest step (⏳), replaced in place as work proceeds —
+  // no accumulating checklist — and on finalize the step is replaced entirely by
+  // the conclusion. `milestones` is kept only to dedup against the last step;
+  // renders use the latest entry. Re-renders are coalesced to respect Feishu's
+  // update rate.
   const milestones: string[] = [];
   let cardFlushInflight = false;
   let cardFlushDirty = false;
@@ -567,7 +570,8 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       try {
         do {
           cardFlushDirty = false;
-          const md = buildMilestoneCardMarkdown({ milestones });
+          // Render only the single latest step — never an accumulating list.
+          const md = buildMilestoneCardMarkdown({ milestones: milestones.slice(-1) });
           if (md.trim()) await updateCardContent(larkClient, cardSession, md);
         } while (cardFlushDirty && !cardFinalizing);
       } catch (err) {
@@ -594,7 +598,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       if (!display || !display.trim()) return true;
 
       if (backgroundMessage.kind === "final") {
-        const md = buildMilestoneCardMarkdown({ milestones, finalText: display });
+        const md = buildMilestoneCardMarkdown({ milestones: [], finalText: display });
         const delivered = await deliverVisibleChannelText(larkClient, messageId, cardSession, md, true);
         if (delivered) deliveredTextChars = md.length;
         return delivered;
@@ -607,7 +611,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
 
     const display = stripVisualBlocks(backgroundMessage.content) || EMPTY_RESULT_NOTICE_BY_LOCALE[locale];
     if (!shouldDeliverBackgroundReply(display, deliveredTextChars)) return true;
-    const md = buildMilestoneCardMarkdown({ milestones, finalText: display });
+    const md = buildMilestoneCardMarkdown({ milestones: [], finalText: display });
     if (cardSession) {
       const ok = await finalizeCard(larkClient, cardSession, md);
       if (ok) {
@@ -650,10 +654,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   if (agentError) replyImages = [];
   const displayBody = stripVisualBlocks(finalBody, { stripSourceBlocks: replyImages.length > 0 })
     || VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
-  // Render the accumulated milestone checklist (✅) followed by the conclusion,
-  // so the final card preserves the visible investigation trail. With no
-  // milestones this is just the conclusion (legacy behavior).
-  const finalCardBody = buildMilestoneCardMarkdown({ milestones, finalText: displayBody });
+  // The final card is JUST the conclusion — the live step indicator is replaced
+  // entirely, no milestone trail is kept on the card.
+  const finalCardBody = buildMilestoneCardMarkdown({ milestones: [], finalText: displayBody });
 
   // Stop any further coalesced milestone renders and let the in-flight one
   // settle, so finalizeCard isn't overwritten by a later (higher-sequence)
