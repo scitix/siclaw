@@ -200,6 +200,13 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(cols).toContain("session_id");
   });
 
+  it("agents.tool_capabilities column exists after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(agents)");
+    expect(rows.map((r) => r.name)).toContain("tool_capabilities");
+  });
+
   it("skills and skill_versions files columns exist after migration", async () => {
     await runPortalMigrations();
     const db = getDb();

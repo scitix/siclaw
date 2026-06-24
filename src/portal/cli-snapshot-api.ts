@@ -30,7 +30,9 @@ import { timingSafeEqual } from "node:crypto";
 import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
 import { getDb, type Db } from "../gateway/db.js";
+import { safeParseJson } from "../gateway/dialect-helpers.js";
 import { defaultProviderModelCompat } from "../core/model-compat.js";
+import { resolveCapabilities } from "../core/tool-capabilities.js";
 import type {
   CliSnapshotKnowledgeRepo,
   CliSnapshotClusterCredential,
@@ -196,6 +198,7 @@ interface AgentRow {
   model_provider: string | null;
   model_id: string | null;
   model_routing: unknown;
+  tool_capabilities: unknown;
   system_prompt: string | null;
   icon: string | null;
   color: string | null;
@@ -265,7 +268,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     // the request is scoped, so the TUI can render its picker without a
     // second round-trip.
     const [allAgents] = await db.query<AgentRow[]>(
-      "SELECT id, name, description, status, model_provider, model_id, model_routing, system_prompt, icon, color FROM agents WHERE status = 'active' ORDER BY name",
+      "SELECT id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, system_prompt, icon, color FROM agents WHERE status = 'active' ORDER BY name",
     );
 
     // Resolve the scoping agent (if any). Return 404 early so the client
@@ -530,6 +533,14 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       color: a.color,
     }));
 
+    // Resolve the agent's capability groups → concrete allowedTools at this
+    // boundary (the AgentBox/TUI stays oblivious to group keys). null/empty =
+    // unrestricted; we only emit the field when non-null to keep the payload
+    // compact (TUI treats absent as null).
+    const allowedToolsOut = activeAgent
+      ? resolveCapabilities(safeParseJson<string[] | null>(activeAgent.tool_capabilities, null))
+      : null;
+
     const activeAgentOut: CliSnapshotActiveAgent | null = activeAgent
       ? {
           name: activeAgent.name,
@@ -538,6 +549,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           modelProvider: activeAgent.model_provider,
           modelId: activeAgent.model_id,
           ...(modelRoutingOut ? { modelRouting: modelRoutingOut } : {}),
+          ...(allowedToolsOut ? { allowedTools: allowedToolsOut } : {}),
         }
       : null;
 

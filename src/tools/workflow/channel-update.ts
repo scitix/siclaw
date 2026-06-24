@@ -62,6 +62,5 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: createChannelUpdateTool,
   modes: ["channel"],
-  platform: true,
   available: (refs) => Boolean(refs.channelMessageExecutor && refs.sessionIdRef),
 };

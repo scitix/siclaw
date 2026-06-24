@@ -239,9 +239,8 @@ type: Network
 
   // --- Registration ---
 
-  it("registration has correct modes and platform flag", () => {
+  it("registration has correct modes", () => {
     expect(registration.modes).toEqual(["web", "channel"]);
-    expect(registration.platform).toBe(true);
     expect(registration.category).toBe("workflow");
   });
 });

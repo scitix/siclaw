@@ -296,5 +296,4 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: (refs) => createManageScheduleTool(refs.kubeconfigRef, refs.sessionIdRef),
   modes: ["web", "channel"],
-  platform: true,
 };

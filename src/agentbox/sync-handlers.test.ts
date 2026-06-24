@@ -5,10 +5,12 @@ import path from "node:path";
 import {
   createClusterHandler,
   createHostHandler,
+  createToolsHandler,
   knowledgeHandler,
   mcpHandler,
   skillsHandler,
 } from "./sync-handlers.js";
+import type { GatewaySyncClientLike } from "../shared/gateway-sync.js";
 import { CredentialBroker } from "./credential-broker.js";
 import type {
   CredentialTransport,
@@ -145,6 +147,97 @@ describe("per-broker isolation", () => {
       broker2.dispose();
       fs.rmSync(dir2, { recursive: true, force: true });
     }
+  });
+});
+
+describe("createToolsHandler", () => {
+  /** A fake GatewaySyncClientLike that returns a canned tool-capabilities body. */
+  function fakeClient(body: unknown): GatewaySyncClientLike & { calls: Array<[string, string]> } {
+    const calls: Array<[string, string]> = [];
+    return {
+      calls,
+      request: (p: string, m: "GET" | "POST") => {
+        calls.push([p, m]);
+        return Promise.resolve(body);
+      },
+    };
+  }
+
+  it("handler type is 'tools'", () => {
+    expect(createToolsHandler({ allowedToolsState: null }, null).type).toBe("tools");
+  });
+
+  it("fetch uses the per-box client and hits /api/internal/tool-capabilities", async () => {
+    const boxClient = fakeClient({ allowedTools: ["read", "ls"] });
+    // Pass a DIFFERENT client into fetch() to prove the box client wins.
+    const otherClient = fakeClient({ allowedTools: ["should_not_be_used"] });
+    const handler = createToolsHandler({ allowedToolsState: null }, boxClient);
+    const payload = await handler.fetch(otherClient);
+    expect(payload).toEqual({ allowedTools: ["read", "ls"] });
+    expect(boxClient.calls).toEqual([["/api/internal/tool-capabilities", "GET"]]);
+    expect(otherClient.calls).toEqual([]);
+  });
+
+  it("materialize writes a non-null list into the target state and returns its length", async () => {
+    const target = { allowedToolsState: null as string[] | null };
+    const handler = createToolsHandler(target, null);
+    const count = await handler.materialize({ allowedTools: ["read", "ls", "grep"] });
+    expect(count).toBe(3);
+    expect(target.allowedToolsState).toEqual(["read", "ls", "grep"]);
+  });
+
+  it("materialize treats null as 'no restriction' (whitelist off), returns 0", async () => {
+    const target = { allowedToolsState: ["read"] as string[] | null };
+    const handler = createToolsHandler(target, null);
+    const count = await handler.materialize({ allowedTools: null });
+    expect(count).toBe(0);
+    expect(target.allowedToolsState).toBeNull();
+  });
+
+  it("materialize coerces a malformed (non-array) payload to null, not a crash", async () => {
+    const target = { allowedToolsState: ["read"] as string[] | null };
+    const handler = createToolsHandler(target, null);
+    // Simulate a skeleton/garbage response.
+    const count = await handler.materialize({ allowedTools: undefined } as any);
+    expect(count).toBe(0);
+    expect(target.allowedToolsState).toBeNull();
+  });
+
+  it("postReload invalidates every session (mirrors mcpHandler)", async () => {
+    const dummyBrain = { reload: async () => {} };
+    const inv1 = vi.fn();
+    const inv2 = vi.fn();
+    const handler = createToolsHandler({ allowedToolsState: null }, null);
+    await handler.postReload!({
+      sessions: [
+        { id: "s1", brain: dummyBrain, invalidate: inv1 },
+        { id: "s2", brain: dummyBrain, invalidate: inv2 },
+      ],
+    });
+    expect(inv1).toHaveBeenCalledOnce();
+    expect(inv2).toHaveBeenCalledOnce();
+  });
+
+  it("postReload is a no-op with no sessions and tolerates a missing invalidate", async () => {
+    const dummyBrain = { reload: async () => {} };
+    const handler = createToolsHandler({ allowedToolsState: null }, null);
+    await expect(handler.postReload!({})).resolves.toBeUndefined();
+    await expect(handler.postReload!({ sessions: [] })).resolves.toBeUndefined();
+    await expect(
+      handler.postReload!({ sessions: [{ id: "s1", brain: dummyBrain }] }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("does NOT touch loadConfig/writeConfig — materialize is a pure in-memory no-op", async () => {
+    // The config mock at the top of this file throws nothing, but we assert the
+    // contract structurally: two independent targets stay isolated, proving no
+    // process-global state is involved.
+    const a = { allowedToolsState: null as string[] | null };
+    const b = { allowedToolsState: null as string[] | null };
+    await createToolsHandler(a, null).materialize({ allowedTools: ["read"] });
+    await createToolsHandler(b, null).materialize({ allowedTools: ["bash"] });
+    expect(a.allowedToolsState).toEqual(["read"]);
+    expect(b.allowedToolsState).toEqual(["bash"]);
   });
 });
 

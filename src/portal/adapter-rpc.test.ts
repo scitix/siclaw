@@ -47,7 +47,21 @@ describe("config.getAgent", () => {
       id: "a1", name: "Agent 1", description: "desc", status: "active",
       model_provider: "openai", model_id: "gpt-4", system_prompt: "You are helpful",
       icon: "bot", color: "#fff", idle_timeout_sec: 300,
+      // No tool_capabilities column on this row → unrestricted (null).
+      tool_capabilities: null,
     });
+  });
+
+  it("parses a stored tool_capabilities JSON array (TEXT column)", async () => {
+    mockQuery([{
+      id: "a1", name: "Agent 1", description: "desc", status: "active",
+      model_provider: "openai", model_id: "gpt-4", system_prompt: "p",
+      icon: "bot", color: "#fff",
+      tool_capabilities: JSON.stringify(["read_files", "run_commands"]),
+    }]);
+
+    const result = await getHandler("config.getAgent")({ agentId: "a1" }, "a1") as { tool_capabilities: unknown };
+    expect(result.tool_capabilities).toEqual(["read_files", "run_commands"]);
   });
 
   it("throws when agent not found", async () => {

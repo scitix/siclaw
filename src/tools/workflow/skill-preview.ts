@@ -138,5 +138,4 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: (_refs) => createSkillPreviewTool(),
   modes: ["web", "channel"],
-  platform: true,
 };

@@ -102,5 +102,4 @@ clusters; when several remain, ask the user which to use rather than guessing.`,
 export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createClusterListTool(refs.kubeconfigRef),
-  platform: true,
 };

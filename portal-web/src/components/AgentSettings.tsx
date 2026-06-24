@@ -4,6 +4,8 @@ import { api } from "../api"
 import { useToast } from "./toast"
 import { AgentTasks } from "./AgentTasks"
 import { AgentApiKeys } from "./AgentApiKeys"
+import { CapabilityGroupSelector } from "./CapabilityGroupSelector"
+import { toCapabilitySet } from "../lib/toolCapabilities"
 
 interface Agent {
   id: string; name: string; description: string; status: string
@@ -11,6 +13,10 @@ interface Agent {
   is_production: boolean; icon: string; color: string; created_at: string
   model_routing?: unknown
   idle_timeout_sec?: number
+  // Wire form: the raw `agents` TEXT column — a JSON string ('["read_files"]')
+  // or null, not a decoded array (mirrors model_routing). toCapabilitySet
+  // coerces both forms.
+  tool_capabilities?: string | string[] | null
 }
 
 interface AgentResources {
@@ -41,6 +47,7 @@ const ROUTE_COOLDOWN_LABEL = "by condition"
 const TABS = [
   { key: "basic", label: "Basic" },
   { key: "model", label: "Model" },
+  { key: "tools", label: "Tools" },
   { key: "skills", label: "Skills" },
   { key: "mcp", label: "MCP" },
   { key: "knowledge", label: "Knowledge" },
@@ -165,6 +172,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [systemPrompt, setSystemPrompt] = useState(agent.system_prompt || "")
   const [isProduction, setIsProduction] = useState(agent.is_production)
   const [idleTimeoutSec, setIdleTimeoutSec] = useState<number>(agent.idle_timeout_sec ?? 300)
+  const [selectedCapabilities, setSelectedCapabilities] = useState<Set<string>>(toCapabilitySet(agent.tool_capabilities))
 
   // ── Data ──
   const [providers, setProviders] = useState<Provider[]>([])
@@ -196,6 +204,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     setFallbackCandidates(normalizeRouteCandidates(modelRouting, agent.model_provider || "", agent.model_id || ""))
     setSystemPrompt(agent.system_prompt || ""); setIsProduction(agent.is_production)
     setIdleTimeoutSec(agent.idle_timeout_sec ?? 300)
+    setSelectedCapabilities(toCapabilitySet(agent.tool_capabilities))
   }, [agent])
 
   // Load data
@@ -251,7 +260,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     try {
       const updated = await api<Agent>(`/agents/${agent.id}`, {
         method: "PUT",
-        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300 },
+        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, tool_capabilities: Array.from(selectedCapabilities) },
       })
       await api(`/agents/${agent.id}/resources`, {
         method: "PUT",
@@ -265,7 +274,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   }
 
   // Tabs that need the Save button
-  const saveTabs: TabKey[] = ["basic", "model", "skills", "mcp", "knowledge", "resources", "channels"]
+  const saveTabs: TabKey[] = ["basic", "model", "tools", "skills", "mcp", "knowledge", "resources", "channels"]
   const showSave = saveTabs.includes(activeTab)
 
   return (
@@ -303,6 +312,15 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
       <div className="flex-1 overflow-auto">
         {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} />}
         {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} routingEnabled={routingEnabled} setRoutingEnabled={setRoutingEnabled} fallbackCandidates={fallbackCandidates} setFallbackCandidates={setFallbackCandidates} />}
+        {activeTab === "tools" && (
+          <div className="px-6 py-6 space-y-4 max-w-2xl">
+            <div>
+              <h3 className="text-[13px] font-medium text-foreground">Tool capabilities</h3>
+              <p className="text-[12px] text-muted-foreground mt-0.5">Restrict which built-in tools this agent can use. Changes apply live — the running agent reloads on save.</p>
+            </div>
+            <CapabilityGroupSelector selected={selectedCapabilities} onChange={setSelectedCapabilities} />
+          </div>
+        )}
         {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} isProduction={isProduction} loading={loadingSkills || loadingResources} />}
         {activeTab === "mcp" && <McpTab allMcpServers={allMcpServers} selectedMcpIds={selectedMcpIds} setSelectedMcpIds={setSelectedMcpIds} loading={loadingMcp || loadingResources} />}
         {activeTab === "knowledge" && <KnowledgeTab allRepos={allKnowledgeRepos} selectedIds={selectedKnowledgeRepoIds} setSelectedIds={setSelectedKnowledgeRepoIds} loading={loadingKnowledge || loadingResources} />}

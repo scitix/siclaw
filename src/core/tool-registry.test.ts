@@ -60,19 +60,19 @@ describe("ToolRegistry", () => {
     expect(createB).toHaveBeenCalledTimes(1);
   });
 
-  it("allowedTools filters non-platform tools; platform tools pass through", () => {
+  it("allowedTools whitelist passes only listed tools; no exemptions", () => {
     const reg = new ToolRegistry();
     reg.register(
       { category: "query", create: () => stubToolDef("a") },
       { category: "query", create: () => stubToolDef("b") },
-      { category: "workflow", create: () => stubToolDef("platform_one"), platform: true },
+      { category: "workflow", create: () => stubToolDef("c") },
     );
     const tools = reg.resolve({
       mode: "web",
       refs: stubRefs(),
-      allowedTools: ["a"], // only "a" from non-platform tools, plus platform tool always
+      allowedTools: ["a"], // only "a"; "b" and "c" are excluded
     });
-    expect(tools.map((t) => t.name).sort()).toEqual(["a", "platform_one"]);
+    expect(tools.map((t) => t.name).sort()).toEqual(["a"]);
   });
 
   it("allowedTools = null disables whitelist (all tools passing mode+available included)", () => {
@@ -85,14 +85,14 @@ describe("ToolRegistry", () => {
     expect(tools.map((t) => t.name)).toEqual(["a", "b"]);
   });
 
-  it("empty allowedTools array filters out non-platform tools only", () => {
+  it("empty allowedTools array yields zero tools", () => {
     const reg = new ToolRegistry();
     reg.register(
       { category: "query", create: () => stubToolDef("a") },
-      { category: "workflow", create: () => stubToolDef("p"), platform: true },
+      { category: "workflow", create: () => stubToolDef("p") },
     );
     const tools = reg.resolve({ mode: "web", refs: stubRefs(), allowedTools: [] });
-    expect(tools.map((t) => t.name)).toEqual(["p"]);
+    expect(tools.map((t) => t.name)).toEqual([]);
   });
 
   it("register supports variadic entries", () => {

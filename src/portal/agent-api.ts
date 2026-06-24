@@ -18,6 +18,28 @@ import {
 import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
+import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
+import { safeParseJson } from "../gateway/dialect-helpers.js";
+
+/**
+ * Decode an `agents` row's JSON-in-TEXT columns so the REST response carries
+ * real objects/arrays, not raw JSON strings. These columns (`model_routing`,
+ * `tool_capabilities`) are stored as TEXT-of-JSON (no JSON column type); a raw
+ * `SELECT *` returns the undecoded string, which every Web client then has to
+ * remember to JSON.parse — a forgotten parse silently mis-renders (see the
+ * tool_capabilities echo bug). Decoding here is the single boundary that keeps
+ * the wire honest. `safeParseJson` tolerates null / TEXT-string / pre-parsed
+ * object, so this is safe across MySQL + SQLite and non-breaking for the
+ * already-tolerant frontend coercers.
+ */
+function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
+  if (!row) return row;
+  return {
+    ...row,
+    model_routing: safeParseJson(row.model_routing, null),
+    tool_capabilities: safeParseJson(row.tool_capabilities, null),
+  };
+}
 
 /**
  * Coerce an idle-timeout request value to a non-negative integer (seconds).
@@ -89,16 +111,18 @@ export function registerAgentRoutes(
     const id = crypto.randomUUID();
     const db = getDb();
     let modelRouting: string | null | undefined;
+    let toolCapabilities: string | null | undefined;
     try {
       modelRouting = encodeModelRoutingForDb(body.model_routing);
+      toolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
     } catch (err) {
       sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
       return;
     }
 
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, system_prompt, is_production, idle_timeout_sec, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, system_prompt, is_production, idle_timeout_sec, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -107,6 +131,7 @@ export function registerAgentRoutes(
         body.model_provider ?? null,
         body.model_id ?? null,
         modelRouting ?? null,
+        toolCapabilities ?? null,
         body.system_prompt ?? null,
         body.is_production ?? 1,
         clampIdleTimeoutSec(body.idle_timeout_sec),
@@ -134,7 +159,7 @@ export function registerAgentRoutes(
     }
 
     const [rows] = await db.query("SELECT * FROM agents WHERE id = ?", [id]) as any;
-    sendJson(res, 201, rows[0]);
+    sendJson(res, 201, decodeAgentRow(rows[0]));
   });
 
   // GET /api/v1/agents/:id — get by id
@@ -150,7 +175,7 @@ export function registerAgentRoutes(
       return;
     }
 
-    sendJson(res, 200, rows[0]);
+    sendJson(res, 200, decodeAgentRow(rows[0]));
   });
 
   // PUT /api/v1/agents/:id — update (admin only)
@@ -188,6 +213,21 @@ export function registerAgentRoutes(
       }
     }
 
+    let toolCapabilitiesChanged = false;
+    if ("tool_capabilities" in body) {
+      try {
+        const toolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
+        if (toolCapabilities !== undefined) {
+          setClauses.push("tool_capabilities = ?");
+          values.push(toolCapabilities);
+          toolCapabilitiesChanged = true;
+        }
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+
     if (setClauses.length === 0) {
       sendJson(res, 400, { error: "No fields to update" });
       return;
@@ -205,13 +245,19 @@ export function registerAgentRoutes(
       return;
     }
 
-    sendJson(res, 200, rows[0]);
+    sendJson(res, 200, decodeAgentRow(rows[0]));
 
     // is_production change affects skills bundle (prod=approved only, dev=all)
     // and also the visible cluster/host set — credential-list filters out
     // cross-env bindings, so the AgentBox must drop its cached list.
     if ("is_production" in body) {
       connectionMap.notify(params.id, "agent.reload", { resources: ["skills", "cluster", "host"] });
+    }
+
+    // tool_capabilities change → push a tools reload so the active AgentBox
+    // re-fetches its whitelist and invalidates live sessions (mid-turn-safe).
+    if (toolCapabilitiesChanged) {
+      connectionMap.notify(params.id, "agent.reload", { agentId: params.id, resources: ["tools"] });
     }
   });
 
@@ -493,7 +539,7 @@ export function registerAgentRoutes(
     }
 
     const [newRows] = await db.query("SELECT * FROM agents WHERE id = ?", [newId]) as any;
-    sendJson(res, 201, newRows[0]);
+    sendJson(res, 201, decodeAgentRow(newRows[0]));
   });
 
   // ================================================================

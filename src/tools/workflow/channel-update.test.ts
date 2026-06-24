@@ -19,7 +19,6 @@ const text = (r: any) => (r.content[0] as any).text as string;
 
 describe("channel_update tool", () => {
   it("is channel-only and unavailable without a channel message executor", () => {
-    expect(registration.platform).toBe(true);
     expect(registration.modes).toEqual(["channel"]);
     expect(registration.available?.(makeRefs(undefined))).toBe(false);
     expect(registration.available?.(makeRefs(vi.fn() as any))).toBe(true);
