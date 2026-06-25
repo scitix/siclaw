@@ -6,9 +6,9 @@ import {
 } from "../gateway-sync.js";
 
 describe("GATEWAY_SYNC_DESCRIPTORS", () => {
-  const expectedTypes: GatewaySyncType[] = ["mcp", "skills", "cluster", "host", "knowledge", "tools"];
+  const expectedTypes: GatewaySyncType[] = ["mcp", "a2a", "skills", "cluster", "host", "knowledge", "tools"];
 
-  it("contains exactly the six expected syncable types", () => {
+  it("contains exactly the seven expected syncable types", () => {
     const actual = Object.keys(GATEWAY_SYNC_DESCRIPTORS).sort();
     expect(actual).toEqual([...expectedTypes].sort());
   });

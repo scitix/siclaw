@@ -185,6 +185,35 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_ams_mcp FOREIGN KEY (mcp_server_id) REFERENCES mcp_servers(id) ON DELETE CASCADE
   )`,
 
+  // External A2A agents this org can CALL (Siclaw as A2A client). Mirrors
+  // mcp_servers: admin-curated registry, bound to agents via agent_a2a_servers.
+  // api_key is the remote agent's bearer credential — never exposed to the model.
+  // agent_card_json caches the remote's discovered Agent Card to skip a fetch at
+  // session build (nullable — refreshed lazily).
+  `CREATE TABLE IF NOT EXISTS a2a_servers (
+    id CHAR(36) PRIMARY KEY,
+    org_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    base_url VARCHAR(500) NOT NULL,
+    api_key VARCHAR(500),
+    agent_card_json TEXT,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    description TEXT,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (org_id, name)
+  )`,
+
+  // Agent <-> A2A Server junction
+  `CREATE TABLE IF NOT EXISTS agent_a2a_servers (
+    agent_id CHAR(36) NOT NULL,
+    a2a_server_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, a2a_server_id),
+    CONSTRAINT fk_aas_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_aas_a2a FOREIGN KEY (a2a_server_id) REFERENCES a2a_servers(id) ON DELETE CASCADE
+  )`,
+
   // Agent Tasks (scheduled jobs scoped to agents)
   `CREATE TABLE IF NOT EXISTS agent_tasks (
     id CHAR(36) PRIMARY KEY,

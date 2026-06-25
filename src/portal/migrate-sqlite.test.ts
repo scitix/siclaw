@@ -11,7 +11,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     await closeDb();
   });
 
-  it("creates all 33 tables without error", async () => {
+  it("creates all 35 tables without error", async () => {
     await runPortalMigrations();
     const db = getDb();
     const [rows] = await db.query<Array<{ name: string }>>(
@@ -20,7 +20,9 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     const tableNames = rows.map((r) => r.name);
 
     const expected = [
+      "a2a_servers",
       "a2a_tasks",
+      "agent_a2a_servers",
       "agent_api_keys",
       "agent_channel_auth",
       "agent_clusters",

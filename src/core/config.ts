@@ -78,6 +78,8 @@ export interface SiclawConfig {
   debugPodStartupTimeout: number;
   allowedTools: string[] | null;
   mcpServers: Record<string, unknown>;
+  /** External A2A agents this agent may CALL, keyed by registered name. */
+  a2aServers: Record<string, unknown>;
   metrics?: { port?: number; token?: string; includeUserId?: boolean };
   debug: boolean;
   userId: string;
@@ -154,6 +156,7 @@ const DEFAULTS: SiclawConfig = {
   debugPodStartupTimeout: 60,
   allowedTools: null,
   mcpServers: {},
+  a2aServers: {},
   debug: false,
   userId: "default",
 };
@@ -219,6 +222,7 @@ let snapshotOverride: {
   default?: SiclawConfig["default"];
   modelRouting?: SiclawConfig["modelRouting"];
   mcpServers?: SiclawConfig["mcpServers"];
+  a2aServers?: SiclawConfig["a2aServers"];
 } | null = null;
 
 export function setPortalSnapshot(
@@ -227,6 +231,7 @@ export function setPortalSnapshot(
     default?: SiclawConfig["default"];
     modelRouting?: SiclawConfig["modelRouting"];
     mcpServers?: SiclawConfig["mcpServers"];
+    a2aServers?: SiclawConfig["a2aServers"];
   } | null,
 ): void {
   snapshotOverride = override;
@@ -262,6 +267,9 @@ export function loadConfig(): SiclawConfig {
     }
     if (snapshotOverride.mcpServers && Object.keys(snapshotOverride.mcpServers).length > 0) {
       cached.mcpServers = snapshotOverride.mcpServers;
+    }
+    if (snapshotOverride.a2aServers && Object.keys(snapshotOverride.a2aServers).length > 0) {
+      cached.a2aServers = snapshotOverride.a2aServers;
     }
   }
 

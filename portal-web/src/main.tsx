@@ -13,6 +13,7 @@ import { Hosts } from "./pages/Hosts"
 import { Skills } from "./pages/Skills"
 import { SkillDetail } from "./pages/SkillDetail"
 import { MCP } from "./pages/MCP"
+import { A2A } from "./pages/A2A"
 import { Models } from "./pages/Models"
 import { MyTasks } from "./pages/MyTasks"
 import { TaskRuns } from "./pages/TaskRuns"
@@ -45,6 +46,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Route path="skills/new" element={<SkillDetail />} />
         <Route path="skills/:id" element={<SkillDetail />} />
         <Route path="mcp" element={<MCP />} />
+        <Route path="a2a" element={<A2A />} />
         <Route path="settings/knowledge" element={<KnowledgeAdmin />} />
         <Route path="my-tasks" element={<MyTasks />} />
         <Route path="agents/:agentId/tasks/:taskId" element={<TaskRuns />} />

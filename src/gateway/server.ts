@@ -13,6 +13,7 @@
  *   POST /api/internal/credential-request  — proxy to adapter
  *   GET  /api/internal/settings            — proxy to adapter
  *   GET  /api/internal/mcp-servers         — proxy to adapter
+ *   GET  /api/internal/a2a-servers         — proxy to adapter
  *   GET  /api/internal/skills/bundle       — proxy to adapter
  *   *    /api/internal/agent-tasks[/:id]   — proxy to adapter
  *   POST /api/internal/feedback            — AgentBox feedback
@@ -40,6 +41,7 @@ import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
   handleMcpServers,
+  handleA2aServers,
   handleToolCapabilities,
   handleSkillsBundle,
   handleKnowledgeBundle,
@@ -468,7 +470,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // All types route through GATEWAY_SYNC_DESCRIPTORS — the legacy
     // "credentials" umbrella type is replaced by the more granular
     // "cluster" + "host" so CRUD events can notify only what changed.
-    const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "cluster", "host", "knowledge"];
+    const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "a2a", "cluster", "host", "knowledge"];
 
     const boxes = await agentBoxManager.list();
     // Only "running" boxes are reachable — Pending/Terminating/Succeeded/Failed
@@ -686,6 +688,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/mcp-servers" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleMcpServers(req, res, identity, frontendClient);
+            return;
+          }
+
+          // External A2A agents — filtered by agent binding (via RPC)
+          if (url === "/api/internal/a2a-servers" && method === "GET") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            handleA2aServers(req, res, identity, frontendClient);
             return;
           }
 

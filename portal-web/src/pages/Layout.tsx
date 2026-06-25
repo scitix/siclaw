@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react"
 import { Outlet, Link, useLocation } from "react-router-dom"
-import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio, BarChart3, BookOpen, PanelLeftClose, PanelLeftOpen, Sun, Moon } from "lucide-react"
+import { Bot, MessageSquare, Zap, Plug, Share2, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio, BarChart3, BookOpen, PanelLeftClose, PanelLeftOpen, Sun, Moon } from "lucide-react"
 import { api, clearToken } from "../api"
 import { NotificationBell } from "../components/NotificationBell"
 import { useTheme } from "../hooks/useTheme"
@@ -12,6 +12,7 @@ const siclawItems = [
   { path: "/agents", label: "Agents", icon: Bot },
   { path: "/skills", label: "Skills", icon: Zap },
   { path: "/mcp", label: "MCP", icon: Plug },
+  { path: "/a2a", label: "A2A", icon: Share2 },
 ]
 
 const settingsItems = [

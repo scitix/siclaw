@@ -7,6 +7,7 @@
  * Endpoints:
  *   GET    /api/internal/settings          — model providers + entries
  *   GET    /api/internal/mcp-servers       — MCP config for the agent
+ *   GET    /api/internal/a2a-servers       — external A2A agent config for the agent
  *   GET    /api/internal/skills/bundle     — skill bundle for the agent
  *   GET    /api/internal/agent-tasks       — scheduled tasks for the agent
  *   POST   /api/internal/agent-tasks       — create a task
@@ -160,7 +161,7 @@ async function fetchAgentResources(
   frontendClient: FrontendWsClient,
   orgId: string,
   agentId: string,
-): Promise<{ skillIds: string[]; mcpServerIds: string[]; isProduction: boolean }> {
+): Promise<{ skillIds: string[]; mcpServerIds: string[]; a2aServerIds: string[]; isProduction: boolean }> {
   const data = await frontendClient.request("config.getResources", {
     agentId,
     orgId,
@@ -168,6 +169,7 @@ async function fetchAgentResources(
   return {
     skillIds: data.skill_ids ?? [],
     mcpServerIds: data.mcp_server_ids ?? [],
+    a2aServerIds: data.a2a_server_ids ?? [],
     isProduction: data.is_production ?? true,
   };
 }
@@ -225,6 +227,42 @@ export async function handleMcpServers(
     sendJson(res, 200, { mcpServers: data.mcpServers });
   } catch (err) {
     console.error("[internal-api] mcp-servers error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
+ * GET /api/internal/a2a-servers
+ *
+ * Returns external A2A agent configs bound to the agent (Siclaw as A2A client).
+ * Fetches binding via RPC, then queries A2A details via RPC. Mirrors
+ * handleMcpServers — same boundary, different syncable type.
+ */
+export async function handleA2aServers(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  frontendClient: FrontendWsClient,
+): Promise<void> {
+  try {
+    const { a2aServerIds } = await fetchAgentResources(frontendClient, identity.orgId, identity.agentId);
+
+    if (a2aServerIds.length === 0) {
+      sendJson(res, 200, { a2aServers: {} });
+      return;
+    }
+
+    const data = await frontendClient.request("config.getA2aServers", {
+      // Forwarded for parity with config.getMcpServers. Org isolation here is
+      // already enforced upstream: a2aServerIds came from this agent's
+      // agent_a2a_servers bindings (config.getResources), so only ids the agent
+      // is bound to are ever queried.
+      agentId: identity.agentId,
+      ids: a2aServerIds,
+    });
+    sendJson(res, 200, { a2aServers: data.a2aServers });
+  } catch (err) {
+    console.error("[internal-api] a2a-servers error:", err);
     sendJson(res, 500, { error: "Internal server error" });
   }
 }

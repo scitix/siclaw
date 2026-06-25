@@ -78,6 +78,7 @@ export function registerAgentRoutes(
         a.is_production, a.idle_timeout_sec, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
         (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
+        (SELECT COUNT(*) FROM agent_a2a_servers aas WHERE aas.agent_id = a.id) AS a2a_count,
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
         (SELECT COUNT(*) FROM agent_hosts ah WHERE ah.agent_id = a.id) AS hosts_count,
         (SELECT COUNT(*) FROM agent_tasks at2 WHERE at2.agent_id = a.id) AS tasks_count,
@@ -293,6 +294,7 @@ export function registerAgentRoutes(
       host_ids?: string[];
       skill_ids?: string[];
       mcp_server_ids?: string[];
+      a2a_server_ids?: string[];
       channel_ids?: string[];
       knowledge_repo_ids?: string[];
     }>(req);
@@ -336,6 +338,12 @@ export function registerAgentRoutes(
           await conn.query("INSERT INTO agent_mcp_servers (agent_id, mcp_server_id) VALUES (?, ?)", [agentId, mid]);
         }
       }
+      if (body.a2a_server_ids !== undefined) {
+        await conn.query("DELETE FROM agent_a2a_servers WHERE agent_id = ?", [agentId]);
+        for (const aid of body.a2a_server_ids) {
+          await conn.query("INSERT INTO agent_a2a_servers (agent_id, a2a_server_id) VALUES (?, ?)", [agentId, aid]);
+        }
+      }
       if (body.channel_ids !== undefined) {
         await conn.query("DELETE FROM agent_channel_auth WHERE agent_id = ?", [agentId]);
         for (const cid of body.channel_ids) {
@@ -371,7 +379,7 @@ export function registerAgentRoutes(
     const db = getDb();
     const agentId = params.id;
 
-    const [[clusters], [hosts], [skills], [mcpServers], [channels], [knowledgeRepos]] = await Promise.all([
+    const [[clusters], [hosts], [skills], [mcpServers], [a2aServers], [channels], [knowledgeRepos]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
          JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
@@ -393,6 +401,11 @@ export function registerAgentRoutes(
         [agentId],
       ),
       db.query(
+        `SELECT a.id, a.name, a.base_url FROM agent_a2a_servers aas
+         JOIN a2a_servers a ON aas.a2a_server_id = a.id WHERE aas.agent_id = ?`,
+        [agentId],
+      ),
+      db.query(
         `SELECT ch.id, ch.name, ch.type FROM agent_channel_auth ach
          JOIN channels ch ON ach.channel_id = ch.id WHERE ach.agent_id = ?`,
         [agentId],
@@ -409,6 +422,7 @@ export function registerAgentRoutes(
       hosts,
       skills,
       mcp_servers: mcpServers,
+      a2a_servers: a2aServers,
       channels,
       knowledge_repos: knowledgeRepos,
     });
@@ -479,6 +493,18 @@ export function registerAgentRoutes(
         await conn.query(
           "INSERT INTO agent_mcp_servers (agent_id, mcp_server_id) VALUES (?, ?)",
           [newId, row.mcp_server_id],
+        );
+      }
+
+      // Copy A2A server bindings
+      const [a2aRows] = await conn.query(
+        "SELECT a2a_server_id FROM agent_a2a_servers WHERE agent_id = ?",
+        [sourceId],
+      ) as any;
+      for (const row of a2aRows) {
+        await conn.query(
+          "INSERT INTO agent_a2a_servers (agent_id, a2a_server_id) VALUES (?, ?)",
+          [newId, row.a2a_server_id],
         );
       }
 

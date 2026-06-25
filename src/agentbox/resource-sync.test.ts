@@ -132,8 +132,9 @@ describe("syncResource — error paths", () => {
 
 describe("syncAllResources", () => {
   it("attempts every initialSync=true type and returns succeeded/failed buckets", async () => {
-    // mcp/skills/knowledge have initialSync=true; cluster/host have false.
+    // mcp/a2a/skills/knowledge have initialSync=true; cluster/host have false.
     handlerRegistry.set("mcp", makeHandler({ type: "mcp", materializeImpl: async () => 1 }));
+    handlerRegistry.set("a2a", makeHandler({ type: "a2a", materializeImpl: async () => 1 }));
     handlerRegistry.set("skills", makeHandler({ type: "skills", materializeImpl: async () => 2 }));
     handlerRegistry.set(
       "knowledge",
@@ -151,7 +152,7 @@ describe("syncAllResources", () => {
     const result = await promise;
     vi.useRealTimers();
 
-    expect(result.succeeded.sort()).toEqual(["mcp", "skills"]);
+    expect(result.succeeded.sort()).toEqual(["a2a", "mcp", "skills"]);
     expect(result.failed).toEqual(["knowledge"]);
   });
 

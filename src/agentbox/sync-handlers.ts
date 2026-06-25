@@ -77,6 +77,52 @@ export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
   },
 };
 
+// ── A2A handler ───────────────────────────────────────────────────────
+
+/**
+ * Payload shape returned by the Gateway's /api/internal/a2a-servers.
+ */
+interface A2aPayload {
+  a2aServers: Record<string, unknown>;
+}
+
+/**
+ * a2aHandler — mirror of mcpHandler for external A2A agents (Siclaw as client).
+ *
+ * Same lifecycle contract: the A2A client tool-set is built at session creation
+ * time, so a binding change refreshes the in-memory config and invalidates live
+ * sessions to force a rebuild on their next prompt. The materialized config
+ * carries the remote agents' base URLs + api keys; the api key never reaches the
+ * model — it is consumed only by the outbound A2A client in the node main process.
+ */
+export const a2aHandler: AgentBoxSyncHandler<A2aPayload> = {
+  type: "a2a",
+
+  async fetch(client: GatewaySyncClientLike | null): Promise<A2aPayload> {
+    if (!client) throw new Error("[a2a] GatewaySyncClientLike required but missing");
+    const descriptor = GATEWAY_SYNC_DESCRIPTORS.a2a;
+    const data = await client.request(descriptor.gatewayPath, "GET");
+    return data as A2aPayload;
+  },
+
+  async materialize(payload: A2aPayload): Promise<number> {
+    const config = loadConfig();
+    // Gateway payload is the source of truth — replace, not merge (same as mcp).
+    const a2aServers = payload?.a2aServers ?? {};
+    writeConfig({ ...config, a2aServers });
+    return Object.keys(a2aServers).length;
+  },
+
+  async postReload(context: ReloadContext): Promise<void> {
+    // Identical contract to mcpHandler — see its comment.
+    reloadConfig();
+    if (!context.sessions?.length) return;
+    for (const session of context.sessions) {
+      session.invalidate?.();
+    }
+  },
+};
+
 // ── Skills helpers ────────────────────────────────────────────────────
 
 /** Write a single skill (specs + scripts) into the resolved directory */
@@ -489,14 +535,15 @@ export function createToolsHandler(
 
 const handlers = new Map<GatewaySyncType, AgentBoxSyncHandler<any>>([
   ["mcp", mcpHandler],
+  ["a2a", a2aHandler],
   ["skills", skillsHandler],
   ["knowledge", knowledgeHandler],
 ]);
 
 /**
- * Look up the static handler for a given sync type. Only mcp and skills
- * are registered here — their handlers are process-global and carry no
- * per-session state.
+ * Look up the static handler for a given sync type. Only mcp, a2a, skills
+ * and knowledge are registered here — their handlers are process-global and
+ * carry no per-session state.
  *
  * cluster/host handlers are NOT registered in this map: each AgentBox
  * httpServer constructs its own factory-bound instance (closing over

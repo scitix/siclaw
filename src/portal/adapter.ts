@@ -496,7 +496,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const db = getDb();
     const agentId = params.agentId;
 
-    const [[clusters], [hosts], [skills], [mcpServers], [agentRows]] = await Promise.all([
+    const [[clusters], [hosts], [skills], [mcpServers], [a2aServers], [agentRows]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
          JOIN clusters c ON ac.cluster_id = c.id
@@ -520,6 +520,10 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
         [agentId],
       ),
       db.query(
+        "SELECT a2a_server_id FROM agent_a2a_servers WHERE agent_id = ?",
+        [agentId],
+      ),
+      db.query(
         "SELECT is_production FROM agents WHERE id = ?",
         [agentId],
       ),
@@ -532,6 +536,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       hosts,
       skill_ids: skills.map((r: { skill_id: string }) => r.skill_id),
       mcp_server_ids: mcpServers.map((r: { mcp_server_id: string }) => r.mcp_server_id),
+      a2a_server_ids: a2aServers.map((r: { a2a_server_id: string }) => r.a2a_server_id),
       is_production: isProduction,
     });
   });
@@ -1767,7 +1772,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("config.getResources", async (params) => {
     const db = getDb();
     const agentId = params.agentId;
-    const [[clusters], [hosts], [skills], [mcpServers], [knowledgeRepos], [agentRows]] = await Promise.all([
+    const [[clusters], [hosts], [skills], [mcpServers], [a2aServers], [knowledgeRepos], [agentRows]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
          JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
@@ -1787,6 +1792,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
         [agentId],
       ),
       db.query(
+        "SELECT a2a_server_id FROM agent_a2a_servers WHERE agent_id = ?",
+        [agentId],
+      ),
+      db.query(
         "SELECT repo_id FROM agent_knowledge_repos WHERE agent_id = ?",
         [agentId],
       ),
@@ -1801,6 +1810,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       hosts,
       skill_ids: skills.map((r: { skill_id: string }) => r.skill_id),
       mcp_server_ids: mcpServers.map((r: { mcp_server_id: string }) => r.mcp_server_id),
+      a2a_server_ids: a2aServers.map((r: { a2a_server_id: string }) => r.a2a_server_id),
       knowledge_repo_ids: (knowledgeRepos as any[]).map((r: any) => r.repo_id),
       is_production: isProduction,
     };
@@ -1932,6 +1942,32 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       };
     }
     return { mcpServers };
+  });
+
+  handlers.set("config.getA2aServers", async (params) => {
+    if (!params.ids?.length) {
+      return { a2aServers: {} };
+    }
+    const db = getDb();
+    const placeholders = params.ids.map(() => "?").join(",");
+    const [rows] = await db.query(
+      `SELECT name, base_url, api_key, agent_card_json, description, enabled
+       FROM a2a_servers WHERE id IN (${placeholders}) AND enabled = 1`,
+      params.ids,
+    ) as any;
+    const a2aServers: Record<string, unknown> = {};
+    for (const row of rows) {
+      a2aServers[row.name] = {
+        baseUrl: row.base_url,
+        // api_key is the remote agent's bearer credential. It is materialized
+        // into AgentBox config (node main process) for outbound calls and is
+        // NEVER surfaced to the model — same posture as mcp_servers.headers.
+        ...(row.api_key ? { apiKey: row.api_key } : {}),
+        ...(row.agent_card_json ? { agentCard: safeParseJson(row.agent_card_json, null) } : {}),
+        ...(row.description ? { description: row.description } : {}),
+      };
+    }
+    return { a2aServers };
   });
 
   handlers.set("config.getSkillBundle", async (params) => {

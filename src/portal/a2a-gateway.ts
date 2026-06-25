@@ -10,49 +10,21 @@ import { getDb } from "../gateway/db.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { authenticateApiKey, type ApiKeyAuthResult } from "./api-key-auth.js";
 import { resolveAgentModelBinding } from "./chat-gateway.js";
+import {
+  A2A_VERSION,
+  A2A_JSON,
+  ASSISTANT_ARTIFACT_ID,
+  A2A_TASK_STATES,
+  isTerminalState,
+  type A2aTaskState,
+  type A2aMessage,
+  type NormalizedA2aMessage,
+  type SendMessageRequest,
+  type A2aStreamResponse,
+} from "./a2a-protocol.js";
 
-const A2A_VERSION = "1.0";
-const A2A_JSON = "application/a2a+json; charset=utf-8";
 const MAX_A2A_BODY_BYTES = 1024 * 1024;
 const MAX_A2A_ID_BYTES = 255;
-const ASSISTANT_ARTIFACT_ID = "assistant-text";
-
-type A2aTaskState =
-  | "TASK_STATE_SUBMITTED"
-  | "TASK_STATE_WORKING"
-  | "TASK_STATE_COMPLETED"
-  | "TASK_STATE_FAILED"
-  | "TASK_STATE_CANCELED"
-  | "TASK_STATE_REJECTED";
-
-const A2A_TASK_STATES = new Set<A2aTaskState>([
-  "TASK_STATE_SUBMITTED",
-  "TASK_STATE_WORKING",
-  "TASK_STATE_COMPLETED",
-  "TASK_STATE_FAILED",
-  "TASK_STATE_CANCELED",
-  "TASK_STATE_REJECTED",
-]);
-
-interface A2aMessage {
-  messageId?: string;
-  contextId?: string;
-  taskId?: string;
-  role?: string;
-  parts?: Array<{ text?: string; raw?: string; url?: string; data?: unknown; mediaType?: string }>;
-  metadata?: Record<string, unknown>;
-}
-
-interface NormalizedA2aMessage extends A2aMessage {
-  messageId: string;
-  contextId?: string;
-}
-
-interface SendMessageRequest {
-  message?: A2aMessage;
-  configuration?: Record<string, unknown>;
-  metadata?: Record<string, unknown>;
-}
 
 interface A2aTaskRecord {
   id: string;
@@ -71,12 +43,6 @@ interface A2aTaskRecord {
   completedAt: string | null;
 }
 
-type A2aStreamResponse =
-  | { task: Record<string, unknown> }
-  | { message: Record<string, unknown> }
-  | { statusUpdate: Record<string, unknown> }
-  | { artifactUpdate: Record<string, unknown> };
-
 interface ActiveTracker {
   unsubscribe: () => void;
   artifactText: string;
@@ -89,13 +55,6 @@ class A2aHttpError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
     super(message);
   }
-}
-
-function isTerminalState(state: A2aTaskState): boolean {
-  return state === "TASK_STATE_COMPLETED"
-    || state === "TASK_STATE_FAILED"
-    || state === "TASK_STATE_CANCELED"
-    || state === "TASK_STATE_REJECTED";
 }
 
 // Terminal states as a SQL literal list, for the terminal-immutable guard in setTaskState.

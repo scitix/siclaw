@@ -16,7 +16,7 @@
 
 import type { JobStopResult, TaskOutputSnapshot } from "./tool-registry.js";
 
-export type JobType = "subagent" | "bash" | "node" | "pod" | "host" | "local";
+export type JobType = "subagent" | "bash" | "node" | "pod" | "host" | "local" | "a2a";
 
 /**
  * Terminal + live states a background job can be in. A superset of SpawnSubagentStatus's

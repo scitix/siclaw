@@ -24,6 +24,7 @@ interface AgentResources {
   hosts: { id: string; name: string; ip: string; port?: number }[]
   skills: { id: string; name: string; description?: string }[]
   mcp_servers: { id: string; name: string; transport?: string }[]
+  a2a_servers: { id: string; name: string; base_url: string }[]
   channels: { id: string; name: string; type: string }[]
   knowledge_repos: { id: string; name: string; description?: string }[]
 }
@@ -50,6 +51,7 @@ const TABS = [
   { key: "tools", label: "Tools" },
   { key: "skills", label: "Skills" },
   { key: "mcp", label: "MCP" },
+  { key: "a2a", label: "A2A" },
   { key: "knowledge", label: "Knowledge" },
   { key: "resources", label: "Resources" },
   { key: "channels", label: "Channels" },
@@ -182,14 +184,17 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [allHosts, setAllHosts] = useState<AvailableHost[]>([])
   const [allSkills, setAllSkills] = useState<{ id: string; name: string; description: string; status: string; version: number; installed_version?: number | null; labels: string[] | null; is_builtin?: boolean }[]>([])
   const [allMcpServers, setAllMcpServers] = useState<{ id: string; name: string; transport: string; enabled: number }[]>([])
+  const [allA2aServers, setAllA2aServers] = useState<{ id: string; name: string; base_url: string; enabled: number; has_api_key: boolean }[]>([])
   const [allKnowledgeRepos, setAllKnowledgeRepos] = useState<{ id: string; name: string; description: string | null; active_version: number | null }[]>([])
   const [loadingKnowledge, setLoadingKnowledge] = useState(true)
   const [loadingSkills, setLoadingSkills] = useState(true)
   const [loadingMcp, setLoadingMcp] = useState(true)
+  const [loadingA2a, setLoadingA2a] = useState(true)
   const [selectedClusterIds, setSelectedClusterIds] = useState<Set<string>>(new Set())
   const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(new Set())
   const [selectedSkillIds, setSelectedSkillIds] = useState<Set<string>>(new Set())
   const [selectedMcpIds, setSelectedMcpIds] = useState<Set<string>>(new Set())
+  const [selectedA2aIds, setSelectedA2aIds] = useState<Set<string>>(new Set())
   const [selectedKnowledgeRepoIds, setSelectedKnowledgeRepoIds] = useState<Set<string>>(new Set())
   const [selectedChannelIds, setSelectedChannelIds] = useState<Set<string>>(new Set())
   const [skillLabelFilter, setSkillLabelFilter] = useState("")
@@ -214,6 +219,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     api<{ data: AvailableHost[] }>("/hosts").then(r => setAllHosts(Array.isArray(r.data) ? r.data : [])).catch(() => setAllHosts([]))
     api<{ data: typeof allSkills }>("/siclaw/skills?page_size=500").then(r => setAllSkills(Array.isArray(r.data) ? r.data : [])).catch(() => setAllSkills([])).finally(() => setLoadingSkills(false))
     api<{ data: typeof allMcpServers }>("/siclaw/mcp").then(r => setAllMcpServers(Array.isArray(r.data) ? r.data : [])).catch(() => setAllMcpServers([])).finally(() => setLoadingMcp(false))
+    api<{ data: typeof allA2aServers }>("/siclaw/a2a").then(r => setAllA2aServers(Array.isArray(r.data) ? r.data : [])).catch(() => setAllA2aServers([])).finally(() => setLoadingA2a(false))
     api<{ data: typeof allKnowledgeRepos }>("/siclaw/admin/knowledge/repos").then(r => setAllKnowledgeRepos(Array.isArray(r.data) ? r.data : [])).catch(() => setAllKnowledgeRepos([])).finally(() => setLoadingKnowledge(false))
   }, [])
 
@@ -233,6 +239,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
       setSelectedHostIds(new Set(resources.hosts?.map(h => h.id) || []))
       setSelectedSkillIds(new Set(resources.skills?.map(s => s.id) || []))
       setSelectedMcpIds(new Set(resources.mcp_servers?.map(m => m.id) || []))
+      setSelectedA2aIds(new Set(resources.a2a_servers?.map(a => a.id) || []))
       setSelectedChannelIds(new Set(resources.channels?.map(c => c.id) || []))
       setSelectedKnowledgeRepoIds(new Set(resources.knowledge_repos?.map((k: any) => k.id) || []))
     }
@@ -264,7 +271,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
       })
       await api(`/agents/${agent.id}/resources`, {
         method: "PUT",
-        body: { cluster_ids: Array.from(selectedClusterIds), host_ids: Array.from(selectedHostIds), skill_ids: Array.from(selectedSkillIds), mcp_server_ids: Array.from(selectedMcpIds), channel_ids: Array.from(selectedChannelIds), knowledge_repo_ids: Array.from(selectedKnowledgeRepoIds) },
+        body: { cluster_ids: Array.from(selectedClusterIds), host_ids: Array.from(selectedHostIds), skill_ids: Array.from(selectedSkillIds), mcp_server_ids: Array.from(selectedMcpIds), a2a_server_ids: Array.from(selectedA2aIds), channel_ids: Array.from(selectedChannelIds), knowledge_repo_ids: Array.from(selectedKnowledgeRepoIds) },
       })
       onUpdate(updated)
       toast.success("Saved — agent will reload automatically")
@@ -274,7 +281,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   }
 
   // Tabs that need the Save button
-  const saveTabs: TabKey[] = ["basic", "model", "tools", "skills", "mcp", "knowledge", "resources", "channels"]
+  const saveTabs: TabKey[] = ["basic", "model", "tools", "skills", "mcp", "a2a", "knowledge", "resources", "channels"]
   const showSave = saveTabs.includes(activeTab)
 
   return (
@@ -323,6 +330,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
         )}
         {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} isProduction={isProduction} loading={loadingSkills || loadingResources} />}
         {activeTab === "mcp" && <McpTab allMcpServers={allMcpServers} selectedMcpIds={selectedMcpIds} setSelectedMcpIds={setSelectedMcpIds} loading={loadingMcp || loadingResources} />}
+        {activeTab === "a2a" && <A2aTab allA2aServers={allA2aServers} selectedA2aIds={selectedA2aIds} setSelectedA2aIds={setSelectedA2aIds} loading={loadingA2a || loadingResources} />}
         {activeTab === "knowledge" && <KnowledgeTab allRepos={allKnowledgeRepos} selectedIds={selectedKnowledgeRepoIds} setSelectedIds={setSelectedKnowledgeRepoIds} loading={loadingKnowledge || loadingResources} />}
         {activeTab === "resources" && <ResourcesTab allClusters={allClusters} allHosts={allHosts} selectedClusterIds={selectedClusterIds} setSelectedClusterIds={setSelectedClusterIds} selectedHostIds={selectedHostIds} setSelectedHostIds={setSelectedHostIds} loading={loadingResources} isProduction={isProduction} />}
         {activeTab === "channels" && <ChannelsTab agentId={agent.id} selectedChannelIds={selectedChannelIds} setSelectedChannelIds={setSelectedChannelIds} />}
@@ -621,6 +629,41 @@ function McpTab({ allMcpServers, selectedMcpIds, setSelectedMcpIds, loading }: {
               <input type="checkbox" checked={selectedMcpIds.has(s.id)} onChange={e => { const next = new Set(selectedMcpIds); e.target.checked ? next.add(s.id) : next.delete(s.id); setSelectedMcpIds(next) }} className="rounded" />
               <span className="font-mono flex-1">{s.name}</span>
               <span className="px-1 py-0.5 rounded text-[9px] bg-secondary text-muted-foreground">{s.transport}</span>
+              <span className={`h-2 w-2 rounded-full ${s.enabled ? "bg-green-500" : "bg-muted-foreground/40"}`} />
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function A2aTab({ allA2aServers, selectedA2aIds, setSelectedA2aIds, loading }: {
+  allA2aServers: { id: string; name: string; base_url: string; enabled: number; has_api_key: boolean }[]
+  selectedA2aIds: Set<string>; setSelectedA2aIds: (v: Set<string>) => void
+  loading: boolean
+}) {
+  if (loading) return <div className="flex items-center justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+  const allSelected = allA2aServers.length > 0 && allA2aServers.every(s => selectedA2aIds.has(s.id))
+  return (
+    <div className="px-6 py-6 space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-[12px] text-muted-foreground font-medium">A2A Servers ({selectedA2aIds.size} / {allA2aServers.length})</span>
+        {allA2aServers.length > 0 && (
+          <button type="button" onClick={() => allSelected ? setSelectedA2aIds(new Set()) : setSelectedA2aIds(new Set(allA2aServers.map(s => s.id)))} className="h-7 px-2 text-[11px] rounded border border-border text-muted-foreground hover:text-foreground">
+            {allSelected ? "Deselect All" : "Select All"}
+          </button>
+        )}
+      </div>
+      {allA2aServers.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground/60">No A2A servers available.</p>
+      ) : (
+        <div className="max-h-[60vh] overflow-auto border border-border rounded-md">
+          {allA2aServers.map(s => (
+            <label key={s.id} className="flex items-center gap-2 px-2 py-1.5 hover:bg-secondary/30 cursor-pointer text-[12px]">
+              <input type="checkbox" checked={selectedA2aIds.has(s.id)} onChange={e => { const next = new Set(selectedA2aIds); e.target.checked ? next.add(s.id) : next.delete(s.id); setSelectedA2aIds(next) }} className="rounded" />
+              <span className="font-mono flex-1">{s.name}</span>
+              <span className="text-[10px] text-muted-foreground/60 font-mono truncate max-w-[200px]">{s.base_url}</span>
               <span className={`h-2 w-2 rounded-full ${s.enabled ? "bg-green-500" : "bg-muted-foreground/40"}`} />
             </label>
           ))}

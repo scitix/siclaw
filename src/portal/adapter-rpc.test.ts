@@ -78,6 +78,7 @@ describe("config.getResources", () => {
       .mockResolvedValueOnce([[{ id: "h1", name: "host-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }], []])
       .mockResolvedValueOnce([[{ skill_id: "s1" }, { skill_id: "s2" }], []])
       .mockResolvedValueOnce([[{ mcp_server_id: "m1" }], []])
+      .mockResolvedValueOnce([[{ a2a_server_id: "x1" }], []])
       .mockResolvedValueOnce([[{ repo_id: "kr1" }], []])
       .mockResolvedValueOnce([[{ is_production: 1 }], []]);
     (getDb as any).mockReturnValue({ query });
@@ -87,6 +88,7 @@ describe("config.getResources", () => {
     expect(result.hosts).toHaveLength(1);
     expect(result.skill_ids).toEqual(["s1", "s2"]);
     expect(result.mcp_server_ids).toEqual(["m1"]);
+    expect(result.a2a_server_ids).toEqual(["x1"]);
     expect(result.knowledge_repo_ids).toEqual(["kr1"]);
     expect(result.is_production).toBe(true);
   });
@@ -98,12 +100,14 @@ describe("config.getResources", () => {
       .mockResolvedValueOnce([[], []])
       .mockResolvedValueOnce([[], []])
       .mockResolvedValueOnce([[], []])
+      .mockResolvedValueOnce([[], []])
       .mockResolvedValueOnce([[], []]);
     (getDb as any).mockReturnValue({ query });
 
     const result = await getHandler("config.getResources")({ agentId: "a1" }, "a1");
     expect(result.is_production).toBe(true);
     expect(result.skill_ids).toEqual([]);
+    expect(result.a2a_server_ids).toEqual([]);
     expect(result.knowledge_repo_ids).toEqual([]);
   });
 });
@@ -347,6 +351,50 @@ describe("config.getMcpServers", () => {
 
     const result = await getHandler("config.getMcpServers")({ ids: ["id1"] }, "a1");
     expect("description" in result.mcpServers.plain).toBe(false);
+  });
+});
+
+describe("config.getA2aServers", () => {
+  it("returns a2a servers by IDs with the api key passed through", async () => {
+    mockQuery([
+      { name: "prod-sre", base_url: "https://peer.example.com/api/v1/a2a/agents/sre", api_key: "sk-remote", agent_card_json: null, description: null },
+    ]);
+
+    const result = await getHandler("config.getA2aServers")({ ids: ["id1"] }, "a1");
+    expect(result.a2aServers["prod-sre"]).toBeDefined();
+    expect(result.a2aServers["prod-sre"].baseUrl).toBe("https://peer.example.com/api/v1/a2a/agents/sre");
+    // api_key is consumed by the outbound client in the node main process; it
+    // is materialized into config but never reaches the model.
+    expect(result.a2aServers["prod-sre"].apiKey).toBe("sk-remote");
+  });
+
+  it("returns empty map when no IDs provided", async () => {
+    const result = await getHandler("config.getA2aServers")({ ids: [] }, "a1");
+    expect(result).toEqual({ a2aServers: {} });
+  });
+
+  it("returns empty map when ids is undefined", async () => {
+    const result = await getHandler("config.getA2aServers")({}, "a1");
+    expect(result).toEqual({ a2aServers: {} });
+  });
+
+  it("parses the cached agent card JSON when present", async () => {
+    mockQuery([
+      { name: "carded", base_url: "https://peer.example.com/a", api_key: null, agent_card_json: '{"name":"Peer","version":"1.0"}', description: null },
+    ]);
+
+    const result = await getHandler("config.getA2aServers")({ ids: ["id1"] }, "a1");
+    expect(result.a2aServers.carded.agentCard).toEqual({ name: "Peer", version: "1.0" });
+    expect("apiKey" in result.a2aServers.carded).toBe(false);
+  });
+
+  it("omits description when null", async () => {
+    mockQuery([
+      { name: "plain", base_url: "https://peer.example.com/a", api_key: null, agent_card_json: null, description: null },
+    ]);
+
+    const result = await getHandler("config.getA2aServers")({ ids: ["id1"] }, "a1");
+    expect("description" in result.a2aServers.plain).toBe(false);
   });
 });
 
@@ -1685,16 +1733,16 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 48 handlers", () => {
+  it("registers exactly 49 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(48);
+    expect(handlers.size).toBe(49);
   });
 
   it("all expected handler names are registered", () => {
     const handlers = buildAdapterRpcHandlers();
     const expected = [
       "config.getAgent", "config.getResources", "config.getSettings",
-      "config.getModelBinding", "config.getMcpServers", "config.getSkillBundle", "config.getKnowledgeBundle",
+      "config.getModelBinding", "config.getMcpServers", "config.getA2aServers", "config.getSkillBundle", "config.getKnowledgeBundle",
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",

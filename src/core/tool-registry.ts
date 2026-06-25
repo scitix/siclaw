@@ -190,7 +190,7 @@ export interface BackgroundExecRequest {
   /** True in K8s prod where the command is sudo-wrapped (bash shell mode only). */
   isProd: boolean;
   /** Job kind for the registry + concurrency accounting. Defaults to "bash". */
-  jobType?: "bash" | "node" | "pod" | "host" | "local";
+  jobType?: "bash" | "node" | "pod" | "host" | "local" | "a2a";
   /** Called exactly once when the job settles (completed/failed/killed), before notify.
    *  node_exec uses it to unpin (release) the debug pod it acquired for the job. */
   onComplete?: () => void;

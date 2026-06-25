@@ -15,7 +15,7 @@
 // ── Scalar types ──────────────────────────────────────────────────────
 
 /** Every syncable type is identified by a well-known key. */
-export type GatewaySyncType = "mcp" | "skills" | "cluster" | "host" | "knowledge" | "tools";
+export type GatewaySyncType = "mcp" | "a2a" | "skills" | "cluster" | "host" | "knowledge" | "tools";
 
 // ── Config / descriptor interfaces ────────────────────────────────────
 
@@ -128,6 +128,14 @@ export const GATEWAY_SYNC_DESCRIPTORS: Record<GatewaySyncType, GatewaySyncDescri
     type: "mcp",
     gatewayPath: "/api/internal/mcp-servers",
     reloadPath: "/api/reload-mcp",
+    retry: { maxRetries: 3, baseDelayMs: 1000 },
+    requiresGatewayClient: true,
+    initialSync: true,
+  },
+  a2a: {
+    type: "a2a",
+    gatewayPath: "/api/internal/a2a-servers",
+    reloadPath: "/api/reload-a2a",
     retry: { maxRetries: 3, baseDelayMs: 1000 },
     requiresGatewayClient: true,
     initialSync: true,

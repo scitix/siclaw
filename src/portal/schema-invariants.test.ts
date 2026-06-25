@@ -25,6 +25,7 @@ const TABLES_WITH_UPDATED_AT = [
   "agent_tasks",
   "channels",
   "mcp_servers",
+  "a2a_servers",
   "skills",
   "model_providers",
   "agent_diagnostics",

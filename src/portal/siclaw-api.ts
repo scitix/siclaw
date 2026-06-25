@@ -254,6 +254,47 @@ export function sqlDayKey(raw: unknown): string | null {
   return null;
 }
 
+/** Cap stored agent cards so a hostile/buggy remote can't bloat the DB row. */
+const MAX_AGENT_CARD_BYTES = 64 * 1024;
+/** A2A server name must be a legal LLM tool-name fragment (used as a2a__<name>__send). */
+const A2A_NAME_RE = /^[A-Za-z0-9_-]+$/;
+const AGENT_CARD_FETCH_TIMEOUT_MS = 3000;
+
+/**
+ * Best-effort discovery of a remote A2A agent's card (admin-triggered, at create/
+ * update). GETs `{baseUrl}/.well-known/agent-card.json` and returns the raw JSON
+ * text to cache in `a2a_servers.agent_card_json`, or null on ANY failure.
+ *
+ * NEVER throws and NEVER blocks the CRUD operation: the card only enriches the
+ * tool description; a missing card just falls back to the admin-typed description.
+ * SSRF note: baseUrl is admin-supplied (write-gated) and is the same endpoint the
+ * runtime will call anyway, but this fetch runs in the Portal process — keep the
+ * timeout tight and the trigger admin-only.
+ */
+export async function fetchRemoteAgentCard(
+  baseUrl: string,
+  apiKey?: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  try {
+    const base = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+    const res = await fetchImpl(`${base}/.well-known/agent-card.json`, {
+      method: "GET",
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+      signal: AbortSignal.timeout(AGENT_CARD_FETCH_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_AGENT_CARD_BYTES) return null;
+    JSON.parse(text); // validate it is JSON before caching
+    return text;
+  } catch {
+    // Best-effort enrichment — any failure (timeout, network, non-JSON, oversize)
+    // degrades to "no cached card", never an error to the admin. (catch justified.)
+    return null;
+  }
+}
+
 export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, ctx?: SiclawApiContext): void {
   const P = "/api/v1/siclaw";
 
@@ -1735,6 +1776,222 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     // Notify bound agents to reload MCP config
     ctx?.notifyMcpAgents?.(params.id, ["mcp"]);
+  });
+
+  // ================================================================
+  // External A2A Agents (Siclaw as A2A client)
+  // ================================================================
+  //
+  // Admin-curated registry of remote A2A agents this org may CALL. Mirrors the
+  // MCP server CRUD above. Two deliberate differences:
+  //   • api_key is a bearer credential — write-only. It is NEVER returned by the
+  //     read endpoints; a `has_api_key` boolean is surfaced instead so the UI can
+  //     show whether one is set without leaking it.
+  //   • agent_card_json is a system-managed cache, populated best-effort by a
+  //     remote card fetch on create (and on base_url/api_key change). It is not a
+  //     client-supplied field; reads expose only a `has_agent_card` boolean.
+
+  // Columns safe to return on reads (api_key + agent_card_json excluded).
+  const A2A_READ_COLUMNS =
+    "id, org_id, name, base_url, description, enabled, created_by, created_at, updated_at, " +
+    "(api_key IS NOT NULL AND api_key <> '') AS has_api_key, " +
+    "(agent_card_json IS NOT NULL) AS has_agent_card";
+
+  // Hot-reload: push agent.reload(resources:["a2a"]) to every agent bound to this
+  // server so active AgentBoxes rebuild their a2a tools. Uses the live
+  // connectionMap mechanism (same as the knowledge/host/cluster CRUD), NOT the
+  // unwired ctx hook. Best-effort, fire-and-forget — a notify failure must never
+  // break the CRUD response (catch justified).
+  const notifyA2aBoundAgents = async (a2aServerId: string): Promise<void> => {
+    try {
+      const [bound] = await getDb().query(
+        "SELECT agent_id FROM agent_a2a_servers WHERE a2a_server_id = ?",
+        [a2aServerId],
+      ) as any;
+      for (const r of bound as Array<{ agent_id: string }>) {
+        config.connectionMap.notify(r.agent_id, "agent.reload", { agentId: r.agent_id, resources: ["a2a"] });
+      }
+    } catch (err) {
+      console.warn(`[siclaw-api] a2a reload notify failed for ${a2aServerId}:`, err);
+    }
+  };
+
+  // List A2A servers
+  router.get(`${P}/a2a`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT ${A2A_READ_COLUMNS} FROM a2a_servers WHERE org_id = ? ORDER BY created_at DESC, id DESC`,
+      [auth.orgId],
+    ) as any;
+    sendJson(res, 200, { data: rows });
+  });
+
+  // Create A2A server
+  router.post(`${P}/a2a`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "write")) return;
+    const body = await parseBody<Record<string, unknown>>(req);
+    if (!body.name || !body.base_url) {
+      sendJson(res, 400, { error: "name and base_url are required" });
+      return;
+    }
+    // name becomes part of the LLM tool name `a2a__<name>__send`, which must match
+    // the provider's tool-name charset — reject anything that would produce an illegal name.
+    if (!A2A_NAME_RE.test(String(body.name))) {
+      sendJson(res, 400, { error: "name must match ^[A-Za-z0-9_-]+$ (it becomes part of the tool name a2a__<name>__send)" });
+      return;
+    }
+    const id = crypto.randomUUID();
+    const apiKey = body.api_key ? String(body.api_key) : undefined;
+
+    // Best-effort: discover and cache the remote Agent Card now so the tool
+    // description is rich from the first session. Failure → null (admin
+    // description is used as the fallback); never blocks the create.
+    const agentCardJson = await fetchRemoteAgentCard(String(body.base_url), apiKey);
+
+    const db = getDb();
+    await db.query(
+      `INSERT INTO a2a_servers (id, org_id, name, base_url, api_key, agent_card_json, enabled, description, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, auth.orgId, body.name, body.base_url,
+        apiKey ?? null, agentCardJson, body.enabled !== false ? 1 : 0,
+        body.description || null, auth.userId,
+      ],
+    );
+
+    const [rows] = await db.query(`SELECT ${A2A_READ_COLUMNS} FROM a2a_servers WHERE id = ?`, [id]) as any;
+    sendJson(res, 201, rows[0]);
+  });
+
+  // Get A2A server
+  router.get(`${P}/a2a/:id`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT ${A2A_READ_COLUMNS} FROM a2a_servers WHERE id = ? AND org_id = ?`,
+      [params.id, auth.orgId],
+    ) as any;
+    if (rows.length === 0) {
+      sendJson(res, 404, { error: "A2A server not found" });
+      return;
+    }
+    sendJson(res, 200, rows[0]);
+  });
+
+  // Update A2A server
+  router.put(`${P}/a2a/:id`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "write")) return;
+    const body = await parseBody<Record<string, unknown>>(req);
+    if (body.name !== undefined && !A2A_NAME_RE.test(String(body.name))) {
+      sendJson(res, 400, { error: "name must match ^[A-Za-z0-9_-]+$" });
+      return;
+    }
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT id FROM a2a_servers WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "A2A server not found" });
+      return;
+    }
+
+    await db.query(
+      `UPDATE a2a_servers SET
+       name = COALESCE(?, name), base_url = COALESCE(?, base_url),
+       api_key = COALESCE(?, api_key), description = COALESCE(?, description),
+       updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [
+        body.name ?? null, body.base_url ?? null,
+        body.api_key ?? null, body.description ?? null,
+        params.id,
+      ],
+    );
+
+    // Re-discover the agent card when the endpoint or credential changed. Only
+    // overwrite on a successful fetch — a transient failure must not wipe a
+    // previously-good card (the call itself uses base_url, not the card).
+    if (body.base_url !== undefined || body.api_key !== undefined) {
+      const [cur] = await db.query("SELECT base_url, api_key FROM a2a_servers WHERE id = ?", [params.id]) as any;
+      if (cur[0]?.base_url) {
+        const card = await fetchRemoteAgentCard(cur[0].base_url, cur[0].api_key ?? undefined);
+        if (card) await db.query("UPDATE a2a_servers SET agent_card_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [card, params.id]);
+      }
+    }
+
+    const [rows] = await db.query(`SELECT ${A2A_READ_COLUMNS} FROM a2a_servers WHERE id = ?`, [params.id]) as any;
+    sendJson(res, 200, rows[0]);
+
+    // Notify bound agents to reload A2A config (fire-and-forget)
+    void notifyA2aBoundAgents(params.id);
+  });
+
+  // Delete A2A server
+  router.delete(`${P}/a2a/:id`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "write")) return;
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT id FROM a2a_servers WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "A2A server not found" });
+      return;
+    }
+
+    // Notify BEFORE delete — agent_a2a_servers cascades, so bindings
+    // must still be resolvable when the notifier looks them up. await so the
+    // lookup runs while the rows still exist.
+    await notifyA2aBoundAgents(params.id);
+
+    await db.query("DELETE FROM a2a_servers WHERE id = ?", [params.id]);
+    sendJson(res, 200, { ok: true });
+  });
+
+  // Toggle A2A server enabled/disabled
+  router.put(`${P}/a2a/:id/toggle`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const body = await parseBody<{ enabled: boolean }>(req);
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT id FROM a2a_servers WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "A2A server not found" });
+      return;
+    }
+
+    await db.query(
+      "UPDATE a2a_servers SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [body.enabled ? 1 : 0, params.id],
+    );
+
+    const [rows] = await db.query(`SELECT ${A2A_READ_COLUMNS} FROM a2a_servers WHERE id = ?`, [params.id]) as any;
+    sendJson(res, 200, rows[0]);
+
+    // Notify bound agents to reload A2A config (fire-and-forget)
+    void notifyA2aBoundAgents(params.id);
   });
 
   // ================================================================

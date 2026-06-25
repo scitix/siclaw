@@ -564,6 +564,7 @@ describe("registerAgentRoutes", () => {
         .mockResolvedValueOnce([[], []])
         .mockResolvedValueOnce([[{ id: "s1", name: "skill" }], []])
         .mockResolvedValueOnce([[], []])
+        .mockResolvedValueOnce([[], []])
         .mockResolvedValueOnce([[{ id: "ch1", name: "lark" }], []])
         .mockResolvedValueOnce([[], []]);
 
@@ -576,6 +577,7 @@ describe("registerAgentRoutes", () => {
       expect(body.clusters).toHaveLength(1);
       expect(body.hosts).toHaveLength(0);
       expect(body.skills).toHaveLength(1);
+      expect(body.a2a_servers).toHaveLength(0);
       expect(body.channels).toHaveLength(1);
     });
   });

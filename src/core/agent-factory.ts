@@ -41,6 +41,7 @@ import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
 import { convertOpenAIPdfPayload } from "./openai-file-payload.js";
 import { McpClientManager } from "./mcp-client.js";
+import { buildA2aTools } from "./a2a-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
@@ -451,6 +452,20 @@ export async function createSiclawSession(
   // The whole `mcpTools` array is MCP by construction, so an unconditional push
   // is simpler than and equivalent to skipping by an `mcp__` name prefix.
   customTools.push(...mcpTools);
+
+  // -- A2A client tools (call EXTERNAL A2A agents; dynamic, not in registry) --
+  // Mirror of the MCP block: a tool per bound external A2A agent, EXEMPT from the
+  // per-agent allowedTools whitelist (availability is the orthogonal `agent_a2a_servers`
+  // binding). buildA2aTools returns [] when no background executor is wired (the call is
+  // inherently async) or there are no bound servers. See docs/design/2026-06-24-a2a-client.md.
+  const a2aTools = buildA2aTools(config.a2aServers ?? {}, {
+    backgroundExec: opts?.backgroundExecExecutor,
+    sessionIdRef,
+  });
+  if (a2aTools.length > 0) {
+    console.log(`[agent-factory] Added ${a2aTools.length} A2A tools: ${a2aTools.map(t => t.name).join(", ")}`);
+  }
+  customTools.push(...a2aTools);
 
   // -- Path-restricted file I/O tools --
   // Whitelist: only skills directories + user-data + reports + repos + docs (no credentials, no config)
