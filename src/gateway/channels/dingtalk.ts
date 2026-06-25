@@ -40,7 +40,9 @@ import { resolveAgentSystemPrompt } from "../agent-model-binding.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { appendMessage, ensureChatSession } from "../chat-repo.js";
-import { collectResponse } from "./lark.js";
+import { collectChannelResponse } from "./lark.js";
+import type { RenderedReplyImage } from "./visual-image.js";
+import { deliverImages } from "./dingtalk-image.js";
 import {
   buildMarkdownMessage,
   buildTextMessage,
@@ -94,6 +96,12 @@ interface DingTalkRobotMessage {
   conversationType?: string;  // "1" = 1:1, "2" = group
   sessionWebhook: string;
   msgId?: string;
+  /**
+   * Sender's staff id. Required to address a 1:1 image reply via the robot
+   * OpenAPI (`oToMessages/batchSend` takes `userIds`); absent/irrelevant for
+   * group replies, which address the group by `conversationId`.
+   */
+  senderStaffId?: string;
 }
 
 /**
@@ -161,7 +169,7 @@ export function createDingTalkHandler(
           ackDingTalkCallback(dwClient, downstream);
           // Run the actual work detached so the WS read loop is never blocked.
           setImmediate(() => {
-            handleDingTalkMessage(downstream, channelId, agentBoxManager, tlsOptions, frontendClient)
+            handleDingTalkMessage(downstream, channelId, agentBoxManager, tlsOptions, frontendClient, config)
               .catch((err) => {
                 console.error(`[dingtalk] Error handling message for channel=${channelId}:`, err);
               });
@@ -227,6 +235,7 @@ export async function handleDingTalkMessage(
   agentBoxManager: AgentBoxManager,
   tlsOptions?: { cert: string; key: string; ca: string },
   frontendClient?: FrontendWsClient,
+  config?: DingTalkChannelConfig,
 ): Promise<void> {
   let message: DingTalkRobotMessage;
   try {
@@ -324,14 +333,18 @@ export async function handleDingTalkMessage(
 
   const promptOpts: PromptOptions = { text, agentId, mode: "channel", sessionId, systemPromptTemplate };
   let resultText = "";
+  let replyImages: RenderedReplyImage[] = [];
   let agentError: Error | null = null;
   try {
     const promptResult = await client.prompt(promptOpts);
-    // Persist assistant + tool rows too (full transcript), only when the session
-    // row exists (createdBy present), so the audit shows the agent's actions.
-    resultText = await collectResponse(client, promptResult.sessionId, "dingtalk", {
+    // Collect the reply with audit persistence (assistant + tool rows, when the
+    // session row exists) AND image artifacts for channel delivery.
+    const collected = await collectChannelResponse(client, promptResult.sessionId, "dingtalk", {
+      includeImages: true,
       persist: auditable ? { agentId } : undefined,
     });
+    resultText = collected.text;
+    replyImages = collected.images;
   } catch (err) {
     agentError = err instanceof Error ? err : new Error(String(err));
     console.error(`[dingtalk] Agent execution failed for session=${sessionId}:`, agentError);
@@ -359,6 +372,27 @@ export async function handleDingTalkMessage(
     ? buildTextMessage(finalBody)
     : (resultText ? buildMarkdownMessage(finalBody) : buildTextMessage(finalBody));
   await replyToDingTalk(sessionWebhook, body);
+
+  // Deliver any agent-produced images as separate robot messages (mirrors
+  // Lark's replyVisualImages). Best-effort and post-text: image delivery needs
+  // an access token + robot-send permission (config), and a failed image must
+  // never break the primary reply. Skipped when the agent errored, produced no
+  // images, or the channel config was not threaded through (older callers).
+  if (!agentError && config && replyImages.length > 0) {
+    const target = {
+      routeType,
+      openConversationId: routeType === "group" ? conversationId : undefined,
+      senderStaffId: message.senderStaffId,
+    };
+    try {
+      const delivered = await deliverImages(config, target, replyImages);
+      if (delivered < replyImages.length) {
+        console.warn(`[dingtalk] Delivered ${delivered}/${replyImages.length} reply images for session=${sessionId}`);
+      }
+    } catch (err) {
+      console.error(`[dingtalk] Image delivery failed for session=${sessionId}: ${safeErrorMessage(err)}`);
+    }
+  }
 }
 
 /**
