@@ -24,6 +24,7 @@ import https from "node:https";
 import type { RuntimeConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
+import { driveCompile } from "./agentbox/compile-driver.js";
 import {
   type RpcHandler,
   type RpcContext,
@@ -354,6 +355,66 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     })();
 
     return { ok: true, sessionId };
+  });
+
+  // ── KB compile (control plane = sicore internal/siclaw/compilation) ──────
+  // A compile run is a job, not a long-lived agent: it is addressed by the
+  // run id (the box is spawned with agentId == run_id). sicore routes
+  // compile.start here by the run's runtime_id (ConnectionMap's runtime-direct
+  // path), then steer/resume reach the same box by run_id.
+
+  rpcMethods.set("compile.start", async (params) => {
+    const runId = params.run_id as string;
+    const orgId = params.org_id as string | undefined;
+    const round = typeof params.round === "number" ? params.round : 1;
+    const sourceRef = params.source_ref as string | undefined;
+    if (!runId) throw new Error("run_id is required");
+
+    // Async-ack: spawn the compile box and drive its stream in the background;
+    // the box relays summary/parked/done back to sicore via compile.* RPCs.
+    (async () => {
+      try {
+        const handle = await agentBoxManager.getOrCreate(runId, { boxType: "compile", orgId });
+        const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+        await driveCompile({ client, runId, round, sourceRef, frontendClient });
+      } catch (err) {
+        console.error(`[runtime] compile.start background failure run=${runId}:`, err);
+        // No compile.failed RPC in v1; surface via summary so the owner sees it.
+        await frontendClient
+          .request("compile.summary", { run_id: runId, summary: `compile box error: ${err instanceof Error ? err.message : String(err)}` })
+          .catch(() => {});
+      }
+    })();
+
+    return { ok: true, run_id: runId };
+  });
+
+  rpcMethods.set("compile.steer", async (params) => {
+    const runId = params.run_id as string;
+    const rulings = params.rulings;
+    if (!runId) throw new Error("run_id is required");
+    const handle = await agentBoxManager.getAsync(runId);
+    if (!handle) throw new Error(`compile box for run ${runId} not found`);
+    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+    await client.postJson("/rulings", { run_id: runId, rulings });
+    return { ok: true };
+  });
+
+  rpcMethods.set("compile.resume", async (params) => {
+    const runId = params.run_id as string;
+    const rulings = params.rulings;
+    if (!runId) throw new Error("run_id is required");
+    // v1: the compile box does not yet persist/resume sessions. If the box is
+    // still live this is equivalent to steer; if it was spun down we cannot
+    // resume a parked compile yet. (Follow-up: respawn + SDK resume(session_ref)
+    // + re-POST rulings.)
+    const handle = await agentBoxManager.getAsync(runId);
+    if (!handle) {
+      throw new Error(`compile box for run ${runId} is gone; resume-from-session not implemented (v1 live-steer only)`);
+    }
+    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+    await client.postJson("/rulings", { run_id: runId, rulings });
+    return { ok: true };
   });
 
   rpcMethods.set("chat.abort", async (params) => {

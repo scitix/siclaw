@@ -11,10 +11,16 @@ export type AgentBoxStatus = "starting" | "running" | "stopping" | "stopped" | "
 
 /** AgentBox configuration */
 export interface AgentBoxConfig {
-  /** Agent ID — the pod identity; also the cert CN. */
+  /** Agent ID — the pod identity; also the cert CN. For a compile box this is
+   *  the compile run id (the run is a job, not a long-lived agent). */
   agentId: string;
   /** Organization ID — for RBAC scoping in Upstream Adapter */
   orgId?: string;
+  /** Box flavor. "agent" (default) = normal agentbox; "compile" = a KB compile
+   *  box (different image, writable /work volume, driven by the compile protocol). */
+  boxType?: "agent" | "compile";
+  /** Optional image override. Compile boxes default to $SICLAW_COMPILE_BOX_IMAGE. */
+  image?: string;
   /** Allowed tools list for this agent (null = all) */
   allowedTools?: string[] | null;
   /** Environment variables */

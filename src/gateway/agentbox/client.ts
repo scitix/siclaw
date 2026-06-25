@@ -207,6 +207,19 @@ export class AgentBoxClient {
   }
 
   /**
+   * POST a JSON body to an arbitrary path, returning parsed JSON.
+   * Used by the compile driver (POST /compile, POST /rulings).
+   */
+  async postJson<T = unknown>(path: string, body: unknown): Promise<T> {
+    const resp = await this.fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return resp.json();
+  }
+
+  /**
    * Get context usage
    */
   async getContextUsage(sessionId: string): Promise<ContextUsageResponse> {
@@ -317,16 +330,25 @@ export class AgentBoxClient {
   }
 
   /**
-   * Subscribe to the SSE event stream
+   * Subscribe to a session's SSE event stream.
    *
    * Returns an AsyncIterable that can be iterated with for-await-of.
    */
   async *streamEvents(sessionId: string): AsyncIterable<unknown> {
-    const url = `${this.endpoint}/api/stream/${sessionId}`;
+    yield* this.streamPath(`/api/stream/${sessionId}`);
+  }
+
+  /**
+   * Subscribe to an SSE event stream on an arbitrary path. The compile box
+   * streams structured events on /events/:runId; agentbox uses /api/stream/:id.
+   * Both speak `data: <json>\n\n` with `: heartbeat` comment lines.
+   */
+  async *streamPath(path: string): AsyncIterable<unknown> {
+    const url = `${this.endpoint}${path}`;
 
     // Use https.request for HTTPS with mTLS
     if (this.httpsAgent && this.endpoint.startsWith("https://")) {
-      yield* this.streamEventsHttps(sessionId);
+      yield* this.streamPathHttps(path);
       return;
     }
 
@@ -343,7 +365,7 @@ export class AgentBoxClient {
       throw new Error("No response body");
     }
 
-    console.log(`[agentbox-client] SSE open sessionId=${sessionId}`);
+    console.log(`[agentbox-client] SSE open path=${path}`);
     const decoder = new TextDecoder();
     let buffer = "";
     let eventCount = 0;
@@ -366,25 +388,25 @@ export class AgentBoxClient {
               eventCount++;
               yield JSON.parse(data);
             } catch {
-              console.warn(`[agentbox-client] SSE parse error sessionId=${sessionId}: ${data.slice(0, 100)}`);
+              console.warn(`[agentbox-client] SSE parse error path=${path}: ${data.slice(0, 100)}`);
             }
           }
         }
       }
     } catch (err) {
-      console.error(`[agentbox-client] SSE stream error sessionId=${sessionId}:`, err instanceof Error ? err.message : err);
+      console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
       throw err;
     } finally {
-      console.log(`[agentbox-client] SSE closed sessionId=${sessionId} (${eventCount} events)`);
+      console.log(`[agentbox-client] SSE closed path=${path} (${eventCount} events)`);
       reader.releaseLock();
     }
   }
 
   /**
-   * SSE stream over HTTPS with mTLS
+   * SSE stream over HTTPS with mTLS, on an arbitrary path.
    */
-  private async *streamEventsHttps(sessionId: string): AsyncIterable<unknown> {
-    const urlObj = new URL(`/api/stream/${sessionId}`, this.endpoint);
+  private async *streamPathHttps(path: string): AsyncIterable<unknown> {
+    const urlObj = new URL(path, this.endpoint);
 
     const res = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
       const req = https.request(
@@ -406,7 +428,7 @@ export class AgentBoxClient {
       throw new Error(`Stream request failed: ${res.statusCode}`);
     }
 
-    console.log(`[agentbox-client] SSE open (HTTPS) sessionId=${sessionId}`);
+    console.log(`[agentbox-client] SSE open (HTTPS) path=${path}`);
     let buffer = "";
     let eventCount = 0;
 
@@ -424,16 +446,16 @@ export class AgentBoxClient {
               eventCount++;
               yield JSON.parse(data);
             } catch {
-              console.warn(`[agentbox-client] SSE parse error sessionId=${sessionId}: ${data.slice(0, 100)}`);
+              console.warn(`[agentbox-client] SSE parse error path=${path}: ${data.slice(0, 100)}`);
             }
           }
         }
       }
     } catch (err) {
-      console.error(`[agentbox-client] SSE stream error sessionId=${sessionId}:`, err instanceof Error ? err.message : err);
+      console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
       throw err;
     } finally {
-      console.log(`[agentbox-client] SSE closed (HTTPS) sessionId=${sessionId} (${eventCount} events)`);
+      console.log(`[agentbox-client] SSE closed (HTTPS) path=${path} (${eventCount} events)`);
     }
   }
 
