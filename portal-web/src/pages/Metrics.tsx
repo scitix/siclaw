@@ -149,7 +149,7 @@ export function Metrics() {
                 {timingLoading ? (
                   <div className="flex items-center justify-center py-6"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
                 ) : (
-                  <TimingStatsCard data={timing} rangeLabel={rLabel} entryLabel={ENTRY_LABELS[entry]} />
+                  <TimingStatsCard data={timing} rangeLabel={rLabel} entryLabel={ENTRY_LABELS[entry]} entry={entry} />
                 )}
               </>
             )}

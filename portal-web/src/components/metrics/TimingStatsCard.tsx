@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react"
-import type { LatencyStats, TimingStats, ToolLatencyStats } from "../../hooks/useMetrics"
+import type { EntryMode, LatencyStats, TimingStats, ToolLatencyStats } from "../../hooks/useMetrics"
 
 type TopN = 3 | 5 | 10
 const TOP_OPTIONS: TopN[] = [3, 5, 10]
@@ -66,11 +66,18 @@ export function TimingStatsCard({
   data,
   rangeLabel,
   entryLabel,
+  entry,
 }: {
   data: TimingStats | null
   rangeLabel: string
   entryLabel: string
+  entry: EntryMode
 }) {
+  // TTFT / thinking come from assistant metadata.timing, written only on the
+  // web/api/a2a path (sse-consumer). Channel (IM) sessions persist assistant
+  // rows without it, so those two rows are always empty for entry=channel —
+  // flag it so a count of 0 doesn't read as a bug. Tool latency still populates.
+  const noModelTiming = entry === "channel"
   const [topN, setTopN] = useState<TopN>(3)
   const tools = data?.tools ?? []
   const visibleTools: ToolLatencyStats[] = tools.slice(0, topN)
@@ -99,6 +106,12 @@ export function TimingStatsCard({
         <StatRow label="TTFT" hint="time to first token" stats={data?.ttft ?? EMPTY_STATS} />
         <StatRow label="Thinking" hint="reasoning before output" stats={data?.thinking ?? EMPTY_STATS} />
       </StatGrid>
+
+      {noModelTiming && (
+        <p className="mt-2 text-[10px] text-muted-foreground/80">
+          TTFT &amp; thinking aren&apos;t recorded for channel (IM) sessions — only tool latency below.
+        </p>
+      )}
 
       <div className="mt-4 pt-3 border-t border-border">
         <div className="flex items-center justify-between gap-3 mb-2">

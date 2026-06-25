@@ -900,8 +900,10 @@ export async function collectChannelResponse(
   const persist = options.persist;
   const redaction = persist ? buildRedactionConfigForModelConfig(persist.modelConfig) : null;
   const redact = (s: string): string => (redaction ? redactText(s, redaction) : s);
-  // FIFO per-tool queues so parallel tool calls pair start↔end correctly
-  // (same approach as sse-consumer's pendingTool* maps).
+  // FIFO per-tool queues to pair start↔end (same approach as sse-consumer's
+  // pendingTool* maps). Caveat inherited from there: multiple *concurrent*
+  // same-name calls finishing out of order can mispair, skewing that row's
+  // durationMs. Only affects the audit metric, never the reply; acceptable.
   const toolInputs = new Map<string, string[]>();
   const toolStarts = new Map<string, number[]>();
   const pushQ = <T,>(m: Map<string, T[]>, k: string, v: T): void => { const a = m.get(k) ?? []; a.push(v); m.set(k, a); };
