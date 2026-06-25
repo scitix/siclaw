@@ -157,12 +157,29 @@ ocr:
 agentbox:
   debugImage: ""
   persistence:
+    # PVC persistence has two independent concepts:
+    #   1. PVC availability (infrastructure) — is a shared RWX PVC present that
+    #      agents can mount? Controlled by `enabled` (chart provisions one) OR
+    #      `claimName` (reference one you created out-of-band).
+    #   2. Global default policy — should callers that DON'T set a per-agent
+    #      persistence value use the PVC? Controlled by `enabled` only.
+    # A per-agent opt-in (chat.send persistence:true, e.g. from a product portal)
+    # mounts the PVC whenever it is *available*, regardless of the global default.
+
+    # Global default policy. true ⇒ also chart-provision + mount the PVC below.
     enabled: false
-    # Override the shared PVC name. Empty → "<release-fullname>-data".
+    # Reference a PRE-EXISTING RWX PVC by name. Set this (with enabled:false) to
+    # make the PVC available for per-agent opt-in while keeping the global default
+    # OFF. REQUIRED and has NO default on this path — the name differs per
+    # deployment and must match a PVC you already created; empty ⇒ no PVC to
+    # mount, all agents fall back to emptyDir.
+    # When enabled:true this just overrides the chart-managed PVC name
+    # (empty → "<release-fullname>-data").
     claimName: ""
-    # REQUIRED when enabled: true. Must support ReadWriteMany.
+    # REQUIRED when enabled: true (chart-provisioned PVC). Must support ReadWriteMany.
     # Examples: nfs, efs-sc, csi-cephfs, longhorn (with RWX).
     # Leaving this empty while enabled keeps the PVC in Pending state.
+    # Ignored when referencing an existing PVC via claimName (enabled:false).
     storageClassName: ""
     size: "10Gi"
 

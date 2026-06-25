@@ -112,6 +112,24 @@ in the same namespace don't collide; users can override via
 {{- end }}
 
 {{/*
+Is a shared PVC available for AgentBox pods to mount? Returns "true" or "".
+
+Decouples PVC availability (infrastructure) from the global default policy
+(persistence.enabled). Available when EITHER:
+  - persistence.enabled       — the chart provisions & mounts its own PVC, or
+  - persistence.claimName set  — the deployer references a pre-existing RWX PVC
+                                 they created out-of-band (mount it, inject the
+                                 claim name) WITHOUT turning the global default on.
+When available, the runtime gets SICLAW_PERSISTENCE_CLAIM_NAME so a per-agent
+opt-in (chat.send persistence:true) can actually mount the PVC even while the
+global default stays off.
+*/}}
+{{- define "siclaw.persistence.pvcAvailable" -}}
+{{- $p := .Values.agentbox.persistence | default dict -}}
+{{- if or $p.enabled (ne ($p.claimName | default "") "") -}}true{{- end -}}
+{{- end }}
+
+{{/*
 Name of the chart-managed Runtime CA Secret.
 */}}
 {{- define "siclaw.runtimeCaSecretName" -}}

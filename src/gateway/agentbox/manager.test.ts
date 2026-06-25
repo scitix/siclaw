@@ -215,6 +215,51 @@ describe("AgentBoxManager — K8s mode", () => {
   });
 });
 
+// ── Per-agent persistence is anchored at cold spawn ────────────────────
+//
+// chat.send carries `persistence` per request, but the volume mode is fixed
+// when the pod is created (K8s cannot hot-change a running pod's mounts). A
+// warm pod is reused by agentId WITHOUT spawning, so a changed persistence
+// value must NOT recycle it or reach a new pod spec — it only applies on the
+// next cold spawn. These tests pin that contract. (Cold-spawn volume selection
+// from boxConfig.persistence is covered by k8s-spawner.test.ts.)
+
+describe("AgentBoxManager — persistence anchored at cold spawn (warm reuse ignores it)", () => {
+  it("K8s: a running pod is reused without re-spawning when persistence flips", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-agent-a", {
+      boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+
+    // Pod already running: neither a true nor a (changed) false value spawns.
+    await mgr.getOrCreate("agent-a", { persistence: true });
+    await mgr.getOrCreate("agent-a", { persistence: false });
+
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("Local: cached running box is reused without re-spawning when persistence flips", async () => {
+    const spawner = new FakeSpawner("local");
+    const mgr = new AgentBoxManager(spawner);
+
+    // Cold spawn anchors the value; the spawner records exactly one spawn.
+    await mgr.getOrCreate("agent-a", { persistence: true });
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].persistence).toBe(true);
+
+    // Cached box still running → reused; the new false value never re-spawns.
+    spawner.getReturns.set("box-agent-a", {
+      boxId: "box-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "x", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    await mgr.getOrCreate("agent-a", { persistence: false });
+
+    expect(spawner.spawnCalls).toHaveLength(1); // still just the cold spawn
+  });
+});
+
 // ── Health-check timer (local only) ────────────────────────────────────
 
 describe("AgentBoxManager — health check timer", () => {

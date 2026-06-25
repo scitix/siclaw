@@ -105,6 +105,15 @@ export class AgentBoxManager {
    * on warm-pod reuse, so the chat hot path and channel/cron paths pay nothing
    * when the pod already exists.
    */
+  /**
+   * Per-agent config (e.g. `config.persistence`) is only consumed on a COLD
+   * spawn. A pod is keyed by agentId; when one is already running it is reused
+   * as-is, so persistence is effectively anchored at the agent's first spawn.
+   * Changing it on a later call does NOT recycle the pod — K8s cannot hot-change
+   * a running pod's volume mounts — and takes effect only on the next cold spawn
+   * (after the pod restarts or is idle-released). Callers are expected to send a
+   * stable value per agent.
+   */
   async getOrCreate(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
     if (this.isK8s) {
@@ -118,6 +127,9 @@ export class AgentBoxManager {
 
     const info = await this.spawner.get(name);
     if (info && info.status === "running" && info.endpoint && this.isCertFresh(info)) {
+      // Warm reuse: return the running pod without spawning, so a changed
+      // config.persistence never reaches the pod spec (anchored at cold spawn —
+      // see getOrCreate docstring).
       return { boxId: name, endpoint: info.endpoint, agentId };
     }
     if (info && info.status === "running" && !this.isCertFresh(info)) {
@@ -143,6 +155,8 @@ export class AgentBoxManager {
       existing.lastActiveAt = new Date();
       const info = await this.spawner.get(existing.handle.boxId);
       if (info && info.status === "running") {
+        // Warm reuse: cached running box returned without spawning, so a changed
+        // config.persistence is ignored until the next cold spawn (see getOrCreate).
         return existing.handle;
       }
       this.boxes.delete(agentId);
