@@ -64,7 +64,7 @@ interface ChatSession {
   updated_at?: string
 }
 
-interface ChatMessage {
+export interface ChatMessage {
   id: string
   role: "user" | "assistant" | "tool"
   content: string
@@ -398,7 +398,18 @@ async function fetchSessionPage1(
     `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
   )
   const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-  return { items, pilotMsgs: annotateSubagentCompletions(annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage)))) }
+  return { items, pilotMsgs: buildPilotMessages(items) }
+}
+
+/**
+ * Map raw chat_messages rows → rendered PilotMessages with the full annotation
+ * pipeline (delegation synthesis, exec-job + sub-agent completion folding). This
+ * is the exact transform the live chat applies, so any read-only consumer (e.g.
+ * the admin session-snapshot view) renders identically. Input must be in
+ * chronological order (oldest first).
+ */
+export function buildPilotMessages(items: ChatMessage[]): PilotMessage[] {
+  return annotateSubagentCompletions(annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage))))
 }
 
 export function toPilotMessage(m: ChatMessage): PilotMessage {

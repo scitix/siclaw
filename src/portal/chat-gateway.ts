@@ -731,6 +731,7 @@ export function registerChatRoutes(
       text: body.text,
       sessionId,
       mode: "api",
+      origin: "api", // audit category: external API-key sessions (/api/v1/run)
       modelProvider: modelBinding.modelProvider,
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,

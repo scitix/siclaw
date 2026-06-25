@@ -1710,6 +1710,9 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     if (qs.get("userId")) { conds.push("s.user_id = ?"); params.push(qs.get("userId")); }
     if (qs.get("toolName")) { conds.push("m.tool_name = ?"); params.push(qs.get("toolName")); }
     if (qs.get("outcome")) { conds.push("m.outcome = ?"); params.push(qs.get("outcome")); }
+    // Entry-form filter (chat_sessions.origin). "web" matches NULL/"web".
+    if (qs.get("origin") === "web") { conds.push("(s.origin IS NULL OR s.origin = 'web')"); }
+    else if (qs.get("origin")) { conds.push("s.origin = ?"); params.push(qs.get("origin")); }
     if (qs.get("cursorTs") && qs.get("cursorId")) {
       const cursorDate = new Date(parseInt(qs.get("cursorTs")!, 10));
       conds.push("(m.created_at < ? OR (m.created_at = ? AND m.id < ?))");
@@ -1722,7 +1725,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
               SUBSTR(m.tool_input, 1, 500) AS toolInput,
               m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
-              s.user_id AS userId, s.agent_id AS agentId
+              s.user_id AS userId, s.agent_id AS agentId, s.origin AS origin
        FROM chat_messages m
        LEFT JOIN chat_sessions s ON m.session_id = s.id
        WHERE ${conds.join(" AND ")}
@@ -1734,7 +1737,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const logs = rows.slice(0, limit).map((r: any) => ({
       id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
       toolName: r.toolName, toolInput: r.toolInput, outcome: r.outcome,
-      durationMs: r.durationMs, timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
+      durationMs: r.durationMs, origin: r.origin ?? null,
+      timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
     }));
     sendJson(res, 200, { logs, hasMore });
   });

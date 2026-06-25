@@ -186,6 +186,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const orgId = params.orgId as string | undefined;
     const text = params.text as string;
     const incomingSessionId = params.sessionId as string | undefined;
+    // Session entry-form for audit categorization (Web / API / A2A). null =
+    // web (default). Portal call sites stamp "api" (/api/v1/run) and "a2a";
+    // channels stamp "channel" via their own ensureChatSession. Only consumed
+    // when THIS handler creates the session row.
+    const origin = params.origin as string | undefined;
     // Portal stamps turnStartMs at POST receipt — closer to user click than
     // the runtime's loop start. Use it as the canonical turn anchor when
     // present; fall back gracefully so direct callers (tests, /run path)
@@ -242,7 +247,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // Persist user message + ensure session row before any agent events
         // could land. consumeAgentSse writes assistant/tool rows with FK
         // referencing chat_sessions, so the row has to exist first.
-        await ensureChatSession(sessionId, agentId, userId, text);
+        await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
         await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
 

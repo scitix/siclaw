@@ -1905,3 +1905,60 @@ describe("collectResponse — SSE event flattening", () => {
     expect(text).toBe("Generated image:");
   });
 });
+
+describe("collectChannelResponse — audit persistence", () => {
+  function fakeClient(events: unknown[]) {
+    return { streamEvents: async function* () { for (const e of events) yield e; } } as any;
+  }
+
+  it("persists every assistant turn + each tool call when persist is set", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Checking nodes" }] } },
+      { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get nodes" } },
+      { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "node ok" }], details: {} } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "All healthy." }] } },
+    ];
+    const collected = await collectChannelResponse(fakeClient(events), "s-audit", "lark", { persist: { agentId: "a1" } });
+    // Reply text is still the final assistant turn.
+    expect(collected.text).toBe("All healthy.");
+
+    const calls = appendMessageMock.mock.calls.map((c) => c[0] as any);
+    expect(calls.filter((m) => m.role === "assistant").map((m) => m.content)).toEqual(["Checking nodes", "All healthy."]);
+    const toolRows = calls.filter((m) => m.role === "tool");
+    expect(toolRows).toHaveLength(1);
+    expect(toolRows[0]).toMatchObject({ sessionId: "s-audit", toolName: "bash", outcome: "success" });
+    expect(toolRows[0].toolInput).toContain("kubectl get nodes");
+    expect(toolRows[0].content).toBe("node ok");
+  });
+
+  it("does NOT persist anything when persist is omitted (reply-only path)", async () => {
+    const events = [
+      { type: "tool_execution_start", toolName: "bash", args: {} },
+      { type: "tool_execution_end", toolName: "bash", result: { content: [], details: {} } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } },
+    ];
+    await collectChannelResponse(fakeClient(events), "s-nop", "lark", {});
+    expect(appendMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("derives tool outcome (error / blocked) from result.details", async () => {
+    const events = [
+      { type: "tool_execution_start", toolName: "bash", args: {} },
+      { type: "tool_execution_end", toolName: "bash", result: { content: [], details: { error: "boom" } } },
+      { type: "tool_execution_start", toolName: "pod_exec", args: {} },
+      { type: "tool_execution_end", toolName: "pod_exec", result: { content: [], details: { blocked: true } } },
+    ];
+    await collectChannelResponse(fakeClient(events), "s-out", "lark", { persist: { agentId: "a1" } });
+    const toolRows = appendMessageMock.mock.calls.map((c) => c[0] as any).filter((m) => m.role === "tool");
+    expect(toolRows.map((m) => m.outcome)).toEqual(["error", "blocked"]);
+  });
+
+  it("a persist failure does not break the reply (best-effort)", async () => {
+    appendMessageMock.mockRejectedValueOnce(new Error("db down"));
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "still replies" }] } },
+    ];
+    const collected = await collectChannelResponse(fakeClient(events), "s-fail", "lark", { persist: { agentId: "a1" } });
+    expect(collected.text).toBe("still replies");
+  });
+});

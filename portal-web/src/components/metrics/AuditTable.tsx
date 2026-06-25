@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react"
 import { ChevronDown, ChevronRight, CheckCircle, XCircle, Ban, Loader2 } from "lucide-react"
-import { useAudit, useUsers, resolveRange, type AuditLog, type TimeRange } from "../../hooks/useMetrics"
+import { useAudit, useUsers, resolveRange, originLabel, type AuditLog, type EntryMode, type TimeRange } from "../../hooks/useMetrics"
 import { AuditDetailPanel } from "./AuditDetailPanel"
 
 const TOOL_OPTIONS = ["All", "restricted_bash", "local_script", "pod_exec", "kubectl", "cluster_probe", "cluster_list"]
@@ -47,7 +47,7 @@ function OutcomeIcon({ outcome }: { outcome: string | null }) {
   }
 }
 
-export function AuditTable({ userFilterId, usernameHint, timeRange }: { userFilterId: string | null; usernameHint: string | null; timeRange: TimeRange }) {
+export function AuditTable({ userFilterId, usernameHint, entry, timeRange }: { userFilterId: string | null; usernameHint: string | null; entry: EntryMode; timeRange: TimeRange }) {
   const [tool, setTool] = useState("All")
   const [status, setStatus] = useState("All")
   const [expandedId, setExpandedId] = useState<string | null>(null)
@@ -67,10 +67,11 @@ export function AuditTable({ userFilterId, usernameHint, timeRange }: { userFilt
       userId: userFilterId ?? undefined,
       toolName: tool === "All" ? undefined : tool,
       outcome: status === "All" ? undefined : status,
+      entry,
       from: String(fromMs),
       to: String(toMs),
     }
-  }, [tool, status, timeRange.from, timeRange.to, userFilterId])
+  }, [tool, status, entry, timeRange.from, timeRange.to, userFilterId])
 
   const { logs, hasMore, loading, loadMore } = useAudit(params)
 
@@ -109,6 +110,7 @@ export function AuditTable({ userFilterId, usernameHint, timeRange }: { userFilt
               <th className="w-8"></th>
               <th className="text-left px-3 py-2.5 font-medium">Time</th>
               <th className="text-left px-3 py-2.5 font-medium">User</th>
+              <th className="text-left px-3 py-2.5 font-medium">Entry</th>
               <th className="text-left px-3 py-2.5 font-medium">Agent</th>
               <th className="text-left px-3 py-2.5 font-medium">Tool</th>
               <th className="text-left px-3 py-2.5 font-medium">Command</th>
@@ -118,7 +120,7 @@ export function AuditTable({ userFilterId, usernameHint, timeRange }: { userFilt
           </thead>
           <tbody className="divide-y divide-border/60">
             {logs.length === 0 && !loading ? (
-              <tr><td colSpan={8} className="text-center py-12 text-muted-foreground text-[12px]">No entries found</td></tr>
+              <tr><td colSpan={9} className="text-center py-12 text-muted-foreground text-[12px]">No entries found</td></tr>
             ) : logs.map((log: AuditLog) => (
               <AuditRow
                 key={log.id}
@@ -162,7 +164,10 @@ function AuditRow({ log, username, expanded, onToggle }: { log: AuditLog; userna
           <span className="mr-1">{formatDate(log.timestamp)}</span>{formatTime(log.timestamp)}
         </td>
         <td className="px-3 py-2.5">{username}</td>
-        <td className="px-3 py-2.5 text-muted-foreground">{log.agentId ?? "—"}</td>
+        <td className="px-3 py-2.5">
+          <span className="px-1.5 py-0.5 rounded text-[10px] bg-secondary text-muted-foreground">{originLabel(log.origin)}</span>
+        </td>
+        <td className="px-3 py-2.5 text-muted-foreground">{log.agentName ?? log.agentId ?? "—"}</td>
         <td className="px-3 py-2.5">
           <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-secondary text-muted-foreground">{log.toolName ?? "—"}</span>
         </td>
@@ -172,7 +177,7 @@ function AuditRow({ log, username, expanded, onToggle }: { log: AuditLog; userna
       </tr>
       {expanded && (
         <tr className="bg-secondary/20">
-          <td colSpan={8} className="px-6 py-4"><AuditDetailPanel log={log} /></td>
+          <td colSpan={9} className="px-6 py-4"><AuditDetailPanel log={log} /></td>
         </tr>
       )}
     </>

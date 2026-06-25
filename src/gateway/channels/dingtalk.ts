@@ -39,6 +39,7 @@ import { resolveBinding, handlePairingCode, isChannelAccessDenied } from "../cha
 import { resolveAgentSystemPrompt } from "../agent-model-binding.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
+import { appendMessage, ensureChatSession } from "../chat-repo.js";
 import { collectResponse } from "./lark.js";
 import {
   buildMarkdownMessage,
@@ -301,12 +302,36 @@ export async function handleDingTalkMessage(
   // it was created with until /new.
   const systemPromptTemplate = await resolveAgentSystemPrompt(agentId, frontendClient);
 
+  // Audit: persist the session + inbound user message so DingTalk sessions are
+  // visible in the audit (they were previously invisible — no chat_messages at
+  // all). origin="channel" unifies IM channels alongside Web/API/A2A. user_id =
+  // the binding owner (a real user UUID), mirroring lark. Best-effort: a persist
+  // failure must NOT break the reply (DingTalk worked without persistence before).
+  const auditable = !!binding.createdBy;
+  if (auditable) {
+    try {
+      await ensureChatSession(sessionId, agentId, binding.createdBy!, text, text, "channel");
+      await appendMessage({
+        sessionId,
+        role: "user",
+        content: text,
+        metadata: { source: "dingtalk", channelId, conversationId, route: routeType },
+      });
+    } catch (err) {
+      console.error(`[dingtalk] Failed to persist channel user message session=${sessionId}:`, err);
+    }
+  }
+
   const promptOpts: PromptOptions = { text, agentId, mode: "channel", sessionId, systemPromptTemplate };
   let resultText = "";
   let agentError: Error | null = null;
   try {
     const promptResult = await client.prompt(promptOpts);
-    resultText = await collectResponse(client, promptResult.sessionId, "dingtalk");
+    // Persist assistant + tool rows too (full transcript), only when the session
+    // row exists (createdBy present), so the audit shows the agent's actions.
+    resultText = await collectResponse(client, promptResult.sessionId, "dingtalk", {
+      persist: auditable ? { agentId } : undefined,
+    });
   } catch (err) {
     agentError = err instanceof Error ? err : new Error(String(err));
     console.error(`[dingtalk] Agent execution failed for session=${sessionId}:`, agentError);
