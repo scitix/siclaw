@@ -86,7 +86,13 @@ export class K8sSpawner implements BoxSpawner {
    * Create an AgentBox Pod
    */
   async spawn(boxConfig: AgentBoxConfig): Promise<AgentBoxHandle> {
-    const { namespace, image, imagePullPolicy, labelPrefix } = this.config;
+    const { namespace, imagePullPolicy, labelPrefix } = this.config;
+    // Compile boxes run a different image ($SICLAW_COMPILE_BOX_IMAGE) but reuse
+    // the same spawn/cert/mTLS/port machinery as an agentbox.
+    const isCompile = boxConfig.boxType === "compile";
+    const image =
+      boxConfig.image ??
+      (isCompile ? process.env.SICLAW_COMPILE_BOX_IMAGE || "kbc-compile-box:latest" : this.config.image);
     const agentId = boxConfig.agentId;
     if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
     const podName = this.podName(agentId);
@@ -189,6 +195,20 @@ export class K8sSpawner implements BoxSpawner {
       }
     }
 
+    // Compile boxes are lean — they do NOT phone home for settings, so the LLM
+    // endpoint (company massapi) must be injected as env. v1: forward the
+    // Anthropic-compatible knobs from the runtime deployment ("credentials don't
+    // enter the sandbox" → the base URL is a proxy, key injected proxy-side).
+    if (isCompile) {
+      const COMPILE_FORWARDED_ENV = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+      for (const name of COMPILE_FORWARDED_ENV) {
+        const value = process.env[name];
+        if (value !== undefined && value !== "") {
+          env.push({ name, value });
+        }
+      }
+    }
+
     // Add custom environment variables
     if (boxConfig.env) {
       for (const [key, value] of Object.entries(boxConfig.env)) {
@@ -213,8 +233,11 @@ export class K8sSpawner implements BoxSpawner {
         name: podName,
         namespace,
         labels: {
+          // Keep app=agentbox so existing list()/cleanup() lifecycle management
+          // covers compile pods too; boxType distinguishes them for observability.
           [`${labelPrefix}/app`]: "agentbox",
           [`${labelPrefix}/agent`]: agentId,
+          [`${labelPrefix}/boxType`]: boxConfig.boxType ?? "agent",
         },
       },
       spec: {
@@ -265,6 +288,8 @@ export class K8sSpawner implements BoxSpawner {
             name: "tmp",
             emptyDir: { sizeLimit: "100Mi" },
           },
+          // Compile boxes write drop/ + bundle/ under /work; rootfs is read-only.
+          ...(isCompile ? [{ name: "work", emptyDir: { sizeLimit: "1Gi" } } as k8s.V1Volume] : []),
         ],
         containers: [
           {
@@ -315,6 +340,7 @@ export class K8sSpawner implements BoxSpawner {
                 name: "tmp",
                 mountPath: "/tmp",
               },
+              ...(isCompile ? [{ name: "work", mountPath: "/work" } as k8s.V1VolumeMount] : []),
             ],
             resources: {
               requests: {
