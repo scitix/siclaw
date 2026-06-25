@@ -24,6 +24,14 @@ export interface AgentBoxConfig {
     cpu?: string;
     memory?: string;
   };
+  /**
+   * Per-agent session/memory persistence override.
+   * - true  → mount the shared PVC (session JSONL + memory survive pod restarts)
+   * - false → use emptyDir (session cleared on pod restart/idle release)
+   * - undefined → fall back to the spawner's global persistence config
+   * Only honored by K8sSpawner; ignored by Local/Process spawners.
+   */
+  persistence?: boolean;
 }
 
 /** AgentBox information */

@@ -613,3 +613,95 @@ describe("K8sSpawner — list + cleanup", () => {
     expect(calls.deleteCollectionNamespacedPod[0].labelSelector).toBe("siclaw.io/app=agentbox");
   });
 });
+
+describe("K8sSpawner — per-agent persistence (PVC override)", () => {
+  // Drive readNamespacedPod: first call 404 (new pod), then a Running pod so
+  // spawn() resolves. Lets us inspect the createNamespacedPod body.
+  function readReturnsRunningAfter404() {
+    let r = 0;
+    readPodImpl.fn = async () => {
+      r++;
+      if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { name: "agentbox-default", labels: {} },
+      };
+    };
+  }
+
+  function userDataVolume() {
+    const body = calls.createNamespacedPod[0].body;
+    const vols = body.spec.volumes as any[];
+    return vols.find((v) => v.name === "user-data");
+  }
+
+  function userDataMount() {
+    const body = calls.createNamespacedPod[0].body;
+    const mounts = body.spec.containers[0].volumeMounts as any[];
+    return mounts.find((m) => m.name === "user-data");
+  }
+
+  it("boxConfig.persistence=true mounts the shared PVC with a per-agent subPath", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ persistence: { enabled: false, claimName: "siclaw-data" } });
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "diagnose-1", persistence: true });
+
+    expect(userDataVolume().persistentVolumeClaim).toEqual({ claimName: "siclaw-data" });
+    expect(userDataVolume().emptyDir).toBeUndefined();
+    expect(userDataMount().subPath).toBe("agents/diagnose-1");
+  });
+
+  it("boxConfig.persistence=false uses emptyDir even when global persistence is enabled", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ persistence: { enabled: true, claimName: "siclaw-data" } });
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "shopping-1", persistence: false });
+
+    expect(userDataVolume().emptyDir).toEqual({});
+    expect(userDataVolume().persistentVolumeClaim).toBeUndefined();
+    expect(userDataMount().subPath).toBeUndefined();
+  });
+
+  it("undefined boxConfig.persistence falls back to the spawner's global config (enabled)", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ persistence: { enabled: true, claimName: "siclaw-data" } });
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "legacy-1" });
+
+    expect(userDataVolume().persistentVolumeClaim).toEqual({ claimName: "siclaw-data" });
+    expect(userDataMount().subPath).toBe("agents/legacy-1");
+  });
+
+  it("undefined boxConfig.persistence falls back to the spawner's global config (disabled)", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner(); // no persistence config at all
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "legacy-2" });
+
+    expect(userDataVolume().emptyDir).toEqual({});
+    expect(userDataMount().subPath).toBeUndefined();
+  });
+
+  it("persistence requested but no claimName configured → falls back to emptyDir (no broken mount)", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner(); // global persistence undefined → no claimName
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "diagnose-2", persistence: true });
+
+    // Must not emit a PVC volume that can never bind.
+    expect(userDataVolume().persistentVolumeClaim).toBeUndefined();
+    expect(userDataVolume().emptyDir).toEqual({});
+    expect(userDataMount().subPath).toBeUndefined();
+  });
+});
