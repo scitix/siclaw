@@ -167,6 +167,17 @@ function createSpawner(
     // only when explicitly configured (helm opt or SICLAW_PERSISTENCE_CLAIM_NAME).
     const claimName = opts.k8sPersistenceClaimName ?? process.env.SICLAW_PERSISTENCE_CLAIM_NAME;
     const globalEnabled = process.env.SICLAW_PERSISTENCE_ENABLED === "true";
+    // Behaviour change vs the old hardcoded "siclaw-data" default: a raw-env
+    // deploy that set only SICLAW_PERSISTENCE_ENABLED=true (no claim name) now
+    // silently degrades to emptyDir instead of binding a PVC named "siclaw-data".
+    // Warn once at startup so that regression is visible (Helm always injects the
+    // claim name when a PVC is available, so chart users never hit this).
+    if (globalEnabled && !claimName) {
+      console.warn(
+        "[runtime] SICLAW_PERSISTENCE_ENABLED=true but SICLAW_PERSISTENCE_CLAIM_NAME is unset — " +
+        "persistence falls back to emptyDir (no shared PVC mounted; session/memory will NOT survive pod restarts)",
+      );
+    }
     // Decouple infrastructure (claimName: is a shared PVC available?) from policy
     // (enabled: the global default for callers that don't specify per-agent).
     // Pass claimName whenever it's configured — so a per-agent opt-in
