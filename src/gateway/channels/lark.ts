@@ -24,6 +24,7 @@ import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { appendMessage, ensureChatSession } from "../chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
+import { resolveAgentModelBinding } from "../agent-model-binding.js";
 import {
   openTypingCard,
   updateCardContent,
@@ -630,7 +631,20 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const handle = await agentBoxManager.getOrCreate(agentId);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
-  const promptOpts: PromptOptions = { text: buildChannelTurnPrompt(text), agentId, mode: "channel", sessionId };
+  const modelBinding = frontendClient
+    ? await resolveAgentModelBinding(agentId, frontendClient)
+    : null;
+  const promptOpts: PromptOptions = {
+    text: buildChannelTurnPrompt(text),
+    agentId,
+    mode: "channel",
+    sessionId,
+    modelProvider: modelBinding?.modelProvider,
+    modelId: modelBinding?.modelId,
+    modelConfig: modelBinding?.modelConfig,
+    modelRouting: modelBinding?.modelRouting,
+    systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
+  };
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
   let agentError: Error | null = null;
@@ -642,7 +656,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       // Audit: persist assistant + tool rows so the channel transcript matches
       // web/api/a2a (origin="channel" set on the session above). Tool output on
       // this stream is already sanitized at the agentbox boundary.
-      persist: { agentId },
+      persist: { agentId, modelConfig: modelBinding?.modelConfig },
     });
     resultText = collected.text;
     replyImages = collected.images;

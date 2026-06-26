@@ -48,6 +48,12 @@ vi.mock("../channel-manager.js", () => ({
     v !== null && typeof v === "object" && (v as { walled?: unknown }).walled === true,
 }));
 
+const resolveAgentModelBindingMock = vi.fn();
+
+vi.mock("../agent-model-binding.js", () => ({
+  resolveAgentModelBinding: (...args: unknown[]) => resolveAgentModelBindingMock(...args),
+}));
+
 const ensureChatSessionMock = vi.fn();
 const appendMessageMock = vi.fn();
 
@@ -181,8 +187,10 @@ beforeEach(() => {
   resolvePersonalBindingMock.mockReset();
   handlePersonalPairingCodeMock.mockReset();
   resetPersonalSessionMock.mockReset();
+  resolveAgentModelBindingMock.mockReset();
   ensureChatSessionMock.mockReset();
   appendMessageMock.mockReset();
+  resolveAgentModelBindingMock.mockResolvedValue(null);
   ensureChatSessionMock.mockResolvedValue(undefined);
   appendMessageMock.mockResolvedValue("msg-db-1");
   resetLarkBindingQueuesForTest();
@@ -630,6 +638,60 @@ describe("handleLarkMessage — routing to AgentBox", () => {
 
     const promptArg = promptMock.mock.calls[0][0];
     expect(promptArg).not.toHaveProperty("userId");
+  });
+
+  it("passes the resolved agent model binding into the AgentBox prompt payload", async () => {
+    const modelConfig = {
+      name: "custom",
+      baseUrl: "https://llm.example/v1",
+      apiKey: "sk-test",
+      api: "openai-completions",
+      authHeader: true,
+      models: [
+        {
+          id: "deepseek-ai/DeepSeek-V4-Pro",
+          name: "DeepSeek V4 Pro",
+          reasoning: true,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 8192,
+        },
+      ],
+    };
+    const modelRouting = {
+      enabled: true,
+      strategy: "ordered_fallback",
+      candidates: [{ provider: "fallback", modelId: "backup" }],
+    };
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    resolveAgentModelBindingMock.mockResolvedValue({
+      modelProvider: "sicore-custom-254e68c4",
+      modelId: "deepseek-ai/DeepSeek-V4-Pro",
+      modelConfig,
+      modelRouting,
+      systemPrompt: "  custom prompt  ",
+    });
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makeTextEvent("ping"),
+      makeLarkClient(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(resolveAgentModelBindingMock).toHaveBeenCalledWith("a1", expect.anything());
+    expect(promptMock).toHaveBeenCalledWith(expect.objectContaining({
+      modelProvider: "sicore-custom-254e68c4",
+      modelId: "deepseek-ai/DeepSeek-V4-Pro",
+      modelConfig,
+      modelRouting,
+      systemPromptTemplate: "custom prompt",
+    }));
   });
 
   it("persists channel sessions/messages before prompting and wraps the current request", async () => {
