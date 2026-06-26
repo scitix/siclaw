@@ -73,6 +73,7 @@ function fakeAgentBoxManager() {
   return {
     setCertManager: vi.fn(),
     setSpawnEnvResolver: vi.fn(),
+    setPersistenceResolver: vi.fn(),
     getOrCreate: vi.fn(async () => ({ endpoint: "https://fake.internal" })),
     list: vi.fn(() => []),
     cleanup: vi.fn(async () => {}),

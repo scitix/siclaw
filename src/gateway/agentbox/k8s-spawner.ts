@@ -216,11 +216,32 @@ export class K8sSpawner implements BoxSpawner {
     // Shared PVC is now scoped per-agent only — all users of the agent share
     // this subdirectory (memory is agent-shared per the 2026-04-18 spec).
     const safeAgentId = this.sanitizePathSegment(agentId);
-    if (this.config.persistence?.enabled) {
+
+    // Persistence decision is per-agent: boxConfig.persistence overrides the
+    // spawner's global config (undefined → fall back to global). Mounting the
+    // PVC requires a claimName, so an agent that requests persistence on a
+    // runtime with no shared PVC configured falls back to emptyDir (with a
+    // warning) rather than spawning a pod that can never mount.
+    const persistenceClaimName = this.config.persistence?.claimName;
+    const wantsPersistence = boxConfig.persistence ?? !!this.config.persistence?.enabled;
+    const persistenceEnabled = wantsPersistence && !!persistenceClaimName;
+    if (wantsPersistence && !persistenceClaimName) {
+      console.warn(
+        `[k8s-spawner] Agent ${agentId} requests persistence but no shared PVC claimName is configured; ` +
+        `falling back to emptyDir (session/memory will NOT survive pod restarts)`,
+      );
+    }
+    if (persistenceEnabled) {
       const subDir = `agents/${safeAgentId}`;
-      console.log(`[k8s-spawner] Persistence enabled: shared PVC "${this.config.persistence.claimName}", subPath "${subDir}"`);
+      console.log(`[k8s-spawner] Persistence enabled for agent ${agentId}: shared PVC "${persistenceClaimName}", subPath "${subDir}"`);
       this.ensureAgentDir(safeAgentId);
     }
+
+    // user-data volume: shared PVC when persistence resolved on (claimName is
+    // narrowed to string by the && below), otherwise an ephemeral emptyDir.
+    const userDataVolume: k8s.V1Volume = persistenceEnabled && persistenceClaimName
+      ? { name: "user-data", persistentVolumeClaim: { claimName: persistenceClaimName } }
+      : { name: "user-data", emptyDir: {} };
 
     // Pod definition
     const pod: k8s.V1Pod = {
@@ -266,15 +287,7 @@ export class K8sSpawner implements BoxSpawner {
             name: "knowledge-local",
             emptyDir: {},
           },
-          this.config.persistence?.enabled
-            ? {
-                name: "user-data",
-                persistentVolumeClaim: { claimName: this.config.persistence.claimName },
-              }
-            : {
-                name: "user-data",
-                emptyDir: {},
-              },
+          userDataVolume,
           {
             name: "client-cert",
             secret: { secretName: certSecretName },
@@ -320,7 +333,7 @@ export class K8sSpawner implements BoxSpawner {
               {
                 name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
-                ...(this.config.persistence?.enabled
+                ...(persistenceEnabled
                   ? { subPath: `agents/${safeAgentId}` }
                   : {}),
               },

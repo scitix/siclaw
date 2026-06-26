@@ -58,6 +58,7 @@ import { MetricsAggregator } from "./metrics-aggregator.js";
 import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
+import { resolveAgentModelBinding } from "./agent-model-binding.js";
 
 export interface RuntimeServer {
   httpServer: http.Server;
@@ -171,6 +172,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
   agentBoxManager.setSpawnEnvResolver(resolveAgentSpawnEnv);
 
+  // Per-agent PVC persistence is an AGENT property, not a per-request flag:
+  // resolve it server-side by agentId so every cold-spawn entry point (chat,
+  // channel webhooks, cron, abort/steer) lands the same mode for the same agent
+  // — not whichever caller happens to spawn the pod first. Registered on the
+  // shared manager and consulted only on a cold spawn. siclaw core leaves
+  // binding.persistence undefined → global fallback (behaviour identical to
+  // upstream); a product portal fills it in its config.getModelBinding handler.
+  agentBoxManager.setPersistenceResolver(async (agentId) => {
+    const binding = await resolveAgentModelBinding(agentId, frontendClient);
+    return binding?.persistence;
+  });
+
   // Per-session AbortController for the in-flight chat.send SSE consumer, keyed
   // by sessionId. chat.abort looks this up to break the gateway's consumeAgentSse
   // loop so its abort-finalization runs (in-flight tool rows → "stopped", partial
@@ -251,6 +264,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
 
+        // Persistence is resolved by agentId in the manager's persistenceResolver
+        // (registered in startRuntime), not from per-request params — so every
+        // entry point lands the same mode for the same agent.
         const handle = await agentBoxManager.getOrCreate(agentId);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 

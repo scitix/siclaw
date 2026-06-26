@@ -2,12 +2,18 @@ Thank you for installing {{ include "siclaw.fullname" . }}!
 
 {{- if and (eq (include "siclaw.runtime.enabled" .) "true") .Values.agentbox.persistence.enabled }}
 
-ℹ️  User data persistence is enabled.
+ℹ️  User data persistence is enabled (global default ON).
    Chart-managed PVC: "{{ include "siclaw.dataPvcName" . }}" (ReadWriteMany).
    {{- if not .Values.agentbox.persistence.storageClassName }}
    ⚠️  agentbox.persistence.storageClassName is empty — the PVC will stay Pending until you set it to a RWX-capable StorageClass (e.g. nfs, efs-sc, csi-cephfs).
    {{- end }}
    Gateway will create per-user subdirectories automatically.
+{{- else if and (eq (include "siclaw.runtime.enabled" .) "true") (eq (include "siclaw.persistence.pvcAvailable" .) "true") }}
+
+ℹ️  User data persistence: global default OFF, PVC available for per-agent opt-in.
+   Referencing existing PVC: "{{ include "siclaw.dataPvcName" . }}" (must already exist, ReadWriteMany).
+   Agents are ephemeral (emptyDir) by default; only agents whose caller sends
+   persistence:true mount the PVC. The chart does NOT create this PVC.
 {{- end }}
 
 {{- if eq (include "siclaw.runtime.enabled" .) "true" }}

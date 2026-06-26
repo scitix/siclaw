@@ -31,6 +31,12 @@ export interface ResolvedModelBinding {
   modelRouting?: ModelRoutePolicy;
   /** Agent's custom system prompt template (agents.system_prompt). Null/absent = built-in default. */
   systemPrompt?: string | null;
+  /**
+   * Per-agent session/memory persistence toggle. siclaw core leaves this
+   * undefined (no native per-agent store); a product portal that wants per-agent
+   * persistence resolves it from its own data and carries it over chat.send.
+   */
+  persistence?: boolean;
 }
 
 export async function resolveAgentModelBinding(
