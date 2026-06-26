@@ -36,7 +36,7 @@ import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
 import { resolveBinding, handlePairingCode, isChannelAccessDenied } from "../channel-manager.js";
-import { resolveAgentSystemPrompt } from "../agent-model-binding.js";
+import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "../agent-model-binding.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
 import { appendMessage, ensureChatSession } from "../chat-repo.js";
@@ -310,6 +310,14 @@ export async function handleDingTalkMessage(
   // at session creation, so an existing 1:1 multi-turn session keeps the prompt
   // it was created with until /new.
   const systemPromptTemplate = await resolveAgentSystemPrompt(agentId, frontendClient);
+  // Forward the agent's bound model so AgentBox uses it instead of its built-in
+  // default (mirrors web/api/a2a/lark — without this a model-bound agent fell
+  // back to AgentBox's default model, e.g. an invalid-key Kimi → 401 / empty
+  // reply). null-tolerant: a default-model agent leaves these undefined and
+  // keeps the default. System prompt stays sourced from resolveAgentSystemPrompt
+  // above, which (unlike the model binding) is populated for default-model
+  // agents too — so this does not regress custom prompts.
+  const modelBinding = frontendClient ? await resolveAgentModelBinding(agentId, frontendClient) : null;
 
   // Audit: persist the session + inbound user message so DingTalk sessions are
   // visible in the audit (they were previously invisible — no chat_messages at
@@ -331,7 +339,17 @@ export async function handleDingTalkMessage(
     }
   }
 
-  const promptOpts: PromptOptions = { text, agentId, mode: "channel", sessionId, systemPromptTemplate };
+  const promptOpts: PromptOptions = {
+    text,
+    agentId,
+    mode: "channel",
+    sessionId,
+    modelProvider: modelBinding?.modelProvider,
+    modelId: modelBinding?.modelId,
+    modelConfig: modelBinding?.modelConfig,
+    modelRouting: modelBinding?.modelRouting,
+    systemPromptTemplate,
+  };
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
   let agentError: Error | null = null;
@@ -341,7 +359,7 @@ export async function handleDingTalkMessage(
     // session row exists) AND image artifacts for channel delivery.
     const collected = await collectChannelResponse(client, promptResult.sessionId, "dingtalk", {
       includeImages: true,
-      persist: auditable ? { agentId } : undefined,
+      persist: auditable ? { agentId, modelConfig: modelBinding?.modelConfig } : undefined,
     });
     resultText = collected.text;
     replyImages = collected.images;
