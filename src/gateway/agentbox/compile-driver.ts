@@ -48,6 +48,11 @@ export async function driveCompile(opts: DriveCompileOptions): Promise<void> {
 
   for await (const raw of client.streamPath(`/events/${runId}`)) {
     const evt = raw as BoxEvent;
+    // Live stream to the browser (fire-and-forget), mirroring chat.event: every
+    // box event (incl. the agent's reasoning `log`) is relayed so the frontend
+    // can watch the compile like a Claude Code session. The ledger updates below
+    // stay req/response so run state is durably persisted regardless of viewers.
+    frontendClient.emitEvent("compile.event", { run_id: runId, event: evt });
     switch (evt.type) {
       case "summary":
         await frontendClient.request("compile.summary", { run_id: runId, summary: evt.summary });
