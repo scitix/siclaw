@@ -13,20 +13,28 @@ function makeClient(events: unknown[]): AgentBoxClient {
   } as unknown as AgentBoxClient;
 }
 
-function makeFrontend(): { client: FrontendWsClient; calls: Array<{ method: string; params: any }> } {
+function makeFrontend(): {
+  client: FrontendWsClient;
+  calls: Array<{ method: string; params: any }>;
+  events: Array<{ channel: string; data: any }>;
+} {
   const calls: Array<{ method: string; params: any }> = [];
+  const events: Array<{ channel: string; data: any }> = [];
   const client = {
     request: vi.fn((method: string, params: unknown) => {
       calls.push({ method, params });
       return Promise.resolve({ ok: true });
     }),
+    emitEvent: vi.fn((channel: string, data: unknown) => {
+      events.push({ channel, data });
+    }),
   } as unknown as FrontendWsClient;
-  return { client, calls };
+  return { client, calls, events };
 }
 
 describe("driveCompile", () => {
   it("starts the box and relays summary/parked/done to sicore compile.* RPCs", async () => {
-    const { client: frontendClient, calls } = makeFrontend();
+    const { client: frontendClient, calls, events } = makeFrontend();
     const checkpoint = {
       round: 1,
       contradictions: [{ id: "c1", options: ["a", "b", "unsure"] }],
@@ -52,6 +60,11 @@ describe("driveCompile", () => {
     expect(calls[0].params).toEqual({ run_id: "r1", summary: "read 5 docs" });
     expect(calls[1].params).toEqual({ run_id: "r1", checkpoint });
     expect(calls[2].params).toEqual({ run_id: "r1", bundle: "YmFzZTY0", message: "compiled" });
+
+    // Live stream: EVERY box event (incl. log + end) is relayed as compile.event.
+    expect(events.map((e) => e.channel)).toEqual(["compile.event", "compile.event", "compile.event", "compile.event", "compile.event"]);
+    expect(events.map((e) => (e.data.event as { type: string }).type)).toEqual(["summary", "log", "parked", "done", "end"]);
+    expect(events[0].data.run_id).toBe("r1");
   });
 
   it("relays box error events via the summary channel (v1 has no compile.failed)", async () => {
