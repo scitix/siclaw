@@ -260,6 +260,69 @@ describe("AgentBoxManager — persistence anchored at cold spawn (warm reuse ign
   });
 });
 
+// ── Per-agent persistence resolved by agentId (entry-point independent) ─
+//
+// The injected persistenceResolver makes persistence a true agent property:
+// any cold-spawn entry point (chat, channel, cron, abort) that passes NO
+// per-request value still gets the agent's resolved mode. An explicit config
+// value (e.g. task-coordinator's binding.persistence) wins; the resolver is
+// consulted only on a cold spawn, never on warm reuse.
+
+describe("AgentBoxManager — persistence resolved by agentId via resolver", () => {
+  it("K8s: cold spawn with no config uses the resolver's value", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPersistenceResolver(async () => true);
+
+    await mgr.getOrCreate("agent-a"); // no config — mirrors lark/dingtalk/abort
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].persistence).toBe(true);
+  });
+
+  it("Local: cold spawn with no config uses the resolver's value", async () => {
+    const spawner = new FakeSpawner("local");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPersistenceResolver(async () => true);
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls[0].persistence).toBe(true);
+  });
+
+  it("explicit config.persistence wins over the resolver", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setPersistenceResolver(async () => false);
+
+    await mgr.getOrCreate("agent-a", { persistence: true });
+    expect(spawner.spawnCalls[0].persistence).toBe(true);
+  });
+
+  it("no resolver and no config → persistence undefined (global fallback)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+
+    await mgr.getOrCreate("agent-a");
+    expect(spawner.spawnCalls[0].persistence).toBeUndefined();
+  });
+
+  it("resolver is NOT consulted on warm reuse (only cold spawn)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    let resolverCalls = 0;
+    mgr.setPersistenceResolver(async () => { resolverCalls++; return true; });
+
+    // Pod already running → warm reuse, resolver must not fire.
+    spawner.getReturns.set("agentbox-agent-a", {
+      boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    await mgr.getOrCreate("agent-a");
+
+    expect(spawner.spawnCalls).toHaveLength(0);
+    expect(resolverCalls).toBe(0);
+  });
+});
+
 // ── Health-check timer (local only) ────────────────────────────────────
 
 describe("AgentBoxManager — health check timer", () => {

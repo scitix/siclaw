@@ -40,6 +40,7 @@ export class AgentBoxManager {
   private healthCheckTimer?: ReturnType<typeof setInterval>;
   private readonly isK8s: boolean;
   private spawnEnvResolver?: (agentId: string) => Promise<Record<string, string> | undefined>;
+  private persistenceResolver?: (agentId: string) => Promise<boolean | undefined>;
 
   constructor(spawner: BoxSpawner, config?: AgentBoxManagerConfig) {
     this.spawner = spawner;
@@ -65,6 +66,22 @@ export class AgentBoxManager {
    */
   setSpawnEnvResolver(fn: (agentId: string) => Promise<Record<string, string> | undefined>): void {
     this.spawnEnvResolver = fn;
+  }
+
+  /**
+   * Inject a resolver for the per-agent PVC persistence mode. Same contract as
+   * setSpawnEnvResolver: consulted on EVERY cold spawn (from any entry point —
+   * chat RPCs, channel webhooks, cron tasks, abort/steer) and NEVER on warm
+   * reuse. This is what makes persistence a true agent-level property: the
+   * value is resolved by agentId, independent of which entry point first
+   * cold-spawns the (one-per-agent) pod. Without it, only entry points that
+   * happened to pass `config.persistence` would honour it, so a pod cold-spawned
+   * by e.g. a Lark message would silently fall to the global default and ignore
+   * the agent's configured mode. Returns undefined to fall back to the global
+   * config (the spawner gates the actual mount on a claimName regardless).
+   */
+  setPersistenceResolver(fn: (agentId: string) => Promise<boolean | undefined>): void {
+    this.persistenceResolver = fn;
   }
 
   startHealthCheck(): void {
@@ -100,19 +117,19 @@ export class AgentBoxManager {
   }
 
   /**
-   * Get a running AgentBox for the agent, or spawn one. On a cold spawn the
-   * injected `spawnEnvResolver` (if any) is consulted for per-agent env — never
-   * on warm-pod reuse, so the chat hot path and channel/cron paths pay nothing
-   * when the pod already exists.
-   */
-  /**
-   * Per-agent config (e.g. `config.persistence`) is only consumed on a COLD
-   * spawn. A pod is keyed by agentId; when one is already running it is reused
-   * as-is, so persistence is effectively anchored at the agent's first spawn.
-   * Changing it on a later call does NOT recycle the pod — K8s cannot hot-change
-   * a running pod's volume mounts — and takes effect only on the next cold spawn
-   * (after the pod restarts or is idle-released). Callers are expected to send a
-   * stable value per agent.
+   * Get a running AgentBox for the agent, or spawn one.
+   *
+   * Per-agent config — the injected `spawnEnvResolver` (env, e.g. idle timeout)
+   * and `persistenceResolver` (PVC mode) — is resolved ONLY on a cold spawn,
+   * never on warm-pod reuse, so the chat hot path and channel/cron paths pay no
+   * RPC when the pod already exists.
+   *
+   * Because a pod is keyed by agentId, the persistence/env mode is resolved on
+   * each cold spawn (including a cert-stale recreate) from the agent-level
+   * resolver — NOT from whichever entry point happens to call first. The volume
+   * mount is fixed at pod creation (K8s cannot hot-change a running pod's
+   * mounts), so a configuration change applies on the agent's next cold spawn
+   * (after restart/idle-release), not immediately on a warm pod.
    */
   async getOrCreate(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
@@ -127,9 +144,9 @@ export class AgentBoxManager {
 
     const info = await this.spawner.get(name);
     if (info && info.status === "running" && info.endpoint && this.isCertFresh(info)) {
-      // Warm reuse: return the running pod without spawning, so a changed
-      // config.persistence never reaches the pod spec (anchored at cold spawn —
-      // see getOrCreate docstring).
+      // Warm reuse: return the running pod without spawning. Per-agent config
+      // (env/persistence) is NOT re-resolved here — the pod's volume mount is
+      // already fixed, so a changed mode applies on the next cold spawn.
       return { boxId: name, endpoint: info.endpoint, agentId };
     }
     if (info && info.status === "running" && !this.isCertFresh(info)) {
@@ -142,6 +159,7 @@ export class AgentBoxManager {
     const handle = await this.spawner.spawn({
       ...config,
       agentId,
+      persistence: await this.resolvePersistence(agentId, config?.persistence),
       env: Object.keys(resolvedEnv).length > 0 ? resolvedEnv : undefined,
     });
 
@@ -155,8 +173,8 @@ export class AgentBoxManager {
       existing.lastActiveAt = new Date();
       const info = await this.spawner.get(existing.handle.boxId);
       if (info && info.status === "running") {
-        // Warm reuse: cached running box returned without spawning, so a changed
-        // config.persistence is ignored until the next cold spawn (see getOrCreate).
+        // Warm reuse: cached running box returned without spawning. Per-agent
+        // config (env/persistence) is NOT re-resolved — applies on next cold spawn.
         return existing.handle;
       }
       this.boxes.delete(agentId);
@@ -168,6 +186,7 @@ export class AgentBoxManager {
     const handle = await this.spawner.spawn({
       ...config,
       agentId,
+      persistence: await this.resolvePersistence(agentId, config?.persistence),
       env: Object.keys(resolvedEnv).length > 0 ? resolvedEnv : undefined,
     });
 
@@ -183,6 +202,18 @@ export class AgentBoxManager {
   private async resolveEnv(agentId: string, configEnv?: Record<string, string>): Promise<Record<string, string>> {
     const lazy = this.spawnEnvResolver ? (await this.spawnEnvResolver(agentId)) ?? {} : {};
     return { ...lazy, ...(configEnv ?? {}) };
+  }
+
+  /**
+   * Resolve the per-agent PVC persistence mode for a cold spawn. An explicit
+   * `configValue` (e.g. task-coordinator passing `binding.persistence`) wins;
+   * otherwise the injected `persistenceResolver` is consulted by agentId. Either
+   * may be undefined → the spawner falls back to its global config. Only called
+   * on a cold spawn, so warm-pod reuse pays no RPC.
+   */
+  private async resolvePersistence(agentId: string, configValue?: boolean): Promise<boolean | undefined> {
+    if (configValue !== undefined) return configValue;
+    return this.persistenceResolver ? await this.persistenceResolver(agentId) : undefined;
   }
 
   /**

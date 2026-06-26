@@ -44,6 +44,7 @@ function fakeAgentBoxManager() {
   return {
     setCertManager: vi.fn(),
     setSpawnEnvResolver: vi.fn(),
+    setPersistenceResolver: vi.fn(),
     getAsync: vi.fn(async () => nextHandle),
     getOrCreate: vi.fn(async () => { throw new Error("getOrCreate must not be called for liveness"); }),
     list: vi.fn(() => []),
