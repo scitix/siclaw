@@ -412,6 +412,25 @@ export function buildPilotMessages(items: ChatMessage[]): PilotMessage[] {
   return annotateSubagentCompletions(annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage))))
 }
 
+/**
+ * Recover the most recent persisted context-usage snapshot from loaded history.
+ * The Runtime stores it on the latest assistant row's `metadata.context_usage`
+ * (see sse-consumer.ts agent_end handling), so the context meter can render on
+ * session open/refresh instead of staying blank until the next live turn.
+ * Items are chronological (oldest first), so scan from the end.
+ */
+function latestContextUsageFromItems(items: ChatMessage[]): ContextUsage | null {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const md = normalizeMetadata(items[i]?.metadata)
+    const cu = md?.context_usage as ContextUsage | undefined
+    // Require percent > 0 to match the meter's render guard (InputArea), so a
+    // zero-percent snapshot (e.g. usage-less turn) doesn't shadow an earlier
+    // real one and leave the meter blank.
+    if (cu && typeof cu === "object" && typeof cu.percent === "number" && cu.percent > 0) return cu
+  }
+  return null
+}
+
 export function toPilotMessage(m: ChatMessage): PilotMessage {
   const toolArgs = m.tool_input ? tryParseJson(m.tool_input) : undefined
   const metadata = normalizeMetadata(m.metadata)
@@ -829,6 +848,13 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
         setMessages(pilotMsgs)
+        // Restore the context meter from persisted history so it shows on open/
+        // refresh — without it the meter stays blank until the next live
+        // agent_end. Only set when a snapshot is found: never blank an existing
+        // value (a cache-hit restore at line ~833, or a live agent_end that
+        // landed while this fetch was in flight).
+        const restoredUsage = latestContextUsageFromItems(items)
+        if (restoredUsage) setContextUsage(restoredUsage)
         setHasMore(items.length >= PAGE_SIZE)
         const hasRunning = hasRunningPersistedMessages(pilotMsgs)
 

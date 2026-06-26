@@ -100,6 +100,32 @@ describe("consumeAgentSse — assistant message flow", () => {
     expect(assistantRow.sessionId).toBe("sid");
   });
 
+  it("merges the agent_end context-usage snapshot onto the last assistant row's metadata", async () => {
+    // Lets the frontend restore the context meter on session reopen/refresh.
+    const cu = { tokens: 24144, contextWindow: 100000, percent: 24.1, inputTokens: 24118, outputTokens: 26 };
+    const events = [
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Hi" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hi" }] } },
+      { type: "agent_end", contextUsage: cu },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const upd = updateCalls.find((u) => u.metadata?.context_usage);
+    expect(upd).toBeDefined();
+    expect(upd.metadata.context_usage).toEqual(cu);
+    expect(upd.messageId).toBe("msg-1"); // the assistant row's id
+    expect(upd.content).toBe("Hi"); // original content re-sent (handler does content ?? "" → must not wipe)
+  });
+
+  it("does not update on agent_end when no contextUsage is present", async () => {
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hi" }] } },
+      { type: "agent_end" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    expect(updateCalls.find((u) => u.metadata?.context_usage)).toBeUndefined();
+  });
+
   it("skips assistant persistence when cleaned text is empty (pi-agent diagnostic)", async () => {
     const events = [
       { type: "message_start" },
@@ -346,6 +372,27 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
     expect(appendCalls.filter((r) => r.role === "assistant" && r.content === "hello")).toHaveLength(1);
+  });
+
+  it("folds the context-usage snapshot into the deferred assistant row (agent_end precedes commit)", async () => {
+    // Real ordering: agent_end fires BEFORE model_route_success, and the assistant
+    // persist is deferred to the commit — so the snapshot must ride the append, not
+    // a post-hoc updateMessage (the row doesn't exist yet at agent_end).
+    const cu = { tokens: 24252, contextWindow: 100000, percent: 24.25, inputTokens: 24230, outputTokens: 22 };
+    const events = [
+      { type: "model_route_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }], stopReason: "stop" } },
+      { type: "agent_end", contextUsage: cu },
+      { type: "model_route_success", attempt: 1, candidateKey: "openai/gpt-4", provider: "openai", modelId: "gpt-4", isFallback: false, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+    const row = appendCalls.find((r) => r.role === "assistant" && r.content === "hi");
+    expect(row).toBeDefined();
+    expect(row.metadata.context_usage).toEqual(cu);
+    // No post-hoc patch needed on the routed path.
+    expect(updateCalls.find((u) => u.metadata?.context_usage)).toBeUndefined();
   });
 
   it("discards a failed primary's partial reply and error on rollback, persisting only the fallback's answer", async () => {

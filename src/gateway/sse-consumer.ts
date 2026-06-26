@@ -378,6 +378,21 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // make a naive UI sum double-count the same interval N times. Tracked
   // and only emitted once.
   let firstAssistantPersisted = false;
+  // Latest persisted assistant message of the turn — so the `agent_end`
+  // context-usage snapshot can be merged onto its metadata. Persisting the
+  // snapshot lets the frontend restore the context meter when a session is
+  // reopened/refreshed (it otherwise only has it from a live agent_end, which a
+  // cold session never replays). Overwritten on each assistant message_end, so
+  // by agent_end these point at the turn's final assistant message.
+  let lastAssistantDbMessageId: string | undefined;
+  let lastAssistantContent: string | undefined;
+  let lastAssistantMetadata: Record<string, unknown> | undefined;
+  // Latest agent_end context-usage snapshot of the turn. agent_end fires BEFORE
+  // model_route_success (the commit point that runs the deferred assistant
+  // persist on routed turns — i.e. every turn), so the assistant row usually
+  // isn't written yet when agent_end arrives. We therefore stash the snapshot
+  // here and let the deferred persistAssistant fold it into the row's metadata.
+  let capturedContextUsage: Record<string, unknown> | undefined;
   let latestModelRouteSwitch: Record<string, unknown> | null = null;
   let currentModelRouteMetadata: Record<string, unknown> | null = null;
 
@@ -401,6 +416,35 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     }
 
     let dbMessageId: string | undefined;
+
+    // ── Capture context-usage snapshot from agent_end ──────────────────────
+    // The brain computes {tokens, contextWindow, percent, inputTokens, ...} and
+    // attaches it to agent_end (enrichAgentEndEvent in agentbox/http-server.ts).
+    // Persisting it in the last assistant row's metadata lets the frontend
+    // restore the context meter on session reopen/refresh (otherwise it's blank
+    // until the next live turn). Two delivery orders:
+    //   • routed turn (default): agent_end precedes the deferred persist, so the
+    //     row isn't written yet — persistAssistant folds capturedContextUsage in.
+    //   • immediate persist (non-routed): the row already exists, so patch it now.
+    // Best-effort: a persistence failure must never break the SSE stream.
+    if (eventType === "agent_end" && persist) {
+      const contextUsage = (evt as Record<string, unknown>).contextUsage;
+      if (contextUsage && typeof contextUsage === "object") {
+        capturedContextUsage = contextUsage as Record<string, unknown>;
+        if (lastAssistantDbMessageId) {
+          try {
+            await updateMessage({
+              messageId: lastAssistantDbMessageId,
+              sessionId,
+              content: lastAssistantContent ?? "",
+              metadata: { ...(lastAssistantMetadata ?? {}), context_usage: capturedContextUsage },
+            });
+          } catch (err) {
+            console.warn(`[sse-consumer] ${userId}: failed to persist context_usage:`, err);
+          }
+        }
+      }
+    }
 
     // ── Model route audit + UI notices ──────────────
     if (eventType === "model_route_start") {
@@ -763,12 +807,23 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
             };
             const persistAssistant = async () => {
-              await appendMessage({
+              // Fold in the context-usage snapshot if agent_end already arrived
+              // (the routed/default order — agent_end precedes this commit). The
+              // closure reads capturedContextUsage at RUN time, not definition time.
+              const rowMetadata = capturedContextUsage
+                ? { ...assistantRowMetadata, context_usage: capturedContextUsage }
+                : assistantRowMetadata;
+              const id = await appendMessage({
                 sessionId,
                 role: "assistant",
                 content: assistantRowContent,
-                metadata: assistantRowMetadata,
+                metadata: rowMetadata,
               });
+              // Remember the turn's latest assistant row so a later agent_end (the
+              // immediate/non-routed order) can patch the snapshot onto its metadata.
+              lastAssistantDbMessageId = id;
+              lastAssistantContent = assistantRowContent;
+              lastAssistantMetadata = rowMetadata;
               await incrementMessageCount(sessionId);
             };
             // Flip the first-assistant flag NOW (not inside the deferred op):
