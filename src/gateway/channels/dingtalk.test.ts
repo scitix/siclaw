@@ -378,6 +378,42 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
     sessionRegistry.forget(promptArg.sessionId);
   });
 
+  it("passes the resolved agent model binding into the AgentBox prompt payload", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "agent-mb", bindingId: "b1" });
+    promptMock.mockResolvedValue({ sessionId: "s-mb" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const modelConfig = {
+      name: "custom",
+      baseUrl: "https://llm.example/v1",
+      apiKey: "sk-test",
+      api: "openai-completions",
+      authHeader: true,
+      models: [{
+        id: "deepseek-ai/DeepSeek-V4-Pro", name: "DeepSeek V4 Pro", reasoning: true,
+        input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128000, maxTokens: 8192,
+      }],
+    };
+    const modelRouting = { enabled: true, strategy: "ordered_fallback", candidates: [{ provider: "fallback", modelId: "backup" }] };
+    // Method-aware mock: config.getModelBinding → full binding; config.getAgent → system prompt.
+    const frontend = { request: vi.fn(async (method: string) => {
+      if (method === "config.getModelBinding") {
+        return { binding: { modelProvider: "sicore-custom-x", modelId: "deepseek-ai/DeepSeek-V4-Pro", modelConfig, modelRouting, systemPrompt: "p" } };
+      }
+      return { system_prompt: "p" };
+    }) };
+
+    await handleDingTalkMessage(makeDownstream("hi"), "ch", makeAgentBoxManager("agent-mb") as any, undefined, frontend as any);
+
+    expect(frontend.request).toHaveBeenCalledWith("config.getModelBinding", { agentId: "agent-mb" });
+    const promptArg = promptMock.mock.calls[0][0] as any;
+    expect(promptArg.modelProvider).toBe("sicore-custom-x");
+    expect(promptArg.modelId).toBe("deepseek-ai/DeepSeek-V4-Pro");
+    expect(promptArg.modelConfig).toEqual(modelConfig);
+    expect(promptArg.modelRouting).toEqual(modelRouting);
+    sessionRegistry.forget(promptArg.sessionId);
+  });
+
   it("does not pass userId into the AgentBox prompt payload", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "a", bindingId: "b" });
     promptMock.mockResolvedValue({ sessionId: "s" });

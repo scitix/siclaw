@@ -226,6 +226,20 @@ describe("registerA2aRoutes", () => {
     expect(rows[0].session_id).toMatch(/^[0-9a-f-]{36}$/);
   });
 
+  it("forwards the agent's system prompt into chat.send", async () => {
+    const { router, conn } = await makeRouter();
+    await getDb().query("UPDATE agents SET system_prompt = ? WHERE id = ?", ["你是 SRE 专家。", "a1"]);
+    const res = await runRoute(router, fakeReq({
+      url: "/api/v1/a2a/agents/a1/message:send",
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: { message: { role: "ROLE_USER", contextId: "ctx-sp", parts: [{ text: "hi" }] } },
+    }));
+    expect(res._status).toBe(200);
+    const sent = (conn.map.sendCommand as any).mock.calls.find((c: any[]) => c[1] === "chat.send");
+    expect(sent[2].systemPrompt).toBe("你是 SRE 专家。");
+  });
+
   it("maps a non-UUID A2A context to a stable internal Siclaw session", async () => {
     const { router, conn } = await makeRouter();
     const first = await runRoute(router, fakeReq({
