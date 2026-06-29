@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { jsonSchemaToTypebox, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, mcpContentToAgentContent, McpClientManager } from "./mcp-client.js";
+import { jsonSchemaToTypebox, normalizeMcpInputSchema, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, mcpContentToAgentContent, McpClientManager } from "./mcp-client.js";
 
 describe("jsonSchemaToTypebox", () => {
   it("converts string type", () => {
@@ -166,5 +166,44 @@ describe("createToolDefinition server description", () => {
   it("applies the server context to the fallback description too", () => {
     const def = makeDef("Monitoring tenant ID: t-123");
     expect(def.description).toBe('[Server "grafana" context: Monitoring tenant ID: t-123]\nMCP tool query from grafana');
+  });
+});
+
+describe("normalizeMcpInputSchema", () => {
+  const TYPEBOX_KIND = Symbol.for("TypeBox.Kind");
+
+  it("returns a plain JSON Schema without TypeBox kind metadata", () => {
+    // This is the core invariant behind scitix/siclaw#355: MCP tool parameters
+    // must NOT carry the @sinclair/typebox Kind symbol, otherwise the pi runtime
+    // (typebox 1.x) skips its JSON-Schema arg coercion and string-encoded integers
+    // like "10" fail validation with "must be integer".
+    const result = normalizeMcpInputSchema({
+      type: "object",
+      properties: { panelId: { type: "integer" } },
+      required: ["panelId"],
+    });
+    expect(Object.getOwnPropertySymbols(result)).not.toContain(TYPEBOX_KIND);
+    // By contrast, the old TypeBox conversion DID carry the symbol.
+    const viaTypebox = jsonSchemaToTypebox({ type: "object", properties: {} });
+    expect(Object.getOwnPropertySymbols(viaTypebox)).toContain(TYPEBOX_KIND);
+  });
+
+  it("preserves properties, required and additionalProperties", () => {
+    const result = normalizeMcpInputSchema({
+      type: "object",
+      properties: { panelId: { type: "integer" }, dashboardUid: { type: "string" } },
+      required: ["panelId", "dashboardUid"],
+      additionalProperties: { type: "string" },
+    }) as any;
+    expect(result.type).toBe("object");
+    expect(result.properties.panelId).toEqual({ type: "integer" });
+    expect(result.required).toEqual(["panelId", "dashboardUid"]);
+    expect(result.additionalProperties).toEqual({ type: "string" });
+  });
+
+  it("guarantees object shape for missing/empty/invalid schemas", () => {
+    expect(normalizeMcpInputSchema(undefined) as any).toMatchObject({ type: "object", properties: {} });
+    expect(normalizeMcpInputSchema({}) as any).toMatchObject({ type: "object", properties: {} });
+    expect(normalizeMcpInputSchema([1, 2]) as any).toMatchObject({ type: "object", properties: {} });
   });
 });
