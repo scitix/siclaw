@@ -7,7 +7,8 @@
 
 import https from "node:https";
 import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
-import type { ModelRoutePolicy } from "../../core/model-routing.js";
+import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core/model-routing.js";
+import { enrichImagesFromText } from "./image-url-ingest.js";
 
 export interface AgentBoxTlsOptions {
   cert: string;
@@ -133,14 +134,34 @@ export class AgentBoxClient {
   }
 
   /**
+   * Resolve image URLs in the prompt text into vision `images`, but ONLY when the
+   * prompt's model/route can take image input (see DESIGN decision 1). Non-vision:
+   * the URL is left as plain text — the model replies it can't open it; no
+   * fail-closed turn.
+   *
+   * This is the SINGLE backend place text-URL images are resolved, covering all
+   * Gateway front-ends (Feishu / Web chat / a2a / cron). Only user→agent prompts
+   * flow through THIS client; system/synthetic prompts run inside the AgentBox
+   * process and never reach here, so this never scans system text. The fetch +
+   * SSRF allowlist stay in the Gateway process (the AgentBox pod is
+   * network-isolated and must not fetch arbitrary user URLs).
+   */
+  async #withResolvedImageUrls(opts: PromptOptions): Promise<PromptOptions> {
+    if (!modelOptionsSupportImageInput(opts)) return opts;
+    const images = await enrichImagesFromText(opts.text, opts.images ?? []);
+    return images.length ? { ...opts, images } : opts;
+  }
+
+  /**
    * Send a prompt
    */
   async prompt(opts: PromptOptions): Promise<PromptResponse> {
-    console.log(`[agentbox-client] prompt sessionId=${opts.sessionId ?? "new"}`);
+    const sendOpts = await this.#withResolvedImageUrls(opts);
+    console.log(`[agentbox-client] prompt sessionId=${sendOpts.sessionId ?? "new"}`);
     const resp = await this.fetch("/api/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(opts),
+      body: JSON.stringify(sendOpts),
     });
     const result: PromptResponse = await resp.json();
     console.log(`[agentbox-client] prompt → ok=${result.ok} sessionId=${result.sessionId}`);

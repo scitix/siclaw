@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { Readable } from "node:stream";
 import {
   buildChannelTurnPrompt,
   createLarkHandler,
@@ -221,9 +222,16 @@ describe("handleLarkMessage — payload shape guards", () => {
     expect(larkClient.im.message.reply).not.toHaveBeenCalled();
   });
 
-  it("bails on non-text message types (image, file, sticker, …)", async () => {
+  it("bails on unsupported message types (audio, file, sticker, …)", async () => {
     const larkClient = makeLarkClient();
-    const data = makeTextEvent("irrelevant", { message_type: "image" });
+    const data = makeTextEvent("irrelevant", { message_type: "audio" });
+    await handleLarkMessage(data, larkClient, "lark", makeAgentBoxManager() as any);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("bails on an image message that carries no image_key", async () => {
+    const larkClient = makeLarkClient();
+    const data = { message: { message_id: "m", chat_id: "oc_x", message_type: "image", content: "{}" } };
     await handleLarkMessage(data, larkClient, "lark", makeAgentBoxManager() as any);
     expect(resolveBindingMock).not.toHaveBeenCalled();
   });
@@ -2022,5 +2030,119 @@ describe("collectChannelResponse — audit persistence", () => {
     ];
     const collected = await collectChannelResponse(fakeClient(events), "s-fail", "lark", { persist: { agentId: "a1" } });
     expect(collected.text).toBe("still replies");
+  });
+});
+
+// ── Inbound images (text URLs + native lark) ───────────────────────────────
+
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]);
+const PNG_B64 = PNG_BYTES.toString("base64");
+
+/** Lark client whose receive-side resource API returns a PNG stream. */
+function makeLarkClientWithResource() {
+  return {
+    im: {
+      message: { reply: vi.fn().mockResolvedValue({}) },
+      messageResource: {
+        get: vi.fn().mockResolvedValue({
+          getReadableStream: () => Readable.from([PNG_BYTES]),
+          writeFile: vi.fn(),
+          headers: {},
+        }),
+      },
+    },
+  };
+}
+
+function makeImageEvent(imageKey: string, overrides: Record<string, unknown> = {}) {
+  return {
+    sender: { sender_id: { open_id: "ou_user_1" } },
+    message: {
+      message_id: "mid-img",
+      chat_id: "oc_abc123",
+      message_type: "image",
+      content: JSON.stringify({ image_key: imageKey }),
+      ...overrides,
+    },
+  };
+}
+
+function makePostEvent(text: string, imageKey: string) {
+  return {
+    sender: { sender_id: { open_id: "ou_user_1" } },
+    message: {
+      message_id: "mid-post",
+      chat_id: "oc_abc123",
+      message_type: "post",
+      content: JSON.stringify({
+        title: "",
+        content: [[{ tag: "text", text }, { tag: "img", image_key: imageKey }]],
+      }),
+    },
+  };
+}
+
+describe("handleLarkMessage — inbound images", () => {
+  it("native image message → prompt carries images + placeholder text persisted", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a1", sessionId: "session-fixed" }));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makeImageEvent("img_k1"),
+      makeLarkClientWithResource(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(promptMock).toHaveBeenCalledWith(expect.objectContaining({
+      images: [{ mimeType: "image/png", data: PNG_B64 }],
+      mode: "channel",
+    }));
+    // image-only message → placeholder, not an empty user row
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({ role: "user", content: "[image]" }));
+  });
+
+  it("post with embedded image → prompt carries images AND the caption text", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a1", sessionId: "session-fixed" }));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makePostEvent("look at this error", "img_k2"),
+      makeLarkClientWithResource(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const arg = promptMock.mock.calls[0][0];
+    expect(arg.images).toEqual([{ mimeType: "image/png", data: PNG_B64 }]);
+    expect(arg.text).toContain("look at this error");
+  });
+
+  it("text image URL → left in prompt text for the unified layer (lark no longer resolves it)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a1", sessionId: "session-fixed" }));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makeTextEvent("check this https://oss.siflow.cn/x.png"),
+      makeLarkClient(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    // The channel hands the raw URL text to AgentBoxClient.prompt; URL→image
+    // resolution (vision-gated) happens THERE, not in the channel. So no images
+    // are attached here, and the URL survives in the prompt text.
+    const arg = promptMock.mock.calls[0][0];
+    expect(arg).not.toHaveProperty("images");
+    expect(arg.text).toContain("https://oss.siflow.cn/x.png");
   });
 });

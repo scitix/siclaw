@@ -386,3 +386,84 @@ describe("AgentBoxClient — streamEvents (SSE)", () => {
     } finally { await srv.close(); }
   });
 });
+
+describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => {
+  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]);
+  function imageResponse(buf: Buffer) {
+    return {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "image/png" }),
+      arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+    } as unknown as Response;
+  }
+  function mkModelConfig(input: string[], id: string) {
+    return {
+      name: "prov", baseUrl: "http://x", apiKey: "k", api: "openai", authHeader: false,
+      models: [{ id, name: id, reasoning: false, input, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100 }],
+    };
+  }
+
+  let srv: Srv;
+  let client: AgentBoxClient;
+  let realFetch: typeof globalThis.fetch;
+
+  beforeAll(async () => {
+    srv = await startServer((req, res) => {
+      if (req.method === "POST" && req.url === "/api/prompt") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, sessionId: "s1" }));
+      } else { res.writeHead(404); res.end(); }
+    });
+    client = new AgentBoxClient(`http://127.0.0.1:${srv.port}`);
+  });
+  afterAll(async () => { await srv.close(); });
+
+  beforeEach(() => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    realFetch = globalThis.fetch.bind(globalThis);
+    // Host-split: image URLs are stubbed; the agentbox POST is forwarded to the real local server.
+    vi.stubGlobal("fetch", vi.fn(async (url: any, init: any) => {
+      if (String(url).includes("oss.siflow.cn")) return imageResponse(PNG);
+      return realFetch(url, init);
+    }));
+  });
+  afterEach(() => {
+    delete process.env.SICLAW_IMAGE_URL_ALLOWLIST;
+    vi.unstubAllGlobals();
+  });
+
+  it("vision model: resolves an allowlisted URL into images; URL stays in text", async () => {
+    await client.prompt({
+      text: "see https://oss.siflow.cn/a.png",
+      modelProvider: "openai", modelId: "gpt-4o", modelConfig: mkModelConfig(["text", "image"], "gpt-4o"),
+    });
+    const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
+    const body = JSON.parse(req.body);
+    expect(body.images).toEqual([{ mimeType: "image/png", data: PNG.toString("base64") }]);
+    expect(body.text).toContain("oss.siflow.cn/a.png"); // original URL left in text
+  });
+
+  it("non-vision model: does NOT resolve; no images, URL stays as plain text", async () => {
+    await client.prompt({
+      text: "see https://oss.siflow.cn/a.png",
+      modelProvider: "deepseek", modelId: "deepseek-chat", modelConfig: mkModelConfig(["text"], "deepseek-chat"),
+    });
+    const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
+    const body = JSON.parse(req.body);
+    expect(body.images).toBeUndefined();
+    expect(body.text).toContain("oss.siflow.cn/a.png");
+  });
+
+  it("vision routing candidate (no single-model fields): still resolves", async () => {
+    await client.prompt({
+      text: "see https://oss.siflow.cn/a.png",
+      modelRouting: {
+        enabled: true,
+        candidates: [{ provider: "openai", modelId: "gpt-4o", modelConfig: mkModelConfig(["text", "image"], "gpt-4o") }],
+      },
+    });
+    const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
+    expect(JSON.parse(req.body).images).toHaveLength(1);
+  });
+});
