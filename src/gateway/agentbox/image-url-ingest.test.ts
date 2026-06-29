@@ -4,6 +4,7 @@ import {
   assertAllowedImageUrl,
   enrichImagesFromText,
   extractImageUrls,
+  redactImageUrlsInText,
   sniffImageMime,
   type InboundImage,
 } from "./image-url-ingest.js";
@@ -225,5 +226,22 @@ describe("enrichImagesFromText", () => {
     const out = await enrichImagesFromText("https://oss.siflow.cn/a.png https://oss.siflow.cn/b.png https://oss.siflow.cn/c.png", existing);
     expect(out).toHaveLength(4);
     expect(fetchMock).toHaveBeenCalledTimes(2); // 4 - 2 existing = 2 slots → only 2 fetches
+  });
+});
+
+describe("redactImageUrlsInText", () => {
+  it("strips signed-URL query (Signature/AccessKeyId) but keeps host+path", () => {
+    expect(
+      redactImageUrlsInText("see https://oss.siflow.cn/a.jpg?Signature=secret&AccessKeyId=key here"),
+    ).toBe("see https://oss.siflow.cn/a.jpg here");
+  });
+  it("redacts multiple image URLs and leaves other text intact", () => {
+    expect(
+      redactImageUrlsInText("a https://h.cn/x.png?s=1 b https://h.cn/y.webp?t=2"),
+    ).toBe("a https://h.cn/x.png b https://h.cn/y.webp");
+  });
+  it("leaves non-image / extensionless URLs and empty text untouched", () => {
+    expect(redactImageUrlsInText("hello https://h.cn/page")).toBe("hello https://h.cn/page");
+    expect(redactImageUrlsInText("")).toBe("");
   });
 });

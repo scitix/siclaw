@@ -466,4 +466,17 @@ describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => 
     const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
     expect(JSON.parse(req.body).images).toHaveLength(1);
   });
+
+  it("redacts signed-URL credentials from the forwarded text (fetch still used the full URL)", async () => {
+    await client.prompt({
+      text: "see https://oss.siflow.cn/a.png?Signature=secret&AccessKeyId=key",
+      modelProvider: "openai", modelId: "gpt-4o", modelConfig: mkModelConfig(["text", "image"], "gpt-4o"),
+    });
+    const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
+    const body = JSON.parse(req.body);
+    expect(body.text).toContain("oss.siflow.cn/a.png");
+    expect(body.text).not.toContain("Signature"); // creds stripped from model/history text
+    expect(body.text).not.toContain("secret");
+    expect(body.images).toHaveLength(1); // ...but the image was still resolved (full URL fetched)
+  });
 });

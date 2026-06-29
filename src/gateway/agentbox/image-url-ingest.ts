@@ -150,6 +150,17 @@ export function extractImageUrls(text: string): string[] {
   return [...new Set(matches)];
 }
 
+/**
+ * Strip the query (signed-URL creds like `Signature` / `AccessKeyId`) from any
+ * image URL in the text, keeping host+path. Used before the text is persisted or
+ * sent to the model — the fetch itself uses the full URL, so this never affects
+ * resolution. Mirrors `safeUrl()` on the logging path.
+ */
+export function redactImageUrlsInText(text: string): string {
+  if (!text) return text;
+  return text.replace(IMAGE_URL_RE, (m) => safeUrl(m));
+}
+
 /** Aggregate a readable stream into a Buffer, aborting past `maxBytes`. */
 export async function streamToBuffer(stream: Readable, maxBytes: number): Promise<Buffer> {
   const chunks: Buffer[] = [];

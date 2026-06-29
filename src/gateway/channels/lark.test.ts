@@ -2190,6 +2190,27 @@ describe("handleLarkMessage — inbound images", () => {
     expect(arg).not.toHaveProperty("images");
     expect(arg.text).toContain("https://oss.siflow.cn/x.png");
   });
+
+  it("persists the user row with signed-URL credentials stripped (prompt keeps the full URL)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a1", sessionId: "session-fixed" }));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makeTextEvent("look https://oss.siflow.cn/x.png?Signature=secret"),
+      makeLarkClient(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const userRow = appendMessageMock.mock.calls.find((c) => c[0].role === "user")?.[0];
+    expect(userRow.content).toContain("oss.siflow.cn/x.png");
+    expect(userRow.content).not.toContain("Signature"); // creds stripped from the persisted row
+    // the prompt forwarded to AgentBoxClient keeps the full signed URL (client.prompt fetches it)
+    expect(promptMock.mock.calls[0][0].text).toContain("Signature=secret");
+  });
 });
 
 describe("extractInbound — post receive shapes", () => {

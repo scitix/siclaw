@@ -38,6 +38,7 @@ import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } f
 import { replyImageToLark } from "./lark-image.js";
 import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
 import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
+import { redactImageUrlsInText } from "../agentbox/image-url-ingest.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -623,12 +624,16 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
 
   console.log(`[lark] Message channel=${channelId} chat=${chatId} sender=${senderOpenId ?? "unknown"} → agent=${agentId} session=${sessionId}: "${effectiveText.slice(0, 80)}" images=${imageRefs.length}`);
 
+  // Persist with signed-URL credentials stripped (the prompt still uses the full
+  // URL — see promptText below — so resolution is unaffected). Keeps DB rows /
+  // session title free of plaintext Signature/AccessKeyId.
+  const persistedText = redactImageUrlsInText(effectiveText);
   try {
-    await ensureChatSession(sessionId, agentId, binding.createdBy, effectiveText, effectiveText, "channel");
+    await ensureChatSession(sessionId, agentId, binding.createdBy, persistedText, persistedText, "channel");
     await appendMessage({
       sessionId,
       role: "user",
-      content: effectiveText,
+      content: persistedText,
       metadata: { source: "lark", channelId, chatId, messageId, bindingId: binding.bindingId, senderOpenId, sessionKey, route },
     });
   } catch (err) {
