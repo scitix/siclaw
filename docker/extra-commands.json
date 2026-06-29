@@ -1,4 +1,165 @@
 {
   "version": 1,
-  "commands": {}
+  "commands": {
+    "sed": {
+      "category": "text",
+      "description": "stream editor for filtering and transforming text",
+      "allowedFlags": ["-e", "-n", "-E", "-i", "-f"]
+    },
+    "awk": {
+      "category": "text",
+      "description": "pattern scanning and processing language",
+      "allowedFlags": ["-F", "-v", "-f"]
+    },
+    "gawk": {
+      "category": "text",
+      "description": "GNU implementation of awk",
+      "allowedFlags": ["-F", "-v", "-f"]
+    },
+    "mawk": {
+      "category": "text",
+      "description": "fast implementation of awk",
+      "allowedFlags": ["-F", "-v", "-f"]
+    },
+    "nawk": {
+      "category": "text",
+      "description": "new awk implementation",
+      "allowedFlags": ["-F", "-v", "-f"]
+    },
+    "bc": {
+      "category": "general",
+      "description": "arbitrary precision calculator language",
+      "allowedFlags": ["-l", "-q"]
+    },
+    "nc": {
+      "category": "network",
+      "description": "arbitrary TCP and UDP connections and listens",
+      "allowedFlags": ["-l", "-p", "-u", "-v", "-w", "-z"]
+    },
+    "ncat": {
+      "category": "network",
+      "description": "concatenate and redirect sockets (nmap netcat)",
+      "allowedFlags": ["-l", "-p", "-u", "-v", "-w"]
+    },
+    "netcat": {
+      "category": "network",
+      "description": "TCP/IP swiss army knife",
+      "allowedFlags": ["-l", "-p", "-u", "-v", "-w", "-z"]
+    },
+    "socat": {
+      "category": "network",
+      "description": "multipurpose relay for bidirectional data transfer",
+      "allowedFlags": ["-d", "-v", "-u", "-U"]
+    },
+    "wget": {
+      "category": "network",
+      "description": "non-interactive network downloader",
+      "allowedFlags": ["-O", "-o", "-q", "-c", "--timeout", "-P"]
+    },
+    "sudo": {
+      "category": "process",
+      "description": "execute a command as another user",
+      "allowedFlags": ["-u", "-i", "-S", "-n", "-k"]
+    },
+    "su": {
+      "category": "process",
+      "description": "run a shell with substitute user and group IDs",
+      "allowedFlags": ["-c", "-l", "-s", "-"]
+    },
+    "nsenter": {
+      "category": "process",
+      "description": "run program in different namespaces",
+      "allowedFlags": ["-t", "-m", "-u", "-i", "-n", "-p"]
+    },
+    "chroot": {
+      "category": "process",
+      "description": "run command or interactive shell with special root directory",
+      "allowedFlags": ["--userspec", "--groups"]
+    },
+    "setpriv": {
+      "category": "process",
+      "description": "run a program with different privilege settings",
+      "allowedFlags": ["--reuid", "--regid", "--clear-groups", "--no-new-privs"]
+    },
+    "runuser": {
+      "category": "process",
+      "description": "run a command with substitute user and group ID",
+      "allowedFlags": ["-u", "-l", "-c", "-s"]
+    },
+    "xargs": {
+      "category": "process",
+      "description": "build and execute command lines from standard input",
+      "allowedFlags": ["-n", "-I", "-0", "-P", "-d", "-r"]
+    },
+    "timeout": {
+      "category": "process",
+      "description": "run a command with a time limit",
+      "allowedFlags": ["-s", "-k", "--preserve-status"]
+    },
+    "nice": {
+      "category": "process",
+      "description": "run a program with modified scheduling priority",
+      "allowedFlags": ["-n"]
+    },
+    "ionice": {
+      "category": "process",
+      "description": "set or get process I/O scheduling class and priority",
+      "allowedFlags": ["-c", "-n", "-p"]
+    },
+    "setsid": {
+      "category": "process",
+      "description": "run a program in a new session",
+      "allowedFlags": ["-c", "-w", "-f"]
+    },
+    "stdbuf": {
+      "category": "process",
+      "description": "run command with modified buffering operations for its standard streams",
+      "allowedFlags": ["-i", "-o", "-e"]
+    },
+    "watch": {
+      "category": "process",
+      "description": "execute a program periodically, showing output fullscreen",
+      "allowedFlags": ["-n", "-d", "-t", "-g"]
+    },
+    "strace": {
+      "category": "diagnostic",
+      "description": "trace system calls and signals",
+      "allowedFlags": ["-f", "-e", "-p", "-o", "-c", "-t"]
+    },
+    "ltrace": {
+      "category": "diagnostic",
+      "description": "trace library calls",
+      "allowedFlags": ["-f", "-e", "-p", "-o", "-c"]
+    },
+    "gdb": {
+      "category": "diagnostic",
+      "description": "the GNU debugger",
+      "allowedFlags": ["-p", "-x", "-batch", "--args", "-ex"]
+    },
+    "ssh": {
+      "category": "network",
+      "description": "OpenSSH remote login client",
+      "allowedFlags": ["-p", "-i", "-l", "-o", "-L", "-R", "-N", "-f"]
+    },
+    "scp": {
+      "category": "network",
+      "description": "secure copy (remote file copy program)",
+      "allowedFlags": ["-P", "-i", "-r", "-p", "-o"]
+    },
+    "sftp": {
+      "category": "network",
+      "description": "secure file transfer program",
+      "allowedFlags": ["-P", "-i", "-b", "-o", "-r"]
+    },
+    "rsync": {
+      "category": "network",
+      "description": "fast, versatile remote (and local) file-copying tool",
+      "allowedFlags": ["-a", "-v", "-z", "-r", "-e", "--delete", "--exclude"]
+    },
+    "telnet": {
+      "category": "network",
+      "description": "user interface to the TELNET protocol",
+      "allowedFlags": ["-l", "-a", "-e"]
+    }
+  }
 }
