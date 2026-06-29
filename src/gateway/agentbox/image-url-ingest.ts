@@ -244,8 +244,13 @@ export async function enrichImagesFromText(
   existing: InboundImage[] = [],
 ): Promise<InboundImage[]> {
   const out: InboundImage[] = [...existing];
-  if (out.length >= MAX_INBOUND_IMAGES) return out;
-  const urls = extractImageUrls(text);
+  const budget = MAX_INBOUND_IMAGES - out.length;
+  if (budget <= 0) return out;
+  // Bound the fan-out BEFORE firing requests: at most `budget` concurrent fetches,
+  // not one per extracted URL. extractImageUrls dedups but does not cap count, so
+  // a message with many URLs would otherwise open N outbound connections at once
+  // (transient memory / DoS / SSRF amplification).
+  const urls = extractImageUrls(text).slice(0, budget);
   if (urls.length === 0) return out;
 
   // One deadline for the whole step (a slow allowlisted host must not stall the
@@ -262,9 +267,6 @@ export async function enrichImagesFromText(
       }
     }),
   );
-  for (const img of settled) {
-    if (out.length >= MAX_INBOUND_IMAGES) break;
-    if (img) out.push(img);
-  }
+  for (const img of settled) if (img) out.push(img);
   return out;
 }

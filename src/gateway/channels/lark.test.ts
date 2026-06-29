@@ -2165,6 +2165,8 @@ describe("handleLarkMessage — inbound images", () => {
     // but the placeholder still records that the user sent an image
     expect(arg).not.toHaveProperty("images");
     expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({ role: "user", content: "[image]" }));
+    // and the prompt tells the model an image was attached but can't be read
+    expect(arg.text).toContain("cannot read images");
   });
 
   it("text image URL → left in prompt text for the unified layer (lark no longer resolves it)", async () => {

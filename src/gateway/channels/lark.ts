@@ -741,8 +741,14 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const images = visionCapable
     ? await collectInboundImages({ imageRefs, larkClient, messageId })
     : [];
+  // Non-vision model + the user sent native image(s): they were dropped (can't be
+  // used). Tell the model so it can inform the user — mirroring the text-URL path,
+  // where a non-vision model at least sees the URL and can say it can't open it.
+  const promptText = !visionCapable && imageRefs.length > 0
+    ? `${effectiveText}\n[Note: the user attached ${imageRefs.length} image(s), but the current model cannot read images.]`
+    : effectiveText;
   const promptOpts: PromptOptions = {
-    text: buildChannelTurnPrompt(effectiveText),
+    text: buildChannelTurnPrompt(promptText),
     agentId,
     mode: "channel",
     sessionId,

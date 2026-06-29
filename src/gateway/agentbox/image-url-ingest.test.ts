@@ -206,4 +206,24 @@ describe("enrichImagesFromText", () => {
     // bounded by the ~100ms total budget, NOT 2×(per-hop 5s) run sequentially
     expect(Date.now() - start).toBeLessThan(2000);
   });
+
+  it("bounds the parallel fan-out to the media budget (does not fetch every URL)", async () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    const fetchMock = vi.fn(async () => imageResponse(PNG));
+    vi.stubGlobal("fetch", fetchMock);
+    const manyUrls = Array.from({ length: 50 }, (_, i) => `https://oss.siflow.cn/img${i}.png`).join(" ");
+    const out = await enrichImagesFromText(manyUrls, []);
+    expect(out).toHaveLength(4); // capped at MAX_INBOUND_IMAGES
+    expect(fetchMock).toHaveBeenCalledTimes(4); // only 4 fetches fired, not 50 — bounded BEFORE fan-out
+  });
+
+  it("bounds the fan-out by the remaining budget when existing images are present", async () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    const fetchMock = vi.fn(async () => imageResponse(PNG));
+    vi.stubGlobal("fetch", fetchMock);
+    const existing: InboundImage[] = [{ mimeType: "image/png", data: "x" }, { mimeType: "image/png", data: "y" }];
+    const out = await enrichImagesFromText("https://oss.siflow.cn/a.png https://oss.siflow.cn/b.png https://oss.siflow.cn/c.png", existing);
+    expect(out).toHaveLength(4);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // 4 - 2 existing = 2 slots → only 2 fetches
+  });
 });
