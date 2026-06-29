@@ -705,3 +705,56 @@ describe("K8sSpawner — per-agent persistence (PVC override)", () => {
     expect(userDataMount().subPath).toBeUndefined();
   });
 });
+
+describe("K8sSpawner — nodeSelector", () => {
+  // Drive readNamespacedPod: first call 404 (new pod), then a Running pod so
+  // spawn() resolves. Lets us inspect the createNamespacedPod body.
+  function readReturnsRunningAfter404() {
+    let r = 0;
+    readPodImpl.fn = async () => {
+      r++;
+      if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return {
+        status: { phase: "Running", podIP: "10.7.7.7", conditions: [{ type: "Ready", status: "True" }] },
+        metadata: { name: "agentbox-default", labels: {} },
+      };
+    };
+  }
+
+  function podSpec() {
+    return calls.createNamespacedPod[0].body.spec;
+  }
+
+  it("applies the configured nodeSelector onto the pod spec", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ nodeSelector: { disktype: "ssd", pool: "agents" } });
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "default" });
+
+    expect(podSpec().nodeSelector).toEqual({ disktype: "ssd", pool: "agents" });
+  });
+
+  it("omits nodeSelector when not configured", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "default" });
+
+    expect(podSpec().nodeSelector).toBeUndefined();
+  });
+
+  it("omits nodeSelector when configured as an empty map", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ nodeSelector: {} });
+    s.setCertManager(cm as any);
+    readReturnsRunningAfter404();
+
+    await s.spawn({ agentId: "default" });
+
+    expect(podSpec().nodeSelector).toBeUndefined();
+  });
+});

@@ -167,6 +167,10 @@ ocr:
 # -- AgentBox (spawned at runtime by K8s spawner)
 agentbox:
   debugImage: ""
+  # Node selector applied to every spawned AgentBox pod. Constrains pods to
+  # nodes carrying all of these labels (e.g. { disktype: ssd, pool: agents }).
+  # Empty ⇒ no constraint; the scheduler picks any eligible node.
+  nodeSelector: {}
   persistence:
     # PVC persistence has two independent concepts:
     #   1. PVC availability (infrastructure) — is a shared RWX PVC present that

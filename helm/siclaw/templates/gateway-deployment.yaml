@@ -94,6 +94,12 @@ spec:
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
             {{- end }}
+            {{- if .Values.agentbox.nodeSelector }}
+            # Node scheduling constraint forwarded by the runtime spawner onto
+            # every spawned AgentBox pod (parsed as a JSON label map).
+            - name: SICLAW_AGENTBOX_NODE_SELECTOR
+              value: {{ toJson .Values.agentbox.nodeSelector | quote }}
+            {{- end }}
             - name: SICLAW_SKILLS_DIR
               value: ".siclaw/skills"
             # Phone-home upstream — auto-discover Portal if enabled, else use configured URL

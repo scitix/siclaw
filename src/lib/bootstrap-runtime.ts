@@ -184,12 +184,56 @@ function createSpawner(
     // (boxConfig.persistence, e.g. from an external portal) can mount the PVC even
     // when the global flag is off. The spawner gates the actual mount on claimName,
     // so when it's absent persistence simply degrades to emptyDir.
+    // Optional node scheduling constraint for spawned AgentBox pods. Passed as a
+    // JSON object map via env (Helm renders agentbox.nodeSelector with toJson).
+    // Malformed JSON is ignored with a warning rather than crashing startup.
+    const nodeSelector = parseNodeSelector(process.env.SICLAW_AGENTBOX_NODE_SELECTOR);
+
     return new K8sSpawner({
       namespace,
       image,
       persistence: claimName ? { enabled: globalEnabled, claimName } : undefined,
+      nodeSelector,
     });
   }
   if (kind === "process") return new ProcessSpawner();
   return new LocalSpawner(certManager, `https://127.0.0.1:${config.internalPort}`, 4000);
+}
+
+/**
+ * Parse the SICLAW_AGENTBOX_NODE_SELECTOR env var into a label map.
+ *
+ * Expects a JSON object of string→string labels (e.g. {"disktype":"ssd"}).
+ * Returns undefined for empty/unset input or anything that isn't a flat
+ * string-valued object, warning once so misconfiguration is visible without
+ * crashing runtime startup.
+ */
+function parseNodeSelector(raw: string | undefined): Record<string, string> | undefined {
+  if (!raw || !raw.trim()) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.warn(
+      `[runtime] SICLAW_AGENTBOX_NODE_SELECTOR is not valid JSON — ignoring (got: ${raw})`,
+    );
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    console.warn(
+      "[runtime] SICLAW_AGENTBOX_NODE_SELECTOR must be a JSON object of string labels — ignoring",
+    );
+    return undefined;
+  }
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value !== "string") {
+      console.warn(
+        `[runtime] SICLAW_AGENTBOX_NODE_SELECTOR label "${key}" is not a string — ignoring that entry`,
+      );
+      continue;
+    }
+    result[key] = value;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
 }

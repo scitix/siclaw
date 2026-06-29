@@ -27,9 +27,15 @@ export interface K8sSpawnerConfig {
     /** Name of the pre-existing shared PVC (e.g. "siclaw-data") */
     claimName: string;
   };
+  /**
+   * Node selector applied to every spawned AgentBox pod. Constrains pods to
+   * nodes carrying all of these labels. Empty/undefined ⇒ no constraint
+   * (scheduler picks any eligible node).
+   */
+  nodeSelector?: Record<string, string>;
 }
 
-const DEFAULT_CONFIG: Required<Omit<K8sSpawnerConfig, "persistence">> = {
+const DEFAULT_CONFIG: Required<Omit<K8sSpawnerConfig, "persistence" | "nodeSelector">> = {
   namespace: "default",
   image: "siclaw-agentbox:latest",
   imagePullPolicy: "Always",
@@ -41,7 +47,7 @@ export class K8sSpawner implements BoxSpawner {
 
   private kc: k8s.KubeConfig;
   private coreApi: k8s.CoreV1Api;
-  private config: Required<Omit<K8sSpawnerConfig, "persistence">> & Pick<K8sSpawnerConfig, "persistence">;
+  private config: Required<Omit<K8sSpawnerConfig, "persistence" | "nodeSelector">> & Pick<K8sSpawnerConfig, "persistence" | "nodeSelector">;
   private certManager: CertificateManager | null = null;
 
   constructor(config?: K8sSpawnerConfig) {
@@ -271,6 +277,9 @@ export class K8sSpawner implements BoxSpawner {
         subdomain: "agentbox-hs",
         automountServiceAccountToken: false,
         restartPolicy: "Never",
+        ...(this.config.nodeSelector && Object.keys(this.config.nodeSelector).length > 0
+          ? { nodeSelector: this.config.nodeSelector }
+          : {}),
         // ── Security: dual-user isolation (ADR-010) ─────────────────
         // Container starts as root (entrypoint fixes volume permissions,
         // then drops to agentbox via runuser). Child processes run as
