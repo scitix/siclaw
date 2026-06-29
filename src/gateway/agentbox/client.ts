@@ -7,7 +7,8 @@
 
 import https from "node:https";
 import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
-import type { ModelRoutePolicy } from "../../core/model-routing.js";
+import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core/model-routing.js";
+import { enrichImagesFromText, redactImageUrlsInText } from "./image-url-ingest.js";
 
 export interface AgentBoxTlsOptions {
   cert: string;
@@ -133,14 +134,45 @@ export class AgentBoxClient {
   }
 
   /**
+   * Resolve image URLs in the prompt text into vision `images`, but ONLY when the
+   * prompt's model/route can take image input (see DESIGN decision 1). Non-vision:
+   * the URL is left as plain text — the model replies it can't open it; no
+   * fail-closed turn.
+   *
+   * This is the SINGLE backend place text-URL images are resolved, covering ALL
+   * front-ends that reach AgentBox via this client — Feishu, DingTalk, Web chat,
+   * a2a, and cron (every `client.prompt` caller). Only user→agent prompts
+   * flow through THIS client; system/synthetic prompts run inside the AgentBox
+   * process and never reach here, so this never scans system text. The fetch +
+   * SSRF allowlist stay in the Gateway process (the AgentBox pod is
+   * network-isolated and must not fetch arbitrary user URLs).
+   *
+   * The text forwarded to AgentBox (model context + session history) has any
+   * signed-URL credentials stripped — the fetch above already used the full URL,
+   * so resolution is unaffected, but `Signature`/`AccessKeyId` don't get
+   * persisted/sent in plaintext.
+   */
+  async #withResolvedImageUrls(opts: PromptOptions): Promise<PromptOptions> {
+    const images = modelOptionsSupportImageInput(opts)
+      ? await enrichImagesFromText(opts.text, opts.images ?? [])
+      : opts.images;
+    const text = redactImageUrlsInText(opts.text);
+    if (text === opts.text && images === opts.images) return opts;
+    const next: PromptOptions = { ...opts, text };
+    if (images && images.length) next.images = images;
+    return next;
+  }
+
+  /**
    * Send a prompt
    */
   async prompt(opts: PromptOptions): Promise<PromptResponse> {
-    console.log(`[agentbox-client] prompt sessionId=${opts.sessionId ?? "new"}`);
+    const sendOpts = await this.#withResolvedImageUrls(opts);
+    console.log(`[agentbox-client] prompt sessionId=${sendOpts.sessionId ?? "new"}`);
     const resp = await this.fetch("/api/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(opts),
+      body: JSON.stringify(sendOpts),
     });
     const result: PromptResponse = await resp.json();
     console.log(`[agentbox-client] prompt → ok=${result.ok} sessionId=${result.sessionId}`);

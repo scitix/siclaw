@@ -36,6 +36,9 @@ import {
 } from "./lark-card.js";
 import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 import { replyImageToLark } from "./lark-image.js";
+import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
+import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
+import { redactImageUrlsInText } from "../agentbox/image-url-ingest.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -285,6 +288,86 @@ function isBotMentioned(message: any, botOpenId?: string): boolean {
   return mentions.some((m) => m.key !== "@_all");
 }
 
+/**
+ * Placeholder text for an image-only message (no caption). Keeps the user
+ * message row, session title, and prompt non-empty so the audit transcript
+ * still shows "user sent image(s)".
+ */
+const IMAGE_ONLY_PLACEHOLDER = "[image]";
+
+/**
+ * Pull the user text and any inbound image references out of a Feishu message.
+ * This is the ONLY place message content is parsed — `imageRefs` is carried
+ * through the queue as a structured value (no re-parse downstream).
+ *
+ *   - text  → `content.text`
+ *   - image → `content.image_key`
+ *   - post  → rich text whose `content` is a `Node[][]` (array of paragraphs of
+ *             nodes); flatten and split by `tag`: img → image_key, text → text.
+ *
+ * Unknown types yield empty text + no refs (caller drops them).
+ */
+export function extractInbound(message: any): { text: string; imageRefs: LarkImageRef[] } {
+  const msgType: string = message?.message_type;
+  let raw: any;
+  try {
+    raw = JSON.parse(message?.content ?? "");
+  } catch {
+    return { text: "", imageRefs: [] };
+  }
+
+  if (msgType === "text") {
+    return { text: stripMentions(typeof raw?.text === "string" ? raw.text : ""), imageRefs: [] };
+  }
+
+  if (msgType === "image") {
+    const imageKey = typeof raw?.image_key === "string" ? raw.image_key : null;
+    return { text: "", imageRefs: imageKey ? [{ imageKey }] : [] };
+  }
+
+  if (msgType === "post") {
+    const imageRefs: LarkImageRef[] = [];
+    const textParts: string[] = [];
+    // Post content is normally delivered flat as `{ title, content: Node[][] }`,
+    // but some Feishu API/SDK versions deliver the locale-nested send-shape
+    // `{ zh_cn: { title, content }, en_us: {…} }` on receive — accept both so a
+    // nested payload is not silently dropped (it would otherwise yield neither
+    // text nor image and the whole turn would be discarded).
+    const post = Array.isArray(raw?.content) ? raw : firstLocalePost(raw);
+    if (typeof post?.title === "string" && post.title) textParts.push(post.title);
+    const paragraphs: any[][] = Array.isArray(post?.content) ? post.content : [];
+    for (const node of paragraphs.flat()) {
+      if (node?.tag === "img" && typeof node?.image_key === "string") {
+        imageRefs.push({ imageKey: node.image_key });
+      } else if ((node?.tag === "text" || node?.tag === "a") && typeof node?.text === "string") {
+        textParts.push(node.text);
+      }
+      // A hyperlink's href may itself be an image URL — surface it so the unified
+      // text-URL resolver (AgentBoxClient.prompt) can pick it up.
+      if (node?.tag === "a" && typeof node?.href === "string") {
+        textParts.push(node.href);
+      }
+    }
+    return { text: stripMentions(textParts.join(" ")), imageRefs };
+  }
+
+  return { text: "", imageRefs: [] };
+}
+
+function stripMentions(text: string): string {
+  return text.replace(/@_user_\d+/g, "").trim();
+}
+
+/** Feishu post may arrive locale-nested as `{ zh_cn: { content: Node[][] } }`;
+ *  pick the first locale block that carries a `content` array. */
+function firstLocalePost(raw: any): any {
+  if (!raw || typeof raw !== "object") return undefined;
+  for (const v of Object.values(raw)) {
+    if (v && typeof v === "object" && Array.isArray((v as any).content)) return v;
+  }
+  return undefined;
+}
+
 export function buildChannelTurnPrompt(text: string): string {
   return [
     "<channel-turn>",
@@ -334,17 +417,14 @@ export async function handleLarkMessage(
   // is still visible. Lets us tell "never delivered" from "silently dropped".
   console.log(`[lark] recv event chat=${chatId} chat_type=${chatType} msg_type=${msgType} sender=${senderOpenId ?? "?"} channelCfg=${channelId}`);
 
-  if (msgType !== "text") return;
+  // Accept text, native image, and rich-text (post, may embed images). Other
+  // types (audio/file/sticker/…) are still dropped.
+  if (msgType !== "text" && msgType !== "image" && msgType !== "post") return;
 
-  let text: string;
-  try {
-    const content = JSON.parse(message.content);
-    text = content.text;
-  } catch { return; }
-
-  if (!text || text.trim().length === 0) return;
-  text = text.replace(/@_user_\d+/g, "").trim();
-  if (text.length === 0) return;
+  const { text, imageRefs } = extractInbound(message);
+  // Drop only when there is neither text NOR an image — an image-only message
+  // has empty text but must continue.
+  if (text.length === 0 && imageRefs.length === 0) return;
 
   const personalBot = channelConfig?.personal_bot;
   const personalChannelId = personalBot?.channel_id ?? channelId;
@@ -386,6 +466,7 @@ export async function handleLarkMessage(
     const queueKey = `${binding.bindingId}:${personalSessionKey}`;
     const queued = enqueueBindingTask(queueKey, () => processQueuedLarkMessage({
       text,
+      imageRefs,
       messageId,
       chatId,
       senderOpenId,
@@ -461,6 +542,7 @@ export async function handleLarkMessage(
   const queueKey = `${binding.bindingId}:${binding.sessionKey ?? "__binding__"}`;
   const queued = enqueueBindingTask(queueKey, () => processQueuedLarkMessage({
     text,
+    imageRefs,
     messageId,
     chatId,
     senderOpenId,
@@ -482,6 +564,7 @@ export async function handleLarkMessage(
 
 interface QueuedLarkMessageContext {
   text: string;
+  imageRefs: LarkImageRef[];
   messageId: string;
   chatId: string;
   senderOpenId: string | null;
@@ -498,6 +581,7 @@ interface QueuedLarkMessageContext {
 async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<void> {
   const {
     text,
+    imageRefs,
     messageId,
     chatId,
     senderOpenId,
@@ -516,6 +600,14 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     return;
   }
 
+  // After the command branch (matched on the raw text): an image whose caption
+  // is exactly a command word (e.g. "/new") is routed as that command and its
+  // image dropped — an accepted edge, since commands are exact-match only.
+  // An image-only message has empty text, so give it a placeholder. Replace
+  // `text` uniformly here (not just in promptOpts) so the session title,
+  // persisted user row, and logs all show "user sent image(s)".
+  const effectiveText = text.length === 0 && imageRefs.length > 0 ? IMAGE_ONLY_PLACEHOLDER : text;
+
   const binding = await resolveQueuedBinding(route, channelId, chatId, senderOpenId, frontendClient!, sessionKey);
   if (!binding) {
     console.log(`[lark] Binding disappeared before queued run channel=${channelId} chat=${chatId} route=${route}`);
@@ -530,14 +622,18 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const sessionId = binding.sessionId;
   sessionRegistry.remember(sessionId, binding.createdBy, agentId);
 
-  console.log(`[lark] Message channel=${channelId} chat=${chatId} sender=${senderOpenId ?? "unknown"} → agent=${agentId} session=${sessionId}: "${text.slice(0, 80)}"`);
+  console.log(`[lark] Message channel=${channelId} chat=${chatId} sender=${senderOpenId ?? "unknown"} → agent=${agentId} session=${sessionId}: "${effectiveText.slice(0, 80)}" images=${imageRefs.length}`);
 
+  // Persist with signed-URL credentials stripped (the prompt still uses the full
+  // URL — see promptText below — so resolution is unaffected). Keeps DB rows /
+  // session title free of plaintext Signature/AccessKeyId.
+  const persistedText = redactImageUrlsInText(effectiveText);
   try {
-    await ensureChatSession(sessionId, agentId, binding.createdBy, text, text, "channel");
+    await ensureChatSession(sessionId, agentId, binding.createdBy, persistedText, persistedText, "channel");
     await appendMessage({
       sessionId,
       role: "user",
-      content: text,
+      content: persistedText,
       metadata: { source: "lark", channelId, chatId, messageId, bindingId: binding.bindingId, senderOpenId, sessionKey, route },
     });
   } catch (err) {
@@ -634,8 +730,30 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const modelBinding = frontendClient
     ? await resolveAgentModelBinding(agentId, frontendClient)
     : null;
+  // Native Lark images are vision-gated too, mirroring the text-URL path: a
+  // non-vision model can't use them and would fail-closed at AgentBox media
+  // filtering, so skip the download entirely for non-vision models (the [image]
+  // placeholder in effectiveText still records that the user sent an image).
+  // Text image URLs are NOT handled here — they are resolved generically (and
+  // vision-gated) at the `AgentBoxClient.prompt()` boundary, shared with Portal
+  // Web chat / a2a / cron.
+  const visionCapable = modelOptionsSupportImageInput({
+    modelProvider: modelBinding?.modelProvider,
+    modelId: modelBinding?.modelId,
+    modelConfig: modelBinding?.modelConfig,
+    modelRouting: modelBinding?.modelRouting,
+  });
+  const images = visionCapable
+    ? await collectInboundImages({ imageRefs, larkClient, messageId })
+    : [];
+  // Non-vision model + the user sent native image(s): they were dropped (can't be
+  // used). Tell the model so it can inform the user — mirroring the text-URL path,
+  // where a non-vision model at least sees the URL and can say it can't open it.
+  const promptText = !visionCapable && imageRefs.length > 0
+    ? `${effectiveText}\n[Note: the user attached ${imageRefs.length} image(s), but the current model cannot read images.]`
+    : effectiveText;
   const promptOpts: PromptOptions = {
-    text: buildChannelTurnPrompt(text),
+    text: buildChannelTurnPrompt(promptText),
     agentId,
     mode: "channel",
     sessionId,
@@ -644,6 +762,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     modelConfig: modelBinding?.modelConfig,
     modelRouting: modelBinding?.modelRouting,
     systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
+    ...(images.length ? { images } : {}),
   };
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];

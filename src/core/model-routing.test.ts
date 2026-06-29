@@ -8,6 +8,7 @@ import {
   createModelRouteState,
   isModelRoutePolicyEnabled,
   markModelRouteUserSelection,
+  modelOptionsSupportImageInput,
   normalizeCandidates,
   normalizeModelRoutePolicy,
   normalizeModelRouteState,
@@ -1384,6 +1385,70 @@ describe("runPromptWithModelRouting", () => {
       lastSuccessAt: 2,
       lastFailureAt: undefined,
     });
+  });
+});
+
+describe("modelOptionsSupportImageInput", () => {
+  const visionModelConfig = { models: [{ id: "gpt-4o", input: ["text", "image"] }] };
+  const textModelConfig = { models: [{ id: "deepseek-chat", input: ["text"] }] };
+
+  it("single model: true when modelConfig declares image input", () => {
+    expect(
+      modelOptionsSupportImageInput({ modelProvider: "openai", modelId: "gpt-4o", modelConfig: visionModelConfig }),
+    ).toBe(true);
+  });
+
+  it("single model: false when modelConfig declares only text", () => {
+    expect(
+      modelOptionsSupportImageInput({ modelProvider: "deepseek", modelId: "deepseek-chat", modelConfig: textModelConfig }),
+    ).toBe(false);
+  });
+
+  it("routed: true when ANY candidate is image-capable", () => {
+    const modelRouting: ModelRoutePolicy = {
+      enabled: true,
+      candidates: [
+        { provider: "deepseek", modelId: "deepseek-chat", modelConfig: textModelConfig },
+        { provider: "openai", modelId: "gpt-4o", modelConfig: visionModelConfig },
+      ],
+    };
+    expect(modelOptionsSupportImageInput({ modelRouting })).toBe(true);
+  });
+
+  it("routed: false when no candidate is image-capable", () => {
+    const modelRouting: ModelRoutePolicy = {
+      enabled: true,
+      candidates: [{ provider: "deepseek", modelId: "deepseek-chat", modelConfig: textModelConfig }],
+    };
+    expect(modelOptionsSupportImageInput({ modelRouting })).toBe(false);
+  });
+
+  it("false when no model info at all", () => {
+    expect(modelOptionsSupportImageInput({})).toBe(false);
+    expect(modelOptionsSupportImageInput({ modelProvider: "openai", modelId: "gpt-4o" })).toBe(false);
+  });
+
+  it("routing candidates take precedence over single-model fields", () => {
+    const modelRouting: ModelRoutePolicy = {
+      enabled: true,
+      candidates: [{ provider: "openai", modelId: "gpt-4o", modelConfig: visionModelConfig }],
+    };
+    expect(
+      modelOptionsSupportImageInput({ modelProvider: "x", modelId: "y", modelConfig: textModelConfig, modelRouting }),
+    ).toBe(true);
+  });
+
+  it("disabled routing: vision candidates ignored, falls back to single model", () => {
+    const modelRouting: ModelRoutePolicy = {
+      enabled: false,
+      candidates: [{ provider: "openai", modelId: "gpt-4o", modelConfig: visionModelConfig }],
+    };
+    // disabled policy won't use its candidates → must not report vision from them
+    expect(modelOptionsSupportImageInput({ modelRouting })).toBe(false);
+    // disabled → judged by the single model's own declared input instead
+    expect(
+      modelOptionsSupportImageInput({ modelRouting, modelProvider: "openai", modelId: "gpt-4o", modelConfig: visionModelConfig }),
+    ).toBe(true);
   });
 });
 
