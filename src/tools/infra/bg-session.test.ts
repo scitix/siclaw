@@ -14,6 +14,12 @@ const {
   killRemoteSessionViaSsh,
 } = await import("./bg-session.js");
 
+// NOTE: the assertions below check SHELL-STRING COMPOSITION only — they intentionally do not
+// exercise runtime semantics (real exit-status propagation, or the `pkill -s <sid>` reap chain),
+// which are the two guarantees this wrapper exists to provide. Those depend on `setsid(2)` /
+// process-group behavior that can't be observed without a real Linux shell, so they are verified
+// manually on a CentOS 7 / BusyBox target (see the PR's manual test plan) rather than in CI. A
+// green run of this file alone does not prove the runtime contract holds.
 describe("bg-session", () => {
   it("builds a unique, sanitized pidfile path", () => {
     const a = backgroundPgidFile("functions.host_exec:0");

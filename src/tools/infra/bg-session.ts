@@ -45,6 +45,16 @@ export function backgroundPgidFile(toolCallId: string): string {
  *
  * The inner `sh -c` records its own pid via `echo $$`; setsid has already made that pid the new
  * session id, so `pkill -s <sid>` still reaps the whole tree (incl. timeout's own process group).
+ *
+ * LOAD-BEARING CONTRACT — two assumptions this correctness depends on:
+ *   1. The launching shell must NOT exec-optimize a multi-command sequence. POSIX shells
+ *      (bash/dash/ash/busybox sh) run `<cmd>; exit $?` as a forked child, which is exactly what
+ *      keeps setsid a non-leader so it exec's in place. A shell that tail-call-optimized the
+ *      sequence would let setsid inherit leader status, fork internally, and — with no `-w` —
+ *      the parent would exit 0 immediately, silently dropping the real exit code.
+ *   2. Do NOT "simplify" this to `exec setsid …`. `exec` makes setsid inherit the launching
+ *      shell's process-group-leader status, which triggers the same internal fork + lost exit
+ *      code regression. The forked-child path (no `exec`) is required, not incidental.
  */
 export function wrapBackgroundSession(innerCmd: string, pgidFile: string): string {
   const launch = `echo $$ > ${pgidFile}; ${innerCmd}; rc=$?; rm -f ${pgidFile}; exit $rc`;
