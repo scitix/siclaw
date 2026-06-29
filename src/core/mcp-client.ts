@@ -1,7 +1,7 @@
 /**
  * MCP Client Manager — connects to external MCP servers and exposes their tools
- * as pi-agent ToolDefinitions (TypeBox schema) for the pi-agent brain,
- * and as raw config for the Claude SDK brain (native MCP support).
+ * as pi-agent ToolDefinitions (raw MCP JSON Schema as parameters) for the
+ * pi-agent brain, and as raw config for the Claude SDK brain (native MCP support).
  *
  * Supports three transport types: stdio, sse, streamable-http.
  * Config loaded from .siclaw/config/settings.json mcpServers field.
@@ -55,12 +55,41 @@ interface ManagedMcpClient {
 }
 
 // ---------------------------------------------------------------------------
+// MCP inputSchema handling
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize an MCP tool `inputSchema` into the JSON Schema object passed to the
+ * pi runtime as a tool's `parameters`.
+ *
+ * We intentionally keep this as a *plain JSON Schema* (no TypeBox kind metadata)
+ * so the runtime's argument coercion runs — see the detailed note in
+ * `createToolDefinition` and scitix/siclaw#355. We only guarantee the object
+ * shape the providers and validator expect (`type: "object"` + `properties`),
+ * preserving any other fields (`required`, `additionalProperties`, ...).
+ */
+export function normalizeMcpInputSchema(schema: any): TSchema {
+  const base = schema && typeof schema === "object" && !Array.isArray(schema) ? schema : {};
+  const normalized = {
+    ...base,
+    type: "object" as const,
+    properties: base.properties ?? {},
+  };
+  // Cast: ToolDefinition.parameters is typed as TSchema, but the pi runtime accepts
+  // (and here requires) a raw JSON Schema object at runtime.
+  return normalized as unknown as TSchema;
+}
+
+// ---------------------------------------------------------------------------
 // JSON Schema → TypeBox conversion
 // ---------------------------------------------------------------------------
 
 /**
  * Convert a JSON Schema object (as returned by MCP tool inputSchema) to a
  * TypeBox TSchema. Covers the common subset used by MCP tools.
+ *
+ * NOTE: No longer used for MCP tool `parameters` (see `normalizeMcpInputSchema`
+ * and scitix/siclaw#355). Retained for compatibility / potential reuse.
  */
 export function jsonSchemaToTypebox(schema: any): TSchema {
   if (!schema || typeof schema !== "object") return Type.Any();
@@ -285,7 +314,18 @@ export class McpClientManager {
   ): ToolDefinition {
     const fullName = buildMcpToolName(serverName, mcpTool.name);
     const inputSchema = mcpTool.inputSchema ?? { type: "object", properties: {} };
-    const parameters = jsonSchemaToTypebox(inputSchema);
+    // Pass the MCP inputSchema through as raw JSON Schema instead of converting it
+    // into a @sinclair/typebox TSchema. The pi runtime validates and coerces tool
+    // arguments with a *different* TypeBox package (`typebox` 1.x, bundled under
+    // @earendil-works/pi-ai) whose schema-kind detection (`~kind` string prop) is
+    // incompatible with @sinclair/typebox 0.34's metadata (`Symbol.for('TypeBox.Kind')`).
+    // Converting here silently disables string→number/boolean coercion (e.g. "10" → 10):
+    // `Value.Convert` no-ops and pi-ai's JSON-Schema coercion fallback is skipped because
+    // `hasTypeBoxMetadata` detects the 0.34 symbol — so integer/object params such as
+    // get_panel_image's `panelId` fail validation with "must be integer". Raw JSON Schema
+    // leaves the kind metadata absent, letting pi-ai's coercion path run, and providers
+    // advertise tools straight from `.properties`/`.required`. See scitix/siclaw#355.
+    const parameters = normalizeMcpInputSchema(inputSchema);
 
     // Prepend the admin-provided server description so the model sees server-level
     // context (e.g. monitoring tenant IDs) on every tool from that server.
