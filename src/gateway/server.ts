@@ -24,7 +24,7 @@ import https from "node:https";
 import type { RuntimeConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
-import { driveCompile } from "./agentbox/compile-driver.js";
+import { driveCompile, driveSession } from "./agentbox/compile-driver.js";
 import {
   type RpcHandler,
   type RpcContext,
@@ -362,21 +362,55 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // run id (the box is spawned with agentId == run_id). sicore routes
   // compile.start here by the run's runtime_id (ConnectionMap's runtime-direct
   // path), then steer/resume reach the same box by run_id.
+  //
+  // Local development escape hatch: point SICLAW_COMPILE_BOX_ENDPOINT at a
+  // manually started kbc compile_box.py (usually http://127.0.0.1:3000). That
+  // lets developers reuse their local Claude Code/OAuth session while still
+  // testing the sicore↔runtime source-bundle protocol.
+  const localCompileBoxEndpoint = process.env.SICLAW_COMPILE_BOX_ENDPOINT?.trim();
+  const compileBoxClient = async (runId: string, orgId?: string): Promise<AgentBoxClient> => {
+    if (localCompileBoxEndpoint) {
+      return new AgentBoxClient(localCompileBoxEndpoint, 30000, agentBoxTlsOptions);
+    }
+    const handle = await agentBoxManager.getOrCreate(runId, { boxType: "compile", orgId });
+    return new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+  };
+  const existingCompileBoxClient = async (runId: string): Promise<AgentBoxClient> => {
+    if (localCompileBoxEndpoint) {
+      return new AgentBoxClient(localCompileBoxEndpoint, 30000, agentBoxTlsOptions);
+    }
+    const handle = await agentBoxManager.getAsync(runId);
+    if (!handle) throw new Error(`compile box for run ${runId} not found`);
+    return new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+  };
 
   rpcMethods.set("compile.start", async (params) => {
     const runId = params.run_id as string;
     const orgId = params.org_id as string | undefined;
     const round = typeof params.round === "number" ? params.round : 1;
     const sourceRef = params.source_ref as string | undefined;
+    const instruction = params.instruction as string | undefined;
+    const authoringBundleBase64 = params.authoring_bundle_base64 as string | undefined;
+    const authoringBundleSHA256 = params.authoring_bundle_sha256 as string | undefined;
+    const authoringBundleSizeBytes = typeof params.authoring_bundle_size_bytes === "number" ? params.authoring_bundle_size_bytes : undefined;
     if (!runId) throw new Error("run_id is required");
 
     // Async-ack: spawn the compile box and drive its stream in the background;
     // the box relays summary/parked/done back to sicore via compile.* RPCs.
     (async () => {
       try {
-        const handle = await agentBoxManager.getOrCreate(runId, { boxType: "compile", orgId });
-        const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
-        await driveCompile({ client, runId, round, sourceRef, frontendClient });
+        const client = await compileBoxClient(runId, orgId);
+        await driveCompile({
+          client,
+          runId,
+          round,
+          sourceRef,
+          instruction,
+          authoringBundleBase64,
+          authoringBundleSHA256,
+          authoringBundleSizeBytes,
+          frontendClient,
+        });
       } catch (err) {
         console.error(`[runtime] compile.start background failure run=${runId}:`, err);
         // No compile.failed RPC in v1; surface via summary so the owner sees it.
@@ -393,9 +427,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const runId = params.run_id as string;
     const rulings = params.rulings;
     if (!runId) throw new Error("run_id is required");
-    const handle = await agentBoxManager.getAsync(runId);
-    if (!handle) throw new Error(`compile box for run ${runId} not found`);
-    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+    const client = await existingCompileBoxClient(runId);
     await client.postJson("/rulings", { run_id: runId, rulings });
     return { ok: true };
   });
@@ -408,13 +440,57 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // still live this is equivalent to steer; if it was spun down we cannot
     // resume a parked compile yet. (Follow-up: respawn + SDK resume(session_ref)
     // + re-POST rulings.)
-    const handle = await agentBoxManager.getAsync(runId);
-    if (!handle) {
-      throw new Error(`compile box for run ${runId} is gone; resume-from-session not implemented (v1 live-steer only)`);
-    }
-    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+    const client = await existingCompileBoxClient(runId);
     await client.postJson("/rulings", { run_id: runId, rulings });
     return { ok: true };
+  });
+
+  // ── KB session (persistent conversational + compiling box) ──────────────
+  // Unlike compile.start (one-shot), a session box is started lazily on the first
+  // message (prepare chat) and stays alive across turns. We keep ONE event-relay
+  // loop per run; the map entry lives for the loop's lifetime so a later message
+  // reattaches to the same box instead of spawning a second relay. The entry is
+  // dropped when the loop ends (box spun down / died) so the next message respawns.
+  const compileSessions = new Map<string, Promise<{ client: AgentBoxClient }>>();
+  const ensureCompileSession = (runId: string, orgId: string | undefined, instruction: string | undefined) => {
+    let pending = compileSessions.get(runId);
+    if (!pending) {
+      pending = (async () => {
+        const client = await compileBoxClient(runId, orgId);
+        await client.postJson(`/session/${runId}`, { instruction: instruction ?? "" });
+        // Relay loop runs detached for the session's lifetime.
+        driveSession({ client, runId, frontendClient })
+          .catch(async (err) => {
+            console.error(`[runtime] compile session relay failed run=${runId}:`, err);
+            await frontendClient
+              .request("compile.failed", { run_id: runId, error: err instanceof Error ? err.message : String(err) })
+              .catch(() => {});
+          })
+          .finally(() => {
+            compileSessions.delete(runId);
+          });
+        return { client };
+      })();
+      // Set synchronously (no await between get and set) so concurrent first
+      // messages share ONE session + relay loop.
+      compileSessions.set(runId, pending);
+      // If session start itself failed, drop the entry so a retry can respawn.
+      pending.catch(() => compileSessions.delete(runId));
+    }
+    return pending;
+  };
+
+  rpcMethods.set("compile.message", async (params) => {
+    const runId = params.run_id as string;
+    const orgId = params.org_id as string | undefined;
+    const instruction = params.instruction as string | undefined;
+    const message = params.message as string;
+    if (!runId) throw new Error("run_id is required");
+    if (!message) throw new Error("message is required");
+    // Ensure the box session + relay loop (once), then inject the user turn.
+    const { client } = await ensureCompileSession(runId, orgId, instruction);
+    await client.postJson(`/message/${runId}`, { message });
+    return { ok: true, run_id: runId };
   });
 
   rpcMethods.set("chat.abort", async (params) => {

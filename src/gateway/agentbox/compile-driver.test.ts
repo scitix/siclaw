@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { driveCompile } from "./compile-driver.js";
+import { driveCompile, driveSession } from "./compile-driver.js";
 import type { AgentBoxClient } from "./client.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 
@@ -121,5 +121,49 @@ describe("driveCompile", () => {
 
     expect(calls.map((c) => c.method)).toEqual(["compile.sourceBundle", "compile.syncArtifacts", "compile.done"]);
     expect(calls[1].params).toEqual({ run_id: "r1", artifacts });
+  });
+
+  it("relays a conversational turn_done to compile.assistantTurn (prepare chat persist)", async () => {
+    const { client: frontendClient, calls, events } = makeFrontend();
+    const client = makeClient([
+      { type: "log", text: "let me think" },
+      { type: "turn_done", text: "Here is my answer." },
+    ]);
+
+    await driveCompile({ client, runId: "r1", round: 1, frontendClient });
+
+    // log is box-local (live only); turn_done persists the assistant reply.
+    expect(calls.map((c) => c.method)).toEqual(["compile.sourceBundle", "compile.assistantTurn"]);
+    expect(calls[1].params).toEqual({ run_id: "r1", text: "Here is my answer." });
+    expect(events.map((e) => (e.data.event as { type: string }).type)).toEqual(["log", "turn_done"]);
+  });
+});
+
+describe("driveSession", () => {
+  it("relays the session stream WITHOUT the compile setup POSTs", async () => {
+    const { client: frontendClient, calls, events } = makeFrontend();
+    const client = makeClient([
+      { type: "log", text: "thinking out loud" },
+      { type: "turn_done", text: "the KB should cover X and Y" },
+      { type: "end" },
+    ]);
+
+    await driveSession({ client, runId: "s1", frontendClient });
+
+    // A session is started/fed by the compile.message handler, not the relay —
+    // so driveSession never POSTs /sources|/authoring|/compile.
+    expect(client.postJson as any).not.toHaveBeenCalled();
+    expect(calls.map((c) => c.method)).toEqual(["compile.assistantTurn"]);
+    expect(calls[0].params).toEqual({ run_id: "s1", text: "the KB should cover X and Y" });
+    expect(events.map((e) => (e.data.event as { type: string }).type)).toEqual(["log", "turn_done", "end"]);
+  });
+
+  it("an empty turn_done relays an empty text (sicore no-ops, e.g. a pure tool turn)", async () => {
+    const { client: frontendClient, calls } = makeFrontend();
+    const client = makeClient([{ type: "turn_done" }, { type: "end" }]);
+
+    await driveSession({ client, runId: "s1", frontendClient });
+
+    expect(calls).toEqual([{ method: "compile.assistantTurn", params: { run_id: "s1", text: "" } }]);
   });
 });

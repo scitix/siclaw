@@ -85,12 +85,36 @@ export async function driveCompile(opts: DriveCompileOptions): Promise<void> {
     instruction: instruction ?? "",
   });
 
+  await relayBoxEvents(client, runId, frontendClient);
+}
+
+export interface DriveSessionOptions {
+  client: AgentBoxClient;
+  runId: string;
+  frontendClient: FrontendWsClient;
+}
+
+/**
+ * Drive a persistent conversational box session: just relay its event stream to
+ * sicore until the box emits `end`. The session itself is started (POST /session)
+ * and fed turns (POST /message) by the compile.message handler in server.ts; this
+ * is the long-lived consumer that turns box events into compile.* RPCs + the live
+ * browser stream — the same relay the one-shot compile uses, minus the setup.
+ */
+export async function driveSession(opts: DriveSessionOptions): Promise<void> {
+  await relayBoxEvents(opts.client, opts.runId, opts.frontendClient);
+}
+
+/**
+ * Consume the box's /events SSE and relay each event two ways: live to the
+ * browser as compile.event (fire-and-forget, incl. the agent's `log` reasoning),
+ * and as durable compile.* req/response RPCs so run state persists regardless of
+ * viewers. Shared by the one-shot compile and the persistent session. Returns
+ * when the box closes the stream (`end`).
+ */
+export async function relayBoxEvents(client: AgentBoxClient, runId: string, frontendClient: FrontendWsClient): Promise<void> {
   for await (const raw of client.streamPath(`/events/${runId}`)) {
     const evt = raw as BoxEvent;
-    // Live stream to the browser (fire-and-forget), mirroring chat.event: every
-    // box event (incl. the agent's reasoning `log`) is relayed so the frontend
-    // can watch the compile like a Claude Code session. The ledger updates below
-    // stay req/response so run state is durably persisted regardless of viewers.
     frontendClient.emitEvent("compile.event", { run_id: runId, event: evt });
     switch (evt.type) {
       case "summary":
@@ -112,6 +136,12 @@ export async function driveCompile(opts: DriveCompileOptions): Promise<void> {
         // state instead of restarting from the frozen authoring snapshot.
         await frontendClient.request("compile.syncArtifacts", { run_id: runId, artifacts: evt.artifacts });
         break;
+      case "turn_done":
+        // A conversational turn ended; persist the whole assistant reply so the
+        // prepare chat is durable (sicore no-ops on an empty text, e.g. a pure
+        // tool/compile turn). The live text already streamed via compile.event.
+        await frontendClient.request("compile.assistantTurn", { run_id: runId, text: evt.text ?? "" });
+        break;
       case "error":
         // Terminal failure the box reported — mark the run failed in sicore so it
         // goes terminal now instead of stalling until the watchdog reaps it.
@@ -120,7 +150,7 @@ export async function driveCompile(opts: DriveCompileOptions): Promise<void> {
       case "log":
       case "end":
       default:
-        // log/end are box-local lifecycle; nothing to relay.
+        // log/end are box-local lifecycle; the live stream already carried them.
         break;
     }
   }
