@@ -233,13 +233,20 @@ export class K8sSpawner implements BoxSpawner {
     // Anthropic-compatible knobs from the runtime deployment ("credentials don't
     // enter the sandbox" → the base URL is a proxy, key injected proxy-side).
     if (isCompile) {
-      const COMPILE_FORWARDED_ENV = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+      const COMPILE_FORWARDED_ENV = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_SMOKE"];
       for (const name of COMPILE_FORWARDED_ENV) {
         const value = process.env[name];
         if (value !== undefined && value !== "") {
           env.push({ name, value });
         }
       }
+      // The pod rootfs is read-only; the default HOME (/home/kbc) is therefore
+      // not writable, so Claude Code's shell-snapshot + config writes to ~/.claude
+      // hit EROFS and break the in-box Bash tool. Point HOME at the writable /work
+      // emptyDir (mounted below for compile boxes) → ~/.claude = /work/.claude.
+      // /work content the agent works on (raw/candidate/bundle) is unaffected, and
+      // the B5 workspace sync only mirrors authoring/candidate/eval/release.
+      env.push({ name: "HOME", value: "/work" });
     }
 
     // Add custom environment variables

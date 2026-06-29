@@ -457,6 +457,25 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!pending) {
       pending = (async () => {
         const client = await compileBoxClient(runId, orgId);
+        // Materialize the repo's frozen raw sources into /work/raw so the prepare
+        // agent can actually read the docs (mirrors driveCompile's setup). Best-
+        // effort: a session with no frozen manifest (empty KB) just starts with an
+        // empty workspace, and a fetch error must not block the conversation.
+        try {
+          const sourceBundle = (await frontendClient.request("compile.sourceBundle", { run_id: runId })) as {
+            bundle_base64?: string;
+            bundle_sha256?: string;
+          };
+          if (sourceBundle?.bundle_base64) {
+            await client.postJson("/sources", {
+              run_id: runId,
+              bundle_base64: sourceBundle.bundle_base64,
+              bundle_sha256: sourceBundle.bundle_sha256,
+            });
+          }
+        } catch (err) {
+          console.warn(`[runtime] compile session ${runId}: raw materialize skipped:`, err instanceof Error ? err.message : String(err));
+        }
         await client.postJson(`/session/${runId}`, { instruction: instruction ?? "" });
         // Relay loop runs detached for the session's lifetime.
         driveSession({ client, runId, frontendClient })
