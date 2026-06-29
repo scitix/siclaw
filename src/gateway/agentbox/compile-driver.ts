@@ -3,14 +3,17 @@
  * sicore control plane.
  *
  * The compile box (kbc, Python) speaks a lean compile protocol over mTLS:
- *   POST /compile {run_id, round, source_ref}      → start
- *   GET  /events/:run_id  (SSE)                     → summary | parked | done | log | error | end
+ *   POST /sources {run_id, bundle_base64, bundle_sha256} → materialize frozen raw input
+ *   POST /authoring {run_id, bundle_base64, bundle_sha256} → materialize authoring assets
+ *   POST /compile {run_id, round, source_ref, instruction} → start
+ *   GET  /events/:run_id  (SSE)        → summary | parked | done | syncArtifacts | log | error | end
  *   POST /rulings {run_id, rulings}                 → resume a parked compile
  *
- * This driver POSTs /compile, consumes the SSE stream, and relays the
- * structured events to sicore as compile.* RPCs over the runtime's WS — the
- * matching inbound handlers live in sicore's internal/siclaw/compilation. The
- * run state machine lives in sicore; this driver is stateless plumbing.
+ * This driver asks sicore for the run's frozen source bundle, POSTs it to
+ * /sources, POSTs /compile, consumes the SSE stream, and relays the structured
+ * events to sicore as compile.* RPCs over the runtime's WS — the matching
+ * inbound handlers live in sicore's internal/siclaw/compilation. The run state
+ * machine lives in sicore; this driver is stateless plumbing.
  */
 
 import type { AgentBoxClient } from "./client.js";
@@ -21,6 +24,10 @@ export interface DriveCompileOptions {
   runId: string;
   round: number;
   sourceRef?: string;
+  instruction?: string;
+  authoringBundleBase64?: string;
+  authoringBundleSHA256?: string;
+  authoringBundleSizeBytes?: number;
   frontendClient: FrontendWsClient;
 }
 
@@ -32,6 +39,13 @@ interface BoxEvent {
   message?: string;
   error?: string;
   text?: string;
+  artifacts?: Array<{ path: string; content: string }>;
+}
+
+interface SourceBundleResponse {
+  bundle_base64?: string;
+  bundle_sha256?: string;
+  source_ref?: string;
 }
 
 /**
@@ -40,11 +54,36 @@ interface BoxEvent {
  * handler) logs and reports the failure.
  */
 export async function driveCompile(opts: DriveCompileOptions): Promise<void> {
-  const { client, runId, round, sourceRef, frontendClient } = opts;
+  const { client, runId, round, sourceRef, instruction, authoringBundleBase64, authoringBundleSHA256, authoringBundleSizeBytes, frontendClient } = opts;
+
+  const sourceBundle = await frontendClient.request("compile.sourceBundle", { run_id: runId }) as SourceBundleResponse;
+  if (!sourceBundle?.bundle_base64) {
+    throw new Error(`compile.sourceBundle for run ${runId} returned no bundle_base64`);
+  }
+
+  await client.postJson("/sources", {
+    run_id: runId,
+    bundle_base64: sourceBundle.bundle_base64,
+    bundle_sha256: sourceBundle.bundle_sha256,
+  });
+
+  if (authoringBundleBase64) {
+    await client.postJson("/authoring", {
+      run_id: runId,
+      bundle_base64: authoringBundleBase64,
+      bundle_sha256: authoringBundleSHA256,
+      bundle_size_bytes: authoringBundleSizeBytes,
+    });
+  }
 
   // Kick off the compile. workdir defaults to /work on the box (the spawned
   // pod's writable volume). Fast ack — the box runs the compile in the bg.
-  await client.postJson("/compile", { run_id: runId, round, source_ref: sourceRef });
+  await client.postJson("/compile", {
+    run_id: runId,
+    round,
+    source_ref: sourceRef ?? sourceBundle.source_ref,
+    instruction: instruction ?? "",
+  });
 
   for await (const raw of client.streamPath(`/events/${runId}`)) {
     const evt = raw as BoxEvent;
@@ -67,10 +106,16 @@ export async function driveCompile(opts: DriveCompileOptions): Promise<void> {
           message: evt.message,
         });
         break;
+      case "syncArtifacts":
+        // Persist the box's in-progress workspace files (candidate/PLAN/eval) so
+        // work survives a box crash and a resumed box bootstraps from the latest
+        // state instead of restarting from the frozen authoring snapshot.
+        await frontendClient.request("compile.syncArtifacts", { run_id: runId, artifacts: evt.artifacts });
+        break;
       case "error":
-        // v1 has no compile.failed RPC; surface the error to the owner via the
-        // summary channel so it's visible rather than a silent stall.
-        await frontendClient.request("compile.summary", { run_id: runId, summary: `error: ${evt.error}` });
+        // Terminal failure the box reported — mark the run failed in sicore so it
+        // goes terminal now instead of stalling until the watchdog reaps it.
+        await frontendClient.request("compile.failed", { run_id: runId, error: evt.error });
         break;
       case "log":
       case "end":
