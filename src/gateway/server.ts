@@ -512,6 +512,34 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, run_id: runId };
   });
 
+  // Unified compile: run a compile as a turn on the run's LIVE session box (same
+  // box as the conversation). Ensure the session (spawns + materializes /work/raw
+  // if the user compiles without chatting first), materialize the authoring assets
+  // into /work/authoring, then trigger the box's own compile turn. summary/parked/
+  // done flow back over the existing session relay.
+  rpcMethods.set("compile.runInSession", async (params) => {
+    const runId = params.run_id as string;
+    const orgId = params.org_id as string | undefined;
+    const instruction = params.instruction as string | undefined;
+    const authoringBundleBase64 = params.authoring_bundle_base64 as string | undefined;
+    const authoringBundleSHA256 = params.authoring_bundle_sha256 as string | undefined;
+    const authoringBundleSizeBytes = typeof params.authoring_bundle_size_bytes === "number" ? params.authoring_bundle_size_bytes : undefined;
+    if (!runId) throw new Error("run_id is required");
+    // Pass no session instruction here — `instruction` is the compile brief, which
+    // goes to the compile turn, not the session's standing system prompt.
+    const { client } = await ensureCompileSession(runId, orgId, undefined);
+    if (authoringBundleBase64) {
+      await client.postJson("/authoring", {
+        run_id: runId,
+        bundle_base64: authoringBundleBase64,
+        bundle_sha256: authoringBundleSHA256,
+        bundle_size_bytes: authoringBundleSizeBytes,
+      });
+    }
+    await client.postJson(`/compile-turn/${runId}`, { instruction: instruction ?? "" });
+    return { ok: true, run_id: runId };
+  });
+
   rpcMethods.set("chat.abort", async (params) => {
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
