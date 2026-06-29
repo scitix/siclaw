@@ -21,12 +21,19 @@ function makeFrontend(): {
   const calls: Array<{ method: string; params: any }> = [];
   const events: Array<{ channel: string; data: any }> = [];
   const client = {
-    request: vi.fn((method: string, params: unknown) => {
-      calls.push({ method, params });
-      return Promise.resolve({ ok: true });
-    }),
     emitEvent: vi.fn((channel: string, data: unknown) => {
       events.push({ channel, data });
+    }),
+    request: vi.fn((method: string, params: unknown) => {
+      calls.push({ method, params });
+      if (method === "compile.sourceBundle") {
+        return Promise.resolve({
+          bundle_base64: "c291cmNlcy10Zy16",
+          bundle_sha256: "abc123",
+          source_ref: "knowledge://repos/kb/manifests/m1",
+        });
+      }
+      return Promise.resolve({ ok: true });
     }),
   } as unknown as FrontendWsClient;
   return { client, calls, events };
@@ -48,18 +55,40 @@ describe("driveCompile", () => {
       { type: "end" }, // not relayed
     ]);
 
-    await driveCompile({ client, runId: "r1", round: 1, frontendClient });
-
-    expect(client.postJson as any).toHaveBeenCalledWith("/compile", {
-      run_id: "r1",
+    await driveCompile({
+      client,
+      runId: "r1",
       round: 1,
-      source_ref: undefined,
+      instruction: "# KB Authoring Compile Task",
+      authoringBundleBase64: "YXV0aG9yaW5nLXRnei16",
+      authoringBundleSHA256: "authoring123",
+      authoringBundleSizeBytes: 19,
+      frontendClient,
     });
 
-    expect(calls.map((c) => c.method)).toEqual(["compile.summary", "compile.parked", "compile.done"]);
-    expect(calls[0].params).toEqual({ run_id: "r1", summary: "read 5 docs" });
-    expect(calls[1].params).toEqual({ run_id: "r1", checkpoint });
-    expect(calls[2].params).toEqual({ run_id: "r1", bundle: "YmFzZTY0", message: "compiled" });
+    expect(client.postJson as any).toHaveBeenNthCalledWith(1, "/sources", {
+      run_id: "r1",
+      bundle_base64: "c291cmNlcy10Zy16",
+      bundle_sha256: "abc123",
+    });
+    expect(client.postJson as any).toHaveBeenNthCalledWith(2, "/authoring", {
+      run_id: "r1",
+      bundle_base64: "YXV0aG9yaW5nLXRnei16",
+      bundle_sha256: "authoring123",
+      bundle_size_bytes: 19,
+    });
+    expect(client.postJson as any).toHaveBeenNthCalledWith(3, "/compile", {
+      run_id: "r1",
+      round: 1,
+      source_ref: "knowledge://repos/kb/manifests/m1",
+      instruction: "# KB Authoring Compile Task",
+    });
+
+    expect(calls.map((c) => c.method)).toEqual(["compile.sourceBundle", "compile.summary", "compile.parked", "compile.done"]);
+    expect(calls[0].params).toEqual({ run_id: "r1" });
+    expect(calls[1].params).toEqual({ run_id: "r1", summary: "read 5 docs" });
+    expect(calls[2].params).toEqual({ run_id: "r1", checkpoint });
+    expect(calls[3].params).toEqual({ run_id: "r1", bundle: "YmFzZTY0", message: "compiled" });
 
     // Live stream: EVERY box event (incl. log + end) is relayed as compile.event.
     expect(events.map((e) => e.channel)).toEqual(["compile.event", "compile.event", "compile.event", "compile.event", "compile.event"]);
@@ -67,12 +96,30 @@ describe("driveCompile", () => {
     expect(events[0].data.run_id).toBe("r1");
   });
 
-  it("relays box error events via the summary channel (v1 has no compile.failed)", async () => {
+  it("relays a box error as compile.failed so the run goes terminal", async () => {
     const { client: frontendClient, calls } = makeFrontend();
     const client = makeClient([{ type: "error", error: "boom" }, { type: "end" }]);
 
     await driveCompile({ client, runId: "r1", round: 2, frontendClient });
 
-    expect(calls).toEqual([{ method: "compile.summary", params: { run_id: "r1", summary: "error: boom" } }]);
+    expect(calls).toEqual([
+      { method: "compile.sourceBundle", params: { run_id: "r1" } },
+      { method: "compile.failed", params: { run_id: "r1", error: "boom" } },
+    ]);
+  });
+
+  it("relays box syncArtifacts to compile.syncArtifacts so mid-compile work is durable", async () => {
+    const { client: frontendClient, calls } = makeFrontend();
+    const artifacts = [{ path: "candidate/01.md", content: "# hi" }];
+    const client = makeClient([
+      { type: "syncArtifacts", artifacts },
+      { type: "done", bundle_b64: "YmFzZTY0", message: "compiled" },
+      { type: "end" },
+    ]);
+
+    await driveCompile({ client, runId: "r1", round: 1, frontendClient });
+
+    expect(calls.map((c) => c.method)).toEqual(["compile.sourceBundle", "compile.syncArtifacts", "compile.done"]);
+    expect(calls[1].params).toEqual({ run_id: "r1", artifacts });
   });
 });
