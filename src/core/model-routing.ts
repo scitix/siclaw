@@ -394,6 +394,44 @@ export function filterCandidatesForPromptMedia(candidates: ModelRouteCandidate[]
   return candidates.filter((candidate) => candidateSupportsPromptMedia(candidate, media));
 }
 
+/**
+ * Does the model selected for this prompt declare `image` input support? Used by
+ * `AgentBoxClient` to gate text-URL image resolution: only resolve URLs into
+ * vision images when a capable model exists; otherwise leave the URL as plain
+ * text (no fail-closed).
+ *
+ * Enabled routing: image-capable if ANY candidate declares image — in the
+ * fallback-runner path, media filtering routes a turn-with-images only to such a
+ * candidate. NOTE: this is an OPTIMISTIC, gateway-side guess; it cannot see the
+ * session's user-pinned candidate (held in the AgentBox modelRouteState), so a
+ * pinned text-primary + vision-fallback turn can still reach the single-model
+ * preflight and fail closed (documented residual edge — see DESIGN risk table).
+ * Disabled routing: candidates won't be used → judge by the single model + its
+ * modelConfig instead.
+ * No model info: conservatively false (do not resolve URLs).
+ */
+export function modelOptionsSupportImageInput(opts: {
+  modelProvider?: string;
+  modelId?: string;
+  modelConfig?: unknown;
+  modelRouting?: ModelRoutePolicy;
+}): boolean {
+  const candidates = isModelRoutePolicyEnabled(opts.modelRouting)
+    ? normalizeCandidates(opts.modelRouting?.candidates)
+    : [];
+  if (candidates.length > 0) {
+    return candidates.some((candidate) => candidateInputSet(candidate).has("image"));
+  }
+  if (opts.modelProvider && opts.modelId && isRecord(opts.modelConfig)) {
+    return candidateInputSet({
+      provider: opts.modelProvider,
+      modelId: opts.modelId,
+      modelConfig: opts.modelConfig,
+    }).has("image");
+  }
+  return false;
+}
+
 export function unsupportedPromptMediaMessage(media?: PromptMedia): string {
   const required = requiredInputsForPromptMedia(media);
   if (required.length === 0) return "No model route candidate is available for this prompt.";
