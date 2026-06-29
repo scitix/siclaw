@@ -71,7 +71,10 @@ runtime:
     baseUrl: ""           # e.g. http://tei-embedding.<ns>.svc.cluster.local/v1
     model: ""             # e.g. Qwen/Qwen3-Embedding-4B (empty → BAAI/bge-m3)
     dimensions: 0         # e.g. 2560 (0/empty → 1024). Must match the model.
-    apiKey: ""            # optional; empty for unauthenticated self-hosted endpoints
+    apiKey: ""            # optional. Empty ⇒ unauthenticated for a self-hosted
+                          # endpoint on a DIFFERENT origin than the LLM provider.
+                          # If the embedding baseUrl is the SAME origin as the
+                          # default LLM provider, that provider's key is reused.
   # Max sub-agent child sessions a single AgentBox runs concurrently. A wide
   # spawn_subagent fan-out queues past this instead of starting one child agent +
   # one LLM stream per target at once (avoids provider 429s / pod pressure).

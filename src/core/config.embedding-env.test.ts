@@ -85,3 +85,52 @@ describe("getEmbeddingConfig — SICLAW_EMBEDDING_* env overrides", () => {
     expect(getEmbeddingConfig()).toBeNull();
   });
 });
+
+// Security contract: an empty embedding apiKey must only inherit the default
+// LLM provider's key when the embedding endpoint is the SAME ORIGIN. A
+// cross-origin endpoint (the self-hosted TEI case the env path enables) must
+// NOT receive the LLM credential, otherwise a high-value key leaks to a
+// different trust domain. See getEmbeddingConfig() in config.ts.
+describe("getEmbeddingConfig — empty-key credential inheritance", () => {
+  function writeSettings(settings: Record<string, unknown>): void {
+    fs.writeFileSync(path.join(cfgDir, "settings.json"), JSON.stringify(settings));
+  }
+
+  const PROVIDER = {
+    providers: {
+      openai: {
+        baseUrl: "https://llm.example.com/v1",
+        apiKey: "sk-secret-llm-key",
+        models: [{ id: "gpt-4o", name: "gpt-4o" }],
+      },
+    },
+    default: { provider: "openai", modelId: "gpt-4o" },
+  };
+
+  it("does NOT inherit the LLM key for a cross-origin embedding endpoint", () => {
+    writeSettings({
+      ...PROVIDER,
+      embedding: { baseUrl: "http://tei.svc/v1", apiKey: "", model: "", dimensions: 0 },
+    });
+    reloadConfig();
+    expect(getEmbeddingConfig()?.apiKey).toBe("");
+  });
+
+  it("inherits the LLM key when the embedding endpoint is the same origin", () => {
+    writeSettings({
+      ...PROVIDER,
+      embedding: { baseUrl: "https://llm.example.com/v1/embeddings", apiKey: "", model: "", dimensions: 0 },
+    });
+    reloadConfig();
+    expect(getEmbeddingConfig()?.apiKey).toBe("sk-secret-llm-key");
+  });
+
+  it("uses an explicit embedding key regardless of origin", () => {
+    writeSettings({
+      ...PROVIDER,
+      embedding: { baseUrl: "http://tei.svc/v1", apiKey: "emb-own-key", model: "", dimensions: 0 },
+    });
+    reloadConfig();
+    expect(getEmbeddingConfig()?.apiKey).toBe("emb-own-key");
+  });
+});
