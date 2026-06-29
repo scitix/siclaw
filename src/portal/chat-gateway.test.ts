@@ -521,6 +521,107 @@ describe("chat-gateway routes", () => {
         maxTokensField: "max_tokens",
       });
     });
+
+    it("forwards raw images (not OCR) when the bound model supports vision", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4v" }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4v", name: "GPT-4V", reasoning: 0, vision: 1, context_window: 128000, max_tokens: 4096 }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: {
+          text: "what's in this image",
+          session_id: "s1",
+          attachments: [{ kind: "image", filename: "shot.png", mimeType: "image/png", data: "aGVsbG8=" }],
+        },
+      });
+
+      router.handle(req, res);
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      // Vision model: image goes through raw, never to OCR.
+      expect(fetchMock).not.toHaveBeenCalled();
+      const command = (connMap.sendCommand as any).mock.calls[0][2];
+      expect(command.images).toEqual([{ mimeType: "image/png", data: "aGVsbG8=" }]);
+      expect(command.text).toBe("what's in this image");
+      expect(command.text).not.toContain("OCR");
+      // Model descriptor exposes the image input capability.
+      expect(command.modelConfig.models[0].input).toEqual(["text", "image"]);
+    });
+
+    it("uses a default prompt for an image-only vision message", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4v" }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4v", name: "GPT-4V", reasoning: 0, vision: 1, context_window: 128000, max_tokens: 4096 }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: {
+          text: "",
+          session_id: "s1",
+          attachments: [{ kind: "image", filename: "shot.png", mimeType: "image/png", data: "aGVsbG8=" }],
+        },
+      });
+
+      router.handle(req, res);
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      const command = (connMap.sendCommand as any).mock.calls[0][2];
+      expect(command.text).toBe("Please analyze the attached file(s).");
+      expect(command.images).toHaveLength(1);
+    });
+
+    it("keeps OCR and sends no raw images when the bound model lacks vision", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4" }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, vision: 0, context_window: 128000, max_tokens: 4096 }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: {
+          text: "what's wrong here",
+          session_id: "s1",
+          attachments: [{ kind: "image", filename: "shot.png", mimeType: "image/png", data: "aGVsbG8=" }],
+        },
+      });
+
+      router.handle(req, res);
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      const command = (connMap.sendCommand as any).mock.calls[0][2];
+      // Non-vision model: no raw images, image still flows through the OCR path.
+      expect(command.images).toBeUndefined();
+      expect(command.text).toContain("OCR");
+      expect(command.modelConfig.models[0].input).toEqual(["text"]);
+    });
   });
 
   // ── chat.steer ───────────────────────────────────────────

@@ -353,6 +353,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     model_id VARCHAR(255) NOT NULL,
     name VARCHAR(255),
     reasoning TINYINT(1) NOT NULL DEFAULT 0,
+    vision TINYINT(1) NOT NULL DEFAULT 0,
     context_window INT NOT NULL DEFAULT 128000,
     max_tokens INT NOT NULL DEFAULT 65536,
     is_default TINYINT(1) NOT NULL DEFAULT 0,
@@ -553,6 +554,7 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "agents", "tool_capabilities", "TEXT DEFAULT NULL");
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
+  await safeAlterTable(db, "model_entries", "vision", "TINYINT(1) NOT NULL DEFAULT 0");
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
   await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "skills", "files", "MEDIUMTEXT DEFAULT NULL");

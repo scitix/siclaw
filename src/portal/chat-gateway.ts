@@ -17,6 +17,7 @@ import {
 } from "../gateway/rest-router.js";
 import { verifyJwt } from "../gateway/jwt.js";
 import type { ResolvedModelBinding } from "../gateway/agent-model-binding.js";
+import { modelOptionsSupportImageInput } from "../core/model-routing.js";
 import { getDb } from "../gateway/db.js";
 import {
   ErrorCodes,
@@ -24,7 +25,7 @@ import {
   isErrorDetail,
   type ErrorDetail,
 } from "../lib/error-envelope.js";
-import { defaultProviderModelCompat } from "../core/model-compat.js";
+import { buildProviderModelDescriptor } from "../core/model-compat.js";
 import { resolveAgentModelRouting } from "./model-routing-config.js";
 import { authenticateApiKey } from "./api-key-auth.js";
 
@@ -297,19 +298,12 @@ export async function resolveAgentModelBinding(agentId: string): Promise<Resolve
   if (!provider) return null;
 
   const [entryRows] = await db.query(
-    "SELECT model_id, name, reasoning, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
+    "SELECT model_id, name, reasoning, vision, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
     [provider.id],
   ) as any;
-  const models = (entryRows as any[]).map((m: any) => ({
-    id: m.model_id,
-    name: m.name ?? m.model_id,
-    reasoning: !!m.reasoning,
-    input: ["text"] as string[],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: m.context_window,
-    maxTokens: m.max_tokens,
-    compat: defaultProviderModelCompat({ api: provider.api_type, baseUrl: provider.base_url }),
-  }));
+  const models = (entryRows as any[]).map((m: any) =>
+    buildProviderModelDescriptor(m, { api: provider.api_type, baseUrl: provider.base_url }),
+  );
 
   const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
     provider: agent.model_provider,
@@ -468,13 +462,48 @@ export function registerChatRoutes(
       }
     });
 
-    const promptText = await appendOcrEvidence(body.text ?? "", body.attachments);
+    // When the bound model can natively read images, forward image attachments
+    // as raw `images` (true multimodal) instead of OCR-ing them to text. PDFs
+    // (and all attachments for non-vision models) keep the existing OCR path.
+    // Uses the same routing-aware gate as the shared AgentBoxClient image-URL
+    // resolution (model-routing.ts), so a turn with a text-primary + vision
+    // fallback treats uploaded attachments and pasted image URLs identically —
+    // routing sends the turn to the vision candidate either way.
+    let promptText: string;
+    let images: Array<{ mimeType: string; data: string }> | undefined;
+    if (modelOptionsSupportImageInput({
+      modelProvider: modelBinding.modelProvider,
+      modelId: modelBinding.modelId,
+      modelConfig: modelBinding.modelConfig,
+      modelRouting: modelBinding.modelRouting,
+    })) {
+      const normalized = normalizeChatAttachments(body.attachments);
+      images = normalized
+        .filter((a): a is ChatAttachment & { data: string } => a.kind === "image" && typeof a.data === "string")
+        .map((a) => ({
+          mimeType: normalizeMimeType(a.mimeType ?? a.mime_type, a.filename),
+          data: a.data,
+        }));
+      // Non-image attachments (PDFs) still go through OCR; images are excluded
+      // from the OCR input so they are never double-processed.
+      promptText = await appendOcrEvidence(body.text ?? "", normalized.filter((a) => a.kind !== "image"));
+      // Image-only message with no text and no OCR evidence: a bare images
+      // payload with empty text leaves runtime prompt behavior undefined, so
+      // fall back to a default instruction (aligns with sicore).
+      if (promptText.trim() === "" && images.length > 0) {
+        promptText = ATTACHMENT_ONLY_PROMPT;
+      }
+      if (images.length === 0) images = undefined;
+    } else {
+      promptText = await appendOcrEvidence(body.text ?? "", body.attachments);
+    }
 
     // Send chat.send command
     const result = await connectionMap.sendCommand(agentId, "chat.send", {
       agentId,
       userId: auth.userId,
       text: promptText,
+      ...(images ? { images } : {}),
       sessionId,
       modelProvider: modelBinding.modelProvider,
       modelId: modelBinding.modelId,

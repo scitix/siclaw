@@ -1,6 +1,6 @@
 import { getDb } from "../gateway/db.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
-import { defaultProviderModelCompat } from "../core/model-compat.js";
+import { buildProviderModelDescriptor } from "../core/model-compat.js";
 import {
   normalizeCandidates,
   normalizeModelRoutePolicy,
@@ -25,6 +25,7 @@ interface ModelRow {
   model_id: string;
   name: string | null;
   reasoning: number | boolean;
+  vision: number | boolean;
   context_window: number;
   max_tokens: number;
 }
@@ -96,7 +97,7 @@ async function loadProviderConfigs(providerNames: string[]): Promise<Map<string,
     if (!provider) continue;
 
     const [modelRows] = await db.query<ModelRow[]>(
-      "SELECT model_id, name, reasoning, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
+      "SELECT model_id, name, reasoning, vision, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
       [provider.id],
     );
     out.set(provider.name, {
@@ -105,16 +106,9 @@ async function loadProviderConfigs(providerNames: string[]): Promise<Map<string,
       apiKey: provider.api_key ?? "",
       api: provider.api_type,
       authHeader: true,
-      models: modelRows.map((model) => ({
-        id: model.model_id,
-        name: model.name ?? model.model_id,
-        reasoning: !!model.reasoning,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: model.context_window,
-        maxTokens: model.max_tokens,
-        compat: defaultProviderModelCompat({ api: provider.api_type, baseUrl: provider.base_url }),
-      })),
+      models: modelRows.map((model) =>
+        buildProviderModelDescriptor(model, { api: provider.api_type, baseUrl: provider.base_url }),
+      ),
     });
   }
   return out;

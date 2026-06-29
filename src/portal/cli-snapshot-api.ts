@@ -31,7 +31,7 @@ import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
 import { getDb, type Db } from "../gateway/db.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
-import { defaultProviderModelCompat } from "../core/model-compat.js";
+import { buildProviderModelDescriptor } from "../core/model-compat.js";
 import { resolveCapabilities } from "../core/tool-capabilities.js";
 import type {
   CliSnapshotKnowledgeRepo,
@@ -99,6 +99,7 @@ interface ModelRow {
   model_id: string;
   name: string | null;
   reasoning: number;
+  vision: number;
   context_window: number;
   max_tokens: number;
   is_default: number;
@@ -294,7 +295,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE api_key IS NOT NULL AND api_key != '' ORDER BY sort_order, name",
     );
     const [models] = await db.query<ModelRow[]>(
-      "SELECT provider_id, model_id, name, reasoning, context_window, max_tokens, is_default FROM model_entries ORDER BY provider_id, sort_order, model_id",
+      "SELECT provider_id, model_id, name, reasoning, vision, context_window, max_tokens, is_default FROM model_entries ORDER BY provider_id, sort_order, model_id",
     );
     // MCP: scoped to agent via agent_mcp_servers when active, else all enabled.
     const [mcps] = activeAgentId
@@ -408,16 +409,9 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
         apiKey: p.api_key ?? "",
         api: p.api_type,
         authHeader: true,
-        models: entries.map((m) => ({
-          id: m.model_id,
-          name: m.name ?? m.model_id,
-          reasoning: Boolean(m.reasoning),
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: m.context_window,
-          maxTokens: m.max_tokens,
-          compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
-        })),
+        models: entries.map((m) =>
+          buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+        ),
       };
       // First model flagged is_default wins. If none, first provider's first model is a fallback.
       const defaultEntry = entries.find((m) => m.is_default === 1);
