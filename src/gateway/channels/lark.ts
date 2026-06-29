@@ -37,6 +37,7 @@ import {
 import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 import { replyImageToLark } from "./lark-image.js";
 import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
+import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -326,15 +327,24 @@ export function extractInbound(message: any): { text: string; imageRefs: LarkIma
   if (msgType === "post") {
     const imageRefs: LarkImageRef[] = [];
     const textParts: string[] = [];
-    // im.message.receive_v1 delivers post content already locale-resolved as
-    // `{ title, content: Node[][] }` (the `{zh_cn:{…}}` nesting is a SEND-API
-    // shape, not a receive event), so parse the flat form directly.
-    const paragraphs: any[][] = Array.isArray(raw?.content) ? raw.content : [];
+    // Post content is normally delivered flat as `{ title, content: Node[][] }`,
+    // but some Feishu API/SDK versions deliver the locale-nested send-shape
+    // `{ zh_cn: { title, content }, en_us: {…} }` on receive — accept both so a
+    // nested payload is not silently dropped (it would otherwise yield neither
+    // text nor image and the whole turn would be discarded).
+    const post = Array.isArray(raw?.content) ? raw : firstLocalePost(raw);
+    if (typeof post?.title === "string" && post.title) textParts.push(post.title);
+    const paragraphs: any[][] = Array.isArray(post?.content) ? post.content : [];
     for (const node of paragraphs.flat()) {
       if (node?.tag === "img" && typeof node?.image_key === "string") {
         imageRefs.push({ imageKey: node.image_key });
-      } else if (node?.tag === "text" && typeof node?.text === "string") {
+      } else if ((node?.tag === "text" || node?.tag === "a") && typeof node?.text === "string") {
         textParts.push(node.text);
+      }
+      // A hyperlink's href may itself be an image URL — surface it so the unified
+      // text-URL resolver (AgentBoxClient.prompt) can pick it up.
+      if (node?.tag === "a" && typeof node?.href === "string") {
+        textParts.push(node.href);
       }
     }
     return { text: stripMentions(textParts.join(" ")), imageRefs };
@@ -345,6 +355,16 @@ export function extractInbound(message: any): { text: string; imageRefs: LarkIma
 
 function stripMentions(text: string): string {
   return text.replace(/@_user_\d+/g, "").trim();
+}
+
+/** Feishu post may arrive locale-nested as `{ zh_cn: { content: Node[][] } }`;
+ *  pick the first locale block that carries a `content` array. */
+function firstLocalePost(raw: any): any {
+  if (!raw || typeof raw !== "object") return undefined;
+  for (const v of Object.values(raw)) {
+    if (v && typeof v === "object" && Array.isArray((v as any).content)) return v;
+  }
+  return undefined;
 }
 
 export function buildChannelTurnPrompt(text: string): string {
@@ -579,9 +599,12 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     return;
   }
 
-  // After the command branch: an image-only message has empty text, so give it a
-  // placeholder. Replace `text` uniformly here (not just in promptOpts) so the
-  // session title, persisted user row, and logs all show "user sent image(s)".
+  // After the command branch (matched on the raw text): an image whose caption
+  // is exactly a command word (e.g. "/new") is routed as that command and its
+  // image dropped — an accepted edge, since commands are exact-match only.
+  // An image-only message has empty text, so give it a placeholder. Replace
+  // `text` uniformly here (not just in promptOpts) so the session title,
+  // persisted user row, and logs all show "user sent image(s)".
   const effectiveText = text.length === 0 && imageRefs.length > 0 ? IMAGE_ONLY_PLACEHOLDER : text;
 
   const binding = await resolveQueuedBinding(route, channelId, chatId, senderOpenId, frontendClient!, sessionKey);
@@ -702,11 +725,22 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const modelBinding = frontendClient
     ? await resolveAgentModelBinding(agentId, frontendClient)
     : null;
-  // Download native Lark images at execution time — close to the prompt, and
-  // skipped entirely when the queue rejects. Text image URLs are NOT handled
-  // here: they are resolved generically (and vision-gated) at the
-  // `AgentBoxClient.prompt()` boundary, shared with Portal Web chat / a2a / cron.
-  const images = await collectInboundImages({ imageRefs, larkClient, messageId });
+  // Native Lark images are vision-gated too, mirroring the text-URL path: a
+  // non-vision model can't use them and would fail-closed at AgentBox media
+  // filtering, so skip the download entirely for non-vision models (the [image]
+  // placeholder in effectiveText still records that the user sent an image).
+  // Text image URLs are NOT handled here — they are resolved generically (and
+  // vision-gated) at the `AgentBoxClient.prompt()` boundary, shared with Portal
+  // Web chat / a2a / cron.
+  const visionCapable = modelOptionsSupportImageInput({
+    modelProvider: modelBinding?.modelProvider,
+    modelId: modelBinding?.modelId,
+    modelConfig: modelBinding?.modelConfig,
+    modelRouting: modelBinding?.modelRouting,
+  });
+  const images = visionCapable
+    ? await collectInboundImages({ imageRefs, larkClient, messageId })
+    : [];
   const promptOpts: PromptOptions = {
     text: buildChannelTurnPrompt(effectiveText),
     agentId,

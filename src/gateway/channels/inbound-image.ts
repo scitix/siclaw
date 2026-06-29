@@ -2,7 +2,6 @@ import type { Readable } from "node:stream";
 import {
   type InboundImage,
   MAX_INBOUND_IMAGES,
-  MAX_IMAGE_BASE64_CHARS,
   MAX_IMAGE_BYTES,
   sniffImageMime,
   streamToBuffer,
@@ -84,12 +83,8 @@ export async function collectInboundImages(
   for (const ref of imageRefs) {
     if (out.length >= MAX_INBOUND_IMAGES) break;
     try {
-      const img = await fetchLarkResource(larkClient, messageId, ref.imageKey);
-      if (img.data.length > MAX_IMAGE_BASE64_CHARS) {
-        console.warn(`[lark-inbound-image] skip oversize image (image_key=${ref.imageKey}): ${img.data.length} base64 chars`);
-        continue;
-      }
-      out.push(img);
+      // fetchLarkResource bounds raw bytes at MAX_IMAGE_BYTES, so no extra base64 cap needed.
+      out.push(await fetchLarkResource(larkClient, messageId, ref.imageKey));
     } catch (err) {
       console.warn(`[lark-inbound-image] lark resource failed image_key=${ref.imageKey}: ${errMsg(err)}`);
     }

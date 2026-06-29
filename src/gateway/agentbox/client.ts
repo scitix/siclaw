@@ -139,8 +139,9 @@ export class AgentBoxClient {
    * the URL is left as plain text — the model replies it can't open it; no
    * fail-closed turn.
    *
-   * This is the SINGLE backend place text-URL images are resolved, covering all
-   * Gateway front-ends (Feishu / Web chat / a2a / cron). Only user→agent prompts
+   * This is the SINGLE backend place text-URL images are resolved, covering ALL
+   * front-ends that reach AgentBox via this client — Feishu, DingTalk, Web chat,
+   * a2a, and cron (every `client.prompt` caller). Only user→agent prompts
    * flow through THIS client; system/synthetic prompts run inside the AgentBox
    * process and never reach here, so this never scans system text. The fetch +
    * SSRF allowlist stay in the Gateway process (the AgentBox pod is

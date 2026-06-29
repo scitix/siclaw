@@ -34,11 +34,15 @@ export interface InboundImage {
 // (images + files share the budget), single item base64 ≤ 8MB, mime ∈
 // {png,jpeg,webp}. Mirror the caps here to fail fast before hitting AgentBox.
 export const MAX_INBOUND_IMAGES = 4;
-export const MAX_IMAGE_BASE64_CHARS = 8 * 1024 * 1024;
-// 6MiB raw → ≤8MiB base64, so the AgentBox base64 cap can never be exceeded.
+// 6MiB raw → ≤8MiB base64, comfortably under AgentBox's 8MiB base64 item cap
+// (so no separate base64-length check is needed anywhere downstream).
 export const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const DEFAULT_FETCH_TIMEOUT_MS = 5000;
+// Overall deadline for resolving ALL URLs in one prompt, so a slow-but-allowlisted
+// host can't stall the turn (the per-fetch timeout alone bounds one hop, not the
+// whole sequential/parallel batch).
+const DEFAULT_TOTAL_TIMEOUT_MS = 8000;
 
 // Extension-anchored: an OSS signed URL keeps its `.jpg` before the `?query`.
 // Extensionless URLs are intentionally out of scope for v1 (no HEAD probe).
@@ -63,6 +67,13 @@ function fetchTimeoutMs(): number {
   if (!raw) return DEFAULT_FETCH_TIMEOUT_MS;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_FETCH_TIMEOUT_MS;
+}
+
+function totalTimeoutMs(): number {
+  const raw = process.env.SICLAW_IMAGE_URL_TOTAL_TIMEOUT_MS?.trim();
+  if (!raw) return DEFAULT_TOTAL_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_TOTAL_TIMEOUT_MS;
 }
 
 /**
@@ -183,19 +194,25 @@ async function readLimitedBody(res: Response, maxBytes: number): Promise<Buffer>
   return Buffer.concat(chunks);
 }
 
-/** Fetch an image URL behind the SSRF guard, following redirects manually. */
-export async function fetchUrlImage(url: string): Promise<InboundImage> {
+/**
+ * Fetch an image URL behind the SSRF guard, following redirects manually.
+ * `overallSignal` (optional) is the caller's batch-wide deadline, combined with
+ * the per-hop timeout so one slow hop can't outlive the whole resolution budget.
+ */
+export async function fetchUrlImage(url: string, overallSignal?: AbortSignal): Promise<InboundImage> {
   const timeoutMs = fetchTimeoutMs();
   let current = url;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     assertAllowedImageUrl(current); // re-validate every hop (redirect can't escape the allowlist)
-    const res = await fetch(current, {
-      redirect: "manual",
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    const perHop = AbortSignal.timeout(timeoutMs);
+    const signal = overallSignal ? AbortSignal.any([perHop, overallSignal]) : perHop;
+    const res = await fetch(current, { redirect: "manual", signal });
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
       if (!loc) throw new Error(`redirect without location: ${safeUrl(current)}`);
+      // Drain the redirect body so undici releases the connection instead of
+      // holding it until GC.
+      await res.body?.cancel().catch(() => {});
       current = new URL(loc, current).toString();
       continue;
     }
@@ -227,21 +244,27 @@ export async function enrichImagesFromText(
   existing: InboundImage[] = [],
 ): Promise<InboundImage[]> {
   const out: InboundImage[] = [...existing];
+  if (out.length >= MAX_INBOUND_IMAGES) return out;
   const urls = extractImageUrls(text);
   if (urls.length === 0) return out;
 
-  for (const url of urls) {
-    if (out.length >= MAX_INBOUND_IMAGES) break;
-    try {
-      const img = await fetchUrlImage(url);
-      if (img.data.length > MAX_IMAGE_BASE64_CHARS) {
-        console.warn(`[image-url-ingest] skip oversize image (url=${safeUrl(url)}): ${img.data.length} base64 chars`);
-        continue;
+  // One deadline for the whole step (a slow allowlisted host must not stall the
+  // turn), and fetch the URLs in parallel rather than sequentially. The raw-byte
+  // cap in fetchUrlImage (MAX_IMAGE_BYTES) already bounds each image's size.
+  const overall = AbortSignal.timeout(totalTimeoutMs());
+  const settled = await Promise.all(
+    urls.map(async (url) => {
+      try {
+        return await fetchUrlImage(url, overall);
+      } catch (err) {
+        console.warn(`[image-url-ingest] url image failed url=${safeUrl(url)}: ${errMsg(err)}`);
+        return null;
       }
-      out.push(img);
-    } catch (err) {
-      console.warn(`[image-url-ingest] url image failed url=${safeUrl(url)}: ${errMsg(err)}`);
-    }
+    }),
+  );
+  for (const img of settled) {
+    if (out.length >= MAX_INBOUND_IMAGES) break;
+    if (img) out.push(img);
   }
   return out;
 }
