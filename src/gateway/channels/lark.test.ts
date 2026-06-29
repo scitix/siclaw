@@ -6,6 +6,7 @@ import {
   handleLarkMessage,
   collectResponse,
   collectChannelResponse,
+  extractInbound,
   resetLarkBindingQueuesForTest,
 } from "./lark.js";
 import {
@@ -2083,6 +2084,19 @@ function makePostEvent(text: string, imageKey: string) {
 }
 
 describe("handleLarkMessage — inbound images", () => {
+  // Native images are vision-gated now; default the binding to a vision-capable model.
+  const VISION_BINDING = {
+    modelProvider: "openai",
+    modelId: "gpt-4o",
+    modelConfig: {
+      name: "p", baseUrl: "", apiKey: "", api: "openai", authHeader: false,
+      models: [{ id: "gpt-4o", name: "gpt-4o", reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100 }],
+    },
+  };
+  beforeEach(() => {
+    resolveAgentModelBindingMock.mockResolvedValue(VISION_BINDING);
+  });
+
   it("native image message → prompt carries images + placeholder text persisted", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a1", sessionId: "session-fixed" }));
     promptMock.mockResolvedValue({ sessionId: "session-fixed" });
@@ -2124,6 +2138,35 @@ describe("handleLarkMessage — inbound images", () => {
     expect(arg.text).toContain("look at this error");
   });
 
+  it("native image + non-vision model → no images attached, placeholder still recorded", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a1", sessionId: "session-fixed" }));
+    resolveAgentModelBindingMock.mockResolvedValue({
+      modelProvider: "deepseek",
+      modelId: "deepseek-chat",
+      modelConfig: {
+        name: "p", baseUrl: "", apiKey: "", api: "openai", authHeader: false,
+        models: [{ id: "deepseek-chat", name: "deepseek-chat", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100 }],
+      },
+    });
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makeImageEvent("img_k1"),
+      makeLarkClientWithResource(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const arg = promptMock.mock.calls[0][0];
+    // non-vision → native image not downloaded/attached (mirrors the text-URL path),
+    // but the placeholder still records that the user sent an image
+    expect(arg).not.toHaveProperty("images");
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({ role: "user", content: "[image]" }));
+  });
+
   it("text image URL → left in prompt text for the unified layer (lark no longer resolves it)", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({ agentId: "a1", sessionId: "session-fixed" }));
     promptMock.mockResolvedValue({ sessionId: "session-fixed" });
@@ -2144,5 +2187,34 @@ describe("handleLarkMessage — inbound images", () => {
     const arg = promptMock.mock.calls[0][0];
     expect(arg).not.toHaveProperty("images");
     expect(arg.text).toContain("https://oss.siflow.cn/x.png");
+  });
+});
+
+describe("extractInbound — post receive shapes", () => {
+  it("parses locale-nested post content instead of silently dropping it", () => {
+    const message = {
+      message_type: "post",
+      content: JSON.stringify({
+        zh_cn: { title: "Title", content: [[{ tag: "text", text: "hello" }, { tag: "img", image_key: "img_k9" }]] },
+      }),
+    };
+    const { text, imageRefs } = extractInbound(message);
+    expect(imageRefs).toEqual([{ imageKey: "img_k9" }]);
+    expect(text).toContain("hello");
+    expect(text).toContain("Title"); // title surfaced
+  });
+
+  it("parses the flat post shape and surfaces a hyperlink href + title", () => {
+    const message = {
+      message_type: "post",
+      content: JSON.stringify({
+        title: "Report",
+        content: [[{ tag: "a", text: "see", href: "https://oss.siflow.cn/x.png" }]],
+      }),
+    };
+    const { text } = extractInbound(message);
+    expect(text).toContain("Report");
+    expect(text).toContain("see");
+    expect(text).toContain("https://oss.siflow.cn/x.png"); // href surfaced for the unified URL resolver
   });
 });

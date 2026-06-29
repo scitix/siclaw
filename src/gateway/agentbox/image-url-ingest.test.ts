@@ -32,6 +32,7 @@ const ENV_KEYS = [
   "SICLAW_IMAGE_URL_ALLOWLIST",
   "SICLAW_IMAGE_URL_ALLOW_HTTP",
   "SICLAW_IMAGE_URL_FETCH_TIMEOUT_MS",
+  "SICLAW_IMAGE_URL_TOTAL_TIMEOUT_MS",
 ];
 
 beforeEach(() => {
@@ -188,5 +189,21 @@ describe("enrichImagesFromText", () => {
     const out = await enrichImagesFromText("https://oss.siflow.cn/a.jpeg", existing);
     expect(out).toHaveLength(4);
     expect(fetchMock).not.toHaveBeenCalled(); // budget full → never fetches
+  });
+
+  it("bounds the whole step by a total timeout and fetches in parallel (hanging host doesn't stall)", async () => {
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_TOTAL_TIMEOUT_MS = "100";
+    // fetch that honours the abort signal but otherwise never resolves
+    const fetchMock = vi.fn((_url: any, init: any) => new Promise((_res, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const start = Date.now();
+    const out = await enrichImagesFromText("https://oss.siflow.cn/a.png https://oss.siflow.cn/b.png", []);
+    expect(out).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // both fired in parallel, not gated one-by-one
+    // bounded by the ~100ms total budget, NOT 2×(per-hop 5s) run sequentially
+    expect(Date.now() - start).toBeLessThan(2000);
   });
 });
