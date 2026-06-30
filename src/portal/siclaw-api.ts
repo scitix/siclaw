@@ -3061,7 +3061,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
               SUBSTR(m.tool_input, 1, 500) AS toolInput,
               m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
-              ${actorUserColumn("s")} AS userId, s.agent_id AS agentId, s.origin AS origin,
+              s.user_id AS userId, s.sender_external_id AS senderId, s.agent_id AS agentId, s.origin AS origin,
               a.name AS agentName
        FROM chat_messages m
        LEFT JOIN chat_sessions s ON m.session_id = s.id
@@ -3215,7 +3215,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const db = getDb();
     const [rows] = await db.query(
-      `SELECT s.id AS sessionId, ${actorUserColumn("s")} AS userId, s.channel_id AS channelId, s.agent_id AS agentId, a.name AS agentName,
+      `SELECT s.id AS sessionId, s.user_id AS userId, s.sender_external_id AS senderId, s.channel_id AS channelId, s.agent_id AS agentId, a.name AS agentName,
               s.title AS title, s.preview AS preview, s.origin AS origin, s.message_count AS messageCount,
               s.created_at AS createdAt, s.last_active_at AS lastActiveAt,
               (SELECT COUNT(*) FROM chat_messages cm WHERE cm.session_id = s.id AND cm.role = 'tool') AS toolCallCount,
@@ -3294,7 +3294,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const db = getDb();
 
     const [sRows] = await db.query(
-      `SELECT s.id AS sessionId, ${actorUserColumn("s")} AS userId, s.channel_id AS channelId, s.agent_id AS agentId, a.name AS agentName,
+      `SELECT s.id AS sessionId, s.user_id AS userId, s.sender_external_id AS senderId, s.channel_id AS channelId, s.agent_id AS agentId, a.name AS agentName,
               s.title AS title, s.preview AS preview, s.origin AS origin, s.message_count AS messageCount,
               s.created_at AS createdAt, s.last_active_at AS lastActiveAt
        FROM chat_sessions s LEFT JOIN agents a ON s.agent_id = a.id

@@ -31,8 +31,18 @@ export type EntryMode = "all" | "web" | "api" | "a2a" | "channel" | "scheduled";
  * sender id — Lark open_id / DingTalk staffId — which is the "same person" key),
  * NOT the binding owner. For every other origin it is the session's `user_id`
  * (web=logged-in, api/a2a=API-key owner). siclaw has no SiCore-user concept, so
- * no SiCore identity appears here. Use this anywhere the Metrics queries filter,
- * group, or project the user.
+ * no SiCore identity appears here.
+ *
+ * Use this ONLY for the actor-based FILTER and the distinct-actor COUNT — it is
+ * the canonical "who acted" expression. Do NOT project it as the response
+ * `userId` field: row payloads expose `user_id` (always the owner) and
+ * `sender_external_id` separately, so a consumer never has to disambiguate one
+ * overloaded field by `origin`.
+ *
+ * The channel dimension is intentionally NOT scoped here: Lark `open_id` is
+ * per-app unique and DingTalk `staffId` has a distinct shape, so senders never
+ * collide across origins/channels — narrowing to one channel is left to the
+ * explicit `channel_id` filter, not folded into this expression.
  *
  * `alias` is the chat_sessions table alias (default "s"); pass "" for an
  * unaliased `FROM chat_sessions`.
