@@ -704,16 +704,7 @@ describe("registerAgentRoutes", () => {
   // ── API Keys ─────────────────────────────────────────────
   describe("API keys", () => {
     describe("GET /api/v1/siclaw/agents/:id/api-keys", () => {
-      it("requires admin", async () => {
-        const { status } = await runRoute(router, fakeReq({
-          url: "/api/v1/siclaw/agents/a1/api-keys",
-          method: "GET",
-          headers: { authorization: `Bearer ${USER_TOKEN}` },
-        }));
-        expect(status).toBe(403);
-      });
-
-      it("lists keys for admin", async () => {
+      it("admin lists all keys for the agent (no owner filter)", async () => {
         query.mockResolvedValueOnce([[{ id: "k1", name: "test" }], []]);
         const { status, body } = await runRoute(router, fakeReq({
           url: "/api/v1/siclaw/agents/a1/api-keys",
@@ -721,6 +712,23 @@ describe("registerAgentRoutes", () => {
         }));
         expect(status).toBe(200);
         expect(body.data).toHaveLength(1);
+        // admin → filter on agent only
+        expect(query.mock.calls[0][1]).toEqual(["a1"]);
+        expect(query.mock.calls[0][0]).not.toMatch(/created_by = \?/);
+      });
+
+      it("regular user lists only their own keys (created_by filter)", async () => {
+        query.mockResolvedValueOnce([[{ id: "k1", created_by: "u1" }], []]);
+        const { status, body } = await runRoute(router, fakeReq({
+          url: "/api/v1/siclaw/agents/a1/api-keys",
+          method: "GET",
+          headers: { authorization: `Bearer ${USER_TOKEN}` },
+        }));
+        expect(status).toBe(200);
+        expect(body.data).toHaveLength(1);
+        // user → scoped to (agent, self)
+        expect(query.mock.calls[0][0]).toMatch(/created_by = \?/);
+        expect(query.mock.calls[0][1]).toEqual(["a1", "u1"]);
       });
     });
 
@@ -739,6 +747,23 @@ describe("registerAgentRoutes", () => {
         expect(status).toBe(201);
         expect(body.key).toMatch(/^sk-[a-f0-9]+$/);
       });
+
+      it("a regular user may create a key, stamped created_by = caller", async () => {
+        query
+          .mockResolvedValueOnce([undefined, []])
+          .mockResolvedValueOnce([[{ id: "k1", agent_id: "a1", name: "mine" }], []]);
+
+        const { status } = await runRoute(router, fakeReq({
+          url: "/api/v1/siclaw/agents/a1/api-keys",
+          method: "POST",
+          body: { name: "mine" },
+          headers: { authorization: `Bearer ${USER_TOKEN}` },
+        }));
+
+        expect(status).toBe(201);
+        // INSERT args: [id, agentId, name, keyHash, plaintext, keyPrefix, expires, created_by]
+        expect(query.mock.calls[0][1][7]).toBe("u1");
+      });
     });
 
     describe("DELETE /api/v1/siclaw/agents/:id/api-keys/:kid", () => {
@@ -751,9 +776,9 @@ describe("registerAgentRoutes", () => {
         expect(status).toBe(404);
       });
 
-      it("deletes key and its service accounts", async () => {
+      it("admin deletes any key and its service accounts", async () => {
         query
-          .mockResolvedValueOnce([[{ id: "k1" }], []])
+          .mockResolvedValueOnce([[{ id: "k1", created_by: "someone-else" }], []])
           .mockResolvedValueOnce([undefined, []])  // service accounts delete
           .mockResolvedValueOnce([undefined, []]); // key delete
 
@@ -763,6 +788,33 @@ describe("registerAgentRoutes", () => {
         }));
         expect(status).toBe(200);
         expect(body).toEqual({ ok: true });
+      });
+
+      it("a regular user may delete their own key", async () => {
+        query
+          .mockResolvedValueOnce([[{ id: "k1", created_by: "u1" }], []])
+          .mockResolvedValueOnce([undefined, []])
+          .mockResolvedValueOnce([undefined, []]);
+
+        const { status } = await runRoute(router, fakeReq({
+          url: "/api/v1/siclaw/agents/a1/api-keys/k1",
+          method: "DELETE",
+          headers: { authorization: `Bearer ${USER_TOKEN}` },
+        }));
+        expect(status).toBe(200);
+      });
+
+      it("a regular user cannot delete someone else's key (403, no delete issued)", async () => {
+        query.mockResolvedValueOnce([[{ id: "k1", created_by: "admin-1" }], []]);
+
+        const { status } = await runRoute(router, fakeReq({
+          url: "/api/v1/siclaw/agents/a1/api-keys/k1",
+          method: "DELETE",
+          headers: { authorization: `Bearer ${USER_TOKEN}` },
+        }));
+        expect(status).toBe(403);
+        // only the SELECT ran — no DELETE statements
+        expect(query.mock.calls).toHaveLength(1);
       });
     });
   });
