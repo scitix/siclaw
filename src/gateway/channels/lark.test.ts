@@ -426,6 +426,8 @@ describe("handleLarkMessage — personal bot p2p", () => {
       "hello personal",
       "hello personal",
       "channel",
+      undefined,
+      expect.objectContaining({ senderExternalId: "ou_user_1" }),
     );
     expect(promptMock).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: "session-open-ou1",
@@ -717,6 +719,9 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       {} as any,
     );
 
+    // Record the raw open_id as the channel sender on the SESSION, NEVER the
+    // binding owner. Session row user_id stays the owner ("user-1") for
+    // ownership, but the channel audit actor is the sender_external_id.
     expect(ensureChatSessionMock).toHaveBeenCalledWith(
       "session-fixed",
       "a1",
@@ -724,6 +729,8 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       "检查当前集群",
       "检查当前集群",
       "channel",
+      undefined,
+      expect.objectContaining({ senderExternalId: "ou_user_1", channelId: "lark" }),
     );
     expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: "session-fixed",
@@ -746,6 +753,32 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     });
     expect(promptMock.mock.calls[0][0].text).toContain("<channel-turn>");
     expect(promptMock.mock.calls[0][0].text).toContain("检查当前集群");
+  });
+
+  it("records the raw open_id as the channel sender even for a sicore_user session key", async () => {
+    // siclaw has no SiCore-user concept: regardless of the server-issued session
+    // key, the audit sender is always the raw open_id, stamped on the session.
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      sessionKey: "sicore_user:sender-99",
+      createdBy: "owner-1",
+    }));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    await handleLarkMessage(
+      makeTextEvent("查一下"),
+      makeLarkClient(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    // Session row still owned by createdBy; the channel sender is the open_id.
+    expect(ensureChatSessionMock).toHaveBeenCalledWith(
+      "session-fixed", "a1", "owner-1", "查一下", "查一下", "channel",
+      undefined, expect.objectContaining({ senderExternalId: "ou_user_1" }),
+    );
   });
 
   it("reuses the same durable session for multiple messages from the same sender in the same group", async () => {

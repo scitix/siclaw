@@ -24,6 +24,24 @@
 
 export type EntryMode = "all" | "web" | "api" | "a2a" | "channel" | "scheduled";
 
+/**
+ * SQL expression for the "user" a row is attributed to in the Metrics axis.
+ *
+ * For **channel** sessions the audit actor is the channel sender (the raw
+ * sender id — Lark open_id / DingTalk staffId — which is the "same person" key),
+ * NOT the binding owner. For every other origin it is the session's `user_id`
+ * (web=logged-in, api/a2a=API-key owner). siclaw has no SiCore-user concept, so
+ * no SiCore identity appears here. Use this anywhere the Metrics queries filter,
+ * group, or project the user.
+ *
+ * `alias` is the chat_sessions table alias (default "s"); pass "" for an
+ * unaliased `FROM chat_sessions`.
+ */
+export function actorUserColumn(alias = "s"): string {
+  const p = alias ? `${alias}.` : "";
+  return `CASE WHEN ${p}origin = 'channel' THEN ${p}sender_external_id ELSE ${p}user_id END`;
+}
+
 /** The user-selectable entry buckets (excludes the internal "delegation"). */
 export const ENTRY_MODES: readonly EntryMode[] = ["all", "web", "api", "a2a", "channel", "scheduled"];
 

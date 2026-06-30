@@ -95,6 +95,18 @@ describe("ensureChatSession", () => {
 
     expect(fake.calls[0].params.title).toHaveLength(255);
   });
+
+  it("stamps sender_external_id + channel_id when the channel-audit opts provide them", async () => {
+    await ensureChatSession("sid", "agent", "user", "Title", "Preview", "channel", undefined, { senderExternalId: "ou_x", channelId: "lark" });
+    expect(fake.calls[0].params.sender_external_id).toBe("ou_x");
+    expect(fake.calls[0].params.channel_id).toBe("lark");
+  });
+
+  it("omits channel-audit columns when no opts are passed (web/api callers unchanged)", async () => {
+    await ensureChatSession("sid", "agent", "user", "Title", "Preview", "web");
+    expect(fake.calls[0].params.sender_external_id).toBeUndefined();
+    expect(fake.calls[0].params.channel_id).toBeUndefined();
+  });
 });
 
 describe("appendMessage", () => {

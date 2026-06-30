@@ -309,14 +309,17 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
       yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done." }] } };
     });
 
-    await handleDingTalkMessage(makeDownstream("查一下 pod"), "ch", makeAgentBoxManager("agent-7") as any, undefined, {} as any);
+    await handleDingTalkMessage(makeDownstream("查一下 pod", { senderStaffId: "staff-1" }), "ch", makeAgentBoxManager("agent-7") as any, undefined, {} as any);
 
     // Session row created with origin="channel" (6th arg), owner as user_id.
     expect(ensureChatSessionMock).toHaveBeenCalledTimes(1);
     const ecArgs = ensureChatSessionMock.mock.calls[0];
     expect(ecArgs[1]).toBe("agent-7");     // agentId
-    expect(ecArgs[2]).toBe("owner-1");     // user_id = binding owner
+    expect(ecArgs[2]).toBe("owner-1");     // user_id = binding owner (ownership)
     expect(ecArgs[5]).toBe("channel");     // origin
+    // The channel sender is the raw staff id, the channel is "ch", stamped on the
+    // session. NEVER the owner. siclaw has no SiCore-user concept.
+    expect(ecArgs[7]).toMatchObject({ senderExternalId: "staff-1", channelId: "ch" });
 
     const rows = appendMessageMock.mock.calls.map((c) => c[0] as any);
     expect(rows.find((m) => m.role === "user")?.content).toBe("查一下 pod");
