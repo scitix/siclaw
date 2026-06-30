@@ -12,7 +12,7 @@ import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
 import type { AgentMode } from "../core/tool-registry.js";
-import { isMemoryEnabled, loadConfig } from "../core/config.js";
+import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
@@ -755,8 +755,15 @@ export function createHttpServer(
     // IMPORTANT: append after DP markers, not prepend before them.
     // Prepending would break marker detection in pi-agent extension input handlers
     // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
+    //
+    // The directive is injected UNCONDITIONALLY (not gated on memory): following the
+    // user's language is a baseline behaviour every agent needs, independent of whether
+    // it has long-term memory. Only the PROFILE.md persistence below is a memory concern.
+    // (Previously this was accidentally gated on isMemoryEnabled() as a side effect of
+    // "disable memory by default", which left memory-off agents — e.g. the GPU-cloud
+    // sales-guide — with no language enforcement, so they drifted to the model's bias.)
     const detectedLang = detectLanguage(promptText);
-    if (detectedLang !== "English" && isMemoryEnabled()) {
+    if (detectedLang !== "English") {
       // Only two DP markers remain after the refactor: activation and exit.
       const dpMarkers = [DP_ACTIVATION_MARKER, `${DP_EXIT_MARKER}\n`];
       const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
