@@ -247,6 +247,8 @@ Examples (pass the id from host_list; names shown here for readability):
       // This requires `setsid` + `timeout` on the host — the SAME dependency the background path
       // already takes for every host command (util-linux + coreutils, present on any normal SSH
       // target incl. BusyBox); a host missing them errors visibly rather than orphaning silently.
+      // setsid is invoked WITHOUT `-w` (see wrapBackgroundSession) so it works on older util-linux
+      // (e.g. CentOS 7's 2.23.2) and BusyBox, which don't support the `-w`/`--wait` flag.
       const cap = Math.min(params.timeout_seconds ?? 30, 120);
       const timeout = cap * 1000;
       const fgPgidFile = backgroundPgidFile(toolCallId);

@@ -14,6 +14,12 @@ const {
   killRemoteSessionViaSsh,
 } = await import("./bg-session.js");
 
+// NOTE: the assertions below check SHELL-STRING COMPOSITION only — they intentionally do not
+// exercise runtime semantics (real exit-status propagation, or the `pkill -s <sid>` reap chain),
+// which are the two guarantees this wrapper exists to provide. Those depend on `setsid(2)` /
+// process-group behavior that can't be observed without a real Linux shell, so they are verified
+// manually on a CentOS 7 / BusyBox target (see the PR's manual test plan) rather than in CI. A
+// green run of this file alone does not prove the runtime contract holds.
 describe("bg-session", () => {
   it("builds a unique, sanitized pidfile path", () => {
     const a = backgroundPgidFile("functions.host_exec:0");
@@ -24,7 +30,9 @@ describe("bg-session", () => {
 
   it("wraps a command as a setsid session that records its session id and cleans up", () => {
     const wrapped = wrapBackgroundSession("timeout 600 sh -c 'do work'", "/tmp/x.pgid");
-    expect(wrapped.startsWith("setsid -w sh -c ")).toBe(true);
+    expect(wrapped.startsWith("setsid sh -c ")).toBe(true);
+    expect(wrapped).not.toContain("setsid -w");            // no util-linux >= 2.24 dependency
+    expect(wrapped.endsWith("; exit $?")).toBe(true);      // forces a forked (non-leader) setsid child
     expect(wrapped).toContain("echo $$ > /tmp/x.pgid");   // record session id
     expect(wrapped).toContain("timeout 600 sh -c");        // inner command preserved
     expect(wrapped).toContain("rm -f /tmp/x.pgid");        // cleanup on normal exit
