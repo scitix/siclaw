@@ -52,6 +52,26 @@ spec:
               value: "{{ include "siclaw.fullname" . }}-runtime.{{ .Release.Namespace }}.svc.cluster.local"
             - name: SICLAW_MEMORY_ENABLED
               value: {{ ternary "true" "false" .Values.runtime.memory.enabled | quote }}
+            {{- with .Values.runtime.embedding }}
+            {{- if .baseUrl }}
+            # Embedding endpoint for memory's vector search. Forwarded by the
+            # runtime spawner into each AgentBox pod (SICLAW_EMBEDDING_*).
+            - name: SICLAW_EMBEDDING_BASE_URL
+              value: {{ .baseUrl | quote }}
+            {{- if .model }}
+            - name: SICLAW_EMBEDDING_MODEL
+              value: {{ .model | quote }}
+            {{- end }}
+            {{- if .dimensions }}
+            - name: SICLAW_EMBEDDING_DIMENSIONS
+              value: {{ .dimensions | quote }}
+            {{- end }}
+            {{- if .apiKey }}
+            - name: SICLAW_EMBEDDING_API_KEY
+              value: {{ .apiKey | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.runtime.subagentConcurrency }}
             # Forwarded by the runtime spawner into each AgentBox pod; if unset the
             # agentbox falls back to its built-in default (5).
@@ -73,6 +93,12 @@ spec:
             {{- if .Values.agentbox.debugImage }}
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
+            {{- end }}
+            {{- if .Values.agentbox.nodeSelector }}
+            # Node scheduling constraint forwarded by the runtime spawner onto
+            # every spawned AgentBox pod (parsed as a JSON label map).
+            - name: SICLAW_AGENTBOX_NODE_SELECTOR
+              value: {{ toJson .Values.agentbox.nodeSelector | quote }}
             {{- end }}
             - name: SICLAW_SKILLS_DIR
               value: ".siclaw/skills"

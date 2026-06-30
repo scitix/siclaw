@@ -316,6 +316,29 @@ export function loadConfig(): SiclawConfig {
     if (!isNaN(v) && v > 0) cached.debugPodStartupTimeout = v;
   }
 
+  // Embedding config via env — infrastructure override for K8s/AgentBox, where
+  // there is no settings.json `embedding` section and Portal does not serve one.
+  // Each field overrides the file value individually; missing fields keep the
+  // file value (or fall back to getEmbeddingConfig()'s defaults). The block is
+  // only constructed when at least one var is set, so non-memory deployments are
+  // unaffected. `getEmbeddingConfig()` still returns null when baseUrl is empty.
+  {
+    const envBaseUrl = process.env.SICLAW_EMBEDDING_BASE_URL;
+    const envModel = process.env.SICLAW_EMBEDDING_MODEL;
+    const envApiKey = process.env.SICLAW_EMBEDDING_API_KEY;
+    const envDimensions = process.env.SICLAW_EMBEDDING_DIMENSIONS;
+    if (envBaseUrl || envModel || envApiKey || envDimensions) {
+      const existing = cached.embedding;
+      const parsedDims = envDimensions !== undefined ? parseInt(envDimensions, 10) : NaN;
+      cached.embedding = {
+        baseUrl: envBaseUrl ?? existing?.baseUrl ?? "",
+        apiKey: envApiKey ?? existing?.apiKey ?? "",
+        model: envModel ?? existing?.model ?? "BAAI/bge-m3",
+        dimensions: !isNaN(parsedDims) && parsedDims > 0 ? parsedDims : existing?.dimensions ?? 1024,
+      };
+    }
+  }
+
   return cached;
 }
 
@@ -381,10 +404,36 @@ export function getDefaultLlm(): { baseUrl: string; apiKey: string; authHeader: 
 }
 
 /**
+ * True when two URLs share scheme + host + port (same trust domain). Used to
+ * decide whether the embedding endpoint may inherit the default LLM provider's
+ * API key. Malformed/empty URLs ⇒ false (fail closed: never leak the key).
+ */
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    // URL.host already includes the port, so protocol + host == origin.
+    return ua.protocol === ub.protocol && ua.host === ub.host;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Get embedding configuration.
  *
- * Falls back to the default provider's apiKey if `embedding.apiKey` is empty.
- * Returns null if no embedding config and no default provider.
+ * apiKey resolution:
+ *   1. explicit `embedding.apiKey` (always wins)
+ *   2. default LLM provider key — ONLY when the embedding endpoint is the SAME
+ *      ORIGIN as that provider (one provider serving both chat and embeddings).
+ *
+ * Inheriting the LLM key for an *independent* endpoint (the K8s/self-hosted TEI
+ * case the SICLAW_EMBEDDING_* env path enables) would ship a high-value
+ * credential to a different trust domain as `Authorization: Bearer …`. For a
+ * cross-origin endpoint with no explicit key we send none and let
+ * "empty = unauthenticated" hold, matching the chart docs.
+ *
+ * Returns null if no embedding baseUrl is configured.
  */
 export function getEmbeddingConfig(): EmbeddingConfig | null {
   const config = loadConfig();
@@ -393,15 +442,16 @@ export function getEmbeddingConfig(): EmbeddingConfig | null {
   const model = config.embedding?.model ?? "BAAI/bge-m3";
   const dimensions = config.embedding?.dimensions ?? 1024;
 
-  // apiKey: explicit embedding key → default provider key → empty
+  // baseUrl is required for embedding API calls; without it, fall back to FTS-only
+  if (!baseUrl) return null;
+
   let apiKey = config.embedding?.apiKey ?? "";
   if (!apiKey) {
     const defaultLlm = getDefaultLlm();
-    if (defaultLlm) apiKey = defaultLlm.apiKey;
+    if (defaultLlm && sameOrigin(baseUrl, defaultLlm.baseUrl)) {
+      apiKey = defaultLlm.apiKey;
+    }
   }
-
-  // baseUrl is required for embedding API calls; without it, fall back to FTS-only
-  if (!baseUrl) return null;
 
   return { baseUrl, apiKey, model, dimensions };
 }
