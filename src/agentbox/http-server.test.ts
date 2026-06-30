@@ -16,6 +16,7 @@ import type https from "node:https";
 
 const mockConfigState = vi.hoisted(() => ({
   modelRouting: undefined as unknown,
+  memoryEnabled: true,
 }));
 
 // Silence metrics auth side effects.
@@ -53,7 +54,7 @@ vi.mock("../core/config.js", () => ({
     },
     modelRouting: mockConfigState.modelRouting,
   }),
-  isMemoryEnabled: () => true,
+  isMemoryEnabled: () => mockConfigState.memoryEnabled,
 }));
 
 // Make sync-handlers a no-op registry.
@@ -236,6 +237,7 @@ const origEnv = { SICLAW_GATEWAY_URL: process.env.SICLAW_GATEWAY_URL, SICLAW_CER
 
 beforeEach(async () => {
   mockConfigState.modelRouting = undefined;
+  mockConfigState.memoryEnabled = true;
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -328,6 +330,37 @@ describe("http-server — prompt + session lifecycle", () => {
       "Please analyze the attached image.",
       { images: [{ mimeType: "image/png", data: "aW1n" }] },
     );
+  });
+
+  // Regression: language-following must NOT be gated on memory. A memory-off agent
+  // (e.g. the GPU-cloud sales-guide) still needs its reply to follow the user's
+  // language; the `[System: respond in X]` directive is injected regardless of memory.
+  it("POST /api/prompt injects the language directive even when memory is disabled", async () => {
+    mockConfigState.memoryEnabled = false;
+    const session = await sm.getOrCreate("lang-nomem");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "你好",
+      sessionId: "lang-nomem",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+    });
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt.mock.calls[0][0]).toBe("[System: respond in Chinese]\n你好");
+  });
+
+  it("POST /api/prompt leaves English prompts untouched when memory is disabled", async () => {
+    mockConfigState.memoryEnabled = false;
+    const session = await sm.getOrCreate("lang-en-nomem");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hello there",
+      sessionId: "lang-en-nomem",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+    });
+    expect(r.status).toBe(200);
+    expect(session.brain.prompt.mock.calls[0][0]).toBe("hello there");
   });
 
   it("POST /api/prompt forwards large valid images to brain.prompt", async () => {
