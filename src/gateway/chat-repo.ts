@@ -7,6 +7,7 @@
 
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { normalizeChatSessionTitle } from "./chat-session-fields.js";
+import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 
 export interface ChatSessionLineageInput {
   /** Parent chat session for delegated child sessions. Null/undefined for normal top-level chat. */
@@ -137,10 +138,15 @@ export async function ensureChatSession(
  * path in `getMessages` below reverses the transformation.
  */
 export async function appendMessage(msg: AppendMessageInput): Promise<string> {
+  // Defence in depth: never persist the agentbox's injected `[System: respond in X]`
+  // language directive as a user message (it's a model-only control token). The
+  // gateway path already stores the original text, so this is a no-op there, but it
+  // guards any caller that hands us a brain-recorded user turn.
+  const content = msg.role === "user" ? stripLanguageDirective(msg.content) : msg.content;
   const result = await getClient().request("chat.appendMessage", {
     session_id: msg.sessionId,
     role: msg.role,
-    content: msg.content,
+    content,
     tool_name: msg.toolName ?? null,
     tool_input: msg.toolInput ?? null,
     metadata: msg.metadata != null ? JSON.stringify(msg.metadata) : null,

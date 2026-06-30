@@ -46,6 +46,7 @@ import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
 import { detectLanguage } from "../shared/detect-language.js";
+import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import type {
   DelegationAppendMessagePayload,
   DelegationEventPayload,
@@ -1104,6 +1105,13 @@ export class AgentBoxSessionManager {
   }
 
   private async persistAppendMessage(message: DelegationAppendMessagePayload): Promise<string> {
+    // The brain records the user turn with the agentbox's injected
+    // `[System: respond in X]` language directive. Strip it before syncing the user
+    // message to the portal so it never surfaces in any consumer's chat UI (the
+    // directive already did its job at the model; it's not part of the user's text).
+    if (message.role === "user" && typeof message.content === "string") {
+      message = { ...message, content: stripLanguageDirective(message.content) };
+    }
     const result = await this.persistDelegationEvent({ type: "delegation.append_message", message });
     return result.id ?? "";
   }
