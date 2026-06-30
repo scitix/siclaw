@@ -10,6 +10,7 @@ interface ModelEntry {
   model_id: string
   name: string
   reasoning: boolean
+  vision: boolean
   context_window: number
   max_tokens: number
   is_default: boolean
@@ -43,12 +44,12 @@ export function Models() {
 
   // Add model
   const [showAddModel, setShowAddModel] = useState<string | null>(null)
-  const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", reasoning: false, is_default: false })
+  const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", reasoning: false, vision: false, is_default: false })
   const [addingModel, setAddingModel] = useState(false)
 
   // Edit model
   const [editingModelId, setEditingModelId] = useState<string | null>(null)
-  const [editModelForm, setEditModelForm] = useState({ model_id: "", name: "", context_window: "", max_tokens: "", reasoning: false, is_default: false })
+  const [editModelForm, setEditModelForm] = useState({ model_id: "", name: "", context_window: "", max_tokens: "", reasoning: false, vision: false, is_default: false })
   const [savingModel, setSavingModel] = useState(false)
 
   const fetchProviders = async () => {
@@ -114,7 +115,7 @@ export function Models() {
         body: { ...modelForm, context_window: parseInt(modelForm.context_window), max_tokens: parseInt(modelForm.max_tokens) },
       })
       setShowAddModel(null)
-      setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", reasoning: false, is_default: false })
+      setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", reasoning: false, vision: false, is_default: false })
       await fetchProviders()
       toast.success("Model added")
     } catch (err: any) { toast.error(err.message) } finally { setAddingModel(false) }
@@ -133,6 +134,7 @@ export function Models() {
       context_window: String(model.context_window),
       max_tokens: String(model.max_tokens),
       reasoning: !!model.reasoning,
+      vision: !!model.vision,
       is_default: !!model.is_default,
     })
   }
@@ -149,6 +151,7 @@ export function Models() {
           context_window: parseInt(editModelForm.context_window),
           max_tokens: parseInt(editModelForm.max_tokens),
           reasoning: editModelForm.reasoning,
+          vision: editModelForm.vision,
           is_default: editModelForm.is_default,
         },
       })
@@ -265,7 +268,7 @@ export function Models() {
                               <div>
                                 <p className="text-sm font-mono">{model.model_id}</p>
                                 <p className="text-xs text-muted-foreground">
-                                  {model.name || model.model_id}{model.reasoning ? " · reasoning" : ""} · {(model.context_window / 1000).toFixed(0)}K
+                                  {model.name || model.model_id}{model.reasoning ? " · reasoning" : ""}{model.vision ? " · vision" : ""} · {(model.context_window / 1000).toFixed(0)}K
                                   {!!model.is_default && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-primary/20 text-primary">default</span>}
                                 </p>
                               </div>
@@ -286,6 +289,10 @@ export function Models() {
                                   <div className="flex items-center gap-2">
                                     <button type="button" role="switch" aria-checked={editModelForm.reasoning} onClick={() => setEditModelForm({ ...editModelForm, reasoning: !editModelForm.reasoning })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${editModelForm.reasoning ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${editModelForm.reasoning ? "translate-x-3" : "translate-x-0"}`} /></button>
                                     <span className="text-xs text-muted-foreground">Reasoning model</span>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <button type="button" role="switch" aria-checked={editModelForm.vision} onClick={() => setEditModelForm({ ...editModelForm, vision: !editModelForm.vision })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${editModelForm.vision ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${editModelForm.vision ? "translate-x-3" : "translate-x-0"}`} /></button>
+                                    <span className="text-xs text-muted-foreground">Vision model</span>
                                   </div>
                                   <div className="flex items-center gap-2">
                                     <button type="button" role="switch" aria-checked={editModelForm.is_default} onClick={() => setEditModelForm({ ...editModelForm, is_default: !editModelForm.is_default })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${editModelForm.is_default ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${editModelForm.is_default ? "translate-x-3" : "translate-x-0"}`} /></button>
@@ -316,6 +323,10 @@ export function Models() {
                           <div className="flex items-center gap-2">
                             <button type="button" role="switch" aria-checked={modelForm.reasoning} onClick={() => setModelForm({ ...modelForm, reasoning: !modelForm.reasoning })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${modelForm.reasoning ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${modelForm.reasoning ? "translate-x-3" : "translate-x-0"}`} /></button>
                             <span className="text-xs text-muted-foreground">Reasoning model</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button type="button" role="switch" aria-checked={modelForm.vision} onClick={() => setModelForm({ ...modelForm, vision: !modelForm.vision })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${modelForm.vision ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${modelForm.vision ? "translate-x-3" : "translate-x-0"}`} /></button>
+                            <span className="text-xs text-muted-foreground">Vision model</span>
                           </div>
                           <div className="flex items-center gap-2">
                             <button type="button" role="switch" aria-checked={modelForm.is_default} onClick={() => setModelForm({ ...modelForm, is_default: !modelForm.is_default })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${modelForm.is_default ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${modelForm.is_default ? "translate-x-3" : "translate-x-0"}`} /></button>

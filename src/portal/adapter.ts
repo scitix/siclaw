@@ -15,7 +15,7 @@ import {
   parseBody,
   type RestRouter,
 } from "../gateway/rest-router.js";
-import { defaultProviderModelCompat } from "../core/model-compat.js";
+import { buildProviderModelDescriptor } from "../core/model-compat.js";
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { safeParseSkillFiles } from "../shared/skill-package.js";
 import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
@@ -878,7 +878,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
 
     const p = providerRows[0];
     const [modelRows] = await db.query(
-      `SELECT model_id, name, reasoning, context_window, max_tokens
+      `SELECT model_id, name, reasoning, vision, context_window, max_tokens
        FROM model_entries WHERE provider_id = ? ORDER BY sort_order, created_at`,
       [p.id],
     ) as any;
@@ -893,14 +893,9 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
           baseUrl: p.base_url,
           apiKey: p.api_key || "",
           api: p.api_type,
-          models: (modelRows as any[]).map((m: any) => ({
-            id: m.model_id,
-            name: m.name || m.model_id,
-            reasoning: !!m.reasoning,
-            contextWindow: m.context_window,
-            maxTokens: m.max_tokens,
-            compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
-          })),
+          models: (modelRows as any[]).map((m: any) =>
+            buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+          ),
         },
       },
       default: { provider: agent.model_provider, modelId: agent.model_id },
@@ -1476,19 +1471,12 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
     const p = providerRows[0];
     const [entryRows] = await db.query(
-      "SELECT model_id, name, reasoning, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
+      "SELECT model_id, name, reasoning, vision, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
       [p.id],
     ) as any;
-    const models = (entryRows as any[]).map((m: any) => ({
-      id: m.model_id,
-      name: m.name ?? m.model_id,
-      reasoning: !!m.reasoning,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: m.context_window,
-      maxTokens: m.max_tokens,
-      compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
-    }));
+    const models = (entryRows as any[]).map((m: any) =>
+      buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+    );
     const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
       provider: agent.model_provider,
       modelId: agent.model_id,
@@ -1864,7 +1852,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
     const p = providerRows[0];
     const [modelRows] = await db.query(
-      `SELECT model_id, name, reasoning, context_window, max_tokens
+      `SELECT model_id, name, reasoning, vision, context_window, max_tokens
        FROM model_entries WHERE provider_id = ? ORDER BY sort_order, created_at`,
       [p.id],
     ) as any;
@@ -1878,14 +1866,9 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
           baseUrl: p.base_url,
           apiKey: p.api_key || "",
           api: p.api_type,
-          models: (modelRows as any[]).map((m: any) => ({
-            id: m.model_id,
-            name: m.name || m.model_id,
-            reasoning: !!m.reasoning,
-            contextWindow: m.context_window,
-            maxTokens: m.max_tokens,
-            compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
-          })),
+          models: (modelRows as any[]).map((m: any) =>
+            buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+          ),
         },
       },
       default: { provider: agent.model_provider, modelId: agent.model_id },
@@ -1912,19 +1895,12 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
     const p = providerRows[0];
     const [entryRows] = await db.query(
-      "SELECT model_id, name, reasoning, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
+      "SELECT model_id, name, reasoning, vision, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
       [p.id],
     ) as any;
-    const models = (entryRows as any[]).map((m: any) => ({
-      id: m.model_id,
-      name: m.name ?? m.model_id,
-      reasoning: !!m.reasoning,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: m.context_window,
-      maxTokens: m.max_tokens,
-      compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
-    }));
+    const models = (entryRows as any[]).map((m: any) =>
+      buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+    );
     const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
       provider: agent.model_provider,
       modelId: agent.model_id,

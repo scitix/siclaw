@@ -2633,11 +2633,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const trim = (v: unknown): string | null => (typeof v === "string" ? v.trim() : null);
     const modelId = trim(body.model_id);
     await db.query(
-      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, is_default, sort_order)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, vision, context_window, max_tokens, is_default, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, params.id, modelId, trim(body.name) || modelId,
-        body.reasoning ? 1 : 0, body.context_window ?? null,
+        body.reasoning ? 1 : 0, body.vision ? 1 : 0, body.context_window ?? null,
         body.max_tokens ?? null, body.is_default ? 1 : 0,
         body.sort_order ?? 0,
       ],
@@ -2665,7 +2665,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     }
 
     const body = await parseBody<Record<string, unknown>>(req);
-    const fields = ["model_id", "name", "reasoning", "context_window", "max_tokens", "is_default", "sort_order"];
+    const fields = ["model_id", "name", "reasoning", "vision", "context_window", "max_tokens", "is_default", "sort_order"];
     const sets: string[] = [];
     const values: unknown[] = [];
     for (const f of fields) {
