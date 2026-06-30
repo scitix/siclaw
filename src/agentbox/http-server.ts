@@ -115,7 +115,7 @@ const DP_EXIT_MARKER = "[DP_EXIT]";
 // the gateway is the original text, so this only affects the live render. Strip the
 // directive from the first text block of any user-role message event before it leaves
 // the agentbox; the model already saw it, and consumers see the clean text.
-function stripUserDirectiveFromEvent(event: unknown): unknown {
+export function stripUserDirectiveFromEvent(event: unknown): unknown {
   const e = event as { message?: { role?: string; content?: unknown } } | null;
   const msg = e?.message;
   if (!msg || msg.role !== "user") return event;
