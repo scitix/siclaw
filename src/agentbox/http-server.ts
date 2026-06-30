@@ -21,6 +21,7 @@ import { HttpTransport } from "./credential-transport.js";
 import { getSyncHandler, createClusterHandler, createHostHandler, createToolsHandler } from "./sync-handlers.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
+import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import {
   candidateSupportsPromptMedia,
   clearModelRouteUserSelectionIfDifferent,
@@ -105,6 +106,37 @@ const MAX_BODY_SIZE = MAX_PROMPT_MEDIA_ITEMS * MAX_PROMPT_MEDIA_BASE64_CHARS + 5
 const BODY_TIMEOUT_MS = 30_000; // 30s
 const DP_ACTIVATION_MARKER = "[Deep Investigation]\n";
 const DP_EXIT_MARKER = "[DP_EXIT]";
+
+// We prepend a `[System: respond in X]` language directive to the user's prompt so
+// the model follows the input language. pi-agent records that as the user turn and
+// re-emits it as a `message_start`/`message_end` brain event, which is streamed LIVE
+// to the frontend (and forwarded to portals like sicore as chat.event) — leaking the
+// internal directive into the displayed user bubble. The user message persisted by
+// the gateway is the original text, so this only affects the live render. Strip the
+// directive from the first text block of any user-role message event before it leaves
+// the agentbox; the model already saw it, and consumers see the clean text.
+function stripUserDirectiveFromEvent(event: unknown): unknown {
+  const e = event as { message?: { role?: string; content?: unknown } } | null;
+  const msg = e?.message;
+  if (!msg || msg.role !== "user") return event;
+  const content = msg.content;
+  if (typeof content === "string") {
+    const stripped = stripLanguageDirective(content);
+    return stripped === content ? event : { ...e, message: { ...msg, content: stripped } };
+  }
+  if (Array.isArray(content)) {
+    const idx = content.findIndex((b) => (b as { type?: string })?.type === "text");
+    if (idx < 0) return event;
+    const block = content[idx] as { type: string; text?: unknown };
+    if (typeof block.text !== "string") return event;
+    const stripped = stripLanguageDirective(block.text);
+    if (stripped === block.text) return event;
+    const newContent = content.slice();
+    newContent[idx] = { ...block, text: stripped };
+    return { ...e, message: { ...msg, content: newContent } };
+  }
+  return event;
+}
 const MAX_PROMPT_IMAGES = MAX_PROMPT_MEDIA_ITEMS;
 const MAX_PROMPT_IMAGE_BASE64_CHARS = MAX_PROMPT_MEDIA_BASE64_CHARS;
 const SUPPORTED_PROMPT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
@@ -992,7 +1024,7 @@ export function createHttpServer(
       if (closed || res.writableEnded) return;
       try {
         sseEventCount++;
-        const data = JSON.stringify(event);
+        const data = JSON.stringify(stripUserDirectiveFromEvent(event));
         res.write(`data: ${data}\n\n`);
       } catch (err) {
         console.warn(`[agentbox-http] SSE write error for session ${sessionId}:`, err);
