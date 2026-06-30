@@ -573,24 +573,29 @@ export function registerAgentRoutes(
   // API Keys (Portal-owned)
   // ================================================================
 
-  // List API keys
+  // List API keys. Admins see every key for the agent; a regular user sees only
+  // the keys they created (so each user manages their own without seeing others').
   router.get("/api/v1/siclaw/agents/:id/api-keys", async (req, res, params) => {
-    const auth = requireAdmin(req, res, jwtSecret);
-    if (!auth) return;
+    const auth = requireAuth(req, jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
 
     const db = getDb();
+    const ownerOnly = auth.role !== "admin";
     const [rows] = await db.query(
       `SELECT id, agent_id, name, key_plain, key_prefix, last_used_at, expires_at, created_by, created_at
-       FROM agent_api_keys WHERE agent_id = ? ORDER BY created_at DESC, id DESC`,
-      [params.id],
+       FROM agent_api_keys WHERE agent_id = ?${ownerOnly ? " AND created_by = ?" : ""}
+       ORDER BY created_at DESC, id DESC`,
+      ownerOnly ? [params.id, auth.userId] : [params.id],
     ) as any;
     sendJson(res, 200, { data: rows });
   });
 
-  // Create API key
+  // Create API key. Any authenticated user may create a key for themselves
+  // (stamped created_by = caller); admins included. Ownership is what scopes
+  // list/delete below.
   router.post("/api/v1/siclaw/agents/:id/api-keys", async (req, res, params) => {
-    const auth = requireAdmin(req, res, jwtSecret);
-    if (!auth) return;
+    const auth = requireAuth(req, jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
 
     const body = await parseBody<Record<string, unknown>>(req);
     const id = crypto.randomUUID();
@@ -613,17 +618,22 @@ export function registerAgentRoutes(
     sendJson(res, 201, { ...rows[0], key: plaintext });
   });
 
-  // Delete API key
+  // Delete API key. Admins may delete any key for the agent; a regular user may
+  // delete only keys they created.
   router.delete("/api/v1/siclaw/agents/:id/api-keys/:kid", async (req, res, params) => {
-    const auth = requireAdmin(req, res, jwtSecret);
-    if (!auth) return;
+    const auth = requireAuth(req, jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
 
     const db = getDb();
     const [existing] = await db.query(
-      "SELECT id FROM agent_api_keys WHERE id = ? AND agent_id = ?",
+      "SELECT id, created_by FROM agent_api_keys WHERE id = ? AND agent_id = ?",
       [params.kid, params.id],
     ) as any;
     if (existing.length === 0) { sendJson(res, 404, { error: "API key not found" }); return; }
+    if (auth.role !== "admin" && existing[0].created_by !== auth.userId) {
+      sendJson(res, 403, { error: "You can only delete your own API keys" });
+      return;
+    }
 
     await db.query("DELETE FROM api_key_service_accounts WHERE api_key_id = ?", [params.kid]);
     await db.query("DELETE FROM agent_api_keys WHERE id = ?", [params.kid]);
