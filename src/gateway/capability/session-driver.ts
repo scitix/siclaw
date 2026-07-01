@@ -45,13 +45,16 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
 
   for await (const raw of client.streamPath(`/events/${runId}`)) {
     const evt = raw as BoxEvent;
+    // ANY box event means the box is alive → bump activity so the watchdog never
+    // reaps an actively-working run (e.g. a long compile emitting only `log`).
+    // touch() is in-memory only (no persist), so it is cheap to call every event.
+    manager.touch(runId);
     switch (evt.type) {
       case "log":
         emit("log", { text: evt.text ?? "" });
         break;
       case "summary":
         emit("summary", { text: evt.summary ?? "" });
-        manager.touch(runId);
         break;
       case "turn_done":
         // A conversational/compile turn ended. Surface the reply; the run is now

@@ -48,7 +48,10 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
       { run_id: "r1", type: "summary", payload: { text: "wrote 3 pages" } },
       { run_id: "r1", type: "turn", payload: { text: "done for now" } },
     ]);
-    expect(mgr.touch).toHaveBeenCalledWith("r1"); // summary bumps activity
+    // EVERY box event bumps activity (watchdog must not reap an active run that
+    // only emits `log`): log + summary + turn_done + end = 4 touches.
+    expect(mgr.touch).toHaveBeenCalledTimes(4);
+    expect(mgr.touch).toHaveBeenCalledWith("r1");
     expect(mgr.setStatus).toHaveBeenCalledWith("r1", "idle"); // turn ended → idle
   });
 
