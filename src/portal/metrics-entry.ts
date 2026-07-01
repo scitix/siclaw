@@ -24,6 +24,54 @@
 
 export type EntryMode = "all" | "web" | "api" | "a2a" | "channel" | "scheduled";
 
+/**
+ * SQL expression for the "user" a row is attributed to in the Metrics axis.
+ *
+ * For **channel** sessions the audit actor is the channel sender (the raw
+ * sender id — Lark open_id / DingTalk staffId — which is the "same person" key),
+ * NOT the binding owner. For every other origin it is the session's `user_id`
+ * (web=logged-in, api/a2a=API-key owner). siclaw has no SiCore-user concept, so
+ * no SiCore identity appears here.
+ *
+ * Use this ONLY for the actor-based FILTER and the distinct-actor COUNT — it is
+ * the canonical "who acted" expression. Do NOT project it as the response
+ * `userId` field: row payloads expose `user_id` (always the owner) and
+ * `sender_external_id` separately, so a consumer never has to disambiguate one
+ * overloaded field by `origin`.
+ *
+ * The channel dimension is intentionally NOT scoped here: Lark `open_id` is
+ * per-app unique and DingTalk `staffId` has a distinct shape, so senders never
+ * collide across origins/channels — narrowing to one channel is left to the
+ * explicit `channel_id` filter, not folded into this expression.
+ *
+ * `alias` is the chat_sessions table alias (default "s"); pass "" for an
+ * unaliased `FROM chat_sessions`.
+ */
+export function actorUserColumn(alias = "s"): string {
+  const p = alias ? `${alias}.` : "";
+  return `CASE WHEN ${p}origin = 'channel' THEN ${p}sender_external_id ELSE ${p}user_id END`;
+}
+
+/**
+ * SQL column expression for a channel_id / sender_external_id filter, parent-aware.
+ *
+ * `channel_id` and `sender_external_id` are stamped on the PARENT channel
+ * session only. A MESSAGE-LEVEL query that uses {@link entryMessagePredicate}'s
+ * parent join counts a delegation child's rows (origin='delegation', these
+ * columns NULL) under the parent's channel entry — so it MUST filter/project via
+ * `COALESCE(child, parent)`, or those rows vanish the moment a channel/sender
+ * filter is applied. Pass `parentAlias` for such queries. Omit it for
+ * SESSION-LEVEL queries (no parent join; a delegation child is never a channel
+ * session there) — passing it would reference an unjoined alias.
+ *
+ * Centralized so every filter site inherits the same parent-aware form and the
+ * three query endpoints (audit / summary / timing) cannot silently diverge.
+ */
+export function channelColExpr(col: "channel_id" | "sender_external_id", alias = "s", parentAlias?: string): string {
+  const a = alias ? `${alias}.` : "";
+  return parentAlias ? `COALESCE(${a}${col}, ${parentAlias}.${col})` : `${a}${col}`;
+}
+
 /** The user-selectable entry buckets (excludes the internal "delegation"). */
 export const ENTRY_MODES: readonly EntryMode[] = ["all", "web", "api", "a2a", "channel", "scheduled"];
 

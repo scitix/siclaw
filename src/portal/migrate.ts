@@ -291,6 +291,8 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     parent_agent_id CHAR(36) DEFAULT NULL,
     delegation_id CHAR(36) DEFAULT NULL,
     target_agent_id CHAR(36) DEFAULT NULL,
+    sender_external_id VARCHAR(128) DEFAULT NULL,
+    channel_id CHAR(36) DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_active_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP NULL DEFAULT NULL
@@ -563,6 +565,11 @@ export async function runPortalMigrations(): Promise<void> {
   // enforced in app code (validateJumpChain) and acquire-time tolerates dangling refs.
   await safeAlterTable(db, "hosts", "jump_host_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "hosts", "passphrase", "VARCHAR(500) DEFAULT NULL");
+  // Channel (Lark/DingTalk) audit attribution: the actual end-user actor and the
+  // channel, distinct from the binding-owner user_id. Read by the Metrics
+  // "by user" axis (actorUserColumn). Nullable; only set for channel sessions.
+  await safeAlterTable(db, "chat_sessions", "sender_external_id", "VARCHAR(128) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "channel_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "skill_versions", "labels", "TEXT DEFAULT NULL");
   await safeAlterTable(db, "skill_versions", "files", "MEDIUMTEXT DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "parent_session_id", "CHAR(36) DEFAULT NULL");

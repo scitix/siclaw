@@ -115,6 +115,7 @@ export async function ensureChatSession(
   sessionId: string, agentId: string, userId: string,
   title?: string, preview?: string, origin?: string,
   lineage?: ChatSessionLineageInput,
+  opts?: { senderExternalId?: string | null; channelId?: string | null },
 ): Promise<void> {
   const payload: Record<string, unknown> = {
     session_id: sessionId, agent_id: agentId, user_id: userId,
@@ -126,6 +127,11 @@ export async function ensureChatSession(
     payload.delegation_id = lineage.delegationId ?? null;
     payload.target_agent_id = lineage.targetAgentId ?? null;
   }
+  // Channel (Lark/DingTalk) audit dimensions: the raw sender id (open_id /
+  // staffId — the "same person" key, never the binding owner) and which channel.
+  // Each gated on != null so web/api/a2a callers leave the payload unchanged.
+  if (opts?.senderExternalId != null) payload.sender_external_id = opts.senderExternalId;
+  if (opts?.channelId != null) payload.channel_id = opts.channelId;
   await getClient().request("chat.ensureSession", payload);
 }
 

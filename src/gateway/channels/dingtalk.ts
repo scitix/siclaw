@@ -325,9 +325,13 @@ export async function handleDingTalkMessage(
   // the binding owner (a real user UUID), mirroring lark. Best-effort: a persist
   // failure must NOT break the reply (DingTalk worked without persistence before).
   const auditable = !!binding.createdBy;
+  // Channel audit actor (NOT runtime identity). The sender's raw DingTalk staff
+  // id is the "same person" key for channel audit; it is stamped on the SESSION
+  // (chat_sessions), never falls back to the binding owner. NULL when absent.
+  const senderExternalId = message.senderStaffId ?? null;
   if (auditable) {
     try {
-      await ensureChatSession(sessionId, agentId, binding.createdBy!, text, text, "channel");
+      await ensureChatSession(sessionId, agentId, binding.createdBy!, text, text, "channel", undefined, { senderExternalId, channelId });
       await appendMessage({
         sessionId,
         role: "user",

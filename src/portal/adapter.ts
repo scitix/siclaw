@@ -1006,6 +1006,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       title?: string; preview?: string; origin?: string;
       parent_session_id?: string | null; parent_agent_id?: string | null;
       delegation_id?: string | null; target_agent_id?: string | null;
+      sender_external_id?: string | null; channel_id?: string | null;
     }>(req);
     const db = getDb();
     // last_active_at omitted: relies on schema DEFAULT CURRENT_TIMESTAMP for
@@ -1014,11 +1015,12 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const upsert = buildUpsert(
       db,
       "chat_sessions",
-      ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin", "parent_session_id", "parent_agent_id", "delegation_id", "target_agent_id"],
+      ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin", "parent_session_id", "parent_agent_id", "delegation_id", "target_agent_id", "sender_external_id", "channel_id"],
       [body.session_id, body.agent_id, body.user_id,
        normalizeChatSessionTitle(body.title), normalizeChatSessionPreview(body.preview), 0, body.origin || null,
        body.parent_session_id ?? null, body.parent_agent_id ?? null,
-       body.delegation_id ?? null, body.target_agent_id ?? null],
+       body.delegation_id ?? null, body.target_agent_id ?? null,
+       body.sender_external_id ?? null, body.channel_id ?? null],
       ["id"],
       [{ col: "last_active_at", expr: "CURRENT_TIMESTAMP" }],
     );
