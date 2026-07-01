@@ -131,7 +131,9 @@ export function SessionTable({
     })
 
   const openSession = (s: SessionListItem) => setSnapshotId(s.sessionId)
-  const usernameFor = (s: SessionListItem) => (s.userId ? userMap.get(s.userId) ?? s.userId : "—")
+  // Channel rows: the actor is the sender (open_id); other origins: the owner.
+  const usernameFor = (s: SessionListItem) =>
+    s.origin === "channel" ? (s.senderId ?? "—") : (s.userId ? userMap.get(s.userId) ?? s.userId : "—")
 
   return (
     <section className="px-6 py-6 space-y-4">

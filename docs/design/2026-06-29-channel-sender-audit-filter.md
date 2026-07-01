@@ -117,6 +117,30 @@ In the Sessions / Tools tables, a channel row's actor column shows the
 `sender_external_id` (truncated, full value on hover), so an operator can spot
 the same person across multiple sessions at a glance.
 
+### Response shape: owner and sender are separate fields
+
+Audit row payloads (`audit/sessions`, `metrics/audit`, the session snapshot)
+return **`userId` = the owner `user_id` (always a portal user)** and a separate
+**`senderId` = `sender_external_id` (channel sender, null off-channel)**. The
+actor is NOT overloaded onto a single `userId` field whose meaning flips by
+`origin` — a consumer that joins `siclaw_users` on `userId` stays correct for
+every row, and the UI simply renders `senderId` for channel rows, `userId`
+otherwise. `actorUserColumn` (the origin-aware CASE) is used only for the
+actor-based *filter* and the *distinct-actor count*, never as a projected field.
+
+### Metric semantics: NULL senders and the distinct-actor count
+
+`distinctUsers` counts `COUNT(DISTINCT actorUserColumn)` — owners for off-channel
+rows, senders for channel rows. Two consequences, both intentional:
+
+- A channel session whose sender is NULL (event omitted it) is **excluded** from
+  `distinctUsers` and from any sender-grouped view, while still counting in
+  `totalSessions`. So "distinct senders" ≤ "channel sessions"; the two tiles can
+  legitimately differ.
+- For the `all` entry the distinct set mixes portal UUIDs and channel sender ids.
+  They never collide (disjoint formats), so the count is meaningful as "distinct
+  actors across all entries".
+
 ## Migration
 
 `migrate.ts` is additive (CREATE TABLE IF NOT EXISTS + idempotent

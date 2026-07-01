@@ -64,6 +64,9 @@ export interface AuditLog {
   id: string
   sessionId: string
   userId: string | null
+  // Channel (Lark/DingTalk) sender id (open_id / staffId); null for web/api/a2a.
+  // The actor to display is senderId for channel rows, else userId.
+  senderId: string | null
   agentId: string | null
   agentName: string | null
   toolName: string | null
@@ -102,6 +105,9 @@ export interface TimingStats {
 export interface SessionListItem {
   sessionId: string
   userId: string | null
+  /** Channel (Lark/DingTalk) sender id (open_id / staffId); null for web/api/a2a.
+   *  Display the sender for channel rows, the owner userId otherwise. */
+  senderId: string | null
   /** For channel sessions: which channel the session belongs to (else null). */
   channelId: string | null
   agentId: string
