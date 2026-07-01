@@ -52,6 +52,26 @@ export function actorUserColumn(alias = "s"): string {
   return `CASE WHEN ${p}origin = 'channel' THEN ${p}sender_external_id ELSE ${p}user_id END`;
 }
 
+/**
+ * SQL column expression for a channel_id / sender_external_id filter, parent-aware.
+ *
+ * `channel_id` and `sender_external_id` are stamped on the PARENT channel
+ * session only. A MESSAGE-LEVEL query that uses {@link entryMessagePredicate}'s
+ * parent join counts a delegation child's rows (origin='delegation', these
+ * columns NULL) under the parent's channel entry — so it MUST filter/project via
+ * `COALESCE(child, parent)`, or those rows vanish the moment a channel/sender
+ * filter is applied. Pass `parentAlias` for such queries. Omit it for
+ * SESSION-LEVEL queries (no parent join; a delegation child is never a channel
+ * session there) — passing it would reference an unjoined alias.
+ *
+ * Centralized so every filter site inherits the same parent-aware form and the
+ * three query endpoints (audit / summary / timing) cannot silently diverge.
+ */
+export function channelColExpr(col: "channel_id" | "sender_external_id", alias = "s", parentAlias?: string): string {
+  const a = alias ? `${alias}.` : "";
+  return parentAlias ? `COALESCE(${a}${col}, ${parentAlias}.${col})` : `${a}${col}`;
+}
+
 /** The user-selectable entry buckets (excludes the internal "delegation"). */
 export const ENTRY_MODES: readonly EntryMode[] = ["all", "web", "api", "a2a", "channel", "scheduled"];
 

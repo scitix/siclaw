@@ -99,7 +99,10 @@ export function Metrics() {
               {isAudit && entry === "channel" && (
                 <select
                   value={channelId}
-                  onChange={(e) => setChannelId(e.target.value)}
+                  // Clear the sender when the channel changes — a sender id is
+                  // scoped to its channel, so a stale pick would filter the new
+                  // channel to an empty set with no visible reason.
+                  onChange={(e) => { setChannelId(e.target.value); setSenderId("") }}
                   className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
                 >
                   <option value="">All Channels</option>

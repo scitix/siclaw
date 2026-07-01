@@ -54,7 +54,7 @@ import {
   normalizeChatSessionTitle,
   truncateChatSessionTitle,
 } from "./chat-session-fields.js";
-import { normalizeEntry, entrySessionPredicate, entryMessagePredicate, actorUserColumn } from "./metrics-entry.js";
+import { normalizeEntry, entrySessionPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
 import { summariseLatency, extractTimingMs } from "./metrics-timing.js";
 
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
@@ -2856,12 +2856,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // Channel sub-axis: narrow to one channel (only meaningful for entry=channel).
     const channelId = entry === "channel" ? (query.channelId || null) : null;
     // User filter is origin-aware: channel sessions group by the actual sender
-    // (sender_external_id), never the binding owner. The channelId filter is
-    // session-level. Appends to `params` in order.
-    const userChanCond = (alias: string, params: unknown[]): string => {
+    // (sender_external_id), never the binding owner. `parentAlias` is passed for
+    // MESSAGE-level queries (which join parent_s and count delegation children
+    // under the parent's channel entry) so the channel filter COALESCEs to the
+    // parent — else those child rows drop; session-level queries omit it.
+    // Appends to `params` in order.
+    const userChanCond = (alias: string, params: unknown[], parentAlias?: string): string => {
       let s = "";
       if (userFilter) { s += ` AND ${actorUserColumn(alias)} = ?`; params.push(userFilter); }
-      if (channelId) { s += ` AND ${alias ? alias + "." : ""}channel_id = ?`; params.push(channelId); }
+      if (channelId) { s += ` AND ${channelColExpr("channel_id", alias, parentAlias)} = ?`; params.push(channelId); }
       return s;
     };
 
@@ -2880,7 +2883,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
         AND ${msg.predicate}
         AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
-    totalPromptsSql += userChanCond("s", pParams);
+    totalPromptsSql += userChanCond("s", pParams, "parent_s");
     const [pRows] = await db.query(totalPromptsSql, pParams) as [Array<{ c: number }>, unknown];
     const totalPrompts = Number(pRows[0]?.c ?? 0);
 
@@ -2899,7 +2902,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       ${msg.join}
       WHERE m.role = 'tool' AND m.created_at >= ? AND m.created_at <= ?
         AND ${msg.predicate}`;
-    toolCallsSql += userChanCond("s", tcParams);
+    toolCallsSql += userChanCond("s", tcParams, "parent_s");
     const [tcRows] = await db.query(toolCallsSql, tcParams) as [Array<{ c: number }>, unknown];
     const toolCalls = Number(tcRows[0]?.c ?? 0);
 
@@ -2916,7 +2919,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         AND m.tool_name IN ('local_script', 'host_script', 'pod_script', 'node_script')
         AND m.created_at >= ? AND m.created_at <= ?
         AND ${msg.predicate}`;
-    skillsSql += userChanCond("s", suParams);
+    skillsSql += userChanCond("s", suParams, "parent_s");
     skillsSql += " ORDER BY m.created_at DESC LIMIT ?";
     suParams.push(SKILL_ROW_LIMIT + 1);
     const [suRows] = await db.query(skillsSql, suParams) as [Array<{ toolInput: string | null }>, unknown];
@@ -2969,7 +2972,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       WHERE m.role = 'user' AND m.created_at >= ? AND m.created_at <= ?
         AND ${msg.predicate}
         AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
-    dailyPromptsSql += userChanCond("s", dpParams);
+    dailyPromptsSql += userChanCond("s", dpParams, "parent_s");
     dailyPromptsSql += " GROUP BY DATE(m.created_at)";
 
     const dtParams: unknown[] = [from, to];
@@ -2978,7 +2981,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       ${msg.join}
       WHERE m.role = 'tool' AND m.created_at >= ? AND m.created_at <= ?
         AND ${msg.predicate}`;
-    dailyToolsSql += userChanCond("s", dtParams);
+    dailyToolsSql += userChanCond("s", dtParams, "parent_s");
     dailyToolsSql += " GROUP BY DATE(m.created_at)";
 
     const [dpRes, dtRes] = await Promise.all([
@@ -3050,8 +3053,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // don't vanish the moment a channel/sender filter is applied. (user_id IS set
     // on the child, so the actor filter needs no parent fallback.)
     if (query.userId) { conds.push(`${actorUserColumn("s")} = ?`); params.push(query.userId); }
-    if (channelId) { conds.push("COALESCE(s.channel_id, parent_s.channel_id) = ?"); params.push(channelId); }
-    if (query.senderExternalId) { conds.push("COALESCE(s.sender_external_id, parent_s.sender_external_id) = ?"); params.push(query.senderExternalId); }
+    if (channelId) { conds.push(`${channelColExpr("channel_id", "s", "parent_s")} = ?`); params.push(channelId); }
+    if (query.senderExternalId) { conds.push(`${channelColExpr("sender_external_id", "s", "parent_s")} = ?`); params.push(query.senderExternalId); }
     if (query.toolName) { conds.push("m.tool_name = ?"); params.push(query.toolName); }
     if (query.outcome) { conds.push("m.outcome = ?"); params.push(query.outcome); }
     if (query.cursorTs && query.cursorId) {
@@ -3066,7 +3069,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
               SUBSTR(m.tool_input, 1, 500) AS toolInput,
               m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
-              s.user_id AS userId, COALESCE(s.sender_external_id, parent_s.sender_external_id) AS senderId, s.agent_id AS agentId, s.origin AS origin,
+              s.user_id AS userId, ${channelColExpr("sender_external_id", "s", "parent_s")} AS senderId, s.agent_id AS agentId, s.origin AS origin,
               a.name AS agentName
        FROM chat_messages m
        LEFT JOIN chat_sessions s ON m.session_id = s.id
@@ -3128,10 +3131,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const entry = normalizeEntry(query.entry ?? query.source);
     const msg = entryMessagePredicate(entry); // delegation-inherited (sub-agent tool latency counts)
     const channelId = entry === "channel" ? (query.channelId || null) : null;
+    // Both timing queries are MESSAGE-level (parent_s joined, delegation children
+    // counted under the parent's entry), so the channel filter COALESCEs to the
+    // parent — else sub-agent latency rows drop when a channel filter is applied.
     const userChanCond = (alias: string, params: unknown[]): string => {
       let s = "";
       if (userFilter) { s += ` AND ${actorUserColumn(alias)} = ?`; params.push(userFilter); }
-      if (channelId) { s += ` AND ${alias ? alias + "." : ""}channel_id = ?`; params.push(channelId); }
+      if (channelId) { s += ` AND ${channelColExpr("channel_id", alias, "parent_s")} = ?`; params.push(channelId); }
       return s;
     };
     const TIMING_ROW_LIMIT = 50_000;

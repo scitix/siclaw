@@ -3,6 +3,7 @@ import {
   ENTRY_MODES,
   normalizeEntry,
   actorUserColumn,
+  channelColExpr,
   entrySessionPredicate,
   entryMessagePredicate,
   type EntryMode,
@@ -18,6 +19,21 @@ describe("actorUserColumn", () => {
   it("supports an unaliased chat_sessions table", () => {
     expect(actorUserColumn("")).toBe(
       "CASE WHEN origin = 'channel' THEN sender_external_id ELSE user_id END",
+    );
+  });
+});
+
+describe("channelColExpr", () => {
+  it("session-level (no parent) → bare aliased column", () => {
+    expect(channelColExpr("channel_id", "s")).toBe("s.channel_id");
+    expect(channelColExpr("sender_external_id", "")).toBe("sender_external_id");
+  });
+  it("message-level (parent alias) → COALESCE child→parent so delegation children inherit", () => {
+    expect(channelColExpr("channel_id", "s", "parent_s")).toBe(
+      "COALESCE(s.channel_id, parent_s.channel_id)",
+    );
+    expect(channelColExpr("sender_external_id", "s", "parent_s")).toBe(
+      "COALESCE(s.sender_external_id, parent_s.sender_external_id)",
     );
   });
 });
