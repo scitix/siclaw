@@ -3075,7 +3075,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const hasMore = rows.length > limit;
     const logs = rows.slice(0, limit).map((r: any) => ({
-      id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
+      id: r.id, sessionId: r.sessionId, userId: r.userId, senderId: r.senderId ?? null, agentId: r.agentId,
       agentName: r.agentName ?? null,
       toolName: r.toolName, toolInput: r.toolInput, outcome: r.outcome,
       durationMs: r.durationMs, origin: r.origin ?? null,
@@ -3231,7 +3231,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const hasMore = rows.length > limit;
     const toIso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null));
     const sessions = rows.slice(0, limit).map((r: any) => ({
-      sessionId: r.sessionId, userId: r.userId, channelId: r.channelId ?? null, agentId: r.agentId, agentName: r.agentName ?? null,
+      sessionId: r.sessionId, userId: r.userId, senderId: r.senderId ?? null, channelId: r.channelId ?? null, agentId: r.agentId, agentName: r.agentName ?? null,
       agentGroupName: null, // siclaw has no agent groups
       title: r.title ?? null, preview: r.preview ?? null,
       origin: r.origin ?? null,
@@ -3326,7 +3326,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     sendJson(res, 200, {
       session: {
-        sessionId: s.sessionId, userId: s.userId, agentId: s.agentId, agentName: s.agentName ?? null,
+        sessionId: s.sessionId, userId: s.userId, senderId: s.senderId ?? null, agentId: s.agentId, agentName: s.agentName ?? null,
         title: s.title ?? null, preview: s.preview ?? null, origin: s.origin ?? null,
         messageCount: Number(s.messageCount ?? 0),
         createdAt: toIso(s.createdAt), lastActiveAt: toIso(s.lastActiveAt),

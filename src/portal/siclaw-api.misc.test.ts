@@ -535,7 +535,8 @@ describe("siclaw-api misc routes", () => {
     it("returns per-session rows with tool/error counts + agentName, entry-filtered", async () => {
       query.mockResolvedValueOnce([[
         {
-          sessionId: "s1", userId: "u1", agentId: "a1", agentName: "Ops Agent",
+          sessionId: "s1", userId: "owner-1", senderId: "ou_alice", channelId: "chan-1",
+          agentId: "a1", agentName: "Ops Agent",
           title: "t", preview: "p", origin: "channel", messageCount: 8,
           createdAt: new Date(1000), lastActiveAt: new Date(2000),
           toolCallCount: 5, errorToolCallCount: 2,
@@ -553,6 +554,8 @@ describe("siclaw-api misc routes", () => {
       expect(body.sessions[0]).toMatchObject({
         sessionId: "s1", agentName: "Ops Agent", agentGroupName: null,
         origin: "channel", messageCount: 8, toolCallCount: 5, errorToolCallCount: 2,
+        // owner and channel sender are separate fields (not overloaded on userId)
+        userId: "owner-1", senderId: "ou_alice", channelId: "chan-1",
       });
     });
 
