@@ -15,7 +15,7 @@
 import type { AgentBoxClient } from "../agentbox/client.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import type { CapabilityRunManager } from "./run-manager.js";
-import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACT } from "./contract.js";
+import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACT, CAPABILITY_PERSIST_TURN } from "./contract.js";
 
 interface BoxEvent {
   type: string;
@@ -49,6 +49,7 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
     // reaps an actively-working run (e.g. a long compile emitting only `log`).
     // touch() is in-memory only (no persist), so it is cheap to call every event.
     manager.touch(runId);
+    console.log(`[capability] run=${runId} box event: ${evt.type}`);
     switch (evt.type) {
       case "log":
         emit("log", { text: evt.text ?? "" });
@@ -57,9 +58,16 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         emit("summary", { text: evt.summary ?? "" });
         break;
       case "turn_done":
-        // A conversational/compile turn ended. Surface the reply; the run is now
-        // idle (awaiting the next turn) — NOT terminal.
+        // A conversational/compile turn ended. Surface the reply LIVE, then persist
+        // it durably (the frontend renders from a DB refetch, not the live frame) —
+        // this is the generalization of compile.assistantTurn. The run is now idle
+        // (awaiting the next turn) — NOT terminal.
         emit("turn", { text: evt.text ?? "" });
+        try {
+          await frontendClient.request(CAPABILITY_PERSIST_TURN, { run_id: runId, text: evt.text ?? "" });
+        } catch (err) {
+          console.error(`[capability] run=${runId} persistTurn failed:`, err instanceof Error ? err.message : String(err));
+        }
         await manager.setStatus(runId, "idle");
         break;
       case "syncArtifacts":

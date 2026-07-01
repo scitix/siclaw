@@ -40,6 +40,9 @@ export const CAPABILITY_PERSIST_RUN_STATE = "capability.persistRunState" as cons
 export const CAPABILITY_GET_RUN = "capability.getRun" as const;
 export const CAPABILITY_LIST_ACTIVE_RUNS = "capability.listActiveRuns" as const;
 
+/** Durably persist an assistant conversational turn (generalizes compile.assistantTurn). */
+export const CAPABILITY_PERSIST_TURN = "capability.persistTurn" as const;
+
 /** The opaque run-state row siclaw persists (and reads back on recovery). */
 export interface CapabilityRunState {
   runId: string;
