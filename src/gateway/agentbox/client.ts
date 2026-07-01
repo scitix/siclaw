@@ -208,7 +208,7 @@ export class AgentBoxClient {
 
   /**
    * POST a JSON body to an arbitrary path, returning parsed JSON.
-   * Used by the compile driver (POST /compile, POST /rulings).
+   * Used by the capability session driver (POST /sources, /session, /message).
    */
   async postJson<T = unknown>(path: string, body: unknown): Promise<T> {
     const resp = await this.fetch(path, {
@@ -339,7 +339,7 @@ export class AgentBoxClient {
   }
 
   /**
-   * Subscribe to an SSE event stream on an arbitrary path. The compile box
+   * Subscribe to an SSE event stream on an arbitrary path. The kb box
    * streams structured events on /events/:runId; agentbox uses /api/stream/:id.
    * Both speak `data: <json>\n\n` with `: heartbeat` comment lines.
    */
