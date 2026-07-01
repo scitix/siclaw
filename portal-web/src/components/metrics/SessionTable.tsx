@@ -28,11 +28,15 @@ const DEFAULT_VISIBLE_SESSIONS = 5
 
 export function SessionTable({
   userFilterId,
+  channelFilterId,
+  senderFilterId,
   usernameHint,
   entry,
   timeRange,
 }: {
   userFilterId: string | null
+  channelFilterId: string | null
+  senderFilterId: string | null
   usernameHint: string | null
   entry: EntryMode
   timeRange: TimeRange
@@ -66,11 +70,13 @@ export function SessionTable({
     return {
       userId: userFilterId ?? undefined,
       agentId: agentId || undefined,
+      channelId: channelFilterId ?? undefined,
+      senderExternalId: senderFilterId ?? undefined,
       from: String(fromMs),
       to: String(toMs),
       entry,
     }
-  }, [agentId, timeRange.from, timeRange.to, userFilterId, entry])
+  }, [agentId, timeRange.from, timeRange.to, userFilterId, channelFilterId, senderFilterId, entry])
 
   const { sessions, hasMore, loading, loadMore } = useSessions(params)
 
@@ -125,7 +131,9 @@ export function SessionTable({
     })
 
   const openSession = (s: SessionListItem) => setSnapshotId(s.sessionId)
-  const usernameFor = (s: SessionListItem) => (s.userId ? userMap.get(s.userId) ?? s.userId : "—")
+  // Channel rows: the actor is the sender (open_id); other origins: the owner.
+  const usernameFor = (s: SessionListItem) =>
+    s.origin === "channel" ? (s.senderId ?? "—") : (s.userId ? userMap.get(s.userId) ?? s.userId : "—")
 
   return (
     <section className="px-6 py-6 space-y-4">

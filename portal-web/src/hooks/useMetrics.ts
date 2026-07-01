@@ -64,6 +64,9 @@ export interface AuditLog {
   id: string
   sessionId: string
   userId: string | null
+  // Channel (Lark/DingTalk) sender id (open_id / staffId); null for web/api/a2a.
+  // The actor to display is senderId for channel rows, else userId.
+  senderId: string | null
   agentId: string | null
   agentName: string | null
   toolName: string | null
@@ -102,6 +105,11 @@ export interface TimingStats {
 export interface SessionListItem {
   sessionId: string
   userId: string | null
+  /** Channel (Lark/DingTalk) sender id (open_id / staffId); null for web/api/a2a.
+   *  Display the sender for channel rows, the owner userId otherwise. */
+  senderId: string | null
+  /** For channel sessions: which channel the session belongs to (else null). */
+  channelId: string | null
   agentId: string
   agentName: string | null
   agentGroupName: string | null  // siclaw has no agent groups → always null
@@ -300,6 +308,10 @@ interface AuditParams {
   userId?: string
   toolName?: string
   outcome?: string
+  /** Channel sub-filter (only meaningful when entry === "channel"). */
+  channelId?: string
+  /** Exact channel sender id (Lark open_id / DingTalk staffId), channel entry only. */
+  senderExternalId?: string
   /** Entry-form axis (overview / web / api / a2a / channel / scheduled). */
   entry?: EntryMode
   /** Absolute window bounds (unix ms as strings), already resolved + frozen by
@@ -331,6 +343,8 @@ export function useAudit(params: AuditParams): {
     if (p.userId) q.set("userId", p.userId)
     if (p.toolName) q.set("toolName", p.toolName)
     if (p.outcome) q.set("outcome", p.outcome)
+    if (p.channelId) q.set("channelId", p.channelId)
+    if (p.senderExternalId) q.set("senderExternalId", p.senderExternalId)
     if (p.entry) q.set("entry", p.entry)
     if (p.from) q.set("from", p.from)
     if (p.to) q.set("to", p.to)
@@ -359,7 +373,7 @@ export function useAudit(params: AuditParams): {
     setLogs([])
     doFetch(false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params.userId, params.toolName, params.outcome, params.entry, params.from, params.to])
+  }, [params.userId, params.toolName, params.outcome, params.channelId, params.senderExternalId, params.entry, params.from, params.to])
 
   return { logs, hasMore, loading, loadMore: () => doFetch(true), refresh: () => doFetch(false) }
 }
@@ -369,6 +383,10 @@ export function useAudit(params: AuditParams): {
 export interface SessionParams {
   userId?: string
   agentId?: string
+  /** Channel sub-filter (only meaningful when entry === "channel"). */
+  channelId?: string
+  /** Exact channel sender id (Lark open_id / DingTalk staffId), channel entry only. */
+  senderExternalId?: string
   entry?: EntryMode
   /** Resolved epoch-ms (as string), frozen by the caller for cursor pagination. */
   from?: string
@@ -396,6 +414,8 @@ export function useSessions(params: SessionParams): {
     const p = paramsRef.current
     if (p.userId) q.set("userId", p.userId)
     if (p.agentId) q.set("agentId", p.agentId)
+    if (p.channelId) q.set("channelId", p.channelId)
+    if (p.senderExternalId) q.set("senderExternalId", p.senderExternalId)
     if (p.entry) q.set("entry", p.entry)
     if (p.from) q.set("from", p.from)
     if (p.to) q.set("to", p.to)
@@ -422,7 +442,7 @@ export function useSessions(params: SessionParams): {
     setSessions([])
     doFetch(false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params.userId, params.agentId, params.entry, params.from, params.to])
+  }, [params.userId, params.agentId, params.channelId, params.senderExternalId, params.entry, params.from, params.to])
 
   return { sessions, hasMore, loading, loadMore: () => doFetch(true), refresh: () => doFetch(false) }
 }
@@ -511,4 +531,59 @@ export function useUsers(): { users: UserListEntry[]; loading: boolean } {
   }, [])
 
   return { users, loading }
+}
+
+// ── Channels list (reuses the existing /channels admin endpoint) ──
+// Populates the Metrics channel sub-filter (shown for the "channel" entry).
+
+export interface ChannelListEntry { id: string; name: string }
+
+export function useChannels(): { channels: ChannelListEntry[]; loading: boolean } {
+  const [channels, setChannels] = useState<ChannelListEntry[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    api<{ data: Array<{ id: string; name?: string }> }>("/channels")
+      .then((r) => {
+        if (cancelled) return
+        const list = Array.isArray(r.data) ? r.data : []
+        setChannels(list.map((c) => ({ id: c.id, name: c.name || c.id })))
+        setLoading(false)
+      })
+      .catch(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [])
+
+  return { channels, loading }
+}
+
+// ── Channel senders (distinct open_ids / staffIds seen in a window) ──
+// Feeds the Metrics open_id filter combobox so an admin can pin one sender even
+// when they are not linked to a SiCore account.
+
+export interface ChannelSender { senderId: string; sessionCount: number; messageCount: number; lastSeen: string }
+
+export function useChannelSenders(
+  range: TimeRange,
+  channelId: string | null,
+  enabled: boolean,
+): { senders: ChannelSender[]; loading: boolean } {
+  const [senders, setSenders] = useState<ChannelSender[]>([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!enabled) { setSenders([]); return }
+    let cancelled = false
+    setLoading(true)
+    const { fromMs, toMs } = resolveRange(range)
+    const q = new URLSearchParams({ from: String(fromMs), to: String(toMs) })
+    if (channelId) q.set("channelId", channelId)
+    api<{ senders: ChannelSender[] }>(`/siclaw/audit/channel-senders?${q.toString()}`)
+      .then((r) => { if (!cancelled) { setSenders(Array.isArray(r.senders) ? r.senders : []); setLoading(false) } })
+      .catch(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [enabled, channelId, range.from, range.to])
+
+  return { senders, loading }
 }

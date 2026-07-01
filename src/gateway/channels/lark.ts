@@ -621,6 +621,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const agentId = binding.agentId;
   const sessionId = binding.sessionId;
   sessionRegistry.remember(sessionId, binding.createdBy, agentId);
+  // Channel audit actor (NOT runtime identity — that stays `createdBy` via
+  // remember() above). The sender's raw open_id is the "same person" key for
+  // channel audit; it is stamped on the SESSION (chat_sessions), never falls
+  // back to the binding owner. open_id is NULL when the event omits it.
+  const senderExternalId = senderOpenId ?? null;
 
   console.log(`[lark] Message channel=${channelId} chat=${chatId} sender=${senderOpenId ?? "unknown"} → agent=${agentId} session=${sessionId}: "${effectiveText.slice(0, 80)}" images=${imageRefs.length}`);
 
@@ -629,7 +634,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // session title free of plaintext Signature/AccessKeyId.
   const persistedText = redactImageUrlsInText(effectiveText);
   try {
-    await ensureChatSession(sessionId, agentId, binding.createdBy, persistedText, persistedText, "channel");
+    await ensureChatSession(sessionId, agentId, binding.createdBy, persistedText, persistedText, "channel", undefined, { senderExternalId, channelId });
     await appendMessage({
       sessionId,
       role: "user",

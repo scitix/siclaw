@@ -24,6 +24,34 @@
 
 export type EntryMode = "all" | "web" | "api" | "a2a" | "channel" | "scheduled";
 
+/**
+ * SQL expression for the "user" a row is attributed to in the Metrics axis.
+ *
+ * For **channel** sessions the audit actor is the channel sender (the raw
+ * sender id — Lark open_id / DingTalk staffId — which is the "same person" key),
+ * NOT the binding owner. For every other origin it is the session's `user_id`
+ * (web=logged-in, api/a2a=API-key owner). siclaw has no SiCore-user concept, so
+ * no SiCore identity appears here.
+ *
+ * Use this ONLY for the actor-based FILTER and the distinct-actor COUNT — it is
+ * the canonical "who acted" expression. Do NOT project it as the response
+ * `userId` field: row payloads expose `user_id` (always the owner) and
+ * `sender_external_id` separately, so a consumer never has to disambiguate one
+ * overloaded field by `origin`.
+ *
+ * The channel dimension is intentionally NOT scoped here: Lark `open_id` is
+ * per-app unique and DingTalk `staffId` has a distinct shape, so senders never
+ * collide across origins/channels — narrowing to one channel is left to the
+ * explicit `channel_id` filter, not folded into this expression.
+ *
+ * `alias` is the chat_sessions table alias (default "s"); pass "" for an
+ * unaliased `FROM chat_sessions`.
+ */
+export function actorUserColumn(alias = "s"): string {
+  const p = alias ? `${alias}.` : "";
+  return `CASE WHEN ${p}origin = 'channel' THEN ${p}sender_external_id ELSE ${p}user_id END`;
+}
+
 /** The user-selectable entry buckets (excludes the internal "delegation"). */
 export const ENTRY_MODES: readonly EntryMode[] = ["all", "web", "api", "a2a", "channel", "scheduled"];
 

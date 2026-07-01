@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from "react"
 import { Loader2, RefreshCw } from "lucide-react"
-import { useSummary, useTiming, useUsers, rangeLabel, ENTRY_LABELS, DEFAULT_RANGE, type EntryMode, type TimeRange } from "../hooks/useMetrics"
+import { useSummary, useTiming, useUsers, useChannels, useChannelSenders, rangeLabel, ENTRY_LABELS, DEFAULT_RANGE, type EntryMode, type TimeRange } from "../hooks/useMetrics"
 import { KpiCards } from "../components/metrics/KpiCards"
 import { TrendChart } from "../components/metrics/TrendChart"
 import { TimingStatsCard } from "../components/metrics/TimingStatsCard"
@@ -9,6 +9,7 @@ import { SessionTable } from "../components/metrics/SessionTable"
 import { GrafanaFrame } from "../components/metrics/GrafanaFrame"
 import { TimeRangePicker } from "../components/metrics/TimeRangePicker"
 import { EntrySelector } from "../components/metrics/EntrySelector"
+import { SenderCombobox } from "../components/metrics/SenderCombobox"
 
 type TabKey = "dashboard" | "sessions" | "tools" | "grafana"
 
@@ -18,15 +19,27 @@ const TAB_LABEL: Record<TabKey, string> = { dashboard: "Dashboard", sessions: "S
 export function Metrics() {
   const [tab, setTab] = useState<TabKey>("dashboard")
   const [userId, setUserId] = useState<string>("")         // "" = All Users (Sessions/Tools filter only)
+  const [channelId, setChannelId] = useState<string>("")   // "" = All Channels (channel entry only)
+  const [senderId, setSenderId] = useState<string>("")     // exact channel sender open_id/staffId (channel entry only)
   const [timeRange, setTimeRange] = useState<TimeRange>(DEFAULT_RANGE)
   const [entry, setEntry] = useState<EntryMode>("all")     // entry-form axis, shared across tabs
 
-  const filterUserId = userId || null
+  // The "who" axis is origin-aware. Channel actors are open_ids, NOT portal
+  // users, so the portal-user filter does not apply on the channel entry (it
+  // would match no channel rows) — channel uses the sender (open_id) filter
+  // instead. Only apply the portal-user filter off-channel.
+  const filterUserId = entry === "channel" ? null : (userId || null)
+  // Channel sub-filters only apply to the channel entry; ignored otherwise.
+  const filterChannelId = entry === "channel" ? (channelId || null) : null
+  const filterSenderId = entry === "channel" ? (senderId.trim() || null) : null
   const rLabel = rangeLabel(timeRange)
   const isAudit = tab === "sessions" || tab === "tools"
   const showControls = tab !== "grafana"
 
   const { users } = useUsers()
+  const { channels } = useChannels()
+  // Distinct channel senders seen in the window — feeds the open_id combobox.
+  const { senders } = useChannelSenders(timeRange, filterChannelId, isAudit && entry === "channel")
   // Dashboard is an external-facing showcase: aggregate only, never scoped to
   // an individual — so summary/timing are fetched without a user filter.
   const { data: summary, loading: summaryLoading, refresh: refreshSummary } = useSummary(timeRange, null, entry)
@@ -65,9 +78,11 @@ export function Metrics() {
                   <RefreshCw className={`h-3.5 w-3.5 transition-transform duration-500 ${spinning ? "animate-spin" : ""}`} />
                 </button>
               )}
-              {/* User filter — audit tabs only (the Dashboard is an outward-facing
-                  board and does not drill down by user). */}
-              {isAudit && (
+              {/* Portal-user filter — audit tabs, and NOT the channel entry
+                  (channel actors are open_ids, not portal users; channel uses the
+                  sender filter below). The Dashboard is outward-facing and never
+                  drills down by user. */}
+              {isAudit && entry !== "channel" && (
                 <select
                   value={userId}
                   onChange={(e) => setUserId(e.target.value)}
@@ -78,6 +93,26 @@ export function Metrics() {
                     <option key={u.id} value={u.id}>{u.username}</option>
                   ))}
                 </select>
+              )}
+              {/* Channel sub-filter — audit tabs, only when the channel entry is
+                  selected (channelId is meaningless for web/api/a2a). */}
+              {isAudit && entry === "channel" && (
+                <select
+                  value={channelId}
+                  onChange={(e) => setChannelId(e.target.value)}
+                  className="h-8 px-2 pr-6 text-[12px] rounded-md bg-secondary border border-border text-foreground focus:outline-none focus:border-blue-500"
+                >
+                  <option value="">All Channels</option>
+                  {channels.map((c) => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              )}
+              {/* Channel sender (open_id / staffId) — dropdown + free input:
+                  pick from senders seen in the window (with counts + last-seen)
+                  or type/paste an id. Audit tabs, channel entry only. */}
+              {isAudit && entry === "channel" && (
+                <SenderCombobox value={senderId} onChange={setSenderId} senders={senders} />
               )}
               {/* Entry-form axis + time window — shared by Dashboard/Sessions/Tools. */}
               {showControls && <EntrySelector value={entry} onChange={setEntry} />}
@@ -157,11 +192,11 @@ export function Metrics() {
         )}
 
         {tab === "sessions" && (
-          <SessionTable userFilterId={filterUserId} usernameHint={selectedUsername} entry={entry} timeRange={timeRange} />
+          <SessionTable userFilterId={filterUserId} channelFilterId={filterChannelId} senderFilterId={filterSenderId} usernameHint={entry === "channel" ? null : selectedUsername} entry={entry} timeRange={timeRange} />
         )}
 
         {tab === "tools" && (
-          <AuditTable userFilterId={filterUserId} usernameHint={selectedUsername} entry={entry} timeRange={timeRange} />
+          <AuditTable userFilterId={filterUserId} channelFilterId={filterChannelId} senderFilterId={filterSenderId} usernameHint={entry === "channel" ? null : selectedUsername} entry={entry} timeRange={timeRange} />
         )}
 
         {tab === "grafana" && <GrafanaFrame />}

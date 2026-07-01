@@ -47,7 +47,7 @@ function OutcomeIcon({ outcome }: { outcome: string | null }) {
   }
 }
 
-export function AuditTable({ userFilterId, usernameHint, entry, timeRange }: { userFilterId: string | null; usernameHint: string | null; entry: EntryMode; timeRange: TimeRange }) {
+export function AuditTable({ userFilterId, channelFilterId, senderFilterId, usernameHint, entry, timeRange }: { userFilterId: string | null; channelFilterId: string | null; senderFilterId: string | null; usernameHint: string | null; entry: EntryMode; timeRange: TimeRange }) {
   const [tool, setTool] = useState("All")
   const [status, setStatus] = useState("All")
   const [expandedId, setExpandedId] = useState<string | null>(null)
@@ -67,11 +67,13 @@ export function AuditTable({ userFilterId, usernameHint, entry, timeRange }: { u
       userId: userFilterId ?? undefined,
       toolName: tool === "All" ? undefined : tool,
       outcome: status === "All" ? undefined : status,
+      channelId: channelFilterId ?? undefined,
+      senderExternalId: senderFilterId ?? undefined,
       entry,
       from: String(fromMs),
       to: String(toMs),
     }
-  }, [tool, status, entry, timeRange.from, timeRange.to, userFilterId])
+  }, [tool, status, entry, timeRange.from, timeRange.to, userFilterId, channelFilterId, senderFilterId])
 
   const { logs, hasMore, loading, loadMore } = useAudit(params)
 
@@ -125,7 +127,9 @@ export function AuditTable({ userFilterId, usernameHint, entry, timeRange }: { u
               <AuditRow
                 key={log.id}
                 log={log}
-                username={log.userId ? (userMap.get(log.userId) ?? log.userId) : "—"}
+                username={log.origin === "channel"
+                  ? (log.senderId ?? "—")
+                  : (log.userId ? (userMap.get(log.userId) ?? log.userId) : "—")}
                 expanded={expandedId === log.id}
                 onToggle={() => toggleExpand(log.id)}
               />

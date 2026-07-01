@@ -2,10 +2,25 @@ import { describe, it, expect } from "vitest";
 import {
   ENTRY_MODES,
   normalizeEntry,
+  actorUserColumn,
   entrySessionPredicate,
   entryMessagePredicate,
   type EntryMode,
 } from "./metrics-entry.js";
+
+describe("actorUserColumn", () => {
+  it("attributes channel rows to the sender (sender_external_id), else user_id", () => {
+    const expr = actorUserColumn("s");
+    expect(expr).toBe(
+      "CASE WHEN s.origin = 'channel' THEN s.sender_external_id ELSE s.user_id END",
+    );
+  });
+  it("supports an unaliased chat_sessions table", () => {
+    expect(actorUserColumn("")).toBe(
+      "CASE WHEN origin = 'channel' THEN sender_external_id ELSE user_id END",
+    );
+  });
+});
 
 describe("normalizeEntry", () => {
   it("passes through the known entry modes", () => {
