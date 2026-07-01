@@ -26,6 +26,7 @@ import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { driveCompile, driveSession } from "./agentbox/compile-driver.js";
 import { getBoxProfile } from "./agentbox/box-profile.js";
+import { CapabilityRunManager } from "./capability/run-manager.js";
 import {
   type RpcHandler,
   type RpcContext,
@@ -546,6 +547,56 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       });
     }
     await client.postJson(`/compile-turn/${runId}`, { instruction: instruction ?? "" });
+    return { ok: true, run_id: runId };
+  });
+
+  // ── Capability protocol (option B): siclaw owns the run lifecycle ──────────
+  // B2a: the run-lifecycle manager + capability.start/message/cancel handlers.
+  // siclaw MINTS the runId and persists execution state to the consumer's opaque
+  // store (capability.persistRunState); box driving reuses the existing compile
+  // session machinery (kb-compile). The event-protocol rename (→ capability.event)
+  // and per-profile driving are B2b. Registered now but UNUSED until the consumer
+  // (sicore) starts calling these in B3 — additive, compile.* path unchanged.
+  const capabilityRunManager = new CapabilityRunManager(frontendClient);
+  void capabilityRunManager.recover();
+  capabilityRunManager.startWatchdog();
+
+  rpcMethods.set("capability.start", async (params) => {
+    const profile = (params.profile as string) || "kb-compile";
+    const orgId = params.org_id as string | undefined;
+    const correlationId = params.correlation_id as string | undefined;
+    const input = (params.input as Record<string, unknown> | undefined) ?? {};
+    const instruction = input.instruction as string | undefined;
+    // siclaw mints the runId + persists a running state (the run is siclaw-owned).
+    const rec = await capabilityRunManager.startRun({ profile, orgId: orgId ?? "", correlationId });
+    // Drive the box under the minted runId. B2a reuses the kb-compile session
+    // machinery; generalized per-profile driving is B2b.
+    try {
+      await ensureCompileSession(rec.runId, orgId, instruction);
+    } catch (err) {
+      await capabilityRunManager.endRun(rec.runId, "failed");
+      throw err;
+    }
+    return { run_id: rec.runId };
+  });
+
+  rpcMethods.set("capability.message", async (params) => {
+    const runId = params.run_id as string;
+    const orgId = params.org_id as string | undefined;
+    const message = params.message as string;
+    if (!runId) throw new Error("run_id is required");
+    if (!message) throw new Error("message is required");
+    capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
+    const { client } = await ensureCompileSession(runId, orgId, undefined);
+    await client.postJson(`/message/${runId}`, { message });
+    return { ok: true, run_id: runId };
+  });
+
+  rpcMethods.set("capability.cancel", async (params) => {
+    const runId = params.run_id as string;
+    if (!runId) throw new Error("run_id is required");
+    await agentBoxManager.stop(runId).catch(() => {});
+    await capabilityRunManager.endRun(runId, "done");
     return { ok: true, run_id: runId };
   });
 

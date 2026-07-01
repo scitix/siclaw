@@ -31,6 +31,30 @@ export const CAPABILITY_EVENT = "capability.event" as const;
 export const CAPABILITY_PERSIST_ARTIFACT = "capability.persistArtifact" as const;
 export const CAPABILITY_FETCH_INPUT = "capability.fetchInput" as const;
 
+/**
+ * siclaw → consumer: opaque run-state store (option B). siclaw OWNS the execution
+ * run; the consumer persists it as a dumb store so an in-flight run survives a
+ * stateless-runtime restart. Mirrors the Go side (internal/siclaw/capability).
+ */
+export const CAPABILITY_PERSIST_RUN_STATE = "capability.persistRunState" as const;
+export const CAPABILITY_GET_RUN = "capability.getRun" as const;
+export const CAPABILITY_LIST_ACTIVE_RUNS = "capability.listActiveRuns" as const;
+
+/** The opaque run-state row siclaw persists (and reads back on recovery). */
+export interface CapabilityRunState {
+  runId: string;
+  orgId?: string;
+  correlationId?: string;
+  profile: string;
+  status: CapabilityLifecycleStatus;
+  /** Opaque resume blob (JSON-serializable). */
+  checkpoint?: unknown;
+  /** Box session id (for resume). */
+  sessionRef?: string;
+  /** Which runtime owns the box. */
+  runtimeId?: string;
+}
+
 // ---- Consumer → siclaw ----
 
 export interface CapabilityStartRequest {
