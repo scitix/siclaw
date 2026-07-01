@@ -127,8 +127,8 @@ export function AuditTable({ userFilterId, channelFilterId, senderFilterId, user
               <AuditRow
                 key={log.id}
                 log={log}
-                username={log.origin === "channel"
-                  ? (log.senderId ?? "—")
+                username={log.senderId
+                  ? log.senderId
                   : (log.userId ? (userMap.get(log.userId) ?? log.userId) : "—")}
                 expanded={expandedId === log.id}
                 onToggle={() => toggleExpand(log.id)}

@@ -495,6 +495,23 @@ describe("siclaw-api misc routes", () => {
       expect(sql).toContain("s.origin = 'delegation' AND parent_s.origin = 'api'"); // inheritance
       expect(sql).toContain("LEFT JOIN agents a ON s.agent_id = a.id");             // agentName
     });
+
+    it("channel + sender filters inherit from the parent session (delegation children not dropped)", async () => {
+      query.mockResolvedValueOnce([[], []]);
+      await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/metrics/audit?from=1000&to=2000&entry=channel&channelId=chan-1&senderExternalId=ou_a",
+        method: "GET",
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+      }));
+      const sql: string = query.mock.calls[0][0];
+      // channel_id / sender_external_id are NULL on a delegation child, so the
+      // filters COALESCE to the parent channel session — else sub-agent tool
+      // rows silently vanish from a channel/sender-filtered view.
+      expect(sql).toContain("COALESCE(s.channel_id, parent_s.channel_id) = ?");
+      expect(sql).toContain("COALESCE(s.sender_external_id, parent_s.sender_external_id) = ?");
+      // projected senderId is parent-aware too, so kept delegation rows show the sender
+      expect(sql).toContain("COALESCE(s.sender_external_id, parent_s.sender_external_id) AS senderId");
+    });
   });
 
   describe("GET /api/v1/siclaw/metrics/timing", () => {

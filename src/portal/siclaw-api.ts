@@ -3044,9 +3044,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const conds: string[] = ["m.role = 'tool'", "m.created_at BETWEEN ? AND ?", msg.predicate];
     const params: unknown[] = [from, to];
     // Origin-aware actor: channel rows filter by the actual sender, never owner.
+    // channel_id / sender_external_id live on the PARENT channel session; a
+    // delegation child inherits them via parent_s (COALESCE) so its tool rows —
+    // which the entry predicate already counts under the parent's channel entry —
+    // don't vanish the moment a channel/sender filter is applied. (user_id IS set
+    // on the child, so the actor filter needs no parent fallback.)
     if (query.userId) { conds.push(`${actorUserColumn("s")} = ?`); params.push(query.userId); }
-    if (channelId) { conds.push("s.channel_id = ?"); params.push(channelId); }
-    if (query.senderExternalId) { conds.push("s.sender_external_id = ?"); params.push(query.senderExternalId); }
+    if (channelId) { conds.push("COALESCE(s.channel_id, parent_s.channel_id) = ?"); params.push(channelId); }
+    if (query.senderExternalId) { conds.push("COALESCE(s.sender_external_id, parent_s.sender_external_id) = ?"); params.push(query.senderExternalId); }
     if (query.toolName) { conds.push("m.tool_name = ?"); params.push(query.toolName); }
     if (query.outcome) { conds.push("m.outcome = ?"); params.push(query.outcome); }
     if (query.cursorTs && query.cursorId) {
@@ -3061,7 +3066,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
               SUBSTR(m.tool_input, 1, 500) AS toolInput,
               m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
-              s.user_id AS userId, s.sender_external_id AS senderId, s.agent_id AS agentId, s.origin AS origin,
+              s.user_id AS userId, COALESCE(s.sender_external_id, parent_s.sender_external_id) AS senderId, s.agent_id AS agentId, s.origin AS origin,
               a.name AS agentName
        FROM chat_messages m
        LEFT JOIN chat_sessions s ON m.session_id = s.id
