@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo, AgentBoxStatus } from "./types.js";
+import { getBoxProfile } from "./box-profile.js";
 import { CertificateManager } from "../security/cert-manager.js";
 
 export interface K8sSpawnerConfig {
@@ -93,12 +94,12 @@ export class K8sSpawner implements BoxSpawner {
    */
   async spawn(boxConfig: AgentBoxConfig): Promise<AgentBoxHandle> {
     const { namespace, imagePullPolicy, labelPrefix } = this.config;
-    // Compile boxes run a different image ($SICLAW_COMPILE_BOX_IMAGE) but reuse
-    // the same spawn/cert/mTLS/port machinery as an agentbox.
-    const isCompile = boxConfig.boxType === "compile";
-    const image =
-      boxConfig.image ??
-      (isCompile ? process.env.SICLAW_COMPILE_BOX_IMAGE || "kbc-compile-box:latest" : this.config.image);
+    // A box's shape (image, extra env/HOME/volumes, tool/trust envelope) comes
+    // from its BoxProfile — the default "agent" profile is a normal agentbox; a
+    // capability like "kb-compile" declares its own image + writable /work etc.
+    // All flavors reuse the same spawn/cert/mTLS/port machinery below.
+    const profile = getBoxProfile(boxConfig.profile);
+    const image = boxConfig.image ?? profile.image ?? this.config.image;
     const agentId = boxConfig.agentId;
     if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
     const podName = this.podName(agentId);
@@ -119,9 +120,18 @@ export class K8sSpawner implements BoxSpawner {
     try {
       const existing = await this.coreApi.readNamespacedPod({ name: podName, namespace });
       const phase = existing.status?.phase;
-      if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown") {
-        console.log(`[k8s-spawner] Removing stale pod ${podName} (phase: ${phase})`);
-        await this.coreApi.deleteNamespacedPod({ name: podName, namespace });
+      // A pod being torn down (or spawned) under this name for a DIFFERENT profile
+      // must not be reused — its image/tools/volumes are the old shape. Treat a
+      // profile mismatch (or an in-progress deletion) like a stale pod: delete +
+      // wait, then create fresh with the requested profile.
+      const existingProfile = existing.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent";
+      const profileMismatch = existingProfile !== profile.name;
+      const terminating = existing.metadata?.deletionTimestamp != null;
+      if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown" || profileMismatch || terminating) {
+        console.log(
+          `[k8s-spawner] Removing stale pod ${podName} (phase: ${phase}, profile: ${existingProfile}→${profile.name})`,
+        );
+        await this.coreApi.deleteNamespacedPod({ name: podName, namespace }).catch(() => {});
         // Wait for pod to be fully deleted
         await this.waitForPodDeleted(podName, namespace);
       } else if (phase === "Running" || phase === "Pending") {
@@ -228,25 +238,23 @@ export class K8sSpawner implements BoxSpawner {
       }
     }
 
-    // Compile boxes are lean — they do NOT phone home for settings, so the LLM
-    // endpoint (company massapi) must be injected as env. v1: forward the
-    // Anthropic-compatible knobs from the runtime deployment ("credentials don't
-    // enter the sandbox" → the base URL is a proxy, key injected proxy-side).
-    if (isCompile) {
-      const COMPILE_FORWARDED_ENV = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_SMOKE"];
-      for (const name of COMPILE_FORWARDED_ENV) {
-        const value = process.env[name];
-        if (value !== undefined && value !== "") {
-          env.push({ name, value });
-        }
+    // Profile-declared extra env forwarding, ON TOP of the base allowlist. A lean
+    // capability box (e.g. kb-compile) does NOT phone home for settings, so its LLM
+    // endpoint (company massapi, Anthropic-compatible) must be injected as env
+    // ("credentials don't enter the sandbox" → the base URL is a proxy, key
+    // injected proxy-side). Which names to forward is the profile's declaration.
+    for (const name of profile.envForward ?? []) {
+      const value = process.env[name];
+      if (value !== undefined && value !== "") {
+        env.push({ name, value });
       }
-      // The pod rootfs is read-only; the default HOME (/home/kbc) is therefore
-      // not writable, so Claude Code's shell-snapshot + config writes to ~/.claude
-      // hit EROFS and break the in-box Bash tool. Point HOME at the writable /work
-      // emptyDir (mounted below for compile boxes) → ~/.claude = /work/.claude.
-      // /work content the agent works on (raw/candidate/bundle) is unaffected, and
-      // the B5 workspace sync only mirrors authoring/candidate/eval/release.
-      env.push({ name: "HOME", value: "/work" });
+    }
+    // The pod rootfs is read-only; a profile that runs Claude Code needs a writable
+    // HOME (its default e.g. /home/kbc is not writable, so ~/.claude writes hit
+    // EROFS and break the in-box Bash tool). The profile points HOME at one of its
+    // writable volumes below (e.g. /work → ~/.claude = /work/.claude).
+    if (profile.home) {
+      env.push({ name: "HOME", value: profile.home });
     }
 
     // Add custom environment variables
@@ -295,11 +303,12 @@ export class K8sSpawner implements BoxSpawner {
         namespace,
         labels: {
           // Keep app=agentbox so existing list()/cleanup() lifecycle management
-          // covers compile pods too; boxType distinguishes them for observability.
+          // covers capability pods too; the profile name distinguishes them for
+          // observability (label key kept as boxType for continuity).
           [`${labelPrefix}/app`]: "agentbox",
           [`${labelPrefix}/agent`]: agentId,
           [caFpLabel]: caFp,
-          [`${labelPrefix}/boxType`]: boxConfig.boxType ?? "agent",
+          [`${labelPrefix}/boxType`]: profile.name,
         },
       },
       spec: {
@@ -345,8 +354,15 @@ export class K8sSpawner implements BoxSpawner {
             name: "tmp",
             emptyDir: { sizeLimit: "100Mi" },
           },
-          // Compile boxes write drop/ + bundle/ under /work; rootfs is read-only.
-          ...(isCompile ? [{ name: "work", emptyDir: { sizeLimit: "1Gi" } } as k8s.V1Volume] : []),
+          // Profile-declared writable volumes (rootfs is read-only). e.g. kb-compile
+          // needs /work for the agent's raw/candidate/bundle + ~/.claude.
+          ...(profile.volumes ?? []).map(
+            (v) =>
+              ({
+                name: v.name,
+                emptyDir: v.sizeLimit ? { sizeLimit: v.sizeLimit } : {},
+              }) as k8s.V1Volume,
+          ),
         ],
         containers: [
           {
@@ -397,7 +413,9 @@ export class K8sSpawner implements BoxSpawner {
                 name: "tmp",
                 mountPath: "/tmp",
               },
-              ...(isCompile ? [{ name: "work", mountPath: "/work" } as k8s.V1VolumeMount] : []),
+              ...(profile.volumes ?? []).map(
+                (v) => ({ name: v.name, mountPath: v.mountPath }) as k8s.V1VolumeMount,
+              ),
             ],
             resources: {
               requests: {
@@ -581,6 +599,7 @@ export class K8sSpawner implements BoxSpawner {
           : new Date(),
         lastActiveAt: new Date(),
         caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
+        profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
       };
     } catch (err: any) {
       if (err.code === 404 || err.statusCode === 404) {
@@ -615,6 +634,7 @@ export class K8sSpawner implements BoxSpawner {
           ? new Date(pod.metadata.creationTimestamp)
           : new Date(),
         lastActiveAt: new Date(),
+        profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
       };
     });
   }

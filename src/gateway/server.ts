@@ -25,6 +25,7 @@ import type { RuntimeConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { driveCompile, driveSession } from "./agentbox/compile-driver.js";
+import { getBoxProfile } from "./agentbox/box-profile.js";
 import {
   type RpcHandler,
   type RpcContext,
@@ -372,7 +373,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (localCompileBoxEndpoint) {
       return new AgentBoxClient(localCompileBoxEndpoint, 30000, agentBoxTlsOptions);
     }
-    const handle = await agentBoxManager.getOrCreate(runId, { boxType: "compile", orgId });
+    const handle = await agentBoxManager.getOrCreate(runId, { profile: "kb-compile", orgId });
     return new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
   };
   const existingCompileBoxClient = async (runId: string): Promise<AgentBoxClient> => {
@@ -476,7 +477,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         } catch (err) {
           console.warn(`[runtime] compile session ${runId}: raw materialize skipped:`, err instanceof Error ? err.message : String(err));
         }
-        await client.postJson(`/session/${runId}`, { instruction: instruction ?? "" });
+        // Pass the kb-compile profile's tool whitelist to the box (null → box uses
+        // its default set). This is the declarative tool/trust envelope reaching the
+        // box: a restrictive profile (e.g. kb-test) is enforced by construction in
+        // the box's ClaudeAgentOptions, not by prompt.
+        const compileAllowedTools = getBoxProfile("kb-compile").allowedTools ?? null;
+        await client.postJson(`/session/${runId}`, {
+          instruction: instruction ?? "",
+          allowed_tools: compileAllowedTools,
+        });
         // Relay loop runs detached for the session's lifetime.
         driveSession({ client, runId, frontendClient })
           .catch(async (err) => {
