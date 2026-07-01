@@ -88,6 +88,11 @@ interface UsePilotChatOptions {
 
 interface UsePilotChatReturn {
   messages: PilotMessage[]
+  /** The session id that `messages` currently belong to. Updated atomically with `messages`
+   *  on every session switch/load, so consumers can tell whether the loaded messages actually
+   *  correspond to the active session (they lag behind `sessionId` during the async history
+   *  load). Guards message-derived writes (e.g. auto-titling) against a stale-messages race. */
+  messagesSessionId: string | null
   streaming: boolean
   streamText: string
   dpActive: boolean
@@ -726,6 +731,11 @@ function hasActiveAsyncDelegationSurface(messages: PilotMessage[]): boolean {
 
 export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePilotChatReturn {
   const [messages, setMessages] = useState<PilotMessage[]>([])
+  // The session id that `messages` currently belong to. Kept in lockstep with every
+  // wholesale `setMessages` in the session-switch effect below so a stale-messages window
+  // (activeSessionId already switched, but the new session's history hasn't loaded yet) is
+  // observable to consumers. Live per-turn appends keep the same session, so they don't touch it.
+  const [messagesSessionId, setMessagesSessionId] = useState<string | null>(sessionId ?? null)
   const [streaming, setStreaming] = useState(false)
   const [streamText, setStreamText] = useState("")
   const [dpActive, setDpActive] = useState(false)
@@ -800,6 +810,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
     if (!sessionId) {
       setMessages([])
+      setMessagesSessionId(null)
       setStreaming(false)
       streamingRef.current = false
       recoveredStreamingRef.current = false
@@ -817,6 +828,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     const cached = messagesCacheRef.current.get(sessionId)
     if (cached?.streaming) {
       setMessages(cached.messages)
+      setMessagesSessionId(sessionId)
       setStreaming(true)
       streamingRef.current = true
       recoveredStreamingRef.current = false
@@ -848,6 +860,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
         setMessages(pilotMsgs)
+        setMessagesSessionId(sessionId!)
         // Restore the context meter from persisted history so it shows on open/
         // refresh — without it the meter stays blank until the next live
         // agent_end. Only set when a snapshot is found: never blank an existing
@@ -875,6 +888,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         console.error("[usePilotChat] Failed to load messages:", err)
         if (!cancelled) {
           setMessages([])
+          setMessagesSessionId(sessionId!)
           setStreaming(false)
           streamingRef.current = false
           recoveredStreamingRef.current = false
@@ -1913,6 +1927,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
   return {
     messages,
+    messagesSessionId,
     streaming,
     streamText,
     dpActive,

@@ -266,6 +266,13 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
   useEffect(() => {
     if (!activeSessionId) return
     if (titledSessionRef.current === activeSessionId) return
+    // Guard against the stale-messages race: on a session switch `activeSessionId`
+    // updates synchronously, but `pilot.messages` still holds the PREVIOUS session's
+    // messages until usePilotChat's async history load resolves. Without this check we
+    // would derive a title from the previous session's first message and PUT it onto the
+    // newly-active (often empty) session — producing a session whose title belongs to a
+    // different conversation. Only proceed once the loaded messages match the active session.
+    if (pilot.messagesSessionId !== activeSessionId) return
     const userMsg = pilot.messages.find((m) => m.role === "user")
     const assistantMsg = pilot.messages.find((m) => m.role === "assistant")
     if (!userMsg || !assistantMsg) return
@@ -283,7 +290,7 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
     api(`/siclaw/agents/${agentId}/chat/sessions/${activeSessionId}`, {
       method: "PUT", body: { title },
     }).catch(() => {})
-  }, [activeSessionId, pilot.messages, sessions, agentId])
+  }, [activeSessionId, pilot.messages, pilot.messagesSessionId, sessions, agentId])
 
   // Close panels on session switch
   useEffect(() => {
