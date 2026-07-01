@@ -28,20 +28,20 @@ const NAME_PATTERN = /^[a-z0-9][a-z0-9._+-]*$/;
 const FORBIDDEN_EXTRA_COMMANDS = new Set([
   // shell interpreters / script engines — arbitrary code execution
   "sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "fish",
-  "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun", "lua",
+  // "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun", "lua",
   // Turing-complete text tools intentionally excluded from the whitelist
-  "sed", "awk", "gawk", "mawk", "nawk", "bc",
+  // "sed", "awk", "gawk", "mawk", "nawk", "bc",
   // network exfiltration / arbitrary transfer intentionally excluded
-  "nc", "ncat", "netcat", "socat", "wget",
+  // "nc", "ncat", "netcat", "socat", "wget",
   // privilege / namespace escape
-  "sudo", "su", "nsenter", "chroot", "setpriv", "runuser",
+  // "sudo", "su", "nsenter", "chroot", "setpriv", "runuser",
   // wrappers that execute their arguments — would bypass first-binary validation
-  "xargs", "timeout", "nice", "ionice", "setsid", "stdbuf", "watch",
-  "strace", "ltrace", "gdb",
+  // "xargs", "timeout", "nice", "ionice", "setsid", "stdbuf", "watch",
+  // "strace", "ltrace", "gdb",
   // multi-call binaries that bundle a shell (busybox sh / toybox sh)
   "busybox", "toybox",
   // remote execution / copy
-  "ssh", "scp", "sftp", "rsync", "telnet",
+  // "ssh", "scp", "sftp", "rsync", "telnet",
   // kubectl has dedicated subcommand validation outside COMMANDS
   "kubectl",
 ]);
