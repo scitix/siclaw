@@ -27,6 +27,8 @@ import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { driveCompile, driveSession } from "./agentbox/compile-driver.js";
 import { getBoxProfile } from "./agentbox/box-profile.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
+import { driveCapabilitySession } from "./capability/session-driver.js";
+import { CAPABILITY_FETCH_INPUT } from "./capability/contract.js";
 import {
   type RpcHandler,
   type RpcContext,
@@ -551,15 +553,59 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   });
 
   // ── Capability protocol (option B): siclaw owns the run lifecycle ──────────
-  // B2a: the run-lifecycle manager + capability.start/message/cancel handlers.
   // siclaw MINTS the runId and persists execution state to the consumer's opaque
-  // store (capability.persistRunState); box driving reuses the existing compile
-  // session machinery (kb-compile). The event-protocol rename (→ capability.event)
-  // and per-profile driving are B2b. Registered now but UNUSED until the consumer
-  // (sicore) starts calling these in B3 — additive, compile.* path unchanged.
+  // store (capability.persistRunState); the box is driven over the GENERIC
+  // capability wire (capability.event / persistArtifact / fetchInput) with the
+  // manager owning lifecycle. This is a capability-native path PARALLEL to the
+  // legacy compile.* path (which stays until B3 deletes it). Registered now but
+  // UNUSED until the consumer (sicore) starts calling these in B3 — additive.
   const capabilityRunManager = new CapabilityRunManager(frontendClient);
   void capabilityRunManager.recover();
   capabilityRunManager.startWatchdog();
+
+  // One persistent capability session (box + relay loop) per run; a later message
+  // reattaches instead of spawning a second relay. Mirrors ensureCompileSession
+  // but speaks capability.* (B3 deletes the compile.* twin).
+  const capabilitySessions = new Map<string, Promise<{ client: AgentBoxClient }>>();
+  const ensureCapabilitySession = (runId: string, orgId: string | undefined, instruction: string | undefined) => {
+    let pending = capabilitySessions.get(runId);
+    if (!pending) {
+      pending = (async () => {
+        const client = await compileBoxClient(runId, orgId);
+        // Materialize the frozen source into /work/raw via the consumer's store.
+        // Best-effort: an empty KB / fetch error must not block the conversation.
+        try {
+          const bundle = (await frontendClient.request(CAPABILITY_FETCH_INPUT, { run_id: runId })) as {
+            bundle_base64?: string;
+            bundle_sha256?: string;
+          };
+          if (bundle?.bundle_base64) {
+            await client.postJson("/sources", {
+              run_id: runId,
+              bundle_base64: bundle.bundle_base64,
+              bundle_sha256: bundle.bundle_sha256,
+            });
+          }
+        } catch (err) {
+          console.warn(`[capability] session ${runId}: source materialize skipped:`, err instanceof Error ? err.message : String(err));
+        }
+        const allowedTools = getBoxProfile("kb-compile").allowedTools ?? null;
+        await client.postJson(`/session/${runId}`, { instruction: instruction ?? "", allowed_tools: allowedTools });
+        driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
+          .catch(async (err) => {
+            console.error(`[capability] session relay failed run=${runId}:`, err);
+            await capabilityRunManager.endRun(runId, "failed").catch(() => {});
+          })
+          .finally(() => {
+            capabilitySessions.delete(runId);
+          });
+        return { client };
+      })();
+      capabilitySessions.set(runId, pending);
+      pending.catch(() => capabilitySessions.delete(runId));
+    }
+    return pending;
+  };
 
   rpcMethods.set("capability.start", async (params) => {
     const profile = (params.profile as string) || "kb-compile";
@@ -569,10 +615,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const instruction = input.instruction as string | undefined;
     // siclaw mints the runId + persists a running state (the run is siclaw-owned).
     const rec = await capabilityRunManager.startRun({ profile, orgId: orgId ?? "", correlationId });
-    // Drive the box under the minted runId. B2a reuses the kb-compile session
-    // machinery; generalized per-profile driving is B2b.
     try {
-      await ensureCompileSession(rec.runId, orgId, instruction);
+      await ensureCapabilitySession(rec.runId, orgId, instruction);
     } catch (err) {
       await capabilityRunManager.endRun(rec.runId, "failed");
       throw err;
@@ -587,7 +631,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!runId) throw new Error("run_id is required");
     if (!message) throw new Error("message is required");
     capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
-    const { client } = await ensureCompileSession(runId, orgId, undefined);
+    const { client } = await ensureCapabilitySession(runId, orgId, undefined);
     await client.postJson(`/message/${runId}`, { message });
     return { ok: true, run_id: runId };
   });
