@@ -9,6 +9,7 @@ import { SessionTable } from "../components/metrics/SessionTable"
 import { GrafanaFrame } from "../components/metrics/GrafanaFrame"
 import { TimeRangePicker } from "../components/metrics/TimeRangePicker"
 import { EntrySelector } from "../components/metrics/EntrySelector"
+import { SenderCombobox } from "../components/metrics/SenderCombobox"
 
 type TabKey = "dashboard" | "sessions" | "tools" | "grafana"
 
@@ -107,26 +108,11 @@ export function Metrics() {
                   ))}
                 </select>
               )}
-              {/* Channel sender (open_id / staffId) — type or pick from senders
-                  seen in the window. Lets you pin an unlinked sender that the
-                  All Users list can't represent. Audit tabs, channel entry only. */}
+              {/* Channel sender (open_id / staffId) — dropdown + free input:
+                  pick from senders seen in the window (with counts + last-seen)
+                  or type/paste an id. Audit tabs, channel entry only. */}
               {isAudit && entry === "channel" && (
-                <>
-                  <input
-                    list="metrics-channel-senders"
-                    value={senderId}
-                    onChange={(e) => setSenderId(e.target.value)}
-                    placeholder="open_id / staff id"
-                    className="h-8 w-44 px-2 text-[12px] rounded-md bg-secondary border border-border text-foreground font-mono placeholder:font-sans focus:outline-none focus:border-blue-500"
-                  />
-                  <datalist id="metrics-channel-senders">
-                    {senders.map((s) => (
-                      <option key={s.senderId} value={s.senderId}>
-                        {`${s.messageCount} msgs · ${s.sessionCount} sessions · last ${new Date(s.lastSeen).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })}`}
-                      </option>
-                    ))}
-                  </datalist>
-                </>
+                <SenderCombobox value={senderId} onChange={setSenderId} senders={senders} />
               )}
               {/* Entry-form axis + time window — shared by Dashboard/Sessions/Tools. */}
               {showControls && <EntrySelector value={entry} onChange={setEntry} />}
