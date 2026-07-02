@@ -467,10 +467,10 @@ async def test_test_message_path():
     print("✓ test-message injects a turn into a live test session")
 
 
-async def test_propose_plan_requires_plan_file():
-    """propose_plan bounces until PLAN.md ## Next Pages carries checkbox entries —
-    the owner UI (提出计划 milestone + approve bar) is file-driven, not event-driven,
-    so a chat-only proposal must be rejected with instructions, not emitted."""
+async def test_propose_plan_never_bounces():
+    """propose_plan is the deterministic approve signal: the handler itself writes
+    authoring/PROPOSED_PLAN.json (code, not model formatting) and always emits —
+    the owner UI must never be held hostage by how the model kept its notes."""
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
         (wd / "authoring").mkdir(parents=True)
@@ -496,22 +496,22 @@ async def test_propose_plan_requires_plan_file():
             compile_box.create_sdk_mcp_server = orig
         pp = captured["propose_plan"].handler
 
-        # template guidance (plain bullets) → bounced, no event
-        (wd / "authoring" / "PLAN.md").write_text(
-            "# Plan\n\n## Next Pages\n- guidance bullet, not a checkbox\n\n## Blocked\n- None\n", "utf-8"
-        )
-        r1 = await pp({"plan": "plan text"})
-        assert "复选框" in r1["content"][0]["text"]
-        assert not events
+        # no PLAN.md checkboxes at all → STILL proposes (advisory reminder only)
+        r1 = await pp({"plan": "## 计划\n- 00 概览\n- 10 用法"})
+        assert events and events[0]["type"] == "plan_proposed"
+        assert "提醒" in r1["content"][0]["text"]
+        proposal = json.loads((wd / "authoring" / "PROPOSED_PLAN.json").read_text("utf-8"))
+        assert proposal["text"].startswith("## 计划") and proposal["proposed_at"]
 
-        # real checkbox list → event emitted, success text
+        # with a maintained checklist → no reminder; re-propose overwrites
         (wd / "authoring" / "PLAN.md").write_text(
             "# Plan\n\n## Next Pages\n- [ ] 00 概览 — 平台是什么\n\n## Blocked\n- None\n", "utf-8"
         )
-        r2 = await pp({"plan": "plan text"})
-        assert events and events[0]["type"] == "plan_proposed"
-        assert "批准" in r2["content"][0]["text"]
-    print("✓ propose_plan gated on PLAN.md ## Next Pages checkboxes")
+        r2 = await pp({"plan": "v2"})
+        assert len(events) == 2
+        assert "提醒" not in r2["content"][0]["text"]
+        assert json.loads((wd / "authoring" / "PROPOSED_PLAN.json").read_text("utf-8"))["text"] == "v2"
+    print("✓ propose_plan always signals; PROPOSED_PLAN.json written by code")
 
 
 async def main():
@@ -524,7 +524,7 @@ async def main():
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
     await test_test_message_path()
-    await test_propose_plan_requires_plan_file()
+    await test_propose_plan_never_bounces()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()
