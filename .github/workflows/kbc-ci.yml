@@ -23,3 +23,5 @@ jobs:
       - run: pip install claude-agent-sdk aiohttp
       - run: python test_compile_box.py
         working-directory: kbc/platform/pod
+      - run: python test_selfcheck.py
+        working-directory: kbc/platform/pod
