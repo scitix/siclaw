@@ -497,20 +497,29 @@ def _make_compile_tools(run: CompileRun):
 
     @tool("propose_plan", ts["propose_plan"]["desc"], {"plan": str})
     async def propose_plan(args):
-        # The owner's plan UI (提出计划 milestone + the approve bar) is driven by
-        # PLAN.md checkboxes, not by this event — files outlive events across
-        # respawns and engine swaps. A proposal that never reached the file is
-        # invisible to the owner, so bounce it back with instructions instead of
-        # silently emitting into the void.
+        # The owner's approve UI is driven by THIS artifact — written here by
+        # code, deterministically, from the tool argument. The signal must never
+        # depend on how the model formatted its working notes (a proposal that
+        # bounces on file formatting is a UI held hostage by prose). PLAN.md
+        # remains the box's own working state; syncing happens at turn end.
+        plan_text = str(args.get("plan", ""))
+        proposal_path = Path(run.workdir) / "authoring" / "PROPOSED_PLAN.json"
+        proposal_path.parent.mkdir(parents=True, exist_ok=True)
+        proposal_path.write_text(json.dumps({
+            "text": plan_text,
+            "proposed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }, ensure_ascii=False, indent=2), "utf-8")
+        await run.emit({"type": "plan_proposed", "plan": plan_text})
+        # Advisory nudge only — working-state hygiene, never a gate.
+        reminder = ""
         plan_path = Path(run.workdir) / "authoring" / "PLAN.md"
         section = ""
         if plan_path.exists():
             m = re.search(r"## Next Pages\n(.*?)(?=\n## |\Z)", plan_path.read_text("utf-8"), re.S)
             section = m.group(1) if m else ""
         if "- [ ]" not in section and "- [x]" not in section:
-            return {"content": [{"type": "text", "text": ts["propose_plan"]["bounce"]}]}
-        await run.emit({"type": "plan_proposed", "plan": args.get("plan", "")})
-        return {"content": [{"type": "text", "text": ts["propose_plan"]["ack"]}]}
+            reminder = ts["propose_plan"]["reminder"]
+        return {"content": [{"type": "text", "text": ts["propose_plan"]["ack"] + reminder}]}
 
     @tool(
         "resolve_ticket",
@@ -605,6 +614,16 @@ async def _emit_message(run: CompileRun, msg) -> None:
     elif name == "ResultMessage":
         reply = "\n\n".join(run._turn_text).strip()
         run._turn_text = []
+        # Sync BEFORE announcing the turn: consumers refetch the workspace on
+        # turn_done, so files this turn produced (PROPOSED_PLAN.json, ticket
+        # receipts, candidate pages) must already be durable. The periodic tick
+        # alone can land seconds later and lose that race.
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)
+            except Exception:
+                pass  # periodic loop retries; a sync hiccup must not kill the turn
         await run.emit({"type": "turn_done", "text": reply})
 
 
@@ -684,6 +703,7 @@ async def _run_wrapper(run: CompileRun):
     """Unified lifecycle: run the driver + periodically sync mid-flight state →
     catch-all error → always finish with end."""
     sent: dict = {}
+    run._sync_sent = sent  # shared with _emit_message's pre-turn_done sync
     syncer = asyncio.create_task(_sync_loop(run, sent))
     try:
         await _COMPILE_IMPL(run)
