@@ -215,6 +215,41 @@ describe("CapabilityRunManager", () => {
     expect(mgr.get(runId)?.status).toBe("idle"); // memory advanced
   });
 
+  it("reapStale silently forgets a resurrection artifact whose store row is already terminal", async () => {
+    // recover()'s listing is a snapshot: a run that ended while the listing was
+    // in flight can re-enter the map as non-terminal. The reap must re-check the
+    // store and drop it — no box stop, no failed overwrite of a done outcome.
+    const be = new FakeBackend();
+    let clock = 1000;
+    const onReap = vi.fn();
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, onReap });
+    be.activeRuns = [{ id: "r-ghost", profile: "kb-compile", org_id: "o1", status: "running" }];
+    await mgr.recover(); // resurrects the ghost (stale snapshot)
+    be.getRunRow = { id: "r-ghost", profile: "kb-compile", status: "done" }; // store truth
+
+    clock = 2000;
+    const reaped = await mgr.reapStale();
+    expect(reaped).toEqual([]); // dropped, not reaped
+    expect(mgr.get("r-ghost")).toBeUndefined();
+    expect(onReap).not.toHaveBeenCalled(); // its box was never stopped
+    expect(be.persists()).toHaveLength(0); // and done was never overwritten
+  });
+
+  it("endRun is terminal-sticky — the first outcome wins", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    be.failPersist = true;
+    await mgr.endRun(runId, "done"); // terminal reached in memory, persist pending
+    be.failPersist = false;
+    await mgr.endRun(runId, "failed"); // e.g. the relay's error catch racing in
+    expect(mgr.get(runId)?.status).toBe("done"); // not overwritten
+
+    await mgr.reconcile(); // flushTerminal retries the ORIGINAL outcome
+    expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
+  });
+
   it("endRun keeps the terminal record until flushTerminal lands it — 'done' stays done", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);

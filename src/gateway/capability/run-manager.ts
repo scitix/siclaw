@@ -182,6 +182,10 @@ export class CapabilityRunManager {
   async endRun(runId: string, status: CapabilityTerminalStatus): Promise<void> {
     const rec = this.runs.get(runId);
     if (!rec) return;
+    // Terminal is sticky: the FIRST outcome wins. Without this, a done whose
+    // persist is still retrying (flushTerminal) gets overwritten to failed by
+    // the relay's error catch when the box stream closes right after `done`.
+    if (isTerminalCapabilityStatus(rec.status)) return;
     rec.status = status;
     rec.lastActivityMs = this.now();
     try {
@@ -233,16 +237,35 @@ export class CapabilityRunManager {
   /** Reap non-terminal runs idle longer than staleMs (stop box, mark failed + persist). */
   async reapStale(): Promise<string[]> {
     const cutoff = this.now() - this.staleMs;
-    const reaped: string[] = [];
+    const candidates: string[] = [];
     for (const rec of [...this.runs.values()]) {
       if (!isTerminalCapabilityStatus(rec.status) && rec.lastActivityMs < cutoff) {
-        reaped.push(rec.runId);
+        candidates.push(rec.runId);
       }
     }
-    for (const runId of reaped) {
-      console.warn(`[capability] watchdog reaping stale run ${runId}`);
+    const reaped: string[] = [];
+    for (const runId of candidates) {
       const rec = this.runs.get(runId);
-      if (rec && this.onReap) {
+      if (!rec) continue;
+      // A candidate can be a resurrection artifact: recover()'s active-run
+      // listing is a snapshot, so a run that ended WHILE the listing was in
+      // flight re-enters the map with its stale non-terminal status. Re-check
+      // the store before acting — if the run already reached a terminal state
+      // there, just forget it (no box stop, and NEVER overwrite a successful
+      // "done" with "failed").
+      try {
+        const req: CapabilityGetRunRequest = { run_id: runId };
+        const row = (await this.backend.request(CAPABILITY_GET_RUN, req)) as CapabilityRunRow | null;
+        if (row?.status && isTerminalCapabilityStatus(row.status)) {
+          this.runs.delete(runId);
+          continue;
+        }
+      } catch {
+        // store unreachable — proceed; a wrong failed persist would be retried
+        // and the store row is non-terminal anyway if we got here at boot.
+      }
+      console.warn(`[capability] watchdog reaping stale run ${runId}`);
+      if (this.onReap) {
         // Stop the run's box BEFORE declaring it failed, so the store never says
         // "failed" while an orphan pod keeps working behind its back.
         try {
@@ -252,6 +275,7 @@ export class CapabilityRunManager {
         }
       }
       await this.endRun(runId, "failed");
+      reaped.push(runId);
     }
     return reaped;
   }
