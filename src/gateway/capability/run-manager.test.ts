@@ -184,7 +184,8 @@ describe("CapabilityRunManager", () => {
       staleMs: 500,
       onReap: (rec) => void stopped.push(rec.runId),
     });
-    be.activeRuns = [{ id: "r-zombie", profile: "kb-compile", org_id: "o1", status: "idle" }];
+    // status running = the row was lost mid-turn; the strict staleMs tier applies.
+    be.activeRuns = [{ id: "r-zombie", profile: "kb-compile", org_id: "o1", status: "running" }];
 
     await mgr.reconcile(); // adopts at t=1000 (fresh — not reaped this tick)
     expect(mgr.get("r-zombie")).toBeDefined();
@@ -213,6 +214,50 @@ describe("CapabilityRunManager", () => {
     be.failPersist = true;
     await expect(mgr.setStatus(runId, "idle")).resolves.toBeUndefined(); // no throw
     expect(mgr.get(runId)?.status).toBe("idle"); // memory advanced
+  });
+
+  it("tiered TTLs: a resting idle run outlives staleMs and closes as done at idleTtl", async () => {
+    const be = new FakeBackend();
+    let clock = 1000;
+    const stopped: string[] = [];
+    const mgr = new CapabilityRunManager(be, {
+      now: () => clock,
+      staleMs: 500,
+      idleTtlMs: 5000,
+      onReap: (rec) => void stopped.push(rec.runId),
+    });
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    await mgr.setStatus(runId, "idle"); // turn finished — conversation at rest
+
+    clock = 3000; // way past staleMs(500) but inside idleTtl(5000)
+    expect(await mgr.reapStale()).toEqual([]); // idle is NOT a wedged turn
+    expect(mgr.get(runId)).toBeDefined();
+
+    clock = 7000; // past idleTtl
+    expect(await mgr.reapStale()).toEqual([runId]);
+    expect(stopped).toEqual([runId]); // box still stopped (resource hygiene)
+    // ...but the outcome is a normal session end, not a failure.
+    expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
+  });
+
+  it("onAdopt fires once per NEWLY adopted run — never for runs already tracked", async () => {
+    const be = new FakeBackend();
+    const adopted: string[] = [];
+    const mgr = new CapabilityRunManager(be, { onAdopt: (rec) => void adopted.push(rec.runId) });
+    const mine = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    be.activeRuns = [
+      { id: mine.runId, profile: "kb-compile", org_id: "o1", status: "running" }, // already tracked
+      { id: "r-lost", profile: "kb-compile", org_id: "o1", status: "idle" }, // lost during restart
+    ];
+    await mgr.recover();
+    expect(adopted).toEqual(["r-lost"]);
+
+    be.getRunRow = { id: "r-solo", profile: "kb-compile", org_id: "o1", status: "idle" };
+    await mgr.adopt("r-solo");
+    expect(adopted).toEqual(["r-lost", "r-solo"]);
+    await mgr.adopt("r-solo"); // second adopt = already tracked, no re-fire
+    expect(adopted).toEqual(["r-lost", "r-solo"]);
   });
 
   it("reapStale silently forgets a resurrection artifact whose store row is already terminal", async () => {

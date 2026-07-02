@@ -49,24 +49,38 @@ export interface CapabilityRunRecord {
 export interface CapabilityRunManagerOptions {
   /** Injectable clock (tests). Defaults to Date.now. */
   now?: () => number;
-  /** A run with no activity for this long while non-terminal is reaped as failed. */
+  /** A RUNNING run silent for this long is a wedged turn — reaped as failed. */
   staleMs?: number;
+  /**
+   * An IDLE run (conversation at rest) is kept warm this long, then closed as
+   * "done" — inactivity is a normal session end, not a failure. Defaults to 2h.
+   */
+  idleTtlMs?: number;
   /** Watchdog tick interval. */
   watchdogIntervalMs?: number;
   /**
-   * Invoked for each run the watchdog reaps, BEFORE it is marked failed — the
+   * Invoked for each run the watchdog reaps, BEFORE its terminal mark — the
    * place to stop the run's box so a reaped run never leaves an orphan pod
-   * running behind a store row that says "failed". Errors are logged, not fatal.
+   * running behind a terminal store row. Errors are logged, not fatal.
    */
   onReap?: (rec: CapabilityRunRecord) => Promise<void> | void;
+  /**
+   * Invoked for each run recover()/adopt() newly registers from the consumer's
+   * store — the place to re-attach the event relay to a still-alive box so a
+   * runtime restart doesn't leave a working box deaf (its queued events replay
+   * on re-attach) and stale-looking to the watchdog. Fire-and-forget.
+   */
+  onAdopt?: (rec: CapabilityRunRecord) => void;
 }
 
 export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
   private readonly now: () => number;
   private readonly staleMs: number;
+  private readonly idleTtlMs: number;
   private readonly watchdogIntervalMs: number;
   private readonly onReap?: (rec: CapabilityRunRecord) => Promise<void> | void;
+  private readonly onAdopt?: (rec: CapabilityRunRecord) => void;
   private watchdogTimer?: ReturnType<typeof setInterval>;
   private reconciling = false;
 
@@ -76,8 +90,10 @@ export class CapabilityRunManager {
   ) {
     this.now = opts.now ?? Date.now;
     this.staleMs = opts.staleMs ?? 10 * 60_000; // 10 min
+    this.idleTtlMs = opts.idleTtlMs ?? 2 * 60 * 60_000; // 2 h
     this.watchdogIntervalMs = opts.watchdogIntervalMs ?? 60_000; // 1 min
     this.onReap = opts.onReap;
+    this.onAdopt = opts.onAdopt;
   }
 
   /** siclaw mints the run id (the consumer never does — option B). */
@@ -141,6 +157,7 @@ export class CapabilityRunManager {
       };
       this.runs.set(rec.runId, rec);
       console.log(`[capability] adopted run ${runId} from the consumer store (missed by boot recovery)`);
+      this.onAdopt?.(rec);
       return rec;
     } catch (err) {
       console.warn(`[capability] adopt(${runId}) failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -215,7 +232,7 @@ export class CapabilityRunManager {
         // Store rows key the run id as `id` (the consumer's DB primary key) —
         // see CapabilityRunRow in contract.ts.
         if (!r.id || this.runs.has(r.id)) continue;
-        this.runs.set(r.id, {
+        const rec: CapabilityRunRecord = {
           runId: r.id,
           profile: r.profile ?? "",
           orgId: r.org_id ?? "",
@@ -224,7 +241,9 @@ export class CapabilityRunManager {
           sessionRef: r.session_ref || undefined,
           status: r.status || "running",
           lastActivityMs: this.now(),
-        });
+        };
+        this.runs.set(r.id, rec);
+        this.onAdopt?.(rec);
         n++;
       }
       return n;
@@ -234,17 +253,24 @@ export class CapabilityRunManager {
     }
   }
 
-  /** Reap non-terminal runs idle longer than staleMs (stop box, mark failed + persist). */
+  /**
+   * Reap non-terminal runs that outlived their tier's TTL (stop box + persist a
+   * terminal state). Two very different kinds of stale:
+   *   - running past staleMs  = a wedged turn            → failed
+   *   - idle    past idleTtlMs = a conversation at rest  → done (normal end)
+   */
   async reapStale(): Promise<string[]> {
-    const cutoff = this.now() - this.staleMs;
-    const candidates: string[] = [];
+    const now = this.now();
+    const candidates: Array<{ runId: string; outcome: CapabilityTerminalStatus }> = [];
     for (const rec of [...this.runs.values()]) {
-      if (!isTerminalCapabilityStatus(rec.status) && rec.lastActivityMs < cutoff) {
-        candidates.push(rec.runId);
+      if (isTerminalCapabilityStatus(rec.status)) continue;
+      const idle = rec.status === "idle";
+      if (rec.lastActivityMs < now - (idle ? this.idleTtlMs : this.staleMs)) {
+        candidates.push({ runId: rec.runId, outcome: idle ? "done" : "failed" });
       }
     }
     const reaped: string[] = [];
-    for (const runId of candidates) {
+    for (const { runId, outcome } of candidates) {
       const rec = this.runs.get(runId);
       if (!rec) continue;
       // A candidate can be a resurrection artifact: recover()'s active-run
@@ -264,17 +290,17 @@ export class CapabilityRunManager {
         // store unreachable — proceed; a wrong failed persist would be retried
         // and the store row is non-terminal anyway if we got here at boot.
       }
-      console.warn(`[capability] watchdog reaping stale run ${runId}`);
+      console.warn(`[capability] watchdog reaping stale run ${runId} → ${outcome}`);
       if (this.onReap) {
-        // Stop the run's box BEFORE declaring it failed, so the store never says
-        // "failed" while an orphan pod keeps working behind its back.
+        // Stop the run's box BEFORE the terminal mark, so the store never says
+        // "ended" while an orphan pod keeps working behind its back.
         try {
           await this.onReap(rec);
         } catch (err) {
           console.warn(`[capability] onReap(${runId}) failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      await this.endRun(runId, "failed");
+      await this.endRun(runId, outcome);
       reaped.push(runId);
     }
     return reaped;

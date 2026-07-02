@@ -387,17 +387,33 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // manager owning lifecycle. This is the ONLY KB box control plane — the legacy
   // compile.* path was deleted in B4; authoring-chat runs entirely on capability.*.
   const capabilityRunManager = new CapabilityRunManager(frontendClient, {
-    // A reaped run must not leave its box behind: stop the pod before the run is
-    // marked failed, so the store and the cluster agree. Local escape-hatch boxes
+    // A reaped run must not leave its box behind: stop the pod before the run's
+    // terminal mark, so the store and the cluster agree. Local escape-hatch boxes
     // aren't managed by the spawner — stop() is a no-op/404 there, hence catch.
     onReap: async (rec) => {
       await agentBoxManager.stop(rec.runId).catch((err) => {
         console.warn(`[capability] reap: stopping box ${rec.runId} failed:`, err instanceof Error ? err.message : String(err));
       });
     },
+    // A recovered/adopted run whose box is STILL ALIVE gets its relay re-attached
+    // immediately: the box's queued events replay (late-persisting turns and
+    // artifacts we missed during the restart), touch resumes, and the watchdog
+    // stops seeing a deaf-but-healthy run as stale. Dead boxes stay lazy — the
+    // next message respawns them (with workspace rehydration); we don't
+    // resurrect pods for possibly-abandoned runs.
+    onAdopt: (rec) => {
+      void (async () => {
+        try {
+          const alive = await agentBoxManager.getAsync(rec.runId);
+          if (!alive) return;
+          await ensureCapabilitySession(rec.runId, rec.profile, rec.orgId || undefined, undefined);
+          console.log(`[capability] re-attached relay to live box for recovered run ${rec.runId}`);
+        } catch (err) {
+          console.warn(`[capability] relay re-attach for ${rec.runId} skipped:`, err instanceof Error ? err.message : String(err));
+        }
+      })();
+    },
   });
-  void capabilityRunManager.recover();
-  capabilityRunManager.startWatchdog();
 
   // One persistent capability session (box + relay loop) per run; a later message
   // reattaches instead of spawning a second relay. The profile comes from the
@@ -434,6 +450,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
     return pending;
   };
+
+  // Recover AFTER ensureCapabilitySession exists — onAdopt re-attaches through it.
+  void capabilityRunManager.recover();
+  capabilityRunManager.startWatchdog();
 
   rpcMethods.set("capability.start", async (params) => {
     const req = params as unknown as CapabilityStartRequest;
@@ -476,6 +496,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
     await client.postJson(`/message/${runId}`, { message });
+    // The box is now working a turn: reflect it (turn_done flips back to idle).
+    // Keeps the consumer's view honest AND puts the run in the strict staleMs
+    // tier — a wedged turn must not enjoy the long idle TTL.
+    await capabilityRunManager.setStatus(runId, "running");
     return { ok: true, run_id: runId };
   });
 
