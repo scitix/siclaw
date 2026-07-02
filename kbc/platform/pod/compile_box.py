@@ -50,6 +50,7 @@ from claude_agent_sdk import (
     InMemorySessionStore,
 )
 
+import selfcheck
 
 # A box usually hosts a single run; a map keeps it clean (and helps health/debugging).
 RUNS: dict[str, "CompileRun"] = {}
@@ -156,9 +157,22 @@ class CompileRun:
         # Assistant text accumulated for the in-flight turn; flushed into the
         # turn_done event so sicore can persist the whole assistant reply.
         self._turn_text: list[str] = []
+        # Layer-1 self-check bookkeeping (selfcheck.py): idempotency key of the
+        # last checked state (skip re-check when nothing changed) and repair
+        # injections used since the ledger last closed (bounds the auto-repair
+        # loop; reset to 0 whenever the check passes).
+        self._selfcheck_key: str | None = None
+        self._l1_repairs_used = 0
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
+
+    async def inject_user_message(self, text: str):
+        """Engine seam: push a user turn into the live session. The Claude SDK
+        driver is one line; a future engine driver (e.g. Codex) reimplements
+        just this method — self-check orchestration stays engine-neutral."""
+        if self.client:
+            await self.client.query(text)
 
 
 class TestRun:
@@ -598,6 +612,44 @@ async def _smoke_compile(run: CompileRun):
     await run.emit({"type": "turn_done", "text": "[smoke] wiring check complete"})
 
 
+def _l1_repair_rounds() -> int:
+    return int(os.environ.get("KBC_L1_REPAIR_ROUNDS", "1"))
+
+
+async def _post_turn_selfcheck(run) -> str | None:
+    """Layer-1 deterministic self-check at turn end (coverage ledger + lint;
+    design: DESIGN-kb-compile-self-verification-2026-07-03 §8.1). All analysis
+    lives in selfcheck.py (engine-neutral); this driver only decides WHEN
+    (candidate state changed + index.md exists) and relays the bounded repair
+    prompt through the run's message seam. turn_done still fires normally —
+    the never-stuck invariant stays intact; a repair is just the next turn.
+    Returns the repair prompt to inject after turn_done, or None."""
+    workdir = getattr(run, "workdir", None)
+    if not workdir:  # test sessions reuse _emit_message but have no workspace
+        return None
+    key = selfcheck.state_key(workdir)
+    if key is None or key == run._selfcheck_key:
+        return None
+    if not (Path(workdir) / "candidate" / "index.md").is_file():
+        return None  # mid-Execute: pages exist but the index isn't written yet
+    run._selfcheck_key = key
+    report = selfcheck.run_layer1(workdir)
+    if report["coverage"]["closed"] and report["lint"]["ok"]:
+        run._l1_repairs_used = 0
+        report["state"] = "passed"
+    elif run._l1_repairs_used < _l1_repair_rounds():
+        report["state"] = "repairing"
+    else:
+        report["state"] = "unconverged"  # budget spent: publish card shows the rest
+    report["repair_rounds_used"] = run._l1_repairs_used
+    selfcheck.write_selfcheck(workdir, report)
+    await run.emit({"type": "summary", "text": selfcheck.narration(report)})
+    if report["state"] == "repairing":
+        run._l1_repairs_used += 1
+        return selfcheck.build_repair_prompt(report)
+    return None
+
+
 async def _emit_message(run: CompileRun, msg) -> None:
     """Relay one Agent SDK message to the SSE stream. Assistant text becomes the
     live chat (`log`) stream AND is accumulated for the turn; a ResultMessage
@@ -614,6 +666,14 @@ async def _emit_message(run: CompileRun, msg) -> None:
     elif name == "ResultMessage":
         reply = "\n\n".join(run._turn_text).strip()
         run._turn_text = []
+        # Layer-1 self-check BEFORE the sync so SELFCHECK.json rides the same
+        # pre-turn_done sync. Fail-open: a self-check crash must not kill the
+        # turn (§4.5) — surface it as a summary line instead of dying silently.
+        repair_msg = None
+        try:
+            repair_msg = await _post_turn_selfcheck(run)
+        except Exception as e:
+            await run.emit({"type": "summary", "text": f"自检(账本)执行失败,本轮跳过: {e!r}"})
         # Sync BEFORE announcing the turn: consumers refetch the workspace on
         # turn_done, so files this turn produced (PROPOSED_PLAN.json, ticket
         # receipts, candidate pages) must already be durable. The periodic tick
@@ -625,6 +685,13 @@ async def _emit_message(run: CompileRun, msg) -> None:
             except Exception:
                 pass  # periodic loop retries; a sync hiccup must not kill the turn
         await run.emit({"type": "turn_done", "text": reply})
+        # Bounded auto-repair AFTER turn_done (async-post-check design, §4.3-c):
+        # the turn ends normally; the repair is an ordinary next turn.
+        if repair_msg:
+            try:
+                await run.inject_user_message(repair_msg)
+            except Exception as e:
+                await run.emit({"type": "summary", "text": f"自检回修注入失败: {e!r}"})
 
 
 # Default tool whitelist for a kb-compile session, used when the runtime profile

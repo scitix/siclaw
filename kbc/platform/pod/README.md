@@ -56,6 +56,22 @@ docker run --rm -p 3000:3000 \
 - **LLM**:本地复用 `~/.claude` 订阅(无需 key);容器/生产必须 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_BASE_URL`→massapi(凭据不进 sandbox)。
 - **传输**:存在 `SICLAW_CERT_PATH`(默认 `/etc/siclaw/certs`)的 `tls.crt/tls.key/ca.crt` → 起 HTTPS 且要求客户端证书(runtime/gateway);否则 HTTP(本地)。复用 agentbox 的每-box mTLS 外壳。
 
+## Layer-1 自检:覆盖账本 + lint(`selfcheck.py`)
+
+完成判据从"模型自证"换成"代码核查"(设计:improve_siclaw/DESIGN-kb-compile-self-verification-2026-07-03.md §8.1):
+
+- **契约**:每个 candidate 页 frontmatter `compiled_from` 列真实 raw 相对路径(纯综合页标
+  `derived: true`);不编的源写 `authoring/EXCLUSIONS.json`(`[{pattern, reason}]`)。
+- **核对**:每轮 turn 结束、candidate 状态有变(幂等键=candidate 树+EXCLUSIONS 内容)且
+  `candidate/index.md` 存在时,机械核对「raw 全部文本源 = compiled_from 并集 + EXCLUSIONS 匹配」
+  并跑结构 lint(provenance 缺失/坏链);结果写 `authoring/SELFCHECK.json`(随 workspace 同步
+  到 sicore,发布卡消费),一行叙述走 `summary` 事件。
+- **回修**:`turn_done` 照常发(never-stuck 不变);未入账时注入**一条**回修指令
+  (`KBC_L1_REPAIR_ROUNDS`,默认 1),额度用尽标 `unconverged`,余项交负责人。全程 fail-open。
+- **引擎中立**:selfcheck.py 纯 stdlib 零 SDK 依赖;驱动只提供"何时触发"+
+  `CompileRun.inject_user_message()` 一个注入缝——换引擎(如 Codex)只重实现这一个方法。
+- Layer-2(红蓝队 PK 自检)后续填 SELFCHECK.json 的 `pk` 字段,同一状态源。
+
 ## 边界 / 下一步
 
 - **resume**:box 重启后会话不续(`InMemorySessionStore`);runtime 侧靠"冷 box 再水化"(重新物化 raw + durable workspace)兜底,SDK `resume`+file-backed `session_store` 是后续增量。

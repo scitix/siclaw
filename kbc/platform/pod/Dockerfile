@@ -24,6 +24,7 @@ WORKDIR /app
 COPY CLAUDE.md /app/CLAUDE.md
 COPY platform/pod/compile_agent.py /app/compile_agent.py
 COPY platform/pod/compile_box.py /app/compile_box.py
+COPY platform/pod/selfcheck.py /app/selfcheck.py
 COPY platform/pod/prompts/ /app/prompts/
 COPY tools/ /app/tools/
 
