@@ -15,11 +15,14 @@
  */
 
 import type {
+  CapabilityGetRunRequest,
   CapabilityLifecycleStatus,
   CapabilityListActiveRunsResponse,
+  CapabilityRunRow,
   CapabilityRunState,
 } from "./contract.js";
 import {
+  CAPABILITY_GET_RUN,
   CAPABILITY_PERSIST_RUN_STATE,
   CAPABILITY_LIST_ACTIVE_RUNS,
   isTerminalCapabilityStatus,
@@ -96,6 +99,41 @@ export class CapabilityRunManager {
 
   get(runId: string): CapabilityRunRecord | undefined {
     return this.runs.get(runId);
+  }
+
+  /**
+   * Adopt a run this runtime doesn't hold in memory by reading it back from the
+   * consumer's store — heals the drift where boot-time recovery missed it (e.g.
+   * the consumer wasn't ready yet). Only non-terminal runs are adopted; returns
+   * undefined when the store doesn't know the run or it already ended, so the
+   * caller can refuse instead of spawning an unmanaged box.
+   */
+  async adopt(runId: string): Promise<CapabilityRunRecord | undefined> {
+    const existing = this.runs.get(runId);
+    if (existing) return existing;
+    try {
+      const req: CapabilityGetRunRequest = { run_id: runId };
+      const row = (await this.backend.request(CAPABILITY_GET_RUN, req)) as CapabilityRunRow | null;
+      if (!row?.id) return undefined;
+      const status: CapabilityLifecycleStatus = row.status || "running";
+      if (isTerminalCapabilityStatus(status)) return undefined;
+      const rec: CapabilityRunRecord = {
+        runId: row.id,
+        profile: row.profile ?? "",
+        orgId: row.org_id ?? "",
+        correlationId: row.correlation_id || undefined,
+        runtimeId: row.runtime_id || undefined,
+        sessionRef: row.session_ref || undefined,
+        status,
+        lastActivityMs: this.now(),
+      };
+      this.runs.set(rec.runId, rec);
+      console.log(`[capability] adopted run ${runId} from the consumer store (missed by boot recovery)`);
+      return rec;
+    } catch (err) {
+      console.warn(`[capability] adopt(${runId}) failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
   }
 
   /** Bump last-activity so the watchdog doesn't reap an actively-used run. */

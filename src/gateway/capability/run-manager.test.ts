@@ -1,14 +1,16 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { CapabilityRunManager, type RunStateBackend } from "./run-manager.js";
-import { CAPABILITY_PERSIST_RUN_STATE, CAPABILITY_LIST_ACTIVE_RUNS } from "./contract.js";
+import { CAPABILITY_PERSIST_RUN_STATE, CAPABILITY_LIST_ACTIVE_RUNS, CAPABILITY_GET_RUN } from "./contract.js";
 
-/** Records every RPC the manager makes; canned response for listActiveRuns. */
+/** Records every RPC the manager makes; canned responses for the store reads. */
 class FakeBackend implements RunStateBackend {
   calls: Array<{ method: string; params: any }> = [];
   activeRuns: any[] = [];
+  getRunRow: any = null;
   async request(method: string, params?: unknown): Promise<any> {
     this.calls.push({ method, params });
     if (method === CAPABILITY_LIST_ACTIVE_RUNS) return { runs: this.activeRuns };
+    if (method === CAPABILITY_GET_RUN) return this.getRunRow;
     return { ok: true };
   }
   persists() {
@@ -77,6 +79,30 @@ describe("CapabilityRunManager", () => {
     expect(n).toBe(2);
     expect(mgr.get("r1")).toMatchObject({ profile: "kb-compile", orgId: "o1", correlationId: "a1", sessionRef: "s1" });
     expect(mgr.get("r2")?.status).toBe("idle");
+  });
+
+  it("adopt re-registers a non-terminal run the store knows but memory lost", async () => {
+    const be = new FakeBackend();
+    be.getRunRow = { id: "r9", profile: "kb-test", org_id: "o1", correlation_id: "a9", status: "idle" };
+    const mgr = new CapabilityRunManager(be);
+
+    const rec = await mgr.adopt("r9");
+    expect(rec).toMatchObject({ runId: "r9", profile: "kb-test", orgId: "o1", correlationId: "a9", status: "idle" });
+    expect(mgr.get("r9")).toBe(rec);
+    // The store read uses the contract request shape.
+    expect(be.calls.find((c) => c.method === CAPABILITY_GET_RUN)?.params).toEqual({ run_id: "r9" });
+  });
+
+  it("adopt refuses terminal and unknown runs (no unmanaged resurrection)", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+
+    be.getRunRow = { id: "r-done", profile: "kb-compile", status: "done" };
+    expect(await mgr.adopt("r-done")).toBeUndefined();
+    expect(mgr.get("r-done")).toBeUndefined();
+
+    be.getRunRow = null;
+    expect(await mgr.adopt("r-nope")).toBeUndefined();
   });
 
   it("recover is best-effort — a backend failure yields 0, not a throw", async () => {
