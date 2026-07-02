@@ -35,6 +35,11 @@ describe("CapabilityRunManager", () => {
       run_id: rec.runId, profile: "kb-compile", org_id: "o1",
       correlation_id: "attempt-1", status: "running",
     });
+    // The persist payload IS the wire shape — exact snake_case key set, nothing
+    // extra, nothing camelCase (contract.ts WIRE RULE; Go reads these keys).
+    expect(Object.keys(p[0].params).sort()).toEqual([
+      "correlation_id", "org_id", "profile", "run_id", "runtime_id", "session_ref", "status",
+    ]);
   });
 
   it("setSessionRef + setStatus persist each transition", async () => {

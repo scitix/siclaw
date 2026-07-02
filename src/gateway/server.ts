@@ -28,6 +28,14 @@ import { getBoxProfile } from "./agentbox/box-profile.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { CAPABILITY_FETCH_INPUT } from "./capability/contract.js";
+import type {
+  CapabilityCancelRequest,
+  CapabilityFetchInputRequest,
+  CapabilityFetchInputResponse,
+  CapabilityMessageRequest,
+  CapabilityStartRequest,
+  CapabilityStartResponse,
+} from "./capability/contract.js";
 import {
   type RpcHandler,
   type RpcContext,
@@ -360,16 +368,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, sessionId };
   });
 
-  // ── Shared KB box client (used by the capability protocol below) ──────────
+  // ── Shared capability box client ───────────────────────────────────────────
   // Local development escape hatch: point SICLAW_COMPILE_BOX_ENDPOINT at a
   // manually started kbc box (usually http://127.0.0.1:3000) to reuse a local
   // Claude Code/OAuth session while testing the sicore↔runtime protocol.
-  const localCompileBoxEndpoint = process.env.SICLAW_COMPILE_BOX_ENDPOINT?.trim();
-  const compileBoxClient = async (runId: string, orgId?: string): Promise<AgentBoxClient> => {
-    if (localCompileBoxEndpoint) {
-      return new AgentBoxClient(localCompileBoxEndpoint, 30000, agentBoxTlsOptions);
+  const localCapabilityBoxEndpoint = process.env.SICLAW_COMPILE_BOX_ENDPOINT?.trim();
+  const capabilityBoxClient = async (runId: string, profile: string, orgId?: string): Promise<AgentBoxClient> => {
+    if (localCapabilityBoxEndpoint) {
+      return new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
     }
-    const handle = await agentBoxManager.getOrCreate(runId, { profile: "kb-compile", orgId });
+    const handle = await agentBoxManager.getOrCreate(runId, { profile, orgId });
     return new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
   };
 
@@ -384,20 +392,20 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   capabilityRunManager.startWatchdog();
 
   // One persistent capability session (box + relay loop) per run; a later message
-  // reattaches instead of spawning a second relay.
+  // reattaches instead of spawning a second relay. The profile comes from the
+  // run record minted at capability.start — the box shape + tool/trust envelope
+  // is fixed for the run's lifetime, never re-negotiated per message.
   const capabilitySessions = new Map<string, Promise<{ client: AgentBoxClient }>>();
-  const ensureCapabilitySession = (runId: string, orgId: string | undefined, instruction: string | undefined) => {
+  const ensureCapabilitySession = (runId: string, profile: string, orgId: string | undefined, instruction: string | undefined) => {
     let pending = capabilitySessions.get(runId);
     if (!pending) {
       pending = (async () => {
-        const client = await compileBoxClient(runId, orgId);
+        const client = await capabilityBoxClient(runId, profile, orgId);
         // Materialize the frozen source into /work/raw via the consumer's store.
         // Best-effort: an empty KB / fetch error must not block the conversation.
         try {
-          const bundle = (await frontendClient.request(CAPABILITY_FETCH_INPUT, { run_id: runId })) as {
-            bundle_base64?: string;
-            bundle_sha256?: string;
-          };
+          const fetchReq: CapabilityFetchInputRequest = { run_id: runId };
+          const bundle = (await frontendClient.request(CAPABILITY_FETCH_INPUT, fetchReq)) as CapabilityFetchInputResponse;
           if (bundle?.bundle_base64) {
             await client.postJson("/sources", {
               run_id: runId,
@@ -408,7 +416,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         } catch (err) {
           console.warn(`[capability] session ${runId}: source materialize skipped:`, err instanceof Error ? err.message : String(err));
         }
-        const allowedTools = getBoxProfile("kb-compile").allowedTools ?? null;
+        const allowedTools = getBoxProfile(profile).allowedTools ?? null;
         await client.postJson(`/session/${runId}`, { instruction: instruction ?? "", allowed_tools: allowedTools });
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
           .catch(async (err) => {
@@ -427,36 +435,47 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   rpcMethods.set("capability.start", async (params) => {
-    const profile = (params.profile as string) || "kb-compile";
-    const orgId = params.org_id as string | undefined;
-    const correlationId = params.correlation_id as string | undefined;
-    const input = (params.input as Record<string, unknown> | undefined) ?? {};
-    const instruction = input.instruction as string | undefined;
+    const req = params as unknown as CapabilityStartRequest;
+    const profile = req.profile?.trim();
+    if (!profile) throw new Error("profile is required");
+    // Fail-closed BEFORE minting the run: an unknown profile must never fall
+    // back to some other box shape (that would hand out the wrong tool/trust
+    // envelope), and we don't persist runs we can't spawn.
+    getBoxProfile(profile);
+    const orgId = req.org_id;
+    const instruction = req.input?.instruction as string | undefined;
     // siclaw mints the runId + persists a running state (the run is siclaw-owned).
-    const rec = await capabilityRunManager.startRun({ profile, orgId: orgId ?? "", correlationId });
+    const rec = await capabilityRunManager.startRun({ profile, orgId: orgId ?? "", correlationId: req.correlation_id });
     try {
-      await ensureCapabilitySession(rec.runId, orgId, instruction);
+      await ensureCapabilitySession(rec.runId, rec.profile, orgId, instruction);
     } catch (err) {
       await capabilityRunManager.endRun(rec.runId, "failed");
       throw err;
     }
-    return { run_id: rec.runId };
+    const res: CapabilityStartResponse = { run_id: rec.runId };
+    return res;
   });
 
   rpcMethods.set("capability.message", async (params) => {
-    const runId = params.run_id as string;
-    const orgId = params.org_id as string | undefined;
-    const message = params.message as string;
+    const req = params as unknown as CapabilityMessageRequest;
+    const runId = req.run_id;
+    const message = req.message;
     if (!runId) throw new Error("run_id is required");
     if (!message) throw new Error("message is required");
+    // The run record is the authority for the box's profile/org. Refuse unknown
+    // runs instead of silently spawning an unmanaged box for them — the consumer
+    // reacts by starting a fresh run (its find-or-start only reuses non-terminal
+    // runs, so this only fires on state drift, e.g. a failed recovery).
+    const rec = capabilityRunManager.get(runId);
+    if (!rec) throw new Error(`unknown capability run: ${runId}`);
     capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
-    const { client } = await ensureCapabilitySession(runId, orgId, undefined);
+    const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
     await client.postJson(`/message/${runId}`, { message });
     return { ok: true, run_id: runId };
   });
 
   rpcMethods.set("capability.cancel", async (params) => {
-    const runId = params.run_id as string;
+    const runId = (params as unknown as CapabilityCancelRequest).run_id;
     if (!runId) throw new Error("run_id is required");
     await agentBoxManager.stop(runId).catch(() => {});
     await capabilityRunManager.endRun(runId, "done");

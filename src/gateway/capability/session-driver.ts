@@ -15,6 +15,13 @@
 import type { AgentBoxClient } from "../agentbox/client.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import type { CapabilityRunManager } from "./run-manager.js";
+import type {
+  CapabilityEventFrame,
+  CapabilityEventPayload,
+  CapabilityEventType,
+  CapabilityPersistArtifactRequest,
+  CapabilityPersistTurnRequest,
+} from "./contract.js";
 import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACT, CAPABILITY_PERSIST_TURN } from "./contract.js";
 
 interface BoxEvent {
@@ -40,8 +47,10 @@ export interface DriveCapabilitySessionOptions {
  */
 export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions): Promise<void> {
   const { client, runId, frontendClient, manager } = opts;
-  const emit = (type: string, payload: Record<string, unknown>) =>
-    frontendClient.emitEvent(CAPABILITY_EVENT, { run_id: runId, type, payload });
+  const emit = (type: CapabilityEventType, payload: CapabilityEventPayload) => {
+    const frame: CapabilityEventFrame = { run_id: runId, type, payload };
+    frontendClient.emitEvent(CAPABILITY_EVENT, frame);
+  };
 
   for await (const raw of client.streamPath(`/events/${runId}`)) {
     const evt = raw as BoxEvent;
@@ -64,7 +73,8 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         // (awaiting the next turn) — NOT terminal.
         emit("turn", { text: evt.text ?? "" });
         try {
-          await frontendClient.request(CAPABILITY_PERSIST_TURN, { run_id: runId, text: evt.text ?? "" });
+          const turn: CapabilityPersistTurnRequest = { run_id: runId, text: evt.text ?? "" };
+          await frontendClient.request(CAPABILITY_PERSIST_TURN, turn);
         } catch (err) {
           console.error(`[capability] run=${runId} persistTurn failed:`, err instanceof Error ? err.message : String(err));
         }
@@ -74,11 +84,12 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         // Knowledge content the box produced → the consumer's store, one artifact
         // at a time. Content is inline base64 (opaque to the transport).
         for (const a of evt.artifacts ?? []) {
-          await frontendClient.request(CAPABILITY_PERSIST_ARTIFACT, {
+          const artifact: CapabilityPersistArtifactRequest = {
             run_id: runId,
             path: a.path,
             content: { inline_base64: Buffer.from(a.content, "utf8").toString("base64") },
-          });
+          };
+          await frontendClient.request(CAPABILITY_PERSIST_ARTIFACT, artifact);
         }
         break;
       case "parked":

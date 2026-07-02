@@ -14,8 +14,16 @@
  * manager; the event-protocol rename (→ capability.event) is B2b.
  */
 
-import type { CapabilityLifecycleStatus, CapabilityRunState } from "./contract.js";
-import { CAPABILITY_PERSIST_RUN_STATE, CAPABILITY_LIST_ACTIVE_RUNS } from "./contract.js";
+import type {
+  CapabilityLifecycleStatus,
+  CapabilityListActiveRunsResponse,
+  CapabilityRunState,
+} from "./contract.js";
+import {
+  CAPABILITY_PERSIST_RUN_STATE,
+  CAPABILITY_LIST_ACTIVE_RUNS,
+  isTerminalCapabilityStatus,
+} from "./contract.js";
 
 /** Just the RPC surface the manager needs (so tests can pass a fake). */
 export interface RunStateBackend {
@@ -33,8 +41,6 @@ export interface CapabilityRunRecord {
   /** Wall-clock ms of the last activity; drives the stale-run watchdog. */
   lastActivityMs: number;
 }
-
-const TERMINAL: CapabilityLifecycleStatus[] = ["done", "failed"];
 
 export interface CapabilityRunManagerOptions {
   /** Injectable clock (tests). Defaults to Date.now. */
@@ -136,20 +142,21 @@ export class CapabilityRunManager {
    */
   async recover(): Promise<number> {
     try {
-      const res = await this.backend.request(CAPABILITY_LIST_ACTIVE_RUNS, {});
-      const rows: any[] = res?.runs ?? [];
+      const res = (await this.backend.request(CAPABILITY_LIST_ACTIVE_RUNS, {})) as CapabilityListActiveRunsResponse;
+      const rows = res?.runs ?? [];
       let n = 0;
       for (const r of rows) {
-        const runId = r.id ?? r.runId;
-        if (!runId) continue;
-        this.runs.set(runId, {
-          runId,
+        // Store rows key the run id as `id` (the consumer's DB primary key) —
+        // see CapabilityRunRow in contract.ts.
+        if (!r.id) continue;
+        this.runs.set(r.id, {
+          runId: r.id,
           profile: r.profile ?? "",
-          orgId: r.org_id ?? r.orgId ?? "",
-          correlationId: r.correlation_id ?? r.correlationId,
-          runtimeId: r.runtime_id ?? r.runtimeId,
-          sessionRef: r.session_ref ?? r.sessionRef,
-          status: (r.status as CapabilityLifecycleStatus) || "running",
+          orgId: r.org_id ?? "",
+          correlationId: r.correlation_id || undefined,
+          runtimeId: r.runtime_id || undefined,
+          sessionRef: r.session_ref || undefined,
+          status: r.status || "running",
           lastActivityMs: this.now(),
         });
         n++;
@@ -166,7 +173,7 @@ export class CapabilityRunManager {
     const cutoff = this.now() - this.staleMs;
     const reaped: string[] = [];
     for (const rec of [...this.runs.values()]) {
-      if (!TERMINAL.includes(rec.status) && rec.lastActivityMs < cutoff) {
+      if (!isTerminalCapabilityStatus(rec.status) && rec.lastActivityMs < cutoff) {
         reaped.push(rec.runId);
       }
     }
@@ -193,24 +200,16 @@ export class CapabilityRunManager {
   }
 
   private async persist(rec: CapabilityRunRecord): Promise<void> {
+    // The contract type IS the wire shape (snake_case) — see contract.ts WIRE RULE.
     const state: CapabilityRunState = {
-      runId: rec.runId,
-      orgId: rec.orgId,
-      correlationId: rec.correlationId,
+      run_id: rec.runId,
+      org_id: rec.orgId ?? "",
+      correlation_id: rec.correlationId ?? "",
       profile: rec.profile,
       status: rec.status,
-      sessionRef: rec.sessionRef,
-      runtimeId: rec.runtimeId,
+      session_ref: rec.sessionRef ?? "",
+      runtime_id: rec.runtimeId ?? "",
     };
-    // Wire field names match the Go handler (snake_case).
-    await this.backend.request(CAPABILITY_PERSIST_RUN_STATE, {
-      run_id: state.runId,
-      org_id: state.orgId ?? "",
-      correlation_id: state.correlationId ?? "",
-      profile: state.profile,
-      status: state.status,
-      session_ref: state.sessionRef ?? "",
-      runtime_id: state.runtimeId ?? "",
-    });
+    await this.backend.request(CAPABILITY_PERSIST_RUN_STATE, state);
   }
 }
