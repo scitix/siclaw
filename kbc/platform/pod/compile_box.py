@@ -37,6 +37,7 @@ from aiohttp import web
 from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeAgentOptions,
+    HookMatcher,
     tool,
     create_sdk_mcp_server,
     InMemorySessionStore,
@@ -673,6 +674,61 @@ async def _run_wrapper(run: CompileRun):
 # profile declares none. Read-only by construction: cannot mutate the snapshot.
 DEFAULT_TEST_ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
 
+# Tool-input keys that name a filesystem path (Read.file_path, Glob/Grep.path).
+_TEST_PATH_KEYS = ("file_path", "path", "notebook_path")
+
+
+def _test_path_escape(root: Path, tool_name: str, tool_input: dict) -> str | None:
+    """C4 fidelity guard predicate: return a human-readable offender when a tool
+    input reaches OUTSIDE the pinned snapshot dir, else None. The allowed_tools
+    whitelist already makes a test session read-only, but an ABSOLUTE path (or a
+    ../ traversal) in Read/Glob/Grep would still reach the LIVE /work draft —
+    breaking "the test measures the pinned snapshot". Pure function → unit-tested."""
+    root = root.resolve()
+    for key in _TEST_PATH_KEYS:
+        v = tool_input.get(key)
+        if not isinstance(v, str) or not v.strip():
+            continue
+        p = Path(v)
+        target = p if p.is_absolute() else root / p
+        try:
+            target.resolve().relative_to(root)
+        except ValueError:
+            return f"{key}={v}"
+    # Glob's pattern is itself a path expression; an absolute pattern escapes even
+    # with `path` unset. (Grep's pattern is regex CONTENT — not a path; skip it.)
+    if tool_name == "Glob":
+        pattern = tool_input.get("pattern")
+        if isinstance(pattern, str) and pattern.startswith("/"):
+            base = pattern.split("*", 1)[0]
+            try:
+                Path(base).resolve().relative_to(root)
+            except ValueError:
+                return f"pattern={pattern}"
+    return None
+
+
+def _make_test_path_guard(root: Path):
+    """PreToolUse hook confining a test session to its snapshot. A hook (not a
+    can_use_tool callback) because hooks fire under bypassPermissions too."""
+
+    async def guard(input_data, tool_use_id, context):
+        offender = _test_path_escape(root, str(input_data.get("tool_name", "")), input_data.get("tool_input") or {})
+        if offender:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"这是只读测试会话,只能读钉死的快照目录({root});{offender} 在快照之外。"
+                        "请从 .siclaw/knowledge/index.md 出发用相对路径读页。"
+                    ),
+                }
+            }
+        return {}
+
+    return guard
+
 
 async def test_session_driver(run: "TestRun"):
     """Read-only consumer driver: host a ClaudeSDKClient over the pinned snapshot
@@ -688,6 +744,9 @@ async def test_session_driver(run: "TestRun"):
         allowed_tools=run.allowed_tools or DEFAULT_TEST_ALLOWED_TOOLS,
         mcp_servers={},                            # no compile signal tools
         permission_mode="bypassPermissions",       # pod 本身即 sandbox
+        # C4: path confinement — absolute/../ reads must not escape the snapshot
+        # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
+        hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd))])]},
         setting_sources=[],                        # 多租户隔离
         max_turns=int(os.environ.get("KBC_TEST_MAX_TURNS", "60")),
         session_id=sid,
