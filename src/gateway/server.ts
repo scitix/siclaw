@@ -543,7 +543,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // candidate/ draft to pin even after a reap/restart.
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
     const allowedTools = getBoxProfile("kb-test").allowedTools ?? null;
-    const opened = (await client.postJson(`/test-session/${runId}`, { allowed_tools: allowedTools })) as {
+    const opened = (await client.postJson(`/test-session/${runId}`, {
+      allowed_tools: allowedTools,
+      // Optional consumer-provided snapshot (e.g. a published version bundle);
+      // absent → the box pins the run's candidate/ draft.
+      ...(req.bundle_base64 ? { bundle_base64: req.bundle_base64, bundle_sha256: req.bundle_sha256 } : {}),
+    })) as {
       test_session_id: string;
       snapshot_hash: string;
       pages: number;

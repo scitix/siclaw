@@ -119,6 +119,16 @@ export interface CapabilityCancelRequest {
 export interface CapabilityTestStartRequest {
   /** The AUTHORING run whose live box + current draft the test session pins. */
   run_id: string;
+  /**
+   * Optional consumer-provided snapshot (base64 tar.gz of root-level wiki
+   * pages, e.g. a PUBLISHED version bundle). When set, the box pins THIS
+   * content instead of packing the run's candidate/ draft — the snapshot
+   * source generalizes to {draft, published version} with the same hash
+   * formula, so gradings stay comparable across sources.
+   */
+  bundle_base64?: string;
+  /** sha256 of the bundle bytes; the box verifies it at install time. */
+  bundle_sha256?: string;
 }
 
 export interface CapabilityTestStartResponse {

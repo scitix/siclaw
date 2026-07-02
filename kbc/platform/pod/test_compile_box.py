@@ -396,6 +396,37 @@ async def test_open_close_test_session_http():
         (Path(wd2) / "candidate" / "only.md").write_text("x")
         compile_box.RUNS["p2"] = compile_box.CompileRun("p2", wd2, 1)
         assert (await client.post("/test-session/p2")).status == 400
+
+        # consumer-provided snapshot bundle (e.g. a published version) → the box
+        # installs THAT instead of pinning candidate/, same hash formula.
+        vbundle = make_source_bundle({"index.md": "# v1 index\n", "gpu.md": "# gpu v1\n"})
+        r = await client.post("/test-session/p1", json={
+            "bundle_base64": base64.b64encode(vbundle).decode(),
+            "bundle_sha256": hashlib.sha256(vbundle).hexdigest(),
+        })
+        assert r.status == 200, await r.text()
+        vb = await r.json()
+        assert vb["pages"] == 2, vb
+        vtid = vb["test_session_id"]
+        vidx = Path(snap_root) / vtid / ".siclaw" / "knowledge" / "index.md"
+        assert vidx.read_text() == "# v1 index\n"
+        want = hashlib.sha256()
+        for rp, data in sorted([("gpu.md", b"# gpu v1\n"), ("index.md", b"# v1 index\n")]):
+            want.update(rp.encode()); want.update(b"\0"); want.update(data); want.update(b"\0")
+        assert vb["snapshot_hash"] == want.hexdigest(), vb
+        assert (await client.post(f"/test-session/{vtid}/close")).status == 200
+
+        # provided bundle missing index.md → 400, snapshot dir cleaned
+        nobidx = make_source_bundle({"only.md": "x"})
+        r = await client.post("/test-session/p1", json={"bundle_base64": base64.b64encode(nobidx).decode()})
+        assert r.status == 400, await r.text()
+
+        # sha mismatch → 400
+        r = await client.post("/test-session/p1", json={
+            "bundle_base64": base64.b64encode(vbundle).decode(),
+            "bundle_sha256": "0" * 64,
+        })
+        assert r.status == 400, await r.text()
     finally:
         await client.close()
         compile_box.ClaudeSDKClient = orig
