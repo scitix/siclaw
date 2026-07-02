@@ -146,8 +146,13 @@ export interface CapabilityRunState {
   runtime_id: string;
 }
 
+export interface CapabilityGetRunRequest {
+  run_id: string;
+}
+
 /**
  * A run row as RETURNED by the consumer's store (getRun / listActiveRuns).
+ * getRun returns the row directly (null when unknown).
  * NOTE the asymmetry: the store's primary key serializes as `id`, not `run_id`
  * (it is the consumer's DB row, json-tagged `id` on the Go model).
  */

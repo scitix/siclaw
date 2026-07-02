@@ -462,11 +462,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const message = req.message;
     if (!runId) throw new Error("run_id is required");
     if (!message) throw new Error("message is required");
-    // The run record is the authority for the box's profile/org. Refuse unknown
-    // runs instead of silently spawning an unmanaged box for them — the consumer
-    // reacts by starting a fresh run (its find-or-start only reuses non-terminal
-    // runs, so this only fires on state drift, e.g. a failed recovery).
-    const rec = capabilityRunManager.get(runId);
+    // The run record is the authority for the box's profile/org. A run missing
+    // from memory is first re-adopted from the consumer's store (heals a boot
+    // recovery that raced the consumer); only a run the STORE doesn't know (or
+    // already ended) is refused — never silently spawn an unmanaged box. The
+    // consumer reacts by starting a fresh run (its find-or-start only reuses
+    // non-terminal runs).
+    const rec = capabilityRunManager.get(runId) ?? (await capabilityRunManager.adopt(runId));
     if (!rec) throw new Error(`unknown capability run: ${runId}`);
     capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
