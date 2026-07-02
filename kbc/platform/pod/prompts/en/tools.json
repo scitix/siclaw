@@ -3,8 +3,9 @@
     "desc": "Report a slice of compile progress (pages produced / contradictions auto-merged / pending), one sentence to one paragraph."
   },
   "propose_plan": {
-    "desc": "Call after Plan-phase alignment: submit a short, readable, reviewable compile plan for the owner's approval, then stop and wait. Do not write candidate/ pages before approval arrives.",
-    "ack": "Plan submitted to the owner; awaiting approval. Do not write candidate/ pages until the approval message arrives."
+    "desc": "Call after Plan-phase alignment: submit a short, readable, reviewable compile plan for the owner's approval, then stop and wait. Prerequisite: first write the candidate-page list as `- [ ] page — one line` checkboxes into the ## Next Pages section of authoring/PLAN.md (the owner UI's plan display and approve button are driven by it). Do not write candidate/ pages before approval arrives.",
+    "ack": "Plan submitted to the owner (the UI can now show the plan list and the approve button); awaiting approval. Do not write candidate/ pages until the approval message arrives.",
+    "bounce": "Plan text received, but the ## Next Pages section of authoring/PLAN.md has no `- [ ] page — one line` checkbox list yet — the owner UI's plan display and the 'Approve · Start compiling' button are driven by this file, and without it the owner sees no plan. Write the candidate pages you intend to produce as checkboxes first (the template's plain bullet description lines do not count), then call propose_plan again."
   },
   "resolve_ticket": {
     "desc": "Call once per contradiction ticket you have patched (one call per ticket, no batching): register which ticket (ticket_id), the value you applied (applied_value), the candidate files you actually edited (pages_edited — must cover the ticket's affected_pages), and a one-line note. This marks the ticket as patched and writes an auditable agent_report — the basis for the contradiction view showing 'AI patched' for the owner to verify.",

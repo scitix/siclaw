@@ -33,6 +33,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import tarfile
 import uuid
@@ -496,6 +497,18 @@ def _make_compile_tools(run: CompileRun):
 
     @tool("propose_plan", ts["propose_plan"]["desc"], {"plan": str})
     async def propose_plan(args):
+        # The owner's plan UI (提出计划 milestone + the approve bar) is driven by
+        # PLAN.md checkboxes, not by this event — files outlive events across
+        # respawns and engine swaps. A proposal that never reached the file is
+        # invisible to the owner, so bounce it back with instructions instead of
+        # silently emitting into the void.
+        plan_path = Path(run.workdir) / "authoring" / "PLAN.md"
+        section = ""
+        if plan_path.exists():
+            m = re.search(r"## Next Pages\n(.*?)(?=\n## |\Z)", plan_path.read_text("utf-8"), re.S)
+            section = m.group(1) if m else ""
+        if "- [ ]" not in section and "- [x]" not in section:
+            return {"content": [{"type": "text", "text": ts["propose_plan"]["bounce"]}]}
         await run.emit({"type": "plan_proposed", "plan": args.get("plan", "")})
         return {"content": [{"type": "text", "text": ts["propose_plan"]["ack"]}]}
 
