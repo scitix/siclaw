@@ -27,15 +27,14 @@ import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { getBoxProfile } from "./agentbox/box-profile.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
-import { CAPABILITY_FETCH_INPUT, isTerminalCapabilityStatus } from "./capability/contract.js";
+import { isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
-  CapabilityFetchInputRequest,
-  CapabilityFetchInputResponse,
   CapabilityMessageRequest,
   CapabilityStartRequest,
   CapabilityStartResponse,
 } from "./capability/contract.js";
+import { materializeCapabilityInputs } from "./capability/materialize.js";
 import {
   type RpcHandler,
   type RpcContext,
@@ -406,25 +405,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // is fixed for the run's lifetime, never re-negotiated per message.
   const capabilitySessions = new Map<string, Promise<{ client: AgentBoxClient }>>();
   const ensureCapabilitySession = (runId: string, profile: string, orgId: string | undefined, instruction: string | undefined) => {
+    // An empty profile would silently resolve to the all-tools default agent
+    // profile (getBoxProfile("") → AGENT) — the wrong shape AND a trust
+    // escalation. Runs minted via capability.start always carry one; refuse
+    // anything else (e.g. a corrupt adopted row) instead of guessing.
+    if (!profile) throw new Error(`capability run ${runId} has no profile`);
     let pending = capabilitySessions.get(runId);
     if (!pending) {
       pending = (async () => {
         const client = await capabilityBoxClient(runId, profile, orgId);
-        // Materialize the frozen source into /work/raw via the consumer's store.
-        // Best-effort: an empty KB / fetch error must not block the conversation.
-        try {
-          const fetchReq: CapabilityFetchInputRequest = { run_id: runId };
-          const bundle = (await frontendClient.request(CAPABILITY_FETCH_INPUT, fetchReq)) as CapabilityFetchInputResponse;
-          if (bundle?.bundle_base64) {
-            await client.postJson("/sources", {
-              run_id: runId,
-              bundle_base64: bundle.bundle_base64,
-              bundle_sha256: bundle.bundle_sha256,
-            });
-          }
-        } catch (err) {
-          console.warn(`[capability] session ${runId}: source materialize skipped:`, err instanceof Error ? err.message : String(err));
-        }
+        // Raw sources + (fresh box only) the durable authoring workspace, both
+        // from the consumer's store. Best-effort — see materializeCapabilityInputs.
+        await materializeCapabilityInputs({ client, backend: frontendClient, runId });
         const allowedTools = getBoxProfile(profile).allowedTools ?? null;
         await client.postJson(`/session/${runId}`, { instruction: instruction ?? "", allowed_tools: allowedTools });
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })

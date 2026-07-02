@@ -196,13 +196,20 @@ export interface CapabilityContentRef {
 }
 
 /**
+ * fetchInput ref selecting the durable authoring-workspace bundle (rehydrates a
+ * fresh box's authoring/candidate state). The default (empty ref) is the frozen
+ * raw-source bundle. Go mirror: capability.InputRefWorkspace.
+ */
+export const CAPABILITY_INPUT_WORKSPACE_REF = "workspace" as const;
+
+/**
  * Input fetch. GENERALIZES compile.sourceBundle. siclaw asks the consumer for
  * the frozen source/config to materialize into the box; the consumer owns it
  * and resolves WHAT to freeze from the run's correlation.
  */
 export interface CapabilityFetchInputRequest {
   run_id: string;
-  /** Optional selector for capabilities with more than one input; unused today. */
+  /** Input kind: "" = frozen raw sources; CAPABILITY_INPUT_WORKSPACE_REF = durable workspace. */
   ref?: string;
 }
 
