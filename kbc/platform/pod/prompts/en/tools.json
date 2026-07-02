@@ -1,0 +1,17 @@
+{
+  "report_summary": {
+    "desc": "Report a slice of compile progress (pages produced / contradictions auto-merged / pending), one sentence to one paragraph."
+  },
+  "propose_plan": {
+    "desc": "Call after Plan-phase alignment: submit a short, readable, reviewable compile plan for the owner's approval, then stop and wait. Do not write candidate/ pages before approval arrives.",
+    "ack": "Plan submitted to the owner; awaiting approval. Do not write candidate/ pages until the approval message arrives."
+  },
+  "resolve_ticket": {
+    "desc": "Call once per contradiction ticket you have patched (one call per ticket, no batching): register which ticket (ticket_id), the value you applied (applied_value), the candidate files you actually edited (pages_edited — must cover the ticket's affected_pages), and a one-line note. This marks the ticket as patched and writes an auditable agent_report — the basis for the contradiction view showing 'AI patched' for the owner to verify.",
+    "need_id": "resolve_ticket requires ticket_id",
+    "read_failed": "failed to read CONTRADICTIONS.json: {e}",
+    "not_found": "ticket {tid} not found; existing ids: {ids}",
+    "write_failed": "failed to write CONTRADICTIONS.json: {e}",
+    "registered": "ticket {tid} registered as patched (agent_report written)"
+  }
+}
