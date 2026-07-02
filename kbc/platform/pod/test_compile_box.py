@@ -474,7 +474,17 @@ async def test_prompt_packs_locale():
             assert compile_box._playbook_text("zh") == "OVERRIDE PLAYBOOK"
         finally:
             del os.environ["KBC_PLAYBOOK"]
-    print("✓ prompt packs: en/zh parity, en fallback, localized guard + constitution, env override")
+
+    # Model-facing tool strings are locale-selected too (descriptions + results).
+    zh_ts = compile_box._tool_strings("zh")
+    en_ts = compile_box._tool_strings("en")
+    assert zh_ts.keys() == en_ts.keys()
+    for key in zh_ts:
+        assert zh_ts[key].keys() == en_ts[key].keys(), key
+    assert "批准" in zh_ts["propose_plan"]["ack"] and "approval" in en_ts["propose_plan"]["ack"]
+    assert compile_box._tool_strings("no-such") == en_ts
+    assert "{tid}" in en_ts["resolve_ticket"]["not_found"]  # format slots survive
+    print("✓ prompt packs: en/zh parity, en fallback, localized guard/constitution/tools, env override")
 
 async def main():
     await test_workspace_sync()

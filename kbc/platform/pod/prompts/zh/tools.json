@@ -1,0 +1,17 @@
+{
+  "report_summary": {
+    "desc": "汇报一段编译进度总结(产出/已并矛盾/待裁),一句到一段话。"
+  },
+  "propose_plan": {
+    "desc": "Plan 阶段对齐后调用:把一份简短、可读、可审核的编译计划抛给负责人请求批准,然后停下等批准。在收到批准前不要写 candidate/ 页面。",
+    "ack": "计划已抛给负责人,等待批准。在收到批准消息前不要写 candidate/ 页面。"
+  },
+  "resolve_ticket": {
+    "desc": "回修完一条矛盾工单后逐条调用(一条一次,别批量):登记你把哪条(ticket_id)按什么值(applied_value)回修了、实际改了哪几个 candidate 文件(pages_edited,必须覆盖该工单的 affected_pages)、一句话备注(note)。这会把该工单标为已回修并写下可审计的 agent_report —— 是「矛盾处理」显示「AI 已回修」、并让负责人核对的依据。",
+    "need_id": "resolve_ticket 需要 ticket_id",
+    "read_failed": "读 CONTRADICTIONS.json 失败: {e}",
+    "not_found": "没找到工单 {tid};现有 id: {ids}",
+    "write_failed": "写 CONTRADICTIONS.json 失败: {e}",
+    "registered": "工单 {tid} 已登记回修(agent_report 已写入)"
+  }
+}

@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
-"""compile_box —— 编译 box 的 served 形态:一个被 siclaw runtime 起、按 box 自有 HTTP+SSE
-契约驱动的"云 Claude Code"(runtime 把事件翻成通用 capability.* 转给消费者,如 sicore)。
+"""compile_box — the served form of the compile box: a "cloud Claude Code"
+spawned by the siclaw runtime and driven over the box's own HTTP+SSE contract
+(the runtime translates events into generic capability.* for consumers, e.g. sicore).
 
-形态(2026-06-25 拍板):box 90% 是"封装入口的无头 Claude Code"(Agent SDK = Claude Code as library,
-引擎/工具/compact 一行不重写);剩下 10% 是 kbc 护城河 —— 用自定义工具让 agent 显式发结构化信号:
-  - report_summary  → SSE `summary`(编译进度,给 verify UI)
-  - propose_plan    → SSE `plan_proposed`(Plan→Execute 对齐)
-  - resolve_ticket  → 写 authoring/CONTRADICTIONS.json 的 agent_report(矛盾工单回修登记;矛盾永不阻塞)
+Shape: the box is 90% "headless Claude Code behind a wrapped entrypoint" (Agent
+SDK = Claude Code as a library; engine/tools/compaction reused verbatim); the
+remaining 10% is the kbc moat — custom tools that make the agent emit explicit
+structured signals:
+  - report_summary  → SSE `summary` (compile progress, for the verify UI)
+  - propose_plan    → SSE `plan_proposed` (Plan→Execute alignment)
+  - resolve_ticket  → writes agent_report into authoring/CONTRADICTIONS.json
+                      (contradiction-ticket patch registration; never blocks)
 
-对接面(被 runtime 调):
-  POST /sources            {run_id?, workdir?, bundle_base64, bundle_sha256?} 上传冻结 raw bundle → workdir/raw
-  POST /authoring          {run_id?, workdir?, bundle_base64, bundle_sha256?} 上传 authoring/candidate/eval/release 资产 → workdir/
-  POST /session/{run_id}   {workdir?, instruction?, allowed_tools?} 起该 run 的持久对话会话(等首条 /message);幂等
-  POST /message/{run_id}   {message} 向持久会话注入一轮用户消息(prepare/编译/回修都是普通 turn)
-  GET  /events/{run_id}    SSE 结构化事件流(session/log/summary/turn_done/syncArtifacts/plan_proposed/error/end)
-  POST /test-session/{run_id}  起测试会话:钉当前草稿为不可变快照 + 只读消费者 session(复用本 pod)
+Surface (driven by the runtime):
+  POST /sources            {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install the frozen raw bundle → workdir/raw
+  POST /authoring          {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install authoring/candidate/eval/release assets → workdir/
+  POST /session/{run_id}   {workdir?, instruction?, allowed_tools?, locale?} start the run's persistent conversational session (waits for the first /message); idempotent
+  POST /message/{run_id}   {message} inject one user turn into the persistent session (prepare/compile/patch are all ordinary turns)
+  GET  /events/{run_id}    structured SSE stream (session/log/summary/turn_done/syncArtifacts/plan_proposed/error/end)
+  POST /test-session/{run_id}  start a test session: pin the current draft as an immutable snapshot + a read-only consumer session (reuses this pod)
   POST /test-message/{tid} · GET /test-events/{tid} · POST /test-session/{tid}/close
   GET  /health
 
-LLM 鉴权:本地复用订阅(SDK 自带 claude 二进制);生产 pod 设 ANTHROPIC_BASE_URL→massapi(key 容器外注入)。
-mTLS:存在 SICLAW_CERT_PATH 证书则起 HTTPS 且要求客户端证书(runtime/gateway);否则 HTTP(本地)。
+LLM auth: local runs reuse the subscription (the SDK ships the claude binary);
+production pods set ANTHROPIC_BASE_URL → massapi (keys injected outside the container).
+mTLS: with SICLAW_CERT_PATH certs present the box serves HTTPS and requires a
+client cert (runtime/gateway); otherwise plain HTTP (local).
 """
 import asyncio
 import base64
@@ -44,10 +50,10 @@ from claude_agent_sdk import (
 )
 
 
-# 每个 box 通常只跑一个 run,但用 map 保持干净(也便于 health/调试)。
+# A box usually hosts a single run; a map keeps it clean (and helps health/debugging).
 RUNS: dict[str, "CompileRun"] = {}
 # Read-only "test session" runs — ephemeral consumer sessions over a pinned draft
-# snapshot (起测试会话). Parallel to RUNS, torn down on close/idle. See TestRun.
+# snapshot (test sessions). Parallel to RUNS, torn down on close/idle. See TestRun.
 TEST_SESSIONS: dict[str, "TestRun"] = {}
 DEFAULT_HTTP_MAX_REQUEST_BYTES = 768 * 1024 * 1024
 
@@ -72,6 +78,19 @@ def _prompt(name: str, locale: str | None) -> str:
         if fp.exists():
             return fp.read_text(encoding="utf-8")
     raise FileNotFoundError(f"prompt pack missing: {name} (locale={locale!r})")
+
+
+def _tool_strings(locale: str | None) -> dict:
+    """Model-facing tool descriptions/result texts from the locale pack (JSON)."""
+    tried = []
+    for cand in ((locale or "").strip().lower(), DEFAULT_LOCALE):
+        if not cand or cand in tried:
+            continue
+        tried.append(cand)
+        fp = _PROMPTS_DIR / cand / "tools.json"
+        if fp.exists():
+            return json.loads(fp.read_text(encoding="utf-8"))
+    raise FileNotFoundError(f"prompt pack missing: tools.json (locale={locale!r})")
 
 
 def _playbook_text(locale: str | None) -> str:
@@ -101,7 +120,8 @@ def _test_snapshot_root() -> str:
     return os.environ.get("KBC_TEST_SNAPSHOT_ROOT", "/tmp/kbc-tests")
 
 
-# 编译驱动可替换:生产 = run_session(真 Agent SDK);测试 = 注入假驱动,免烧 LLM 验协议管线。
+# The compile driver is injectable: production = run_session (real Agent SDK);
+# tests inject a fake driver to exercise the protocol pipeline without an LLM.
 _COMPILE_IMPL = None  # set at bottom to run_session
 # Same injection seam for the read-only test-session driver (set at bottom).
 _TEST_SESSION_IMPL = None
@@ -142,7 +162,7 @@ class CompileRun:
 
 class TestRun:
     """An ephemeral, read-only CONSUMER session over a pinned draft snapshot
-    (起测试会话). Parallel to CompileRun but stripped: no workspace writes, no
+    (start-a-test-session). Parallel to CompileRun but stripped: no workspace writes, no
     compile MCP tools, no park/ruling, no durable persistence. It connects to a
     snapshot dir (`.siclaw/knowledge/`) with read-only tools and answers turns,
     exactly like a real consumer would — then is torn down. Reuses _emit_message
@@ -464,44 +484,42 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
 
 
 def _make_compile_tools(run: CompileRun):
-    """构造 box 的自定义工具(闭包持有 run),= 护城河信号面。"""
+    """Build the box's custom tools (closures over run) — the structured-signal
+    moat. All model-facing text (descriptions + result strings) comes from the
+    run's locale pack."""
+    ts = _tool_strings(run.locale)
 
-    @tool("report_summary", "汇报一段编译进度总结(产出/已并矛盾/待裁),一句到一段话。", {"summary": str})
+    @tool("report_summary", ts["report_summary"]["desc"], {"summary": str})
     async def report_summary(args):
         await run.emit({"type": "summary", "summary": args.get("summary", "")})
         return {"content": [{"type": "text", "text": "summary recorded"}]}
 
-    @tool(
-        "propose_plan",
-        "Plan 阶段对齐后调用:把一份简短、可读、可审核的编译计划抛给负责人请求批准,然后停下等批准。在收到批准前不要写 candidate/ 页面。",
-        {"plan": str},
-    )
+    @tool("propose_plan", ts["propose_plan"]["desc"], {"plan": str})
     async def propose_plan(args):
         await run.emit({"type": "plan_proposed", "plan": args.get("plan", "")})
-        return {"content": [{"type": "text", "text": "计划已抛给负责人,等待批准。在收到批准消息前不要写 candidate/ 页面。"}]}
+        return {"content": [{"type": "text", "text": ts["propose_plan"]["ack"]}]}
 
     @tool(
         "resolve_ticket",
-        "回修完一条矛盾工单后逐条调用(一条一次,别批量):登记你把哪条(ticket_id)按什么值(applied_value)"
-        "回修了、实际改了哪几个 candidate 文件(pages_edited,必须覆盖该工单的 affected_pages)、一句话备注(note)。"
-        "这会把该工单标为已回修并写下可审计的 agent_report —— 是「矛盾处理」显示「AI 已回修」、并让负责人核对的依据。",
+        ts["resolve_ticket"]["desc"],
         {"ticket_id": str, "applied_value": str, "pages_edited": list, "note": str},
     )
     async def resolve_ticket(args):
+        rt = ts["resolve_ticket"]
         tid = str(args.get("ticket_id", "")).strip()
         if not tid:
-            return {"content": [{"type": "text", "text": "resolve_ticket 需要 ticket_id"}]}
+            return {"content": [{"type": "text", "text": rt["need_id"]}]}
         path = Path(run.workdir) / "authoring" / "CONTRADICTIONS.json"
         try:
             tickets = json.loads(path.read_text("utf-8")) if path.exists() else []
             if not isinstance(tickets, list):
                 tickets = []
         except Exception as e:
-            return {"content": [{"type": "text", "text": f"读 CONTRADICTIONS.json 失败: {e}"}]}
+            return {"content": [{"type": "text", "text": rt["read_failed"].format(e=e)}]}
         target = next((tk for tk in tickets if isinstance(tk, dict) and str(tk.get("id")) == tid), None)
         if target is None:
             ids = [tk.get("id") for tk in tickets if isinstance(tk, dict)]
-            return {"content": [{"type": "text", "text": f"没找到工单 {tid};现有 id: {ids}"}]}
+            return {"content": [{"type": "text", "text": rt["not_found"].format(tid=tid, ids=ids)}]}
         # The AI's structured CLAIM (evidence, not truth): the owner reviews it and
         # can reopen. status stays for back-compat; agent_report carries the detail.
         target["status"] = "applied"
@@ -514,8 +532,8 @@ def _make_compile_tools(run: CompileRun):
         try:
             path.write_text(json.dumps(tickets, ensure_ascii=False, indent=2), "utf-8")
         except Exception as e:
-            return {"content": [{"type": "text", "text": f"写 CONTRADICTIONS.json 失败: {e}"}]}
-        return {"content": [{"type": "text", "text": f"工单 {tid} 已登记回修(agent_report 已写入)"}]}
+            return {"content": [{"type": "text", "text": rt["write_failed"].format(e=e)}]}
+        return {"content": [{"type": "text", "text": rt["registered"].format(tid=tid)}]}
 
     return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket])
 
@@ -613,8 +631,8 @@ async def run_session(run: CompileRun):
         system_prompt={"type": "preset", "preset": "claude_code", "append": system_prompt},
         allowed_tools=run.allowed_tools or DEFAULT_COMPILE_ALLOWED_TOOLS,
         mcp_servers={"compile": _make_compile_tools(run)},
-        permission_mode="bypassPermissions",  # pod 本身即 sandbox
-        setting_sources=[],                    # 多租户隔离:不加载外部 settings/CLAUDE.md
+        permission_mode="bypassPermissions",  # the pod itself is the sandbox
+        setting_sources=[],                    # tenant isolation: load no external settings/CLAUDE.md
         max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
         session_id=sid,
         session_store=InMemorySessionStore(),
@@ -646,12 +664,13 @@ async def run_session(run: CompileRun):
 
 
 async def _run_wrapper(run: CompileRun):
-    """统一生命周期:跑驱动 + 周期回写中途态 → 兜底 error → 永远收尾 end。"""
+    """Unified lifecycle: run the driver + periodically sync mid-flight state →
+    catch-all error → always finish with end."""
     sent: dict = {}
     syncer = asyncio.create_task(_sync_loop(run, sent))
     try:
         await _COMPILE_IMPL(run)
-    except Exception as e:  # 顶层边界:把崩溃变成一条 error 事件,不吞
+    except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
         await run.emit({"type": "error", "error": repr(e)})
     finally:
         syncer.cancel()
@@ -740,11 +759,11 @@ async def test_session_driver(run: "TestRun"):
         system_prompt={"type": "preset", "preset": "claude_code", "append": _prompt("test_role", run.locale)},
         allowed_tools=run.allowed_tools or DEFAULT_TEST_ALLOWED_TOOLS,
         mcp_servers={},                            # no compile signal tools
-        permission_mode="bypassPermissions",       # pod 本身即 sandbox
+        permission_mode="bypassPermissions",       # the pod itself is the sandbox
         # C4: path confinement — absolute/../ reads must not escape the snapshot
         # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
         hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd), run.locale)])]},
-        setting_sources=[],                        # 多租户隔离
+        setting_sources=[],                        # tenant isolation
         max_turns=int(os.environ.get("KBC_TEST_MAX_TURNS", "60")),
         session_id=sid,
         session_store=InMemorySessionStore(),
@@ -915,7 +934,7 @@ async def handle_health(request: web.Request):
 
 
 async def handle_open_test(request: web.Request):
-    """起测试会话: pin the parent run's CURRENT draft (candidate/*) into an
+    """Start a test session: pin the parent run's CURRENT draft (candidate/*) into an
     immutable snapshot dir and start a fresh read-only consumer session over it.
     Returns the test session id + snapshot hash. The reply to later /test-message
     turns streams over GET /test-events. NOTE: reuses the parent authoring box
@@ -999,7 +1018,7 @@ def build_app() -> web.Application:
         web.post("/session/{run_id}", handle_session),
         web.post("/message/{run_id}", handle_message),
         web.get("/events/{run_id}", handle_events),
-        # 起测试会话: read-only consumer session over a pinned draft snapshot.
+        # Test session: read-only consumer session over a pinned draft snapshot.
         web.post("/test-session/{run_id}", handle_open_test),
         web.post("/test-message/{tid}", handle_test_message),
         web.get("/test-events/{tid}", handle_test_events),
@@ -1010,7 +1029,8 @@ def build_app() -> web.Application:
 
 
 def _ssl_context():
-    """生产 mTLS:有证书则 HTTPS + 要求客户端证书(runtime/gateway 才能驱动)。本地无证书 → HTTP。"""
+    """Production mTLS: with certs, HTTPS + required client cert (only the
+    runtime/gateway can drive the box). No certs locally → plain HTTP."""
     cert_dir = Path(os.environ.get("SICLAW_CERT_PATH", "/etc/siclaw/certs"))
     crt, key, ca = cert_dir / "tls.crt", cert_dir / "tls.key", cert_dir / "ca.crt"
     if not (crt.exists() and key.exists()):
