@@ -467,6 +467,53 @@ async def test_test_message_path():
     print("✓ test-message injects a turn into a live test session")
 
 
+async def test_propose_plan_requires_plan_file():
+    """propose_plan bounces until PLAN.md ## Next Pages carries checkbox entries —
+    the owner UI (提出计划 milestone + approve bar) is file-driven, not event-driven,
+    so a chat-only proposal must be rejected with instructions, not emitted."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "authoring").mkdir(parents=True)
+        events = []
+
+        class FakeRun:
+            workdir = str(wd)
+
+            async def emit(self, ev):
+                events.append(ev)
+
+        captured = {}
+        orig = compile_box.create_sdk_mcp_server
+
+        def capture(name, tools):
+            captured.update({t.name: t for t in tools})
+            return orig(name, tools=tools)
+
+        compile_box.create_sdk_mcp_server = capture
+        try:
+            compile_box._make_compile_tools(FakeRun())
+        finally:
+            compile_box.create_sdk_mcp_server = orig
+        pp = captured["propose_plan"].handler
+
+        # template guidance (plain bullets) → bounced, no event
+        (wd / "authoring" / "PLAN.md").write_text(
+            "# Plan\n\n## Next Pages\n- guidance bullet, not a checkbox\n\n## Blocked\n- None\n", "utf-8"
+        )
+        r1 = await pp({"plan": "plan text"})
+        assert "复选框" in r1["content"][0]["text"]
+        assert not events
+
+        # real checkbox list → event emitted, success text
+        (wd / "authoring" / "PLAN.md").write_text(
+            "# Plan\n\n## Next Pages\n- [ ] 00 概览 — 平台是什么\n\n## Blocked\n- None\n", "utf-8"
+        )
+        r2 = await pp({"plan": "plan text"})
+        assert events and events[0]["type"] == "plan_proposed"
+        assert "批准" in r2["content"][0]["text"]
+    print("✓ propose_plan gated on PLAN.md ## Next Pages checkboxes")
+
+
 async def main():
     await test_workspace_sync()
     await test_session_driver_conversational()
@@ -477,6 +524,7 @@ async def main():
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
     await test_test_message_path()
+    await test_propose_plan_requires_plan_file()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()
