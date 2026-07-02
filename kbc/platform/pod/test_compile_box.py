@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""compile_box 协议冒烟:注入假编译驱动(不调 LLM),验 HTTP + SSE + park→rulings 全管线。
+"""compile_box 协议冒烟:注入假会话驱动(不调 LLM),验 HTTP + SSE 全管线
+(sources/authoring 物化、持久会话、workspace 同步、只读测试会话)。
 
 跑:platform/pod/.venv/bin/python platform/pod/test_compile_box.py
 """
@@ -20,29 +21,14 @@ import compile_box
 
 
 async def fake_driver(run):
-    """模拟编译:summary → parked(阻塞)→ 收到 rulings → done。不烧 LLM。"""
+    """模拟一轮编译会话:summary → 写 candidate 页 → turn_done。不烧 LLM、永不阻塞
+    (矛盾-as-turn 模型:没有 park、没有 rulings、没有 bundle 提交)。"""
     assert "authoring/CLAUDE.md" in run.instruction, run.instruction
-    await run.emit({"type": "summary", "summary": "read 2 docs, 1 conflict"})
-    fut = asyncio.get_event_loop().create_future()
-    run.pending_park = fut
-    await run.emit({"type": "parked", "checkpoint": {
-        "round": run.round,
-        "contradictions": [{"id": "c1", "summary": "cap 100 vs 300", "evidence": [], "options": ["100", "300", "unsure"]}],
-        "ledger_ref": run.ledger_ref,
-    }})
-    rulings = await fut
-    run.pending_park = None
-    assert rulings == [{"contradiction_id": "c1", "option_index": 1}], rulings
-    run.done = True
-    await run.emit({"type": "done", "bundle_b64": base64.b64encode(b"bundle").decode(), "bytes": 6})
-
-
-async def fake_driver_writes_bundle_without_submit(run):
-    """模拟 Claude 写好了 bundle/ 但忘了调用 submit_bundle。"""
-    bdir = Path(run.workdir) / "bundle"
-    bdir.mkdir(parents=True, exist_ok=True)
-    (bdir / "index.md").write_text("# fallback bundle\n")
-    await run.emit({"type": "summary", "summary": "bundle files written"})
+    await run.emit({"type": "summary", "summary": "read 2 docs, wrote 1 page"})
+    cand = Path(run.workdir) / "candidate"
+    cand.mkdir(parents=True, exist_ok=True)
+    (cand / "index.md").write_text("# smoke candidate\n")
+    await run.emit({"type": "turn_done", "text": "compiled 1 page"})
 
 
 async def read_until(resp, stop_type):
@@ -156,15 +142,14 @@ class _FakeSDKClient:
         pass
 
 
-async def test_compile_kickoff_session():
-    """P1/P2.2: the compile path sets run.kickoff → run_session connects WITH the
-    kickoff prompt and relays assistant text + turn_done (carrying the reply text)."""
+async def test_session_driver_conversational():
+    """run_session connects WITHOUT a prompt (conversational by construction) and
+    relays assistant text + turn_done; the session id is minted and announced."""
     orig = compile_box.ClaudeSDKClient
     compile_box.ClaudeSDKClient = _FakeSDKClient
     try:
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("ps1", td, 1, instruction="authoring/CLAUDE.md present")
-            run.kickoff = compile_box.BOX_COMPILE_TASK
             await compile_box.run_session(run)  # fake yields seed reply + result, then ends
             evs = []
             while not run.events.empty():
@@ -172,12 +157,12 @@ async def test_compile_kickoff_session():
             types = [e["type"] for e in evs]
             assert "session" in types and "log" in types and "turn_done" in types, types
             assert run.session_id, "session_id not set"
-            assert _FakeSDKClient.last.connected_prompt == compile_box.BOX_COMPILE_TASK, "kickoff not sent on connect"
+            assert _FakeSDKClient.last.connected_prompt is None, "session must connect with no kickoff"
             turn = next(e for e in evs if e["type"] == "turn_done")
             assert turn.get("text") == "seed reply", turn
     finally:
         compile_box.ClaudeSDKClient = orig
-    print("✓ compile kickoff session (P1/P2.2)")
+    print("✓ session driver is conversational (no kickoff, log + turn_done)")
 
 
 async def test_conversational_session():
@@ -251,69 +236,6 @@ async def test_message_waits_for_connect():
         compile_box.RUNS.clear()
         os.environ.pop("KBC_CONNECT_TIMEOUT_SECS", None)
     print("✓ message waits for connect (P2.2 race fix)")
-
-
-async def test_compile_turn_in_session():
-    """P3: /compile-turn injects the box's own BOX_COMPILE_TASK as a turn into the
-    live session (compile on the SAME box). 200 + query == BOX_COMPILE_TASK; an
-    extra instruction is appended; unknown run → 404."""
-    compile_box.RUNS.clear()
-    client = TestClient(TestServer(compile_box.build_app()))
-    await client.start_server()
-    try:
-        class _C:
-            def __init__(self):
-                self.queries = []
-
-            async def query(self, text, session_id="default"):
-                self.queries.append(text)
-
-        run = compile_box.CompileRun("ct1", "/tmp", 1)
-        fake = _C()
-        run.client = fake
-        run.connected.set()
-        compile_box.RUNS["ct1"] = run
-
-        r = await client.post("/compile-turn/ct1", json={})
-        assert r.status == 200, await r.text()
-        assert fake.queries and fake.queries[0] == compile_box.BOX_COMPILE_TASK, fake.queries
-
-        r = await client.post("/compile-turn/ct1", json={"instruction": "focus on GPU triage"})
-        assert r.status == 200, await r.text()
-        assert fake.queries[1].startswith(compile_box.BOX_COMPILE_TASK) and "focus on GPU triage" in fake.queries[1]
-
-        r = await client.post("/compile-turn/nope", json={})
-        assert r.status == 404, await r.text()
-    finally:
-        await client.close()
-        compile_box.RUNS.clear()
-    print("✓ compile turn in session (P3)")
-
-
-async def test_compile_turn_ends_clean():
-    """Slice 2: a compile turn ends like any other turn (one ResultMessage → turn_done),
-    with NO submit_bundle gate and NO nudging — so a live session can never get stuck
-    'compiling'. The candidate pages it wrote are synced; the owner publishes separately."""
-    orig = compile_box.ClaudeSDKClient
-    compile_box.ClaudeSDKClient = _FakeSDKClient
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            run = compile_box.CompileRun("ac1", td, 1)
-            run.compiling = True  # simulate a /compile-turn in flight
-            await compile_box.run_session(run)
-            evs = []
-            while not run.events.empty():
-                evs.append(run.events.get_nowait())
-            types = [e["type"] for e in evs]
-            # the turn ended (turn_done), the compiling flag cleared, and NOTHING was
-            # nudged or failed — a finished turn is simply finished.
-            assert "turn_done" in types, types
-            assert not any(e["type"] == "error" for e in evs), evs
-            assert _FakeSDKClient.last.queries == [], _FakeSDKClient.last.queries
-            assert run.compiling is False
-    finally:
-        compile_box.ClaudeSDKClient = orig
-    print("✓ compile turn ends clean — no submit_bundle gate, no nudge (Slice 2)")
 
 
 # ── 起测试会话 (read-only test session) ──
@@ -485,11 +407,9 @@ async def test_test_message_path():
 
 async def main():
     await test_workspace_sync()
-    await test_compile_kickoff_session()
+    await test_session_driver_conversational()
     await test_conversational_session()
     await test_message_waits_for_connect()
-    await test_compile_turn_in_session()
-    await test_compile_turn_ends_clean()
     test_pack_candidates_to_wiki()
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
@@ -561,8 +481,7 @@ async def main():
             })
             assert r.status == 400, await r.text()
 
-            r = await client.post("/compile", json={
-                "run_id": "r1",
+            r = await client.post("/session/r1", json={
                 "workdir": td,
                 "instruction": "# KB Authoring Compile Task\n\n### authoring/CLAUDE.md\nfollow the workspace",
             })
@@ -574,8 +493,8 @@ async def main():
                 "bundle_base64": base64.b64encode(bundle).decode(),
             })
             assert r.status == 409, r.status
-            # /authoring IS allowed on a live run (200): the unified compile-in-session
-            # path uploads authoring assets to the running session before /compile-turn.
+            # /authoring IS allowed on a live run (200): the runtime rehydrates the
+            # durable workspace / pushes assets into an existing session through it.
             r = await client.post("/authoring", json={
                 "run_id": "r1",
                 "workdir": td,
@@ -583,45 +502,27 @@ async def main():
             })
             assert r.status == 200, await r.text()
 
+            # /session is idempotent on a live run → no-op attach
+            r = await client.post("/session/r1", json={"workdir": td})
+            assert r.status == 200 and (await r.json()).get("already_live"), await r.text()
+
             sse = await client.get("/events/r1")
-            phase1 = await read_until(sse, "parked")
-            t1 = [e["type"] for e in phase1]
-            assert "summary" in t1 and t1[-1] == "parked", t1
-            cp = phase1[-1]["checkpoint"]
-            assert cp["contradictions"][0]["id"] == "c1" and cp["round"] == 1, cp
+            events = await read_until(sse, "end")
+            types = [e["type"] for e in events]
+            # capability-era vocabulary only: no parked, no done+bundle
+            assert "summary" in types and "turn_done" in types and types[-1] == "end", types
+            assert "parked" not in types and "done" not in types, types
+            turn = next(e for e in events if e["type"] == "turn_done")
+            assert turn["text"] == "compiled 1 page", turn
+            # the candidate page the driver wrote is synced back as an artifact
+            sync = next(e for e in events if e["type"] == "syncArtifacts")
+            assert any(a["path"] == "candidate/index.md" for a in sync["artifacts"]), sync
 
-            # /rulings while not parked is a 409 only AFTER we consume the park; test the happy path first.
-            r = await client.post("/rulings", json={"run_id": "r1", "rulings": [{"contradiction_id": "c1", "option_index": 1}]})
-            assert r.status == 200, await r.text()
-
-            phase2 = await read_until(sse, "end")
-            t2 = [e["type"] for e in phase2]
-            assert "done" in t2 and t2[-1] == "end", t2
-            done = next(e for e in phase2 if e["type"] == "done")
-            assert base64.b64decode(done["bundle_b64"]) == b"bundle", done
-
-        # rulings on a no-longer-parked run → 409
-        r = await client.post("/rulings", json={"run_id": "r1", "rulings": []})
-        assert r.status == 409, r.status
-        # duplicate run id → 409
-        r = await client.post("/compile", json={"run_id": "r1"})
-        assert r.status == 409, r.status
         # unknown run events → 404
         r = await client.get("/events/nope")
         assert r.status == 404, r.status
 
-        compile_box._COMPILE_IMPL = fake_driver_writes_bundle_without_submit
-        with tempfile.TemporaryDirectory() as td:
-            r = await client.post("/compile", json={"run_id": "r2", "workdir": td})
-            assert r.status == 200, await r.text()
-            sse = await client.get("/events/r2")
-            events = await read_until(sse, "end")
-            types = [e["type"] for e in events]
-            assert "summary" in types and "done" in types and types[-1] == "end", types
-            done = next(e for e in events if e["type"] == "done")
-            assert done["bytes"] > 0, done
-
-        print("OK  compile_box protocol smoke (sources / health / compile / SSE summary+parked / rulings / done+end / 409 / 404)")
+        print("OK  compile_box protocol smoke (sources / authoring / health / session idempotent / SSE summary+turn_done+syncArtifacts+end / 409 / 404)")
     finally:
         await client.close()
 
