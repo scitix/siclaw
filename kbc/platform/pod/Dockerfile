@@ -3,7 +3,7 @@
 # 这是 L3 落地里"临时编译 pod"的镜像(managed-agents / Agent SDK Hybrid 模式)。
 # Agent SDK 自带 Claude Code 二进制,无需单独装 CLI。
 #
-# build:  docker build -f platform/pod/Dockerfile -t kbc-compile-pod .   (在 kbc 仓根跑)
+# build:  docker build -f platform/pod/Dockerfile -t kbc-compile-pod .   (在 kbc/ 目录跑,= build ctx)
 # run(生产,LLM 走公司 massapi):
 #   docker run --rm \
 #     -e ANTHROPIC_BASE_URL=https://<massapi>/   \   # 模型走代理,key 在代理侧注入
@@ -37,6 +37,6 @@ USER kbc
 
 EXPOSE 3000
 
-# served 形态:被 siclaw runtime 起、按 compile 协议驱动(POST /compile、/rulings、SSE /events)。
+# served 形态:被 siclaw runtime 起、按 box 自有 HTTP+SSE 契约驱动(POST /session、/message、SSE /events)。
 # 一次性 CLI 形态仍在 compile_agent.py(本地调试:python compile_agent.py --workdir /work)。
 ENTRYPOINT ["python", "/app/compile_box.py"]
