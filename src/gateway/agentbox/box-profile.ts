@@ -61,7 +61,8 @@ function kbCompileProfile(): BoxProfile {
     envForward: ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_SMOKE"],
     home: "/work",
     volumes: [{ name: "work", mountPath: "/work", sizeLimit: "1Gi" }],
-    // allowedTools stays null until A.3 wires enforcement; the box currently bakes its own set.
+    // null = the box's default compile toolset (posted as allowed_tools on
+    // /session; the box falls back to its own DEFAULT_COMPILE_ALLOWED_TOOLS).
     allowedTools: null,
   };
 }
