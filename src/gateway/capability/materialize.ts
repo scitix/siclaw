@@ -11,6 +11,13 @@
  * roll back up to a sync interval of newer on-disk work. Everything here is
  * best-effort — an empty KB or a store hiccup must not block the conversation;
  * the box then simply starts from whatever did materialize.
+ *
+ * Known bounded gap: a box CONTAINER restart clears its in-process run table
+ * but keeps /work (emptyDir survives container restarts), so /sources then
+ * succeeds and the rehydrate overwrites up to one sync interval (~20s) of
+ * on-disk work that never reached the store. That slice was never visible to
+ * the user and the end state is store-consistent — accepted for now; a box
+ * workspace probe would be needed to close it.
  */
 
 import { CAPABILITY_FETCH_INPUT, CAPABILITY_INPUT_WORKSPACE_REF } from "./contract.js";
