@@ -916,28 +916,77 @@ async def handle_health(request: web.Request):
     return web.json_response({"status": "ok", "runs": len(RUNS), "test_sessions": len(TEST_SESSIONS)})
 
 
+def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | None = None) -> tuple[str, int]:
+    """Install a consumer-PROVIDED wiki snapshot (a tar.gz of root-level pages —
+    e.g. a PUBLISHED version bundle, the exact bytes a publish serves) into
+    {dest}/.siclaw/knowledge/. Lets a test session probe a snapshot that does not
+    live on this box's disk. Returns (content hash — same formula as
+    _pack_candidates_to_wiki so draft and version snapshots are comparable —
+    and the page count)."""
+    actual = hashlib.sha256(bundle).hexdigest()
+    if expected_sha256 and expected_sha256.lower() != actual:
+        raise ValueError(f"snapshot bundle sha256 mismatch: expected {expected_sha256}, got {actual}")
+    kdir = dest / ".siclaw" / "knowledge"
+    kdir.mkdir(parents=True, exist_ok=True)
+    pages: list[tuple[str, bytes]] = []
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
+    except tarfile.TarError as e:
+        raise ValueError(f"invalid snapshot bundle: {e}") from e
+    with tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            rel = _safe_tar_path(member.name)
+            rel_posix = rel.as_posix()
+            if not (rel_posix.endswith(".md") or rel_posix.endswith(".json")):
+                continue
+            src = tf.extractfile(member)
+            if src is None:
+                raise ValueError(f"could not read snapshot entry {member.name!r}")
+            with src:
+                data = src.read()
+            out = kdir / Path(*rel.parts)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(data)
+            pages.append((rel_posix, data))
+    if not any(rp == "index.md" for rp, _ in pages):
+        raise FileNotFoundError("snapshot bundle is missing index.md — cannot test without a root index page")
+    h = hashlib.sha256()
+    for rp, data in sorted(pages):
+        h.update(rp.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
+    return h.hexdigest(), len(pages)
+
+
 async def handle_open_test(request: web.Request):
-    """起测试会话: pin the parent run's CURRENT draft (candidate/*) into an
-    immutable snapshot dir and start a fresh read-only consumer session over it.
-    Returns the test session id + snapshot hash. The reply to later /test-message
-    turns streams over GET /test-events. NOTE: reuses the parent authoring box
-    (no new pod) — the parent run must already be live."""
+    """起测试会话: pin an immutable snapshot and start a fresh read-only consumer
+    session over it. Default snapshot source = the parent run's CURRENT draft
+    (candidate/*); a request carrying `bundle_base64` pins THAT tar.gz instead
+    (e.g. a published version the consumer serves). Returns the test session id +
+    snapshot hash. The reply to later /test-message turns streams over GET
+    /test-events. NOTE: reuses the parent authoring box (no new pod) — the
+    parent run must already be live."""
     parent = RUNS.get(request.match_info["run_id"])
     if not parent:
         return web.json_response({"error": "unknown run"}, status=404)
     active = sum(1 for t in TEST_SESSIONS.values() if not t.done)
     if active >= _max_test_sessions():
         return web.json_response({"error": "too many concurrent test sessions"}, status=429)
+    body = await request.json() if request.body_exists else {}
     tid = str(uuid.uuid4())
     dest = Path(_test_snapshot_root()) / tid
     try:
-        snapshot_hash, pages = _pack_candidates_to_wiki(parent.workdir, dest)
-    except FileNotFoundError as e:
+        encoded = body.get("bundle_base64")
+        if encoded:
+            bundle = base64.b64decode(encoded, validate=True)
+            snapshot_hash, pages = _install_wiki_snapshot(bundle, dest, body.get("bundle_sha256"))
+        else:
+            snapshot_hash, pages = _pack_candidates_to_wiki(parent.workdir, dest)
+    except (FileNotFoundError, ValueError, TypeError) as e:
         shutil.rmtree(dest, ignore_errors=True)
         return web.json_response({"error": str(e)}, status=400)
     run = TestRun(tid, str(dest), parent_run_id=parent.run_id, snapshot_hash=snapshot_hash)
     # Tool whitelist from the runtime BoxProfile (kb-test); None/absent → read-only default.
-    body = await request.json() if request.body_exists else {}
     run.allowed_tools = body.get("allowed_tools")
     TEST_SESSIONS[tid] = run
     run.task = asyncio.create_task(_test_session_wrapper(run))
