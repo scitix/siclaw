@@ -102,6 +102,12 @@ spec:
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
             {{- end }}
+            {{- if .Values.agentbox.compileBoxImage }}
+            # KB-compile box image (kbc/ in this repo) — consumed by the
+            # BoxProfile registry for kb-compile / kb-test capability boxes.
+            - name: SICLAW_COMPILE_BOX_IMAGE
+              value: {{ .Values.agentbox.compileBoxImage | quote }}
+            {{- end }}
             {{- if .Values.agentbox.nodeSelector }}
             # Node scheduling constraint forwarded by the runtime spawner onto
             # every spawned AgentBox pod (parsed as a JSON label map).
