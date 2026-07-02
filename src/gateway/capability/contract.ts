@@ -30,6 +30,19 @@ export const CAPABILITY_START = "capability.start" as const;
 export const CAPABILITY_MESSAGE = "capability.message" as const;
 export const CAPABILITY_CANCEL = "capability.cancel" as const;
 
+/**
+ * Consumer → siclaw: read-only TEST SESSION over a run's pinned draft snapshot
+ * (the product's "起测试会话" / start-a-test-session flow). A test session
+ * REUSES the authoring run's live box (no new pod):
+ * the box pins candidate/ into an immutable snapshot and hosts an ephemeral,
+ * tool-whitelisted consumer session over it. STATELESS by contract — nothing a
+ * test session says is persisted (no persistTurn/persistArtifact); its frames
+ * are live-only capability.event {type:"test"} on the parent run.
+ */
+export const CAPABILITY_TEST_START = "capability.testStart" as const;
+export const CAPABILITY_TEST_MESSAGE = "capability.testMessage" as const;
+export const CAPABILITY_TEST_CLOSE = "capability.testClose" as const;
+
 /** siclaw → consumer: live stream + content sink + input fetch. */
 export const CAPABILITY_EVENT = "capability.event" as const;
 export const CAPABILITY_PERSIST_ARTIFACT = "capability.persistArtifact" as const;
@@ -101,6 +114,33 @@ export interface CapabilityCancelRequest {
   run_id: string;
 }
 
+// ---- Test session (read-only consumer probe over a pinned draft snapshot) ----
+
+export interface CapabilityTestStartRequest {
+  /** The AUTHORING run whose live box + current draft the test session pins. */
+  run_id: string;
+}
+
+export interface CapabilityTestStartResponse {
+  run_id: string;
+  test_session_id: string;
+  /** sha256 over the pinned snapshot — grading binds to (question × snapshot). */
+  snapshot_hash: string;
+  /** Page count of the pinned snapshot. */
+  pages: number;
+}
+
+export interface CapabilityTestMessageRequest {
+  run_id: string;
+  test_session_id: string;
+  message: string;
+}
+
+export interface CapabilityTestCloseRequest {
+  run_id: string;
+  test_session_id: string;
+}
+
 // ---- siclaw → consumer ----
 
 /**
@@ -111,15 +151,20 @@ export type CapabilityEventType =
   | "log" //       agent reasoning / progress narration      (was box `log`)
   | "turn" //      a turn ended; payload.text = assistant reply (was box `turn_done`)
   | "summary" //   a progress summary
-  | "lifecycle"; // run lifecycle transition; payload.status
+  | "lifecycle" // run lifecycle transition; payload.status
+  | "test"; //     read-only test-session frame; payload.test_session_id + payload.kind
 
 export interface CapabilityEventPayload {
-  /** type = log | summary | turn: human/agent text. */
+  /** type = log | summary | turn | test: human/agent text. */
   text?: string;
   /** type = lifecycle: the new lifecycle status. */
   status?: CapabilityLifecycleStatus;
   /** type = lifecycle + failed: error detail. */
   error?: string;
+  /** type = test: which test session this frame belongs to. */
+  test_session_id?: string;
+  /** type = test: inner frame kind (session | log | turn_done | error | end). */
+  kind?: string;
 }
 
 export interface CapabilityEventFrame {

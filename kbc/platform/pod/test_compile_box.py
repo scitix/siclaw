@@ -240,6 +240,35 @@ async def test_message_waits_for_connect():
 
 # ── 起测试会话 (read-only test session) ──
 
+async def test_test_path_escape_guard():
+    """C4 guard predicate: relative + in-snapshot absolute paths pass; absolute /
+    ../ escapes to the live workspace are named; Glob absolute patterns are caught
+    (Grep patterns are regex content — never treated as paths)."""
+    with tempfile.TemporaryDirectory() as snap:
+        root = Path(snap)
+        (root / ".siclaw" / "knowledge").mkdir(parents=True)
+        ok = compile_box._test_path_escape
+        # inside: relative, absolute-in-root, dotted-but-contained
+        assert ok(root, "Read", {"file_path": ".siclaw/knowledge/index.md"}) is None
+        assert ok(root, "Read", {"file_path": str(root / ".siclaw" / "knowledge" / "a.md")}) is None
+        assert ok(root, "Grep", {"path": ".siclaw/knowledge", "pattern": "/dev/infiniband"}) is None  # regex content, not a path
+        assert ok(root, "Glob", {"pattern": ".siclaw/knowledge/*.md"}) is None
+        # escapes: absolute out-of-root, ../ traversal, Glob absolute pattern
+        assert ok(root, "Read", {"file_path": "/work/candidate/index.md"}) == "file_path=/work/candidate/index.md"
+        assert ok(root, "Read", {"file_path": "../../work/raw/src.md"}) is not None
+        assert ok(root, "Grep", {"path": "/work"}) == "path=/work"
+        assert ok(root, "Glob", {"pattern": "/work/**/*.md"}) == "pattern=/work/**/*.md"
+
+        # the PreToolUse hook wraps the predicate into a deny decision
+        guard = compile_box._make_test_path_guard(root)
+        deny = await guard({"tool_name": "Read", "tool_input": {"file_path": "/work/raw/x.md"}}, "t1", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await guard({"tool_name": "Read", "tool_input": {"file_path": "index.md"}}, "t2", None)
+        assert allow == {}, allow
+    print("✓ test-session path guard (C4): snapshot-confined, live /work denied")
+
+
+
 def test_pack_candidates_to_wiki():
     """_pack_candidates_to_wiki mirrors buildPublishBundleFromCandidates: candidate/
     prefix stripped, only .md|.json, root index.md required, content byte-identical —
@@ -304,6 +333,8 @@ async def test_test_session_driver_readonly():
             assert opts.mcp_servers == {}, opts.mcp_servers
             assert compile_box.TEST_ROLE in opts.system_prompt["append"]
             assert _FakeSDKClient.last.connected_prompt is None, "test session must not kickoff"
+            # C4: the snapshot path guard is wired as a PreToolUse hook
+            assert opts.hooks and "PreToolUse" in opts.hooks and opts.hooks["PreToolUse"], opts.hooks
             types = []
             while not run.events.empty():
                 types.append(run.events.get_nowait()["type"])
@@ -411,6 +442,7 @@ async def main():
     await test_conversational_session()
     await test_message_waits_for_connect()
     test_pack_candidates_to_wiki()
+    await test_test_path_escape_guard()
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
     await test_test_message_path()

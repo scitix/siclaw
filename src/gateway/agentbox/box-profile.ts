@@ -68,7 +68,7 @@ function kbCompileProfile(): BoxProfile {
 }
 
 /**
- * kb-test — a read-only, zero-infra KB consumer box (起测试会话). Same kbc image +
+ * kb-test — a read-only, zero-infra KB consumer box (start-a-test-session). Same kbc image +
  * writable /work (Claude Code's ~/.claude) as kb-compile, but a RESTRICTED tool
  * envelope: Read/Glob/Grep only — no Write/Edit/Bash and no compile MCP tools, so
  * it can measure the wiki without mutating it or touching infra. The trust

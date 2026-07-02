@@ -27,12 +27,17 @@ import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { getBoxProfile } from "./agentbox/box-profile.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
+import { driveTestSession } from "./capability/test-relay.js";
 import { isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
   CapabilityMessageRequest,
   CapabilityStartRequest,
   CapabilityStartResponse,
+  CapabilityTestCloseRequest,
+  CapabilityTestMessageRequest,
+  CapabilityTestStartRequest,
+  CapabilityTestStartResponse,
 } from "./capability/contract.js";
 import { materializeCapabilityInputs } from "./capability/materialize.js";
 import {
@@ -509,6 +514,87 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     await agentBoxManager.stop(runId).catch(() => {});
     await capabilityRunManager.endRun(runId, "done");
     return { ok: true, run_id: runId };
+  });
+
+  // ── Read-only test sessions (start-a-test-session) — reuse the run's live box ──
+  // A test session probes the run's CURRENT draft exactly like a real consumer:
+  // the box pins candidate/ into an immutable snapshot and hosts an ephemeral
+  // session over it with the kb-test tool whitelist. Two invariants:
+  //   - REUSE, never respawn: kb-test contributes ONLY its allowedTools list;
+  //     the box stays the run's own (getOrCreate with profile "kb-test" would
+  //     profile-mismatch-respawn the LIVE authoring box — destructive).
+  //   - STATELESS: the relay never persists — test chatter must not pollute the
+  //     authoring history (driveTestSession forwards live frames only).
+  rpcMethods.set("capability.testStart", async (params) => {
+    const req = params as unknown as CapabilityTestStartRequest;
+    const runId = req.run_id;
+    if (!runId) throw new Error("run_id is required");
+    const rec = capabilityRunManager.get(runId) ?? (await capabilityRunManager.adopt(runId));
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
+    capabilityRunManager.touch(runId);
+    // Ensure the authoring session is live. Cold box: this respawns + rehydrates
+    // the durable workspace (materializeCapabilityInputs), so there is a
+    // candidate/ draft to pin even after a reap/restart.
+    const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
+    const allowedTools = getBoxProfile("kb-test").allowedTools ?? null;
+    const opened = (await client.postJson(`/test-session/${runId}`, { allowed_tools: allowedTools })) as {
+      test_session_id: string;
+      snapshot_hash: string;
+      pages: number;
+    };
+    driveTestSession({
+      client,
+      runId,
+      testSessionId: opened.test_session_id,
+      frontendClient,
+      touch: () => capabilityRunManager.touch(runId),
+    }).catch((err) => {
+      // A dead test relay is disposable — log, never fail the authoring run.
+      console.warn(
+        `[capability] test relay ended run=${runId} tid=${opened.test_session_id}:`,
+        err instanceof Error ? err.message : String(err),
+      );
+    });
+    const res: CapabilityTestStartResponse = {
+      run_id: runId,
+      test_session_id: opened.test_session_id,
+      snapshot_hash: opened.snapshot_hash,
+      pages: opened.pages,
+    };
+    return res;
+  });
+
+  rpcMethods.set("capability.testMessage", async (params) => {
+    const req = params as unknown as CapabilityTestMessageRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    if (!req.test_session_id) throw new Error("test_session_id is required");
+    if (!req.message) throw new Error("message is required");
+    const rec = capabilityRunManager.get(req.run_id);
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${req.run_id}`);
+    capabilityRunManager.touch(req.run_id);
+    const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
+    // If the box died since testStart, the respawned box won't know this tid →
+    // the box's 404 surfaces as an error and the consumer starts a fresh test
+    // session (test sessions are disposable; there is nothing to resume).
+    await client.postJson(`/test-message/${req.test_session_id}`, { message: req.message });
+    return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id };
+  });
+
+  rpcMethods.set("capability.testClose", async (params) => {
+    const req = params as unknown as CapabilityTestCloseRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    if (!req.test_session_id) throw new Error("test_session_id is required");
+    const rec = capabilityRunManager.get(req.run_id);
+    if (!rec) return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id, already_closed: true };
+    // Don't resurrect a box just to close a test session that died with it —
+    // the box's teardown already reclaimed everything when the pod went away.
+    if (!localCapabilityBoxEndpoint) {
+      const alive = await agentBoxManager.getAsync(req.run_id);
+      if (!alive) return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id, already_closed: true };
+    }
+    const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
+    await client.postJson(`/test-session/${req.test_session_id}/close`, {});
+    return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id };
   });
 
   rpcMethods.set("chat.abort", async (params) => {
