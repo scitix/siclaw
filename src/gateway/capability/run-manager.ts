@@ -20,6 +20,7 @@ import type {
   CapabilityListActiveRunsResponse,
   CapabilityRunRow,
   CapabilityRunState,
+  CapabilityTerminalStatus,
 } from "./contract.js";
 import {
   CAPABILITY_GET_RUN,
@@ -52,6 +53,12 @@ export interface CapabilityRunManagerOptions {
   staleMs?: number;
   /** Watchdog tick interval. */
   watchdogIntervalMs?: number;
+  /**
+   * Invoked for each run the watchdog reaps, BEFORE it is marked failed — the
+   * place to stop the run's box so a reaped run never leaves an orphan pod
+   * running behind a store row that says "failed". Errors are logged, not fatal.
+   */
+  onReap?: (rec: CapabilityRunRecord) => Promise<void> | void;
 }
 
 export class CapabilityRunManager {
@@ -59,7 +66,9 @@ export class CapabilityRunManager {
   private readonly now: () => number;
   private readonly staleMs: number;
   private readonly watchdogIntervalMs: number;
+  private readonly onReap?: (rec: CapabilityRunRecord) => Promise<void> | void;
   private watchdogTimer?: ReturnType<typeof setInterval>;
+  private reconciling = false;
 
   constructor(
     private readonly backend: RunStateBackend,
@@ -68,6 +77,7 @@ export class CapabilityRunManager {
     this.now = opts.now ?? Date.now;
     this.staleMs = opts.staleMs ?? 10 * 60_000; // 10 min
     this.watchdogIntervalMs = opts.watchdogIntervalMs ?? 60_000; // 1 min
+    this.onReap = opts.onReap;
   }
 
   /** siclaw mints the run id (the consumer never does — option B). */
@@ -92,8 +102,10 @@ export class CapabilityRunManager {
       status: "running",
       lastActivityMs: this.now(),
     };
+    // Persist BEFORE registering: a run must not exist without its store row
+    // (start is the one transition that fails closed — see persist()).
+    await this.persist(rec, { failFast: true });
     this.runs.set(rec.runId, rec);
-    await this.persist(rec);
     return rec;
   }
 
@@ -162,21 +174,33 @@ export class CapabilityRunManager {
 
   /**
    * Terminate a run (done/failed): persist the terminal state, then drop it from
-   * the live map so the watchdog + recovery ignore it.
+   * the live map so the watchdog + recovery ignore it. When the terminal persist
+   * fails, the record STAYS in memory with its terminal status — the reconcile
+   * loop retries the same terminal write (flushTerminal) until it lands, so the
+   * store converges to the true outcome instead of a later blanket "failed".
    */
-  async endRun(runId: string, status: "done" | "failed"): Promise<void> {
+  async endRun(runId: string, status: CapabilityTerminalStatus): Promise<void> {
     const rec = this.runs.get(runId);
     if (!rec) return;
     rec.status = status;
     rec.lastActivityMs = this.now();
-    await this.persist(rec);
-    this.runs.delete(runId);
+    try {
+      await this.persist(rec, { failFast: true });
+      this.runs.delete(runId);
+    } catch (err) {
+      console.warn(
+        `[capability] terminal persist(${runId} → ${status}) failed; reconcile will retry: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /**
-   * On boot, rebuild the in-memory map from the consumer's store so a restarted
-   * runtime knows about in-flight runs (the watchdog can then reap ones whose box
-   * died during the downtime). Best-effort: a backend error is logged, not fatal.
+   * Rebuild the in-memory map from the consumer's store — at boot AND on every
+   * watchdog tick (so a listing the consumer wasn't ready to serve at boot, or a
+   * run this runtime lost track of, is picked up later instead of living forever
+   * as an "active" store row nobody reaps). Runs already tracked are left alone:
+   * clobbering them would reset their staleness clock every tick and blind the
+   * watchdog. Best-effort: a backend error is logged, not fatal.
    */
   async recover(): Promise<number> {
     try {
@@ -186,7 +210,7 @@ export class CapabilityRunManager {
       for (const r of rows) {
         // Store rows key the run id as `id` (the consumer's DB primary key) —
         // see CapabilityRunRow in contract.ts.
-        if (!r.id) continue;
+        if (!r.id || this.runs.has(r.id)) continue;
         this.runs.set(r.id, {
           runId: r.id,
           profile: r.profile ?? "",
@@ -206,7 +230,7 @@ export class CapabilityRunManager {
     }
   }
 
-  /** Reap non-terminal runs idle longer than staleMs (mark failed + persist). */
+  /** Reap non-terminal runs idle longer than staleMs (stop box, mark failed + persist). */
   async reapStale(): Promise<string[]> {
     const cutoff = this.now() - this.staleMs;
     const reaped: string[] = [];
@@ -217,15 +241,54 @@ export class CapabilityRunManager {
     }
     for (const runId of reaped) {
       console.warn(`[capability] watchdog reaping stale run ${runId}`);
+      const rec = this.runs.get(runId);
+      if (rec && this.onReap) {
+        // Stop the run's box BEFORE declaring it failed, so the store never says
+        // "failed" while an orphan pod keeps working behind its back.
+        try {
+          await this.onReap(rec);
+        } catch (err) {
+          console.warn(`[capability] onReap(${runId}) failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       await this.endRun(runId, "failed");
     }
     return reaped;
   }
 
+  /**
+   * One watchdog tick: retry unflushed terminal writes, adopt store rows we lost
+   * track of, then reap the stale.
+   */
+  async reconcile(): Promise<void> {
+    if (this.reconciling) return;
+    this.reconciling = true;
+    try {
+      await this.flushTerminal();
+      await this.recover();
+      await this.reapStale();
+    } finally {
+      this.reconciling = false;
+    }
+  }
+
+  /** Retry terminal states whose persist failed at endRun time (keeps "done" done). */
+  private async flushTerminal(): Promise<void> {
+    for (const rec of [...this.runs.values()]) {
+      if (!isTerminalCapabilityStatus(rec.status)) continue;
+      try {
+        await this.persist(rec, { failFast: true });
+        this.runs.delete(rec.runId);
+      } catch {
+        // still unreachable — keep for the next tick
+      }
+    }
+  }
+
   startWatchdog(): void {
     if (this.watchdogTimer) return;
     this.watchdogTimer = setInterval(() => {
-      void this.reapStale();
+      void this.reconcile();
     }, this.watchdogIntervalMs);
     this.watchdogTimer.unref?.();
   }
@@ -237,7 +300,15 @@ export class CapabilityRunManager {
     }
   }
 
-  private async persist(rec: CapabilityRunRecord): Promise<void> {
+  /**
+   * Write the run row to the consumer's store. The in-memory record is the
+   * runtime's authority (option B — the store is a dumb mirror), so transitions
+   * of an EXISTING run swallow a persist failure with a warning: a transient WS
+   * blip must not fail a healthy run, and the reconcile loop re-converges the
+   * store. The one exception is `failFast` (startRun): a run must not come into
+   * existence without its store row, so start fails closed.
+   */
+  private async persist(rec: CapabilityRunRecord, opts?: { failFast?: boolean }): Promise<void> {
     // The contract type IS the wire shape (snake_case) — see contract.ts WIRE RULE.
     const state: CapabilityRunState = {
       run_id: rec.runId,
@@ -248,6 +319,13 @@ export class CapabilityRunManager {
       session_ref: rec.sessionRef ?? "",
       runtime_id: rec.runtimeId ?? "",
     };
-    await this.backend.request(CAPABILITY_PERSIST_RUN_STATE, state);
+    try {
+      await this.backend.request(CAPABILITY_PERSIST_RUN_STATE, state);
+    } catch (err) {
+      if (opts?.failFast) throw err;
+      console.warn(
+        `[capability] persistRunState(${rec.runId} → ${rec.status}) failed (kept in memory; reconcile heals the store): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 }

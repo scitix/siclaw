@@ -94,6 +94,35 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed");
   });
 
+  it("a persistArtifact outage never kills the relay — later events still flow", async () => {
+    const fe = fakeFrontend();
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACT) throw new Error("ws blip");
+      return { ok: true };
+    });
+    const mgr = fakeManager();
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([
+          { type: "syncArtifacts", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
+          { type: "turn_done", text: "still here" },
+          { type: "end" },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    // Relay survived the artifact failure: the turn after it was still delivered.
+    expect(emits(fe)).toContainEqual({ run_id: "r1", type: "turn", payload: { text: "still here" } });
+    expect(mgr.setStatus).toHaveBeenCalledWith("r1", "idle");
+    expect(mgr.endRun).not.toHaveBeenCalled();
+    // It retried once before giving up on the artifact.
+    const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACT);
+    expect(artifactCalls).toHaveLength(2);
+  }, 10_000);
+
   it("parked (vestigial) is treated as a turn back to idle, never blocks", async () => {
     const fe = fakeFrontend();
     const mgr = fakeManager();

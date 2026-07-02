@@ -27,7 +27,7 @@ import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { getBoxProfile } from "./agentbox/box-profile.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
-import { CAPABILITY_FETCH_INPUT } from "./capability/contract.js";
+import { CAPABILITY_FETCH_INPUT, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
   CapabilityFetchInputRequest,
@@ -387,7 +387,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // capability wire (capability.event / persistArtifact / fetchInput) with the
   // manager owning lifecycle. This is the ONLY KB box control plane — the legacy
   // compile.* path was deleted in B4; authoring-chat runs entirely on capability.*.
-  const capabilityRunManager = new CapabilityRunManager(frontendClient);
+  const capabilityRunManager = new CapabilityRunManager(frontendClient, {
+    // A reaped run must not leave its box behind: stop the pod before the run is
+    // marked failed, so the store and the cluster agree. Local escape-hatch boxes
+    // aren't managed by the spawner — stop() is a no-op/404 there, hence catch.
+    onReap: async (rec) => {
+      await agentBoxManager.stop(rec.runId).catch((err) => {
+        console.warn(`[capability] reap: stopping box ${rec.runId} failed:`, err instanceof Error ? err.message : String(err));
+      });
+    },
+  });
   void capabilityRunManager.recover();
   capabilityRunManager.startWatchdog();
 
@@ -469,7 +478,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // consumer reacts by starting a fresh run (its find-or-start only reuses
     // non-terminal runs).
     const rec = capabilityRunManager.get(runId) ?? (await capabilityRunManager.adopt(runId));
-    if (!rec) throw new Error(`unknown capability run: ${runId}`);
+    // A terminal record can linger in memory while its final persist retries
+    // (flushTerminal) — it is just as unaddressable as an unknown run.
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
     capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
     await client.postJson(`/message/${runId}`, { message });

@@ -82,14 +82,30 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         break;
       case "syncArtifacts":
         // Knowledge content the box produced → the consumer's store, one artifact
-        // at a time. Content is inline base64 (opaque to the transport).
+        // at a time. Content is inline base64 (opaque to the transport). A failed
+        // persist must not fail the run (a transient WS blip would kill a healthy
+        // compile), but it IS real potential loss — the box's sync dedups by
+        // content hash, so this exact version is only re-sent if the file changes
+        // again. Hence one retry, then a loud log.
         for (const a of evt.artifacts ?? []) {
           const artifact: CapabilityPersistArtifactRequest = {
             run_id: runId,
             path: a.path,
             content: { inline_base64: Buffer.from(a.content, "utf8").toString("base64") },
           };
-          await frontendClient.request(CAPABILITY_PERSIST_ARTIFACT, artifact);
+          try {
+            await frontendClient.request(CAPABILITY_PERSIST_ARTIFACT, artifact);
+          } catch {
+            try {
+              await new Promise((r) => setTimeout(r, 1000));
+              await frontendClient.request(CAPABILITY_PERSIST_ARTIFACT, artifact);
+            } catch (err) {
+              console.error(
+                `[capability] run=${runId} persistArtifact(${a.path}) DROPPED after retry (box only re-sends on content change):`,
+                err instanceof Error ? err.message : String(err),
+              );
+            }
+          }
         }
         break;
       case "parked":
