@@ -1,0 +1,21 @@
+# 实例 A:GPU/硬件选型库(重度仪表化)—— 点亮 coverage 叶子
+name: gpu-hardware-infra
+bundle_root: ~/project/unified-hardware-infra/wiki
+constitution: ~/project/kb-method        # infra/SRE 口味参考宪法(装载,非框架内置)
+audit:
+  reserved_extra:                          # 这库的维护/账本页,不计孤儿
+    - README.md
+    - CLAUDE.md
+    - COVERAGE.md
+    - IMAGE_COVERAGE.md
+    - DATA_NOTES.md
+    - WIKI_TOOLING.md
+    - schema.md
+    - purpose.md
+    - PENDING.md
+    - 待澄清与求证.md
+  link_styles: [markdown, wikilink]
+  dimensions:                              # 叶子:这库有覆盖账本工具 → 注册
+    coverage:
+      tool: ~/project/unified-hardware-infra/coverage_gen.py
+tools_registry: {}
