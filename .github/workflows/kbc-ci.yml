@@ -1,0 +1,25 @@
+name: KBC Box CI
+
+# Path-filtered: the kbc compile box is Python and its deps include the
+# claude-agent-sdk (which vendors the Claude Code binary, ~200MB) — only
+# spend that download when kbc/ actually changed.
+on:
+  push:
+    branches: [main]
+    paths: ["kbc/**", ".github/workflows/kbc-ci.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["kbc/**", ".github/workflows/kbc-ci.yml"]
+
+jobs:
+  box-test:
+    name: KBC Box Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install claude-agent-sdk aiohttp
+      - run: python test_compile_box.py
+        working-directory: kbc/platform/pod

@@ -166,6 +166,37 @@ describe("AgentBoxManager — K8s mode", () => {
     expect(spawner.spawnCalls[0].agentId).toBe("agent-a");
   });
 
+  it("reuses a running pod when the requested profile matches", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("agentbox-run-1", {
+      boxId: "agentbox-run-1", agentId: "run-1", status: "running",
+      endpoint: "https://10.0.0.9:3000", createdAt: new Date(), lastActiveAt: new Date(),
+      profile: "kb-compile",
+    });
+    const handle = await mgr.getOrCreate("run-1", { profile: "kb-compile" });
+    expect(handle.endpoint).toBe("https://10.0.0.9:3000");
+    expect(spawner.spawnCalls).toHaveLength(0);
+    expect(spawner.stopCalls).toHaveLength(0);
+  });
+
+  it("stops and respawns when the running pod's profile no longer matches", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    // A pod is running as kb-compile, but the same id is now requested as kb-test.
+    spawner.getReturns.set("agentbox-run-1", {
+      boxId: "agentbox-run-1", agentId: "run-1", status: "running",
+      endpoint: "https://10.0.0.9:3000", createdAt: new Date(), lastActiveAt: new Date(),
+      profile: "kb-compile",
+    });
+    const handle = await mgr.getOrCreate("run-1", { profile: "kb-test" });
+    // Old-shaped pod stopped; a fresh box spawned with the requested profile.
+    expect(spawner.stopCalls).toEqual(["agentbox-run-1"]);
+    expect(spawner.spawnCalls).toHaveLength(1);
+    expect(spawner.spawnCalls[0].profile).toBe("kb-test");
+    expect(handle.boxId).toBe("box-run-1");
+  });
+
   it("podName sanitizes forbidden characters in agentId", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);

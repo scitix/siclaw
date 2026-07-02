@@ -141,13 +141,24 @@ export class AgentBoxManager {
 
   private async getOrCreateK8s(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
     const name = this.podName(agentId);
+    const wantProfile = config?.profile ?? "agent";
 
     const info = await this.spawner.get(name);
     if (info && info.status === "running" && info.endpoint && this.isCertFresh(info)) {
-      // Warm reuse: return the running pod without spawning. Per-agent config
-      // (env/persistence) is NOT re-resolved here — the pod's volume mount is
-      // already fixed, so a changed mode applies on the next cold spawn.
-      return { boxId: name, endpoint: info.endpoint, agentId };
+      const hasProfile = info.profile ?? "agent";
+      if (hasProfile === wantProfile) {
+        // Warm reuse: return the running pod without spawning. Per-agent config
+        // (env/persistence) is NOT re-resolved here — the pod's volume mount is
+        // already fixed, so a changed mode applies on the next cold spawn.
+        return { boxId: name, endpoint: info.endpoint, agentId };
+      }
+      // Profile changed under the same identity — reusing the old-shaped pod would
+      // silently run the wrong image/tools/volumes (the historic stale-box gap).
+      // Stop it and respawn with the requested profile. Fail-closed on trust.
+      console.log(
+        `[agentbox-manager] Profile mismatch for ${name} (running=${hasProfile}, want=${wantProfile}); respawning`,
+      );
+      await this.spawner.stop(name);
     }
     if (info && info.status === "running" && !this.isCertFresh(info)) {
       console.log(`[agentbox-manager] Pod for agent=${agentId} has a stale CA cert; recreating to restore mTLS`);
