@@ -527,6 +527,10 @@ def _make_compile_tools(run: CompileRun):
             "applied_value": str(args.get("applied_value", "")),
             "pages_edited": [str(p) for p in (args.get("pages_edited") or []) if str(p).strip()],
             "note": str(args.get("note", "")),
+            # Echo of the dispatch nonce from the apply directive: lets the
+            # consumer match this receipt to the EXACT dispatch round it answers
+            # (timestamps alone cannot distinguish two overlapping rounds).
+            "dispatch_nonce": str(args.get("dispatch_nonce", "")),
             "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         try:
