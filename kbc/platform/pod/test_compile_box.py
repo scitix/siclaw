@@ -331,7 +331,8 @@ async def test_test_session_driver_readonly():
             assert "Write" not in opts.allowed_tools and "Bash" not in opts.allowed_tools
             assert opts.cwd == snap, opts.cwd
             assert opts.mcp_servers == {}, opts.mcp_servers
-            assert compile_box.TEST_ROLE in opts.system_prompt["append"]
+            # persona comes from the locale pack (TestRun without locale → en default)
+            assert compile_box._prompt("test_role", None) in opts.system_prompt["append"]
             assert _FakeSDKClient.last.connected_prompt is None, "test session must not kickoff"
             # C4: the snapshot path guard is wired as a PreToolUse hook
             assert opts.hooks and "PreToolUse" in opts.hooks and opts.hooks["PreToolUse"], opts.hooks
@@ -436,6 +437,45 @@ async def test_test_message_path():
     print("✓ test-message injects a turn into a live test session")
 
 
+
+
+async def test_prompt_packs_locale():
+    """Prompt packs: en/zh ship the same asset set; unknown locales fall back to
+    en (the platform default); guard steering + constitution seed follow the
+    locale; KBC_PLAYBOOK env still overrides the playbook (local dev)."""
+    en = sorted(q.name for q in (compile_box._PROMPTS_DIR / "en").iterdir())
+    zh = sorted(q.name for q in (compile_box._PROMPTS_DIR / "zh").iterdir())
+    assert en == zh and "box_role.md" in en, (en, zh)
+    assert compile_box._prompt("box_role", "no-such-locale") == compile_box._prompt("box_role", "en")
+    assert "只读的知识消费者" in compile_box._prompt("test_role", "zh")
+    assert "read-only knowledge consumer" in compile_box._prompt("test_role", "en")
+
+    with tempfile.TemporaryDirectory() as snap:
+        root = Path(snap)
+        deny = await compile_box._make_test_path_guard(root, "zh")(
+            {"tool_name": "Read", "tool_input": {"file_path": "/work/x"}}, "t", None)
+        assert "只读测试会话" in deny["hookSpecificOutput"]["permissionDecisionReason"]
+        deny = await compile_box._make_test_path_guard(root, "en")(
+            {"tool_name": "Read", "tool_input": {"file_path": "/work/x"}}, "t", None)
+        assert "read-only test session" in deny["hookSpecificOutput"]["permissionDecisionReason"]
+
+    with tempfile.TemporaryDirectory() as wd:
+        compile_box._ensure_workdir_constitution(wd, "zh")
+        assert "知识库编译器" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory() as wd:
+        compile_box._ensure_workdir_constitution(wd, None)  # platform default = en
+        assert "Iron rules" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as td:
+        override = Path(td) / "pb.md"
+        override.write_text("OVERRIDE PLAYBOOK", encoding="utf-8")
+        os.environ["KBC_PLAYBOOK"] = str(override)
+        try:
+            assert compile_box._playbook_text("zh") == "OVERRIDE PLAYBOOK"
+        finally:
+            del os.environ["KBC_PLAYBOOK"]
+    print("✓ prompt packs: en/zh parity, en fallback, localized guard + constitution, env override")
+
 async def main():
     await test_workspace_sync()
     await test_session_driver_conversational()
@@ -443,6 +483,7 @@ async def main():
     await test_message_waits_for_connect()
     test_pack_candidates_to_wiki()
     await test_test_path_escape_guard()
+    await test_prompt_packs_locale()
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
     await test_test_message_path()

@@ -31,22 +31,30 @@ export interface MaterializeBackend {
   request(method: string, params?: unknown): Promise<any>;
 }
 
+export interface MaterializeResult {
+  /** Consumer-declared locale for the run's box (fetchInput), if any. */
+  locale?: string;
+}
+
 export async function materializeCapabilityInputs(opts: {
   client: MaterializeBoxClient;
   backend: MaterializeBackend;
   runId: string;
-}): Promise<void> {
+}): Promise<MaterializeResult> {
   const { client, backend, runId } = opts;
 
+  const result: MaterializeResult = {};
   let freshBox = false;
   try {
     const req: CapabilityFetchInputRequest = { run_id: runId };
     const src = (await backend.request(CAPABILITY_FETCH_INPUT, req)) as CapabilityFetchInputResponse;
+    if (src?.locale) result.locale = src.locale;
     if (src?.bundle_base64) {
       await client.postJson("/sources", {
         run_id: runId,
         bundle_base64: src.bundle_base64,
         bundle_sha256: src.bundle_sha256,
+        locale: src.locale,
       });
       freshBox = true;
     }
@@ -59,9 +67,9 @@ export async function materializeCapabilityInputs(opts: {
     } else {
       console.warn(`[capability] session ${runId}: source materialize skipped:`, msg);
     }
-    return;
+    return result;
   }
-  if (!freshBox) return; // empty KB — nothing told us the box is fresh, don't guess
+  if (!freshBox) return result; // empty KB — nothing told us the box is fresh, don't guess
 
   try {
     const req: CapabilityFetchInputRequest = { run_id: runId, ref: CAPABILITY_INPUT_WORKSPACE_REF };
@@ -71,6 +79,7 @@ export async function materializeCapabilityInputs(opts: {
         run_id: runId,
         bundle_base64: ws.bundle_base64,
         bundle_sha256: ws.bundle_sha256,
+        locale: result.locale,
       });
       console.log(`[capability] session ${runId}: rehydrated authoring workspace into fresh box`);
     }
@@ -81,4 +90,5 @@ export async function materializeCapabilityInputs(opts: {
       err instanceof Error ? err.message : String(err),
     );
   }
+  return result;
 }

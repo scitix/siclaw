@@ -437,9 +437,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         const client = await capabilityBoxClient(runId, profile, orgId);
         // Raw sources + (fresh box only) the durable authoring workspace, both
         // from the consumer's store. Best-effort — see materializeCapabilityInputs.
-        await materializeCapabilityInputs({ client, backend: frontendClient, runId });
+        // The consumer also declares the run's LOCALE through the same channel;
+        // the box selects its prompt pack with it (absent ⇒ English default).
+        const materialized = await materializeCapabilityInputs({ client, backend: frontendClient, runId });
         const allowedTools = getBoxProfile(profile).allowedTools ?? null;
-        await client.postJson(`/session/${runId}`, { instruction: instruction ?? "", allowed_tools: allowedTools });
+        await client.postJson(`/session/${runId}`, {
+          instruction: instruction ?? "",
+          allowed_tools: allowedTools,
+          locale: materialized.locale,
+        });
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
           .catch(async (err) => {
             console.error(`[capability] session relay failed run=${runId}:`, err);

@@ -43,7 +43,6 @@ from claude_agent_sdk import (
     InMemorySessionStore,
 )
 
-from compile_agent import _find_playbook
 
 # 每个 box 通常只跑一个 run,但用 map 保持干净(也便于 health/调试)。
 RUNS: dict[str, "CompileRun"] = {}
@@ -52,51 +51,46 @@ RUNS: dict[str, "CompileRun"] = {}
 TEST_SESSIONS: dict[str, "TestRun"] = {}
 DEFAULT_HTTP_MAX_REQUEST_BYTES = 768 * 1024 * 1024
 
-# BOX_ROLE = the agent's STANDING identity (→ system prompt, always present). The
-# box is a long-lived conversational + compiling Claude Code session per KB: it
-# converses to prepare (clarify intent/scope) AND compiles when asked. It does NOT
-# auto-start compiling — the session connects and waits for the first /message;
-# a compile is just a turn the owner asks for.
-BOX_ROLE = """你是某个知识库(KB)的 authoring 助手兼编译器,跑在一个持久的 Claude Code 会话里。
-工作目录是这个 KB 的 authoring workspace:
-- `raw/` 是冻结的原始输入快照,只读;`drop/` 可能存在,只是兼容别名。
-- `authoring/` 存准备阶段资产:CLAUDE.md、manifest.yaml、INTENT.md、PLAN.md、QUESTIONS.md、LEDGER.md。
-- `candidate/` 存候选知识库页面 —— **这是你唯一的产出**,含一个 `candidate/index.md` 列出各页。没有 bundle/,不打包、不"提交":负责人审阅后会自行一键发布成版本。
-- `eval/` 存发布前测试。
+# ── Prompt packs — locale-parameterized model-facing text ────────────────────
+# ALL text that reaches the model (standing roles, playbook, guard steering)
+# lives in prompts/<locale>/*.md. The locale is DECLARED BY THE CONSUMER per
+# run (capability.fetchInput → runtime → /session body); the platform default
+# is English and the box never guesses a language from content. zh is the
+# byte-faithful move of the original prompts, so zh runs behave identically.
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+DEFAULT_LOCALE = "en"
 
-你按两个阶段工作,**先 Plan、负责人批准后才 Execute**:
 
-1. **准备 / Plan(对话 + 提计划)**:跟负责人聊清楚这个 KB 要收什么、口径、边界、脱敏要求、待解问题,并维护 `authoring/INTENT.md` / `PLAN.md`。**此阶段绝不写 `candidate/` 页面、不大批产出。** 当你已读懂 `raw/`、且和负责人对齐后,调 `propose_plan` 抛出一份**简短、可读、可审核**的编译计划(打算产出哪些候选页、各页一句话、关键口径如脱敏、仍待定的点),**然后停下等批准**——不要擅自开编。
+def _prompt(name: str, locale: str | None) -> str:
+    """Load a prompt-pack asset, falling back to the English default pack."""
+    tried = []
+    for cand in ((locale or "").strip().lower(), DEFAULT_LOCALE):
+        if not cand or cand in tried:
+            continue
+        tried.append(cand)
+        fp = _PROMPTS_DIR / cand / f"{name}.md"
+        if fp.exists():
+            return fp.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"prompt pack missing: {name} (locale={locale!r})")
 
-2. **执行 / Execute(产出)**:只有收到负责人的**批准消息**后,才把 `raw/` 编成 `candidate/` 页面:逐篇读 raw 抽原子断言(记清 source id/文件/locator);跨断言按 `authoring/CLAUDE.md` + `constitution.md` 裁矛盾(能并列就并列各挂条件、明显笔误标修正)。**遇到拿不准的矛盾:绝不中途停、绝不阻塞 —— 自己做一个最合理的 best-guess 写进页面、在该处标 `⚠️ 存疑`(并列两边来源),同时把这条作为一条"工单"追加进 `authoring/CONTRADICTIONS.json`(格式见下),然后继续编完。负责人事后会在「矛盾处理」里逐条裁决,届时你按裁决回修对应页。** **一页一个文件 Write 进 `candidate/`**(frontmatter 至少含 `compiled_from`/`snapshot`/`last_updated`/`confidence|status`,每条结论标 source id + locator);最后写 `candidate/index.md` 列出各页。写完这一轮就结束 —— 不提交、不打包。
 
-可用的结构化信号工具:
-- `propose_plan` 抛出编译计划请负责人批准(Plan 阶段对齐后调用,然后等批准)。
-- `report_summary` 汇报一段进度。
-- `resolve_ticket` 回修完一条矛盾工单后**逐条**登记(见下"应用裁决")。
+def _playbook_text(locale: str | None) -> str:
+    """Compile playbook: KBC_PLAYBOOK env overrides (local dev), else the pack."""
+    env = os.environ.get("KBC_PLAYBOOK")
+    if env and Path(env).exists():
+        return Path(env).read_text(encoding="utf-8")
+    return _prompt("playbook", locale)
 
-**矛盾工单 `authoring/CONTRADICTIONS.json`(Execute 期间你用 Write 自己维护)** —— 一个 JSON 数组,每条 = 一个你搞不定的矛盾:
-`{"id": 稳定指纹(如 kind+涉及来源), "title": 短标题, "question": 一句话大白话问题, "sources": [{"doc": 来源文件, "quote": 原文摘录}], "options": [候选值本身的干净写法(如 1.30.2-cks、52台),别加"为准/以…为准"之类话术,UI 会自己加], "current_value": 你写进页面的 best-guess 取值, "affected_pages": [受影响的 candidate 文件名], "status": "open", "answer": null}`
-**你永远不阻塞、不等裁决 —— 一律 best-guess 落页 + 标 `⚠️ 存疑` + 落一条工单,编到底。** 工单初次落盘时 `status:"open"`、`answer:null`;`answer` 一直不用你管(负责人的答案在系统侧),`status` 平时保持 `open`。
 
-**应用裁决**:负责人事后会在「矛盾处理」里逐条给出正确答案,你会收到一条「应用以下裁决」指令,里面给你若干 `{ticket_id, affected_pages, 正确值}`。对每条:打开对应 `affected_pages`,把该矛盾处改成正确值、并去掉那处的 `⚠️ 存疑` 标注;若答案是"接受存疑/保留双源",就保持并列、不强行定论。**只动被点名的页,别的页不碰。** **每处理完一条(包括"接受存疑"那种不改值的),都必须立刻调一次 `resolve_ticket(ticket_id, applied_value, pages_edited, note)`** —— 这是唯一能让工单"解单"的动作(负责人侧没有手动关单按钮、全靠它):`applied_value` = 你实际写进页里的值(接受存疑就写"保留双源");`pages_edited` = 你这条实际改动的 candidate 文件名,**必须覆盖该工单的 `affected_pages`**(漏页负责人侧会被自动标"待核");`note` = 一句话说你改了什么。**一条一个、别批量、别漏页**;**别再手工去改 `CONTRADICTIONS.json` 的 `status`**,该工具会替你写。全部回修完再简短回一句总体动了哪几页。
+# The one-line labels that frame owner instructions inside the system prompt.
+_INSTRUCTION_HEADER = {
+    "zh": "# 本次 authoring attempt 的负责人说明",
+    "en": "# Owner's brief for this authoring attempt",
+}
 
-边界诚实:`raw/` 里查不到的不编、不脑补。"""
-
-# TEST_ROLE = the standing identity of a read-only TEST SESSION (起测试会话). It is
-# NOT the authoring/SRE persona — deliberately just a knowledge CONSUMER over the
-# pinned wiki snapshot, so the test measures the wiki, not the agent's tools. The
-# wiki-read instructions mirror the real siclaw consumer (siclaw_main
-# src/core/prompt.ts "Domain Knowledge — LLM Wiki"): Read tool only, no search,
-# start at index.md, whole pages, follow [[links]]. Max fidelity: do NOT tell it
-# it's being tested.
-TEST_ROLE = """你是一个只读的知识消费者。你掌握的全部知识,就是当前工作目录下的这个 LLM-Wiki —— 一组扁平的 markdown 页面,位于 `.siclaw/knowledge/`。
-
-- 用 Read 工具读它,**没有检索工具**。先读 `.siclaw/knowledge/index.md`(列出各组件/概念及一句话说明),挑与问题相关的页。
-- **整页读**。每页自成一体,片段式阅读会破坏它支撑的推理。
-- 页面里出现 `[[xxx]]` 双括号时,去读 `.siclaw/knowledge/xxx.md`;对每个双括号名字都一样处理。
-
-只依据这个 wiki 里的内容回答用户的问题;wiki 里查不到的,直说"这个 wiki 里没有",**绝不编造、绝不脑补**。你是只读的:**绝不写文件、绝不改动任何东西**。自然作答,就当一个真实用户在问你问题。"""
+# The read-only test-session persona lives in prompts/<locale>/test_role.md —
+# deliberately a knowledge CONSUMER over the pinned wiki snapshot, so the test
+# measures the wiki, not the agent's tools (mirrors siclaw_main prompt.ts).
 
 
 def _max_test_sessions() -> int:
@@ -132,6 +126,8 @@ class CompileRun:
         # profile (e.g. kb-test) makes "which tools" enforced by construction here,
         # not by prompt.
         self.allowed_tools: list[str] | None = None
+        # Consumer-declared prompt/output locale (capability.fetchInput → /session).
+        self.locale: str | None = None
         # Set once connect() has returned (success OR failure). A /message that
         # races ahead of the async connect waits on this so client.query() never
         # hits the SDK's "Not connected. Call connect() first." error.
@@ -152,8 +148,10 @@ class TestRun:
     exactly like a real consumer would — then is torn down. Reuses _emit_message
     (`emit`/`_turn_text`) and _await_session_live (`connected`/`client`)."""
 
-    def __init__(self, tid: str, cwd: str, parent_run_id: str, snapshot_hash: str):
+    def __init__(self, tid: str, cwd: str, parent_run_id: str, snapshot_hash: str, locale: str | None = None):
         self.tid = tid
+        # Inherited from the parent authoring run (consumer-declared).
+        self.locale = locale
         self.cwd = cwd                     # the pinned snapshot dir (holds .siclaw/knowledge/)
         self.parent_run_id = parent_run_id
         self.snapshot_hash = snapshot_hash
@@ -292,19 +290,19 @@ def _remove_path(path: Path):
         path.unlink()
 
 
-def _ensure_workdir_constitution(workdir: str):
-    """Make the prompt's file contract true for source-bundle driven runs."""
+def _ensure_workdir_constitution(workdir: str, locale: str | None = None):
+    """Make the prompt's file contract true for source-bundle driven runs. The
+    seeded constitution comes from the locale's prompt pack (first writer wins —
+    all writers in one run flow carry the same consumer-declared locale)."""
     wd = Path(workdir)
     wd.mkdir(parents=True, exist_ok=True)
     dest = wd / "constitution.md"
     if dest.exists():
         return
-    pb = _find_playbook()
-    text = pb.read_text() if pb and pb.exists() else "# Compile constitution\n\nUse the system prompt as the compilation constitution.\n"
-    dest.write_text(text)
+    dest.write_text(_playbook_text(locale), encoding="utf-8")
 
 
-def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | None = None) -> dict:
+def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | None = None, locale: str | None = None) -> dict:
     max_bundle_bytes = int(os.environ.get("KBC_MAX_SOURCE_BUNDLE_BYTES", str(512 * 1024 * 1024)))
     max_unpacked_bytes = int(os.environ.get("KBC_MAX_SOURCE_UNPACKED_BYTES", str(2 * 1024 * 1024 * 1024)))
     if len(bundle) > max_bundle_bytes:
@@ -366,7 +364,7 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
             drop_dir.symlink_to(raw_dir, target_is_directory=True)
         except OSError:
             shutil.copytree(raw_dir, drop_dir)
-        _ensure_workdir_constitution(workdir)
+        _ensure_workdir_constitution(workdir, locale)
     except Exception:
         _remove_path(staging)
         raise
@@ -391,7 +389,7 @@ def _safe_authoring_path(name: str) -> Path:
     return rel
 
 
-def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str | None = None) -> dict:
+def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str | None = None, locale: str | None = None) -> dict:
     max_bundle_bytes = int(os.environ.get("KBC_MAX_AUTHORING_BUNDLE_BYTES", str(64 * 1024 * 1024)))
     max_unpacked_bytes = int(os.environ.get("KBC_MAX_AUTHORING_UNPACKED_BYTES", str(256 * 1024 * 1024)))
     if len(bundle) > max_bundle_bytes:
@@ -449,7 +447,7 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
             if incoming.exists():
                 _remove_path(wd / top)
                 shutil.move(str(incoming), str(wd / top))
-        _ensure_workdir_constitution(workdir)
+        _ensure_workdir_constitution(workdir, locale)
     except Exception:
         _remove_path(staging)
         raise
@@ -588,22 +586,22 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
 
 async def run_session(run: CompileRun):
     """Persistent driver: host ONE long-lived Claude Code session (ClaudeSDKClient)
-    for this KB. BOX_ROLE (+ the playbook + the attempt instruction) is the standing
+    for this KB. box_role (+ the playbook + the attempt instruction) is the standing
     system prompt; the session then takes turns via POST /message — continuous
     prepare + compile in one session, on massapi, with the compile tools.
     Conversational by construction: connect, then wait for the first /message.
     (Durable cross-restart resume + a file-backed session store land in P4; v1
     uses an in-process store.)"""
     wd = str(Path(run.workdir).resolve())
-    pb = _find_playbook()
-    playbook = pb.read_text() if pb and pb.exists() else ""
+    playbook = _playbook_text(run.locale)
     instruction = (run.instruction or "").strip()
     role_parts = []
     if playbook:
         role_parts.append(playbook)
-    role_parts.append(BOX_ROLE)
+    role_parts.append(_prompt("box_role", run.locale))
     if instruction:
-        role_parts.append("# 本次 authoring attempt 的负责人说明\n\n" + instruction)
+        header = _INSTRUCTION_HEADER.get((run.locale or DEFAULT_LOCALE).lower(), _INSTRUCTION_HEADER[DEFAULT_LOCALE])
+        role_parts.append(header + "\n\n" + instruction)
     system_prompt = "\n\n---\n\n".join(role_parts)
 
     sid = run.session_id or str(uuid.uuid4())
@@ -708,9 +706,11 @@ def _test_path_escape(root: Path, tool_name: str, tool_input: dict) -> str | Non
     return None
 
 
-def _make_test_path_guard(root: Path):
+def _make_test_path_guard(root: Path, locale: str | None = None):
     """PreToolUse hook confining a test session to its snapshot. A hook (not a
-    can_use_tool callback) because hooks fire under bypassPermissions too."""
+    can_use_tool callback) because hooks fire under bypassPermissions too. The
+    steering message comes from the locale's prompt pack — it is model-facing."""
+    deny_template = _prompt("guard_deny", locale).strip()
 
     async def guard(input_data, tool_use_id, context):
         offender = _test_path_escape(root, str(input_data.get("tool_name", "")), input_data.get("tool_input") or {})
@@ -719,10 +719,7 @@ def _make_test_path_guard(root: Path):
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
-                    "permissionDecisionReason": (
-                        f"这是只读测试会话,只能读钉死的快照目录({root});{offender} 在快照之外。"
-                        "请从 .siclaw/knowledge/index.md 出发用相对路径读页。"
-                    ),
+                    "permissionDecisionReason": deny_template.format(root=root, offender=offender),
                 }
             }
         return {}
@@ -733,20 +730,20 @@ def _make_test_path_guard(root: Path):
 async def test_session_driver(run: "TestRun"):
     """Read-only consumer driver: host a ClaudeSDKClient over the pinned snapshot
     dir, tools limited to the kb-test profile's whitelist (default Read/Glob/Grep),
-    persona = TEST_ROLE, no MCP, no kickoff. A conversational session — connects and
+    persona = test_role pack, no MCP, no kickoff. A conversational session — connects and
     waits for the first /test-message; each turn streams log + turn_done over GET
     /test-events. Mirrors run_session minus writes/compile-tools/sync/bundle."""
     sid = run.session_id or str(uuid.uuid4())
     run.session_id = sid
     opts = ClaudeAgentOptions(
         cwd=run.cwd,
-        system_prompt={"type": "preset", "preset": "claude_code", "append": TEST_ROLE},
+        system_prompt={"type": "preset", "preset": "claude_code", "append": _prompt("test_role", run.locale)},
         allowed_tools=run.allowed_tools or DEFAULT_TEST_ALLOWED_TOOLS,
         mcp_servers={},                            # no compile signal tools
         permission_mode="bypassPermissions",       # pod 本身即 sandbox
         # C4: path confinement — absolute/../ reads must not escape the snapshot
         # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
-        hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd))])]},
+        hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd), run.locale)])]},
         setting_sources=[],                        # 多租户隔离
         max_turns=int(os.environ.get("KBC_TEST_MAX_TURNS", "60")),
         session_id=sid,
@@ -807,8 +804,9 @@ async def handle_session(request: web.Request):
     run = CompileRun(run_id, body.get("workdir", "/work"), int(body.get("round", 1)), body.get("instruction", ""))
     # Tool whitelist from the runtime BoxProfile (None/absent → driver default).
     run.allowed_tools = body.get("allowed_tools")
+    run.locale = body.get("locale")
     _seed_workdir(run.workdir)
-    _ensure_workdir_constitution(run.workdir)
+    _ensure_workdir_constitution(run.workdir, run.locale)
     RUNS[run_id] = run
     run.task = asyncio.create_task(_run_wrapper(run))
     return web.json_response({"ok": True, "run_id": run_id})
@@ -826,7 +824,7 @@ async def handle_sources(request: web.Request):
 
     try:
         bundle = base64.b64decode(encoded, validate=True)
-        result = _install_source_bundle(bundle, body.get("workdir", "/work"), body.get("bundle_sha256"))
+        result = _install_source_bundle(bundle, body.get("workdir", "/work"), body.get("bundle_sha256"), locale=body.get("locale"))
     except (ValueError, TypeError) as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -848,7 +846,7 @@ async def handle_authoring(request: web.Request):
 
     try:
         bundle = base64.b64decode(encoded, validate=True)
-        result = _install_authoring_bundle(bundle, body.get("workdir", "/work"), body.get("bundle_sha256"))
+        result = _install_authoring_bundle(bundle, body.get("workdir", "/work"), body.get("bundle_sha256"), locale=body.get("locale"))
     except (ValueError, TypeError) as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -935,7 +933,7 @@ async def handle_open_test(request: web.Request):
     except FileNotFoundError as e:
         shutil.rmtree(dest, ignore_errors=True)
         return web.json_response({"error": str(e)}, status=400)
-    run = TestRun(tid, str(dest), parent_run_id=parent.run_id, snapshot_hash=snapshot_hash)
+    run = TestRun(tid, str(dest), parent_run_id=parent.run_id, snapshot_hash=snapshot_hash, locale=parent.locale)
     # Tool whitelist from the runtime BoxProfile (kb-test); None/absent → read-only default.
     body = await request.json() if request.body_exists else {}
     run.allowed_tools = body.get("allowed_tools")

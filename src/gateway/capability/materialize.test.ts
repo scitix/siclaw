@@ -3,7 +3,7 @@ import { materializeCapabilityInputs } from "./materialize.js";
 import { CAPABILITY_FETCH_INPUT, CAPABILITY_INPUT_WORKSPACE_REF } from "./contract.js";
 
 function fakes(opts: {
-  raw?: { bundle_base64?: string; bundle_sha256?: string };
+  raw?: { bundle_base64?: string; bundle_sha256?: string; locale?: string };
   workspace?: { bundle_base64?: string; bundle_sha256?: string };
   workspaceError?: Error;
   sourcesError?: Error;
@@ -35,15 +35,19 @@ beforeEach(() => {
 });
 
 describe("materializeCapabilityInputs", () => {
-  it("fresh box: posts raw sources, then rehydrates the authoring workspace", async () => {
+  it("fresh box: posts raw sources, then rehydrates the authoring workspace (locale rides along)", async () => {
     const { client, backend, posts } = fakes({
-      raw: { bundle_base64: "UkFX", bundle_sha256: "aa" },
+      raw: { bundle_base64: "UkFX", bundle_sha256: "aa", locale: "zh" },
       workspace: { bundle_base64: "V1M=", bundle_sha256: "bb" },
     });
-    await materializeCapabilityInputs({ client, backend, runId: "r1" });
+    const result = await materializeCapabilityInputs({ client, backend, runId: "r1" });
 
+    // The consumer-declared locale is surfaced to the caller (→ /session body)
+    // and forwarded on both installs (they seed the constitution).
+    expect(result.locale).toBe("zh");
     expect(posts.map((p) => p.path)).toEqual(["/sources", "/authoring"]);
-    expect(posts[1].body).toEqual({ run_id: "r1", bundle_base64: "V1M=", bundle_sha256: "bb" });
+    expect(posts[0].body).toMatchObject({ locale: "zh" });
+    expect(posts[1].body).toEqual({ run_id: "r1", bundle_base64: "V1M=", bundle_sha256: "bb", locale: "zh" });
     // Two fetches: default ref (raw) then the workspace ref.
     expect(backend.request).toHaveBeenNthCalledWith(1, CAPABILITY_FETCH_INPUT, { run_id: "r1" });
     expect(backend.request).toHaveBeenNthCalledWith(2, CAPABILITY_FETCH_INPUT, { run_id: "r1", ref: CAPABILITY_INPUT_WORKSPACE_REF });
@@ -73,7 +77,7 @@ describe("materializeCapabilityInputs", () => {
       raw: { bundle_base64: "UkFX" },
       workspaceError: new Error("store hiccup"),
     });
-    await expect(materializeCapabilityInputs({ client, backend, runId: "r1" })).resolves.toBeUndefined();
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r1" })).resolves.toEqual({});
     expect(posts.map((p) => p.path)).toEqual(["/sources"]);
   });
 

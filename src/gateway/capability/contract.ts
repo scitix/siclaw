@@ -261,4 +261,11 @@ export interface CapabilityFetchInputRequest {
 export interface CapabilityFetchInputResponse {
   bundle_base64?: string;
   bundle_sha256?: string;
+  /**
+   * Consumer-declared prompt/output locale for the run's box (e.g. "zh").
+   * Locale is DOMAIN config — the tenant/KB's language — so it rides this
+   * consumer-config channel, not the run row. Absent ⇒ the platform default
+   * (English prompt packs).
+   */
+  locale?: string;
 }
