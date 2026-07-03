@@ -1770,7 +1770,13 @@ function CopyableMessage({
       <div
         ref={bubbleRef}
         className={cn(
-          "px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm shadow-black/10 min-w-0 overflow-hidden",
+          // max-w-full caps the bubble at the parent's max-w-3xl. Without it, an
+          // items-start flex child shrink-wraps to its max-content width, so a
+          // wide table (e.g. an unbreakable sha256 digest) blows the bubble past
+          // 3xl and pushes a page-level horizontal scrollbar — the inner
+          // overflow-x-auto table wrapper can't help while its own width is
+          // unbounded. Capped here, wide tables scroll inside the bubble instead.
+          "px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm shadow-black/10 min-w-0 max-w-full overflow-hidden",
           isUser
             ? "bg-blue-600 text-white rounded-tr-sm [&_pre]:bg-black/20 [&_pre]:text-white [&_code]:bg-card/15 [&_code]:text-white [&_a]:text-blue-200"
             : "bg-card border border-border text-foreground rounded-tl-sm",
