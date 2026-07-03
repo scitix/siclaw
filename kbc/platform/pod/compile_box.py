@@ -714,6 +714,10 @@ async def run_session(run: CompileRun):
         mcp_servers={"compile": _make_compile_tools(run)},
         permission_mode="bypassPermissions",  # the pod itself is the sandbox
         setting_sources=[],                    # tenant isolation: load no external settings/CLAUDE.md
+        # Pin the compile model explicitly: the box talks to massapi (Bedrock),
+        # which serves specific ids — the SDK default may not be one, and the KB
+        # compile default is opus by product decision. Overridable per-deploy.
+        model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
         max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
         session_id=sid,
         session_store=InMemorySessionStore(),
@@ -846,6 +850,9 @@ async def test_session_driver(run: "TestRun"):
         # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
         hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd), run.locale)])]},
         setting_sources=[],                        # tenant isolation
+        # The test session mimics the REAL consumer → the gate/consumer tier
+        # (sonnet), not the compile tier. Massapi-served id; overridable per-deploy.
+        model=os.environ.get("KBC_TEST_MODEL", "claude-sonnet-4-6"),
         max_turns=int(os.environ.get("KBC_TEST_MAX_TURNS", "60")),
         session_id=sid,
         session_store=InMemorySessionStore(),
