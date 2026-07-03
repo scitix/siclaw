@@ -25,3 +25,5 @@ jobs:
         working-directory: kbc/platform/pod
       - run: python test_selfcheck.py
         working-directory: kbc/platform/pod
+      - run: python test_redblue.py
+        working-directory: kbc/platform/pod

@@ -31,6 +31,23 @@ TEXT_SOURCE_EXTS = {".md", ".txt", ".tsv", ".csv", ".json", ".jsonl", ".yaml", "
 EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
 SELFCHECK_PATH = "authoring/SELFCHECK.json"
 
+# TEST_ROLE = the standing identity of a read-only knowledge CONSUMER over a
+# pinned wiki snapshot. Single-sourced in the locale prompt packs
+# (prompts/<locale>/test_role.md) — the SAME text the user-facing test session
+# (compile_box.test_session_driver) uses, so the red-blue blue team measures the
+# wiki exactly as a real consumer reads it and the two copies can't drift.
+# Defaults to zh: the PK/calibration pipeline is not yet locale-threaded and its
+# calibration corpora are Chinese. Mirrors the real siclaw consumer (siclaw_main
+# src/core/prompt.ts "Domain Knowledge — LLM Wiki"): Read only, no search, start
+# at index.md, whole pages, follow [[links]]. Max fidelity: do NOT tell it it's
+# being tested.
+def _pack_test_role(locale: str = "zh") -> str:
+    fp = Path(__file__).resolve().parent / "prompts" / locale / "test_role.md"
+    return fp.read_text(encoding="utf-8").rstrip("\n")
+
+
+TEST_ROLE = _pack_test_role()
+
 # Cap the unaccounted list embedded in a repair prompt — a pathological corpus
 # must not blow up the injected message.
 _REPAIR_LIST_CAP = 40
@@ -240,19 +257,32 @@ def state_key(workdir: str) -> str | None:
     return h.hexdigest()
 
 
+def read_selfcheck(workdir: str) -> dict | None:
+    path = Path(workdir) / SELFCHECK_PATH
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
 def run_layer1(workdir: str) -> dict:
-    """Compute the full Layer-1 report (coverage + lint). Pure; no state writes."""
+    """Compute the full Layer-1 report (coverage + lint). Pure except reading
+    the previous SELFCHECK to carry the Layer-2 `pk` section forward — an L1
+    re-check must never wipe red-blue results."""
     pages = candidate_pages(workdir)
     exclusions, exclusion_errors = load_exclusions(workdir)
     cov = coverage(workdir, pages, exclusions)
     lint = lint_candidate(pages, exclusion_errors)
+    previous = read_selfcheck(workdir) or {}
     return {
         "version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "candidate_tree_hash": candidate_tree_hash(workdir),
         "coverage": cov,
         "lint": {"ok": lint["ok"], "violations": lint["violations"]},
-        "pk": None,  # Layer-2 (red-blue self-check) fills this in later
+        "pk": previous.get("pk"),  # Layer-2 results survive L1 re-checks
     }
 
 
@@ -260,6 +290,53 @@ def write_selfcheck(workdir: str, report: dict) -> None:
     path = Path(workdir) / SELFCHECK_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def update_pk_section(workdir: str, pk: dict) -> None:
+    """Single write-point for the Layer-2 `pk` section. Read-modify-write so the
+    L1 fields are never clobbered; creates a minimal skeleton when no L1 report
+    exists yet (e.g. CLI calibration runs against a bare workdir)."""
+    report = read_selfcheck(workdir) or {"version": 1, "coverage": None, "lint": None, "state": None}
+    report["pk"] = pk
+    report["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    write_selfcheck(workdir, report)
+
+
+def pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
+    """Pin the current draft: copy {workdir}/candidate/*.md|.json into
+    {dest}/.siclaw/knowledge/ with the `candidate/` prefix stripped
+    (candidate/index.md → index.md), mirroring sicore's
+    buildPublishBundleFromCandidates so a consumer reads BYTE-IDENTICALLY to
+    what a publish would serve. Shared by user test sessions (compile_box) and
+    the red-blue blue team (redblue.py). Returns (sha256 over sorted
+    relpath+content, page_count). Raises FileNotFoundError if there are no
+    candidate pages or no root index.md."""
+    candidate = Path(workdir) / "candidate"
+    kdir = dest / ".siclaw" / "knowledge"
+    kdir.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    count = 0
+    has_index = False
+    for f in sorted(candidate.rglob("*")) if candidate.is_dir() else []:
+        if not f.is_file() or f.suffix not in (".md", ".json"):
+            continue
+        rel = f.relative_to(candidate)
+        if ".." in rel.parts:
+            continue
+        rel_posix = rel.as_posix()
+        data = f.read_bytes()
+        out = kdir / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(data)
+        h.update(rel_posix.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
+        count += 1
+        if rel_posix == "index.md":
+            has_index = True
+    if count == 0:
+        raise FileNotFoundError("no candidate pages to test yet — ask the authoring agent to generate pages first")
+    if not has_index:
+        raise FileNotFoundError("draft is missing candidate/index.md — cannot test without a root index page")
+    return h.hexdigest(), count
 
 
 def narration(report: dict) -> str:

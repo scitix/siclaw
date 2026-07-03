@@ -111,7 +111,9 @@ _INSTRUCTION_HEADER = {
 
 # The read-only test-session persona lives in prompts/<locale>/test_role.md —
 # deliberately a knowledge CONSUMER over the pinned wiki snapshot, so the test
-# measures the wiki, not the agent's tools (mirrors siclaw_main prompt.ts).
+# measures the wiki, not the agent's tools (mirrors siclaw_main prompt.ts). The
+# red-blue blue team reads the SAME pack text via selfcheck.TEST_ROLE, so the
+# consumer persona is single-sourced in the locale packs (no drift).
 
 
 def _max_test_sessions() -> int:
@@ -205,39 +207,8 @@ class TestRun:
         await self.events.put(ev)
 
 
-def _pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
-    """Pin the current draft: copy {workdir}/candidate/*.md|.json into
-    {dest}/.siclaw/knowledge/ with the `candidate/` prefix stripped
-    (candidate/index.md → index.md), mirroring sicore's
-    buildPublishBundleFromCandidates so the test reads BYTE-IDENTICALLY to what a
-    publish would serve. Returns (sha256 over sorted relpath+content, page_count).
-    Raises FileNotFoundError if there are no candidate pages or no root index.md."""
-    candidate = Path(workdir) / "candidate"
-    kdir = dest / ".siclaw" / "knowledge"
-    kdir.mkdir(parents=True, exist_ok=True)
-    h = hashlib.sha256()
-    count = 0
-    has_index = False
-    for f in sorted(candidate.rglob("*")) if candidate.is_dir() else []:
-        if not f.is_file() or f.suffix not in (".md", ".json"):
-            continue
-        rel = f.relative_to(candidate)
-        if ".." in rel.parts:
-            continue
-        rel_posix = rel.as_posix()
-        data = f.read_bytes()
-        out = kdir / rel
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(data)
-        h.update(rel_posix.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
-        count += 1
-        if rel_posix == "index.md":
-            has_index = True
-    if count == 0:
-        raise FileNotFoundError("no candidate pages to test yet — ask the authoring agent to generate pages first")
-    if not has_index:
-        raise FileNotFoundError("draft is missing candidate/index.md — cannot test without a root index page")
-    return h.hexdigest(), count
+# Snapshot pinning is single-sourced in selfcheck.py (shared with redblue.py).
+_pack_candidates_to_wiki = selfcheck.pack_candidates_to_wiki
 
 
 # ── B5: mid-compile workspace sync back to sicore ──

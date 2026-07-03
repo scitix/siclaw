@@ -70,7 +70,26 @@ docker run --rm -p 3000:3000 \
   (`KBC_L1_REPAIR_ROUNDS`,默认 1),额度用尽标 `unconverged`,余项交负责人。全程 fail-open。
 - **引擎中立**:selfcheck.py 纯 stdlib 零 SDK 依赖;驱动只提供"何时触发"+
   `CompileRun.inject_user_message()` 一个注入缝——换引擎(如 Codex)只重实现这一个方法。
-- Layer-2(红蓝队 PK 自检)后续填 SELFCHECK.json 的 `pk` 字段,同一状态源。
+## Layer-2 自检:红蓝队 PK(`redblue.py` + `engine.py`)
+
+一写多考的非对称设计:**裁判**(强档,读 raw+快照,`KBC_PK_JUDGE_MODEL` 默认 claude-opus-4-6)
+调研出题面→出题(含变式,优先 冲突/WIP/边界+存疑工单)→判分(四分类归因 覆盖/路由/契约/媒介,
+"正确标未覆盖"=通过);**蓝队**(门槛档=生产消费档,`KBC_PK_BLUE_MODEL` 默认 claude-sonnet-4-6,
+persona=TEST_ROLE 单源共用)只读钉死的 wiki 快照,raw 被多根路径守卫机械屏蔽。
+
+- **编排全在代码**(redblue.py):题量=clamp(8, 页数×1.5, 40)、出题面按 raw 指纹缓存
+  (`authoring/PK_SURVEY_CACHE.json`)、分块答题/判分(`KBC_PK_CHUNK=5`,并发
+  `KBC_PK_CONCURRENCY=2`)、定向复测原语(`questions_override`)、全局墙钟
+  `KBC_PK_WALL_SECS=1800`、任一阶段坏 JSON 重试 1 次后 fail-open(state=failed 不抛)。
+- **引擎中立**(engine.py):`ReadonlyAgentEngine` Protocol 是唯一引擎面;结构化输出=
+  文本 JSON+宽松解析(刻意不用 SDK 工具强制);换 Codex 底座=加一个 adapter,model/effort
+  是普通字符串旋钮。
+- **S0 校准跑器 = 本模块**:`python redblue.py --raw <dir> (--workdir <dir>|--wiki <dir>)
+  [--questions N] [--retest 上次结果.json] [--out pk-result.json]`——离线校准跑的就是
+  生产管线。结果写 SELFCHECK.json 的 `pk` 段(单写点 `selfcheck.update_pk_section`,
+  L1 复检不会抹掉它)。
+- **接线待 S0 过门**:compile_box 的自动触发(L1 passed 后台跑+回修注入+stale 判定)
+  按设计文档 §9.4 在校准通过后接入。
 
 ## 边界 / 下一步
 
