@@ -32,6 +32,10 @@ COPY tools/ /app/tools/
 
 # Tenant isolation: never load external memory (prevents cross-tenant bleed).
 ENV CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+# massapi/Bedrock rejects the `context_management` field Claude Code attaches on
+# large-context turns (HTTP 400). Disable autocompact so it's never sent. The
+# Python modules also setdefault this; the ENV makes it visible at the image level.
+ENV DISABLE_AUTOCOMPACT=1
 # Default served port (overridable via SICLAW_AGENTBOX_PORT, aligned with agentbox).
 ENV SICLAW_AGENTBOX_PORT=3000
 

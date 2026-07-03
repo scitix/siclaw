@@ -54,11 +54,11 @@ class FakeEngine:
                    "variant_type": "直问", "expected": "exp", "source_ref": "a.md"}
                   for i in range(1, 8)]
             return json.dumps({"questions": qs})
-        ids = re.findall(r"\[(q\d+)\]", user_message)
-        assert ids, "chunk prompt carries no question ids"
         if stage == "blue":
-            return json.dumps([{"id": i, "answer": "答", "cited_sources": ["index.md"],
-                                "said_uncovered": False} for i in ids])
+            # real-consumer persona: natural prose + a SOURCES line (NOT JSON)
+            return "根据 wiki,答案是……\nSOURCES: [\"index.md\"]"
+        ids = re.findall(r"\[(q\d+)\]", user_message)
+        assert ids, "verdict prompt carries no question ids"
         out = []
         for i in ids:  # verdict: q1 fails as 覆盖, everything else passes
             if i == "q1":
@@ -120,12 +120,15 @@ async def test_full_run():
         fake = FakeEngine()
         summary, detail = await redblue.run_pk(
             fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
-        assert fake.calls == {"survey": 1, "questions": 1, "blue": 2, "verdict": 2}, fake.calls
+        # blue = per-question (7); judge = batched (7 → 2 chunks of 5+2)
+        assert fake.calls == {"survey": 1, "questions": 1, "blue": 7, "verdict": 2}, fake.calls
         assert summary["state"] == "unconverged" and summary["questions"] == 7, summary
         assert summary["gate_pass"] == 6 and len(summary["failures"]) == 1, summary
         f = summary["failures"][0]
         assert f["category"] == "覆盖" and f["page"] == "p1.md", f
         assert len(detail["answers"]) == 7 and len(detail["verdicts"]) == 7
+        # consumer SOURCES line parsed into structured cited_sources
+        assert detail["answers"]["q1"]["cited_sources"] == ["index.md"], detail["answers"]["q1"]
         prompt = redblue.build_pk_repair_prompt(summary)
         assert "补编X" in prompt and "p1.md" in prompt and "CONTRADICTIONS.json" in prompt
     print("OK  full run (stage counts / chunking 5+2 / decide / repair prompt)")
@@ -159,7 +162,7 @@ async def test_questions_override_targeted_retest():
         summary, detail = await redblue.run_pk(
             fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_override=override)
         assert fake.calls["survey"] == 0 and fake.calls["questions"] == 0, fake.calls
-        assert fake.calls["blue"] == 1 and summary["questions"] == 2, (fake.calls, summary)
+        assert fake.calls["blue"] == 2 and summary["questions"] == 2, (fake.calls, summary)
         assert summary["gate_pass"] == 1  # q1 still fails in the canned verdict
     print("OK  questions_override skips survey/questions (targeted retest primitive)")
 

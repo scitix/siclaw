@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -102,14 +103,6 @@ QUESTIONS_USER = """你是裁判的**出题官**。基于下面的出题面,出 
 "expected": ..., "source_ref": ...}}
 只输出 JSON(不要任何其他文字):{{"questions": [...]}}"""
 
-BLUE_USER = """请依次回答下面 {k} 个问题,每个问题都按你的守则独立作答。
-
-{questions_block}
-
-最终**只输出一个 JSON 数组**,每题一个对象:
-{{"id": "...", "answer": "...", "cited_sources": ["页名.md", ...], "said_uncovered": true/false}}
-(said_uncovered = 你是否声明了"wiki 未覆盖/查不到"。本次以这个 JSON 数组为准,不需要单独的 SOURCES 行,也不要输出其他文字。)"""
-
 VERDICT_USER = """蓝队(只读 wiki 快照,读不到原始语料)已作答。请逐题回原始语料核对并判分。
 - 原始语料(真值):{raw_dir}
 - wiki 快照:{wiki_dir}
@@ -179,8 +172,7 @@ def derive_area_seeds(raw_dir: str, wiki_dir: str, cap: int = 24) -> list[str]:
     index = Path(wiki_dir) / ".siclaw" / "knowledge" / "index.md"
     if index.is_file():
         try:
-            import re as _re
-            seeds += _re.findall(r"\[([^\]]{2,40})\]\([^)]+\.md\)", index.read_text(encoding="utf-8"))
+            seeds += re.findall(r"\[([^\]]{2,40})\]\([^)]+\.md\)", index.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError):
             pass
     seen, out = set(), []
@@ -265,6 +257,37 @@ def _load_contradictions(authoring_dir: str | None) -> list[dict]:
 
 def _chunks(items: list, size: int) -> list[list]:
     return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+# The blue team answers as the REAL consumer (persona = selfcheck.TEST_ROLE),
+# which means natural prose ending in a machine-readable `SOURCES: [...]` line —
+# NOT a JSON object. Forcing JSON on the consumer persona breaks fidelity AND
+# doesn't parse (the two instructions fight). So we ask one natural question at a
+# time and parse the consumer's own SOURCES line.
+_SOURCES_RE = re.compile(r"SOURCES:\s*(\[[^\]]*\])")
+_UNCOVERED_HINTS = ("这个 wiki 里没有", "wiki 里没有", "未覆盖", "没有相关", "查不到", "未收录")
+
+
+def _parse_sources(text: str) -> list[str]:
+    m = _SOURCES_RE.search(text or "")
+    if m:
+        try:
+            v = json.loads(m.group(1))
+            return [str(x) for x in v] if isinstance(v, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def _strip_sources(text: str) -> str:
+    return _SOURCES_RE.sub("", text or "").strip()
+
+
+def _said_uncovered(text: str) -> bool:
+    t = text or ""
+    if any(h in t for h in _UNCOVERED_HINTS):
+        return True
+    return "SOURCES:" in t and _parse_sources(t) == []
 
 
 # ── the pipeline ──
@@ -364,24 +387,33 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                 q.setdefault("id", f"q{i + 1}")
         detail["questions"] = questions
 
-        # 4+5: per-chunk blue answer → judge verdict, chunks concurrent under a semaphore
+        # 4: blue team — ONE natural question per call (real-consumer fidelity),
+        #    parse the consumer's own SOURCES line. Concurrent under the semaphore.
         say(f"自检(PK):蓝队({blue_m})答 {len(questions)} 题、裁判({judge_m})判分…")
         sem = asyncio.Semaphore(concurrency)
 
-        async def _run_chunk(chunk: list[dict]):
-            qblock = "\n".join(f"[{q['id']}] {q['question']}" for q in chunk)
+        async def _blue(q: dict) -> tuple[str, dict]:
             async with sem:
-                answers = await _agent_json(
-                    engine, stage="blue", system=selfcheck.TEST_ROLE,
-                    user=BLUE_USER.format(k=len(chunk), questions_block=qblock),
-                    model=blue_m, cwd=wiki_dir, roots=[wiki_dir],
-                    timeout=_env_float("KBC_PK_BLUE_TIMEOUT", 420))
-            amap = {a.get("id"): a for a in answers if isinstance(a, dict)} \
-                if isinstance(answers, list) else {}
+                text = await engine.run_readonly_agent(
+                    cwd=wiki_dir, system_prompt=selfcheck.TEST_ROLE,
+                    user_message=q["question"], model=blue_m,
+                    allowed_read_roots=[wiki_dir],
+                    timeout_secs=_env_float("KBC_PK_BLUE_TIMEOUT", 300))
+            return q["id"], {"id": q["id"], "answer": _strip_sources(text),
+                             "cited_sources": _parse_sources(text),
+                             "said_uncovered": _said_uncovered(text)}
+
+        for qid, ans in await asyncio.gather(*(_blue(q) for q in questions)):
+            detail["answers"][qid] = ans
+
+        # 5: judge — batched per chunk (judge prompt is fully ours; opus follows
+        #    the JSON contract reliably), fed the consumer's natural answer.
+        async def _judge(chunk: list[dict]) -> dict:
             qa = "\n\n".join(
                 f"[{q['id']}] 问题: {q['question']}\nraw 真值要点: {q.get('expected', '-')}\n"
                 f"raw 出处: {q.get('source_ref', '-')}\n"
-                f"蓝队回答: {json.dumps(amap.get(q['id'], {}), ensure_ascii=False)}"
+                f"蓝队回答: {detail['answers'].get(q['id'], {}).get('answer') or '(蓝队无回答)'}\n"
+                f"蓝队自称引用: {detail['answers'].get(q['id'], {}).get('cited_sources', [])}"
                 for q in chunk)
             async with sem:
                 verdicts = await _agent_json(
@@ -389,13 +421,10 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                     user=VERDICT_USER.format(raw_dir=raw_dir, wiki_dir=wiki_dir, qa_block=qa),
                     model=judge_m, cwd=wiki_dir, roots=judge_roots,
                     timeout=_env_float("KBC_PK_VERDICT_TIMEOUT", 420))
-            vmap = {v.get("id"): v for v in verdicts if isinstance(v, dict)} \
+            return {v.get("id"): v for v in verdicts if isinstance(v, dict)} \
                 if isinstance(verdicts, list) else {}
-            return amap, vmap
 
-        results = await asyncio.gather(*(_run_chunk(c) for c in _chunks(questions, chunk_size)))
-        for amap, vmap in results:
-            detail["answers"].update(amap)
+        for vmap in await asyncio.gather(*(_judge(c) for c in _chunks(questions, chunk_size))):
             detail["verdicts"].update(vmap)
 
         # 6: decide

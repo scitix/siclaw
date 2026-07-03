@@ -52,6 +52,13 @@ from claude_agent_sdk import (
 
 import selfcheck
 
+# massapi/Bedrock rejects the `context_management` field Claude Code attaches
+# once a session's context passes the autocompact buffer (HTTP 400
+# "context_management: Extra inputs are not permitted"). A compile is a long
+# multi-turn session, so it hits this readily. Disable autocompact so the field
+# is never sent. setdefault → an explicit deployment override still wins.
+os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
+
 # A box usually hosts a single run; a map keeps it clean (and helps health/debugging).
 RUNS: dict[str, "CompileRun"] = {}
 # Read-only "test session" runs — ephemeral consumer sessions over a pinned draft

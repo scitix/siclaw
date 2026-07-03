@@ -20,6 +20,15 @@ import uuid
 from pathlib import Path
 from typing import Protocol
 
+# massapi proxies to Bedrock, which rejects the `context_management` request
+# field Claude Code attaches once a turn's context grows past the autocompact
+# buffer ("context_management: Extra inputs are not permitted", HTTP 400).
+# Disabling autocompact stops the field. setdefault so an explicit override
+# wins; the SDK-spawned child inherits this via os.environ (we pass no options.env,
+# so ANTHROPIC_* etc. are inherited too). PK stages are one-shot reads that don't
+# need compaction, so this has no downside here.
+os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
+
 # Tool-input keys that name a filesystem path (same set the test-session guard
 # uses: Read.file_path, Glob/Grep.path, NotebookRead.notebook_path).
 _PATH_KEYS = ("file_path", "path", "notebook_path")
