@@ -214,6 +214,42 @@ def _save_survey_cache(authoring_dir: str | None, fingerprint: str, topics: list
                                ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _load_intent(authoring_dir: str | None) -> str:
+    """INTENT.md = the owner's declared audience/purpose/scope. Fed to the JUDGE
+    only (weighting + scoring yardstick) — never to the blue team, which must
+    stay as ignorant as a real consumer."""
+    if not authoring_dir:
+        return ""
+    p = Path(authoring_dir) / "INTENT.md"
+    if not p.is_file():
+        return ""
+    try:
+        return p.read_text(encoding="utf-8")[:4000]
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _load_exclusion_entries(authoring_dir: str | None, cap: int = 30) -> list[dict]:
+    """Declared exclusions change GRADING semantics: raw content the owner
+    deliberately excluded is not a coverage gap — an honest '本库未收录' is a
+    pass. Tolerant read; malformed file just means no declared exclusions here
+    (Layer 1 already lints the file itself)."""
+    if not authoring_dir:
+        return []
+    p = Path(authoring_dir) / "EXCLUSIONS.json"
+    if not p.is_file():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out = [{"pattern": str(e.get("pattern")), "reason": str(e.get("reason", ""))}
+           for e in data if isinstance(e, dict) and e.get("pattern")]
+    return out[:cap]
+
+
 def _load_contradictions(authoring_dir: str | None) -> list[dict]:
     if not authoring_dir:
         return []
@@ -261,8 +297,24 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
             constitution = Path(constitution_path).read_text(encoding="utf-8")[:8000]
         except (OSError, UnicodeDecodeError):
             constitution = ""
-    judge_system = JUDGE_ROLE + (
-        f"\n\n本库的裁决纪律(constitution,判分时遵循):\n{constitution}" if constitution else "")
+    # Judge context = the owner's CONTRACT artifacts (constitution / INTENT /
+    # declared exclusions) — never the compiler's narrative (PLAN as map, chat
+    # history). Intent sets weighting and the scoring yardstick; exclusions flip
+    # "raw has it but owner opted out" from coverage-fail to honest-pass. The
+    # blue team gets NONE of this: a real consumer doesn't know the scope deal.
+    judge_system = JUDGE_ROLE
+    if constitution:
+        judge_system += f"\n\n本库的裁决纪律(constitution,判分时遵循):\n{constitution}"
+    intent = _load_intent(authoring_dir)
+    if intent:
+        judge_system += ("\n\n本库的定位与受众(INTENT,负责人声明):出题的数量分布要向这里声明的"
+                         "受众/用途倾斜;评分也以它界定的范围为尺——范围外的冷僻点不算缺口。\n" + intent)
+    exclusion_entries = _load_exclusion_entries(authoring_dir)
+    if exclusion_entries:
+        excl_lines = "\n".join(f"- {e['pattern']}: {e['reason']}" for e in exclusion_entries)
+        judge_system += ("\n\n负责人**声明排除**的 raw 范围(刻意不编,带理由):\n" + excl_lines +
+                         "\n对这些范围:不要出\"库里为什么没有\"式的覆盖题;若题目触及、且蓝队诚实回答"
+                         "\"本库未收录\",判 正确标未覆盖(=通过),不算覆盖失败。")
 
     detail: dict = {"questions": [], "answers": {}, "verdicts": {}}
     survey_cache_hit = False

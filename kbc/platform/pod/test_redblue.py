@@ -27,6 +27,7 @@ class FakeEngine:
 
     def __init__(self, broken_stages=()):
         self.calls = {"survey": 0, "questions": 0, "blue": 0, "verdict": 0}
+        self.systems = {}  # stage → last system prompt seen (asymmetry assertions)
         self.broken = set(broken_stages)
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
@@ -42,6 +43,7 @@ class FakeEngine:
         else:
             raise AssertionError(f"unroutable prompt: {user_message[:80]}")
         self.calls[stage] += 1
+        self.systems[stage] = system_prompt
         if stage in self.broken:
             return "总之就是一段完全不是 JSON 的话。"
         if stage == "survey":
@@ -173,6 +175,32 @@ async def test_broken_json_fails_open():
     print("OK  broken JSON → one retry → state=failed (fail-open, never raises)")
 
 
+async def test_contract_artifacts_judge_only():
+    """INTENT/EXCLUSIONS (owner contract) reach every JUDGE stage; the blue
+    team gets none of it — a real consumer doesn't know the scope deal."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        wiki, raw = _pk_workspace(base)
+        authoring = base / "authoring"
+        _mk(base, "authoring/INTENT.md", "受众=平台新同事,专注操作问答")
+        _mk(base, "authoring/EXCLUSIONS.json",
+            json.dumps([{"pattern": "s/tickets/*", "reason": "周报时效性强"}]))
+        fake = FakeEngine()
+        await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=3,
+                             authoring_dir=str(authoring), questions_budget=2)
+        for stage in ("survey", "questions", "verdict"):
+            assert "平台新同事" in fake.systems[stage], stage
+            assert "周报时效性强" in fake.systems[stage] and "声明排除" in fake.systems[stage], stage
+        assert "平台新同事" not in fake.systems["blue"]
+        assert "周报时效性强" not in fake.systems["blue"]
+
+        # without authoring_dir the judge context carries neither
+        fake2 = FakeEngine()
+        await redblue.run_pk(fake2, wiki_dir=wiki, raw_dir=raw, page_count=3, questions_budget=2)
+        assert "声明排除" not in fake2.systems["survey"]
+    print("OK  INTENT/EXCLUSIONS reach judge stages only, blue stays ignorant")
+
+
 def test_pk_section_survives_layer1():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -211,6 +239,7 @@ def main():
     asyncio.run(test_survey_cache())
     asyncio.run(test_questions_override_targeted_retest())
     asyncio.run(test_broken_json_fails_open())
+    asyncio.run(test_contract_artifacts_judge_only())
     test_pk_section_survives_layer1()
     test_stage_wiki_copy_and_seeds()
     print("ALL OK  test_redblue")
