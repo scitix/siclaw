@@ -128,6 +128,7 @@ vi.mock("../core/config.js", () => ({
 import { AgentBoxSessionManager } from "./session.js";
 import { createMemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
+import * as subagentRegistry from "../core/subagent-registry.js";
 
 // ── Test setup ────────────────────────────────────────────────────────
 
@@ -662,5 +663,531 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
     fs.mkdirSync(path.join(mgr.getBaseSessionDir(), "ran-before"), { recursive: true });
     mgr.markPendingAbort("ran-before");
     expect(mgr.consumePendingAbort("ran-before")).toBe(false);
+  });
+});
+
+describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
+  // A child fake brain whose behavior is driven by its prompt text, so the outcome is
+  // deterministic regardless of the (concurrent) order children are created in.
+  function pushPromptDrivenBrains(count: number) {
+    for (let i = 0; i < count; i++) {
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async (text: string) => {
+          if (text.includes("── item")) {
+            // reduce child
+            emitter.emit("event", {
+              type: "message_end",
+              message: { role: "assistant", content: [{ type: "text", text: "SUMMARY: 2 causes (net, storage)" }] },
+            });
+            return;
+          }
+          if (text.includes("pod-b")) throw new Error("cannot reach pod-b");
+          const m = text.match(/(pod-\w+)/);
+          emitter.emit("event", {
+            type: "message_end",
+            message: { role: "assistant", content: [{ type: "text", text: `done ${m ? m[1] : "?"}` }] },
+          });
+        },
+        abort: async () => {},
+      }));
+    }
+  }
+
+  const baseReq = (over: Partial<any>) => ({
+    description: "diagnose pods",
+    renderedTasks: [
+      { item: "pod-a", prompt: "Check pod-a" },
+      { item: "pod-b", prompt: "Check pod-b" },
+      { item: "pod-c", prompt: "Check pod-c" },
+    ],
+    subagentType: "general-purpose",
+    runInBackground: false,
+    parentSessionId: "p1",
+    parentAgentId: null,
+    userId: "u1",
+    taskListId: "tl1",
+    spawnId: "grp1",
+    ...over,
+  });
+
+  it("runs map→reduce: 1 failed item flows into reduce; report is partial", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    pushPromptDrivenBrains(4); // 3 map + 1 reduce
+    const report = await mgr.createSpawnSubagentExecutor()(
+      baseReq({ reducePrompt: "Summarize the causes" }),
+      undefined,
+      undefined,
+    );
+    expect(report.status).toBe("partial"); // 2 done + 1 failed
+    expect(report.itemResults.map((r: any) => r.status)).toEqual(["done", "failed", "done"]);
+    expect(report.itemResults[1].summary).toMatch(/cannot reach pod-b/);
+    expect(report.reduceSummary).toContain("SUMMARY");
+    expect(report.reduceChildSessionId).toBeTruthy();
+    expect(report.circuitBroken).toBeUndefined();
+  });
+
+  it("map partial + slow reduce: group timer disarmed before reduce, overall is partial not timed_out", async () => {
+    // Regression: the group timer is a MAP-phase backstop that drives `mapAbort`. It used to stay
+    // armed through the reduce stage, so a reduce slow enough to outlive it fired the timer
+    // (timedOut=true); combined with a map partial (here 2 done + 1 failed ⇒ doneCount<total,
+    // usableCount>0) the overall status was wrongly reported `timed_out` instead of `partial`. The
+    // fix clears the timer once the map worker pool drains, before reduce runs. Here we shrink the
+    // group backstop to a few ms and hold the reduce open until AFTER that backstop has elapsed, so
+    // the timer WOULD fire during reduce if it were still armed. (The spy is restored by afterEach's
+    // vi.restoreAllMocks, so it never leaks to the other group tests.)
+    const mgr = new AgentBoxSessionManager() as any;
+    vi.spyOn(subagentRegistry, "getSubagentGroupMaxRuntimeMs").mockReturnValue(5);
+
+    let openReduceGate: () => void = () => {};
+    const reduceGate = new Promise<void>((r) => { openReduceGate = r; });
+    let reduceEnteredResolve: () => void = () => {};
+    const reduceEntered = new Promise<void>((r) => { reduceEnteredResolve = r; });
+    for (let i = 0; i < 4; i++) {
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async (text: string) => {
+          if (text.includes("── item")) {
+            reduceEnteredResolve();
+            await reduceGate; // hold reduce open past the 5ms group backstop
+            emitter.emit("event", {
+              type: "message_end",
+              message: { role: "assistant", content: [{ type: "text", text: "SUMMARY: 2 causes" }] },
+            });
+            return;
+          }
+          if (text.includes("pod-b")) throw new Error("cannot reach pod-b"); // 1 failed ⇒ map partial
+          const m = text.match(/(pod-\w+)/);
+          emitter.emit("event", {
+            type: "message_end",
+            message: { role: "assistant", content: [{ type: "text", text: `done ${m ? m[1] : "?"}` }] },
+          });
+        },
+        abort: async () => {},
+      }));
+    }
+
+    const p = mgr.createSpawnSubagentExecutor()(
+      baseReq({ reducePrompt: "Summarize the causes" }),
+      undefined,
+      undefined,
+    );
+    await reduceEntered; // map finished (2 done + 1 failed); reduce now blocked on the gate
+    await new Promise((r) => setTimeout(r, 25)); // let the 5ms map backstop elapse during reduce
+    openReduceGate();
+    const report = await p;
+
+    expect(report.itemResults.map((r: any) => r.status)).toEqual(["done", "failed", "done"]);
+    expect(report.status).toBe("partial"); // NOT timed_out — the reduce-phase timer fire was disarmed
+    expect(report.reduceSummary).toContain("SUMMARY");
+  });
+
+  it("returns per-item capsules and no reduceSummary when reduce_prompt is omitted", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    pushPromptDrivenBrains(3); // 3 map, no reduce
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({}), undefined, undefined);
+    expect(report.reduceSummary).toBeUndefined();
+    expect(report.itemResults[0].summary).toMatch(/done pod-a/);
+  });
+
+  it("keeps at most getGroupWorkerShare() children in flight (below the limiter cap)", async () => {
+    const prev = process.env.SICLAW_SUBAGENT_CONCURRENCY;
+    process.env.SICLAW_SUBAGENT_CONCURRENCY = "3"; // limiter cap 3 → worker share 2
+    try {
+      const mgr = new AgentBoxSessionManager() as any;
+      let active = 0;
+      let maxActive = 0;
+      for (let i = 0; i < 5; i++) {
+        (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+          prompt: async () => {
+            active++;
+            maxActive = Math.max(maxActive, active);
+            await new Promise((r) => setTimeout(r, 5));
+            active--;
+            emitter.emit("event", {
+              type: "message_end",
+              message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+            });
+          },
+          abort: async () => {},
+        }));
+      }
+      const report = await mgr.createSpawnSubagentExecutor()(
+        {
+          description: "batch",
+          renderedTasks: Array.from({ length: 5 }, (_, i) => ({ item: `t${i}`, prompt: `do t${i}` })),
+          subagentType: "general-purpose",
+          runInBackground: false,
+          parentSessionId: "p1",
+          parentAgentId: null,
+          userId: "u1",
+          taskListId: "tl1",
+          spawnId: "grp-share",
+        },
+        undefined,
+        undefined,
+      );
+      expect(report.status).toBe("done");
+      // Worker share (2) caps concurrency BELOW the limiter cap (3) — proves the pool, not the limiter.
+      expect(maxActive).toBe(2);
+    } finally {
+      if (prev === undefined) delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_CONCURRENCY = prev;
+    }
+  });
+
+  it("circuit breaker: first 5 all fail → stop submitting, remaining skipped, no reduce", async () => {
+    const prev = process.env.SICLAW_SUBAGENT_CONCURRENCY;
+    process.env.SICLAW_SUBAGENT_CONCURRENCY = "2"; // worker share 1 → serial, deterministic completion order
+    try {
+      const mgr = new AgentBoxSessionManager() as any;
+      for (let i = 0; i < 6; i++) {
+        (globalThis as any).__fakeBrainFactories.push(() => ({
+          prompt: async () => {
+            throw new Error("template blew up");
+          },
+          abort: async () => {},
+        }));
+      }
+      const report = await mgr.createSpawnSubagentExecutor()(
+        {
+          description: "broken batch",
+          renderedTasks: Array.from({ length: 6 }, (_, i) => ({ item: `t${i}`, prompt: `do t${i}` })),
+          reducePrompt: "summarize",
+          subagentType: "general-purpose",
+          runInBackground: false,
+          parentSessionId: "p1",
+          parentAgentId: null,
+          userId: "u1",
+          taskListId: "tl1",
+          spawnId: "grp-cb",
+        },
+        undefined,
+        undefined,
+      );
+      expect(report.status).toBe("failed");
+      expect(report.circuitBroken).toBe(true);
+      const statuses = report.itemResults.map((r: any) => r.status);
+      expect(statuses.slice(0, 5)).toEqual(["failed", "failed", "failed", "failed", "failed"]);
+      expect(statuses[5]).toBe("skipped");
+      expect(report.itemResults[5].childSessionId).toBe(""); // skipped item never got a child
+      expect(report.reduceSummary).toBeUndefined(); // zero usable output ⇒ reduce skipped
+    } finally {
+      if (prev === undefined) delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_CONCURRENCY = prev;
+    }
+  });
+
+  it("circuit breaker with an in-flight item: reduce skipped, status failed, in-flight aborted", async () => {
+    // Regression (fix 1): when the breaker trips it aborts the in-flight child, which
+    // runSpawnedSubagent returns as `partial` — that partial must NOT lift usableCount over the
+    // reduce gate. worker-share 3 (concurrency 4) runs items concurrently: items 0-4 fast-fail,
+    // and item 5 (the 6th and last pick) hangs, so it is still in flight when the 5th failure
+    // trips the breaker.
+    const prev = process.env.SICLAW_SUBAGENT_CONCURRENCY;
+    process.env.SICLAW_SUBAGENT_CONCURRENCY = "4"; // worker share 3
+    try {
+      const mgr = new AgentBoxSessionManager() as any;
+      const hooks = { pending: [] as Array<() => void>, abortCount: 0 };
+      // Prompt-driven so behaviour is independent of the (concurrent) child-creation order:
+      // "fail *" throws immediately, "hang *" blocks until aborted.
+      for (let i = 0; i < 6; i++) {
+        (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+          prompt: async (text: string) => {
+            if (text.includes("hang")) {
+              await new Promise<void>((resolve) => hooks.pending.push(resolve));
+              emitter.emit("event", {
+                type: "message_end",
+                message: { role: "assistant", content: [{ type: "text", text: "late" }] },
+              });
+              return;
+            }
+            throw new Error("template blew up");
+          },
+          abort: async () => {
+            hooks.abortCount++;
+            const pend = hooks.pending;
+            hooks.pending = [];
+            pend.forEach((r) => r());
+          },
+        }));
+      }
+      const report = await mgr.createSpawnSubagentExecutor()(
+        {
+          description: "broken batch",
+          renderedTasks: [
+            { item: "t0", prompt: "fail t0" },
+            { item: "t1", prompt: "fail t1" },
+            { item: "t2", prompt: "fail t2" },
+            { item: "t3", prompt: "fail t3" },
+            { item: "t4", prompt: "fail t4" },
+            { item: "t5", prompt: "hang t5" }, // 6th (last) pick → in flight when the breaker trips
+          ],
+          reducePrompt: "summarize",
+          subagentType: "general-purpose",
+          runInBackground: false,
+          parentSessionId: "p1",
+          parentAgentId: null,
+          userId: "u1",
+          taskListId: "tl1",
+          spawnId: "grp-cb-inflight",
+        },
+        undefined,
+        undefined,
+      );
+
+      expect(report.circuitBroken).toBe(true);
+      expect(report.status).toBe("failed"); // NOT partial — a doomed batch is a failure
+      expect(report.reduceSummary).toBeUndefined(); // reduce gated by !breaker.tripped
+      expect(lastCreateSiclawSession.calls.length).toBe(6); // 6 map children, NO reduce child (a 7th)
+      expect(report.itemResults.slice(0, 5).map((r: any) => r.status)).toEqual([
+        "failed",
+        "failed",
+        "failed",
+        "failed",
+        "failed",
+      ]);
+      // The in-flight item was aborted by the breaker → runSpawnedSubagent reports it `partial`.
+      expect(report.itemResults[5].status).toBe("partial");
+      expect(hooks.abortCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      if (prev === undefined) delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_CONCURRENCY = prev;
+    }
+  });
+
+  it("short-circuits to all-skipped when the turn signal is already aborted", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const ac = new AbortController();
+    ac.abort();
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({}), undefined, ac.signal);
+    expect(report.status).toBe("failed");
+    expect(report.itemResults.every((r: any) => r.status === "skipped")).toBe(true);
+    expect(lastCreateSiclawSession.calls.length).toBe(0); // no child session ever created
+  });
+
+  // ── v3 collapse path: a single item with no reduce runs as ONE legacy child (no group) ──
+  it("collapses a single item with no reduce_prompt to a legacy child run (bare spawnId, per-child result)", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const sent: any[] = [];
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: async (e: any) => { sent.push(e); return { ok: true }; } };
+    mgr.agentId = "agent-1";
+    pushPromptDrivenBrains(1); // one map-style child; no reduce
+    const report = await mgr.createSpawnSubagentExecutor()(
+      baseReq({ renderedTasks: [{ item: "pod-a", prompt: "Check pod-a" }], spawnId: "collapse1" }),
+      undefined,
+      undefined,
+    );
+    // Collapsed → runSpawnedSubagent's per-child SpawnSubagentResult (summary/childSessionId),
+    // NOT a group SubagentGroupReport (which would carry itemResults).
+    expect((report as any).itemResults).toBeUndefined();
+    expect(report.status).toBe("done");
+    expect(report.summary).toMatch(/done pod-a/);
+    expect(report.childSessionId).toBeTruthy();
+    // The terminal delegation event uses the BARE spawnId (no "#") — folds via the single-subagent
+    // UI path exactly like the pre-v3 single spawn.
+    await new Promise((r) => setTimeout(r, 5));
+    const terminal = sent.find((e) => e.type === "delegation.append_event");
+    expect(terminal?.event.delegationId).toBe("collapse1");
+    expect(terminal.event.delegationId).not.toContain("#");
+  });
+
+  // ── v3 decision #21: the reduce summary must come from the FULL reduce report, not the capsule ──
+  it("reduce summary uses the full reduce report (fullSummary), not the 1800-char capsule", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const LONG = "X".repeat(2500); // > MAX_DELEGATE_CAPSULE_CHARS (1800), < GROUP_REDUCE_SUMMARY_MAX_CHARS (6000)
+    const TAIL = "REDUCE_TAIL_MARKER"; // lives past the 1800 boundary → present in fullSummary, dropped from the capsule
+    // Text-routing brains (order-agnostic): the reduce child (prompt contains "── item") emits the long
+    // report; every other child is a plain map child.
+    for (let i = 0; i < 2; i++) {
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async (text: string) => {
+          const out = text.includes("── item") ? `${LONG}\n${TAIL}` : "done pod-a";
+          emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: out }] } });
+        },
+        abort: async () => {},
+      }));
+    }
+    const report = await mgr.createSpawnSubagentExecutor()(
+      baseReq({ renderedTasks: [{ item: "pod-a", prompt: "Check pod-a" }], reducePrompt: "summarize" }),
+      undefined,
+      undefined,
+    );
+    expect(report.status).toBe("done");
+    expect(report.reduceSummary.length).toBeGreaterThan(1800);
+    expect(report.reduceSummary).toContain(TAIL); // would be absent if the 1800 capsule were used
+  });
+});
+
+describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
+  function managedStub() {
+    return {
+      id: "p1",
+      _backgroundWorkCount: 0,
+      _releaseTimer: null as any,
+      _pendingNotifications: [] as unknown[],
+      _coalesceTimer: null as any,
+      _promptDone: true,
+      _aborted: false,
+    };
+  }
+
+  // Children that hang until aborted, tracking how many were aborted.
+  function pushHangingBrains(count: number, hooks: { pending: Array<() => void>; abortCount: number }) {
+    for (let i = 0; i < count; i++) {
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async () => {
+          await new Promise<void>((resolve) => hooks.pending.push(resolve));
+          emitter.emit("event", {
+            type: "message_end",
+            message: { role: "assistant", content: [{ type: "text", text: "late" }] },
+          });
+        },
+        abort: async () => {
+          hooks.abortCount++;
+          const pend = hooks.pending;
+          hooks.pending = [];
+          pend.forEach((r) => r());
+        },
+      }));
+    }
+  }
+
+  const bgReq = () => ({
+    description: "batch",
+    renderedTasks: [
+      { item: "t0", prompt: "do t0" },
+      { item: "t1", prompt: "do t1" },
+      { item: "t2", prompt: "do t2" },
+    ],
+    subagentType: "general-purpose",
+    runInBackground: true,
+    parentSessionId: "p1",
+    parentAgentId: null,
+    userId: "u1",
+    taskListId: "tl1",
+    spawnId: "grpbg",
+  });
+
+  it("registers a running group job (type subagent + isGroup), holds the parent, and is not counted as bg-exec", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const managed = managedStub();
+    mgr.sessions.set("p1", managed);
+    const hooks = { pending: [] as Array<() => void>, abortCount: 0 };
+    pushHangingBrains(3, hooks);
+
+    const res = mgr.startBackgroundSubagentGroup(bgReq());
+    expect(res.status).toBe("launched");
+    expect(res.jobId).toBe("grpbg");
+    const job = mgr.jobs.get("grpbg");
+    expect(job.type).toBe("subagent"); // reused type (not a new JobType)
+    expect(job.isGroup).toBe(true);
+    expect(job.status).toBe("running");
+    expect(managed._backgroundWorkCount).toBe(1); // parent held until the group finishes
+
+    // Regression: a group job (type "subagent") must NOT count toward the background-EXEC cap.
+    const bgRunning = mgr.jobs.list("p1").filter((j: any) => j.type !== "subagent" && j.status === "running").length;
+    expect(bgRunning).toBe(0);
+
+    // cleanup: stop, let it settle, and cancel the coalesce timer so no stray synthetic turn.
+    await mgr.createJobStopExecutor()("grpbg");
+    await new Promise((r) => setTimeout(r, 30));
+    mgr.discardPendingNotifications("p1");
+  });
+
+  it("job_stop aborts ALL in-flight children of the group", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    mgr.sessions.set("p1", managedStub());
+    const hooks = { pending: [] as Array<() => void>, abortCount: 0 };
+    pushHangingBrains(3, hooks);
+
+    const res = mgr.startBackgroundSubagentGroup(bgReq());
+    await new Promise((r) => setTimeout(r, 25)); // let all 3 children reach the hang
+
+    const stop = await mgr.createJobStopExecutor()(res.jobId);
+    expect(stop.stopped).toBe(true);
+    expect(mgr.jobs.get(res.jobId).status).toBe("stopped");
+
+    await new Promise((r) => setTimeout(r, 30)); // let the group settle
+    expect(hooks.abortCount).toBe(3); // every in-flight child was aborted by the group controller
+    mgr.discardPendingNotifications("p1");
+  });
+
+  // Children that complete immediately, so the whole group settles fast.
+  function pushCompletingBrains(count: number) {
+    for (let i = 0; i < count; i++) {
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async () => {
+          emitter.emit("event", {
+            type: "message_end",
+            message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+          });
+        },
+        abort: async () => {},
+      }));
+    }
+  }
+
+  it("emits live group_progress chat events and a subagent_done carrying is_group", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const sent: any[] = [];
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: async (e: any) => { sent.push(e); return { ok: true }; } };
+    mgr.agentId = "agent-1";
+    mgr.sessions.set("p1", managedStub());
+    pushCompletingBrains(3);
+
+    const res = mgr.startBackgroundSubagentGroup(bgReq());
+    expect(res.status).toBe("launched");
+    await new Promise((r) => setTimeout(r, 120)); // let the group settle (before the 600ms coalesce)
+
+    // group_progress is LIVE-ONLY (emit_chat_event, never append_event) and carries the groupId
+    // + per-item status array so the card animates without a full refetch.
+    const progress = sent.filter(
+      (e) => e.type === "delegation.emit_chat_event" && e.event?.type === "group_progress",
+    );
+    expect(progress.length).toBeGreaterThan(0);
+    expect(progress[0].event.job_id).toBe("grpbg");
+    expect(Array.isArray(progress[0].event.items)).toBe(true);
+
+    // The completion notice reuses the subagent_done channel but flags is_group so the frontend
+    // does an authoritative refetch (it can't fold full per-item detail from this event alone).
+    const done = sent.find((e) => e.event?.type === "subagent_done");
+    expect(done?.event.is_group).toBe(true);
+
+    mgr.discardPendingNotifications("p1");
+  });
+
+  // Smoke defect S2: on settle the emitter's flush-then-stop must emit the pending trailing frame
+  // (the terminal snapshot) rather than discarding it — otherwise the live card animates one frame
+  // short of terminal until the completion refetch lands.
+  it("makeGroupProgressEmitter.settle() flushes the trailing terminal frame instead of dropping it", () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const sent: any[] = [];
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: async (e: any) => { sent.push(e); return { ok: true }; } };
+    mgr.agentId = "agent-1";
+
+    const groupProgress = () =>
+      sent.filter((e) => e.type === "delegation.emit_chat_event" && e.event?.type === "group_progress");
+
+    const emitter = mgr.makeGroupProgressEmitter("p1", "grpX");
+    // First emit flushes immediately (lastEmitAt=0 → elapsed ≫ throttle): an early "map, running" frame.
+    emitter.emit({ phase: "map", items: [{ index: 0, status: "running" }, { index: 1, status: "running" }] });
+    // The terminal frame lands within the throttle window → held as the pending trailing frame.
+    emitter.emit({ phase: "reduce", items: [{ index: 0, status: "done" }, { index: 1, status: "failed" }] });
+    // Settle BEFORE the trailing timer fires: it must flush the pending terminal frame, not drop it.
+    emitter.settle();
+
+    const frames = groupProgress();
+    const last = frames[frames.length - 1];
+    expect(last).toBeDefined();
+    // The last live frame the card sees is the terminal one: reduce phase, every item terminal.
+    expect(last.event.job_id).toBe("grpX");
+    expect(last.event.phase).toBe("reduce");
+    expect(last.event.items.every((it: any) => it.status !== "running" && it.status !== "queued")).toBe(true);
+    expect(last.event.items).toEqual([{ index: 0, status: "done" }, { index: 1, status: "failed" }]);
+
+    // Idempotent: a second settle finds no pending frame → no extra emit (matches the double
+    // settle() in the .then + .finally of startBackgroundSubagentGroup).
+    const before = frames.length;
+    emitter.settle();
+    expect(groupProgress().length).toBe(before);
   });
 });

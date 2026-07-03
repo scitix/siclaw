@@ -27,7 +27,10 @@ export type ResolvedToolDefinition = ToolDefinition & {
   requiresUserApproval?: boolean;
 };
 
-// ── spawn_subagent (design §6) — the sub-agent contract. ──
+// ── one spawned child (design §6) — the INTERNAL per-child contract. ──
+// This is the request `runSpawnedSubagent` consumes for a SINGLE child (map item, reduce, or a
+// collapsed single task). The unified tool→executor boundary is {@link SpawnSubagentGroupRequest}
+// (a 1..N batch plan); the executor derives one of these per child from it.
 
 /** "launched" is the immediate return for a background spawn; it is never a terminal/persisted status. */
 export type SpawnSubagentStatus = "done" | "partial" | "failed" | "timed_out" | "launched";
@@ -105,11 +108,98 @@ export interface SpawnSubagentProgress {
   activity?: string;
 }
 
+/**
+ * The single spawn_subagent executor (design v3 §"Orchestration (batch path)"). The tool ALWAYS hands over a
+ * batch plan ({@link SpawnSubagentGroupRequest}: 1..N rendered tasks + an optional reduce), so
+ * a single task is just the degenerate N=1 group. The executor COLLAPSES a lone task with no
+ * reduce to one legacy child run (per-child {@link SpawnSubagentResult}, byte-identical events /
+ * delegation_id / notification to the pre-v3 single spawn); otherwise it runs the full map→reduce
+ * orchestration ({@link SubagentGroupResult}). Progress is therefore a union — legacy per-child
+ * steps on the collapse path, per-item group phases on the batch path — and so is the result;
+ * the tool layer normalises both into the uniform `item_results[]` model-visible shape.
+ */
 export type SpawnSubagentExecutor = (
-  request: SpawnSubagentRequest,
-  onProgress?: (progress: SpawnSubagentProgress) => void,
+  request: SpawnSubagentGroupRequest,
+  onProgress?: (progress: SpawnSubagentProgress | SubagentGroupProgress) => void,
   signal?: AbortSignal,
-) => Promise<SpawnSubagentResult>;
+) => Promise<SpawnSubagentResult | SubagentGroupResult>;
+
+// ── spawn_subagent batch plan (design §"Tool layer (single entry)" / §"Orchestration (batch path)") — the unified tool's request/result. ──
+
+/** Terminal status of one item in a group. `skipped` = never started (circuit break / timeout). */
+export type GroupItemStatus = "done" | "partial" | "failed" | "timed_out" | "skipped";
+
+/**
+ * The unified spawn_subagent request — always a batch plan of 1..N items (design v3 §"Tool layer (single entry)").
+ * The tool layer has ALREADY validated + rendered the plan (so the executor never re-parses
+ * templates); it hands over one fully-rendered prompt per item. `renderedTasks.length === 1`
+ * with no `reducePrompt` is the degenerate single-task form the executor collapses to a legacy
+ * child run. The per-child {@link SpawnSubagentRequest} is the internal shape `runSpawnedSubagent`
+ * consumes; this is the tool→executor boundary.
+ */
+export interface SpawnSubagentGroupRequest {
+  /** Short UI label for the whole call (single task or batch). */
+  description: string;
+  /** One rendered task per item (item original kept for the report/UI + reduce headers). */
+  renderedTasks: Array<{ item: string | Record<string, string>; prompt: string }>;
+  /** Optional reduce stage: when present, a final child synthesises all item results. */
+  reducePrompt?: string;
+  /** Resolved sub-agent type id, shared by every map child AND the reduce child (v1 limit). */
+  subagentType: string;
+  /** Conditional default at the tool layer: a single item runs foreground, a multi-item batch background. */
+  runInBackground: boolean;
+  /** Parent lineage + shared ledger. */
+  parentSessionId: string;
+  parentAgentId: string | null;
+  userId: string;
+  /** Type-symmetric with SpawnSubagentRequest; children do not consume it (parent-owned ledger). */
+  taskListId: string;
+  /** toolCallId, reused as the groupId (`{groupId}#{index}` tags each child delegation). */
+  spawnId: string;
+}
+
+/** Live progress for a FOREGROUND group (background groups report via the group_progress event). */
+export interface GroupItemProgress {
+  index: number;
+  status: "queued" | "running" | GroupItemStatus;
+}
+export interface SubagentGroupProgress {
+  /** "map" while item children run; "reduce" while the summary child runs. */
+  phase: "map" | "reduce";
+  items: GroupItemProgress[];
+}
+
+/** One item's terminal record in the group report. */
+export interface SubagentGroupItemResult {
+  item: string | Record<string, string>;
+  status: GroupItemStatus;
+  /** Capsule (model-visible only when there is no reduce stage) or a short error/skip note. */
+  summary: string;
+  /** The child's persisted session id for UI drill-in; empty string for `skipped` items. */
+  childSessionId: string;
+}
+
+/**
+ * Discriminated like {@link SpawnSubagentResult}: a background launch carries only a jobId,
+ * a finished/foreground run carries the aggregate report.
+ */
+export type SubagentGroupResult =
+  | { status: "launched"; jobId: string }
+  | SubagentGroupReport;
+
+export interface SubagentGroupReport {
+  status: "done" | "partial" | "failed" | "timed_out";
+  itemResults: SubagentGroupItemResult[];
+  /** Reduce output, ≤ GROUP_REDUCE_SUMMARY_MAX_CHARS (truncation is annotated). Absent when no reduce ran. */
+  reduceSummary?: string;
+  reduceChildSessionId?: string;
+  /** True when the circuit breaker tripped; the reason is folded into the summary. */
+  circuitBroken?: boolean;
+  durationMs: number;
+}
+
+// The batch executor merged into {@link SpawnSubagentExecutor} in v3 (single-tool merge): the one
+// spawn_subagent executor accepts this request and returns SpawnSubagentResult | SubagentGroupResult.
 
 export interface JobStopResult {
   stopped: boolean;
@@ -262,8 +352,10 @@ export interface ToolRefs {
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;
   /**
-   * Optional spawn_subagent executor (design §6). When absent, spawn_subagent
-   * stays out of the resolved tool list so the model never sees a non-working tool.
+   * Optional spawn_subagent executor (design §6, v3 single-tool merge). Handles the whole
+   * batch plan (1..N items + optional reduce), collapsing a single no-reduce task to a legacy
+   * child run. When absent, spawn_subagent stays out of the resolved tool list so the model
+   * never sees a non-working tool (children get no executor → no recursion).
    */
   spawnSubagentExecutor?: SpawnSubagentExecutor;
   /** Cancels a running background job (sub-agent or bash). Enables the job_stop tool. */

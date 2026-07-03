@@ -24,15 +24,21 @@ import type {
   SpawnSubagentRequest,
   SpawnSubagentResult,
   SpawnSubagentStatus,
+  SpawnSubagentGroupRequest,
+  SubagentGroupProgress,
+  SubagentGroupReport,
+  SubagentGroupResult,
+  SubagentGroupItemResult,
   JobStopExecutor,
   BackgroundExecExecutor,
   TaskOutputReader,
   ChannelMessageExecutor,
   AgentMode,
 } from "../core/tool-registry.js";
-import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency } from "../core/subagent-registry.js";
+import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency, getGroupWorkerShare, getSubagentGroupMaxRuntimeMs } from "../core/subagent-registry.js";
+import { buildReduceInput, GroupCircuitBreaker, truncateReduceSummary, type GroupItemOutcome, type GroupItemStatus } from "./subagent-group.js";
 import { JobRegistry, type JobStatus } from "../core/job-registry.js";
-import { buildNotificationBatch, type TaskNotification } from "../core/task-notification.js";
+import { buildNotificationBatch, buildGroupNotificationSummary, summarizeItemStatuses, type TaskNotification } from "../core/task-notification.js";
 import { spawnBackgroundBash } from "../core/background-bash-runner.js";
 import { DiskTaskOutput, getTaskOutputPath } from "../tools/cmd-exec/disk-output.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
@@ -168,6 +174,13 @@ const SESSION_RELEASE_TTL_MS = 30_000;
  * turn (which clears the release timer) always wins the race.
  */
 const NOTIFICATION_COALESCE_MS = 600;
+/**
+ * Min interval between live `group_progress` chat events for a background group. The
+ * orchestrator fires a progress callback on every item start/finish; this coalesces a burst
+ * (e.g. a wave of children finishing together) into one event, with a trailing flush so the
+ * final frame always lands. Live-only immediacy knob — correctness comes from persisted events.
+ */
+const GROUP_PROGRESS_THROTTLE_MS = 700;
 /** One-time guard for the "synthetic turn can't persist" diagnostic (see runSyntheticPrompt). */
 let warnedNoPersist = false;
 /** Delay before auto-clearing a fully-completed plan (CC V2 parity: HIDE_DELAY_MS). */
@@ -340,9 +353,10 @@ export class AgentBoxSessionManager {
   private ledgerHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
-   * Bounds concurrent foreground sub-agent child sessions across this AgentBox
-   * (a wide fan-out emits N spawn_subagent calls that pi runs unbounded). Shared
-   * by every session in the pod so the cap is per-pod, not per-conversation.
+   * Bounds concurrent sub-agent child sessions across this AgentBox — a single spawn_subagent
+   * batch fans its items out through this same limiter (via a bounded worker pool), so a wide
+   * fan-out never spins up one child agent + LLM stream per target at once. Shared by every
+   * session in the pod so the cap is per-pod, not per-conversation.
    */
   private subagentLimiter = new ConcurrencyLimiter(getSubagentConcurrency());
 
@@ -410,38 +424,519 @@ export class AgentBoxSessionManager {
     }
   }
 
+  /**
+   * The single spawn_subagent executor (design v3 §"Orchestration (batch path)", single-tool merge). The tool always
+   * hands over a batch plan (1..N rendered tasks + optional reduce); this dispatches on its shape:
+   *
+   *  - COLLAPSE (renderedTasks.length === 1 && no reducePrompt) → one legacy child run. The child
+   *    request is derived verbatim from the single task with the BARE spawnId (no `#`), so its
+   *    events, delegation_id, and completion notification are byte-identical to the pre-v3 single
+   *    spawn — the runSpawnedSubagent / startBackgroundSubagent bodies are unchanged, this is only
+   *    a new call site.
+   *  - BATCH (otherwise) → the map→reduce group orchestration (runSubagentGroup / background group).
+   *
+   * Foreground vs background was already resolved at the tool layer (conditional default); here we
+   * only branch on request.runInBackground.
+   */
   private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
     return async (request, onProgress, signal) => {
-      if (request.runInBackground) return this.startBackgroundSubagent(request);
-      // Already aborted before we even queue (e.g. the whole turn was cancelled): don't
-      // acquire a slot or spin up a throwaway child session — short-circuit cleanly.
-      if (signal?.aborted) {
-        return { status: "partial", summary: "Sub-agent cancelled before starting.", childSessionId: "", toolCalls: 0, durationMs: 0 };
-      }
-      // Cap concurrent foreground children: a wide fan-out queues past the limit
-      // instead of spinning up one child agent + LLM stream per target at once.
-      const lim = this.subagentLimiter;
-      if (lim.atCapacity) {
-        console.log(
-          `[agentbox-session] sub-agent "${request.description}" queued — ` +
-          `${lim.activeCount}/${lim.limit} running, ${lim.pendingCount + 1} waiting (SICLAW_SUBAGENT_CONCURRENCY=${lim.limit})`,
-        );
-        // Tell the UI this child is waiting for a slot, not running — otherwise pi's
-        // batch tool_execution_start already painted it as "running" (spinner).
-        onProgress?.({
-          status: "queued",
-          toolCalls: 0,
-          steps: [],
-          activity: `Waiting for a free slot (${lim.limit} sub-agents run at a time)…`,
+      const isCollapse = request.renderedTasks.length === 1 && !request.reducePrompt;
+
+      if (isCollapse) {
+        const task = request.renderedTasks[0];
+        // Derive the per-child request. spawnId stays the bare toolCallId (request.spawnId) so the
+        // collapse path's delegation_event folds via the single-subagent UI path, exactly as before.
+        const childReq: SpawnSubagentRequest = {
+          description: request.description,
+          prompt: task.prompt,
+          subagentType: request.subagentType,
+          runInBackground: request.runInBackground,
+          parentSessionId: request.parentSessionId,
+          parentAgentId: request.parentAgentId,
+          userId: request.userId,
+          taskListId: request.taskListId,
+          spawnId: request.spawnId,
+        };
+        if (childReq.runInBackground) return this.startBackgroundSubagent(childReq);
+        // Already aborted before we even queue (e.g. the whole turn was cancelled): don't
+        // acquire a slot or spin up a throwaway child session — short-circuit cleanly.
+        if (signal?.aborted) {
+          return { status: "partial", summary: "Sub-agent cancelled before starting.", childSessionId: "", toolCalls: 0, durationMs: 0 };
+        }
+        // Cap concurrent foreground children: a wide fan-out queues past the limit
+        // instead of spinning up one child agent + LLM stream per target at once.
+        const lim = this.subagentLimiter;
+        if (lim.atCapacity) {
+          console.log(
+            `[agentbox-session] sub-agent "${childReq.description}" queued — ` +
+            `${lim.activeCount}/${lim.limit} running, ${lim.pendingCount + 1} waiting (SICLAW_SUBAGENT_CONCURRENCY=${lim.limit})`,
+          );
+          // Tell the UI this child is waiting for a slot, not running — otherwise pi's
+          // batch tool_execution_start already painted it as "running" (spinner).
+          onProgress?.({
+            status: "queued",
+            toolCalls: 0,
+            steps: [],
+            activity: `Waiting for a free slot (${lim.limit} sub-agents run at a time)…`,
+          });
+        }
+        return lim.run(() => {
+          console.log(`[agentbox-session] sub-agent "${childReq.description}" started — ${lim.activeCount}/${lim.limit} running`);
+          // Flip a previously-queued card to "running" immediately on slot acquisition,
+          // before the child's first tool call emits progress (avoids a stale "Queued").
+          onProgress?.({ status: "running", toolCalls: 0, steps: [] });
+          return this.runSpawnedSubagent(childReq, undefined, onProgress, signal);
         });
       }
-      return lim.run(() => {
-        console.log(`[agentbox-session] sub-agent "${request.description}" started — ${lim.activeCount}/${lim.limit} running`);
-        // Flip a previously-queued card to "running" immediately on slot acquisition,
-        // before the child's first tool call emits progress (avoids a stale "Queued").
-        onProgress?.({ status: "running", toolCalls: 0, steps: [] });
-        return this.runSpawnedSubagent(request, undefined, onProgress, signal);
+
+      // ── Batch (map→reduce): background (default for a multi-item batch) → register a job, return
+      //    "launched", notify on completion; foreground → run the whole group and return inline. ──
+      if (request.runInBackground) return this.startBackgroundSubagentGroup(request);
+      // Already aborted before we queue anything (whole turn cancelled): short-circuit
+      // without creating any child session — every item is skipped.
+      if (signal?.aborted) {
+        return {
+          status: "failed",
+          itemResults: request.renderedTasks.map((t) => ({
+            item: t.item,
+            status: "skipped" as const,
+            summary: "Group cancelled before starting.",
+            childSessionId: "",
+          })),
+          durationMs: 0,
+        };
+      }
+      return this.runSubagentGroup(request, onProgress, signal);
+    };
+  }
+
+  /**
+   * Core group orchestration (design §"Orchestration (batch path)"). Shared by the foreground and background
+   * paths. Contract:
+   *  - The orchestrator itself NEVER holds a `subagentLimiter` slot (that would deadlock
+   *    when several groups run at once). It submits children INTO the global limiter via a
+   *    worker pool that keeps at most `getGroupWorkerShare()` in flight, so an interactive
+   *    spawn_subagent always keeps ≥1 slot.
+   *  - Child sessions are created LAZILY inside each worker (via runSpawnedSubagent) — never
+   *    all N at once.
+   *  - Each child goes through the UNCHANGED runSpawnedSubagent (global limiter, 600s child
+   *    backstop, transcript persistence, delegation_event). Group children are tagged
+   *    `{groupId}#{index}`.
+   *  - A single failed/timed-out item does NOT abort the group; its status + summary flow
+   *    into the reduce input (a bounded, deliberate exception to fail-fast: a failure is a
+   *    valid diagnostic signal, not dirty data to propagate).
+   *  - Circuit breaker (completion order): first 5 all-failed with zero success → stop
+   *    submitting + abort in-flight; the rest are `skipped`.
+   *  - Group-level backstop (scaled to size) aborts the MAP phase; a reduce still runs if
+   *    ≥1 item produced usable output and the user didn't cancel.
+   */
+  private async runSubagentGroup(
+    request: SpawnSubagentGroupRequest,
+    onProgress?: (progress: SubagentGroupProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<SubagentGroupReport> {
+    const startedAt = Date.now();
+    const groupId = request.spawnId;
+    const tasks = request.renderedTasks;
+    const total = tasks.length;
+
+    // Two abort scopes:
+    //  - userAbort fires ONLY on the external signal (user Stop / job_stop). It cancels
+    //    both the map children AND the reduce child.
+    //  - mapAbort fires on userAbort OR the group timeout OR a circuit-break. It cancels
+    //    only the MAP children — a map-phase timeout must NOT kill a still-valuable reduce
+    //    (which keeps its own 600s child backstop).
+    const userAbort = new AbortController();
+    const mapAbort = new AbortController();
+    const onExternalAbort = () => { userAbort.abort(); mapAbort.abort(); };
+    if (signal) {
+      if (signal.aborted) onExternalAbort();
+      else signal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+
+    let timedOut = false;
+    const maxRuntimeMs = getSubagentGroupMaxRuntimeMs(total, getGroupWorkerShare());
+    const timer = setTimeout(() => { timedOut = true; mapAbort.abort(); }, maxRuntimeMs);
+    timer.unref?.();
+
+    type ItemState = {
+      status: "queued" | "running" | GroupItemStatus;
+      summary: string;
+      childSessionId: string;
+    };
+    const states: ItemState[] = tasks.map(() => ({ status: "queued", summary: "", childSessionId: "" }));
+    const breaker = new GroupCircuitBreaker();
+
+    const emit = (phase: "map" | "reduce") =>
+      onProgress?.({
+        phase,
+        items: states.map((s, index) => ({ index, status: s.status })),
       });
+
+    const runOne = async (i: number): Promise<void> => {
+      const state = states[i];
+      // Aborted / tripped before this item starts → never spawn a child (skipped).
+      if (mapAbort.signal.aborted || breaker.tripped) {
+        state.status = "skipped";
+        state.summary = timedOut
+          ? "Skipped (group timed out before this item started)."
+          : breaker.tripped
+            ? "Skipped (circuit breaker: too many early failures)."
+            : "Skipped (group cancelled).";
+        return;
+      }
+      const childReq: SpawnSubagentRequest = {
+        description: `${request.description} [${i + 1}/${total}]`,
+        prompt: tasks[i].prompt,
+        subagentType: request.subagentType,
+        runInBackground: false,
+        parentSessionId: request.parentSessionId,
+        parentAgentId: request.parentAgentId,
+        userId: request.userId,
+        taskListId: request.taskListId,
+        // `#` is not touched by delegation-id validation (verified): children of a group are
+        // tied to it by this prefix, which the UI groups on.
+        spawnId: `${groupId}#${i}`,
+      };
+      let res: SpawnSubagentResult;
+      try {
+        // Submit INTO the global limiter (lazy child creation happens inside runSpawnedSubagent).
+        // Mark `running` + emit only once the slot is acquired (inside the thunk) — an item that
+        // is still waiting for a limiter slot must stay `queued`, not report as running.
+        res = await this.subagentLimiter.run(() => {
+          state.status = "running";
+          emit("map");
+          return this.runSpawnedSubagent(childReq, undefined, undefined, mapAbort.signal);
+        });
+      } catch (err) {
+        res = {
+          status: "failed",
+          summary: `Sub-agent errored: ${err instanceof Error ? err.message : String(err)}`,
+          childSessionId: "",
+          toolCalls: 0,
+          durationMs: 0,
+        };
+      }
+      if (res.status === "launched") {
+        // Defensive: a foreground child never returns launched.
+        state.status = "failed";
+        state.summary = "Unexpected launched status in group map stage.";
+      } else {
+        state.status = res.status;
+        state.summary = res.summary;
+        state.childSessionId = res.childSessionId;
+      }
+      breaker.record(state.status as GroupItemStatus);
+      if (breaker.tripped) {
+        // Stop the whole map phase: skip everything not yet started + abort in-flight.
+        mapAbort.abort();
+      }
+      emit("map");
+    };
+
+    // Worker pool: `getGroupWorkerShare()` workers drain a shared index counter, so at most
+    // that many children are ever submitted to the global limiter at once.
+    let nextIndex = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = nextIndex++;
+        if (i >= total) break;
+        await runOne(i);
+      }
+    };
+    const workerCount = Math.max(1, Math.min(getGroupWorkerShare(), total));
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    // Disarm the group timer NOW that the map phase has drained. Its semantics is a MAP-phase
+    // backstop (it fires `mapAbort`); leaving it armed through a slow reduce would let it fire
+    // during the reduce and set `timedOut = true`, which the overall-status derivation would then
+    // mistake for a map-phase timeout (flagging a map-partial batch `timed_out` instead of
+    // `partial`). The reduce child keeps its own independent 600s backstop, so nothing is left
+    // unguarded.
+    clearTimeout(timer);
+
+    // ── Reduce stage ──
+    const doneCount = states.filter((s) => s.status === "done").length;
+    const usableCount = states.filter((s) => s.status === "done" || s.status === "partial").length;
+
+    let reduceSummary: string | undefined;
+    let reduceChildSessionId: string | undefined;
+    let reduceTruncated = false;
+    // Run reduce when: a reduce_prompt was given, at least one item produced usable output
+    // (done or partial), the user didn't cancel, AND the circuit breaker did not trip. A
+    // map-phase timeout does NOT block reduce (the reduce child keeps its own 600s backstop),
+    // but a tripped breaker signals a systematic template/environment error: an in-flight child
+    // that mapAbort turned into a `partial` must NOT lift usableCount over the gate and drag a
+    // doomed batch into a wasted reduce. Circuit break ⇒ skip reduce, overall status failed.
+    if (request.reducePrompt && usableCount > 0 && !userAbort.signal.aborted && !breaker.tripped) {
+      emit("reduce");
+      const outcomes: GroupItemOutcome[] = states.map((s, i) => ({
+        item: tasks[i].item,
+        status: s.status as GroupItemStatus,
+        summary: s.summary,
+      }));
+      const reduceReq: SpawnSubagentRequest = {
+        description: `${request.description} — summary`,
+        prompt: buildReduceInput(request.reducePrompt, outcomes),
+        subagentType: request.subagentType,
+        runInBackground: false,
+        parentSessionId: request.parentSessionId,
+        parentAgentId: request.parentAgentId,
+        userId: request.userId,
+        taskListId: request.taskListId,
+        spawnId: `${groupId}#reduce`,
+      };
+      try {
+        const reduceRes = await this.subagentLimiter.run(() =>
+          this.runSpawnedSubagent(reduceReq, undefined, undefined, userAbort.signal),
+        );
+        if (reduceRes.status !== "launched") {
+          // Use the FULL reduce report, not the 1800-char capsule, before applying the group's
+          // 6000-char budget (design decision #21): the capsule is already ≤1800, so truncating it
+          // to 6000 was a no-op and the larger group budget never took effect.
+          const trunc = truncateReduceSummary(reduceRes.fullSummary ?? reduceRes.summary);
+          reduceSummary = trunc.text;
+          reduceTruncated = trunc.truncated;
+          reduceChildSessionId = reduceRes.childSessionId;
+        }
+      } catch (err) {
+        reduceSummary = `Reduce stage failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+
+    // ── Overall status ──
+    // `timedOut` can only be set during the MAP phase now — the timer is disarmed above before the
+    // reduce stage, so a slow reduce never flips it. `doneCount === total` still precedes `timedOut`
+    // to cover the race where the timer fired just as the final map child finished `done` (all items
+    // usable ⇒ report `done`, not `timed_out`).
+    const circuitBroken = breaker.tripped;
+    let status: SubagentGroupReport["status"];
+    if (circuitBroken) status = "failed"; // systematic failure (reduce skipped) → whole batch failed
+    else if (usableCount === 0) status = "failed";
+    else if (userAbort.signal.aborted) status = "partial";
+    else if (doneCount === total) status = "done";
+    else if (timedOut) status = "timed_out";
+    else status = "partial";
+
+    const durationMs = Date.now() - startedAt;
+    const itemResults: SubagentGroupItemResult[] = states.map((s, i) => ({
+      item: tasks[i].item,
+      status: s.status as GroupItemStatus,
+      summary: s.summary,
+      childSessionId: s.childSessionId,
+    }));
+
+    // A tripped breaker skips reduce, so there is no reduce summary to fold the reason into;
+    // carry the breaker reason in the terminal capsule (completion notification / group card)
+    // so the user learns WHY the batch stopped. The report additionally flags `circuitBroken`.
+    const capsule = circuitBroken
+      ? `${breaker.reason}\n\n${summarizeItemStatuses(itemResults)}`
+      : reduceSummary ?? summarizeItemStatuses(itemResults);
+
+    // Group terminal delegation_event (design §"Persistence & lineage"): delegationId == groupId ties the
+    // per-child events (`{groupId}#{i}`) together so the UI rebuilds the card on reload.
+    // childSessionId → reduce child when present, else empty string (the card drills in
+    // per-item, not via this field). skipped items are NEVER persisted as child events.
+    await this.persistGroupTerminalEvent(request, {
+      status,
+      capsule,
+      summaryTruncated: reduceTruncated,
+      reduceChildSessionId,
+      durationMs,
+    });
+
+    return {
+      status,
+      itemResults,
+      ...(reduceSummary !== undefined ? { reduceSummary } : {}),
+      ...(reduceChildSessionId ? { reduceChildSessionId } : {}),
+      ...(circuitBroken ? { circuitBroken } : {}),
+      durationMs,
+    };
+  }
+
+  /** Persist the group's terminal delegation_event (best-effort; no-op without persistence). */
+  private async persistGroupTerminalEvent(
+    request: SpawnSubagentGroupRequest,
+    outcome: {
+      status: "done" | "partial" | "failed" | "timed_out";
+      capsule: string;
+      summaryTruncated: boolean;
+      reduceChildSessionId?: string;
+      durationMs: number;
+    },
+  ): Promise<void> {
+    const agentId = request.parentAgentId ?? this.agentId ?? null;
+    const canPersist = Boolean(this.gatewayClient && agentId && request.userId && request.parentSessionId);
+    if (!canPersist) return;
+    try {
+      await this.persistAppendDelegationEvent({
+        parentSessionId: request.parentSessionId,
+        parentAgentId: agentId,
+        userId: request.userId,
+        delegationId: request.spawnId,
+        childSessionId: outcome.reduceChildSessionId ?? "",
+        targetAgentId: agentId,
+        status: outcome.status,
+        capsule: outcome.capsule,
+        fullSummary: outcome.capsule,
+        summaryTruncated: outcome.summaryTruncated,
+        scope: request.description,
+        toolCalls: 0,
+        durationMs: outcome.durationMs,
+      });
+    } catch (err) {
+      console.warn(`[agentbox-session] group terminal delegation event persist failed for ${request.spawnId}:`, err);
+    }
+  }
+
+  /**
+   * Launch a sub-agent group detached (design §"Job model & notification"). Registers a JobRegistry job
+   * (reusing type "subagent" + isGroup), returns "launched" immediately, and notifies the
+   * parent on completion. Background work blocks session release until it finishes.
+   */
+  private startBackgroundSubagentGroup(request: SpawnSubagentGroupRequest): SubagentGroupResult {
+    const jobId = request.spawnId;
+    const controller = new AbortController();
+
+    // Stop latch: the user pressed Stop before this group launched → register it terminal
+    // ("stopped") and skip the run. suppressNotifyTurn keeps the model from waking on its
+    // own cancellation.
+    if (this.sessions.get(request.parentSessionId)?._aborted) {
+      this.jobs.register({
+        jobId,
+        type: "subagent",
+        isGroup: true,
+        parentSessionId: request.parentSessionId,
+        status: "stopped",
+        description: request.description,
+        startedAt: Date.now(),
+        notified: false,
+        suppressNotifyTurn: true,
+      });
+      void this.notifyParent(request.parentSessionId, jobId, {
+        taskId: jobId,
+        status: "stopped",
+        summary: `Sub-agent group "${request.description}" was stopped`,
+      });
+      return { status: "launched", jobId };
+    }
+
+    this.jobs.register({
+      jobId,
+      type: "subagent",
+      isGroup: true,
+      parentSessionId: request.parentSessionId,
+      status: "running",
+      description: request.description,
+      startedAt: Date.now(),
+      notified: false,
+      abort: () => controller.abort(),
+    });
+
+    const parent = this.sessions.get(request.parentSessionId);
+    if (parent) {
+      parent._backgroundWorkCount++;
+      if (parent._releaseTimer) {
+        clearTimeout(parent._releaseTimer);
+        parent._releaseTimer = null;
+      }
+    }
+
+    // Live per-item progress for the background group card (design §"Progress (two paths that must not be confused)", decision #16):
+    // the tool's onUpdate goes dead after "launched", so push a throttled `group_progress`
+    // chat event instead. It is LIVE-ONLY (never persisted) — the card's authoritative state
+    // rebuilds from the persisted per-child + terminal delegation_events on refetch/reload, so
+    // a dropped/coalesced progress frame only costs immediacy, never correctness. Same
+    // emit_chat_event channel as subagent_done, so it degrades gracefully on an old frontend
+    // (unknown event type ignored) and no-ops when persistence isn't wired (gatewayClient absent).
+    const onProgress = this.makeGroupProgressEmitter(request.parentSessionId, jobId);
+
+    void this.runSubagentGroup(request, onProgress.emit, controller.signal)
+      .then((report) => {
+        onProgress.settle();
+        const job = this.jobs.get(jobId);
+        const stopped = job?.status === "stopped";
+        const status: JobStatus = stopped ? "stopped" : report.status;
+        this.jobs.setStatus(jobId, status);
+        void this.notifyParent(request.parentSessionId, jobId, {
+          taskId: jobId,
+          status,
+          summary: stopped
+            ? `Sub-agent group "${request.description}" was stopped`
+            : buildGroupNotificationSummary(request.description, report),
+        });
+      })
+      .catch((err) => {
+        console.warn(`[agentbox-session] background sub-agent group ${jobId} failed:`, err);
+        const stopped = this.jobs.get(jobId)?.status === "stopped";
+        this.jobs.setStatus(jobId, stopped ? "stopped" : "failed");
+        void this.notifyParent(request.parentSessionId, jobId, {
+          taskId: jobId,
+          status: stopped ? "stopped" : "failed",
+          summary: stopped
+            ? `Sub-agent group "${request.description}" was stopped`
+            : `Sub-agent group "${request.description}" failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      })
+      .finally(() => {
+        onProgress.settle();
+        this.releaseBackgroundWork(request.parentSessionId);
+      });
+
+    return { status: "launched", jobId };
+  }
+
+  /**
+   * Build a throttled `group_progress` emitter for a background group (design §"Progress (two paths that must not be confused)"). It
+   * coalesces the per-item transition callbacks (which fire on every item start/finish) into at
+   * most one chat event per {@link GROUP_PROGRESS_THROTTLE_MS}, always flushing the latest state
+   * via a trailing timer so the final "all terminal / reduce" frame is never lost. `settle()`
+   * is flush-then-stop: it synchronously emits any pending trailing frame BEFORE clearing, so the
+   * last live frame the card sees is the terminal one (the completion refetch reconciles the full
+   * per-item detail afterwards). Dropping it here — the old behaviour — left the live card animating
+   * one frame short of terminal until the refetch landed (smoke defect S2).
+   */
+  private makeGroupProgressEmitter(
+    parentSessionId: string,
+    jobId: string,
+  ): { emit: (progress: SubagentGroupProgress) => void; settle: () => void } {
+    let lastEmitAt = 0;
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    let latest: SubagentGroupProgress | null = null;
+    const flush = () => {
+      pending = null;
+      if (!latest) return;
+      lastEmitAt = Date.now();
+      const snapshot = latest;
+      latest = null;
+      void this.persistDelegationEvent({
+        type: "delegation.emit_chat_event",
+        sessionId: parentSessionId,
+        event: { type: "group_progress", job_id: jobId, phase: snapshot.phase, items: snapshot.items },
+      }).catch((err) => {
+        // Best-effort live update (never rethrow): correctness rebuilds from the persisted per-child
+        // + terminal events on refetch. Log so a systematically failing progress channel is visible.
+        console.warn(`[agentbox-session] group ${jobId} group_progress emit failed:`, err);
+      });
+    };
+    return {
+      emit: (progress) => {
+        latest = progress;
+        const elapsed = Date.now() - lastEmitAt;
+        if (elapsed >= GROUP_PROGRESS_THROTTLE_MS) {
+          flush();
+        } else if (!pending) {
+          pending = setTimeout(flush, GROUP_PROGRESS_THROTTLE_MS - elapsed);
+          pending.unref?.();
+        }
+      },
+      // Flush-then-stop: emit the pending trailing frame (the terminal snapshot) synchronously,
+      // then clear the timer. Idempotent — a second settle() finds no pending frame and no-ops.
+      settle: () => {
+        if (pending) { clearTimeout(pending); pending = null; }
+        flush();
+      },
     };
   }
 
@@ -755,8 +1250,17 @@ export class AgentBoxSessionManager {
       void this.persistDelegationEvent({
         type: "delegation.emit_chat_event",
         sessionId,
-        event: { type: "subagent_done", sessionId, job_id: jobId, status: n.status },
-      }).catch(() => {});
+        // is_group (additive, within the reused subagent branch) lets the frontend tell a group
+        // completion apart from a single sub-agent: the group card can't fold full per-item
+        // detail from this event alone, so the frontend does an authoritative refetch instead of
+        // the in-place status fold used for single sub-agents. Absent → treated as single.
+        event: { type: "subagent_done", sessionId, job_id: jobId, status: n.status, is_group: job.isGroup === true },
+      }).catch((err) => {
+        // Best-effort live card fold (never rethrow): the persisted delegation_event still drives
+        // the refetch fold. Log so a systematically failing completion channel is visible instead
+        // of silently leaving the card on "Running…".
+        console.warn(`[agentbox-session] ${job.isGroup ? "group" : "sub-agent"} ${jobId} subagent_done emit failed:`, err);
+      });
     }
 
     // User Stop is terminal: the card already folded to "stopped" above, but do NOT wake the model

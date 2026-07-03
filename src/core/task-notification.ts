@@ -17,6 +17,7 @@
  */
 
 import type { JobStatus } from "./job-registry.js";
+import type { GroupItemStatus, SubagentGroupReport } from "./tool-registry.js";
 
 export interface TaskNotification {
   taskId: string;
@@ -87,4 +88,27 @@ export function buildNotificationBatch(notifications: TaskNotification[]): strin
     `${blocks}\n` +
     `<instructions>${notifications.length} background jobs finished — address them together in ONE reply. ${NOTIFICATION_INSTRUCTIONS}</instructions>`
   );
+}
+
+// ── spawn_subagent batch notification text (design §"Job model & notification") ────────────────
+
+/** Compact per-status digest for a group, e.g. "5 item(s): 3 done, 1 failed, 1 skipped". */
+export function summarizeItemStatuses(items: Array<{ status: GroupItemStatus }>): string {
+  const counts = new Map<GroupItemStatus, number>();
+  for (const it of items) counts.set(it.status, (counts.get(it.status) ?? 0) + 1);
+  const order: GroupItemStatus[] = ["done", "partial", "failed", "timed_out", "skipped"];
+  const parts = order.filter((s) => counts.has(s)).map((s) => `${counts.get(s)} ${s}`);
+  return `${items.length} item(s): ${parts.join(", ")}`;
+}
+
+/**
+ * Group completion notification summary: a one-line status/count digest with the reduce
+ * summary (when present) inlined beneath it. Distinct from a single sub-agent's summary in
+ * that it carries the map→reduce synthesis, so the model relays ONE combined result instead
+ * of N per-item reports. Fed to {@link TaskNotification.summary} (no output_file — the result
+ * is inline, same as a single sub-agent).
+ */
+export function buildGroupNotificationSummary(description: string, report: SubagentGroupReport): string {
+  const head = `Sub-agent group "${description}" ${report.status} — ${summarizeItemStatuses(report.itemResults)}.`;
+  return report.reduceSummary ? `${head}\n\n${report.reduceSummary}` : head;
 }

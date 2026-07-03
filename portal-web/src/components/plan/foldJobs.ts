@@ -43,6 +43,11 @@ function completionFor(msg: PilotMessage): { jobId: string; status: JobStatus; c
   if (meta?.kind !== "delegation_event") return undefined
   const jobId = typeof meta.delegation_id === "string" ? meta.delegation_id : undefined
   if (!jobId) return undefined
+  // A `spawn_subagent_group` child/reduce event is tagged `{groupId}#{index}` (or `#reduce`). Those
+  // are folded into the group card, never surfaced as standalone Jobs-bar entries — the group as a
+  // whole appears once, correlated by its bare-id (`groupId`) launch + terminal event. (The launch
+  // guard below already drops them, since a child has no `launched` row; excluding here is explicit.)
+  if (jobId.includes("#")) return undefined
   const raw = typeof meta.status === "string" ? meta.status : "done"
   const status: JobStatus =
     raw === "partial" || raw === "failed" || raw === "timed_out" ? raw : "done"

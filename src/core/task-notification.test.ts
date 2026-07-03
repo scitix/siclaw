@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { buildTaskNotificationText, buildNotificationBatch, escapeXml } from "./task-notification.js";
+import {
+  buildTaskNotificationText, buildNotificationBatch, escapeXml,
+  summarizeItemStatuses, buildGroupNotificationSummary,
+} from "./task-notification.js";
+import type { SubagentGroupReport } from "./tool-registry.js";
 
 describe("task-notification", () => {
   it("includes output_file for bash notifications", () => {
@@ -62,5 +66,41 @@ describe("task-notification", () => {
 
   it("escapeXml covers the five entities", () => {
     expect(escapeXml(`<>&"'`)).toBe("&lt;&gt;&amp;&quot;&apos;");
+  });
+});
+
+describe("spawn_subagent batch notification text", () => {
+  it("summarizeItemStatuses counts each status in a fixed order", () => {
+    const digest = summarizeItemStatuses([
+      { status: "done" }, { status: "done" }, { status: "failed" }, { status: "skipped" },
+    ]);
+    expect(digest).toBe("4 item(s): 2 done, 1 failed, 1 skipped");
+  });
+
+  it("buildGroupNotificationSummary inlines the reduce summary under a status digest", () => {
+    const report: SubagentGroupReport = {
+      status: "partial",
+      durationMs: 1000,
+      reduceSummary: "Causes: 2 network, 1 storage.",
+      itemResults: [
+        { item: "a", status: "done", summary: "", childSessionId: "c1" },
+        { item: "b", status: "failed", summary: "", childSessionId: "c2" },
+        { item: "c", status: "done", summary: "", childSessionId: "c3" },
+      ],
+    };
+    const summary = buildGroupNotificationSummary("crash triage", report);
+    expect(summary).toContain('Sub-agent group "crash triage" partial');
+    expect(summary).toContain("3 item(s): 2 done, 1 failed");
+    expect(summary).toContain("Causes: 2 network, 1 storage.");
+  });
+
+  it("buildGroupNotificationSummary omits the reduce block when there is no reduce", () => {
+    const report: SubagentGroupReport = {
+      status: "done",
+      durationMs: 5,
+      itemResults: [{ item: "a", status: "done", summary: "cap", childSessionId: "c1" }],
+    };
+    const summary = buildGroupNotificationSummary("g", report);
+    expect(summary).toBe('Sub-agent group "g" done — 1 item(s): 1 done.');
   });
 });

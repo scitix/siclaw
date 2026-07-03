@@ -25,6 +25,7 @@ import {
   X,
   Download,
   CircleAlert,
+  Layers,
 } from "lucide-react"
 import { cn } from "./cn"
 import { Markdown } from "./Markdown"
@@ -258,7 +259,7 @@ const DP_CHECKPOINT_PREFIX_CHIPS: Record<string, PrefixActionChip> = {
     id: "dp-checkpoint-proceed",
     label: "Proceed",
     fullPrompt:
-      "Proceed with the current leading hypothesis or most promising lead. Do not ask for confirmation again. If there are two or more independent hypotheses, validation paths, objects, or evidence sources to check, fan out: emit one spawn_subagent per check in the same turn so they run concurrently, each with a narrow, evidence-oriented scope and only the context it needs — do not check them one-by-one yourself. When the sub-agent reports come back, synthesize them into your hypotheses, confidence, and next step. If there is only one small direct validation, run it yourself. Report evidence after the validation step.",
+      "Proceed with the current leading hypothesis or most promising lead. Do not ask for confirmation again. If there are two or more independent hypotheses, validation paths, objects, or evidence sources to check, fan out: put them all in ONE spawn_subagent call's items list so they run concurrently, each item a narrow, evidence-oriented task with only the context it needs (do not emit multiple spawn_subagent calls) — do not check them one-by-one yourself. When the sub-agent reports come back, synthesize them into your hypotheses, confidence, and next step. If there is only one small direct validation, run it yourself. Report evidence after the validation step.",
     placeholder: "Add optional direction for this step",
   },
   B: {
@@ -266,7 +267,7 @@ const DP_CHECKPOINT_PREFIX_CHIPS: Record<string, PrefixActionChip> = {
     id: "dp-checkpoint-refine",
     label: "Refine",
     fullPrompt:
-      "Refine or add hypotheses based on my additional direction below. Preserve useful evidence, update confidence, and explain what changed. If the refined direction names multiple independent hypotheses, validation paths, objects, or evidence sources, fan out: emit one spawn_subagent per check in the same turn so they run concurrently instead of checking them one-by-one yourself. Synthesize the sub-agent reports when they return.",
+      "Refine or add hypotheses based on my additional direction below. Preserve useful evidence, update confidence, and explain what changed. If the refined direction names multiple independent hypotheses, validation paths, objects, or evidence sources, fan out: put them all in ONE spawn_subagent call's items list so they run concurrently instead of checking them one-by-one yourself (do not emit multiple spawn_subagent calls). Synthesize the sub-agent reports when they return.",
     placeholder: "Describe what to adjust or add",
   },
   C: {
@@ -771,6 +772,7 @@ export function PilotArea({
                           }}
                           onOpenSkillPanel={onOpenSkillPanel}
                           onOpenSchedulePanel={onOpenSchedulePanel}
+                          onOpenSubagent={onOpenSubagent}
                           agentId={agentId}
                         />
                         {typeof childSessionId === "string" && onOpenSubagent && (
@@ -1195,6 +1197,8 @@ function statusTone(status?: string): { label: string; className: string } {
     case "aborted":
     case "cancelled":
       return { label: "Cancelled", className: "bg-amber-500/10 text-amber-400 border-amber-500/30" }
+    case "skipped":
+      return { label: "Skipped", className: "bg-muted text-muted-foreground border-border" }
     default:
       return { label: "Ready", className: "bg-secondary text-muted-foreground border-border" }
   }
@@ -1349,11 +1353,26 @@ function agentWorkBatchSummary(message: PilotMessage): {
   }
 }
 
-// A spawn_subagent launched in the background — detectable from the launch itself (run_in_background
-// arg or the "launched" result), so the card shows the indicator/running state during the LIVE turn,
-// not only after annotateSubagentCompletions runs on a refetch.
-function isBackgroundSpawn(message: PilotMessage): boolean {
+// The unified spawn_subagent tool renders as ONE of two forms (v3 single-tool merge). A BATCH form
+// (map→reduce group card) is a spawn_subagent whose items list has >1 entry OR carries a reduce_prompt;
+// a single item with no reduce is the COLLAPSE form (the legacy AgentWorkCard). The old, now-deleted
+// `spawn_subagent_group` tool name is still recognised so historical sessions keep rendering as a group.
+function isGroupFormMessage(message: PilotMessage): boolean {
+  if (message.toolName === "spawn_subagent_group") return true // legacy history
   if (message.toolName !== "spawn_subagent") return false
+  const args = message.toolArgs as Record<string, unknown> | undefined
+  const items = args?.items
+  const reduce = args?.reduce_prompt
+  const hasReduce = typeof reduce === "string" && reduce.trim() !== ""
+  return Array.isArray(items) && (items.length > 1 || hasReduce)
+}
+
+// A COLLAPSE-form spawn_subagent launched in the background — detectable from the launch itself
+// (run_in_background arg or the "launched" result), so the card shows the indicator/running state
+// during the LIVE turn, not only after annotateSubagentCompletions runs on a refetch. A batch-form
+// launch is a group (handled by the group card), so it is explicitly excluded here.
+function isBackgroundSpawn(message: PilotMessage): boolean {
+  if (message.toolName !== "spawn_subagent" || isGroupFormMessage(message)) return false
   if ((message.toolArgs as Record<string, unknown> | undefined)?.run_in_background === true) return true
   const parsed = message.content ? parseJsonRecord(message.content) : null
   return stringValue(parsed?.status) === "launched"
@@ -1378,6 +1397,13 @@ function agentWorkSummary(message: PilotMessage): {
   const metadata = message.metadata ?? {}
   const parsedContent = message.content ? parseJsonRecord(message.content) : null
   const result = parsedContent ?? details
+  // v3 collapse form: the model-visible content is the uniform `{status, item_results:[…]}`
+  // envelope (no top-level summary/tool_calls/duration_ms), so the legacy single-spawn fields the
+  // card renders come from toolDetails; the capsule also mirrors into item_results[0].summary.
+  const firstItem =
+    (Array.isArray((result as Record<string, unknown>).item_results)
+      ? ((result as Record<string, unknown>).item_results as unknown[])[0]
+      : undefined) as Record<string, unknown> | undefined
   const rawTarget =
     stringValue(args.agent_id) ??
     stringValue(metadata.target_agent_id) ??
@@ -1394,6 +1420,7 @@ function agentWorkSummary(message: PilotMessage): {
   const durationMs =
     numberValue(result.duration_ms) ??
     numberValue(result.durationMs) ??
+    numberValue(details.duration_ms) ??
     numberValue(metadata.duration_ms) ??
     numberValue(metadata.durationMs)
   return {
@@ -1405,6 +1432,8 @@ function agentWorkSummary(message: PilotMessage): {
       // Background spawn: the folded sub-agent report (subBgSummary), not the launch JSON.
       stringValue(metadata.subBgSummary) ??
       stringValue(result.summary) ??
+      stringValue(details.summary) ??
+      stringValue(firstItem?.summary) ??
       (isBackgroundSpawn(message) ? undefined : stringValue(message.content)),
     ),
     fullSummary: normalizeAgentWorkSummary(
@@ -1419,7 +1448,7 @@ function agentWorkSummary(message: PilotMessage): {
       stringValue(result.child_session_id) ??
       stringValue(details.child_session_id) ??
       stringValue(metadata.child_session_id),
-    toolCalls: numberValue(result.tool_calls) ?? numberValue(result.toolCalls),
+    toolCalls: numberValue(result.tool_calls) ?? numberValue(result.toolCalls) ?? numberValue(details.tool_calls),
     duration: compactDuration(durationMs ?? message.metadata?.durationMs as number | undefined),
     toolTrace: toolTraceValue(result.tool_trace ?? result.toolTrace ?? details.tool_trace ?? details.toolTrace),
     status:
@@ -1456,6 +1485,7 @@ function MessageItem({
   onChipClick,
   onOpenSkillPanel,
   onOpenSchedulePanel,
+  onOpenSubagent,
   agentId,
   canEditMessage,
   editingContent,
@@ -1472,6 +1502,8 @@ function MessageItem({
   onChipClick?: (chip: FillActionChip, meta: { isDpCheckpoint: boolean }) => void
   onOpenSkillPanel?: (msg: PilotMessage) => void
   onOpenSchedulePanel?: (msg: PilotMessage) => void
+  /** Drill into a child sub-agent transcript (used by the group card's per-item rows). */
+  onOpenSubagent?: (childSessionId: string, status?: string, label?: string) => void
   agentId?: string
   canEditMessage?: boolean
   editingContent?: string | null
@@ -1495,6 +1527,11 @@ function MessageItem({
   if (isTool) {
     if (message.toolName === "delegate_to_agents") {
       return <AgentWorkBatchCard message={message} />
+    }
+    // Batch form (or legacy spawn_subagent_group) → the map→reduce group card; a single-task
+    // (collapse) spawn_subagent, a delegate, or an agent_work event → the AgentWorkCard.
+    if (isGroupFormMessage(message)) {
+      return <SubagentGroupCard message={message} onOpenSubagent={onOpenSubagent} />
     }
     if (message.toolName === "delegate_to_agent" || message.toolName === "spawn_subagent" || message.metadata?.kind === "agent_work") {
       return <AgentWorkCard message={message} />
@@ -2281,6 +2318,282 @@ function AgentWorkBatchRow({ task }: { task: AgentWorkBatchTask }) {
             <div className="text-[10px] uppercase tracking-wide text-muted-foreground/70">
               capsule capped
             </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── spawn_subagent batch card (declarative map→reduce) ───────────────────────────────────────
+
+interface GroupItemView {
+  index: number
+  label: string
+  status: string
+  summary?: string
+  childSessionId?: string
+}
+
+/** One-line label for a group item (a plain string, or a compact JSON of an object item). */
+function groupItemLabel(raw: unknown): string {
+  if (typeof raw === "string") return raw
+  if (raw && typeof raw === "object") {
+    try { return JSON.stringify(raw) } catch { return String(raw) }
+  }
+  return ""
+}
+
+/**
+ * Unify a group card's state across its two shapes: a FOREGROUND group returns the full report
+ * inline (content/toolDetails.item_results); a BACKGROUND group returns {status:"launched"} and its
+ * detail is folded onto the launch card's metadata (groupItems from persisted events, groupProgress
+ * from the live event, groupStatus/reduce from the terminal event). The launch args always carry the
+ * original items, so item count + labels survive even before any child completes.
+ */
+function groupWorkSummary(message: PilotMessage): {
+  title: string
+  background: boolean
+  overallStatus: string
+  phase?: string
+  items: GroupItemView[]
+  reduceSummary?: string
+  reduceChildSessionId?: string
+  duration?: string
+} {
+  const args = message.toolArgs ?? {}
+  const details = message.toolDetails ?? {}
+  const metadata = message.metadata ?? {}
+  const parsed = message.content ? parseJsonRecord(message.content) : null
+  const background = Boolean(metadata.groupBackground) || stringValue(parsed?.status) === "launched"
+
+  const argItems = Array.isArray(args.items) ? (args.items as unknown[]) : []
+  // Foreground inline: full per-item detail (with child_session_id) lives in toolDetails.item_results.
+  const inlineResults = Array.isArray(details.item_results)
+    ? (details.item_results as Array<Record<string, unknown>>)
+    : Array.isArray(parsed?.item_results)
+      ? (parsed!.item_results as Array<Record<string, unknown>>)
+      : Array.isArray(parsed?.items)
+        ? (parsed!.items as Array<Record<string, unknown>>)
+        : []
+  // Background: folded terminal per-item state + the live progress frame. For a FOREGROUND group
+  // the live frame arrives as toolDetails.items ([{index,status}]) via the tool's onUpdate.
+  const folded = Array.isArray(metadata.groupItems) ? (metadata.groupItems as Array<Record<string, unknown>>) : []
+  const progress = metadata.groupProgress as { phase?: string; items?: Array<Record<string, unknown>> } | undefined
+  const liveItems = Array.isArray(progress?.items)
+    ? progress!.items!
+    : Array.isArray(details.items)
+      ? (details.items as Array<Record<string, unknown>>)
+      : []
+
+  const total = Math.max(argItems.length, inlineResults.length, folded.length, liveItems.length)
+  const items: GroupItemView[] = []
+  for (let i = 0; i < total; i++) {
+    const inline = inlineResults[i]
+    const fold = folded.find((f) => numberValue(f.index) === i)
+    const live = liveItems.find((l) => numberValue(l.index) === i)
+    const rawItem = inline?.item ?? argItems[i]
+    // Priority: inline (foreground, authoritative) → folded terminal event → live frame → default.
+    const status =
+      stringValue(inline?.status) ??
+      stringValue(fold?.status) ??
+      stringValue(live?.status) ??
+      (background ? "running" : "pending")
+    items.push({
+      index: i,
+      label: groupItemLabel(rawItem),
+      status,
+      summary: stringValue(inline?.summary) ?? stringValue(fold?.summary),
+      childSessionId:
+        stringValue(inline?.child_session_id) ??
+        stringValue((fold as Record<string, unknown> | undefined)?.childSessionId),
+    })
+  }
+
+  const overallStatus =
+    stringValue(metadata.groupStatus) ??
+    (background ? "running" : stringValue(parsed?.status)) ??
+    "running"
+  const durationMs =
+    numberValue(parsed?.duration_ms) ??
+    numberValue(details.duration_ms) ??
+    numberValue(metadata.durationMs)
+
+  return {
+    title: stringValue(args.description) ?? stringValue(metadata.scope) ?? "Sub-agent group",
+    background,
+    overallStatus,
+    phase: stringValue(progress?.phase) ?? stringValue(details.phase),
+    items,
+    reduceSummary:
+      stringValue(metadata.groupReduceSummary) ??
+      stringValue(parsed?.reduce_summary) ??
+      stringValue(details.reduce_summary),
+    reduceChildSessionId:
+      stringValue(metadata.groupReduceChildSessionId) ??
+      stringValue(details.reduce_child_session_id),
+    duration: compactDuration(durationMs),
+  }
+}
+
+const GROUP_DONE_STATUSES = new Set(["done", "success", "allowed"])
+
+function SubagentGroupCard({
+  message,
+  onOpenSubagent,
+}: {
+  message: PilotMessage
+  onOpenSubagent?: (childSessionId: string, status?: string, label?: string) => void
+}) {
+  const group = groupWorkSummary(message)
+  const [expanded, setExpanded] = useState(message.isStreaming ?? false)
+  const isOpen = message.isStreaming || expanded
+  const total = group.items.length
+  const doneCount = group.items.filter((i) => GROUP_DONE_STATUSES.has(i.status)).length
+  const settledCount = group.items.filter(
+    (i) => i.status !== "running" && i.status !== "pending" && i.status !== "queued",
+  ).length
+  const isRunning =
+    group.overallStatus === "running" || group.overallStatus === "launched" || message.isStreaming === true
+  const inReduce = group.phase === "reduce"
+  const tone =
+    isRunning && doneCount > 0 && doneCount < total
+      ? { label: `${doneCount}/${total} done`, className: statusTone("partial").className }
+      : isRunning
+        ? { label: inReduce ? "Summarizing" : "Running", className: statusTone("running").className }
+        : statusTone(group.overallStatus)
+  const pct = total > 0 ? Math.round((settledCount / total) * 100) : 0
+  const aggregateBits = [
+    `${total} sub-agent${total === 1 ? "" : "s"}`,
+    group.duration || null,
+  ].filter(Boolean) as string[]
+
+  return (
+    <div className="pl-12 min-w-0">
+      <div className="bg-card border border-border rounded-xl shadow-sm shadow-black/10 overflow-hidden max-w-3xl">
+        <button
+          type="button"
+          className="flex items-center gap-3 w-full px-4 py-3 bg-secondary/70 hover:bg-secondary transition-colors text-left min-w-0"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          <ChevronRight
+            className={cn("w-3.5 h-3.5 text-muted-foreground/70 transition-transform shrink-0", isOpen && "rotate-90")}
+          />
+          <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/30 flex items-center justify-center shrink-0">
+            <Layers className="w-4 h-4 text-purple-400" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="text-sm font-semibold text-foreground truncate">{group.title}</span>
+              <span className="shrink-0 px-1.5 py-0.5 rounded-full border border-purple-500/30 bg-purple-500/10 text-purple-400 text-[10px] font-medium">
+                group
+              </span>
+              {group.background && (
+                <span
+                  className="shrink-0 inline-flex text-muted-foreground/70"
+                  title="Runs in the background — returns immediately, notifies on completion"
+                  aria-label="Background execution"
+                >
+                  <Clock className="w-3.5 h-3.5" />
+                </span>
+              )}
+              <span className={cn("shrink-0 px-2 py-0.5 rounded-full border text-[11px] font-medium", tone.className)}>
+                {tone.label}
+              </span>
+            </div>
+            <div className="text-xs text-muted-foreground truncate">{aggregateBits.join(" · ")}</div>
+          </div>
+          {isRunning && <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />}
+        </button>
+
+        {/* Progress bar — settled (terminal) items over total. */}
+        {total > 0 && (
+          <div className="h-1 w-full bg-secondary/60">
+            <div
+              className={cn("h-full transition-all", isRunning ? "bg-blue-400/70" : "bg-green-500/60")}
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+        )}
+
+        {isOpen && (
+          <div className="px-4 py-3 bg-secondary/20 border-t border-border space-y-3">
+            {total > 0 ? (
+              <div className="ml-1">
+                {group.items.map((item) => (
+                  <SubagentGroupRow key={item.index} item={item} onOpenSubagent={onOpenSubagent} />
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">Preparing group…</p>
+            )}
+            {group.reduceSummary && (
+              <div>
+                <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Combined summary</div>
+                <div className="text-sm text-foreground"><Markdown>{group.reduceSummary}</Markdown></div>
+                {group.reduceChildSessionId && onOpenSubagent && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenSubagent(group.reduceChildSessionId!, group.overallStatus, "Reduce")}
+                    className="mt-1 text-[11px] text-blue-400 hover:text-blue-300 hover:underline underline-offset-2"
+                  >
+                    View reduce transcript →
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function SubagentGroupRow({
+  item,
+  onOpenSubagent,
+}: {
+  item: GroupItemView
+  onOpenSubagent?: (childSessionId: string, status?: string, label?: string) => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const hasDetails = Boolean(item.summary) || Boolean(item.childSessionId)
+  return (
+    <div className="py-1.5 first:pt-0 last:pb-0 border-b border-border/40 last:border-0">
+      <button
+        type="button"
+        className="flex w-full items-start gap-2 text-left min-w-0"
+        onClick={() => hasDetails && setExpanded(!expanded)}
+        disabled={!hasDetails}
+      >
+        <ChevronRight
+          className={cn(
+            "w-3 h-3 mt-0.5 text-muted-foreground/50 transition-transform shrink-0",
+            expanded && "rotate-90",
+            !hasDetails && "invisible",
+          )}
+        />
+        <span className="text-[11px] font-mono text-muted-foreground/70 shrink-0 mt-0.5">#{item.index + 1}</span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-xs text-foreground truncate">{item.label || `Item ${item.index + 1}`}</span>
+            <TaskStatusPill status={item.status} compact />
+          </div>
+        </div>
+      </button>
+      {expanded && hasDetails && (
+        <div className="mt-2 ml-5 rounded-lg border border-border/70 bg-card/45 p-3 space-y-2">
+          {item.summary && (
+            <div className="text-sm text-foreground"><Markdown>{item.summary}</Markdown></div>
+          )}
+          {item.childSessionId && onOpenSubagent && (
+            <button
+              type="button"
+              onClick={() => onOpenSubagent(item.childSessionId!, item.status, "Sub-agent")}
+              className="text-[11px] text-blue-400 hover:text-blue-300 hover:underline underline-offset-2"
+            >
+              View sub-agent transcript →
+            </button>
           )}
         </div>
       )}
