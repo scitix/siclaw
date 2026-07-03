@@ -89,7 +89,6 @@ def _prompt(name: str, locale: str | None) -> str:
             return fp.read_text(encoding="utf-8")
     raise FileNotFoundError(f"prompt pack missing: {name} (locale={locale!r})")
 
-
 def _tool_strings(locale: str | None) -> dict:
     """Model-facing tool descriptions/result texts from the locale pack (JSON)."""
     tried = []
@@ -506,6 +505,108 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
     }
 
 
+# ── Protocol v3 helpers: quickstart brief + proposed-question merge ──
+# Both are deterministic (code, not model formatting) so a durable record can't
+# be lost to how the agent paraphrases — the same principle behind PROPOSED_PLAN.json.
+
+_BRIEF_MARKER = "我的定调标签"
+_BRIEF_PATH = "authoring/BRIEF.json"
+QUESTIONS_PROPOSED_PATH = "authoring/QUESTIONS_PROPOSED.json"
+
+
+def _split_brief_tags(s: str) -> list[str]:
+    """Split a multi-tag value on Chinese/Latin list separators, dropping blanks."""
+    return [t.strip() for t in re.split(r"[、,，;；]", s) if t.strip()]
+
+
+def parse_brief_block(message: str) -> dict | None:
+    """Extract the quickstart 定调 brief block from an opening compile message
+    into the structured BRIEF.json record, or None when no brief block is present.
+    The wizard's 「开始生成知识库」appends a block shaped like:
+
+        我的定调标签(请作为本次编译的 brief):
+        - 给谁看:内部工程师
+        - 内容倾向:详尽百科、保留内部信息、只留最新版本
+        - 自定义:偏排障场景
+        请按这些标签作为编译 brief 执行。
+
+    Parsing it in code (rather than trusting the model to transcribe it) keeps the
+    durable brief verbatim regardless of how the agent paraphrases downstream."""
+    if not message or _BRIEF_MARKER not in message:
+        return None
+    raw = message[message.find(_BRIEF_MARKER):].strip()
+    audience = ""
+    styles: list[str] = []
+    custom: list[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        m = re.match(r"^[-*]\s*给谁看\s*[:：]\s*(.+)$", s)
+        if m:
+            audience = m.group(1).strip()
+            continue
+        m = re.match(r"^[-*]\s*内容倾向\s*[:：]\s*(.+)$", s)
+        if m:
+            styles = _split_brief_tags(m.group(1))
+            continue
+        m = re.match(r"^[-*]\s*自定义\s*[:：]\s*(.+)$", s)
+        if m:
+            custom = _split_brief_tags(m.group(1))
+            continue
+    return {"source": "quickstart_message", "audience": audience,
+            "styles": styles, "custom": custom, "raw": raw}
+
+
+def _write_brief(workdir: str, brief: dict) -> None:
+    path = Path(workdir) / _BRIEF_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(brief, ensure_ascii=False, indent=2) + "\n", "utf-8")
+
+
+def _capture_brief(run: "CompileRun", text: str) -> bool:
+    """Parse + persist the opening brief block if present. Fail-open: a brief
+    capture hiccup must never block the compile turn. Returns whether it wrote."""
+    try:
+        brief = parse_brief_block(text)
+        if brief is None:
+            return False
+        _write_brief(run.workdir, brief)
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_question(q: str) -> str:
+    """Dedup key for a proposed question: whitespace-stripped, trailing
+    punctuation removed, case-folded — so trivially-reworded repeats collapse."""
+    return re.sub(r"\s+", "", str(q or "")).strip("?？。.!！,，、").lower()
+
+
+def merge_proposed_questions(existing: list, incoming: list) -> tuple[list, int, int]:
+    """Append-merge newly proposed questions onto the existing list, skipping
+    duplicates by normalized question text. Returns (merged, added, skipped).
+    Append-only across rounds so a re-proposal never wipes the owner's prior picks."""
+    merged = [q for q in existing if isinstance(q, dict) and str(q.get("question", "")).strip()]
+    seen = {_normalize_question(q.get("question", "")) for q in merged}
+    added = skipped = 0
+    for item in incoming:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        q = str(item.get("question", "")).strip()
+        key = _normalize_question(q)
+        if not key or key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        merged.append({
+            "question": q,
+            "reference": str(item.get("reference", "")).strip(),
+            "source": str(item.get("source", "")).strip(),
+        })
+        added += 1
+    return merged, added, skipped
+
+
 def _make_compile_tools(run: CompileRun):
     """Build the box's custom tools (closures over run) — the structured-signal
     moat. All model-facing text (descriptions + result strings) comes from the
@@ -583,7 +684,29 @@ def _make_compile_tools(run: CompileRun):
             return {"content": [{"type": "text", "text": rt["write_failed"].format(e=e)}]}
         return {"content": [{"type": "text", "text": rt["registered"].format(tid=tid)}]}
 
-    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket])
+    @tool("propose_questions", ts["propose_questions"]["desc"], {"questions": list})
+    async def propose_questions(args):
+        pq = ts["propose_questions"]
+        incoming = args.get("questions")
+        if not isinstance(incoming, list):
+            return {"content": [{"type": "text", "text": pq["need_list"]}]}
+        path = Path(run.workdir) / QUESTIONS_PROPOSED_PATH
+        try:
+            existing = json.loads(path.read_text("utf-8")) if path.exists() else []
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:
+            existing = []  # a corrupt/half-written prior file must not lose this round
+        merged, added, skipped = merge_proposed_questions(existing, incoming)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", "utf-8")
+        except Exception as e:
+            return {"content": [{"type": "text", "text": pq["write_failed"].format(e=e)}]}
+        await run.emit({"type": "summary", "summary": pq["summary"].format(added=added, skipped=skipped, total=len(merged))})
+        return {"content": [{"type": "text", "text": pq["registered"].format(added=added, skipped=skipped, total=len(merged))}]}
+
+    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket, propose_questions])
 
 
 def _seed_workdir(workdir: str):
@@ -717,6 +840,7 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
     "mcp__compile__resolve_ticket",
+    "mcp__compile__propose_questions",
 ]
 
 
@@ -1040,6 +1164,10 @@ async def handle_message(request: web.Request):
     text = (body.get("message") or "").strip()
     if not text:
         return web.json_response({"error": "message is required"}, status=400)
+    # v3 brief: if the wizard's 「开始生成知识库」message carries a 定调标签 block,
+    # persist it deterministically to authoring/BRIEF.json BEFORE the turn so the
+    # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
+    _capture_brief(run, text)
     await run.client.query(text)
     return web.json_response({"ok": True})
 

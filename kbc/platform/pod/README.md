@@ -19,8 +19,17 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
 
   The moat relies on custom tools that let the agent **signal explicitly** (rather than guessing from output):
   `report_summary`→`summary`, `propose_plan`→`plan_proposed`,
-  `resolve_ticket`→writes the `agent_report` in `authoring/CONTRADICTIONS.json` (contradiction-ticket fix-up registration).
+  `resolve_ticket`→writes the `agent_report` in `authoring/CONTRADICTIONS.json` (contradiction-ticket fix-up registration),
+  `propose_questions`→appends (deduped) to `authoring/QUESTIONS_PROPOSED.json` (post-compile test questions, consumed by the frontend "proposed questions / AI-suggested" flow).
   **Contradictions never block**: the agent lands a best-guess page + marks it uncertain + files a ticket, and the owner adjudicates asynchronously afterward (contradiction-as-turn model).
+
+## Protocol v3: three linear-wizard enhancements (BOX_ROLE contract, never-block invariant unchanged)
+
+The linear-wizard mode adds three pure-contract enhancements to the box (design: improve_siclaw/DESIGN-kb-linear-mode-2026-07-03 §3; none introduce a wait-for-user pause):
+
+- **Compile brief**: if the opening message carries a "my tone tags (… as this compile's brief)" block, the `POST /message` handler (code, not the model) deterministically parses it into `authoring/BRIEF.json` (`{source, audience, styles, custom, raw}`) — same principle as PROPOSED_PLAN.json, a structured record not left to the model's transcription. BOX_ROLE tells the agent to read it, update INTENT.md from it, and follow it in compile trade-offs; the brief is an intent layer — when it conflicts with a raw fact, the fact wins and a contradiction ticket is filed.
+- **Unified question queue**: "tone-type follow-ups" that surface mid-compile (conventions / redaction / whether to compile process data / whether to keep old versions) are handled **the same** as source contradictions — best-guess into the page + mark `⚠️ 存疑` + append to the **same** `authoring/CONTRADICTIONS.json` (schema unchanged); no new file, no new protocol. On the owner's side it is the same "questions" queue.
+- **Question timing moved earlier**: after compiling (index written, audited) the agent proactively calls `propose_questions` to prepare 3–5 test questions (a single-fact question + reference ≤150 chars + a mandatory raw source, derived from raw not from candidate); append-style dedup, so repeated calls / re-compiles top up rather than overwrite the previous round.
 
 - **`compile_agent.py` (one-shot, local debugging)** — a one-off `query()`: reads `workdir/drop/`+`constitution.md`→compiles→writes
   `workdir/bundle/`, no HTTP. Used to quickly verify "the brain can compile inside the container".
