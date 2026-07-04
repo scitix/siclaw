@@ -27,3 +27,8 @@ jobs:
         working-directory: kbc/platform/pod
       - run: python test_redblue.py
         working-directory: kbc/platform/pod
+      # codex engine adapter suite: fake codex binary — needs neither the real
+      # CLI nor an LLM; pypdfium2 exercises the PDF page-render transform.
+      - run: pip install pypdfium2 pillow
+      - run: python test_engines_codex.py
+        working-directory: kbc/platform/pod

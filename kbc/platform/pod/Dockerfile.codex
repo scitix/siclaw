@@ -1,0 +1,63 @@
+# 编译 pod 镜像(codex 引擎)= Python + OpenAI Codex CLI + kbc 编译大脑
+#
+# per-engine 镜像:BoxProfile `kb-compile-codex` 用它;`kb-compile`(claude)继续用
+# Dockerfile 的镜像。同一 HTTP+SSE 契约、同一 compile_box.py —— 只有 KBC_ENGINE 不同。
+# 镜像照常打 commit-hash tag(如 main-<hash>),运行镜像可追溯源码。
+#
+# build:  docker build -f platform/pod/Dockerfile.codex -t kbc-compile-box-codex .   (在 kbc/ 目录跑)
+# run(生产):runtime 经 kb-compile-codex profile 起,spawn-time env 注入:
+#   CODEX_ACCESS_TOKEN  短 TTL 订阅 access token(sicore 是唯一刷新者;box 绝不持 refresh token)
+#   CODEX_ACCOUNT_ID    订阅账号 id
+#   CODEX_API_KEY       (可选)API key —— 存在即优先,订阅链路整个跳过
+FROM python:3.11-slim
+
+# Codex CLI:pin 到 release 独立 musl 二进制(免 node 运行时;版本升级走契约测试)。
+ARG CODEX_VERSION=0.139.0
+ARG TARGETARCH=amd64
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) triple=x86_64-unknown-linux-musl ;; \
+      arm64) triple=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-${triple}.tar.gz" \
+      | tar -xz -C /usr/local/bin; \
+    mv "/usr/local/bin/codex-${triple}" /usr/local/bin/codex; \
+    chmod +x /usr/local/bin/codex; \
+    codex --version
+
+# aiohttp = box server;pypdfium2+pillow = PDF 逐页转图(多模态 leveler);
+# pdfplumber/python-pptx/openpyxl/pyyaml = tools/ingest 机械依赖 —— 必须预装:
+# codex 的 workspace-write 沙箱默认无外网,agent 在会话里 pip install 不可用。
+RUN pip install --no-cache-dir aiohttp pypdfium2 pillow pdfplumber python-pptx openpyxl pyyaml
+
+WORKDIR /app
+COPY CLAUDE.md /app/CLAUDE.md
+COPY platform/pod/compile_box.py /app/compile_box.py
+COPY platform/pod/compile_tools.py /app/compile_tools.py
+COPY platform/pod/transform.py /app/transform.py
+COPY platform/pod/mcp_compile_server.py /app/mcp_compile_server.py
+COPY platform/pod/selfcheck.py /app/selfcheck.py
+COPY platform/pod/engines/ /app/engines/
+COPY tools/ /app/tools/
+
+ENV KBC_PLAYBOOK=/app/CLAUDE.md
+# 引擎选择是镜像属性(per-engine image;wire 契约无 engine 字段)
+ENV KBC_ENGINE=codex
+# codex 不吃 PDF → /sources 装源时逐页转图(claude 镜像不开,零行为变化)
+ENV KBC_RENDER_PDF_PAGES=1
+# served 形态默认端口(可被 SICLAW_AGENTBOX_PORT 覆盖,对齐 agentbox)
+ENV SICLAW_AGENTBOX_PORT=3000
+
+# 非 root 运行(对齐 claude 镜像;pod 即 sandbox 的信任模型不变)
+RUN useradd -m -u 1000 kbc
+USER kbc
+
+EXPOSE 3000
+
+# served 形态:被 siclaw runtime 起、按 box 自有 HTTP+SSE 契约驱动(POST /session、/message、SSE /events)。
+ENTRYPOINT ["python", "/app/compile_box.py"]

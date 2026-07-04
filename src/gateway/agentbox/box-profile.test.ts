@@ -45,6 +45,27 @@ describe("getBoxProfile", () => {
     expect(test.allowedTools).not.toContain("Bash");
   });
 
+  it("kb-compile-codex → same box shape as kb-compile, codex image + CODEX auth env", () => {
+    const savedCodex = process.env.SICLAW_COMPILE_BOX_CODEX_IMAGE;
+    try {
+      process.env.SICLAW_COMPILE_BOX_CODEX_IMAGE = "kbc-compile-box-codex:test-tag";
+      const compile = getBoxProfile("kb-compile");
+      const codex = getBoxProfile("kb-compile-codex");
+      // Identical infra shape (writable /work + HOME) — only the engine differs...
+      expect(codex.image).toBe("kbc-compile-box-codex:test-tag");
+      expect(codex.home).toBe(compile.home);
+      expect(codex.volumes).toEqual(compile.volumes);
+      expect(codex.allowedTools).toBeNull();
+      // ...and the auth envelope is codex's: short-TTL token in, NO ANTHROPIC_*.
+      expect(codex.envForward).toContain("CODEX_ACCESS_TOKEN");
+      expect(codex.envForward).toContain("CODEX_API_KEY");
+      expect(codex.envForward).not.toContain("ANTHROPIC_API_KEY");
+    } finally {
+      if (savedCodex === undefined) delete process.env.SICLAW_COMPILE_BOX_CODEX_IMAGE;
+      else process.env.SICLAW_COMPILE_BOX_CODEX_IMAGE = savedCodex;
+    }
+  });
+
   it("fail-closed: an unknown profile throws (no silent downgrade to the all-tools agent)", () => {
     expect(() => getBoxProfile("kb-tset")).toThrow(/unknown BoxProfile/);
   });

@@ -86,10 +86,35 @@ function kbTestProfile(): BoxProfile {
   };
 }
 
+/**
+ * kb-compile-codex — a KB compile box on the Codex engine. Engine selection is
+ * per-engine IMAGE (the box's KBC_ENGINE env is baked in): same HTTP+SSE
+ * contract, same workspace shape — only the LLM harness underneath differs, so
+ * a consumer switches engines by requesting THIS profile instead of kb-compile
+ * (profile difference → box respawn, which "changing engines" should be).
+ *
+ * Auth env: the box holds a short-TTL access token ONLY (sicore is the single
+ * refresher of the subscription credential); CODEX_API_KEY, when present in
+ * the runtime env, wins inside the box.
+ */
+function kbCompileCodexProfile(): BoxProfile {
+  return {
+    name: "kb-compile-codex",
+    image: process.env.SICLAW_COMPILE_BOX_CODEX_IMAGE || "kbc-compile-box-codex:latest",
+    envForward: ["CODEX_ACCESS_TOKEN", "CODEX_ACCOUNT_ID", "CODEX_API_KEY", "KBC_CODEX_MODEL", "KBC_SMOKE"],
+    home: "/work",
+    volumes: [{ name: "work", mountPath: "/work", sizeLimit: "1Gi" }],
+    // null = the box's default compile toolset. The codex engine is shell-centric
+    // (no per-tool whitelist to translate to); the pod remains the sandbox.
+    allowedTools: null,
+  };
+}
+
 /** Builtin profile factories. */
 const BUILTIN_PROFILES: Record<string, () => BoxProfile> = {
   agent: () => AGENT_PROFILE,
   "kb-compile": kbCompileProfile,
+  "kb-compile-codex": kbCompileCodexProfile,
   "kb-test": kbTestProfile,
 };
 
