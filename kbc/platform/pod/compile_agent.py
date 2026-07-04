@@ -18,16 +18,7 @@ from pathlib import Path
 
 from claude_agent_sdk import query, ClaudeAgentOptions
 
-def _find_playbook():
-    """找 kbc playbook(编译纪律):优先 KBC_PLAYBOOK 环境变量,否则向上找 CLAUDE.md。"""
-    env = os.environ.get("KBC_PLAYBOOK")
-    if env:
-        return Path(env)
-    for parent in Path(__file__).resolve().parents:
-        cand = parent / "CLAUDE.md"
-        if cand.exists():
-            return cand
-    return None
+from compile_tools import find_playbook as _find_playbook
 
 TASK = """你是这个知识库的编译器。工作目录里有 `drop/`(原始文档)和 `constitution.md`(裁决纪律)。
 把 `drop/` 编译成一个 OKF bundle 写到 `bundle/`:

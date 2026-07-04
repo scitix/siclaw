@@ -3,10 +3,12 @@
 spawned by the siclaw runtime and driven over the box's own HTTP+SSE contract
 (the runtime translates events into generic capability.* for consumers, e.g. sicore).
 
-Shape: the box is 90% "headless Claude Code behind a wrapped entrypoint" (Agent
-SDK = Claude Code as a library; engine/tools/compaction reused verbatim); the
-remaining 10% is the kbc moat — custom tools that make the agent emit explicit
-structured signals:
+Shape: the box is 90% "headless coding agent behind a wrapped entrypoint" (default
+engine = Claude Agent SDK; the engine sits behind the engines/ seam, and
+KBC_ENGINE=codex swaps in the Codex CLI backend — per-engine images, same wire
+contract); the remaining 10% is the kbc moat — custom tools (bodies in
+compile_tools.py, engine-neutral) that make the agent emit explicit structured
+signals:
   - report_summary  → SSE `summary` (compile progress, for the verify UI)
   - propose_plan    → SSE `plan_proposed` (Plan→Execute alignment)
   - resolve_ticket  → writes agent_report into authoring/CONTRADICTIONS.json
@@ -37,20 +39,26 @@ import re
 import shutil
 import tarfile
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from aiohttp import web
-from claude_agent_sdk import (
-    ClaudeSDKClient,
-    ClaudeAgentOptions,
-    HookMatcher,
-    tool,
-    create_sdk_mcp_server,
-    InMemorySessionStore,
-)
 
+import compile_tools
+import engines
 import selfcheck
+import transform
+from engines.base import SessionSpec, make_test_path_guard, test_path_escape
+
+_find_playbook = compile_tools.find_playbook
+
+# Re-exports so existing consumers/tests keep their import site (the pure
+# predicates moved to the engine-neutral side of the seam, engines/base.py, and
+# the proposed-question merge + stable-id helpers to compile_tools.py).
+_test_path_escape = test_path_escape
+_make_test_path_guard = make_test_path_guard
+merge_proposed_questions = compile_tools.merge_proposed_questions
+_normalize_question = compile_tools._normalize_question
+_question_id = compile_tools._question_id
 
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches
 # once a session's context passes the autocompact buffer (HTTP 400
@@ -146,15 +154,17 @@ class CompileRun:
         self.events: asyncio.Queue = asyncio.Queue()
         self.task: asyncio.Task | None = None
         self.done = False
-        # Persistent Claude Code session (set by run_session). The box is a
-        # long-lived conversational + compiling session, not a one-shot query();
-        # POST /message injects follow-up user turns into this same session.
-        self.client: ClaudeSDKClient | None = None
+        # The live EngineSession (set by run_session). The box is a long-lived
+        # conversational + compiling session, not a one-shot query(); POST
+        # /message injects follow-up user turns into this same session. Kept
+        # under the historical name `client` — it is the duck type the HTTP
+        # handlers and tests speak (`run.client.query(text)`).
+        self.client: "engines.EngineSession | None" = None
         self.session_id: str | None = None
         # Tool whitelist declared by the runtime BoxProfile (via POST /session).
-        # None → use the driver default (DEFAULT_COMPILE_ALLOWED_TOOLS). A restrictive
-        # profile (e.g. kb-test) makes "which tools" enforced by construction here,
-        # not by prompt.
+        # None → the engine default (engines/claude.py DEFAULT_COMPILE_ALLOWED_TOOLS).
+        # A restrictive profile (e.g. kb-test) makes "which tools" enforced by
+        # construction here, not by prompt.
         self.allowed_tools: list[str] | None = None
         # Consumer-declared prompt/output locale (capability.fetchInput → /session).
         self.locale: str | None = None
@@ -176,9 +186,9 @@ class CompileRun:
         await self.events.put(ev)
 
     async def inject_user_message(self, text: str):
-        """Engine seam: push a user turn into the live session. The Claude SDK
-        driver is one line; a future engine driver (e.g. Codex) reimplements
-        just this method — self-check orchestration stays engine-neutral."""
+        """Push a user turn into the live session. `query()` is the EngineSession
+        seam method — every engine adapter implements it, so self-check
+        orchestration stays engine-neutral."""
         if self.client:
             await self.client.query(text)
 
@@ -188,7 +198,7 @@ class TestRun:
     (start-a-test-session). Parallel to CompileRun but stripped: no workspace writes, no
     compile MCP tools, no park/ruling, no durable persistence. It connects to a
     snapshot dir (`.siclaw/knowledge/`) with read-only tools and answers turns,
-    exactly like a real consumer would — then is torn down. Reuses _emit_message
+    exactly like a real consumer would — then is torn down. Reuses _relay_engine_event
     (`emit`/`_turn_text`) and _await_session_live (`connected`/`client`)."""
 
     def __init__(self, tid: str, cwd: str, parent_run_id: str, snapshot_hash: str, locale: str | None = None):
@@ -201,7 +211,7 @@ class TestRun:
         self.events: asyncio.Queue = asyncio.Queue()
         self.task: asyncio.Task | None = None
         self.done = False
-        self.client: ClaudeSDKClient | None = None
+        self.client: "engines.EngineSession | None" = None
         self.session_id: str | None = None
         self.connected: asyncio.Event = asyncio.Event()
         self._turn_text: list[str] = []
@@ -381,7 +391,7 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
         _remove_path(staging)
         raise
 
-    return {
+    result = {
         "workdir": str(wd),
         "raw": str(raw_dir),
         "drop": str(drop_dir),
@@ -390,6 +400,13 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
         "bundle_sha256": actual_sha,
         "bundle_size_bytes": len(bundle),
     }
+    # Multimodal leveler (engine-neutral, off unless the image opts in): render
+    # PDF pages to PNGs so a non-PDF-native engine (codex) can read them. Runs
+    # AFTER the install committed — a render problem must not lose the sources;
+    # a MISSING renderer with the flag on is a broken image and raises (500).
+    if transform.render_enabled():
+        result.update(transform.render_pdf_pages(raw_dir))
+    return result
 
 
 def _safe_authoring_path(name: str) -> Path:
@@ -481,7 +498,7 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
 
 _BRIEF_MARKER = "我的定调标签"
 _BRIEF_PATH = "authoring/BRIEF.json"
-QUESTIONS_PROPOSED_PATH = "authoring/QUESTIONS_PROPOSED.json"
+QUESTIONS_PROPOSED_PATH = compile_tools.QUESTIONS_PROPOSED_PATH
 
 
 def _split_brief_tags(s: str) -> list[str]:
@@ -545,171 +562,6 @@ def _capture_brief(run: "CompileRun", text: str) -> bool:
         return False
 
 
-def _normalize_question(q: str) -> str:
-    """Dedup key for a proposed question: whitespace-stripped, trailing
-    punctuation removed, case-folded — so trivially-reworded repeats collapse."""
-    return re.sub(r"\s+", "", str(q or "")).strip("?？。.!！,，、").lower()
-
-
-def _fnv1a32(s: str) -> int:
-    """32-bit FNV-1a over the UTF-8 bytes of s. Shared, fixed formula with the
-    frontend so both sides derive the SAME proposal id from a question."""
-    h = 2166136261
-    for b in s.encode("utf-8"):
-        h ^= b
-        h = (h * 16777619) & 0xFFFFFFFF
-    return h
-
-
-def _question_id(normalized: str) -> str:
-    """Stable proposal id agreed with the frontend: 'q-' + fnv1a32(normalized
-    question) as zero-padded 8-hex-digit lowercase. The frontend POSTs this as
-    proposal_id on adopt/dismiss — a missing id → empty proposal_id → sicore 500."""
-    return "q-" + format(_fnv1a32(normalized), "08x")
-
-
-def merge_proposed_questions(existing: list, incoming: list) -> tuple[list, int, int]:
-    """Append-merge newly proposed questions onto the existing list, skipping
-    duplicates by normalized question text. Every merged entry carries a stable
-    `id` (see _question_id) — the frontend needs it as proposal_id on adopt/dismiss.
-    A prior explicit id is preserved; legacy/id-less entries are backfilled from
-    the same formula (identical for the same question). Returns (merged, added,
-    skipped). Append-only across rounds so a re-proposal never wipes prior picks."""
-    merged: list = []
-    seen: set = set()
-    for q in existing:
-        if not isinstance(q, dict):
-            continue
-        text = str(q.get("question", "")).strip()
-        if not text:
-            continue
-        key = _normalize_question(text)
-        seen.add(key)
-        qid = str(q.get("id", "")).strip() or _question_id(key)
-        merged.append({**q, "id": qid, "question": text})
-    added = skipped = 0
-    for item in incoming:
-        if not isinstance(item, dict):
-            skipped += 1
-            continue
-        text = str(item.get("question", "")).strip()
-        key = _normalize_question(text)
-        if not key or key in seen:
-            skipped += 1
-            continue
-        seen.add(key)
-        merged.append({
-            "id": _question_id(key),
-            "question": text,
-            "reference": str(item.get("reference", "")).strip(),
-            "source": str(item.get("source", "")).strip(),
-        })
-        added += 1
-    return merged, added, skipped
-
-
-def _make_compile_tools(run: CompileRun):
-    """Build the box's custom tools (closures over run) — the structured-signal
-    moat. All model-facing text (descriptions + result strings) comes from the
-    run's locale pack."""
-    ts = _tool_strings(run.locale)
-
-    @tool("report_summary", ts["report_summary"]["desc"], {"summary": str})
-    async def report_summary(args):
-        await run.emit({"type": "summary", "summary": args.get("summary", "")})
-        return {"content": [{"type": "text", "text": "summary recorded"}]}
-
-    @tool("propose_plan", ts["propose_plan"]["desc"], {"plan": str})
-    async def propose_plan(args):
-        # The owner's approve UI is driven by THIS artifact — written here by
-        # code, deterministically, from the tool argument. The signal must never
-        # depend on how the model formatted its working notes (a proposal that
-        # bounces on file formatting is a UI held hostage by prose). PLAN.md
-        # remains the box's own working state; syncing happens at turn end.
-        plan_text = str(args.get("plan", ""))
-        proposal_path = Path(run.workdir) / "authoring" / "PROPOSED_PLAN.json"
-        proposal_path.parent.mkdir(parents=True, exist_ok=True)
-        proposal_path.write_text(json.dumps({
-            "text": plan_text,
-            "proposed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }, ensure_ascii=False, indent=2), "utf-8")
-        await run.emit({"type": "plan_proposed", "plan": plan_text})
-        # Advisory nudge only — working-state hygiene, never a gate.
-        reminder = ""
-        plan_path = Path(run.workdir) / "authoring" / "PLAN.md"
-        section = ""
-        if plan_path.exists():
-            m = re.search(r"## Next Pages\n(.*?)(?=\n## |\Z)", plan_path.read_text("utf-8"), re.S)
-            section = m.group(1) if m else ""
-        if "- [ ]" not in section and "- [x]" not in section:
-            reminder = ts["propose_plan"]["reminder"]
-        return {"content": [{"type": "text", "text": ts["propose_plan"]["ack"] + reminder}]}
-
-    @tool(
-        "resolve_ticket",
-        ts["resolve_ticket"]["desc"],
-        {"ticket_id": str, "applied_value": str, "pages_edited": list, "note": str},
-    )
-    async def resolve_ticket(args):
-        rt = ts["resolve_ticket"]
-        tid = str(args.get("ticket_id", "")).strip()
-        if not tid:
-            return {"content": [{"type": "text", "text": rt["need_id"]}]}
-        path = Path(run.workdir) / "authoring" / "CONTRADICTIONS.json"
-        try:
-            tickets = json.loads(path.read_text("utf-8")) if path.exists() else []
-            if not isinstance(tickets, list):
-                tickets = []
-        except Exception as e:
-            return {"content": [{"type": "text", "text": rt["read_failed"].format(e=e)}]}
-        target = next((tk for tk in tickets if isinstance(tk, dict) and str(tk.get("id")) == tid), None)
-        if target is None:
-            ids = [tk.get("id") for tk in tickets if isinstance(tk, dict)]
-            return {"content": [{"type": "text", "text": rt["not_found"].format(tid=tid, ids=ids)}]}
-        # The AI's structured CLAIM (evidence, not truth): the owner reviews it and
-        # can reopen. status stays for back-compat; agent_report carries the detail.
-        target["status"] = "applied"
-        target["agent_report"] = {
-            "applied_value": str(args.get("applied_value", "")),
-            "pages_edited": [str(p) for p in (args.get("pages_edited") or []) if str(p).strip()],
-            "note": str(args.get("note", "")),
-            # Echo of the dispatch nonce from the apply directive: lets the
-            # consumer match this receipt to the EXACT dispatch round it answers
-            # (timestamps alone cannot distinguish two overlapping rounds).
-            "dispatch_nonce": str(args.get("dispatch_nonce", "")),
-            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        try:
-            path.write_text(json.dumps(tickets, ensure_ascii=False, indent=2), "utf-8")
-        except Exception as e:
-            return {"content": [{"type": "text", "text": rt["write_failed"].format(e=e)}]}
-        return {"content": [{"type": "text", "text": rt["registered"].format(tid=tid)}]}
-
-    @tool("propose_questions", ts["propose_questions"]["desc"], {"questions": list})
-    async def propose_questions(args):
-        pq = ts["propose_questions"]
-        incoming = args.get("questions")
-        if not isinstance(incoming, list):
-            return {"content": [{"type": "text", "text": pq["need_list"]}]}
-        path = Path(run.workdir) / QUESTIONS_PROPOSED_PATH
-        try:
-            existing = json.loads(path.read_text("utf-8")) if path.exists() else []
-            if not isinstance(existing, list):
-                existing = []
-        except Exception:
-            existing = []  # a corrupt/half-written prior file must not lose this round
-        merged, added, skipped = merge_proposed_questions(existing, incoming)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", "utf-8")
-        except Exception as e:
-            return {"content": [{"type": "text", "text": pq["write_failed"].format(e=e)}]}
-        await run.emit({"type": "summary", "summary": pq["summary"].format(added=added, skipped=skipped, total=len(merged))})
-        return {"content": [{"type": "text", "text": pq["registered"].format(added=added, skipped=skipped, total=len(merged))}]}
-
-    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket, propose_questions])
-
-
 def _seed_workdir(workdir: str):
     """Populate an empty workdir from $KBC_SEED_DIR (test images bake a corpus at
     /seed; the pod's /work is an empty emptyDir that shadows any image /work)."""
@@ -757,7 +609,7 @@ async def _post_turn_selfcheck(run) -> str | None:
     the never-stuck invariant stays intact; a repair is just the next turn.
     Returns the repair prompt to inject after turn_done, or None."""
     workdir = getattr(run, "workdir", None)
-    if not workdir:  # test sessions reuse _emit_message but have no workspace
+    if not workdir:  # test sessions reuse _relay_engine_event but have no workspace
         return None
     key = selfcheck.state_key(workdir)
     if key is None or key == run._selfcheck_key:
@@ -782,20 +634,21 @@ async def _post_turn_selfcheck(run) -> str | None:
     return None
 
 
-async def _emit_message(run: CompileRun, msg) -> None:
-    """Relay one Agent SDK message to the SSE stream. Assistant text becomes the
-    live chat (`log`) stream AND is accumulated for the turn; a ResultMessage
-    marks the turn's end, flushing the accumulated text into `turn_done.text` so
-    sicore can persist the whole assistant reply (and the UI knows it's idle)."""
-    name = type(msg).__name__
-    if name == "AssistantMessage":
-        for block in getattr(msg, "content", []) or []:
-            if type(block).__name__ == "TextBlock":
-                t = (getattr(block, "text", "") or "").strip()
-                if t:
-                    run._turn_text.append(t)
-                    await run.emit({"type": "log", "text": t})
-    elif name == "ResultMessage":
+async def _relay_engine_event(run: CompileRun, ev: dict) -> None:
+    """Relay one neutral engine event (engines/base.py vocabulary) to the SSE
+    stream. `text` becomes the live chat (`log`) stream AND is accumulated for
+    the turn; `turn_end` flushes the accumulated text into `turn_done.text` so
+    sicore can persist the whole assistant reply (and the UI knows it's idle);
+    an engine `error` surfaces as a box error event without ending the run."""
+    etype = ev.get("type")
+    if etype == "text":
+        t = (ev.get("text") or "").strip()
+        if t:
+            run._turn_text.append(t)
+            await run.emit({"type": "log", "text": t})
+    elif etype == "error":
+        await run.emit({"type": "error", "error": str(ev.get("error"))})
+    elif etype == "turn_end":
         reply = "\n\n".join(run._turn_text).strip()
         run._turn_text = []
         # Layer-1 self-check BEFORE the sync so SELFCHECK.json rides the same
@@ -826,26 +679,14 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 await run.emit({"type": "summary", "text": f"自检回修注入失败: {e!r}"})
 
 
-# Default tool whitelist for a kb-compile session, used when the runtime profile
-# declares no allowed_tools (profile.allowedTools = null → box default). A profile
-# that DOES declare a list (e.g. kb-test) overrides this.
-DEFAULT_COMPILE_ALLOWED_TOOLS = [
-    "Read", "Write", "Edit", "Glob", "Grep", "Bash",
-    "mcp__compile__report_summary",
-    "mcp__compile__propose_plan",
-    "mcp__compile__resolve_ticket",
-    "mcp__compile__propose_questions",
-]
-
-
 async def run_session(run: CompileRun):
-    """Persistent driver: host ONE long-lived Claude Code session (ClaudeSDKClient)
-    for this KB. box_role (+ the playbook + the attempt instruction) is the standing
-    system prompt; the session then takes turns via POST /message — continuous
-    prepare + compile in one session, on massapi, with the compile tools.
-    Conversational by construction: connect, then wait for the first /message.
-    (Durable cross-restart resume + a file-backed session store land in P4; v1
-    uses an in-process store.)"""
+    """Persistent driver: host ONE long-lived agent session (EngineSession —
+    claude by default, codex when KBC_ENGINE=codex) for this KB. box_role (+ the
+    playbook + the attempt instruction) is the standing role; the session then
+    takes turns via POST /message — continuous prepare + compile in one session,
+    with the compile tools. Conversational by construction: start, then wait for
+    the first /message. (Durable cross-restart resume + a file-backed session
+    store land in P4; v1 uses an in-process store.)"""
     wd = str(Path(run.workdir).resolve())
     playbook = _playbook_text(run.locale)
     instruction = (run.instruction or "").strip()
@@ -860,54 +701,45 @@ async def run_session(run: CompileRun):
 
     sid = run.session_id or str(uuid.uuid4())
     run.session_id = sid
-    opts = ClaudeAgentOptions(
+    engine = engines.create_session(SessionSpec(
+        kind="compile",
         cwd=wd,
-        # Keep the Claude Code preset (agentic tool conventions) and append the
-        # KB authoring role on top, rather than replacing it.
-        system_prompt={"type": "preset", "preset": "claude_code", "append": system_prompt},
-        allowed_tools=run.allowed_tools or DEFAULT_COMPILE_ALLOWED_TOOLS,
-        mcp_servers={"compile": _make_compile_tools(run)},
-        permission_mode="bypassPermissions",  # the pod itself is the sandbox
-        setting_sources=[],                    # tenant isolation: load no external settings/CLAUDE.md
-        # Pin the compile model explicitly: the box talks to massapi (Bedrock),
-        # which serves specific ids — the SDK default may not be one, and the KB
-        # compile default is opus by product decision. Overridable per-deploy.
-        model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
-        max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
+        system_prompt=system_prompt,
         session_id=sid,
-        session_store=InMemorySessionStore(),
-    )
-    client = ClaudeSDKClient(options=opts)
+        emit=run.emit,
+        workdir=run.workdir,
+        allowed_tools=run.allowed_tools,
+    ))
     try:
-        # Connect and block for the first /message. Set run.client + signal
-        # run.connected only AFTER connect() returns, so a /message that races ahead
-        # of connect waits (handle_message) instead of hitting the SDK's
-        # "Not connected. Call connect() first." error.
-        await client.connect()
-        run.client = client
+        # Start and block for the first /message. Set run.client + signal
+        # run.connected only AFTER start() returns, so a /message that races ahead
+        # of the connect waits (handle_message) instead of hitting the engine's
+        # "not connected" error.
+        await engine.start()
+        run.client = engine
         run.connected.set()
         await run.emit({"type": "session", "session_id": sid})
-        # receive_messages() is the persistent stream: it yields this turn's
-        # output, then blocks for the next turn (injected via POST /message),
-        # keeping the session alive until the box is stopped/cancelled.
-        # A compile turn ends like any other turn: one query → one ResultMessage.
+        # events() is the persistent stream: it yields this turn's output, then
+        # blocks for the next turn (injected via POST /message), keeping the
+        # session alive until the box is stopped/cancelled.
+        # A compile turn ends like any other turn: one query → one turn_end.
         # The candidate pages it wrote to candidate/ are synced and become the
         # current draft; the owner reviews and publishes separately (deterministic
         # publish, no submit gate). A finished turn is simply finished — no
         # nudging — so a live session can never get stuck "compiling".
-        async for msg in client.receive_messages():
-            await _emit_message(run, msg)
+        async for ev in engine.events():
+            await _relay_engine_event(run, ev)
     finally:
-        run.connected.set()  # unblock any /message waiters even if connect failed
+        run.connected.set()  # unblock any /message waiters even if start failed
         run.client = None
-        await client.disconnect()
+        await engine.close()
 
 
 async def _run_wrapper(run: CompileRun):
     """Unified lifecycle: run the driver + periodically sync mid-flight state →
     catch-all error → always finish with end."""
     sent: dict = {}
-    run._sync_sent = sent  # shared with _emit_message's pre-turn_done sync
+    run._sync_sent = sent  # shared with _relay_engine_event's pre-turn_done sync
     syncer = asyncio.create_task(_sync_loop(run, sent))
     try:
         await _COMPILE_IMPL(run)
@@ -928,102 +760,38 @@ async def _run_wrapper(run: CompileRun):
         await run.emit({"type": "end"})
 
 
-# Default tool whitelist for a read-only kb-test session, used when the runtime
-# profile declares none. Read-only by construction: cannot mutate the snapshot.
-DEFAULT_TEST_ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
-
-# Tool-input keys that name a filesystem path (Read.file_path, Glob/Grep.path).
-_TEST_PATH_KEYS = ("file_path", "path", "notebook_path")
-
-
-def _test_path_escape(root: Path, tool_name: str, tool_input: dict) -> str | None:
-    """C4 fidelity guard predicate: return a human-readable offender when a tool
-    input reaches OUTSIDE the pinned snapshot dir, else None. The allowed_tools
-    whitelist already makes a test session read-only, but an ABSOLUTE path (or a
-    ../ traversal) in Read/Glob/Grep would still reach the LIVE /work draft —
-    breaking "the test measures the pinned snapshot". Pure function → unit-tested."""
-    root = root.resolve()
-    for key in _TEST_PATH_KEYS:
-        v = tool_input.get(key)
-        if not isinstance(v, str) or not v.strip():
-            continue
-        p = Path(v)
-        target = p if p.is_absolute() else root / p
-        try:
-            target.resolve().relative_to(root)
-        except ValueError:
-            return f"{key}={v}"
-    # Glob's pattern is itself a path expression; an absolute pattern escapes even
-    # with `path` unset. (Grep's pattern is regex CONTENT — not a path; skip it.)
-    if tool_name == "Glob":
-        pattern = tool_input.get("pattern")
-        if isinstance(pattern, str) and pattern.startswith("/"):
-            base = pattern.split("*", 1)[0]
-            try:
-                Path(base).resolve().relative_to(root)
-            except ValueError:
-                return f"pattern={pattern}"
-    return None
-
-
-def _make_test_path_guard(root: Path, locale: str | None = None):
-    """PreToolUse hook confining a test session to its snapshot. A hook (not a
-    can_use_tool callback) because hooks fire under bypassPermissions too. The
-    steering message comes from the locale's prompt pack — it is model-facing."""
-    deny_template = _prompt("guard_deny", locale).strip()
-
-    async def guard(input_data, tool_use_id, context):
-        offender = _test_path_escape(root, str(input_data.get("tool_name", "")), input_data.get("tool_input") or {})
-        if offender:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": deny_template.format(root=root, offender=offender),
-                }
-            }
-        return {}
-
-    return guard
-
-
 async def test_session_driver(run: "TestRun"):
-    """Read-only consumer driver: host a ClaudeSDKClient over the pinned snapshot
+    """Read-only consumer driver: host an EngineSession over the pinned snapshot
     dir, tools limited to the kb-test profile's whitelist (default Read/Glob/Grep),
     persona = test_role pack, no MCP, no kickoff. A conversational session — connects and
     waits for the first /test-message; each turn streams log + turn_done over GET
-    /test-events. Mirrors run_session minus writes/compile-tools/sync/bundle."""
+    /test-events. Mirrors run_session minus writes/compile-tools/sync/bundle.
+    Claude-engine only for now: codex has no read-confinement hook, so its test
+    sessions await the dedicated snapshot box (handle_open_test refuses early)."""
     sid = run.session_id or str(uuid.uuid4())
     run.session_id = sid
-    opts = ClaudeAgentOptions(
+    engine = engines.create_session(SessionSpec(
+        kind="test",
         cwd=run.cwd,
-        system_prompt={"type": "preset", "preset": "claude_code", "append": _prompt("test_role", run.locale)},
-        allowed_tools=run.allowed_tools or DEFAULT_TEST_ALLOWED_TOOLS,
-        mcp_servers={},                            # no compile signal tools
-        permission_mode="bypassPermissions",       # the pod itself is the sandbox
-        # C4: path confinement — absolute/../ reads must not escape the snapshot
-        # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
-        hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd), run.locale)])]},
-        setting_sources=[],                        # tenant isolation
-        # The test session mimics the REAL consumer → the gate/consumer tier
-        # (sonnet), not the compile tier. Massapi-served id; overridable per-deploy.
-        model=os.environ.get("KBC_TEST_MODEL", "claude-sonnet-4-6"),
-        max_turns=int(os.environ.get("KBC_TEST_MAX_TURNS", "60")),
+        system_prompt=_prompt("test_role", run.locale),
         session_id=sid,
-        session_store=InMemorySessionStore(),
-    )
-    client = ClaudeSDKClient(options=opts)
+        emit=run.emit,
+        allowed_tools=run.allowed_tools,
+        # C4: path confinement — absolute/../ reads must not escape the snapshot
+        # to the live /work draft (adapter wires it as a PreToolUse hook).
+        readonly_root=run.cwd,
+    ))
     try:
-        await client.connect()  # conversational: wait for the first /test-message
-        run.client = client
+        await engine.start()  # conversational: wait for the first /test-message
+        run.client = engine
         run.connected.set()
         await run.emit({"type": "session", "session_id": sid})
-        async for msg in client.receive_messages():
-            await _emit_message(run, msg)
+        async for ev in engine.events():
+            await _relay_engine_event(run, ev)
     finally:
-        run.connected.set()  # unblock any /test-message waiters even if connect failed
+        run.connected.set()  # unblock any /test-message waiters even if start failed
         run.client = None
-        await client.disconnect()
+        await engine.close()
 
 
 async def _test_session_wrapper(run: "TestRun"):
@@ -1234,6 +1002,15 @@ async def handle_open_test(request: web.Request):
     parent = RUNS.get(request.match_info["run_id"])
     if not parent:
         return web.json_response({"error": "unknown run"}, status=404)
+    if engines.engine_kind() != "claude":
+        # codex's sandbox limits writes but NOT reads → the C4 snapshot-read
+        # confinement has no hook equivalent on it. Refuse loudly rather than
+        # serve a test session that could silently read the live draft; the
+        # structural fix (dedicated snapshot-only kb-test box) is the P4 slice.
+        return web.json_response({
+            "error": f"test sessions are not supported on the {engines.engine_kind()!r} engine box; "
+                     "use a claude-engine box (kb-compile profile) for 起测试会话",
+        }, status=501)
     active = sum(1 for t in TEST_SESSIONS.values() if not t.done)
     if active >= _max_test_sessions():
         return web.json_response({"error": "too many concurrent test sessions"}, status=429)
