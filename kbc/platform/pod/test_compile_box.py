@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -607,7 +608,27 @@ def test_merge_proposed_questions():
     merged2, added2, _ = compile_box.merge_proposed_questions(
         ["junk", {"noquestion": 1}, {"question": "C?"}], [{"question": "C?"}])
     assert [q["question"] for q in merged2] == ["C?"] and added2 == 0, merged2
-    print("✓ merge_proposed_questions (append, dedup, drop malformed)")
+
+    # every merged entry carries a 'q-'+8hex id derived from the normalized question;
+    # formula is FNV-1a — locked against the canonical vector for "a".
+    for q in merged:
+        assert re.fullmatch(r"q-[0-9a-f]{8}", q["id"]), q
+    assert compile_box._question_id(compile_box._normalize_question("A?")) == "q-e40c292c"
+    assert merged[0]["id"] == "q-e40c292c", merged[0]
+
+    # re-propose the same question (different case/whitespace) → dedup, id unchanged
+    id_A = merged[0]["id"]
+    again, added3, skipped3 = compile_box.merge_proposed_questions(merged, [{"question": "  a  "}])
+    assert added3 == 0 and skipped3 == 1, (added3, skipped3)
+    assert next(q for q in again if q["question"] == "A?")["id"] == id_A, again
+
+    # an explicit prior id is preserved; a legacy id-less entry is backfilled
+    kept, _, _ = compile_box.merge_proposed_questions(
+        [{"id": "q-legacy1", "question": "D?"}, {"question": "E?"}], [])
+    by_q = {q["question"]: q for q in kept}
+    assert by_q["D?"]["id"] == "q-legacy1", kept
+    assert re.fullmatch(r"q-[0-9a-f]{8}", by_q["E?"]["id"]), kept
+    print("✓ merge_proposed_questions (append, dedup, drop malformed, stable id)")
 
 
 async def test_propose_questions_appends_dedup():
@@ -648,6 +669,8 @@ async def test_propose_questions_appends_dedup():
         data = json.loads(path.read_text())
         assert [q["question"] for q in data] == ["默认 quota 是多少?", "draco 还在用吗?"], data
         assert data[0]["source"] == "policy.md: cap 300"
+        # every persisted entry carries an id (frontend adopt POSTs it as proposal_id)
+        assert all(re.fullmatch(r"q-[0-9a-f]{8}", q["id"]) for q in data), data
         assert "新增 2" in r1["content"][0]["text"], r1
 
         # round 2: one dup (only trailing punctuation differs) + one new → append, skip dup

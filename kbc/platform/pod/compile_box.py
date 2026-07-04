@@ -551,25 +551,56 @@ def _normalize_question(q: str) -> str:
     return re.sub(r"\s+", "", str(q or "")).strip("?？。.!！,，、").lower()
 
 
+def _fnv1a32(s: str) -> int:
+    """32-bit FNV-1a over the UTF-8 bytes of s. Shared, fixed formula with the
+    frontend so both sides derive the SAME proposal id from a question."""
+    h = 2166136261
+    for b in s.encode("utf-8"):
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def _question_id(normalized: str) -> str:
+    """Stable proposal id agreed with the frontend: 'q-' + fnv1a32(normalized
+    question) as zero-padded 8-hex-digit lowercase. The frontend POSTs this as
+    proposal_id on adopt/dismiss — a missing id → empty proposal_id → sicore 500."""
+    return "q-" + format(_fnv1a32(normalized), "08x")
+
+
 def merge_proposed_questions(existing: list, incoming: list) -> tuple[list, int, int]:
     """Append-merge newly proposed questions onto the existing list, skipping
-    duplicates by normalized question text. Returns (merged, added, skipped).
-    Append-only across rounds so a re-proposal never wipes the owner's prior picks."""
-    merged = [q for q in existing if isinstance(q, dict) and str(q.get("question", "")).strip()]
-    seen = {_normalize_question(q.get("question", "")) for q in merged}
+    duplicates by normalized question text. Every merged entry carries a stable
+    `id` (see _question_id) — the frontend needs it as proposal_id on adopt/dismiss.
+    A prior explicit id is preserved; legacy/id-less entries are backfilled from
+    the same formula (identical for the same question). Returns (merged, added,
+    skipped). Append-only across rounds so a re-proposal never wipes prior picks."""
+    merged: list = []
+    seen: set = set()
+    for q in existing:
+        if not isinstance(q, dict):
+            continue
+        text = str(q.get("question", "")).strip()
+        if not text:
+            continue
+        key = _normalize_question(text)
+        seen.add(key)
+        qid = str(q.get("id", "")).strip() or _question_id(key)
+        merged.append({**q, "id": qid, "question": text})
     added = skipped = 0
     for item in incoming:
         if not isinstance(item, dict):
             skipped += 1
             continue
-        q = str(item.get("question", "")).strip()
-        key = _normalize_question(q)
+        text = str(item.get("question", "")).strip()
+        key = _normalize_question(text)
         if not key or key in seen:
             skipped += 1
             continue
         seen.add(key)
         merged.append({
-            "question": q,
+            "id": _question_id(key),
+            "question": text,
             "reference": str(item.get("reference", "")).strip(),
             "source": str(item.get("source", "")).strip(),
         })
