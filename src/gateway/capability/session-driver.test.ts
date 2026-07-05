@@ -21,6 +21,7 @@ function fakeFrontend() {
 function fakeManager() {
   return {
     touch: vi.fn(),
+    touchHeartbeat: vi.fn(),
     setStatus: vi.fn().mockResolvedValue(undefined),
     endRun: vi.fn().mockResolvedValue(undefined),
   } as any;

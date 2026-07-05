@@ -54,8 +54,10 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
 
   // onComment: the box emits `: heartbeat` SSE comments between data events. A
   // long read-only compile phase can be data-silent for >10min — the heartbeat
-  // must count as liveness or the watchdog reaps a healthy run and kills its box.
-  for await (const raw of client.streamPath(`/events/${runId}`, { onComment: () => manager.touch(runId) })) {
+  // must count as liveness (touchHeartbeat, the separate clock) or the watchdog
+  // reaps a healthy run and kills its box. It is deliberately NOT touch(): a box
+  // that ONLY heartbeats (a wedged turn) must still be reaped at dataStaleMs.
+  for await (const raw of client.streamPath(`/events/${runId}`, { onComment: () => manager.touchHeartbeat(runId) })) {
     const evt = raw as BoxEvent;
     // ANY box event means the box is alive → bump activity so the watchdog never
     // reaps an actively-working run (e.g. a long compile emitting only `log`).

@@ -42,15 +42,33 @@ export interface CapabilityRunRecord {
   status: CapabilityLifecycleStatus;
   sessionRef?: string;
   runtimeId?: string;
-  /** Wall-clock ms of the last activity; drives the stale-run watchdog. */
+  /** Wall-clock ms of the last DATA event; drives the stale-run watchdog. */
   lastActivityMs: number;
+  /**
+   * Wall-clock ms of the last liveness signal that is NOT a data event — the
+   * box's `: heartbeat` SSE comments. Tracked separately from lastActivityMs so
+   * a box that only heartbeats (a wedged turn) cannot stay alive forever:
+   * heartbeats bridge a data-silent phase up to dataStaleMs, but data silence
+   * past dataStaleMs is reaped regardless of heartbeats.
+   */
+  lastHeartbeatMs: number;
 }
 
 export interface CapabilityRunManagerOptions {
   /** Injectable clock (tests). Defaults to Date.now. */
   now?: () => number;
-  /** A RUNNING run silent for this long is a wedged turn — reaped as failed. */
+  /**
+   * A RUNNING run with NO liveness at all (neither data nor heartbeat) for this
+   * long is a dead box — reaped as failed. Heartbeats bridge this window.
+   */
   staleMs?: number;
+  /**
+   * A RUNNING run with no DATA event for this long is reaped as failed EVEN IF
+   * heartbeats keep arriving — a box that only heartbeats is a wedged turn, not
+   * a healthy long read-only phase. Defaults to 60 min (env
+   * CAPABILITY_DATA_STALE_MS); must be ≥ staleMs to give heartbeats room to work.
+   */
+  dataStaleMs?: number;
   /**
    * An IDLE run (conversation at rest) is kept warm this long, then closed as
    * "done" — inactivity is a normal session end, not a failure. Defaults to 2h.
@@ -77,6 +95,7 @@ export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
   private readonly now: () => number;
   private readonly staleMs: number;
+  private readonly dataStaleMs: number;
   private readonly idleTtlMs: number;
   private readonly watchdogIntervalMs: number;
   private readonly onReap?: (rec: CapabilityRunRecord) => Promise<void> | void;
@@ -90,6 +109,7 @@ export class CapabilityRunManager {
   ) {
     this.now = opts.now ?? Date.now;
     this.staleMs = opts.staleMs ?? 10 * 60_000; // 10 min
+    this.dataStaleMs = opts.dataStaleMs ?? (Number(process.env.CAPABILITY_DATA_STALE_MS) || 60 * 60_000); // 60 min
     this.idleTtlMs = opts.idleTtlMs ?? 2 * 60 * 60_000; // 2 h
     this.watchdogIntervalMs = opts.watchdogIntervalMs ?? 60_000; // 1 min
     this.onReap = opts.onReap;
@@ -117,6 +137,7 @@ export class CapabilityRunManager {
       runtimeId: p.runtimeId,
       status: "running",
       lastActivityMs: this.now(),
+      lastHeartbeatMs: this.now(),
     };
     // Persist BEFORE registering: a run must not exist without its store row
     // (start is the one transition that fails closed — see persist()).
@@ -154,6 +175,7 @@ export class CapabilityRunManager {
         sessionRef: row.session_ref || undefined,
         status,
         lastActivityMs: this.now(),
+        lastHeartbeatMs: this.now(),
       };
       this.runs.set(rec.runId, rec);
       console.log(`[capability] adopted run ${runId} from the consumer store (missed by boot recovery)`);
@@ -165,10 +187,21 @@ export class CapabilityRunManager {
     }
   }
 
-  /** Bump last-activity so the watchdog doesn't reap an actively-used run. */
+  /** Bump last-DATA activity so the watchdog doesn't reap an actively-used run. */
   touch(runId: string): void {
     const rec = this.runs.get(runId);
     if (rec) rec.lastActivityMs = this.now();
+  }
+
+  /**
+   * Bump the heartbeat clock only (a `: heartbeat` SSE comment — liveness, not
+   * data). Kept separate from touch() so heartbeats bridge a data-silent phase
+   * up to dataStaleMs but can never keep a wedged (data-silent) turn alive
+   * forever — see reapStale.
+   */
+  touchHeartbeat(runId: string): void {
+    const rec = this.runs.get(runId);
+    if (rec) rec.lastHeartbeatMs = this.now();
   }
 
   /** Record the box session id (for resume) + persist. */
@@ -241,6 +274,7 @@ export class CapabilityRunManager {
           sessionRef: r.session_ref || undefined,
           status: r.status || "running",
           lastActivityMs: this.now(),
+          lastHeartbeatMs: this.now(),
         };
         this.runs.set(r.id, rec);
         this.onAdopt?.(rec);
@@ -256,8 +290,15 @@ export class CapabilityRunManager {
   /**
    * Reap non-terminal runs that outlived their tier's TTL (stop box + persist a
    * terminal state). Two very different kinds of stale:
-   *   - running past staleMs  = a wedged turn            → failed
-   *   - idle    past idleTtlMs = a conversation at rest  → done (normal end)
+   *   - running stale = a wedged turn           → failed (two-clock, see below)
+   *   - idle past idleTtlMs = a conversation at rest → done (normal end)
+   *
+   * The RUNNING tier uses two clocks so heartbeats can't make a wedged box
+   * immortal: reap when data has been silent past dataStaleMs (60 min — even if
+   * heartbeats keep arriving), OR when there is NO liveness at all (neither data
+   * nor heartbeat) past staleMs (10 min). So heartbeats bridge a quiet read-only
+   * phase up to dataStaleMs, but a box that never emits data again dies at
+   * dataStaleMs, and a box that goes fully silent dies at staleMs.
    */
   async reapStale(): Promise<string[]> {
     const now = this.now();
@@ -265,7 +306,11 @@ export class CapabilityRunManager {
     for (const rec of [...this.runs.values()]) {
       if (isTerminalCapabilityStatus(rec.status)) continue;
       const idle = rec.status === "idle";
-      if (rec.lastActivityMs < now - (idle ? this.idleTtlMs : this.staleMs)) {
+      const stale = idle
+        ? rec.lastActivityMs < now - this.idleTtlMs
+        : now - rec.lastActivityMs > this.dataStaleMs ||
+          now - Math.max(rec.lastActivityMs, rec.lastHeartbeatMs) > this.staleMs;
+      if (stale) {
         candidates.push({ runId: rec.runId, outcome: idle ? "done" : "failed" });
       }
     }
