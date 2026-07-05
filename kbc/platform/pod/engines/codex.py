@@ -265,6 +265,17 @@ class CodexEngineSession:
                          f"(KBC_CODEX_TURN_TIMEOUT_SECS) and was killed: {shlex.join(argv)}",
             })
         finally:
+            # Cancel path: close() cancels the worker mid-turn, so a CancelledError
+            # lands here with the subprocess possibly still alive. Terminate it BEFORE
+            # nulling _proc — otherwise close()'s own kill check sees _proc=None and a
+            # torn-down turn leaks a live `codex exec` process burning subscription
+            # quota. Bounded wait so a stuck process still can't hang teardown.
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    proc.kill()
             self._proc = None
             await self._events.put({"type": "turn_end"})
 
