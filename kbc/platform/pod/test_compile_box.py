@@ -731,6 +731,86 @@ async def test_message_captures_brief():
     print("✓ /message captures 定调 brief → BRIEF.json (ordinary msg leaves it)")
 
 
+
+async def test_batch_orchestrator_routing_and_resume():
+    """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
+    the threshold gate (small KBs never batch), the orchestrator stamps batches
+    done and emits exactly ONE turn_done, mid-batch owner chat queues, and an
+    interrupted plan resumes from the first pending batch."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        (raw / "a").mkdir(parents=True)
+        (raw / "b").mkdir(parents=True)
+        (raw / "a" / "one.md").write_bytes(b"x" * 300)
+        (raw / "b" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("rb1", str(wd), 1)
+
+        # threshold gate: big threshold → single-session path untouched
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
+        assert not compile_box._should_route_to_batch(run, "直接开始编译")
+        # over threshold + trigger → batch; non-trigger chat never batches
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+        assert compile_box._should_route_to_batch(run, "直接开始编译")
+        assert compile_box._should_route_to_batch(run, "原料已更新,请增量重编: xx")
+        assert not compile_box._should_route_to_batch(run, "你好")
+
+        # stub the session driver: record directives, pretend each session works
+        driven: list[str] = []
+
+        async def fake_drive(run_, directive, label):
+            driven.append(label + "|" + directive.split("\n")[0])
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        compile_box._drive_batch_session = fake_drive
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        types = [e["type"] for e in events]
+        assert types.count("turn_done") == 1, types
+        turn = next(e for e in events if e["type"] == "turn_done")
+        assert "【批 1/2】" in turn["text"] and "【终审】" in turn["text"], turn
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] == "done" for b in plan["batches"]), plan
+        assert (wd / batching.SOURCES_INVENTORY_PATH).is_file()
+        # two batches + 终审 were driven, in order
+        assert len(driven) == 3 and driven[-1].startswith("终审"), driven
+
+        # resume: mark one batch pending again → next trigger routes to batch even
+        # under a huge threshold, and only the pending batch (+终审) re-runs
+        plan["batches"][1]["status"] = "pending"
+        (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
+        assert compile_box._should_route_to_batch(run, "直接开始编译")
+        driven.clear()
+        compile_box._drive_batch_session = fake_drive
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+        assert len(driven) == 2 and driven[0].startswith("批 2/2"), driven
+
+        # mid-batch owner chat queues and is relayed into the next directive
+        run._batch_active = True
+        run._batch_notes.append("注意保密条款")
+        note = compile_box._drain_batch_notes(run)
+        assert "注意保密条款" in note and compile_box._drain_batch_notes(run) == ""
+        run._batch_active = False
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
+
+
 async def main():
     await test_workspace_sync()
     await test_session_driver_conversational()
@@ -747,6 +827,7 @@ async def main():
     test_merge_proposed_questions()
     await test_propose_questions_appends_dedup()
     await test_message_captures_brief()
+    await test_batch_orchestrator_routing_and_resume()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()

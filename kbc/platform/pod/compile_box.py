@@ -50,6 +50,7 @@ from claude_agent_sdk import (
     InMemorySessionStore,
 )
 
+import batching
 import selfcheck
 
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches
@@ -171,6 +172,15 @@ class CompileRun:
         # loop; reset to 0 whenever the check passes).
         self._selfcheck_key: str | None = None
         self._l1_repairs_used = 0
+        # Batch mode (DESIGN-kb-batch-compile-2026-07-05): when the orchestrator
+        # drives per-batch sessions, ResultMessage must NOT emit turn_done (the
+        # whole batch run is ONE turn to sicore); the flushed reply is parked
+        # here for the orchestrator instead. _batch_notes queues owner chat that
+        # arrives mid-batch (relayed into the next batch directive).
+        self._suppress_turn_done = False
+        self._last_turn_reply: str = ""
+        self._batch_active = False
+        self._batch_notes: list[str] = []
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
@@ -798,6 +808,18 @@ async def _emit_message(run: CompileRun, msg) -> None:
     elif name == "ResultMessage":
         reply = "\n\n".join(run._turn_text).strip()
         run._turn_text = []
+        if getattr(run, "_suppress_turn_done", False):
+            # Batch mode: this session's turn is an INTERNAL step of one logical
+            # turn. Park the reply, keep the durability sync, skip selfcheck
+            # (the final full-corpus pass owns it) and skip turn_done.
+            run._last_turn_reply = reply
+            sent = getattr(run, "_sync_sent", None)
+            if sent is not None:
+                try:
+                    await _sync_workspace(run, sent)
+                except Exception:
+                    pass
+            return
         # Layer-1 self-check BEFORE the sync so SELFCHECK.json rides the same
         # pre-turn_done sync. Fail-open: a self-check crash must not kill the
         # turn (§4.5) — surface it as a summary line instead of dying silently.
@@ -838,29 +860,11 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
 ]
 
 
-async def run_session(run: CompileRun):
-    """Persistent driver: host ONE long-lived Claude Code session (ClaudeSDKClient)
-    for this KB. box_role (+ the playbook + the attempt instruction) is the standing
-    system prompt; the session then takes turns via POST /message — continuous
-    prepare + compile in one session, on massapi, with the compile tools.
-    Conversational by construction: connect, then wait for the first /message.
-    (Durable cross-restart resume + a file-backed session store land in P4; v1
-    uses an in-process store.)"""
-    wd = str(Path(run.workdir).resolve())
-    playbook = _playbook_text(run.locale)
-    instruction = (run.instruction or "").strip()
-    role_parts = []
-    if playbook:
-        role_parts.append(playbook)
-    role_parts.append(_prompt("box_role", run.locale))
-    if instruction:
-        header = _INSTRUCTION_HEADER.get((run.locale or DEFAULT_LOCALE).lower(), _INSTRUCTION_HEADER[DEFAULT_LOCALE])
-        role_parts.append(header + "\n\n" + instruction)
-    system_prompt = "\n\n---\n\n".join(role_parts)
-
-    sid = run.session_id or str(uuid.uuid4())
-    run.session_id = sid
-    opts = ClaudeAgentOptions(
+def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, session_id: str) -> "ClaudeAgentOptions":
+    """One options builder for the persistent session AND every batch session —
+    identical role/tools/model so a batch page is written under exactly the same
+    conventions as a single-session page."""
+    return ClaudeAgentOptions(
         cwd=wd,
         # Keep the Claude Code preset (agentic tool conventions) and append the
         # KB authoring role on top, rather than replacing it.
@@ -874,9 +878,267 @@ async def run_session(run: CompileRun):
         # compile default is opus by product decision. Overridable per-deploy.
         model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
         max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
-        session_id=sid,
+        session_id=session_id,
         session_store=InMemorySessionStore(),
     )
+
+
+def _compile_system_prompt(run: "CompileRun") -> str:
+    playbook = _playbook_text(run.locale)
+    instruction = (run.instruction or "").strip()
+    role_parts = []
+    if playbook:
+        role_parts.append(playbook)
+    role_parts.append(_prompt("box_role", run.locale))
+    if instruction:
+        header = _INSTRUCTION_HEADER.get((run.locale or DEFAULT_LOCALE).lower(), _INSTRUCTION_HEADER[DEFAULT_LOCALE])
+        role_parts.append(header + "\n\n" + instruction)
+    return "\n\n---\n\n".join(role_parts)
+
+
+# ── batch mode (DESIGN-kb-batch-compile-2026-07-05) ──────────────────────────
+# Large corpora never fit one session (autocompact is off — massapi rejects the
+# context_management field), so the box splits the compile into code-budgeted
+# batches, each a FRESH session over the same workspace. State handoff is the
+# workspace itself (exact files, code-verifiable), never a prose summary. Small
+# KBs stay on the untouched single-session path (threshold gate).
+
+_BATCH_TRIGGER_PREFIXES = ("直接开始编译", "批准,按此计划执行")
+_BATCH_TRIGGER_SUBSTR = "请增量重编"
+
+
+def _is_compile_trigger(text: str) -> bool:
+    return text.startswith(_BATCH_TRIGGER_PREFIXES) or _BATCH_TRIGGER_SUBSTR in text
+
+
+def _batch_mode_enabled() -> bool:
+    return os.environ.get("KBC_BATCH_MODE", "on") != "off"
+
+
+def _should_route_to_batch(run: "CompileRun", text: str) -> bool:
+    if not _batch_mode_enabled() or run._batch_active or not _is_compile_trigger(text):
+        return False
+    raw_dir = Path(run.workdir) / "raw"
+    inventory = batching.scan_sources(raw_dir)
+    if batching.should_batch(inventory):
+        return True
+    # An interrupted batch run must finish as a batch run even if raw shrank.
+    plan = _load_batch_plan(run)
+    return plan is not None and len(batching.pending_batches(plan)) > 0
+
+
+def _batch_plan_path(run: "CompileRun") -> Path:
+    return Path(run.workdir) / batching.BATCH_PLAN_PATH
+
+
+def _load_batch_plan(run: "CompileRun") -> dict | None:
+    p = _batch_plan_path(run)
+    if not p.is_file():
+        return None
+    try:
+        plan = json.loads(p.read_text())
+        return plan if isinstance(plan, dict) and isinstance(plan.get("batches"), list) else None
+    except Exception:
+        return None
+
+
+def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
+    p = Path(run.workdir) / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(batching.dump_json(value))
+
+
+async def _drive_batch_session(run: "CompileRun", directive: str, label: str) -> str:
+    """One bounded internal session: fresh session_id, same role/tools/workspace.
+    Streams its output through _emit_message with turn_done suppressed; returns
+    the session's final reply text. run.client points at the live session so the
+    park/ruling MCP tools and the inject seam keep working."""
+    wd = str(Path(run.workdir).resolve())
+    opts = _compile_session_opts(run, wd, _compile_system_prompt(run), str(uuid.uuid4()))
+    client = ClaudeSDKClient(options=opts)
+    prev_client = run.client
+    run._suppress_turn_done = True
+    run._last_turn_reply = ""
+    try:
+        await client.connect()
+        run.client = client
+        await run.emit({"type": "log", "text": f"—— {label} 开始 ——"})
+        await client.query(directive)
+        async for msg in client.receive_messages():
+            await _emit_message(run, msg)
+            if type(msg).__name__ == "ResultMessage":
+                break
+        return run._last_turn_reply
+    finally:
+        run._suppress_turn_done = False
+        run.client = prev_client
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+def _drain_batch_notes(run: "CompileRun") -> str:
+    if not run._batch_notes:
+        return ""
+    notes = "\n".join(f"- {n}" for n in run._batch_notes)
+    run._batch_notes = []
+    return f"\n\n负责人在编译过程中补充说(一并考虑,影响后续各批):\n{notes}"
+
+
+def _compose_batch_directive(batch: dict, k: int, n: int, notes: str) -> str:
+    listing = "\n".join(f"- raw/{p}" for p in batch["sources"])
+    return (
+        f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
+        "先读 authoring/BRIEF.json、authoring/INTENT.md 和 candidate/index.md 保持口径与结构一致;"
+        "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
+        "compiled_from 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
+        "本批之外的 raw 源一个都不要读。完成后简短汇报本批编了哪些页。" + notes
+    )
+
+
+def _compose_final_directive(n: int, notes: str) -> str:
+    return (
+        f"【分批编译 · 终审】全部 {n} 批已编完。现在做跨批收口:\n"
+        "1) 通读 candidate/index.md 与各页标题,合并明显重复的主题页、统一术语与结构,修补 index 的分组与链接;\n"
+        "2) 跨批矛盾:同一事实在不同批的页里说法不一致的,照常 best-guess+⚠️存疑+落工单;\n"
+        "3) 核对 authoring/EXCLUSIONS.json:决定不编的源必须显式入账。\n"
+        "只做收口,不重编已经完好的页。完成后简短汇报:总页数、本次收口动了哪些页、还有什么值得负责人注意。" + notes
+    )
+
+
+_PLANNER_ROLE = (
+    "你是知识库分批编译的规划员。工作区里 authoring/SOURCES_INVENTORY.json 列出了全部 raw 源(路径+字节)。"
+    "把它们分成若干批:同主题/同目录尽量同批,每批字节总量不超过给定预算(单个超预算的文件独占一批)。"
+    "把方案写入 authoring/BATCH_PLAN.json,格式 {\"batches\":[{\"id\":\"b01\",\"sources\":[\"相对raw的路径\"]}]}。"
+    "每个源必须恰好出现在一个批里。只读清单文件,不要读源文件内容。写完即结束。"
+)
+
+
+async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
+    """Code baseline always exists; the model may regroup topically but ONLY a
+    plan that passes deterministic validation replaces the baseline."""
+    budget = batching.batch_budget_bytes()
+    baseline = batching.build_plan(inventory, batching.pack_batches(inventory), planner="code")
+    if os.environ.get("KBC_BATCH_PLANNER", "model") == "code":
+        return baseline
+    try:
+        wd = str(Path(run.workdir).resolve())
+        opts = ClaudeAgentOptions(
+            cwd=wd,
+            system_prompt={"type": "preset", "preset": "claude_code", "append": _PLANNER_ROLE},
+            allowed_tools=["Read", "Write", "Glob"],
+            permission_mode="bypassPermissions",
+            setting_sources=[],
+            model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
+            max_turns=8,
+            session_id=str(uuid.uuid4()),
+            session_store=InMemorySessionStore(),
+        )
+        client = ClaudeSDKClient(options=opts)
+        prev = run.client
+        run._suppress_turn_done = True
+        try:
+            await client.connect()
+            run.client = client
+            await client.query(
+                f"预算:每批不超过 {budget} 字节。读 authoring/SOURCES_INVENTORY.json,写 authoring/BATCH_PLAN.json。"
+            )
+            async for msg in client.receive_messages():
+                await _emit_message(run, msg)
+                if type(msg).__name__ == "ResultMessage":
+                    break
+        finally:
+            run._suppress_turn_done = False
+            run.client = prev
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        proposed = batching.normalize_model_plan(_load_batch_plan(run))
+        if proposed:
+            errors = batching.validate_plan(proposed, inventory)
+            if not errors:
+                return batching.build_plan(inventory, proposed["batches"], planner="model")
+            await run.emit({"type": "log", "text": "规划方案未过校验,改用代码基线分批:" + "; ".join(errors[:3])})
+    except Exception as e:
+        await run.emit({"type": "log", "text": f"规划会话失败,改用代码基线分批: {e!r}"})
+    return baseline
+
+
+async def _run_batch_compile(run: "CompileRun", trigger_text: str):
+    """The batch orchestrator: ONE logical turn to sicore (single turn_done at
+    the end), many bounded sessions inside. Crash-resumable at batch granularity:
+    BATCH_PLAN.json carries per-batch done stamps, and any later compile trigger
+    re-enters here and continues from the first pending batch."""
+    run._batch_active = True
+    replies: list[str] = []
+    try:
+        raw_dir = Path(run.workdir) / "raw"
+        inventory = batching.scan_sources(raw_dir)
+        total_kb = batching.corpus_bytes(inventory) // 1024
+        plan = _load_batch_plan(run)
+        resuming = plan is not None and len(batching.pending_batches(plan)) > 0
+        if not resuming:
+            _write_batch_file(run, batching.SOURCES_INVENTORY_PATH, inventory)
+            await run.emit({"type": "summary", "text": f"语料 {total_kb}KB 超过单会话阈值,启用分批编译。"})
+            plan = await _plan_batches(run, inventory)
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+        n = len(plan["batches"])
+        pending = batching.pending_batches(plan)
+        await run.emit({
+            "type": "summary",
+            "text": (f"继续分批编译:剩余 {len(pending)}/{n} 批。" if resuming
+                     else f"分批计划({plan.get('planner')}):共 {n} 批,预算 {plan.get('budget', 0) // 1024}KB/批。"),
+        })
+        for batch in list(pending):
+            k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
+            directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run))
+            reply = await _drive_batch_session(run, directive, f"批 {k}/{n}")
+            if reply:
+                replies.append(f"【批 {k}/{n}】{reply}")
+            batching.stamp_done(plan, batch["id"])
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            await run.emit({"type": "summary", "text": f"批 {k}/{n} 完成,已落库。"})
+        final_reply = await _drive_batch_session(run, _compose_final_directive(n, _drain_batch_notes(run)), "终审")
+        if final_reply:
+            replies.append(f"【终审】{final_reply}")
+        # Full-corpus selfcheck + bounded repair rounds, each a fresh bounded
+        # session (the batch analogue of the ordinary post-turn repair loop).
+        run._selfcheck_key = None  # force re-evaluation over the final state
+        repair = await _post_turn_selfcheck(run)
+        while repair:
+            fix_reply = await _drive_batch_session(run, repair, "账本回修")
+            if fix_reply:
+                replies.append(f"【回修】{fix_reply}")
+            repair = await _post_turn_selfcheck(run)
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)
+            except Exception:
+                pass
+        await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip() or "分批编译完成。"})
+    except Exception as e:
+        await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
+    finally:
+        run._batch_active = False
+
+
+async def run_session(run: CompileRun):
+    """Persistent driver: host ONE long-lived Claude Code session (ClaudeSDKClient)
+    for this KB. BOX_ROLE (+ the playbook + the attempt instruction) is the standing
+    system prompt; the session then takes turns via POST /message — continuous
+    prepare + compile in one session, on massapi, with the compile tools.
+    Conversational by construction: connect, then wait for the first /message.
+    (Durable cross-restart resume + a file-backed session store land in P4; v1
+    uses an in-process store.)"""
+    wd = str(Path(run.workdir).resolve())
+    system_prompt = _compile_system_prompt(run)
+
+    sid = run.session_id or str(uuid.uuid4())
+    run.session_id = sid
+    opts = _compile_session_opts(run, wd, system_prompt, sid)
     client = ClaudeSDKClient(options=opts)
     try:
         # Connect and block for the first /message. Set run.client + signal
@@ -1151,6 +1413,28 @@ async def handle_message(request: web.Request):
     # persist it deterministically to authoring/BRIEF.json BEFORE the turn so the
     # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
     _capture_brief(run, text)
+    # Batch mode (大库): a compile trigger over an above-threshold corpus (or a
+    # plan with pending batches) runs the orchestrator instead of one giant turn.
+    if _should_route_to_batch(run, text):
+        # Claim batch mode SYNCHRONOUSLY, before spawning the orchestrator task:
+        # _run_batch_compile only sets the flag once it starts running, so a
+        # second /message racing in before the task is scheduled would pass
+        # _should_route_to_batch again and spawn a second orchestrator over the
+        # same workspace. Setting it here closes that window (the task keeps its
+        # own idempotent set, and the task's finally clears it).
+        run._batch_active = True
+        asyncio.create_task(_run_batch_compile(run, text))
+        return web.json_response({"ok": True, "batch": True})
+    if run._batch_active:
+        if _is_compile_trigger(text):
+            # A second trigger mid-batch changes nothing the plan doesn't know.
+            await run.emit({"type": "summary", "text": "分批编译进行中,本轮结束后再发起。"})
+        else:
+            # Owner chat mid-batch: queue it — the next batch/终审 directive
+            # relays it, so nothing lands inside a half-read internal session.
+            run._batch_notes.append(text)
+            await run.emit({"type": "summary", "text": "已收到,会带给后续批次一并考虑。"})
+        return web.json_response({"ok": True, "queued": True})
     await run.client.query(text)
     return web.json_response({"ok": True})
 

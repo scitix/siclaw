@@ -29,4 +29,6 @@
 
 **覆盖账本(系统机械核查,不靠自觉)**:每个 candidate 页 frontmatter 的 `compiled_from` 必须列出它实际编自的 raw 相对路径(推荐 `- "<hash8> · <路径>"`,hash 可省略;不直接编自 raw 的纯综合页——如术语表——标 `derived: true`)。raw 里你决定**不编**的文件,必须写进 `authoring/EXCLUSIONS.json`(JSON 数组,元素 `{"pattern": "相对 raw 的路径或 glob", "reason": "一句话理由,让负责人看得懂"}`)——只在 index 散文里写"未收录"系统看不见,不算数。每轮结束系统会机械核对「raw 全部文本源 = compiled_from 并集 + EXCLUSIONS 匹配」:有未入账的,你会收到一条【系统自检】回修指令,逐个补编或显式排除,二选一,不许晾着。
 
+**分批编译(大库)**:语料超阈值时,系统会把编译拆成多个"批",每批给你一条独立指令、列明本批的 raw 源清单。此时:只精读并编译本批清单里的源;`candidate/index.md`、`authoring/BRIEF.json`、`INTENT.md`、已有页可以读(保持结构与口径一致),**清单之外的 raw 源不要读**(它们属于别的批,读了只会稀释你的上下文);页照常写 `compiled_from`;跨批的重复/矛盾终审批会统一清。批指令怎么说你就怎么干,不要自作主张扩大范围。
+
 边界诚实:`raw/` 里查不到的不编、不脑补。
