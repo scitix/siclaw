@@ -958,7 +958,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const activeSessionIdRef = useRef<string | undefined>(sessionId ?? undefined)
   const [isCompacting, setIsCompacting] = useState(false)
   const hasActiveAsyncDelegation = hasActiveAsyncDelegationSurface(messages)
-  const hasActiveBgSubagent = hasActiveBackgroundSubagent(messages)
+  const hasActiveBgSubagent = hasActiveBackgroundSubagent(messages) || hasActiveBackgroundGroup(messages)
   // Detached background work still running (bg exec job or bg sub-agent) — keeps the input's
   // Stop button available after the turn ends so the user can sweep it via chat.abort.
   const hasBackgroundWork = hasActiveBackgroundWork(messages)
@@ -1263,6 +1263,10 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   // cover it, and its completion is a pure-ack synthetic turn (no background_turn_done). Poll
   // history while one is running so its card folds running → done live (annotateSubagentCompletions
   // does the fold); stop once folded. Never clobbers a live /send stream or paged-back scrollback.
+  // Covers the batch (group) form too: a user Stop suppresses BOTH live convergence signals
+  // (job_stop claims the notification → no subagent_done, no synthetic turn → no
+  // background_turn_done), so without this poll a stopped group's card stays "Running" until a
+  // manual reload even though the persisted terminal event is already in the DB.
   useEffect(() => {
     if (!sessionId || !hasActiveBgSubagent) return
     let cancelled = false
@@ -1271,11 +1275,17 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       try {
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
-        if (pageRef.current === 1 && !streamingRef.current && !refetchSuppressedByAbort()) {
+        const applied = pageRef.current === 1 && !streamingRef.current && !refetchSuppressedByAbort()
+        if (applied) {
           setMessages(pilotMsgs)
           setHasMore(items.length >= PAGE_SIZE)
         }
-        if (!hasActiveBackgroundSubagent(pilotMsgs)) return // folded → stop polling
+        // Stop polling only when the folded page was actually APPLIED. Judging fold-ness on an
+        // unapplied fetch races the post-abort suppression window: a Stop lands, the terminal
+        // event persists during refetchSuppressedByAbort(), this poll sees it folded in the FRESH
+        // page, returns — and the on-screen card (which never received that page) sticks on
+        // "Running" forever with no remaining trigger.
+        if (applied && !hasActiveBackgroundSubagent(pilotMsgs) && !hasActiveBackgroundGroup(pilotMsgs)) return
       } catch (err) {
         console.warn("[usePilotChat] background-subagent refresh failed:", err)
       }
