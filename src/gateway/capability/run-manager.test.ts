@@ -280,6 +280,54 @@ describe("CapabilityRunManager", () => {
     expect(be.persists()).toHaveLength(0); // and done was never overwritten
   });
 
+  it("reapStale spares a run touched DURING the store re-check await (finding A)", async () => {
+    // A message landing in the getRun window bumps lastActivityMs. The post-await
+    // freshness re-derive must see it fresh again and skip — no box stop, no
+    // failed mark on a live run.
+    const be = new FakeBackend();
+    let clock = 1000;
+    const onReap = vi.fn();
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, onReap });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" }); // lastActivity=1000
+    be.getRunRow = { id: rec.runId, profile: "kb-compile", status: "running" }; // non-terminal
+    // Simulate a capability.message arriving during the getRun round-trip.
+    const orig = be.request.bind(be);
+    be.request = async (method: string, params?: unknown) => {
+      if (method === CAPABILITY_GET_RUN) mgr.touch(rec.runId); // fresh at clock=2000
+      return orig(method, params);
+    };
+    clock = 2000; // snapshot sees it stale (2000-1000 > 500)…
+
+    const reaped = await mgr.reapStale();
+    expect(reaped).toEqual([]); // …but the re-derive after getRun sees it fresh
+    expect(onReap).not.toHaveBeenCalled();
+    expect(mgr.get(rec.runId)?.status).toBe("running"); // not failed
+  });
+
+  it("reapStale defers (never reaps) when the store is unreachable during the re-check (finding B)", async () => {
+    // A resurrection artifact that is `done` in the store must not be overwritten
+    // to failed while the store is down — the reap is deferred to a later tick.
+    const be = new FakeBackend();
+    let clock = 1000;
+    const onReap = vi.fn();
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, onReap });
+    be.activeRuns = [{ id: "r-ghost", profile: "kb-compile", org_id: "o1", status: "running" }];
+    await mgr.recover(); // resurrects the ghost (its store row is really `done`)
+    // Store unreachable for the GET_RUN re-check.
+    const orig = be.request.bind(be);
+    be.request = async (method: string, params?: unknown) => {
+      if (method === CAPABILITY_GET_RUN) throw new Error("store down");
+      return orig(method, params);
+    };
+    clock = 2000;
+
+    const reaped = await mgr.reapStale();
+    expect(reaped).toEqual([]); // deferred, not reaped
+    expect(onReap).not.toHaveBeenCalled(); // box not stopped
+    expect(be.persists()).toHaveLength(0); // no failed persist → done not clobbered
+    expect(mgr.get("r-ghost")?.status).toBe("running"); // still held for the next tick
+  });
+
   it("endRun is terminal-sticky — the first outcome wins", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);

@@ -11,10 +11,14 @@ on:
     branches: [main]
     paths: ["kbc/**", ".github/workflows/kbc-ci.yml"]
 
+# Least-privilege: this job only reads the repo (no PR writes, no packages).
+permissions:
+  contents: read
+
 jobs:
   box-test:
     name: KBC Box Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -60,7 +60,12 @@ export async function materializeCapabilityInputs(opts: {
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("failed: 409")) {
+    // Prefer the structured HTTP status (client attaches err.status); fall back to
+    // the message only when it's absent (finding E — a client message reword must
+    // not silently turn a 409 into a hard error).
+    const status = (err as { status?: unknown } | null)?.status;
+    const boxAlreadyLive = status === 409 || (typeof status !== "number" && msg.includes("failed: 409"));
+    if (boxAlreadyLive) {
       // The box already holds this run (live on-disk state) — reattach without
       // touching its workspace.
       console.log(`[capability] session ${runId}: box already live; skipping materialization`);

@@ -254,23 +254,32 @@ export class CapabilityRunManager {
   }
 
   /**
+   * The terminal outcome a run has EARNED by its staleness right now, or null if
+   * it is still fresh. Shared by reapStale's initial snapshot AND its post-await
+   * re-validation (finding A) so both judge freshness by exactly the same rule:
+   *   - running past staleMs  → failed
+   *   - idle    past idleTtlMs → done
+   */
+  private stalenessOutcome(rec: CapabilityRunRecord, now: number): CapabilityTerminalStatus | null {
+    if (isTerminalCapabilityStatus(rec.status)) return null;
+    const idle = rec.status === "idle";
+    if (rec.lastActivityMs >= now - (idle ? this.idleTtlMs : this.staleMs)) return null;
+    return idle ? "done" : "failed";
+  }
+
+  /**
    * Reap non-terminal runs that outlived their tier's TTL (stop box + persist a
    * terminal state). Two very different kinds of stale:
    *   - running past staleMs  = a wedged turn            → failed
    *   - idle    past idleTtlMs = a conversation at rest  → done (normal end)
    */
   async reapStale(): Promise<string[]> {
-    const now = this.now();
-    const candidates: Array<{ runId: string; outcome: CapabilityTerminalStatus }> = [];
+    const candidates: string[] = [];
     for (const rec of [...this.runs.values()]) {
-      if (isTerminalCapabilityStatus(rec.status)) continue;
-      const idle = rec.status === "idle";
-      if (rec.lastActivityMs < now - (idle ? this.idleTtlMs : this.staleMs)) {
-        candidates.push({ runId: rec.runId, outcome: idle ? "done" : "failed" });
-      }
+      if (this.stalenessOutcome(rec, this.now())) candidates.push(rec.runId);
     }
     const reaped: string[] = [];
-    for (const { runId, outcome } of candidates) {
+    for (const runId of candidates) {
       const rec = this.runs.get(runId);
       if (!rec) continue;
       // A candidate can be a resurrection artifact: recover()'s active-run
@@ -287,9 +296,20 @@ export class CapabilityRunManager {
           continue;
         }
       } catch {
-        // store unreachable — proceed; a wrong failed persist would be retried
-        // and the store row is non-terminal anyway if we got here at boot.
+        // Store unreachable (finding B): we can't confirm this run didn't already
+        // end. A resurrection artifact could be `done` in the store — reaping it
+        // now would overwrite done→failed via flushTerminal, violating "a done
+        // never degrades to failed". Defer to the next tick; a genuinely wedged
+        // box isn't persisting anything while the store is down anyway.
+        continue;
       }
+      // Re-validate freshness AFTER the store re-check's async gap (finding A): a
+      // capability.message landing during that await bumps lastActivityMs, so a
+      // run snapshotted as stale can be active again by now. Reaping it here would
+      // kill a live turn AND mark the fresh run failed. Re-derive against the
+      // current record; if it's no longer stale, leave it for a later tick.
+      const outcome = this.stalenessOutcome(rec, this.now());
+      if (!outcome) continue;
       console.warn(`[capability] watchdog reaping stale run ${runId} → ${outcome}`);
       if (this.onReap) {
         // Stop the run's box BEFORE the terminal mark, so the store never says

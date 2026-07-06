@@ -483,7 +483,11 @@ export class AgentBoxClient {
       if (!resp.ok) {
         const text = await resp.text().catch(() => "");
         console.error(`[agentbox-client] HTTP error: ${method} ${path} → ${resp.status} ${text.slice(0, 200)}`);
-        throw new Error(`AgentBox request failed: ${resp.status} ${text}`);
+        // Carry the HTTP status structurally so callers can branch on it (e.g.
+        // materialize's 409 = box-already-live) without parsing the message.
+        const e = new Error(`AgentBox request failed: ${resp.status} ${text}`) as Error & { status: number };
+        e.status = resp.status;
+        throw e;
       }
 
       return resp;
@@ -523,7 +527,9 @@ export class AgentBoxClient {
               resolve(new Response(body, { status, statusText: res.statusMessage }));
             } else {
               console.error(`[agentbox-client] HTTPS error: ${method} ${path} → ${status} ${body.slice(0, 200)}`);
-              reject(new Error(`AgentBox request failed: ${status} ${body}`));
+              const e = new Error(`AgentBox request failed: ${status} ${body}`) as Error & { status: number };
+              e.status = status;
+              reject(e);
             }
           });
         },
