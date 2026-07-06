@@ -775,6 +775,10 @@ def _media_verify_enabled() -> bool:
     return os.environ.get("KBC_MEDIA_VERIFY", "on") != "off"
 
 
+def _media_verify_max_images() -> int:
+    return int(os.environ.get("KBC_MEDIA_VERIFY_MAX_IMAGES", "8"))
+
+
 async def _post_turn_media_verify(run) -> str | None:
     """Single-session analogue of the batch image re-verification pass: once the
     draft is settled (ledger closed, lint ok — state 'passed' in SELFCHECK), pages
@@ -793,9 +797,15 @@ async def _post_turn_media_verify(run) -> str | None:
     pending = selfcheck.pending_media_verification(workdir)
     if not pending:
         return None
-    selfcheck.mark_media_verified(workdir, list(pending))
-    await run.emit({"type": "summary", "text": f"自检(图像):{len(pending)} 页引用图片,注入数值复核轮。"})
-    return selfcheck.build_media_verify_prompt(pending)
+    # Chunked: one round covers ≤ max images (whole pages); the remainder rolls
+    # into the next settled turn automatically (only included pages get marked).
+    chunk = selfcheck.cap_media_pending(pending, _media_verify_max_images())
+    selfcheck.mark_media_verified(workdir, list(chunk))
+    left = len(pending) - len(chunk)
+    await run.emit({"type": "summary", "text": (
+        f"自检(图像):{len(chunk)} 页引用图片,注入数值复核轮"
+        + (f"(还有 {left} 页排队,下轮继续)。" if left else "。"))})
+    return selfcheck.build_media_verify_prompt(chunk)
 
 
 # ── Layer-2 red-blue PK wiring (S2, DESIGN-kb-compile-self-verification §9) ──
@@ -1400,13 +1410,21 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # add image-digesting pages), then one more ledger refresh so
         # SELFCHECK.json reflects the verified final state.
         if _media_verify_enabled():
-            pending = selfcheck.pending_media_verification(run.workdir)
-            if pending:
-                selfcheck.mark_media_verified(run.workdir, list(pending))
+            verified_any = False
+            while True:
+                pending = selfcheck.pending_media_verification(run.workdir)
+                if not pending:
+                    break
+                # One bounded session per ≤max-images chunk: a single session
+                # reading 35 images hit the API image limits live (2026-07-06).
+                chunk = selfcheck.cap_media_pending(pending, _media_verify_max_images())
+                selfcheck.mark_media_verified(run.workdir, list(chunk))
                 verify_reply = await _drive_batch_session(
-                    run, selfcheck.build_media_verify_prompt(pending), "图像复核")
+                    run, selfcheck.build_media_verify_prompt(chunk), "图像复核")
                 if verify_reply:
                     replies.append(f"【图像复核】{verify_reply}")
+                verified_any = True
+            if verified_any:
                 await _run_ledger_repairs(run, replies)
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
