@@ -105,6 +105,45 @@ def test_normalize_model_plan_and_progress(tmp_path):
     assert bt.normalize_model_plan([1, 2]) is None
 
 
+def test_effective_weights_images_pdf_binary(tmp_path: Path):
+    raw = _mk(tmp_path, {"a.md": 1000})
+    img = raw / "media" / "shot.png"
+    img.parent.mkdir(parents=True, exist_ok=True)
+    img.write_bytes(b"p" * 170_000)
+    # synthetic pdf: 5 page markers + a /Pages tree node that must NOT count
+    pdf = raw / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4 /Type /Pages " + b"/Type /Page 1 " * 5 + b"x" * 500_000)
+    other = raw / "blob.bin"
+    other.write_bytes(b"z" * 100_000)
+    inv = {i["path"]: i for i in bt.scan_sources(raw)}
+    assert inv["a.md"]["effective"] == 1000
+    assert inv["media/shot.png"]["effective"] == 30 * 1024          # flat image cost
+    assert inv["doc.pdf"]["effective"] == 5 * 8 * 1024              # pages x page-cost
+    assert inv["blob.bin"]["effective"] == int(100_000 * 0.3)
+    print("effective:", {k: v["effective"] for k, v in inv.items()})
+
+
+def test_pack_uses_effective_not_raw_bytes(tmp_path: Path):
+    # 10 images x 170KB raw = 1.7MB raw, but 10 x 30KB effective = 300KB →
+    # fits in TWO 200KB batches instead of ten solo batches.
+    files = {f"media/s{i:02d}.png": 170_000 for i in range(10)}
+    raw = _mk(tmp_path, files)
+    inv = bt.scan_sources(raw)
+    batches = bt.pack_batches(inv, budget=200 * 1024)
+    assert len(batches) == 2, [b["sources"] for b in batches]
+    # threshold also weighted: 300KB effective < 400KB default → no batching
+    assert bt.should_batch(inv, threshold=400 * 1024) is False
+
+
+def test_pdf_fallback_when_no_markers(tmp_path: Path):
+    raw = _mk(tmp_path, {"a.md": 10})
+    pdf = raw / "opaque.pdf"
+    pdf.write_bytes(b"%PDF-1.7 compressed-object-streams " + b"q" * 2_000_000)
+    inv = {i["path"]: i for i in bt.scan_sources(raw)}
+    eff = inv["opaque.pdf"]["effective"]
+    assert 30 * 1024 <= eff <= 400 * 1024  # clamped byte heuristic
+
+
 def main():
     tests = [
         test_scan_skips_hidden_and_empty,
@@ -114,6 +153,9 @@ def main():
         test_validate_plan_accepts_code_baseline,
         test_validate_plan_rejects_missing_duplicate_unknown_overflow,
         test_normalize_model_plan_and_progress,
+        test_effective_weights_images_pdf_binary,
+        test_pack_uses_effective_not_raw_bytes,
+        test_pdf_fallback_when_no_markers,
     ]
     for fn in tests:
         with tempfile.TemporaryDirectory() as td:
