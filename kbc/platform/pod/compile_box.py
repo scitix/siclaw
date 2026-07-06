@@ -1008,8 +1008,10 @@ def _compose_final_directive(n: int, notes: str) -> str:
 
 
 _PLANNER_ROLE = (
-    "你是知识库分批编译的规划员。工作区里 authoring/SOURCES_INVENTORY.json 列出了全部 raw 源(路径+字节)。"
-    "把它们分成若干批:同主题/同目录尽量同批,每批字节总量不超过给定预算(单个超预算的文件独占一批)。"
+    "你是知识库分批编译的规划员。工作区里 authoring/SOURCES_INVENTORY.json 列出了全部 raw 源,"
+    "每项有 path、bytes(原始字节)和 effective(上下文成本估算:文本=原始字节,图片/PDF 已按真实消耗折算,远小于原始字节)。"
+    "把它们分成若干批:同主题/同目录尽量同批,**每批的 effective 总量**不超过给定预算——预算约束只看 effective,绝不要用 bytes 装箱"
+    "(单个 effective 超预算的文件才独占一批)。批数应尽量少:一张图片 effective 很小,几张图和引用它们的文档放同一批反而质量更好。"
     "把方案写入 authoring/BATCH_PLAN.json,格式 {\"batches\":[{\"id\":\"b01\",\"sources\":[\"相对raw的路径\"]}]}。"
     "每个源必须恰好出现在一个批里。只读清单文件,不要读源文件内容。写完即结束。"
 )
@@ -1042,7 +1044,8 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             await client.connect()
             run.client = client
             await client.query(
-                f"预算:每批不超过 {budget} 字节。读 authoring/SOURCES_INVENTORY.json,写 authoring/BATCH_PLAN.json。"
+                f"预算:每批 effective 总量不超过 {budget}(只按 effective 字段装箱,不看 bytes)。"
+                "读 authoring/SOURCES_INVENTORY.json,写 authoring/BATCH_PLAN.json。"
             )
             async for msg in client.receive_messages():
                 await _emit_message(run, msg)
@@ -1058,9 +1061,15 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
         proposed = batching.normalize_model_plan(_load_batch_plan(run))
         if proposed:
             errors = batching.validate_plan(proposed, inventory)
-            if not errors:
+            if not errors and batching.plan_too_fragmented(proposed["batches"], baseline["batches"]):
+                await run.emit({
+                    "type": "log",
+                    "text": f"规划方案过碎({len(proposed['batches'])} 批 vs 基线 {len(baseline['batches'])} 批),改用代码基线分批。",
+                })
+            elif not errors:
                 return batching.build_plan(inventory, proposed["batches"], planner="model")
-            await run.emit({"type": "log", "text": "规划方案未过校验,改用代码基线分批:" + "; ".join(errors[:3])})
+            else:
+                await run.emit({"type": "log", "text": "规划方案未过校验,改用代码基线分批:" + "; ".join(errors[:3])})
     except Exception as e:
         await run.emit({"type": "log", "text": f"规划会话失败,改用代码基线分批: {e!r}"})
     return baseline

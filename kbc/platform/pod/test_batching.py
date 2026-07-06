@@ -144,6 +144,17 @@ def test_pdf_fallback_when_no_markers(tmp_path: Path):
     assert 30 * 1024 <= eff <= 400 * 1024  # clamped byte heuristic
 
 
+def test_plan_fragmentation_guard(tmp_path: Path):
+    base = [{"id": f"b{i:02d}", "sources": [f"s{i}"]} for i in range(14)]
+    ok_model = [{"id": f"m{i:02d}", "sources": [f"s{i}"]} for i in range(16)]      # 14→16: fine
+    frag_model = [{"id": f"m{i:02d}", "sources": [f"s{i}"]} for i in range(25)]    # 14→25: rejected
+    assert bt.plan_too_fragmented(ok_model, base) is False
+    assert bt.plan_too_fragmented(frag_model, base) is True
+    tiny_base = [{"id": "b01", "sources": ["a"]}, {"id": "b02", "sources": ["b"]}]
+    assert bt.plan_too_fragmented([{}, {}, {}, {}], tiny_base) is False  # +2 allowance for tiny plans
+    assert bt.plan_too_fragmented([{}, {}, {}, {}, {}], tiny_base) is True
+
+
 def main():
     tests = [
         test_scan_skips_hidden_and_empty,
@@ -156,6 +167,7 @@ def main():
         test_effective_weights_images_pdf_binary,
         test_pack_uses_effective_not_raw_bytes,
         test_pdf_fallback_when_no_markers,
+        test_plan_fragmentation_guard,
     ]
     for fn in tests:
         with tempfile.TemporaryDirectory() as td:

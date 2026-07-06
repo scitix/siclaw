@@ -265,3 +265,11 @@ def stamp_done(plan: dict[str, Any], batch_id: str) -> dict[str, Any]:
 
 def dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
+def plan_too_fragmented(model_batches: list[dict[str, Any]], baseline_batches: list[dict[str, Any]]) -> bool:
+    """Fragmentation guard: the model planner's value is TOPICAL regrouping, not
+    finer slicing. A plan much more fragmented than the deterministic baseline
+    (seen in the wild: raw-bytes thinking → one lonely image per batch) wastes a
+    whole fresh session per sliver. Allow modest growth for topical splits."""
+    return len(model_batches) > max(int(len(baseline_batches) * 1.5), len(baseline_batches) + 2)
