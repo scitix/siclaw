@@ -765,6 +765,33 @@ def _l1_repair_rounds() -> int:
     return int(os.environ.get("KBC_L1_REPAIR_ROUNDS", "1"))
 
 
+def _media_verify_enabled() -> bool:
+    return os.environ.get("KBC_MEDIA_VERIFY", "on") != "off"
+
+
+async def _post_turn_media_verify(run) -> str | None:
+    """Single-session analogue of the batch image re-verification pass: once the
+    draft is settled (ledger closed, lint ok — state 'passed' in SELFCHECK), pages
+    that digest images get ONE fresh-eyes numeric check, injected as an ordinary
+    next turn. Idempotent via SELFCHECK.json media_verify.verified_pages — a page
+    is only ever verified once per content lifecycle, and the verify turn's own
+    edits don't re-arm it. Returns the directive to inject, or None."""
+    workdir = getattr(run, "workdir", None)
+    if not workdir or not _media_verify_enabled():
+        return None
+    if not (Path(workdir) / "candidate" / "index.md").is_file():
+        return None
+    sc = selfcheck.read_selfcheck(workdir)
+    if not sc or sc.get("state") != "passed":
+        return None  # ledger repairs first; verify next turn once settled
+    pending = selfcheck.pending_media_verification(workdir)
+    if not pending:
+        return None
+    selfcheck.mark_media_verified(workdir, list(pending))
+    await run.emit({"type": "summary", "text": f"自检(图像):{len(pending)} 页引用图片,注入数值复核轮。"})
+    return selfcheck.build_media_verify_prompt(pending)
+
+
 async def _post_turn_selfcheck(run) -> str | None:
     """Layer-1 deterministic self-check at turn end (coverage ledger + lint;
     design: DESIGN-kb-compile-self-verification-2026-07-03 §8.1). All analysis
@@ -847,12 +874,21 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 pass  # periodic loop retries; a sync hiccup must not kill the turn
         await run.emit({"type": "turn_done", "text": reply})
         # Bounded auto-repair AFTER turn_done (async-post-check design, §4.3-c):
-        # the turn ends normally; the repair is an ordinary next turn.
+        # the turn ends normally; the repair is an ordinary next turn. When no
+        # repair is due, a settled draft may instead owe its one-shot image
+        # numeric re-verification (same seam, same never-stuck shape).
         if repair_msg:
             try:
                 await run.inject_user_message(repair_msg)
             except Exception as e:
                 await run.emit({"type": "summary", "text": f"自检回修注入失败: {e!r}"})
+        else:
+            try:
+                verify_msg = await _post_turn_media_verify(run)
+                if verify_msg:
+                    await run.inject_user_message(verify_msg)
+            except Exception as e:
+                await run.emit({"type": "summary", "text": f"图像复核注入失败: {e!r}"})
 
 
 # Default tool whitelist for a kb-compile session, used when the runtime profile
@@ -1005,14 +1041,36 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str) -> str:
     )
 
 
-def _compose_final_directive(n: int, notes: str) -> str:
-    return (
-        f"【分批编译 · 终审】全部 {n} 批已编完。现在做跨批收口:\n"
-        "1) 通读 candidate/index.md 与各页标题,合并明显重复的主题页、统一术语与结构,修补 index 的分组与链接;\n"
-        "2) 跨批矛盾:同一事实在不同批的页里说法不一致的,照常 best-guess+⚠️存疑+落工单;\n"
-        "3) 核对 authoring/EXCLUSIONS.json:决定不编的源必须显式入账。\n"
-        "只做收口,不重编已经完好的页。完成后简短汇报:总页数、本次收口动了哪些页、还有什么值得负责人注意。" + notes
-    )
+def _compose_final_directive(workdir: str, n: int, notes: str) -> str:
+    """Final-pass directive fed with DETERMINISTIC worklists (dup candidates,
+    orphans, ⚠️ count) computed by code — the A/B showed a prose-only '合并明显
+    重复的主题页' leaves double-height duplicates and orphans standing. Concrete
+    pairs + a merge-or-exempt discipline make silence impossible."""
+    pages = selfcheck.candidate_pages(workdir)
+    dups = selfcheck.dup_candidates(pages)
+    exclusions_, excl_errors = selfcheck.load_exclusions(workdir)
+    orphans = [v["page"] for v in selfcheck.lint_candidate(pages, excl_errors)["violations"]
+               if v["kind"] == "orphan"]
+    suspect = sum((p.get("text") or "").count("⚠️") for p in pages.values())
+    lines = [f"【分批编译 · 终审】全部 {n} 批已编完。现在做跨批收口(以下清单是系统机械算出的,逐项处理、不许沉默跳过):"]
+    step = 1
+    if dups:
+        lines.append(f"{step}) 重复页候选({len(dups)} 对)——每对二选一:合并成一页(合并 compiled_from、修 index 链接),"
+                     "或在汇报里给一句书面豁免理由(确属不同主题):")
+        lines += [f"   - {d['pages'][0]} ↔ {d['pages'][1]}({d['reason']})" for d in dups]
+        step += 1
+    if orphans:
+        lines.append(f"{step}) 孤儿页({len(orphans)} 个,从 index.md 无链可达)——挂进 index 或相应父页;确属废页则删除:")
+        lines += [f"   - {p}" for p in orphans]
+        step += 1
+    lines.append(f"{step}) 通读 candidate/index.md 与各页标题,统一术语与结构,修补 index 的分组与链接;")
+    step += 1
+    lines.append(f"{step}) 跨批矛盾(全库现有 ⚠️ 存疑 {suspect} 处):同一事实说法不一的,先按宪法/口径能定的直接收敛改齐"
+                 "(如时间序取最新并保留沿革),定不了的才 best-guess+⚠️存疑+落工单;顺带检查既有 ⚠️ 里有没有其实能收敛的;")
+    step += 1
+    lines.append(f"{step}) 核对 authoring/EXCLUSIONS.json:决定不编的源(含图片/PDF 等媒体)必须显式入账。")
+    lines.append("只做收口,不重编已经完好的页。完成后简短汇报:总页数、本次收口动了哪些页、合并/豁免了哪几对及理由、还有什么值得负责人注意。")
+    return "\n".join(lines) + notes
 
 
 _PLANNER_ROLE = (
@@ -1084,6 +1142,18 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
     return baseline
 
 
+async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
+    """Force a fresh full-corpus selfcheck and drive bounded repair sessions
+    until it stops asking (budget lives in _post_turn_selfcheck)."""
+    run._selfcheck_key = None
+    repair = await _post_turn_selfcheck(run)
+    while repair:
+        fix_reply = await _drive_batch_session(run, repair, "账本回修")
+        if fix_reply:
+            replies.append(f"【回修】{fix_reply}")
+        repair = await _post_turn_selfcheck(run)
+
+
 async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     """The batch orchestrator: ONE logical turn to sicore (single turn_done at
     the end), many bounded sessions inside. Crash-resumable at batch granularity:
@@ -1118,18 +1188,25 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             batching.stamp_done(plan, batch["id"])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
             await run.emit({"type": "summary", "text": f"批 {k}/{n} 完成,已落库。"})
-        final_reply = await _drive_batch_session(run, _compose_final_directive(n, _drain_batch_notes(run)), "终审")
+        final_reply = await _drive_batch_session(
+            run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run)), "终审")
         if final_reply:
             replies.append(f"【终审】{final_reply}")
         # Full-corpus selfcheck + bounded repair rounds, each a fresh bounded
         # session (the batch analogue of the ordinary post-turn repair loop).
-        run._selfcheck_key = None  # force re-evaluation over the final state
-        repair = await _post_turn_selfcheck(run)
-        while repair:
-            fix_reply = await _drive_batch_session(run, repair, "账本回修")
-            if fix_reply:
-                replies.append(f"【回修】{fix_reply}")
-            repair = await _post_turn_selfcheck(run)
+        await _run_ledger_repairs(run, replies)
+        # Image numeric re-verification AFTER the ledger settles (repairs may
+        # add image-digesting pages), then one more ledger refresh so
+        # SELFCHECK.json reflects the verified final state.
+        if _media_verify_enabled():
+            pending = selfcheck.pending_media_verification(run.workdir)
+            if pending:
+                selfcheck.mark_media_verified(run.workdir, list(pending))
+                verify_reply = await _drive_batch_session(
+                    run, selfcheck.build_media_verify_prompt(pending), "图像复核")
+                if verify_reply:
+                    replies.append(f"【图像复核】{verify_reply}")
+                await _run_ledger_repairs(run, replies)
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
             try:

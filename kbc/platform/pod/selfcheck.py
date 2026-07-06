@@ -23,10 +23,17 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Files considered "sources that need accounting". Binary media (images etc.)
-# is out of scope for the ledger — pages digest media narratively; only text
-# can be mechanically attributed.
+# Text sources vs binary media. BOTH are ledger-accountable (2026-07-06): the
+# batch-vs-oneshot A/B showed silent media drops are the single worst coverage
+# failure (29/33 images dropped by the one-shot compile), and a text-only
+# ledger pushed agents to mark image-digest pages `derived: true` — zero
+# machine-checkable provenance exactly where fidelity risk is highest.
+# compiled_from is the agent's declaration either way; the ledger only checks
+# that the declaration is total.
 TEXT_SOURCE_EXTS = {".md", ".txt", ".tsv", ".csv", ".json", ".jsonl", ".yaml", ".yml"}
+IMAGE_SOURCE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+MEDIA_SOURCE_EXTS = IMAGE_SOURCE_EXTS | {".pdf", ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx"}
+KNOWN_SOURCE_EXTS = TEXT_SOURCE_EXTS | MEDIA_SOURCE_EXTS
 
 EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
 SELFCHECK_PATH = "authoring/SELFCHECK.json"
@@ -54,14 +61,16 @@ _REPAIR_LIST_CAP = 40
 
 
 def source_inventory(workdir: str) -> list[str]:
-    """All text source files under {workdir}/raw, as sorted posix paths
-    relative to raw/. Hidden files/dirs (dot-prefixed) are skipped."""
+    """All source files under {workdir}/raw — text AND media — as sorted posix
+    paths relative to raw/. Hidden files/dirs (dot-prefixed) are skipped.
+    Every file must end up cited by some page's compiled_from or explicitly
+    excluded; unknown binary blobs are the agent's to exclude with a reason."""
     raw = Path(workdir) / "raw"
     if not raw.is_dir():
         return []
     out = []
     for f in raw.rglob("*"):
-        if not f.is_file() or f.suffix.lower() not in TEXT_SOURCE_EXTS:
+        if not f.is_file():
             continue
         rel = f.relative_to(raw)
         if any(part.startswith(".") for part in rel.parts):
@@ -170,19 +179,96 @@ def _matches(path: str, pattern: str) -> bool:
 
 _MD_LINK_RE = re.compile(r"\]\(([^)#\s]+\.md)(?:#[^)]*)?\)")
 _WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)")
+# Body-level provenance mentions: (source: X) / (源:X) / (来源:X). The capture
+# is then mined for filename-looking tokens so locators ("§3", "p.12") and
+# prose sources ("内部访谈") never false-positive.
+_BODY_SOURCE_RE = re.compile(r"[（(]\s*(?:source|src|源|来源)\s*[:：]\s*([^）)]{1,300})[）)]", re.IGNORECASE)
+_FILENAME_RE = re.compile(
+    r"[^\s,;、；()（）'\"`]+\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS)) + r")\b",
+    re.IGNORECASE,
+)
+# OKF reserved routing pages: never provenance-required, never orphans.
+_RESERVED_PAGES = {"index.md", "log.md"}
+
+
+def _strip_frontmatter(text: str) -> str:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return text
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() in ("---", "..."):
+            return "\n".join(lines[i + 1:])
+    return text
+
+
+def _body_source_files(text: str) -> list[str]:
+    """Filenames cited in the body via (source:/源:/来源: …), raw//drop/ prefix
+    and `<hash8> · ` decoration stripped."""
+    found: list[str] = []
+    for captured in _BODY_SOURCE_RE.findall(_strip_frontmatter(text)):
+        for token in _FILENAME_RE.findall(captured):
+            entry = token.strip()
+            if "·" in entry:
+                entry = entry.rsplit("·", 1)[1].strip()
+            for prefix in ("raw/", "drop/"):
+                if entry.startswith(prefix):
+                    entry = entry[len(prefix):]
+            if entry and entry not in found:
+                found.append(entry)
+    return found
+
+
+def _out_links(rel: str, text: str, names: set[str]) -> set[str]:
+    """Resolved intra-wiki edges out of one page (md links + wikilinks)."""
+    base = Path(rel).parent
+    out: set[str] = set()
+    for target in _MD_LINK_RE.findall(text):
+        if target.startswith(("http://", "https://", "/")):
+            continue
+        resolved = posixpath.normpath((base / target).as_posix())
+        if resolved in names:
+            out.add(resolved)
+        elif target in names:
+            out.add(target)
+    for target in _WIKI_LINK_RE.findall(text):
+        t = target.strip()
+        if f"{t}.md" in names:
+            out.add(f"{t}.md")
+        elif t in names:
+            out.add(t)
+    return out
+
+
+def _orphan_pages(pages: dict[str, dict]) -> list[str]:
+    """Pages unreachable from index.md by following links — the exact failure
+    the 2026-07-06 A/B caught (css-cluster-operations compiled but never wired
+    into the index, invisible to every consumer that starts at index.md)."""
+    names = set(pages.keys())
+    if "index.md" not in names:
+        return []  # index missing is gated elsewhere; no root to walk from
+    reachable = {"index.md"}
+    frontier = ["index.md"]
+    while frontier:
+        rel = frontier.pop()
+        for target in _out_links(rel, pages[rel].get("text", ""), names):
+            if target not in reachable:
+                reachable.add(target)
+                frontier.append(target)
+    return sorted(names - reachable - _RESERVED_PAGES)
 
 
 def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
     """Structural lint over the candidate tree: provenance presence, intra-wiki
-    link resolution, plus exclusion-file errors. index.md is a routing page and
-    exempt from the provenance requirement."""
+    link resolution, index reachability (orphans), body-citation hygiene, plus
+    exclusion-file errors. index.md is a routing page and exempt from the
+    provenance requirement."""
     violations: list[dict] = []
     names = set(pages.keys())
     for rel, page in pages.items():
         if "error" in page:
             violations.append({"page": rel, "kind": "unreadable", "detail": page["error"]})
             continue
-        if rel != "index.md" and not page["has_compiled_from"] and not page["derived"]:
+        if rel not in _RESERVED_PAGES and not page["has_compiled_from"] and not page["derived"]:
             violations.append({"page": rel, "kind": "no_provenance",
                                "detail": "frontmatter 缺 compiled_from(纯综合页请标 derived: true)"})
         text = page.get("text", "")
@@ -197,9 +283,60 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
             t = target.strip()
             if t and f"{t}.md" not in names and t not in names:
                 violations.append({"page": rel, "kind": "broken_wikilink", "detail": t})
+        # Body cites (source: X.ext) → that file must be in THIS page's
+        # compiled_from (basename match tolerated: bodies usually cite the
+        # basename, compiled_from carries the raw-relative path).
+        cf_full = set(page["sources"])
+        cf_names = {posixpath.basename(s) for s in cf_full}
+        for f in _body_source_files(text):
+            if f in cf_full or posixpath.basename(f) in cf_names:
+                continue
+            violations.append({"page": rel, "kind": "body_source_uncited",
+                               "detail": f"正文引用 (source: {f}) 但该文件不在本页 compiled_from——补登记或修正引用"})
+    for rel in _orphan_pages(pages):
+        violations.append({"page": rel, "kind": "orphan",
+                           "detail": "从 index.md 无链可达——把它挂进 index 或相应父页;确属废页则删除"})
     for err in exclusion_errors:
         violations.append({"page": EXCLUSIONS_PATH, "kind": "exclusions_invalid", "detail": err})
     return {"ok": not violations, "violations": violations}
+
+
+_TITLE_RE = re.compile(r"^title\s*:\s*(.+?)\s*$", re.MULTILINE)
+_HEADING_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+_TITLE_NOISE_RE = re.compile(r"[\s\W_]+", re.UNICODE)
+
+
+def _norm_title(text: str) -> str:
+    m = _TITLE_RE.search(text) or _HEADING_RE.search(text)
+    if not m:
+        return ""
+    return _TITLE_NOISE_RE.sub("", m.group(1).strip().strip("\"'").lower())
+
+
+def dup_candidates(pages: dict[str, dict], cap: int = 20) -> list[dict]:
+    """Deterministic merge-or-exempt worklist for the cross-batch final pass:
+    page pairs with the same (normalized) title, or with heavy compiled_from
+    overlap (≥2 shared sources covering ≥50% of the smaller set). A signal for
+    the final-review directive and the publish card — NOT a lint violation
+    (near-dups can be legitimate, so the model/owner gets the last word)."""
+    infos = []
+    for rel, page in sorted(pages.items()):
+        if rel in _RESERVED_PAGES or "error" in page:
+            continue
+        infos.append((rel, _norm_title(page.get("text", "")), set(page["sources"])))
+    out: list[dict] = []
+    for i in range(len(infos)):
+        for j in range(i + 1, len(infos)):
+            (a, ta, sa), (b, tb, sb) = infos[i], infos[j]
+            shared = sa & sb
+            same_title = bool(ta) and ta == tb
+            overlap = len(shared) >= 2 and len(shared) / max(1, min(len(sa), len(sb))) >= 0.5
+            if same_title or overlap:
+                out.append({"pages": [a, b], "shared_sources": len(shared),
+                            "reason": "标题相同" if same_title else f"共享 {len(shared)} 个来源"})
+            if len(out) >= cap:
+                return out
+    return out
 
 
 def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> dict:
@@ -268,9 +405,10 @@ def read_selfcheck(workdir: str) -> dict | None:
 
 
 def run_layer1(workdir: str) -> dict:
-    """Compute the full Layer-1 report (coverage + lint). Pure except reading
-    the previous SELFCHECK to carry the Layer-2 `pk` section forward — an L1
-    re-check must never wipe red-blue results."""
+    """Compute the full Layer-1 report (coverage + lint + dup candidates). Pure
+    except reading the previous SELFCHECK to carry the Layer-2 `pk` and the
+    `media_verify` sections forward — an L1 re-check must never wipe red-blue
+    results or re-arm an already-run image re-verification."""
     pages = candidate_pages(workdir)
     exclusions, exclusion_errors = load_exclusions(workdir)
     cov = coverage(workdir, pages, exclusions)
@@ -282,7 +420,9 @@ def run_layer1(workdir: str) -> dict:
         "candidate_tree_hash": candidate_tree_hash(workdir),
         "coverage": cov,
         "lint": {"ok": lint["ok"], "violations": lint["violations"]},
+        "dup_candidates": dup_candidates(pages),
         "pk": previous.get("pk"),  # Layer-2 results survive L1 re-checks
+        "media_verify": previous.get("media_verify"),
     }
 
 
@@ -366,8 +506,8 @@ def build_repair_prompt(report: dict) -> str:
         if len(cov["unaccounted"]) > len(shown):
             lines.append(f"- …等共 {len(cov['unaccounted'])} 个(其余见 authoring/SELFCHECK.json)")
         lines.append(
-            "逐个二选一:① 补编 — 把该源内容编进相应 candidate 页(新增或并入),并在该页 frontmatter "
-            "的 compiled_from 登记该源路径;② 显式排除 — 确属不该编的(元文件/活数据/时效性强等),"
+            "逐个二选一(图片/PDF 等媒体同样适用):① 补编 — 把该源内容编进相应 candidate 页(新增或并入),"
+            "并在该页 frontmatter 的 compiled_from 登记该源路径;② 显式排除 — 确属不该编的(元文件/活数据/时效性强等),"
             '加入 authoring/EXCLUSIONS.json(JSON 数组,元素 {"pattern": "相对 raw 的路径或 glob", '
             '"reason": "一句话理由,让负责人看得懂"}).')
     if cov["dangling_citations"]:
@@ -378,4 +518,81 @@ def build_repair_prompt(report: dict) -> str:
         lines.append(f"\nlint 问题({len(lint['violations'])} 处):")
         lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
                   for v in lint["violations"][:_REPAIR_LIST_CAP]]
+    return "\n".join(lines)
+
+
+# ── image re-verification (fresh-eyes numeric check) ─────────────────────────
+# Both real fidelity failures in the 2026-07-06 batch-vs-oneshot A/B were image
+# numeric misreads (a memory bar transcribed as GPU utilization; P0/P1 bars
+# swapped) — and the same-session "auditor hat" re-review cannot catch them,
+# because it re-reads the page, not the pixels. So the driver injects ONE
+# bounded fresh-context pass over pages that digest images, keyed in
+# SELFCHECK.json so it never re-fires for already-verified pages. Scope is
+# images only: PDFs read through their text layer and are cheap to get right;
+# charts/screenshots are where transcription actually fails.
+
+
+def media_citing_pages(workdir: str) -> dict[str, list[str]]:
+    """candidate page → sorted raw-relative image paths it digests, gathered
+    from compiled_from entries AND body (source: …) citations. Basename match
+    tolerated for body citations (bodies usually cite the bare filename)."""
+    raw_images = [p for p in source_inventory(workdir)
+                  if posixpath.splitext(p)[1].lower() in IMAGE_SOURCE_EXTS]
+    by_basename: dict[str, list[str]] = {}
+    for p in raw_images:
+        by_basename.setdefault(posixpath.basename(p), []).append(p)
+    raw_set = set(raw_images)
+    out: dict[str, list[str]] = {}
+    for rel, page in candidate_pages(workdir).items():
+        if "error" in page:
+            continue
+        hits: set[str] = set()
+        for entry in list(page["sources"]) + _body_source_files(page.get("text", "")):
+            if posixpath.splitext(entry)[1].lower() not in IMAGE_SOURCE_EXTS:
+                continue
+            if entry in raw_set:
+                hits.add(entry)
+            else:
+                matches = by_basename.get(posixpath.basename(entry), [])
+                if len(matches) == 1:
+                    hits.add(matches[0])
+        if hits:
+            out[rel] = sorted(hits)
+    return out
+
+
+def pending_media_verification(workdir: str) -> dict[str, list[str]]:
+    """Image-citing pages minus the ones SELFCHECK.json records as verified."""
+    citing = media_citing_pages(workdir)
+    sc = read_selfcheck(workdir) or {}
+    done = set((sc.get("media_verify") or {}).get("verified_pages") or [])
+    return {p: imgs for p, imgs in citing.items() if p not in done}
+
+
+def mark_media_verified(workdir: str, pages: list[str]) -> None:
+    """Single write-point for the media_verify section (read-modify-write like
+    update_pk_section, so L1 fields are never clobbered)."""
+    report = read_selfcheck(workdir) or {"version": 1, "coverage": None, "lint": None, "state": None}
+    mv = report.get("media_verify") or {}
+    mv["verified_pages"] = sorted(set(mv.get("verified_pages") or []) | set(pages))
+    mv["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    report["media_verify"] = mv
+    write_selfcheck(workdir, report)
+
+
+def build_media_verify_prompt(pending: dict[str, list[str]]) -> str:
+    """The bounded fresh-eyes directive. Concrete page←image pairs, concrete
+    reading discipline — never a vague 'double-check your work'."""
+    lines = ["【系统自检 · 图像复核】下列 candidate 页引用了图片来源。图表数值转写是已知的高错风险"
+             "(把显存条读成利用率、柱状图系列互换都真实发生过),请逐页复核:"]
+    shown = sorted(pending.items())[:_REPAIR_LIST_CAP]
+    for page, imgs in shown:
+        lines.append(f"- {page} ← {', '.join('raw/' + i for i in imgs)}")
+    if len(pending) > len(shown):
+        lines.append(f"- …等共 {len(pending)} 页(其余见 authoring/SELFCHECK.json)")
+    lines.append(
+        "对每页:重新打开列出的每张图,先认清图表类型、坐标轴与单位、图例/系列标签,"
+        "再逐个核对页面里来自该图的数字与结论;发现不符就改页(compiled_from 保持准确);"
+        "图上读不清或有歧义的数值,改标 ⚠️ 存疑并按矛盾工单流程落一条工单;"
+        "核对无误的页不要改动。完成后简短汇报:核了几页、发现并修正了什么。")
     return "\n".join(lines)

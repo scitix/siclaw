@@ -63,11 +63,11 @@ def test_inventory_and_exclusions():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/snapshot-a/one.md")
-        _mk(base, "raw/snapshot-a/pic.png")            # binary ext → not a text source
+        _mk(base, "raw/snapshot-a/pic.png")            # media → ALSO ledger-accountable
         _mk(base, "raw/.hidden/x.md")                  # hidden dir → skipped
         _mk(base, "raw/media/MANIFEST.tsv")            # text file in media dir → counted
         inv = selfcheck.source_inventory(td)
-        assert inv == ["media/MANIFEST.tsv", "snapshot-a/one.md"], inv
+        assert inv == ["media/MANIFEST.tsv", "snapshot-a/one.md", "snapshot-a/pic.png"], inv
         assert selfcheck.source_inventory(td + "/nope") == []
 
         # exclusions: missing file → none; malformed → error; glob + dir-prefix forms
@@ -106,8 +106,9 @@ def test_coverage_and_lint():
         assert cov["dangling_citations"] == ["snapshot-a/ghost.md"], cov
         assert not cov["closed"]
         kinds = sorted(v["kind"] for v in report["lint"]["violations"])
-        # bare.md lacks provenance; p1 has a broken wikilink; index is exempt
-        assert kinds == ["broken_wikilink", "no_provenance"], kinds
+        # bare.md lacks provenance AND is unreachable from index; p1 has a
+        # broken wikilink; index is exempt
+        assert kinds == ["broken_wikilink", "no_provenance", "orphan"], kinds
 
         # repair prompt names the concrete gaps
         report["state"] = "repairing"
@@ -123,6 +124,71 @@ def test_coverage_and_lint():
         report["state"] = "passed"
         assert "闭合" in selfcheck.narration(report)
     print("OK  coverage + lint + repair prompt (unaccounted / dangling / exempt index / close)")
+
+
+def test_media_ledger_and_new_lint():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/chart.png")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md)")
+        # body cites the image but compiled_from omits it → body_source_uncited;
+        # the image itself is unaccounted (media is in the ledger now)
+        _mk(base, "candidate/p1.md",
+            "---\ntitle: 监控\ncompiled_from:\n  - s/a.md\n---\n利用率 94%。(source: chart.png)")
+        report = selfcheck.run_layer1(td)
+        assert report["coverage"]["unaccounted"] == ["s/chart.png"], report["coverage"]
+        kinds = sorted(v["kind"] for v in report["lint"]["violations"])
+        assert kinds == ["body_source_uncited"], kinds
+        # (来源: 内部访谈) / locators must NOT false-positive
+        assert selfcheck._body_source_files("x (来源: 内部访谈) y (source: g.md, §3)") == ["g.md"]
+
+        # register the image → ledger closes, lint clean, dangling stays empty
+        _mk(base, "candidate/p1.md",
+            "---\ntitle: 监控\ncompiled_from:\n  - s/a.md\n  - s/chart.png\n---\n利用率 94%。(source: chart.png)")
+        report = selfcheck.run_layer1(td)
+        assert report["coverage"]["closed"] and report["lint"]["ok"], report
+        assert report["coverage"]["dangling_citations"] == [], report["coverage"]
+
+        # dup candidates: same normalized title / heavy source overlap
+        _mk(base, "raw/s/b.md")
+        _mk(base, "candidate/p2.md",
+            "---\ntitle: 监控\ncompiled_from:\n  - s/b.md\n---\n[p1](p1.md)")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md) [p2](p2.md)")
+        report = selfcheck.run_layer1(td)
+        dups = report["dup_candidates"]
+        assert len(dups) == 1 and sorted(dups[0]["pages"]) == ["p1.md", "p2.md"], dups
+        assert dups[0]["reason"] == "标题相同", dups
+    print("OK  media ledger + body_source_uncited + orphan-free close + dup_candidates")
+
+
+def test_media_verify_helpers():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/chart.png")
+        _mk(base, "raw/s/other.png")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md) [t](text-only.md)")
+        # compiled_from full path + body basename citation both resolve
+        _mk(base, "candidate/p1.md",
+            "---\ncompiled_from:\n  - s/a.md\n  - s/chart.png\n---\n94%。(source: other.png)")
+        _mk(base, "candidate/text-only.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        citing = selfcheck.media_citing_pages(td)
+        assert citing == {"p1.md": ["s/chart.png", "s/other.png"]}, citing
+
+        pending = selfcheck.pending_media_verification(td)
+        assert list(pending) == ["p1.md"]
+        prompt = selfcheck.build_media_verify_prompt(pending)
+        assert "raw/s/chart.png" in prompt and "图像复核" in prompt
+
+        selfcheck.mark_media_verified(td, list(pending))
+        assert selfcheck.pending_media_verification(td) == {}
+        # run_layer1 must carry media_verify forward (not wipe it)
+        report = selfcheck.run_layer1(td)
+        assert report["media_verify"]["verified_pages"] == ["p1.md"], report["media_verify"]
+        selfcheck.write_selfcheck(td, report)
+        assert selfcheck.pending_media_verification(td) == {}
+    print("OK  media_citing_pages + pending/mark idempotency + carry-forward")
 
 
 def test_state_key():
@@ -171,7 +237,7 @@ async def test_wiring():
         assert await _post_turn_selfcheck(run) is None
 
         # index exists, b.md unaccounted → repairing + repair prompt returned
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\nidx")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
         _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
         msg = await _post_turn_selfcheck(run)
         assert msg and "s/b.md" in msg, msg
@@ -201,13 +267,39 @@ async def test_wiring():
     print("OK  wiring (trigger gating / repair inject / exclusions-only reopen / budget → unconverged)")
 
 
+async def test_media_verify_wiring():
+    from compile_box import _post_turn_media_verify, _post_turn_selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/chart.png")
+        run = _FakeRun(td)
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/chart.png\n---\nx")
+        assert await _post_turn_selfcheck(run) is None       # ledger closes → passed
+        msg = await _post_turn_media_verify(run)
+        assert msg and "p.md" in msg and "chart.png" in msg, msg
+        assert await _post_turn_media_verify(run) is None    # one-shot per page
+        # a NEW image-citing page later re-arms the pass for that page only
+        _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/chart.png\n---\ny")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
+        assert await _post_turn_selfcheck(run) is None       # still closed
+        msg = await _post_turn_media_verify(run)
+        assert msg and "q.md" in msg and "- p.md" not in msg, msg
+    print("OK  media-verify wiring (settled-draft gate / one-shot / new-page re-arm)")
+
+
 def main():
     os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
     test_parse_compiled_from()
     test_inventory_and_exclusions()
     test_coverage_and_lint()
+    test_media_ledger_and_new_lint()
+    test_media_verify_helpers()
     test_state_key()
     asyncio.run(test_wiring())
+    asyncio.run(test_media_verify_wiring())
     print("ALL OK  test_selfcheck")
 
 
