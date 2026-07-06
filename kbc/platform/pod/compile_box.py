@@ -58,7 +58,10 @@ import selfcheck
 # "context_management: Extra inputs are not permitted"). A compile is a long
 # multi-turn session, so it hits this readily. Disable autocompact so the field
 # is never sent. setdefault → an explicit deployment override still wins.
+# BOTH spellings: CLI 0.2.110 reads DISABLE_AUTO_COMPACT (underscored); the
+# unspaced form alone never worked (live 400s, 2026-07-06).
 os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
+os.environ.setdefault("DISABLE_AUTO_COMPACT", "1")
 
 # A box usually hosts a single run; a map keeps it clean (and helps health/debugging).
 RUNS: dict[str, "CompileRun"] = {}
@@ -908,7 +911,7 @@ def _compile_system_prompt(run: "CompileRun") -> str:
 # workspace itself (exact files, code-verifiable), never a prose summary. Small
 # KBs stay on the untouched single-session path (threshold gate).
 
-_BATCH_TRIGGER_PREFIXES = ("直接开始编译", "批准,按此计划执行")
+_BATCH_TRIGGER_PREFIXES = ("直接开始编译", "批准,按此计划执行", "继续编译")
 _BATCH_TRIGGER_SUBSTR = "请增量重编"
 
 

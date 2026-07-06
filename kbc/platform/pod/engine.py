@@ -28,6 +28,7 @@ from typing import Protocol
 # so ANTHROPIC_* etc. are inherited too). PK stages are one-shot reads that don't
 # need compaction, so this has no downside here.
 os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
+os.environ.setdefault("DISABLE_AUTO_COMPACT", "1")
 
 # Tool-input keys that name a filesystem path (same set the test-session guard
 # uses: Read.file_path, Glob/Grep.path, NotebookRead.notebook_path).

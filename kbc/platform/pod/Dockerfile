@@ -14,7 +14,10 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir claude-agent-sdk aiohttp
+# Pin the SDK: an unpinned install drifts on every rebuild, and the bundled
+# Claude Code CLI drifts with it (API request-shape changes can break the
+# massapi/Bedrock path). 0.2.110 is production-proven on the KB compile path.
+RUN pip install --no-cache-dir claude-agent-sdk==0.2.110 aiohttp
 
 WORKDIR /app
 # CLAUDE.md is only for the legacy CLI (compile_agent.py walks parents for it).
@@ -36,7 +39,9 @@ ENV CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches on
 # large-context turns (HTTP 400). Disable autocompact so it's never sent. The
 # Python modules also setdefault this; the ENV makes it visible at the image level.
-ENV DISABLE_AUTOCOMPACT=1
+# BOTH spellings: CLI 0.2.110 reads DISABLE_AUTO_COMPACT (underscored) — the
+# unspaced form alone was a dead guard (live 400s on 2026-07-06 proved it).
+ENV DISABLE_AUTOCOMPACT=1 DISABLE_AUTO_COMPACT=1
 # Default served port (overridable via SICLAW_AGENTBOX_PORT, aligned with agentbox).
 ENV SICLAW_AGENTBOX_PORT=3000
 
