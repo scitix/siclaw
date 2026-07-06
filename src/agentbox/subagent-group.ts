@@ -17,6 +17,9 @@ import {
   GROUP_REDUCE_INPUT_MAX_CHARS,
   GROUP_REDUCE_SUMMARY_MAX_CHARS,
 } from "../core/subagent-registry.js";
+// Shared boundary-aware truncation (agentbox→agentbox, delegation-summary has zero imports so no
+// cycle): every model-visible capsule clips at a word/line boundary, not mid-token.
+import { truncateAtBoundary } from "./delegation-summary.js";
 // GroupItemStatus is the shared group/tool contract, defined once in core/tool-registry.ts
 // (`skipped` = never started, never persisted as a child event). Import it for local use here
 // and re-export so this module's existing consumers keep importing the name from here.
@@ -81,8 +84,10 @@ function itemLabel(item: string | Record<string, string>): string {
 /** Stable key for duplicate detection (object key order does not matter). */
 function dedupeKey(item: string | Record<string, string>): string {
   if (typeof item === "string") return `s:${item}`;
-  const sorted = Object.keys(item).sort().map((k) => `${k}=${item[k]}`);
-  return `o:${sorted.join("")}`;
+  // JSON-encoded sorted [key, value] pairs: escaping keeps pair boundaries visibly
+  // unambiguous no matter what the values embed (an invisible-separator join is a trap
+  // for readers — it renders identically to an ambiguous plain join).
+  return `o:${JSON.stringify(Object.keys(item).sort().map((k) => [k, item[k]]))}`;
 }
 
 /**
@@ -222,12 +227,9 @@ export function validateAndRenderGroupPlan(input: GroupPlanInput): GroupPlanResu
   return { ok: true, tasks };
 }
 
-/** Truncate a body to `allowed` chars, appending a `[truncated]` marker when it cuts. */
+/** Truncate a body to `allowed` chars at a word/line boundary, marking `[truncated]` when it cuts. */
 function truncateBody(body: string, allowed: number): string {
-  if (body.length <= allowed) return body;
-  const marker = "\n[truncated]";
-  const keep = Math.max(0, allowed - marker.length);
-  return body.slice(0, keep) + marker;
+  return truncateAtBoundary(body, allowed, "\n[truncated]");
 }
 
 /**
@@ -328,8 +330,6 @@ export function truncateReduceSummary(
   summary: string,
   maxChars = GROUP_REDUCE_SUMMARY_MAX_CHARS,
 ): { text: string; truncated: boolean } {
-  if (summary.length <= maxChars) return { text: summary, truncated: false };
-  const marker = `\n\n[reduce summary truncated to ${maxChars} chars]`;
-  const keep = Math.max(0, maxChars - marker.length);
-  return { text: summary.slice(0, keep) + marker, truncated: true };
+  const text = truncateAtBoundary(summary, maxChars, `\n\n[reduce summary truncated to ${maxChars} chars]`);
+  return { text, truncated: text !== summary };
 }

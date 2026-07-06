@@ -57,9 +57,15 @@ function extractFullReportSection(text: string): string | null {
   return extractSection(text, new Set(["full report", "details", "audit report"]));
 }
 
-function truncateAtBoundary(text: string, maxChars: number): string {
+/**
+ * Truncate `text` to `maxChars`, clipping at the nearest newline/sentence boundary (never
+ * mid-word) and appending `suffix`. Shared by the delegate capsule and — via a custom suffix —
+ * the group reduce summary / reduce-input bodies, so every model-visible truncation clips the
+ * same way (design "reuse"). Returns `text` unchanged when it already fits.
+ */
+export function truncateAtBoundary(text: string, maxChars: number, suffix = TRUNCATED_SUFFIX): string {
   if (text.length <= maxChars) return text;
-  const budget = Math.max(0, maxChars - TRUNCATED_SUFFIX.length);
+  const budget = Math.max(0, maxChars - suffix.length);
   const slice = text.slice(0, budget);
   const boundary = Math.max(
     slice.lastIndexOf("\n"),
@@ -67,7 +73,7 @@ function truncateAtBoundary(text: string, maxChars: number): string {
     slice.lastIndexOf("; "),
   );
   const clipped = (boundary > budget * 0.55 ? slice.slice(0, boundary + 1) : slice).trimEnd();
-  return `${clipped}${TRUNCATED_SUFFIX}`;
+  return `${clipped}${suffix}`;
 }
 
 export function buildDelegateSummaryBundle(rawSummary: string, fallback = "Completed. No concise summary was returned."): DelegateSummaryBundle {

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { createSpawnSubagentTool, registration } from "./spawn-subagent.js";
-import { RUN_IN_BACKGROUND_ENABLED, SUBAGENT_GROUP_ENABLED } from "../../core/subagent-registry.js";
+import { RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
 import type {
   ToolRefs,
   SpawnSubagentGroupRequest,
@@ -239,11 +239,12 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
     ]);
   });
 
-  it("surfaces a tripped circuit breaker flag", async () => {
+  it("surfaces a tripped circuit breaker flag AND its reason via group_summary (no reduce)", async () => {
     const executor = vi.fn(async (): Promise<SubagentGroupResult> => ({
       status: "failed",
       durationMs: 5,
       circuitBroken: true,
+      groupSummary: "Circuit breaker: the first 5 sub-agents all failed with no success — likely a template error.",
       itemResults: [
         { item: "a", status: "failed", summary: "boom", childSessionId: "c1" },
         { item: "b", status: "skipped", summary: "skipped", childSessionId: "" },
@@ -254,19 +255,35 @@ describe("spawn_subagent tool — batch (map→reduce) path", () => {
     const mv = JSON.parse(text(r));
     expect(mv.circuit_broken).toBe(true);
     expect(mv.status).toBe("failed");
+    // #7: with no reduce child, the breaker reason must still reach the model (group_summary),
+    // not be discarded. reduce_summary stays absent (no reduce ran).
+    expect(mv.reduce_summary).toBeUndefined();
+    expect(mv.group_summary).toMatch(/circuit breaker/i);
   });
 
-  // Ops rollback lever: with the batch capability OFF, a multi-item plan (or a reduce_prompt) is
-  // rejected before any child starts and the tool degrades to a pure single-task spawn.
-  it("gates batch mode behind SUBAGENT_GROUP_ENABLED", async () => {
+  // Ops rollback lever: batch mode is now env-gated (SICLAW_SUBAGENT_GROUP_ENABLED). Default ON
+  // runs the batch; explicit false rejects a multi-item plan before any child starts and points
+  // the model at N single-item calls.
+  it("runs batch mode when enabled (default)", async () => {
     const executor = vi.fn(async (): Promise<SubagentGroupResult> => ({ status: "launched", jobId: "j" }));
     const tool = createSpawnSubagentTool(makeRefs(executor));
-    const r = await tool.execute("gg", { description: "x", task_template: "{{item}}", items: ["a", "b"] });
-    if (SUBAGENT_GROUP_ENABLED) {
-      expect(executor).toHaveBeenCalled();
-    } else {
+    await tool.execute("gg", { description: "x", task_template: "{{item}}", items: ["a", "b"] });
+    expect(executor).toHaveBeenCalled();
+  });
+
+  it("rejects a batch and hints N single calls when SICLAW_SUBAGENT_GROUP_ENABLED=false", async () => {
+    const prev = process.env.SICLAW_SUBAGENT_GROUP_ENABLED;
+    process.env.SICLAW_SUBAGENT_GROUP_ENABLED = "false";
+    try {
+      const executor = vi.fn(async (): Promise<SubagentGroupResult> => ({ status: "launched", jobId: "j" }));
+      const tool = createSpawnSubagentTool(makeRefs(executor));
+      const r = await tool.execute("gg", { description: "x", task_template: "{{item}}", items: ["a", "b"] });
       expect(executor).not.toHaveBeenCalled();
       expect(text(r)).toMatch(/batch mode is disabled/i);
+      expect(text(r)).toMatch(/one spawn_subagent call per target/i);
+    } finally {
+      if (prev === undefined) delete process.env.SICLAW_SUBAGENT_GROUP_ENABLED;
+      else process.env.SICLAW_SUBAGENT_GROUP_ENABLED = prev;
     }
   });
 });

@@ -17,6 +17,7 @@ import type {
 } from "../components/chat/types"
 import { stripAttachmentOcrEvidence } from "../components/chat/user-message-text"
 import { findPendingSteerIndex, removePendingAt, extractUserMessageText, pendingSteerMatchText } from "./steer-pending"
+import { isGroupForm, normalizeCompletionStatus } from "../lib/group-form"
 
 /** Parse an unknown payload into an ErrorDetail with backward-compat fallbacks.
  *  See docs/design/error-envelope.md §4. */
@@ -686,24 +687,19 @@ function annotateSubagentCompletions(messages: PilotMessage[]): PilotMessage[] {
     if (m.metadata?.kind !== "delegation_event") continue
     const id = messageDelegationId(m)
     if (!id) continue
-    const raw = (messageString(m.metadata?.event_type) ?? messageString(m.metadata?.status) ?? "done").toLowerCase()
-    if (/run|start|queue|pend|progress|synthes/.test(raw)) continue // not a terminal event
-    // Preserve timed_out / partial as their own (amber) statuses — collapsing them into "done"
-    // showed a truncated/timed-out background investigation as a clean green success. statusTone
-    // renders both amber, matching the foreground delegation path.
-    const status = /fail|error/.test(raw) ? "failed"
-      : /cancel|abort|stop/.test(raw) ? "cancelled"
-      : /timed?[-_ ]?out/.test(raw) ? "timed_out"
-      : /partial|truncat/.test(raw) ? "partial"
-      : "done"
+    // Shared terminal-status mapping (the group fold uses the same function). null ⇒ a non-terminal
+    // event (running/queued/synthesizing) → skip. Preserving timed_out/partial as their own amber
+    // statuses matches the foreground delegation path (collapsing them into "done" once showed a
+    // truncated/timed-out background investigation as a clean green success).
+    const status = normalizeCompletionStatus(messageString(m.metadata?.event_type) ?? messageString(m.metadata?.status))
+    if (status === null) continue // not a terminal event
     done.set(id, { status, summary: typeof m.content === "string" ? m.content : undefined })
   }
   let changed = false
   const next = messages.map((m) => {
     if (!isBackgroundSpawnLaunch(m)) return m // foreground spawn already carries its final status
-    const parsed = m.content ? tryParseJson(m.content) : undefined
     changed = true
-    const jobId = messageString(parsed?.job_id) ?? messageDelegationId(m) ?? m.id
+    const jobId = launchJobId(m)
     const c = jobId ? done.get(jobId) : undefined
     return {
       ...m,
@@ -717,18 +713,13 @@ function annotateSubagentCompletions(messages: PilotMessage[]): PilotMessage[] {
   return changed ? next : messages
 }
 
-/** The unified spawn_subagent renders as one of two forms (v3 single-tool merge): a BATCH form
- * (map→reduce group card) when its items list has >1 entry OR it carries a reduce_prompt; otherwise
- * the single-item COLLAPSE form (legacy sub-agent card). The now-deleted `spawn_subagent_group` tool
- * name is still recognised so historical sessions keep rendering as a group. */
-function isGroupForm(m: PilotMessage): boolean {
-  if (m.toolName === "spawn_subagent_group") return true // legacy history
-  if (m.toolName !== "spawn_subagent") return false
-  const args = m.toolArgs as Record<string, unknown> | undefined
-  const items = args?.items
-  const reduce = args?.reduce_prompt
-  const hasReduce = typeof reduce === "string" && reduce.trim() !== ""
-  return Array.isArray(items) && (items.length > 1 || hasReduce)
+/** The launch id a background spawn/group folds on: the tool result's job_id, else the persisted
+ * delegation_id, else the message id. Local to this file (depends on messageDelegationId /
+ * tryParseJson) — that's why it isn't in the shared group-form module. Collapses the three inline
+ * copies of this ladder (single fold, group fold, live group_progress). */
+function launchJobId(m: PilotMessage): string | undefined {
+  const parsed = m.content ? tryParseJson(m.content) : undefined
+  return messageString(parsed?.job_id) ?? messageDelegationId(m) ?? m.id
 }
 
 /** A COLLAPSE-form spawn_subagent launched in the background — detectable from the launch itself
@@ -772,29 +763,40 @@ function isBackgroundGroupLaunch(m: PilotMessage): boolean {
   return Array.isArray(items) && items.length > 1
 }
 
-/** The groupId for a group launch card (= the launched job_id == the spawn toolCallId). */
-function groupLaunchId(m: PilotMessage): string | undefined {
-  const parsed = m.content ? tryParseJson(m.content) : undefined
-  return messageString(parsed?.job_id) ?? messageDelegationId(m) ?? m.id
+
+interface GroupTerminalFold {
+  status: string
+  summary?: string
+  childSessionId?: string
+  /** Per-item status snapshot (index → status) — fills in items never persisted as their own child. */
+  itemStatuses?: Array<{ index: number; status: string }>
 }
 
-/** Map a delegation status/event string to a group item status (mirrors annotateSubagentCompletions). */
-function normalizeGroupStatus(raw?: string): string {
-  const s = (raw ?? "done").toLowerCase()
-  if (/run|start|queue|pend|progress|synthes/.test(s)) return "running"
-  if (/fail|error/.test(s)) return "failed"
-  if (/cancel|abort|stop/.test(s)) return "cancelled"
-  if (/timed?[-_ ]?out/.test(s)) return "timed_out"
-  if (/partial|truncat/.test(s)) return "partial"
-  if (/skip/.test(s)) return "skipped"
-  return "done"
+/** True when the group metadata already on a launch row equals the freshly-computed fold, so the row
+ *  can keep its object identity across an idempotent re-annotate (perf: no needless re-render). Only
+ *  the keys this fold writes are compared; groupItems by length + per-index fields (reviewer B-D). */
+function groupMetaUnchanged(prev: Record<string, unknown> | undefined, next: Record<string, unknown>): boolean {
+  if (!prev) return false
+  if (prev.groupBackground !== next.groupBackground) return false // first annotate adds the marker
+  if (prev.groupStatus !== next.groupStatus) return false
+  if (prev.groupSummary !== next.groupSummary) return false
+  if (prev.groupReduceChildSessionId !== next.groupReduceChildSessionId) return false
+  const a = (prev.groupItems as GroupItemFold[] | undefined) ?? []
+  const b = (next.groupItems as GroupItemFold[] | undefined) ?? []
+  if (a.length !== b.length) return false
+  for (let i = 0; i < b.length; i++) {
+    if (a[i]?.index !== b[i]?.index || a[i]?.status !== b[i]?.status
+      || a[i]?.summary !== b[i]?.summary || a[i]?.childSessionId !== b[i]?.childSessionId) return false
+  }
+  return true
 }
 
 /**
  * Fold a background sub-agent GROUP's persisted events onto its launch card. Children are tied to
  * the group by a `{groupId}#{index}` delegation_id; the whole group by a terminal event whose
  * delegation_id === the groupId. We attach groupItems (per-item status + drill-in id), groupStatus
- * (overall), and the reduce summary/child when a reduce ran. Refresh-safe — it's all chat history.
+ * (overall), groupSummary (the capsule — reduce synthesis OR the breaker/failure reason, always
+ * shown), and the reduce drill-in child when one ran. Refresh-safe — it's all chat history.
  */
 function annotateGroupCompletions(messages: PilotMessage[]): PilotMessage[] {
   // Collect group ids first, so a bare (no-`#`) delegation_event can be told apart from a single
@@ -803,20 +805,20 @@ function annotateGroupCompletions(messages: PilotMessage[]): PilotMessage[] {
   const groupIds = new Set<string>()
   for (const m of messages) {
     if (isBackgroundGroupLaunch(m)) {
-      const id = groupLaunchId(m)
+      const id = launchJobId(m)
       if (id) groupIds.add(id)
     }
   }
   if (groupIds.size === 0) return messages
 
   const itemsByGroup = new Map<string, Map<number, GroupItemFold>>()
-  const terminal = new Map<string, { status: string; summary?: string; childSessionId?: string }>()
+  const terminal = new Map<string, GroupTerminalFold>()
   for (const m of messages) {
     if (m.metadata?.kind !== "delegation_event") continue
     const id = messageDelegationId(m)
     if (!id) continue
     const meta = m.metadata as Record<string, unknown>
-    const status = normalizeGroupStatus(messageString(meta.status) ?? messageString(meta.event_type))
+    const status = normalizeCompletionStatus(messageString(meta.status) ?? messageString(meta.event_type)) ?? "running"
     const childSessionId = messageString(meta.child_session_id) || undefined
     const summary = typeof m.content === "string" && m.content ? m.content : undefined
     const hashIdx = id.lastIndexOf("#")
@@ -831,37 +833,56 @@ function annotateGroupCompletions(messages: PilotMessage[]): PilotMessage[] {
       byIdx.set(index, { index, status, summary, childSessionId })
       itemsByGroup.set(groupId, byIdx)
     } else if (groupIds.has(id)) {
-      terminal.set(id, { status, summary, childSessionId })
+      // Terminal event: parse the per-item status snapshot (index → status) when present, so items
+      // never persisted as their own child event (chiefly `skipped`) can be rendered on reload.
+      const rawSnapshot = Array.isArray(meta.item_statuses) ? (meta.item_statuses as unknown[]) : undefined
+      const itemStatuses = rawSnapshot
+        ?.filter((e): e is Record<string, unknown> => !!e && typeof e === "object")
+        .map((e) => ({ index: Number(e.index), status: String(e.status) }))
+        .filter((e) => Number.isInteger(e.index))
+      terminal.set(id, { status, summary, childSessionId, itemStatuses })
     }
   }
 
   let changed = false
   const next = messages.map((m) => {
     if (!isBackgroundGroupLaunch(m)) return m
-    const groupId = groupLaunchId(m)
+    const groupId = launchJobId(m)
     if (!groupId) return m
-    changed = true
     const byIdx = itemsByGroup.get(groupId)
-    const groupItems = byIdx ? [...byIdx.values()].sort((a, b) => a.index - b.index) : []
     const term = terminal.get(groupId)
-    return {
-      ...m,
-      metadata: {
-        ...(m.metadata ?? {}),
-        groupBackground: true,
-        ...(groupItems.length > 0 ? { groupItems } : {}),
-        ...(term
-          ? {
-              groupStatus: term.status,
-              // A non-empty terminal child_session_id means a reduce child ran → its capsule IS the
-              // reduce summary; an empty id means no reduce ran (the capsule is only a status digest).
-              ...(term.childSessionId
-                ? { groupReduceSummary: term.summary, groupReduceChildSessionId: term.childSessionId }
-                : {}),
-            }
-          : {}),
-      },
+
+    // Merge the terminal per-item snapshot: an index with NO own child delegation_event — chiefly a
+    // `skipped` one (never persisted as a child) — comes from the snapshot, so a reloaded card renders
+    // it correctly instead of the live-only "running" fallback (#3). A real child event always wins.
+    const merged = new Map<number, GroupItemFold>(byIdx ? [...byIdx] : [])
+    for (const s of term?.itemStatuses ?? []) {
+      if (!merged.has(s.index)) merged.set(s.index, { index: s.index, status: s.status })
     }
+    const groupItems = merged.size > 0 ? [...merged.values()].sort((a, b) => a.index - b.index) : []
+
+    const nextMeta: Record<string, unknown> = {
+      ...(m.metadata ?? {}),
+      groupBackground: true,
+      ...(groupItems.length > 0 ? { groupItems } : {}),
+      ...(term
+        ? {
+            groupStatus: term.status,
+            // The capsule (reduce synthesis OR breaker reason OR reduce-failure/cancel note OR digest)
+            // is ALWAYS surfaced so a no-reduce failure still explains WHY on the card (#7). The reduce
+            // drill-in id is attached only when a reduce child actually ran (non-empty child id).
+            ...(term.summary ? { groupSummary: term.summary } : {}),
+            ...(term.childSessionId ? { groupReduceChildSessionId: term.childSessionId } : {}),
+          }
+        : {}),
+    }
+
+    // Identity preservation: only rebuild the row when the folded metadata actually differs from what
+    // it already carries — otherwise a background group in history would re-map (new object identity)
+    // on every idempotent re-annotate, defeating referential-equality render skips.
+    if (groupMetaUnchanged(m.metadata as Record<string, unknown> | undefined, nextMeta)) return m
+    changed = true
+    return { ...m, metadata: nextMeta }
   })
   return changed ? next : messages
 }
@@ -1351,9 +1372,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           setMessages((prev) =>
             prev.map((m) => {
               if (!isBackgroundSpawnLaunch(m) || m.metadata?.subBgStatus) return m
-              const parsedJobId = (m.content ? tryParseJson(m.content) : undefined)?.job_id
-              const launchJobId = (typeof parsedJobId === "string" ? parsedJobId : undefined) ?? messageDelegationId(m) ?? m.id
-              return launchJobId === jobId
+              return launchJobId(m) === jobId
                 ? { ...m, metadata: { ...(m.metadata ?? {}), subBackground: true, subBgStatus: status } }
                 : m
             }),
@@ -1371,7 +1390,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const items = Array.isArray(evt.items) ? (evt.items as unknown[]) : []
           setMessages((prev) =>
             prev.map((m) =>
-              isBackgroundGroupLaunch(m) && groupLaunchId(m) === jobId
+              isBackgroundGroupLaunch(m) && launchJobId(m) === jobId
                 ? { ...m, metadata: { ...(m.metadata ?? {}), groupBackground: true, groupProgress: { phase, items } } }
                 : m,
             ),

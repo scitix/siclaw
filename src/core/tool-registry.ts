@@ -195,6 +195,13 @@ export interface SubagentGroupReport {
   reduceChildSessionId?: string;
   /** True when the circuit breaker tripped; the reason is folded into the summary. */
   circuitBroken?: boolean;
+  /**
+   * Group-level explanation shown to user/model when there is NO reduce summary: the circuit-break
+   * reason, a reduce-stage failure note, or a "reduce skipped (cancelled)" note. Absent on the plain
+   * success path (the reduce summary / per-item digest already covers it). Distinct from
+   * `reduceSummary`, which is present only when a reduce child actually produced synthesis.
+   */
+  groupSummary?: string;
   durationMs: number;
 }
 

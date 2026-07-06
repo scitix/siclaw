@@ -88,10 +88,12 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
   (background) with the **bare `spawnId`** (the tool-call id, no `#`), so its events,
   `delegation_id`, completion notification, and UI card are unchanged. Only the model-visible
   return shape is unified (above).
-- **`SUBAGENT_GROUP_ENABLED` is an ops rollback lever, not tool registration.** Since there is
-  one tool, the switch cannot hide a second tool; instead OFF forces the item cap to 1 and
-  rejects a `reduce_prompt`, degrading `spawn_subagent` to a pure single-task spawn (pre-batch
-  behaviour). This is a behaviour switch, not a compatibility shim.
+- **`isSubagentGroupEnabled()` is an ops rollback lever, not tool registration.** Read from
+  `SICLAW_SUBAGENT_GROUP_ENABLED` (default ON; only `"false"`/`"0"` disables) so ops can flip it
+  WITHOUT a rebuild — like the sibling `SICLAW_*` knobs. Since there is one tool, the switch cannot
+  hide a second tool; instead OFF forces the item cap to 1, rejects a `reduce_prompt` (with an error
+  that points the model at N single-item calls), and gates the tool DESCRIPTION so it stops teaching
+  the batch pattern. A behaviour switch, not a compatibility shim.
 
 ### Orchestration (batch path)
 
@@ -104,8 +106,13 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 - **Two abort scopes.** An external signal (user Stop / `job_stop`) aborts **both** map and
   reduce. The group-size-scaled timeout and the circuit breaker abort **only the map phase** — a
   map-phase timeout must not kill a still-valuable reduce (which keeps its own 600s backstop).
-  Reduce runs when a `reduce_prompt` was given, ≥1 item produced usable output (`done` or
-  `partial`), and the user did not cancel.
+  Reduce runs when a `reduce_prompt` was given, **≥1 item COMPLETED on its own (`done`)**, the user
+  did not cancel, AND the circuit breaker did not trip. Gating on `done` (not `done`+`partial`)
+  matters: every map-child `partial` is a cancellation stub — `runSpawnedSubagent` reports `partial`
+  only when the child was stopped (by mapAbort, or by the parent session's `_aborted` during the
+  child's setup window), never for genuine partial output — so counting partials would let a
+  fully-timed-out batch run a reduce over N "was cancelled" notices. (The reduce INPUT still includes
+  every item's summary, so real content from a completed-enough batch is never dropped.)
 - **A single failed/timed-out item does NOT abort the batch.** Its status + error summary flow
   into the reduce input. This is a bounded, deliberate exception to fail-fast: a failure is a
   valid diagnostic signal, not dirty data to propagate.
@@ -121,7 +128,21 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 - **Reduce summary comes from the FULL reduce report, then the 6000-char budget.** The reduce
   child's `fullSummary` (not its ≤1800 capsule) is fed to `truncateReduceSummary(6000)`; the
   capsule is already ≤1800, so truncating it to 6000 was a no-op and the larger budget never
-  took effect (fixed in v3).
+  took effect (fixed in v3). Truncation clips at a word/line boundary (shared `truncateAtBoundary`),
+  never mid-token.
+- **A failed reduce keeps the map phase.** `reduceSummary` is set ONLY when the reduce child
+  completes (`done`); on reduce failure/timeout the per-item summaries are preserved (never stripped)
+  and the failure is surfaced via `groupSummary`, so one transient synthesis error never discards N
+  successful map results. Overall status is then `partial` (synthesis missing ⇒ not a full success),
+  never `done`.
+- **Overall status ladder.** `circuitBroken → failed`; else `all done → done` — checked BEFORE the
+  cancel/timeout branches, so a Stop that lands *after* every item already finished is not
+  mislabelled `partial` (a failed or cancel-skipped reduce does downgrade an all-done batch to
+  `partial`); else nothing usable → `failed`; else user cancelled → `partial`; else map timed out →
+  `timed_out`; else `partial`.
+- **The group summary is always surfaced when no reduce output exists.** The circuit-break reason /
+  reduce-failure note / cancel note reaches the card, the completion notification, AND the
+  model-visible result (`group_summary`) — so a no-reduce failure still explains WHY it stopped.
 
 ### Persistence & lineage
 
@@ -130,7 +151,14 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
   The reduce child uses `#reduce`. The collapse path uses the bare tool-call id (no `#`).
 - A batch persists one terminal `delegation_event` with `delegation_id = groupToolCallId`.
   `childSessionId` = the reduce child's session id when a reduce ran, else the empty string (the
-  card drills in per-item, not via this field).
+  card drills in per-item, not via this field). It also carries a per-item **status snapshot**
+  (`item_statuses`: index → status) so the card renders items that were never persisted as their
+  own child event — chiefly `skipped` ones — on reload, instead of stranding them on the live-only
+  "running" fallback.
+- **`delegation_id` is `VARCHAR(64)`.** `{groupToolCallId}#reduce` reaches 36 chars for a 29-char
+  provider tool-call id, leaving `CHAR(36)` zero headroom — a longer id silently overflows / drops
+  the reduce child's rows under MySQL strict mode. Widened for headroom; existing MySQL deployments
+  are migrated with an idempotent, MySQL-only `MODIFY COLUMN` (SQLite ignores CHAR width).
 - **`skipped` items are never persisted as a child event** (never started; `skipped` is not in
   the delegation status enum) — they exist only in the aggregate report and the batch terminal
   event's item detail.
@@ -182,11 +210,10 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 
 ## Consequences
 
-- **Steering must teach `items`, not repeated calls.** Every prompt/description that used to say
-  "emit several spawn_subagent calls in one turn to fan out" now says "put the targets in one
-  call's `items`". Missing one lets the model regress to N single-item calls — losing the single
-  approval and the orchestration. (One known residual: `src/core/prompt.ts` still teaches the old
-  pattern and requires human approval to edit — tracked separately.)
+- **Steering teaches `items`, not repeated calls.** Every prompt/description — including
+  `src/core/prompt.ts` and `deep-investigation.ts` — says "put the targets in one call's `items`",
+  not "emit several spawn_subagent calls in one turn". Missing one lets the model regress to N
+  single-item calls, losing the single approval and the orchestration.
 - **Global concurrency default 2 → 4.** A multi-item batch defaults to background and is the
   primary fan-out path; at concurrency 2 the worker share is 1 and a 50-item batch is effectively
   serial. 4 keeps ≥1 slot for interactive spawn while giving batches a usable pool. This changes
@@ -205,6 +232,7 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 ## Env knobs
 
 `SICLAW_SUBAGENT_GROUP_MAX_ITEMS` (50), `SICLAW_SUBAGENT_GROUP_ITEM_BUDGET` (300s),
-`SICLAW_SUBAGENT_GROUP_MAX_RUNTIME` (7200s), `SICLAW_SUBAGENT_CONCURRENCY` (4), and the
-`SUBAGENT_GROUP_ENABLED` rollback lever (OFF → item cap forced to 1 + `reduce_prompt` rejected,
-so `spawn_subagent` degrades to a pure single-task spawn).
+`SICLAW_SUBAGENT_GROUP_MAX_RUNTIME` (7200s), `SICLAW_SUBAGENT_CONCURRENCY` (4), and
+`SICLAW_SUBAGENT_GROUP_ENABLED` (default ON; `"false"`/`"0"` → item cap forced to 1 + `reduce_prompt`
+rejected + batch guidance gated, so `spawn_subagent` degrades to a pure single-task spawn). All six
+parse through the shared `parsePositiveIntEnv` (count vs seconds→ms explicit at each call site).

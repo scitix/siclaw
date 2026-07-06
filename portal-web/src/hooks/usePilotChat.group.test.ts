@@ -68,13 +68,13 @@ describe("annotateGroupCompletions (group card rebuild on reload)", () => {
     ])
     const meta = launchMsg(msgs).metadata!
     expect(meta.groupStatus).toBe("done")
-    expect(meta.groupReduceSummary).toBe("Two causes: net + storage")
+    expect(meta.groupSummary).toBe("Two causes: net + storage")
     expect(meta.groupReduceChildSessionId).toBe("reduce-sess")
     // Terminal folded → no longer active work.
     expect(hasActiveBackgroundWork(msgs)).toBe(false)
   })
 
-  it("an empty terminal child_session_id (no reduce) does NOT set a reduce summary", () => {
+  it("no reduce (empty terminal child_session_id): shows the group summary but no reduce drill-in", () => {
     const msgs = buildPilotMessages([
       groupLaunchRow("grp1", ["a"]),
       childEventRow("grp1", 0, "done", "sess-0", "a ok"),
@@ -82,7 +82,44 @@ describe("annotateGroupCompletions (group card rebuild on reload)", () => {
     ])
     const meta = launchMsg(msgs).metadata!
     expect(meta.groupStatus).toBe("done")
-    expect(meta.groupReduceSummary).toBeUndefined()
+    // The capsule is ALWAYS surfaced (so a no-reduce circuit-break reason stays visible on the card)…
+    expect(meta.groupSummary).toBe("1 item(s): 1 done")
+    // …but the reduce transcript drill-in is gated on a real reduce child (absent here).
+    expect(meta.groupReduceChildSessionId).toBeUndefined()
+  })
+
+  it("#3/#7 renders skipped items from the terminal item_statuses snapshot + surfaces the breaker reason", () => {
+    // Circuit-broke at 2 failures: items 0-1 have their own child events; 2-4 were skipped (never
+    // persisted as children), so the terminal event's item_statuses snapshot is their ONLY record.
+    const termRow = {
+      id: "term-grp1",
+      role: "user",
+      content: "Circuit breaker: the first 2 sub-agents all failed with no success.",
+      metadata: {
+        kind: "delegation_event",
+        delegation_id: "grp1",
+        status: "failed",
+        child_session_id: "", // no reduce ran
+        item_statuses: [
+          { index: 0, status: "failed" }, { index: 1, status: "failed" },
+          { index: 2, status: "skipped" }, { index: 3, status: "skipped" }, { index: 4, status: "skipped" },
+        ],
+      },
+      created_at: new Date().toISOString(),
+    } as unknown as ChatMessage
+    const msgs = buildPilotMessages([
+      groupLaunchRow("grp1", ["a", "b", "c", "d", "e"]),
+      childEventRow("grp1", 0, "failed", "s0", "boom 0"),
+      childEventRow("grp1", 1, "failed", "s1", "boom 1"),
+      termRow,
+    ])
+    const meta = launchMsg(msgs).metadata!
+    expect(meta.groupStatus).toBe("failed")
+    // #7: the breaker reason (capsule) is surfaced even though no reduce child ran.
+    expect(meta.groupSummary).toMatch(/circuit breaker/i)
+    // #3: indices 2-4 come from the snapshot (no child event) → "skipped", not the "running" fallback.
+    const items = meta.groupItems as Array<{ index: number; status: string }>
+    expect(items.map((i) => i.status)).toEqual(["failed", "failed", "skipped", "skipped", "skipped"])
   })
 
   it("does not treat a single sub-agent's bare delegation_event as a group terminal", () => {
@@ -193,7 +230,7 @@ describe("mergePage1IntoHistory — paged-back completion converges (S1)", () =>
     const launchAfter = launchMsg(merged)
     const meta = launchAfter.metadata!
     expect(meta.groupStatus).toBe("done")
-    expect(meta.groupReduceSummary).toBe("Two causes: net + storage")
+    expect(meta.groupSummary).toBe("Two causes: net + storage")
     expect(meta.groupReduceChildSessionId).toBe("reduce-sess")
     expect((meta.groupItems as unknown[]).length).toBe(2)
     // No longer counted as active background work → the input's Stop button clears.
