@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { buildPilotMessages, hasActiveBackgroundWork, mergePage1IntoHistory, type ChatMessage } from "./usePilotChat"
+import { buildPilotMessages, carryLiveGroupProgress, hasActiveBackgroundWork, mergePage1IntoHistory, type ChatMessage } from "./usePilotChat"
 
 // Raw-row helpers mirroring how spawn_subagent_group events are persisted.
 function groupLaunchRow(jobId: string, items: unknown[], description = "diagnose pods"): ChatMessage {
@@ -266,5 +266,46 @@ describe("mergePage1IntoHistory — paged-back completion converges (S1)", () =>
     const idxLaunch = merged.findIndex((m) => m.toolName === "spawn_subagent_group")
     expect(idxOld).toBeGreaterThanOrEqual(0)
     expect(idxOld).toBeLessThan(idxLaunch)
+  })
+})
+
+describe("carryLiveGroupProgress", () => {
+  const frame = { phase: "map", items: [{ index: 0, status: "running" }, { index: 1, status: "queued" }] }
+
+  it("carries the live frame onto a refetched launch card that lost it", () => {
+    const prev = buildPilotMessages([groupLaunchRow("grp3", ["a", "b"])])
+    prev[0] = { ...prev[0], metadata: { ...(prev[0].metadata ?? {}), groupProgress: frame } }
+    const fresh = buildPilotMessages([groupLaunchRow("grp3", ["a", "b"])])
+
+    const out = carryLiveGroupProgress(prev, fresh)
+    expect(out[0].metadata?.groupProgress).toEqual(frame)
+  })
+
+  it("does not shadow a terminal fold or a newer frame, and leaves unrelated rows alone", () => {
+    const prev = buildPilotMessages([groupLaunchRow("grp3", ["a", "b"])])
+    prev[0] = { ...prev[0], metadata: { ...(prev[0].metadata ?? {}), groupProgress: frame } }
+
+    // Fresh page already folded terminal → stale frame must be dropped.
+    const folded = buildPilotMessages([
+      groupLaunchRow("grp3", ["a", "b"]),
+      childEventRow("grp3", 0, "done", "s0", "ok"),
+      childEventRow("grp3", 1, "done", "s1", "ok"),
+      groupTerminalRow("grp3", "done", "all done", ""),
+    ])
+    const outFolded = carryLiveGroupProgress(prev, folded)
+    const launch = outFolded.find((m) => m.toolName === "spawn_subagent_group")!
+    expect(launch.metadata?.groupStatus).toBe("done")
+    expect(launch.metadata?.groupProgress).toBeUndefined()
+
+    // Fresh page carries its own (newer) frame → it wins over the carried one.
+    const newer = { phase: "reduce", items: [{ index: 0, status: "done" }, { index: 1, status: "done" }] }
+    const withNewer = buildPilotMessages([groupLaunchRow("grp3", ["a", "b"])])
+    withNewer[0] = { ...withNewer[0], metadata: { ...(withNewer[0].metadata ?? {}), groupProgress: newer } }
+    const outNewer = carryLiveGroupProgress(prev, withNewer)
+    expect(outNewer[0].metadata?.groupProgress).toEqual(newer)
+
+    // No prev frames at all → fresh list returned as-is.
+    const plain = buildPilotMessages([groupLaunchRow("grp4", ["x"])])
+    expect(carryLiveGroupProgress(buildPilotMessages([]), plain)).toBe(plain)
   })
 })

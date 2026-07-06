@@ -447,6 +447,32 @@ export function mergePage1IntoHistory(current: PilotMessage[], freshPage1: Pilot
 }
 
 /**
+ * Carry the live-only `groupProgress` frame across a history refetch. It is the ONLY source that
+ * can tell a queued batch item from a running one mid-run — a queued item has no persisted trace
+ * at all (its child session is created when a worker picks it up), and a running child's rows live
+ * in the CHILD session, so the parent-page rebuild knows nothing about either. Without the carry,
+ * every wholesale refetch (bg poller, SSE refetch, recovered-run poll) wipes the frame and the card
+ * repaints all non-terminal items with the "running" default until the next transition frame.
+ * The stale frame is dropped once the fresh row folded a terminal `groupStatus` (must not shadow
+ * the itemStatuses snapshot) or carries its own newer frame.
+ */
+export function carryLiveGroupProgress(prev: PilotMessage[], fresh: PilotMessage[]): PilotMessage[] {
+  const carried = new Map<string, unknown>()
+  for (const m of prev) {
+    const gp = (m.metadata as Record<string, unknown> | undefined)?.groupProgress
+    if (gp !== undefined && m.id) carried.set(m.id, gp)
+  }
+  if (carried.size === 0) return fresh
+  return fresh.map((m) => {
+    const gp = m.id ? carried.get(m.id) : undefined
+    if (gp === undefined) return m
+    const meta = (m.metadata ?? {}) as Record<string, unknown>
+    if (meta.groupProgress !== undefined || meta.groupStatus !== undefined) return m
+    return { ...m, metadata: { ...meta, groupProgress: gp } }
+  })
+}
+
+/**
  * Recover the most recent persisted context-usage snapshot from loaded history.
  * The Runtime stores it on the latest assistant row's `metadata.context_usage`
  * (see sse-consumer.ts agent_end handling), so the context meter can render on
@@ -1139,7 +1165,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         // don't let this poll re-paint them as "running" over the optimistic "aborted" state.
         // Also stand down while the /events live feed owns the message list (recoveredLiveRef) —
         // a wholesale DB replace would clobber live-streamed assistant text not yet persisted.
-        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages(pilotMsgs)
+        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
         setHasMore(items.length >= PAGE_SIZE)
 
         if (hasRunning) {
@@ -1193,7 +1219,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           try {
             const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
             if (!cancelled && pageRef.current === 1 && !refetchSuppressedByAbort()) {
-              setMessages(pilotMsgs)
+              setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
               setHasMore(items.length >= PAGE_SIZE)
             }
           } catch { /* keep last live state on refetch failure */ }
@@ -1230,7 +1256,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         const pendingSynthesis = hasPendingDelegationSynthesis(pilotMsgs)
         // Stand down while the /events live feed owns the message list — a wholesale DB replace
         // would clobber live-streamed text not yet persisted.
-        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages(pilotMsgs)
+        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
         setHasMore(items.length >= PAGE_SIZE)
         if (pendingSynthesis) {
           setStreaming(true)
@@ -1277,7 +1303,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         if (cancelled) return
         const applied = pageRef.current === 1 && !streamingRef.current && !refetchSuppressedByAbort()
         if (applied) {
-          setMessages(pilotMsgs)
+          setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
           setHasMore(items.length >= PAGE_SIZE)
         }
         // Stop polling only when the folded page was actually APPLIED. Judging fold-ness on an
@@ -1318,7 +1344,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         if (closed || refetchSuppressedByAbort()) return
         if (pageRef.current === 1) {
           // Page 1 is all that's loaded → wholesale replace with the fresh page 1.
-          setMessages(pilotMsgs)
+          setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
           setHasMore(items.length >= PAGE_SIZE)
         } else {
           // The user has paged back (older history loaded). A wholesale replace would drop that
@@ -1335,7 +1361,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           // window in which a stream can START; re-check here and defer via scheduleRefetch instead
           // of merging (same anti-clobber policy the page-1 branch relies on). No timestamp reorder.
           if (streamingRef.current) { scheduleRefetch(); return }
-          setMessages((prev) => mergePage1IntoHistory(prev, pilotMsgs))
+          setMessages((prev) => mergePage1IntoHistory(prev, carryLiveGroupProgress(prev, pilotMsgs)))
         }
       } catch (err) {
         console.warn("[usePilotChat] background-turn refetch failed:", err)
