@@ -19,11 +19,65 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 DEFAULT_BATCH_THRESHOLD_BYTES = 400 * 1024
 DEFAULT_BATCH_BUDGET_BYTES = 200 * 1024
+
+# ── effective-size weighting ─────────────────────────────────────────────────
+# Raw bytes are a terrible proxy for context cost on non-text sources: a 168KB
+# jpg costs the model roughly as much as a few KB of text (one vision block),
+# and a PDF costs per PAGE, not per byte. Packing by raw bytes turned a 465KB-
+# text corpus with 6MB of screenshots into 28 batches — 26 of them one image
+# each. All knobs env-tunable; everything downstream (threshold, budget,
+# oversized-solo) uses the EFFECTIVE size.
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+TEXT_EXTS = {".md", ".txt", ".tsv", ".csv", ".json", ".jsonl", ".yaml", ".yml", ".xml", ".html", ".rst"}
+
+
+def _image_cost() -> int:
+    return int(os.environ.get("KBC_BATCH_IMAGE_COST_BYTES", str(30 * 1024)))
+
+
+def _pdf_page_cost() -> int:
+    return int(os.environ.get("KBC_BATCH_PDF_PAGE_COST_BYTES", str(8 * 1024)))
+
+
+def _binary_weight() -> float:
+    return float(os.environ.get("KBC_BATCH_BINARY_WEIGHT", "0.3"))
+
+
+_PDF_PAGE_RE = re.compile(rb"/Type\s*/Page(?![s/])")
+
+
+def pdf_page_count(path: Path) -> int | None:
+    """Cheap page estimate: count /Type /Page object markers (excluding /Pages
+    tree nodes) in a single pass. Works for most non-encrypted PDFs; None when
+    nothing is found (e.g. fully compressed object streams) so the caller can
+    fall back to a byte heuristic."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    n = len(_PDF_PAGE_RE.findall(data))
+    return n or None
+
+
+def effective_bytes(path: Path, size: int) -> int:
+    """Context-cost estimate for one source (see module docstring)."""
+    ext = path.suffix.lower()
+    if ext in TEXT_EXTS:
+        return size
+    if ext in IMAGE_EXTS:
+        return _image_cost()
+    if ext == ".pdf":
+        pages = pdf_page_count(path)
+        if pages is not None:
+            return pages * _pdf_page_cost()
+        return max(30 * 1024, min(int(size * 0.1), 400 * 1024))
+    return int(size * _binary_weight())
 
 BATCH_PLAN_PATH = "authoring/BATCH_PLAN.json"
 SOURCES_INVENTORY_PATH = "authoring/SOURCES_INVENTORY.json"
@@ -52,7 +106,11 @@ def scan_sources(raw_dir: Path) -> list[dict[str, Any]]:
         size = p.stat().st_size
         if size == 0:
             continue
-        items.append({"path": str(p.relative_to(raw_dir)), "bytes": size})
+        items.append({
+            "path": str(p.relative_to(raw_dir)),
+            "bytes": size,
+            "effective": effective_bytes(p, size),
+        })
     return items
 
 
@@ -60,8 +118,16 @@ def corpus_bytes(inventory: list[dict[str, Any]]) -> int:
     return sum(int(i["bytes"]) for i in inventory)
 
 
+def _eff(item: dict[str, Any]) -> int:
+    return int(item.get("effective", item["bytes"]))
+
+
+def corpus_effective_bytes(inventory: list[dict[str, Any]]) -> int:
+    return sum(_eff(i) for i in inventory)
+
+
 def should_batch(inventory: list[dict[str, Any]], threshold: int | None = None) -> bool:
-    return corpus_bytes(inventory) > (threshold if threshold is not None else batch_threshold_bytes())
+    return corpus_effective_bytes(inventory) > (threshold if threshold is not None else batch_threshold_bytes())
 
 
 def _top_dir(path: str) -> str:
@@ -99,7 +165,7 @@ def pack_batches(inventory: list[dict[str, Any]], budget: int | None = None) -> 
 
     for item in inventory:
         d = _top_dir(item["path"])
-        size = int(item["bytes"])
+        size = _eff(item)
         if cur and (cur_dir != d or cur_bytes + size > b):
             flush()
         cur_dir = d
@@ -125,6 +191,7 @@ def build_plan(
         "threshold": threshold if threshold is not None else batch_threshold_bytes(),
         "budget": budget if budget is not None else batch_budget_bytes(),
         "total_bytes": corpus_bytes(inventory),
+        "total_effective_bytes": corpus_effective_bytes(inventory),
         "batches": batches,
     }
 
@@ -137,7 +204,7 @@ def validate_plan(
     every batch within budget unless it is a single oversized file."""
     b = budget if budget is not None else batch_budget_bytes()
     errors: list[str] = []
-    sizes = {i["path"]: int(i["bytes"]) for i in inventory}
+    sizes = {i["path"]: _eff(i) for i in inventory}
     seen: dict[str, str] = {}
     batches = plan.get("batches")
     if not isinstance(batches, list) or not batches:
