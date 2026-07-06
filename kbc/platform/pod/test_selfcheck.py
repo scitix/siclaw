@@ -191,6 +191,19 @@ def test_media_verify_helpers():
     print("OK  media_citing_pages + pending/mark idempotency + carry-forward")
 
 
+def test_cap_media_pending():
+    pend = {"a.md": ["i1", "i2"], "b.md": ["i3"], "c.md": ["i4", "i5", "i6"]}
+    c = selfcheck.cap_media_pending(pend, 3)
+    assert c == {"a.md": ["i1", "i2"], "b.md": ["i3"]}, c
+    # an oversized single page is still included alone (progress guaranteed)
+    c2 = selfcheck.cap_media_pending({"z.md": ["1", "2", "3", "4"]}, 2)
+    assert list(c2) == ["z.md"]
+    # column-alignment discipline present in the verify prompt
+    prompt = selfcheck.build_media_verify_prompt({"p.md": ["s/x.png"]})
+    assert "对准列名" in prompt and "一次只 Read 一张" in prompt
+    print("OK  cap_media_pending (whole pages / oversized-single) + prompt discipline")
+
+
 def test_state_key():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -290,6 +303,31 @@ async def test_media_verify_wiring():
     print("OK  media-verify wiring (settled-draft gate / one-shot / new-page re-arm)")
 
 
+async def test_media_verify_chunking():
+    from compile_box import _post_turn_media_verify, _post_turn_selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/i1.png")
+        _mk(base, "raw/s/i2.png")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/i2.png\n---\ny")
+        run = _FakeRun(td)
+        os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"] = "1"
+        try:
+            assert await _post_turn_selfcheck(run) is None  # ledger closes
+            m1 = await _post_turn_media_verify(run)
+            assert m1 and "- p.md" in m1 and "- q.md" not in m1, m1
+            m2 = await _post_turn_media_verify(run)  # remainder rolls into next round
+            assert m2 and "- q.md" in m2 and "- p.md" not in m2, m2
+            assert await _post_turn_media_verify(run) is None
+        finally:
+            del os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"]
+    print("OK  media verify chunking (≤max images per round, remainder next round)")
+
+
 async def test_pk_wiring():
     """S2 red-blue wiring: due-gating → full pass → repairing + repair inject →
     targeted retest → merged final scoreboard → idempotent (tree hash stamped)."""
@@ -353,9 +391,11 @@ def main():
     test_coverage_and_lint()
     test_media_ledger_and_new_lint()
     test_media_verify_helpers()
+    test_cap_media_pending()
     test_state_key()
     asyncio.run(test_wiring())
     asyncio.run(test_media_verify_wiring())
+    asyncio.run(test_media_verify_chunking())
     asyncio.run(test_pk_wiring())
     print("ALL OK  test_selfcheck")
 
