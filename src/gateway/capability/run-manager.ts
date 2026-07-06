@@ -171,14 +171,12 @@ export class CapabilityRunManager {
     if (rec) rec.lastActivityMs = this.now();
   }
 
-  /** Record the box session id (for resume) + persist. */
-  async setSessionRef(runId: string, sessionRef: string): Promise<void> {
-    const rec = this.runs.get(runId);
-    if (!rec) return;
-    rec.sessionRef = sessionRef;
-    rec.lastActivityMs = this.now();
-    await this.persist(rec);
-  }
+  // No setSessionRef: the runtime routes/recovers a run by runId and restores
+  // continuity by rehydrating the workspace FILES into a box, never by resuming
+  // the box's Claude Code session id. The box also uses an in-memory session
+  // store, so a session id wouldn't survive a container restart anyway. session_ref
+  // stays a reserved wire field (adopt/recover carry it through) for a future
+  // where the box persists sessions — until then there is deliberately no writer.
 
   /** Move a live run to idle/running (non-terminal) + persist. */
   async setStatus(runId: string, status: CapabilityLifecycleStatus): Promise<void> {

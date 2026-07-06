@@ -46,18 +46,16 @@ describe("CapabilityRunManager", () => {
     ]);
   });
 
-  it("setSessionRef + setStatus persist each transition", async () => {
+  it("setStatus persists the transition", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
     const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
 
-    await mgr.setSessionRef(runId, "sess-9");
     await mgr.setStatus(runId, "idle");
-    expect(mgr.get(runId)?.sessionRef).toBe("sess-9");
     expect(mgr.get(runId)?.status).toBe("idle");
-    // running(start) + sessionRef + idle = 3 persists.
-    expect(be.persists()).toHaveLength(3);
-    expect(be.persists().at(-1)?.params).toMatchObject({ session_ref: "sess-9", status: "idle" });
+    // running(start) + idle = 2 persists.
+    expect(be.persists()).toHaveLength(2);
+    expect(be.persists().at(-1)?.params).toMatchObject({ status: "idle" });
   });
 
   it("endRun persists the terminal state then drops the run from the live map", async () => {
