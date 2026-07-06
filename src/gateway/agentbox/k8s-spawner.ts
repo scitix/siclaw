@@ -131,7 +131,12 @@ export class K8sSpawner implements BoxSpawner {
         console.log(
           `[k8s-spawner] Removing stale pod ${podName} (phase: ${phase}, profile: ${existingProfile}→${profile.name})`,
         );
-        await this.coreApi.deleteNamespacedPod({ name: podName, namespace }).catch(() => {});
+        // Let delete errors reach the outer catch, which swallows 404 (pod
+        // already gone) and rethrows everything else (finding F): a blanket
+        // `.catch(() => {})` here turned a real API error — RBAC, etc. — into a
+        // waitForPodDeleted timeout instead of a clear failure. Consistent with
+        // the CA-mismatch delete below, which never swallowed.
+        await this.coreApi.deleteNamespacedPod({ name: podName, namespace });
         // Wait for pod to be fully deleted
         await this.waitForPodDeleted(podName, namespace);
       } else if (phase === "Running" || phase === "Pending") {
