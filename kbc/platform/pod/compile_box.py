@@ -57,12 +57,22 @@ import selfcheck
 from engine import ClaudeEngine
 
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches
-# once a session's context passes the autocompact buffer (HTTP 400
-# "context_management: Extra inputs are not permitted"). A compile is a long
-# multi-turn session, so it hits this readily. Disable autocompact so the field
-# is never sent. setdefault → an explicit deployment override still wins.
-# BOTH spellings: CLI 0.2.110 reads DISABLE_AUTO_COMPACT (underscored); the
-# unspaced form alone never worked (live 400s, 2026-07-06).
+# (HTTP 400 "context_management: Extra inputs are not permitted").
+# ROOT CAUSE (settled 2026-07-06 by reading bundled CLI 2.1.191): the field is
+# NOT autocompact — it is the thinking-clear context edit, attached whenever a
+# turn has thinking enabled AND the context-management beta is in the betas
+# list. massapi masquerades as a first-party endpoint, so the CLI auto-enables
+# that beta for modern models; adaptive thinking then decides per-turn → the
+# 400 is intermittent (respawn-rehydrate first turns, image-heavy turns).
+# The gate: `if (o1(provider) && !E2e() && enabled) push(contextManagementBeta)`
+# where E2e() = CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS || hipaa. So THIS is the
+# kill switch. Correct posture on a Bedrock-proxied gateway anyway: any
+# experimental beta that changes the request shape is a 400 hazard here.
+os.environ.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
+# Autocompact stays off too (kept from the earlier mitigation): a compile is a
+# long multi-turn session and massapi has no compaction affordances. BOTH
+# spellings: CLI 0.2.110 read DISABLE_AUTO_COMPACT (underscored).
+# setdefault → an explicit deployment override still wins.
 os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
 os.environ.setdefault("DISABLE_AUTO_COMPACT", "1")
 

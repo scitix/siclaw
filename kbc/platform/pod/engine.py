@@ -21,12 +21,14 @@ from pathlib import Path
 from typing import Protocol
 
 # massapi proxies to Bedrock, which rejects the `context_management` request
-# field Claude Code attaches once a turn's context grows past the autocompact
-# buffer ("context_management: Extra inputs are not permitted", HTTP 400).
-# Disabling autocompact stops the field. setdefault so an explicit override
-# wins; the SDK-spawned child inherits this via os.environ (we pass no options.env,
-# so ANTHROPIC_* etc. are inherited too). PK stages are one-shot reads that don't
-# need compaction, so this has no downside here.
+# field ("Extra inputs are not permitted", HTTP 400). Root cause (2026-07-06,
+# see compile_box.py header): the thinking-clear context edit rides the
+# experimental context-management beta — CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+# is the actual kill switch; autocompact-off stays as belt-and-braces. PK
+# stages are one-shot reads that need neither. setdefault so an explicit
+# override wins; the SDK-spawned child inherits via os.environ (we pass no
+# options.env, so ANTHROPIC_* etc. are inherited too).
+os.environ.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
 os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
 os.environ.setdefault("DISABLE_AUTO_COMPACT", "1")
 
