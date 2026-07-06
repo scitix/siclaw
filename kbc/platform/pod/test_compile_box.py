@@ -993,7 +993,8 @@ class _ToolGapFake:
         pass
 
 
-async def _run_stall_scenario(fake, *, idle, poll, max_retries, tool_idle=660.0):
+async def _run_stall_scenario(fake, *, idle, poll, max_retries, tool_idle=660.0,
+                              rate_base=None, rate_cap=None, rate_max=None):
     """Drive one turn through _consume_turn_stream with the watchdog running, at
     test-tuned knobs (restored after). Returns (run, drained events, raised)."""
     saved = (
@@ -1001,11 +1002,20 @@ async def _run_stall_scenario(fake, *, idle, poll, max_retries, tool_idle=660.0)
         compile_box._MODEL_TOOL_IDLE_TIMEOUT_S,
         compile_box._MODEL_MAX_RETRIES,
         compile_box._MODEL_WATCHDOG_POLL_S,
+        compile_box._MODEL_RATE_BACKOFF_BASE_S,
+        compile_box._MODEL_RATE_BACKOFF_CAP_S,
+        compile_box._MODEL_RATE_MAX_RETRIES,
     )
     compile_box._MODEL_IDLE_TIMEOUT_S = idle
     compile_box._MODEL_TOOL_IDLE_TIMEOUT_S = tool_idle
     compile_box._MODEL_MAX_RETRIES = max_retries
     compile_box._MODEL_WATCHDOG_POLL_S = poll
+    if rate_base is not None:
+        compile_box._MODEL_RATE_BACKOFF_BASE_S = rate_base
+    if rate_cap is not None:
+        compile_box._MODEL_RATE_BACKOFF_CAP_S = rate_cap
+    if rate_max is not None:
+        compile_box._MODEL_RATE_MAX_RETRIES = rate_max
     raised = None
     with tempfile.TemporaryDirectory() as td:
         run = compile_box.CompileRun("wd", td, 1)
@@ -1029,6 +1039,9 @@ async def _run_stall_scenario(fake, *, idle, poll, max_retries, tool_idle=660.0)
                 compile_box._MODEL_TOOL_IDLE_TIMEOUT_S,
                 compile_box._MODEL_MAX_RETRIES,
                 compile_box._MODEL_WATCHDOG_POLL_S,
+                compile_box._MODEL_RATE_BACKOFF_BASE_S,
+                compile_box._MODEL_RATE_BACKOFF_CAP_S,
+                compile_box._MODEL_RATE_MAX_RETRIES,
             ) = saved
     return run, _drain(run), raised
 
@@ -1081,6 +1094,108 @@ async def test_model_stall_exhausts_to_error():
     print("✓ model stall: retries exhausted → ModelStallError (fails fast, no hang)")
 
 
+# ── Rate-limit resilience (C2) ───────────────────────────────────────────────
+
+
+class _RateLimitedFakeClient:
+    """Ends each turn with a rate-limit error result until the Nth query, which
+    produces a normal completion. `is_error` + `api_error_status` mirror the CLI's
+    ResultMessage on a 429/503/529 (CLI >= 2.1.110)."""
+
+    def __init__(self, options=None, succeed_on_query=2, status=429):
+        self.options = options
+        self.queries = []
+        self.interrupts = 0
+        self._succeed_on = succeed_on_query
+        self._status = status
+        self._gate = asyncio.Event()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+        self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if len(self.queries) >= self._succeed_on:
+                yield AssistantMessage("compiled ok")
+                yield ResultMessage()
+                self._closed = True
+                return
+            r = ResultMessage()
+            r.is_error = True
+            r.api_error_status = self._status
+            yield r
+            # loop back and wait for the retry query
+
+    async def disconnect(self):
+        self._closed = True
+
+
+async def test_model_rate_limit_backoff_then_completes():
+    """C2: a 429 error result backs off + re-issues; the retry completes."""
+    fake = _RateLimitedFakeClient(succeed_on_query=2, status=429)
+    run, evs, raised = await _run_stall_scenario(
+        fake, idle=90, poll=0.03, max_retries=3, rate_base=0.01, rate_cap=0.02, rate_max=5)
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert fake.queries == ["批 1/10", "批 1/10"], fake.queries
+    assert "rate_limited" in types, types
+    assert next(e for e in evs if e["type"] == "rate_limited")["status"] == 429
+    assert run._last_turn_reply == "compiled ok", run._last_turn_reply
+    print("✓ rate limit: 429 backs off + re-issues, then completes (C2)")
+
+
+async def test_model_rate_limit_exhausts_gracefully():
+    """C2: persistent 529 → after the retry budget the turn ends with a clear note
+    (run idle), not a crash."""
+    fake = _RateLimitedFakeClient(succeed_on_query=999, status=529)
+    run, evs, raised = await _run_stall_scenario(
+        fake, idle=90, poll=0.03, max_retries=3, rate_base=0.01, rate_cap=0.02, rate_max=2)
+    types = [e["type"] for e in evs]
+    assert raised is None, raised                       # graceful, not a crash
+    assert types.count("rate_limited") == 2, types      # rate_max retries
+    assert any(e["type"] == "summary" and "限流" in e.get("text", "") for e in evs), evs
+    print("✓ rate limit: exhausted budget ends gracefully with a note, no crash (C2)")
+
+
+# ── Graceful-shutdown flush (F3) ─────────────────────────────────────────────
+
+
+async def test_shutdown_flush_syncs_active_runs():
+    """F3: on_shutdown final-syncs each active run's unsynced workspace so a pod
+    kill (SIGTERM) doesn't lose the last window of on-disk work."""
+    saved = compile_box._SHUTDOWN_DRAIN_MAX_S
+    compile_box._SHUTDOWN_DRAIN_MAX_S = 0.1
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "candidate").mkdir(parents=True)
+            (wd / "candidate" / "01.md").write_text("# page one\n", "utf-8")
+            run = compile_box.CompileRun("shut1", td, 1)
+            run._sync_sent = {}
+            compile_box.RUNS["shut1"] = run
+            try:
+                await compile_box._flush_on_shutdown(None)
+            finally:
+                compile_box.RUNS.pop("shut1", None)
+            evs = _drain(run)
+            sync = [e for e in evs if e["type"] == "syncArtifacts"]
+            assert sync, evs
+            assert "candidate/01.md" in [a["path"] for a in sync[0]["artifacts"]], sync
+    finally:
+        compile_box._SHUTDOWN_DRAIN_MAX_S = saved
+    print("✓ shutdown flush: final-syncs active runs' unsynced workspace (F3)")
+
+
 async def main():
     # PK never fires in these wiring tests — a qualifying fixture must not spawn
     # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
@@ -1106,6 +1221,9 @@ async def main():
     await test_model_stall_live_stream_not_reaped()
     await test_model_stall_tool_gap_not_reaped()
     await test_model_stall_exhausts_to_error()
+    await test_model_rate_limit_backoff_then_completes()
+    await test_model_rate_limit_exhausts_gracefully()
+    await test_shutdown_flush_syncs_active_runs()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()
