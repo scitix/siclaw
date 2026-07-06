@@ -185,7 +185,12 @@ export interface CapabilityRunState {
   status: CapabilityLifecycleStatus;
   /** Opaque resume blob (JSON-serializable). Reserved — no writer yet. */
   checkpoint?: unknown;
-  /** Box session id (for resume). Reserved — no writer yet. */
+  /**
+   * Box session id, reserved for a future where the box persists its session and
+   * a resume needs it. Deliberately has NO writer: continuity today is workspace-
+   * file rehydration + routing by run_id, not session-id resume (adopt/recover
+   * carry any stored value through, but nothing sets or consumes it).
+   */
   session_ref: string;
   /** Which runtime owns the box. */
   runtime_id: string;
