@@ -80,6 +80,19 @@ runtime:
   # one LLM stream per target at once (avoids provider 429s / pod pressure).
   # Forwarded to each AgentBox pod as SICLAW_SUBAGENT_CONCURRENCY. Default 5.
   subagentConcurrency: 5
+  # LLM endpoint for LEAN CAPABILITY BOXES (kb-compile / kb-test) ONLY. The chat
+  # path does not read these — agent models come from the Portal/Upstream model
+  # descriptors. They exist so the runtime can forward ANTHROPIC_* into spawned
+  # kb boxes (BoxProfile envForward). Token rotation: update the Secret, then
+  # rollout-restart the runtime (env Secrets resolve at pod start); live kb
+  # boxes keep their spawn-time token until respawned — either keep the old
+  # token valid through a grace window, or delete agentbox pods after rotating.
+  llm:
+    baseUrl: ""            # e.g. https://api.scitix.ai/model-api (massapi proxy)
+    model: ""              # optional ANTHROPIC_MODEL default for the box CLI
+    tokenSecret:
+      name: ""             # existing Secret holding the massapi token
+      key: "ANTHROPIC_AUTH_TOKEN"
   env: {}
 
 # -- Portal (standalone web UI, replaces Upstream)

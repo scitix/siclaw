@@ -143,6 +143,26 @@ spec:
                   name: {{ $caSecret }}
                   key: tls.key
             {{- end }}
+            {{- with .Values.runtime.llm }}
+            # LLM endpoint for lean capability boxes (kb-compile / kb-test) —
+            # forwarded into spawned kb boxes via BoxProfile envForward. The
+            # chat path does not read these (agent models come from the Portal).
+            {{- if .baseUrl }}
+            - name: ANTHROPIC_BASE_URL
+              value: {{ .baseUrl | quote }}
+            {{- end }}
+            {{- if .model }}
+            - name: ANTHROPIC_MODEL
+              value: {{ .model | quote }}
+            {{- end }}
+            {{- if and .tokenSecret .tokenSecret.name }}
+            - name: ANTHROPIC_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .tokenSecret.name }}
+                  key: {{ .tokenSecret.key | default "ANTHROPIC_AUTH_TOKEN" }}
+            {{- end }}
+            {{- end }}
             # User-supplied env entries come last so callers can override any
             # of the values above (e.g. swap in SICLAW_CA_CERT_FILE).
             {{- range $key, $value := .Values.runtime.env }}
