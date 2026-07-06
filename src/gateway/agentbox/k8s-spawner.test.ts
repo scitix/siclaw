@@ -248,6 +248,39 @@ describe("K8sSpawner — spawn branches", () => {
     }
   });
 
+  it("kb profile forwards KBC_* runtime env by prefix into the box pod, deduped, skipping empties", async () => {
+    process.env.KBC_PK_MODE = "off";
+    process.env.KBC_MEDIA_VERIFY = "on";
+    process.env.KBC_SMOKE = ""; // empty ⇒ not forwarded
+    process.env.ANTHROPIC_BASE_URL = "https://massapi.example/model-api";
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.21", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    try {
+      await s.spawn({ agentId: "kbrun", profile: "kb-compile" });
+      const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+      expect(env).toContainEqual({ name: "KBC_PK_MODE", value: "off" });
+      expect(env).toContainEqual({ name: "KBC_MEDIA_VERIFY", value: "on" });
+      expect(env.some((e: any) => e.name === "KBC_SMOKE")).toBe(false);
+      // no duplicates from wildcard + explicit entries overlapping
+      expect(env.filter((e: any) => e.name === "ANTHROPIC_BASE_URL").length).toBe(1);
+    } finally {
+      delete process.env.KBC_PK_MODE;
+      delete process.env.KBC_MEDIA_VERIFY;
+      delete process.env.KBC_SMOKE;
+      delete process.env.ANTHROPIC_BASE_URL;
+    }
+  });
+
   it("does not inject SICLAW_SUBAGENT_CONCURRENCY when unset on the runtime", async () => {
     delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
 
