@@ -947,7 +947,11 @@ def _compile_system_prompt(run: "CompileRun") -> str:
 # workspace itself (exact files, code-verifiable), never a prose summary. Small
 # KBs stay on the untouched single-session path (threshold gate).
 
-_BATCH_TRIGGER_PREFIXES = ("直接开始编译", "批准,按此计划执行", "继续编译")
+# Machine-canonical only: these exact strings are what UI buttons send (quick
+# start / plan approve / the 07-06 resume button, whose directive prefix-matches
+# "直接开始编译"). Natural-language phrasings deliberately do NOT trigger — a human
+# saying "继续编译前我想先改个要求" must not launch the train.
+_BATCH_TRIGGER_PREFIXES = ("直接开始编译", "批准,按此计划执行")
 _BATCH_TRIGGER_SUBSTR = "请增量重编"
 
 
