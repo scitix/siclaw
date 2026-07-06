@@ -477,10 +477,21 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
 
         await asyncio.gather(*(_judge(c) for c in _chunks(questions, chunk_size)))
 
+        # 5b: the judge sometimes drops ids from a chunk's JSON (seen live
+        # 2026-07-07: 4/24 missing, twice). Re-judge ONLY the missing ones once;
+        # whatever is still missing is UNGRADED — cancelled/dropped is not a
+        # wiki failure, must not trigger a repair round, and must not pollute
+        # the pass-rate denominator.
+        missing = [q for q in questions if q["id"] not in detail["verdicts"]]
+        if missing:
+            say(f"自检(PK):{len(missing)} 题判分缺失,补判一轮…")
+            await asyncio.gather(*(_judge(c) for c in _chunks(missing, chunk_size)))
+
         # 6: decide
-        summary = _summarize(questions, detail["verdicts"], missing_as_failure=True)
+        summary = _summarize(questions, detail["verdicts"], missing_as_failure=False)
         summary.update({
             "state": "passed" if not summary["failures"] else "unconverged",
+            "ungraded": sorted(q["id"] for q in questions if q["id"] not in detail["verdicts"]),
             "survey_cache_hit": survey_cache_hit,
             "blue_model": blue_m, "judge_model": judge_m,
         })
@@ -493,6 +504,8 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
             # Salvage the graded subset: cancelled ≠ failed, and the spend is sunk.
             summary = _summarize(detail["questions"], detail["verdicts"], missing_as_failure=False)
             summary.update({"state": "partial", "error": repr(e),
+                            "ungraded": sorted(q["id"] for q in detail["questions"]
+                                               if q["id"] not in detail["verdicts"]),
                             "survey_cache_hit": survey_cache_hit,
                             "blue_model": blue_m, "judge_model": judge_m})
         else:

@@ -596,23 +596,8 @@ def cap_media_pending(pending: dict[str, list[str]], max_images: int) -> dict[st
     return out
 
 
-def build_media_verify_prompt(pending: dict[str, list[str]]) -> str:
-    """The bounded fresh-eyes directive. Concrete page←image pairs, concrete
-    reading discipline — never a vague 'double-check your work'."""
-    lines = ["【系统自检 · 图像复核】下列 candidate 页引用了图片来源。图表数值转写是已知的高错风险"
-             "(把显存条读成利用率、柱状图系列互换都真实发生过),请逐页复核:"]
-    shown = sorted(pending.items())[:_REPAIR_LIST_CAP]
-    for page, imgs in shown:
-        lines.append(f"- {page} ← {', '.join('raw/' + i for i in imgs)}")
-    if len(pending) > len(shown):
-        lines.append(f"- …等共 {len(pending)} 页(其余见 authoring/SELFCHECK.json)")
-    lines.append(
-        "对每页:重新打开列出的每张图——**一次只 Read 一张,核完再开下一张**(一条消息连读多图会撞"
-        "图片处理上限,图会被静默丢弃);先认清图表类型、坐标轴与单位、图例/系列标签,"
-        "再逐个核对页面里来自该图的数字与结论。"
-        "**表格型监控截图(nvitop/nvidia-smi/top 等)必须把每个数值对准列名再转写:百分比条要先确认"
-        "它属于哪一列(MEM 显存条 ≠ GPU-Util,这个混淆真实发生过两次);N/A 行(掉卡/离线)要如实记录,"
-        "不要写成「每块都…」的平均化描述。** 发现不符就改页(compiled_from 保持准确);"
-        "图上读不清或有歧义的数值,改标 ⚠️ 存疑并按矛盾工单流程落一条工单;"
-        "核对无误的页不要改动。完成后简短汇报:核了几页、发现并修正了什么。")
-    return "\n".join(lines)
+# The v1 prompt-based re-verification ("re-open the image and check") was
+# superseded 2026-07-07 by blind transcription + text-only comparison in
+# mediaverify.py — claim-in-context re-reading is a confirmation check, proven
+# twice live (MEM 条→GPU-Util survived it; 跨图 H20 survived it). The
+# deterministic halves (media_citing_pages / pending / mark / cap) stay here.

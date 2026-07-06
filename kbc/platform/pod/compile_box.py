@@ -52,6 +52,7 @@ from claude_agent_sdk import (
 )
 
 import batching
+import mediaverify
 import redblue
 import selfcheck
 from engine import ClaudeEngine
@@ -200,6 +201,8 @@ class CompileRun:
         # Layer-2 red-blue PK (S2): the in-flight background task, if any.
         # Single-flight per run; durable state lives in SELFCHECK.json `pk`.
         self._pk_task: asyncio.Task | None = None
+        # Blind image verify (图像复核 v2): the in-flight background task.
+        self._media_task: asyncio.Task | None = None
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
@@ -789,33 +792,78 @@ def _media_verify_max_images() -> int:
     return int(os.environ.get("KBC_MEDIA_VERIFY_MAX_IMAGES", "8"))
 
 
-async def _post_turn_media_verify(run) -> str | None:
-    """Single-session analogue of the batch image re-verification pass: once the
-    draft is settled (ledger closed, lint ok — state 'passed' in SELFCHECK), pages
-    that digest images get ONE fresh-eyes numeric check, injected as an ordinary
-    next turn. Idempotent via SELFCHECK.json media_verify.verified_pages — a page
-    is only ever verified once per content lifecycle, and the verify turn's own
-    edits don't re-arm it. Returns the directive to inject, or None."""
+def _media_verify_due(run) -> dict[str, list[str]] | None:
+    """A ≤max-images chunk of image-citing pages owed a blind verify on the
+    settled draft, else None. Idempotent via media_verify.verified_pages —
+    pages verify once per content lifecycle; the remainder rolls into the next
+    settled turn automatically (only the chunk gets marked)."""
     workdir = getattr(run, "workdir", None)
     if not workdir or not _media_verify_enabled():
         return None
+    task = getattr(run, "_media_task", None)
+    if task is not None and not task.done():
+        return None  # single-flight
     if not (Path(workdir) / "candidate" / "index.md").is_file():
         return None
     sc = selfcheck.read_selfcheck(workdir)
     if not sc or sc.get("state") != "passed":
-        return None  # ledger repairs first; verify next turn once settled
+        return None  # ledger repairs first; verify once settled
     pending = selfcheck.pending_media_verification(workdir)
     if not pending:
         return None
-    # Chunked: one round covers ≤ max images (whole pages); the remainder rolls
-    # into the next settled turn automatically (only included pages get marked).
-    chunk = selfcheck.cap_media_pending(pending, _media_verify_max_images())
-    selfcheck.mark_media_verified(workdir, list(chunk))
-    left = len(pending) - len(chunk)
-    await run.emit({"type": "summary", "text": (
-        f"自检(图像):{len(chunk)} 页引用图片,注入数值复核轮"
-        + (f"(还有 {left} 页排队,下轮继续)。" if left else "。"))})
-    return selfcheck.build_media_verify_prompt(chunk)
+    return selfcheck.cap_media_pending(pending, _media_verify_max_images())
+
+
+def _maybe_start_media_verify(run) -> bool:
+    """Kick the blind transcribe+compare flow as a background task (图像复核 v2).
+    Marks the chunk verified up-front (one-shot semantics, same as v1) so a
+    crash costs one chunk's verification, never a loop."""
+    try:
+        chunk = _media_verify_due(run)
+    except Exception:
+        return False  # a broken due-check must never break the turn seam
+    if not chunk:
+        return False
+    selfcheck.mark_media_verified(run.workdir, list(chunk))
+    run._media_task = asyncio.get_running_loop().create_task(
+        _run_media_verify_flow(run, chunk))
+    return True
+
+
+async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
+    """Blind transcription + text-only comparison over one chunk, then ONE
+    repair turn for confirmed findings. De-anchored by construction: the
+    transcriber never sees the page, the comparer never sees the image —
+    the 07-06/07 live failures (MEM 条→GPU-Util, 跨图 H20) were both
+    confirmation-bias artifacts of claim-in-context re-reading. Fail-open."""
+    try:
+        n_imgs = sum(len(v) for v in chunk.values())
+        await run.emit({"type": "summary",
+                        "text": f"自检(图像):盲转写复核 {len(chunk)} 页 / {n_imgs} 张图(后台)…"})
+        loop = asyncio.get_running_loop()
+        result = await mediaverify.run_blind_verify(
+            ClaudeEngine(), run.workdir, chunk,
+            progress=lambda s: loop.create_task(run.emit({"type": "summary", "text": s})))
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)  # MEDIA_TRANSCRIPTS.json rides along
+            except Exception:
+                pass
+        findings, errors = result["findings"], result["errors"]
+        tail = f";{len(errors)} 项转写/比对失败" if errors else ""
+        if findings:
+            await run.emit({"type": "summary", "text": (
+                f"自检(图像):{result['images']} 张图已核,{len(findings)} 条断言与图不符/超源,注入回修{tail}")})
+            await run.inject_user_message(mediaverify.build_repair_prompt(findings))
+        else:
+            await run.emit({"type": "summary", "text": (
+                f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓{tail}")})
+    except Exception as e:
+        try:
+            await run.emit({"type": "summary", "text": f"自检(图像)执行失败,本轮跳过: {e!r}"})
+        except Exception:
+            pass
 
 
 # ── Layer-2 red-blue PK wiring (S2, DESIGN-kb-compile-self-verification §9) ──
@@ -883,6 +931,9 @@ def _pk_due(run) -> str | None:
     sc = selfcheck.read_selfcheck(workdir) or {}
     if sc.get("state") != "passed":
         return None
+    media_task = getattr(run, "_media_task", None)
+    if media_task is not None and not media_task.done():
+        return None  # blind image verify owns the seam first
     if _media_verify_enabled() and selfcheck.pending_media_verification(workdir):
         return None
     pk = sc.get("pk") or {}
@@ -907,14 +958,16 @@ def _pk_narration(summary: dict) -> str:
     n, ok = summary.get("questions", 0), summary.get("gate_pass", 0)
     fails = len(summary.get("failures") or [])
     wall = summary.get("wall_secs", 0)
+    ung = len(summary.get("ungraded") or [])
+    tail = f"(另 {ung} 题裁判未判,不计分)" if ung else ""
     if state == "passed":
-        return f"自检(红蓝队):{ok}/{n} 全过 ✓({wall}s)"
+        return f"自检(红蓝队):{ok}/{n - ung} 全过 ✓({wall}s){tail}"
     if state == "partial":
-        return f"自检(红蓝队):超时截断,已判 {summary.get('graded', 0)}/{n},{fails} 项未过——结果已入账"
+        return f"自检(红蓝队):超时截断,已判 {summary.get('graded', 0)}/{n},{fails} 项未过——结果已入账{tail}"
     if state == "repairing":
-        return f"自检(红蓝队):{ok}/{n} 过,{fails} 项未过,已注入回修轮"
+        return f"自检(红蓝队):{ok}/{n - ung} 过,{fails} 项未过,已注入回修轮{tail}"
     if state == "unconverged":
-        return f"自检(红蓝队):{ok}/{n} 过,{fails} 项未过——余项见发布确认卡"
+        return f"自检(红蓝队):{ok}/{n - ung} 过,{fails} 项未过——余项见发布确认卡{tail}"
     return f"自检(红蓝队)失败:{summary.get('error', '?')}"
 
 
@@ -961,16 +1014,25 @@ async def _run_pk_flow(run, kind: str) -> None:
         summary["kind"] = kind
 
         if kind == "retest":
-            # Merge into the standing scoreboard: total stays the full round's
-            # question count; resolved retest questions convert to passes.
+            # Merge into the standing scoreboard. gate_pass sums (retested
+            # passes were failures before, so no double count); a retest
+            # question the judge again failed to grade KEEPS its previous
+            # failed standing (never counts as resolved); ungraded questions
+            # stay out of the pass-rate denominator.
+            prev_ungraded = sorted(prev_pk.get("ungraded") or [])
             total_q = int(prev_pk.get("questions") or summary.get("questions") or 0)
-            resolved = len(override or []) - len(summary.get("failures") or [])
+            retest_ungraded = set(summary.get("ungraded") or [])
+            carried = [f for f in (prev_pk.get("failures") or [])
+                       if f.get("id") in retest_ungraded]
+            summary["failures"] = (summary.get("failures") or []) + carried
+            summary["gate_pass"] = int(prev_pk.get("gate_pass") or 0) + int(summary.get("gate_pass") or 0)
             summary["questions"] = total_q
-            summary["gate_pass"] = int(prev_pk.get("gate_pass") or 0) + max(0, resolved)
-            summary["pass_rate"] = round(summary["gate_pass"] / total_q, 3) if total_q else 0.0
+            graded_total = max(1, total_q - len(prev_ungraded))
+            summary["pass_rate"] = round(summary["gate_pass"] / graded_total, 3)
+            summary["ungraded"] = prev_ungraded
             summary["rounds_used"] = prev_rounds + 1
             if summary.get("state") not in ("failed",):
-                summary["state"] = "passed" if not summary.get("failures") else "unconverged"
+                summary["state"] = "passed" if not summary["failures"] else "unconverged"
         elif (summary.get("state") == "unconverged"
               and summary.get("failures") and prev_rounds < _pk_repair_rounds()):
             summary["state"] = "repairing"
@@ -1096,16 +1158,10 @@ async def _emit_message(run: CompileRun, msg) -> None:
             except Exception as e:
                 await run.emit({"type": "summary", "text": f"自检回修注入失败: {e!r}"})
         else:
-            try:
-                verify_msg = await _post_turn_media_verify(run)
-                if verify_msg:
-                    await run.inject_user_message(verify_msg)
-                else:
-                    # Seam order: ledger repairs → image re-verify → red-blue PK.
-                    # Only a draft the cheaper layers are done with gets examined.
-                    _maybe_start_pk(run)
-            except Exception as e:
-                await run.emit({"type": "summary", "text": f"图像复核注入失败: {e!r}"})
+            # Seam order: ledger repairs → blind image verify → red-blue PK.
+            # Only a draft the cheaper layers are done with gets examined.
+            if not _maybe_start_media_verify(run):
+                _maybe_start_pk(run)
 
 
 # Default tool whitelist for a kb-compile session, used when the runtime profile
@@ -1420,21 +1476,36 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # add image-digesting pages), then one more ledger refresh so
         # SELFCHECK.json reflects the verified final state.
         if _media_verify_enabled():
-            verified_any = False
+            repaired_any = False
             while True:
                 pending = selfcheck.pending_media_verification(run.workdir)
                 if not pending:
                     break
-                # One bounded session per ≤max-images chunk: a single session
-                # reading 35 images hit the API image limits live (2026-07-06).
+                # Blind transcribe+compare per ≤max-images chunk (v2): engine
+                # sessions read one image each — no in-session image pileup.
                 chunk = selfcheck.cap_media_pending(pending, _media_verify_max_images())
                 selfcheck.mark_media_verified(run.workdir, list(chunk))
-                verify_reply = await _drive_batch_session(
-                    run, selfcheck.build_media_verify_prompt(chunk), "图像复核")
-                if verify_reply:
-                    replies.append(f"【图像复核】{verify_reply}")
-                verified_any = True
-            if verified_any:
+                try:
+                    result = await mediaverify.run_blind_verify(
+                        ClaudeEngine(), run.workdir, chunk,
+                        progress=lambda s: asyncio.get_running_loop().create_task(
+                            run.emit({"type": "summary", "text": s})))
+                except Exception as e:
+                    await run.emit({"type": "summary", "text": f"自检(图像)执行失败,跳过本组: {e!r}"})
+                    continue
+                if result["errors"]:
+                    await run.emit({"type": "summary",
+                                    "text": f"自检(图像):{len(result['errors'])} 项转写/比对失败(见日志),其余照常。"})
+                if result["findings"]:
+                    verify_reply = await _drive_batch_session(
+                        run, mediaverify.build_repair_prompt(result["findings"]), "图像复核")
+                    if verify_reply:
+                        replies.append(f"【图像复核】{verify_reply}")
+                    repaired_any = True
+                else:
+                    await run.emit({"type": "summary",
+                                    "text": f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓"})
+            if repaired_any:
                 await _run_ledger_repairs(run, replies)
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:

@@ -31,17 +31,19 @@ COPY platform/pod/selfcheck.py /app/selfcheck.py
 COPY platform/pod/batching.py /app/batching.py
 COPY platform/pod/engine.py /app/engine.py
 COPY platform/pod/redblue.py /app/redblue.py
+COPY platform/pod/mediaverify.py /app/mediaverify.py
 COPY platform/pod/prompts/ /app/prompts/
 COPY tools/ /app/tools/
 
 # Tenant isolation: never load external memory (prevents cross-tenant bleed).
 ENV CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
-# massapi/Bedrock rejects the `context_management` field Claude Code attaches on
-# large-context turns (HTTP 400). Disable autocompact so it's never sent. The
-# Python modules also setdefault this; the ENV makes it visible at the image level.
-# BOTH spellings: CLI 0.2.110 reads DISABLE_AUTO_COMPACT (underscored) — the
-# unspaced form alone was a dead guard (live 400s on 2026-07-06 proved it).
-ENV DISABLE_AUTOCOMPACT=1 DISABLE_AUTO_COMPACT=1
+# massapi/Bedrock rejects the `context_management` request field (HTTP 400).
+# Root cause (2026-07-06, see compile_box.py header): the thinking-clear
+# context edit rides the experimental context-management beta — DISABLE_
+# EXPERIMENTAL_BETAS is the real kill switch; autocompact-off stays as
+# belt-and-braces. The Python modules also setdefault these; the ENV makes
+# the posture visible at the image level.
+ENV CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 DISABLE_AUTOCOMPACT=1 DISABLE_AUTO_COMPACT=1
 # Default served port (overridable via SICLAW_AGENTBOX_PORT, aligned with agentbox).
 ENV SICLAW_AGENTBOX_PORT=3000
 

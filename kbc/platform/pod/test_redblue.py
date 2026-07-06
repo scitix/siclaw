@@ -25,12 +25,13 @@ def _mk(base: Path, rel: str, text: str = "x"):
 class FakeEngine:
     """Stage-routed canned responses; counts calls per stage."""
 
-    def __init__(self, broken_stages=(), slow_verdict_from=None):
+    def __init__(self, broken_stages=(), slow_verdict_from=None, drop_verdict_ids=()):
         self.calls = {"survey": 0, "questions": 0, "blue": 0, "verdict": 0}
         self.systems = {}  # stage → last system prompt seen (asymmetry assertions)
         self.users = {}    # stage → last user message seen
         self.broken = set(broken_stages)
         self.slow_verdict_from = slow_verdict_from  # Nth verdict call onward hangs
+        self.drop_verdict_ids = set(drop_verdict_ids)  # judge "forgets" these ids
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
                                  model, effort=None, allowed_read_roots, timeout_secs):
@@ -66,6 +67,8 @@ class FakeEngine:
         assert ids, "verdict prompt carries no question ids"
         out = []
         for i in ids:  # verdict: q1 fails as 覆盖, everything else passes
+            if i in self.drop_verdict_ids:
+                continue  # judge silently omits this id from its JSON
             if i == "q1":
                 out.append({"id": i, "score": "错", "failure_category": "覆盖",
                             "reason": "缺", "fix": "补编X", "page": "p1.md"})
@@ -184,6 +187,26 @@ async def test_questions_override_targeted_retest():
     print("OK  questions_override skips survey/questions (targeted retest primitive)")
 
 
+async def test_dropped_verdicts_retry_then_ungraded():
+    """The judge omitting ids from a chunk (seen live: 4/24, twice) gets ONE
+    dedicated re-judge round; persistently missing ids land in `ungraded` —
+    never in failures, never inflating the repair queue."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine(drop_verdict_ids={"q3"})
+        summary, detail = await redblue.run_pk(
+            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+        # 7 questions → 2 verdict chunks + 1 retry chunk for the missing id
+        assert fake.calls["verdict"] == 3, fake.calls
+        assert summary["ungraded"] == ["q3"], summary
+        assert summary["graded"] == 6 and summary["gate_pass"] == 5, summary
+        fails = {f["id"] for f in summary["failures"]}
+        assert fails == {"q1"}, fails                     # only the REAL failure
+        assert summary["pass_rate"] == round(5 / 6, 3)    # graded denominator
+        assert "q3" not in detail["verdicts"]
+    print("OK  dropped verdict ids → one re-judge → ungraded (not failures)")
+
+
 async def test_wall_timeout_salvages_partial():
     """Wall-clock timeout with graded verdicts on hand → state=partial keeping
     the graded subset (the spend is sunk); ungraded questions are NOT failures."""
@@ -292,6 +315,7 @@ def main():
     asyncio.run(test_full_run())
     asyncio.run(test_survey_cache())
     asyncio.run(test_questions_override_targeted_retest())
+    asyncio.run(test_dropped_verdicts_retry_then_ungraded())
     asyncio.run(test_wall_timeout_salvages_partial())
     asyncio.run(test_media_pages_steer_question_officer())
     asyncio.run(test_broken_json_fails_open())

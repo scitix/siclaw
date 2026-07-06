@@ -178,8 +178,6 @@ def test_media_verify_helpers():
 
         pending = selfcheck.pending_media_verification(td)
         assert list(pending) == ["p1.md"]
-        prompt = selfcheck.build_media_verify_prompt(pending)
-        assert "raw/s/chart.png" in prompt and "图像复核" in prompt
 
         selfcheck.mark_media_verified(td, list(pending))
         assert selfcheck.pending_media_verification(td) == {}
@@ -198,10 +196,7 @@ def test_cap_media_pending():
     # an oversized single page is still included alone (progress guaranteed)
     c2 = selfcheck.cap_media_pending({"z.md": ["1", "2", "3", "4"]}, 2)
     assert list(c2) == ["z.md"]
-    # column-alignment discipline present in the verify prompt
-    prompt = selfcheck.build_media_verify_prompt({"p.md": ["s/x.png"]})
-    assert "对准列名" in prompt and "一次只 Read 一张" in prompt
-    print("OK  cap_media_pending (whole pages / oversized-single) + prompt discipline")
+    print("OK  cap_media_pending (whole pages / oversized-single)")
 
 
 def test_state_key():
@@ -281,30 +276,12 @@ async def test_wiring():
 
 
 async def test_media_verify_wiring():
-    from compile_box import _post_turn_media_verify, _post_turn_selfcheck
-
-    with tempfile.TemporaryDirectory() as td:
-        base = Path(td)
-        _mk(base, "raw/s/a.md")
-        _mk(base, "raw/s/chart.png")
-        run = _FakeRun(td)
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/chart.png\n---\nx")
-        assert await _post_turn_selfcheck(run) is None       # ledger closes → passed
-        msg = await _post_turn_media_verify(run)
-        assert msg and "p.md" in msg and "chart.png" in msg, msg
-        assert await _post_turn_media_verify(run) is None    # one-shot per page
-        # a NEW image-citing page later re-arms the pass for that page only
-        _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/chart.png\n---\ny")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
-        assert await _post_turn_selfcheck(run) is None       # still closed
-        msg = await _post_turn_media_verify(run)
-        assert msg and "q.md" in msg and "- p.md" not in msg, msg
-    print("OK  media-verify wiring (settled-draft gate / one-shot / new-page re-arm)")
-
-
-async def test_media_verify_chunking():
-    from compile_box import _post_turn_media_verify, _post_turn_selfcheck
+    """Blind-verify wiring (v2): settled-draft gate, ≤max-images chunking with
+    the remainder rolling to the next trigger, findings → repair injection,
+    clean chunk → no injection, all-verified → PK unblocked."""
+    import compile_box
+    import mediaverify as mv
+    from compile_box import _maybe_start_media_verify, _post_turn_selfcheck
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -315,17 +292,41 @@ async def test_media_verify_chunking():
         _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
         _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/i2.png\n---\ny")
         run = _FakeRun(td)
+
+        calls: list[dict] = []
+
+        async def fake_verify(engine, workdir, pending, progress=None):
+            calls.append(dict(pending))
+            if len(calls) == 1:  # first chunk: one confirmed misread
+                return {"findings": [{"page": "p.md", "image": "s/i1.png", "kind": "不一致",
+                                      "claim": "GPU-Util 94%", "expected": "GPU-Util 0%(94% 是 MEM 条)",
+                                      "fix": "改为 0%"}],
+                        "errors": [], "images": 1, "cache_hits": 0}
+            return {"findings": [], "errors": [], "images": 1, "cache_hits": 1}
+
         os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"] = "1"
+        os.environ["KBC_PK_MODE"] = "auto"  # so the PK-yields assertion is meaningful
+        orig = mv.run_blind_verify
+        mv.run_blind_verify = fake_verify
         try:
-            assert await _post_turn_selfcheck(run) is None  # ledger closes
-            m1 = await _post_turn_media_verify(run)
-            assert m1 and "- p.md" in m1 and "- q.md" not in m1, m1
-            m2 = await _post_turn_media_verify(run)  # remainder rolls into next round
-            assert m2 and "- q.md" in m2 and "- p.md" not in m2, m2
-            assert await _post_turn_media_verify(run) is None
+            # not settled yet → no start (selfcheck hasn't run/passed)
+            assert not _maybe_start_media_verify(run)
+            assert await _post_turn_selfcheck(run) is None  # ledger closes → passed
+            assert _maybe_start_media_verify(run)           # chunk 1 (p.md, cap 1 image)
+            await run._media_task
+            assert calls[0] == {"p.md": ["s/i1.png"]}, calls
+            assert run.injected and "图像复核" in run.injected[-1] and "94% 是 MEM 条" in run.injected[-1]
+            assert compile_box._pk_due(run) is None         # q.md still pending → PK waits
+            assert _maybe_start_media_verify(run)           # remainder rolls: chunk 2 (q.md)
+            await run._media_task
+            assert calls[1] == {"q.md": ["s/i2.png"]}, calls
+            assert len(run.injected) == 1                   # clean chunk → no injection
+            assert not _maybe_start_media_verify(run)       # all verified → done
         finally:
+            mv.run_blind_verify = orig
             del os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"]
-    print("OK  media verify chunking (≤max images per round, remainder next round)")
+            os.environ["KBC_PK_MODE"] = "off"
+    print("OK  blind media-verify wiring (gate / chunk+roll / findings→repair / PK yields)")
 
 
 async def test_pk_wiring():
@@ -395,7 +396,6 @@ def main():
     test_state_key()
     asyncio.run(test_wiring())
     asyncio.run(test_media_verify_wiring())
-    asyncio.run(test_media_verify_chunking())
     asyncio.run(test_pk_wiring())
     print("ALL OK  test_selfcheck")
 
