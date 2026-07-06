@@ -236,6 +236,10 @@ _pack_candidates_to_wiki = selfcheck.pack_candidates_to_wiki
 WORKSPACE_SYNC_DIRS = ("authoring", "candidate", "eval", "release")
 SYNC_INTERVAL_SECS = int(os.environ.get("KBC_SYNC_INTERVAL_SECS", "20"))
 MAX_SYNC_FILE_BYTES = int(os.environ.get("KBC_MAX_SYNC_FILE_BYTES", str(1024 * 1024)))
+# SDK stdio JSON reader buffer. The SDK default is 1MB, and one oversized tool
+# result (a Read of a big source file) kills the whole session with a fatal
+# "exceeded maximum buffer size" — seen live on a 139-source compile (2026-07-06).
+SDK_MAX_BUFFER_BYTES = int(os.environ.get("KBC_SDK_MAX_BUFFER_BYTES", str(16 * 1024 * 1024)))
 
 
 def _collect_workspace_artifacts(workdir: str) -> list[dict]:
@@ -878,6 +882,7 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         # compile default is opus by product decision. Overridable per-deploy.
         model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
         max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
+        max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=session_id,
         session_store=InMemorySessionStore(),
     )
@@ -1034,6 +1039,7 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             setting_sources=[],
             model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
             max_turns=8,
+            max_buffer_size=SDK_MAX_BUFFER_BYTES,
             session_id=str(uuid.uuid4()),
             session_store=InMemorySessionStore(),
         )
