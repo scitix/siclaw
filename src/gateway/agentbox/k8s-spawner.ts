@@ -243,10 +243,24 @@ export class K8sSpawner implements BoxSpawner {
     // endpoint (company massapi, Anthropic-compatible) must be injected as env
     // ("credentials don't enter the sandbox" → the base URL is a proxy, key
     // injected proxy-side). Which names to forward is the profile's declaration.
-    for (const name of profile.envForward ?? []) {
-      const value = process.env[name];
-      if (value !== undefined && value !== "") {
+    // A trailing "*" forwards every var with that prefix (e.g. "KBC_*" — the KB
+    // box's ops knobs: PK on/off, budgets, model tiers — so production can tune
+    // them via the runtime deployment env instead of rebuilding the box image).
+    const forwarded = new Set(env.map((e) => e.name));
+    const forwardOne = (name: string, value: string | undefined) => {
+      if (value !== undefined && value !== "" && !forwarded.has(name)) {
+        forwarded.add(name);
         env.push({ name, value });
+      }
+    };
+    for (const name of profile.envForward ?? []) {
+      if (name.endsWith("*")) {
+        const prefix = name.slice(0, -1);
+        for (const [key, value] of Object.entries(process.env)) {
+          if (key.startsWith(prefix)) forwardOne(key, value);
+        }
+      } else {
+        forwardOne(name, process.env[name]);
       }
     }
     // The pod rootfs is read-only; a profile that runs Claude Code needs a writable

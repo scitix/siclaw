@@ -58,7 +58,7 @@ function kbCompileProfile(): BoxProfile {
   return {
     name: "kb-compile",
     image: process.env.SICLAW_COMPILE_BOX_IMAGE || "kbc-compile-box:latest",
-    envForward: ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_SMOKE"],
+    envForward: ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_*"],
     home: "/work",
     volumes: [{ name: "work", mountPath: "/work", sizeLimit: "4Gi" }], // installer allows 2GB unpacked raw + candidate output — 1Gi evicted large-corpus pods
     // null = the box's default compile toolset (posted as allowed_tools on
@@ -79,7 +79,7 @@ function kbTestProfile(): BoxProfile {
   return {
     name: "kb-test",
     image: process.env.SICLAW_COMPILE_BOX_IMAGE || "kbc-compile-box:latest",
-    envForward: ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_SMOKE"],
+    envForward: ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_*"],
     home: "/work",
     // Same cap as kb-compile — the profiles' documented invariant is "identical
     // box shape, trust differs only in allowedTools" (a sizeLimit is a ceiling,
