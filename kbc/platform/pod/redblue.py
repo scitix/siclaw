@@ -52,10 +52,14 @@ def _judge_model() -> str:
 
 
 def question_budget(page_count: int) -> int:
-    """Scale by KB size — code formula, never model discretion (principle 8)."""
+    """Scale by KB size — code formula, never model discretion (principle 8).
+    Defaults tuned for compile-flow wiring (2026-07-06): 1.0/page capped at 24 —
+    the marginal information of question 25+ is low (the A/B graded a whole
+    compile on ~20 non-trivial assertions), and 24 questions keeps a full pass
+    inside the wall clock (blue is one fresh session PER question)."""
     lo = _env_int("KBC_PK_QUESTIONS_MIN", 8)
-    hi = _env_int("KBC_PK_QUESTIONS_MAX", 40)
-    per = _env_float("KBC_PK_QUESTIONS_PER_PAGE", 1.5)
+    hi = _env_int("KBC_PK_QUESTIONS_MAX", 24)
+    per = _env_float("KBC_PK_QUESTIONS_PER_PAGE", 1.0)
     return max(lo, min(hi, int(page_count * per)))
 
 
@@ -90,7 +94,7 @@ QUESTIONS_USER = """你是裁判的**出题官**。基于下面的出题面,出 
 
 出题面(已调研):
 {topics_json}
-{contradictions_block}
+{contradictions_block}{media_block}
 要求:
 1. 优先覆盖 难/冲突/WIP/边界 标记的知识点{contradictions_hint};
 2. 重点知识点出**变式**(同一 knowledge_point 出 2 道不同 variant_type),角度从
@@ -259,6 +263,45 @@ def _chunks(items: list, size: int) -> list[list]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
+def _media_block(media_pages: dict | None, cap: int = 15) -> str:
+    """Question-officer hint: wiki pages whose numbers came from chart/screenshot
+    transcription — the one failure mode the 2026-07-06 A/B actually caught
+    twice. Numeric-verification questions against these pages are the highest-
+    value asks a PK round can make."""
+    if not media_pages:
+        return ""
+    lines = [f"- {page} ← {', '.join(imgs)}" for page, imgs in sorted(media_pages.items())[:cap]]
+    return ("\n图表转写页(这些 wiki 页的数字来自图片/图表转写,是已知的高错风险面——"
+            "优先对它们出数值核对题,expected 写 raw 图里的真值要点):\n" + "\n".join(lines) + "\n")
+
+
+def _summarize(questions: list[dict], verdicts: dict, *, missing_as_failure: bool) -> dict:
+    """The decide step, shared by the normal path (a question with no verdict =
+    the judge dropped it = failure) and the timeout-salvage path (ungraded
+    questions are simply not counted — they were cancelled, not failed)."""
+    failures, gate_pass, graded = [], 0, 0
+    for q in questions:
+        v = verdicts.get(q["id"])
+        if v is None and not missing_as_failure:
+            continue
+        graded += 1
+        v = v or {}
+        if v.get("score") in PASS_SCORES:
+            gate_pass += 1
+        else:
+            failures.append({
+                "id": q["id"], "question": q["question"][:120],
+                "score": v.get("score", "无判定"),
+                "category": v.get("failure_category", "无判定"),
+                "page": v.get("page", "-"), "fix": v.get("fix", "-"),
+            })
+    return {
+        "questions": len(questions), "graded": graded, "gate_pass": gate_pass,
+        "pass_rate": round(gate_pass / graded, 3) if graded else 0.0,
+        "failures": failures,
+    }
+
+
 # The blue team answers as the REAL consumer (persona = selfcheck.TEST_ROLE),
 # which means natural prose ending in a machine-readable `SOURCES: [...]` line —
 # NOT a JSON object. Forcing JSON on the consumer persona breaks fidelity AND
@@ -297,6 +340,7 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                  constitution_path: str | None = None,
                  questions_budget: int | None = None,
                  questions_override: list[dict] | None = None,
+                 media_pages: dict | None = None,
                  blue_model: str | None = None, judge_model: str | None = None,
                  progress=None) -> tuple[dict, dict]:
     """Run one PK round. Returns (pk_summary, detail).
@@ -305,13 +349,17 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
     full questions/answers/verdicts for the CLI / targeted retest.
     `questions_override` skips survey+authoring stages — the targeted-retest
     primitive (§9.3-6): re-test exactly the failed questions after a repair.
-    Fail-open: any stage error → state=failed with the reason; never raises."""
+    `media_pages` (page → image paths) steers the question officer toward
+    numeric-verification questions on chart-transcribed pages.
+    Fail-open: any stage error → state=failed with the reason; a WALL-CLOCK
+    timeout salvages what already got graded as state=partial (the tokens are
+    spent either way — keep the information). Never raises."""
     t0 = time.monotonic()
     blue_m = blue_model or _blue_model()
     judge_m = judge_model or _judge_model()
     say = progress or (lambda s: None)
     chunk_size = _env_int("KBC_PK_CHUNK", 5)
-    concurrency = _env_int("KBC_PK_CONCURRENCY", 2)
+    concurrency = _env_int("KBC_PK_CONCURRENCY", 3)
     judge_roots = [wiki_dir, raw_dir]
 
     constitution = ""
@@ -376,7 +424,8 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
             data = await _agent_json(
                 engine, stage="questions", system=judge_system,
                 user=QUESTIONS_USER.format(n=n, topics_json=json.dumps(topics, ensure_ascii=False),
-                                           contradictions_block=cblock, contradictions_hint=chint),
+                                           contradictions_block=cblock, contradictions_hint=chint,
+                                           media_block=_media_block(media_pages)),
                 model=judge_m, cwd=wiki_dir, roots=judge_roots,
                 timeout=_env_float("KBC_PK_QUESTIONS_TIMEOUT", 300))
             questions = data.get("questions", []) if isinstance(data, dict) else []
@@ -392,23 +441,24 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
         say(f"自检(PK):蓝队({blue_m})答 {len(questions)} 题、裁判({judge_m})判分…")
         sem = asyncio.Semaphore(concurrency)
 
-        async def _blue(q: dict) -> tuple[str, dict]:
+        async def _blue(q: dict) -> None:
             async with sem:
                 text = await engine.run_readonly_agent(
                     cwd=wiki_dir, system_prompt=selfcheck.TEST_ROLE,
                     user_message=q["question"], model=blue_m,
                     allowed_read_roots=[wiki_dir],
                     timeout_secs=_env_float("KBC_PK_BLUE_TIMEOUT", 300))
-            return q["id"], {"id": q["id"], "answer": _strip_sources(text),
-                             "cited_sources": _parse_sources(text),
-                             "said_uncovered": _said_uncovered(text)}
+            # Written as each answer lands (not after the gather): a wall-clock
+            # cancellation must not vaporize the answers that DID complete.
+            detail["answers"][q["id"]] = {"id": q["id"], "answer": _strip_sources(text),
+                                          "cited_sources": _parse_sources(text),
+                                          "said_uncovered": _said_uncovered(text)}
 
-        for qid, ans in await asyncio.gather(*(_blue(q) for q in questions)):
-            detail["answers"][qid] = ans
+        await asyncio.gather(*(_blue(q) for q in questions))
 
         # 5: judge — batched per chunk (judge prompt is fully ours; opus follows
         #    the JSON contract reliably), fed the consumer's natural answer.
-        async def _judge(chunk: list[dict]) -> dict:
+        async def _judge(chunk: list[dict]) -> None:
             qa = "\n\n".join(
                 f"[{q['id']}] 问题: {q['question']}\nraw 真值要点: {q.get('expected', '-')}\n"
                 f"raw 出处: {q.get('source_ref', '-')}\n"
@@ -421,40 +471,33 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                     user=VERDICT_USER.format(raw_dir=raw_dir, wiki_dir=wiki_dir, qa_block=qa),
                     model=judge_m, cwd=wiki_dir, roots=judge_roots,
                     timeout=_env_float("KBC_PK_VERDICT_TIMEOUT", 420))
-            return {v.get("id"): v for v in verdicts if isinstance(v, dict)} \
-                if isinstance(verdicts, list) else {}
+            if isinstance(verdicts, list):  # incremental for the same salvage reason
+                detail["verdicts"].update(
+                    {v.get("id"): v for v in verdicts if isinstance(v, dict)})
 
-        for vmap in await asyncio.gather(*(_judge(c) for c in _chunks(questions, chunk_size))):
-            detail["verdicts"].update(vmap)
+        await asyncio.gather(*(_judge(c) for c in _chunks(questions, chunk_size)))
 
         # 6: decide
-        failures = []
-        gate_pass = 0
-        for q in questions:
-            v = detail["verdicts"].get(q["id"]) or {}
-            if v.get("score") in PASS_SCORES:
-                gate_pass += 1
-            else:
-                failures.append({
-                    "id": q["id"], "question": q["question"][:120],
-                    "score": v.get("score", "无判定"),
-                    "category": v.get("failure_category", "无判定"),
-                    "page": v.get("page", "-"), "fix": v.get("fix", "-"),
-                })
-        return {
-            "state": "passed" if not failures else "unconverged",
-            "questions": len(questions), "gate_pass": gate_pass,
-            "pass_rate": round(gate_pass / len(questions), 3),
-            "failures": failures,
+        summary = _summarize(questions, detail["verdicts"], missing_as_failure=True)
+        summary.update({
+            "state": "passed" if not summary["failures"] else "unconverged",
             "survey_cache_hit": survey_cache_hit,
             "blue_model": blue_m, "judge_model": judge_m,
-        }
+        })
+        return summary
 
     try:
         summary = await asyncio.wait_for(_body(), timeout=_env_float("KBC_PK_WALL_SECS", 1800))
     except (Exception, asyncio.TimeoutError) as e:  # fail-open boundary (§4.5): report, never raise
-        summary = {"state": "failed", "error": repr(e), "survey_cache_hit": survey_cache_hit,
-                   "blue_model": blue_m, "judge_model": judge_m}
+        if detail["questions"] and detail["verdicts"]:
+            # Salvage the graded subset: cancelled ≠ failed, and the spend is sunk.
+            summary = _summarize(detail["questions"], detail["verdicts"], missing_as_failure=False)
+            summary.update({"state": "partial", "error": repr(e),
+                            "survey_cache_hit": survey_cache_hit,
+                            "blue_model": blue_m, "judge_model": judge_m})
+        else:
+            summary = {"state": "failed", "error": repr(e), "survey_cache_hit": survey_cache_hit,
+                       "blue_model": blue_m, "judge_model": judge_m}
     summary["wall_secs"] = int(time.monotonic() - t0)
     return summary, detail
 

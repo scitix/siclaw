@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import tarfile
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -51,7 +52,9 @@ from claude_agent_sdk import (
 )
 
 import batching
+import redblue
 import selfcheck
+from engine import ClaudeEngine
 
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches
 # once a session's context passes the autocompact buffer (HTTP 400
@@ -184,6 +187,9 @@ class CompileRun:
         self._last_turn_reply: str = ""
         self._batch_active = False
         self._batch_notes: list[str] = []
+        # Layer-2 red-blue PK (S2): the in-flight background task, if any.
+        # Single-flight per run; durable state lives in SELFCHECK.json `pk`.
+        self._pk_task: asyncio.Task | None = None
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
@@ -792,6 +798,193 @@ async def _post_turn_media_verify(run) -> str | None:
     return selfcheck.build_media_verify_prompt(pending)
 
 
+# ── Layer-2 red-blue PK wiring (S2, DESIGN-kb-compile-self-verification §9) ──
+# Async post-check shape (option c): turn_done fires normally, the PK runs as a
+# background task over a PINNED snapshot, findings come back as an ordinary
+# injected repair turn, and ONE targeted retest of the failed questions closes
+# the round. Bounded and idempotent by construction: tested_tree_hash in the
+# SELFCHECK `pk` section keys "this draft was already examined"; rounds are
+# capped; every failure path writes an honest terminal pk state (fail-open).
+
+PK_RESULT_PATH = "authoring/PK_RESULT.json"
+_PK_ANSWER_PERSIST_CAP = 4000  # chars per answer in the persisted detail
+
+
+def _pk_mode() -> str:
+    return os.environ.get("KBC_PK_MODE", "auto")
+
+
+def _pk_repair_rounds() -> int:
+    return int(os.environ.get("KBC_PK_REPAIR_ROUNDS", "1"))
+
+
+def _read_pk_result(workdir: str) -> dict | None:
+    p = Path(workdir) / PK_RESULT_PATH
+    if not p.is_file():
+        return None
+    try:
+        v = json.loads(p.read_text(encoding="utf-8"))
+        return v if isinstance(v, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _write_pk_result(workdir: str, detail: dict) -> None:
+    """Persist the full question/answer/verdict detail (rides syncArtifacts, so
+    a respawned box can still run the targeted retest). Answers are truncated —
+    the retest only needs the questions; long answers are debugging color."""
+    slim = {
+        "questions": detail.get("questions", []),
+        "verdicts": detail.get("verdicts", {}),
+        "answers": {
+            qid: {**a, "answer": (a.get("answer") or "")[:_PK_ANSWER_PERSIST_CAP]}
+            for qid, a in (detail.get("answers") or {}).items()
+        },
+    }
+    p = Path(workdir) / PK_RESULT_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(slim, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+
+
+def _pk_due(run) -> str | None:
+    """'full' | 'retest' when the settled draft owes a PK pass, else None.
+    Ordering contract: ledger repairs and the image re-verify own the seam
+    first — PK only examines a draft the cheaper layers are done with."""
+    workdir = getattr(run, "workdir", None)
+    if not workdir or _pk_mode() != "auto":
+        return None
+    if getattr(run, "_batch_active", False):
+        return None  # the train's own end triggers PK
+    task = getattr(run, "_pk_task", None)
+    if task is not None and not task.done():
+        return None  # single-flight
+    if not (Path(workdir) / "candidate" / "index.md").is_file():
+        return None
+    sc = selfcheck.read_selfcheck(workdir) or {}
+    if sc.get("state") != "passed":
+        return None
+    if _media_verify_enabled() and selfcheck.pending_media_verification(workdir):
+        return None
+    pk = sc.get("pk") or {}
+    if pk.get("state") == "repairing":
+        return "retest"
+    if pk.get("tested_tree_hash") == selfcheck.candidate_tree_hash(workdir):
+        return None  # this exact draft was already examined (any terminal state)
+    return "full"
+
+
+def _maybe_start_pk(run) -> None:
+    try:
+        kind = _pk_due(run)
+    except Exception:
+        return  # a broken due-check must never break the turn seam
+    if kind:
+        run._pk_task = asyncio.get_running_loop().create_task(_run_pk_flow(run, kind))
+
+
+def _pk_narration(summary: dict) -> str:
+    state = summary.get("state")
+    n, ok = summary.get("questions", 0), summary.get("gate_pass", 0)
+    fails = len(summary.get("failures") or [])
+    wall = summary.get("wall_secs", 0)
+    if state == "passed":
+        return f"自检(红蓝队):{ok}/{n} 全过 ✓({wall}s)"
+    if state == "partial":
+        return f"自检(红蓝队):超时截断,已判 {summary.get('graded', 0)}/{n},{fails} 项未过——结果已入账"
+    if state == "repairing":
+        return f"自检(红蓝队):{ok}/{n} 过,{fails} 项未过,已注入回修轮"
+    if state == "unconverged":
+        return f"自检(红蓝队):{ok}/{n} 过,{fails} 项未过——余项见发布确认卡"
+    return f"自检(红蓝队)失败:{summary.get('error', '?')}"
+
+
+async def _run_pk_flow(run, kind: str) -> None:
+    """One PK round over a pinned snapshot of the current draft. Fail-open at
+    every boundary — a PK crash costs the PK, never the compile session."""
+    workdir = run.workdir
+    tmp = tempfile.mkdtemp(prefix="kbc-pk-")
+    try:
+        tree = selfcheck.candidate_tree_hash(workdir)
+        _, pages = selfcheck.pack_candidates_to_wiki(workdir, Path(tmp))
+        raw_dir = str(Path(workdir) / "raw")
+        authoring_dir = str(Path(workdir) / "authoring")
+        constitution = Path(workdir) / "constitution.md"
+        sc = selfcheck.read_selfcheck(workdir) or {}
+        prev_pk = sc.get("pk") or {}
+        prev_rounds = int(prev_pk.get("rounds_used") or 0)
+
+        override = None
+        if kind == "retest":
+            prev_detail = _read_pk_result(workdir)
+            failed_ids = {f.get("id") for f in prev_pk.get("failures") or []}
+            override = [q for q in (prev_detail or {}).get("questions", [])
+                        if q.get("id") in failed_ids] or None
+            if override is None:
+                # Detail lost (e.g. pre-sync crash) → full pass, but count the
+                # burned round so this can never oscillate full↔repairing.
+                kind = "full"
+                prev_rounds = max(prev_rounds, _pk_repair_rounds())
+
+        await run.emit({"type": "summary", "text": (
+            f"自检(红蓝队):{'定向复测 ' + str(len(override)) + ' 题' if override else '全量体检'}"
+            "开始(后台运行,不影响会话)…")})
+        loop = asyncio.get_running_loop()
+        summary, detail = await redblue.run_pk(
+            ClaudeEngine(), wiki_dir=tmp, raw_dir=raw_dir, page_count=pages,
+            authoring_dir=authoring_dir,
+            constitution_path=str(constitution) if constitution.is_file() else None,
+            questions_override=override,
+            media_pages=None if override else selfcheck.media_citing_pages(workdir),
+            progress=lambda s: loop.create_task(
+                run.emit({"type": "summary", "text": s})))
+        summary["tested_tree_hash"] = tree
+        summary["kind"] = kind
+
+        if kind == "retest":
+            # Merge into the standing scoreboard: total stays the full round's
+            # question count; resolved retest questions convert to passes.
+            total_q = int(prev_pk.get("questions") or summary.get("questions") or 0)
+            resolved = len(override or []) - len(summary.get("failures") or [])
+            summary["questions"] = total_q
+            summary["gate_pass"] = int(prev_pk.get("gate_pass") or 0) + max(0, resolved)
+            summary["pass_rate"] = round(summary["gate_pass"] / total_q, 3) if total_q else 0.0
+            summary["rounds_used"] = prev_rounds + 1
+            if summary.get("state") not in ("failed",):
+                summary["state"] = "passed" if not summary.get("failures") else "unconverged"
+        elif (summary.get("state") == "unconverged"
+              and summary.get("failures") and prev_rounds < _pk_repair_rounds()):
+            summary["state"] = "repairing"
+            summary["rounds_used"] = prev_rounds
+        else:
+            summary["rounds_used"] = prev_rounds
+
+        selfcheck.update_pk_section(workdir, summary)
+        if detail.get("questions"):
+            _write_pk_result(workdir, detail)
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)
+            except Exception:
+                pass
+        await run.emit({"type": "summary", "text": _pk_narration(summary)})
+        if summary.get("state") == "repairing":
+            await run.inject_user_message(redblue.build_pk_repair_prompt(summary))
+    except Exception as e:
+        try:
+            selfcheck.update_pk_section(workdir, {
+                "state": "failed", "error": repr(e),
+                "tested_tree_hash": selfcheck.candidate_tree_hash(workdir)})
+        except Exception:
+            pass
+        try:
+            await run.emit({"type": "summary", "text": f"自检(红蓝队)执行失败,本轮跳过: {e!r}"})
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def _post_turn_selfcheck(run) -> str | None:
     """Layer-1 deterministic self-check at turn end (coverage ledger + lint;
     design: DESIGN-kb-compile-self-verification-2026-07-03 §8.1). All analysis
@@ -887,6 +1080,10 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 verify_msg = await _post_turn_media_verify(run)
                 if verify_msg:
                     await run.inject_user_message(verify_msg)
+                else:
+                    # Seam order: ledger repairs → image re-verify → red-blue PK.
+                    # Only a draft the cheaper layers are done with gets examined.
+                    _maybe_start_pk(run)
             except Exception as e:
                 await run.emit({"type": "summary", "text": f"图像复核注入失败: {e!r}"})
 
@@ -1222,6 +1419,11 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
     finally:
         run._batch_active = False
+    # Red-blue PK examines the train's FINAL state, in the background, after the
+    # single logical turn has closed (never inside it — turn_done latency is
+    # user-visible; the PK verdict is not urgent). _pk_due re-checks the settled
+    # gates itself, so a failed train simply doesn't qualify.
+    _maybe_start_pk(run)
 
 
 async def run_session(run: CompileRun):

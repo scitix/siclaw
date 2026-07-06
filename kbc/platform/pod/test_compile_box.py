@@ -812,6 +812,9 @@ async def test_batch_orchestrator_routing_and_resume():
 
 
 async def main():
+    # PK never fires in these wiring tests — a qualifying fixture must not spawn
+    # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
+    os.environ["KBC_PK_MODE"] = "off"
     await test_workspace_sync()
     await test_session_driver_conversational()
     await test_conversational_session()

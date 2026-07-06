@@ -290,8 +290,64 @@ async def test_media_verify_wiring():
     print("OK  media-verify wiring (settled-draft gate / one-shot / new-page re-arm)")
 
 
+async def test_pk_wiring():
+    """S2 red-blue wiring: due-gating → full pass → repairing + repair inject →
+    targeted retest → merged final scoreboard → idempotent (tree hash stamped)."""
+    import compile_box
+    import redblue as rb
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        run = _FakeRun(td)
+        os.environ["KBC_PK_MODE"] = "off"
+        assert await compile_box._post_turn_selfcheck(run) is None  # ledger passes
+        assert compile_box._pk_due(run) is None                     # mode off
+        os.environ["KBC_PK_MODE"] = "auto"
+        assert compile_box._pk_due(run) == "full"
+
+        async def fake_run_pk(engine, **kw):
+            if kw.get("questions_override"):
+                assert [q["id"] for q in kw["questions_override"]] == ["q1"]
+                return ({"state": "passed", "questions": 1, "graded": 1, "gate_pass": 1,
+                         "pass_rate": 1.0, "failures": [], "wall_secs": 1},
+                        {"questions": kw["questions_override"], "answers": {}, "verdicts": {}})
+            return ({"state": "unconverged", "questions": 3, "graded": 3, "gate_pass": 2,
+                     "pass_rate": 0.667, "wall_secs": 1,
+                     "failures": [{"id": "q1", "question": "问", "score": "错",
+                                   "category": "覆盖", "page": "p.md", "fix": "补"}]},
+                    {"questions": [{"id": "q1", "question": "问"}, {"id": "q2", "question": "b"},
+                                   {"id": "q3", "question": "c"}],
+                     "answers": {"q1": {"answer": "长" * 9000}}, "verdicts": {}})
+
+        orig = rb.run_pk
+        rb.run_pk = fake_run_pk
+        try:
+            await compile_box._run_pk_flow(run, "full")
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            assert sc["pk"]["state"] == "repairing" and sc["pk"]["rounds_used"] == 0, sc["pk"]
+            assert run.injected and "红蓝队" in run.injected[-1] and "补" in run.injected[-1]
+            detail = json.loads((base / "authoring/PK_RESULT.json").read_text())
+            assert len(detail["answers"]["q1"]["answer"]) == 4000  # persisted truncated
+
+            assert compile_box._pk_due(run) == "retest"
+            await compile_box._run_pk_flow(run, "retest")
+            pk = json.loads((base / "authoring/SELFCHECK.json").read_text())["pk"]
+            # merged scoreboard: 2 passes from the full round + 1 resolved retest
+            assert pk["state"] == "passed" and pk["rounds_used"] == 1, pk
+            assert pk["questions"] == 3 and pk["gate_pass"] == 3 and pk["pass_rate"] == 1.0, pk
+            assert compile_box._pk_due(run) is None  # tree hash stamped → idempotent
+        finally:
+            rb.run_pk = orig
+            os.environ["KBC_PK_MODE"] = "off"
+    print("OK  pk wiring (gating / repairing+inject / targeted retest merge / idempotent)")
+
+
 def main():
     os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
+    os.environ.setdefault("KBC_PK_MODE", "off")  # PK never fires in unrelated wiring tests
     test_parse_compiled_from()
     test_inventory_and_exclusions()
     test_coverage_and_lint()
@@ -300,6 +356,7 @@ def main():
     test_state_key()
     asyncio.run(test_wiring())
     asyncio.run(test_media_verify_wiring())
+    asyncio.run(test_pk_wiring())
     print("ALL OK  test_selfcheck")
 
 

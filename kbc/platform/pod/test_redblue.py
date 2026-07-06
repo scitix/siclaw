@@ -25,10 +25,12 @@ def _mk(base: Path, rel: str, text: str = "x"):
 class FakeEngine:
     """Stage-routed canned responses; counts calls per stage."""
 
-    def __init__(self, broken_stages=()):
+    def __init__(self, broken_stages=(), slow_verdict_from=None):
         self.calls = {"survey": 0, "questions": 0, "blue": 0, "verdict": 0}
         self.systems = {}  # stage → last system prompt seen (asymmetry assertions)
+        self.users = {}    # stage → last user message seen
         self.broken = set(broken_stages)
+        self.slow_verdict_from = slow_verdict_from  # Nth verdict call onward hangs
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
                                  model, effort=None, allowed_read_roots, timeout_secs):
@@ -44,6 +46,9 @@ class FakeEngine:
             raise AssertionError(f"unroutable prompt: {user_message[:80]}")
         self.calls[stage] += 1
         self.systems[stage] = system_prompt
+        self.users[stage] = user_message
+        if stage == "verdict" and self.slow_verdict_from and self.calls["verdict"] >= self.slow_verdict_from:
+            await asyncio.sleep(30)  # parked until the wall clock cancels us
         if stage in self.broken:
             return "总之就是一段完全不是 JSON 的话。"
         if stage == "survey":
@@ -81,10 +86,22 @@ def _pk_workspace(base: Path):
 
 def test_budget_and_helpers():
     assert redblue.question_budget(2) == 8      # floor
-    assert redblue.question_budget(20) == 30    # 20*1.5
-    assert redblue.question_budget(100) == 40   # cap
+    assert redblue.question_budget(20) == 20    # 20*1.0
+    assert redblue.question_budget(100) == 24   # cap (S2 default: 24 focused > 40 sprawled)
     assert redblue._chunks([1, 2, 3, 4, 5, 6, 7], 5) == [[1, 2, 3, 4, 5], [6, 7]]
-    print("OK  question_budget clamp + chunks")
+    # _summarize: normal path counts a missing verdict as a failure (the judge
+    # dropped it); salvage path skips it (cancelled ≠ failed).
+    qs = [{"id": "q1", "question": "a"}, {"id": "q2", "question": "b"}]
+    vs = {"q1": {"score": "对", "failure_category": "无"}}
+    full = redblue._summarize(qs, vs, missing_as_failure=True)
+    assert full["graded"] == 2 and full["gate_pass"] == 1 and len(full["failures"]) == 1
+    part = redblue._summarize(qs, vs, missing_as_failure=False)
+    assert part["graded"] == 1 and part["gate_pass"] == 1 and not part["failures"]
+    # media block formatting + cap
+    assert redblue._media_block(None) == ""
+    blk = redblue._media_block({"p1.md": ["s/a.png", "s/b.png"]})
+    assert "图表转写页" in blk and "p1.md ← s/a.png, s/b.png" in blk
+    print("OK  question_budget clamp + chunks + _summarize + _media_block")
 
 
 def test_parse_json_lenient_cases():
@@ -167,6 +184,40 @@ async def test_questions_override_targeted_retest():
     print("OK  questions_override skips survey/questions (targeted retest primitive)")
 
 
+async def test_wall_timeout_salvages_partial():
+    """Wall-clock timeout with graded verdicts on hand → state=partial keeping
+    the graded subset (the spend is sunk); ungraded questions are NOT failures."""
+    import os
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine(slow_verdict_from=2)  # chunk 1 grades, chunk 2 hangs
+        os.environ["KBC_PK_WALL_SECS"] = "2"
+        os.environ["KBC_PK_CONCURRENCY"] = "1"  # serialize so chunk 1 finishes first
+        try:
+            summary, detail = await redblue.run_pk(
+                fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+        finally:
+            del os.environ["KBC_PK_WALL_SECS"], os.environ["KBC_PK_CONCURRENCY"]
+        assert summary["state"] == "partial", summary
+        assert summary["graded"] == 5 and summary["questions"] == 7, summary
+        assert len(summary["failures"]) == 1  # q1 fails in chunk 1; q6/q7 ungraded ≠ failed
+        assert "error" in summary and len(detail["verdicts"]) == 5
+    print("OK  wall timeout → partial salvage (graded kept, cancelled not failed)")
+
+
+async def test_media_pages_steer_question_officer():
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine()
+        await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=3,
+                             questions_budget=2,
+                             media_pages={"p1.md": ["s/chart.png"]})
+        assert "图表转写页" in fake.users["questions"], fake.users["questions"][:200]
+        assert "p1.md ← s/chart.png" in fake.users["questions"]
+        assert "图表转写页" not in fake.users["blue"]  # blue stays ignorant
+    print("OK  media_pages reach the question officer only")
+
+
 async def test_broken_json_fails_open():
     with tempfile.TemporaryDirectory() as td:
         wiki, raw = _pk_workspace(Path(td))
@@ -241,6 +292,8 @@ def main():
     asyncio.run(test_full_run())
     asyncio.run(test_survey_cache())
     asyncio.run(test_questions_override_targeted_retest())
+    asyncio.run(test_wall_timeout_salvages_partial())
+    asyncio.run(test_media_pages_steer_question_officer())
     asyncio.run(test_broken_json_fails_open())
     asyncio.run(test_contract_artifacts_judge_only())
     test_pk_section_survives_layer1()
