@@ -37,6 +37,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -155,6 +156,28 @@ _COMPILE_IMPL = None  # set at bottom to run_session
 _TEST_SESSION_IMPL = None
 
 
+# ── Model-stall watchdog (L1) ────────────────────────────────────────────────
+# A compile turn can wedge on a black-holed model request (massapi/upstream
+# accepts the connection but never responds). The bundled `claude` CLI's own
+# request timeout is ~60min and not tunable from here, so a routine upstream
+# hiccup froze a run for an hour. We own the recovery: a turn-scoped watchdog
+# reaps a wedged model request in seconds and re-issues the turn.
+#
+# Idle is measured as MODEL-response latency — a pending tool (Read/Bash run in
+# the CLI, not the model) relaxes the bound so a long tool never looks like a
+# stall (invariant I4: never false-kill a live turn).
+_MODEL_IDLE_TIMEOUT_S = float(os.environ.get("KBC_MODEL_IDLE_TIMEOUT_S", "90"))
+_MODEL_TOOL_IDLE_TIMEOUT_S = float(os.environ.get("KBC_MODEL_TOOL_IDLE_TIMEOUT_S", "660"))
+_MODEL_MAX_RETRIES = int(os.environ.get("KBC_MODEL_MAX_RETRIES", "3"))
+_MODEL_WATCHDOG_POLL_S = float(os.environ.get("KBC_MODEL_WATCHDOG_POLL_S", "10"))
+
+
+class ModelStallError(Exception):
+    """A turn's model request stalled past the idle bound and exhausted retries.
+    Raised out of the consume loop so _run_wrapper fails the run with a clear
+    reason instead of the box sitting silently."""
+
+
 class CompileRun:
     def __init__(self, run_id: str, workdir: str, round_: int, instruction: str = ""):
         self.run_id = run_id
@@ -203,15 +226,38 @@ class CompileRun:
         self._pk_task: asyncio.Task | None = None
         # Blind image verify (图像复核 v2): the in-flight background task.
         self._media_task: asyncio.Task | None = None
+        # Model-stall watchdog (L1) — turn-scoped state, updated by the receive
+        # loop (_consume_turn_stream) and the watchdog task. A turn is "active"
+        # from query() until its real ResultMessage; the watchdog only judges an
+        # active turn, and only against model latency (see _MODEL_* above).
+        self._turn_active = False
+        self._tool_pending = False          # last assistant msg asked for a tool
+        self._last_model_activity = 0.0     # monotonic ts of the last inbound SDK msg / query
+        self._last_directive = ""           # the in-flight turn's text, for retry
+        self._model_retries = 0             # retries used on the in-flight turn
+        self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
+        self._stall_fatal = False           # retries exhausted → fail this turn
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
+
+    def _begin_turn(self, directive: str):
+        """Arm the stall watchdog for a new model turn. Called for every turn —
+        the owner's /message AND internal self-check/verify/batch injections."""
+        self._last_directive = directive
+        self._turn_active = True
+        self._tool_pending = False
+        self._model_retries = 0
+        self._stall_retrying = False
+        self._stall_fatal = False
+        self._last_model_activity = time.monotonic()
 
     async def inject_user_message(self, text: str):
         """Engine seam: push a user turn into the live session. The Claude SDK
         driver is one line; a future engine driver (e.g. Codex) reimplements
         just this method — self-check orchestration stays engine-neutral."""
         if self.client:
+            self._begin_turn(text)
             await self.client.query(text)
 
 
@@ -1197,6 +1243,12 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=session_id,
         session_store=InMemorySessionStore(),
+        # Stream partial deltas so the stall watchdog sees fine-grained model
+        # liveness: a live-but-slow generation keeps emitting StreamEvents (idle
+        # clock stays fresh), while a black-holed request emits nothing at all.
+        # _emit_message ignores StreamEvent by name, so the log/turn stream and
+        # the batch driver's ResultMessage detection are unchanged.
+        include_partial_messages=True,
     )
 
 
@@ -1284,11 +1336,9 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str) ->
         await client.connect()
         run.client = client
         await run.emit({"type": "log", "text": f"—— {label} 开始 ——"})
+        run._begin_turn(directive)
         await client.query(directive)
-        async for msg in client.receive_messages():
-            await _emit_message(run, msg)
-            if type(msg).__name__ == "ResultMessage":
-                break
+        await _consume_turn_stream(run, client, stop_on_result=True)
         return run._last_turn_reply
     finally:
         run._suppress_turn_done = False
@@ -1387,14 +1437,13 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
         try:
             await client.connect()
             run.client = client
-            await client.query(
+            directive = (
                 f"预算:每批 effective 总量不超过 {budget}(只按 effective 字段装箱,不看 bytes)。"
                 "读 authoring/SOURCES_INVENTORY.json,写 authoring/BATCH_PLAN.json。"
             )
-            async for msg in client.receive_messages():
-                await _emit_message(run, msg)
-                if type(msg).__name__ == "ResultMessage":
-                    break
+            run._begin_turn(directive)  # planner is a model call too — arm the stall watchdog
+            await client.query(directive)
+            await _consume_turn_stream(run, client, stop_on_result=True)
         finally:
             run._suppress_turn_done = False
             run.client = prev
@@ -1525,6 +1574,82 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     _maybe_start_pk(run)
 
 
+def _note_model_activity(run: CompileRun, msg) -> None:
+    """Every inbound SDK message (StreamEvent delta, assistant/user turn, result)
+    proves the model link is alive → reset the idle clock. An assistant message
+    that asks for a tool flips tool_pending so the watchdog uses the longer bound
+    while the CLI runs Read/Bash (that gap is not a model stall)."""
+    run._last_model_activity = time.monotonic()
+    if type(msg).__name__ == "AssistantMessage":
+        blocks = getattr(msg, "content", None) or []
+        run._tool_pending = any(type(b).__name__ == "ToolUseBlock" for b in blocks)
+    else:
+        run._tool_pending = False
+
+
+async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool) -> None:
+    """Relay a session's message stream through _emit_message, owning the
+    stall-retry seam. A ResultMessage that the watchdog provoked (via interrupt())
+    is NOT a real turn end: discard it and re-issue the directive (bounded), or
+    raise ModelStallError when retries are spent. A REAL ResultMessage ends the
+    turn — cleared BEFORE _emit_message, which may inject a follow-up turn that
+    re-arms the watchdog. stop_on_result mirrors the batch driver's break."""
+    async for msg in client.receive_messages():
+        _note_model_activity(run, msg)
+        if type(msg).__name__ == "ResultMessage":
+            if run._stall_retrying:
+                run._turn_text = []           # the wedged attempt produced nothing usable
+                run._stall_retrying = False
+                if run._stall_fatal:
+                    run._turn_active = False
+                    raise ModelStallError(
+                        f"model request stalled; exhausted {run._model_retries} attempt(s)"
+                    )
+                run._last_model_activity = time.monotonic()
+                await client.query(run._last_directive)   # retry on a fresh request
+                continue
+            run._turn_active = False
+            await _emit_message(run, msg)
+            if stop_on_result:
+                return
+            continue
+        await _emit_message(run, msg)
+
+
+async def _model_stall_watchdog(run: CompileRun) -> None:
+    """Reap a turn wedged on a black-holed model request. Interrupt the attempt;
+    _consume_turn_stream then re-issues it (or fails). Only judges an ACTIVE turn,
+    and relaxes to the tool bound while a tool is pending — never false-kills a
+    live turn or a long tool (I4)."""
+    while not run.done:
+        await asyncio.sleep(_MODEL_WATCHDOG_POLL_S)
+        if not run._turn_active or run._stall_retrying:
+            continue
+        client = run.client
+        if client is None:
+            continue
+        bound = _MODEL_TOOL_IDLE_TIMEOUT_S if run._tool_pending else _MODEL_IDLE_TIMEOUT_S
+        idle = time.monotonic() - run._last_model_activity
+        if idle <= bound:
+            continue
+        run._stall_fatal = run._model_retries >= _MODEL_MAX_RETRIES
+        run._model_retries += 1
+        run._stall_retrying = True
+        run._last_model_activity = time.monotonic()   # bridge the interrupt→result gap
+        await run.emit({
+            "type": "turn_stalled",
+            "attempt": run._model_retries,
+            "fatal": run._stall_fatal,
+            "idle_s": round(idle, 1),
+        })
+        try:
+            await client.interrupt()
+        except Exception as e:
+            # No interrupted-result will come → don't leave the loop waiting on it.
+            run._stall_retrying = False
+            await run.emit({"type": "summary", "text": f"模型停滞:中断失败,下一轮重试 {e!r}"})
+
+
 async def run_session(run: CompileRun):
     """Persistent driver: host ONE long-lived Claude Code session (ClaudeSDKClient)
     for this KB. BOX_ROLE (+ the playbook + the attempt instruction) is the standing
@@ -1557,8 +1682,7 @@ async def run_session(run: CompileRun):
         # current draft; the owner reviews and publishes separately (deterministic
         # publish, no submit gate). A finished turn is simply finished — no
         # nudging — so a live session can never get stuck "compiling".
-        async for msg in client.receive_messages():
-            await _emit_message(run, msg)
+        await _consume_turn_stream(run, client, stop_on_result=False)
     finally:
         run.connected.set()  # unblock any /message waiters even if connect failed
         run.client = None
@@ -1571,16 +1695,19 @@ async def _run_wrapper(run: CompileRun):
     sent: dict = {}
     run._sync_sent = sent  # shared with _emit_message's pre-turn_done sync
     syncer = asyncio.create_task(_sync_loop(run, sent))
+    watchdog = asyncio.create_task(_model_stall_watchdog(run))
     try:
         await _COMPILE_IMPL(run)
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
         await run.emit({"type": "error", "error": repr(e)})
     finally:
         syncer.cancel()
-        try:
-            await syncer
-        except asyncio.CancelledError:
-            pass
+        watchdog.cancel()
+        for _t in (syncer, watchdog):
+            try:
+                await _t
+            except asyncio.CancelledError:
+                pass
         # Final sync so the last writes are durable even if no tick caught them —
         # especially on the crash path where no bundle was submitted.
         try:

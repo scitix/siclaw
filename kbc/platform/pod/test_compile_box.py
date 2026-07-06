@@ -115,6 +115,20 @@ class ResultMessage:
     pass
 
 
+# Stand-ins for the SDK's other message/block types — only the class NAME matters
+# to the watchdog (_note_model_activity dispatches on type(msg).__name__).
+class StreamEvent:  # partial-delta liveness (include_partial_messages)
+    pass
+
+
+class UserMessage:  # tool_result carrier
+    pass
+
+
+class ToolUseBlock:  # a content block that requests a tool
+    pass
+
+
 class _FakeSDKClient:
     """Stands in for ClaudeSDKClient: records connect/query, yields preloaded
     messages then stops (the real client blocks for the next turn)."""
@@ -856,6 +870,217 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+# ── Model-stall watchdog (L1) ────────────────────────────────────────────────
+
+
+def _drain(run):
+    evs = []
+    while not run.events.empty():
+        evs.append(run.events.get_nowait())
+    return evs
+
+
+class _StallingFakeClient:
+    """Black-holes each attempt (receive blocks on a gate) until the Nth query;
+    interrupt() unblocks with a bare ResultMessage (the interrupted attempt). The
+    Nth query produces a real reply + ResultMessage. `produce_on_query=999` never
+    recovers (exhaustion path)."""
+
+    def __init__(self, options=None, produce_on_query=2):
+        self.options = options
+        self.queries = []
+        self.interrupts = 0
+        self._produce_on = produce_on_query
+        self._gate = asyncio.Event()
+        self._mode = "blackhole"
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+        if len(self.queries) >= self._produce_on:
+            self._mode = "produce"
+        else:
+            self._mode = "blackhole"          # no gate → receive blocks (the wedge)
+        if self._mode == "produce":
+            self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1
+        self._mode = "interrupted"
+        self._gate.set()
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if self._mode == "interrupted":
+                yield ResultMessage()          # the interrupted attempt ends
+            elif self._mode == "produce":
+                yield AssistantMessage("批 1/10 完成")
+                yield ResultMessage()
+                self._closed = True
+                return
+            # blackhole → loop back and block on the gate again
+
+    async def disconnect(self):
+        self._closed = True
+
+
+class _LiveStreamFake:
+    """A live-but-slow generation: emits StreamEvent liveness faster than the idle
+    bound, so the watchdog must never reap it."""
+
+    def __init__(self, options=None, ticks=6, dt=0.05):
+        self.options = options
+        self.queries = []
+        self.interrupts = 0
+        self._ticks = ticks
+        self._dt = dt
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def receive_messages(self):
+        for _ in range(self._ticks):
+            await asyncio.sleep(self._dt)
+            yield StreamEvent()
+        yield AssistantMessage("done streaming")
+        yield ResultMessage()
+
+    async def disconnect(self):
+        pass
+
+
+class _ToolGapFake:
+    """A tool the CLI runs for a while: after the assistant asks for a tool
+    (tool_pending), there is a model-silent gap longer than the idle bound but
+    shorter than the tool bound — must NOT be reaped."""
+
+    def __init__(self, options=None, gap=0.3):
+        self.options = options
+        self.queries = []
+        self.interrupts = 0
+        self._gap = gap
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def receive_messages(self):
+        am = AssistantMessage("calling read")
+        am.content = [TextBlock("calling read"), ToolUseBlock()]
+        yield am                                # tool_pending = True
+        await asyncio.sleep(self._gap)          # model-silent while the CLI runs the tool
+        yield UserMessage()                     # tool_result → tool_pending = False
+        yield AssistantMessage("read done")
+        yield ResultMessage()
+
+    async def disconnect(self):
+        pass
+
+
+async def _run_stall_scenario(fake, *, idle, poll, max_retries, tool_idle=660.0):
+    """Drive one turn through _consume_turn_stream with the watchdog running, at
+    test-tuned knobs (restored after). Returns (run, drained events, raised)."""
+    saved = (
+        compile_box._MODEL_IDLE_TIMEOUT_S,
+        compile_box._MODEL_TOOL_IDLE_TIMEOUT_S,
+        compile_box._MODEL_MAX_RETRIES,
+        compile_box._MODEL_WATCHDOG_POLL_S,
+    )
+    compile_box._MODEL_IDLE_TIMEOUT_S = idle
+    compile_box._MODEL_TOOL_IDLE_TIMEOUT_S = tool_idle
+    compile_box._MODEL_MAX_RETRIES = max_retries
+    compile_box._MODEL_WATCHDOG_POLL_S = poll
+    raised = None
+    with tempfile.TemporaryDirectory() as td:
+        run = compile_box.CompileRun("wd", td, 1)
+        run._suppress_turn_done = True          # isolate the watchdog from post-turn machinery
+        run.client = fake
+        wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+        try:
+            await run.inject_user_message("批 1/10")
+            await compile_box._consume_turn_stream(run, fake, stop_on_result=True)
+        except compile_box.ModelStallError as e:
+            raised = e
+        finally:
+            run.done = True
+            wdog.cancel()
+            try:
+                await wdog
+            except asyncio.CancelledError:
+                pass
+            (
+                compile_box._MODEL_IDLE_TIMEOUT_S,
+                compile_box._MODEL_TOOL_IDLE_TIMEOUT_S,
+                compile_box._MODEL_MAX_RETRIES,
+                compile_box._MODEL_WATCHDOG_POLL_S,
+            ) = saved
+    return run, _drain(run), raised
+
+
+async def test_model_stall_retries_then_completes():
+    """A black-holed model request is interrupted and re-issued on a fresh query;
+    the retry produces output and the turn finishes (turn_stalled then completes)."""
+    fake = _StallingFakeClient(produce_on_query=2)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.15, poll=0.03, max_retries=3)
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert fake.interrupts == 1, fake.interrupts
+    assert fake.queries == ["批 1/10", "批 1/10"], fake.queries
+    assert "turn_stalled" in types, types
+    assert run._last_turn_reply == "批 1/10 完成", run._last_turn_reply
+    print("✓ model stall: interrupt + retry recovers a black-holed request")
+
+
+async def test_model_stall_live_stream_not_reaped():
+    """A live-but-slow generation (StreamEvents flowing) is never reaped (I4)."""
+    fake = _LiveStreamFake(ticks=6, dt=0.05)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.15, poll=0.03, max_retries=3)
+    assert raised is None, raised
+    assert fake.interrupts == 0, fake.interrupts
+    assert "turn_stalled" not in [e["type"] for e in evs]
+    print("✓ model stall: a live-but-slow stream is never reaped")
+
+
+async def test_model_stall_tool_gap_not_reaped():
+    """A model-silent gap while the CLI runs a tool (tool_pending) uses the longer
+    tool bound — not mistaken for a model stall (I4)."""
+    fake = _ToolGapFake(gap=0.3)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.15, poll=0.03, max_retries=3, tool_idle=1.0)
+    assert raised is None, raised
+    assert fake.interrupts == 0, fake.interrupts
+    assert "turn_stalled" not in [e["type"] for e in evs]
+    print("✓ model stall: a long tool (tool_pending) is not mistaken for a stall")
+
+
+async def test_model_stall_exhausts_to_error():
+    """A request that never recovers is retried up to the bound, then fails the
+    turn with ModelStallError (the run fails fast instead of hanging for ~1h)."""
+    fake = _StallingFakeClient(produce_on_query=999)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.1, poll=0.03, max_retries=2)
+    types = [e["type"] for e in evs]
+    assert isinstance(raised, compile_box.ModelStallError), raised
+    assert fake.interrupts == 3, fake.interrupts          # 2 retries + the fatal attempt
+    assert types.count("turn_stalled") == 3, types
+    assert any(e["type"] == "turn_stalled" and e.get("fatal") for e in evs), evs
+    print("✓ model stall: retries exhausted → ModelStallError (fails fast, no hang)")
+
+
 async def main():
     # PK never fires in these wiring tests — a qualifying fixture must not spawn
     # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
@@ -877,6 +1102,10 @@ async def main():
     await test_propose_questions_appends_dedup()
     await test_message_captures_brief()
     await test_batch_orchestrator_routing_and_resume()
+    await test_model_stall_retries_then_completes()
+    await test_model_stall_live_stream_not_reaped()
+    await test_model_stall_tool_gap_not_reaped()
+    await test_model_stall_exhausts_to_error()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()
