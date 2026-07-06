@@ -170,6 +170,32 @@ _MODEL_TOOL_IDLE_TIMEOUT_S = float(os.environ.get("KBC_MODEL_TOOL_IDLE_TIMEOUT_S
 _MODEL_MAX_RETRIES = int(os.environ.get("KBC_MODEL_MAX_RETRIES", "3"))
 _MODEL_WATCHDOG_POLL_S = float(os.environ.get("KBC_MODEL_WATCHDOG_POLL_S", "10"))
 
+# ── Rate-limit resilience (C2) ───────────────────────────────────────────────
+# massapi under concurrency (5-10 boxes × the red-blue PK) can return 429/503/529.
+# The bundled CLI retries internally a few times; past that the turn ends with
+# is_error=True and api_error_status set (CLI >= 2.1.110). We back off and re-issue
+# rather than failing the run — massapi's limits are not ours to fix (out of
+# scope), so this is graceful handling, not a fix. Exhaustion ends the turn with a
+# clear owner-facing note instead of a crash.
+_MODEL_RATE_STATUSES = frozenset({429, 503, 529})
+_MODEL_RATE_MAX_RETRIES = int(os.environ.get("KBC_MODEL_RATE_MAX_RETRIES", "5"))
+_MODEL_RATE_BACKOFF_BASE_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_BASE_S", "2"))
+_MODEL_RATE_BACKOFF_CAP_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_CAP_S", "30"))
+
+# ── Graceful-shutdown flush (F3) ─────────────────────────────────────────────
+# SIGTERM stops the box (pod delete / eviction / OOM after the runtime reap).
+# /work is an emptyDir destroyed with the pod, and work reaches the store only via
+# the periodic sync — so without a shutdown flush the last ≤SYNC_INTERVAL_SECS is
+# lost. on_shutdown final-syncs each active run and gives the relay a bounded
+# window to drain. Best-effort within the grace period (F1 is the durable fix).
+_SHUTDOWN_DRAIN_S = float(os.environ.get("KBC_SHUTDOWN_DRAIN_S", "0.5"))
+_SHUTDOWN_DRAIN_MAX_S = float(os.environ.get("KBC_SHUTDOWN_DRAIN_MAX_S", "8"))
+
+
+def _rate_backoff_delay(attempt: int) -> float:
+    """Exponential backoff (attempt is 1-based), capped."""
+    return min(_MODEL_RATE_BACKOFF_BASE_S * (2 ** (attempt - 1)), _MODEL_RATE_BACKOFF_CAP_S)
+
 
 class ModelStallError(Exception):
     """A turn's model request stalled past the idle bound and exhausted retries.
@@ -231,9 +257,10 @@ class CompileRun:
         self._tool_pending = False          # last assistant msg asked for a tool
         self._last_model_activity = 0.0     # monotonic ts of the last inbound SDK msg / query
         self._last_directive = ""           # the in-flight turn's text, for retry
-        self._model_retries = 0             # retries used on the in-flight turn
+        self._model_retries = 0             # stall retries used on the in-flight turn
         self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
-        self._stall_fatal = False           # retries exhausted → fail this turn
+        self._stall_fatal = False           # stall retries exhausted → fail this turn
+        self._rate_retries = 0              # rate-limit (429/503/529) retries on the in-flight turn
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
@@ -247,6 +274,7 @@ class CompileRun:
         self._model_retries = 0
         self._stall_retrying = False
         self._stall_fatal = False
+        self._rate_retries = 0
         self._last_model_activity = time.monotonic()
 
     async def inject_user_message(self, text: str):
@@ -1537,6 +1565,31 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
                 run._last_model_activity = time.monotonic()
                 await client.query(run._last_directive)   # retry on a fresh request
                 continue
+            # C2: a rate-limited / overloaded model call ends the turn with
+            # is_error + api_error_status. Back off and re-issue rather than
+            # surfacing it as a finished turn.
+            status = getattr(msg, "api_error_status", None)
+            if getattr(msg, "is_error", False) and status in _MODEL_RATE_STATUSES:
+                if run._rate_retries < _MODEL_RATE_MAX_RETRIES:
+                    run._rate_retries += 1
+                    delay = _rate_backoff_delay(run._rate_retries)
+                    run._turn_text = []
+                    await run.emit({
+                        "type": "rate_limited",
+                        "status": status,
+                        "attempt": run._rate_retries,
+                        "backoff_s": round(delay, 1),
+                    })
+                    run._last_model_activity = time.monotonic()  # backoff isn't a stall
+                    await asyncio.sleep(delay)
+                    run._last_model_activity = time.monotonic()
+                    await client.query(run._last_directive)
+                    continue
+                await run.emit({
+                    "type": "summary",
+                    "text": f"模型限流(HTTP {status}),退避重试 {run._rate_retries} 次仍未通过,本轮先停,请稍后再开编。",
+                })
+                # fall through: end the turn (run goes idle), do not crash
             run._turn_active = False
             await _emit_message(run, msg)
             if stop_on_result:
@@ -2047,8 +2100,30 @@ async def handle_close_test(request: web.Request):
     return web.json_response({"ok": True})
 
 
+async def _flush_on_shutdown(_app) -> None:
+    """aiohttp on_shutdown (F3): SIGTERM is stopping the box. Emit a final
+    workspace sync for every active run so the last unsynced work reaches the
+    store instead of dying with the emptyDir /work, then give the SSE relay a
+    bounded window to drain the queued events before connections close.
+    Best-effort — a store that never acks still loses it; F1 is the durable fix."""
+    runs = [r for r in RUNS.values() if getattr(r, "_sync_sent", None) is not None]
+    for run in runs:
+        try:
+            n = await _sync_workspace(run, run._sync_sent)
+            if n:
+                await run.emit({"type": "summary", "text": f"[shutdown] 落盘 {n} 个改动文件"})
+        except Exception:
+            pass
+    deadline = time.monotonic() + _SHUTDOWN_DRAIN_MAX_S
+    while runs and time.monotonic() < deadline:
+        if all(run.events.empty() for run in runs):
+            break
+        await asyncio.sleep(_SHUTDOWN_DRAIN_S)
+
+
 def build_app() -> web.Application:
     app = web.Application(client_max_size=_http_max_request_bytes())
+    app.on_shutdown.append(_flush_on_shutdown)
     app.add_routes([
         web.post("/sources", handle_sources),
         web.post("/authoring", handle_authoring),
