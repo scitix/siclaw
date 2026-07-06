@@ -52,11 +52,25 @@ export const DEFAULT_BACKGROUND_BASH_CONCURRENCY = 4;
  * Bounds detached processes per pod; past the cap, restricted-bash falls back to a
  * foreground run with a note. Invalid / non-positive values fall back to the default.
  */
-export function getBackgroundBashConcurrency(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.SICLAW_BACKGROUND_BASH_CONCURRENCY;
-  if (raw == null || raw.trim() === "") return DEFAULT_BACKGROUND_BASH_CONCURRENCY;
+/**
+ * Parse a positive-integer env value: blank/NaN/non-positive → `fallback`. With
+ * `{ unitMs: true }` the raw value is read as SECONDS and returned as milliseconds
+ * (×1000) — this makes the seconds-vs-count distinction explicit at the call site.
+ * Single source of truth for every `SICLAW_*` count/duration knob below.
+ */
+export function parsePositiveIntEnv(
+  raw: string | undefined,
+  fallback: number,
+  opts?: { unitMs?: boolean },
+): number {
+  if (raw == null || raw.trim() === "") return fallback;
   const n = Number(raw);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_BACKGROUND_BASH_CONCURRENCY;
+  if (!(Number.isFinite(n) && n >= 1)) return fallback;
+  return opts?.unitMs ? Math.floor(n) * 1000 : Math.floor(n);
+}
+
+export function getBackgroundBashConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  return parsePositiveIntEnv(env.SICLAW_BACKGROUND_BASH_CONCURRENCY, DEFAULT_BACKGROUND_BASH_CONCURRENCY);
 }
 
 /**
@@ -80,10 +94,7 @@ export const DEFAULT_SUBAGENT_CONCURRENCY = 4;
  * Invalid / non-positive values fall back to the default.
  */
 export function getSubagentConcurrency(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.SICLAW_SUBAGENT_CONCURRENCY;
-  if (raw == null || raw.trim() === "") return DEFAULT_SUBAGENT_CONCURRENCY;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_SUBAGENT_CONCURRENCY;
+  return parsePositiveIntEnv(env.SICLAW_SUBAGENT_CONCURRENCY, DEFAULT_SUBAGENT_CONCURRENCY);
 }
 
 /** Default wall-clock backstop for a sub-agent's whole run, in ms (10 minutes). */
@@ -98,10 +109,7 @@ export const DEFAULT_SUBAGENT_MAX_RUNTIME_MS = 10 * 60_000;
  * values fall back to the default.
  */
 export function getSubagentMaxRuntimeMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.SICLAW_SUBAGENT_MAX_RUNTIME;
-  if (raw == null || raw.trim() === "") return DEFAULT_SUBAGENT_MAX_RUNTIME_MS;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) * 1000 : DEFAULT_SUBAGENT_MAX_RUNTIME_MS;
+  return parsePositiveIntEnv(env.SICLAW_SUBAGENT_MAX_RUNTIME, DEFAULT_SUBAGENT_MAX_RUNTIME_MS, { unitMs: true });
 }
 
 export const DEFAULT_SUBAGENT_TYPE = "general-purpose";
@@ -141,13 +149,19 @@ export function getSubagentType(name?: string): SubagentType | undefined {
 
 /**
  * Operational rollback lever for spawn_subagent's batch (map→reduce) capability (design v3
- * decision #20). Since v3 merged the batch path into the single `spawn_subagent` tool, this no
- * longer gates a separate tool's registration — instead, when OFF the tool's item cap is forced
- * to 1 (see the tool layer), so a multi-item plan or a reduce_prompt is rejected and the tool
- * degrades to a pure single-task spawn (pre-batch behaviour). Flip to `false` for a clean
- * rollback without touching call sites.
+ * decision #20). Read from `SICLAW_SUBAGENT_GROUP_ENABLED` (default ON; only "false"/"0"
+ * disables) so ops can flip it WITHOUT a rebuild — mirroring the sibling `SICLAW_*` knobs.
+ * Since v3 merged the batch path into the single `spawn_subagent` tool, this no longer gates a
+ * separate tool's registration — instead, when OFF the tool's item cap is forced to 1 (see the
+ * tool layer), so a multi-item plan or a reduce_prompt is rejected and the tool degrades to a
+ * pure single-task spawn (pre-batch behaviour).
  */
-export const SUBAGENT_GROUP_ENABLED = true;
+export function isSubagentGroupEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.SICLAW_SUBAGENT_GROUP_ENABLED;
+  if (raw == null || raw.trim() === "") return true;
+  const v = raw.trim().toLowerCase();
+  return !(v === "false" || v === "0");
+}
 
 /** Default upper bound on the number of items in one `spawn_subagent` batch call. */
 export const DEFAULT_MAX_GROUP_ITEMS = 50;
@@ -157,14 +171,11 @@ export const DEFAULT_MAX_GROUP_ITEMS = 50;
  * `SICLAW_SUBAGENT_GROUP_MAX_ITEMS` (default {@link DEFAULT_MAX_GROUP_ITEMS}). Bounds a
  * fan-out the model can request in one turn; past the cap the tool fails fast with a
  * "split into batches" hint before any child is started. Invalid / non-positive values
- * fall back to the default. (When {@link SUBAGENT_GROUP_ENABLED} is off the tool clamps the
+ * fall back to the default. (When {@link isSubagentGroupEnabled} is off the tool clamps the
  * effective cap to 1 regardless of this value.)
  */
 export function getMaxGroupItems(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.SICLAW_SUBAGENT_GROUP_MAX_ITEMS;
-  if (raw == null || raw.trim() === "") return DEFAULT_MAX_GROUP_ITEMS;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_MAX_GROUP_ITEMS;
+  return parsePositiveIntEnv(env.SICLAW_SUBAGENT_GROUP_MAX_ITEMS, DEFAULT_MAX_GROUP_ITEMS);
 }
 
 /** Model-visible cap (chars) on a group's reduce summary — larger than a normal capsule
@@ -195,10 +206,7 @@ export const DEFAULT_GROUP_RUNTIME_HARD_CAP_MS = 7_200_000;
  * limit — each child keeps its own 600s backstop ({@link getSubagentMaxRuntimeMs}).
  */
 export function getGroupItemBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.SICLAW_SUBAGENT_GROUP_ITEM_BUDGET;
-  if (raw == null || raw.trim() === "") return DEFAULT_GROUP_ITEM_BUDGET_MS;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) * 1000 : DEFAULT_GROUP_ITEM_BUDGET_MS;
+  return parsePositiveIntEnv(env.SICLAW_SUBAGENT_GROUP_ITEM_BUDGET, DEFAULT_GROUP_ITEM_BUDGET_MS, { unitMs: true });
 }
 
 /**
@@ -206,10 +214,7 @@ export function getGroupItemBudgetMs(env: NodeJS.ProcessEnv = process.env): numb
  * (in SECONDS; default 7200 = 2h). Invalid / non-positive values fall back to the default.
  */
 export function getGroupHardCapMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env.SICLAW_SUBAGENT_GROUP_MAX_RUNTIME;
-  if (raw == null || raw.trim() === "") return DEFAULT_GROUP_RUNTIME_HARD_CAP_MS;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) * 1000 : DEFAULT_GROUP_RUNTIME_HARD_CAP_MS;
+  return parsePositiveIntEnv(env.SICLAW_SUBAGENT_GROUP_MAX_RUNTIME, DEFAULT_GROUP_RUNTIME_HARD_CAP_MS, { unitMs: true });
 }
 
 /**

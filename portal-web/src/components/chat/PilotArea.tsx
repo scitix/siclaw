@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect } from "react"
 import type { KeyboardEvent as ReactKeyboardEvent } from "react"
 import { formatToolInput } from "../../hooks/usePilotChat"
+import { isGroupForm } from "../../lib/group-form"
 import {
   Terminal,
   User,
@@ -1357,22 +1358,15 @@ function agentWorkBatchSummary(message: PilotMessage): {
 // (map→reduce group card) is a spawn_subagent whose items list has >1 entry OR carries a reduce_prompt;
 // a single item with no reduce is the COLLAPSE form (the legacy AgentWorkCard). The old, now-deleted
 // `spawn_subagent_group` tool name is still recognised so historical sessions keep rendering as a group.
-function isGroupFormMessage(message: PilotMessage): boolean {
-  if (message.toolName === "spawn_subagent_group") return true // legacy history
-  if (message.toolName !== "spawn_subagent") return false
-  const args = message.toolArgs as Record<string, unknown> | undefined
-  const items = args?.items
-  const reduce = args?.reduce_prompt
-  const hasReduce = typeof reduce === "string" && reduce.trim() !== ""
-  return Array.isArray(items) && (items.length > 1 || hasReduce)
-}
+// `isGroupForm` (the batch/collapse discriminator) is imported from ../../lib/group-form — one
+// shared predicate consumed by both this renderer and the usePilotChat folds, so the two can't drift.
 
 // A COLLAPSE-form spawn_subagent launched in the background — detectable from the launch itself
 // (run_in_background arg or the "launched" result), so the card shows the indicator/running state
 // during the LIVE turn, not only after annotateSubagentCompletions runs on a refetch. A batch-form
 // launch is a group (handled by the group card), so it is explicitly excluded here.
 function isBackgroundSpawn(message: PilotMessage): boolean {
-  if (message.toolName !== "spawn_subagent" || isGroupFormMessage(message)) return false
+  if (message.toolName !== "spawn_subagent" || isGroupForm(message)) return false
   if ((message.toolArgs as Record<string, unknown> | undefined)?.run_in_background === true) return true
   const parsed = message.content ? parseJsonRecord(message.content) : null
   return stringValue(parsed?.status) === "launched"
@@ -1530,7 +1524,7 @@ function MessageItem({
     }
     // Batch form (or legacy spawn_subagent_group) → the map→reduce group card; a single-task
     // (collapse) spawn_subagent, a delegate, or an agent_work event → the AgentWorkCard.
-    if (isGroupFormMessage(message)) {
+    if (isGroupForm(message)) {
       return <SubagentGroupCard message={message} onOpenSubagent={onOpenSubagent} />
     }
     if (message.toolName === "delegate_to_agent" || message.toolName === "spawn_subagent" || message.metadata?.kind === "agent_work") {
@@ -2392,12 +2386,19 @@ function groupWorkSummary(message: PilotMessage): {
       ? (details.items as Array<Record<string, unknown>>)
       : []
 
+  // Index → entry maps so the per-item merge below is O(total), not O(total × entries) — two linear
+  // `.find` scans per index was quadratic on a large batch, re-run on every card render.
+  const foldByIndex = new Map<number, Record<string, unknown>>()
+  for (const f of folded) { const i = numberValue(f.index); if (i !== undefined) foldByIndex.set(i, f) }
+  const liveByIndex = new Map<number, Record<string, unknown>>()
+  for (const l of liveItems) { const i = numberValue(l.index); if (i !== undefined) liveByIndex.set(i, l) }
+
   const total = Math.max(argItems.length, inlineResults.length, folded.length, liveItems.length)
   const items: GroupItemView[] = []
   for (let i = 0; i < total; i++) {
     const inline = inlineResults[i]
-    const fold = folded.find((f) => numberValue(f.index) === i)
-    const live = liveItems.find((l) => numberValue(l.index) === i)
+    const fold = foldByIndex.get(i)
+    const live = liveByIndex.get(i)
     const rawItem = inline?.item ?? argItems[i]
     // Priority: inline (foreground, authoritative) → folded terminal event → live frame → default.
     const status =
@@ -2412,7 +2413,7 @@ function groupWorkSummary(message: PilotMessage): {
       summary: stringValue(inline?.summary) ?? stringValue(fold?.summary),
       childSessionId:
         stringValue(inline?.child_session_id) ??
-        stringValue((fold as Record<string, unknown> | undefined)?.childSessionId),
+        stringValue(fold?.childSessionId),
     })
   }
 
@@ -2431,10 +2432,16 @@ function groupWorkSummary(message: PilotMessage): {
     overallStatus,
     phase: stringValue(progress?.phase) ?? stringValue(details.phase),
     items,
+    // "Combined summary" content: the reduce synthesis when a reduce ran, ELSE the group-level
+    // explanation (circuit-break reason / reduce-failure / cancel note) so a no-reduce failure still
+    // says WHY on the card (#7). Background reads the folded capsule (metadata.groupSummary);
+    // foreground reads the inline result (reduce_summary on success, group_summary otherwise).
     reduceSummary:
-      stringValue(metadata.groupReduceSummary) ??
+      stringValue(metadata.groupSummary) ??
       stringValue(parsed?.reduce_summary) ??
-      stringValue(details.reduce_summary),
+      stringValue(details.reduce_summary) ??
+      stringValue(parsed?.group_summary) ??
+      stringValue(details.group_summary),
     reduceChildSessionId:
       stringValue(metadata.groupReduceChildSessionId) ??
       stringValue(details.reduce_child_session_id),
@@ -2451,7 +2458,9 @@ function SubagentGroupCard({
   message: PilotMessage
   onOpenSubagent?: (childSessionId: string, status?: string, label?: string) => void
 }) {
-  const group = groupWorkSummary(message)
+  // Memoized: groupWorkSummary rebuilds the full per-item view (Map merges over 4 sources); recompute
+  // only when the message reference changes, not on unrelated re-renders (e.g. expand toggles).
+  const group = useMemo(() => groupWorkSummary(message), [message])
   const [expanded, setExpanded] = useState(message.isStreaming ?? false)
   const isOpen = message.isStreaming || expanded
   const total = group.items.length

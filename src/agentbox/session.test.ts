@@ -626,6 +626,32 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
     expect(terminal.event.delegationId).toBe("sub1");
   });
 
+  it("#2 background GROUP latch PERSISTS a bare-groupId terminal event with an all-skipped snapshot", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const sent: any[] = [];
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: async (e: any) => { sent.push(e); return { ok: true }; } };
+    mgr.agentId = "agent-1";
+    mgr.sessions.set("p1", { id: "p1", _aborted: true });
+    const res = mgr.startBackgroundSubagentGroup({
+      description: "batch", spawnId: "grp1", parentSessionId: "p1", parentAgentId: null, userId: "u",
+      taskListId: "tl1", subagentType: "general-purpose", runInBackground: true,
+      renderedTasks: [{ item: "a", prompt: "do a" }, { item: "b", prompt: "do b" }],
+    });
+    expect(res.status).toBe("launched");
+    expect(mgr.jobs.get("grp1").status).toBe("stopped");
+    await new Promise((r) => setTimeout(r, 5)); // let the fire-and-forget persist run
+    // Without this bare-groupId terminal event, annotateGroupCompletions leaves the launch card
+    // "Running…" forever on reload (hasActiveBackgroundGroup stays true). The all-skipped snapshot
+    // lets the reloaded card render the never-started items instead of the "running" fallback. #2.
+    const terminal = sent.find((e) => e.type === "delegation.append_event" && e.event.delegationId === "grp1");
+    expect(terminal).toBeDefined();
+    expect(terminal.event.status).toBe("partial");
+    expect(terminal.event.itemStatuses).toEqual([
+      { index: 0, status: "skipped" },
+      { index: 1, status: "skipped" },
+    ]);
+  });
+
   it("#9 background sub-agent bails when parent _aborted during setup (no child prompt)", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     // Parent already aborted by the time the child's setup (createSiclawSession) completes.
@@ -962,6 +988,104 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
     expect(report.status).toBe("failed");
     expect(report.itemResults.every((r: any) => r.status === "skipped")).toBe(true);
     expect(lastCreateSiclawSession.calls.length).toBe(0); // no child session ever created
+  });
+
+  it("#1 reduce failure keeps every per-item summary and reports partial (not done)", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    // 3 map children succeed; the reduce child throws (⇒ runSpawnedSubagent returns `failed`).
+    for (let i = 0; i < 4; i++) {
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async (text: string) => {
+          if (text.includes("── item")) throw new Error("reduce model exploded");
+          const m = text.match(/(pod-\w+)/);
+          emitter.emit("event", {
+            type: "message_end",
+            message: { role: "assistant", content: [{ type: "text", text: `done ${m ? m[1] : "?"}` }] },
+          });
+        },
+        abort: async () => {},
+      }));
+    }
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({ reducePrompt: "Summarize" }), undefined, undefined);
+    // Every map item completed, but the reduce failed → NOT a full success.
+    expect(report.itemResults.map((r: any) => r.status)).toEqual(["done", "done", "done"]);
+    expect(report.status).toBe("partial"); // synthesis missing ⇒ partial, never "done" (D6)
+    // Crucially, a failed reduce must NOT strip the per-item summaries (regression #1): the parent
+    // model still gets all map output to synthesize itself instead of re-running the whole batch.
+    expect(report.reduceSummary).toBeUndefined();
+    expect(report.itemResults[0].summary).toMatch(/done pod-a/);
+    expect(report.itemResults[2].summary).toMatch(/done pod-c/);
+    expect(report.groupSummary).toMatch(/reduce stage/i);
+  });
+
+  it("#5 map times out with zero completions → reduce skipped, status timed_out, no fabricated summary", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    vi.spyOn(subagentRegistry, "getSubagentGroupMaxRuntimeMs").mockReturnValue(15);
+    const hooks = { pending: [] as Array<() => void> };
+    for (let i = 0; i < 4; i++) {
+      // 3 map children hang until aborted; a reduce child (a 4th) must NEVER be created.
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async (text: string) => {
+          if (text.includes("── item")) throw new Error("reduce must not run");
+          await new Promise<void>((resolve) => hooks.pending.push(resolve));
+          emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "late" }] } });
+        },
+        abort: async () => { const p = hooks.pending; hooks.pending = []; p.forEach((r) => r()); },
+      }));
+    }
+    const report = await mgr.createSpawnSubagentExecutor()(baseReq({ reducePrompt: "Summarize" }), undefined, undefined);
+    expect(report.status).toBe("timed_out");
+    // doneCount===0 closes the reduce gate → no reduce over N "was cancelled" stubs (regression #5).
+    expect(report.reduceSummary).toBeUndefined();
+    expect(report.itemResults.every((r: any) => r.status === "partial")).toBe(true);
+    expect(lastCreateSiclawSession.calls.length).toBe(3); // 3 map children only — NO reduce child
+  });
+
+  it("user Stop mid-flight → in-flight item partial, not-yet-started skipped, status partial (ladder)", async () => {
+    const prev = process.env.SICLAW_SUBAGENT_CONCURRENCY;
+    process.env.SICLAW_SUBAGENT_CONCURRENCY = "2"; // worker share 1 → serial, deterministic order
+    try {
+      const mgr = new AgentBoxSessionManager() as any;
+      const ac = new AbortController();
+      const hooks = { pending: [] as Array<() => void>, hanging: () => {} };
+      const hangStarted = new Promise<void>((r) => { hooks.hanging = r; });
+      for (let i = 0; i < 3; i++) {
+        (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+          prompt: async (text: string) => {
+            if (text.includes("hang")) {
+              hooks.hanging();
+              await new Promise<void>((resolve) => hooks.pending.push(resolve));
+              emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "late" }] } });
+              return;
+            }
+            emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done ok" }] } });
+          },
+          abort: async () => { const p = hooks.pending; hooks.pending = []; p.forEach((r) => r()); },
+        }));
+      }
+      const p = mgr.createSpawnSubagentExecutor()(
+        {
+          description: "batch",
+          renderedTasks: [
+            { item: "t0", prompt: "ok t0" },   // completes done
+            { item: "t1", prompt: "hang t1" }, // in flight when Stop lands → partial
+            { item: "t2", prompt: "ok t2" },   // never started → skipped
+          ],
+          subagentType: "general-purpose", runInBackground: false,
+          parentSessionId: "p1", parentAgentId: null, userId: "u1", taskListId: "tl1", spawnId: "grp-abort",
+        },
+        undefined,
+        ac.signal,
+      );
+      await hangStarted;  // t0 done; t1 now hanging (serial worker)
+      ac.abort();          // user Stop lands mid-flight
+      const report = await p;
+      expect(report.itemResults.map((r: any) => r.status)).toEqual(["done", "partial", "skipped"]);
+      expect(report.status).toBe("partial"); // usableCount>0 & userAbort → partial (position 4)
+    } finally {
+      if (prev === undefined) delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_CONCURRENCY = prev;
+    }
   });
 
   // ── v3 collapse path: a single item with no reduce runs as ONE legacy child (no group) ──

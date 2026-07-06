@@ -56,6 +56,34 @@ export async function safeAlterTable(
 }
 
 /**
+ * Idempotently widen a column's TYPE (MySQL only). CHAR→VARCHAR is a type change that
+ * {@link safeAlterTable} (add-if-missing) never applies to an existing column, so widening an
+ * existing deployment needs an explicit MODIFY. Guarded on the current COLUMN_TYPE so a large
+ * table (chat_messages) is copied at most ONCE — never re-copied on every migration run. SQLite
+ * has no fixed CHAR width and no cheap MODIFY COLUMN, so it is a no-op there.
+ */
+export async function widenColumn(
+  db: Db,
+  table: string,
+  column: string,
+  definition: string,
+): Promise<void> {
+  if (db.driver !== "mysql") return;
+  if (!(await columnExists(db, table, column))) return; // a fresh install already made it wide
+  const [rows] = await db.query<Array<{ COLUMN_TYPE: string }>>(
+    `SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [table, column],
+  );
+  const current = (rows[0]?.COLUMN_TYPE ?? "").toLowerCase();
+  // Target column type = the definition up to its first attribute keyword (DEFAULT/NULL/NOT).
+  const targetType = definition.trim().split(/\s+(?=default\b|null\b|not\b)/i)[0].toLowerCase();
+  if (!targetType || current === targetType) return; // already at the target type — skip the copy
+  await db.query(`ALTER TABLE \`${table}\` MODIFY COLUMN \`${column}\` ${definition}`);
+  console.log(`[portal-migrate] widened ${table}.${column}: ${current} → ${targetType}`);
+}
+
+/**
  * Idempotently create a non-unique index. MySQL doesn't support
  * `CREATE INDEX IF NOT EXISTS` in versions <= 8.0.28, so we check first.
  */

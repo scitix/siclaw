@@ -156,6 +156,17 @@ describe("validateAndRenderGroupPlan — duplicates", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/duplicates item 1/);
   });
+  it("does not collide distinct objects whose values embed key= text", () => {
+    const r = validateAndRenderGroupPlan({
+      taskTemplate: "{{a}} {{b}}",
+      items: [
+        { a: "1b=2", b: "3" },
+        { a: "1", b: "2b=3" },
+      ],
+      maxItems: MAX,
+    });
+    expect(r.ok).toBe(true);
+  });
 });
 
 describe("buildReduceInput", () => {

@@ -37,7 +37,7 @@ import {
   DEFAULT_SUBAGENT_TYPE,
   getMaxGroupItems,
   RUN_IN_BACKGROUND_ENABLED,
-  SUBAGENT_GROUP_ENABLED,
+  isSubagentGroupEnabled,
 } from "../../core/subagent-registry.js";
 import { validateAndRenderGroupPlan } from "../../agentbox/subagent-group.js";
 
@@ -62,8 +62,22 @@ function itemToText(item: string | Record<string, string>): string {
   return typeof item === "string" ? item : JSON.stringify(item);
 }
 
-function buildDescription(): string {
+function buildDescription(groupEnabled: boolean): string {
   const lines = listSubagentTypes().map((t) => `- ${t.agentType}: ${t.whenToUse}`);
+  // Rollback (SICLAW_SUBAGENT_GROUP_ENABLED=false): the tool is single-task only, so DON'T teach the
+  // batch pattern the tool would then reject — describe the single spawn and point at N separate calls.
+  if (!groupEnabled) {
+    return (
+      "Launch a single isolated sub-agent to handle ONE bounded task and get its findings back. Pass a " +
+      "one-element `items` array holding a single complete task briefing; multi-item batches, " +
+      "`task_template`, and `reduce_prompt` are DISABLED in this deployment. To run the same task across " +
+      "several targets, emit one spawn_subagent call per target. The sub-agent starts fresh and sees ONLY " +
+      "its prompt — brief it like a smart colleague who just walked in: concrete targets, paths, and what " +
+      "to check, and the report format you want back. Never delegate understanding, and never redo work a " +
+      "sub-agent is already doing.\n\nAvailable subagent_type values:\n" +
+      lines.join("\n")
+    );
+  }
   return (
     "Launch isolated sub-agent(s) to handle bounded work and get their findings back — one tool for " +
     "both a single task and a whole batch. You supply a list of `items` (the for-loop) rendered through " +
@@ -118,7 +132,7 @@ export function createSpawnSubagentTool(
     label: "Spawn Sub-agent",
     renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("spawn_subagent")), 0, 0),
     renderResult: renderTextResult,
-    description: buildDescription(),
+    description: buildDescription(isSubagentGroupEnabled()),
     parameters: Type.Object({
       description: Type.String({ description: "Short (3-5 word) label for the task or batch." }),
       task_template: Type.Optional(
@@ -189,13 +203,15 @@ export function createSpawnSubagentTool(
       // Ops rollback lever (design decision #20): with the batch capability OFF, spawn_subagent
       // degrades to a pure single-task tool — a multi-item plan or a reduce_prompt is rejected and
       // the item cap is forced to 1. This is a behaviour switch, not a compatibility shim.
-      if (!SUBAGENT_GROUP_ENABLED && (items.length > 1 || reducePrompt)) {
+      const groupEnabled = isSubagentGroupEnabled();
+      if (!groupEnabled && (items.length > 1 || reducePrompt)) {
         return errorResult(
-          "spawn_subagent batch mode is disabled (SUBAGENT_GROUP_ENABLED=false): pass a single item and " +
-          "no reduce_prompt.",
+          "spawn_subagent batch mode is disabled (SICLAW_SUBAGENT_GROUP_ENABLED=false): pass a single " +
+          "item and no reduce_prompt. To run the same task across several targets, emit one " +
+          "spawn_subagent call per target (a single item each) instead of a batch.",
         );
       }
-      const maxItems = SUBAGENT_GROUP_ENABLED ? getMaxGroupItems() : 1;
+      const maxItems = groupEnabled ? getMaxGroupItems() : 1;
 
       // Fail-fast: validate + render the whole plan BEFORE any child starts. A bad plan (bad
       // placeholders, mixed items, over the cap, duplicates) bounces straight back to the model.
@@ -316,6 +332,10 @@ function toToolOutput(
       ),
     };
     if (hasReduce) modelVisible.reduce_summary = result.reduceSummary;
+    // No reduce summary, but a group-level explanation exists (circuit-break reason / reduce-stage
+    // failure / cancel-skip): surface it so the model learns WHY the batch stopped (#7). Never both
+    // — when a reduce ran, reduce_summary IS the synthesis; groupSummary is undefined on that path.
+    else if (result.groupSummary) modelVisible.group_summary = result.groupSummary;
     if (result.circuitBroken) modelVisible.circuit_broken = true;
     return {
       content: [{ type: "text" as const, text: JSON.stringify(modelVisible) }],
@@ -363,7 +383,7 @@ export const registration: ToolEntry = {
   modes: ["web", "channel", "cli"],
   // Hidden unless the runtime injected an executor (same "never show a non-working tool" contract;
   // children get no executor → spawn_subagent is hidden from them → no recursion). The batch
-  // capability is gated by SUBAGENT_GROUP_ENABLED at the CALL layer (item cap), not here — the tool
+  // capability is gated by isSubagentGroupEnabled() at the CALL layer (item cap), not here — the tool
   // itself is always available for single-task spawns.
   available: (refs) => Boolean(refs.spawnSubagentExecutor),
   requiresUserApproval: true,

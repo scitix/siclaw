@@ -5,7 +5,7 @@ import {
   getMaxGroupItems, DEFAULT_MAX_GROUP_ITEMS,
   getSubagentGroupMaxRuntimeMs, GROUP_RUNTIME_FLOOR_MS, DEFAULT_GROUP_RUNTIME_HARD_CAP_MS,
   getGroupWorkerShare, getGroupItemBudgetMs, DEFAULT_GROUP_ITEM_BUDGET_MS,
-  getGroupHardCapMs, SUBAGENT_GROUP_ENABLED,
+  getGroupHardCapMs, isSubagentGroupEnabled, parsePositiveIntEnv,
 } from "./subagent-registry.js";
 
 describe("getSubagentMaxRuntimeMs", () => {
@@ -79,9 +79,33 @@ describe("getGroupWorkerShare", () => {
   });
 });
 
-describe("SUBAGENT_GROUP_ENABLED", () => {
-  it("is on by default", () => {
-    expect(SUBAGENT_GROUP_ENABLED).toBe(true);
+describe("isSubagentGroupEnabled", () => {
+  it("is on by default and for blank/unset", () => {
+    expect(isSubagentGroupEnabled({})).toBe(true);
+    expect(isSubagentGroupEnabled({ SICLAW_SUBAGENT_GROUP_ENABLED: "  " })).toBe(true);
+  });
+  it("is off only for an explicit false/0 (case-insensitive)", () => {
+    expect(isSubagentGroupEnabled({ SICLAW_SUBAGENT_GROUP_ENABLED: "false" })).toBe(false);
+    expect(isSubagentGroupEnabled({ SICLAW_SUBAGENT_GROUP_ENABLED: "FALSE" })).toBe(false);
+    expect(isSubagentGroupEnabled({ SICLAW_SUBAGENT_GROUP_ENABLED: "0" })).toBe(false);
+    expect(isSubagentGroupEnabled({ SICLAW_SUBAGENT_GROUP_ENABLED: "true" })).toBe(true);
+    expect(isSubagentGroupEnabled({ SICLAW_SUBAGENT_GROUP_ENABLED: "1" })).toBe(true);
+  });
+});
+
+describe("parsePositiveIntEnv", () => {
+  it("returns fallback for blank/unset/invalid/non-positive", () => {
+    expect(parsePositiveIntEnv(undefined, 7)).toBe(7);
+    expect(parsePositiveIntEnv("  ", 7)).toBe(7);
+    expect(parsePositiveIntEnv("abc", 7)).toBe(7);
+    expect(parsePositiveIntEnv("0", 7)).toBe(7);
+    expect(parsePositiveIntEnv("-2", 7)).toBe(7);
+  });
+  it("floors a positive integer", () => {
+    expect(parsePositiveIntEnv("12.7", 7)).toBe(12);
+  });
+  it("converts seconds→ms with unitMs", () => {
+    expect(parsePositiveIntEnv("300", 1000, { unitMs: true })).toBe(300_000);
   });
 });
 
