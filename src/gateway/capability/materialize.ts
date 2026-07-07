@@ -34,6 +34,10 @@ export interface MaterializeBackend {
 export interface MaterializeResult {
   /** Consumer-declared locale for the run's box (fetchInput), if any. */
   locale?: string;
+  /** Consumer-managed LLM endpoint for the box (opaque passthrough; never logged). */
+  llm?: { base_url?: string; auth_token?: string };
+  /** Consumer-managed KBC_* behavior knobs for the box (opaque passthrough). */
+  settings?: Record<string, string>;
 }
 
 export async function materializeCapabilityInputs(opts: {
@@ -49,6 +53,8 @@ export async function materializeCapabilityInputs(opts: {
     const req: CapabilityFetchInputRequest = { run_id: runId };
     const src = (await backend.request(CAPABILITY_FETCH_INPUT, req)) as CapabilityFetchInputResponse;
     if (src?.locale) result.locale = src.locale;
+    if (src?.llm && typeof src.llm === "object") result.llm = src.llm;
+    if (src?.settings && typeof src.settings === "object") result.settings = src.settings;
     if (src?.bundle_base64) {
       await client.postJson("/sources", {
         run_id: runId,

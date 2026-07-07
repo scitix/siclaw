@@ -445,6 +445,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           instruction: instruction ?? "",
           allowed_tools: allowedTools,
           locale: materialized.locale,
+          // Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
+          // opaque passthrough — the box applies them in-process before its SDK
+          // connects. Never logged here; token stays out of the pod spec.
+          llm: materialized.llm,
+          settings: materialized.settings,
         });
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
           .catch(async (err) => {
