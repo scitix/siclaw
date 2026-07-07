@@ -888,6 +888,23 @@ def _media_verify_due(run) -> dict[str, list[str]] | None:
     return selfcheck.cap_media_pending(pending, _media_verify_max_images())
 
 
+async def _set_converge_phase(run, phase: str) -> None:
+    """Set the DURABLE verify converge phase (SELFCHECK.json) + sync it, so the
+    frontend reads an authoritative 校对中/修订中/settled signal instead of
+    run_status (the phantom's root). Additive + fail-open — no control-flow
+    change, so it cannot affect the never-stuck turn/repair logic."""
+    wd = getattr(run, "workdir", None)
+    if not wd:
+        return
+    selfcheck.set_converge_phase(wd, phase)
+    sent = getattr(run, "_sync_sent", None)
+    if sent is not None:
+        try:
+            await _sync_workspace(run, sent)
+        except Exception:
+            pass
+
+
 def _maybe_start_media_verify(run) -> bool:
     """Kick the blind transcribe+compare flow as a background task (图像复核 v2).
     Marks the chunk verified up-front (one-shot semantics, same as v1) so a
@@ -914,6 +931,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
         n_imgs = sum(len(v) for v in chunk.values())
         await run.emit({"type": "summary",
                         "text": f"自检(图像):盲转写复核 {len(chunk)} 页 / {n_imgs} 张图(后台)…"})
+        await _set_converge_phase(run, "verifying")
         loop = asyncio.get_running_loop()
         result = await mediaverify.run_blind_verify(
             ClaudeEngine(), run.workdir, chunk,
@@ -929,6 +947,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
         if findings:
             await run.emit({"type": "summary", "text": (
                 f"自检(图像):{result['images']} 张图已核,{len(findings)} 条断言与图不符/超源,注入回修{tail}")})
+            await _set_converge_phase(run, "revising")
             await run.inject_user_message(mediaverify.build_repair_prompt(findings))
         else:
             await run.emit({"type": "summary", "text": (
@@ -1075,6 +1094,7 @@ async def _run_pk_flow(run, kind: str) -> None:
         await run.emit({"type": "summary", "text": (
             f"自检(红蓝队):{'定向复测 ' + str(len(override)) + ' 题' if override else '全量体检'}"
             "开始(后台运行,不影响会话)…")})
+        await _set_converge_phase(run, "verifying")
         loop = asyncio.get_running_loop()
         summary, detail = await redblue.run_pk(
             ClaudeEngine(), wiki_dir=tmp, raw_dir=raw_dir, page_count=pages,
@@ -1125,7 +1145,12 @@ async def _run_pk_flow(run, kind: str) -> None:
                 pass
         await run.emit({"type": "summary", "text": _pk_narration(summary)})
         if summary.get("state") == "repairing":
+            await _set_converge_phase(run, "revising")
             await run.inject_user_message(redblue.build_pk_repair_prompt(summary))
+        elif summary.get("state") in ("passed", "partial", "unconverged"):
+            # Converged: red-blue (the final layer) reached a terminal state and
+            # no repair was injected → the draft is stable and testable.
+            await _set_converge_phase(run, "settled")
     except Exception as e:
         try:
             selfcheck.update_pk_section(workdir, {

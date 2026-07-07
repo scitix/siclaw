@@ -460,6 +460,32 @@ def update_pk_section(workdir: str, pk: dict) -> None:
     write_selfcheck(workdir, report)
 
 
+# The verify converge-phase is the AUTHORITATIVE, DURABLE signal the frontend
+# reads to show 校对中/修订中 and gate the test step — instead of run_status,
+# which was the root of the "box looks idle yet still working" phantom. Verify
+# runs (red-blue/media) are post-turn: without a persisted "in progress" marker
+# the frontend only had transient `summary` events (lost on reload). This closes
+# that gap. It is PURELY ADDITIVE — a field write, no control-flow change — so it
+# cannot affect the never-stuck turn/repair logic.
+CONVERGE_PHASES = ("verifying", "revising", "settled")
+
+
+def set_converge_phase(workdir: str, phase: str) -> None:
+    """Write the verify converge phase (verifying → a check is running; revising →
+    a check found issues and a repair turn was injected; settled → converged, the
+    draft is stable and testable). Read-modify-write; fail-open (a signal write
+    must never break the verify flow)."""
+    if phase not in CONVERGE_PHASES:
+        return
+    try:
+        report = read_selfcheck(workdir) or {"version": 1, "coverage": None, "lint": None, "state": None}
+        report["converge_phase"] = phase
+        report["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        write_selfcheck(workdir, report)
+    except Exception:
+        pass
+
+
 def pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
     """Pin the current draft: copy {workdir}/candidate/*.md|.json into
     {dest}/.siclaw/knowledge/ with the `candidate/` prefix stripped
