@@ -401,6 +401,17 @@ export class AgentBoxSessionManager {
   private subagentLimiter = new ConcurrencyLimiter(getSubagentConcurrency());
 
   /**
+   * Collective cap on GROUP-spawned children (map workers AND the reduce child) across ALL live
+   * groups in this AgentBox: `max(1, concurrency - 1)` — one below the global `subagentLimiter`.
+   * A single group's worker pool already stays one below the global cap, but that guarantee is
+   * per-group: two concurrent batches (sessions share this manager) would together saturate the
+   * global limiter and park an interactive single spawn behind a ~10-min child. Group children
+   * acquire this slot BEFORE the global one (strict ordering — group-slot holders only ever wait
+   * on the global limiter, and global holders never wait on a group slot, so no cycle).
+   */
+  private groupChildLimiter = new ConcurrencyLimiter(getGroupWorkerShare());
+
+  /**
    * Unified background-job registry (sub-agents + bash), keyed by jobId.
    * Replaces the old inline subagentJobs map; shared by notifyParent / job_stop.
    */
@@ -661,7 +672,7 @@ export class AgentBoxSessionManager {
       let skippedInSlot = false;
       let res: SpawnSubagentResult | undefined;
       try {
-        res = await this.subagentLimiter.run(async () => {
+        res = await this.groupChildLimiter.run(() => this.subagentLimiter.run(async () => {
           if (mapAbort.signal.aborted) {
             skippedInSlot = true;
             return undefined;
@@ -671,7 +682,7 @@ export class AgentBoxSessionManager {
           state.status = "running";
           emit("map");
           return this.runSpawnedSubagent(childReq, undefined, undefined, mapAbort.signal);
-        });
+        }));
       } catch (err) {
         res = {
           status: "failed",
@@ -711,9 +722,11 @@ export class AgentBoxSessionManager {
     };
 
     // Worker pool via the shared ConcurrencyLimiter (reuse — one concurrency primitive, not a
-    // hand-rolled index counter): at most `getGroupWorkerShare()` items are submitted to the GLOBAL
-    // subagentLimiter at once, so an interactive single spawn always keeps ≥1 slot. runOne never
-    // throws (it catches internally), so no pool.run() rejects.
+    // hand-rolled index counter): at most `getGroupWorkerShare()` items are submitted per group.
+    // The "interactive single spawn always keeps ≥1 global slot" guarantee is enforced by the
+    // manager-wide `groupChildLimiter` (collective cap across ALL live groups — this per-group
+    // pool alone can't provide it once two batches run concurrently). runOne never throws (it
+    // catches internally), so no pool.run() rejects.
     const pool = new ConcurrencyLimiter(Math.min(getGroupWorkerShare(), total));
     await Promise.all(tasks.map((_, i) => pool.run(() => runOne(i))));
 
@@ -768,9 +781,9 @@ export class AgentBoxSessionManager {
           spawnId: `${groupId}#reduce`,
         };
         try {
-          const reduceRes = await this.subagentLimiter.run(() =>
+          const reduceRes = await this.groupChildLimiter.run(() => this.subagentLimiter.run(() =>
             this.runSpawnedSubagent(reduceReq, undefined, undefined, userAbort.signal),
-          );
+          ));
           if (reduceRes.status === "done") {
             // Use the FULL reduce report, not the 1800-char capsule, before applying the group's
             // 6000-char budget (design decision #21): the capsule is already ≤1800, so truncating it

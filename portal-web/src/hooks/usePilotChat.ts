@@ -473,6 +473,41 @@ export function carryLiveGroupProgress(prev: PilotMessage[], fresh: PilotMessage
 }
 
 /**
+ * Reuse the previously rendered row OBJECT for any freshly fetched row that is semantically
+ * unchanged. The annotate chain derives its folded fields (groupStatus / groupItems / …) from
+ * delegation_event rows on every fetch, so a rebuilt page gives every row a new identity even
+ * when nothing changed — defeating memoized row components (`SubagentGroupCard`'s
+ * `useMemo([message])` recomputed on every 2.5s poll). Comparing content + status + metadata
+ * (both sides are annotate-built, so equal structures serialize equally) restores identity
+ * stability; a false mismatch merely rebuilds a row, never shows stale data.
+ */
+export function preserveUnchangedRows(prev: PilotMessage[], fresh: PilotMessage[]): PilotMessage[] {
+  if (prev.length === 0) return fresh
+  const prevById = new Map(prev.map((m) => [m.id, m]))
+  return fresh.map((m) => {
+    const p = m.id ? prevById.get(m.id) : undefined
+    if (
+      p &&
+      p.role === m.role &&
+      p.content === m.content &&
+      p.toolStatus === m.toolStatus &&
+      p.isStreaming === m.isStreaming &&
+      JSON.stringify(p.metadata ?? null) === JSON.stringify(m.metadata ?? null)
+    ) {
+      return p
+    }
+    return m
+  })
+}
+
+/** Standard reconciliation of a freshly fetched page 1 against the rendered list: carry the
+ *  live-only group progress (queued-vs-running knowledge), then restore row identity for
+ *  unchanged rows so memoized components skip re-rendering. */
+export function reconcileRefetchedPage1(prev: PilotMessage[], fresh: PilotMessage[]): PilotMessage[] {
+  return preserveUnchangedRows(prev, carryLiveGroupProgress(prev, fresh))
+}
+
+/**
  * Recover the most recent persisted context-usage snapshot from loaded history.
  * The Runtime stores it on the latest assistant row's `metadata.context_usage`
  * (see sse-consumer.ts agent_end handling), so the context meter can render on
@@ -1165,7 +1200,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         // don't let this poll re-paint them as "running" over the optimistic "aborted" state.
         // Also stand down while the /events live feed owns the message list (recoveredLiveRef) —
         // a wholesale DB replace would clobber live-streamed assistant text not yet persisted.
-        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
+        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
         setHasMore(items.length >= PAGE_SIZE)
 
         if (hasRunning) {
@@ -1219,7 +1254,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           try {
             const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
             if (!cancelled && pageRef.current === 1 && !refetchSuppressedByAbort()) {
-              setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
+              setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
               setHasMore(items.length >= PAGE_SIZE)
             }
           } catch { /* keep last live state on refetch failure */ }
@@ -1256,7 +1291,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         const pendingSynthesis = hasPendingDelegationSynthesis(pilotMsgs)
         // Stand down while the /events live feed owns the message list — a wholesale DB replace
         // would clobber live-streamed text not yet persisted.
-        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
+        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
         setHasMore(items.length >= PAGE_SIZE)
         if (pendingSynthesis) {
           setStreaming(true)
@@ -1301,17 +1336,26 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       try {
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
-        const applied = pageRef.current === 1 && !streamingRef.current && !refetchSuppressedByAbort()
-        if (applied) {
-          setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
+        const blocked = streamingRef.current || refetchSuppressedByAbort()
+        if (!blocked && pageRef.current === 1) {
+          setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
           setHasMore(items.length >= PAGE_SIZE)
+          // Fast-path stop — only on an APPLIED page. Judging fold-ness on an unapplied fetch
+          // races the post-abort suppression window: a Stop lands, the terminal event persists
+          // during refetchSuppressedByAbort(), this poll sees it folded in the FRESH page,
+          // returns — and the on-screen card (which never received that page) sticks on
+          // "Running" forever with no remaining trigger.
+          if (!hasActiveBackgroundSubagent(pilotMsgs) && !hasActiveBackgroundGroup(pilotMsgs)) return
+        } else if (!blocked) {
+          // Paged back: a wholesale replace would drop the loaded scrollback, but skipping
+          // entirely (the old `pageRef === 1` gate) stranded a stopped group's card on
+          // "Running" with this poll re-scheduling forever — when Stop suppresses every live
+          // signal this poll is the only fold path. Merge the fresh page 1 into the loaded
+          // history (same anti-clobber policy as the SSE refetch path). No in-poll stop
+          // judgment here: once the merge folds the card, the effect's hasActiveBgSubagent
+          // dependency flips false and the cleanup below cancels the timer.
+          setMessages((prev) => mergePage1IntoHistory(prev, reconcileRefetchedPage1(prev, pilotMsgs)))
         }
-        // Stop polling only when the folded page was actually APPLIED. Judging fold-ness on an
-        // unapplied fetch races the post-abort suppression window: a Stop lands, the terminal
-        // event persists during refetchSuppressedByAbort(), this poll sees it folded in the FRESH
-        // page, returns — and the on-screen card (which never received that page) sticks on
-        // "Running" forever with no remaining trigger.
-        if (applied && !hasActiveBackgroundSubagent(pilotMsgs) && !hasActiveBackgroundGroup(pilotMsgs)) return
       } catch (err) {
         console.warn("[usePilotChat] background-subagent refresh failed:", err)
       }
@@ -1344,7 +1388,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         if (closed || refetchSuppressedByAbort()) return
         if (pageRef.current === 1) {
           // Page 1 is all that's loaded → wholesale replace with the fresh page 1.
-          setMessages((prev) => carryLiveGroupProgress(prev, pilotMsgs))
+          setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
           setHasMore(items.length >= PAGE_SIZE)
         } else {
           // The user has paged back (older history loaded). A wholesale replace would drop that
@@ -1361,7 +1405,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           // window in which a stream can START; re-check here and defer via scheduleRefetch instead
           // of merging (same anti-clobber policy the page-1 branch relies on). No timestamp reorder.
           if (streamingRef.current) { scheduleRefetch(); return }
-          setMessages((prev) => mergePage1IntoHistory(prev, carryLiveGroupProgress(prev, pilotMsgs)))
+          setMessages((prev) => mergePage1IntoHistory(prev, reconcileRefetchedPage1(prev, pilotMsgs)))
         }
       } catch (err) {
         console.warn("[usePilotChat] background-turn refetch failed:", err)

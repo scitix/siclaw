@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { buildPilotMessages, carryLiveGroupProgress, hasActiveBackgroundWork, mergePage1IntoHistory, type ChatMessage } from "./usePilotChat"
+import { buildPilotMessages, carryLiveGroupProgress, hasActiveBackgroundWork, mergePage1IntoHistory, preserveUnchangedRows, reconcileRefetchedPage1, type ChatMessage } from "./usePilotChat"
 
 // Raw-row helpers mirroring how spawn_subagent_group events are persisted.
 function groupLaunchRow(jobId: string, items: unknown[], description = "diagnose pods"): ChatMessage {
@@ -307,5 +307,41 @@ describe("carryLiveGroupProgress", () => {
     // No prev frames at all → fresh list returned as-is.
     const plain = buildPilotMessages([groupLaunchRow("grp4", ["x"])])
     expect(carryLiveGroupProgress(buildPilotMessages([]), plain)).toBe(plain)
+  })
+})
+
+describe("preserveUnchangedRows / reconcileRefetchedPage1", () => {
+  it("restores row identity for unchanged rows and rebuilds only the changed one", () => {
+    const rows = [
+      groupLaunchRow("grp5", ["a", "b"]),
+      childEventRow("grp5", 0, "done", "s0", "a ok"),
+    ]
+    const prev = buildPilotMessages(rows)
+    const freshSame = buildPilotMessages(rows)
+    const same = preserveUnchangedRows(prev, freshSame)
+    // Annotate rebuilt every object in freshSame, but identity is restored from prev.
+    for (let i = 0; i < same.length; i++) expect(same[i]).toBe(prev[i])
+
+    // Second child terminal arrives → launch card fold changes → launch row rebuilt,
+    // untouched child row keeps its identity.
+    const freshChanged = buildPilotMessages([...rows, childEventRow("grp5", 1, "done", "s1", "b ok")])
+    const changed = preserveUnchangedRows(prev, freshChanged)
+    const prevLaunch = prev.find((m) => m.toolName === "spawn_subagent_group")!
+    const newLaunch = changed.find((m) => m.toolName === "spawn_subagent_group")!
+    expect(newLaunch).not.toBe(prevLaunch)
+    const prevChild0 = prev.find((m) => m.id === "child-grp5-0")!
+    expect(changed.find((m) => m.id === "child-grp5-0")).toBe(prevChild0)
+  })
+
+  it("reconcile keeps BOTH the carried live frame and the previous row identity", () => {
+    const frame = { phase: "map", items: [{ index: 0, status: "queued" }] }
+    const prev = buildPilotMessages([groupLaunchRow("grp6", ["a", "b"])])
+    prev[0] = { ...prev[0], metadata: { ...(prev[0].metadata ?? {}), groupProgress: frame } }
+    const fresh = buildPilotMessages([groupLaunchRow("grp6", ["a", "b"])])
+
+    const out = reconcileRefetchedPage1(prev, fresh)
+    // carry re-attached the frame, making the row equal to prev → identity restored.
+    expect(out[0]).toBe(prev[0])
+    expect(out[0].metadata?.groupProgress).toEqual(frame)
   })
 })

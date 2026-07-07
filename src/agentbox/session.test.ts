@@ -860,6 +860,56 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
     }
   });
 
+  it("caps children COLLECTIVELY across concurrent groups — an interactive slot stays free", async () => {
+    const prev = process.env.SICLAW_SUBAGENT_CONCURRENCY;
+    process.env.SICLAW_SUBAGENT_CONCURRENCY = "4"; // limiter cap 4 → collective group cap 3
+    try {
+      const mgr = new AgentBoxSessionManager() as any;
+      let active = 0;
+      let maxActive = 0;
+      for (let i = 0; i < 8; i++) {
+        (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+          prompt: async () => {
+            active++;
+            maxActive = Math.max(maxActive, active);
+            await new Promise((r) => setTimeout(r, 10));
+            active--;
+            emitter.emit("event", {
+              type: "message_end",
+              message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+            });
+          },
+          abort: async () => {},
+        }));
+      }
+      const mkReq = (id: string) => ({
+        description: `batch ${id}`,
+        renderedTasks: Array.from({ length: 4 }, (_, i) => ({ item: `${id}-t${i}`, prompt: `do ${id}-t${i}` })),
+        subagentType: "general-purpose",
+        runInBackground: false,
+        parentSessionId: `p-${id}`,
+        parentAgentId: null,
+        userId: "u1",
+        taskListId: "tl1",
+        spawnId: `grp-${id}`,
+      });
+      const exec = mgr.createSpawnSubagentExecutor();
+      const [a, b] = await Promise.all([
+        exec(mkReq("a"), undefined, undefined),
+        exec(mkReq("b"), undefined, undefined),
+      ]);
+      expect(a.status).toBe("done");
+      expect(b.status).toBe("done");
+      // Each group's own pool allows 3 workers (share = 4-1), so two groups would submit 6 and
+      // saturate the global limiter (4) without the shared groupChildLimiter. The collective cap
+      // keeps ALL group children at 3, leaving ≥1 global slot for an interactive single spawn.
+      expect(maxActive).toBe(3);
+    } finally {
+      if (prev === undefined) delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_CONCURRENCY = prev;
+    }
+  });
+
   it("circuit breaker: first 5 all fail → stop submitting, remaining skipped, no reduce", async () => {
     const prev = process.env.SICLAW_SUBAGENT_CONCURRENCY;
     process.env.SICLAW_SUBAGENT_CONCURRENCY = "2"; // worker share 1 → serial, deterministic completion order

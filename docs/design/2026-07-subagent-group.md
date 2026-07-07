@@ -98,11 +98,16 @@ one approval ─► tool layer: validateAndRenderGroupPlan (fail-fast) → rende
 ### Orchestration (batch path)
 
 - **The orchestrator never holds a `subagentLimiter` slot.** It submits children *into* the
-  global limiter through a worker pool that keeps at most `getGroupWorkerShare()` =
-  `max(1, concurrency-1)` in flight. This is the single resource cap (no second, nested group
-  semaphore — that risks deadlock) and it always leaves ≥1 slot for an interactive single spawn
-  (no head-of-line starvation). Child sessions are created **lazily inside each worker** — never
-  all N at once.
+  global limiter through a per-group worker pool that keeps at most `getGroupWorkerShare()` =
+  `max(1, concurrency-1)` in flight. Child sessions are created **lazily inside each worker** —
+  never all N at once.
+- **The "≥1 slot for an interactive single spawn" guarantee is COLLECTIVE, not per-group.** A
+  per-group pool alone lets two concurrent batches (sessions share one AgentBox manager) demand
+  `2×(concurrency-1)` global slots and starve a foreground single spawn behind a ~10-min child.
+  All group-spawned children (map workers AND the reduce child) therefore also pass through the
+  manager-wide `groupChildLimiter` (`max(1, concurrency-1)`), acquired BEFORE the global slot.
+  The strict acquisition order makes the nested semaphore deadlock-free: group-slot holders only
+  ever wait on the global limiter, and global-slot holders never wait on a group slot.
 - **Two abort scopes.** An external signal (user Stop / `job_stop`) aborts **both** map and
   reduce. The group-size-scaled timeout and the circuit breaker abort **only the map phase** — a
   map-phase timeout must not kill a still-valuable reduce (which keeps its own 600s backstop).

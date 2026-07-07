@@ -98,6 +98,9 @@ export function summarizeItemStatuses(items: Array<{ status: GroupItemStatus }>)
   for (const it of items) counts.set(it.status, (counts.get(it.status) ?? 0) + 1);
   const order: GroupItemStatus[] = ["done", "partial", "failed", "timed_out", "skipped"];
   const parts = order.filter((s) => counts.has(s)).map((s) => `${counts.get(s)} ${s}`);
+  // Catch-all so the counts always sum to items.length even if the status union ever widens
+  // past the canonical order above — a silently dropped status would misreport the digest.
+  for (const [s, n] of counts) if (!order.includes(s)) parts.push(`${n} ${s}`);
   return `${items.length} item(s): ${parts.join(", ")}`;
 }
 

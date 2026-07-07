@@ -183,7 +183,10 @@ export function getMaxGroupItems(env: NodeJS.ProcessEnv = process.env): number {
 export const GROUP_REDUCE_SUMMARY_MAX_CHARS = 6000;
 
 /** Cap (chars) on the assembled reduce INPUT (all item results concatenated). Past this
- *  the builder truncates each item proportionally and marks `[truncated]`. */
+ *  the builder truncates each item proportionally and marks `[truncated]`. Budget math: a
+ *  full 50-item batch of 1800-char capsules is ~90K chars; the 150K ceiling is ~40K tokens,
+ *  comfortable headroom inside a 128K-token model context alongside the reduce child's
+ *  system prompt. */
 export const GROUP_REDUCE_INPUT_MAX_CHARS = 150_000;
 
 /** Default per-item wall-clock BUDGET (expected-value, not a hard limit) used by the
