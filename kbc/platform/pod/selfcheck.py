@@ -308,7 +308,7 @@ def update_pk_section(workdir: str, pk: dict) -> None:
 def pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
     """Pin the current draft: copy {workdir}/candidate/*.md|.json into
     {dest}/.siclaw/knowledge/ with the `candidate/` prefix stripped
-    (candidate/index.md → index.md), mirroring sicore's
+    (candidate/index.md → index.md), mirroring the consumer's
     buildPublishBundleFromCandidates so a consumer reads BYTE-IDENTICALLY to
     what a publish would serve. Shared by user test sessions (compile_box) and
     the red-blue blue team (redblue.py). Returns (sha256 over sorted
