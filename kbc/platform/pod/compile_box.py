@@ -1717,6 +1717,39 @@ async def _teardown_test_session(run: "TestRun"):
 
 # ── HTTP ──
 
+# ── consumer-managed box config (DESIGN-kb-llm-binding-v2-2026-07-07) ────────
+# sicore owns the credential store and the KB capability policy; both arrive on
+# the /session body and apply IN-PROCESS (the box spawns before fetchInput runs,
+# so pod env is too early — and this keeps the token out of the pod spec).
+# Precedence: consumer config > runtime-env forward (helm fallback) > image
+# defaults. ONE exception: KBC_PK_MODE=off set at the runtime level is the ops
+# KILL SWITCH and must win over consumer config.
+_PK_KILL_AT_BOOT = os.environ.get("KBC_PK_MODE") == "off"
+
+
+def _apply_session_config(body: dict) -> None:
+    """Apply consumer-managed llm/settings from the /session body to os.environ.
+    Never log the token; whitelist settings keys to the box's own vocabulary."""
+    llm = body.get("llm")
+    if isinstance(llm, dict):
+        if llm.get("base_url"):
+            os.environ["ANTHROPIC_BASE_URL"] = str(llm["base_url"])
+        if llm.get("auth_token"):
+            os.environ["ANTHROPIC_AUTH_TOKEN"] = str(llm["auth_token"])
+            # The SDK accepts either; clear a stale forwarded API key so the
+            # consumer credential unambiguously wins.
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+    settings = body.get("settings")
+    if isinstance(settings, dict):
+        for key, value in settings.items():
+            k = str(key)
+            if not k.startswith("KBC_") or value is None:
+                continue  # whitelist: only the box's own knob vocabulary
+            if k == "KBC_PK_MODE" and _PK_KILL_AT_BOOT:
+                continue  # ops kill switch outranks consumer config
+            os.environ[k] = str(value)
+
+
 async def handle_session(request: web.Request):
     """Start (or no-op attach to) the run's persistent CONVERSATIONAL session —
     it connects and waits for the first /message (prepare chat; a compile is just
@@ -1726,6 +1759,10 @@ async def handle_session(request: web.Request):
     if run_id in RUNS:
         return web.json_response({"ok": True, "run_id": run_id, "already_live": True})
     body = await request.json() if request.body_exists else {}
+    # Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
+    # applied to os.environ BEFORE any SDK/engine session exists, so the
+    # persistent session, batch sessions, PK and media-verify all inherit them.
+    _apply_session_config(body)
     run = CompileRun(run_id, body.get("workdir", "/work"), int(body.get("round", 1)), body.get("instruction", ""))
     # Tool whitelist from the runtime BoxProfile (None/absent → driver default).
     run.allowed_tools = body.get("allowed_tools")

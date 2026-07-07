@@ -278,4 +278,18 @@ export interface CapabilityFetchInputResponse {
    * (English prompt packs).
    */
   locale?: string;
+  /**
+   * Consumer-managed LLM endpoint for the run's box (DESIGN-kb-llm-binding-v2).
+   * The consumer (e.g. sicore) owns the credential store; the runtime passes
+   * this through OPAQUELY into the box /session body and MUST NOT log it.
+   * Absent ⇒ the box falls back to the runtime-env-forwarded ANTHROPIC_* vars
+   * (the helm Secret path).
+   */
+  llm?: { base_url?: string; auth_token?: string };
+  /**
+   * Consumer-managed box behavior knobs, keyed by the box's OWN env vocabulary
+   * (KBC_* — model tiers, PK/media-verify switches, budgets). Same wire shape
+   * as the env fallback so v1/v2 share one semantics; the box whitelists keys.
+   */
+  settings?: Record<string, string>;
 }
