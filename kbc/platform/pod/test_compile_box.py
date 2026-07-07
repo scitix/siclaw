@@ -569,6 +569,51 @@ async def test_propose_plan_never_bounces():
 
 # ── Protocol v3: brief consumption + append-only proposed questions ──
 
+def test_apply_session_config():
+    """Consumer-managed llm/settings from /session body (DESIGN-kb-llm-binding-v2):
+    llm applies + clears a stale forwarded API key; settings whitelisted to
+    KBC_*; the boot-time KBC_PK_MODE=off kill switch outranks consumer config."""
+    keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+            "KBC_COMPILE_MODEL", "KBC_PK_MODE")
+    backup = {k: os.environ.get(k) for k in keys}
+    kill_backup = compile_box._PK_KILL_AT_BOOT
+    try:
+        os.environ["ANTHROPIC_API_KEY"] = "stale-forwarded-key"
+        os.environ.pop("KBC_PK_MODE", None)
+        os.environ.pop("KBC_COMPILE_MODEL", None)
+        compile_box._PK_KILL_AT_BOOT = False
+        compile_box._apply_session_config({
+            "llm": {"base_url": "https://massapi.example/model-api", "auth_token": "tok-1"},
+            "settings": {"KBC_COMPILE_MODEL": "claude-opus-4-8",
+                         "KBC_PK_MODE": "auto",
+                         "EVIL_KEY": "nope", "PATH": "/pwn"},
+        })
+        assert os.environ["ANTHROPIC_BASE_URL"] == "https://massapi.example/model-api"
+        assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "tok-1"
+        assert "ANTHROPIC_API_KEY" not in os.environ           # stale key cleared
+        assert os.environ["KBC_COMPILE_MODEL"] == "claude-opus-4-8"
+        assert os.environ["KBC_PK_MODE"] == "auto"
+        assert "EVIL_KEY" not in os.environ and os.environ.get("PATH") != "/pwn"
+
+        # ops kill switch: runtime-level off beats consumer "auto"
+        os.environ["KBC_PK_MODE"] = "off"
+        compile_box._PK_KILL_AT_BOOT = True
+        compile_box._apply_session_config({"settings": {"KBC_PK_MODE": "auto"}})
+        assert os.environ["KBC_PK_MODE"] == "off"
+
+        # absent/None fields are a clean no-op
+        compile_box._apply_session_config({})
+        compile_box._apply_session_config({"llm": None, "settings": None})
+    finally:
+        for k, v in backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        compile_box._PK_KILL_AT_BOOT = kill_backup
+    print("\u2713 _apply_session_config: llm + whitelist + kill-switch precedence")
+
+
 def test_parse_brief_block():
     """The wizard's 定调标签 block parses into the BRIEF.json record (tags split on
     Chinese separators, raw kept from the marker); an ordinary message → None."""
@@ -826,6 +871,7 @@ async def main():
     await test_open_close_test_session_http()
     await test_test_message_path()
     await test_propose_plan_never_bounces()
+    test_apply_session_config()
     test_parse_brief_block()
     test_merge_proposed_questions()
     await test_propose_questions_appends_dedup()
