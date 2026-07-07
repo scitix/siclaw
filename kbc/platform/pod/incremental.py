@@ -145,11 +145,17 @@ def integrity_violations(
         affected_pages(modified/deleted 命中的现存页)
         ∪ 模型安置 added 源实际落笔的页(added-target,模型申报)
         ∪ {index.md}(页集变了要刷新)
-    任何在此集合之外发生字节变化(改/新建/删除)的页 = 违规,走回修:"你动了不该动的
-    页 X,请还原"。确定性、逐字节,不靠模型自觉 —— 和 selfcheck 的 charset 一个路子。
+    只守**现存页**:授权集之外的现存页被**改或删** = 越界(走回修"还原")。**新建页
+    不算越界** —— 建新页是合法产出(added 源单独成页、或拆页),由 coverage 账本(源全
+    覆盖)+ 孤儿 lint(必须挂进 index)兜底,不该被本护栏误判成"动了不该动的页"。确定
+    性、逐字节,不靠模型自觉 —— 和 selfcheck 的 charset 一个路子。
     """
     editable = set(editable_pages) | {INDEX_PAGE}
-    return sorted(rel for rel in changed_pages(before, after) if rel not in editable)
+    return sorted(
+        rel
+        for rel, kind in changed_pages(before, after).items()
+        if kind != "created" and rel not in editable
+    )
 
 
 # ── 协议:sicore 输入(RAW_CHANGES)→ box 输出(CHANGESET)──────────────────────
@@ -195,6 +201,14 @@ def materialize_changeset(workdir: str) -> dict | None:
     )
     (Path(workdir) / CHANGESET_PATH).write_text(
         json.dumps(cs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # Consume-once: drop the input so a later turn / box respawn can't re-route on a
+    # stale changeset. The enriched CHANGESET.json remains for this turn's repair
+    # rounds (they read it, not RAW_CHANGES). sicore also clears it on baseline
+    # advance — this is the box-side belt to that suspenders.
+    try:
+        (Path(workdir) / RAW_CHANGES_PATH).unlink()
+    except OSError:
+        pass
     return cs
 
 
@@ -225,7 +239,8 @@ def build_scoped_directive(changeset: dict) -> str:
     n_del = len(changeset.get("deleted", []))
     lines = [
         "【增量重编】本轮变更已由代码算好,写在 authoring/CHANGESET.json。**先读它**,只做范围内的事:",
-        f"· 改动源 {n_mod} 个 → 打开各自 affected_pages,**按 diff(+/−)只改动到的那几处事实,不重写整页**。",
+        f"· 改动源 {n_mod} 个 → 打开各自 affected_pages,**按 diff(+/−)只改动到的那几处事实,不重写整页**;"
+        "若某条 diff 为空(未提供),就重读该源、对照更新受影响页里相关事实(仍只动这几页)。",
         f"· 新增源 {n_add} 个 → 按 cascading-ingest 编入最相关的现存页或建新页;**若并入某现存页,"
         "必须把该页名追加进 authoring/ADDED_TARGETS.json(页名数组)**,否则收尾护栏会当它越界。",
         f"· 删除源 {n_del} 个 → 从其 affected_pages 移除该源内容/引用;页因此清空则删页。",
