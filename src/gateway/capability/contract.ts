@@ -51,8 +51,8 @@ export const CAPABILITY_FETCH_INPUT = "capability.fetchInput" as const;
 /**
  * siclaw → consumer: opaque run-state store (option B). siclaw OWNS the execution
  * run; the consumer persists it as a dumb store so an in-flight run survives a
- * stateless-runtime restart. getRun is part of the consumer's store obligation
- * even though the runtime currently only calls persist + listActiveRuns.
+ * stateless-runtime restart. The runtime calls persist + listActiveRuns (boot/
+ * reconcile recovery) and getRun (adopt + the reap re-check).
  */
 export const CAPABILITY_PERSIST_RUN_STATE = "capability.persistRunState" as const;
 export const CAPABILITY_GET_RUN = "capability.getRun" as const;

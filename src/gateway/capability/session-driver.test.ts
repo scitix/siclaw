@@ -123,15 +123,17 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(artifactCalls).toHaveLength(2);
   }, 10_000);
 
-  it("parked (vestigial) is treated as a turn back to idle, never blocks", async () => {
+  it("an unhandled box event (e.g. the retired 'parked') is ignored, not fatal", async () => {
+    // The box never emits 'parked' (the handler was removed as dead code); a stray
+    // one must fall through harmlessly — no turn, no status change, no crash.
     const fe = fakeFrontend();
     const mgr = fakeManager();
     await driveCapabilitySession({
       client: fakeClient([{ type: "parked", message: "conflict noted" }, { type: "end" }]),
       runId: "r1", frontendClient: fe, manager: mgr,
     });
-    expect(emits(fe)).toContainEqual({ run_id: "r1", type: "turn", payload: { text: "conflict noted" } });
-    expect(mgr.setStatus).toHaveBeenCalledWith("r1", "idle");
-    expect(mgr.endRun).not.toHaveBeenCalled(); // did NOT terminate
+    expect(emits(fe)).not.toContainEqual(expect.objectContaining({ type: "turn" }));
+    expect(mgr.setStatus).not.toHaveBeenCalled();
+    expect(mgr.endRun).not.toHaveBeenCalled();
   });
 });

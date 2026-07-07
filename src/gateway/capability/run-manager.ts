@@ -40,7 +40,6 @@ export interface CapabilityRunRecord {
   orgId: string;
   correlationId?: string;
   status: CapabilityLifecycleStatus;
-  sessionRef?: string;
   runtimeId?: string;
   /** Wall-clock ms of the last activity; drives the stale-run watchdog. */
   lastActivityMs: number;
@@ -73,8 +72,16 @@ export interface CapabilityRunManagerOptions {
   onAdopt?: (rec: CapabilityRunRecord) => void;
 }
 
+// A run whose reap re-check (getRun) throws is deferred to a later tick — but a
+// PERMANENT per-run throw (a poison store row that never deserializes) must not
+// defer forever and pin its box. After this many consecutive failed re-checks we
+// stop deferring and reap the run anyway.
+const MAX_REAP_DEFERRALS = 5;
+
 export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
+  // runId → consecutive failed reap re-checks; cleared on a successful re-check.
+  private reapDeferrals = new Map<string, number>();
   private readonly now: () => number;
   private readonly staleMs: number;
   private readonly idleTtlMs: number;
@@ -151,7 +158,6 @@ export class CapabilityRunManager {
         orgId: row.org_id ?? "",
         correlationId: row.correlation_id || undefined,
         runtimeId: row.runtime_id || undefined,
-        sessionRef: row.session_ref || undefined,
         status,
         lastActivityMs: this.now(),
       };
@@ -169,14 +175,18 @@ export class CapabilityRunManager {
   touch(runId: string): void {
     const rec = this.runs.get(runId);
     if (rec) rec.lastActivityMs = this.now();
+    // Real activity ⇒ not a poison row — reset any accrued reap-defer count so a
+    // later stale episode starts its give-up budget fresh.
+    this.reapDeferrals.delete(runId);
   }
 
-  // No setSessionRef: the runtime routes/recovers a run by runId and restores
-  // continuity by rehydrating the workspace FILES into a box, never by resuming
-  // the box's Claude Code session id. The box also uses an in-memory session
-  // store, so a session id wouldn't survive a container restart anyway. session_ref
-  // stays a reserved wire field (adopt/recover carry it through) for a future
-  // where the box persists sessions — until then there is deliberately no writer.
+  // No box session id anywhere: the runtime routes/recovers a run by runId and
+  // restores continuity by rehydrating the workspace FILES into a box, never by
+  // resuming the box's Claude Code session id (the box also uses an in-memory
+  // session store, so a session id wouldn't survive a container restart anyway).
+  // `session_ref` stays a reserved wire field (persisted as ""), with no record
+  // mirror and no runtime handling — a future persistent-session design would
+  // re-introduce both without a protocol change.
 
   /** Move a live run to idle/running (non-terminal) + persist. */
   async setStatus(runId: string, status: CapabilityLifecycleStatus): Promise<void> {
@@ -236,7 +246,6 @@ export class CapabilityRunManager {
           orgId: r.org_id ?? "",
           correlationId: r.correlation_id || undefined,
           runtimeId: r.runtime_id || undefined,
-          sessionRef: r.session_ref || undefined,
           status: r.status || "running",
           lastActivityMs: this.now(),
         };
@@ -289,6 +298,7 @@ export class CapabilityRunManager {
       try {
         const req: CapabilityGetRunRequest = { run_id: runId };
         const row = (await this.backend.request(CAPABILITY_GET_RUN, req)) as CapabilityRunRow | null;
+        this.reapDeferrals.delete(runId); // a successful re-check clears the poison counter
         if (row?.status && isTerminalCapabilityStatus(row.status)) {
           this.runs.delete(runId);
           continue;
@@ -299,7 +309,20 @@ export class CapabilityRunManager {
         // now would overwrite done→failed via flushTerminal, violating "a done
         // never degrades to failed". Defer to the next tick; a genuinely wedged
         // box isn't persisting anything while the store is down anyway.
-        continue;
+        //
+        // Bounded give-up (jacoblee review): a PERMANENT per-run getRun throw (a
+        // poison row that never deserializes) would defer on every tick and pin
+        // the box forever. After MAX_REAP_DEFERRALS consecutive failures, stop
+        // deferring and reap — a store outage is transient (the counter clears on
+        // the next success), so only a genuinely stuck row reaches the cap.
+        const n = (this.reapDeferrals.get(runId) ?? 0) + 1;
+        if (n < MAX_REAP_DEFERRALS) {
+          this.reapDeferrals.set(runId, n);
+          continue;
+        }
+        console.warn(`[capability] run ${runId}: reap re-check failed ${n}× — giving up the defer and reaping`);
+        this.reapDeferrals.delete(runId);
+        // fall through to reap
       }
       // Re-validate freshness AFTER the store re-check's async gap (finding A): a
       // capability.message landing during that await bumps lastActivityMs, so a
@@ -384,7 +407,10 @@ export class CapabilityRunManager {
       correlation_id: rec.correlationId ?? "",
       profile: rec.profile,
       status: rec.status,
-      session_ref: rec.sessionRef ?? "",
+      // Reserved wire field, always "" — the runtime does not track a box session
+      // id (see the note above adopt()); a future persistent-session design would
+      // re-introduce the mirror + carry-through.
+      session_ref: "",
       runtime_id: rec.runtimeId ?? "",
     };
     try {
