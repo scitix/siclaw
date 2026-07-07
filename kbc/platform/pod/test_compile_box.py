@@ -95,7 +95,68 @@ async def test_workspace_sync():
         assert await compile_box._sync_workspace(run, sent) == 1
         ev = run.events.get_nowait()
         assert [a["path"] for a in ev["artifacts"]] == ["candidate/01.md"], ev
-    print("✓ workspace sync (B5)")
+        # deleted file → tombstone (page merge/rename must not leave orphan rows)
+        (wd / "candidate" / "01.md").unlink()
+        assert await compile_box._sync_workspace(run, sent) == 1
+        ev = run.events.get_nowait()
+        assert ev["artifacts"] == [{"path": "candidate/01.md", "deleted": True}], ev
+        assert "candidate/01.md" not in sent
+        # steady state after the tombstone → no re-emit
+        assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        # a file that becomes UNCOLLECTABLE (oversized) but still exists on disk
+        # must NOT be tombstoned — deletion is judged by is_file(), not by
+        # absence from the collection.
+        (wd / "eval" / "TESTS.md").write_text("x" * (compile_box.MAX_SYNC_FILE_BYTES + 1))
+        assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        assert "eval/TESTS.md" in sent, "row kept: file exists, just oversized"
+    print("✓ workspace sync (B5) + deletion tombstones")
+
+
+def _drain_event_types(run) -> list:
+    types = []
+    while not run.events.empty():
+        types.append(run.events.get_nowait()["type"])
+    return types
+
+
+async def test_run_wrapper_terminal_signals():
+    """_run_wrapper's closing protocol: a CLEAN driver exit emits done→end (so
+    the runtime terminalizes instead of leaving the run idle to 409 forever); a
+    crash emits error→end with NO done; a cancellation emits neither (just end)
+    and propagates."""
+    orig = compile_box._COMPILE_IMPL
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            async def clean(run):
+                return None
+            compile_box._COMPILE_IMPL = clean
+            run = compile_box.CompileRun("wrap-clean", td, 1)
+            await compile_box._run_wrapper(run)
+            types = _drain_event_types(run)
+            assert types[-2:] == ["done", "end"], types
+
+            async def boom(run):
+                raise RuntimeError("boom")
+            compile_box._COMPILE_IMPL = boom
+            run = compile_box.CompileRun("wrap-boom", td, 1)
+            await compile_box._run_wrapper(run)
+            types = _drain_event_types(run)
+            assert "error" in types and "done" not in types and types[-1] == "end", types
+
+            async def cancelled(run):
+                raise asyncio.CancelledError()
+            compile_box._COMPILE_IMPL = cancelled
+            run = compile_box.CompileRun("wrap-cancel", td, 1)
+            try:
+                await compile_box._run_wrapper(run)
+                raise AssertionError("CancelledError should propagate")
+            except asyncio.CancelledError:
+                pass
+            types = _drain_event_types(run)
+            assert "done" not in types and "error" not in types and types[-1] == "end", types
+    finally:
+        compile_box._COMPILE_IMPL = orig
+    print("✓ run wrapper terminal signals: clean→done+end, crash→error+end, cancel→end only")
 
 
 # Test doubles for the Agent SDK message stream. _emit_message dispatches on
@@ -524,6 +585,7 @@ async def test_prompt_packs_locale():
 
 async def main():
     await test_workspace_sync()
+    await test_run_wrapper_terminal_signals()
     await test_session_driver_conversational()
     await test_conversational_session()
     await test_message_waits_for_connect()
@@ -629,9 +691,13 @@ async def main():
             sse = await client.get("/events/r1")
             events = await read_until(sse, "end")
             types = [e["type"] for e in events]
-            # capability-era vocabulary only: no parked, no done+bundle
-            assert "summary" in types and "turn_done" in types and types[-1] == "end", types
-            assert "parked" not in types and "done" not in types, types
+            # capability-era vocabulary: no parked, no done+bundle payload. A clean
+            # session EXIT closes done→end (explicit terminal, so the runtime never
+            # guesses from a bare end) — done carries no bundle and follows the turns.
+            assert "summary" in types and "turn_done" in types and types[-2:] == ["done", "end"], types
+            assert "parked" not in types, types
+            done_ev = next(e for e in events if e["type"] == "done")
+            assert "bundle" not in done_ev and "artifacts" not in done_ev, done_ev
             turn = next(e for e in events if e["type"] == "turn_done")
             assert turn["text"] == "compiled 1 page", turn
             # the candidate page the driver wrote is synced back as an artifact

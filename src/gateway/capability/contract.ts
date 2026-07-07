@@ -232,12 +232,24 @@ export interface CapabilityPersistTurnRequest {
  * Content sink. GENERALIZES compile.syncArtifacts + the compile.done bundle.
  * Knowledge content the box produced is written into the CONSUMER's store;
  * siclaw never persists knowledge content itself (only execution state).
+ *
+ * Deletions travel as TOMBSTONES (`deleted: true`, no content): the box's sync
+ * is per-path diffs, so without them a file the agent deleted (page merge,
+ * rename, restructure) would leave an orphan row the consumer publishes and the
+ * next workspace rehydration resurrects. The old compile.done full-bundle
+ * replace covered this implicitly; the generalization must carry it explicitly.
+ * DEPLOY ORDER: the consumer must understand `deleted` before a box that emits
+ * it rolls out — an older consumer would treat the tombstone as an empty-content
+ * upsert.
  */
 export interface CapabilityPersistArtifactRequest {
   run_id: string;
   /** Logical path within the capability workspace, e.g. "candidate/00-intro.md". */
   path: string;
-  content: CapabilityContentRef;
+  /** Present on add/update; absent when `deleted` is set. */
+  content?: CapabilityContentRef;
+  /** Tombstone: delete the row for `path` from the consumer's store. */
+  deleted?: boolean;
 }
 
 export interface CapabilityContentRef {
