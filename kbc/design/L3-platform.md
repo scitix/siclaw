@@ -77,7 +77,7 @@ siclaw's skills are already a "draft → published version → traceable" model 
 
 - **Take**: the lifecycle dot bar (draft → verified → published) / the version-timeline drawer + rollback (each version's detail = that version's "compile summary," not line-by-line diff) / the status banner / contradiction cards (borrow its "approval-card inline accordion" skeleton, replacing the content with evidence + options) / the card·drawer·dialog architecture (few pages).
 - **Drop**: line-by-line diff preview / independent-reviewer track / global contributions / skill spaces / batch.
-- **Self-contained components that can be lifted directly**: `SkillLifecycleStatus.tsx`, `components/VersionHistoryDrawer.tsx`, the status banner. Source: `/Users/sdliu/project/siclaw_main/src/gateway/web/src/pages/Skills/`.
+- **Self-contained components that can be lifted directly**: `SkillLifecycleStatus.tsx`, `components/VersionHistoryDrawer.tsx`, the status banner. Source: `src/gateway/web/src/pages/Skills/`.
 
 > ⚠️ **Visual styling is not frozen**. Only the information architecture / interaction patterns are locked; the concrete styling is decided when building the frontend.
 > Styling reference: the existing **8080 consume-face demo** "GPU selection knowledge base · evidence desk" (`~/test-gpu-kb/app/`, uvicorn gpuwiki.server), with sourced/evidence-style Q&A — or find another suitable frontend sample.
@@ -113,7 +113,7 @@ Orthogonal to "where the human reviews." v1 = run headless `claude -p` on the se
 | Capability | Implementation | Status |
 |---|---|---|
 | git storage (versions/history/diff) | `platform/forge/docker-compose.yml` (Forgejo 11) | ✅ verified |
-| Multi-tenancy (org/repo) | Forgejo org/repo | ✅ exists (single repo kbc/aliyun-fc) |
+| Multi-tenancy (org/repo) | Forgejo org/repo | ✅ exists (single repo kbc/example-kb) |
 | Auth (read/write token) | Forgejo token + `.kbc.token` / `.kbc.ro.token` | ✅ verified |
 | Read-only isolation (consumer has no write path) | Read-only token (read:repository) | ✅ verified (writes rejected with 401) |
 

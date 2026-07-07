@@ -8,7 +8,7 @@
 
 **Do not assume what the user's KB looks like** — do not assume the format (it can be a mix of ppt / spreadsheet / image / doc / md),
 do not assume the structure, **and do not assume which methodology it should use**. Our own methodology (kb-method) is one specific instance
-in the infra/SRE flavor — not a universal law — so it stays in `~/project/kb-method` as a reference constitution and does not enter this repo.
+in the infra/SRE flavor — not a universal law — so it stays in `/path/to/kb-method` as a reference constitution and does not enter this repo.
 
 The only universal assumption: `bundle_root` points to an OKF markdown tree.
 
@@ -44,7 +44,7 @@ LLM calls go through **headless Claude Code** (`tools/llm.py`, reuses Claude Cod
 .venv/bin/python tools/ingest.py --src <file or directory> --out out/ingested/
 .venv/bin/python tools/compile_loop.py --ledger out/ledger.json --ingested out/ingested/ --constitution <constitution file>
 .venv/bin/python tools/emit.py       --ledger out/ledger.json --out out/bundle/        # ledger → OKF bundle
-.venv/bin/python tools/kb_audit.py   --profile examples/profile.siflow.yaml
+.venv/bin/python tools/kb_audit.py   --profile examples/profile.minimal.yaml
 .venv/bin/python tools/kb_eval.py    --bundle out/bundle/ --questions <question-set.yaml>      # optional publish gate
 ```
 

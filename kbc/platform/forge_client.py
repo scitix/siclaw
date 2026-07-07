@@ -13,7 +13,7 @@ bridge.py 在它之上做"矛盾 ↔ issue"的翻译;worker.py 驱动整轮。
 配置走环境变量,默认指向本地开发 Forgejo:
   KBC_FORGE_URL    默认 http://localhost:3300
   KBC_FORGE_TOKEN  默认读 platform/forge/.kbc.token
-  KBC_FORGE_REPO   形如 owner/name(CLI 用),如 kbc/aliyun-fc
+  KBC_FORGE_REPO   形如 owner/name(CLI 用),如 kbc/example-kb
 """
 import argparse
 import base64
@@ -209,7 +209,7 @@ def _smoke(fc):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="forge_client —— forge REST 的哑封装 + 自检")
-    p.add_argument("--repo", default=os.environ.get("KBC_FORGE_REPO", "kbc/aliyun-fc"))
+    p.add_argument("--repo", default=os.environ.get("KBC_FORGE_REPO", "kbc/example-kb"))
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("smoke", help="端到端自检")
     pi = sub.add_parser("open-issue"); pi.add_argument("title"); pi.add_argument("body")

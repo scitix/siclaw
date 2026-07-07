@@ -39,7 +39,7 @@ def answer(version, bundle, question):
 
 def main():
     ap = argparse.ArgumentParser(description="只读消费已发布版本")
-    ap.add_argument("--repo", default="kbc/aliyun-fc")
+    ap.add_argument("--repo", default="kbc/example-kb")
     ap.add_argument("--version", required=True)
     ap.add_argument("--ask", default=None)
     ap.add_argument("--prove-readonly", action="store_true", help="证明只读:尝试写,应被拒")

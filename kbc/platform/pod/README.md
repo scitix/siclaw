@@ -29,7 +29,7 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
 
 ```bash
 # kbc repo root — one-shot form
-mkdir -p /tmp/wd/drop && cp drop/aliyun-fc/*.md /tmp/wd/drop/ && cp constitution.md /tmp/wd/
+mkdir -p /tmp/wd/drop && cp drop/example-kb/*.md /tmp/wd/drop/ && cp constitution.md /tmp/wd/
 platform/pod/.venv/bin/python platform/pod/compile_agent.py --workdir /tmp/wd
 
 # served form + protocol smoke test (fake driver, does not burn LLM)

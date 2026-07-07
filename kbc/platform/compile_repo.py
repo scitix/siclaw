@@ -5,7 +5,7 @@
 本脚本只做**编排 + 用 repo_sync 搬运**。无人值守版的推理走 headless claude(compile_loop 经 llm.py)。
 
 用法:
-  python3 platform/compile_repo.py --repo kbc/aliyun-fc --workdir /tmp/kbc-run
+  python3 platform/compile_repo.py --repo kbc/example-kb --workdir /tmp/kbc-run
 """
 import argparse
 import subprocess
@@ -54,7 +54,7 @@ def compile_repo(repo, workdir):
 
 def main():
     ap = argparse.ArgumentParser(description="编侧后端整环:repo drop → 编译 → bundle 回 repo")
-    ap.add_argument("--repo", default="kbc/aliyun-fc")
+    ap.add_argument("--repo", default="kbc/example-kb")
     ap.add_argument("--workdir", required=True)
     a = ap.parse_args()
     compile_repo(a.repo, a.workdir)

@@ -109,7 +109,7 @@ _INSTRUCTION_HEADER = {
 
 # The read-only test-session persona lives in prompts/<locale>/test_role.md —
 # deliberately a knowledge CONSUMER over the pinned wiki snapshot, so the test
-# measures the wiki, not the agent's tools (mirrors siclaw_main prompt.ts).
+# measures the wiki, not the agent's tools (mirrors siclaw prompt.ts).
 
 
 def _max_test_sessions() -> int:

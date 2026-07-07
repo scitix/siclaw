@@ -24,4 +24,4 @@ docker compose -f platform/forge/docker-compose.yml down -v    # clean (deletes 
 
 ## First-time initialization (run once after starting the container)
 
-See `platform/forge/bootstrap.sh`: create the admin, create an API token, create the test repo `aliyun-fc` and push the conflicting corpus into it.
+See `platform/forge/bootstrap.sh`: create the admin, create an API token, create the test repo `example-kb` and push the conflicting corpus into it.

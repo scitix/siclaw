@@ -110,7 +110,7 @@ def status(ledger_path, repo):
 def main(argv=None):
     p = argparse.ArgumentParser(description="bridge —— parked 矛盾 ↔ forge issue 翻译官")
     p.add_argument("--ledger", default="out/ledger.json")
-    p.add_argument("--repo", default="kbc/aliyun-fc")
+    p.add_argument("--repo", default="kbc/example-kb")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("push", help="parked 矛盾 → 开成 issue")
     sub.add_parser("pull", help="读人类回复 → 回填账本")
