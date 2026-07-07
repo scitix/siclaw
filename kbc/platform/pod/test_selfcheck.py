@@ -427,6 +427,44 @@ async def test_pk_wiring():
     print("OK  pk wiring (gating / repairing+inject / targeted retest merge / idempotent / converge phase)")
 
 
+async def test_seam_settles_when_nothing_pending():
+    """The turn seam sets converge_phase='settled' when no ledger repair, no media,
+    no PK is pending — so converge_phase is AUTHORITATIVE even with verify OFF, and
+    the frontend gates the test step on 'settled' with no config lookup."""
+    import compile_box
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+
+        class _R:  # just what _emit_message touches
+            workdir = td
+            _selfcheck_key = None
+            _l1_repairs_used = 0
+            _turn_text = ["编好了"]
+            _sync_sent = None
+            _suppress_turn_done = False
+            async def emit(self, ev):
+                pass
+            async def inject_user_message(self, t):
+                pass
+
+        class ResultMessage:  # type(msg).__name__ drives the seam
+            pass
+
+        os.environ["KBC_PK_MODE"] = "off"        # verify OFF (both layers)
+        os.environ["KBC_MEDIA_VERIFY"] = "off"
+        try:
+            await compile_box._emit_message(_R(), ResultMessage())
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            assert sc.get("converge_phase") == "settled", sc.get("converge_phase")
+        finally:
+            os.environ["KBC_PK_MODE"] = "off"
+            os.environ.pop("KBC_MEDIA_VERIFY", None)
+    print("OK  seam settles converge_phase when nothing pending (verify-off authoritative)")
+
+
 def test_converge_phase_helper():
     """set_converge_phase: writes the durable authoritative signal (verifying/
     revising/settled), preserves the L1 coverage section, ignores junk phases."""
@@ -459,6 +497,7 @@ def main():
     asyncio.run(test_wiring())
     asyncio.run(test_media_verify_wiring())
     asyncio.run(test_pk_wiring())
+    asyncio.run(test_seam_settles_when_nothing_pending())
     test_converge_phase_helper()
     print("ALL OK  test_selfcheck")
 

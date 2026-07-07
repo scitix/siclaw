@@ -1037,13 +1037,17 @@ def _pk_due(run) -> str | None:
     return "full"
 
 
-def _maybe_start_pk(run) -> None:
+def _maybe_start_pk(run) -> bool:
+    """Returns whether a PK round was started (so the turn seam can tell 'a verify
+    is now pending' from 'nothing left to do → settled')."""
     try:
         kind = _pk_due(run)
     except Exception:
-        return  # a broken due-check must never break the turn seam
+        return False  # a broken due-check must never break the turn seam
     if kind:
         run._pk_task = asyncio.get_running_loop().create_task(_run_pk_flow(run, kind))
+        return True
+    return False
 
 
 def _pk_narration(summary: dict) -> str:
@@ -1252,15 +1256,23 @@ async def _emit_message(run: CompileRun, msg) -> None:
         # repair is due, a settled draft may instead owe its one-shot image
         # numeric re-verification (same seam, same never-stuck shape).
         if repair_msg:
+            # A ledger repair is a revision-in-progress: mark it so the frontend
+            # keeps "生成与完善进行中" (converge not done) through the repair turn.
+            await _set_converge_phase(run, "revising")
             try:
                 await run.inject_user_message(repair_msg)
             except Exception as e:
                 await run.emit({"type": "summary", "text": f"自检回修注入失败: {e!r}"})
         else:
             # Seam order: ledger repairs → blind image verify → red-blue PK.
-            # Only a draft the cheaper layers are done with gets examined.
-            if not _maybe_start_media_verify(run):
-                _maybe_start_pk(run)
+            # Only a draft the cheaper layers are done with gets examined. When
+            # NOTHING is pending (verify disabled, or all layers already clean on
+            # this exact draft), the draft is stable → settled. This makes
+            # converge_phase authoritative for BOTH verify-on and verify-off, so the
+            # frontend gates the test step on `settled` with no config lookup.
+            started = _maybe_start_media_verify(run) or _maybe_start_pk(run)
+            if not started:
+                await _set_converge_phase(run, "settled")
 
 
 # Default tool whitelist for a kb-compile session, used when the runtime profile
@@ -1623,8 +1635,10 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     # Red-blue PK examines the train's FINAL state, in the background, after the
     # single logical turn has closed (never inside it — turn_done latency is
     # user-visible; the PK verdict is not urgent). _pk_due re-checks the settled
-    # gates itself, so a failed train simply doesn't qualify.
-    _maybe_start_pk(run)
+    # gates itself, so a failed train simply doesn't qualify. Nothing pending →
+    # the draft is stable (settled), same authoritative signal as the seam.
+    if not _maybe_start_pk(run):
+        await _set_converge_phase(run, "settled")
 
 
 def _note_model_activity(run: CompileRun, msg) -> None:
