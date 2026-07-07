@@ -162,6 +162,44 @@ def test_media_ledger_and_new_lint():
     print("OK  media ledger + body_source_uncited + orphan-free close + dup_candidates")
 
 
+def test_charset_corruption_detection():
+    """U+FFFD (the lossy-UTF-8-decode marker) anywhere in a page — path OR body
+    prose — must block state=passed. Body-prose corruption is INVISIBLE to the
+    coverage ledger (it only diffs paths), so this lint is the only guard against
+    silently shipping a \ufffd in published text (siflow-test 2026-07-07: 需/础/成 got
+    mangled to 3× U+FFFD by an upstream stream chunk-boundary split)."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md)")
+        # U+FFFD in BODY prose only — paths are clean, so coverage closes.
+        _mk(base, "candidate/p1.md",
+            "---\ntitle: t\ncompiled_from:\n  - s/a.md\n---\n基\ufffd设施层说明。(source: a.md)")
+        report = selfcheck.run_layer1(td)
+        # The ledger alone would ship it: coverage is closed (corruption is prose).
+        assert report["coverage"]["closed"], report["coverage"]
+        # The lint catches it → not ok → compile_box cannot set state=passed.
+        viols = [v for v in report["lint"]["violations"] if v["kind"] == "charset_corruption"]
+        assert len(viols) == 1 and viols[0]["page"] == "p1.md", report["lint"]
+        assert "第6行" in viols[0]["detail"], viols[0]["detail"]
+        assert not report["lint"]["ok"]
+        # It is surfaced to the model in the bounded repair turn.
+        assert "charset_corruption" in selfcheck.build_repair_prompt(report)
+        # A corrupted PATH is caught too (redundant with coverage's dangling, but
+        # with actionable "restore from raw" guidance instead of "fix the path").
+        _mk(base, "candidate/p1.md",
+            "---\ntitle: t\ncompiled_from:\n  - s/\ufffd.md\n---\nclean body。(source: a.md)")
+        report = selfcheck.run_layer1(td)
+        assert any(v["kind"] == "charset_corruption" for v in report["lint"]["violations"])
+        # Clean page → no charset violation, ledger closes, lint ok.
+        _mk(base, "candidate/p1.md",
+            "---\ntitle: t\ncompiled_from:\n  - s/a.md\n---\n基础设施层说明。(source: a.md)")
+        report = selfcheck.run_layer1(td)
+        assert all(v["kind"] != "charset_corruption" for v in report["lint"]["violations"])
+        assert report["lint"]["ok"] and report["coverage"]["closed"], report
+    print("OK  charset_corruption (U+FFFD) detection — path + body, blocks passed")
+
+
 def test_media_verify_helpers():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
