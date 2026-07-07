@@ -45,7 +45,7 @@ def push_bundle(repo, workdir, branch="main", message="compile: 回写 bundle + 
 def main():
     ap = argparse.ArgumentParser(description="repo ↔ 本地 的 raw/产物 搬运")
     ap.add_argument("cmd", choices=["pull", "push"])
-    ap.add_argument("--repo", default="kbc/aliyun-fc")
+    ap.add_argument("--repo", default="kbc/example-kb")
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--ref", default="main")
     a = ap.parse_args()

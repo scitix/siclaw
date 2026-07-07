@@ -1,13 +1,14 @@
-# 发布闸题集(可选)— 起步模板,按你的库写
+# Publish-gate question set (optional) — a starter template, write your own for your KB
 #
-# 陷阱题是关键:专挑"看着能答、其实该说未覆盖 / 该平铺矛盾"的题,探出脑补与口径混。
-# 编完后用:python tools/kb_eval.py --bundle bundle/ --questions questions.yaml
+# Trap questions are the point: deliberately pick questions that "look answerable but should actually say
+# not-covered / should lay out a contradiction", to surface fabrication and conflated conventions.
+# After compiling, run: python tools/kb_eval.py --bundle bundle/ --questions questions.yaml
 
 threshold: 1.0
 questions:
-  # 覆盖陷阱:问一个库里没有的细节,正确答案是"未覆盖"而非脑补
-  - q: "〔填一个你的库里查不到细节的问题〕"
-    expect: "应回答'本知识库未覆盖',不能脑补编造。"
-  # 矛盾陷阱:问一个库里源头打架的点,正确答案是平铺/按裁决,而非随便选一个
-  - q: "〔填一个源头相互矛盾的问题〕"
-    expect: "应平铺各说法并标源、或反映已裁结论,不能无视另一面直接下定论。"
+  # Coverage trap: ask for a detail the KB does not contain; the correct answer is "not covered", not fabrication
+  - q: "<fill in a question whose detail cannot be found in your KB>"
+    expect: "Should answer 'this knowledge base does not cover that' and must not fabricate."
+  # Contradiction trap: ask about a point where the sources conflict; the correct answer is to lay them out / follow the ruling, not to pick one at random
+  - q: "<fill in a question where the sources contradict each other>"
+    expect: "Should lay out each claim with its source, or reflect the adjudicated conclusion, and must not ignore one side and jump to a verdict."

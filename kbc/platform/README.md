@@ -36,6 +36,6 @@ Runs the kbc compile brain as a **Claude Agent SDK** `query()` task, containeriz
 ## Relationship to the sicore landing (important)
 
 > These are **base adapter prototypes**. **The first real landing = sicore**, which **reuses sicore's own `siclaw_knowledge` module + Temporal** and **does not use Forgejo**.
-> That landing design lives in a worktree of the sicore repo: `~/project/sicore-kb-authoring` → `docs/design/kb-authoring-platform.md`.
+> That landing design lives in a worktree of the sicore repo: the sicore repo's `docs/design/kb-authoring-platform.md`.
 > The forge set is kept as: ① an interface reference ② a standalone deployment option for non-sicore customers.
 > The `pod/` set (Agent SDK compile) **will be reused** — it is exactly what runs inside the sicore compile pod image.

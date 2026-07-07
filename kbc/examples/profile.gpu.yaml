@@ -1,9 +1,9 @@
-# 实例 A:GPU/硬件选型库(重度仪表化)—— 点亮 coverage 叶子
+# Example A: a GPU/hardware-selection KB (heavily instrumented) —— lights up the coverage leaf
 name: gpu-hardware-infra
-bundle_root: ~/project/unified-hardware-infra/wiki
-constitution: ~/project/kb-method        # infra/SRE 口味参考宪法(装载,非框架内置)
+bundle_root: /path/to/hardware-kb/wiki
+constitution: /path/to/kb-method         # an infra/SRE-flavored reference constitution (loaded, not built into the framework)
 audit:
-  reserved_extra:                          # 这库的维护/账本页,不计孤儿
+  reserved_extra:                          # this KB's maintenance / ledger pages, not counted as orphans
     - README.md
     - CLAUDE.md
     - COVERAGE.md
@@ -13,9 +13,9 @@ audit:
     - schema.md
     - purpose.md
     - PENDING.md
-    - 待澄清与求证.md
+    - TO-CLARIFY.md
   link_styles: [markdown, wikilink]
-  dimensions:                              # 叶子:这库有覆盖账本工具 → 注册
+  dimensions:                              # leaf: this KB has a coverage-ledger tool → register it
     coverage:
-      tool: ~/project/unified-hardware-infra/coverage_gen.py
+      tool: /path/to/hardware-kb/coverage_gen.py
 tools_registry: {}

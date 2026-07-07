@@ -1,25 +1,28 @@
-# Profile schema v0 — 每个知识库挂上框架的唯一实例化入口。
+# Profile schema v0 — the single instantiation entry point that attaches one knowledge base to the framework.
 #
-# 铁则:框架发"机制",不发"内容"。一切 KB 专属(它在哪、用哪份宪法、点亮哪些可选维度、
-# 注册了哪些动态造的工具)都只住在 Profile 里。框架代码里 grep 不到任何库的具体知识。
+# Hard rule: the framework ships "mechanism", not "content". Everything KB-specific (where it lives,
+# which constitution it uses, which optional dimensions it lights up, which dynamically-built tools it
+# registers) lives only in the Profile. You cannot grep any KB's concrete knowledge out of the framework code.
 #
-# 唯一普适假设 = bundle_root 指向"一棵 OKF markdown 树"。其余字段不命中就是空,空即裸库。
+# The one universal assumption = bundle_root points at "an OKF markdown tree". Any other field that is not
+# set is simply empty, and empty means a bare KB.
 
-name: <kb-id>                      # 人读的库标识
+name: <kb-id>                      # human-readable KB identifier
 
-bundle_root: <path>                # 必填:OKF bundle 目录(唯一普适假设)
+bundle_root: <path>                # required: the OKF bundle directory (the one universal assumption)
 
-constitution: <path|null>          # 宪法 = loaded-not-baked:指向哪份就是哪份;
-                                   # null 合法(无宪法的库照样能 lint)。框架不内置任何一份。
+constitution: <path|null>          # constitution = loaded-not-baked: whichever you point at is the one in force;
+                                   # null is valid (a KB with no constitution can still lint). The framework builds in none.
 
-audit:                             # 脊椎(通用 lint)永远跑;以下是它的可选旋钮 + 叶子
-  reserved_extra: []               # 除 OKF 保留名 index.md/log.md 外,额外不计孤儿的文件
-                                   # (维护/账本页等)。裸库留空。
-  link_styles: [markdown]          # 审计哪种链接约定:markdown[, wikilink]
-  dimensions: {}                   # 叶子·条件维度:Profile 注册了才跑,裸库为空。
-                                   # 例(GPU 才有,siflow 没有):
-                                   #   coverage:       { tool: <path> }       # 源→编译覆盖账本
+audit:                             # the spine (generic lint) always runs; below are its optional knobs + leaves
+  reserved_extra: []               # files, beyond the OKF reserved names index.md/log.md, that are not counted as orphans
+                                   # (maintenance / ledger pages, etc.). Leave empty for a bare KB.
+  link_styles: [markdown]          # which link convention to audit: markdown[, wikilink]
+  dimensions: {}                   # leaf · conditional dimensions: run only when the Profile registers them, empty for a bare KB.
+                                   # e.g. (present for the GPU example, absent for the minimal example):
+                                   #   coverage:       { tool: <path> }       # source→compile coverage ledger
                                    #   sensitive_scan: { tool: <path>, blocklist: <path> }
 
-tools_registry: {}                 # 动态造工具的捕获/版本登记槽:Claude Code 为本库现造的小工具
-                                   # 在此登记(名→路径/版本/校验),保证 build 可复现。裸库为空。
+tools_registry: {}                 # capture/version registry slot for dynamically-built tools: small tools Claude Code
+                                   # builds on the fly for this KB are registered here (name→path/version/checksum),
+                                   # so the build stays reproducible. Empty for a bare KB.

@@ -60,7 +60,7 @@ def publish(repo, version, bundle_dir="bundle", ledger="out/ledger.json", notes=
 
 def main():
     ap = argparse.ArgumentParser(description="发布一版(提交 bundle + 打 tag/release)")
-    ap.add_argument("--repo", default="kbc/aliyun-fc")
+    ap.add_argument("--repo", default="kbc/example-kb")
     ap.add_argument("--version", required=True, help="版本号,如 v1")
     ap.add_argument("--bundle", default="bundle")
     ap.add_argument("--ledger", default="out/ledger.json")

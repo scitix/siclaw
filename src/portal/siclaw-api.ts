@@ -57,7 +57,7 @@ import {
 import { normalizeEntry, entrySessionPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
 import { summariseLatency, extractTimingMs } from "./metrics-timing.js";
 
-/** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
+/** Trace viewer message limit — matches siclaw.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
 
 // ── MCP config import / export ────────────────────────────────
