@@ -49,6 +49,8 @@ from claude_agent_sdk import (
     InMemorySessionStore,
 )
 
+import office_ingest
+
 
 # A box usually hosts a single run; a map keeps it clean (and helps health/debugging).
 RUNS: dict[str, "CompileRun"] = {}
@@ -367,6 +369,7 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
     drop_dir = wd / "drop"
     file_count = 0
     total_bytes = 0
+    office_converted: list = []
 
     try:
         staging.mkdir(mode=0o755)
@@ -408,6 +411,15 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
         _remove_path(raw_dir)
         _remove_path(drop_dir)
         staging.rename(raw_dir)
+        # Pre-render binary office sources (.pptx/.xlsx/.docx) to a sibling
+        # `<name>.md` so the agent's Read — native for pdf/text/images — can
+        # consume them too. Per-file fail-open: a corrupt file is skipped, the
+        # original stays, and the install never aborts on one bad deck.
+        office_converted, office_errors = office_ingest.convert_tree(str(raw_dir))
+        for rel, err in office_errors:
+            print(f"[office] {rel}: conversion skipped ({err})")
+        if office_converted:
+            print(f"[office] pre-rendered {len(office_converted)} office file(s) to sibling markdown")
         try:
             drop_dir.symlink_to(raw_dir, target_is_directory=True)
         except OSError:
@@ -425,6 +437,7 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
         "bytes": total_bytes,
         "bundle_sha256": actual_sha,
         "bundle_size_bytes": len(bundle),
+        "office_converted": len(office_converted),
     }
 
 
