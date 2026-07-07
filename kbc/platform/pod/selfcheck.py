@@ -293,6 +293,24 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
                 continue
             violations.append({"page": rel, "kind": "body_source_uncited",
                                "detail": f"正文引用 (source: {f}) 但该文件不在本页 compiled_from——补登记或修正引用"})
+        # Charset integrity: U+FFFD (replacement char) is never legitimate KB
+        # content — it is the fingerprint of a LOSSY UTF-8 decode (a multibyte
+        # char split at a stream chunk boundary upstream, e.g. the model-output
+        # SSE through the gateway). It corrupts BOTH paths (the coverage ledger
+        # flags those as dangling) AND body prose — and prose corruption is
+        # INVISIBLE to the coverage ledger, so before this it shipped silently.
+        # Scan the FULL page text (frontmatter + body) so a corrupted draft can
+        # never reach state=passed → never settles / publishes with a � in it.
+        # Guidance is "restore from raw", not "rewrite": copying the damaged span
+        # keeps the damage; deleting the char drops content.
+        if "\ufffd" in text:
+            bad_lines = [i + 1 for i, ln in enumerate(text.splitlines()) if "\ufffd" in ln]
+            shown = "、".join(f"第{n}行" for n in bad_lines[:10])
+            more = f" 等共 {len(bad_lines)} 行" if len(bad_lines) > 10 else ""
+            violations.append({"page": rel, "kind": "charset_corruption",
+                               "detail": (f"含 U+FFFD 替换字符({shown}{more})——这是编码损坏"
+                                          "(多字节字符在传输中被截断),不是内容笔误;逐处定位 �,"
+                                          "对照 raw 原文判断本应是哪个字并改回,切勿照抄损坏文本、勿删字略过")})
     for rel in _orphan_pages(pages):
         violations.append({"page": rel, "kind": "orphan",
                            "detail": "从 index.md 无链可达——把它挂进 index 或相应父页;确属废页则删除"})
