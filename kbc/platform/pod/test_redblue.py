@@ -25,13 +25,17 @@ def _mk(base: Path, rel: str, text: str = "x"):
 class FakeEngine:
     """Stage-routed canned responses; counts calls per stage."""
 
-    def __init__(self, broken_stages=(), slow_verdict_from=None, drop_verdict_ids=()):
+    def __init__(self, broken_stages=(), slow_verdict_from=None, drop_verdict_ids=(),
+                 error_verdict_ids=()):
         self.calls = {"survey": 0, "questions": 0, "blue": 0, "verdict": 0}
         self.systems = {}  # stage → last system prompt seen (asymmetry assertions)
         self.users = {}    # stage → last user message seen
+        self.models = {}   # stage → last model id seen (verdict-tier assertions)
+        self.roots = {}    # stage → last allowed_read_roots seen (de-agentic assertions)
         self.broken = set(broken_stages)
         self.slow_verdict_from = slow_verdict_from  # Nth verdict call onward hangs
         self.drop_verdict_ids = set(drop_verdict_ids)  # judge "forgets" these ids
+        self.error_verdict_ids = set(error_verdict_ids)  # any chunk w/ these ids raises
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
                                  model, effort=None, allowed_read_roots, timeout_secs):
@@ -48,6 +52,10 @@ class FakeEngine:
         self.calls[stage] += 1
         self.systems[stage] = system_prompt
         self.users[stage] = user_message
+        self.models[stage] = model
+        self.roots[stage] = list(allowed_read_roots)
+        if stage == "verdict" and self.error_verdict_ids & set(re.findall(r"\[(q\d+)\]", user_message)):
+            raise RuntimeError("judge boom")  # a single chunk fails hard, others must survive
         if stage == "verdict" and self.slow_verdict_from and self.calls["verdict"] >= self.slow_verdict_from:
             await asyncio.sleep(30)  # parked until the wall clock cancels us
         if stage in self.broken:
@@ -228,6 +236,74 @@ async def test_wall_timeout_salvages_partial():
     print("OK  wall timeout → partial salvage (graded kept, cancelled not failed)")
 
 
+async def test_verdict_error_contained_no_workloss():
+    """缺陷2 regression: a verdict chunk that ERRORS must not vaporize the sibling
+    chunks that already graded (the old fail-fast gather did exactly that → 0/24
+    salvaged in prod). The run completes on its own (no wall timeout); the failed
+    chunk's ids land in ungraded WITH a stage=verdict reason. It found a genuine
+    failure (q1) on a completed run → unconverged (repairable); ungraded ≠ partial
+    here — partial is reserved for a run that was itself cut short (salvaged)."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        # 7 questions → chunks q1..q5 (grades) + q6,q7 (raises). concurrency 1 so
+        # chunk 1 is committed before chunk 2 blows up.
+        import os
+        fake = FakeEngine(error_verdict_ids={"q6"})
+        os.environ["KBC_PK_CONCURRENCY"] = "1"
+        try:
+            summary, detail = await redblue.run_pk(
+                fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+        finally:
+            del os.environ["KBC_PK_CONCURRENCY"]
+        # THE regression: chunk 1's five verdicts SURVIVED the sibling's hard error
+        assert len(detail["verdicts"]) == 5, detail["verdicts"]
+        assert summary["graded"] == 5, summary
+        assert set(summary["ungraded"]) == {"q6", "q7"}, summary
+        # the failure is OBSERVABLE: each ungraded id carries why + which stage
+        reasons = summary["ungraded_reasons"]
+        assert reasons["q6"]["stage"] == "verdict" and "boom" in reasons["q6"]["reason"], reasons
+        # the run finished on its own (contained), it did NOT ride the wall clock
+        assert summary["wall_secs"] < 20 and not summary.get("salvaged"), summary
+        # q1's real failure still counts + drives repair; q6/q7 ungraded, NOT failures
+        assert {f["id"] for f in summary["failures"]} == {"q1"}, summary["failures"]
+        assert summary["state"] == "unconverged", summary  # completed run + real failure
+    print("OK  verdict chunk error contained → graded siblings kept, reasons observable")
+
+
+async def test_verdict_deagentified():
+    """判官去 agentic (缺陷1 fix): the verdict call runs on the gate tier and is
+    fenced OUT of raw — it grades from the inlined `expected` rubric, never by
+    agentically re-reading raw (the loop that hung). survey/questions stay strong-
+    tier and raw-capable."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine()
+        await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=10,
+                             questions_budget=7,
+                             blue_model="B", judge_model="J")
+        # verdict = gate tier (default sonnet), NOT the strong authoring judge "J"
+        assert fake.models["verdict"] == "claude-sonnet-4-6", fake.models
+        assert fake.models["survey"] == "J" and fake.models["questions"] == "J", fake.models
+        assert fake.models["blue"] == "B", fake.models
+        # verdict is fenced out of raw; survey/questions keep raw for real research
+        assert raw not in fake.roots["verdict"], fake.roots["verdict"]
+        assert raw in fake.roots["survey"] and raw in fake.roots["questions"], fake.roots
+        # the verdict prompt no longer instructs raw reading
+        assert "回原始语料核对" not in fake.users["verdict"], fake.users["verdict"][:200]
+        assert "raw 真值要点" in fake.users["verdict"]  # grades from the inlined rubric
+        # KBC_PK_VERDICT_MODEL overrides the gate-tier default
+        import os
+        fake2 = FakeEngine()
+        os.environ["KBC_PK_VERDICT_MODEL"] = "opus-override"
+        try:
+            await redblue.run_pk(fake2, wiki_dir=wiki, raw_dir=raw, page_count=3,
+                                 questions_budget=2, judge_model="J")
+        finally:
+            del os.environ["KBC_PK_VERDICT_MODEL"]
+        assert fake2.models["verdict"] == "opus-override", fake2.models
+    print("OK  verdict de-agentified (gate tier, fenced out of raw, inlined rubric)")
+
+
 async def test_media_pages_steer_question_officer():
     with tempfile.TemporaryDirectory() as td:
         wiki, raw = _pk_workspace(Path(td))
@@ -317,6 +393,8 @@ def main():
     asyncio.run(test_questions_override_targeted_retest())
     asyncio.run(test_dropped_verdicts_retry_then_ungraded())
     asyncio.run(test_wall_timeout_salvages_partial())
+    asyncio.run(test_verdict_error_contained_no_workloss())
+    asyncio.run(test_verdict_deagentified())
     asyncio.run(test_media_pages_steer_question_officer())
     asyncio.run(test_broken_json_fails_open())
     asyncio.run(test_contract_artifacts_judge_only())
