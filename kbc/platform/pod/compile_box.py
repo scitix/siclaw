@@ -1188,7 +1188,8 @@ async def _post_turn_selfcheck(run) -> str | None:
         return None
     # Consume the scoped-incremental guard state once, whatever this turn's outcome
     # (a tree that didn't change → no violations possible → nothing to guard).
-    incr = run._incr_pending
+    # getattr: test doubles / non-incremental runs may not carry the attribute.
+    incr = getattr(run, "_incr_pending", None)
     run._incr_pending = None
     key = selfcheck.state_key(workdir)
     if key is None or key == run._selfcheck_key:
