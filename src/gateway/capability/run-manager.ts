@@ -6,7 +6,7 @@
  * in-memory AND persists each transition to the consumer's opaque store via
  * `capability.persistRunState`. On boot it recovers in-flight runs via
  * `capability.listActiveRuns`, and a watchdog fails runs that went stale without
- * a terminal signal — the same durability the sicore compile state machine gave,
+ * a terminal signal — the same durability the consumer's compile state machine gave,
  * but now OWNED BY SICLAW with the consumer as a dumb backing store.
  *
  * ⚠️ B2a: this is the run-lifecycle + persistence core. Box spawning/driving and

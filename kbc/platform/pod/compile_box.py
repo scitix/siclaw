@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """compile_box — the served form of the compile box: a "cloud Claude Code"
 spawned by the siclaw runtime and driven over the box's own HTTP+SSE contract
-(the runtime translates events into generic capability.* for consumers, e.g. sicore).
+(the runtime translates events into generic capability.* for consumers, e.g. a downstream platform).
 
 Shape: the box is 90% "headless Claude Code behind a wrapped entrypoint" (Agent
 SDK = Claude Code as a library; engine/tools/compaction reused verbatim); the
@@ -155,7 +155,7 @@ class CompileRun:
         # hits the SDK's "Not connected. Call connect() first." error.
         self.connected: asyncio.Event = asyncio.Event()
         # Assistant text accumulated for the in-flight turn; flushed into the
-        # turn_done event so sicore can persist the whole assistant reply.
+        # turn_done event so the consumer can persist the whole assistant reply.
         self._turn_text: list[str] = []
 
     async def emit(self, ev: dict):
@@ -195,7 +195,7 @@ class TestRun:
 def _pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
     """Pin the current draft: copy {workdir}/candidate/*.md|.json into
     {dest}/.siclaw/knowledge/ with the `candidate/` prefix stripped
-    (candidate/index.md → index.md), mirroring sicore's
+    (candidate/index.md → index.md), mirroring the consumer's
     buildPublishBundleFromCandidates so the test reads BYTE-IDENTICALLY to what a
     publish would serve. Returns (sha256 over sorted relpath+content, page_count).
     Raises FileNotFoundError if there are no candidate pages or no root index.md."""
@@ -237,11 +237,11 @@ def _pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
     return h.hexdigest(), count
 
 
-# ── B5: mid-compile workspace sync back to sicore ──
+# ── B5: mid-compile workspace sync back to the consumer ──
 # The agent writes candidate/PLAN/eval into /work (an emptyDir). Without syncing
 # them back, a box crash loses all in-progress work and a resume restarts from
 # the frozen authoring snapshot. A periodic sync streams changed workspace files
-# to sicore (compile.syncArtifacts) so the work is durable and a resumed box can
+# to the consumer (compile.syncArtifacts) so the work is durable and a resumed box can
 # bootstrap from the latest state instead of restarting.
 WORKSPACE_SYNC_DIRS = ("authoring", "candidate", "eval", "release")
 SYNC_INTERVAL_SECS = int(os.environ.get("KBC_SYNC_INTERVAL_SECS", "20"))
@@ -602,7 +602,7 @@ def _seed_workdir(workdir: str):
 
 
 async def _smoke_compile(run: CompileRun):
-    """KBC_SMOKE=1: prove the sicore↔runtime↔box wiring (live events + artifact
+    """KBC_SMOKE=1: prove the consumer↔runtime↔box wiring (live events + artifact
     sync + turn persistence) in-cluster WITHOUT calling an LLM (the real compile
     is validated separately). Speaks only the capability-era event vocabulary."""
     await run.emit({"type": "summary", "summary": "[smoke] wiring check — no LLM"})
@@ -617,7 +617,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
     """Relay one Agent SDK message to the SSE stream. Assistant text becomes the
     live chat (`log`) stream AND is accumulated for the turn; a ResultMessage
     marks the turn's end, flushing the accumulated text into `turn_done.text` so
-    sicore can persist the whole assistant reply (and the UI knows it's idle)."""
+    the consumer can persist the whole assistant reply (and the UI knows it's idle)."""
     name = type(msg).__name__
     if name == "AssistantMessage":
         for block in getattr(msg, "content", []) or []:

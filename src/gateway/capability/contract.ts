@@ -1,7 +1,7 @@
 /**
  * Capability contract — the generic, capability-agnostic protocol between a
  * siclaw runtime capability (a profile-shaped box driven by the runtime) and a
- * consumer control plane (sicore, gpu-cloud, ...).
+ * consumer control plane (any downstream platform).
  *
  * This GENERALIZES the deleted compile.* bolt-on into ONE vocabulary, so a
  * consumer implements a single thin adapter instead of a bespoke protocol per
@@ -17,7 +17,7 @@
  * ── WIRE RULE ─────────────────────────────────────────────────────────────────
  * Every interface below IS the wire shape: field names are snake_case, exactly
  * as serialized on the WS frames and parsed by the Go consumer adapter
- * (sicore internal/siclaw/capability/contract.go mirrors these). Producers and
+ * (the consumer's Go adapter mirrors these in its own contract.go). Producers and
  * handlers MUST build/read payloads through these types — do not hand-write
  * payload literals with other casings; a mismatched key is read as a zero value
  * on the other side and the data is silently dropped.

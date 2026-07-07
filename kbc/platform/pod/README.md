@@ -3,7 +3,7 @@
 The siclaw platform's **compile box**: runs the kbc compile brain as a **Claude Agent SDK** persistent session = a "headless
 Claude Code with a wrapped entry point". The engine / tools / compact are not rewritten by a single line; it only adds structured-signal tools for the kbc moat.
 Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to start it per BoxProfile
-(`kb-compile` / `kb-test`), and events are translated by the runtime into the generic `capability.*` and forwarded to consumers (sicore, etc.).
+(`kb-compile` / `kb-test`), and events are translated by the runtime into the generic `capability.*` and forwarded to consumers (a downstream platform, etc.).
 
 ## Two forms (same brain)
 
