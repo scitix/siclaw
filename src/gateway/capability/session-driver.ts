@@ -9,7 +9,7 @@
  * This is the capability-native replacement for compile-driver's relayBoxEvents
  * (which still speaks compile.* and stays in use until B3 deletes the old path).
  * Contradiction handling is a normal turn, so there is NO parked/awaiting_input
- * frame — a box `parked` (vestigial) is treated as a turn that returned to idle.
+ * frame — the box never emits `parked`, so there is no handler for it.
  */
 
 import type { AgentBoxClient } from "../agentbox/client.js";
@@ -22,7 +22,12 @@ import type {
   CapabilityPersistArtifactRequest,
   CapabilityPersistTurnRequest,
 } from "./contract.js";
-import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACT, CAPABILITY_PERSIST_TURN } from "./contract.js";
+import {
+  CAPABILITY_EVENT,
+  CAPABILITY_PERSIST_ARTIFACT,
+  CAPABILITY_PERSIST_TURN,
+  isTerminalCapabilityStatus,
+} from "./contract.js";
 
 interface BoxEvent {
   type: string;
@@ -30,7 +35,8 @@ interface BoxEvent {
   message?: string;
   text?: string;
   error?: string;
-  artifacts?: Array<{ path: string; content: string }>;
+  /** `deleted` entries are tombstones — the box removed a previously-synced file. */
+  artifacts?: Array<{ path: string; content?: string; deleted?: boolean }>;
 }
 
 export interface DriveCapabilitySessionOptions {
@@ -88,11 +94,17 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         // content hash, so this exact version is only re-sent if the file changes
         // again. Hence one retry, then a loud log.
         for (const a of evt.artifacts ?? []) {
-          const artifact: CapabilityPersistArtifactRequest = {
-            run_id: runId,
-            path: a.path,
-            content: { inline_base64: Buffer.from(a.content, "utf8").toString("base64") },
-          };
+          const artifact: CapabilityPersistArtifactRequest = a.deleted
+            ? // Tombstone: the box deleted this file (page merge/rename/restructure).
+              // Without propagating it, the consumer's row outlives the file —
+              // publish ships the deleted page and the next respawn's workspace
+              // rehydration resurrects it onto the box's disk.
+              { run_id: runId, path: a.path, deleted: true }
+            : {
+                run_id: runId,
+                path: a.path,
+                content: { inline_base64: Buffer.from(a.content ?? "", "utf8").toString("base64") },
+              };
           try {
             await frontendClient.request(CAPABILITY_PERSIST_ARTIFACT, artifact);
           } catch {
@@ -108,12 +120,6 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
           }
         }
         break;
-      case "parked":
-        // Vestigial: the contradiction-as-turn model never blocks. Treat like a
-        // turn that returned to idle so a stray park can't wedge the run.
-        emit("turn", { text: evt.message ?? "" });
-        await manager.setStatus(runId, "idle");
-        break;
       case "done":
         emit("lifecycle", { status: "done" });
         await manager.endRun(runId, "done");
@@ -122,9 +128,25 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         emit("lifecycle", { status: "failed", error: evt.error ?? "" });
         await manager.endRun(runId, "failed");
         break;
-      case "end":
+      case "end": {
+        // The box's session coroutine exited (clean stream close: max_turns
+        // exhaustion, subprocess EOF). This run can never take another turn —
+        // the box keeps its RUNS entry with a dead client, so every /message
+        // 409s. Left non-terminal it wedges the consumer for the whole idle TTL
+        // (find-or-start only replaces TERMINAL runs) and the watchdog then
+        // blesses the dead session as a 2h-idle "done". Terminalize now instead:
+        // the consumer starts a fresh run on the next message and the workspace
+        // rehydrates — the designed recovery path. endRun is sticky, so a done/
+        // error that arrived before `end` keeps its outcome; the lifecycle frame
+        // is skipped in that case to avoid a duplicate.
+        const rec = manager.get(runId);
+        if (rec && !isTerminalCapabilityStatus(rec.status)) {
+          emit("lifecycle", { status: "done" });
+        }
+        await manager.endRun(runId, "done");
+        break;
+      }
       default:
-        // end is box-local; the live stream already carried the content.
         break;
     }
   }

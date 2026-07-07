@@ -1,23 +1,23 @@
-# 本库裁决纪律(constitution)— 起步模板,按你的库改
+# This KB's adjudication discipline (constitution) — starter template, adapt to your KB
 
-> 这是**装载给编译器的规则**。编译器只照这里裁决,不脑补。
-> 下面是常见默认项,按你这个库的领域**增删改**——它们不是普世法,是你这个库的约定。
+> This is **the rule set loaded into the compiler**. The compiler adjudicates strictly by what's here; it does not fabricate.
+> Below are common defaults; **add/remove/edit** them for your KB's domain — they are not universal law, they are your KB's conventions.
 
-## 不变量(建议保留)
+## Invariants (recommended to keep)
 
-- **溯源**:每条结论可回链到原始文档里的具体位置。
-- **边界诚实**:库里查不到的 → 答"未覆盖",不借库外常识补。
-- **存疑不硬编**:信息不足以判定的,不写成事实,升级问人。
+- **Provenance**: every conclusion can be linked back to a specific location in the raw sources.
+- **Boundary honesty**: anything not findable in the KB → answer "not covered"; don't patch it with outside-the-KB common sense.
+- **Do not hard-code the doubtful**: when the information is insufficient to decide, don't write it as fact; escalate and ask.
 
-## 矛盾裁法(编译器据此:能归并的自动裁,归并不了的升级问人)
+## Contradiction rulings (the compiler acts on these: auto-adjudicate what can merge, escalate what cannot)
 
-- **可并列**:同一指标多个取值、但产生条件不同(口径 / 版本 / 配置 / 时点)
-  → 并列保留各取值、各挂其条件,**不升级**。
-- **笔误**:明显的排版 / 单位笔误 → 直接标记修正,**不升级**。
-- **其余真冲突**(同一事实相互矛盾、无法靠上面归并)→ **升级**,问领域专家。
+- **Can coexist side by side**: the same metric has multiple values, but under different conditions (convention / version / configuration / point in time)
+  → keep each value side by side, each hung on its condition, **do not escalate**.
+- **Typo**: an obvious typesetting / unit typo → mark the correction directly, **do not escalate**.
+- **All other genuine conflicts** (the same fact contradicts itself and can't be merged by the above) → **escalate**, ask a domain expert.
 
-## 旋钮(可选,按需开)
+## Knobs (optional, turn on as needed)
 
-- **敏感**:若文档含凭据 / 隐私 / 客户数据,在此声明红线(哪些不得进产出)。
-- **证据等级**:若同一断言有多级来源(实测 / 厂商标称 / 传闻),在此定优先级。
-- **留白**:某些区块"暂不编",在此声明,编译器标"未覆盖"而非硬编。
+- **Sensitive**: if the documents contain credentials / privacy / customer data, declare the red lines here (what must not enter the output).
+- **Evidence level**: if the same assertion has multi-tier sources (measured / vendor-stated / hearsay), set the priority here.
+- **Leave-blank**: for blocks that are "not to be compiled for now", declare it here; the compiler marks them "not covered" rather than hard-coding.

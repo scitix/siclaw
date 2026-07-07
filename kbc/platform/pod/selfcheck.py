@@ -315,6 +315,7 @@ def pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
     relpath+content, page_count). Raises FileNotFoundError if there are no
     candidate pages or no root index.md."""
     candidate = Path(workdir) / "candidate"
+    candidate_real = candidate.resolve()
     kdir = dest / ".siclaw" / "knowledge"
     kdir.mkdir(parents=True, exist_ok=True)
     pages: list[tuple[str, bytes]] = []
@@ -323,6 +324,15 @@ def pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
             continue
         rel = f.relative_to(candidate)
         if ".." in rel.parts:
+            continue
+        # Symlink confinement (security): is_file() follows symlinks and rglob can
+        # descend a symlinked dir, so a compile session (Write+Bash) could
+        # `ln -s /etc/passwd candidate/leak.md` and leak host-file content into the
+        # read-only snapshot. Pack only files whose REAL path stays under candidate/
+        # — covers both file symlinks and symlinked directories.
+        try:
+            f.resolve().relative_to(candidate_real)
+        except (ValueError, OSError):
             continue
         rel_posix = rel.as_posix()
         data = f.read_bytes()

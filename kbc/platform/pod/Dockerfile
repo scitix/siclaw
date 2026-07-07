@@ -14,7 +14,10 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir claude-agent-sdk aiohttp
+# claude-agent-sdk + aiohttp = the box runtime; python-pptx/openpyxl/python-docx
+# let office_ingest pre-render .pptx/.xlsx/.docx sources to markdown (pdf/text/
+# images are read natively by the agent's Read tool, so no parser is needed there).
+RUN pip install --no-cache-dir claude-agent-sdk aiohttp python-pptx openpyxl python-docx
 
 WORKDIR /app
 # CLAUDE.md is only for the legacy CLI (compile_agent.py walks parents for it).
@@ -24,6 +27,7 @@ WORKDIR /app
 COPY CLAUDE.md /app/CLAUDE.md
 COPY platform/pod/compile_agent.py /app/compile_agent.py
 COPY platform/pod/compile_box.py /app/compile_box.py
+COPY platform/pod/office_ingest.py /app/office_ingest.py
 COPY platform/pod/selfcheck.py /app/selfcheck.py
 COPY platform/pod/engine.py /app/engine.py
 COPY platform/pod/redblue.py /app/redblue.py

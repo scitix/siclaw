@@ -6,7 +6,7 @@
  * in-memory AND persists each transition to the consumer's opaque store via
  * `capability.persistRunState`. On boot it recovers in-flight runs via
  * `capability.listActiveRuns`, and a watchdog fails runs that went stale without
- * a terminal signal — the same durability the sicore compile state machine gave,
+ * a terminal signal — the same durability the consumer's compile state machine gave,
  * but now OWNED BY SICLAW with the consumer as a dumb backing store.
  *
  * ⚠️ B2a: this is the run-lifecycle + persistence core. Box spawning/driving and
@@ -40,7 +40,6 @@ export interface CapabilityRunRecord {
   orgId: string;
   correlationId?: string;
   status: CapabilityLifecycleStatus;
-  sessionRef?: string;
   runtimeId?: string;
   /** Wall-clock ms of the last activity; drives the stale-run watchdog. */
   lastActivityMs: number;
@@ -73,8 +72,16 @@ export interface CapabilityRunManagerOptions {
   onAdopt?: (rec: CapabilityRunRecord) => void;
 }
 
+// A run whose reap re-check (getRun) throws is deferred to a later tick — but a
+// PERMANENT per-run throw (a poison store row that never deserializes) must not
+// defer forever and pin its box. After this many consecutive failed re-checks we
+// stop deferring and reap the run anyway.
+const MAX_REAP_DEFERRALS = 5;
+
 export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
+  // runId → consecutive failed reap re-checks; cleared on a successful re-check.
+  private reapDeferrals = new Map<string, number>();
   private readonly now: () => number;
   private readonly staleMs: number;
   private readonly idleTtlMs: number;
@@ -151,7 +158,6 @@ export class CapabilityRunManager {
         orgId: row.org_id ?? "",
         correlationId: row.correlation_id || undefined,
         runtimeId: row.runtime_id || undefined,
-        sessionRef: row.session_ref || undefined,
         status,
         lastActivityMs: this.now(),
       };
@@ -169,21 +175,30 @@ export class CapabilityRunManager {
   touch(runId: string): void {
     const rec = this.runs.get(runId);
     if (rec) rec.lastActivityMs = this.now();
+    // Real activity ⇒ not a poison row — reset any accrued reap-defer count so a
+    // later stale episode starts its give-up budget fresh.
+    this.reapDeferrals.delete(runId);
   }
 
-  /** Record the box session id (for resume) + persist. */
-  async setSessionRef(runId: string, sessionRef: string): Promise<void> {
-    const rec = this.runs.get(runId);
-    if (!rec) return;
-    rec.sessionRef = sessionRef;
-    rec.lastActivityMs = this.now();
-    await this.persist(rec);
-  }
+  // No box session id anywhere: the runtime routes/recovers a run by runId and
+  // restores continuity by rehydrating the workspace FILES into a box, never by
+  // resuming the box's Claude Code session id (the box also uses an in-memory
+  // session store, so a session id wouldn't survive a container restart anyway).
+  // `session_ref` stays a reserved wire field (persisted as ""), with no record
+  // mirror and no runtime handling — a future persistent-session design would
+  // re-introduce both without a protocol change.
 
   /** Move a live run to idle/running (non-terminal) + persist. */
   async setStatus(runId: string, status: CapabilityLifecycleStatus): Promise<void> {
     const rec = this.runs.get(runId);
     if (!rec) return;
+    // Terminal is sticky — mirror endRun. A record can sit here in a TERMINAL
+    // state while its final persist retries (flushTerminal). capability.message
+    // calls setStatus("running") after two awaits (ensure session + POST
+    // /message), so a done/error/cancel landing in that window must not be
+    // flipped back to non-terminal — that would hide the record from
+    // flushTerminal and degrade the true outcome to a watchdog "failed".
+    if (isTerminalCapabilityStatus(rec.status)) return;
     rec.status = status;
     rec.lastActivityMs = this.now();
     await this.persist(rec);
@@ -238,7 +253,6 @@ export class CapabilityRunManager {
           orgId: r.org_id ?? "",
           correlationId: r.correlation_id || undefined,
           runtimeId: r.runtime_id || undefined,
-          sessionRef: r.session_ref || undefined,
           status: r.status || "running",
           lastActivityMs: this.now(),
         };
@@ -254,23 +268,32 @@ export class CapabilityRunManager {
   }
 
   /**
+   * The terminal outcome a run has EARNED by its staleness right now, or null if
+   * it is still fresh. Shared by reapStale's initial snapshot AND its post-await
+   * re-validation (finding A) so both judge freshness by exactly the same rule:
+   *   - running past staleMs  → failed
+   *   - idle    past idleTtlMs → done
+   */
+  private stalenessOutcome(rec: CapabilityRunRecord, now: number): CapabilityTerminalStatus | null {
+    if (isTerminalCapabilityStatus(rec.status)) return null;
+    const idle = rec.status === "idle";
+    if (rec.lastActivityMs >= now - (idle ? this.idleTtlMs : this.staleMs)) return null;
+    return idle ? "done" : "failed";
+  }
+
+  /**
    * Reap non-terminal runs that outlived their tier's TTL (stop box + persist a
    * terminal state). Two very different kinds of stale:
    *   - running past staleMs  = a wedged turn            → failed
    *   - idle    past idleTtlMs = a conversation at rest  → done (normal end)
    */
   async reapStale(): Promise<string[]> {
-    const now = this.now();
-    const candidates: Array<{ runId: string; outcome: CapabilityTerminalStatus }> = [];
+    const candidates: string[] = [];
     for (const rec of [...this.runs.values()]) {
-      if (isTerminalCapabilityStatus(rec.status)) continue;
-      const idle = rec.status === "idle";
-      if (rec.lastActivityMs < now - (idle ? this.idleTtlMs : this.staleMs)) {
-        candidates.push({ runId: rec.runId, outcome: idle ? "done" : "failed" });
-      }
+      if (this.stalenessOutcome(rec, this.now())) candidates.push(rec.runId);
     }
     const reaped: string[] = [];
-    for (const { runId, outcome } of candidates) {
+    for (const runId of candidates) {
       const rec = this.runs.get(runId);
       if (!rec) continue;
       // A candidate can be a resurrection artifact: recover()'s active-run
@@ -282,14 +305,39 @@ export class CapabilityRunManager {
       try {
         const req: CapabilityGetRunRequest = { run_id: runId };
         const row = (await this.backend.request(CAPABILITY_GET_RUN, req)) as CapabilityRunRow | null;
+        this.reapDeferrals.delete(runId); // a successful re-check clears the poison counter
         if (row?.status && isTerminalCapabilityStatus(row.status)) {
           this.runs.delete(runId);
           continue;
         }
       } catch {
-        // store unreachable — proceed; a wrong failed persist would be retried
-        // and the store row is non-terminal anyway if we got here at boot.
+        // Store unreachable (finding B): we can't confirm this run didn't already
+        // end. A resurrection artifact could be `done` in the store — reaping it
+        // now would overwrite done→failed via flushTerminal, violating "a done
+        // never degrades to failed". Defer to the next tick; a genuinely wedged
+        // box isn't persisting anything while the store is down anyway.
+        //
+        // Bounded give-up (jacoblee review): a PERMANENT per-run getRun throw (a
+        // poison row that never deserializes) would defer on every tick and pin
+        // the box forever. After MAX_REAP_DEFERRALS consecutive failures, stop
+        // deferring and reap — a store outage is transient (the counter clears on
+        // the next success), so only a genuinely stuck row reaches the cap.
+        const n = (this.reapDeferrals.get(runId) ?? 0) + 1;
+        if (n < MAX_REAP_DEFERRALS) {
+          this.reapDeferrals.set(runId, n);
+          continue;
+        }
+        console.warn(`[capability] run ${runId}: reap re-check failed ${n}× — giving up the defer and reaping`);
+        this.reapDeferrals.delete(runId);
+        // fall through to reap
       }
+      // Re-validate freshness AFTER the store re-check's async gap (finding A): a
+      // capability.message landing during that await bumps lastActivityMs, so a
+      // run snapshotted as stale can be active again by now. Reaping it here would
+      // kill a live turn AND mark the fresh run failed. Re-derive against the
+      // current record; if it's no longer stale, leave it for a later tick.
+      const outcome = this.stalenessOutcome(rec, this.now());
+      if (!outcome) continue;
       console.warn(`[capability] watchdog reaping stale run ${runId} → ${outcome}`);
       if (this.onReap) {
         // Stop the run's box BEFORE the terminal mark, so the store never says
@@ -366,7 +414,10 @@ export class CapabilityRunManager {
       correlation_id: rec.correlationId ?? "",
       profile: rec.profile,
       status: rec.status,
-      session_ref: rec.sessionRef ?? "",
+      // Reserved wire field, always "" — the runtime does not track a box session
+      // id (see the note above adopt()); a future persistent-session design would
+      // re-introduce the mirror + carry-through.
+      session_ref: "",
       runtime_id: rec.runtimeId ?? "",
     };
     try {

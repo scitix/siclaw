@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """compile_box — the served form of the compile box: a "cloud Claude Code"
 spawned by the siclaw runtime and driven over the box's own HTTP+SSE contract
-(the runtime translates events into generic capability.* for consumers, e.g. sicore).
+(the runtime translates events into generic capability.* for consumers, e.g. a downstream platform).
 
 Shape: the box is 90% "headless Claude Code behind a wrapped entrypoint" (Agent
 SDK = Claude Code as a library; engine/tools/compaction reused verbatim); the
@@ -50,6 +50,7 @@ from claude_agent_sdk import (
     InMemorySessionStore,
 )
 
+import office_ingest
 import selfcheck
 
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches
@@ -164,7 +165,7 @@ class CompileRun:
         # hits the SDK's "Not connected. Call connect() first." error.
         self.connected: asyncio.Event = asyncio.Event()
         # Assistant text accumulated for the in-flight turn; flushed into the
-        # turn_done event so sicore can persist the whole assistant reply.
+        # turn_done event so the consumer can persist the whole assistant reply.
         self._turn_text: list[str] = []
         # Layer-1 self-check bookkeeping (selfcheck.py): idempotency key of the
         # last checked state (skip re-check when nothing changed) and repair
@@ -218,11 +219,11 @@ class TestRun:
 _pack_candidates_to_wiki = selfcheck.pack_candidates_to_wiki
 
 
-# ── B5: mid-compile workspace sync back to sicore ──
+# ── B5: mid-compile workspace sync back to the consumer ──
 # The agent writes candidate/PLAN/eval into /work (an emptyDir). Without syncing
 # them back, a box crash loses all in-progress work and a resume restarts from
 # the frozen authoring snapshot. A periodic sync streams changed workspace files
-# to sicore (compile.syncArtifacts) so the work is durable and a resumed box can
+# to the consumer (compile.syncArtifacts) so the work is durable and a resumed box can
 # bootstrap from the latest state instead of restarting.
 WORKSPACE_SYNC_DIRS = ("authoring", "candidate", "eval", "release")
 SYNC_INTERVAL_SECS = int(os.environ.get("KBC_SYNC_INTERVAL_SECS", "20"))
@@ -254,14 +255,32 @@ def _collect_workspace_artifacts(workdir: str) -> list[dict]:
 
 async def _sync_workspace(run: CompileRun, sent: dict) -> int:
     """Emit a syncArtifacts event for workspace files changed since `sent`
-    (path → content sha). Updates `sent`; returns the number of changed files."""
+    (path → content sha), plus TOMBSTONES ({path, deleted: true}) for
+    previously-synced files that no longer exist on disk. Updates `sent`;
+    returns the number of changed entries."""
     changed = []
+    collected = set()
     for art in _collect_workspace_artifacts(run.workdir):
+        collected.add(art["path"])
         sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
         if sent.get(art["path"]) == sha:
             continue
         sent[art["path"]] = sha
         changed.append(art)
+    # Tombstones: a previously-synced file the agent deleted (page merge, rename,
+    # restructure) must be deleted from the consumer's store too — otherwise the
+    # orphan row gets published and the next respawn's workspace rehydration puts
+    # the file back on disk, silently undoing the deletion. Judged by is_file(),
+    # NOT by absence from the collection: a file that merely became oversized or
+    # binary is skipped by the collector but still exists, and must keep its
+    # last-synced row. `sent` scopes the sweep to paths this box life actually
+    # synced, so a store row that never materialized here can't be tombstoned.
+    wd = Path(run.workdir)
+    for path in [p for p in sent if p not in collected]:
+        if (wd / path).is_file():
+            continue  # still on disk, just not collectable — keep the row
+        del sent[path]
+        changed.append({"path": path, "deleted": True})
     if changed:
         await run.emit({"type": "syncArtifacts", "artifacts": changed})
     return len(changed)
@@ -332,6 +351,7 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
     drop_dir = wd / "drop"
     file_count = 0
     total_bytes = 0
+    office_converted: list = []
 
     try:
         staging.mkdir(mode=0o755)
@@ -373,6 +393,15 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
         _remove_path(raw_dir)
         _remove_path(drop_dir)
         staging.rename(raw_dir)
+        # Pre-render binary office sources (.pptx/.xlsx/.docx) to a sibling
+        # `<name>.md` so the agent's Read — native for pdf/text/images — can
+        # consume them too. Per-file fail-open: a corrupt file is skipped, the
+        # original stays, and the install never aborts on one bad deck.
+        office_converted, office_errors = office_ingest.convert_tree(str(raw_dir))
+        for rel, err in office_errors:
+            print(f"[office] {rel}: conversion skipped ({err})")
+        if office_converted:
+            print(f"[office] pre-rendered {len(office_converted)} office file(s) to sibling markdown")
         try:
             drop_dir.symlink_to(raw_dir, target_is_directory=True)
         except OSError:
@@ -390,6 +419,7 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
         "bytes": total_bytes,
         "bundle_sha256": actual_sha,
         "bundle_size_bytes": len(bundle),
+        "office_converted": len(office_converted),
     }
 
 
@@ -579,7 +609,7 @@ def _seed_workdir(workdir: str):
 
 
 async def _smoke_compile(run: CompileRun):
-    """KBC_SMOKE=1: prove the sicore↔runtime↔box wiring (live events + artifact
+    """KBC_SMOKE=1: prove the consumer↔runtime↔box wiring (live events + artifact
     sync + turn persistence) in-cluster WITHOUT calling an LLM (the real compile
     is validated separately). Speaks only the capability-era event vocabulary."""
     await run.emit({"type": "summary", "summary": "[smoke] wiring check — no LLM"})
@@ -633,7 +663,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
     """Relay one Agent SDK message to the SSE stream. Assistant text becomes the
     live chat (`log`) stream AND is accumulated for the turn; a ResultMessage
     marks the turn's end, flushing the accumulated text into `turn_done.text` so
-    sicore can persist the whole assistant reply (and the UI knows it's idle)."""
+    the consumer can persist the whole assistant reply (and the UI knows it's idle)."""
     name = type(msg).__name__
     if name == "AssistantMessage":
         for block in getattr(msg, "content", []) or []:
@@ -757,12 +787,20 @@ async def run_session(run: CompileRun):
 
 async def _run_wrapper(run: CompileRun):
     """Unified lifecycle: run the driver + periodically sync mid-flight state →
-    catch-all error → always finish with end."""
+    catch-all error → always finish with end. A CLEAN driver exit (max_turns
+    exhaustion, subprocess EOF) additionally emits an explicit `done` before
+    `end`: the session can never take another turn, and a bare `end` left the
+    runtime guessing — the run lingered idle, 409'd every /message, and was
+    eventually mislabeled by the idle watchdog. Cancellation (CancelledError)
+    bypasses both the except and the `clean` flag, so a cancelled run still
+    closes with just `end`."""
     sent: dict = {}
+    clean = False
     run._sync_sent = sent  # shared with _emit_message's pre-turn_done sync
     syncer = asyncio.create_task(_sync_loop(run, sent))
     try:
         await _COMPILE_IMPL(run)
+        clean = True
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
         await run.emit({"type": "error", "error": repr(e)})
     finally:
@@ -776,7 +814,10 @@ async def _run_wrapper(run: CompileRun):
         try:
             await _sync_workspace(run, sent)
         except Exception as e:
+            clean = False
             await run.emit({"type": "error", "error": f"final workspace sync failed: {e!r}"})
+        if clean:
+            await run.emit({"type": "done"})
         await run.emit({"type": "end"})
 
 

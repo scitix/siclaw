@@ -131,7 +131,12 @@ export class K8sSpawner implements BoxSpawner {
         console.log(
           `[k8s-spawner] Removing stale pod ${podName} (phase: ${phase}, profile: ${existingProfile}→${profile.name})`,
         );
-        await this.coreApi.deleteNamespacedPod({ name: podName, namespace }).catch(() => {});
+        // Let delete errors reach the outer catch, which swallows 404 (pod
+        // already gone) and rethrows everything else (finding F): a blanket
+        // `.catch(() => {})` here turned a real API error — RBAC, etc. — into a
+        // waitForPodDeleted timeout instead of a clear failure. Consistent with
+        // the CA-mismatch delete below, which never swallowed.
+        await this.coreApi.deleteNamespacedPod({ name: podName, namespace });
         // Wait for pod to be fully deleted
         await this.waitForPodDeleted(podName, namespace);
       } else if (phase === "Running" || phase === "Pending") {
@@ -417,16 +422,23 @@ export class K8sSpawner implements BoxSpawner {
                 (v) => ({ name: v.name, mountPath: v.mountPath }) as k8s.V1VolumeMount,
               ),
             ],
-            resources: {
-              requests: {
-                cpu: boxConfig.resources?.cpu || "100m",
-                memory: boxConfig.resources?.memory || "256Mi",
-              },
-              limits: {
-                cpu: boxConfig.resources?.cpu || "2000m",
-                memory: boxConfig.resources?.memory || "4Gi",
-              },
-            },
+            // Per-call resources win; the BoxProfile's resources are the fallback
+            // (jacoblee review: profile.resources was declared but read nowhere,
+            // so a memory-hungry profile silently got the default limit and could
+            // OOM). Same precedence as profile.image / profile.volumes above.
+            resources: (() => {
+              const res = boxConfig.resources ?? profile.resources;
+              return {
+                requests: {
+                  cpu: res?.cpu || "100m",
+                  memory: res?.memory || "256Mi",
+                },
+                limits: {
+                  cpu: res?.cpu || "2000m",
+                  memory: res?.memory || "4Gi",
+                },
+              };
+            })(),
             readinessProbe: {
               httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
               initialDelaySeconds: 2,

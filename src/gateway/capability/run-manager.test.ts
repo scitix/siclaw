@@ -46,18 +46,16 @@ describe("CapabilityRunManager", () => {
     ]);
   });
 
-  it("setSessionRef + setStatus persist each transition", async () => {
+  it("setStatus persists the transition", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
     const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
 
-    await mgr.setSessionRef(runId, "sess-9");
     await mgr.setStatus(runId, "idle");
-    expect(mgr.get(runId)?.sessionRef).toBe("sess-9");
     expect(mgr.get(runId)?.status).toBe("idle");
-    // running(start) + sessionRef + idle = 3 persists.
-    expect(be.persists()).toHaveLength(3);
-    expect(be.persists().at(-1)?.params).toMatchObject({ session_ref: "sess-9", status: "idle" });
+    // running(start) + idle = 2 persists.
+    expect(be.persists()).toHaveLength(2);
+    expect(be.persists().at(-1)?.params).toMatchObject({ status: "idle" });
   });
 
   it("endRun persists the terminal state then drops the run from the live map", async () => {
@@ -79,7 +77,7 @@ describe("CapabilityRunManager", () => {
     const mgr = new CapabilityRunManager(be);
     const n = await mgr.recover();
     expect(n).toBe(2);
-    expect(mgr.get("r1")).toMatchObject({ profile: "kb-compile", orgId: "o1", correlationId: "a1", sessionRef: "s1" });
+    expect(mgr.get("r1")).toMatchObject({ profile: "kb-compile", orgId: "o1", correlationId: "a1" });
     expect(mgr.get("r2")?.status).toBe("idle");
   });
 
@@ -280,6 +278,106 @@ describe("CapabilityRunManager", () => {
     expect(be.persists()).toHaveLength(0); // and done was never overwritten
   });
 
+  it("reapStale spares a run touched DURING the store re-check await (finding A)", async () => {
+    // A message landing in the getRun window bumps lastActivityMs. The post-await
+    // freshness re-derive must see it fresh again and skip — no box stop, no
+    // failed mark on a live run.
+    const be = new FakeBackend();
+    let clock = 1000;
+    const onReap = vi.fn();
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, onReap });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" }); // lastActivity=1000
+    be.getRunRow = { id: rec.runId, profile: "kb-compile", status: "running" }; // non-terminal
+    // Simulate a capability.message arriving during the getRun round-trip.
+    const orig = be.request.bind(be);
+    be.request = async (method: string, params?: unknown) => {
+      if (method === CAPABILITY_GET_RUN) mgr.touch(rec.runId); // fresh at clock=2000
+      return orig(method, params);
+    };
+    clock = 2000; // snapshot sees it stale (2000-1000 > 500)…
+
+    const reaped = await mgr.reapStale();
+    expect(reaped).toEqual([]); // …but the re-derive after getRun sees it fresh
+    expect(onReap).not.toHaveBeenCalled();
+    expect(mgr.get(rec.runId)?.status).toBe("running"); // not failed
+  });
+
+  it("reapStale defers (never reaps) when the store is unreachable during the re-check (finding B)", async () => {
+    // A resurrection artifact that is `done` in the store must not be overwritten
+    // to failed while the store is down — the reap is deferred to a later tick.
+    const be = new FakeBackend();
+    let clock = 1000;
+    const onReap = vi.fn();
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, onReap });
+    be.activeRuns = [{ id: "r-ghost", profile: "kb-compile", org_id: "o1", status: "running" }];
+    await mgr.recover(); // resurrects the ghost (its store row is really `done`)
+    // Store unreachable for the GET_RUN re-check.
+    const orig = be.request.bind(be);
+    be.request = async (method: string, params?: unknown) => {
+      if (method === CAPABILITY_GET_RUN) throw new Error("store down");
+      return orig(method, params);
+    };
+    clock = 2000;
+
+    const reaped = await mgr.reapStale();
+    expect(reaped).toEqual([]); // deferred, not reaped
+    expect(onReap).not.toHaveBeenCalled(); // box not stopped
+    expect(be.persists()).toHaveLength(0); // no failed persist → done not clobbered
+    expect(mgr.get("r-ghost")?.status).toBe("running"); // still held for the next tick
+  });
+
+  it("reapStale gives up deferring after repeated re-check failures and reaps a poison row (bounded give-up)", async () => {
+    // A PERMANENT per-run getRun throw (a store row that never deserializes) must
+    // not defer forever and pin its box — after MAX_REAP_DEFERRALS the reap proceeds.
+    const be = new FakeBackend();
+    let clock = 1000;
+    const onReap = vi.fn();
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, onReap });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    const orig = be.request.bind(be);
+    be.request = async (method: string, params?: unknown) => {
+      if (method === CAPABILITY_GET_RUN) throw new Error("poison row"); // permanent per-run failure
+      return orig(method, params);
+    };
+    clock = 2000; // stale
+
+    // The first four ticks defer (< MAX_REAP_DEFERRALS = 5); the fifth gives up and reaps.
+    for (let i = 0; i < 4; i++) expect(await mgr.reapStale()).toEqual([]);
+    expect(onReap).not.toHaveBeenCalled();
+    const reaped = await mgr.reapStale();
+    expect(reaped).toEqual([rec.runId]);
+    expect(onReap).toHaveBeenCalledTimes(1);
+    expect(mgr.get(rec.runId)).toBeUndefined(); // reaped → dropped
+  });
+
+  it("a successful re-check clears the give-up counter (a transient outage doesn't accrue)", async () => {
+    const be = new FakeBackend();
+    let clock = 1000;
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500 });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    let throwGet = true;
+    const orig = be.request.bind(be);
+    be.request = async (method: string, params?: unknown) => {
+      if (method === CAPABILITY_GET_RUN) {
+        if (throwGet) throw new Error("transient outage");
+        return { id: rec.runId, profile: "kb-compile", status: "running" }; // non-terminal
+      }
+      return orig(method, params);
+    };
+    clock = 2000;
+    // Three failing ticks (defer), then the store recovers → counter resets, and
+    // a message keeps the run fresh so it's never wrongly reaped.
+    for (let i = 0; i < 3; i++) expect(await mgr.reapStale()).toEqual([]);
+    throwGet = false;
+    mgr.touch(rec.runId); // fresh again on the recovered tick
+    expect(await mgr.reapStale()).toEqual([]); // re-check succeeds, run is fresh → spared, counter cleared
+    // Now fail again: it must take a FULL MAX_REAP_DEFERRALS run, not carry the old 3.
+    throwGet = true;
+    clock = 4000; // stale once more
+    for (let i = 0; i < 4; i++) expect(await mgr.reapStale()).toEqual([]);
+    expect(await mgr.reapStale()).toEqual([rec.runId]); // 5th consecutive failure reaps
+  });
+
   it("endRun is terminal-sticky — the first outcome wins", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
@@ -292,6 +390,25 @@ describe("CapabilityRunManager", () => {
     expect(mgr.get(runId)?.status).toBe("done"); // not overwritten
 
     await mgr.reconcile(); // flushTerminal retries the ORIGINAL outcome
+    expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
+  });
+
+  it("setStatus is terminal-sticky — a racing message cannot resurrect a retained terminal record", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    be.failPersist = true;
+    await mgr.endRun(runId, "done"); // terminal reached in memory, persist pending
+    be.failPersist = false;
+    // capability.message's post-/message setStatus("running") landing after the
+    // terminal: without the guard this flipped the record non-terminal, hid it
+    // from flushTerminal, and the watchdog later degraded the outcome to failed.
+    await mgr.setStatus(runId, "running");
+    expect(mgr.get(runId)?.status).toBe("done"); // not resurrected
+
+    await mgr.reconcile(); // flushTerminal still sees the terminal record and lands it
+    expect(mgr.get(runId)).toBeUndefined();
     expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
   });
 
