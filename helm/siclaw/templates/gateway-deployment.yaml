@@ -102,11 +102,14 @@ spec:
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
             {{- end }}
-            {{- if .Values.agentbox.compileBoxImage }}
+            {{- $compileBoxImage := include "siclaw.compileBoxImage" . }}
+            {{- if $compileBoxImage }}
             # KB-compile box image (kbc/ in this repo) — consumed by the
             # BoxProfile registry for kb-compile / kb-test capability boxes.
+            # Derived from image.registry/tag via compileBoxEnabled, or pinned
+            # explicitly via compileBoxImage. Absent ⇒ KB dark (fail-closed).
             - name: SICLAW_COMPILE_BOX_IMAGE
-              value: {{ .Values.agentbox.compileBoxImage | quote }}
+              value: {{ $compileBoxImage | quote }}
             {{- end }}
             {{- if .Values.agentbox.nodeSelector }}
             # Node scheduling constraint forwarded by the runtime spawner onto

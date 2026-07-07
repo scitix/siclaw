@@ -183,10 +183,15 @@ ocr:
 # -- AgentBox (spawned at runtime by K8s spawner)
 agentbox:
   debugImage: ""
-  # KB-compile box image (built from this repo's kbc/ — see kbc/platform/pod/
-  # Dockerfile). Consumed by the BoxProfile registry for kb-compile / kb-test
-  # capability boxes. Empty ⇒ the runtime's built-in default tag; pin a
-  # commit-sha tag here for releases, e.g. "registry/.../kbc-compile-box:main-<sha>".
+  # KB compile capability (kb-compile / kb-test boxes; built from this repo's
+  # kbc/, ships with every release via `make docker`). The RELEASE-COUPLED
+  # switch: true ⇒ the runtime spawns {image.registry}/kbc-compile-box:{image.tag}
+  # — same registry/tag convention as every other component. false + no
+  # override ⇒ KB stays dark (fail-closed; compile attempts error, chat
+  # unaffected).
+  compileBoxEnabled: false
+  # Full-image override (implies enabled): hot-fix the compile brain
+  # independently of a release, e.g. "registry/.../kbc-compile-box:main-<sha>".
   compileBoxImage: ""
   # Node selector applied to every spawned AgentBox pod. Constrains pods to
   # nodes carrying all of these labels (e.g. { disktype: ssd, pool: agents }).
