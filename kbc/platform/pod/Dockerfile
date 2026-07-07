@@ -29,6 +29,7 @@ COPY platform/pod/compile_agent.py /app/compile_agent.py
 COPY platform/pod/compile_box.py /app/compile_box.py
 COPY platform/pod/selfcheck.py /app/selfcheck.py
 COPY platform/pod/batching.py /app/batching.py
+COPY platform/pod/incremental.py /app/incremental.py
 COPY platform/pod/engine.py /app/engine.py
 COPY platform/pod/redblue.py /app/redblue.py
 COPY platform/pod/mediaverify.py /app/mediaverify.py
