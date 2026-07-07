@@ -493,6 +493,37 @@ async def test_open_close_test_session_http():
         (Path(wd2) / "candidate" / "only.md").write_text("x")
         compile_box.RUNS["p2"] = compile_box.CompileRun("p2", wd2, 1)
         assert (await client.post("/test-session/p2")).status == 400
+
+        # consumer-provided snapshot bundle (e.g. a published version) → the box
+        # installs THAT instead of pinning candidate/, same hash formula.
+        vbundle = make_source_bundle({"index.md": "# v1 index\n", "gpu.md": "# gpu v1\n"})
+        r = await client.post("/test-session/p1", json={
+            "bundle_base64": base64.b64encode(vbundle).decode(),
+            "bundle_sha256": hashlib.sha256(vbundle).hexdigest(),
+        })
+        assert r.status == 200, await r.text()
+        vb = await r.json()
+        assert vb["pages"] == 2, vb
+        vtid = vb["test_session_id"]
+        vidx = Path(snap_root) / vtid / ".siclaw" / "knowledge" / "index.md"
+        assert vidx.read_text() == "# v1 index\n"
+        want = hashlib.sha256()
+        for rp, data in sorted([("gpu.md", b"# gpu v1\n"), ("index.md", b"# v1 index\n")]):
+            want.update(rp.encode()); want.update(b"\0"); want.update(data); want.update(b"\0")
+        assert vb["snapshot_hash"] == want.hexdigest(), vb
+        assert (await client.post(f"/test-session/{vtid}/close")).status == 200
+
+        # provided bundle missing index.md → 400, snapshot dir cleaned
+        nobidx = make_source_bundle({"only.md": "x"})
+        r = await client.post("/test-session/p1", json={"bundle_base64": base64.b64encode(nobidx).decode()})
+        assert r.status == 400, await r.text()
+
+        # sha mismatch → 400
+        r = await client.post("/test-session/p1", json={
+            "bundle_base64": base64.b64encode(vbundle).decode(),
+            "bundle_sha256": "0" * 64,
+        })
+        assert r.status == 400, await r.text()
     finally:
         await client.close()
         compile_box.ClaudeSDKClient = orig
@@ -583,7 +614,88 @@ async def test_prompt_packs_locale():
     assert "{tid}" in en_ts["resolve_ticket"]["not_found"]  # format slots survive
     print("✓ prompt packs: en/zh parity, en fallback, localized guard/constitution/tools, env override")
 
+
+async def test_propose_plan_never_bounces():
+    """propose_plan is the deterministic approve signal: the handler itself writes
+    authoring/PROPOSED_PLAN.json (code, not model formatting) and always emits —
+    the owner UI must never be held hostage by how the model kept its notes."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "authoring").mkdir(parents=True)
+        events = []
+
+        class FakeRun:
+            workdir = str(wd)
+            locale = "zh"  # model-facing tool strings come from the locale pack
+
+            async def emit(self, ev):
+                events.append(ev)
+
+        captured = {}
+        orig = compile_box.create_sdk_mcp_server
+
+        def capture(name, tools):
+            captured.update({t.name: t for t in tools})
+            return orig(name, tools=tools)
+
+        compile_box.create_sdk_mcp_server = capture
+        try:
+            compile_box._make_compile_tools(FakeRun())
+        finally:
+            compile_box.create_sdk_mcp_server = orig
+        pp = captured["propose_plan"].handler
+
+        # no PLAN.md checkboxes at all → STILL proposes (advisory reminder only)
+        r1 = await pp({"plan": "## 计划\n- 00 概览\n- 10 用法"})
+        assert events and events[0]["type"] == "plan_proposed"
+        assert "提醒" in r1["content"][0]["text"]
+        proposal = json.loads((wd / "authoring" / "PROPOSED_PLAN.json").read_text("utf-8"))
+        assert proposal["text"].startswith("## 计划") and proposal["proposed_at"]
+
+        # with a maintained checklist → no reminder; re-propose overwrites
+        (wd / "authoring" / "PLAN.md").write_text(
+            "# Plan\n\n## Next Pages\n- [ ] 00 概览 — 平台是什么\n\n## Blocked\n- None\n", "utf-8"
+        )
+        r2 = await pp({"plan": "v2"})
+        assert len(events) == 2
+        assert "提醒" not in r2["content"][0]["text"]
+        assert json.loads((wd / "authoring" / "PROPOSED_PLAN.json").read_text("utf-8"))["text"] == "v2"
+    print("✓ propose_plan always signals; PROPOSED_PLAN.json written by code")
+
+
+def test_install_wiki_snapshot_size_guard():
+    """Fix A: the published-snapshot installer rejects an oversized compressed
+    bundle AND a decompression bomb (accumulated-unpacked cap), like its sibling
+    installers — else a gzip-bomb bundle_base64 OOMs the pod + the parent run."""
+    import tempfile as _tf
+    ok = make_source_bundle({"index.md": "# i\n", "p.md": "x" * 100})
+    with _tf.TemporaryDirectory() as d:
+        dest = Path(d)
+        os.environ["KBC_MAX_SNAPSHOT_BUNDLE_BYTES"] = "10"      # compressed cap
+        try:
+            try:
+                compile_box._install_wiki_snapshot(ok, dest / "a")
+                assert False, "should reject oversized compressed bundle"
+            except ValueError as e:
+                assert "too large" in str(e), e
+        finally:
+            del os.environ["KBC_MAX_SNAPSHOT_BUNDLE_BYTES"]
+        os.environ["KBC_MAX_SNAPSHOT_UNPACKED_BYTES"] = "5"     # unpacked cap
+        try:
+            try:
+                compile_box._install_wiki_snapshot(ok, dest / "b")
+                assert False, "should reject bundle that unpacks too large"
+            except ValueError as e:
+                assert "unpacks too large" in str(e), e
+        finally:
+            del os.environ["KBC_MAX_SNAPSHOT_UNPACKED_BYTES"]
+        h, pages = compile_box._install_wiki_snapshot(ok, dest / "c")  # within limits → ok
+        assert pages == 2 and len(h) == 64, (pages, h)
+    print("✓ install_wiki_snapshot size guards (compressed + unpacked caps)")
+
+
 async def main():
+    test_install_wiki_snapshot_size_guard()
     await test_workspace_sync()
     await test_run_wrapper_terminal_signals()
     await test_session_driver_conversational()
@@ -596,6 +708,7 @@ async def main():
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
     await test_test_message_path()
+    await test_propose_plan_never_bounces()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()

@@ -3,8 +3,9 @@
     "desc": "Report a slice of compile progress (pages produced / contradictions auto-merged / pending), one sentence to one paragraph."
   },
   "propose_plan": {
-    "desc": "Call after Plan-phase alignment: submit a short, readable, reviewable compile plan for the owner's approval, then stop and wait. Do not write candidate/ pages before approval arrives.",
-    "ack": "Plan submitted to the owner; awaiting approval. Do not write candidate/ pages until the approval message arrives."
+    "desc": "Call after Plan-phase alignment: submit a short, readable, reviewable compile plan (the plan argument, markdown) for the owner's approval, then stop and wait. Do not write candidate/ pages before approval arrives.",
+    "ack": "Plan submitted to the owner (the UI now shows the plan and the approve control); awaiting approval. Do not write candidate/ pages until the approval message arrives.",
+    "reminder": " (Reminder: while you are at it, maintain the candidate-page list as `- [ ] page — one line` in the ## Next Pages section of authoring/PLAN.md as your working state, to make progress easy to track; this does not affect the plan you just submitted.)"
   },
   "resolve_ticket": {
     "desc": "Call once per contradiction ticket you have patched (one call per ticket, no batching): register which ticket (ticket_id), the value you applied (applied_value), the candidate files you actually edited (pages_edited — must cover the ticket's affected_pages), and a one-line note. This marks the ticket as patched and writes an auditable agent_report — the basis for the contradiction view showing 'AI patched' for the owner to verify.",

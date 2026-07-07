@@ -33,6 +33,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import tarfile
 import uuid
@@ -50,7 +51,14 @@ from claude_agent_sdk import (
 )
 
 import office_ingest
+import selfcheck
 
+# massapi/Bedrock rejects the `context_management` field Claude Code attaches
+# once a session's context passes the autocompact buffer (HTTP 400
+# "context_management: Extra inputs are not permitted"). A compile is a long
+# multi-turn session, so it hits this readily. Disable autocompact so the field
+# is never sent. setdefault → an explicit deployment override still wins.
+os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
 
 # A box usually hosts a single run; a map keeps it clean (and helps health/debugging).
 RUNS: dict[str, "CompileRun"] = {}
@@ -111,7 +119,9 @@ _INSTRUCTION_HEADER = {
 
 # The read-only test-session persona lives in prompts/<locale>/test_role.md —
 # deliberately a knowledge CONSUMER over the pinned wiki snapshot, so the test
-# measures the wiki, not the agent's tools (mirrors siclaw prompt.ts).
+# measures the wiki, not the agent's tools (mirrors siclaw prompt.ts). The
+# red-blue blue team reads the SAME pack text via selfcheck.TEST_ROLE, so the
+# consumer persona is single-sourced in the locale packs (no drift).
 
 
 def _max_test_sessions() -> int:
@@ -157,9 +167,22 @@ class CompileRun:
         # Assistant text accumulated for the in-flight turn; flushed into the
         # turn_done event so the consumer can persist the whole assistant reply.
         self._turn_text: list[str] = []
+        # Layer-1 self-check bookkeeping (selfcheck.py): idempotency key of the
+        # last checked state (skip re-check when nothing changed) and repair
+        # injections used since the ledger last closed (bounds the auto-repair
+        # loop; reset to 0 whenever the check passes).
+        self._selfcheck_key: str | None = None
+        self._l1_repairs_used = 0
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
+
+    async def inject_user_message(self, text: str):
+        """Engine seam: push a user turn into the live session. The Claude SDK
+        driver is one line; a future engine driver (e.g. Codex) reimplements
+        just this method — self-check orchestration stays engine-neutral."""
+        if self.client:
+            await self.client.query(text)
 
 
 class TestRun:
@@ -192,49 +215,8 @@ class TestRun:
         await self.events.put(ev)
 
 
-def _pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
-    """Pin the current draft: copy {workdir}/candidate/*.md|.json into
-    {dest}/.siclaw/knowledge/ with the `candidate/` prefix stripped
-    (candidate/index.md → index.md), mirroring the consumer's
-    buildPublishBundleFromCandidates so the test reads BYTE-IDENTICALLY to what a
-    publish would serve. Returns (sha256 over sorted relpath+content, page_count).
-    Raises FileNotFoundError if there are no candidate pages or no root index.md."""
-    candidate = Path(workdir) / "candidate"
-    kdir = dest / ".siclaw" / "knowledge"
-    kdir.mkdir(parents=True, exist_ok=True)
-    h = hashlib.sha256()
-    count = 0
-    has_index = False
-    candidate_real = candidate.resolve()
-    for f in sorted(candidate.rglob("*")) if candidate.is_dir() else []:
-        if not f.is_file() or f.suffix not in (".md", ".json"):
-            continue
-        rel = f.relative_to(candidate)
-        if ".." in rel.parts:
-            continue
-        # Symlink confinement (security): is_file() follows symlinks and rglob can
-        # descend a symlinked dir, so a compile session (which has Write+Bash) could
-        # `ln -s /etc/passwd candidate/leak.md` and leak host-file content into the
-        # read-only test snapshot. Pack only files whose REAL path stays under
-        # candidate/ — covers both file symlinks and symlinked directories.
-        try:
-            f.resolve().relative_to(candidate_real)
-        except (ValueError, OSError):
-            continue
-        rel_posix = rel.as_posix()
-        data = f.read_bytes()
-        out = kdir / rel
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(data)
-        h.update(rel_posix.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
-        count += 1
-        if rel_posix == "index.md":
-            has_index = True
-    if count == 0:
-        raise FileNotFoundError("no candidate pages to test yet — ask the authoring agent to generate pages first")
-    if not has_index:
-        raise FileNotFoundError("draft is missing candidate/index.md — cannot test without a root index page")
-    return h.hexdigest(), count
+# Snapshot pinning is single-sourced in selfcheck.py (shared with redblue.py).
+_pack_candidates_to_wiki = selfcheck.pack_candidates_to_wiki
 
 
 # ── B5: mid-compile workspace sync back to the consumer ──
@@ -537,8 +519,29 @@ def _make_compile_tools(run: CompileRun):
 
     @tool("propose_plan", ts["propose_plan"]["desc"], {"plan": str})
     async def propose_plan(args):
-        await run.emit({"type": "plan_proposed", "plan": args.get("plan", "")})
-        return {"content": [{"type": "text", "text": ts["propose_plan"]["ack"]}]}
+        # The owner's approve UI is driven by THIS artifact — written here by
+        # code, deterministically, from the tool argument. The signal must never
+        # depend on how the model formatted its working notes (a proposal that
+        # bounces on file formatting is a UI held hostage by prose). PLAN.md
+        # remains the box's own working state; syncing happens at turn end.
+        plan_text = str(args.get("plan", ""))
+        proposal_path = Path(run.workdir) / "authoring" / "PROPOSED_PLAN.json"
+        proposal_path.parent.mkdir(parents=True, exist_ok=True)
+        proposal_path.write_text(json.dumps({
+            "text": plan_text,
+            "proposed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }, ensure_ascii=False, indent=2), "utf-8")
+        await run.emit({"type": "plan_proposed", "plan": plan_text})
+        # Advisory nudge only — working-state hygiene, never a gate.
+        reminder = ""
+        plan_path = Path(run.workdir) / "authoring" / "PLAN.md"
+        section = ""
+        if plan_path.exists():
+            m = re.search(r"## Next Pages\n(.*?)(?=\n## |\Z)", plan_path.read_text("utf-8"), re.S)
+            section = m.group(1) if m else ""
+        if "- [ ]" not in section and "- [x]" not in section:
+            reminder = ts["propose_plan"]["reminder"]
+        return {"content": [{"type": "text", "text": ts["propose_plan"]["ack"] + reminder}]}
 
     @tool(
         "resolve_ticket",
@@ -568,6 +571,10 @@ def _make_compile_tools(run: CompileRun):
             "applied_value": str(args.get("applied_value", "")),
             "pages_edited": [str(p) for p in (args.get("pages_edited") or []) if str(p).strip()],
             "note": str(args.get("note", "")),
+            # Echo of the dispatch nonce from the apply directive: lets the
+            # consumer match this receipt to the EXACT dispatch round it answers
+            # (timestamps alone cannot distinguish two overlapping rounds).
+            "dispatch_nonce": str(args.get("dispatch_nonce", "")),
             "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         try:
@@ -613,6 +620,45 @@ async def _smoke_compile(run: CompileRun):
     await run.emit({"type": "turn_done", "text": "[smoke] wiring check complete"})
 
 
+def _l1_repair_rounds() -> int:
+    return int(os.environ.get("KBC_L1_REPAIR_ROUNDS", "1"))
+
+
+async def _post_turn_selfcheck(run) -> str | None:
+    """Layer-1 deterministic self-check at turn end (coverage ledger + lint;
+    design: DESIGN-kb-compile-self-verification-2026-07-03 §8.1). All analysis
+    lives in selfcheck.py (engine-neutral); this driver only decides WHEN
+    (candidate state changed + index.md exists) and relays the bounded repair
+    prompt through the run's message seam. turn_done still fires normally —
+    the never-stuck invariant stays intact; a repair is just the next turn.
+    Returns the repair prompt to inject after turn_done, or None."""
+    workdir = getattr(run, "workdir", None)
+    if not workdir:  # test sessions reuse _emit_message but have no workspace
+        return None
+    key = selfcheck.state_key(workdir)
+    if key is None or key == run._selfcheck_key:
+        return None
+    if not (Path(workdir) / "candidate" / "index.md").is_file():
+        return None  # mid-Execute: pages exist but the index isn't written yet
+    run._selfcheck_key = key
+    report = selfcheck.run_layer1(workdir)
+    if report["coverage"]["closed"] and report["lint"]["ok"]:
+        run._l1_repairs_used = 0
+        report["state"] = "passed"
+    elif run._l1_repairs_used < _l1_repair_rounds():
+        report["state"] = "repairing"
+    else:
+        report["state"] = "unconverged"  # budget spent: publish card shows the rest
+    report["repair_rounds_used"] = run._l1_repairs_used
+    selfcheck.write_selfcheck(workdir, report)
+    locale = getattr(run, "locale", None)
+    await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
+    if report["state"] == "repairing":
+        run._l1_repairs_used += 1
+        return selfcheck.build_repair_prompt(report, locale)
+    return None
+
+
 async def _emit_message(run: CompileRun, msg) -> None:
     """Relay one Agent SDK message to the SSE stream. Assistant text becomes the
     live chat (`log`) stream AND is accumulated for the turn; a ResultMessage
@@ -629,7 +675,38 @@ async def _emit_message(run: CompileRun, msg) -> None:
     elif name == "ResultMessage":
         reply = "\n\n".join(run._turn_text).strip()
         run._turn_text = []
+        # Layer-1 self-check BEFORE the sync so SELFCHECK.json rides the same
+        # pre-turn_done sync. Fail-open: a self-check crash must not kill the
+        # turn (§4.5) — surface it as a summary line instead of dying silently.
+        repair_msg = None
+        try:
+            repair_msg = await _post_turn_selfcheck(run)
+        except Exception as e:
+            msg = (f"Self-check (ledger) failed, skipped this round: {e!r}"
+                   if selfcheck._is_en(getattr(run, "locale", None))
+                   else f"自检(账本)执行失败,本轮跳过: {e!r}")
+            await run.emit({"type": "summary", "text": msg})
+        # Sync BEFORE announcing the turn: consumers refetch the workspace on
+        # turn_done, so files this turn produced (PROPOSED_PLAN.json, ticket
+        # receipts, candidate pages) must already be durable. The periodic tick
+        # alone can land seconds later and lose that race.
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)
+            except Exception:
+                pass  # periodic loop retries; a sync hiccup must not kill the turn
         await run.emit({"type": "turn_done", "text": reply})
+        # Bounded auto-repair AFTER turn_done (async-post-check design, §4.3-c):
+        # the turn ends normally; the repair is an ordinary next turn.
+        if repair_msg:
+            try:
+                await run.inject_user_message(repair_msg)
+            except Exception as e:
+                msg = (f"Self-check repair injection failed: {e!r}"
+                       if selfcheck._is_en(getattr(run, "locale", None))
+                       else f"自检回修注入失败: {e!r}")
+                await run.emit({"type": "summary", "text": msg})
 
 
 # Default tool whitelist for a kb-compile session, used when the runtime profile
@@ -674,6 +751,10 @@ async def run_session(run: CompileRun):
         mcp_servers={"compile": _make_compile_tools(run)},
         permission_mode="bypassPermissions",  # the pod itself is the sandbox
         setting_sources=[],                    # tenant isolation: load no external settings/CLAUDE.md
+        # Pin the compile model explicitly: the box talks to massapi (Bedrock),
+        # which serves specific ids — the SDK default may not be one, and the KB
+        # compile default is opus by product decision. Overridable per-deploy.
+        model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
         max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
         session_id=sid,
         session_store=InMemorySessionStore(),
@@ -715,6 +796,7 @@ async def _run_wrapper(run: CompileRun):
     closes with just `end`."""
     sent: dict = {}
     clean = False
+    run._sync_sent = sent  # shared with _emit_message's pre-turn_done sync
     syncer = asyncio.create_task(_sync_loop(run, sent))
     try:
         await _COMPILE_IMPL(run)
@@ -816,6 +898,9 @@ async def test_session_driver(run: "TestRun"):
         # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
         hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd), run.locale)])]},
         setting_sources=[],                        # tenant isolation
+        # The test session mimics the REAL consumer → the gate/consumer tier
+        # (sonnet), not the compile tier. Massapi-served id; overridable per-deploy.
+        model=os.environ.get("KBC_TEST_MODEL", "claude-sonnet-4-6"),
         max_turns=int(os.environ.get("KBC_TEST_MAX_TURNS", "60")),
         session_id=sid,
         session_store=InMemorySessionStore(),
@@ -985,28 +1070,86 @@ async def handle_health(request: web.Request):
     return web.json_response({"status": "ok", "runs": len(RUNS), "test_sessions": len(TEST_SESSIONS)})
 
 
+def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | None = None) -> tuple[str, int]:
+    """Install a consumer-PROVIDED wiki snapshot (a tar.gz of root-level pages —
+    e.g. a PUBLISHED version bundle, the exact bytes a publish serves) into
+    {dest}/.siclaw/knowledge/. Lets a test session probe a snapshot that does not
+    live on this box's disk. Returns (content hash — via selfcheck.content_hash,
+    the same formula as pack_candidates_to_wiki so draft and version snapshots are
+    comparable — and the page count)."""
+    # DoS hardening, mirroring _install_source_bundle / _install_authoring_bundle:
+    # cap the compressed input AND accumulate the declared uncompressed size, so a
+    # gzip-bomb bundle_base64 that slips under the HTTP request cap can't OOM the
+    # box (which shares the pod with the live parent authoring run).
+    max_bundle_bytes = int(os.environ.get("KBC_MAX_SNAPSHOT_BUNDLE_BYTES", str(64 * 1024 * 1024)))
+    max_unpacked_bytes = int(os.environ.get("KBC_MAX_SNAPSHOT_UNPACKED_BYTES", str(256 * 1024 * 1024)))
+    if len(bundle) > max_bundle_bytes:
+        raise ValueError(f"snapshot bundle is too large: {len(bundle)} > {max_bundle_bytes}")
+    actual = hashlib.sha256(bundle).hexdigest()
+    if expected_sha256 and expected_sha256.lower() != actual:
+        raise ValueError(f"snapshot bundle sha256 mismatch: expected {expected_sha256}, got {actual}")
+    kdir = dest / ".siclaw" / "knowledge"
+    kdir.mkdir(parents=True, exist_ok=True)
+    pages: list[tuple[str, bytes]] = []
+    total_bytes = 0
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
+    except tarfile.TarError as e:
+        raise ValueError(f"invalid snapshot bundle: {e}") from e
+    with tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            total_bytes += member.size
+            if total_bytes > max_unpacked_bytes:
+                raise ValueError(f"snapshot bundle unpacks too large: {total_bytes} > {max_unpacked_bytes}")
+            rel = _safe_tar_path(member.name)
+            rel_posix = rel.as_posix()
+            if not (rel_posix.endswith(".md") or rel_posix.endswith(".json")):
+                continue
+            src = tf.extractfile(member)
+            if src is None:
+                raise ValueError(f"could not read snapshot entry {member.name!r}")
+            with src:
+                data = src.read()
+            out = kdir / Path(*rel.parts)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(data)
+            pages.append((rel_posix, data))
+    if not any(rp == "index.md" for rp, _ in pages):
+        raise FileNotFoundError("snapshot bundle is missing index.md — cannot test without a root index page")
+    return selfcheck.content_hash(pages), len(pages)
+
+
 async def handle_open_test(request: web.Request):
-    """Start a test session: pin the parent run's CURRENT draft (candidate/*) into an
-    immutable snapshot dir and start a fresh read-only consumer session over it.
-    Returns the test session id + snapshot hash. The reply to later /test-message
-    turns streams over GET /test-events. NOTE: reuses the parent authoring box
-    (no new pod) — the parent run must already be live."""
+    """Start a test session: pin an immutable snapshot and start a fresh read-only
+    consumer session over it. Default snapshot source = the parent run's CURRENT
+    draft (candidate/*); a request carrying `bundle_base64` pins THAT tar.gz
+    instead (e.g. a published version the consumer serves). Returns the test
+    session id + snapshot hash. The reply to later /test-message turns streams
+    over GET /test-events. NOTE: reuses the parent authoring box (no new pod) —
+    the parent run must already be live."""
     parent = RUNS.get(request.match_info["run_id"])
     if not parent:
         return web.json_response({"error": "unknown run"}, status=404)
     active = sum(1 for t in TEST_SESSIONS.values() if not t.done)
     if active >= _max_test_sessions():
         return web.json_response({"error": "too many concurrent test sessions"}, status=429)
+    body = await request.json() if request.body_exists else {}
     tid = str(uuid.uuid4())
     dest = Path(_test_snapshot_root()) / tid
     try:
-        snapshot_hash, pages = _pack_candidates_to_wiki(parent.workdir, dest)
-    except FileNotFoundError as e:
+        encoded = body.get("bundle_base64")
+        if encoded:
+            bundle = base64.b64decode(encoded, validate=True)
+            snapshot_hash, pages = _install_wiki_snapshot(bundle, dest, body.get("bundle_sha256"))
+        else:
+            snapshot_hash, pages = _pack_candidates_to_wiki(parent.workdir, dest)
+    except (FileNotFoundError, ValueError, TypeError) as e:
         shutil.rmtree(dest, ignore_errors=True)
         return web.json_response({"error": str(e)}, status=400)
     run = TestRun(tid, str(dest), parent_run_id=parent.run_id, snapshot_hash=snapshot_hash, locale=parent.locale)
     # Tool whitelist from the runtime BoxProfile (kb-test); None/absent → read-only default.
-    body = await request.json() if request.body_exists else {}
     run.allowed_tools = body.get("allowed_tools")
     TEST_SESSIONS[tid] = run
     run.task = asyncio.create_task(_test_session_wrapper(run))

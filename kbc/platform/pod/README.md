@@ -56,6 +56,24 @@ docker run --rm -p 3000:3000 \
 - **LLM**: locally reuses the `~/.claude` subscription (no key needed); container/production must use `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL`→massapi (credentials do not enter the sandbox).
 - **Transport**: if `tls.crt/tls.key/ca.crt` exist under `SICLAW_CERT_PATH` (default `/etc/siclaw/certs`) → serve HTTPS and require a client certificate (runtime/gateway); otherwise HTTP (local). Reuses agentbox's per-box mTLS shell.
 
+## Layer-1 self-check: coverage ledger + lint (`selfcheck.py`)
+
+The completion criterion moves from "the model certifies itself" to "code verifies it" (design: improve_siclaw/DESIGN-kb-compile-self-verification-2026-07-03.md §8.1):
+
+- **Contract**: every candidate page's frontmatter `compiled_from` lists the real raw-relative paths it was compiled from (a pure synthesis page is marked `derived: true`); a source you decide not to compile goes into `authoring/EXCLUSIONS.json` (`[{pattern, reason}]`).
+- **Check**: at each turn end, when the candidate state changed (idempotency key = candidate tree + EXCLUSIONS content) and `candidate/index.md` exists, mechanically verify "all raw text sources = union of compiled_from + EXCLUSIONS matches" and run a structural lint (missing provenance / broken links); the result is written to `authoring/SELFCHECK.json` (synced to the consumer with the workspace, consumed by the publish card), with a one-line narration on the `summary` event.
+- **Repair**: `turn_done` still fires as usual (the never-stuck invariant holds); when something is unaccounted, a bounded repair instruction is injected (`KBC_L1_REPAIR_ROUNDS`, default 1). The budget is **per gap-episode** — it resets each time coverage closes, so a long restructuring compile that reopens and re-closes gaps can trigger repeated rounds (each episode still terminates; the count is not bounded over the whole run). Once the budget for the current episode is spent the report is marked `unconverged` and the rest is left to the owner. Fail-open throughout.
+- **Engine-neutral**: selfcheck.py is pure stdlib with zero SDK dependency; the driver only provides "when to trigger" plus one injection seam, `CompileRun.inject_user_message()` — swapping engines (e.g. Codex) only reimplements this one method.
+
+## Layer-2 self-check: red-blue PK (`redblue.py` + `engine.py`)
+
+An asymmetric "one writer, many examiners" design: the **judge** (strong tier, reads raw + snapshot, `KBC_PK_JUDGE_MODEL` default claude-opus-4-6) surveys the question surface → writes questions (with variants, prioritizing conflict / WIP / boundary + flagged tickets) → grades with four-category attribution (coverage / routing / contract / medium; "correctly said not-covered" = pass); the **blue team** (gate tier = production consumer tier, `KBC_PK_BLUE_MODEL` default claude-sonnet-4-6, persona = TEST_ROLE, single-sourced) reads only the pinned wiki snapshot, with raw mechanically blocked by multi-root path guards.
+
+- **Orchestration is all in code** (redblue.py): question budget = clamp(8, pages×1.5, 40); the question surface is cached by raw fingerprint (`authoring/PK_SURVEY_CACHE.json`); chunked answering/grading (`KBC_PK_CHUNK=5`, concurrency `KBC_PK_CONCURRENCY=2`); a targeted-retest primitive (`questions_override`); a global wall clock `KBC_PK_WALL_SECS=1800`; any stage's bad JSON is retried once, then fails open (state=failed, never raises).
+- **Engine-neutral** (engine.py): the `ReadonlyAgentEngine` Protocol is the only engine surface; structured output = text JSON + lenient parse (deliberately not SDK tool-forcing); swapping to a Codex base = adding one adapter, with model/effort as plain string knobs.
+- **S0 calibration runner = this module**: `python redblue.py --raw <dir> (--workdir <dir>|--wiki <dir>) [--questions N] [--retest last-result.json] [--out pk-result.json]` — offline calibration runs the exact production pipeline. Results are written to the `pk` section of SELFCHECK.json (single write point `selfcheck.update_pk_section`; an L1 re-check never wipes it).
+- **Wiring pending S0 sign-off**: compile_box's automatic trigger (background run after L1 passes + repair injection + staleness detection) is wired in per design doc §9.4 once calibration passes.
+
 ## Boundaries / next steps
 
 - **resume**: the session does not survive a box restart (`InMemorySessionStore`); the runtime side falls back on "re-hydrate a cold box" (re-materialize raw + durable workspace), with SDK `resume` + a file-backed `session_store` as a later increment.

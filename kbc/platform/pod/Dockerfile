@@ -28,11 +28,18 @@ COPY CLAUDE.md /app/CLAUDE.md
 COPY platform/pod/compile_agent.py /app/compile_agent.py
 COPY platform/pod/compile_box.py /app/compile_box.py
 COPY platform/pod/office_ingest.py /app/office_ingest.py
+COPY platform/pod/selfcheck.py /app/selfcheck.py
+COPY platform/pod/engine.py /app/engine.py
+COPY platform/pod/redblue.py /app/redblue.py
 COPY platform/pod/prompts/ /app/prompts/
 COPY tools/ /app/tools/
 
 # Tenant isolation: never load external memory (prevents cross-tenant bleed).
 ENV CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+# massapi/Bedrock rejects the `context_management` field Claude Code attaches on
+# large-context turns (HTTP 400). Disable autocompact so it's never sent. The
+# Python modules also setdefault this; the ENV makes it visible at the image level.
+ENV DISABLE_AUTOCOMPACT=1
 # Default served port (overridable via SICLAW_AGENTBOX_PORT, aligned with agentbox).
 ENV SICLAW_AGENTBOX_PORT=3000
 
