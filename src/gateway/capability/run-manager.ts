@@ -192,6 +192,13 @@ export class CapabilityRunManager {
   async setStatus(runId: string, status: CapabilityLifecycleStatus): Promise<void> {
     const rec = this.runs.get(runId);
     if (!rec) return;
+    // Terminal is sticky — mirror endRun. A record can sit here in a TERMINAL
+    // state while its final persist retries (flushTerminal). capability.message
+    // calls setStatus("running") after two awaits (ensure session + POST
+    // /message), so a done/error/cancel landing in that window must not be
+    // flipped back to non-terminal — that would hide the record from
+    // flushTerminal and degrade the true outcome to a watchdog "failed".
+    if (isTerminalCapabilityStatus(rec.status)) return;
     rec.status = status;
     rec.lastActivityMs = this.now();
     await this.persist(rec);

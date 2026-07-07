@@ -393,6 +393,25 @@ describe("CapabilityRunManager", () => {
     expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
   });
 
+  it("setStatus is terminal-sticky — a racing message cannot resurrect a retained terminal record", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    be.failPersist = true;
+    await mgr.endRun(runId, "done"); // terminal reached in memory, persist pending
+    be.failPersist = false;
+    // capability.message's post-/message setStatus("running") landing after the
+    // terminal: without the guard this flipped the record non-terminal, hid it
+    // from flushTerminal, and the watchdog later degraded the outcome to failed.
+    await mgr.setStatus(runId, "running");
+    expect(mgr.get(runId)?.status).toBe("done"); // not resurrected
+
+    await mgr.reconcile(); // flushTerminal still sees the terminal record and lands it
+    expect(mgr.get(runId)).toBeUndefined();
+    expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
+  });
+
   it("endRun keeps the terminal record until flushTerminal lands it — 'done' stays done", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
