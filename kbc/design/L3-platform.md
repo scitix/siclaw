@@ -1,163 +1,163 @@
-# L3 平台化 — v1 蓝图(2026-06-25 收敛)
+# L3 Platformization — v1 Blueprint (converged 2026-06-25)
 
-> L3 = 把 kbc 从「一个人本地命令行用」变成「团队托管在线用」的服务。
-> L1 规约 / L2 工具 已可本地端到端跑;L3 加多租户 + 托管 + 只读消费。
+> L3 = turning kbc from "one person using it locally on the command line" into a service "a team uses online, hosted."
+> L1 (spec) / L2 (tools) already run end-to-end locally; L3 adds multi-tenancy + hosting + read-only consumption.
 >
-> **承重立场**:不自造"运行时 + 存储 + 评审 UI"三件套。
-> 存储/数据面 = 复用一个 **git forge(Forgejo)当 headless git 托管**(只用它 ~10%:git 存储 + 版本 + 鉴权 + 多租户);
-> 用户**完全不感知 forge**(它跑内网,我们的 web 在前面)。我们只造:**用户无感知的包装 UI** + **护城河(矛盾→裁决)**。
+> **Load-bearing stance**: do not build our own "runtime + storage + review UI" trio.
+> Storage / data plane = reuse a **git forge (Forgejo) as headless git hosting** (we use only ~10% of it: git storage + versioning + auth + multi-tenancy);
+> users are **completely unaware of the forge** (it runs on the internal network, our web sits in front). We build only: **a wrapper UI users don't perceive** + **the moat (contradiction → adjudication)**.
 
-## 〇、一句话 v1
+## 0. v1 in one sentence
 
-> **「本地交互编译模式 + 一个发布按钮 + 只读消费」,托管化。** 维护者体验 ≈ 丢文档 + 跟 agent 聊 + 点发布。
+> **"Local interactive compile mode + one publish button + read-only consumption," made hosted.** The maintainer experience ≈ drop documents + chat with the agent + click publish.
 
-## 一、v1 锁定范围 —— 暴露给用户的就 5 件事
+## 1. v1 locked scope — only 5 things exposed to the user
 
-1. **丢 raw + 跟 agent 编** —— 维护者丢原始文档、跟编译 agent 对话,agent 按编译纪律(带源 / 矛盾不自裁 / 宁缺毋错)读写知识库。
-2. **真矛盾,agent 在对话里问你裁** —— 不走 PR/issue,就在 chat 里问"这条按哪个理解",你一句话裁(=护城河,搬进对话)。
-3. **验** —— 看 ①编译总结 ②待裁矛盾 ③试问效果(见 §五)。
-4. **发布一版** —— 点发布 = 切一个不可变版本(git tag),自动可回溯。
-5. **只读消费** —— 消费者对**已发布的那一版**问答(只读、带源),看不到草稿。
+1. **Drop raw + compile with the agent** — the maintainer drops raw source documents and converses with the compile agent, which reads and writes the knowledge base following compile discipline (cite sources / never self-adjudicate contradictions / better to omit than to be wrong).
+2. **For real contradictions, the agent asks you to adjudicate in the conversation** — no PR/issue; it just asks in chat "which reading applies here," and you adjudicate in one sentence (= the moat, moved into the conversation).
+3. **Verify** — review ① the compile summary ② contradictions awaiting adjudication ③ the test-query results (see §5).
+4. **Publish a version** — clicking publish = cutting an immutable version (git tag), automatically traceable.
+5. **Read-only consumption** — consumers ask questions against **that published version** (read-only, sourced) and cannot see drafts.
 
-**v1 明确不做(写下来,不是忘了):** 逐次审/PR 流程、并发/多写冲突处理、多人协作/独立审核者/技能空间、批量操作、容器编排/K8s、webhook、计费配额。前提:维护者就一两个、私下对齐。团队大了再加。
+**v1 explicitly does NOT do (written down, not forgotten):** per-change review / PR flow, concurrency / multi-writer conflict handling, multi-person collaboration / independent reviewers / skill spaces, batch operations, container orchestration / K8s, webhooks, billing quotas. Premise: there are only one or two maintainers, aligned privately. Add these once the team grows.
 
-## 二、两个区 + 发布闸(替代"逐次审")
+## 2. Two zones + a publish gate (replacing "per-change review")
 
-- **草稿区**:维护者 + agent 随便改,无门槛。
-- **发布区**:不可变版本,**消费者只看这个**。
-- **发布闸** = 唯一保留的"门" = 一个郑重的"发布"动作 = 打 tag。它**白送"可回溯"**(每版一个 tag,随时回退)。
+- **Draft zone**: maintainer + agent change freely, no gate.
+- **Published zone**: immutable versions, **consumers see only this**.
+- **Publish gate** = the only "gate" retained = one deliberate "publish" action = tagging. It **gives "traceability" for free** (one tag per version, roll back anytime).
 
-> 区分两种"审":**逐次审改**(每个改动等人批准)→ ❌ 砍(协作才需要);**发布闸**(草稿→郑重发布不可变版)→ ✅ 留(否则读者读到半成品)。
+> Distinguish two kinds of "review": **per-change review** (every change waits for human approval) → ❌ cut (only needed for collaboration); **publish gate** (draft → deliberately publishing an immutable version) → ✅ keep (otherwise readers see half-finished work).
 
-## 三、forge 的角色:headless git 托管(用 ~10%)
+## 3. The forge's role: headless git hosting (using ~10%)
 
-你的 5 个底层需求,逐个落到 git:读写=文件;**并发+合并 / 行级版本 / 改前可审 = git 的本职**;鉴权/多租户。
+Your 5 underlying needs map onto git one by one: read/write = files; **concurrency + merge / line-level versioning / reviewable-before-change = git's core job**; auth / multi-tenancy.
 
-- **存储内核必须是 git**(行级 diff / 三方合并 / 历史)——S3 版本 / Nextcloud / DB 出局(blob 级、无行级合并、无审/无回溯语义)。
-- **全套 forge vs 裸 git**:裸 git 更小,但鉴权 / 多租户 / 审核写要自己拼;Forgejo 单容器 + sqlite,**白送这些**,资源极轻 → v1 选 Forgejo。
-- **只用 git 存储 + tag 版本 + 只读访问 + token 鉴权 / org 多租户;不用它的 issue/PR 界面。**
-- 换掉它的条件:若砍掉"多租户 + 鉴权 + 发布区隔离",裸 git 即够,forge 变多余。当前不满足,故留。
+- **The storage core must be git** (line-level diff / three-way merge / history) — S3 versioning / Nextcloud / DB are out (blob-level, no line-level merge, no review / no rollback semantics).
+- **Full forge vs. bare git**: bare git is smaller, but you'd have to assemble auth / multi-tenancy / reviewed writes yourself; Forgejo is a single container + sqlite, **giving these for free**, extremely light on resources → v1 picks Forgejo.
+- **Use only git storage + tag versioning + read-only access + token auth / org multi-tenancy; do not use its issue/PR UI.**
+- Condition for replacing it: if we cut "multi-tenancy + auth + published-zone isolation," bare git would suffice and the forge becomes redundant. Currently not met, so it stays.
 
-## 四、两个面:维护(写) / 消费(只读)—— 同一 git 底座
+## 4. Two faces: maintain (write) / consume (read-only) — same git substrate
 
-| | 维护模式(写) | 消费模式(只读) |
+| | Maintain mode (write) | Consume mode (read-only) |
 |---|---|---|
-| 谁 | 库的 owner/维护者(一两个) | 问问题的人 / siclaw 挂载 |
-| 看到啥 | 我们的编译 web:聊天编 + 矛盾卡片 + 试问 + 发布 | 只读问答框,挂已发布版 |
-| 权限 | forge write | forge read-only |
-| 行为契约(**装载**) | `constitution.md` 裁决纪律 | consume 契约(只用库内容/带源/未覆盖诚实/拒变更命令) |
-| 隔离 | —— | **物理无写路径**:只读已发布 bundle,连不到草稿/编译 |
+| Who | The KB's owner/maintainer (one or two) | People asking questions / siclaw mount |
+| Sees what | Our compile web: chat compile + contradiction cards + test query + publish | Read-only Q&A box, mounted on the published version |
+| Permission | forge write | forge read-only |
+| Behavior contract (**loaded**) | `constitution.md` adjudication discipline | consume contract (use only KB content / cite sources / honest about not covered / refuse change commands) |
+| Isolation | —— | **Physically no write path**: read-only published bundle, cannot reach drafts/compile |
 
-> 维护者的"试问"和消费者的"问答"是同一个东西,只是一个连草稿、一个连已发布版。
+> The maintainer's "test query" and the consumer's "Q&A" are the same thing — one connects to the draft, the other to the published version.
 
-## 五、审核面 = 编译总结 + 矛盾卡片 + 试问(**不是逐行 diff**)
+## 5. Review surface = compile summary + contradiction cards + test query (**not line-by-line diff**)
 
-逐行 diff 是给代码用的;我们的产物是"给人问答的知识",agent 会重写/重组织文字 → 逐行 diff 全是无语义噪音。我们**关注问答效果**,所以审核面是:
+Line-by-line diff is for code; our product is "knowledge for people to query," and the agent rewrites/reorganizes the text → line-by-line diff is all semantically meaningless noise. We **care about Q&A quality**, so the review surface is:
 
-1. **编译总结** —— agent 抛:读了哪几篇 → 产出哪些页 → 自动并了哪些矛盾(FYI)→ 留了哪些给你裁 → 哪些"未覆盖"。(来源:账本 findings + resolutions,已有)
-2. **待裁矛盾卡片** —— 真冲突:证据内联 + 选项①②③④,点一下裁。(来源:账本 parked,护城河)
-3. **试问框** —— 发布前自己问几句,看带源回答对不对 = 按"问答效果"验收。(来源:消费模式 / `kb_eval`,已有)
+1. **Compile summary** — the agent surfaces: which sources it read → which pages it produced → which contradictions it auto-merged (FYI) → which it left for you to adjudicate → which are "not covered." (Source: ledger findings + resolutions, already exists)
+2. **Contradiction cards awaiting adjudication** — real conflicts: evidence inline + options ①②③④, adjudicate with one click. (Source: ledger parked, the moat)
+3. **Test-query box** — before publishing, ask a few questions yourself and check whether the sourced answers are right = acceptance by "Q&A quality." (Source: consume mode / `kb_eval`, already exists)
 
-> 这三样 kbc **现在都有**(总结=读账本、矛盾=parked、试问=消费/闸),UI 只是把它们呈现出来,不用新造引擎。
+> All three already exist in kbc **today** (summary = read the ledger, contradictions = parked, test query = consume/gate); the UI just presents them, no new engine needed.
 
-维护者界面示意(信息架构,非风格):
+Maintainer interface sketch (information architecture, not styling):
 ```
-┌─ 知识库 X ───────────── [草稿]●──○ 已发布 v? ─┐
-│ banner:草稿中 · 点"发布"才对只读用户可见        │
-│ 📋 编译总结:5篇→12页;自动并10处;待裁2处;未覆盖3处 │
-│ 🟡 待你确认(2) ▸ 试用额度 90 vs 30 天 [①90][②30][③各有条件][④存疑]│
-│ 💬 试问:[ 问题… ] → 带源回答                    │
-│ [ 发布这一版 ]                  📜 版本历史(抽屉)│
+┌─ Knowledge Base X ───────────── [Draft]●──○ Published v? ─┐
+│ banner: In draft · only visible to read-only users after "Publish" │
+│ 📋 Compile summary: 5 sources→12 pages; 10 auto-merged; 2 to adjudicate; 3 not covered │
+│ 🟡 Awaiting your confirmation (2) ▸ Trial quota 90 vs 30 days [①90][②30][③conditional][④mark-uncertain]│
+│ 💬 Test query: [ question… ] → sourced answer                    │
+│ [ Publish this version ]                  📜 Version history (drawer)│
 └──────────────────────────────────────────────────┘
 ```
 
-## 六、UI 蓝本:轻参考 siclaw skill 生命周期 —— 但**风格不锁**
+## 6. UI blueprint: lightly reference the siclaw skill lifecycle — but **styling not locked**
 
-siclaw 的 skill 已是"草稿→发布版本→可回溯"模型(banner 文案就有"草稿仅测试环境、发布才进生产")。**轻参考它的信息架构/交互模式,不复刻**:
+siclaw's skills are already a "draft → published version → traceable" model (the banner copy even says "drafts are test-env only; publishing goes to production"). **Lightly reference its information architecture / interaction patterns, do not replicate**:
 
-- **拿**:生命周期圆点条(草稿→已验证→已发布)/ 版本时间线抽屉 + 回滚(每版详情=该版"编译总结",非逐行 diff)/ 状态 banner / 矛盾卡片(借其"审批卡内联手风琴"骨架,内容换成证据+选项)/ 卡片·抽屉·对话框架构(少页面)。
-- **弃**:逐行 Diff 预览 / 独立审核者 track / 全局贡献 / 技能空间 / 批量。
-- **可直接抠的自包含组件**:`SkillLifecycleStatus.tsx`、`components/VersionHistoryDrawer.tsx`、状态 banner。源:`/Users/sdliu/project/siclaw_main/src/gateway/web/src/pages/Skills/`。
+- **Take**: the lifecycle dot bar (draft → verified → published) / the version-timeline drawer + rollback (each version's detail = that version's "compile summary," not line-by-line diff) / the status banner / contradiction cards (borrow its "approval-card inline accordion" skeleton, replacing the content with evidence + options) / the card·drawer·dialog architecture (few pages).
+- **Drop**: line-by-line diff preview / independent-reviewer track / global contributions / skill spaces / batch.
+- **Self-contained components that can be lifted directly**: `SkillLifecycleStatus.tsx`, `components/VersionHistoryDrawer.tsx`, the status banner. Source: `/Users/sdliu/project/siclaw_main/src/gateway/web/src/pages/Skills/`.
 
-> ⚠️ **视觉风格不固化**。只锁信息架构/交互模式;具体风格做前端时再定。
-> 风格参考:已有 **8080 消费面 demo**「GPU 选型知识库·证据台」(`~/test-gpu-kb/app/`,uvicorn gpuwiki.server),带源/证据式问答 —— 或另找合适前端 sample。
+> ⚠️ **Visual styling is not frozen**. Only the information architecture / interaction patterns are locked; the concrete styling is decided when building the frontend.
+> Styling reference: the existing **8080 consume-face demo** "GPU selection knowledge base · evidence desk" (`~/test-gpu-kb/app/`, uvicorn gpuwiki.server), with sourced/evidence-style Q&A — or find another suitable frontend sample.
 
-## 七、自造 vs fork 红线(护城河不外包)
+## 7. Build vs. fork red line (the moat is not outsourced)
 
-- **fork(底座,别重写)**:Forgejo(git 存储 / tag / 鉴权 / 多租户)。
-- **自造(~30%,护城河)**:① 用户无感知的包装 web(聊天编 / 编译总结 / 矛盾卡片 / 试问 / 发布)② 矛盾→自裁/升级裁决环(已验)③ 两个 KB 专属闸指标(bundle 自矛盾 + 源→编译 coverage)。
-- 消费问答 / 发布闸:kbc 已有,平台化只是套只读壳 + 接已发布版。
+- **fork (the substrate, don't rewrite)**: Forgejo (git storage / tag / auth / multi-tenancy).
+- **Build (~30%, the moat)**: ① the wrapper web users don't perceive (chat compile / compile summary / contradiction cards / test query / publish) ② the contradiction → self-adjudicate/escalate adjudication loop (verified) ③ two KB-specific gate metrics (bundle self-contradiction + source → compile coverage).
+- Consumer Q&A / publish gate: kbc already has these; platformization just wraps a read-only shell + connects to the published version.
 
-## 八、对已写代码的影响
+## 8. Impact on already-written code
 
-- `platform/forge_client.py` —— **留**(数据面访问层)。v1 需补:**提交文件** + **打 tag/release**。当前的 issue/PR 方法降为"暂不用"。
-- `platform/bridge.py`(矛盾→forge issue)—— **v1 搁置**(矛盾在 chat 里裁,不上 forge issue;若将来要异步/多人审再启用)。
-- `worker.py` —— 形态待定(见 §九)。
+- `platform/forge_client.py` — **keep** (data-plane access layer). v1 needs to add: **commit files** + **tag/release**. The current issue/PR methods are demoted to "not used for now."
+- `platform/bridge.py` (contradiction → forge issue) — **shelved for v1** (contradictions are adjudicated in chat, not filed as forge issues; enable later if async / multi-person review is needed).
+- `worker.py` — form TBD (see §9).
 
-## 九、运行时(轴 B:远程跑编译 agent)
+## 9. Runtime (axis B: run the compile agent remotely)
 
-与"人在哪评审"正交。v1 = 在服务器上跑 headless `claude -p`(`llm.py` 已是这后端,复用订阅鉴权、无需 key;GPU 库消费已验)或保活一个服务器端 agent 会话。容器化(Docker per-job / agentbox)= v2。
+Orthogonal to "where the human reviews." v1 = run headless `claude -p` on the server (`llm.py` is already this backend, reusing subscription auth, no key needed; GPU-KB consumption verified) or keep a server-side agent session alive. Containerization (Docker per-job / agentbox) = v2.
 
-## 十、待定 / 承重假设
+## 10. Open items / load-bearing assumptions
 
-- **承重假设(已认)**:forge-centric(平台=包装 + headless forge),非 bespoke runtime。
-- Gitea vs **Forgejo**(倾向 Forgejo,治理更开放)。
-- UI 视觉风格:待选(§六)。
-- 运行时形态(§九):v1 headless,v2 容器。
+- **Load-bearing assumption (accepted)**: forge-centric (platform = wrapper + headless forge), not a bespoke runtime.
+- Gitea vs. **Forgejo** (leaning Forgejo, more open governance).
+- UI visual styling: TBD (§6).
+- Runtime form (§9): v1 headless, v2 containers.
 
-## 十一、平台基础能力矩阵(v1)—— 每条对到实现 + 状态
+## 11. Platform capability matrix (v1) — each row mapped to implementation + status
 
-> 状态:✅验=有实现且真跑过验证 / ✅有=有实现(L2 既有或已写) / 🟡=进行中 / ⏳=明确 v2。
+> Status: ✅ verified = implemented and actually run-verified / ✅ exists = implemented (pre-existing in L2 or already written) / 🟡 = in progress / ⏳ = explicitly v2.
 
-**A. 数据面 / 存储(Forgejo headless git 托管)**
-| 能力 | 实现 | 状态 |
+**A. Data plane / storage (Forgejo headless git hosting)**
+| Capability | Implementation | Status |
 |---|---|---|
-| git 存储(版本/历史/diff) | `platform/forge/docker-compose.yml`(Forgejo 11) | ✅验 |
-| 多租户(org/仓) | Forgejo org/repo | ✅有(单仓 kbc/aliyun-fc) |
-| 鉴权(读/写 token) | Forgejo token + `.kbc.token` / `.kbc.ro.token` | ✅验 |
-| 只读隔离(消费无写路径) | 只读 token(read:repository) | ✅验(写被拒 401) |
+| git storage (versions/history/diff) | `platform/forge/docker-compose.yml` (Forgejo 11) | ✅ verified |
+| Multi-tenancy (org/repo) | Forgejo org/repo | ✅ exists (single repo kbc/aliyun-fc) |
+| Auth (read/write token) | Forgejo token + `.kbc.token` / `.kbc.ro.token` | ✅ verified |
+| Read-only isolation (consumer has no write path) | Read-only token (read:repository) | ✅ verified (writes rejected with 401) |
 
-**B. 数据面访问层 `platform/forge_client.py`**
-| 能力 | 方法 | 状态 |
+**B. Data-plane access layer `platform/forge_client.py`**
+| Capability | Method | Status |
 |---|---|---|
-| 读写仓文件 / 多文件一次提交 | get_file / put_file / commit_files | ✅验 |
-| 打 tag/release / 列版本 / 列文件树 | create_release / list_releases / list_tree | ✅验 |
-| issue / 分支 / PR | open_issue·get_comments… / create_branch / open_pr | ✅有(v1 搁置) |
+| Read/write repo files / commit multiple files at once | get_file / put_file / commit_files | ✅ verified |
+| Tag/release / list versions / list file tree | create_release / list_releases / list_tree | ✅ verified |
+| issue / branch / PR | open_issue·get_comments… / create_branch / open_pr | ✅ exists (shelved for v1) |
 
-**C. 维护侧(编)**
-| 能力 | 实现 | 状态 |
+**C. Maintain side (compile)**
+| Capability | Implementation | Status |
 |---|---|---|
-| 丢 raw(drop 文件 CRUD,自动留痕) | git/forge(commit_files) | ✅有(git 天然 diff) |
-| 拉 raw / 推 bundle(repo↔本地) | `platform/repo_sync.py` pull/push_bundle | ✅验(pull)/🟡(push 整环中) |
-| 编译(raw→bundle:ingest→compile→emit) | `tools/{ingest,compile_loop,emit}.py` | ✅有(L2) |
-| 编侧整环编排(pull→编→push) | `platform/compile_repo.py` | 🟡 后台验证中 |
-| 矛盾裁决(护城河) | `tools/triage.py` / v1 在 chat 裁 | ✅有(L2) |
-| 编译总结 | ledger findings → 发布说明 | ✅验 |
+| Drop raw (drop file CRUD, auto history trail) | git/forge (commit_files) | ✅ exists (git's native diff) |
+| Pull raw / push bundle (repo↔local) | `platform/repo_sync.py` pull/push_bundle | ✅ verified (pull) / 🟡 (push, full loop in progress) |
+| Compile (raw→bundle: ingest→compile→emit) | `tools/{ingest,compile_loop,emit}.py` | ✅ exists (L2) |
+| Maintain-side full-loop orchestration (pull→compile→push) | `platform/compile_repo.py` | 🟡 verifying in background |
+| Contradiction adjudication (the moat) | `tools/triage.py` / v1 adjudicates in chat | ✅ exists (L2) |
+| Compile summary | ledger findings → release notes | ✅ verified |
 
-**D. 发布闸**
-| 能力 | 实现 | 状态 |
+**D. Publish gate**
+| Capability | Implementation | Status |
 |---|---|---|
-| 发布一版(打 tag,郑重动作) | `platform/publish.py` + create_release | ✅验(v1) |
-| 发布说明=编译总结 | publish.summary_from_ledger | ✅验 |
-| 可回溯(版本历史/回滚) | git tags / list_releases | ✅验(列版本)/ 🟡回滚 UI(前端) |
+| Publish a version (tag, a deliberate action) | `platform/publish.py` + create_release | ✅ verified (v1) |
+| Release notes = compile summary | publish.summary_from_ledger | ✅ verified |
+| Traceable (version history/rollback) | git tags / list_releases | ✅ verified (list versions) / 🟡 rollback UI (frontend) |
 
-**E. 消费侧(只读问答)**
-| 能力 | 实现 | 状态 |
+**E. Consume side (read-only Q&A)**
+| Capability | Implementation | Status |
 |---|---|---|
-| 取已发布版(只读) | `platform/consume.py` fetch_published(@tag) | ✅验 |
-| 带源问答(consume 契约) | consume.answer + `tools/llm.py` | ✅验(fc=300/fc-2-0=100 各带源) |
+| Fetch published version (read-only) | `platform/consume.py` fetch_published(@tag) | ✅ verified |
+| Sourced Q&A (consume contract) | consume.answer + `tools/llm.py` | ✅ verified (fc=300/fc-2-0=100, each sourced) |
 
-**F. 运行时(轴 B)**
-| 能力 | 实现 | 状态 |
+**F. Runtime (axis B)**
+| Capability | Implementation | Status |
 |---|---|---|
-| 远程跑编译/问答 agent(headless,无需 key) | `tools/llm.py`(claude -p) | ✅验 |
+| Run compile/Q&A agent remotely (headless, no key needed) | `tools/llm.py` (claude -p) | ✅ verified |
 
-**G. 明确 v2 / 未做(写下来不是忘了)**
-| 能力 | 归属 |
+**G. Explicitly v2 / not done (written down, not forgotten)**
+| Capability | Belongs to |
 |---|---|
-| webhook 自动触发(drop diff→自动编) | v2(核心 `compile_repo` 不返工,外包一层) |
-| 包装前端 UI(维护 web / 消费 web,§六 轻参考、风格待定) | L3 后段 |
-| 增量编译(只重编受影响子图,`sources.hash` 已设计) | v2(v1 小库全量重编) |
-| 多 worker / 容器编排 / 计费配额 / 多人协作审核 | v2 |
+| webhook auto-trigger (drop diff → auto compile) | v2 (core `compile_repo` unchanged, wrap one layer around it) |
+| Wrapper frontend UI (maintain web / consume web, §6 light reference, styling TBD) | L3 later stage |
+| Incremental compile (recompile only the affected subgraph, `sources.hash` already designed) | v2 (v1 recompiles small KBs fully) |
+| Multiple workers / container orchestration / billing quotas / multi-person collaborative review | v2 |
 
-**v1 端到端验收线**:`drop/` 文件 → 编 → 发布 v1 → 只读消费带源答 —— 已逐段验证;`compile_repo` 整环(后台)跑通后,这条线全程自动化(手动触发)即闭合。
+**v1 end-to-end acceptance line**: `drop/` files → compile → publish v1 → read-only consume with sourced answers — verified segment by segment; once the `compile_repo` full loop (background) runs through, this line closes with full automation (manual trigger).
