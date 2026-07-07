@@ -1074,15 +1074,24 @@ def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | Non
     """Install a consumer-PROVIDED wiki snapshot (a tar.gz of root-level pages —
     e.g. a PUBLISHED version bundle, the exact bytes a publish serves) into
     {dest}/.siclaw/knowledge/. Lets a test session probe a snapshot that does not
-    live on this box's disk. Returns (content hash — same formula as
-    _pack_candidates_to_wiki so draft and version snapshots are comparable —
-    and the page count)."""
+    live on this box's disk. Returns (content hash — via selfcheck.content_hash,
+    the same formula as pack_candidates_to_wiki so draft and version snapshots are
+    comparable — and the page count)."""
+    # DoS hardening, mirroring _install_source_bundle / _install_authoring_bundle:
+    # cap the compressed input AND accumulate the declared uncompressed size, so a
+    # gzip-bomb bundle_base64 that slips under the HTTP request cap can't OOM the
+    # box (which shares the pod with the live parent authoring run).
+    max_bundle_bytes = int(os.environ.get("KBC_MAX_SNAPSHOT_BUNDLE_BYTES", str(64 * 1024 * 1024)))
+    max_unpacked_bytes = int(os.environ.get("KBC_MAX_SNAPSHOT_UNPACKED_BYTES", str(256 * 1024 * 1024)))
+    if len(bundle) > max_bundle_bytes:
+        raise ValueError(f"snapshot bundle is too large: {len(bundle)} > {max_bundle_bytes}")
     actual = hashlib.sha256(bundle).hexdigest()
     if expected_sha256 and expected_sha256.lower() != actual:
         raise ValueError(f"snapshot bundle sha256 mismatch: expected {expected_sha256}, got {actual}")
     kdir = dest / ".siclaw" / "knowledge"
     kdir.mkdir(parents=True, exist_ok=True)
     pages: list[tuple[str, bytes]] = []
+    total_bytes = 0
     try:
         tf = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
     except tarfile.TarError as e:
@@ -1091,6 +1100,9 @@ def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | Non
         for member in tf.getmembers():
             if not member.isfile():
                 continue
+            total_bytes += member.size
+            if total_bytes > max_unpacked_bytes:
+                raise ValueError(f"snapshot bundle unpacks too large: {total_bytes} > {max_unpacked_bytes}")
             rel = _safe_tar_path(member.name)
             rel_posix = rel.as_posix()
             if not (rel_posix.endswith(".md") or rel_posix.endswith(".json")):
@@ -1106,10 +1118,7 @@ def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | Non
             pages.append((rel_posix, data))
     if not any(rp == "index.md" for rp, _ in pages):
         raise FileNotFoundError("snapshot bundle is missing index.md — cannot test without a root index page")
-    h = hashlib.sha256()
-    for rp, data in sorted(pages):
-        h.update(rp.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
-    return h.hexdigest(), len(pages)
+    return selfcheck.content_hash(pages), len(pages)
 
 
 async def handle_open_test(request: web.Request):

@@ -70,10 +70,34 @@ def source_inventory(workdir: str) -> list[str]:
     return sorted(out)
 
 
+def _strip_source_prefix(entry: str) -> str:
+    """Drop a leading raw/ or drop/ so a path compares against the raw-relative
+    inventory. Applied to BOTH compiled_from entries and exclusion patterns, so
+    the two namespaces line up (a `raw/live.csv` exclusion matches inventory
+    `live.csv`, matching how the adjacent compiled_from field accepts the prefix)."""
+    for prefix in ("raw/", "drop/"):
+        if entry.startswith(prefix):
+            return entry[len(prefix):]
+    return entry
+
+
+def _norm_source_entry(raw: str) -> str:
+    """One compiled_from list entry → a raw-relative source path. Tolerates
+    `"<hash8> · <path>"`, surrounding quotes, and a raw/ or drop/ prefix."""
+    entry = raw.strip().strip("\"'").strip()
+    if "·" in entry:
+        entry = entry.rsplit("·", 1)[1].strip()
+    return _strip_source_prefix(entry.strip("\"'").strip())
+
+
 def parse_compiled_from(md_text: str) -> tuple[list[str], bool, bool]:
     """Parse a candidate page's frontmatter.
 
-    Returns (source_paths, derived, has_compiled_from). Tolerated entry forms:
+    Returns (source_paths, derived, has_compiled_from). `compiled_from` is read
+    in BOTH the block form (`compiled_from:` then `- item` lines) and the inline
+    flow form (`compiled_from: [a.md, "b.md"]`) — the inline form previously
+    parsed to zero sources and triggered a spurious repair on a cited page.
+    Tolerated entry forms:
       - "<hash8> · <path>"   (provenance with fingerprint)
       - "<path>" / '<path>' / <path>
     A leading raw/ or drop/ prefix is stripped so paths compare against the
@@ -96,21 +120,24 @@ def parse_compiled_from(md_text: str) -> tuple[list[str], bool, bool]:
             rest = line.split(":", 1)[1].strip()
             if key == "compiled_from":
                 has_key = True
-                # block form (`compiled_from:` alone) opens the list; inline
-                # `compiled_from: []` means key present with zero entries
-                in_list = rest == ""
+                if rest.startswith("["):
+                    # inline flow list on one line: compiled_from: [raw/a.md, "b.md"]
+                    inner = rest[1:-1] if rest.endswith("]") else rest[1:]
+                    for item in inner.split(","):
+                        entry = _norm_source_entry(item)
+                        if entry:
+                            sources.append(entry)
+                else:
+                    # block form (`compiled_from:` alone) opens the list; inline
+                    # `compiled_from: []` is handled above (rest == "[]")
+                    in_list = rest == ""
             elif key == "derived":
                 derived = rest.lower() in ("true", "yes")
             continue
         if in_list:
             m = re.match(r"^\s*-\s*(.+?)\s*$", line)
             if m:
-                entry = m.group(1).strip().strip("\"'").strip()
-                if "·" in entry:
-                    entry = entry.rsplit("·", 1)[1].strip()
-                for prefix in ("raw/", "drop/"):
-                    if entry.startswith(prefix):
-                        entry = entry[len(prefix):]
+                entry = _norm_source_entry(m.group(1))
                 if entry:
                     sources.append(entry)
             elif stripped:
@@ -162,10 +189,33 @@ def load_exclusions(workdir: str) -> tuple[list[dict], list[str]]:
     return entries, errors
 
 
+def _seg_glob(pat_parts: list[str], tgt_parts: list[str]) -> bool:
+    """Segment-aware glob: `*` / `?` match WITHIN one path segment (never cross
+    `/`); a whole `**` segment matches zero or more segments. Prevents `notes/*`
+    from silently swallowing `notes/sub/secret.md` (the over-exclusion false-PASS)."""
+    if not pat_parts:
+        return not tgt_parts
+    head = pat_parts[0]
+    if head == "**":
+        return any(_seg_glob(pat_parts[1:], tgt_parts[i:]) for i in range(len(tgt_parts) + 1))
+    if not tgt_parts:
+        return False
+    if fnmatch.fnmatch(tgt_parts[0], head):
+        return _seg_glob(pat_parts[1:], tgt_parts[1:])
+    return False
+
+
 def _matches(path: str, pattern: str) -> bool:
-    if pattern.endswith("/"):  # directory prefix form
+    """Does a raw-relative inventory `path` match an exclusion `pattern`? The
+    pattern is normalized to the raw-relative namespace (a raw/ or drop/ prefix is
+    stripped, matching how compiled_from entries are normalized), and globbing is
+    SEGMENT-AWARE — `*` never crosses `/`. Use a trailing `/` (dir-prefix) or `**`
+    to exclude a whole subtree; `notes/*` excludes only the files directly under
+    notes/."""
+    pattern = _strip_source_prefix(pattern)
+    if pattern.endswith("/"):  # directory prefix form: the whole subtree
         return path.startswith(pattern)
-    return fnmatch.fnmatch(path, pattern)
+    return _seg_glob(pattern.split("/"), path.split("/"))
 
 
 _MD_LINK_RE = re.compile(r"\]\(([^)#\s]+\.md)(?:#[^)]*)?\)")
@@ -209,7 +259,17 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
     cited: set[str] = set()
     for page in pages.values():
         cited.update(page["sources"])
-    excluded = {s for s in sources if any(_matches(s, e["pattern"]) for e in exclusions)}
+    excluded: set[str] = set()
+    hit: set[str] = set()  # exclusion patterns that matched ≥1 inventory path
+    for s in sources:
+        for e in exclusions:
+            if _matches(s, e["pattern"]):
+                excluded.add(s)
+                hit.add(e["pattern"])
+    # A pattern that matches nothing is almost always a typo (wrong prefix, wrong
+    # glob) — surfaced as a warning so the owner fixes it, but non-blocking (a
+    # stale exclusion for an already-removed file shouldn't wedge the gate).
+    noop_exclusions = sorted({e["pattern"] for e in exclusions} - hit)
     unaccounted = sorted(source_set - cited - excluded)
     dangling = sorted(cited - source_set)
     return {
@@ -218,13 +278,27 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
         "excluded": len(excluded),
         "unaccounted": unaccounted,
         "dangling_citations": dangling,
+        "noop_exclusions": noop_exclusions,
         "closed": not unaccounted,
     }
 
 
+def content_hash(pages: list[tuple[str, bytes]]) -> str:
+    """THE canonical (rel_posix, bytes) digest, sorted by rel_posix. Single source
+    of truth behind the draft snapshot (pack_candidates_to_wiki), the self-check
+    idempotency key (candidate_tree_hash), and an installed published bundle
+    (compile_box._install_wiki_snapshot) — so byte-identical content yields the
+    SAME snapshot_hash across all three and (question × snapshot) grading stays
+    comparable across draft and published sources. Do not inline this formula
+    anywhere; keep this the only copy so the three can't silently drift."""
+    h = hashlib.sha256()
+    for rel_posix, data in sorted(pages):
+        h.update(rel_posix.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
+    return h.hexdigest()
+
+
 def candidate_tree_hash(workdir: str) -> str | None:
-    """Content hash of candidate/**/*.md|.json (same scheme as
-    _pack_candidates_to_wiki — hashed in rel_posix order) — the self-check
+    """Content hash of candidate/**/*.md|.json (via content_hash) — the self-check
     idempotency key. None when there is no candidate tree."""
     cand = Path(workdir) / "candidate"
     if not cand.is_dir():
@@ -233,13 +307,21 @@ def candidate_tree_hash(workdir: str) -> str | None:
     for f in cand.rglob("*"):
         if not f.is_file() or f.suffix not in (".md", ".json"):
             continue
-        entries.append((f.relative_to(cand).as_posix(), f.read_bytes()))
+        rel = f.relative_to(cand).as_posix()
+        try:
+            data = f.read_bytes()
+        except OSError:
+            # Unreadable (dangling symlink / FIFO / perm-denied). Do NOT raise:
+            # state_key runs BEFORE run_layer1's fail-open, so an exception here
+            # would silently disable the coverage gate. Include the path with
+            # empty bytes so the tree hash still changes when the file appears
+            # (rotating the idempotency key → a re-check), and candidate_pages
+            # surfaces the real read error as an "unreadable" lint violation.
+            data = b""
+        entries.append((rel, data))
     if not entries:
         return None
-    h = hashlib.sha256()
-    for rel, data in sorted(entries):
-        h.update(rel.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
-    return h.hexdigest()
+    return content_hash(entries)
 
 
 def state_key(workdir: str) -> str | None:
@@ -344,16 +426,10 @@ def pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
         raise FileNotFoundError("no candidate pages to test yet — ask the authoring agent to generate pages first")
     if not any(rp == "index.md" for rp, _ in pages):
         raise FileNotFoundError("draft is missing candidate/index.md — cannot test without a root index page")
-    # Hash in rel_posix-STRING order (not filesystem/Path order): a draft pinned
-    # here and a published bundle installed by compile_box._install_wiki_snapshot
-    # must yield the SAME hash for byte-identical content, so the (question ×
-    # snapshot) grading key stays comparable across draft and published sources.
-    # Path-sort and string-sort diverge for nested trees (e.g. dir `a/` vs file
-    # `a.md`); _install_wiki_snapshot already sorts by string, so we match it.
-    h = hashlib.sha256()
-    for rel_posix, data in sorted(pages):
-        h.update(rel_posix.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
-    return h.hexdigest(), len(pages)
+    # content_hash sorts by rel_posix STRING (not filesystem/Path order), so a
+    # draft pinned here and a published bundle installed by _install_wiki_snapshot
+    # yield the SAME hash for byte-identical content (they share this one formula).
+    return content_hash(pages), len(pages)
 
 
 def _is_en(locale: str | None) -> bool:
@@ -369,27 +445,33 @@ def narration(report: dict, locale: str | None = None) -> str:
     """One status line for the summary event stream (the only thing users see),
     in the run's locale (see _is_en)."""
     cov, lint = report["coverage"], report["lint"]
-    if _is_en(locale):
+    en = _is_en(locale)
+    noop = cov.get("noop_exclusions") or []
+    warn = ""
+    if noop:
+        warn = (f" ⚠ {len(noop)} exclusion(s) match no source — likely a typo" if en
+                else f" ⚠ {len(noop)} 条排除未命中任何源——疑似写错")
+    if en:
         if report["state"] == "passed":
             return (f"Self-check (ledger): closed ✓ — {cov['cited']} sources compiled"
-                    f" / {cov['excluded']} explicitly excluded / {cov['total_sources']} total; lint passed")
+                    f" / {cov['excluded']} explicitly excluded / {cov['total_sources']} total; lint passed") + warn
         parts = []
         if cov["unaccounted"]:
             parts.append(f"{len(cov['unaccounted'])} source file(s) unaccounted")
         if not lint["ok"]:
             parts.append(f"{len(lint['violations'])} lint issue(s)")
         tail = "repair requested" if report["state"] == "repairing" else "repair budget spent; remaining items left for the owner"
-        return "Self-check (ledger): " + ", ".join(parts) + " — " + tail
+        return "Self-check (ledger): " + ", ".join(parts) + " — " + tail + warn
     if report["state"] == "passed":
         return (f"自检(账本):闭合 ✓ — {cov['cited']} 源已编 / {cov['excluded']} 显式排除"
-                f" / 共 {cov['total_sources']};lint 通过")
+                f" / 共 {cov['total_sources']};lint 通过") + warn
     parts = []
     if cov["unaccounted"]:
         parts.append(f"{len(cov['unaccounted'])} 个源文件未入账")
     if not lint["ok"]:
         parts.append(f"{len(lint['violations'])} 处 lint 问题")
     tail = "已请求回修" if report["state"] == "repairing" else "回修额度用尽,余项待负责人处理"
-    return "自检(账本):" + "、".join(parts) + " — " + tail
+    return "自检(账本):" + "、".join(parts) + " — " + tail + warn
 
 
 def build_repair_prompt(report: dict, locale: str | None = None) -> str:

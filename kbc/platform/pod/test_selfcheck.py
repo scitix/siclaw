@@ -229,13 +229,84 @@ def test_pack_hash_is_relposix_sorted():
     print("OK  pack hash is rel_posix-sorted (draft/published snapshot comparability, nested-tree safe)")
 
 
+def test_parse_compiled_from_inline():
+    """Fix D: an inline flow list must parse to sources (previously → [] → spurious repair)."""
+    src, _, has = selfcheck.parse_compiled_from('---\ncompiled_from: [raw/a.md, "b.md"]\n---\nx')
+    assert has and src == ["a.md", "b.md"], src
+    src, _, has = selfcheck.parse_compiled_from("---\ncompiled_from: [snapshot/x.md]\n---\ny")
+    assert has and src == ["snapshot/x.md"], src
+    src, _, has = selfcheck.parse_compiled_from("---\ncompiled_from: []\n---\nz")  # still empty-but-present
+    assert has and src == [], src
+    print("OK  parse_compiled_from inline flow list (fix D)")
+
+
+def test_matches_segment_aware():
+    """Fix B: `*` never crosses `/`; raw/ prefix on the exclusion side is normalized."""
+    assert selfcheck._matches("notes/a.md", "notes/*")
+    assert not selfcheck._matches("notes/sub/secret.md", "notes/*")  # over-exclusion false-PASS closed
+    assert selfcheck._matches("notes/sub/secret.md", "notes/**")     # ** crosses segments
+    assert selfcheck._matches("notes/sub/secret.md", "notes/")       # dir-prefix = whole subtree
+    assert selfcheck._matches("live.csv", "raw/live.csv")            # prefix-mismatch false-GAP closed
+    assert selfcheck._matches("d/live.csv", "drop/d/live.csv")
+    print("OK  _matches segment-aware + prefix-normalized (fix B)")
+
+
+def test_noop_exclusion_warning():
+    """Fix B#3: an exclusion matching no source is surfaced as a warning (not blocking)."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/a.md"); _mk(base, "candidate/index.md", "---\ntype: index\n---\ni")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - a.md\n---\nx")
+        _mk(base, "authoring/EXCLUSIONS.json",
+            json.dumps([{"pattern": "nope/*.md", "reason": "typo, matches nothing"}]))
+        report = selfcheck.run_layer1(td)
+        assert report["coverage"]["noop_exclusions"] == ["nope/*.md"], report["coverage"]
+        assert report["coverage"]["closed"]  # non-blocking: still closed
+        assert "no source" in selfcheck.narration({**report, "state": "passed"}, "en")
+    print("OK  no-op exclusion surfaced, non-blocking (fix B#3)")
+
+
+def test_candidate_tree_hash_unreadable():
+    """Fix C: a perm-denied candidate file must not crash state_key (runs before fail-open)."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("OK  candidate_tree_hash unreadable (skipped as root)"); return
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "candidate/index.md", "i")
+        bad = base / "candidate" / "denied.md"; bad.write_text("x"); bad.chmod(0)
+        try:
+            assert selfcheck.state_key(td) is not None  # must NOT raise
+        finally:
+            bad.chmod(0o644)  # let tempdir cleanup succeed
+    print("OK  candidate_tree_hash tolerates a perm-denied file (fix C)")
+
+
+def test_content_hash_shared_formula():
+    """Design: pack / tree / canonical must agree for byte-identical content (nested)."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        files = {"index.md": "i", "a.md": "A", "a/b.md": "B"}  # nested: Path- vs string-sort diverge
+        for rel, txt in files.items():
+            _mk(base, f"candidate/{rel}", txt)
+        h_pack, _ = selfcheck.pack_candidates_to_wiki(str(base), base / "snap")
+        h_tree = selfcheck.candidate_tree_hash(str(base))
+        want = selfcheck.content_hash([(rel, txt.encode()) for rel, txt in files.items()])
+        assert h_pack == want == h_tree, (h_pack, h_tree, want)
+    print("OK  content_hash: pack == tree == canonical (single shared formula)")
+
+
 def main():
     os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
     test_parse_compiled_from()
+    test_parse_compiled_from_inline()
     test_inventory_and_exclusions()
+    test_matches_segment_aware()
+    test_noop_exclusion_warning()
     test_coverage_and_lint()
     test_state_key()
+    test_candidate_tree_hash_unreadable()
     test_pack_hash_is_relposix_sorted()
+    test_content_hash_shared_formula()
     asyncio.run(test_wiring())
     print("ALL OK  test_selfcheck")
 

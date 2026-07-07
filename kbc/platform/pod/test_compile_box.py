@@ -663,7 +663,39 @@ async def test_propose_plan_never_bounces():
     print("✓ propose_plan always signals; PROPOSED_PLAN.json written by code")
 
 
+def test_install_wiki_snapshot_size_guard():
+    """Fix A: the published-snapshot installer rejects an oversized compressed
+    bundle AND a decompression bomb (accumulated-unpacked cap), like its sibling
+    installers — else a gzip-bomb bundle_base64 OOMs the pod + the parent run."""
+    import tempfile as _tf
+    ok = make_source_bundle({"index.md": "# i\n", "p.md": "x" * 100})
+    with _tf.TemporaryDirectory() as d:
+        dest = Path(d)
+        os.environ["KBC_MAX_SNAPSHOT_BUNDLE_BYTES"] = "10"      # compressed cap
+        try:
+            try:
+                compile_box._install_wiki_snapshot(ok, dest / "a")
+                assert False, "should reject oversized compressed bundle"
+            except ValueError as e:
+                assert "too large" in str(e), e
+        finally:
+            del os.environ["KBC_MAX_SNAPSHOT_BUNDLE_BYTES"]
+        os.environ["KBC_MAX_SNAPSHOT_UNPACKED_BYTES"] = "5"     # unpacked cap
+        try:
+            try:
+                compile_box._install_wiki_snapshot(ok, dest / "b")
+                assert False, "should reject bundle that unpacks too large"
+            except ValueError as e:
+                assert "unpacks too large" in str(e), e
+        finally:
+            del os.environ["KBC_MAX_SNAPSHOT_UNPACKED_BYTES"]
+        h, pages = compile_box._install_wiki_snapshot(ok, dest / "c")  # within limits → ok
+        assert pages == 2 and len(h) == 64, (pages, h)
+    print("✓ install_wiki_snapshot size guards (compressed + unpacked caps)")
+
+
 async def main():
+    test_install_wiki_snapshot_size_guard()
     await test_workspace_sync()
     await test_run_wrapper_terminal_signals()
     await test_session_driver_conversational()
