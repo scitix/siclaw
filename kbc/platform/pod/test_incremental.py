@@ -90,7 +90,14 @@ def test_integrity_guard():
         (base / "candidate/b.md").unlink()
         after3 = incremental.page_hashes(td)
         assert "b.md" in incremental.integrity_violations(before, after3, {"a.md", "c.md"})
-        print("OK  integrity guard (affected+index allowed, out-of-scope edit/delete flagged, added-target honored)")
+        # a NEWLY CREATED page (added source → new page) is NOT a violation, even
+        # undeclared — the guard only protects existing pages from modify/delete;
+        # coverage + orphan lint gate spurious new pages.
+        _mk(base, "candidate/brand-new.md", _page(["snap/five.md"]) + "\n新页。")
+        after4 = incremental.page_hashes(td)
+        assert "brand-new.md" not in incremental.integrity_violations(before, after4, {"a.md"}), \
+            "a newly created page must not be flagged as out-of-scope"
+        print("OK  integrity guard (affected+index allowed, out-of-scope edit/delete flagged, created page allowed, added-target honored)")
 
 
 def test_protocol_raw_changes_to_changeset():
