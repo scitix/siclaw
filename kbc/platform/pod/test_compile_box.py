@@ -316,6 +316,42 @@ def test_pack_candidates_to_wiki():
     print("✓ pack candidates to wiki (snapshot parity with publish)")
 
 
+def test_pack_candidates_symlink_confinement():
+    """Security: the compile session has Write+Bash, so it could ln -s a host file
+    into candidate/. The pinner must NOT copy content whose real path escapes
+    candidate/ — neither a file symlink nor a symlinked directory."""
+    with tempfile.TemporaryDirectory() as wd, tempfile.TemporaryDirectory() as dest_root, tempfile.TemporaryDirectory() as outside:
+        secret = Path(outside) / "secret.md"
+        secret.write_text("TOP-SECRET host content\n")
+        secret_dir = Path(outside) / "hostdir"
+        secret_dir.mkdir()
+        (secret_dir / "leak2.md").write_text("SECRET via symlinked dir\n")
+
+        cand = Path(wd) / "candidate"
+        cand.mkdir()
+        (cand / "index.md").write_text("# index\n")
+        (cand / "real.md").write_text("legit page\n")
+        # (a) file symlink escaping candidate/ (relative name, no "..", is_file() true)
+        os.symlink(secret, cand / "leak.md")
+        # (b) symlinked directory pointing outside candidate/
+        os.symlink(secret_dir, cand / "sub")
+
+        dest = Path(dest_root) / "snap"
+        h, pages = compile_box._pack_candidates_to_wiki(wd, dest)
+        kdir = dest / ".siclaw" / "knowledge"
+        # Only the two real pages are packed; neither symlink target leaked.
+        assert pages == 2, pages
+        assert (kdir / "index.md").is_file()
+        assert (kdir / "real.md").is_file()
+        assert not (kdir / "leak.md").exists(), "file symlink escaped confinement"
+        assert not (kdir / "sub" / "leak2.md").exists(), "symlinked dir escaped confinement"
+        # And the secret content never entered the snapshot bytes.
+        for p in kdir.rglob("*"):
+            if p.is_file():
+                assert "SECRET" not in p.read_text(), p
+    print("✓ pack candidates symlink confinement (no host-file exfil into snapshot)")
+
+
 async def test_test_session_driver_readonly():
     """The read-only consumer driver configures Read/Glob/Grep ONLY (no Write/Edit/
     Bash, no MCP), cwd = the snapshot dir, persona = TEST_ROLE, no kickoff; it emits
@@ -492,6 +528,7 @@ async def main():
     await test_conversational_session()
     await test_message_waits_for_connect()
     test_pack_candidates_to_wiki()
+    test_pack_candidates_symlink_confinement()
     await test_test_path_escape_guard()
     await test_prompt_packs_locale()
     await test_test_session_driver_readonly()

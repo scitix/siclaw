@@ -203,11 +203,21 @@ def _pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
     h = hashlib.sha256()
     count = 0
     has_index = False
+    candidate_real = candidate.resolve()
     for f in sorted(candidate.rglob("*")) if candidate.is_dir() else []:
         if not f.is_file() or f.suffix not in (".md", ".json"):
             continue
         rel = f.relative_to(candidate)
         if ".." in rel.parts:
+            continue
+        # Symlink confinement (security): is_file() follows symlinks and rglob can
+        # descend a symlinked dir, so a compile session (which has Write+Bash) could
+        # `ln -s /etc/passwd candidate/leak.md` and leak host-file content into the
+        # read-only test snapshot. Pack only files whose REAL path stays under
+        # candidate/ — covers both file symlinks and symlinked directories.
+        try:
+            f.resolve().relative_to(candidate_real)
+        except (ValueError, OSError):
             continue
         rel_posix = rel.as_posix()
         data = f.read_bytes()

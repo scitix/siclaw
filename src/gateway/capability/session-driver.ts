@@ -9,7 +9,7 @@
  * This is the capability-native replacement for compile-driver's relayBoxEvents
  * (which still speaks compile.* and stays in use until B3 deletes the old path).
  * Contradiction handling is a normal turn, so there is NO parked/awaiting_input
- * frame — a box `parked` (vestigial) is treated as a turn that returned to idle.
+ * frame — the box never emits `parked`, so there is no handler for it.
  */
 
 import type { AgentBoxClient } from "../agentbox/client.js";
@@ -107,12 +107,6 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
             }
           }
         }
-        break;
-      case "parked":
-        // Vestigial: the contradiction-as-turn model never blocks. Treat like a
-        // turn that returned to idle so a stray park can't wedge the run.
-        emit("turn", { text: evt.message ?? "" });
-        await manager.setStatus(runId, "idle");
         break;
       case "done":
         emit("lifecycle", { status: "done" });

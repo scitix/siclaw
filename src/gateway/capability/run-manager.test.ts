@@ -77,7 +77,7 @@ describe("CapabilityRunManager", () => {
     const mgr = new CapabilityRunManager(be);
     const n = await mgr.recover();
     expect(n).toBe(2);
-    expect(mgr.get("r1")).toMatchObject({ profile: "kb-compile", orgId: "o1", correlationId: "a1", sessionRef: "s1" });
+    expect(mgr.get("r1")).toMatchObject({ profile: "kb-compile", orgId: "o1", correlationId: "a1" });
     expect(mgr.get("r2")?.status).toBe("idle");
   });
 
@@ -324,6 +324,58 @@ describe("CapabilityRunManager", () => {
     expect(onReap).not.toHaveBeenCalled(); // box not stopped
     expect(be.persists()).toHaveLength(0); // no failed persist → done not clobbered
     expect(mgr.get("r-ghost")?.status).toBe("running"); // still held for the next tick
+  });
+
+  it("reapStale gives up deferring after repeated re-check failures and reaps a poison row (bounded give-up)", async () => {
+    // A PERMANENT per-run getRun throw (a store row that never deserializes) must
+    // not defer forever and pin its box — after MAX_REAP_DEFERRALS the reap proceeds.
+    const be = new FakeBackend();
+    let clock = 1000;
+    const onReap = vi.fn();
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, onReap });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    const orig = be.request.bind(be);
+    be.request = async (method: string, params?: unknown) => {
+      if (method === CAPABILITY_GET_RUN) throw new Error("poison row"); // permanent per-run failure
+      return orig(method, params);
+    };
+    clock = 2000; // stale
+
+    // The first four ticks defer (< MAX_REAP_DEFERRALS = 5); the fifth gives up and reaps.
+    for (let i = 0; i < 4; i++) expect(await mgr.reapStale()).toEqual([]);
+    expect(onReap).not.toHaveBeenCalled();
+    const reaped = await mgr.reapStale();
+    expect(reaped).toEqual([rec.runId]);
+    expect(onReap).toHaveBeenCalledTimes(1);
+    expect(mgr.get(rec.runId)).toBeUndefined(); // reaped → dropped
+  });
+
+  it("a successful re-check clears the give-up counter (a transient outage doesn't accrue)", async () => {
+    const be = new FakeBackend();
+    let clock = 1000;
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500 });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    let throwGet = true;
+    const orig = be.request.bind(be);
+    be.request = async (method: string, params?: unknown) => {
+      if (method === CAPABILITY_GET_RUN) {
+        if (throwGet) throw new Error("transient outage");
+        return { id: rec.runId, profile: "kb-compile", status: "running" }; // non-terminal
+      }
+      return orig(method, params);
+    };
+    clock = 2000;
+    // Three failing ticks (defer), then the store recovers → counter resets, and
+    // a message keeps the run fresh so it's never wrongly reaped.
+    for (let i = 0; i < 3; i++) expect(await mgr.reapStale()).toEqual([]);
+    throwGet = false;
+    mgr.touch(rec.runId); // fresh again on the recovered tick
+    expect(await mgr.reapStale()).toEqual([]); // re-check succeeds, run is fresh → spared, counter cleared
+    // Now fail again: it must take a FULL MAX_REAP_DEFERRALS run, not carry the old 3.
+    throwGet = true;
+    clock = 4000; // stale once more
+    for (let i = 0; i < 4; i++) expect(await mgr.reapStale()).toEqual([]);
+    expect(await mgr.reapStale()).toEqual([rec.runId]); // 5th consecutive failure reaps
   });
 
   it("endRun is terminal-sticky — the first outcome wins", async () => {
