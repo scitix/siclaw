@@ -51,6 +51,17 @@ def _judge_model() -> str:
     return os.environ.get("KBC_PK_JUDGE_MODEL", "claude-opus-4-6")
 
 
+def _verdict_model() -> str:
+    """Grading a blue answer against the INLINED raw-truth rubric (`expected`,
+    extracted by the strong judge during the questions stage) is a mechanical
+    check, not authoring — the gate tier suffices and is far faster/cheaper than
+    the opus authoring judge. Root cause of the 2026-07-07 stall: the verdict was
+    an AGENTIC session (raw+wiki roots, max_turns 40) re-reading raw per chunk →
+    it looped and hung. De-agentified + gate-tier here. Overridable to the strong
+    judge if grading quality ever demands it."""
+    return os.environ.get("KBC_PK_VERDICT_MODEL", "claude-sonnet-4-6")
+
+
 def question_budget(page_count: int) -> int:
     """Scale by KB size — code formula, never model discretion (principle 8).
     Defaults tuned for compile-flow wiring (2026-07-06): 1.0/page capped at 24 —
@@ -107,20 +118,25 @@ QUESTIONS_USER = """你是裁判的**出题官**。基于下面的出题面,出 
 "expected": ..., "source_ref": ...}}
 只输出 JSON(不要任何其他文字):{{"questions": [...]}}"""
 
-VERDICT_USER = """蓝队(只读 wiki 快照,读不到原始语料)已作答。请逐题回原始语料核对并判分。
-- 原始语料(真值):{raw_dir}
-- wiki 快照:{wiki_dir}
+# De-agentified verdict (2026-07-07): grade against the INLINED `raw 真值要点`
+# already carried on each question — do NOT re-read raw (that agentic loop was
+# the stall). No {raw_dir}/{wiki_dir} in the prompt; the qa_block is self-contained.
+VERDICT_ROLE = """你是知识库测试【裁判】的判分员。逐题依据**已给的 raw 真值要点**核对蓝队回答并判分。
+真值要点是出题阶段从原始语料萃取的裁决依据——判分以它为准,**不要再去翻阅原始语料**(重读既慢又非必要,
+本轮判分只对着要点核对答案)。蓝队只读 wiki 快照、读不到原始语料,它答得好不好反映的是 wiki 文字站不站得住。"""
+
+VERDICT_USER = """请对下面每题判分。**只依据每题给出的「raw 真值要点」**,不要试图读取任何文件。
 
 判分标准:
-- score: 对 / 部分对 / 错(含 raw 无据处脑补、矛盾区单口径硬裁) /
-  正确标未覆盖(raw 本无 / WIP / 矛盾区,蓝队诚实平铺或明说未覆盖 = 好结果,算通过)
+- score: 对 / 部分对 / 错(含真值要点无据处脑补、矛盾区单口径硬裁) /
+  正确标未覆盖(真值要点标明 raw 本无 / WIP / 矛盾区,蓝队诚实平铺或明说未覆盖 = 好结果,算通过)
 - failure_category(无失败填"无"):
   覆盖(wiki 没编这个内容) / 路由(wiki 编了但蓝队没找到/index 没指到) /
   契约(脑补/没带源/该说未覆盖却硬答/矛盾区乱裁) / 媒介(链接坏/格式/表达误导)
 - fix: 失败时具体修哪页/哪条路由/哪个链接;通过填 "-"
 - page: 该题内容应落在/实际落在的 wiki 页名;不确定填 "-"
 
-题目与蓝队回答:
+题目、raw 真值要点与蓝队回答:
 {qa_block}
 
 只输出 JSON 数组(不要任何其他文字),每题:
@@ -302,6 +318,47 @@ def _summarize(questions: list[dict], verdicts: dict, *, missing_as_failure: boo
     }
 
 
+def _finalize(questions: list[dict], detail: dict, *, survey_cache_hit: bool,
+              blue_m: str, judge_m: str, verdict_m: str, salvaged: bool = False,
+              error: str | None = None) -> dict:
+    """Build the terminal pk summary with an OBSERVABLE state (root cause of
+    "why stuck was invisible": the old path wrote a bare TimeoutError()). Every
+    untested question gets a reason (per-item error captured during blue/judge,
+    else "judge-dropped"). State:
+      unconverged — real wiki failures found (owner must act)
+      partial     — some questions untested (timeout/error), rest graded
+      passed      — all graded, none failed
+    A hard early-stage failure (survey/questions) is handled by the caller."""
+    summary = _summarize(questions, detail["verdicts"], missing_as_failure=False)
+    ungraded = sorted(q["id"] for q in questions if q["id"] not in detail["verdicts"])
+    errors = detail.get("errors", {})
+    summary["ungraded_reasons"] = {
+        qid: errors.get(qid, {"stage": "judge", "reason": "judge dropped id from JSON"})
+        for qid in ungraded
+    }
+    if salvaged:
+        # Interrupted (wall-clock/hard error): incomplete by definition — never
+        # claim full coverage, and don't let a found-failure masquerade as the
+        # repair-triggering "unconverged" off a run that didn't finish.
+        state = "partial"
+    elif summary["failures"]:
+        state = "unconverged"
+    elif ungraded:
+        state = "partial"  # 诚实半完成:能判的判了,判不动的诚实亮出来、可续
+    else:
+        state = "passed"
+    summary.update({
+        "state": state, "ungraded": ungraded,
+        "survey_cache_hit": survey_cache_hit,
+        "blue_model": blue_m, "judge_model": judge_m, "verdict_model": verdict_m,
+    })
+    if salvaged:
+        summary["salvaged"] = True
+    if error:
+        summary["error"] = error
+    return summary
+
+
 # The blue team answers as the REAL consumer (persona = selfcheck.TEST_ROLE),
 # which means natural prose ending in a machine-readable `SOURCES: [...]` line —
 # NOT a JSON object. Forcing JSON on the consumer persona breaks fidelity AND
@@ -357,6 +414,7 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
     t0 = time.monotonic()
     blue_m = blue_model or _blue_model()
     judge_m = judge_model or _judge_model()
+    verdict_m = _verdict_model()
     say = progress or (lambda s: None)
     chunk_size = _env_int("KBC_PK_CHUNK", 5)
     concurrency = _env_int("KBC_PK_CONCURRENCY", 3)
@@ -373,22 +431,34 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
     # history). Intent sets weighting and the scoring yardstick; exclusions flip
     # "raw has it but owner opted out" from coverage-fail to honest-pass. The
     # blue team gets NONE of this: a real consumer doesn't know the scope deal.
-    judge_system = JUDGE_ROLE
+    # Built once as an appendix so the survey/questions role (reads raw) and the
+    # de-agentified verdict role (grades from inlined truth) share the same
+    # grading yardstick without duplicating it.
+    context_appendix = ""
     if constitution:
-        judge_system += f"\n\n本库的裁决纪律(constitution,判分时遵循):\n{constitution}"
+        context_appendix += f"\n\n本库的裁决纪律(constitution,判分时遵循):\n{constitution}"
     intent = _load_intent(authoring_dir)
     if intent:
-        judge_system += ("\n\n本库的定位与受众(INTENT,负责人声明):出题的数量分布要向这里声明的"
-                         "受众/用途倾斜;评分也以它界定的范围为尺——范围外的冷僻点不算缺口。\n" + intent)
+        context_appendix += ("\n\n本库的定位与受众(INTENT,负责人声明):出题的数量分布要向这里声明的"
+                             "受众/用途倾斜;评分也以它界定的范围为尺——范围外的冷僻点不算缺口。\n" + intent)
     exclusion_entries = _load_exclusion_entries(authoring_dir)
     if exclusion_entries:
         excl_lines = "\n".join(f"- {e['pattern']}: {e['reason']}" for e in exclusion_entries)
-        judge_system += ("\n\n负责人**声明排除**的 raw 范围(刻意不编,带理由):\n" + excl_lines +
-                         "\n对这些范围:不要出\"库里为什么没有\"式的覆盖题;若题目触及、且蓝队诚实回答"
-                         "\"本库未收录\",判 正确标未覆盖(=通过),不算覆盖失败。")
+        context_appendix += ("\n\n负责人**声明排除**的 raw 范围(刻意不编,带理由):\n" + excl_lines +
+                             "\n对这些范围:不要出\"库里为什么没有\"式的覆盖题;若题目触及、且蓝队诚实回答"
+                             "\"本库未收录\",判 正确标未覆盖(=通过),不算覆盖失败。")
+    judge_system = JUDGE_ROLE + context_appendix      # survey + questions (agentic, reads raw)
+    verdict_system = VERDICT_ROLE + context_appendix  # verdict (de-agentified, grades from inlined truth)
 
-    detail: dict = {"questions": [], "answers": {}, "verdicts": {}}
+    # `errors` (id → {stage, reason}) makes a partial run OBSERVABLE: every
+    # untested question carries why. Written per-item so a stalled sibling can't
+    # erase a completed one (root cause 缺陷2: fail-fast gather vaporized work).
+    detail: dict = {"questions": [], "answers": {}, "verdicts": {}, "errors": {}}
     survey_cache_hit = False
+
+    def _record_error(stage: str, ids: list[str], e: BaseException) -> None:
+        for qid in ids:
+            detail["errors"].setdefault(qid, {"stage": stage, "reason": repr(e)[:300]})
 
     async def _body() -> dict:
         nonlocal survey_cache_hit
@@ -442,40 +512,60 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
         sem = asyncio.Semaphore(concurrency)
 
         async def _blue(q: dict) -> None:
+            # Per-item containment (缺陷2): a single blue call that stalls/errors
+            # records its reason and returns — it must not raise through gather
+            # and cancel the siblings that already completed.
             async with sem:
-                text = await engine.run_readonly_agent(
-                    cwd=wiki_dir, system_prompt=selfcheck.TEST_ROLE,
-                    user_message=q["question"], model=blue_m,
-                    allowed_read_roots=[wiki_dir],
-                    timeout_secs=_env_float("KBC_PK_BLUE_TIMEOUT", 300))
+                try:
+                    text = await engine.run_readonly_agent(
+                        cwd=wiki_dir, system_prompt=selfcheck.TEST_ROLE,
+                        user_message=q["question"], model=blue_m,
+                        allowed_read_roots=[wiki_dir],
+                        timeout_secs=_env_float("KBC_PK_BLUE_TIMEOUT", 300))
+                except (Exception, asyncio.TimeoutError) as e:
+                    _record_error("blue", [q["id"]], e)
+                    return
             # Written as each answer lands (not after the gather): a wall-clock
             # cancellation must not vaporize the answers that DID complete.
             detail["answers"][q["id"]] = {"id": q["id"], "answer": _strip_sources(text),
                                           "cited_sources": _parse_sources(text),
                                           "said_uncovered": _said_uncovered(text)}
 
-        await asyncio.gather(*(_blue(q) for q in questions))
+        # return_exceptions=True as a belt: even a bug in the wrapper can't turn
+        # one bad item into a whole-round abort.
+        await asyncio.gather(*(_blue(q) for q in questions), return_exceptions=True)
 
-        # 5: judge — batched per chunk (judge prompt is fully ours; opus follows
-        #    the JSON contract reliably), fed the consumer's natural answer.
+        # 5: judge — batched per chunk, DE-AGENTIFIED (2026-07-07 root-cause fix):
+        #    grades from the inlined `expected` raw-truth rubric, gate-tier model,
+        #    NO raw root (roots=[wiki_dir]) so it can't loop re-reading raw. The
+        #    old agentic verdict (raw root + "回原始语料核对" + max_turns 40) is
+        #    what hung and, via fail-fast gather, vaporized all 24 answered blues.
         async def _judge(chunk: list[dict]) -> None:
             qa = "\n\n".join(
                 f"[{q['id']}] 问题: {q['question']}\nraw 真值要点: {q.get('expected', '-')}\n"
                 f"raw 出处: {q.get('source_ref', '-')}\n"
-                f"蓝队回答: {detail['answers'].get(q['id'], {}).get('answer') or '(蓝队无回答)'}\n"
+                f"蓝队回答: {detail['answers'].get(q['id'], {}).get('answer') or '(蓝队无回答/未测)'}\n"
                 f"蓝队自称引用: {detail['answers'].get(q['id'], {}).get('cited_sources', [])}"
                 for q in chunk)
             async with sem:
-                verdicts = await _agent_json(
-                    engine, stage="verdict", system=judge_system,
-                    user=VERDICT_USER.format(raw_dir=raw_dir, wiki_dir=wiki_dir, qa_block=qa),
-                    model=judge_m, cwd=wiki_dir, roots=judge_roots,
-                    timeout=_env_float("KBC_PK_VERDICT_TIMEOUT", 420))
+                try:
+                    verdicts = await _agent_json(
+                        engine, stage="verdict", system=verdict_system,
+                        user=VERDICT_USER.format(qa_block=qa),
+                        model=verdict_m, cwd=wiki_dir, roots=[wiki_dir],
+                        timeout=_env_float("KBC_PK_VERDICT_TIMEOUT", 180))
+                except (Exception, asyncio.TimeoutError) as e:
+                    _record_error("verdict", [q["id"] for q in chunk], e)
+                    return
             if isinstance(verdicts, list):  # incremental for the same salvage reason
-                detail["verdicts"].update(
-                    {v.get("id"): v for v in verdicts if isinstance(v, dict)})
+                got = {v.get("id"): v for v in verdicts if isinstance(v, dict)}
+                detail["verdicts"].update(got)
+                # a verdict landing clears any earlier per-item error for that id
+                for gid in got:
+                    detail["errors"].pop(gid, None)
 
-        await asyncio.gather(*(_judge(c) for c in _chunks(questions, chunk_size)))
+        await asyncio.gather(*(_judge(c) for c in _chunks(questions, chunk_size)),
+                             return_exceptions=True)
 
         # 5b: the judge sometimes drops ids from a chunk's JSON (seen live
         # 2026-07-07: 4/24 missing, twice). Re-judge ONLY the missing ones once;
@@ -485,32 +575,29 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
         missing = [q for q in questions if q["id"] not in detail["verdicts"]]
         if missing:
             say(f"自检(PK):{len(missing)} 题判分缺失,补判一轮…")
-            await asyncio.gather(*(_judge(c) for c in _chunks(missing, chunk_size)))
+            await asyncio.gather(*(_judge(c) for c in _chunks(missing, chunk_size)),
+                                 return_exceptions=True)
 
-        # 6: decide
-        summary = _summarize(questions, detail["verdicts"], missing_as_failure=False)
-        summary.update({
-            "state": "passed" if not summary["failures"] else "unconverged",
-            "ungraded": sorted(q["id"] for q in questions if q["id"] not in detail["verdicts"]),
-            "survey_cache_hit": survey_cache_hit,
-            "blue_model": blue_m, "judge_model": judge_m,
-        })
-        return summary
+        # 6: decide — observable terminal state (passed / partial / unconverged),
+        # every untested question carries a reason.
+        return _finalize(questions, detail, survey_cache_hit=survey_cache_hit,
+                         blue_m=blue_m, judge_m=judge_m, verdict_m=verdict_m)
 
     try:
         summary = await asyncio.wait_for(_body(), timeout=_env_float("KBC_PK_WALL_SECS", 1800))
     except (Exception, asyncio.TimeoutError) as e:  # fail-open boundary (§4.5): report, never raise
-        if detail["questions"] and detail["verdicts"]:
-            # Salvage the graded subset: cancelled ≠ failed, and the spend is sunk.
-            summary = _summarize(detail["questions"], detail["verdicts"], missing_as_failure=False)
-            summary.update({"state": "partial", "error": repr(e),
-                            "ungraded": sorted(q["id"] for q in detail["questions"]
-                                               if q["id"] not in detail["verdicts"]),
-                            "survey_cache_hit": survey_cache_hit,
-                            "blue_model": blue_m, "judge_model": judge_m})
+        stage = getattr(e, "stage", None)  # PKStageError carries which stage
+        if detail["questions"]:
+            # Salvage whatever got graded (cancelled ≠ failed, spend is sunk) as a
+            # partial; ungraded questions carry their reason. Only a hard EARLY
+            # failure (survey/questions → no questions at all) is a bare `failed`.
+            summary = _finalize(detail["questions"], detail, survey_cache_hit=survey_cache_hit,
+                                blue_m=blue_m, judge_m=judge_m, verdict_m=verdict_m,
+                                salvaged=True, error=repr(e))
         else:
-            summary = {"state": "failed", "error": repr(e), "survey_cache_hit": survey_cache_hit,
-                       "blue_model": blue_m, "judge_model": judge_m}
+            summary = {"state": "failed", "error": repr(e), "stage": stage or "survey",
+                       "survey_cache_hit": survey_cache_hit, "blue_model": blue_m,
+                       "judge_model": judge_m, "verdict_model": verdict_m}
     summary["wall_secs"] = int(time.monotonic() - t0)
     return summary, detail
 
