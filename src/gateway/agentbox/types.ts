@@ -11,10 +11,17 @@ export type AgentBoxStatus = "starting" | "running" | "stopping" | "stopped" | "
 
 /** AgentBox configuration */
 export interface AgentBoxConfig {
-  /** Agent ID — the pod identity; also the cert CN. */
+  /** Agent ID — the pod identity; also the cert CN. For a capability box (e.g. a
+   *  KB compile run) this is the run id (the run is a job, not a long-lived agent). */
   agentId: string;
   /** Organization ID — for RBAC scoping in Upstream Adapter */
   orgId?: string;
+  /** BoxProfile name selecting the box shape + tool/trust envelope (see
+   *  box-profile.ts). undefined → the default "agent" profile (a normal agentbox).
+   *  Replaces the old `boxType` flag — a capability = a profile, not a fork. */
+  profile?: string;
+  /** Optional explicit image override (wins over the profile's image; used by tests/local). */
+  image?: string;
   /** Allowed tools list for this agent (null = all) */
   allowedTools?: string[] | null;
   /** Environment variables */
@@ -49,6 +56,12 @@ export interface AgentBoxInfo {
    * matches the runtime's current CA — see AgentBoxManager.getOrCreateK8s.
    */
   caFingerprint?: string;
+  /** BoxProfile name this pod was spawned with (from its label; "agent" if absent).
+   *  Used by the manager to refuse reusing a pod whose profile no longer matches
+   *  the requested one — otherwise a profile change silently reuses the old-shaped
+   *  box (image/tools/volumes), breaking the "different scenario = different box"
+   *  isolation. */
+  profile?: string;
 }
 
 /** AgentBox handle, used for subsequent operations */

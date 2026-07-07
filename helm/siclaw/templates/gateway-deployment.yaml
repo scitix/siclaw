@@ -10,6 +10,14 @@ spec:
   # Singleton — see comment in values.yaml. Recreate (not RollingUpdate) so
   # the old pod is torn down before the new one starts, avoiding the brief
   # two-pod overlap that would evict each other on the upstream WS map.
+  #
+  # ⚠️ CORRECTNESS-BEARING since capability relay re-attach (onAdopt): two
+  # runtime pods sharing one adapter secret share one runtime_id, so BOTH
+  # would adopt the same capability runs and attach relays to the same box —
+  # and a box's /events queue is single-consumer, so the two relays would
+  # SPLIT the event stream (artifacts/turns silently lost). Do not flip this
+  # to RollingUpdate or replicas>1 without first giving each pod its own
+  # identity + partitioning runs.
   replicas: 1
   strategy:
     type: Recreate
@@ -93,6 +101,12 @@ spec:
             {{- if .Values.agentbox.debugImage }}
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
+            {{- end }}
+            {{- if .Values.agentbox.compileBoxImage }}
+            # KB-compile box image (kbc/ in this repo) — consumed by the
+            # BoxProfile registry for kb-compile / kb-test capability boxes.
+            - name: SICLAW_COMPILE_BOX_IMAGE
+              value: {{ .Values.agentbox.compileBoxImage | quote }}
             {{- end }}
             {{- if .Values.agentbox.nodeSelector }}
             # Node scheduling constraint forwarded by the runtime spawner onto

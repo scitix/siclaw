@@ -24,6 +24,22 @@ import https from "node:https";
 import type { RuntimeConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
+import { getBoxProfile } from "./agentbox/box-profile.js";
+import { CapabilityRunManager } from "./capability/run-manager.js";
+import { driveCapabilitySession } from "./capability/session-driver.js";
+import { driveTestSession } from "./capability/test-relay.js";
+import { isTerminalCapabilityStatus } from "./capability/contract.js";
+import type {
+  CapabilityCancelRequest,
+  CapabilityMessageRequest,
+  CapabilityStartRequest,
+  CapabilityStartResponse,
+  CapabilityTestCloseRequest,
+  CapabilityTestMessageRequest,
+  CapabilityTestStartRequest,
+  CapabilityTestStartResponse,
+} from "./capability/contract.js";
+import { materializeCapabilityInputs } from "./capability/materialize.js";
 import {
   type RpcHandler,
   type RpcContext,
@@ -354,6 +370,237 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     })();
 
     return { ok: true, sessionId };
+  });
+
+  // ── Shared capability box client ───────────────────────────────────────────
+  // Local development escape hatch: point SICLAW_COMPILE_BOX_ENDPOINT at a
+  // manually started kbc box (usually http://127.0.0.1:3000) to reuse a local
+  // Claude Code/OAuth session while testing the consumer↔runtime protocol.
+  const localCapabilityBoxEndpoint = process.env.SICLAW_COMPILE_BOX_ENDPOINT?.trim();
+  const capabilityBoxClient = async (runId: string, profile: string, orgId?: string): Promise<AgentBoxClient> => {
+    if (localCapabilityBoxEndpoint) {
+      return new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
+    }
+    const handle = await agentBoxManager.getOrCreate(runId, { profile, orgId });
+    return new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+  };
+
+  // ── Capability protocol (option B): siclaw owns the run lifecycle ──────────
+  // siclaw MINTS the runId and persists execution state to the consumer's opaque
+  // store (capability.persistRunState); the box is driven over the GENERIC
+  // capability wire (capability.event / persistArtifact / fetchInput) with the
+  // manager owning lifecycle. This is the ONLY KB box control plane — the legacy
+  // compile.* path was deleted in B4; authoring-chat runs entirely on capability.*.
+  const capabilityRunManager = new CapabilityRunManager(frontendClient, {
+    // A reaped run must not leave its box behind: stop the pod before the run's
+    // terminal mark, so the store and the cluster agree. Local escape-hatch boxes
+    // aren't managed by the spawner — stop() is a no-op/404 there, hence catch.
+    onReap: async (rec) => {
+      await agentBoxManager.stop(rec.runId).catch((err) => {
+        console.warn(`[capability] reap: stopping box ${rec.runId} failed:`, err instanceof Error ? err.message : String(err));
+      });
+    },
+    // A recovered/adopted run whose box is STILL ALIVE gets its relay re-attached
+    // immediately: the box's queued events replay (late-persisting turns and
+    // artifacts we missed during the restart), touch resumes, and the watchdog
+    // stops seeing a deaf-but-healthy run as stale. Dead boxes stay lazy — the
+    // next message respawns them (with workspace rehydration); we don't
+    // resurrect pods for possibly-abandoned runs.
+    onAdopt: (rec) => {
+      void (async () => {
+        try {
+          const alive = await agentBoxManager.getAsync(rec.runId);
+          if (!alive) return;
+          await ensureCapabilitySession(rec.runId, rec.profile, rec.orgId || undefined, undefined);
+          console.log(`[capability] re-attached relay to live box for recovered run ${rec.runId}`);
+        } catch (err) {
+          console.warn(`[capability] relay re-attach for ${rec.runId} skipped:`, err instanceof Error ? err.message : String(err));
+        }
+      })();
+    },
+  });
+
+  // One persistent capability session (box + relay loop) per run; a later message
+  // reattaches instead of spawning a second relay. The profile comes from the
+  // run record minted at capability.start — the box shape + tool/trust envelope
+  // is fixed for the run's lifetime, never re-negotiated per message.
+  const capabilitySessions = new Map<string, Promise<{ client: AgentBoxClient }>>();
+  const ensureCapabilitySession = (runId: string, profile: string, orgId: string | undefined, instruction: string | undefined) => {
+    // An empty profile would silently resolve to the all-tools default agent
+    // profile (getBoxProfile("") → AGENT) — the wrong shape AND a trust
+    // escalation. Runs minted via capability.start always carry one; refuse
+    // anything else (e.g. a corrupt adopted row) instead of guessing.
+    if (!profile) throw new Error(`capability run ${runId} has no profile`);
+    let pending = capabilitySessions.get(runId);
+    if (!pending) {
+      pending = (async () => {
+        const client = await capabilityBoxClient(runId, profile, orgId);
+        // Raw sources + (fresh box only) the durable authoring workspace, both
+        // from the consumer's store. Best-effort — see materializeCapabilityInputs.
+        // The consumer also declares the run's LOCALE through the same channel;
+        // the box selects its prompt pack with it (absent ⇒ English default).
+        const materialized = await materializeCapabilityInputs({ client, backend: frontendClient, runId });
+        const allowedTools = getBoxProfile(profile).allowedTools ?? null;
+        await client.postJson(`/session/${runId}`, {
+          instruction: instruction ?? "",
+          allowed_tools: allowedTools,
+          locale: materialized.locale,
+        });
+        driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
+          .catch(async (err) => {
+            console.error(`[capability] session relay failed run=${runId}:`, err);
+            await capabilityRunManager.endRun(runId, "failed").catch(() => {});
+          })
+          .finally(() => {
+            capabilitySessions.delete(runId);
+          });
+        return { client };
+      })();
+      capabilitySessions.set(runId, pending);
+      pending.catch(() => capabilitySessions.delete(runId));
+    }
+    return pending;
+  };
+
+  // Recover AFTER ensureCapabilitySession exists — onAdopt re-attaches through it.
+  void capabilityRunManager.recover();
+  capabilityRunManager.startWatchdog();
+
+  rpcMethods.set("capability.start", async (params) => {
+    const req = params as unknown as CapabilityStartRequest;
+    const profile = req.profile?.trim();
+    if (!profile) throw new Error("profile is required");
+    // Fail-closed BEFORE minting the run: an unknown profile must never fall
+    // back to some other box shape (that would hand out the wrong tool/trust
+    // envelope), and we don't persist runs we can't spawn.
+    getBoxProfile(profile);
+    const orgId = req.org_id;
+    const instruction = req.input?.instruction as string | undefined;
+    // siclaw mints the runId + persists a running state (the run is siclaw-owned).
+    const rec = await capabilityRunManager.startRun({ profile, orgId: orgId ?? "", correlationId: req.correlation_id });
+    try {
+      await ensureCapabilitySession(rec.runId, rec.profile, orgId, instruction);
+    } catch (err) {
+      await capabilityRunManager.endRun(rec.runId, "failed");
+      throw err;
+    }
+    const res: CapabilityStartResponse = { run_id: rec.runId };
+    return res;
+  });
+
+  rpcMethods.set("capability.message", async (params) => {
+    const req = params as unknown as CapabilityMessageRequest;
+    const runId = req.run_id;
+    const message = req.message;
+    if (!runId) throw new Error("run_id is required");
+    if (!message) throw new Error("message is required");
+    // The run record is the authority for the box's profile/org. A run missing
+    // from memory is first re-adopted from the consumer's store (heals a boot
+    // recovery that raced the consumer); only a run the STORE doesn't know (or
+    // already ended) is refused — never silently spawn an unmanaged box. The
+    // consumer reacts by starting a fresh run (its find-or-start only reuses
+    // non-terminal runs).
+    const rec = capabilityRunManager.get(runId) ?? (await capabilityRunManager.adopt(runId));
+    // A terminal record can linger in memory while its final persist retries
+    // (flushTerminal) — it is just as unaddressable as an unknown run.
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
+    capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
+    const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
+    await client.postJson(`/message/${runId}`, { message });
+    // The box is now working a turn: reflect it (turn_done flips back to idle).
+    // Keeps the consumer's view honest AND puts the run in the strict staleMs
+    // tier — a wedged turn must not enjoy the long idle TTL.
+    await capabilityRunManager.setStatus(runId, "running");
+    return { ok: true, run_id: runId };
+  });
+
+  rpcMethods.set("capability.cancel", async (params) => {
+    const runId = (params as unknown as CapabilityCancelRequest).run_id;
+    if (!runId) throw new Error("run_id is required");
+    await agentBoxManager.stop(runId).catch(() => {});
+    await capabilityRunManager.endRun(runId, "done");
+    return { ok: true, run_id: runId };
+  });
+
+  // ── Read-only test sessions (start-a-test-session) — reuse the run's live box ──
+  // A test session probes the run's CURRENT draft exactly like a real consumer:
+  // the box pins candidate/ into an immutable snapshot and hosts an ephemeral
+  // session over it with the kb-test tool whitelist. Two invariants:
+  //   - REUSE, never respawn: kb-test contributes ONLY its allowedTools list;
+  //     the box stays the run's own (getOrCreate with profile "kb-test" would
+  //     profile-mismatch-respawn the LIVE authoring box — destructive).
+  //   - STATELESS: the relay never persists — test chatter must not pollute the
+  //     authoring history (driveTestSession forwards live frames only).
+  rpcMethods.set("capability.testStart", async (params) => {
+    const req = params as unknown as CapabilityTestStartRequest;
+    const runId = req.run_id;
+    if (!runId) throw new Error("run_id is required");
+    const rec = capabilityRunManager.get(runId) ?? (await capabilityRunManager.adopt(runId));
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
+    capabilityRunManager.touch(runId);
+    // Ensure the authoring session is live. Cold box: this respawns + rehydrates
+    // the durable workspace (materializeCapabilityInputs), so there is a
+    // candidate/ draft to pin even after a reap/restart.
+    const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
+    const allowedTools = getBoxProfile("kb-test").allowedTools ?? null;
+    const opened = (await client.postJson(`/test-session/${runId}`, { allowed_tools: allowedTools })) as {
+      test_session_id: string;
+      snapshot_hash: string;
+      pages: number;
+    };
+    driveTestSession({
+      client,
+      runId,
+      testSessionId: opened.test_session_id,
+      frontendClient,
+      touch: () => capabilityRunManager.touch(runId),
+    }).catch((err) => {
+      // A dead test relay is disposable — log, never fail the authoring run.
+      console.warn(
+        `[capability] test relay ended run=${runId} tid=${opened.test_session_id}:`,
+        err instanceof Error ? err.message : String(err),
+      );
+    });
+    const res: CapabilityTestStartResponse = {
+      run_id: runId,
+      test_session_id: opened.test_session_id,
+      snapshot_hash: opened.snapshot_hash,
+      pages: opened.pages,
+    };
+    return res;
+  });
+
+  rpcMethods.set("capability.testMessage", async (params) => {
+    const req = params as unknown as CapabilityTestMessageRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    if (!req.test_session_id) throw new Error("test_session_id is required");
+    if (!req.message) throw new Error("message is required");
+    const rec = capabilityRunManager.get(req.run_id);
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${req.run_id}`);
+    capabilityRunManager.touch(req.run_id);
+    const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
+    // If the box died since testStart, the respawned box won't know this tid →
+    // the box's 404 surfaces as an error and the consumer starts a fresh test
+    // session (test sessions are disposable; there is nothing to resume).
+    await client.postJson(`/test-message/${req.test_session_id}`, { message: req.message });
+    return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id };
+  });
+
+  rpcMethods.set("capability.testClose", async (params) => {
+    const req = params as unknown as CapabilityTestCloseRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    if (!req.test_session_id) throw new Error("test_session_id is required");
+    const rec = capabilityRunManager.get(req.run_id);
+    if (!rec) return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id, already_closed: true };
+    // Don't resurrect a box just to close a test session that died with it —
+    // the box's teardown already reclaimed everything when the pod went away.
+    if (!localCapabilityBoxEndpoint) {
+      const alive = await agentBoxManager.getAsync(req.run_id);
+      if (!alive) return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id, already_closed: true };
+    }
+    const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
+    await client.postJson(`/test-session/${req.test_session_id}/close`, {});
+    return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id };
   });
 
   rpcMethods.set("chat.abort", async (params) => {

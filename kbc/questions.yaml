@@ -1,0 +1,14 @@
+# Publish-gate question set (optional) — a starter template, write your own for your KB
+#
+# Trap questions are the point: deliberately pick questions that "look answerable but should actually say
+# not-covered / should lay out a contradiction", to surface fabrication and conflated conventions.
+# After compiling, run: python tools/kb_eval.py --bundle bundle/ --questions questions.yaml
+
+threshold: 1.0
+questions:
+  # Coverage trap: ask for a detail the KB does not contain; the correct answer is "not covered", not fabrication
+  - q: "<fill in a question whose detail cannot be found in your KB>"
+    expect: "Should answer 'this knowledge base does not cover that' and must not fabricate."
+  # Contradiction trap: ask about a point where the sources conflict; the correct answer is to lay them out / follow the ruling, not to pick one at random
+  - q: "<fill in a question where the sources contradict each other>"
+    expect: "Should lay out each claim with its source, or reflect the adjudicated conclusion, and must not ignore one side and jump to a verdict."

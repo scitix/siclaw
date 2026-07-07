@@ -1,0 +1,21 @@
+# Example A: a GPU/hardware-selection KB (heavily instrumented) —— lights up the coverage leaf
+name: gpu-hardware-infra
+bundle_root: /path/to/hardware-kb/wiki
+constitution: /path/to/kb-method         # an infra/SRE-flavored reference constitution (loaded, not built into the framework)
+audit:
+  reserved_extra:                          # this KB's maintenance / ledger pages, not counted as orphans
+    - README.md
+    - CLAUDE.md
+    - COVERAGE.md
+    - IMAGE_COVERAGE.md
+    - DATA_NOTES.md
+    - WIKI_TOOLING.md
+    - schema.md
+    - purpose.md
+    - PENDING.md
+    - TO-CLARIFY.md
+  link_styles: [markdown, wikilink]
+  dimensions:                              # leaf: this KB has a coverage-ledger tool → register it
+    coverage:
+      tool: /path/to/hardware-kb/coverage_gen.py
+tools_registry: {}

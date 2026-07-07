@@ -1,0 +1,6 @@
+# 本地凭据/token，绝不入库
+*.token
+*.secret
+secrets*
+.env
+pod/.venv/

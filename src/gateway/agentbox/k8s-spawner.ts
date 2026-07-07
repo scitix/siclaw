@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo, AgentBoxStatus } from "./types.js";
+import { getBoxProfile } from "./box-profile.js";
 import { CertificateManager } from "../security/cert-manager.js";
 
 export interface K8sSpawnerConfig {
@@ -92,7 +93,13 @@ export class K8sSpawner implements BoxSpawner {
    * Create an AgentBox Pod
    */
   async spawn(boxConfig: AgentBoxConfig): Promise<AgentBoxHandle> {
-    const { namespace, image, imagePullPolicy, labelPrefix } = this.config;
+    const { namespace, imagePullPolicy, labelPrefix } = this.config;
+    // A box's shape (image, extra env/HOME/volumes, tool/trust envelope) comes
+    // from its BoxProfile — the default "agent" profile is a normal agentbox; a
+    // capability like "kb-compile" declares its own image + writable /work etc.
+    // All flavors reuse the same spawn/cert/mTLS/port machinery below.
+    const profile = getBoxProfile(boxConfig.profile);
+    const image = boxConfig.image ?? profile.image ?? this.config.image;
     const agentId = boxConfig.agentId;
     if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
     const podName = this.podName(agentId);
@@ -113,8 +120,22 @@ export class K8sSpawner implements BoxSpawner {
     try {
       const existing = await this.coreApi.readNamespacedPod({ name: podName, namespace });
       const phase = existing.status?.phase;
-      if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown") {
-        console.log(`[k8s-spawner] Removing stale pod ${podName} (phase: ${phase})`);
+      // A pod being torn down (or spawned) under this name for a DIFFERENT profile
+      // must not be reused — its image/tools/volumes are the old shape. Treat a
+      // profile mismatch (or an in-progress deletion) like a stale pod: delete +
+      // wait, then create fresh with the requested profile.
+      const existingProfile = existing.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent";
+      const profileMismatch = existingProfile !== profile.name;
+      const terminating = existing.metadata?.deletionTimestamp != null;
+      if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown" || profileMismatch || terminating) {
+        console.log(
+          `[k8s-spawner] Removing stale pod ${podName} (phase: ${phase}, profile: ${existingProfile}→${profile.name})`,
+        );
+        // Let delete errors reach the outer catch, which swallows 404 (pod
+        // already gone) and rethrows everything else (finding F): a blanket
+        // `.catch(() => {})` here turned a real API error — RBAC, etc. — into a
+        // waitForPodDeleted timeout instead of a clear failure. Consistent with
+        // the CA-mismatch delete below, which never swallowed.
         await this.coreApi.deleteNamespacedPod({ name: podName, namespace });
         // Wait for pod to be fully deleted
         await this.waitForPodDeleted(podName, namespace);
@@ -222,6 +243,25 @@ export class K8sSpawner implements BoxSpawner {
       }
     }
 
+    // Profile-declared extra env forwarding, ON TOP of the base allowlist. A lean
+    // capability box (e.g. kb-compile) does NOT phone home for settings, so its LLM
+    // endpoint (company massapi, Anthropic-compatible) must be injected as env
+    // ("credentials don't enter the sandbox" → the base URL is a proxy, key
+    // injected proxy-side). Which names to forward is the profile's declaration.
+    for (const name of profile.envForward ?? []) {
+      const value = process.env[name];
+      if (value !== undefined && value !== "") {
+        env.push({ name, value });
+      }
+    }
+    // The pod rootfs is read-only; a profile that runs Claude Code needs a writable
+    // HOME (its default e.g. /home/kbc is not writable, so ~/.claude writes hit
+    // EROFS and break the in-box Bash tool). The profile points HOME at one of its
+    // writable volumes below (e.g. /work → ~/.claude = /work/.claude).
+    if (profile.home) {
+      env.push({ name: "HOME", value: profile.home });
+    }
+
     // Add custom environment variables
     if (boxConfig.env) {
       for (const [key, value] of Object.entries(boxConfig.env)) {
@@ -267,9 +307,13 @@ export class K8sSpawner implements BoxSpawner {
         name: podName,
         namespace,
         labels: {
+          // Keep app=agentbox so existing list()/cleanup() lifecycle management
+          // covers capability pods too; the profile name distinguishes them for
+          // observability (label key kept as boxType for continuity).
           [`${labelPrefix}/app`]: "agentbox",
           [`${labelPrefix}/agent`]: agentId,
           [caFpLabel]: caFp,
+          [`${labelPrefix}/boxType`]: profile.name,
         },
       },
       spec: {
@@ -315,6 +359,15 @@ export class K8sSpawner implements BoxSpawner {
             name: "tmp",
             emptyDir: { sizeLimit: "100Mi" },
           },
+          // Profile-declared writable volumes (rootfs is read-only). e.g. kb-compile
+          // needs /work for the agent's raw/candidate/bundle + ~/.claude.
+          ...(profile.volumes ?? []).map(
+            (v) =>
+              ({
+                name: v.name,
+                emptyDir: v.sizeLimit ? { sizeLimit: v.sizeLimit } : {},
+              }) as k8s.V1Volume,
+          ),
         ],
         containers: [
           {
@@ -365,17 +418,27 @@ export class K8sSpawner implements BoxSpawner {
                 name: "tmp",
                 mountPath: "/tmp",
               },
+              ...(profile.volumes ?? []).map(
+                (v) => ({ name: v.name, mountPath: v.mountPath }) as k8s.V1VolumeMount,
+              ),
             ],
-            resources: {
-              requests: {
-                cpu: boxConfig.resources?.cpu || "100m",
-                memory: boxConfig.resources?.memory || "256Mi",
-              },
-              limits: {
-                cpu: boxConfig.resources?.cpu || "2000m",
-                memory: boxConfig.resources?.memory || "4Gi",
-              },
-            },
+            // Per-call resources win; the BoxProfile's resources are the fallback
+            // (jacoblee review: profile.resources was declared but read nowhere,
+            // so a memory-hungry profile silently got the default limit and could
+            // OOM). Same precedence as profile.image / profile.volumes above.
+            resources: (() => {
+              const res = boxConfig.resources ?? profile.resources;
+              return {
+                requests: {
+                  cpu: res?.cpu || "100m",
+                  memory: res?.memory || "256Mi",
+                },
+                limits: {
+                  cpu: res?.cpu || "2000m",
+                  memory: res?.memory || "4Gi",
+                },
+              };
+            })(),
             readinessProbe: {
               httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
               initialDelaySeconds: 2,
@@ -548,6 +611,7 @@ export class K8sSpawner implements BoxSpawner {
           : new Date(),
         lastActiveAt: new Date(),
         caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
+        profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
       };
     } catch (err: any) {
       if (err.code === 404 || err.statusCode === 404) {
@@ -582,6 +646,7 @@ export class K8sSpawner implements BoxSpawner {
           ? new Date(pod.metadata.creationTimestamp)
           : new Date(),
         lastActiveAt: new Date(),
+        profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
       };
     });
   }

@@ -1,0 +1,28 @@
+# Profile schema v0 — the single instantiation entry point that attaches one knowledge base to the framework.
+#
+# Hard rule: the framework ships "mechanism", not "content". Everything KB-specific (where it lives,
+# which constitution it uses, which optional dimensions it lights up, which dynamically-built tools it
+# registers) lives only in the Profile. You cannot grep any KB's concrete knowledge out of the framework code.
+#
+# The one universal assumption = bundle_root points at "an OKF markdown tree". Any other field that is not
+# set is simply empty, and empty means a bare KB.
+
+name: <kb-id>                      # human-readable KB identifier
+
+bundle_root: <path>                # required: the OKF bundle directory (the one universal assumption)
+
+constitution: <path|null>          # constitution = loaded-not-baked: whichever you point at is the one in force;
+                                   # null is valid (a KB with no constitution can still lint). The framework builds in none.
+
+audit:                             # the spine (generic lint) always runs; below are its optional knobs + leaves
+  reserved_extra: []               # files, beyond the OKF reserved names index.md/log.md, that are not counted as orphans
+                                   # (maintenance / ledger pages, etc.). Leave empty for a bare KB.
+  link_styles: [markdown]          # which link convention to audit: markdown[, wikilink]
+  dimensions: {}                   # leaf · conditional dimensions: run only when the Profile registers them, empty for a bare KB.
+                                   # e.g. (present for the GPU example, absent for the minimal example):
+                                   #   coverage:       { tool: <path> }       # source→compile coverage ledger
+                                   #   sensitive_scan: { tool: <path>, blocklist: <path> }
+
+tools_registry: {}                 # capture/version registry slot for dynamically-built tools: small tools Claude Code
+                                   # builds on the fly for this KB are registered here (name→path/version/checksum),
+                                   # so the build stays reproducible. Empty for a bare KB.
