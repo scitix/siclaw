@@ -118,7 +118,7 @@ _INSTRUCTION_HEADER = {
 
 # The read-only test-session persona lives in prompts/<locale>/test_role.md —
 # deliberately a knowledge CONSUMER over the pinned wiki snapshot, so the test
-# measures the wiki, not the agent's tools (mirrors siclaw_main prompt.ts). The
+# measures the wiki, not the agent's tools (mirrors siclaw prompt.ts). The
 # red-blue blue team reads the SAME pack text via selfcheck.TEST_ROLE, so the
 # consumer persona is single-sourced in the locale packs (no drift).
 
@@ -621,10 +621,11 @@ async def _post_turn_selfcheck(run) -> str | None:
         report["state"] = "unconverged"  # budget spent: publish card shows the rest
     report["repair_rounds_used"] = run._l1_repairs_used
     selfcheck.write_selfcheck(workdir, report)
-    await run.emit({"type": "summary", "text": selfcheck.narration(report)})
+    locale = getattr(run, "locale", None)
+    await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
-        return selfcheck.build_repair_prompt(report)
+        return selfcheck.build_repair_prompt(report, locale)
     return None
 
 
@@ -651,7 +652,10 @@ async def _emit_message(run: CompileRun, msg) -> None:
         try:
             repair_msg = await _post_turn_selfcheck(run)
         except Exception as e:
-            await run.emit({"type": "summary", "text": f"自检(账本)执行失败,本轮跳过: {e!r}"})
+            msg = (f"Self-check (ledger) failed, skipped this round: {e!r}"
+                   if selfcheck._is_en(getattr(run, "locale", None))
+                   else f"自检(账本)执行失败,本轮跳过: {e!r}")
+            await run.emit({"type": "summary", "text": msg})
         # Sync BEFORE announcing the turn: consumers refetch the workspace on
         # turn_done, so files this turn produced (PROPOSED_PLAN.json, ticket
         # receipts, candidate pages) must already be durable. The periodic tick
@@ -669,7 +673,10 @@ async def _emit_message(run: CompileRun, msg) -> None:
             try:
                 await run.inject_user_message(repair_msg)
             except Exception as e:
-                await run.emit({"type": "summary", "text": f"自检回修注入失败: {e!r}"})
+                msg = (f"Self-check repair injection failed: {e!r}"
+                       if selfcheck._is_en(getattr(run, "locale", None))
+                       else f"自检回修注入失败: {e!r}")
+                await run.emit({"type": "summary", "text": msg})
 
 
 # Default tool whitelist for a kb-compile session, used when the runtime profile
