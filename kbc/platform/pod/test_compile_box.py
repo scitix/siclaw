@@ -558,7 +558,7 @@ async def test_prompt_packs_locale():
 
     with tempfile.TemporaryDirectory() as wd:
         compile_box._ensure_workdir_constitution(wd, "zh")
-        assert "知识库编译器" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")
+        assert "铁则" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")  # zh playbook section header (parallels en "Iron rules")
     with tempfile.TemporaryDirectory() as wd:
         compile_box._ensure_workdir_constitution(wd, None)  # platform default = en
         assert "Iron rules" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")
