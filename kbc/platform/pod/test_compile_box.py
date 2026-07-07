@@ -830,6 +830,42 @@ async def test_incremental_route():
     print("OK  incremental route (RAW_CHANGES → scoped CHANGESET + guard-armed + scoped directive; absent/non-trigger → no route)")
 
 
+async def test_incremental_integrity_guard():
+    """M3: on an incremental turn a page touched OUTSIDE the authorized set forces a
+    repair even when the coverage ledger is clean — "leave the rest untouched" is
+    enforced by byte comparison, not the model's word. The guard state is one-shot."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md) [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        run = compile_box.CompileRun("incrg", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        # arm the guard: this round's changeset only authorizes a.md
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        run._incr_pending = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
+        # model edits a.md (authorized) AND drifts into c.md (unauthorized)
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        # coverage ledger is clean (both sources still cited) yet integrity forces a repair naming c.md
+        assert repair is not None and "增量越界" in repair and "c.md" in repair, repair
+        assert run._incr_pending is None  # one-shot consumed
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["incremental"]["out_of_scope_pages"] == ["c.md"], sc
+    print("OK  incremental integrity guard (out-of-scope edit → repair even with clean ledger; one-shot)")
+
+
 async def test_batch_orchestrator_routing_and_resume():
     """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
     the threshold gate (small KBs never batch), the orchestrator stamps batches
@@ -1256,6 +1292,7 @@ async def main():
     await test_propose_questions_appends_dedup()
     await test_message_captures_brief()
     await test_incremental_route()
+    await test_incremental_integrity_guard()
     await test_batch_orchestrator_routing_and_resume()
     await test_model_stall_retries_then_completes()
     await test_model_stall_live_stream_not_reaped()

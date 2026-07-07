@@ -146,6 +146,13 @@ def test_scoped_directive():
     print("OK  scoped directive (counts + CHANGESET + added-target + byte-guard mentioned)")
 
 
+def test_integrity_repair_directive():
+    d = incremental.build_integrity_repair(["c.md", "d.md"])
+    assert "增量越界" in d and "c.md" in d and "d.md" in d
+    assert "还原到本轮开始前" in d and "ADDED_TARGETS.json" in d
+    print("OK  integrity repair directive (names violating pages + restore instruction)")
+
+
 if __name__ == "__main__":
     test_resolve_affected_pages()
     test_build_changeset()
@@ -153,4 +160,5 @@ if __name__ == "__main__":
     test_protocol_raw_changes_to_changeset()
     test_added_targets_and_authorized()
     test_scoped_directive()
+    test_integrity_repair_directive()
     print("\nALL OK  test_incremental")

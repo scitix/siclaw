@@ -234,3 +234,21 @@ def build_scoped_directive(changeset: dict) -> str:
         "· 领域裁决照常按 constitution.md;遇新矛盾照走工单。改完简短说动了哪几页。",
     ]
     return "\n".join(lines)
+
+
+_VIOLATION_CAP = 20
+
+
+def build_integrity_repair(violations: list[str]) -> str:
+    """越界回修指令:本轮改动了授权范围外的页(收尾逐页 sha256 比对发现)。要求模型把
+    它们**还原到本轮开始前的内容**,只保留 affected_pages(+ 申报的 added 落笔页 + index)
+    的改动。这让"其余不动"从愿望变成有回修闭环的硬约束。"""
+    shown = "、".join(violations[:_VIOLATION_CAP])
+    more = f" 等共 {len(violations)} 页" if len(violations) > _VIOLATION_CAP else ""
+    return (
+        "【增量越界】本轮你改动了**授权范围之外**的页(收尾逐页比对 sha256 发现):\n"
+        f"- {shown}{more}\n"
+        "这些页本轮不该被碰。请把它们**逐页还原到本轮开始前的内容**,只保留 CHANGESET.json 的 "
+        "affected_pages(+ 你申报进 ADDED_TARGETS.json 的 added 落笔页 + index.md)那些改动;"
+        "别顺手'改进'范围外的页。"
+    )
