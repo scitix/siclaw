@@ -53,6 +53,7 @@ from claude_agent_sdk import (
 )
 
 import batching
+import incremental
 import mediaverify
 import redblue
 import selfcheck
@@ -247,6 +248,10 @@ class CompileRun:
         self._last_turn_reply: str = ""
         self._batch_active = False
         self._batch_notes: list[str] = []
+        # Scoped incremental (真增量): armed at kickoff with {before: page_hashes,
+        # changeset}; the post-turn seam runs the byte-integrity guard against it,
+        # then clears it. None = this turn is not a scoped incremental.
+        self._incr_pending: dict | None = None
         # Layer-2 red-blue PK (S2): the in-flight background task, if any.
         # Single-flight per run; durable state lives in SELFCHECK.json `pk`.
         self._pk_task: asyncio.Task | None = None
@@ -1353,6 +1358,17 @@ def _batch_mode_enabled() -> bool:
     return os.environ.get("KBC_BATCH_MODE", "on") != "off"
 
 
+def _should_route_to_incremental(run: "CompileRun", text: str) -> bool:
+    """A compile trigger + a machine-computed changeset from sicore
+    (authoring/RAW_CHANGES.json with real changes) → the SCOPED incremental path,
+    which re-touches only the affected pages instead of re-planning the whole
+    corpus. No changeset (or empty) → fall through to the normal full compile /
+    batch route (backward compatible: sicore not yet wired = old behavior)."""
+    if run._batch_active or not _is_compile_trigger(text):
+        return False
+    return incremental.has_changes(incremental.load_raw_changes(run.workdir))
+
+
 def _should_route_to_batch(run: "CompileRun", text: str) -> bool:
     if not _batch_mode_enabled() or run._batch_active or not _is_compile_trigger(text):
         return False
@@ -1363,6 +1379,23 @@ def _should_route_to_batch(run: "CompileRun", text: str) -> bool:
     # An interrupted batch run must finish as a batch run even if raw shrank.
     plan = _load_batch_plan(run)
     return plan is not None and len(batching.pending_batches(plan)) > 0
+
+
+async def _start_incremental(run: "CompileRun", text: str) -> None:
+    """Scoped incremental kickoff: materialize the model-facing CHANGESET from
+    sicore's RAW_CHANGES, snapshot page hashes for the post-turn integrity guard,
+    then inject the scoped directive. It is ONE ordinary model turn (not the batch
+    orchestrator), so turn_done + the normal post-turn seam (coverage/charset +,
+    once wired, the byte-integrity guard) apply unchanged."""
+    cs = incremental.materialize_changeset(run.workdir)
+    if cs is None:
+        # Race / empty after the route check → fall back to a normal turn.
+        await run.client.query(text)
+        return
+    run._incr_pending = {"before": incremental.page_hashes(run.workdir), "changeset": cs}
+    await run.emit({"type": "summary",
+                    "text": f"增量重编:{len(cs['affected_pages'])} 页受影响,只改这些,其余不动。"})
+    await run.client.query(incremental.build_scoped_directive(cs))
 
 
 def _batch_plan_path(run: "CompileRun") -> Path:
@@ -2069,6 +2102,13 @@ async def handle_message(request: web.Request):
     # persist it deterministically to authoring/BRIEF.json BEFORE the turn so the
     # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
     _capture_brief(run, text)
+    # Scoped incremental (真增量): a compile trigger + a machine-computed changeset
+    # from sicore → re-touch only affected pages, NOT a whole-corpus re-plan. Takes
+    # precedence over the batch/full route (which is the "recompile everything"
+    # fallback when no changeset is present).
+    if _should_route_to_incremental(run, text):
+        await _start_incremental(run, text)
+        return web.json_response({"ok": True, "incremental": True})
     # Batch mode (大库): a compile trigger over an above-threshold corpus (or a
     # plan with pending batches) runs the orchestrator instead of one giant turn.
     if _should_route_to_batch(run, text):

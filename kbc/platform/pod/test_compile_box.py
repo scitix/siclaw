@@ -791,6 +791,45 @@ async def test_message_captures_brief():
 
 
 
+async def test_incremental_route():
+    """Scoped incremental (DESIGN-kb-incremental-recompile-v2): a compile trigger +
+    sicore's machine-computed RAW_CHANGES routes to the scoped path — materializes
+    CHANGESET.json (affected pages reverse-looked-up), arms the byte-integrity guard
+    state, injects the scoped directive — instead of a full-corpus re-plan."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "candidate").mkdir(parents=True)
+        (wd / "authoring").mkdir(parents=True)
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntitle: t\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+        run = compile_box.CompileRun("incr1", str(wd), 1)
+        # no RAW_CHANGES yet → NOT incremental (falls through to normal/full route)
+        assert not compile_box._should_route_to_incremental(run, "请增量重编")
+        # sicore writes the machine-computed changeset input
+        (wd / "authoring" / "RAW_CHANGES.json").write_text(_json.dumps({
+            "modified": ["snap/one.md"], "added": [], "deleted": [],
+            "diffs": {"snap/one.md": "- old fact\n+ new fact"},
+            "snapshot_fingerprint": "SNAP"}))
+        assert compile_box._should_route_to_incremental(run, "请增量重编")
+        assert not compile_box._should_route_to_incremental(run, "随便聊两句")  # non-trigger never routes
+
+        fake = _FakeSDKClient()
+        run.client = fake
+        await compile_box._start_incremental(run, "请增量重编")
+        # CHANGESET.json materialized: affected page reverse-looked-up + sicore's diff
+        cs = _json.loads((wd / "authoring" / "CHANGESET.json").read_text())
+        assert cs["affected_pages"] == ["a.md"], cs
+        assert cs["modified"][0]["diff"] == "- old fact\n+ new fact"
+        # byte-integrity guard state armed (before-hashes captured for the post-turn check)
+        assert run._incr_pending is not None and "a.md" in run._incr_pending["before"]
+        # the scoped directive was injected (not a batch orchestrator)
+        assert any("增量重编" in q and "CHANGESET.json" in q for q in fake.queries), fake.queries
+    print("OK  incremental route (RAW_CHANGES → scoped CHANGESET + guard-armed + scoped directive; absent/non-trigger → no route)")
+
+
 async def test_batch_orchestrator_routing_and_resume():
     """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
     the threshold gate (small KBs never batch), the orchestrator stamps batches
@@ -1216,6 +1255,7 @@ async def main():
     test_merge_proposed_questions()
     await test_propose_questions_appends_dedup()
     await test_message_captures_brief()
+    await test_incremental_route()
     await test_batch_orchestrator_routing_and_resume()
     await test_model_stall_retries_then_completes()
     await test_model_stall_live_stream_not_reaped()
