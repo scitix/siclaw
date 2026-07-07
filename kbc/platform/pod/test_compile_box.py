@@ -859,6 +859,52 @@ async def test_message_captures_brief():
     print("✓ /message captures 定调 brief → BRIEF.json (ordinary msg leaves it)")
 
 
+def test_pr382_review_fixes():
+    """Review fixes: brief guard + capped/last-marker raw (A/C), atomic writer (B),
+    question-id parity vector + intentional dedup (D/E)."""
+    good = ("开始生成知识库\n\n我的定调标签(请作为本次编译的 brief):\n"
+            "- 给谁看:内部工程师\n- 内容倾向:详尽百科\n请执行。")
+    b = compile_box.parse_brief_block(good)
+    assert b and b["audience"] == "内部工程师", b
+    # A(parse): marker present but no bullet field → None (a bare prose mention is not a brief)
+    assert compile_box.parse_brief_block("关于我的定调标签我想补充一句") is None
+    assert compile_box.parse_brief_block("我的定调标签") is None
+    # C: raw is taken from the LAST marker and capped
+    noise = ("我的定调标签 早前顺口提过\n我的定调标签(brief):\n- 给谁看:A\n" + "y" * 9000)
+    b2 = compile_box.parse_brief_block(noise)
+    assert b2 and b2["audience"] == "A", b2
+    assert len(b2["raw"]) == compile_box._BRIEF_RAW_MAX and "早前顺口提过" not in b2["raw"], len(b2["raw"])
+
+    # A(capture): first-wins — a later marker message never clobbers BRIEF.json
+    with tempfile.TemporaryDirectory() as td:
+        class _R:  # _capture_brief only reads .workdir
+            workdir = td
+        r = _R()
+        assert compile_box._capture_brief(r, good) is True
+        first = json.loads((Path(td) / "authoring" / "BRIEF.json").read_text())
+        assert compile_box._capture_brief(r, "我的定调标签(brief):\n- 给谁看:别人\n") is False
+        assert json.loads((Path(td) / "authoring" / "BRIEF.json").read_text()) == first
+
+    # B: atomic writer round-trips + overwrites + leaves no temp
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "sub" / "x.json"
+        compile_box._write_text_atomic(p, '{"a":1}\n')
+        assert p.read_text() == '{"a":1}\n'
+        compile_box._write_text_atomic(p, '{"a":2}\n')
+        assert p.read_text() == '{"a":2}\n' and not list(Path(td).rglob("*.tmp"))
+
+    # D/E: question-id parity vector — MUST equal the frontend's proposal-id.test vector
+    def qid(q):
+        return compile_box._question_id(compile_box._normalize_question(q))
+    assert qid("GPU 有几张?") == "q-4d6d3b41"
+    assert qid("gpu有几张。") == "q-4d6d3b41"            # E: case + trailing-punct + space collapse
+    assert qid("Hello World") == "q-3b9f5c61"
+    assert qid("\ufeffHello World") == "q-3b9f5c61"      # D: BOM stripped identically to the frontend
+    assert qid("H100\tvs　A100") == "q-a5a7d897"
+    assert qid("AbC?") == "q-1a47e90b"
+    print("✓ pr382 review fixes (brief guard/cap/first-wins, atomic write, id parity vector)")
+
+
 async def main():
     test_install_wiki_snapshot_size_guard()
     await test_workspace_sync()
@@ -878,6 +924,7 @@ async def main():
     test_merge_proposed_questions()
     await test_propose_questions_appends_dedup()
     await test_message_captures_brief()
+    test_pr382_review_fixes()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()

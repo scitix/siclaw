@@ -512,6 +512,23 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
 _BRIEF_MARKER = "我的定调标签"
 _BRIEF_PATH = "authoring/BRIEF.json"
 QUESTIONS_PROPOSED_PATH = "authoring/QUESTIONS_PROPOSED.json"
+_BRIEF_RAW_MAX = 4000  # cap the durable brief's raw slice — the agent is told to follow it
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write `text` atomically: a temp file in the same dir + os.replace. A torn
+    write (SIGTERM / OOM / full disk mid-write) must never leave a half-file that
+    the next read falls back to empty on — that would silently drop prior rounds
+    (e.g. every earlier proposed question). os.replace is atomic within one
+    filesystem on POSIX."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text, "utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _split_brief_tags(s: str) -> list[str]:
@@ -534,7 +551,11 @@ def parse_brief_block(message: str) -> dict | None:
     durable brief verbatim regardless of how the agent paraphrases downstream."""
     if not message or _BRIEF_MARKER not in message:
         return None
-    raw = message[message.find(_BRIEF_MARKER):].strip()
+    # Take the LAST marker occurrence (the wizard appends the brief block at the
+    # end) and cap the slice — an unbounded first-occurrence slice would lock onto
+    # a marker mentioned earlier in prose and pull the whole unrelated tail into
+    # the durable brief, bloating the agent's context.
+    raw = message[message.rfind(_BRIEF_MARKER):].strip()[:_BRIEF_RAW_MAX]
     audience = ""
     styles: list[str] = []
     custom: list[str] = []
@@ -552,20 +573,27 @@ def parse_brief_block(message: str) -> dict | None:
         if m:
             custom = _split_brief_tags(m.group(1))
             continue
+    if not (audience or styles or custom):
+        return None  # marker present but no tag field parsed → not a real brief
     return {"source": "quickstart_message", "audience": audience,
             "styles": styles, "custom": custom, "raw": raw}
 
 
 def _write_brief(workdir: str, brief: dict) -> None:
-    path = Path(workdir) / _BRIEF_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(brief, ensure_ascii=False, indent=2) + "\n", "utf-8")
+    _write_text_atomic(Path(workdir) / _BRIEF_PATH,
+                       json.dumps(brief, ensure_ascii=False, indent=2) + "\n")
 
 
 def _capture_brief(run: "CompileRun", text: str) -> bool:
-    """Parse + persist the opening brief block if present. Fail-open: a brief
-    capture hiccup must never block the compile turn. Returns whether it wrote."""
+    """Parse + persist the OPENING brief block, first-capture-wins. Fail-open: a
+    brief capture hiccup must never block the compile turn. Returns whether it
+    wrote. Runs on every /message, so it only writes when BRIEF.json does not yet
+    exist — otherwise a later message that merely mentions the marker phrase (a
+    quote, an aside) would clobber the real brief, often with a near-empty record
+    the agent is then told to follow."""
     try:
+        if (Path(run.workdir) / _BRIEF_PATH).exists():
+            return False
         brief = parse_brief_block(text)
         if brief is None:
             return False
@@ -575,10 +603,25 @@ def _capture_brief(run: "CompileRun", text: str) -> bool:
         return False
 
 
+# The exact whitespace set to strip, enumerated so it is byte-identical with the
+# frontend's mirror (ECMAScript `\s`). Python `re` `\s` and JS `\s` are DIFFERENT
+# fixed sets (Python `\s` strips U+0085 / U+001C–U+001F, JS `\s` strips U+FEFF),
+# so relying on `\s` on either side makes the derived id diverge for a question
+# containing one of those chars — and the frontend re-derives this id for legacy
+# id-less rows, so a divergence resurfaces the adopt/dismiss failure. This
+# explicit class removes the ambiguity; keep it in lockstep with the frontend.
+_WS_RE = re.compile("[\t\n\x0b\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
+_QUESTION_PUNCT = "?？。.!！,，、"
+
+
 def _normalize_question(q: str) -> str:
-    """Dedup key for a proposed question: whitespace-stripped, trailing
-    punctuation removed, case-folded — so trivially-reworded repeats collapse."""
-    return re.sub(r"\s+", "", str(q or "")).strip("?？。.!！,，、").lower()
+    """Dedup key + stable-id basis for a proposed question: strip the fixed
+    whitespace set (`_WS_RE`, enumerated to match the frontend — NOT `\\s`), strip
+    a fixed leading/trailing punctuation set, then lowercase. Trailing punctuation
+    and case are collapsed BY DESIGN — `删除?` and `删除。` map to one key (a
+    question differing only by trailing punctuation is treated as the same); an
+    all-punctuation question normalizes to `""` and the caller drops it."""
+    return _WS_RE.sub("", str(q or "")).strip(_QUESTION_PUNCT).lower()
 
 
 def _fnv1a32(s: str) -> int:
@@ -594,7 +637,7 @@ def _fnv1a32(s: str) -> int:
 def _question_id(normalized: str) -> str:
     """Stable proposal id agreed with the frontend: 'q-' + fnv1a32(normalized
     question) as zero-padded 8-hex-digit lowercase. The frontend POSTs this as
-    proposal_id on adopt/dismiss — a missing id → empty proposal_id → sicore 500."""
+    proposal_id on adopt/dismiss — a missing id → empty proposal_id → the consumer 500s."""
     return "q-" + format(_fnv1a32(normalized), "08x")
 
 
@@ -658,11 +701,10 @@ def _make_compile_tools(run: CompileRun):
         # remains the box's own working state; syncing happens at turn end.
         plan_text = str(args.get("plan", ""))
         proposal_path = Path(run.workdir) / "authoring" / "PROPOSED_PLAN.json"
-        proposal_path.parent.mkdir(parents=True, exist_ok=True)
-        proposal_path.write_text(json.dumps({
+        _write_text_atomic(proposal_path, json.dumps({
             "text": plan_text,
             "proposed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }, ensure_ascii=False, indent=2), "utf-8")
+        }, ensure_ascii=False, indent=2))
         await run.emit({"type": "plan_proposed", "plan": plan_text})
         # Advisory nudge only — working-state hygiene, never a gate.
         reminder = ""
@@ -710,7 +752,7 @@ def _make_compile_tools(run: CompileRun):
             "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         try:
-            path.write_text(json.dumps(tickets, ensure_ascii=False, indent=2), "utf-8")
+            _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
         except Exception as e:
             return {"content": [{"type": "text", "text": rt["write_failed"].format(e=e)}]}
         return {"content": [{"type": "text", "text": rt["registered"].format(tid=tid)}]}
@@ -729,9 +771,8 @@ def _make_compile_tools(run: CompileRun):
         except Exception:
             existing = []  # a corrupt/half-written prior file must not lose this round
         merged, added, skipped = merge_proposed_questions(existing, incoming)
-        path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", "utf-8")
+            _write_text_atomic(path, json.dumps(merged, ensure_ascii=False, indent=2) + "\n")
         except Exception as e:
             return {"content": [{"type": "text", "text": pq["write_failed"].format(e=e)}]}
         await run.emit({"type": "summary", "summary": pq["summary"].format(added=added, skipped=skipped, total=len(merged))})
