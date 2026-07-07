@@ -405,21 +405,45 @@ async def test_pk_wiring():
             await compile_box._run_pk_flow(run, "full")
             sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
             assert sc["pk"]["state"] == "repairing" and sc["pk"]["rounds_used"] == 0, sc["pk"]
+            # converge phase = revising (verify found issues → a repair was injected)
+            assert sc["converge_phase"] == "revising", sc.get("converge_phase")
             assert run.injected and "红蓝队" in run.injected[-1] and "补" in run.injected[-1]
             detail = json.loads((base / "authoring/PK_RESULT.json").read_text())
             assert len(detail["answers"]["q1"]["answer"]) == 4000  # persisted truncated
 
             assert compile_box._pk_due(run) == "retest"
             await compile_box._run_pk_flow(run, "retest")
-            pk = json.loads((base / "authoring/SELFCHECK.json").read_text())["pk"]
+            scc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            pk = scc["pk"]
             # merged scoreboard: 2 passes from the full round + 1 resolved retest
             assert pk["state"] == "passed" and pk["rounds_used"] == 1, pk
             assert pk["questions"] == 3 and pk["gate_pass"] == 3 and pk["pass_rate"] == 1.0, pk
+            # converged → phase settles to "settled" (the draft is stable + testable)
+            assert scc["converge_phase"] == "settled", scc.get("converge_phase")
             assert compile_box._pk_due(run) is None  # tree hash stamped → idempotent
         finally:
             rb.run_pk = orig
             os.environ["KBC_PK_MODE"] = "off"
-    print("OK  pk wiring (gating / repairing+inject / targeted retest merge / idempotent)")
+    print("OK  pk wiring (gating / repairing+inject / targeted retest merge / idempotent / converge phase)")
+
+
+def test_converge_phase_helper():
+    """set_converge_phase: writes the durable authoritative signal (verifying/
+    revising/settled), preserves the L1 coverage section, ignores junk phases."""
+    import selfcheck
+    with tempfile.TemporaryDirectory() as td:
+        _mk(Path(td), "raw/s/a.md")
+        _mk(Path(td), "candidate/index.md", "---\ntype: index\n---\ni")
+        _mk(Path(td), "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        selfcheck.write_selfcheck(td, selfcheck.run_layer1(td))  # L1 first
+        selfcheck.set_converge_phase(td, "verifying")
+        sc = json.loads((Path(td) / "authoring/SELFCHECK.json").read_text())
+        assert sc["converge_phase"] == "verifying" and sc["coverage"]["closed"], sc  # L1 preserved
+        selfcheck.set_converge_phase(td, "settled")
+        assert json.loads((Path(td) / "authoring/SELFCHECK.json").read_text())["converge_phase"] == "settled"
+        selfcheck.set_converge_phase(td, "bogus")  # invalid → no-op, phase unchanged
+        assert json.loads((Path(td) / "authoring/SELFCHECK.json").read_text())["converge_phase"] == "settled"
+    print("OK  set_converge_phase (durable signal, L1 preserved, junk ignored)")
 
 
 def main():
@@ -435,6 +459,7 @@ def main():
     asyncio.run(test_wiring())
     asyncio.run(test_media_verify_wiring())
     asyncio.run(test_pk_wiring())
+    test_converge_phase_helper()
     print("ALL OK  test_selfcheck")
 
 
