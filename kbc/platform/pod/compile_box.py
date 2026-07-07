@@ -1186,6 +1186,10 @@ async def _post_turn_selfcheck(run) -> str | None:
     workdir = getattr(run, "workdir", None)
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
+    # Consume the scoped-incremental guard state once, whatever this turn's outcome
+    # (a tree that didn't change → no violations possible → nothing to guard).
+    incr = run._incr_pending
+    run._incr_pending = None
     key = selfcheck.state_key(workdir)
     if key is None or key == run._selfcheck_key:
         return None
@@ -1193,7 +1197,18 @@ async def _post_turn_selfcheck(run) -> str | None:
         return None  # mid-Execute: pages exist but the index isn't written yet
     run._selfcheck_key = key
     report = selfcheck.run_layer1(workdir)
-    if report["coverage"]["closed"] and report["lint"]["ok"]:
+    # Scoped-incremental byte-integrity guard: on an incremental turn, pages OUTSIDE
+    # the authorized set (affected ∪ declared added-targets ∪ index) must be byte-
+    # identical to their pre-turn state. A violation forces a repair even if the
+    # ledger passed — "leave the rest untouched" is a hard guarantee, not a hope.
+    incr_violations: list[str] = []
+    if incr:
+        after = incremental.page_hashes(workdir)
+        editable = incremental.authorized_pages(workdir, incr["changeset"])
+        incr_violations = incremental.integrity_violations(incr["before"], after, editable)
+        report["incremental"] = {"out_of_scope_pages": incr_violations}
+    ledger_clean = report["coverage"]["closed"] and report["lint"]["ok"]
+    if ledger_clean and not incr_violations:
         run._l1_repairs_used = 0
         report["state"] = "passed"
     elif run._l1_repairs_used < _l1_repair_rounds():
@@ -1205,7 +1220,12 @@ async def _post_turn_selfcheck(run) -> str | None:
     await run.emit({"type": "summary", "text": selfcheck.narration(report)})
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
-        return selfcheck.build_repair_prompt(report)
+        parts = []
+        if not ledger_clean:
+            parts.append(selfcheck.build_repair_prompt(report))
+        if incr_violations:
+            parts.append(incremental.build_integrity_repair(incr_violations))
+        return "\n\n".join(parts)
     return None
 
 
