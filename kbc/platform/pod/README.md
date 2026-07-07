@@ -65,7 +65,7 @@ docker run --rm -p 3000:3000 \
 - **核对**:每轮 turn 结束、candidate 状态有变(幂等键=candidate 树+EXCLUSIONS 内容)且
   `candidate/index.md` 存在时,机械核对「raw 全部文本源 = compiled_from 并集 + EXCLUSIONS 匹配」
   并跑结构 lint(provenance 缺失/坏链);结果写 `authoring/SELFCHECK.json`(随 workspace 同步
-  到 sicore,发布卡消费),一行叙述走 `summary` 事件。
+  到消费者,发布卡消费),一行叙述走 `summary` 事件。
 - **回修**:`turn_done` 照常发(never-stuck 不变);未入账时注入**一条**回修指令
   (`KBC_L1_REPAIR_ROUNDS`,默认 1),额度用尽标 `unconverged`,余项交负责人。全程 fail-open。
 - **引擎中立**:selfcheck.py 纯 stdlib 零 SDK 依赖;驱动只提供"何时触发"+
