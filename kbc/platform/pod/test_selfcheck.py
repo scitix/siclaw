@@ -6,6 +6,7 @@ Pure-function tests need only stdlib; the wiring test imports compile_box
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
@@ -109,11 +110,15 @@ def test_coverage_and_lint():
         # bare.md lacks provenance; p1 has a broken wikilink; index is exempt
         assert kinds == ["broken_wikilink", "no_provenance"], kinds
 
-        # repair prompt names the concrete gaps
+        # repair prompt names the concrete gaps — locale-threaded, platform default = en
         report["state"] = "repairing"
-        prompt = selfcheck.build_repair_prompt(report)
+        prompt = selfcheck.build_repair_prompt(report)  # default locale → en
         assert "snapshot-a/two.md" in prompt and "ghost.md" in prompt and "EXCLUSIONS.json" in prompt
-        assert "未入账" in selfcheck.narration(report)
+        assert "Unaccounted raw source files" in prompt  # English by default
+        zh_prompt = selfcheck.build_repair_prompt(report, "zh")
+        assert "snapshot-a/two.md" in zh_prompt and "未入账" in zh_prompt
+        assert "unaccounted" in selfcheck.narration(report, "en")
+        assert "未入账" in selfcheck.narration(report, "zh")
 
         # close the ledger: cite two.md from bare.md (also fixes its provenance) + fix link
         _mk(base, "candidate/bare.md", "---\ncompiled_from:\n  - snapshot-a/two.md\n---\nok")
@@ -121,8 +126,9 @@ def test_coverage_and_lint():
         report = selfcheck.run_layer1(td)
         assert report["coverage"]["closed"] and report["lint"]["ok"], report
         report["state"] = "passed"
-        assert "闭合" in selfcheck.narration(report)
-    print("OK  coverage + lint + repair prompt (unaccounted / dangling / exempt index / close)")
+        assert "closed" in selfcheck.narration(report)  # default locale → en
+        assert "闭合" in selfcheck.narration(report, "zh")
+    print("OK  coverage + lint + repair prompt (unaccounted / dangling / exempt index / close / locale)")
 
 
 def test_state_key():
@@ -201,12 +207,35 @@ async def test_wiring():
     print("OK  wiring (trigger gating / repair inject / exclusions-only reopen / budget → unconverged)")
 
 
+def test_pack_hash_is_relposix_sorted():
+    """pack_candidates_to_wiki must hash in rel_posix-STRING order so a draft
+    pinned here and a published bundle installed by compile_box._install_wiki_snapshot
+    yield the SAME snapshot_hash for byte-identical content (the question ×
+    snapshot grading key is comparable across sources). Uses a nested tree where
+    Path-sort and string-sort diverge (dir `a/` vs files `a.md`/`a-x.md`)."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        files = {"index.md": "i", "a.md": "A", "a-x.md": "X", "a/b.md": "B"}
+        for rel, txt in files.items():
+            _mk(base, f"candidate/{rel}", txt)
+        h, n = selfcheck.pack_candidates_to_wiki(str(base), base / "snap")
+        assert n == 4, n
+        # canonical hash = entries sorted by rel_posix string (same formula as
+        # _install_wiki_snapshot), NOT filesystem Path order
+        want = hashlib.sha256()
+        for rp, txt in sorted(files.items()):
+            want.update(rp.encode()); want.update(b"\0"); want.update(txt.encode()); want.update(b"\0")
+        assert h == want.hexdigest(), "pack hash must be rel_posix-string ordered (draft/published comparability)"
+    print("OK  pack hash is rel_posix-sorted (draft/published snapshot comparability, nested-tree safe)")
+
+
 def main():
     os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
     test_parse_compiled_from()
     test_inventory_and_exclusions()
     test_coverage_and_lint()
     test_state_key()
+    test_pack_hash_is_relposix_sorted()
     asyncio.run(test_wiring())
     print("ALL OK  test_selfcheck")
 

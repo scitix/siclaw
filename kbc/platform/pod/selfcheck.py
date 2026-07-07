@@ -37,7 +37,7 @@ SELFCHECK_PATH = "authoring/SELFCHECK.json"
 # (compile_box.test_session_driver) uses, so the red-blue blue team measures the
 # wiki exactly as a real consumer reads it and the two copies can't drift.
 # Defaults to zh: the PK/calibration pipeline is not yet locale-threaded and its
-# calibration corpora are Chinese. Mirrors the real siclaw consumer (siclaw_main
+# calibration corpora are Chinese. Mirrors the real siclaw consumer (siclaw
 # src/core/prompt.ts "Domain Knowledge — LLM Wiki"): Read only, no search, start
 # at index.md, whole pages, follow [[links]]. Max fidelity: do NOT tell it it's
 # being tested.
@@ -223,20 +223,23 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
 
 
 def candidate_tree_hash(workdir: str) -> str | None:
-    """Content hash of candidate/**/*.md|.json (mirrors _pack_candidates_to_wiki's
-    scheme) — the self-check idempotency key. None when there is no candidate tree."""
+    """Content hash of candidate/**/*.md|.json (same scheme as
+    _pack_candidates_to_wiki — hashed in rel_posix order) — the self-check
+    idempotency key. None when there is no candidate tree."""
     cand = Path(workdir) / "candidate"
     if not cand.is_dir():
         return None
-    h = hashlib.sha256()
-    count = 0
-    for f in sorted(cand.rglob("*")):
+    entries: list[tuple[str, bytes]] = []
+    for f in cand.rglob("*"):
         if not f.is_file() or f.suffix not in (".md", ".json"):
             continue
-        rel = f.relative_to(cand).as_posix()
-        h.update(rel.encode()); h.update(b"\0"); h.update(f.read_bytes()); h.update(b"\0")
-        count += 1
-    return h.hexdigest() if count else None
+        entries.append((f.relative_to(cand).as_posix(), f.read_bytes()))
+    if not entries:
+        return None
+    h = hashlib.sha256()
+    for rel, data in sorted(entries):
+        h.update(rel.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
+    return h.hexdigest()
 
 
 def state_key(workdir: str) -> str | None:
@@ -314,9 +317,7 @@ def pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
     candidate = Path(workdir) / "candidate"
     kdir = dest / ".siclaw" / "knowledge"
     kdir.mkdir(parents=True, exist_ok=True)
-    h = hashlib.sha256()
-    count = 0
-    has_index = False
+    pages: list[tuple[str, bytes]] = []
     for f in sorted(candidate.rglob("*")) if candidate.is_dir() else []:
         if not f.is_file() or f.suffix not in (".md", ".json"):
             continue
@@ -328,20 +329,47 @@ def pack_candidates_to_wiki(workdir: str, dest: Path) -> tuple[str, int]:
         out = kdir / rel
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(data)
-        h.update(rel_posix.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
-        count += 1
-        if rel_posix == "index.md":
-            has_index = True
-    if count == 0:
+        pages.append((rel_posix, data))
+    if not pages:
         raise FileNotFoundError("no candidate pages to test yet — ask the authoring agent to generate pages first")
-    if not has_index:
+    if not any(rp == "index.md" for rp, _ in pages):
         raise FileNotFoundError("draft is missing candidate/index.md — cannot test without a root index page")
-    return h.hexdigest(), count
+    # Hash in rel_posix-STRING order (not filesystem/Path order): a draft pinned
+    # here and a published bundle installed by compile_box._install_wiki_snapshot
+    # must yield the SAME hash for byte-identical content, so the (question ×
+    # snapshot) grading key stays comparable across draft and published sources.
+    # Path-sort and string-sort diverge for nested trees (e.g. dir `a/` vs file
+    # `a.md`); _install_wiki_snapshot already sorts by string, so we match it.
+    h = hashlib.sha256()
+    for rel_posix, data in sorted(pages):
+        h.update(rel_posix.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
+    return h.hexdigest(), len(pages)
 
 
-def narration(report: dict) -> str:
-    """One status line for the summary event stream (the only thing users see)."""
+def _is_en(locale: str | None) -> bool:
+    """Locale gate for user-facing self-check text. The platform default is
+    English (compile_box.DEFAULT_LOCALE='en'); a KB is Chinese only when the
+    consumer declares locale=zh. Mirrors the box's prompt-pack locale so an
+    English KB's self-check narration/repair match its English box_role instead
+    of arriving in Chinese."""
+    return (locale or "en").lower().startswith("en")
+
+
+def narration(report: dict, locale: str | None = None) -> str:
+    """One status line for the summary event stream (the only thing users see),
+    in the run's locale (see _is_en)."""
     cov, lint = report["coverage"], report["lint"]
+    if _is_en(locale):
+        if report["state"] == "passed":
+            return (f"Self-check (ledger): closed ✓ — {cov['cited']} sources compiled"
+                    f" / {cov['excluded']} explicitly excluded / {cov['total_sources']} total; lint passed")
+        parts = []
+        if cov["unaccounted"]:
+            parts.append(f"{len(cov['unaccounted'])} source file(s) unaccounted")
+        if not lint["ok"]:
+            parts.append(f"{len(lint['violations'])} lint issue(s)")
+        tail = "repair requested" if report["state"] == "repairing" else "repair budget spent; remaining items left for the owner"
+        return "Self-check (ledger): " + ", ".join(parts) + " — " + tail
     if report["state"] == "passed":
         return (f"自检(账本):闭合 ✓ — {cov['cited']} 源已编 / {cov['excluded']} 显式排除"
                 f" / 共 {cov['total_sources']};lint 通过")
@@ -354,10 +382,35 @@ def narration(report: dict) -> str:
     return "自检(账本):" + "、".join(parts) + " — " + tail
 
 
-def build_repair_prompt(report: dict) -> str:
-    """The bounded repair turn injected by the driver. Speaks the BOX_ROLE
-    contract language; lists concrete gaps, never vague exhortations."""
+def build_repair_prompt(report: dict, locale: str | None = None) -> str:
+    """The bounded repair turn injected by the driver, in the run's locale (see
+    _is_en). Speaks the BOX_ROLE contract language; lists concrete gaps, never
+    vague exhortations."""
     cov, lint = report["coverage"], report["lint"]
+    if _is_en(locale):
+        lines = ["[System self-check · coverage ledger] This round's mechanical check found the following; "
+                 "please address them (do not rewrite unrelated pages because of this):"]
+        if cov["unaccounted"]:
+            shown = cov["unaccounted"][:_REPAIR_LIST_CAP]
+            lines.append(f"\nUnaccounted raw source files ({len(cov['unaccounted'])}):")
+            lines += [f"- {p}" for p in shown]
+            if len(cov["unaccounted"]) > len(shown):
+                lines.append(f"- …{len(cov['unaccounted'])} total (see authoring/SELFCHECK.json for the rest)")
+            lines.append(
+                "For each, choose one: (1) Compile it — fold the source's content into the relevant candidate "
+                "page (new or merged) and register that source path in the page's frontmatter compiled_from; "
+                "(2) Explicitly exclude — if it genuinely should not be compiled (meta files / live data / "
+                'highly time-sensitive, etc.), add it to authoring/EXCLUSIONS.json (a JSON array of '
+                '{"pattern": "path or glob relative to raw", "reason": "one-line reason the owner can understand"}).')
+        if cov["dangling_citations"]:
+            lines.append(f"\ncompiled_from cites nonexistent sources (dangling, {len(cov['dangling_citations'])}):")
+            lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
+            lines.append("Change them to real raw-relative paths.")
+        if not lint["ok"]:
+            lines.append(f"\nLint issues ({len(lint['violations'])}):")
+            lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
+                      for v in lint["violations"][:_REPAIR_LIST_CAP]]
+        return "\n".join(lines)
     lines = ["【系统自检 · 覆盖账本】本轮机械核对发现以下问题,请处理(不要因此重写无关页面):"]
     if cov["unaccounted"]:
         shown = cov["unaccounted"][:_REPAIR_LIST_CAP]
