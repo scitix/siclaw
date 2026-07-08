@@ -112,7 +112,7 @@ export interface CreateSiclawSessionOpts {
   sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
   /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
   taskListId?: string;
-  /** Runtime bridge that spawns a sub-agent (design §6). Injected by the agentbox. */
+  /** Runtime bridge that spawns sub-agent(s) — single or map→reduce batch (design §6). Injected by the agentbox. */
   spawnSubagentExecutor?: import("./tool-registry.js").SpawnSubagentExecutor;
   /** Runtime bridge that cancels a background job — sub-agent or bash (design §7). */
   jobStopExecutor?: import("./tool-registry.js").JobStopExecutor;

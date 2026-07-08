@@ -21,21 +21,21 @@
  * Capability group key → the internal tool names it grants.
  *
  * Copied verbatim from the design (per-agent-tool-capabilities-DESIGN.md
- * "接口与数据结构"). The group keys are the stable contract stored in
+ * "Interface and data structures"). The group keys are the stable contract stored in
  * `agents.tool_capabilities`; the tool-name arrays may evolve as tools are
  * added/renamed without changing stored selections.
  */
 export const CAPABILITY_GROUPS: Record<string, string[]> = {
   read_files:      ["read", "grep", "find", "ls"],
-  write_sandbox:   ["write", "edit", "skill_preview"],   // 含技能创作
+  write_sandbox:   ["write", "edit", "skill_preview"],   // includes skill authoring
   inspect_infra:   ["cluster_list", "cluster_probe", "host_list", "resolve_pod_netns"],
   run_commands:    ["bash", "node_exec", "pod_exec", "host_exec"],
   run_scripts:     ["node_script", "pod_script", "local_script", "host_script"],
   search_memory:   ["memory_search", "memory_get"],
-  plan_tasks:      ["task_create", "task_update", "task_list", "task_get"],     // 拆分①
-  spawn_subagents: ["spawn_subagent", "task_output", "job_stop"],               // 拆分①（权限放大）
+  plan_tasks:      ["task_create", "task_update", "task_list", "task_get"],     // split ①
+  spawn_subagents: ["spawn_subagent", "task_output", "job_stop"], // split ① (permission amplification)
   scheduling:      ["manage_schedule"],
-  session_output:  ["task_report", "save_feedback", "channel_update"],   // 含 IM 渠道可见更新
+  session_output:  ["task_report", "save_feedback", "channel_update"],   // includes IM-channel-visible updates
 };
 
 /**

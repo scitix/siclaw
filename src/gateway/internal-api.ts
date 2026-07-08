@@ -550,6 +550,9 @@ async function appendDelegationEvent(
     ...(evt.durationMs != null ? { duration_ms: evt.durationMs } : {}),
     ...(evt.partialSource ? { partial_source: evt.partialSource } : {}),
     ...(evt.interruptedTool ? { interrupted_tool: evt.interruptedTool } : {}),
+    // Group terminal event: per-item status snapshot so the frontend can render never-persisted
+    // (skipped) items on reload instead of the live-only "running" fallback.
+    ...(evt.itemStatuses ? { item_statuses: evt.itemStatuses } : {}),
   };
 
   return appendDelegationMessage(frontendClient, {

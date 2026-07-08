@@ -37,6 +37,25 @@ describe("foldJobs", () => {
     expect(foldJobs([completion("fg-1", "done")])).toEqual([])
   })
 
+  it("surfaces a sub-agent batch as ONE job (bare-id terminal), not per child", () => {
+    // Group launch (job_id === groupId) + per-child events tagged `{groupId}#{i}` + the group's
+    // bare-id terminal event. Only the group as a whole should appear in the bar.
+    const msgs = [
+      launched("grp1"),
+      completion("grp1#0", "done", "sess-0"),
+      completion("grp1#1", "failed", "sess-1"),
+      completion("grp1", "partial", "reduce-sess"),
+    ]
+    const jobs = foldJobs(msgs)
+    expect(jobs).toHaveLength(1)
+    expect(jobs[0]).toMatchObject({ jobId: "grp1", status: "partial", childSessionId: "reduce-sess" })
+  })
+
+  it("never surfaces a group child event on its own (no `#`-tagged standalone jobs)", () => {
+    // Child/reduce events with no matching launched group must not create phantom bar entries.
+    expect(foldJobs([completion("grp1#0", "done"), completion("grp1#reduce", "done")])).toEqual([])
+  })
+
   it("ignores unrelated messages", () => {
     const msgs = [
       { id: "1", role: "assistant", content: "hello", timestamp: 0 } as unknown as PilotMessage,

@@ -26,7 +26,7 @@ import {
   requireAdmin,
   type AuthContext,
 } from "../gateway/rest-router.js";
-import { getDb } from "../gateway/db.js";
+import { getDb, type Db } from "../gateway/db.js";
 import {
   buildUpsert,
   jsonArrayContains,
@@ -224,6 +224,45 @@ function parsePagination(query: Record<string, string>): {
   const page = Math.max(1, parseInt(query.page || "1", 10));
   const pageSize = Math.min(100, Math.max(1, parseInt(query.page_size || "20", 10)));
   return { page, pageSize, offset: (page - 1) * pageSize };
+}
+
+/**
+ * Read-only authorization gate for a chat session.
+ *
+ * Returns true when the requester may READ the session: either they own it
+ * directly, or — for a *delegated sub-agent* session (one with a non-null
+ * `parent_session_id`) — they own the parent session (same agent, not deleted).
+ *
+ * Why the parent hop: a spawned sub-agent runs as its own persisted
+ * chat_session, but in local mode agent-factory injects no userId for the
+ * child, so the row lands with `user_id = 'unknown'`. Owner-only gating would
+ * then 404 the "View sub-agent transcript" drill-down. Parent ownership is the
+ * correct read boundary — whoever owns the parent conversation may read the
+ * transcripts it delegated.
+ *
+ * READ endpoints only. Rename/delete stay owner-only (write authorization is
+ * unchanged) — do not route mutations through this helper.
+ */
+async function resolveReadableSession(
+  db: Db,
+  sessionId: string,
+  agentId: string,
+  userId: string,
+): Promise<boolean> {
+  const [rows] = await db.query(
+    "SELECT user_id, parent_session_id FROM chat_sessions WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+    [sessionId, agentId],
+  ) as any;
+  if (rows.length === 0) return false;
+  if (rows[0].user_id === userId) return true;
+  // Delegated sub-agent session: authorize via the parent session's owner.
+  const parentId = rows[0].parent_session_id;
+  if (!parentId) return false;
+  const [parent] = await db.query(
+    "SELECT id FROM chat_sessions WHERE id = ? AND agent_id = ? AND user_id = ? AND deleted_at IS NULL",
+    [parentId, agentId, userId],
+  ) as any;
+  return parent.length > 0;
 }
 
 // ── Route registration ────────────────────────────────────────
@@ -1863,12 +1902,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const { page, pageSize, offset } = parsePagination(query);
     const db = getDb();
 
-    // Verify session belongs to user
-    const [session] = await db.query(
-      "SELECT id FROM chat_sessions WHERE id = ? AND agent_id = ? AND user_id = ? AND deleted_at IS NULL",
-      [params.sid, params.id, auth.userId],
-    ) as any;
-    if (session.length === 0) {
+    // Read access: direct owner, or the parent-session owner of a delegated
+    // sub-agent transcript (see resolveReadableSession).
+    if (!(await resolveReadableSession(db, params.sid, params.id, auth.userId))) {
       sendJson(res, 404, { error: "Session not found" });
       return;
     }
@@ -1911,11 +1947,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
 
     const db = getDb();
-    const [session] = await db.query(
-      "SELECT id FROM chat_sessions WHERE id = ? AND agent_id = ? AND user_id = ? AND deleted_at IS NULL",
-      [params.sid, params.id, auth.userId],
-    ) as any;
-    if (session.length === 0) {
+    // Read access: direct owner, or the parent-session owner of a delegated
+    // sub-agent session (see resolveReadableSession).
+    if (!(await resolveReadableSession(db, params.sid, params.id, auth.userId))) {
       sendJson(res, 404, { error: "Session not found" });
       return;
     }

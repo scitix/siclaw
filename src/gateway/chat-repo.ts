@@ -8,6 +8,7 @@
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
+import type { GroupItemStatus } from "../core/tool-registry.js";
 
 export interface ChatSessionLineageInput {
   /** Parent chat session for delegated child sessions. Null/undefined for normal top-level chat. */
@@ -93,6 +94,8 @@ export interface AppendDelegationEventInput {
   durationMs?: number;
   partialSource?: "steered" | "runtime_fallback";
   interruptedTool?: string;
+  /** Group terminal event per-item status snapshot (mirrors DelegationEventPayload.itemStatuses). */
+  itemStatuses?: Array<{ index: number; status: GroupItemStatus }>;
 }
 
 /** Module-level FrontendWsClient reference, set via initChatRepo(). */
@@ -193,6 +196,7 @@ export async function appendDelegationEvent(evt: AppendDelegationEventInput): Pr
     ...(evt.durationMs != null ? { duration_ms: evt.durationMs } : {}),
     ...(evt.partialSource ? { partial_source: evt.partialSource } : {}),
     ...(evt.interruptedTool ? { interrupted_tool: evt.interruptedTool } : {}),
+    ...(evt.itemStatuses ? { item_statuses: evt.itemStatuses } : {}),
   };
 
   return appendMessage({
