@@ -100,6 +100,23 @@ describe("consumeAgentSse — assistant message flow", () => {
     expect(assistantRow.sessionId).toBe("sid");
   });
 
+  it("stamps opts.traceId onto every persisted row (message-level trace filtering)", async () => {
+    const events = [
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Hi" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hi" }] } },
+    ];
+    await consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      traceId: "0123456789abcdef0123456789abcdef",
+    });
+    const assistantRow = appendCalls.find((r) => r.role === "assistant");
+    expect(assistantRow.traceId).toBe("0123456789abcdef0123456789abcdef");
+  });
+
   it("merges the agent_end context-usage snapshot onto the last assistant row's metadata", async () => {
     // Lets the frontend restore the context meter on session reopen/refresh.
     const cu = { tokens: 24144, contextWindow: 100000, percent: 24.1, inputTokens: 24118, outputTokens: 26 };

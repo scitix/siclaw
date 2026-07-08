@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import http from "node:http";
 import {
   handleSettings,
+  handleTracingConfig,
   handleMcpServers,
   handleToolCapabilities,
   handleSkillsBundle,
@@ -113,6 +114,36 @@ describe("handleSettings", () => {
     frontend.nextError = new Error("down");
     const res = new FakeRes();
     await handleSettings(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(500);
+    errSpy.mockRestore();
+  });
+});
+
+// ── handleTracingConfig ───────────────────────────────────
+
+describe("handleTracingConfig", () => {
+  it("200 with proxied TracingConfig and calls config.getTracingConfig with NO agentId", async () => {
+    frontend.responses.set("config.getTracingConfig", {
+      enabled: true,
+      serviceName: "siclaw-agentbox",
+      sendContent: false,
+      exporters: [{ url: "http://phoenix:6006/v1/traces", headers: {} }],
+    });
+    const res = new FakeRes();
+    await handleTracingConfig(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).enabled).toBe(true);
+    // Global config: must NOT be scoped to an agentId (would drop tracing for
+    // agents without a bound provider).
+    expect(frontend.calls[0].method).toBe("config.getTracingConfig");
+    expect(frontend.calls[0].params).toEqual({});
+  });
+
+  it("500 when RPC fails", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    frontend.nextError = new Error("down");
+    const res = new FakeRes();
+    await handleTracingConfig(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
     expect(res.statusCode).toBe(500);
     errSpy.mockRestore();
   });

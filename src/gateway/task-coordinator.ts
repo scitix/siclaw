@@ -276,6 +276,7 @@ export class TaskCoordinator {
 
       const promptOpts: PromptOptions = {
         sessionId,
+        userId,
         text: prompt,
         mode: "task",
         agentId,
@@ -285,7 +286,7 @@ export class TaskCoordinator {
         modelRouting: binding.modelRouting,
         systemPromptTemplate: binding.systemPrompt ?? undefined,
       };
-      await client.prompt(promptOpts);
+      const promptResult = await client.prompt(promptOpts);
 
       // Seed chat_sessions + user message via RPC. `origin: "task"` is the
       // one signal that lets upstream's Metrics dashboard split scheduled cron
@@ -305,6 +306,7 @@ export class TaskCoordinator {
           client,
           sessionId,
           userId,
+          traceId: promptResult.traceId,
           persistMessages: true,
           redactionConfig,
           signal: abortCtrl.signal,

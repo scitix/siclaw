@@ -93,6 +93,11 @@ runtime:
     tokenSecret:
       name: ""             # existing Secret holding the massapi token
       key: "ANTHROPIC_AUTH_TOKEN"
+  # Extra runtime env, spread into the gateway container (overrides values above).
+  # Trace environment (Langfuse deployment.environment.name) is auto-injected per
+  # agent by Portal, so you normally leave this unset. SICLAW_TRACING_ENVIRONMENT set
+  # here is only a fallback for deployments where Portal does not supply one (Portal's
+  # per-agent value wins when present).
   env: {}
 
 # -- Portal (standalone web UI, replaces Upstream)

@@ -76,6 +76,15 @@ export class GatewayClient {
   }
 
   /**
+   * Fetch the GLOBAL tracing config (TracingConfig) for a hot-reload. Distinct
+   * from fetchSettings: this proxies to config.getTracingConfig (no agentId), so
+   * it never drops tracing for an agent without a bound provider.
+   */
+  async fetchTracingConfig(): Promise<any> {
+    return this.request("/api/internal/tracing-config", "GET");
+  }
+
+  /**
    * List the agent's scheduled tasks. Agent identity is derived from the
    * mTLS client certificate by the Gateway — no userId/agentId needed here.
    */

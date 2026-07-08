@@ -49,6 +49,42 @@ export interface EmbeddingConfig {
   dimensions: number;
 }
 
+export interface TracingExporterConfig {
+  /**
+   * Full OTLP traces endpoint URL (including path).
+   *   Phoenix:  http://phoenix:6006/v1/traces
+   *   Langfuse: http://langfuse:3000/api/public/otel/v1/traces
+   */
+  url: string;
+  /**
+   * Static auth headers (the secret rides along in settings.json, delivered by
+   * the Gateway within the same trust domain — handled like the existing
+   * providers.apiKey).
+   *   Phoenix:  { authorization: "Bearer <key>", "x-project-name": "siclaw" }
+   *   Langfuse: { Authorization: "Basic <base64(pk:sk)>" }
+   */
+  headers?: Record<string, string>;
+}
+
+export interface TracingConfig {
+  /** Master switch. Defaults to false — tracing is fully no-op unless explicitly enabled. */
+  enabled?: boolean;
+  /** OpenTelemetry service.name resource attribute. Defaults to "siclaw-agentbox". */
+  serviceName?: string;
+  /**
+   * Deployment environment (Langfuse `deployment.environment.name`). Per-runtime:
+   * sourced from SICLAW_TRACING_ENVIRONMENT, forwarded to every agentbox by the
+   * k8s-spawner allowlist. Unset → trace lands in Langfuse's `default` environment.
+   */
+  environment?: string;
+  /** PII gate. When false (default), content attributes are never written to spans. */
+  sendContent?: boolean;
+  /** Trust-premise declaration. Defaults to true — exported content is treated like internal logs. */
+  requiresTrustedBackend?: boolean;
+  /** OTLP fan-out targets — one BatchSpanProcessor per entry. */
+  exporters?: TracingExporterConfig[];
+}
+
 export interface SiclawConfig {
   providers: Record<string, ProviderConfig>;
   default?: { provider: string; modelId: string };
@@ -79,6 +115,7 @@ export interface SiclawConfig {
   allowedTools: string[] | null;
   mcpServers: Record<string, unknown>;
   metrics?: { port?: number; token?: string; includeUserId?: boolean };
+  tracing?: TracingConfig;
   debug: boolean;
   userId: string;
 }
@@ -92,6 +129,42 @@ function parseBooleanEnv(value: string | undefined, defaultValue: boolean): bool
   if (TRUE_VALUES.has(normalized)) return true;
   if (FALSE_VALUES.has(normalized)) return false;
   return defaultValue;
+}
+
+/**
+ * Coerce an arbitrary environment label into a value the tracing backend accepts.
+ * Langfuse validates the environment against `^(?!langfuse)[a-z0-9-_]+$` (≤40 chars)
+ * and — critically — silently drops any non-matching value to `default` rather than
+ * repairing it. A runtime name carrying spaces/dots/CJK (e.g. "Shanghai Prod", "上海")
+ * would therefore vanish into `default`. Normalise at this boundary so the injected
+ * value survives: lowercase, strip the reserved `langfuse` prefix, replace illegal
+ * runs with `-`, cap at 40, trim separators. Idempotent — an already-valid label is
+ * returned unchanged. Returns undefined for empty / all-illegal input so the caller
+ * omits the attribute (→ backend's `default`) instead of stamping an empty string.
+ */
+export function sanitizeLangfuseEnv(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const normalized = value
+    .toLowerCase()
+    .replace(/^langfuse[-_]?/, "") // reserved prefix — Langfuse rejects it outright
+    .replace(/[^a-z0-9_-]+/g, "-") // spaces / dots / CJK / etc → single hyphen
+    .slice(0, 40) // Langfuse caps environment names at 40 chars
+    .replace(/^[-]+|[-]+$/g, ""); // trim leading/trailing hyphens (also a mid-slice cut)
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+/**
+ * The trace deployment environment (Langfuse `deployment.environment.name`),
+ * read and normalized from the pod env `SICLAW_TRACING_ENVIRONMENT`. This value is
+ * orthogonal to the DB-backed tracing config (`buildTracingConfig()` emits only
+ * serviceName / sendContent / exporters, never this) and comes from the process
+ * env — so BOTH the startup path (loadConfig) and the hot-reload path
+ * (POST /api/reload-tracing → reinitTracing) must merge it, or a reload would
+ * silently rebuild the provider without an environment and drop every trace into
+ * Langfuse's `default`. Single source of truth so the two paths agree.
+ */
+export function resolveTracingEnvironment(): string | undefined {
+  return sanitizeLangfuseEnv(process.env.SICLAW_TRACING_ENVIRONMENT);
 }
 
 /**
@@ -336,6 +409,22 @@ export function loadConfig(): SiclawConfig {
         model: envModel ?? existing?.model ?? "BAAI/bge-m3",
         dimensions: !isNaN(parsedDims) && parsedDims > 0 ? parsedDims : existing?.dimensions ?? 1024,
       };
+    }
+  }
+
+  // Trace deployment environment (Langfuse deployment.environment.name), read from
+  // SICLAW_TRACING_ENVIRONMENT in the agentbox process env. Two suppliers, same key:
+  //   • Portal injects it per-agent (spawn_env → boxConfig.env → pod env), derived
+  //     from the runtime the agent is bound to — the zero-config default.
+  //   • Ops may set it on the runtime deployment (k8s-spawner allowlist) to pin
+  //     every agentbox to one bucket — an explicit override.
+  // Normalised here (sanitizeLangfuseEnv) so an unnormalised runtime name doesn't
+  // silently fall to `default` at ingestion. Only augments an existing tracing block
+  // — with no enabled exporters, initTracing still no-ops. Local mode leaves it unset.
+  {
+    const envEnvironment = resolveTracingEnvironment();
+    if (envEnvironment) {
+      cached.tracing = { ...(cached.tracing ?? {}), environment: envEnvironment };
     }
   }
 

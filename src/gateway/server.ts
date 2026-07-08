@@ -25,6 +25,7 @@ import type { RuntimeConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { getBoxProfile } from "./agentbox/box-profile.js";
+import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { driveTestSession } from "./capability/test-relay.js";
@@ -55,6 +56,7 @@ import { checkMetricsAuth } from "../shared/metrics.js";
 import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
+  handleTracingConfig,
   handleMcpServers,
   handleToolCapabilities,
   handleSkillsBundle,
@@ -158,31 +160,30 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── RPC Methods (chat only) ──────────────────────────────
   const rpcMethods = new Map<string, RpcHandler>();
 
-  // Resolve the per-agent spawn env. Currently only the idle self-destruct
-  // window (agents.idle_timeout_sec → SICLAW_AGENTBOX_IDLE_TIMEOUT), which the
-  // AgentBox reads at startup (config.server.idleTimeoutSec). The Runtime is
-  // DB-free, so the value comes from Portal via the `config.getAgent` RPC (the
-  // same channel other agent config flows through) — NOT a direct DB read.
-  // Best-effort: any RPC failure falls back to the AgentBox's own default
+  // Resolve the per-agent spawn env. Two sources fold together in buildSpawnEnv:
+  // the idle self-destruct window (agents.idle_timeout_sec →
+  // SICLAW_AGENTBOX_IDLE_TIMEOUT, read at AgentBox startup), and a generic,
+  // Portal-owned `spawn_env` map of extra per-agent env vars forwarded verbatim.
+  // The Runtime is DB-free, so both come from Portal via the `config.getAgent`
+  // RPC (the same channel other agent config flows through) — NOT a direct DB
+  // read. Best-effort: any RPC failure falls back to the AgentBox's own defaults
   // rather than failing the spawn. The env only takes effect on a cold spawn —
-  // K8sSpawner ignores it when a pod is already running, so a changed timeout
-  // applies on the agent's next restart.
+  // K8sSpawner ignores it when a pod is already running, so changes apply on the
+  // agent's next restart.
   //
   // Registered on the AgentBoxManager (not wired per-call) so EVERY cold-spawn
   // entry point — chat RPCs here, plus channel webhooks and cron tasks that
-  // share this manager — honours the per-agent window. The manager invokes it
+  // share this manager — honours the per-agent env. The manager invokes it
   // lazily, only on an actual spawn, so warm-pod reuse pays no RPC.
   const resolveAgentSpawnEnv = async (agentId: string): Promise<Record<string, string> | undefined> => {
     try {
       const agent = await frontendClient.request("config.getAgent", { agentId }) as
-        | { idle_timeout_sec?: number | null }
+        | { idle_timeout_sec?: number | null; spawn_env?: Record<string, unknown> | null }
         | null;
-      const sec = agent?.idle_timeout_sec;
-      if (sec !== undefined && sec !== null) {
-        return { SICLAW_AGENTBOX_IDLE_TIMEOUT: String(sec) };
-      }
+      const env = buildSpawnEnv(agent);
+      return Object.keys(env).length > 0 ? env : undefined;
     } catch (err) {
-      console.warn(`[gateway] Failed to resolve idle timeout for agent ${agentId}:`, err);
+      console.warn(`[gateway] Failed to resolve spawn env for agent ${agentId}:`, err);
     }
     return undefined;
   };
@@ -242,6 +243,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const files = params.files as PromptOptions["files"];
     const promptOpts: PromptOptions = {
       sessionId,
+      userId,
       text,
       agentId,
       modelProvider: params.modelProvider as string | undefined,
@@ -320,6 +322,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             client,
             sessionId: promptResult.sessionId,
             userId,
+            traceId: promptResult.traceId,
             persistMessages: true,
             redactionConfig,
             signal: abortCtrl.signal,
@@ -797,6 +800,41 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
+  // tracing.reloadAll — GLOBAL tracing hot-reload. Unlike agent.reload, tracing
+  // is a single fan-out set shared by every agent, so this enumerates ALL
+  // running boxes (no agentId filter) and POSTs /api/reload-tracing to each.
+  // Uses the generic AgentBoxClient.post (NOT reloadResource) because tracing
+  // config never lands on disk — see DESIGN module 3. Each box is contained in
+  // its own try/catch so one unreachable/slow box cannot block the rest.
+  rpcMethods.set("tracing.reloadAll", async () => {
+    const boxes = await agentBoxManager.list();
+    // Only "running" boxes are reachable; Pending/Terminating pods have no/stale
+    // podIP and would ETIMEDOUT (same rationale as agent.reload).
+    const targets = boxes.filter((b) => b.status === "running");
+
+    if (targets.length === 0) {
+      console.log("[rpc] tracing.reloadAll: no running boxes, skipping");
+      return { ok: true, reloaded: 0, failed: [], boxes: 0 };
+    }
+
+    const failed: string[] = [];
+    await Promise.all(
+      targets.map(async (box) => {
+        try {
+          const client = new AgentBoxClient(box.endpoint, 15_000, agentBoxTlsOptions);
+          await client.post("/api/reload-tracing");
+        } catch (err: any) {
+          console.warn(`[rpc] tracing.reloadAll: box=${box.boxId} failed: ${err.message}`);
+          failed.push(box.boxId);
+        }
+      }),
+    );
+
+    const reloaded = targets.length - failed.length;
+    console.log(`[rpc] tracing.reloadAll: boxes=${targets.length} reloaded=${reloaded} failed=[${failed}]`);
+    return { ok: true, reloaded, failed, boxes: targets.length };
+  });
+
   // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──
   // Portal sends commands (e.g. chat.send, agent.reload, task.fireNow) to
   // Runtime over the persistent WS connection. We route them through the
@@ -966,6 +1004,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/settings" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleSettings(req, res, identity, frontendClient);
+            return;
+          }
+
+          // Global tracing config (no agentId) — hot-reload source via RPC
+          if (url === "/api/internal/tracing-config" && method === "GET") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            handleTracingConfig(req, res, identity, frontendClient);
             return;
           }
 
