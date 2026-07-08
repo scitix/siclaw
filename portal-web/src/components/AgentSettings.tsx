@@ -773,7 +773,7 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
   agentId: string; selectedChannelIds: Set<string>; setSelectedChannelIds: (v: Set<string>) => void
 }) {
   const toast = useToast()
-  const [bindings, setBindings] = useState<{ id: string; channel_id: string; channel_name: string; channel_type: string; route_key: string; route_type: string }[]>([])
+  const [bindings, setBindings] = useState<{ id: string; channel_id: string; channel_name: string; channel_type: string; route_key: string; route_type: string; display_name?: string | null }[]>([])
   const [allChannels, setAllChannels] = useState<{ id: string; name: string; type: string }[]>([])
   const [loading, setLoading] = useState(true)
   const [pairingCode, setPairingCode] = useState<string | null>(null)
@@ -875,8 +875,8 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
             {bindings.map(b => (
               <div key={b.id} className="flex items-center justify-between px-3 py-2 rounded-md border border-border/50">
                 <div>
-                  <p className="text-[12px] font-mono">{b.channel_name || b.channel_id}</p>
-                  <p className="text-[10px] text-muted-foreground">{b.route_type}: {b.route_key}</p>
+                  <p className="text-[12px]">{b.display_name || <span className="font-mono">{b.route_key}</span>}</p>
+                  <p className="text-[10px] text-muted-foreground font-mono">{b.channel_name || b.channel_id} · {b.route_type}: {b.route_key}</p>
                 </div>
                 <button onClick={() => handleUnbind(b.id)} title="Unbind" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
                   <Trash2 className="h-3.5 w-3.5" />

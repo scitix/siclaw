@@ -1391,7 +1391,7 @@ describe("channel.resolveBinding", () => {
     const result = await getHandler("channel.resolveBinding")(
       { channel_id: "ch1", route_key: "group-123" }, "a1",
     );
-    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s1", createdBy: "u1", routeType: "group" });
+    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s1", createdBy: "u1", routeType: "group", displayName: null });
   });
 
   it("lazily creates a session for legacy bindings", async () => {
@@ -1406,7 +1406,7 @@ describe("channel.resolveBinding", () => {
     );
 
     expect(query.mock.calls[1][0]).toContain("UPDATE channel_bindings SET session_id");
-    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s-new", createdBy: "u1", routeType: "group" });
+    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s-new", createdBy: "u1", routeType: "group", displayName: null });
   });
 
   it("lazily creates a participant session when session_key is provided", async () => {
@@ -1436,6 +1436,7 @@ describe("channel.resolveBinding", () => {
       sessionKey: "open_id:ou_1",
       createdBy: "u1",
       routeType: "group",
+      displayName: null,
     });
   });
 
@@ -1510,9 +1511,51 @@ describe("channel.pair", () => {
       expect.any(String),
       "group-1",
       "group",
+      null,
       "u1",
     ]);
     expect(query.mock.calls[4][0]).toContain("DELETE FROM channel_binding_sessions");
+  });
+
+  it("seeds display_name from route_display_name", async () => {
+    const query = mockQuery(
+      [{ agent_id: "a1", created_by: "u1" }],
+      [],
+      [],
+      [{ id: "b-new", agent_id: "a1", session_id: "binding-session", route_type: "group", created_by: "u1" }],
+      [],
+      [],
+      [{ name: "My Agent" }],
+    );
+
+    const result = await getHandler("channel.pair")(
+      { code: "ABC123", channel_id: "ch1", route_key: "group-1", route_type: "group", route_display_name: "  运维告警群  " }, "a1",
+    );
+    expect(result.success).toBe(true);
+    expect(query.mock.calls[2][0]).toContain("display_name");
+    expect(query.mock.calls[2][1]).toContain("运维告警群");
+  });
+
+  it("re-pair without a name keeps the existing display_name (not in update set)", async () => {
+    const query = mockQuery(
+      [{ agent_id: "a2", created_by: "u1" }],
+      [{ id: "b-old", agent_id: "a1", session_id: "s-old", route_type: "group", display_name: "运维告警群", created_by: "u1" }],
+      [],
+      [{ id: "b-old", agent_id: "a2", session_id: "s-new", route_type: "group", display_name: "运维告警群", created_by: "u1" }],
+      [],
+      [],
+      [{ name: "Other Agent" }],
+    );
+
+    const result = await getHandler("channel.pair")(
+      { code: "ABC123", channel_id: "ch1", route_key: "group-1", route_type: "group" }, "a1",
+    );
+    expect(result.success).toBe(true);
+    // Upsert SQL: display_name appears in the INSERT column list but must NOT
+    // appear in the ON-conflict UPDATE clause when no name was provided.
+    const upsertSql: string = query.mock.calls[2][0];
+    const updateClause = upsertSql.slice(upsertSql.search(/on (duplicate key update|conflict)/i));
+    expect(updateClause).not.toContain("display_name");
   });
 
   it("returns error for invalid pairing code", async () => {
@@ -1537,6 +1580,53 @@ describe("channel.pair", () => {
     );
     expect(result.success).toBe(false);
     expect(result.error).toContain("Failed to create binding");
+  });
+});
+
+describe("channel.updateBindingMeta", () => {
+  it("updates the cached display name", async () => {
+    const query = mockQuery({ affectedRows: 1 } as any);
+
+    const result = await getHandler("channel.updateBindingMeta")(
+      { channel_id: "ch1", route_key: "group-1", display_name: "运维告警群" }, "a1",
+    );
+    expect(result).toEqual({ success: true });
+    expect(query.mock.calls[0][0]).toContain("UPDATE channel_bindings SET display_name");
+    expect(query.mock.calls[0][1]).toEqual(["运维告警群", "ch1", "group-1"]);
+  });
+
+  it("returns an error when the binding is missing", async () => {
+    mockQuery({ affectedRows: 0 } as any);
+
+    const result = await getHandler("channel.updateBindingMeta")(
+      { channel_id: "ch1", route_key: "group-404", display_name: "x" }, "a1",
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("not found");
+  });
+
+  it("rejects an empty name without touching the DB", async () => {
+    const query = mockQuery();
+
+    const result = await getHandler("channel.updateBindingMeta")(
+      { channel_id: "ch1", route_key: "group-1", display_name: "   " }, "a1",
+    );
+    expect(result.success).toBe(false);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("truncates at 255 code points without splitting surrogate pairs", async () => {
+    const query = mockQuery({ affectedRows: 1 } as any);
+
+    const result = await getHandler("channel.updateBindingMeta")(
+      { channel_id: "ch1", route_key: "group-1", display_name: "😀".repeat(300) }, "a1",
+    );
+    expect(result).toEqual({ success: true });
+    const stored: string = query.mock.calls[0][1][0];
+    // 255 code points (matches MySQL VARCHAR(255) char semantics),
+    // i.e. 510 UTF-16 units — and the last char is a whole emoji.
+    expect([...stored]).toHaveLength(255);
+    expect(stored.endsWith("😀")).toBe(true);
   });
 });
 
@@ -1741,9 +1831,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 48 handlers", () => {
+  it("registers exactly 49 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(48);
+    expect(handlers.size).toBe(49);
   });
 
   it("all expected handler names are registered", () => {
@@ -1759,6 +1849,7 @@ describe("buildAdapterRpcHandlers", () => {
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",
       "channel.list", "channel.resolveBinding", "channel.pair", "channel.resetSession",
+      "channel.updateBindingMeta",
       "channel.resolvePersonalBinding", "channel.pairPersonal", "channel.resetPersonalSession",
       "agent.listForSkill", "agent.listForMcp", "agent.listForCluster", "agent.listForHost",
       "metrics.summary", "metrics.audit", "metrics.auditDetail",
