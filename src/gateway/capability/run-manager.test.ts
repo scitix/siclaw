@@ -25,6 +25,17 @@ beforeEach(() => {
 });
 
 describe("CapabilityRunManager", () => {
+  it("startRun initialStatus idle — a hosting-only run is a conversation at rest, not a stuck turn", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1", initialStatus: "idle" });
+    expect(rec.status).toBe("idle");
+    expect(be.persists().at(-1)?.params).toMatchObject({ run_id: rec.runId, status: "idle" });
+    // The first real turn flips it running, exactly like any at-rest run.
+    await mgr.setStatus(rec.runId, "running");
+    expect(mgr.get(rec.runId)?.status).toBe("running");
+  });
+
   it("startRun mints an id, tracks it, and persists a running state", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
@@ -137,6 +148,81 @@ describe("CapabilityRunManager", () => {
     clock = 2200; // only 200ms since touch < staleMs(500)
     expect(await mgr.reapStale()).toEqual([]);
     expect(mgr.get(rec.runId)).toBeDefined();
+  });
+
+  it("two-clock: heartbeats bridge a data-silent phase up to dataStaleMs", async () => {
+    const be = new FakeBackend();
+    let clock = 1000;
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, dataStaleMs: 5000 });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" }); // data+hb at t=1000
+
+    // Data silent past staleMs (a long read-only compile phase), but heartbeats
+    // keep arriving → NOT reaped, because data silence is still < dataStaleMs.
+    clock = 2000;
+    mgr.touchHeartbeat(rec.runId); // heartbeat at 2000; last DATA still 1000
+    clock = 2200; // data silent 1200ms (> staleMs 500) but heartbeat only 200ms ago
+    expect(await mgr.reapStale()).toEqual([]);
+    expect(mgr.get(rec.runId)).toBeDefined();
+  });
+
+  it("two-clock: a box that ONLY heartbeats is reaped at dataStaleMs (no wedged-turn immortality)", async () => {
+    const be = new FakeBackend();
+    let clock = 1000;
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, dataStaleMs: 5000 });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" }); // last DATA at 1000
+
+    // Heartbeats keep firing but no DATA ever comes again.
+    for (const t of [2000, 3000, 4000, 5000, 6000]) {
+      clock = t;
+      mgr.touchHeartbeat(rec.runId);
+    }
+    clock = 6001; // data silent 5001ms > dataStaleMs(5000), despite a fresh heartbeat
+    expect(await mgr.reapStale()).toEqual([rec.runId]);
+    expect(be.persists().at(-1)?.params).toMatchObject({ run_id: rec.runId, status: "failed" });
+  });
+
+  it("two-clock: a fully silent box (no data, no heartbeat) is reaped at staleMs", async () => {
+    const be = new FakeBackend();
+    let clock = 1000;
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, dataStaleMs: 5000 });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    clock = 1600; // 600ms since last data AND last heartbeat: > staleMs(500), < dataStaleMs
+    expect(await mgr.reapStale()).toEqual([rec.runId]);
+    expect(be.persists().at(-1)?.params).toMatchObject({ run_id: rec.runId, status: "failed" });
+  });
+
+  it("two-clock invariant: dataStaleMs below staleMs is clamped up (heartbeat bridge never silently disabled)", async () => {
+    const be = new FakeBackend();
+    let clock = 1000;
+    // Misconfigured: dataStaleMs(100) < staleMs(500). Unclamped, the data clock
+    // would reap at +100ms of data silence and the heartbeat bridge would never matter.
+    const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500, dataStaleMs: 100 });
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" }); // data+hb at 1000
+
+    clock = 1300;
+    mgr.touchHeartbeat(rec.runId); // heartbeat fresh; data silent 300ms > misconfigured 100
+    clock = 1350;
+    expect(await mgr.reapStale()).toEqual([]); // clamped to staleMs(500) → still alive
+    clock = 1600; // data silent 600ms > clamped dataStaleMs(500) → reaped, heartbeats or not
+    expect(await mgr.reapStale()).toEqual([rec.runId]);
+  });
+
+  it("two-clock: a non-positive CAPABILITY_DATA_STALE_MS env falls back to the default instead of 0", async () => {
+    process.env.CAPABILITY_DATA_STALE_MS = "0";
+    try {
+      const be = new FakeBackend();
+      let clock = 1000;
+      const mgr = new CapabilityRunManager(be, { now: () => clock, staleMs: 500 }); // dataStaleMs from env
+      const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+      clock = 1800;
+      mgr.touchHeartbeat(rec.runId); // data silent 800ms; an honored env 0 would mean instant data-stale
+      clock = 1900;
+      expect(await mgr.reapStale()).toEqual([]); // default 60min in force, heartbeat bridges
+    } finally {
+      delete process.env.CAPABILITY_DATA_STALE_MS;
+    }
   });
 
   it("reapStale stops the box via onReap before failing the run; an onReap error doesn't block the reap", async () => {

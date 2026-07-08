@@ -355,6 +355,29 @@ describe("AgentBoxClient — streamEvents (SSE)", () => {
     } finally { await srv.close(); }
   });
 
+  it("accepts SSE-valid space-less data: lines and still routes comments to onComment only", async () => {
+    // Per the SSE spec the value is everything after the colon minus ONE
+    // optional leading space — "data:x" is as valid as "data: x". Today's box
+    // always sends the space; a spec-conforming producer must not be dropped.
+    const srv = await startServer((req, res) => {
+      if (req.url?.startsWith("/api/stream/")) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data:{"type":"tight"}\n\n`);
+        res.write(`: heartbeat\n\n`);
+        res.write(`data: {"type":"spaced"}\n\n`);
+        res.end();
+      } else { res.writeHead(404); res.end(); }
+    });
+    try {
+      const client = new AgentBoxClient(`http://127.0.0.1:${srv.port}`);
+      const events: any[] = [];
+      for await (const ev of client.streamEvents("s1") as AsyncIterable<any>) {
+        events.push(ev);
+      }
+      expect(events).toEqual([{ type: "tight" }, { type: "spaced" }]);
+    } finally { await srv.close(); }
+  });
+
   it("skips malformed data lines without crashing the iterator", async () => {
     const srv = await startServer((req, res) => {
       if (req.url?.startsWith("/api/stream/")) {

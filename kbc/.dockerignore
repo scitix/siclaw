@@ -1,0 +1,3 @@
+# Keep test files out of the compile-box image (the Dockerfile COPYs
+# platform/pod/*.py with a glob; tests are not needed at runtime).
+platform/pod/test_*.py
