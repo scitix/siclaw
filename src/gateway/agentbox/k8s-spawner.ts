@@ -258,11 +258,23 @@ export class K8sSpawner implements BoxSpawner {
         env.push({ name, value });
       }
     };
+    // Prefix forwarding is trust-by-naming: everything it matches lands in the
+    // PodSpec in cleartext (readable by anyone with pod-get in the namespace).
+    // Forwarded prefixes are for OPS KNOBS only — a secret must never be named
+    // under one (credentials reach the box via the /session body, not env).
+    // Belt-and-braces: refuse secret-shaped names so a credential parked in the
+    // runtime env can't ride the glob into the pod spec.
+    const secretShaped = /(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_?KEY|PRIVATE)/i;
     for (const name of profile.envForward ?? []) {
       if (name.endsWith("*")) {
         const prefix = name.slice(0, -1);
         for (const [key, value] of Object.entries(process.env)) {
-          if (key.startsWith(prefix)) forwardOne(key, value);
+          if (!key.startsWith(prefix)) continue;
+          if (secretShaped.test(key.slice(prefix.length))) {
+            console.warn(`[k8s-spawner] refusing to forward secret-shaped env ${key} (matched prefix ${name})`);
+            continue;
+          }
+          forwardOne(key, value);
         }
       } else {
         forwardOne(name, process.env[name]);

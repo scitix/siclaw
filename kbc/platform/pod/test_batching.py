@@ -155,6 +155,55 @@ def test_plan_fragmentation_guard(tmp_path: Path):
     assert bt.plan_too_fragmented([{}, {}, {}, {}, {}], tiny_base) is True
 
 
+def test_validate_plan_rejects_duplicate_and_empty_batch_ids(tmp_path: Path):
+    """Review fix: stamp_done marks EVERY batch with the matching id, so a plan
+    with twin ids would stamp both on the first completion and silently never
+    run the second. validate_plan must reject it up front."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.md").write_bytes(b"x" * 10)
+    (raw / "b.md").write_bytes(b"y" * 10)
+    inv = bt.scan_sources(raw)
+    dup = {"batches": [{"id": "b01", "sources": ["a.md"]}, {"id": "b01", "sources": ["b.md"]}]}
+    errs = bt.validate_plan(dup, inv, budget=100)
+    assert any("duplicate batch id" in e for e in errs), errs
+    empty = {"batches": [{"id": " ", "sources": ["a.md"]}, {"sources": ["b.md"]}]}
+    errs = bt.validate_plan(empty, inv, budget=100)
+    assert sum("empty or missing id" in e for e in errs) == 2, errs
+
+
+def test_scan_confines_symlinks(tmp_path: Path):
+    """Review fix (defense-in-depth): a symlink under raw/ pointing outside must
+    not be inventoried — same realpath confinement as the snapshot pinner."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "real.md").write_bytes(b"x" * 10)
+    outside = tmp_path / "outside.md"
+    outside.write_bytes(b"secret" * 10)
+    (raw / "leak.md").symlink_to(outside)          # file symlink → skipped
+    (raw / "dir").symlink_to(tmp_path / "raw2", target_is_directory=True)
+    (tmp_path / "raw2").mkdir()
+    (tmp_path / "raw2" / "esc.md").write_bytes(b"z" * 10)  # via dir symlink → confined away
+    paths = [i["path"] for i in bt.scan_sources(raw)]
+    assert paths == ["real.md"], paths
+
+
+def test_prune_missing_sources(tmp_path: Path):
+    """Review fix: on resume, sources deleted from raw/ are dropped from PENDING
+    batches (a batch left empty is stamped done); done batches stay untouched."""
+    plan = {"batches": [
+        {"id": "b01", "sources": ["gone.md", "kept.md"]},
+        {"id": "b02", "sources": ["all-gone.md"]},
+        {"id": "b03", "sources": ["done-gone.md"], "status": "done"},
+    ]}
+    dropped = bt.prune_missing_sources(plan, {"kept.md"})
+    assert sorted(dropped) == ["all-gone.md", "gone.md"], dropped
+    assert plan["batches"][0]["sources"] == ["kept.md"]
+    assert plan["batches"][1]["status"] == "done" and plan["batches"][1]["sources"] == []
+    assert plan["batches"][2]["sources"] == ["done-gone.md"]  # history, not instructions
+    assert [b["id"] for b in bt.pending_batches(plan)] == ["b01"]
+
+
 def main():
     tests = [
         test_scan_skips_hidden_and_empty,
@@ -163,6 +212,9 @@ def main():
         test_pack_oversized_single_file_gets_own_batch,
         test_validate_plan_accepts_code_baseline,
         test_validate_plan_rejects_missing_duplicate_unknown_overflow,
+        test_validate_plan_rejects_duplicate_and_empty_batch_ids,
+        test_scan_confines_symlinks,
+        test_prune_missing_sources,
         test_normalize_model_plan_and_progress,
         test_effective_weights_images_pdf_binary,
         test_pack_uses_effective_not_raw_bytes,

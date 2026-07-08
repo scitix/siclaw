@@ -116,7 +116,14 @@ export class CapabilityRunManager {
   ) {
     this.now = opts.now ?? Date.now;
     this.staleMs = opts.staleMs ?? 10 * 60_000; // 10 min
-    this.dataStaleMs = opts.dataStaleMs ?? (Number(process.env.CAPABILITY_DATA_STALE_MS) || 60 * 60_000); // 60 min
+    // Two-clock invariant: dataStaleMs >= staleMs, or the heartbeat bridge is
+    // silently disabled (a run would be reaped by the data clock before the
+    // heartbeat clock ever mattered). Clamp rather than trust the env; a
+    // non-positive/garbage env value falls back to the 60 min default.
+    const envDataStale = Number(process.env.CAPABILITY_DATA_STALE_MS);
+    const rawDataStale = opts.dataStaleMs ??
+      (Number.isFinite(envDataStale) && envDataStale > 0 ? envDataStale : 60 * 60_000); // 60 min
+    this.dataStaleMs = Math.max(rawDataStale, this.staleMs);
     this.idleTtlMs = opts.idleTtlMs ?? 2 * 60 * 60_000; // 2 h
     this.watchdogIntervalMs = opts.watchdogIntervalMs ?? 60_000; // 1 min
     this.onReap = opts.onReap;

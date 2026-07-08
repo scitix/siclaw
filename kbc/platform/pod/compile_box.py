@@ -1695,6 +1695,17 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             await run.emit({"type": "summary", "text": f"语料 {total_kb}KB 超过单会话阈值,启用分批编译。"})
             plan = await _plan_batches(run, inventory)
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+        else:
+            # The pinned plan predates this run; a source deleted from raw/ in
+            # between would leave a batch directive pointing at a missing file.
+            # (Added sources are caught later by the coverage ledger.)
+            dropped = batching.prune_missing_sources(plan, {i["path"] for i in inventory})
+            if dropped:
+                _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                await run.emit({"type": "summary",
+                                "text": f"断点续批:{len(dropped)} 个源已不在 raw/ 中,已从待编批次剔除:"
+                                        + ", ".join(sorted(dropped)[:5])
+                                        + ("…" if len(dropped) > 5 else "")})
         n = len(plan["batches"])
         pending = batching.pending_batches(plan)
         await run.emit({
@@ -1710,6 +1721,15 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 replies.append(f"【批 {k}/{n}】{reply}")
             batching.stamp_done(plan, batch["id"])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            # Push the done-stamp (and the batch's pages) to the durable store
+            # NOW: if it only rode the next periodic sync, a crash in that window
+            # would re-run an already-done batch on resume.
+            sent = getattr(run, "_sync_sent", None)
+            if sent is not None:
+                try:
+                    await _sync_workspace(run, sent)
+                except Exception:
+                    pass  # periodic sync will retry; the local stamp is already on disk
             await run.emit({"type": "summary", "text": f"批 {k}/{n} 完成,已落库。"})
         final_reply = await _drive_batch_session(
             run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run)), "终审")
@@ -1753,6 +1773,22 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                                     "text": f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓"})
             if repaired_any:
                 await _run_ledger_repairs(run, replies)
+        # Owner notes that arrived during the tail phases (ledger repair / image
+        # verify) were acked as "will be considered" but have no later batch to
+        # ride — honor the contract with a bounded digest session before the
+        # turn closes. Two passes: a note can land while the first one runs.
+        for _ in range(2):
+            tail_notes = _drain_batch_notes(run)
+            if not tail_notes:
+                break
+            notes_reply = await _drive_batch_session(
+                run,
+                "负责人在编译收尾期间的补充留言如下,请评估是否需要据此调整草稿"
+                "(需要就改并简述,不需要就说明理由):\n" + tail_notes,
+                "留言消化")
+            if notes_reply:
+                replies.append(f"【留言消化】{notes_reply}")
+            await _run_ledger_repairs(run, replies)  # the digest may have touched pages
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
             try:
@@ -1762,6 +1798,15 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip() or "分批编译完成。"})
     except Exception as e:
         await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
+        # never-block: the single logical turn must still CLOSE — a consumer
+        # gating on turn_done would otherwise hang on an orchestrator error.
+        # Done batches are stamped in BATCH_PLAN.json, so the honest story is
+        # "interrupted, resumable from the first pending batch".
+        try:
+            await run.emit({"type": "turn_done",
+                            "text": "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。"})
+        except Exception:
+            pass
     finally:
         run._batch_active = False
     # Red-blue PK examines the train's FINAL state, in the background, after the

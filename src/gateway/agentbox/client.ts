@@ -382,8 +382,10 @@ export class AgentBoxClient {
         buffer = lines.pop() || ""; // Retain incomplete line
 
         for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const data = line.slice(6);
+          if (line.startsWith("data:")) {
+            // SSE spec: the value is everything after the colon, minus ONE
+            // optional leading space — "data:x" is as valid as "data: x".
+            const data = line.slice(5).replace(/^ /, "");
             try {
               eventCount++;
               yield JSON.parse(data);
@@ -445,8 +447,10 @@ export class AgentBoxClient {
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const data = line.slice(6);
+          if (line.startsWith("data:")) {
+            // SSE spec: the value is everything after the colon, minus ONE
+            // optional leading space — "data:x" is as valid as "data: x".
+            const data = line.slice(5).replace(/^ /, "");
             try {
               eventCount++;
               yield JSON.parse(data);

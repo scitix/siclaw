@@ -94,13 +94,21 @@ def batch_budget_bytes() -> int:
 def scan_sources(raw_dir: Path) -> list[dict[str, Any]]:
     """Inventory of raw sources: repo-relative path + size, sorted for stable
     plans. Hidden files and empty files are skipped (they carry no compile
-    content; the installer never writes them, but a defensive skip is cheap)."""
+    content; the installer never writes them, but a defensive skip is cheap).
+    Symlinks are skipped and every path is realpath-confined to raw/ — the
+    bundle installer already rejects link members, but this scan must not be
+    the weaker of the two paths (same hardening as the S1 snapshot pinner)."""
     items: list[dict[str, Any]] = []
     if not raw_dir.is_dir():
         return items
+    root = raw_dir.resolve()
     for p in sorted(raw_dir.rglob("*")):
-        if not p.is_file():
+        if p.is_symlink() or not p.is_file():
             continue
+        try:
+            p.resolve().relative_to(root)
+        except (OSError, ValueError):
+            continue  # escapes raw/ via a linked parent — not ours to inventory
         if any(part.startswith(".") for part in p.relative_to(raw_dir).parts):
             continue
         size = p.stat().st_size
@@ -206,12 +214,21 @@ def validate_plan(
     errors: list[str] = []
     sizes = {i["path"]: _eff(i) for i in inventory}
     seen: dict[str, str] = {}
+    seen_ids: set[str] = set()
     batches = plan.get("batches")
     if not isinstance(batches, list) or not batches:
         return ["plan has no batches"]
     for batch in batches:
         sources = batch.get("sources")
         bid = str(batch.get("id", "?"))
+        # Batch ids must be unique and non-empty: stamp_done marks EVERY batch
+        # with the matching id, so a duplicate would get stamped alongside its
+        # twin and silently never run.
+        if not str(batch.get("id") or "").strip():
+            errors.append("batch with empty or missing id")
+        elif bid in seen_ids:
+            errors.append(f"duplicate batch id {bid}")
+        seen_ids.add(bid)
         if not isinstance(sources, list) or not sources:
             errors.append(f"batch {bid}: empty or missing sources")
             continue
@@ -261,6 +278,27 @@ def stamp_done(plan: dict[str, Any], batch_id: str) -> dict[str, Any]:
         if b.get("id") == batch_id:
             b["status"] = "done"
     return plan
+
+
+def prune_missing_sources(plan: dict[str, Any], known: set[str]) -> list[str]:
+    """Drop sources that no longer exist in raw/ from the PENDING batches of a
+    resumed plan (a source deleted between runs would otherwise leave a batch
+    directive pointing at a missing file). A pending batch left with no sources
+    is stamped done — nothing remains to compile in it. Done batches are left
+    untouched (their stamps are history, not instructions). Returns the dropped
+    source paths."""
+    dropped: list[str] = []
+    for b in plan.get("batches", []):
+        if b.get("status") == "done":
+            continue
+        sources = [s for s in b.get("sources", []) if s in known]
+        gone = [s for s in b.get("sources", []) if s not in known]
+        if gone:
+            dropped.extend(gone)
+            b["sources"] = sources
+            if not sources:
+                b["status"] = "done"
+    return dropped
 
 
 def dump_json(value: Any) -> str:

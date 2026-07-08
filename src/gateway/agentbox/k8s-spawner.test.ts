@@ -281,6 +281,38 @@ describe("K8sSpawner — spawn branches", () => {
     }
   });
 
+  it("refuses to forward secret-shaped names through the prefix glob (ops knobs only)", async () => {
+    process.env.KBC_PK_MODE = "off";                       // knob → forwarded
+    process.env.KBC_MASSAPI_TOKEN = "sk-parked";           // secret-shaped → refused
+    process.env.KBC_WEBHOOK_SECRET = "hush";               // secret-shaped → refused
+    process.env.KBC_SIGNING_API_KEY = "k";                 // secret-shaped → refused
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.22", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    try {
+      await s.spawn({ agentId: "kbrun2", profile: "kb-compile" });
+      const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+      expect(env).toContainEqual({ name: "KBC_PK_MODE", value: "off" });
+      for (const leaked of ["KBC_MASSAPI_TOKEN", "KBC_WEBHOOK_SECRET", "KBC_SIGNING_API_KEY"]) {
+        expect(env.some((e: any) => e.name === leaked)).toBe(false);
+      }
+    } finally {
+      delete process.env.KBC_PK_MODE;
+      delete process.env.KBC_MASSAPI_TOKEN;
+      delete process.env.KBC_WEBHOOK_SECRET;
+      delete process.env.KBC_SIGNING_API_KEY;
+    }
+  });
+
   it("does not inject SICLAW_SUBAGENT_CONCURRENCY when unset on the runtime", async () => {
     delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
 

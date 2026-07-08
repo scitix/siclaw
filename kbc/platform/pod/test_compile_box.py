@@ -1071,6 +1071,98 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+async def test_batch_orchestrator_review_fixes():
+    """Review fixes: (a) resume prunes sources deleted from raw/ (no directive
+    points at a missing file; an emptied batch is skipped); (b) an orchestrator
+    error still CLOSES the logical turn (error + turn_done, never-block); (c)
+    owner notes arriving during the tail phases get a bounded digest session
+    instead of being silently abandoned at turn_done."""
+    import batching
+
+    def _events(run):
+        evs = []
+        while not run.events.empty():
+            evs.append(run.events.get_nowait())
+        return evs
+
+    os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+    os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+    os.environ["KBC_BATCH_PLANNER"] = "code"
+    real_drive = compile_box._drive_batch_session
+    try:
+        # (a) resume after a source vanished: plan pins deleted.md in a pending
+        # batch (and a fully-vanished batch) — directives must not mention them.
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            raw = wd / "raw"
+            (raw / "a").mkdir(parents=True)
+            (raw / "a" / "kept.md").write_bytes(b"x" * 300)
+            plan = batching.build_plan(
+                [{"path": "a/kept.md", "bytes": 300, "effective": 300}],
+                [{"id": "b01", "sources": ["a/kept.md", "a/deleted.md"]},
+                 {"id": "b02", "sources": ["a/vanished.md"]}],
+                planner="code")
+            (wd / "authoring").mkdir()
+            (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+            run = compile_box.CompileRun("rf1", str(wd), 1)
+            driven: list[str] = []
+
+            async def fake_drive(run_, directive, label):
+                driven.append(f"{label}|{directive}")
+                return f"done {label}"
+
+            compile_box._drive_batch_session = fake_drive
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            evs = _events(run)
+            assert any("已不在 raw/" in e.get("text", "") for e in evs
+                       if e["type"] == "summary"), evs
+            assert not any("deleted.md" in d or "vanished.md" in d for d in driven), driven
+            assert sum(d.startswith("批") for d in driven) == 1, driven  # b02 emptied → skipped
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert all(b["status"] == "done" for b in saved["batches"]), saved
+
+        # (b) orchestrator error → error AND turn_done both emitted
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "a").mkdir(parents=True)
+            (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+            run = compile_box.CompileRun("rf2", str(wd), 1)
+
+            async def boom(run_, directive, label):
+                raise RuntimeError("session exploded")
+
+            compile_box._drive_batch_session = boom
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            types = [e["type"] for e in _events(run)]
+            assert "error" in types and types.count("turn_done") == 1, types
+
+        # (c) a note landing during the tail phases (after the last batch has
+        # drained the queue) gets its own 留言消化 session carrying the text
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "a").mkdir(parents=True)
+            (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+            run = compile_box.CompileRun("rf3", str(wd), 1)
+            driven = []
+
+            async def drive_and_note(run_, directive, label):
+                driven.append(f"{label}|{directive}")
+                if label == "终审":  # owner speaks while the tail is running
+                    run_._batch_notes.append("附录不要发布")
+                return f"done {label}"
+
+            compile_box._drive_batch_session = drive_and_note
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            digest = [d for d in driven if d.startswith("留言消化|")]
+            assert len(digest) == 1 and "附录不要发布" in digest[0], driven
+            assert [e for e in _events(run) if e["type"] == "turn_done"], "turn still closes"
+    finally:
+        compile_box._drive_batch_session = real_drive
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch orchestrator review fixes: resume-prune / error turn_done / tail-note digest")
+
+
 # ── Model-stall watchdog (L1) ────────────────────────────────────────────────
 
 
@@ -1469,6 +1561,7 @@ async def main():
     await test_incremental_route()
     await test_incremental_integrity_guard()
     await test_batch_orchestrator_routing_and_resume()
+    await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()
     await test_model_stall_live_stream_not_reaped()
     await test_model_stall_tool_gap_not_reaped()
