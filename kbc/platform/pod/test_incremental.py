@@ -113,7 +113,7 @@ def test_protocol_raw_changes_to_changeset():
         assert incremental.has_changes(incremental.load_raw_changes(td)) is False
         assert incremental.materialize_changeset(td) is None
 
-        # real sicore input → enriched CHANGESET.json written, affected_pages resolved
+        # real consumer input → enriched CHANGESET.json written, affected_pages resolved
         _mk(base, "authoring/RAW_CHANGES.json", json.dumps({
             "added": [], "modified": ["snap/two.md"], "deleted": [],
             "diffs": {"snap/two.md": "- old\n+ new"},
@@ -121,7 +121,7 @@ def test_protocol_raw_changes_to_changeset():
         }))
         cs = incremental.materialize_changeset(td)
         assert cs is not None and cs["affected_pages"] == ["a.md"], cs        # box reverse-looked-up
-        assert cs["modified"][0]["diff"] == "- old\n+ new"                    # sicore's diff passed through
+        assert cs["modified"][0]["diff"] == "- old\n+ new"                    # the consumer's diff passed through
         # persisted for the model to read
         written = json.loads((base / "authoring/CHANGESET.json").read_text())
         assert written["affected_pages"] == ["a.md"] and written["snapshot_fingerprint"] == "SNAP"

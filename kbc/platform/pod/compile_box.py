@@ -242,7 +242,7 @@ class CompileRun:
         self._l1_repairs_used = 0
         # Batch mode (DESIGN-kb-batch-compile-2026-07-05): when the orchestrator
         # drives per-batch sessions, ResultMessage must NOT emit turn_done (the
-        # whole batch run is ONE turn to sicore); the flushed reply is parked
+        # whole batch run is ONE turn to the consumer); the flushed reply is parked
         # here for the orchestrator instead. _batch_notes queues owner chat that
         # arrives mid-batch (relayed into the next batch directive).
         self._suppress_turn_done = False
@@ -1458,11 +1458,11 @@ def _batch_mode_enabled() -> bool:
 
 
 def _should_route_to_incremental(run: "CompileRun", text: str) -> bool:
-    """A compile trigger + a machine-computed changeset from sicore
+    """A compile trigger + a machine-computed changeset from the consumer
     (authoring/RAW_CHANGES.json with real changes) → the SCOPED incremental path,
     which re-touches only the affected pages instead of re-planning the whole
     corpus. No changeset (or empty) → fall through to the normal full compile /
-    batch route (backward compatible: sicore not yet wired = old behavior)."""
+    batch route (backward compatible: the consumer not yet wired = old behavior)."""
     if run._batch_active or not _is_compile_trigger(text):
         return False
     return incremental.has_changes(incremental.load_raw_changes(run.workdir))
@@ -1482,7 +1482,7 @@ def _should_route_to_batch(run: "CompileRun", text: str) -> bool:
 
 async def _start_incremental(run: "CompileRun", text: str) -> None:
     """Scoped incremental kickoff: materialize the model-facing CHANGESET from
-    sicore's RAW_CHANGES, snapshot page hashes for the post-turn integrity guard,
+    the consumer's RAW_CHANGES, snapshot page hashes for the post-turn integrity guard,
     then inject the scoped directive. It is ONE ordinary model turn (not the batch
     orchestrator), so turn_done + the normal post-turn seam (coverage/charset +,
     once wired, the byte-integrity guard) apply unchanged."""
@@ -1678,7 +1678,7 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
 
 
 async def _run_batch_compile(run: "CompileRun", trigger_text: str):
-    """The batch orchestrator: ONE logical turn to sicore (single turn_done at
+    """The batch orchestrator: ONE logical turn to the consumer (single turn_done at
     the end), many bounded sessions inside. Crash-resumable at batch granularity:
     BATCH_PLAN.json carries per-batch done stamps, and any later compile trigger
     re-enters here and continues from the first pending batch."""
@@ -2080,7 +2080,7 @@ async def _teardown_test_session(run: "TestRun"):
 # ── HTTP ──
 
 # ── consumer-managed box config (DESIGN-kb-llm-binding-v2-2026-07-07) ────────
-# sicore owns the credential store and the KB capability policy; both arrive on
+# The consumer owns the credential store and the KB capability policy; both arrive on
 # the /session body and apply IN-PROCESS (the box spawns before fetchInput runs,
 # so pod env is too early — and this keeps the token out of the pod spec).
 # Precedence: consumer config > runtime-env forward (helm fallback) > image
@@ -2213,7 +2213,7 @@ async def handle_message(request: web.Request):
     # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
     _capture_brief(run, text)
     # Scoped incremental (真增量): a compile trigger + a machine-computed changeset
-    # from sicore → re-touch only affected pages, NOT a whole-corpus re-plan. Takes
+    # from the consumer → re-touch only affected pages, NOT a whole-corpus re-plan. Takes
     # precedence over the batch/full route (which is the "recompile everything"
     # fallback when no changeset is present).
     if _should_route_to_incremental(run, text):

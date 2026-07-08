@@ -297,7 +297,7 @@ export interface CapabilityFetchInputResponse {
   locale?: string;
   /**
    * Consumer-managed LLM endpoint for the run's box (DESIGN-kb-llm-binding-v2).
-   * The consumer (e.g. sicore) owns the credential store; the runtime passes
+   * The consumer owns the credential store; the runtime passes
    * this through OPAQUELY into the box /session body and MUST NOT log it.
    * Absent ⇒ the box falls back to the runtime-env-forwarded ANTHROPIC_* vars
    * (the helm Secret path).
