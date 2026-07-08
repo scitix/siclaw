@@ -388,6 +388,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     session_id CHAR(36) DEFAULT NULL,
     route_key VARCHAR(255) NOT NULL,
     route_type VARCHAR(20) NOT NULL DEFAULT 'group',
+    display_name VARCHAR(255) DEFAULT NULL,
     created_by CHAR(36),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (channel_id, route_key)
@@ -577,6 +578,10 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_sessions", "delegation_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "target_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "channel_bindings", "session_id", "CHAR(36) DEFAULT NULL");
+  // Human-readable name of the bound chat (group title / user name), fetched
+  // from the channel platform at PAIR time and lazily refreshed by the gateway.
+  // Display-only cache — identity is always route_key, never this name.
+  await safeAlterTable(db, "channel_bindings", "display_name", "VARCHAR(255) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "from_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "parent_session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "delegation_id", "CHAR(36) DEFAULT NULL");
