@@ -769,6 +769,14 @@ def mark_media_verified(workdir: str, pages: list[str], exhausted: bool = False)
     mv["verified_pages"] = sorted(set(mv.get("verified_pages") or []) | set(pages))
     if exhausted:
         mv["exhausted"] = sorted(set(mv.get("exhausted") or []) | set(pages))
+    elif mv.get("attempts"):
+        # A COMPLETED verification clears the page's retry count: a stale
+        # residue would otherwise push a later re-entry (page re-cited after a
+        # recompile) to "exhausted" after fewer real failures than the budget
+        # implies — and the map stays bounded. Exhausted pages keep their count
+        # as forensics (they are marked verified and never re-enter pending).
+        for p in pages:
+            mv["attempts"].pop(p, None)
     mv["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     report["media_verify"] = mv
     write_selfcheck(workdir, report)
