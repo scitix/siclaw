@@ -268,18 +268,30 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
     save_transcripts(workdir, cache)
 
     findings: list[dict] = []
+    completed: list[str] = []
+    failed: list[str] = []
     cand = Path(workdir) / "candidate"
     empty = tempfile.mkdtemp(prefix="kbc-mv-")
 
     async def _page(page: str, imgs: list[str]):
         ts = {i: transcripts[i] for i in imgs if i in transcripts}
-        if not ts:
+        if len(ts) < len(imgs):
+            # Partial (or zero) transcripts: comparing against an incomplete
+            # inventory would mis-grade BOTH ways — a wrong claim about the
+            # missing image has nothing to contradict it (false pass), and a
+            # correct claim about it gets flagged beyond-transcript (false
+            # fail). Skip the page whole; the caller retries it later.
+            missing = len(imgs) - len(ts)
+            errors.append(f"page {page}: {missing} image(s) not transcribed — comparison skipped" if en
+                          else f"页 {page}: {missing} 张图未转写——本轮不比对")
+            failed.append(page)
             return
         try:
             text = (cand / page).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as e:
             errors.append(f"failed to read page {page}: {e!r}" if en
                           else f"读页失败 {page}: {e!r}")
+            failed.append(page)
             return
         async with sem:
             try:
@@ -287,13 +299,17 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
             except Exception as e:
                 errors.append(f"comparison failed {page}: {e!r}" if en
                               else f"比对失败 {page}: {e!r}")
+                failed.append(page)
+                return
+        completed.append(page)
 
     say(f"Self-check (image · comparison): comparing {len(pending)} page(s)…" if en
         else f"自检(图像·比对):{len(pending)} 页比对中…")
     await asyncio.gather(*(_page(p, imgs) for p, imgs in pending.items()))
     shutil.rmtree(empty, ignore_errors=True)
     return {"findings": findings, "errors": errors,
-            "images": len(images), "cache_hits": hits}
+            "images": len(images), "cache_hits": hits,
+            "completed_pages": sorted(completed), "failed_pages": sorted(failed)}
 
 
 # Stored finding kinds → English display labels (render-time only; the stored

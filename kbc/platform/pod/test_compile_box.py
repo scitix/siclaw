@@ -953,6 +953,9 @@ async def test_incremental_route():
         assert run._incr_pending is not None and "a.md" in run._incr_pending["before"]
         # the scoped directive was injected (not a batch orchestrator)
         assert any("[Incremental recompile]" in q and "CHANGESET.json" in q for q in fake.queries), fake.queries
+        # review fix: the incremental kickoff arms the stall watchdog like
+        # every other model-turn injection site
+        assert run._turn_active and "[Incremental recompile]" in run._last_directive
     print("OK  incremental route (RAW_CHANGES → scoped CHANGESET + guard-armed + scoped directive; absent/non-trigger → no route)")
 
 
@@ -986,10 +989,19 @@ async def test_incremental_integrity_guard():
         repair = await compile_box._post_turn_selfcheck(run)
         # coverage ledger is clean (both sources still cited) yet integrity forces a repair naming c.md
         assert repair is not None and "Incremental scope violation" in repair and "c.md" in repair, repair
-        assert run._incr_pending is None  # one-shot consumed
+        # review fix: on a violation the guard RE-ARMS for the repair turn itself
+        # (the repair restores toward the ORIGINAL baseline) — it used to be
+        # consumed here, leaving the repair turn unguarded.
+        assert run._incr_pending is not None and run._incr_pending["changeset"] is cs
+        # the repair restores c.md → the re-armed guard clears cleanly
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        run._selfcheck_key = None
+        repair2 = await compile_box._post_turn_selfcheck(run)
+        assert repair2 is None, repair2
+        assert run._incr_pending is None  # consumed on the clean pass
         sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
-        assert sc["incremental"]["out_of_scope_pages"] == ["c.md"], sc
-    print("OK  incremental integrity guard (out-of-scope edit → repair even with clean ledger; one-shot)")
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+    print("OK  incremental integrity guard (violation → repair + re-armed guard; clean pass consumes)")
 
 
 async def test_batch_orchestrator_routing_and_resume():
@@ -1182,6 +1194,83 @@ async def test_batch_orchestrator_review_fixes():
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
         del os.environ["KBC_BATCH_BUDGET_BYTES"]
     print("✓ batch orchestrator review fixes: resume-prune / error turn_done / tail-note digest")
+
+
+async def test_stall_interrupt_deadline_closes_turn():
+    """Review fix: a true black-hole can swallow interrupt() too — the retry
+    latch used to stay set forever (receive loop blocked, watchdog muted). Past
+    the deadline the watchdog closes the turn honestly (error + turn_done) and
+    disconnects to unblock the loop."""
+    class _SwallowingClient(_StallingFakeClient):
+        def __init__(self):
+            super().__init__(produce_on_query=999)
+            self.disconnects = 0
+
+        async def interrupt(self):
+            self.interrupts += 1          # accepted — but nothing ever arrives
+
+        async def disconnect(self):
+            self.disconnects += 1
+            self._closed = True
+            self._gate.set()              # let receive_messages exit
+
+    fake = _SwallowingClient()
+    saved = (compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S)
+    compile_box._MODEL_IDLE_TIMEOUT_S = 0.1
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._MODEL_MAX_RETRIES = 3
+    compile_box._STALL_INTERRUPT_DEADLINE_S = 0.2
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("wdl", td, 1)
+            run._suppress_turn_done = True
+            run.client = fake
+            wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+            try:
+                await run.inject_user_message("批 1/10")
+                await asyncio.wait_for(
+                    compile_box._consume_turn_stream(run, fake, stop_on_result=True),
+                    timeout=5)
+            finally:
+                run.done = True
+                wdog.cancel()
+                try:
+                    await wdog
+                except asyncio.CancelledError:
+                    pass
+            evs = _drain(run)
+            types = [e["type"] for e in evs]
+            assert fake.interrupts >= 1 and fake.disconnects == 1, (fake.interrupts, fake.disconnects)
+            assert "error" in types and "turn_done" in types, types
+            assert not run._turn_active and not run._stall_retrying
+    finally:
+        (compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S) = saved
+    print("✓ stall interrupt deadline: wedged latch closes the turn (error + turn_done) and unblocks")
+
+
+async def test_run_wrapper_closes_turn_on_driver_crash():
+    """Review fix (never-block symmetry): a driver that dies mid-turn must not
+    leave a consumer gating on turn_done hanging — error AND turn_done both fire."""
+    async def dying_impl(run):
+        run._begin_turn("owner message")   # a turn is in flight…
+        raise compile_box.ModelStallError("exhausted")
+
+    saved_impl = compile_box._COMPILE_IMPL
+    compile_box._COMPILE_IMPL = dying_impl
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("wcr", td, 1)
+            await compile_box._run_wrapper(run)
+            evs = _drain(run)
+            types = [e["type"] for e in evs]
+            assert "error" in types and "turn_done" in types and types[-1] == "end", types
+            assert types.index("error") < types.index("turn_done"), types
+            assert getattr(run, "_ended", False) is True
+    finally:
+        compile_box._COMPILE_IMPL = saved_impl
+    print("✓ run wrapper: driver crash mid-turn still closes the logical turn")
 
 
 # ── Model-stall watchdog (L1) ────────────────────────────────────────────────
@@ -1587,6 +1676,8 @@ async def main():
     await test_model_stall_live_stream_not_reaped()
     await test_model_stall_tool_gap_not_reaped()
     await test_model_stall_exhausts_to_error()
+    await test_stall_interrupt_deadline_closes_turn()
+    await test_run_wrapper_closes_turn_on_driver_crash()
     await test_model_rate_limit_backoff_then_completes()
     await test_model_rate_limit_exhausts_gracefully()
     await test_shutdown_flush_syncs_active_runs()

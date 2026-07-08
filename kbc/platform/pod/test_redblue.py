@@ -26,16 +26,21 @@ class FakeEngine:
     """Stage-routed canned responses; counts calls per stage."""
 
     def __init__(self, broken_stages=(), slow_verdict_from=None, drop_verdict_ids=(),
-                 error_verdict_ids=()):
+                 error_verdict_ids=(), error_blue_questions=(), uncovered_blue_questions=(),
+                 uncovered_verdict_ids=()):
         self.calls = {"survey": 0, "questions": 0, "blue": 0, "verdict": 0}
         self.systems = {}  # stage → last system prompt seen (asymmetry assertions)
         self.users = {}    # stage → last user message seen
+        self.verdict_users = []  # EVERY verdict user message (chunk-content assertions)
         self.models = {}   # stage → last model id seen (verdict-tier assertions)
         self.roots = {}    # stage → last allowed_read_roots seen (de-agentic assertions)
         self.broken = set(broken_stages)
         self.slow_verdict_from = slow_verdict_from  # Nth verdict call onward hangs
         self.drop_verdict_ids = set(drop_verdict_ids)  # judge "forgets" these ids
         self.error_verdict_ids = set(error_verdict_ids)  # any chunk w/ these ids raises
+        self.error_blue_questions = set(error_blue_questions)  # blue call raises (infra down)
+        self.uncovered_blue_questions = set(uncovered_blue_questions)  # genuine "not covered" reply
+        self.uncovered_verdict_ids = set(uncovered_verdict_ids)  # judge grades 正确标未覆盖
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
                                  model, effort=None, allowed_read_roots, timeout_secs):
@@ -54,6 +59,8 @@ class FakeEngine:
         self.calls[stage] += 1
         self.systems[stage] = system_prompt
         self.users[stage] = user_message
+        if stage == "verdict":
+            self.verdict_users.append(user_message)
         self.models[stage] = model
         self.roots[stage] = list(allowed_read_roots)
         if stage == "verdict" and self.error_verdict_ids & set(re.findall(r"\[(q\d+)\]", user_message)):
@@ -71,6 +78,11 @@ class FakeEngine:
                   for i in range(1, 8)]
             return json.dumps({"questions": qs})
         if stage == "blue":
+            if user_message in self.error_blue_questions:
+                raise asyncio.TimeoutError("blue infra down")  # engine call timed out
+            if user_message in self.uncovered_blue_questions:
+                # a GENUINE consumer reply: honestly says the wiki has nothing
+                return "This wiki does not cover that.\nSOURCES: []"
             # real-consumer persona: natural prose + a SOURCES line (NOT JSON)
             return "根据 wiki,答案是……\nSOURCES: [\"index.md\"]"
         ids = re.findall(r"\[(q\d+)\]", user_message)
@@ -79,7 +91,10 @@ class FakeEngine:
         for i in ids:  # verdict: q1 fails as 覆盖, everything else passes
             if i in self.drop_verdict_ids:
                 continue  # judge silently omits this id from its JSON
-            if i == "q1":
+            if i in self.uncovered_verdict_ids:
+                out.append({"id": i, "score": "正确标未覆盖", "failure_category": "无",
+                            "reason": "honest not-covered", "fix": "-", "page": "-"})
+            elif i == "q1":
                 out.append({"id": i, "score": "错", "failure_category": "覆盖",
                             "reason": "缺", "fix": "补编X", "page": "p1.md"})
             else:
@@ -282,6 +297,44 @@ async def test_verdict_error_contained_no_workloss():
     print("OK  verdict chunk error contained → graded siblings kept, reasons observable")
 
 
+async def test_blue_infra_failure_ungraded_not_judged():
+    """A blue call that crashes/times out is an INFRASTRUCTURE failure, not a KB
+    signal: the question must never reach the judge (who could grade the
+    placeholder answer 正确标未覆盖 and let an outage inflate pass_rate as a
+    PASS). It lands in `ungraded` with a distinguishable blue-infra reason,
+    stays out of the graded denominator, never drives repair, and its per-item
+    error record survives in detail. A blue answer that GENUINELY says
+    not-covered still grades normally (the honest-uncovered contract)."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine(error_blue_questions={"问题3"},          # q3: infra failure
+                          uncovered_blue_questions={"问题2"},      # q2: honest not-covered
+                          uncovered_verdict_ids={"q2"})
+        summary, detail = await redblue.run_pk(
+            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+        # q3 has no recorded answer and is NOT in any judge input:
+        # 6 answered → chunks 5+1, no re-judge round
+        assert fake.calls["blue"] == 7 and fake.calls["verdict"] == 2, fake.calls
+        assert "q3" not in detail["answers"]
+        assert fake.verdict_users and all("[q3]" not in u for u in fake.verdict_users)
+        # ungraded with the infra reason, in the existing {stage, reason} shape
+        assert summary["ungraded"] == ["q3"], summary
+        r = summary["ungraded_reasons"]["q3"]
+        assert r["stage"] == "blue" and r["reason"].startswith("blue infrastructure failure"), r
+        # per-item error record kept (observable), never popped by a verdict landing
+        assert detail["errors"]["q3"]["stage"] == "blue", detail["errors"]
+        assert "q3" not in detail["verdicts"]
+        # denominator excludes the outage: 6 graded, q1 the only REAL failure
+        assert summary["graded"] == 6 and summary["gate_pass"] == 5, summary
+        assert summary["pass_rate"] == round(5 / 6, 3), summary
+        assert {f["id"] for f in summary["failures"]} == {"q1"}, summary["failures"]
+        assert summary["state"] == "unconverged", summary  # repair driven by q1 only
+        # the GENUINE honest-uncovered reply DID reach the judge and passes
+        assert detail["answers"]["q2"]["said_uncovered"] is True, detail["answers"]["q2"]
+        assert detail["verdicts"]["q2"]["score"] == "正确标未覆盖", detail["verdicts"]["q2"]
+    print("OK  blue infra failure → ungraded (never judged, out of denominator); honest-uncovered still passes")
+
+
 async def test_verdict_deagentified():
     """判官去 agentic (缺陷1 fix): the verdict call runs on the gate tier and is
     fenced OUT of raw — it grades from the inlined `expected` rubric, never by
@@ -432,6 +485,7 @@ def main():
     asyncio.run(test_dropped_verdicts_retry_then_ungraded())
     asyncio.run(test_wall_timeout_salvages_partial())
     asyncio.run(test_verdict_error_contained_no_workloss())
+    asyncio.run(test_blue_infra_failure_ungraded_not_judged())
     asyncio.run(test_verdict_deagentified())
     asyncio.run(test_media_pages_steer_question_officer())
     asyncio.run(test_zh_locale_branch())

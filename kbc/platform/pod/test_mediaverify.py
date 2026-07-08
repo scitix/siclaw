@@ -94,7 +94,45 @@ async def test_blind_flow_and_isolation():
 
         cache = json.loads((base / "authoring/MEDIA_TRANSCRIPTS.json").read_text())
         assert set(cache) == {"s/i1.png", "s/i2.png"}
+
+        # completion accounting (review fix): both pages verified whole
+        assert result["completed_pages"] == ["p.md", "q.md"] and result["failed_pages"] == [], result
     print("OK  blind flow (transcribe/compare counts, isolation, findings, cache+invalidate)")
+
+
+class _PartialEngine(FakeEngine):
+    """Transcription fails for one of the two images on the page."""
+
+    async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
+                                 model, effort=None, allowed_read_roots, timeout_secs):
+        if ("You are an image transcriber" in system_prompt or "图像转写员" in system_prompt) \
+                and "s/bad.png" in user_message:
+            raise RuntimeError("vision API choked")
+        return await super().run_readonly_agent(
+            cwd=cwd, system_prompt=system_prompt, user_message=user_message, model=model,
+            effort=effort, allowed_read_roots=allowed_read_roots, timeout_secs=timeout_secs)
+
+
+async def test_partial_transcription_skips_comparison():
+    """Review fix: a page with ANY untranscribed image is never compared against
+    the partial set (false-pass/false-fail both ways) — it fails whole and the
+    caller retries it; a fully-transcribed sibling page still completes."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/i1.png", "PNGBYTES-1")
+        _mk(base, "raw/s/bad.png", "PNGBYTES-BAD")
+        _mk(base, "candidate/p.md", "---\n---\n利用率 GPU-Util 94%。(source: s/i1.png)(source: s/bad.png)")
+        _mk(base, "candidate/q.md", "---\n---\n正常描述。(source: s/i1.png)")
+        fake = _PartialEngine()
+        pending = {"p.md": ["s/i1.png", "s/bad.png"], "q.md": ["s/i1.png"]}
+        result = await mediaverify.run_blind_verify(fake, td, pending)
+        assert result["failed_pages"] == ["p.md"], result
+        assert result["completed_pages"] == ["q.md"], result
+        # the partially-transcribed page was NEVER compared (only q.md was)
+        assert fake.calls["compare"] == 1 and "正常描述" in fake.users["compare"][0]
+        assert any("not transcribed — comparison skipped" in e or "未转写" in e
+                   for e in result["errors"]), result["errors"]
+    print("OK  partial transcription skips comparison (page retries whole)")
 
 
 def test_repair_prompt():
@@ -114,6 +152,7 @@ def test_repair_prompt():
 
 def main():
     asyncio.run(test_blind_flow_and_isolation())
+    asyncio.run(test_partial_transcription_skips_comparison())
     test_repair_prompt()
     print("ALL OK  test_mediaverify")
 

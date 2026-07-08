@@ -572,9 +572,11 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
     detail: dict = {"questions": [], "answers": {}, "verdicts": {}, "errors": {}}
     survey_cache_hit = False
 
-    def _record_error(stage: str, ids: list[str], e: BaseException) -> None:
+    def _record_error(stage: str, ids: list[str], e: BaseException,
+                      note: str | None = None) -> None:
+        reason = f"{note}: {repr(e)[:260]}" if note else repr(e)[:300]
         for qid in ids:
-            detail["errors"].setdefault(qid, {"stage": stage, "reason": repr(e)[:300]})
+            detail["errors"].setdefault(qid, {"stage": stage, "reason": reason})
 
     async def _body() -> dict:
         nonlocal survey_cache_hit
@@ -651,7 +653,13 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                         allowed_read_roots=[wiki_dir],
                         timeout_secs=_env_float("KBC_PK_BLUE_TIMEOUT", 300))
                 except (Exception, asyncio.TimeoutError) as e:
-                    _record_error("blue", [q["id"]], e)
+                    # Infrastructure failure, NOT a KB signal: no answer is
+                    # recorded, so the id never reaches the judge (grading a
+                    # placeholder could let an outage enter the pass-rate
+                    # denominator — even as a PASS, if the judge reads "no
+                    # answer" as honest not-covered). The record stays in
+                    # detail["errors"] and surfaces via ungraded_reasons.
+                    _record_error("blue", [q["id"]], e, note="blue infrastructure failure")
                     return
             # Written as each answer lands (not after the gather): a wall-clock
             # cancellation must not vaporize the answers that DID complete.
@@ -668,6 +676,11 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
         #    NO raw root (roots=[wiki_dir]) so it can't loop re-reading raw. The
         #    old agentic verdict (raw root + "回原始语料核对" + max_turns 40) is
         #    what hung and, via fail-fast gather, vaporized all 24 answered blues.
+        #    Only questions WITH a recorded blue answer are gradable: a blue
+        #    INFRA failure (call errored/timed out — nothing recorded) is not a
+        #    KB signal and must not reach the judge; it stays ungraded with its
+        #    stage=blue reason. A blue answer that GENUINELY says not-covered IS
+        #    recorded and grades normally (the honest-uncovered contract).
         async def _judge(chunk: list[dict]) -> None:
             if en:
                 qa = "\n\n".join(
@@ -675,14 +688,14 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                     f"Raw ground-truth points: {q.get('expected', '-')}\n"
                     f"Raw source: {q.get('source_ref', '-')}\n"
                     f"Blue-team answer: "
-                    f"{detail['answers'].get(q['id'], {}).get('answer') or '(no blue answer / untested)'}\n"
+                    f"{detail['answers'].get(q['id'], {}).get('answer') or '(empty reply)'}\n"
                     f"Blue-team claimed sources: {detail['answers'].get(q['id'], {}).get('cited_sources', [])}"
                     for q in chunk)
             else:
                 qa = "\n\n".join(
                     f"[{q['id']}] 问题: {q['question']}\nraw 真值要点: {q.get('expected', '-')}\n"
                     f"raw 出处: {q.get('source_ref', '-')}\n"
-                    f"蓝队回答: {detail['answers'].get(q['id'], {}).get('answer') or '(蓝队无回答/未测)'}\n"
+                    f"蓝队回答: {detail['answers'].get(q['id'], {}).get('answer') or '(空回答)'}\n"
                     f"蓝队自称引用: {detail['answers'].get(q['id'], {}).get('cited_sources', [])}"
                     for q in chunk)
             async with sem:
@@ -696,21 +709,27 @@ async def run_pk(engine: ReadonlyAgentEngine, *, wiki_dir: str, raw_dir: str,
                     _record_error("verdict", [q["id"] for q in chunk], e)
                     return
             if isinstance(verdicts, list):  # incremental for the same salvage reason
-                got = {v.get("id"): v for v in verdicts if isinstance(v, dict)}
+                chunk_ids = {q["id"] for q in chunk}
+                got = {v.get("id"): v for v in verdicts
+                       if isinstance(v, dict) and v.get("id") in chunk_ids}
                 detail["verdicts"].update(got)
-                # a verdict landing clears any earlier per-item error for that id
+                # a verdict landing clears any earlier per-item error for that
+                # id — only ids actually in this chunk, so a hallucinated id
+                # can't grade an unasked question or erase a blue-infra record
                 for gid in got:
                     detail["errors"].pop(gid, None)
 
-        await asyncio.gather(*(_judge(c) for c in _chunks(questions, chunk_size)),
+        answered = [q for q in questions if q["id"] in detail["answers"]]
+        await asyncio.gather(*(_judge(c) for c in _chunks(answered, chunk_size)),
                              return_exceptions=True)
 
         # 5b: the judge sometimes drops ids from a chunk's JSON (seen live
-        # 2026-07-07: 4/24 missing, twice). Re-judge ONLY the missing ones once;
-        # whatever is still missing is UNGRADED — cancelled/dropped is not a
-        # wiki failure, must not trigger a repair round, and must not pollute
-        # the pass-rate denominator.
-        missing = [q for q in questions if q["id"] not in detail["verdicts"]]
+        # 2026-07-07: 4/24 missing, twice). Re-judge ONLY the missing ones once
+        # (answered only — a blue-infra id has nothing to grade); whatever is
+        # still missing is UNGRADED — cancelled/dropped is not a wiki failure,
+        # must not trigger a repair round, and must not pollute the pass-rate
+        # denominator.
+        missing = [q for q in answered if q["id"] not in detail["verdicts"]]
         if missing:
             say(_t(locale,
                    f"Self-check (PK): {len(missing)} question(s) missing verdicts, re-judging once…",

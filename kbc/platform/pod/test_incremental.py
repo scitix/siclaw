@@ -36,13 +36,55 @@ def test_resolve_affected_pages():
             td, {"added": [], "modified": ["snap/two.md"], "deleted": ["snap/three.md"]})
         assert aff == ["a.md", "b.md"], aff
         assert un == ["c.md"], un                      # index excluded from both
-        # basename tolerance: compiled_from carries raw-relative, changeset a bare name
+        # full-path matching: a bare basename does NOT match snap/four.md (no
+        # basename fallback — matching is normalized full paths only)
         aff2, _ = incremental.resolve_affected_pages(td, {"modified": ["four.md"]})
-        assert aff2 == ["c.md"], aff2
+        assert aff2 == [], aff2
         # added-only round → no existing page is "affected"
         aff3, un3 = incremental.resolve_affected_pages(td, {"added": ["snap/new.md"]})
         assert aff3 == [] and un3 == ["a.md", "b.md", "c.md"], (aff3, un3)
-        print("OK  resolve_affected_pages (modified+deleted→pages, added≠affected, basename, index excluded)")
+        print("OK  resolve_affected_pages (modified+deleted→pages, added≠affected, full-path only, index excluded)")
+
+
+def test_no_basename_cross_match():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[s](snap-cfg.md) [v](vendor-cfg.md)")
+        _mk(base, "candidate/snap-cfg.md", _page(["snap/config.md"]))
+        _mk(base, "candidate/vendor-cfg.md", _page(["vendor/config.md"]))
+        # same basename, different directory: changing snap/config.md must NOT
+        # pull in the page compiled only from vendor/config.md
+        cs = incremental.build_changeset(td, {"modified": ["snap/config.md"]})
+        assert cs["affected_pages"] == ["snap-cfg.md"], cs["affected_pages"]
+        assert cs["unaffected_pages"] == ["vendor-cfg.md"], cs["unaffected_pages"]
+        # …and because vendor-cfg.md is NOT authorized, the byte-freeze guard
+        # still flags a genuine out-of-scope drift into it
+        auth = incremental.authorized_pages(td, cs)
+        assert "vendor-cfg.md" not in auth, auth
+        before = incremental.page_hashes(td)
+        _mk(base, "candidate/vendor-cfg.md", _page(["vendor/config.md"]) + "\n越界改动。")
+        after = incremental.page_hashes(td)
+        assert incremental.integrity_violations(before, after, auth) == ["vendor-cfg.md"], \
+            "guard must flag out-of-scope edit to the same-basename sibling"
+        print("OK  no basename cross-match (same-basename dirs isolated; guard still flags drift)")
+
+
+def test_raw_prefix_normalization():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
+        _mk(base, "candidate/p.md", _page(["raw/snap/one.md"]))   # prefixed compiled_from
+        _mk(base, "candidate/q.md", _page(["snap/two.md"]))       # unprefixed compiled_from
+        # original motivation intact: raw/-prefixed compiled_from ↔ unprefixed changeset
+        aff, _ = incremental.resolve_affected_pages(td, {"modified": ["snap/one.md"]})
+        assert aff == ["p.md"], aff
+        # and the reverse: prefixed changeset ↔ unprefixed compiled_from
+        aff2, _ = incremental.resolve_affected_pages(td, {"modified": ["raw/snap/two.md"]})
+        assert aff2 == ["q.md"], aff2
+        # ./ collapse + drop/ prefix normalize too
+        aff3, _ = incremental.resolve_affected_pages(td, {"modified": ["./drop/snap/one.md"]})
+        assert aff3 == ["p.md"], aff3
+        print("OK  raw/drop prefix normalization (prefixed↔unprefixed full paths still match)")
 
 
 def test_build_changeset():
@@ -165,6 +207,8 @@ def test_integrity_repair_directive():
 
 if __name__ == "__main__":
     test_resolve_affected_pages()
+    test_no_basename_cross_match()
+    test_raw_prefix_normalization()
     test_build_changeset()
     test_integrity_guard()
     test_protocol_raw_changes_to_changeset()

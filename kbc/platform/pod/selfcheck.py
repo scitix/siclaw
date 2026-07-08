@@ -758,15 +758,37 @@ def pending_media_verification(workdir: str) -> dict[str, list[str]]:
     return {p: imgs for p, imgs in citing.items() if p not in done}
 
 
-def mark_media_verified(workdir: str, pages: list[str]) -> None:
+def mark_media_verified(workdir: str, pages: list[str], exhausted: bool = False) -> None:
     """Single write-point for the media_verify section (read-modify-write like
-    update_pk_section, so L1 fields are never clobbered)."""
+    update_pk_section, so L1 fields are never clobbered). exhausted=True records
+    the pages ALSO in media_verify.exhausted — verification kept failing past
+    the attempt budget, so they ship unverified but VISIBLY flagged (fail-open
+    must never read as a clean pass)."""
     report = read_selfcheck(workdir) or {"version": 1, "coverage": None, "lint": None, "state": None}
     mv = report.get("media_verify") or {}
     mv["verified_pages"] = sorted(set(mv.get("verified_pages") or []) | set(pages))
+    if exhausted:
+        mv["exhausted"] = sorted(set(mv.get("exhausted") or []) | set(pages))
     mv["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     report["media_verify"] = mv
     write_selfcheck(workdir, report)
+
+
+def bump_media_attempts(workdir: str, pages: list[str]) -> dict[str, int]:
+    """Retry accounting for pages whose verification FAILED (transcription or
+    comparison error): read-modify-write media_verify.attempts and return the
+    new counts for `pages`. The caller marks a page exhausted once its count
+    reaches the budget — bounded retries instead of the old mark-before-verify
+    (silent permanent false-pass) or unbounded re-runs."""
+    report = read_selfcheck(workdir) or {"version": 1, "coverage": None, "lint": None, "state": None}
+    mv = report.get("media_verify") or {}
+    attempts = mv.get("attempts") or {}
+    for p in pages:
+        attempts[p] = int(attempts.get(p, 0)) + 1
+    mv["attempts"] = attempts
+    report["media_verify"] = mv
+    write_selfcheck(workdir, report)
+    return {p: attempts[p] for p in pages}
 
 
 def cap_media_pending(pending: dict[str, list[str]], max_images: int) -> dict[str, list[str]]:

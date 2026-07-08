@@ -255,6 +255,13 @@ class CompileRun:
         # arrives mid-batch (relayed into the next batch directive).
         self._suppress_turn_done = False
         self._last_turn_reply: str = ""
+        # Media blind-verify bookkeeping: pages handed to the in-flight verify
+        # task (subtracted from the due-check) — verified marks land only AFTER
+        # a completed verification (failed pages retry, bounded by attempts).
+        self._media_inflight: set[str] = set()
+        # When the stall watchdog fired interrupt(): bounds the wait for the
+        # interrupted result (a true black-hole can swallow interrupt() too).
+        self._stall_interrupted_at = 0.0
         self._batch_active = False
         self._batch_notes: list[str] = []
         # Scoped incremental (真增量): armed at kickoff with {before: page_hashes,
@@ -950,6 +957,50 @@ def _media_verify_max_images() -> int:
     return int(os.environ.get("KBC_MEDIA_VERIFY_MAX_IMAGES", "8"))
 
 
+def _media_verify_attempts() -> int:
+    """Failed-verification retries per page before it ships with a VISIBLE
+    exhausted flag in SELFCHECK.json (fail-open must never equal false-pass)."""
+    return max(1, int(os.environ.get("KBC_MEDIA_VERIFY_ATTEMPTS", "2")))
+
+
+def _media_verify_rounds() -> int:
+    """Bound on the batch-tail verify/repair loop: repair turns can add new
+    image citations that re-enter pending, so the loop needs a hard cap."""
+    return max(1, int(os.environ.get("KBC_MEDIA_VERIFY_ROUNDS", "3")))
+
+
+def _settle_media_outcome(run, chunk: dict, result: dict | None) -> list[str]:
+    """Post-verify bookkeeping (review fix: pages used to be marked verified
+    BEFORE verification ran, so a total transcription failure shipped image
+    claims unchecked, permanently). Completed pages are marked verified; failed
+    pages get an attempt bump and retry on a later trigger until the budget is
+    spent — then they are marked with a visible `exhausted` flag. result=None
+    means the whole flow failed → every page in the chunk is a failed attempt.
+    Returns the pages exhausted this round."""
+    completed = list((result or {}).get("completed_pages") or [])
+    failed = list((result or {}).get("failed_pages") or [])
+    if result is None:
+        failed = list(chunk)
+    if completed:
+        selfcheck.mark_media_verified(run.workdir, completed)
+    exhausted: list[str] = []
+    if failed:
+        counts = selfcheck.bump_media_attempts(run.workdir, failed)
+        exhausted = [p for p in failed if counts.get(p, 0) >= _media_verify_attempts()]
+        if exhausted:
+            selfcheck.mark_media_verified(run.workdir, exhausted, exhausted=True)
+    return exhausted
+
+
+async def _emit_media_exhausted(run, exhausted: list[str]) -> None:
+    if not exhausted:
+        return
+    await run.emit({"type": "summary", "text": _loc(run,
+        f"Self-check (images): {len(exhausted)} page(s) could not be verified after "
+        f"{_media_verify_attempts()} attempt(s) — shipped with a visible flag in SELFCHECK.json.",
+        f"自检(图像):{len(exhausted)} 页在 {_media_verify_attempts()} 次尝试后仍无法完成复核——已放行并在 SELFCHECK.json 显式标记。")})
+
+
 def _media_verify_due(run) -> dict[str, list[str]] | None:
     """A ≤max-images chunk of image-citing pages owed a blind verify on the
     settled draft, else None. Idempotent via media_verify.verified_pages —
@@ -966,7 +1017,9 @@ def _media_verify_due(run) -> dict[str, list[str]] | None:
     sc = selfcheck.read_selfcheck(workdir)
     if not sc or sc.get("state") != "passed":
         return None  # ledger repairs first; verify once settled
-    pending = selfcheck.pending_media_verification(workdir)
+    inflight = getattr(run, "_media_inflight", set())  # test doubles may lack it
+    pending = {p: imgs for p, imgs in selfcheck.pending_media_verification(workdir).items()
+               if p not in inflight}
     if not pending:
         return None
     return selfcheck.cap_media_pending(pending, _media_verify_max_images())
@@ -991,15 +1044,16 @@ async def _set_converge_phase(run, phase: str) -> None:
 
 def _maybe_start_media_verify(run) -> bool:
     """Kick the blind transcribe+compare flow as a background task (图像复核 v2).
-    Marks the chunk verified up-front (one-shot semantics, same as v1) so a
-    crash costs one chunk's verification, never a loop."""
+    Verified marks land only AFTER a completed verification (review fix — the
+    old up-front mark turned a total transcription failure into a silent,
+    permanent false-pass); the in-flight set + attempt budget keep it loop-free."""
     try:
         chunk = _media_verify_due(run)
     except Exception:
         return False  # a broken due-check must never break the turn seam
     if not chunk:
         return False
-    selfcheck.mark_media_verified(run.workdir, list(chunk))
+    run._media_inflight = getattr(run, "_media_inflight", set()) | set(chunk)
     run._media_task = asyncio.get_running_loop().create_task(
         _run_media_verify_flow(run, chunk))
     return True
@@ -1023,6 +1077,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             ClaudeEngine(), run.workdir, chunk,
             progress=lambda s: loop.create_task(run.emit({"type": "summary", "text": s})),
             locale=getattr(run, "locale", None))
+        await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, result))
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
             try:
@@ -1047,8 +1102,11 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Self-check (images) failed, skipping this round: {e!r}",
                 f"自检(图像)执行失败,本轮跳过: {e!r}")})
+            await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, None))
         except Exception:
             pass
+    finally:
+        run._media_inflight = getattr(run, "_media_inflight", set()) - set(chunk)
 
 
 # ── Layer-2 red-blue PK wiring (S2, DESIGN-kb-compile-self-verification §9) ──
@@ -1258,7 +1316,10 @@ async def _run_pk_flow(run, kind: str) -> None:
         if summary.get("state") == "repairing":
             await _set_converge_phase(run, "revising")
             await run.inject_user_message(redblue.build_pk_repair_prompt(summary, locale=getattr(run, "locale", None)))
-        elif summary.get("state") in ("passed", "partial", "unconverged"):
+        elif summary.get("state") in ("passed", "partial", "unconverged", "failed"):
+            # `failed` included (review fix): run_pk is fail-open and RETURNS
+            # failed rather than raising — without a terminal here the phase
+            # wedged at "verifying" and the frontend test-step gate never opened.
             # Converged: red-blue (the final layer) reached a terminal state and
             # no repair was injected → the draft is stable and testable.
             await _set_converge_phase(run, "settled")
@@ -1273,6 +1334,11 @@ async def _run_pk_flow(run, kind: str) -> None:
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Self-check (red-blue PK) failed, skipping this round: {e!r}",
                 f"自检(红蓝队)执行失败,本轮跳过: {e!r}")})
+        except Exception:
+            pass
+        try:
+            # Fail-open PK must still terminalize the converge gate.
+            await _set_converge_phase(run, "settled")
         except Exception:
             pass
     finally:
@@ -1326,6 +1392,12 @@ async def _post_turn_selfcheck(run) -> str | None:
     await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
+        if incr and incr_violations:
+            # Re-arm the byte-integrity guard for the repair turn itself: the
+            # repair restores out-of-scope pages toward the ORIGINAL baseline,
+            # so it is judged against that same baseline — otherwise a second
+            # out-of-scope edit made DURING repair would ship unguarded.
+            run._incr_pending = incr
         parts = []
         if not ledger_clean:
             parts.append(selfcheck.build_repair_prompt(report, locale))
@@ -1522,6 +1594,7 @@ async def _start_incremental(run: "CompileRun", text: str) -> None:
     cs = incremental.materialize_changeset(run.workdir)
     if cs is None:
         # Race / empty after the route check → fall back to a normal turn.
+        run._begin_turn(text)
         await run.client.query(text)
         return
     run._incr_pending = {"before": incremental.page_hashes(run.workdir), "changeset": cs}
@@ -1529,7 +1602,9 @@ async def _start_incremental(run: "CompileRun", text: str) -> None:
                     "text": _loc(run,
                      f"Incremental recompile: {len(cs['affected_pages'])} page(s) affected — touching only those, everything else stays untouched.",
                      f"增量重编:{len(cs['affected_pages'])} 页受影响,只改这些,其余不动。")})
-    await run.client.query(incremental.build_scoped_directive(cs, locale=getattr(run, "locale", None)))
+    directive = incremental.build_scoped_directive(cs, locale=getattr(run, "locale", None))
+    run._begin_turn(directive)  # arm the stall watchdog — same as every other kickoff
+    await run.client.query(directive)
 
 
 def _batch_plan_path(run: "CompileRun") -> Path:
@@ -1866,14 +1941,22 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # SELFCHECK.json reflects the verified final state.
         if _media_verify_enabled():
             repaired_any = False
+            rounds = 0
             while True:
                 pending = selfcheck.pending_media_verification(run.workdir)
                 if not pending:
                     break
+                rounds += 1
+                if rounds > _media_verify_rounds():
+                    # Repair turns can add new image citations that re-enter
+                    # pending — cap the loop; the remainder rides a later turn.
+                    await run.emit({"type": "summary", "text": _loc(run,
+                        f"Self-check (images): verify/repair round cap ({_media_verify_rounds()}) reached — remaining pages will be picked up on the next trigger.",
+                        f"自检(图像):验修轮达到上限({_media_verify_rounds()} 轮)——剩余页将在下一轮触发时继续复核。")})
+                    break
                 # Blind transcribe+compare per ≤max-images chunk (v2): engine
                 # sessions read one image each — no in-session image pileup.
                 chunk = selfcheck.cap_media_pending(pending, _media_verify_max_images())
-                selfcheck.mark_media_verified(run.workdir, list(chunk))
                 try:
                     result = await mediaverify.run_blind_verify(
                         ClaudeEngine(), run.workdir, chunk,
@@ -1884,7 +1967,9 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     await run.emit({"type": "summary", "text": _loc(run,
                         f"Self-check (images) failed, skipping this chunk: {e!r}",
                         f"自检(图像)执行失败,跳过本组: {e!r}")})
+                    await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, None))
                     continue
+                await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, result))
                 if result["errors"]:
                     await run.emit({"type": "summary",
                                     "text": _loc(run,
@@ -2023,6 +2108,9 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
         await _emit_message(run, msg)
 
 
+_STALL_INTERRUPT_DEADLINE_S = int(os.environ.get("KBC_STALL_INTERRUPT_DEADLINE_S", "120"))
+
+
 async def _model_stall_watchdog(run: CompileRun) -> None:
     """Reap a turn wedged on a black-holed model request. Interrupt the attempt;
     _consume_turn_stream then re-issues it (or fails). Only judges an ACTIVE turn,
@@ -2030,7 +2118,25 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
     live turn or a long tool (I4)."""
     while not run.done:
         await asyncio.sleep(_MODEL_WATCHDOG_POLL_S)
-        if not run._turn_active or run._stall_retrying:
+        if not run._turn_active:
+            continue
+        if run._stall_retrying:
+            # Interrupted, waiting for the interrupted result. A true black-hole
+            # can swallow interrupt() too — then the latch stays set and the
+            # receive loop blocks forever. Bound the wait; past the deadline,
+            # close the turn honestly and disconnect to unblock the loop.
+            if time.monotonic() - run._stall_interrupted_at > _STALL_INTERRUPT_DEADLINE_S:
+                run._stall_retrying = False
+                run._turn_active = False
+                await run.emit({"type": "error",
+                                "error": f"model stall: interrupt produced nothing within {_STALL_INTERRUPT_DEADLINE_S}s"})
+                await run.emit({"type": "turn_done", "text": _loc(run,
+                    "The turn stalled and could not be recovered — nothing was applied; send the message again to retry.",
+                    "本轮模型停滞且中断无响应——未产生结果,重新发送即可重试。")})
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
             continue
         client = run.client
         if client is None:
@@ -2042,6 +2148,7 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
         run._stall_fatal = run._model_retries >= _MODEL_MAX_RETRIES
         run._model_retries += 1
         run._stall_retrying = True
+        run._stall_interrupted_at = time.monotonic()
         run._last_model_activity = time.monotonic()   # bridge the interrupt→result gap
         await run.emit({
             "type": "turn_stalled",
@@ -2117,6 +2224,16 @@ async def _run_wrapper(run: CompileRun):
         clean = True
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
         await run.emit({"type": "error", "error": repr(e)})
+        if getattr(run, "_turn_active", False):
+            # never-block symmetry (review fix): a consumer gating on turn_done
+            # must not hang because the driver died mid-turn (stall-fatal etc.).
+            run._turn_active = False
+            try:
+                await run.emit({"type": "turn_done", "text": _loc(run,
+                    "The turn failed before completing — send the message again to retry.",
+                    "本轮在完成前失败——重新发送消息即可重试。")})
+            except Exception:
+                pass
     finally:
         syncer.cancel()
         watchdog.cancel()
@@ -2135,6 +2252,7 @@ async def _run_wrapper(run: CompileRun):
         if clean:
             await run.emit({"type": "done"})
         await run.emit({"type": "end"})
+        run._ended = True  # shutdown drain skips finished runs
 
 
 # Default tool whitelist for a read-only kb-test session, used when the runtime
@@ -2276,7 +2394,12 @@ _PK_KILL_AT_BOOT = os.environ.get("KBC_PK_MODE") == "off"
 
 def _apply_session_config(body: dict) -> None:
     """Apply consumer-managed llm/settings from the /session body to os.environ.
-    Never log the token; whitelist settings keys to the box's own vocabulary."""
+    Never log the token; whitelist settings keys to the box's own vocabulary.
+    INVARIANT: os.environ is process-global, so this leans on the platform's
+    one-pod-per-run spawn (the gateway creates a dedicated box per runId) — a
+    second concurrent /session on the same pod would clobber the first run's
+    credential/tiers. If multi-run pods ever become real, carry llm/settings
+    per-run (SDK client env) instead of mutating the process environment."""
     llm = body.get("llm")
     if isinstance(llm, dict):
         if llm.get("base_url"):
@@ -2430,6 +2553,7 @@ async def handle_message(request: web.Request):
                 "Noted — it will be passed along to the remaining batches.",
                 "已收到,会带给后续批次一并考虑。")})
         return web.json_response({"ok": True, "queued": True})
+    run._begin_turn(text)  # arm the stall watchdog — every model turn, incl. the owner's
     await run.client.query(text)
     return web.json_response({"ok": True})
 
@@ -2444,15 +2568,22 @@ async def handle_events(request: web.Request):
         "Connection": "keep-alive",
     })
     await resp.prepare(request)
-    while True:
-        try:
-            ev = await asyncio.wait_for(run.events.get(), timeout=25)
-        except asyncio.TimeoutError:
-            await resp.write(b": heartbeat\n\n")  # keep-alive
-            continue
-        await resp.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode())
-        if ev.get("type") == "end":
-            break
+    run._relays = getattr(run, "_relays", 0) + 1
+    try:
+        while True:
+            try:
+                ev = await asyncio.wait_for(run.events.get(), timeout=25)
+            except asyncio.TimeoutError:
+                await resp.write(b": heartbeat\n\n")  # keep-alive
+                continue
+            await resp.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode())
+            # Delivery mark AFTER the socket write: the shutdown drain gates on
+            # queue.join(), so "drained" means written out, not merely dequeued.
+            run.events.task_done()
+            if ev.get("type") == "end":
+                break
+    finally:
+        run._relays = getattr(run, "_relays", 1) - 1
     return resp
 
 
@@ -2611,10 +2742,19 @@ async def _flush_on_shutdown(_app) -> None:
         except Exception:
             pass
     deadline = time.monotonic() + _SHUTDOWN_DRAIN_MAX_S
-    while runs and time.monotonic() < deadline:
-        if all(run.events.empty() for run in runs):
-            break
-        await asyncio.sleep(_SHUTDOWN_DRAIN_S)
+    # Drain means DELIVERY (the relay task_done()s after the socket write), not
+    # dequeue — and only runs someone is listening to: an ended run or one with
+    # no live relay would never drain and would burn the whole deadline,
+    # starving the active runs' grace window.
+    to_drain = [r for r in runs
+                if not getattr(r, "_ended", False) and getattr(r, "_relays", 0) > 0]
+    if to_drain:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(r.events.join() for r in to_drain)),
+                timeout=max(0.0, deadline - time.monotonic()))
+        except asyncio.TimeoutError:
+            pass
 
 
 def build_app() -> web.Application:

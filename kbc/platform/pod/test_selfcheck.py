@@ -341,12 +341,15 @@ async def test_media_verify_wiring():
 
         async def fake_verify(engine, workdir, pending, progress=None, locale=None):
             calls.append(dict(pending))
-            if len(calls) == 1:  # first chunk: one confirmed misread
+            done = sorted(pending)  # every page in the chunk verifies to completion
+            if len(calls) == 1:  # first chunk: one confirmed misread (still a COMPLETED verification)
                 return {"findings": [{"page": "p.md", "image": "s/i1.png", "kind": "不一致",
                                       "claim": "GPU-Util 94%", "expected": "GPU-Util 0%(94% 是 MEM 条)",
                                       "fix": "改为 0%"}],
-                        "errors": [], "images": 1, "cache_hits": 0}
-            return {"findings": [], "errors": [], "images": 1, "cache_hits": 1}
+                        "errors": [], "images": 1, "cache_hits": 0,
+                        "completed_pages": done, "failed_pages": []}
+            return {"findings": [], "errors": [], "images": 1, "cache_hits": 1,
+                    "completed_pages": done, "failed_pages": []}
 
         os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"] = "1"
         os.environ["KBC_PK_MODE"] = "auto"  # so the PK-yields assertion is meaningful
@@ -371,6 +374,94 @@ async def test_media_verify_wiring():
             del os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"]
             os.environ["KBC_PK_MODE"] = "off"
     print("OK  blind media-verify wiring (gate / chunk+roll / findings→repair / PK yields)")
+
+
+
+
+async def test_media_failed_pages_retry_then_exhaust():
+    """Review fix: verified marks land only AFTER a completed verification.
+    A failed page retries on later triggers, bounded by KBC_MEDIA_VERIFY_ATTEMPTS,
+    then ships with a VISIBLE exhausted flag — never a silent false-pass."""
+    import compile_box
+    import mediaverify as mv
+    from compile_box import _maybe_start_media_verify, _post_turn_selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/i1.png")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        run = _FakeRun(td)
+
+        async def failing_verify(engine, workdir, pending, progress=None, locale=None):
+            return {"findings": [], "errors": ["transcription failed s/i1.png: boom"],
+                    "images": 1, "cache_hits": 0,
+                    "completed_pages": [], "failed_pages": sorted(pending)}
+
+        os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "2"
+        os.environ["KBC_PK_MODE"] = "off"
+        orig = mv.run_blind_verify
+        mv.run_blind_verify = failing_verify
+        try:
+            assert await _post_turn_selfcheck(run) is None      # ledger passes → settled draft
+            assert _maybe_start_media_verify(run)               # attempt 1
+            await run._media_task
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            mvsec = sc["media_verify"]
+            assert "p.md" not in (mvsec.get("verified_pages") or []), mvsec  # NOT falsely passed
+            assert mvsec["attempts"]["p.md"] == 1, mvsec
+            run._media_task = None
+            assert _maybe_start_media_verify(run)               # attempt 2 (retry, not skipped)
+            await run._media_task
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            mvsec = sc["media_verify"]
+            assert mvsec["attempts"]["p.md"] == 2, mvsec
+            assert "p.md" in mvsec["verified_pages"] and "p.md" in mvsec["exhausted"], mvsec
+            run._media_task = None
+            assert not _maybe_start_media_verify(run)           # budget spent → no more retries
+        finally:
+            mv.run_blind_verify = orig
+            del os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"]
+    print("OK  media failed pages retry then exhaust (visible flag, no silent false-pass)")
+
+
+async def test_pk_failed_state_settles_converge():
+    """Review fix: run_pk is fail-open and RETURNS state=failed — both that and
+    an outright raise must still terminalize converge_phase (it used to wedge
+    at 'verifying', locking the frontend test-step gate forever)."""
+    import compile_box
+    import redblue as rb
+
+    for scenario in ("returns_failed", "raises"):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            _mk(base, "raw/s/a.md")
+            _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+            _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+            run = _FakeRun(td)
+            os.environ["KBC_PK_MODE"] = "off"
+            assert await compile_box._post_turn_selfcheck(run) is None
+
+            async def fake_failed(engine, **kw):
+                return ({"state": "failed", "error": "pk infra down", "questions": 0}, {})
+
+            async def fake_raises(engine, **kw):
+                raise RuntimeError("pk infra down")
+
+            orig = rb.run_pk
+            rb.run_pk = fake_failed if scenario == "returns_failed" else fake_raises
+            os.environ["KBC_PK_MODE"] = "auto"
+            try:
+                await compile_box._run_pk_flow(run, "full")
+            finally:
+                rb.run_pk = orig
+                os.environ["KBC_PK_MODE"] = "off"
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            assert sc["pk"]["state"] == "failed", (scenario, sc["pk"])
+            assert sc.get("converge_phase") == "settled", (scenario, sc.get("converge_phase"))
+    print("OK  pk failed/raise still settles converge_phase (no verifying wedge)")
+
 
 
 async def test_pk_wiring():
@@ -596,6 +687,8 @@ def main():
     test_content_hash_shared_formula()
     asyncio.run(test_wiring())
     asyncio.run(test_media_verify_wiring())
+    asyncio.run(test_media_failed_pages_retry_then_exhaust())
+    asyncio.run(test_pk_failed_state_settles_converge())
     asyncio.run(test_pk_wiring())
     asyncio.run(test_seam_settles_when_nothing_pending())
     test_converge_phase_helper()

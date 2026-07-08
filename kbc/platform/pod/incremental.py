@@ -38,19 +38,35 @@ INDEX_PAGE = "index.md"
 
 
 # ── 反查:变更源 → 受影响页(compiled_from 反向 = dependency index)──────────────
+def _norm_source(path: str) -> str:
+    """Normalize a source path to its canonical raw-relative posix form:
+    posix separators, `./`/`//` collapsed (posixpath.normpath), and one leading
+    `raw/` or `drop/` segment stripped — mirroring selfcheck's compiled_from
+    entry normalization, so both sides of a lookup land in the same namespace."""
+    p = posixpath.normpath(path.replace("\\", "/")).lstrip("/")
+    head, _, rest = p.partition("/")
+    return rest if rest and head in ("raw", "drop") else p
+
+
 def _pages_citing(pages: dict[str, dict], sources: set[str]) -> set[str]:
-    """compiled_from 命中 `sources` 中任一源的候选页。既比 raw-相对全路径,也比
-    basename(compiled_from 带 raw-相对路径,变更源集用同一形式,basename 容错是
-    对齐 selfcheck 正文引用的宽松度,防两侧路径前缀写法不一致漏配)。"""
+    """Candidate pages whose compiled_from cites any source in `sources`.
+
+    Matching guarantee: **full-path only**, after normalizing BOTH sides with
+    `_norm_source` — never by basename. The normalization preserves the
+    original leniency for prefix-form mismatches between the two sides
+    (`raw/x/y.md` vs `x/y.md` refer to the same source), but cross-directory
+    same-basename sources (`snap/config.md` vs `vendor/config.md`) stay
+    distinct: a change to one can neither pull the other's pages into
+    affected_pages nor authorize edits to them, so the post-turn byte-freeze
+    guard keeps flagging genuine out-of-scope drift."""
     if not sources:
         return set()
-    src_basenames = {posixpath.basename(s) for s in sources}
+    norm_sources = {_norm_source(s) for s in sources}
     hit: set[str] = set()
     for rel, page in pages.items():
         if rel == INDEX_PAGE or "error" in page:
             continue
-        cf = set(page.get("sources", []))
-        if cf & sources or {posixpath.basename(c) for c in cf} & src_basenames:
+        if {_norm_source(c) for c in page.get("sources", [])} & norm_sources:
             hit.add(rel)
     return hit
 
