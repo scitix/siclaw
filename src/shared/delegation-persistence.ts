@@ -1,3 +1,8 @@
+// Type-only import (erased at runtime; src/shared already type-imports from src/core elsewhere,
+// and tool-registry does not import shared → no cycle). Keeps the group item-status snapshot
+// precisely typed on the wire.
+import type { GroupItemStatus } from "../core/tool-registry.js";
+
 export interface DelegationLineagePayload {
   parentSessionId?: string | null;
   parentAgentId?: string | null;
@@ -60,6 +65,13 @@ export interface DelegationEventPayload {
   durationMs?: number;
   partialSource?: "steered" | "runtime_fallback";
   interruptedTool?: string;
+  /**
+   * Per-item status snapshot for a spawn_subagent GROUP terminal event (index → status). Lets the
+   * frontend render items that were never persisted as their own child event — chiefly `skipped`
+   * ones (circuit-break / group-timeout / pre-launch stop) — instead of stranding them on the
+   * live-only "running" fallback after a reload. Absent for single-subagent events. Additive.
+   */
+  itemStatuses?: Array<{ index: number; status: GroupItemStatus }>;
 }
 
 export interface ChannelDeliverMessagePayload {

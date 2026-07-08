@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """compile_box — the served form of the compile box: a "cloud Claude Code"
 spawned by the siclaw runtime and driven over the box's own HTTP+SSE contract
-(the runtime translates events into generic capability.* for consumers, e.g. sicore).
+(the runtime translates events into generic capability.* for consumers, e.g. a downstream platform).
 
 Shape: the box is 90% "headless Claude Code behind a wrapped entrypoint" (Agent
 SDK = Claude Code as a library; engine/tools/compaction reused verbatim); the
@@ -55,6 +55,7 @@ from claude_agent_sdk import (
 import batching
 import incremental
 import mediaverify
+import office_ingest
 import redblue
 import selfcheck
 from engine import ClaudeEngine
@@ -137,7 +138,7 @@ _INSTRUCTION_HEADER = {
 
 # The read-only test-session persona lives in prompts/<locale>/test_role.md —
 # deliberately a knowledge CONSUMER over the pinned wiki snapshot, so the test
-# measures the wiki, not the agent's tools (mirrors siclaw_main prompt.ts). The
+# measures the wiki, not the agent's tools (mirrors siclaw prompt.ts). The
 # red-blue blue team reads the SAME pack text via selfcheck.TEST_ROLE, so the
 # consumer persona is single-sourced in the locale packs (no drift).
 
@@ -231,7 +232,7 @@ class CompileRun:
         # hits the SDK's "Not connected. Call connect() first." error.
         self.connected: asyncio.Event = asyncio.Event()
         # Assistant text accumulated for the in-flight turn; flushed into the
-        # turn_done event so sicore can persist the whole assistant reply.
+        # turn_done event so the consumer can persist the whole assistant reply.
         self._turn_text: list[str] = []
         # Layer-1 self-check bookkeeping (selfcheck.py): idempotency key of the
         # last checked state (skip re-check when nothing changed) and repair
@@ -328,11 +329,11 @@ class TestRun:
 _pack_candidates_to_wiki = selfcheck.pack_candidates_to_wiki
 
 
-# ── B5: mid-compile workspace sync back to sicore ──
+# ── B5: mid-compile workspace sync back to the consumer ──
 # The agent writes candidate/PLAN/eval into /work (an emptyDir). Without syncing
 # them back, a box crash loses all in-progress work and a resume restarts from
 # the frozen authoring snapshot. A periodic sync streams changed workspace files
-# to sicore (compile.syncArtifacts) so the work is durable and a resumed box can
+# to the consumer (compile.syncArtifacts) so the work is durable and a resumed box can
 # bootstrap from the latest state instead of restarting.
 WORKSPACE_SYNC_DIRS = ("authoring", "candidate", "eval", "release")
 SYNC_INTERVAL_SECS = int(os.environ.get("KBC_SYNC_INTERVAL_SECS", "20"))
@@ -368,14 +369,32 @@ def _collect_workspace_artifacts(workdir: str) -> list[dict]:
 
 async def _sync_workspace(run: CompileRun, sent: dict) -> int:
     """Emit a syncArtifacts event for workspace files changed since `sent`
-    (path → content sha). Updates `sent`; returns the number of changed files."""
+    (path → content sha), plus TOMBSTONES ({path, deleted: true}) for
+    previously-synced files that no longer exist on disk. Updates `sent`;
+    returns the number of changed entries."""
     changed = []
+    collected = set()
     for art in _collect_workspace_artifacts(run.workdir):
+        collected.add(art["path"])
         sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
         if sent.get(art["path"]) == sha:
             continue
         sent[art["path"]] = sha
         changed.append(art)
+    # Tombstones: a previously-synced file the agent deleted (page merge, rename,
+    # restructure) must be deleted from the consumer's store too — otherwise the
+    # orphan row gets published and the next respawn's workspace rehydration puts
+    # the file back on disk, silently undoing the deletion. Judged by is_file(),
+    # NOT by absence from the collection: a file that merely became oversized or
+    # binary is skipped by the collector but still exists, and must keep its
+    # last-synced row. `sent` scopes the sweep to paths this box life actually
+    # synced, so a store row that never materialized here can't be tombstoned.
+    wd = Path(run.workdir)
+    for path in [p for p in sent if p not in collected]:
+        if (wd / path).is_file():
+            continue  # still on disk, just not collectable — keep the row
+        del sent[path]
+        changed.append({"path": path, "deleted": True})
     if changed:
         await run.emit({"type": "syncArtifacts", "artifacts": changed})
     return len(changed)
@@ -446,6 +465,7 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
     drop_dir = wd / "drop"
     file_count = 0
     total_bytes = 0
+    office_converted: list = []
 
     try:
         staging.mkdir(mode=0o755)
@@ -487,6 +507,15 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
         _remove_path(raw_dir)
         _remove_path(drop_dir)
         staging.rename(raw_dir)
+        # Pre-render binary office sources (.pptx/.xlsx/.docx) to a sibling
+        # `<name>.md` so the agent's Read — native for pdf/text/images — can
+        # consume them too. Per-file fail-open: a corrupt file is skipped, the
+        # original stays, and the install never aborts on one bad deck.
+        office_converted, office_errors = office_ingest.convert_tree(str(raw_dir))
+        for rel, err in office_errors:
+            print(f"[office] {rel}: conversion skipped ({err})")
+        if office_converted:
+            print(f"[office] pre-rendered {len(office_converted)} office file(s) to sibling markdown")
         try:
             drop_dir.symlink_to(raw_dir, target_is_directory=True)
         except OSError:
@@ -504,6 +533,7 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
         "bytes": total_bytes,
         "bundle_sha256": actual_sha,
         "bundle_size_bytes": len(bundle),
+        "office_converted": len(office_converted),
     }
 
 
@@ -597,6 +627,23 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
 _BRIEF_MARKER = "我的定调标签"
 _BRIEF_PATH = "authoring/BRIEF.json"
 QUESTIONS_PROPOSED_PATH = "authoring/QUESTIONS_PROPOSED.json"
+_BRIEF_RAW_MAX = 4000  # cap the durable brief's raw slice — the agent is told to follow it
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write `text` atomically: a temp file in the same dir + os.replace. A torn
+    write (SIGTERM / OOM / full disk mid-write) must never leave a half-file that
+    the next read falls back to empty on — that would silently drop prior rounds
+    (e.g. every earlier proposed question). os.replace is atomic within one
+    filesystem on POSIX."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text, "utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _split_brief_tags(s: str) -> list[str]:
@@ -619,7 +666,11 @@ def parse_brief_block(message: str) -> dict | None:
     durable brief verbatim regardless of how the agent paraphrases downstream."""
     if not message or _BRIEF_MARKER not in message:
         return None
-    raw = message[message.find(_BRIEF_MARKER):].strip()
+    # Take the LAST marker occurrence (the wizard appends the brief block at the
+    # end) and cap the slice — an unbounded first-occurrence slice would lock onto
+    # a marker mentioned earlier in prose and pull the whole unrelated tail into
+    # the durable brief, bloating the agent's context.
+    raw = message[message.rfind(_BRIEF_MARKER):].strip()[:_BRIEF_RAW_MAX]
     audience = ""
     styles: list[str] = []
     custom: list[str] = []
@@ -637,20 +688,27 @@ def parse_brief_block(message: str) -> dict | None:
         if m:
             custom = _split_brief_tags(m.group(1))
             continue
+    if not (audience or styles or custom):
+        return None  # marker present but no tag field parsed → not a real brief
     return {"source": "quickstart_message", "audience": audience,
             "styles": styles, "custom": custom, "raw": raw}
 
 
 def _write_brief(workdir: str, brief: dict) -> None:
-    path = Path(workdir) / _BRIEF_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(brief, ensure_ascii=False, indent=2) + "\n", "utf-8")
+    _write_text_atomic(Path(workdir) / _BRIEF_PATH,
+                       json.dumps(brief, ensure_ascii=False, indent=2) + "\n")
 
 
 def _capture_brief(run: "CompileRun", text: str) -> bool:
-    """Parse + persist the opening brief block if present. Fail-open: a brief
-    capture hiccup must never block the compile turn. Returns whether it wrote."""
+    """Parse + persist the OPENING brief block, first-capture-wins. Fail-open: a
+    brief capture hiccup must never block the compile turn. Returns whether it
+    wrote. Runs on every /message, so it only writes when BRIEF.json does not yet
+    exist — otherwise a later message that merely mentions the marker phrase (a
+    quote, an aside) would clobber the real brief, often with a near-empty record
+    the agent is then told to follow."""
     try:
+        if (Path(run.workdir) / _BRIEF_PATH).exists():
+            return False
         brief = parse_brief_block(text)
         if brief is None:
             return False
@@ -660,10 +718,25 @@ def _capture_brief(run: "CompileRun", text: str) -> bool:
         return False
 
 
+# The exact whitespace set to strip, enumerated so it is byte-identical with the
+# frontend's mirror (ECMAScript `\s`). Python `re` `\s` and JS `\s` are DIFFERENT
+# fixed sets (Python `\s` strips U+0085 / U+001C–U+001F, JS `\s` strips U+FEFF),
+# so relying on `\s` on either side makes the derived id diverge for a question
+# containing one of those chars — and the frontend re-derives this id for legacy
+# id-less rows, so a divergence resurfaces the adopt/dismiss failure. This
+# explicit class removes the ambiguity; keep it in lockstep with the frontend.
+_WS_RE = re.compile("[\t\n\x0b\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
+_QUESTION_PUNCT = "?？。.!！,，、"
+
+
 def _normalize_question(q: str) -> str:
-    """Dedup key for a proposed question: whitespace-stripped, trailing
-    punctuation removed, case-folded — so trivially-reworded repeats collapse."""
-    return re.sub(r"\s+", "", str(q or "")).strip("?？。.!！,，、").lower()
+    """Dedup key + stable-id basis for a proposed question: strip the fixed
+    whitespace set (`_WS_RE`, enumerated to match the frontend — NOT `\\s`), strip
+    a fixed leading/trailing punctuation set, then lowercase. Trailing punctuation
+    and case are collapsed BY DESIGN — `删除?` and `删除。` map to one key (a
+    question differing only by trailing punctuation is treated as the same); an
+    all-punctuation question normalizes to `""` and the caller drops it."""
+    return _WS_RE.sub("", str(q or "")).strip(_QUESTION_PUNCT).lower()
 
 
 def _fnv1a32(s: str) -> int:
@@ -679,7 +752,7 @@ def _fnv1a32(s: str) -> int:
 def _question_id(normalized: str) -> str:
     """Stable proposal id agreed with the frontend: 'q-' + fnv1a32(normalized
     question) as zero-padded 8-hex-digit lowercase. The frontend POSTs this as
-    proposal_id on adopt/dismiss — a missing id → empty proposal_id → sicore 500."""
+    proposal_id on adopt/dismiss — a missing id → empty proposal_id → the consumer 500s."""
     return "q-" + format(_fnv1a32(normalized), "08x")
 
 
@@ -743,11 +816,10 @@ def _make_compile_tools(run: CompileRun):
         # remains the box's own working state; syncing happens at turn end.
         plan_text = str(args.get("plan", ""))
         proposal_path = Path(run.workdir) / "authoring" / "PROPOSED_PLAN.json"
-        proposal_path.parent.mkdir(parents=True, exist_ok=True)
-        proposal_path.write_text(json.dumps({
+        _write_text_atomic(proposal_path, json.dumps({
             "text": plan_text,
             "proposed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }, ensure_ascii=False, indent=2), "utf-8")
+        }, ensure_ascii=False, indent=2))
         await run.emit({"type": "plan_proposed", "plan": plan_text})
         # Advisory nudge only — working-state hygiene, never a gate.
         reminder = ""
@@ -795,7 +867,7 @@ def _make_compile_tools(run: CompileRun):
             "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         try:
-            path.write_text(json.dumps(tickets, ensure_ascii=False, indent=2), "utf-8")
+            _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
         except Exception as e:
             return {"content": [{"type": "text", "text": rt["write_failed"].format(e=e)}]}
         return {"content": [{"type": "text", "text": rt["registered"].format(tid=tid)}]}
@@ -814,9 +886,8 @@ def _make_compile_tools(run: CompileRun):
         except Exception:
             existing = []  # a corrupt/half-written prior file must not lose this round
         merged, added, skipped = merge_proposed_questions(existing, incoming)
-        path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", "utf-8")
+            _write_text_atomic(path, json.dumps(merged, ensure_ascii=False, indent=2) + "\n")
         except Exception as e:
             return {"content": [{"type": "text", "text": pq["write_failed"].format(e=e)}]}
         await run.emit({"type": "summary", "summary": pq["summary"].format(added=added, skipped=skipped, total=len(merged))})
@@ -848,7 +919,7 @@ def _seed_workdir(workdir: str):
 
 
 async def _smoke_compile(run: CompileRun):
-    """KBC_SMOKE=1: prove the sicore↔runtime↔box wiring (live events + artifact
+    """KBC_SMOKE=1: prove the consumer↔runtime↔box wiring (live events + artifact
     sync + turn persistence) in-cluster WITHOUT calling an LLM (the real compile
     is validated separately). Speaks only the capability-era event vocabulary."""
     await run.emit({"type": "summary", "summary": "[smoke] wiring check — no LLM"})
@@ -1218,12 +1289,13 @@ async def _post_turn_selfcheck(run) -> str | None:
         report["state"] = "unconverged"  # budget spent: publish card shows the rest
     report["repair_rounds_used"] = run._l1_repairs_used
     selfcheck.write_selfcheck(workdir, report)
-    await run.emit({"type": "summary", "text": selfcheck.narration(report)})
+    locale = getattr(run, "locale", None)
+    await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
         parts = []
         if not ledger_clean:
-            parts.append(selfcheck.build_repair_prompt(report))
+            parts.append(selfcheck.build_repair_prompt(report, locale))
         if incr_violations:
             parts.append(incremental.build_integrity_repair(incr_violations))
         return "\n\n".join(parts)
@@ -1234,7 +1306,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
     """Relay one Agent SDK message to the SSE stream. Assistant text becomes the
     live chat (`log`) stream AND is accumulated for the turn; a ResultMessage
     marks the turn's end, flushing the accumulated text into `turn_done.text` so
-    sicore can persist the whole assistant reply (and the UI knows it's idle)."""
+    the consumer can persist the whole assistant reply (and the UI knows it's idle)."""
     name = type(msg).__name__
     if name == "AssistantMessage":
         for block in getattr(msg, "content", []) or []:
@@ -1265,7 +1337,10 @@ async def _emit_message(run: CompileRun, msg) -> None:
         try:
             repair_msg = await _post_turn_selfcheck(run)
         except Exception as e:
-            await run.emit({"type": "summary", "text": f"自检(账本)执行失败,本轮跳过: {e!r}"})
+            msg = (f"Self-check (ledger) failed, skipped this round: {e!r}"
+                   if selfcheck._is_en(getattr(run, "locale", None))
+                   else f"自检(账本)执行失败,本轮跳过: {e!r}")
+            await run.emit({"type": "summary", "text": msg})
         # Sync BEFORE announcing the turn: consumers refetch the workspace on
         # turn_done, so files this turn produced (PROPOSED_PLAN.json, ticket
         # receipts, candidate pages) must already be durable. The periodic tick
@@ -1288,7 +1363,10 @@ async def _emit_message(run: CompileRun, msg) -> None:
             try:
                 await run.inject_user_message(repair_msg)
             except Exception as e:
-                await run.emit({"type": "summary", "text": f"自检回修注入失败: {e!r}"})
+                msg = (f"Self-check repair injection failed: {e!r}"
+                       if selfcheck._is_en(getattr(run, "locale", None))
+                       else f"自检回修注入失败: {e!r}")
+                await run.emit({"type": "summary", "text": msg})
         else:
             # Seam order: ledger repairs → blind image verify → red-blue PK.
             # Only a draft the cheaper layers are done with gets examined. When
@@ -1837,13 +1915,21 @@ async def run_session(run: CompileRun):
 
 async def _run_wrapper(run: CompileRun):
     """Unified lifecycle: run the driver + periodically sync mid-flight state →
-    catch-all error → always finish with end."""
+    catch-all error → always finish with end. A CLEAN driver exit (max_turns
+    exhaustion, subprocess EOF) additionally emits an explicit `done` before
+    `end`: the session can never take another turn, and a bare `end` left the
+    runtime guessing — the run lingered idle, 409'd every /message, and was
+    eventually mislabeled by the idle watchdog. Cancellation (CancelledError)
+    bypasses both the except and the `clean` flag, so a cancelled run still
+    closes with just `end`."""
     sent: dict = {}
+    clean = False
     run._sync_sent = sent  # shared with _emit_message's pre-turn_done sync
     syncer = asyncio.create_task(_sync_loop(run, sent))
     watchdog = asyncio.create_task(_model_stall_watchdog(run))
     try:
         await _COMPILE_IMPL(run)
+        clean = True
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
         await run.emit({"type": "error", "error": repr(e)})
     finally:
@@ -1859,7 +1945,10 @@ async def _run_wrapper(run: CompileRun):
         try:
             await _sync_workspace(run, sent)
         except Exception as e:
+            clean = False
             await run.emit({"type": "error", "error": f"final workspace sync failed: {e!r}"})
+        if clean:
+            await run.emit({"type": "done"})
         await run.emit({"type": "end"})
 
 
@@ -2186,15 +2275,24 @@ def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | Non
     """Install a consumer-PROVIDED wiki snapshot (a tar.gz of root-level pages —
     e.g. a PUBLISHED version bundle, the exact bytes a publish serves) into
     {dest}/.siclaw/knowledge/. Lets a test session probe a snapshot that does not
-    live on this box's disk. Returns (content hash — same formula as
-    _pack_candidates_to_wiki so draft and version snapshots are comparable —
-    and the page count)."""
+    live on this box's disk. Returns (content hash — via selfcheck.content_hash,
+    the same formula as pack_candidates_to_wiki so draft and version snapshots are
+    comparable — and the page count)."""
+    # DoS hardening, mirroring _install_source_bundle / _install_authoring_bundle:
+    # cap the compressed input AND accumulate the declared uncompressed size, so a
+    # gzip-bomb bundle_base64 that slips under the HTTP request cap can't OOM the
+    # box (which shares the pod with the live parent authoring run).
+    max_bundle_bytes = int(os.environ.get("KBC_MAX_SNAPSHOT_BUNDLE_BYTES", str(64 * 1024 * 1024)))
+    max_unpacked_bytes = int(os.environ.get("KBC_MAX_SNAPSHOT_UNPACKED_BYTES", str(256 * 1024 * 1024)))
+    if len(bundle) > max_bundle_bytes:
+        raise ValueError(f"snapshot bundle is too large: {len(bundle)} > {max_bundle_bytes}")
     actual = hashlib.sha256(bundle).hexdigest()
     if expected_sha256 and expected_sha256.lower() != actual:
         raise ValueError(f"snapshot bundle sha256 mismatch: expected {expected_sha256}, got {actual}")
     kdir = dest / ".siclaw" / "knowledge"
     kdir.mkdir(parents=True, exist_ok=True)
     pages: list[tuple[str, bytes]] = []
+    total_bytes = 0
     try:
         tf = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
     except tarfile.TarError as e:
@@ -2203,6 +2301,9 @@ def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | Non
         for member in tf.getmembers():
             if not member.isfile():
                 continue
+            total_bytes += member.size
+            if total_bytes > max_unpacked_bytes:
+                raise ValueError(f"snapshot bundle unpacks too large: {total_bytes} > {max_unpacked_bytes}")
             rel = _safe_tar_path(member.name)
             rel_posix = rel.as_posix()
             if not (rel_posix.endswith(".md") or rel_posix.endswith(".json")):
@@ -2218,10 +2319,7 @@ def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | Non
             pages.append((rel_posix, data))
     if not any(rp == "index.md" for rp, _ in pages):
         raise FileNotFoundError("snapshot bundle is missing index.md — cannot test without a root index page")
-    h = hashlib.sha256()
-    for rp, data in sorted(pages):
-        h.update(rp.encode()); h.update(b"\0"); h.update(data); h.update(b"\0")
-    return h.hexdigest(), len(pages)
+    return selfcheck.content_hash(pages), len(pages)
 
 
 async def handle_open_test(request: web.Request):

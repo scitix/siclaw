@@ -184,6 +184,85 @@ describe("siclaw-api misc routes", () => {
       }));
       expect(status).toBe(401);
     });
+
+    it("stays owner-only — no parent-session hop for a non-owned session", async () => {
+      // Owner-check finds nothing; delete must 404 without any further lookup.
+      query.mockResolvedValueOnce([[], []]);
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions/s1",
+        method: "DELETE",
+      }));
+      expect(status).toBe(404);
+      expect(query).toHaveBeenCalledTimes(1);
+      expect(query.mock.calls[0][0]).toContain("user_id = ?");
+    });
+  });
+
+  // ── Chat messages (read access, incl. delegated sub-agent transcripts) ──
+  describe("GET /api/v1/siclaw/agents/:id/chat/sessions/:sid/messages", () => {
+    it("returns 401 without auth", async () => {
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions/s1/messages",
+        method: "GET",
+        headers: { authorization: "" },
+      }));
+      expect(status).toBe(401);
+    });
+
+    it("returns messages for the direct owner (no parent hop)", async () => {
+      query
+        .mockResolvedValueOnce([[{ user_id: "u1", parent_session_id: null }], []]) // resolveReadableSession
+        .mockResolvedValueOnce([[{ count: 1 }], []]) // COUNT
+        .mockResolvedValueOnce([[{ id: "m1", metadata: null }], []]); // list
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions/s1/messages",
+        method: "GET",
+      }));
+      expect(status).toBe(200);
+      expect(body.data).toHaveLength(1);
+      // Direct owner short-circuits: exactly one auth query (no parent lookup).
+      expect(query.mock.calls[0][0]).toContain("parent_session_id");
+      expect(query.mock.calls[1][0]).toContain("COUNT(*)");
+    });
+
+    it("allows the parent-session owner to read a delegated sub-agent transcript (user_id='unknown')", async () => {
+      query
+        .mockResolvedValueOnce([[{ user_id: "unknown", parent_session_id: "p1" }], []]) // child row
+        .mockResolvedValueOnce([[{ id: "p1" }], []]) // parent owned by requester
+        .mockResolvedValueOnce([[{ count: 0 }], []]) // COUNT
+        .mockResolvedValueOnce([[], []]); // list
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions/child1/messages",
+        method: "GET",
+      }));
+      expect(status).toBe(200);
+      expect(body.data).toEqual([]);
+      // Parent lookup is scoped to the requester (user_id = ?).
+      expect(query.mock.calls[1][0]).toContain("user_id = ?");
+      expect(query.mock.calls[1][1]).toEqual(["p1", "a1", "u1"]);
+    });
+
+    it("404s when the delegated session's parent belongs to someone else", async () => {
+      query
+        .mockResolvedValueOnce([[{ user_id: "unknown", parent_session_id: "p1" }], []]) // child row
+        .mockResolvedValueOnce([[], []]); // parent NOT owned by requester
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions/child1/messages",
+        method: "GET",
+      }));
+      expect(status).toBe(404);
+      expect(query).toHaveBeenCalledTimes(2);
+    });
+
+    it("404s for an orphan non-owned session with no parent", async () => {
+      query.mockResolvedValueOnce([[{ user_id: "unknown", parent_session_id: null }], []]);
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions/x1/messages",
+        method: "GET",
+      }));
+      expect(status).toBe(404);
+      expect(query).toHaveBeenCalledTimes(1);
+    });
   });
 
   // ── My-tasks ─────────────────────────────────────────────

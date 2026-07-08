@@ -15,7 +15,7 @@
  */
 
 import { getDb } from "../gateway/db.js";
-import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex } from "./migrate-compat.js";
+import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn } from "./migrate-compat.js";
 
 const PORTAL_SCHEMA_SQLS: string[] = [
   // Users (simple auth, no org/RBAC)
@@ -289,7 +289,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     origin VARCHAR(20) DEFAULT NULL,
     parent_session_id CHAR(36) DEFAULT NULL,
     parent_agent_id CHAR(36) DEFAULT NULL,
-    delegation_id CHAR(36) DEFAULT NULL,
+    delegation_id VARCHAR(64) DEFAULT NULL,
     target_agent_id CHAR(36) DEFAULT NULL,
     sender_external_id VARCHAR(128) DEFAULT NULL,
     channel_id CHAR(36) DEFAULT NULL,
@@ -310,7 +310,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     metadata TEXT,
     from_agent_id CHAR(36) DEFAULT NULL,
     parent_session_id CHAR(36) DEFAULT NULL,
-    delegation_id CHAR(36) DEFAULT NULL,
+    delegation_id VARCHAR(64) DEFAULT NULL,
     target_agent_id CHAR(36) DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
@@ -574,13 +574,20 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "skill_versions", "files", "MEDIUMTEXT DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "parent_session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "parent_agent_id", "CHAR(36) DEFAULT NULL");
-  await safeAlterTable(db, "chat_sessions", "delegation_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "target_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "channel_bindings", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "from_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "parent_session_id", "CHAR(36) DEFAULT NULL");
-  await safeAlterTable(db, "chat_messages", "delegation_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "target_agent_id", "CHAR(36) DEFAULT NULL");
+
+  // Widen delegation_id CHAR(36)→VARCHAR(64) on EXISTING deployments. A group reduce child's id
+  // `${toolCallId}#reduce` reaches 36 chars for a 29-char provider id and would overflow CHAR(36)
+  // under MySQL strict mode (dropping the reduce child's session + delegation rows). safeAlterTable
+  // above only ADDs missing columns; widenColumn MODIFYs the existing type (idempotent, MySQL-only).
+  await widenColumn(db, "chat_sessions", "delegation_id", "VARCHAR(64) DEFAULT NULL");
+  await widenColumn(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
 
   // Indexes that used to be inlined inside CREATE TABLE (+ overlay/org_name
   // indexes added later). Safe to run now that all referenced columns exist.

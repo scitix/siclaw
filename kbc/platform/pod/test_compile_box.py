@@ -96,7 +96,68 @@ async def test_workspace_sync():
         assert await compile_box._sync_workspace(run, sent) == 1
         ev = run.events.get_nowait()
         assert [a["path"] for a in ev["artifacts"]] == ["candidate/01.md"], ev
-    print("✓ workspace sync (B5)")
+        # deleted file → tombstone (page merge/rename must not leave orphan rows)
+        (wd / "candidate" / "01.md").unlink()
+        assert await compile_box._sync_workspace(run, sent) == 1
+        ev = run.events.get_nowait()
+        assert ev["artifacts"] == [{"path": "candidate/01.md", "deleted": True}], ev
+        assert "candidate/01.md" not in sent
+        # steady state after the tombstone → no re-emit
+        assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        # a file that becomes UNCOLLECTABLE (oversized) but still exists on disk
+        # must NOT be tombstoned — deletion is judged by is_file(), not by
+        # absence from the collection.
+        (wd / "eval" / "TESTS.md").write_text("x" * (compile_box.MAX_SYNC_FILE_BYTES + 1))
+        assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        assert "eval/TESTS.md" in sent, "row kept: file exists, just oversized"
+    print("✓ workspace sync (B5) + deletion tombstones")
+
+
+def _drain_event_types(run) -> list:
+    types = []
+    while not run.events.empty():
+        types.append(run.events.get_nowait()["type"])
+    return types
+
+
+async def test_run_wrapper_terminal_signals():
+    """_run_wrapper's closing protocol: a CLEAN driver exit emits done→end (so
+    the runtime terminalizes instead of leaving the run idle to 409 forever); a
+    crash emits error→end with NO done; a cancellation emits neither (just end)
+    and propagates."""
+    orig = compile_box._COMPILE_IMPL
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            async def clean(run):
+                return None
+            compile_box._COMPILE_IMPL = clean
+            run = compile_box.CompileRun("wrap-clean", td, 1)
+            await compile_box._run_wrapper(run)
+            types = _drain_event_types(run)
+            assert types[-2:] == ["done", "end"], types
+
+            async def boom(run):
+                raise RuntimeError("boom")
+            compile_box._COMPILE_IMPL = boom
+            run = compile_box.CompileRun("wrap-boom", td, 1)
+            await compile_box._run_wrapper(run)
+            types = _drain_event_types(run)
+            assert "error" in types and "done" not in types and types[-1] == "end", types
+
+            async def cancelled(run):
+                raise asyncio.CancelledError()
+            compile_box._COMPILE_IMPL = cancelled
+            run = compile_box.CompileRun("wrap-cancel", td, 1)
+            try:
+                await compile_box._run_wrapper(run)
+                raise AssertionError("CancelledError should propagate")
+            except asyncio.CancelledError:
+                pass
+            types = _drain_event_types(run)
+            assert "done" not in types and "error" not in types and types[-1] == "end", types
+    finally:
+        compile_box._COMPILE_IMPL = orig
+    print("✓ run wrapper terminal signals: clean→done+end, crash→error+end, cancel→end only")
 
 
 # Test doubles for the Agent SDK message stream. _emit_message dispatches on
@@ -331,6 +392,42 @@ def test_pack_candidates_to_wiki():
     print("✓ pack candidates to wiki (snapshot parity with publish)")
 
 
+def test_pack_candidates_symlink_confinement():
+    """Security: the compile session has Write+Bash, so it could ln -s a host file
+    into candidate/. The pinner must NOT copy content whose real path escapes
+    candidate/ — neither a file symlink nor a symlinked directory."""
+    with tempfile.TemporaryDirectory() as wd, tempfile.TemporaryDirectory() as dest_root, tempfile.TemporaryDirectory() as outside:
+        secret = Path(outside) / "secret.md"
+        secret.write_text("TOP-SECRET host content\n")
+        secret_dir = Path(outside) / "hostdir"
+        secret_dir.mkdir()
+        (secret_dir / "leak2.md").write_text("SECRET via symlinked dir\n")
+
+        cand = Path(wd) / "candidate"
+        cand.mkdir()
+        (cand / "index.md").write_text("# index\n")
+        (cand / "real.md").write_text("legit page\n")
+        # (a) file symlink escaping candidate/ (relative name, no "..", is_file() true)
+        os.symlink(secret, cand / "leak.md")
+        # (b) symlinked directory pointing outside candidate/
+        os.symlink(secret_dir, cand / "sub")
+
+        dest = Path(dest_root) / "snap"
+        h, pages = compile_box._pack_candidates_to_wiki(wd, dest)
+        kdir = dest / ".siclaw" / "knowledge"
+        # Only the two real pages are packed; neither symlink target leaked.
+        assert pages == 2, pages
+        assert (kdir / "index.md").is_file()
+        assert (kdir / "real.md").is_file()
+        assert not (kdir / "leak.md").exists(), "file symlink escaped confinement"
+        assert not (kdir / "sub" / "leak2.md").exists(), "symlinked dir escaped confinement"
+        # And the secret content never entered the snapshot bytes.
+        for p in kdir.rglob("*"):
+            if p.is_file():
+                assert "SECRET" not in p.read_text(), p
+    print("✓ pack candidates symlink confinement (no host-file exfil into snapshot)")
+
+
 async def test_test_session_driver_readonly():
     """The read-only consumer driver configures Read/Glob/Grep ONLY (no Write/Edit/
     Bash, no MCP), cwd = the snapshot dir, persona = TEST_ROLE, no kickoff; it emits
@@ -507,7 +604,7 @@ async def test_prompt_packs_locale():
 
     with tempfile.TemporaryDirectory() as wd:
         compile_box._ensure_workdir_constitution(wd, "zh")
-        assert "知识库编译器" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")
+        assert "铁则" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")  # zh playbook section header (parallels en "Iron rules")
     with tempfile.TemporaryDirectory() as wd:
         compile_box._ensure_workdir_constitution(wd, None)  # platform default = en
         assert "Iron rules" in (Path(wd) / "constitution.md").read_text(encoding="utf-8")
@@ -581,6 +678,37 @@ async def test_propose_plan_never_bounces():
     print("✓ propose_plan always signals; PROPOSED_PLAN.json written by code")
 
 
+def test_install_wiki_snapshot_size_guard():
+    """Fix A: the published-snapshot installer rejects an oversized compressed
+    bundle AND a decompression bomb (accumulated-unpacked cap), like its sibling
+    installers — else a gzip-bomb bundle_base64 OOMs the pod + the parent run."""
+    import tempfile as _tf
+    ok = make_source_bundle({"index.md": "# i\n", "p.md": "x" * 100})
+    with _tf.TemporaryDirectory() as d:
+        dest = Path(d)
+        os.environ["KBC_MAX_SNAPSHOT_BUNDLE_BYTES"] = "10"      # compressed cap
+        try:
+            try:
+                compile_box._install_wiki_snapshot(ok, dest / "a")
+                assert False, "should reject oversized compressed bundle"
+            except ValueError as e:
+                assert "too large" in str(e), e
+        finally:
+            del os.environ["KBC_MAX_SNAPSHOT_BUNDLE_BYTES"]
+        os.environ["KBC_MAX_SNAPSHOT_UNPACKED_BYTES"] = "5"     # unpacked cap
+        try:
+            try:
+                compile_box._install_wiki_snapshot(ok, dest / "b")
+                assert False, "should reject bundle that unpacks too large"
+            except ValueError as e:
+                assert "unpacks too large" in str(e), e
+        finally:
+            del os.environ["KBC_MAX_SNAPSHOT_UNPACKED_BYTES"]
+        h, pages = compile_box._install_wiki_snapshot(ok, dest / "c")  # within limits → ok
+        assert pages == 2 and len(h) == 64, (pages, h)
+    print("✓ install_wiki_snapshot size guards (compressed + unpacked caps)")
+
+
 # ── Protocol v3: brief consumption + append-only proposed questions ──
 
 def test_apply_session_config():
@@ -626,8 +754,6 @@ def test_apply_session_config():
                 os.environ[k] = v
         compile_box._PK_KILL_AT_BOOT = kill_backup
     print("\u2713 _apply_session_config: llm + whitelist + kill-switch precedence")
-
-
 def test_parse_brief_block():
     """The wizard's 定调标签 block parses into the BRIEF.json record (tags split on
     Chinese separators, raw kept from the marker); an ordinary message → None."""
@@ -1271,15 +1397,64 @@ async def test_shutdown_flush_syncs_active_runs():
     print("✓ shutdown flush: final-syncs active runs' unsynced workspace (F3)")
 
 
+def test_pr382_review_fixes():
+    """Review fixes: brief guard + capped/last-marker raw (A/C), atomic writer (B),
+    question-id parity vector + intentional dedup (D/E)."""
+    good = ("开始生成知识库\n\n我的定调标签(请作为本次编译的 brief):\n"
+            "- 给谁看:内部工程师\n- 内容倾向:详尽百科\n请执行。")
+    b = compile_box.parse_brief_block(good)
+    assert b and b["audience"] == "内部工程师", b
+    # A(parse): marker present but no bullet field → None (a bare prose mention is not a brief)
+    assert compile_box.parse_brief_block("关于我的定调标签我想补充一句") is None
+    assert compile_box.parse_brief_block("我的定调标签") is None
+    # C: raw is taken from the LAST marker and capped
+    noise = ("我的定调标签 早前顺口提过\n我的定调标签(brief):\n- 给谁看:A\n" + "y" * 9000)
+    b2 = compile_box.parse_brief_block(noise)
+    assert b2 and b2["audience"] == "A", b2
+    assert len(b2["raw"]) == compile_box._BRIEF_RAW_MAX and "早前顺口提过" not in b2["raw"], len(b2["raw"])
+
+    # A(capture): first-wins — a later marker message never clobbers BRIEF.json
+    with tempfile.TemporaryDirectory() as td:
+        class _R:  # _capture_brief only reads .workdir
+            workdir = td
+        r = _R()
+        assert compile_box._capture_brief(r, good) is True
+        first = json.loads((Path(td) / "authoring" / "BRIEF.json").read_text())
+        assert compile_box._capture_brief(r, "我的定调标签(brief):\n- 给谁看:别人\n") is False
+        assert json.loads((Path(td) / "authoring" / "BRIEF.json").read_text()) == first
+
+    # B: atomic writer round-trips + overwrites + leaves no temp
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "sub" / "x.json"
+        compile_box._write_text_atomic(p, '{"a":1}\n')
+        assert p.read_text() == '{"a":1}\n'
+        compile_box._write_text_atomic(p, '{"a":2}\n')
+        assert p.read_text() == '{"a":2}\n' and not list(Path(td).rglob("*.tmp"))
+
+    # D/E: question-id parity vector — MUST equal the frontend's proposal-id.test vector
+    def qid(q):
+        return compile_box._question_id(compile_box._normalize_question(q))
+    assert qid("GPU 有几张?") == "q-4d6d3b41"
+    assert qid("gpu有几张。") == "q-4d6d3b41"            # E: case + trailing-punct + space collapse
+    assert qid("Hello World") == "q-3b9f5c61"
+    assert qid("\ufeffHello World") == "q-3b9f5c61"      # D: BOM stripped identically to the frontend
+    assert qid("H100\tvs　A100") == "q-a5a7d897"
+    assert qid("AbC?") == "q-1a47e90b"
+    print("✓ pr382 review fixes (brief guard/cap/first-wins, atomic write, id parity vector)")
+
+
 async def main():
     # PK never fires in these wiring tests — a qualifying fixture must not spawn
     # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
     os.environ["KBC_PK_MODE"] = "off"
+    test_install_wiki_snapshot_size_guard()
     await test_workspace_sync()
+    await test_run_wrapper_terminal_signals()
     await test_session_driver_conversational()
     await test_conversational_session()
     await test_message_waits_for_connect()
     test_pack_candidates_to_wiki()
+    test_pack_candidates_symlink_confinement()
     await test_test_path_escape_guard()
     await test_prompt_packs_locale()
     await test_test_session_driver_readonly()
@@ -1301,6 +1476,7 @@ async def main():
     await test_model_rate_limit_backoff_then_completes()
     await test_model_rate_limit_exhausts_gracefully()
     await test_shutdown_flush_syncs_active_runs()
+    test_pr382_review_fixes()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()
@@ -1396,9 +1572,13 @@ async def main():
             sse = await client.get("/events/r1")
             events = await read_until(sse, "end")
             types = [e["type"] for e in events]
-            # capability-era vocabulary only: no parked, no done+bundle
-            assert "summary" in types and "turn_done" in types and types[-1] == "end", types
-            assert "parked" not in types and "done" not in types, types
+            # capability-era vocabulary: no parked, no done+bundle payload. A clean
+            # session EXIT closes done→end (explicit terminal, so the runtime never
+            # guesses from a bare end) — done carries no bundle and follows the turns.
+            assert "summary" in types and "turn_done" in types and types[-2:] == ["done", "end"], types
+            assert "parked" not in types, types
+            done_ev = next(e for e in events if e["type"] == "done")
+            assert "bundle" not in done_ev and "artifacts" not in done_ev, done_ev
             turn = next(e for e in events if e["type"] == "turn_done")
             assert turn["text"] == "compiled 1 page", turn
             # the candidate page the driver wrote is synced back as an artifact
