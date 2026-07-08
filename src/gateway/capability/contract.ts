@@ -1,7 +1,7 @@
 /**
  * Capability contract — the generic, capability-agnostic protocol between a
  * siclaw runtime capability (a profile-shaped box driven by the runtime) and a
- * consumer control plane (sicore, gpu-cloud, ...).
+ * consumer control plane (any downstream platform).
  *
  * This GENERALIZES the deleted compile.* bolt-on into ONE vocabulary, so a
  * consumer implements a single thin adapter instead of a bespoke protocol per
@@ -17,7 +17,7 @@
  * ── WIRE RULE ─────────────────────────────────────────────────────────────────
  * Every interface below IS the wire shape: field names are snake_case, exactly
  * as serialized on the WS frames and parsed by the Go consumer adapter
- * (sicore internal/siclaw/capability/contract.go mirrors these). Producers and
+ * (the consumer's Go adapter mirrors these in its own contract.go). Producers and
  * handlers MUST build/read payloads through these types — do not hand-write
  * payload literals with other casings; a mismatched key is read as a zero value
  * on the other side and the data is silently dropped.
@@ -51,8 +51,8 @@ export const CAPABILITY_FETCH_INPUT = "capability.fetchInput" as const;
 /**
  * siclaw → consumer: opaque run-state store (option B). siclaw OWNS the execution
  * run; the consumer persists it as a dumb store so an in-flight run survives a
- * stateless-runtime restart. getRun is part of the consumer's store obligation
- * even though the runtime currently only calls persist + listActiveRuns.
+ * stateless-runtime restart. The runtime calls persist + listActiveRuns (boot/
+ * reconcile recovery) and getRun (adopt + the reap re-check).
  */
 export const CAPABILITY_PERSIST_RUN_STATE = "capability.persistRunState" as const;
 export const CAPABILITY_GET_RUN = "capability.getRun" as const;
@@ -195,7 +195,12 @@ export interface CapabilityRunState {
   status: CapabilityLifecycleStatus;
   /** Opaque resume blob (JSON-serializable). Reserved — no writer yet. */
   checkpoint?: unknown;
-  /** Box session id (for resume). Reserved — no writer yet. */
+  /**
+   * Box session id, reserved for a future where the box persists its session and
+   * a resume needs it. Deliberately has NO writer: continuity today is workspace-
+   * file rehydration + routing by run_id, not session-id resume (adopt/recover
+   * carry any stored value through, but nothing sets or consumes it).
+   */
   session_ref: string;
   /** Which runtime owns the box. */
   runtime_id: string;
@@ -237,12 +242,24 @@ export interface CapabilityPersistTurnRequest {
  * Content sink. GENERALIZES compile.syncArtifacts + the compile.done bundle.
  * Knowledge content the box produced is written into the CONSUMER's store;
  * siclaw never persists knowledge content itself (only execution state).
+ *
+ * Deletions travel as TOMBSTONES (`deleted: true`, no content): the box's sync
+ * is per-path diffs, so without them a file the agent deleted (page merge,
+ * rename, restructure) would leave an orphan row the consumer publishes and the
+ * next workspace rehydration resurrects. The old compile.done full-bundle
+ * replace covered this implicitly; the generalization must carry it explicitly.
+ * DEPLOY ORDER: the consumer must understand `deleted` before a box that emits
+ * it rolls out — an older consumer would treat the tombstone as an empty-content
+ * upsert.
  */
 export interface CapabilityPersistArtifactRequest {
   run_id: string;
   /** Logical path within the capability workspace, e.g. "candidate/00-intro.md". */
   path: string;
-  content: CapabilityContentRef;
+  /** Present on add/update; absent when `deleted` is set. */
+  content?: CapabilityContentRef;
+  /** Tombstone: delete the row for `path` from the consumer's store. */
+  deleted?: boolean;
 }
 
 export interface CapabilityContentRef {

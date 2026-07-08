@@ -375,7 +375,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── Shared capability box client ───────────────────────────────────────────
   // Local development escape hatch: point SICLAW_COMPILE_BOX_ENDPOINT at a
   // manually started kbc box (usually http://127.0.0.1:3000) to reuse a local
-  // Claude Code/OAuth session while testing the sicore↔runtime protocol.
+  // Claude Code/OAuth session while testing the consumer↔runtime protocol.
   const localCapabilityBoxEndpoint = process.env.SICLAW_COMPILE_BOX_ENDPOINT?.trim();
   const capabilityBoxClient = async (runId: string, profile: string, orgId?: string): Promise<AgentBoxClient> => {
     if (localCapabilityBoxEndpoint) {

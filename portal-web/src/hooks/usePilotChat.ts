@@ -17,6 +17,7 @@ import type {
 } from "../components/chat/types"
 import { stripAttachmentOcrEvidence } from "../components/chat/user-message-text"
 import { findPendingSteerIndex, removePendingAt, extractUserMessageText, pendingSteerMatchText } from "./steer-pending"
+import { isGroupForm, normalizeCompletionStatus } from "../lib/group-form"
 
 /** Parse an unknown payload into an ErrorDetail with backward-compat fallbacks.
  *  See docs/design/error-envelope.md §4. */
@@ -414,7 +415,96 @@ async function fetchSessionPage1(
  * chronological order (oldest first).
  */
 export function buildPilotMessages(items: ChatMessage[]): PilotMessage[] {
-  return annotateSubagentCompletions(annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage))))
+  return reannotatePilotMessages(items.map(toPilotMessage))
+}
+
+/**
+ * Re-run the full annotation pipeline over already-mapped PilotMessages. Shared by
+ * buildPilotMessages (after the raw→PilotMessage map) and mergePage1IntoHistory (which combines
+ * two already-mapped lists). Every annotate stage recomputes its folds from the delegation_event /
+ * exec_job_event rows present in the list, so re-running over already-annotated messages is
+ * idempotent — it just re-derives the same (or newly-complete) folded metadata.
+ */
+function reannotatePilotMessages(messages: PilotMessage[]): PilotMessage[] {
+  return annotateGroupCompletions(annotateSubagentCompletions(annotateExecJobCompletions(annotateDelegationSynthesis(messages))))
+}
+
+/**
+ * Merge a freshly-fetched page 1 into the currently-loaded history WITHOUT discarding paged-back
+ * scrollback. Used by the background-turn refetch when the user has scrolled up (pageRef > 1): a
+ * wholesale page-1 replace would drop the older messages, but SKIPPING the refresh strands a
+ * completed background job's card on its stale "Running…" state until a manual reload (smoke defect
+ * S1). We drop the stale copies of any message page 1 re-returned (dedup by id — page 1 wins), keep
+ * the older scrollback, then re-run the annotation chain so terminal delegation_events fold onto
+ * their launch card even when that card has scrolled into an older page. Chronological order holds:
+ * everything kept from `current` is older than page 1's window, so it stays ahead of the fresh
+ * page-1 block.
+ */
+export function mergePage1IntoHistory(current: PilotMessage[], freshPage1: PilotMessage[]): PilotMessage[] {
+  const freshIds = new Set(freshPage1.map((m) => m.id))
+  const older = current.filter((m) => !freshIds.has(m.id))
+  return reannotatePilotMessages([...older, ...freshPage1])
+}
+
+/**
+ * Carry the live-only `groupProgress` frame across a history refetch. It is the ONLY source that
+ * can tell a queued batch item from a running one mid-run — a queued item has no persisted trace
+ * at all (its child session is created when a worker picks it up), and a running child's rows live
+ * in the CHILD session, so the parent-page rebuild knows nothing about either. Without the carry,
+ * every wholesale refetch (bg poller, SSE refetch, recovered-run poll) wipes the frame and the card
+ * repaints all non-terminal items with the "running" default until the next transition frame.
+ * The stale frame is dropped once the fresh row folded a terminal `groupStatus` (must not shadow
+ * the itemStatuses snapshot) or carries its own newer frame.
+ */
+export function carryLiveGroupProgress(prev: PilotMessage[], fresh: PilotMessage[]): PilotMessage[] {
+  const carried = new Map<string, unknown>()
+  for (const m of prev) {
+    const gp = (m.metadata as Record<string, unknown> | undefined)?.groupProgress
+    if (gp !== undefined && m.id) carried.set(m.id, gp)
+  }
+  if (carried.size === 0) return fresh
+  return fresh.map((m) => {
+    const gp = m.id ? carried.get(m.id) : undefined
+    if (gp === undefined) return m
+    const meta = (m.metadata ?? {}) as Record<string, unknown>
+    if (meta.groupProgress !== undefined || meta.groupStatus !== undefined) return m
+    return { ...m, metadata: { ...meta, groupProgress: gp } }
+  })
+}
+
+/**
+ * Reuse the previously rendered row OBJECT for any freshly fetched row that is semantically
+ * unchanged. The annotate chain derives its folded fields (groupStatus / groupItems / …) from
+ * delegation_event rows on every fetch, so a rebuilt page gives every row a new identity even
+ * when nothing changed — defeating memoized row components (`SubagentGroupCard`'s
+ * `useMemo([message])` recomputed on every 2.5s poll). Comparing content + status + metadata
+ * (both sides are annotate-built, so equal structures serialize equally) restores identity
+ * stability; a false mismatch merely rebuilds a row, never shows stale data.
+ */
+export function preserveUnchangedRows(prev: PilotMessage[], fresh: PilotMessage[]): PilotMessage[] {
+  if (prev.length === 0) return fresh
+  const prevById = new Map(prev.map((m) => [m.id, m]))
+  return fresh.map((m) => {
+    const p = m.id ? prevById.get(m.id) : undefined
+    if (
+      p &&
+      p.role === m.role &&
+      p.content === m.content &&
+      p.toolStatus === m.toolStatus &&
+      p.isStreaming === m.isStreaming &&
+      JSON.stringify(p.metadata ?? null) === JSON.stringify(m.metadata ?? null)
+    ) {
+      return p
+    }
+    return m
+  })
+}
+
+/** Standard reconciliation of a freshly fetched page 1 against the rendered list: carry the
+ *  live-only group progress (queued-vs-running knowledge), then restore row identity for
+ *  unchanged rows so memoized components skip re-rendering. */
+export function reconcileRefetchedPage1(prev: PilotMessage[], fresh: PilotMessage[]): PilotMessage[] {
+  return preserveUnchangedRows(prev, carryLiveGroupProgress(prev, fresh))
 }
 
 /**
@@ -658,24 +748,19 @@ function annotateSubagentCompletions(messages: PilotMessage[]): PilotMessage[] {
     if (m.metadata?.kind !== "delegation_event") continue
     const id = messageDelegationId(m)
     if (!id) continue
-    const raw = (messageString(m.metadata?.event_type) ?? messageString(m.metadata?.status) ?? "done").toLowerCase()
-    if (/run|start|queue|pend|progress|synthes/.test(raw)) continue // not a terminal event
-    // Preserve timed_out / partial as their own (amber) statuses — collapsing them into "done"
-    // showed a truncated/timed-out background investigation as a clean green success. statusTone
-    // renders both amber, matching the foreground delegation path.
-    const status = /fail|error/.test(raw) ? "failed"
-      : /cancel|abort|stop/.test(raw) ? "cancelled"
-      : /timed?[-_ ]?out/.test(raw) ? "timed_out"
-      : /partial|truncat/.test(raw) ? "partial"
-      : "done"
+    // Shared terminal-status mapping (the group fold uses the same function). null ⇒ a non-terminal
+    // event (running/queued/synthesizing) → skip. Preserving timed_out/partial as their own amber
+    // statuses matches the foreground delegation path (collapsing them into "done" once showed a
+    // truncated/timed-out background investigation as a clean green success).
+    const status = normalizeCompletionStatus(messageString(m.metadata?.event_type) ?? messageString(m.metadata?.status))
+    if (status === null) continue // not a terminal event
     done.set(id, { status, summary: typeof m.content === "string" ? m.content : undefined })
   }
   let changed = false
   const next = messages.map((m) => {
     if (!isBackgroundSpawnLaunch(m)) return m // foreground spawn already carries its final status
-    const parsed = m.content ? tryParseJson(m.content) : undefined
     changed = true
-    const jobId = messageString(parsed?.job_id) ?? messageDelegationId(m) ?? m.id
+    const jobId = launchJobId(m)
     const c = jobId ? done.get(jobId) : undefined
     return {
       ...m,
@@ -689,11 +774,20 @@ function annotateSubagentCompletions(messages: PilotMessage[]): PilotMessage[] {
   return changed ? next : messages
 }
 
-/** A spawn_subagent launched in the background — detectable from the launch itself (args /
- * "launched" result), so it works during the LIVE turn too, not only after annotate runs on a
- * refetch. */
+/** The launch id a background spawn/group folds on: the tool result's job_id, else the persisted
+ * delegation_id, else the message id. Local to this file (depends on messageDelegationId /
+ * tryParseJson) — that's why it isn't in the shared group-form module. Collapses the three inline
+ * copies of this ladder (single fold, group fold, live group_progress). */
+function launchJobId(m: PilotMessage): string | undefined {
+  const parsed = m.content ? tryParseJson(m.content) : undefined
+  return messageString(parsed?.job_id) ?? messageDelegationId(m) ?? m.id
+}
+
+/** A COLLAPSE-form spawn_subagent launched in the background — detectable from the launch itself
+ * (args / "launched" result), so it works during the LIVE turn too, not only after annotate runs on
+ * a refetch. A batch-form launch is a group (handled by annotateGroupCompletions), so it is excluded. */
 function isBackgroundSpawnLaunch(m: PilotMessage): boolean {
-  if (m.role !== "tool" || m.toolName !== "spawn_subagent") return false
+  if (m.role !== "tool" || m.toolName !== "spawn_subagent" || isGroupForm(m)) return false
   if ((m.toolArgs as Record<string, unknown> | undefined)?.run_in_background === true) return true
   const parsed = m.content ? tryParseJson(m.content) : undefined
   return parsed?.status === "launched"
@@ -702,6 +796,161 @@ function isBackgroundSpawnLaunch(m: PilotMessage): boolean {
 /** A background spawn_subagent that launched but whose completion hasn't folded in yet. */
 function hasActiveBackgroundSubagent(messages: PilotMessage[]): boolean {
   return messages.some((m) => isBackgroundSpawnLaunch(m) && !m.metadata?.subBgStatus)
+}
+
+// ── spawn_subagent batch (declarative map→reduce) ────────────────────────────────────────────
+// A batch-form spawn_subagent launch tool row returns {status:"launched", job_id: groupId}; each
+// child persists a delegation_event tagged `{groupId}#{index}`, and the whole batch one terminal
+// event tagged `groupId`. annotateGroupCompletions folds all of those onto the launch card so it
+// rebuilds on reload; live per-item progress arrives via the group_progress chat event (SSE below).
+
+interface GroupItemFold { index: number; status: string; summary?: string; childSessionId?: string }
+
+/** A batch-form spawn_subagent (or legacy spawn_subagent_group) launched in the background — a
+ *  multi-item batch defaults to background, so a "launched" result marks it; before the result lands
+ *  we infer from the conditional default (run_in_background ?? items.length > 1). A foreground batch
+ *  returns its full report inline instead, so it never matches here. */
+function isBackgroundGroupLaunch(m: PilotMessage): boolean {
+  if (m.role !== "tool" || !isGroupForm(m)) return false
+  const parsed = m.content ? tryParseJson(m.content) : undefined
+  if (parsed?.status === "launched") return true
+  if (parsed) return false // a non-launched result → foreground inline
+  // No result yet (live window): infer from the args + the tool's conditional default.
+  const args = m.toolArgs as Record<string, unknown> | undefined
+  const rib = args?.run_in_background
+  if (rib === false) return false
+  if (rib === true) return true
+  const items = args?.items
+  return Array.isArray(items) && items.length > 1
+}
+
+
+interface GroupTerminalFold {
+  status: string
+  summary?: string
+  childSessionId?: string
+  /** Per-item status snapshot (index → status) — fills in items never persisted as their own child. */
+  itemStatuses?: Array<{ index: number; status: string }>
+}
+
+/** True when the group metadata already on a launch row equals the freshly-computed fold, so the row
+ *  can keep its object identity across an idempotent re-annotate (perf: no needless re-render). Only
+ *  the keys this fold writes are compared; groupItems by length + per-index fields (reviewer B-D). */
+function groupMetaUnchanged(prev: Record<string, unknown> | undefined, next: Record<string, unknown>): boolean {
+  if (!prev) return false
+  if (prev.groupBackground !== next.groupBackground) return false // first annotate adds the marker
+  if (prev.groupStatus !== next.groupStatus) return false
+  if (prev.groupSummary !== next.groupSummary) return false
+  if (prev.groupReduceChildSessionId !== next.groupReduceChildSessionId) return false
+  const a = (prev.groupItems as GroupItemFold[] | undefined) ?? []
+  const b = (next.groupItems as GroupItemFold[] | undefined) ?? []
+  if (a.length !== b.length) return false
+  for (let i = 0; i < b.length; i++) {
+    if (a[i]?.index !== b[i]?.index || a[i]?.status !== b[i]?.status
+      || a[i]?.summary !== b[i]?.summary || a[i]?.childSessionId !== b[i]?.childSessionId) return false
+  }
+  return true
+}
+
+/**
+ * Fold a background sub-agent GROUP's persisted events onto its launch card. Children are tied to
+ * the group by a `{groupId}#{index}` delegation_id; the whole group by a terminal event whose
+ * delegation_id === the groupId. We attach groupItems (per-item status + drill-in id), groupStatus
+ * (overall), groupSummary (the capsule — reduce synthesis OR the breaker/failure reason, always
+ * shown), and the reduce drill-in child when one ran. Refresh-safe — it's all chat history.
+ */
+function annotateGroupCompletions(messages: PilotMessage[]): PilotMessage[] {
+  // Collect group ids first, so a bare (no-`#`) delegation_event can be told apart from a single
+  // sub-agent's (which also persists a bare delegation_event) — only ids that match a group launch
+  // are treated as a group terminal.
+  const groupIds = new Set<string>()
+  for (const m of messages) {
+    if (isBackgroundGroupLaunch(m)) {
+      const id = launchJobId(m)
+      if (id) groupIds.add(id)
+    }
+  }
+  if (groupIds.size === 0) return messages
+
+  const itemsByGroup = new Map<string, Map<number, GroupItemFold>>()
+  const terminal = new Map<string, GroupTerminalFold>()
+  for (const m of messages) {
+    if (m.metadata?.kind !== "delegation_event") continue
+    const id = messageDelegationId(m)
+    if (!id) continue
+    const meta = m.metadata as Record<string, unknown>
+    const status = normalizeCompletionStatus(messageString(meta.status) ?? messageString(meta.event_type)) ?? "running"
+    const childSessionId = messageString(meta.child_session_id) || undefined
+    const summary = typeof m.content === "string" && m.content ? m.content : undefined
+    const hashIdx = id.lastIndexOf("#")
+    if (hashIdx > 0) {
+      const groupId = id.slice(0, hashIdx)
+      if (!groupIds.has(groupId)) continue // not one of ours
+      const rest = id.slice(hashIdx + 1)
+      if (rest === "reduce") continue // reduce child — the terminal event already carries it
+      const index = Number(rest)
+      if (!Number.isInteger(index)) continue
+      const byIdx = itemsByGroup.get(groupId) ?? new Map<number, GroupItemFold>()
+      byIdx.set(index, { index, status, summary, childSessionId })
+      itemsByGroup.set(groupId, byIdx)
+    } else if (groupIds.has(id)) {
+      // Terminal event: parse the per-item status snapshot (index → status) when present, so items
+      // never persisted as their own child event (chiefly `skipped`) can be rendered on reload.
+      const rawSnapshot = Array.isArray(meta.item_statuses) ? (meta.item_statuses as unknown[]) : undefined
+      const itemStatuses = rawSnapshot
+        ?.filter((e): e is Record<string, unknown> => !!e && typeof e === "object")
+        .map((e) => ({ index: Number(e.index), status: String(e.status) }))
+        .filter((e) => Number.isInteger(e.index))
+      terminal.set(id, { status, summary, childSessionId, itemStatuses })
+    }
+  }
+
+  let changed = false
+  const next = messages.map((m) => {
+    if (!isBackgroundGroupLaunch(m)) return m
+    const groupId = launchJobId(m)
+    if (!groupId) return m
+    const byIdx = itemsByGroup.get(groupId)
+    const term = terminal.get(groupId)
+
+    // Merge the terminal per-item snapshot: an index with NO own child delegation_event — chiefly a
+    // `skipped` one (never persisted as a child) — comes from the snapshot, so a reloaded card renders
+    // it correctly instead of the live-only "running" fallback (#3). A real child event always wins.
+    const merged = new Map<number, GroupItemFold>(byIdx ? [...byIdx] : [])
+    for (const s of term?.itemStatuses ?? []) {
+      if (!merged.has(s.index)) merged.set(s.index, { index: s.index, status: s.status })
+    }
+    const groupItems = merged.size > 0 ? [...merged.values()].sort((a, b) => a.index - b.index) : []
+
+    const nextMeta: Record<string, unknown> = {
+      ...(m.metadata ?? {}),
+      groupBackground: true,
+      ...(groupItems.length > 0 ? { groupItems } : {}),
+      ...(term
+        ? {
+            groupStatus: term.status,
+            // The capsule (reduce synthesis OR breaker reason OR reduce-failure/cancel note OR digest)
+            // is ALWAYS surfaced so a no-reduce failure still explains WHY on the card (#7). The reduce
+            // drill-in id is attached only when a reduce child actually ran (non-empty child id).
+            ...(term.summary ? { groupSummary: term.summary } : {}),
+            ...(term.childSessionId ? { groupReduceChildSessionId: term.childSessionId } : {}),
+          }
+        : {}),
+    }
+
+    // Identity preservation: only rebuild the row when the folded metadata actually differs from what
+    // it already carries — otherwise a background group in history would re-map (new object identity)
+    // on every idempotent re-annotate, defeating referential-equality render skips.
+    if (groupMetaUnchanged(m.metadata as Record<string, unknown> | undefined, nextMeta)) return m
+    changed = true
+    return { ...m, metadata: nextMeta }
+  })
+  return changed ? next : messages
+}
+
+/** A background group that launched but whose terminal event hasn't folded in yet. */
+function hasActiveBackgroundGroup(messages: PilotMessage[]): boolean {
+  return messages.some((m) => isBackgroundGroupLaunch(m) && !m.metadata?.groupStatus)
 }
 
 /** A background exec job (host_exec/node_exec/pod_exec/bash run_in_background) that launched
@@ -718,7 +967,11 @@ function isActiveBackgroundExecJob(m: PilotMessage): boolean {
  *  poller, so it's covered by isLoading and not counted here.) Used to keep the input's Stop
  *  button available so the user can sweep these via chat.abort without a follow-up message. */
 export function hasActiveBackgroundWork(messages: PilotMessage[]): boolean {
-  return messages.some((m) => isActiveBackgroundExecJob(m)) || hasActiveBackgroundSubagent(messages)
+  return (
+    messages.some((m) => isActiveBackgroundExecJob(m)) ||
+    hasActiveBackgroundSubagent(messages) ||
+    hasActiveBackgroundGroup(messages)
+  )
 }
 
 function hasPendingDelegationSynthesis(messages: PilotMessage[]): boolean {
@@ -766,7 +1019,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const activeSessionIdRef = useRef<string | undefined>(sessionId ?? undefined)
   const [isCompacting, setIsCompacting] = useState(false)
   const hasActiveAsyncDelegation = hasActiveAsyncDelegationSurface(messages)
-  const hasActiveBgSubagent = hasActiveBackgroundSubagent(messages)
+  const hasActiveBgSubagent = hasActiveBackgroundSubagent(messages) || hasActiveBackgroundGroup(messages)
   // Detached background work still running (bg exec job or bg sub-agent) — keeps the input's
   // Stop button available after the turn ends so the user can sweep it via chat.abort.
   const hasBackgroundWork = hasActiveBackgroundWork(messages)
@@ -947,7 +1200,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         // don't let this poll re-paint them as "running" over the optimistic "aborted" state.
         // Also stand down while the /events live feed owns the message list (recoveredLiveRef) —
         // a wholesale DB replace would clobber live-streamed assistant text not yet persisted.
-        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages(pilotMsgs)
+        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
         setHasMore(items.length >= PAGE_SIZE)
 
         if (hasRunning) {
@@ -1001,7 +1254,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           try {
             const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
             if (!cancelled && pageRef.current === 1 && !refetchSuppressedByAbort()) {
-              setMessages(pilotMsgs)
+              setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
               setHasMore(items.length >= PAGE_SIZE)
             }
           } catch { /* keep last live state on refetch failure */ }
@@ -1038,7 +1291,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         const pendingSynthesis = hasPendingDelegationSynthesis(pilotMsgs)
         // Stand down while the /events live feed owns the message list — a wholesale DB replace
         // would clobber live-streamed text not yet persisted.
-        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages(pilotMsgs)
+        if (!refetchSuppressedByAbort() && !recoveredLiveRef.current) setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
         setHasMore(items.length >= PAGE_SIZE)
         if (pendingSynthesis) {
           setStreaming(true)
@@ -1071,6 +1324,10 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   // cover it, and its completion is a pure-ack synthetic turn (no background_turn_done). Poll
   // history while one is running so its card folds running → done live (annotateSubagentCompletions
   // does the fold); stop once folded. Never clobbers a live /send stream or paged-back scrollback.
+  // Covers the batch (group) form too: a user Stop suppresses BOTH live convergence signals
+  // (job_stop claims the notification → no subagent_done, no synthetic turn → no
+  // background_turn_done), so without this poll a stopped group's card stays "Running" until a
+  // manual reload even though the persisted terminal event is already in the DB.
   useEffect(() => {
     if (!sessionId || !hasActiveBgSubagent) return
     let cancelled = false
@@ -1079,11 +1336,26 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       try {
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
-        if (pageRef.current === 1 && !streamingRef.current && !refetchSuppressedByAbort()) {
-          setMessages(pilotMsgs)
+        const blocked = streamingRef.current || refetchSuppressedByAbort()
+        if (!blocked && pageRef.current === 1) {
+          setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
           setHasMore(items.length >= PAGE_SIZE)
+          // Fast-path stop — only on an APPLIED page. Judging fold-ness on an unapplied fetch
+          // races the post-abort suppression window: a Stop lands, the terminal event persists
+          // during refetchSuppressedByAbort(), this poll sees it folded in the FRESH page,
+          // returns — and the on-screen card (which never received that page) sticks on
+          // "Running" forever with no remaining trigger.
+          if (!hasActiveBackgroundSubagent(pilotMsgs) && !hasActiveBackgroundGroup(pilotMsgs)) return
+        } else if (!blocked) {
+          // Paged back: a wholesale replace would drop the loaded scrollback, but skipping
+          // entirely (the old `pageRef === 1` gate) stranded a stopped group's card on
+          // "Running" with this poll re-scheduling forever — when Stop suppresses every live
+          // signal this poll is the only fold path. Merge the fresh page 1 into the loaded
+          // history (same anti-clobber policy as the SSE refetch path). No in-poll stop
+          // judgment here: once the merge folds the card, the effect's hasActiveBgSubagent
+          // dependency flips false and the cleanup below cancels the timer.
+          setMessages((prev) => mergePage1IntoHistory(prev, reconcileRefetchedPage1(prev, pilotMsgs)))
         }
-        if (!hasActiveBackgroundSubagent(pilotMsgs)) return // folded → stop polling
       } catch (err) {
         console.warn("[usePilotChat] background-subagent refresh failed:", err)
       }
@@ -1111,16 +1383,30 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     let refetchTimer: ReturnType<typeof setTimeout> | null = null
 
     async function refetchHistory() {
-      // Only safe to wholesale-replace with page 1 when page 1 is all that's loaded.
-      // If the user has paged back (loaded older history), replacing would discard that
-      // scrollback — skip the live refresh; the completed turn still appears on their next
-      // message or on reload.
-      if (pageRef.current !== 1) return
       try {
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (closed || refetchSuppressedByAbort()) return
-        setMessages(pilotMsgs)
-        setHasMore(items.length >= PAGE_SIZE)
+        if (pageRef.current === 1) {
+          // Page 1 is all that's loaded → wholesale replace with the fresh page 1.
+          setMessages((prev) => reconcileRefetchedPage1(prev, pilotMsgs))
+          setHasMore(items.length >= PAGE_SIZE)
+        } else {
+          // The user has paged back (older history loaded). A wholesale replace would drop that
+          // scrollback, but skipping the refresh strands a completed background turn's card on its
+          // stale "Running…" state until a manual reload (smoke defect S1). Merge the fresh page 1
+          // into the loaded history by id (dedup, no scrollback loss) and re-run the annotation
+          // chain so the terminal delegation_events fold onto their launch card even when it has
+          // scrolled into an older page. hasMore is unchanged — the older pages still exist.
+          //
+          // But NOT while a live /send is streaming: the merge keys by id, and an optimistic (not-
+          // yet-persisted) streaming message has no id in the fresh page 1, so it would fall into
+          // the `older` bucket and be reordered AHEAD of the persisted page-1 block — corrupting the
+          // live order. scheduleRefetch already defers while streaming, but the await above opens a
+          // window in which a stream can START; re-check here and defer via scheduleRefetch instead
+          // of merging (same anti-clobber policy the page-1 branch relies on). No timestamp reorder.
+          if (streamingRef.current) { scheduleRefetch(); return }
+          setMessages((prev) => mergePage1IntoHistory(prev, reconcileRefetchedPage1(prev, pilotMsgs)))
+        }
       } catch (err) {
         console.warn("[usePilotChat] background-turn refetch failed:", err)
       }
@@ -1166,12 +1452,28 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           setMessages((prev) =>
             prev.map((m) => {
               if (!isBackgroundSpawnLaunch(m) || m.metadata?.subBgStatus) return m
-              const parsedJobId = (m.content ? tryParseJson(m.content) : undefined)?.job_id
-              const launchJobId = (typeof parsedJobId === "string" ? parsedJobId : undefined) ?? messageDelegationId(m) ?? m.id
-              return launchJobId === jobId
+              return launchJobId(m) === jobId
                 ? { ...m, metadata: { ...(m.metadata ?? {}), subBackground: true, subBgStatus: status } }
                 : m
             }),
+          )
+          // A group completion reuses this channel (is_group flag): the card can't fold full
+          // per-item detail from this event alone (no summaries/child ids here), so do one
+          // authoritative refetch — annotateGroupCompletions then rebuilds the whole card.
+          if (evt.is_group === true) scheduleRefetch()
+        } else if (evt?.type === "group_progress" && typeof evt.job_id === "string") {
+          // Live per-item progress for a background group: fold the phase + item statuses onto the
+          // launch card in place (no refetch). Summaries + drill-in ids arrive on the completion
+          // refetch above; here we only animate status. Unknown to an old frontend → safely ignored.
+          const jobId = evt.job_id
+          const phase = typeof evt.phase === "string" ? evt.phase : "map"
+          const items = Array.isArray(evt.items) ? (evt.items as unknown[]) : []
+          setMessages((prev) =>
+            prev.map((m) =>
+              isBackgroundGroupLaunch(m) && launchJobId(m) === jobId
+                ? { ...m, metadata: { ...(m.metadata ?? {}), groupBackground: true, groupProgress: { phase, items } } }
+                : m,
+            ),
           )
         }
 

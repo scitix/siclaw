@@ -1,8 +1,8 @@
-# drop/ — 把你的原始文档丢这里
+# drop/ — drop your raw sources here
 
-任意格式:pdf / ppt / xlsx / 图片 / word / markdown / 代码 … 子目录随意。
+Any format: pdf / ppt / xlsx / image / word / markdown / code … subdirectories as you like.
 
-放好后,在本仓打开 Claude Code,说一句"编译 drop/ 里的文档"即可开始。
-编译器会:ingest → 抽断言检矛盾 → 矛盾在对话里问你 → 你裁了接着编 → 产出 OKF bundle 到 `bundle/`。
+Once they're in place, open Claude Code in this repo and just say "compile the documents in drop/" to begin.
+The compiler will: ingest → extract assertions and detect contradictions → ask you about contradictions in the conversation → you adjudicate and it continues compiling → produce an OKF bundle into `bundle/`.
 
-(本目录内容不入 git——是你这个库的私有素材;只跟踪本说明。)
+(The contents of this directory are not tracked in git — they are the private material of your KB; only this note is tracked.)

@@ -66,6 +66,14 @@ export interface JobRecord {
   abort?: () => void;
   // ── subagent-only ───────────────────────────────────────────────
   childSessionId?: string;
+  /**
+   * Set on a `spawn_subagent` batch (map→reduce) job. The job `type` stays "subagent" (reused
+   * deliberately so the three `type === "subagent"` branches — notifyParent event routing,
+   * background-bash concurrency exclusion, stopJob wording — stay correct without a new
+   * JobType). This flag is display/stats-only, so a group can be told apart from a single
+   * sub-agent where that matters (e.g. the Jobs bar / group card).
+   */
+  isGroup?: boolean;
   // ── bash-only ───────────────────────────────────────────────────
   /** Absolute path to the streamed output file, under <userDataDir>/agent/tasks/. */
   outputFile?: string;

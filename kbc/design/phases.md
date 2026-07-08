@@ -1,35 +1,35 @@
-# Phase 模型:可组合的能力,不是死流水线
+# Phase model: composable capabilities, not a rigid pipeline
 
-> **原则**:框架由若干 **phase(能力单元)** 组成,每个 phase 有清晰的 `输入 → 输出` 契约。
-> phase 之间**不互相焊死**——通过共享物(raw / 归一态 / 账本 / bundle / 出处)传递,可**自由组合、按需触发**。
-> **除"编译核心"外,每个 phase 都是可选的。** 流程是"按需拼 phase",不是"跑一条固定的环"。
+> **Principle**: the framework is composed of several **phases (capability units)**, each with a clear `input → output` contract.
+> Phases are **not welded to each other**—they pass work through shared artifacts (raw / normalized form / ledger / bundle / provenance), and can be **freely composed and triggered on demand**.
+> **Except for the "compile core," every phase is optional.** The flow is "assemble phases on demand," not "run one fixed loop."
 
-## phase 清单(各自的契约)
+## Phase inventory (each with its contract)
 
-| phase | 工具 | 输入 → 输出 | 触发时机 | 可选? |
+| phase | Tool | Input → Output | Trigger | Optional? |
 |---|---|---|---|---|
-| **ingest** | `ingest.py` | raw 文件树 → 归一 md + 出处 | 有异构源时 | 可选(本就是 markdown 就跳过) |
-| **compile** | `compile_loop.py` | 归一 md → OKF 断言/bundle + 账本(检矛盾→裁决) | 要建/更新知识 | **核心**(最小不可省) |
-| **audit** | `kb_audit.py` | bundle → 链接/孤儿等 lint | 任意时刻想体检 | 可选,可对任意 bundle 单跑 |
-| **eval(发布闸)** | `kb_eval.py` | bundle + 题集 → 过闸判定 | 发布前想压测 | **可选**,可对任意 bundle 单跑、不依赖编译 |
-| **update(增量)** | `compile_loop.py`(重入) | 变更的 raw → 只重编受影响子图 | raw 改了 | 可选(就是 compile 的重触发) |
-| **serve(消费)** | (消费端 / siclaw 挂载) | bundle → 带源回答 | 上线问答 | 可选 |
+| **ingest** | `ingest.py` | raw file tree → normalized md + provenance | when there are heterogeneous sources | Optional (skip if already markdown) |
+| **compile** | `compile_loop.py` | normalized md → OKF assertions/bundle + ledger (detect contradictions → adjudicate) | to build/update knowledge | **Core** (the minimal, non-omittable one) |
+| **audit** | `kb_audit.py` | bundle → lint for links/orphans/etc. | whenever you want a health check | Optional, can run standalone on any bundle |
+| **eval (publish gate)** | `kb_eval.py` | bundle + question set → gate pass/fail decision | to stress-test before publishing | **Optional**, can run standalone on any bundle, independent of compilation |
+| **update (incremental)** | `compile_loop.py` (re-entry) | changed raw → recompile only the affected subgraph | when raw changed | Optional (just a re-trigger of compile) |
+| **serve (consume)** | (consumer side / siclaw mount) | bundle → answers with sources | to go live with Q&A | Optional |
 
-## 怎么组合(都是合法路径)
+## How to compose (all are valid paths)
 
-- 只想给一个**已有 bundle** 体检:单跑 `audit`,不碰编译。
-- 只想**压测**别人给的 bundle 够不够格:单跑 `eval`,不碰编译(发布闸是纯消费侧)。
-- 标准建库:`ingest → compile`,想要质量门再 `→ eval`,不想要就停在 compile。
-- raw 改了:`ingest(变更文件)→ compile(重入,增量)`,按需再 `eval`。
-- 源本就是干净 markdown:跳过 ingest,直接 `compile`。
+- Just want a health check on an **existing bundle**: run `audit` standalone, don't touch compilation.
+- Just want to **stress-test** whether someone else's bundle is up to par: run `eval` standalone, don't touch compilation (the publish gate is purely consumer-side).
+- Standard KB build: `ingest → compile`; add `→ eval` if you want a quality gate, or stop at compile if you don't.
+- raw changed: `ingest (changed files) → compile (re-entry, incremental)`, then `eval` as needed.
+- Sources are already clean markdown: skip ingest, go straight to `compile`.
 
-## 为什么这样切(设计立场)
+## Why cut it this way (design stance)
 
-- **每个 phase 自带契约、能独立跑** → 谁都不绑谁;新 phase 加进来只需声明 `输入→输出`。
-- **共享物是接口,不是调用链**:账本(编译状态)、bundle(OKF 产物)、出处(回源)是 phase 间唯一耦合点;
-  phase A 不直接 call phase B。
-- **可选优先**:发布闸、audit、增量、ingest 都可缺省。最小可用 = 一个 compile。
-- **按需触发**:同一个 phase 可被多种事件触发(compile 既是首次建库、也是增量更新、也是反哺重编)。
+- **Each phase carries its own contract and can run independently** → nothing binds anything else; adding a new phase only requires declaring `input → output`.
+- **Shared artifacts are the interface, not a call chain**: the ledger (compile state), the bundle (OKF output), and provenance (trace back to source) are the only coupling points between phases;
+  phase A does not directly call phase B.
+- **Optional-first**: the publish gate, audit, incremental, and ingest can all be omitted. The minimal usable set = a single compile.
+- **Triggered on demand**: the same phase can be triggered by multiple events (compile is the first-time build, the incremental update, and the feedback-driven recompile alike).
 
-> 反面教材:把 ingest→compile→audit→eval→serve 写成一个固定顺序、缺一不可、互相 import 的大循环。
-> 那会让"我只想 lint 一下"或"我只想压测别人的 bundle"变成做不到的事。**别焊死。**
+> Anti-pattern: writing ingest→compile→audit→eval→serve as one big loop with a fixed order, where every step is mandatory and they import each other.
+> That would make "I just want to lint" or "I just want to stress-test someone else's bundle" impossible. **Don't weld it shut.**

@@ -100,7 +100,7 @@ describe("deepInvestigationExtension — activation via [Deep Investigation] mar
     expect(transform).toBeDefined();
     expect(transform.text).toContain("Deep Investigation mode");  // preamble
     expect(transform.text).toContain("Do not ask the user to choose A/B/C after every message");
-    expect(transform.text).toContain("emit one spawn_subagent per lead in a single turn");
+    expect(transform.text).toContain("put them all in ONE spawn_subagent call's items list");
     expect(transform.text).toContain("do not spawn one sub-agent, wait for it");
     expect(transform.text).toContain("Do not render any visible choice list in the markdown");
     expect(transform.text).toContain("<!-- hypothesis-checkpoint -->");

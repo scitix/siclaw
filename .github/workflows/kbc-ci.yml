@@ -11,17 +11,23 @@ on:
     branches: [main]
     paths: ["kbc/**", ".github/workflows/kbc-ci.yml"]
 
+# Least-privilege: this job only reads the repo (no PR writes, no packages).
+permissions:
+  contents: read
+
 jobs:
   box-test:
     name: KBC Box Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install claude-agent-sdk aiohttp
+      - run: pip install claude-agent-sdk aiohttp python-pptx openpyxl python-docx
       - run: python test_compile_box.py
+        working-directory: kbc/platform/pod
+      - run: python test_office_ingest.py
         working-directory: kbc/platform/pod
       - run: python test_selfcheck.py
         working-directory: kbc/platform/pod

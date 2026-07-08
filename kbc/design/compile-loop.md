@@ -1,91 +1,91 @@
-# 编译环状态机(阶段③ · 心脏 · 草案 v0)
+# Compile-loop state machine (Phase ③ · the heart · draft v0)
 
-> 自驱编译:读账本 → 编下一批 → 记三态 → 能自裁的自裁、不可约的攒成领域选择题 →
-> **绕过 block 继续编,只剩 block 才停**。状态全在账本+git,任意时刻可中断/恢复。
+> Self-driven compile: read the ledger → compile the next batch → record three states → self-adjudicate what can be self-adjudicated, batch the irreducible ones into domain multiple-choice questions →
+> **route around blocks and keep compiling; stop only when nothing but blocks remains**. All state lives in the ledger + git; interruptible/resumable at any moment.
 >
-> **机器是机制(框架发,域无关);"什么算可自裁/怎么裁"由装载的宪法说了算(per-KB)。**
-> 本文件只定义编排骨架,不内置任何库的具体分类法。
+> **The machine is mechanism (shipped by the framework, domain-agnostic); "what counts as self-adjudicable / how to adjudicate" is decided by the loaded constitution (per-KB).**
+> This file defines only the orchestration skeleton; it hard-codes no specific taxonomy for any KB.
 
-## 一、持久状态 = 账本(resume 与增量都靠它)
+## 1. Persistent state = the ledger (both resume and incremental rely on it)
 
 ```
-ledger（json 或 sqlite,随 bundle 进 git）:
-  sources : [{anchor_id, src_file, loc, hash, status}]    # 来自 ingest 的 provenance
+ledger (json or sqlite, travels with the bundle in git):
+  sources : [{anchor_id, src_file, loc, hash, status}]    # provenance from ingest
             # status: pending | compiled | parked
-  nodes   : [{node_id, type, from_anchors[], hash}]        # 产出的 OKF 节点 + 反向出处
+  nodes   : [{node_id, type, from_anchors[], hash}]        # produced OKF nodes + back-references to source
   findings: [{finding_id, kind, refs[], status, resolution, mcq}]
             # kind: dup | contradiction | gap
             # status: auto_resolved | parked | ruled
-            # resolution: 规则名 或 人裁结论(含 "ruled by human @date")
-            # mcq: 若 parked,这里存框好的领域选择题(证据内联+预分类选项)
-  rounds  : {dry_count, last_progress_at}                  # 收敛守卫
+            # resolution: rule name or human ruling (includes "ruled by human @date")
+            # mcq: if parked, holds the framed domain multiple-choice question (evidence inlined + pre-classified options)
+  rounds  : {dry_count, last_progress_at}                  # convergence guard
 ```
 
-- `sources.hash` = 增量的钥匙:raw 文件变了 → hash 变 → 该 anchor 及其下游 nodes 标重检。
-- `findings` 去重靠 `kind+refs` 指纹:**同一个矛盾只 park 一次**(否则每轮重复抛,永不收敛)。
+- `sources.hash` = the key to incremental compilation: a raw file changes → its hash changes → that anchor and its downstream nodes are flagged for re-check.
+- `findings` are de-duplicated by a `kind+refs` fingerprint: **the same contradiction is parked only once** (otherwise it is re-thrown every round and never converges).
 
-## 二、状态与迁移
+## 2. States and transitions
 
 ```
-        ┌──────┐  装载 profile/宪法 + ingest 语料 + 账本(无则建空)
+        ┌──────┐  load profile/constitution + ingest corpus + ledger (create empty if none)
         │ INIT │
         └──┬───┘
            ▼
-   ┌────────────────┐   有可推进批次? ── 是 ─────────────▶ COMPILE_BATCH
-   │     SELECT     │   无,但有 parked ───────────────▶ PARK ─▶ WAIT_HUMAN
-   │  (读账本选活)  │   无,且无 parked ─▶ DRY? ─ <K ─▶(回 SELECT)
-   └───────▲────────┘                          └─ ≥K ─▶ CONVERGED
-           │
-  ┌────────┴─────────┐  抽取→结构化成 OKF→去重/织链→检测矛盾
-  │  COMPILE_BATCH   │  成功结构化的 → nodes ✅ compiled
-  └────────┬─────────┘
-           ▼  每个 finding 过一遍
-     ┌───────────┐   宪法.classify(finding) ──┐
-     │  TRIAGE   │   可自裁 ─▶ AUTO_RESOLVE ─▶ ✅ ─▶ 回 SELECT
-     │ (护城河)  │   不可约 ─▶ PARK_ITEM(框成 MCQ,攒批)─▶ 回 SELECT
-     │           │   没理解 ─▶ PARK_ITEM(标存疑,攒批)─▶ 回 SELECT
-     └───────────┘
+   ┌─────────────────────┐  any advanceable batch? ── yes ──────────▶ COMPILE_BATCH
+   │        SELECT       │  none, but parked exist ─────────────────▶ PARK ─▶ WAIT_HUMAN
+   │ (read ledger, pick) │  none, and no parked ─▶ DRY? ─ <K ─▶ (back to SELECT)
+   └──────────▲──────────┘                        └─ ≥K ─▶ CONVERGED
+              │
+   ┌──────────┴──────────┐  extract → structure into OKF → dedup/weave links → detect contradictions
+   │    COMPILE_BATCH     │  successfully structured → nodes ✅ compiled
+   └──────────┬──────────┘
+              ▼  iterate over every finding
+     ┌──────────────┐   constitution.classify(finding) ──┐
+     │    TRIAGE     │   self-adjudicable ─▶ AUTO_RESOLVE ─▶ ✅ ─▶ back to SELECT
+     │  (the moat)   │   irreducible ─▶ PARK_ITEM (frame as MCQ, batch) ─▶ back to SELECT
+     │              │   not understood ─▶ PARK_ITEM (flag questionable, batch) ─▶ back to SELECT
+     └──────────────┘
 
-  WAIT_HUMAN ── 人裁到达 ──▶ BACKFILL(回填固化)──▶ 回 SELECT
-  [raw 更新事件] ─▶ 按 hash 标受影响 nodes 重检 ─▶ 重新进 SELECT
+  WAIT_HUMAN ── human ruling arrives ──▶ BACKFILL (backfill & harden) ──▶ back to SELECT
+  [raw update event] ─▶ flag affected nodes for re-check by hash ─▶ re-enter SELECT
 ```
 
-**逐状态:**
+**State by state:**
 
-| 状态 | 做什么 | 出口 |
+| State | What it does | Exit |
 |---|---|---|
-| **INIT** | 装载 profile/宪法/语料/账本 | → SELECT |
-| **SELECT** | 从账本挑下一批可推进的活:未编的源 anchor / 被人裁解锁的 parked / 被增量标重检的 node | 见三 |
-| **COMPILE_BATCH** | 对该批:抽取断言(带 provenance)→ 按宪法结构化成 OKF 节点 → 与既有去重/织链 → 检测矛盾。成功的写 nodes ✅ | → TRIAGE(逐 finding) |
-| **TRIAGE** | 调 `宪法.classify(finding)` 决定走向(**这是护城河的判断点,机器只分派,规则在宪法**) | 三选一↓ |
-| **AUTO_RESOLVE** | 套宪法默认裁法(如并列标注/留新/标记),记 resolution+provenance,该项 ✅ | → SELECT |
-| **PARK_ITEM** | 把框好的领域 MCQ(证据内联+预分类选项+"我也不确定"逃生口)写进待对齐批,该单元 parked | → SELECT(**继续绕**) |
-| **PARK** | 只剩人能裁了:把待对齐批整批抛给人,持久化,挂起 | → WAIT_HUMAN |
-| **WAIT_HUMAN** | 挂起(用 fork 的循环运行时的 interrupt/WAITING_FOR_CONFIRMATION),零算力等 | 人裁到达 → BACKFILL |
-| **BACKFILL** | 应用人裁:矛盾→compiled(记人裁结论+date),解锁依赖项 | → SELECT(恢复) |
-| **CONVERGED** | 无可推进、无 parked、干涸 ≥K 轮 = 编译完成,交阶段⑥发布闸 | 终态(至 raw 更新或新问题再入) |
+| **INIT** | Load profile/constitution/corpus/ledger | → SELECT |
+| **SELECT** | Pick the next advanceable batch of work from the ledger: uncompiled source anchors / parked items unlocked by a human ruling / nodes flagged for re-check by the incremental path | See section 3 |
+| **COMPILE_BATCH** | For that batch: extract assertions (with provenance) → structure them into OKF nodes per the constitution → dedup/weave links against existing nodes → detect contradictions. Write successful ones to nodes ✅ | → TRIAGE (per finding) |
+| **TRIAGE** | Call `constitution.classify(finding)` to decide the direction (**this is the moat's decision point; the machine only dispatches, the rules live in the constitution**) | One of three ↓ |
+| **AUTO_RESOLVE** | Apply the constitution's default resolution (e.g., annotate side-by-side / keep the newer / mark), record resolution+provenance, item ✅ | → SELECT |
+| **PARK_ITEM** | Write the framed domain MCQ (evidence inlined + pre-classified options + an "I'm not sure either" escape hatch) into the pending-alignment batch; that unit is parked | → SELECT (**keep routing around**) |
+| **PARK** | Only human-adjudicable items remain: throw the whole pending-alignment batch to the human, persist, suspend | → WAIT_HUMAN |
+| **WAIT_HUMAN** | Suspended (via the forked loop runtime's interrupt/WAITING_FOR_CONFIRMATION), waiting with zero compute | Human ruling arrives → BACKFILL |
+| **BACKFILL** | Apply the human ruling: contradiction → compiled (record the human ruling + date), unlock dependents | → SELECT (resume) |
+| **CONVERGED** | Nothing advanceable, nothing parked, dry for ≥K rounds = compilation complete, hand off to the Phase ⑥ publish gate | Terminal state (re-enters on a raw update or a new problem) |
 
-## 三、两个停止条件(必须分清)
+## 3. Two stop conditions (must be told apart)
 
-- **PARK(block)**:能编的都编了,**剩下全是只有人能裁的**。→ 抛 MCQ 批,等人。
-  这是你说的"block 到底再停"。**注意:不是撞到第一个 block 就停,是把 block 攒着、绕过去继续编,只剩 block 才停。**
-- **CONVERGED(干涸)**:没有可推进的,也没有 parked,且连续 K 轮无新进展。→ 真停,交发布闸。
-  `dry_count` 防空转(agent 老"觉得还有的理解"导致无限循环)。
+- **PARK (block)**: everything compilable has been compiled, **all that remains is human-only adjudication**. → throw the MCQ batch, wait for the human.
+  This is what you called "stop only at the bottom of the blocks." **Note: it does not stop at the first block it hits; it accumulates blocks, routes around them and keeps compiling, and stops only when nothing but blocks remains.**
+- **CONVERGED (dried up)**: nothing advanceable, nothing parked, and K consecutive rounds with no new progress. → truly stop, hand off to the publish gate.
+  `dry_count` guards against spinning (the agent perpetually "feeling there's more to understand" and looping forever).
 
-## 四、护城河的纪律(TRIAGE 不塌的关键)
+## 4. Discipline of the moat (the key to TRIAGE not collapsing)
 
-1. **默认 park,不默认猜**:只有宪法给出确定性规则时才 AUTO_RESOLVE;否则 PARK_ITEM(存疑不硬编)。
-2. **但别淹没人**:宪法的自裁规则吃掉大头(如"口径差异→并列"),只有真领域分叉才 park。
-3. **一个矛盾只 park 一次**(按 `kind+refs` 指纹去重),否则永不收敛。
-4. **攒批再抛**:PARK_ITEM 只入队,PARK 才整批抛给人——不逐条打断。
+1. **Park by default, don't guess by default**: AUTO_RESOLVE only when the constitution gives a deterministic rule; otherwise PARK_ITEM (leave it questionable, don't hard-code).
+2. **But don't drown the human**: the constitution's self-adjudication rules absorb the bulk (e.g., "convention difference → side-by-side"); only genuine domain forks get parked.
+3. **A contradiction is parked only once** (de-duplicated by the `kind+refs` fingerprint), otherwise it never converges.
+4. **Batch, then throw**: PARK_ITEM only enqueues; PARK is what throws the whole batch to the human—no per-item interruptions.
 
-## 五、resume / 增量(阶段④的接入点)
+## 5. resume / incremental (the integration point for Phase ④)
 
-- **resume**:每次迁移都持久化账本 + 把 OKF 节点写盘。任意中断后重入 = 重读账本,从 SELECT 续,幂等。状态不在对话里。
-- **增量(阶段④)**:外部"raw 更新"事件 = 比对 `sources.hash`,变了的 anchor → 其下游 nodes 标重检 → 注入 SELECT。**只重编受影响的子图 + 邻居 + 在 delta 上重跑矛盾检测,不全量重来。** 别人没 provenance 就只能全量重编 —— 这是护城河的延伸。
+- **resume**: every transition persists the ledger + writes OKF nodes to disk. Re-entry after any interruption = re-read the ledger, continue from SELECT, idempotent. State does not live in the conversation.
+- **incremental (Phase ④)**: an external "raw update" event = diff `sources.hash`; changed anchors → their downstream nodes flagged for re-check → injected into SELECT. **Recompile only the affected subgraph + neighbors + re-run contradiction detection on the delta, not everything from scratch.** Anyone without provenance can only do a full recompile — this is an extension of the moat.
 
-## 六、边界(本草案不含)
+## 6. Boundaries (not covered by this draft)
 
-- COMPILE_BATCH 里"抽取/结构化"的具体智能 = agent 在宪法约束下干的活,本文件只定义它何时被调度、产物如何记账。
-- MCQ 的框法质量 = 已单独验证(领域语言+证据内联+预分类选项)。
-- 发布闸(阶段⑥)= 下游,CONVERGED 后接。
+- The actual intelligence of "extract/structure" inside COMPILE_BATCH = work the agent does under the constitution's constraints; this file defines only when it is scheduled and how its outputs are recorded in the ledger.
+- The quality of MCQ framing = validated separately (domain language + evidence inlined + pre-classified options).
+- The publish gate (Phase ⑥) = downstream, connected after CONVERGED.

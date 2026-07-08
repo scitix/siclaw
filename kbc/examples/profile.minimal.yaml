@@ -1,0 +1,13 @@
+# Example B: a nearly-bare platform KB (markdown + frontmatter only, no coverage/sensitive tools)
+# —— Same framework, but here `dimensions` is empty and only the spine runs. This is living
+#    proof of the "make no assumption about what the KB looks like" design.
+name: minimal-kb
+bundle_root: /path/to/platform-kb/wiki
+constitution: /path/to/kb-method          # same infra flavor; a KB in another domain points at a different constitution
+audit:
+  reserved_extra:                           # maintenance / review pages, not counted as orphans
+    - LEDGER.md
+    - TO-ALIGN.md
+  link_styles: [markdown]
+  dimensions: {}                            # bare KB: no leaf tools
+tools_registry: {}

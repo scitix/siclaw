@@ -65,6 +65,21 @@ describe("materializeCapabilityInputs", () => {
     expect(backend.request).toHaveBeenCalledTimes(1); // workspace never fetched
   });
 
+  it("live box detected via structured err.status (message wording independent)", async () => {
+    // The client attaches err.status; a reworded message with no "failed: 409"
+    // substring must still be recognized as box-already-live (finding E).
+    const err = Object.assign(new Error("conflict: box already holds this run"), { status: 409 });
+    const { client, backend, posts } = fakes({
+      raw: { bundle_base64: "UkFX" },
+      workspace: { bundle_base64: "V1M=" },
+      sourcesError: err,
+    });
+    await materializeCapabilityInputs({ client, backend, runId: "r1" });
+
+    expect(posts).toEqual([]);
+    expect(backend.request).toHaveBeenCalledTimes(1);
+  });
+
   it("empty KB (no raw bundle): posts nothing and does not guess freshness", async () => {
     const { client, backend, posts } = fakes({ raw: {}, workspace: { bundle_base64: "V1M=" } });
     await materializeCapabilityInputs({ client, backend, runId: "r1" });

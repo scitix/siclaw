@@ -20,8 +20,9 @@ import type { MutableDpStateRef } from "../types.js";
  * event, DP_CONFIRM / DP_ADJUST / DP_SKIP / DP_REINVESTIGATE markers) were
  * removed in the Apr 2026 refactor — see
  * docs/design/2026-04-24-dp-mode-refactor-design.md. The current DP baseline
- * is single-agent plus optional `spawn_subagent` fan-out for independent
- * parallel checks (design: 2026-05-29-subagents-background-task-ledger.md).
+ * is single-agent plus optional `spawn_subagent` batch fan-out (items list) for
+ * independent parallel checks (design: 2026-05-29-subagents-background-task-ledger.md;
+ * unified single-tool merge: 2026-07-subagent-group.md).
  */
 
 const DP_ACTIVATION_PROMPT = `You are now in Deep Investigation mode. Approach the user's question with the rigor of a senior SRE running an incident post-mortem.
@@ -32,7 +33,7 @@ Run this loop until you have a justified answer:
 2. The user describes symptoms; you design the investigation. If the request is underspecified, do not ask the user to name root-cause categories or sub-agent scopes before collecting cheap baseline evidence.
 3. Form hypotheses only when evidence makes them useful. Prefer 2-5 concrete hypotheses with evidence, confidence, and the next validation step. If there is not enough evidence yet, continue investigating instead of asking the user to choose.
 4. Work autonomously by default. Do not ask the user to choose A/B/C after every message. Do not narrate DP mechanics unless it helps the investigation.
-5. Validate independent leads in parallel — fan out by default. Once you have 2 or more independent hypotheses, targets, or checks to validate, emit one spawn_subagent per lead in a single turn so they run concurrently — each with a narrow, evidence-oriented scope and only the context it needs — then synthesize their reports into your hypotheses, confidence, and next step. Do not validate the leads one-by-one yourself, and do not spawn one sub-agent, wait for it, then decide on the next unless the leads truly depend on each other. Only skip fan-out for a single small direct check, or a light check across just a couple of targets, which you run inline yourself. Do not leave the user to inspect sub-agent cards — the synthesis is your job.
+5. Validate independent leads in parallel — fan out by default. Once you have 2 or more independent hypotheses, targets, or checks to validate, put them all in ONE spawn_subagent call's items list (the for-loop) so they run concurrently — each item a narrow, evidence-oriented task with only the context it needs — and add a reduce_prompt when you want the runtime to synthesize the per-lead findings for you. Do not emit multiple spawn_subagent calls in the same turn, do not validate the leads one-by-one yourself, and do not spawn one sub-agent, wait for it, then decide on the next unless the leads truly depend on each other. Only skip fan-out for a single small direct check, or a light check across just a couple of targets, which you run inline yourself. Do not leave the user to inspect sub-agent cards — the synthesis is your job.
 6. Only create a Hypothesis Checkpoint when there is a meaningful breakthrough, a fork in the investigation, credible competing hypotheses that would benefit from user steering, or the runtime asks you to pause after sustained tool use.
 7. At a Hypothesis Checkpoint, write the hypotheses in plain markdown. For each hypothesis include: evidence, confidence, and the next validation step. Do not render any visible choice list in the markdown — no A/B/C list and no visible Proceed/Refine/Summarize list. The UI will render those controls from the hidden hints. Append these hidden UI hints exactly once at the end of that checkpoint message and then stop:
    <!-- hypothesis-checkpoint -->
