@@ -25,14 +25,10 @@ WORKDIR /app
 # locale prompt packs (prompts/<locale>/playbook.md); the env is a local-dev
 # escape hatch and setting it in the image would override every locale.
 COPY CLAUDE.md /app/CLAUDE.md
-COPY platform/pod/compile_agent.py /app/compile_agent.py
-COPY platform/pod/compile_box.py /app/compile_box.py
-COPY platform/pod/selfcheck.py /app/selfcheck.py
-COPY platform/pod/batching.py /app/batching.py
-COPY platform/pod/incremental.py /app/incremental.py
-COPY platform/pod/engine.py /app/engine.py
-COPY platform/pod/redblue.py /app/redblue.py
-COPY platform/pod/mediaverify.py /app/mediaverify.py
+# All pod modules via a glob so a new one can never be forgotten again (2026-07-07:
+# incremental.py was omitted from the explicit list and crashed the box on startup
+# with ModuleNotFoundError). test_*.py are excluded via kbc/.dockerignore.
+COPY platform/pod/*.py /app/
 COPY platform/pod/prompts/ /app/prompts/
 COPY tools/ /app/tools/
 
