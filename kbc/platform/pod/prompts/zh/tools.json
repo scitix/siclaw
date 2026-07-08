@@ -14,5 +14,12 @@
     "not_found": "没找到工单 {tid};现有 id: {ids}",
     "write_failed": "写 CONTRADICTIONS.json 失败: {e}",
     "registered": "工单 {tid} 已登记回修(agent_report 已写入)"
+  },
+  "propose_questions": {
+    "desc": "编完(写完 candidate/index.md、审计过)后顺手调:提交 3-5 道供负责人测试知识库的备题。questions 是数组,每条 {question: 单一事实问句, reference: 参考答案(≤150字), source: 原料出处}。追加式:重复调用会按题面去重合并进 authoring/QUESTIONS_PROPOSED.json,绝不覆盖前一轮已备的题。",
+    "need_list": "propose_questions 需要 questions 数组",
+    "write_failed": "写 QUESTIONS_PROPOSED.json 失败: {e}",
+    "summary": "已备 {added} 道测试题(去重跳过 {skipped}),共 {total} 道待负责人挑选。",
+    "registered": "备题已登记:新增 {added}、去重跳过 {skipped}、当前共 {total} 道(authoring/QUESTIONS_PROPOSED.json)。"
   }
 }

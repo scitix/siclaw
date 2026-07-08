@@ -89,7 +89,6 @@ def _prompt(name: str, locale: str | None) -> str:
             return fp.read_text(encoding="utf-8")
     raise FileNotFoundError(f"prompt pack missing: {name} (locale={locale!r})")
 
-
 def _tool_strings(locale: str | None) -> dict:
     """Model-facing tool descriptions/result texts from the locale pack (JSON)."""
     tried = []
@@ -506,6 +505,182 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
     }
 
 
+# ── Protocol v3 helpers: quickstart brief + proposed-question merge ──
+# Both are deterministic (code, not model formatting) so a durable record can't
+# be lost to how the agent paraphrases — the same principle behind PROPOSED_PLAN.json.
+
+_BRIEF_MARKER = "我的定调标签"
+_BRIEF_PATH = "authoring/BRIEF.json"
+QUESTIONS_PROPOSED_PATH = "authoring/QUESTIONS_PROPOSED.json"
+_BRIEF_RAW_MAX = 4000  # cap the durable brief's raw slice — the agent is told to follow it
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write `text` atomically: a temp file in the same dir + os.replace. A torn
+    write (SIGTERM / OOM / full disk mid-write) must never leave a half-file that
+    the next read falls back to empty on — that would silently drop prior rounds
+    (e.g. every earlier proposed question). os.replace is atomic within one
+    filesystem on POSIX."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text, "utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _split_brief_tags(s: str) -> list[str]:
+    """Split a multi-tag value on Chinese/Latin list separators, dropping blanks."""
+    return [t.strip() for t in re.split(r"[、,，;；]", s) if t.strip()]
+
+
+def parse_brief_block(message: str) -> dict | None:
+    """Extract the quickstart 定调 brief block from an opening compile message
+    into the structured BRIEF.json record, or None when no brief block is present.
+    The wizard's 「开始生成知识库」appends a block shaped like:
+
+        我的定调标签(请作为本次编译的 brief):
+        - 给谁看:内部工程师
+        - 内容倾向:详尽百科、保留内部信息、只留最新版本
+        - 自定义:偏排障场景
+        请按这些标签作为编译 brief 执行。
+
+    Parsing it in code (rather than trusting the model to transcribe it) keeps the
+    durable brief verbatim regardless of how the agent paraphrases downstream."""
+    if not message or _BRIEF_MARKER not in message:
+        return None
+    # Take the LAST marker occurrence (the wizard appends the brief block at the
+    # end) and cap the slice — an unbounded first-occurrence slice would lock onto
+    # a marker mentioned earlier in prose and pull the whole unrelated tail into
+    # the durable brief, bloating the agent's context.
+    raw = message[message.rfind(_BRIEF_MARKER):].strip()[:_BRIEF_RAW_MAX]
+    audience = ""
+    styles: list[str] = []
+    custom: list[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        m = re.match(r"^[-*]\s*给谁看\s*[:：]\s*(.+)$", s)
+        if m:
+            audience = m.group(1).strip()
+            continue
+        m = re.match(r"^[-*]\s*内容倾向\s*[:：]\s*(.+)$", s)
+        if m:
+            styles = _split_brief_tags(m.group(1))
+            continue
+        m = re.match(r"^[-*]\s*自定义\s*[:：]\s*(.+)$", s)
+        if m:
+            custom = _split_brief_tags(m.group(1))
+            continue
+    if not (audience or styles or custom):
+        return None  # marker present but no tag field parsed → not a real brief
+    return {"source": "quickstart_message", "audience": audience,
+            "styles": styles, "custom": custom, "raw": raw}
+
+
+def _write_brief(workdir: str, brief: dict) -> None:
+    _write_text_atomic(Path(workdir) / _BRIEF_PATH,
+                       json.dumps(brief, ensure_ascii=False, indent=2) + "\n")
+
+
+def _capture_brief(run: "CompileRun", text: str) -> bool:
+    """Parse + persist the OPENING brief block, first-capture-wins. Fail-open: a
+    brief capture hiccup must never block the compile turn. Returns whether it
+    wrote. Runs on every /message, so it only writes when BRIEF.json does not yet
+    exist — otherwise a later message that merely mentions the marker phrase (a
+    quote, an aside) would clobber the real brief, often with a near-empty record
+    the agent is then told to follow."""
+    try:
+        if (Path(run.workdir) / _BRIEF_PATH).exists():
+            return False
+        brief = parse_brief_block(text)
+        if brief is None:
+            return False
+        _write_brief(run.workdir, brief)
+        return True
+    except Exception:
+        return False
+
+
+# The exact whitespace set to strip, enumerated so it is byte-identical with the
+# frontend's mirror (ECMAScript `\s`). Python `re` `\s` and JS `\s` are DIFFERENT
+# fixed sets (Python `\s` strips U+0085 / U+001C–U+001F, JS `\s` strips U+FEFF),
+# so relying on `\s` on either side makes the derived id diverge for a question
+# containing one of those chars — and the frontend re-derives this id for legacy
+# id-less rows, so a divergence resurfaces the adopt/dismiss failure. This
+# explicit class removes the ambiguity; keep it in lockstep with the frontend.
+_WS_RE = re.compile("[\t\n\x0b\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
+_QUESTION_PUNCT = "?？。.!！,，、"
+
+
+def _normalize_question(q: str) -> str:
+    """Dedup key + stable-id basis for a proposed question: strip the fixed
+    whitespace set (`_WS_RE`, enumerated to match the frontend — NOT `\\s`), strip
+    a fixed leading/trailing punctuation set, then lowercase. Trailing punctuation
+    and case are collapsed BY DESIGN — `删除?` and `删除。` map to one key (a
+    question differing only by trailing punctuation is treated as the same); an
+    all-punctuation question normalizes to `""` and the caller drops it."""
+    return _WS_RE.sub("", str(q or "")).strip(_QUESTION_PUNCT).lower()
+
+
+def _fnv1a32(s: str) -> int:
+    """32-bit FNV-1a over the UTF-8 bytes of s. Shared, fixed formula with the
+    frontend so both sides derive the SAME proposal id from a question."""
+    h = 2166136261
+    for b in s.encode("utf-8"):
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def _question_id(normalized: str) -> str:
+    """Stable proposal id agreed with the frontend: 'q-' + fnv1a32(normalized
+    question) as zero-padded 8-hex-digit lowercase. The frontend POSTs this as
+    proposal_id on adopt/dismiss — a missing id → empty proposal_id → the consumer 500s."""
+    return "q-" + format(_fnv1a32(normalized), "08x")
+
+
+def merge_proposed_questions(existing: list, incoming: list) -> tuple[list, int, int]:
+    """Append-merge newly proposed questions onto the existing list, skipping
+    duplicates by normalized question text. Every merged entry carries a stable
+    `id` (see _question_id) — the frontend needs it as proposal_id on adopt/dismiss.
+    A prior explicit id is preserved; legacy/id-less entries are backfilled from
+    the same formula (identical for the same question). Returns (merged, added,
+    skipped). Append-only across rounds so a re-proposal never wipes prior picks."""
+    merged: list = []
+    seen: set = set()
+    for q in existing:
+        if not isinstance(q, dict):
+            continue
+        text = str(q.get("question", "")).strip()
+        if not text:
+            continue
+        key = _normalize_question(text)
+        seen.add(key)
+        qid = str(q.get("id", "")).strip() or _question_id(key)
+        merged.append({**q, "id": qid, "question": text})
+    added = skipped = 0
+    for item in incoming:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        text = str(item.get("question", "")).strip()
+        key = _normalize_question(text)
+        if not key or key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        merged.append({
+            "id": _question_id(key),
+            "question": text,
+            "reference": str(item.get("reference", "")).strip(),
+            "source": str(item.get("source", "")).strip(),
+        })
+        added += 1
+    return merged, added, skipped
+
+
 def _make_compile_tools(run: CompileRun):
     """Build the box's custom tools (closures over run) — the structured-signal
     moat. All model-facing text (descriptions + result strings) comes from the
@@ -526,11 +701,10 @@ def _make_compile_tools(run: CompileRun):
         # remains the box's own working state; syncing happens at turn end.
         plan_text = str(args.get("plan", ""))
         proposal_path = Path(run.workdir) / "authoring" / "PROPOSED_PLAN.json"
-        proposal_path.parent.mkdir(parents=True, exist_ok=True)
-        proposal_path.write_text(json.dumps({
+        _write_text_atomic(proposal_path, json.dumps({
             "text": plan_text,
             "proposed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }, ensure_ascii=False, indent=2), "utf-8")
+        }, ensure_ascii=False, indent=2))
         await run.emit({"type": "plan_proposed", "plan": plan_text})
         # Advisory nudge only — working-state hygiene, never a gate.
         reminder = ""
@@ -578,12 +752,33 @@ def _make_compile_tools(run: CompileRun):
             "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         try:
-            path.write_text(json.dumps(tickets, ensure_ascii=False, indent=2), "utf-8")
+            _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
         except Exception as e:
             return {"content": [{"type": "text", "text": rt["write_failed"].format(e=e)}]}
         return {"content": [{"type": "text", "text": rt["registered"].format(tid=tid)}]}
 
-    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket])
+    @tool("propose_questions", ts["propose_questions"]["desc"], {"questions": list})
+    async def propose_questions(args):
+        pq = ts["propose_questions"]
+        incoming = args.get("questions")
+        if not isinstance(incoming, list):
+            return {"content": [{"type": "text", "text": pq["need_list"]}]}
+        path = Path(run.workdir) / QUESTIONS_PROPOSED_PATH
+        try:
+            existing = json.loads(path.read_text("utf-8")) if path.exists() else []
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:
+            existing = []  # a corrupt/half-written prior file must not lose this round
+        merged, added, skipped = merge_proposed_questions(existing, incoming)
+        try:
+            _write_text_atomic(path, json.dumps(merged, ensure_ascii=False, indent=2) + "\n")
+        except Exception as e:
+            return {"content": [{"type": "text", "text": pq["write_failed"].format(e=e)}]}
+        await run.emit({"type": "summary", "summary": pq["summary"].format(added=added, skipped=skipped, total=len(merged))})
+        return {"content": [{"type": "text", "text": pq["registered"].format(added=added, skipped=skipped, total=len(merged))}]}
+
+    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket, propose_questions])
 
 
 def _seed_workdir(workdir: str):
@@ -717,6 +912,7 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
     "mcp__compile__resolve_ticket",
+    "mcp__compile__propose_questions",
 ]
 
 
@@ -1040,6 +1236,10 @@ async def handle_message(request: web.Request):
     text = (body.get("message") or "").strip()
     if not text:
         return web.json_response({"error": "message is required"}, status=400)
+    # v3 brief: if the wizard's 「开始生成知识库」message carries a 定调标签 block,
+    # persist it deterministically to authoring/BRIEF.json BEFORE the turn so the
+    # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
+    _capture_brief(run, text)
     await run.client.query(text)
     return web.json_response({"ok": True})
 

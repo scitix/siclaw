@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -694,6 +695,216 @@ def test_install_wiki_snapshot_size_guard():
     print("✓ install_wiki_snapshot size guards (compressed + unpacked caps)")
 
 
+# ── Protocol v3: brief consumption + append-only proposed questions ──
+
+def test_parse_brief_block():
+    """The wizard's 定调标签 block parses into the BRIEF.json record (tags split on
+    Chinese separators, raw kept from the marker); an ordinary message → None."""
+    msg = (
+        "开始生成知识库。\n\n"
+        "我的定调标签(请作为本次编译的 brief):\n"
+        "- 给谁看:内部工程师\n"
+        "- 内容倾向:详尽百科、保留内部信息、只留最新版本\n"
+        "- 自定义:偏排障场景、少写背景\n"
+        "请按这些标签作为编译 brief 执行。"
+    )
+    brief = compile_box.parse_brief_block(msg)
+    assert brief["source"] == "quickstart_message"
+    assert brief["audience"] == "内部工程师", brief
+    assert brief["styles"] == ["详尽百科", "保留内部信息", "只留最新版本"], brief
+    assert brief["custom"] == ["偏排障场景", "少写背景"], brief
+    assert brief["raw"].startswith("我的定调标签"), brief  # QUICKSTART prefix stripped off
+    # no brief block → None (an ordinary prepare/compile message is left untouched)
+    assert compile_box.parse_brief_block("把 raw/ 编成候选页") is None
+    assert compile_box.parse_brief_block("") is None
+    print("✓ parse_brief_block (tags split, raw from marker, None when absent)")
+
+
+def test_merge_proposed_questions():
+    """Append-merge is dedup-by-question, drops malformed entries, and never wipes
+    the carried-over list."""
+    existing = [{"question": "A?", "reference": "a", "source": "s"}]
+    merged, added, skipped = compile_box.merge_proposed_questions(existing, [
+        {"question": "A?", "reference": "dup", "source": "x"},  # dup of existing #1
+        {"question": "B?", "reference": "b", "source": "s2"},   # new
+        {"question": "   ", "reference": "", "source": ""},      # blank → skip
+        "not-a-dict",                                            # junk → skip
+    ])
+    assert [q["question"] for q in merged] == ["A?", "B?"], merged
+    assert added == 1 and skipped == 3, (added, skipped)
+    # malformed existing entries are dropped from the carry-over; identical incoming skipped
+    merged2, added2, _ = compile_box.merge_proposed_questions(
+        ["junk", {"noquestion": 1}, {"question": "C?"}], [{"question": "C?"}])
+    assert [q["question"] for q in merged2] == ["C?"] and added2 == 0, merged2
+
+    # every merged entry carries a 'q-'+8hex id derived from the normalized question;
+    # formula is FNV-1a — locked against the canonical vector for "a".
+    for q in merged:
+        assert re.fullmatch(r"q-[0-9a-f]{8}", q["id"]), q
+    assert compile_box._question_id(compile_box._normalize_question("A?")) == "q-e40c292c"
+    assert merged[0]["id"] == "q-e40c292c", merged[0]
+
+    # re-propose the same question (different case/whitespace) → dedup, id unchanged
+    id_A = merged[0]["id"]
+    again, added3, skipped3 = compile_box.merge_proposed_questions(merged, [{"question": "  a  "}])
+    assert added3 == 0 and skipped3 == 1, (added3, skipped3)
+    assert next(q for q in again if q["question"] == "A?")["id"] == id_A, again
+
+    # an explicit prior id is preserved; a legacy id-less entry is backfilled
+    kept, _, _ = compile_box.merge_proposed_questions(
+        [{"id": "q-legacy1", "question": "D?"}, {"question": "E?"}], [])
+    by_q = {q["question"]: q for q in kept}
+    assert by_q["D?"]["id"] == "q-legacy1", kept
+    assert re.fullmatch(r"q-[0-9a-f]{8}", by_q["E?"]["id"]), kept
+    print("✓ merge_proposed_questions (append, dedup, drop malformed, stable id)")
+
+
+async def test_propose_questions_appends_dedup():
+    """propose_questions writes authoring/QUESTIONS_PROPOSED.json append-only: a
+    second round adds new questions and skips duplicates (never overwrites), and
+    each round emits a summary line."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "authoring").mkdir(parents=True)
+        events = []
+
+        class FakeRun:
+            workdir = str(wd)
+            locale = "zh"  # model-facing tool strings come from the locale pack
+
+            async def emit(self, ev):
+                events.append(ev)
+
+        captured = {}
+        orig = compile_box.create_sdk_mcp_server
+
+        def capture(name, tools):
+            captured.update({t.name: t for t in tools})
+            return orig(name, tools=tools)
+
+        compile_box.create_sdk_mcp_server = capture
+        try:
+            compile_box._make_compile_tools(FakeRun())
+        finally:
+            compile_box.create_sdk_mcp_server = orig
+        pq = captured["propose_questions"].handler
+        path = wd / "authoring" / "QUESTIONS_PROPOSED.json"
+
+        r1 = await pq({"questions": [
+            {"question": "默认 quota 是多少?", "reference": "300", "source": "policy.md: cap 300"},
+            {"question": "draco 还在用吗?", "reference": "已废弃", "source": "manual.md"},
+        ]})
+        data = json.loads(path.read_text())
+        assert [q["question"] for q in data] == ["默认 quota 是多少?", "draco 还在用吗?"], data
+        assert data[0]["source"] == "policy.md: cap 300"
+        # every persisted entry carries an id (frontend adopt POSTs it as proposal_id)
+        assert all(re.fullmatch(r"q-[0-9a-f]{8}", q["id"]) for q in data), data
+        assert "新增 2" in r1["content"][0]["text"], r1
+
+        # round 2: one dup (only trailing punctuation differs) + one new → append, skip dup
+        r2 = await pq({"questions": [
+            {"question": "默认 quota 是多少", "reference": "x", "source": "y"},  # dup of #1
+            {"question": "支持哪些区域?", "reference": "cn-*", "source": "regions.md"},
+        ]})
+        data = json.loads(path.read_text())
+        assert len(data) == 3 and data[2]["question"] == "支持哪些区域?", data
+        assert "新增 1" in r2["content"][0]["text"] and "跳过 1" in r2["content"][0]["text"], r2
+        assert sum(1 for e in events if e["type"] == "summary") == 2, events
+
+        # bad arg → guarded, file untouched
+        bad = await pq({"questions": "nope"})
+        assert "数组" in bad["content"][0]["text"], bad
+        assert len(json.loads(path.read_text())) == 3
+    print("✓ propose_questions appends + dedups (never overwrites prior picks)")
+
+
+async def test_message_captures_brief():
+    """POST /message persists a 定调标签 block to authoring/BRIEF.json before the
+    turn (message still reaches the agent verbatim); an ordinary message writes none."""
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            class _C:
+                def __init__(self):
+                    self.queries = []
+
+                async def query(self, text, session_id="default"):
+                    self.queries.append(text)
+
+            run = compile_box.CompileRun("brief-run", td, 1)
+            run.client = _C()
+            run.connected.set()
+            compile_box.RUNS["brief-run"] = run
+
+            msg = ("开始生成知识库\n\n我的定调标签(请作为本次编译的 brief):\n"
+                   "- 给谁看:内部工程师\n- 内容倾向:详尽百科、只留最新版本\n"
+                   "- 自定义:偏排障场景\n请按这些标签作为编译 brief 执行。")
+            r = await client.post("/message/brief-run", json={"message": msg})
+            assert r.status == 200, await r.text()
+            brief = json.loads((Path(td) / "authoring" / "BRIEF.json").read_text())
+            assert brief["audience"] == "内部工程师", brief
+            assert brief["styles"] == ["详尽百科", "只留最新版本"], brief
+            assert brief["custom"] == ["偏排障场景"], brief
+            assert run.client.queries == [msg], run.client.queries  # agent still sees the block
+
+            # ordinary message → no clobber (BRIEF.json stays the first brief)
+            r = await client.post("/message/brief-run", json={"message": "继续编下一篇"})
+            assert r.status == 200, await r.text()
+            assert json.loads((Path(td) / "authoring" / "BRIEF.json").read_text())["audience"] == "内部工程师"
+    finally:
+        await client.close()
+        compile_box.RUNS.clear()
+    print("✓ /message captures 定调 brief → BRIEF.json (ordinary msg leaves it)")
+
+
+def test_pr382_review_fixes():
+    """Review fixes: brief guard + capped/last-marker raw (A/C), atomic writer (B),
+    question-id parity vector + intentional dedup (D/E)."""
+    good = ("开始生成知识库\n\n我的定调标签(请作为本次编译的 brief):\n"
+            "- 给谁看:内部工程师\n- 内容倾向:详尽百科\n请执行。")
+    b = compile_box.parse_brief_block(good)
+    assert b and b["audience"] == "内部工程师", b
+    # A(parse): marker present but no bullet field → None (a bare prose mention is not a brief)
+    assert compile_box.parse_brief_block("关于我的定调标签我想补充一句") is None
+    assert compile_box.parse_brief_block("我的定调标签") is None
+    # C: raw is taken from the LAST marker and capped
+    noise = ("我的定调标签 早前顺口提过\n我的定调标签(brief):\n- 给谁看:A\n" + "y" * 9000)
+    b2 = compile_box.parse_brief_block(noise)
+    assert b2 and b2["audience"] == "A", b2
+    assert len(b2["raw"]) == compile_box._BRIEF_RAW_MAX and "早前顺口提过" not in b2["raw"], len(b2["raw"])
+
+    # A(capture): first-wins — a later marker message never clobbers BRIEF.json
+    with tempfile.TemporaryDirectory() as td:
+        class _R:  # _capture_brief only reads .workdir
+            workdir = td
+        r = _R()
+        assert compile_box._capture_brief(r, good) is True
+        first = json.loads((Path(td) / "authoring" / "BRIEF.json").read_text())
+        assert compile_box._capture_brief(r, "我的定调标签(brief):\n- 给谁看:别人\n") is False
+        assert json.loads((Path(td) / "authoring" / "BRIEF.json").read_text()) == first
+
+    # B: atomic writer round-trips + overwrites + leaves no temp
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "sub" / "x.json"
+        compile_box._write_text_atomic(p, '{"a":1}\n')
+        assert p.read_text() == '{"a":1}\n'
+        compile_box._write_text_atomic(p, '{"a":2}\n')
+        assert p.read_text() == '{"a":2}\n' and not list(Path(td).rglob("*.tmp"))
+
+    # D/E: question-id parity vector — MUST equal the frontend's proposal-id.test vector
+    def qid(q):
+        return compile_box._question_id(compile_box._normalize_question(q))
+    assert qid("GPU 有几张?") == "q-4d6d3b41"
+    assert qid("gpu有几张。") == "q-4d6d3b41"            # E: case + trailing-punct + space collapse
+    assert qid("Hello World") == "q-3b9f5c61"
+    assert qid("\ufeffHello World") == "q-3b9f5c61"      # D: BOM stripped identically to the frontend
+    assert qid("H100\tvs　A100") == "q-a5a7d897"
+    assert qid("AbC?") == "q-1a47e90b"
+    print("✓ pr382 review fixes (brief guard/cap/first-wins, atomic write, id parity vector)")
+
+
 async def main():
     test_install_wiki_snapshot_size_guard()
     await test_workspace_sync()
@@ -709,6 +920,11 @@ async def main():
     await test_open_close_test_session_http()
     await test_test_message_path()
     await test_propose_plan_never_bounces()
+    test_parse_brief_block()
+    test_merge_proposed_questions()
+    await test_propose_questions_appends_dedup()
+    await test_message_captures_brief()
+    test_pr382_review_fixes()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()
