@@ -919,7 +919,7 @@ async def test_message_captures_brief():
 
 async def test_incremental_route():
     """Scoped incremental (DESIGN-kb-incremental-recompile-v2): a compile trigger +
-    sicore's machine-computed RAW_CHANGES routes to the scoped path — materializes
+    the consumer's machine-computed RAW_CHANGES routes to the scoped path — materializes
     CHANGESET.json (affected pages reverse-looked-up), arms the byte-integrity guard
     state, injects the scoped directive — instead of a full-corpus re-plan."""
     import json as _json
@@ -934,7 +934,7 @@ async def test_incremental_route():
         run = compile_box.CompileRun("incr1", str(wd), 1)
         # no RAW_CHANGES yet → NOT incremental (falls through to normal/full route)
         assert not compile_box._should_route_to_incremental(run, "请增量重编")
-        # sicore writes the machine-computed changeset input
+        # the consumer writes the machine-computed changeset input
         (wd / "authoring" / "RAW_CHANGES.json").write_text(_json.dumps({
             "modified": ["snap/one.md"], "added": [], "deleted": [],
             "diffs": {"snap/one.md": "- old fact\n+ new fact"},
@@ -945,7 +945,7 @@ async def test_incremental_route():
         fake = _FakeSDKClient()
         run.client = fake
         await compile_box._start_incremental(run, "请增量重编")
-        # CHANGESET.json materialized: affected page reverse-looked-up + sicore's diff
+        # CHANGESET.json materialized: affected page reverse-looked-up + the consumer's diff
         cs = _json.loads((wd / "authoring" / "CHANGESET.json").read_text())
         assert cs["affected_pages"] == ["a.md"], cs
         assert cs["modified"][0]["diff"] == "- old fact\n+ new fact"

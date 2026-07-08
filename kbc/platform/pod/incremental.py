@@ -1,15 +1,15 @@
 """KB 增量重编 — box 侧确定性核心(DESIGN-kb-incremental-recompile-v2-2026-07-07).
 
 现状 "请增量重编" 路由到全量批量重排(非增量)。本模块把它变成真增量的
-box 半边:给定 sicore 机器算出的**变更源集**(added/modified/deleted),用
+box 半边:给定消费方机器算出的**变更源集**(added/modified/deleted),用
 `compiled_from`(= 官方 dependency index 的反向)**确定性反查受影响页**,拼出模型
 只需消费的 `CHANGESET.json`,并提供收尾的**越界改动护栏**(未授权页字节不变)。
 
 引擎中立:纯 filesystem + stdlib,复用 selfcheck 的 compiled_from 解析。谁能编由
-sicore 的单飞锁裁(管控面);本模块只回答 "怎么增量编"(执行面)。
+消费方的单飞锁裁(管控面);本模块只回答 "怎么增量编"(执行面)。
 
 分工(见设计 §2):
-  - sicore  → 算 changed_sources(它有指纹基线 + 上次 raw 内容)+ 每个 modified 的 unified diff。
+  - 消费方 → 算 changed_sources(它有指纹基线 + 上次 raw 内容)+ 每个 modified 的 unified diff。
   - 本模块  → 反查 affected_pages、拼 CHANGESET、算护栏。
   - 模型    → 读 CHANGESET,按三类外科手术式改受影响页 + index,其余别碰。
 """
@@ -23,7 +23,7 @@ from pathlib import Path
 
 from selfcheck import candidate_pages
 
-# sicore → box(管控面把机器算的变更交给执行面):变更源集 + 每个 modified 的 unified
+# 消费方 → box(管控面把机器算的变更交给执行面):变更源集 + 每个 modified 的 unified
 # diff + 基线/快照指纹。box 读它、富集 affected_pages,再落下面的 CHANGESET(给模型)。
 RAW_CHANGES_PATH = "authoring/RAW_CHANGES.json"
 # box → 模型:富集后的完整 changeset(模型这一轮只消费这个)。
@@ -82,7 +82,7 @@ def build_changeset(
 ) -> dict:
     """组装 CHANGESET.json 内容(调用方负责落盘 + 同步)。
 
-    `diffs`: {源路径: 统一diff字符串},由 sicore 对每个 modified 源产出(旧→新);
+    `diffs`: {源路径: 统一diff字符串},由消费方对每个 modified 源产出(旧→新);
     added/deleted 无 diff(added 是全新内容、deleted 只需移除)。缺省空 —— 无 diff
     时降级为"重读该源",仍是范围化的(只是没有 +/− 精度)。
     """
@@ -158,12 +158,12 @@ def integrity_violations(
     )
 
 
-# ── 协议:sicore 输入(RAW_CHANGES)→ box 输出(CHANGESET)──────────────────────
+# ── 协议:消费方输入(RAW_CHANGES)→ box 输出(CHANGESET)──────────────────────
 def load_raw_changes(workdir: str) -> dict | None:
-    """读 sicore 写的增量输入 `authoring/RAW_CHANGES.json`。形状(sicore 负责写):
+    """读消费方写的增量输入 `authoring/RAW_CHANGES.json`。形状(消费方负责写):
         {"added":[路径], "modified":[路径], "deleted":[路径],
          "diffs": {路径: 统一diff}, "baseline_fingerprint":…, "snapshot_fingerprint":…}
-    缺失/损坏/结构非法 → None(box 回退全量编译,向后兼容——sicore 半边没跟上不崩)。
+    缺失/损坏/结构非法 → None(box 回退全量编译,向后兼容——消费方半边没跟上不崩)。
     """
     path = Path(workdir) / RAW_CHANGES_PATH
     if not path.is_file():
@@ -203,7 +203,7 @@ def materialize_changeset(workdir: str) -> dict | None:
         json.dumps(cs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     # Consume-once: drop the input so a later turn / box respawn can't re-route on a
     # stale changeset. The enriched CHANGESET.json remains for this turn's repair
-    # rounds (they read it, not RAW_CHANGES). sicore also clears it on baseline
+    # rounds (they read it, not RAW_CHANGES). the consumer also clears it on baseline
     # advance — this is the box-side belt to that suspenders.
     try:
         (Path(workdir) / RAW_CHANGES_PATH).unlink()
