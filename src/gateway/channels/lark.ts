@@ -16,6 +16,7 @@ import {
   resolvePersonalBinding,
   handlePersonalPairingCode,
   resetPersonalSession,
+  updateBindingMeta,
   isChannelAccessDenied,
   type ResolvedChannelBinding,
   type ChannelAccessDenied,
@@ -265,6 +266,63 @@ function buildLarkSessionKey(senderOpenId: string | null, chatId: string): strin
 }
 
 /**
+ * Fetch the group chat title, best-effort. Only requires the bot to be a
+ * member of the chat (scope im:chat:readonly) — no contacts permission.
+ * Returns null on any failure (missing scope, bot kicked, SDK mock in tests).
+ */
+async function fetchLarkChatName(larkClient: any, chatId: string): Promise<string | null> {
+  try {
+    const resp: any = await larkClient.request({
+      method: "GET",
+      url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`,
+    });
+    const name = resp?.data?.name ?? resp?.name;
+    return typeof name === "string" && name.trim() ? name.trim() : null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[lark] Could not fetch chat name for chat=${chatId}: ${msg}`);
+    return null;
+  }
+}
+
+// Per-binding refresh attempts this process. A successful refresh pins the
+// counter to the cap (done for this gateway lifetime — renames are picked up
+// after a restart); a transient fetch failure leaves room to retry on later
+// messages, bounded so a persistently-failing API isn't hammered.
+const bindingNameRefreshAttempts = new Map<string, number>();
+const BINDING_NAME_REFRESH_MAX_ATTEMPTS = 3;
+
+/**
+ * Fire-and-forget: refresh the binding's cached chat title when the platform
+ * reports a different (or first) name. Display-only — failures are logged and
+ * never affect message handling.
+ */
+function backfillBindingDisplayName(
+  larkClient: any,
+  channelId: string,
+  chatId: string,
+  binding: ResolvedChannelBinding,
+  frontendClient: FrontendWsClient,
+): void {
+  const attempts = bindingNameRefreshAttempts.get(binding.bindingId) ?? 0;
+  if (attempts >= BINDING_NAME_REFRESH_MAX_ATTEMPTS) return;
+  // Count the attempt up front so concurrent messages can't stampede the API.
+  bindingNameRefreshAttempts.set(binding.bindingId, attempts + 1);
+  void (async () => {
+    const name = await fetchLarkChatName(larkClient, chatId);
+    if (!name) return; // transient failure — later messages may retry up to the cap
+    bindingNameRefreshAttempts.set(binding.bindingId, BINDING_NAME_REFRESH_MAX_ATTEMPTS);
+    if (name === binding.displayName) return;
+    try {
+      await updateBindingMeta(channelId, chatId, name, frontendClient);
+      console.log(`[lark] Binding name refreshed channel=${channelId} chat=${chatId} name="${name}"`);
+    } catch (err) {
+      console.warn(`[lark] Failed to update binding name for chat=${chatId}:`, err);
+    }
+  })();
+}
+
+/**
  * Whether a group message is actually directed at THIS bot.
  *
  * Feishu delivers a group message to an app scoped to "receive @bot messages"
@@ -496,7 +554,9 @@ export async function handleLarkMessage(
   const pairMatch = text.match(/^PAIR\s+([A-Z0-9]{6})$/i);
   if (pairMatch) {
     const code = pairMatch[1].toUpperCase();
-    const result = await handlePairingCode(code, groupChannelId, chatId, "group", frontendClient!);
+    // Seed the binding's display name with the group title (best-effort).
+    const chatName = await fetchLarkChatName(larkClient, chatId);
+    const result = await handlePairingCode(code, groupChannelId, chatId, "group", frontendClient!, chatName ?? undefined);
 
     const replyText = formatPairReply(result, locale);
     await replyToLark(larkClient, messageId, replyText);
@@ -531,6 +591,9 @@ export async function handleLarkMessage(
     // Only reply if the message looks like it's directed at the bot (@mention).
     return;
   }
+
+  // Keep the binding's cached group title fresh (display-only, detached).
+  backfillBindingDisplayName(larkClient, groupChannelId, chatId, binding, frontendClient!);
 
   // Use the SERVER-authoritative session key (not the local open_id default) for
   // both the queue and the queued context, so the two-path contract holds:

@@ -38,6 +38,7 @@ const resetBindingSessionMock = vi.fn();
 const resolvePersonalBindingMock = vi.fn();
 const handlePersonalPairingCodeMock = vi.fn();
 const resetPersonalSessionMock = vi.fn();
+const updateBindingMetaMock = vi.fn();
 
 vi.mock("../channel-manager.js", () => ({
   resolveBinding: (...args: unknown[]) => resolveBindingMock(...args),
@@ -46,6 +47,7 @@ vi.mock("../channel-manager.js", () => ({
   resolvePersonalBinding: (...args: unknown[]) => resolvePersonalBindingMock(...args),
   handlePersonalPairingCode: (...args: unknown[]) => handlePersonalPairingCodeMock(...args),
   resetPersonalSession: (...args: unknown[]) => resetPersonalSessionMock(...args),
+  updateBindingMeta: (...args: unknown[]) => updateBindingMetaMock(...args),
   isChannelAccessDenied: (v: unknown) =>
     v !== null && typeof v === "object" && (v as { walled?: unknown }).walled === true,
 }));
@@ -261,7 +263,7 @@ describe("handleLarkMessage — PAIR command", () => {
 
     await handleLarkMessage(data, larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
 
-    expect(handlePairingCodeMock).toHaveBeenCalledWith("ABC123", "lark", "oc_abc123", "group", expect.anything());
+    expect(handlePairingCodeMock).toHaveBeenCalledWith("ABC123", "lark", "oc_abc123", "group", expect.anything(), undefined);
     expect(larkClient.im.message.reply).toHaveBeenCalledWith(expect.objectContaining({
       path: { message_id: "mid-1" },
       data: expect.objectContaining({
@@ -312,8 +314,21 @@ describe("handleLarkMessage — PAIR command", () => {
       },
     );
 
-    expect(handlePairingCodeMock).toHaveBeenCalledWith("ABC123", "lark", "oc_abc123", "group", expect.anything());
+    expect(handlePairingCodeMock).toHaveBeenCalledWith("ABC123", "lark", "oc_abc123", "group", expect.anything(), undefined);
     expect(handlePersonalPairingCodeMock).not.toHaveBeenCalled();
+  });
+
+  it("seeds the binding display name from the fetched group title", async () => {
+    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
+    const larkClient = makeLarkClient() as any;
+    larkClient.request = vi.fn().mockResolvedValue({ data: { name: " 运维告警群 " } });
+
+    await handleLarkMessage(makeTextEvent("PAIR ABC123"), larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
+
+    expect(larkClient.request).toHaveBeenCalledWith(expect.objectContaining({
+      url: expect.stringContaining("/open-apis/im/v1/chats/oc_abc123"),
+    }));
+    expect(handlePairingCodeMock).toHaveBeenCalledWith("ABC123", "lark", "oc_abc123", "group", expect.anything(), "运维告警群");
   });
 
   it("PAIR success reply is Chinese for zh-CN (feishu domain)", async () => {
@@ -590,6 +605,71 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(text).toContain("https://sicore.example/auth");
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("backfills the binding display name once when the platform reports a new title", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ bindingId: "b-name-1", displayName: null }));
+    promptMock.mockResolvedValue({ sessionId: "remote-1" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    updateBindingMetaMock.mockResolvedValue({ success: true });
+    const larkClient = makeLarkClient() as any;
+    larkClient.request = vi.fn().mockResolvedValue({ data: { name: "新群名" } });
+
+    await handleLarkMessage(makeTextEvent("hello"), larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
+    await new Promise((r) => setImmediate(r)); // detached backfill settles
+    expect(updateBindingMetaMock).toHaveBeenCalledWith("lark", "oc_abc123", "新群名", expect.anything());
+
+    // Once-per-process guard: a second message must not re-hit the platform API.
+    larkClient.request.mockClear();
+    updateBindingMetaMock.mockClear();
+    await handleLarkMessage(makeTextEvent("again"), larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
+    await new Promise((r) => setImmediate(r));
+    expect(larkClient.request).not.toHaveBeenCalled();
+    expect(updateBindingMetaMock).not.toHaveBeenCalled();
+  });
+
+  it("a transient name-fetch failure is retried on a later message (bounded)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ bindingId: "b-name-retry", displayName: null }));
+    promptMock.mockResolvedValue({ sessionId: "remote-1" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    updateBindingMetaMock.mockResolvedValue({ success: true });
+    const larkClient = makeLarkClient() as any;
+    larkClient.request = vi.fn().mockRejectedValueOnce(new Error("rate limited"))
+      .mockResolvedValue({ data: { name: "新群名" } });
+
+    // First message: fetch fails transiently — no update, but the guard must
+    // NOT be poisoned for the rest of the process lifetime.
+    await handleLarkMessage(makeTextEvent("hello"), larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
+    await new Promise((r) => setImmediate(r));
+    expect(updateBindingMetaMock).not.toHaveBeenCalled();
+
+    // Second message: retried and succeeds.
+    await handleLarkMessage(makeTextEvent("again"), larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
+    await new Promise((r) => setImmediate(r));
+    expect(updateBindingMetaMock).toHaveBeenCalledWith("lark", "oc_abc123", "新群名", expect.anything());
+
+    // Third message: success pinned the guard — no further API traffic.
+    larkClient.request.mockClear();
+    await handleLarkMessage(makeTextEvent("third"), larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
+    await new Promise((r) => setImmediate(r));
+    expect(larkClient.request).not.toHaveBeenCalled();
+  });
+
+  it("persistent name-fetch failures stop after the attempt cap", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ bindingId: "b-name-cap", displayName: null }));
+    promptMock.mockResolvedValue({ sessionId: "remote-1" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    updateBindingMetaMock.mockClear(); // mocks persist across tests in this file
+    const larkClient = makeLarkClient() as any;
+    larkClient.request = vi.fn().mockRejectedValue(new Error("down"));
+
+    for (let i = 0; i < 5; i++) {
+      await handleLarkMessage(makeTextEvent(`msg-${i}`), larkClient, "lark", makeAgentBoxManager() as any, undefined, {} as any);
+      await new Promise((r) => setImmediate(r));
+    }
+    // 3 attempts max, not one per message.
+    expect(larkClient.request).toHaveBeenCalledTimes(3);
+    expect(updateBindingMetaMock).not.toHaveBeenCalled();
   });
 
   it("with binding → getOrCreate uses agentId alone, and registers the durable channel session owner", async () => {

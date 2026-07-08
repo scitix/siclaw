@@ -37,6 +37,8 @@ export interface ResolvedChannelBinding {
   sessionKey?: string | null;
   createdBy: string | null;
   routeType: "group" | "user";
+  /** Cached chat title from the platform; null/absent until backfilled. */
+  displayName?: string | null;
 }
 
 /**
@@ -88,12 +90,31 @@ export async function handlePairingCode(
   routeKey: string,
   routeType: "group" | "user",
   frontendClient: FrontendWsClient,
+  routeDisplayName?: string,
 ): Promise<{ success: boolean; agentName?: string; error?: string }> {
   return frontendClient.request("channel.pair", {
     code,
     channel_id: channelId,
     route_key: routeKey,
     route_type: routeType,
+    ...(routeDisplayName ? { route_display_name: routeDisplayName } : {}),
+  });
+}
+
+/**
+ * Push a freshly observed chat title onto the binding (display-only cache).
+ * Best-effort: callers fire-and-forget; a failure just leaves the old name.
+ */
+export async function updateBindingMeta(
+  channelId: string,
+  routeKey: string,
+  displayName: string,
+  frontendClient: FrontendWsClient,
+): Promise<{ success: boolean; error?: string }> {
+  return frontendClient.request("channel.updateBindingMeta", {
+    channel_id: channelId,
+    route_key: routeKey,
+    display_name: displayName,
   });
 }
 

@@ -36,6 +36,7 @@ interface ChannelBindingRow {
   agent_id: string;
   session_id?: string | null;
   route_type?: "group" | "user" | string | null;
+  display_name?: string | null;
   created_by?: string | null;
   channel_created_by?: string | null;
 }
@@ -47,6 +48,8 @@ interface ResolvedChannelBinding {
   sessionKey?: string | null;
   createdBy: string | null;
   routeType: "group" | "user";
+  /** Cached chat title (group name); null until the gateway backfills it. */
+  displayName?: string | null;
 }
 
 function normalizeRouteType(value: unknown): "group" | "user" {
@@ -59,7 +62,7 @@ async function selectChannelBinding(
   routeKey: string,
 ): Promise<ChannelBindingRow | null> {
   const [rows] = await db.query(
-    `SELECT cb.id, cb.agent_id, cb.session_id, cb.route_type, cb.created_by,
+    `SELECT cb.id, cb.agent_id, cb.session_id, cb.route_type, cb.display_name, cb.created_by,
             c.created_by AS channel_created_by
      FROM channel_bindings cb
      LEFT JOIN channels c ON cb.channel_id = c.id
@@ -93,6 +96,7 @@ async function resolveChannelBinding(
     ...(session.sessionKey ? { sessionKey: session.sessionKey } : {}),
     createdBy: row.created_by ?? row.channel_created_by ?? null,
     routeType: normalizeRouteType(row.route_type),
+    displayName: row.display_name ?? null,
   };
 }
 
@@ -161,9 +165,19 @@ function normalizeChannelSessionKey(value: string): string {
   return trimmed;
 }
 
+/** Display-only cache of the chat title; identity stays route_key. Empty → null. */
+function normalizeBindingDisplayName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  // Cap at 255 code points (not UTF-16 units) — matches MySQL VARCHAR(255)
+  // char semantics; never splits a surrogate pair.
+  return [...trimmed].slice(0, 255).join("");
+}
+
 async function pairChannelBinding(
   db: Db,
-  params: { code: string; channel_id: string; route_key: string; route_type: "group" | "user" },
+  params: { code: string; channel_id: string; route_key: string; route_type: "group" | "user"; route_display_name?: string | null },
 ): Promise<{ success: boolean; agentName?: string; error?: string }> {
   const now = toSqlTimestamp(new Date());
   const [codeRows] = await db.query(
@@ -178,14 +192,19 @@ async function pairChannelBinding(
   const existingBinding = await selectChannelBinding(db, params.channel_id, params.route_key);
   const bindingId = existingBinding?.id ?? crypto.randomUUID();
   const sessionId = crypto.randomUUID();
+  const displayName = normalizeBindingDisplayName(params.route_display_name);
   try {
     const upsert = buildUpsert(
       db,
       "channel_bindings",
-      ["id", "channel_id", "agent_id", "session_id", "route_key", "route_type", "created_by"],
-      [bindingId, params.channel_id, pairingCode.agent_id, sessionId, params.route_key, params.route_type, pairingCode.created_by],
+      ["id", "channel_id", "agent_id", "session_id", "route_key", "route_type", "display_name", "created_by"],
+      [bindingId, params.channel_id, pairingCode.agent_id, sessionId, params.route_key, params.route_type, displayName, pairingCode.created_by],
       ["channel_id", "route_key"],
-      ["agent_id", "session_id", "route_type", "created_by"],
+      // Keep an existing name when a re-pair couldn't fetch one (null) — the
+      // gateway's lazy backfill owns refreshes, PAIR only seeds.
+      displayName
+        ? ["agent_id", "session_id", "route_type", "display_name", "created_by"]
+        : ["agent_id", "session_id", "route_type", "created_by"],
     );
     await db.query(upsert.sql, upsert.params);
     const row = await selectChannelBinding(db, params.channel_id, params.route_key);
@@ -248,6 +267,26 @@ async function resetChannelBindingSession(
     oldSessionId: row.session_id ?? null,
     sessionId,
   };
+}
+
+/**
+ * Update display-only metadata on a binding (currently just the chat title).
+ * Called by the gateway when it observes a fresh name from the platform API.
+ */
+async function updateChannelBindingMeta(
+  db: Db,
+  channelId: string,
+  routeKey: string,
+  displayName: string | null,
+): Promise<{ success: boolean; error?: string }> {
+  const normalized = normalizeBindingDisplayName(displayName);
+  if (!normalized) return { success: false, error: "display_name must not be empty" };
+  const [result] = await db.query(
+    "UPDATE channel_bindings SET display_name = ? WHERE channel_id = ? AND route_key = ?",
+    [normalized, channelId, routeKey],
+  ) as any;
+  if (!result?.affectedRows) return { success: false, error: "Binding not found" };
+  return { success: true };
 }
 
 interface PersonalChannelConfig {
@@ -1530,6 +1569,17 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     sendJson(res, 200, await pairChannelBinding(db, body));
   });
 
+  // POST /api/internal/siclaw/channel/update-binding-meta
+  router.post("/api/internal/siclaw/channel/update-binding-meta", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ channel_id: string; route_key: string; display_name: string }>(req);
+    const db = getDb();
+    sendJson(res, 200, await updateChannelBindingMeta(db, body.channel_id, body.route_key, body.display_name));
+  });
+
   // POST /api/internal/siclaw/channel/reset-session
   router.post("/api/internal/siclaw/channel/reset-session", async (req, res) => {
     if (!requireInternalAuth(req, internalSecret)) {
@@ -2663,6 +2713,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("channel.resetSession", async (params) => {
     const db = getDb();
     return resetChannelBindingSession(db, params.channel_id, params.route_key, params.session_key);
+  });
+
+  handlers.set("channel.updateBindingMeta", async (params) => {
+    const db = getDb();
+    return updateChannelBindingMeta(db, params.channel_id, params.route_key, params.display_name);
   });
 
   handlers.set("channel.resolvePersonalBinding", async (params) => {
