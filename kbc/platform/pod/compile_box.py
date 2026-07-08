@@ -1392,11 +1392,13 @@ async def _post_turn_selfcheck(run) -> str | None:
     await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
-        if incr and incr_violations:
-            # Re-arm the byte-integrity guard for the repair turn itself: the
-            # repair restores out-of-scope pages toward the ORIGINAL baseline,
-            # so it is judged against that same baseline — otherwise a second
-            # out-of-scope edit made DURING repair would ship unguarded.
+        if incr:
+            # Re-arm the byte-integrity guard for the repair turn itself —
+            # for ANY incremental turn entering repair, not only one that
+            # already violated: an in-scope turn with an unclean ledger gets a
+            # coverage/lint repair turn too, and THAT turn could drift out of
+            # scope just as easily. Judged against the ORIGINAL baseline (the
+            # repair restores toward it).
             run._incr_pending = incr
         parts = []
         if not ledger_clean:
@@ -2130,9 +2132,18 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
                 run._turn_active = False
                 await run.emit({"type": "error",
                                 "error": f"model stall: interrupt produced nothing within {_STALL_INTERRUPT_DEADLINE_S}s"})
+                # Disconnecting ENDS this box's session (run_session has no
+                # reconnect loop — deliberately: this fires only on a double
+                # black-hole, and recovery is owned by the platform: the run
+                # terminalizes via `end`, and the consumer's next message
+                # find-or-starts a fresh run/box with workspace rehydration).
+                # The turn_done text must promise exactly that — not an
+                # in-place retry this box can no longer serve (/message would
+                # 409 on run.client=None).
                 await run.emit({"type": "turn_done", "text": _loc(run,
-                    "The turn stalled and could not be recovered — nothing was applied; send the message again to retry.",
-                    "本轮模型停滞且中断无响应——未产生结果,重新发送即可重试。")})
+                    "The turn stalled and could not be recovered — nothing was applied. "
+                    "The compile session will be recreated automatically on your next message.",
+                    "本轮模型停滞且中断无响应——未产生结果;编译会话将在你下一条消息时自动重建,届时重发即可。")})
                 try:
                     await client.disconnect()
                 except Exception:

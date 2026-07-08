@@ -1004,6 +1004,41 @@ async def test_incremental_integrity_guard():
     print("OK  incremental integrity guard (violation → repair + re-armed guard; clean pass consumes)")
 
 
+async def test_incremental_guard_rearms_on_ledger_repair():
+    """Round-4 review fix: an incremental turn that stayed IN scope but failed
+    the coverage ledger enters repairing too — the guard must re-arm for that
+    ledger-repair turn as well (it used to be gated on violations only)."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "orphaned-src.md").write_text("never cited")  # → unaccounted
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("incrl", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        armed = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
+        run._incr_pending = armed
+        # the turn edits ONLY the authorized page (no byte violations)…
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        # …but the ledger is unclean (orphaned-src.md unaccounted) → repairing
+        assert repair is not None and "orphaned-src.md" in repair, repair
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+        # the guard is re-armed for the ledger-repair turn
+        assert run._incr_pending is not None and run._incr_pending["changeset"] is cs
+    print("OK  incremental guard re-arms on in-scope ledger repair (round-4 fix)")
+
+
 async def test_batch_orchestrator_routing_and_resume():
     """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
     the threshold gate (small KBs never batch), the orchestrator stamps batches
@@ -1243,6 +1278,8 @@ async def test_stall_interrupt_deadline_closes_turn():
             types = [e["type"] for e in evs]
             assert fake.interrupts >= 1 and fake.disconnects == 1, (fake.interrupts, fake.disconnects)
             assert "error" in types and "turn_done" in types, types
+            done_text = next(e["text"] for e in evs if e["type"] == "turn_done")
+            assert "recreated automatically" in done_text, done_text  # honest: no in-place retry on this box
             assert not run._turn_active and not run._stall_retrying
     finally:
         (compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
@@ -1670,6 +1707,7 @@ async def main():
     await test_message_captures_brief()
     await test_incremental_route()
     await test_incremental_integrity_guard()
+    await test_incremental_guard_rearms_on_ledger_repair()
     await test_batch_orchestrator_routing_and_resume()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()

@@ -426,6 +426,55 @@ async def test_media_failed_pages_retry_then_exhaust():
     print("OK  media failed pages retry then exhaust (visible flag, no silent false-pass)")
 
 
+async def test_media_attempt_count_resets_on_success():
+    """Round-4 review fix: a page that fails once then completes verification
+    must have its attempt count cleared — a stale residue would push a later
+    re-entry to 'exhausted' after fewer real failures than the budget implies."""
+    import compile_box
+    import mediaverify as mv
+    from compile_box import _maybe_start_media_verify, _post_turn_selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/i1.png")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        run = _FakeRun(td)
+        calls = [0]
+
+        async def flaky_verify(engine, workdir, pending, progress=None, locale=None):
+            calls[0] += 1
+            if calls[0] == 1:  # first attempt: transcription failure
+                return {"findings": [], "errors": ["transcription failed s/i1.png: flaky"],
+                        "images": 1, "cache_hits": 0,
+                        "completed_pages": [], "failed_pages": sorted(pending)}
+            return {"findings": [], "errors": [], "images": 1, "cache_hits": 0,
+                    "completed_pages": sorted(pending), "failed_pages": []}
+
+        os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "3"
+        os.environ["KBC_PK_MODE"] = "off"
+        orig = mv.run_blind_verify
+        mv.run_blind_verify = flaky_verify
+        try:
+            assert await _post_turn_selfcheck(run) is None
+            assert _maybe_start_media_verify(run)           # attempt 1 → fails
+            await run._media_task
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            assert sc["media_verify"]["attempts"]["p.md"] == 1, sc["media_verify"]
+            run._media_task = None
+            assert _maybe_start_media_verify(run)           # attempt 2 → succeeds
+            await run._media_task
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            mvsec = sc["media_verify"]
+            assert "p.md" in mvsec["verified_pages"] and "p.md" not in (mvsec.get("exhausted") or []), mvsec
+            assert "p.md" not in (mvsec.get("attempts") or {}), mvsec  # count cleared on success
+        finally:
+            mv.run_blind_verify = orig
+            del os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"]
+    print("OK  media attempt count resets on successful verification")
+
+
 async def test_pk_failed_state_settles_converge():
     """Review fix: run_pk is fail-open and RETURNS state=failed — both that and
     an outright raise must still terminalize converge_phase (it used to wedge
@@ -688,6 +737,7 @@ def main():
     asyncio.run(test_wiring())
     asyncio.run(test_media_verify_wiring())
     asyncio.run(test_media_failed_pages_retry_then_exhaust())
+    asyncio.run(test_media_attempt_count_resets_on_success())
     asyncio.run(test_pk_failed_state_settles_converge())
     asyncio.run(test_pk_wiring())
     asyncio.run(test_seam_settles_when_nothing_pending())
