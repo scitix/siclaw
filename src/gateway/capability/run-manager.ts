@@ -128,6 +128,16 @@ export class CapabilityRunManager {
     correlationId?: string;
     runtimeId?: string;
     runId?: string; // caller may supply one (else minted)
+    /**
+     * Initial lifecycle status. "running" ONLY when a kickoff instruction will
+     * drive an immediate turn; an instruction-less start (find-or-start for a
+     * chat that follows via capability.message, or a run minted just to HOST
+     * test sessions) is a conversation at rest — "idle". A hosting-only run
+     * never gets a turn_done, so an initial "running" would stick forever:
+     * consumers reading run status as "the draft is being updated" would gate
+     * asks against a box that is just idling (seen live 07-08).
+     */
+    initialStatus?: "running" | "idle";
   }): Promise<CapabilityRunRecord> {
     const rec: CapabilityRunRecord = {
       runId: p.runId ?? this.mintRunId(),
@@ -135,7 +145,7 @@ export class CapabilityRunManager {
       orgId: p.orgId,
       correlationId: p.correlationId,
       runtimeId: p.runtimeId,
-      status: "running",
+      status: p.initialStatus ?? "running",
       lastActivityMs: this.now(),
       lastHeartbeatMs: this.now(),
     };

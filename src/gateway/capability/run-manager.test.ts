@@ -25,6 +25,17 @@ beforeEach(() => {
 });
 
 describe("CapabilityRunManager", () => {
+  it("startRun initialStatus idle — a hosting-only run is a conversation at rest, not a stuck turn", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const rec = await mgr.startRun({ profile: "kb-compile", orgId: "o1", initialStatus: "idle" });
+    expect(rec.status).toBe("idle");
+    expect(be.persists().at(-1)?.params).toMatchObject({ run_id: rec.runId, status: "idle" });
+    // The first real turn flips it running, exactly like any at-rest run.
+    await mgr.setStatus(rec.runId, "running");
+    expect(mgr.get(rec.runId)?.status).toBe("running");
+  });
+
   it("startRun mints an id, tracks it, and persists a running state", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
