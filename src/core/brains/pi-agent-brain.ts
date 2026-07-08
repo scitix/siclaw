@@ -10,6 +10,7 @@ import type {
   BrainSession,
   BrainModelInfo,
   BrainModelParams,
+  BrainToolDefinition,
   BrainContextUsage,
   BrainSessionStats,
   BrainProviderResponse,
@@ -241,6 +242,20 @@ export class PiAgentBrain implements BrainSession {
       maxTokens: model.maxTokens,
       reasoning: model.reasoning,
     };
+  }
+
+  /**
+   * The model-visible tool set. The session is built with noTools:"builtin", so
+   * getAllTools() is exactly the model-visible set (allowedTools-filtered custom
+   * tools + MCP + restricted file tools + extension tools). `parameters` is a
+   * TypeBox TSchema, which serialises to a JSON schema.
+   */
+  getTools(): BrainToolDefinition[] {
+    return this.session.getAllTools().map((t) => ({
+      name: t.name,
+      description: t.description,
+      parameters: t.parameters,
+    }));
   }
 
   async setModel(info: BrainModelInfo): Promise<void> {

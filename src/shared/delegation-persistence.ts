@@ -23,6 +23,8 @@ export interface DelegationAppendMessagePayload {
   parentSessionId?: string | null;
   delegationId?: string | null;
   targetAgentId?: string | null;
+  /** per-prompt root trace id inherited from the parent, for DB trace filtering. */
+  traceId?: string | null;
 }
 
 export interface DelegationUpdateMessagePayload {
@@ -72,6 +74,8 @@ export interface DelegationEventPayload {
    * live-only "running" fallback after a reload. Absent for single-subagent events. Additive.
    */
   itemStatuses?: Array<{ index: number; status: GroupItemStatus }>;
+  /** per-prompt root trace id inherited from the parent, for DB trace filtering. */
+  traceId?: string | null;
 }
 
 export interface ChannelDeliverMessagePayload {

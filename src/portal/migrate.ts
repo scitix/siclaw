@@ -167,6 +167,26 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     UNIQUE (org_id, name)
   )`,
 
+  // Tracing exporters (admin-managed third-party analysis platforms).
+  // Global — NO org_id (tracing is one fan-out set shared by every agent),
+  // so there is also no UNIQUE(org_id, name). `auth` holds type-specific
+  // credential material as a TEXT JSON blob (langfuse {publicKey,secretKey},
+  // phoenix {apiKey,projectName}, otlp {headers}); the OTLP headers are
+  // assembled at read time in buildTracingConfig(). Mirrors mcp_servers'
+  // double-driver-safe style: no JSON column / TIMESTAMP(3) / ON UPDATE.
+  `CREATE TABLE IF NOT EXISTS tracing_exporters (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    platform_type VARCHAR(30) NOT NULL,
+    url VARCHAR(500) NOT NULL,
+    auth TEXT,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_by CHAR(36),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
   // Agent <-> Skill junction
   `CREATE TABLE IF NOT EXISTS agent_skills (
     agent_id CHAR(36) NOT NULL,
@@ -312,6 +332,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     parent_session_id CHAR(36) DEFAULT NULL,
     delegation_id VARCHAR(64) DEFAULT NULL,
     target_agent_id CHAR(36) DEFAULT NULL,
+    trace_id CHAR(32) DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
   )`,
@@ -528,17 +549,24 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "chat_messages", "idx_chat_messages_delegation", "delegation_id");
   // message_feedback — Metrics aggregates by session.
   await ensureIndex(db, "message_feedback", "idx_message_feedback_session", "session_id, created_at");
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_trace", "trace_id");
   // a2a_tasks — every A2A query is scoped by (agent_id, api_key_id), so lead the composite
   // indexes with that prefix. #340 already created idx_a2a_tasks_agent/_context (older column
   // lists) on every deployed DB, and ensureIndex is name-only — so we must drop those and
   // recreate under NEW names, or the new prefixes never apply on existing DBs (mirrors the
   // skills uq_skills_org_name → idx_skills_org_name precedent below). Drop+rename is one-time
   // idempotent: once the old names are gone dropIndexIfExists is a no-op.
-  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_agent");
-  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_context");
+  //
+  // ORDER MATTERS on MySQL: idx_a2a_tasks_agent (single agent_id column) backs the FK
+  // fk_a2a_tasks_agent, and InnoDB refuses to DROP an index still needed by a foreign key
+  // (ER_DROP_INDEX_FK 1553). So create the (agent_id, …)-leading composites FIRST — once
+  // idx_a2a_tasks_agent_key exists InnoDB uses it as the FK's backing index — THEN drop the
+  // old single-column index. (SQLite has no such restriction; the order is harmless there.)
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_agent_key", "agent_id, api_key_id, created_at");
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_session", "session_id");
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_context_key", "agent_id, api_key_id, context_id, created_at");
+  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_agent");
+  await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_context");
   // notifications
   await ensureIndex(db, "notifications", "idx_notifications_user", "user_id, read_at, created_at");
   // agent_api_keys
@@ -607,6 +635,7 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_messages", "parent_session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "target_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "trace_id", "CHAR(32) DEFAULT NULL");
 
   // Widen delegation_id CHAR(36)→VARCHAR(64) on EXISTING deployments. A group reduce child's id
   // `${toolCallId}#reduce` reaches 36 chars for a 29-char provider id and would overflow CHAR(36)

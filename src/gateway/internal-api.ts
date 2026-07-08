@@ -196,6 +196,40 @@ export async function handleSettings(
 }
 
 /**
+ * GET /api/internal/tracing-config
+ *
+ * Proxies to Portal's config.getTracingConfig RPC — the GLOBAL tracing config
+ * (TracingConfig). No agentId is passed: tracing is a single fan-out set shared
+ * by every agent, so it must not be resolved through the agent-scoped
+ * config.getSettings (which drops tracing for agents without a bound provider).
+ * Used by the AgentBox hot-reload path (POST /api/reload-tracing).
+ *
+ * TRUST-DOMAIN ASSUMPTION (deliberate, not a leak): the payload carries the
+ * fully-assembled exporter auth in PLAINTEXT (unlike the admin REST list/get
+ * routes, which maskExporterAuth for the browser). This is required — the box
+ * exports spans DIRECTLY to the OTLP endpoint, so it must hold the real headers,
+ * exactly like it already holds providers.apiKey. Tracing is global (no
+ * per-tenant exporter concept), so every AgentBox that phones home gets the same
+ * set. The security boundary is the caller cert (Gateway/Runtime-OU + mTLS), not
+ * per-box scoping: any box inside the trust domain can read the exporter creds.
+ * If exporters ever become tenant-scoped, scope this fetch to the caller's tenant.
+ */
+export async function handleTracingConfig(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  _identity: CertificateIdentity,
+  frontendClient: FrontendWsClient,
+): Promise<void> {
+  try {
+    const data = await frontendClient.request("config.getTracingConfig", {});
+    sendJson(res, 200, data);
+  } catch (err) {
+    console.error("[internal-api] tracing-config error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
  * GET /api/internal/mcp-servers
  *
  * Returns MCP server configs bound to the agent.
@@ -491,6 +525,7 @@ async function appendDelegationMessage(
     parent_session_id: msg.parentSessionId ?? null,
     delegation_id: msg.delegationId ?? null,
     target_agent_id: msg.targetAgentId ?? null,
+    trace_id: msg.traceId ?? null,
   });
   return result.id as string;
 }
@@ -563,6 +598,7 @@ async function appendDelegationEvent(
     fromAgentId: evt.targetAgentId,
     delegationId: evt.delegationId,
     targetAgentId: evt.targetAgentId,
+    traceId: evt.traceId,
   });
 }
 

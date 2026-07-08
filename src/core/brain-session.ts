@@ -44,6 +44,18 @@ export interface BrainModelInfo {
   reasoning: boolean;
 }
 
+/**
+ * A model-visible tool, in a provider-neutral shape. `parameters` is the tool's
+ * JSON-schema-ish parameter definition (pi's TypeBox TSchema serialises to one).
+ * Consumed by the trace recorder to emit Langfuse tool-definition data — see
+ * docs/design/2026-07-08-langfuse-tool-instrumentation.md "Data-source contract".
+ */
+export interface BrainToolDefinition {
+  name: string;
+  description?: string;
+  parameters?: unknown;
+}
+
 /** Per-model runtime tunables forwarded from the control plane's modelConfig.params. */
 export interface BrainModelParams {
   /** Reasoning effort: off|minimal|low|medium|high|xhigh. */
@@ -118,6 +130,13 @@ export interface BrainSession {
 
   /** Get the currently active model. */
   getModel(): BrainModelInfo | undefined;
+
+  /**
+   * Optional: the model-visible tool set. Pulled live by the trace recorder (same
+   * event-time pull pattern as getModel/getSessionStats) to emit tool definitions
+   * on the llm.call generation. Absent → no tool definitions are recorded.
+   */
+  getTools?(): BrainToolDefinition[];
 
   /** Switch to a different model. */
   setModel(model: BrainModelInfo): Promise<void>;

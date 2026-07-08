@@ -313,6 +313,29 @@ describe("K8sSpawner — spawn branches", () => {
     }
   });
 
+  it("forwards SICLAW_TRACING_ENVIRONMENT from the runtime into the pod (allowlist)", async () => {
+    process.env.SICLAW_TRACING_ENVIRONMENT = "prod";
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.13", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    try {
+      await s.spawn({ agentId: "default" });
+      const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+      expect(env).toContainEqual({ name: "SICLAW_TRACING_ENVIRONMENT", value: "prod" });
+    } finally {
+      delete process.env.SICLAW_TRACING_ENVIRONMENT;
+    }
+  });
+
   it("does not inject SICLAW_SUBAGENT_CONCURRENCY when unset on the runtime", async () => {
     delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
 

@@ -129,6 +129,34 @@ describe("GatewayClient — fetchSettings (GET JSON)", () => {
   });
 });
 
+describe("GatewayClient — fetchTracingConfig (GET JSON)", () => {
+  let srv: TestServer;
+  let client: GatewayClient;
+
+  beforeAll(async () => {
+    srv = await startServer((req, res) => {
+      if (req.url === "/api/internal/tracing-config") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ enabled: true, serviceName: "siclaw-agentbox", exporters: [] }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+    client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+    fs.rmSync(certPath, { recursive: true, force: true });
+  });
+
+  afterAll(async () => { await srv.close(); });
+
+  it("GETs /api/internal/tracing-config and returns the parsed TracingConfig", async () => {
+    const tracing = await client.fetchTracingConfig();
+    expect(tracing).toEqual({ enabled: true, serviceName: "siclaw-agentbox", exporters: [] });
+    expect(srv.requests.some((r) => r.method === "GET" && r.url === "/api/internal/tracing-config")).toBe(true);
+  });
+});
+
 describe("GatewayClient — agent task CRUD", () => {
   let srv: TestServer;
   let client: GatewayClient;

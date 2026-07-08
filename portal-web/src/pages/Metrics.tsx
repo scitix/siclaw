@@ -7,14 +7,15 @@ import { TimingStatsCard } from "../components/metrics/TimingStatsCard"
 import { AuditTable } from "../components/metrics/AuditTable"
 import { SessionTable } from "../components/metrics/SessionTable"
 import { GrafanaFrame } from "../components/metrics/GrafanaFrame"
+import { TracingPlatforms } from "../components/metrics/TracingPlatforms"
 import { TimeRangePicker } from "../components/metrics/TimeRangePicker"
 import { EntrySelector } from "../components/metrics/EntrySelector"
 import { SenderCombobox } from "../components/metrics/SenderCombobox"
 
-type TabKey = "dashboard" | "sessions" | "tools" | "grafana"
+type TabKey = "dashboard" | "sessions" | "tools" | "grafana" | "tracing"
 
-const TAB_ORDER: TabKey[] = ["dashboard", "sessions", "tools", "grafana"]
-const TAB_LABEL: Record<TabKey, string> = { dashboard: "Dashboard", sessions: "Sessions", tools: "Tools", grafana: "Grafana" }
+const TAB_ORDER: TabKey[] = ["dashboard", "sessions", "tools", "grafana", "tracing"]
+const TAB_LABEL: Record<TabKey, string> = { dashboard: "Dashboard", sessions: "Sessions", tools: "Tools", grafana: "Grafana", tracing: "Tracing" }
 
 export function Metrics() {
   const [tab, setTab] = useState<TabKey>("dashboard")
@@ -203,6 +204,8 @@ export function Metrics() {
         )}
 
         {tab === "grafana" && <GrafanaFrame />}
+
+        {tab === "tracing" && <TracingPlatforms />}
       </div>
     </div>
   )

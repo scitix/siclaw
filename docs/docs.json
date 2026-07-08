@@ -94,7 +94,8 @@
           {
             "group": "Platform",
             "pages": [
-              "features/channels"
+              "features/channels",
+              "features/tracing"
             ]
           }
         ]

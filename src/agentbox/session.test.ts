@@ -126,6 +126,7 @@ vi.mock("../core/config.js", () => ({
 
 // Import SUT after mocks
 import { AgentBoxSessionManager } from "./session.js";
+import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
 import { createMemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import * as subagentRegistry from "../core/subagent-registry.js";
@@ -670,6 +671,44 @@ describe("AgentBoxSessionManager — Stop / abort latches", () => {
     expect(res.status).toBe("partial");
   });
 
+  it("block B: sub-agent recorder — startPrompt gets mainTraceId + spawnSpanContext, attach precedes it, endPrompt(done→completed)+detach", async () => {
+    const T1 = "0123456789abcdef0123456789abcdef";
+    // Parent's spawn_subagent tool span context, captured at dispatch — threaded to
+    // the child startPrompt so its ROOT nests under that span (nested layout).
+    const SC = { traceId: T1, spanId: "1122334455667788", traceFlags: 1, isRemote: true };
+    const mgr = new AgentBoxSessionManager() as any;
+    // fake brain emits an assistant message so finalText is non-empty → status stays "done"
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => {
+        emitter.emit("event", { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+      },
+    }));
+    const attachSpy = vi.spyOn(tracingRecorder, "attach");
+    const startSpy = vi.spyOn(tracingRecorder, "startPrompt");
+    const endSpy = vi.spyOn(tracingRecorder, "endPrompt");
+    const detachSpy = vi.spyOn(tracingRecorder, "detach");
+    try {
+      const res = await mgr.runSpawnedSubagent(
+        { spawnId: "s1", parentSessionId: "parent", parentAgentId: "a1", description: "d", prompt: "do x",
+          userId: "u1", subagentType: "general-purpose", taskListId: "tl", runInBackground: false },
+        { childSessionId: "child-1", mainTraceId: T1, spawnSpanContext: SC },
+      );
+      expect(res.status).toBe("done");
+      // Core anti-regression: the child's ROOT must inherit the parent's mainTraceId (4th arg,
+      // for DB stamping) AND get the spawn span context (5th arg, for span nesting); attach must
+      // precede startPrompt (else startPrompt takes the id-only branch, no span).
+      expect(startSpy).toHaveBeenCalledWith("child-1", "do x", "u1", T1, SC);
+      expect(attachSpy).toHaveBeenCalledWith("child-1", expect.anything(), expect.objectContaining({ userId: "u1" }));
+      expect(attachSpy.mock.invocationCallOrder[0]).toBeLessThan(startSpy.mock.invocationCallOrder[0]);
+      // done → completed; detach runs after endPrompt (finally safety net).
+      expect(endSpy).toHaveBeenCalledWith("child-1", "completed");
+      expect(detachSpy).toHaveBeenCalledWith("child-1");
+      expect(endSpy.mock.invocationCallOrder[0]).toBeLessThan(detachSpy.mock.invocationCallOrder[0]);
+    } finally {
+      attachSpy.mockRestore(); startSpy.mockRestore(); endSpy.mockRestore(); detachSpy.mockRestore();
+    }
+  });
+
   it("#1 stopSessionJobs re-sweep catches a job registered after the first sweep", () => {
     const mgr = new AgentBoxSessionManager() as any;
     mgr.jobs.register({ jobId: "j1", type: "bash", parentSessionId: "p1", status: "running", description: "d", startedAt: 0, notified: false, abort: () => {} });
@@ -750,6 +789,34 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
     expect(report.reduceSummary).toContain("SUMMARY");
     expect(report.reduceChildSessionId).toBeTruthy();
     expect(report.circuitBroken).toBeUndefined();
+  });
+
+  it("batch trace: captures the spawn span ONCE with the bare groupId (never #i) and threads it to every child", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const SC = { traceId: "a".repeat(32), spanId: "1".repeat(16), traceFlags: 1, isRemote: true };
+    const T1 = "0".repeat(32);
+    // Capture-once happens in the executor regardless of a live provider; stub the recorder reads
+    // and mock the child runner so no real child sessions spin up — we assert only trace threading.
+    const ensureSpy = vi.spyOn(tracingRecorder, "ensureToolSpan").mockReturnValue(SC as any);
+    vi.spyOn(tracingRecorder, "getRootTraceId").mockReturnValue(T1);
+    const runSpy = vi.spyOn(mgr, "runSpawnedSubagent").mockResolvedValue({
+      status: "done", summary: "ok", childSessionId: "c", toolCalls: 0, durationMs: 1,
+    });
+
+    await mgr.createSpawnSubagentExecutor()(baseReq({ reducePrompt: "Summarize" }), undefined, undefined);
+
+    // ONE capture, at group level, with the BARE groupId (= toolCallId) — never a derived
+    // `${groupId}#i` (which would mint a phantom tool span per child, breaking the nesting).
+    expect(ensureSpy).toHaveBeenCalledTimes(1);
+    expect(ensureSpy).toHaveBeenCalledWith("p1", "grp1", "spawn_subagent");
+    for (const call of ensureSpy.mock.calls) expect(String(call[1])).not.toContain("#");
+
+    // Every child (3 map + 1 reduce) nests under the SAME spawn span + shares the SAME trace id.
+    expect(runSpy).toHaveBeenCalledTimes(4);
+    for (const call of runSpy.mock.calls) {
+      expect(call[1]?.spawnSpanContext).toBe(SC);
+      expect(call[1]?.mainTraceId).toBe(T1);
+    }
   });
 
   it("map partial + slow reduce: group timer disarmed before reduce, overall is partial not timed_out", async () => {
