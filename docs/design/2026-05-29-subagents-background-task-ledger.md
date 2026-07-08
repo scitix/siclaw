@@ -134,6 +134,12 @@ TodoWrite cannot. The cost (ids, file-locking, persistence) is paid once.
 
 ## 6. `spawn_subagent` (sub-agents)
 
+> **Superseded by [2026-07-subagent-group.md](./2026-07-subagent-group.md) (v3 single-tool merge).**
+> The `prompt`-per-call schema and "emit N calls in one turn to fan out" pattern below were
+> replaced by an items-only batch schema: `spawn_subagent({ task_template?, items[1..N],
+> reduce_prompt? })`. Fan-out is now ONE call with a list of `items`, not N calls; a single item
+> is the degenerate case. The sections below are retained as the original 2026-05 record.
+
 ### Contract
 - **Input:** `{ description, prompt, subagent_type?, model?, run_in_background? }`. One call = one child.
 - **Parallelism:** the model emits N calls in one turn → pi runs them concurrently (native).

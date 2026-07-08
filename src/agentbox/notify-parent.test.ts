@@ -395,6 +395,40 @@ describe("notifyParent", () => {
     expect(execEvents).toHaveLength(0);
   });
 
+  it("a background GROUP job (type subagent + isGroup) notifies once with the inline group summary", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let cb: ((e: any) => void) | undefined;
+    const brain = {
+      followUp: vi.fn(async () => {}),
+      subscribe: vi.fn((fn: (e: any) => void) => { cb = fn; return () => {}; }),
+      prompt: vi.fn(async () => {
+        cb?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Relaying group result" }] } });
+      }),
+    };
+    const managed = fakeManaged("s1", brain as any, true);
+    mgr.sessions.set("s1", managed);
+    // Group job reuses type "subagent" (+ isGroup) → same inline-result notification path, no output_file.
+    mgr.jobs.register({ jobId: "grp1", type: "subagent", isGroup: true, parentSessionId: "s1", description: "triage", status: "partial", startedAt: 0, notified: false });
+    const send = vi.fn(async () => ({ ok: true, id: "x" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
+    mgr.agentId = "agent-1";
+    const summary = 'Sub-agent group "triage" partial — 3 item(s): 2 done, 1 failed.\n\nCauses: net, storage.';
+    await mgr.notifyParent("s1", "grp1", { taskId: "grp1", status: "partial", summary });
+    // dedup: a second notify for the same group job is a no-op.
+    await mgr.notifyParent("s1", "grp1", { taskId: "grp1", status: "partial", summary });
+    await flushCoalesce();
+    expect(brain.prompt).toHaveBeenCalledTimes(1); // ONE synthetic turn, deduped
+    const promptText = brain.prompt.mock.calls[0][0] as string;
+    expect(promptText).toContain("<task_notification>");
+    // Quotes are XML-escaped inside the <summary> block.
+    expect(promptText).toContain("Sub-agent group &quot;triage&quot; partial");
+    expect(promptText).toContain("Causes: net, storage.");
+    // Live fold event uses the subagent_done channel (a group is a subagent job), NOT exec_job_event.
+    const fold = send.mock.calls.map((c) => c[0]).filter((e: any) => e?.event?.type === "subagent_done");
+    expect(fold).toHaveLength(1);
+    expect(fold[0].event.job_id).toBe("grp1");
+  });
+
   it("does NOT emit background_turn_done when not persistable (no gatewayClient)", async () => {
     const { mgr, brain } = setup(true);
     // No gatewayClient / agentId → canPersist is false.
