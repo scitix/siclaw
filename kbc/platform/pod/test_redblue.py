@@ -25,25 +25,48 @@ def _mk(base: Path, rel: str, text: str = "x"):
 class FakeEngine:
     """Stage-routed canned responses; counts calls per stage."""
 
-    def __init__(self, broken_stages=()):
+    def __init__(self, broken_stages=(), slow_verdict_from=None, drop_verdict_ids=(),
+                 error_verdict_ids=(), error_blue_questions=(), uncovered_blue_questions=(),
+                 uncovered_verdict_ids=()):
         self.calls = {"survey": 0, "questions": 0, "blue": 0, "verdict": 0}
         self.systems = {}  # stage → last system prompt seen (asymmetry assertions)
+        self.users = {}    # stage → last user message seen
+        self.verdict_users = []  # EVERY verdict user message (chunk-content assertions)
+        self.models = {}   # stage → last model id seen (verdict-tier assertions)
+        self.roots = {}    # stage → last allowed_read_roots seen (de-agentic assertions)
         self.broken = set(broken_stages)
+        self.slow_verdict_from = slow_verdict_from  # Nth verdict call onward hangs
+        self.drop_verdict_ids = set(drop_verdict_ids)  # judge "forgets" these ids
+        self.error_verdict_ids = set(error_verdict_ids)  # any chunk w/ these ids raises
+        self.error_blue_questions = set(error_blue_questions)  # blue call raises (infra down)
+        self.uncovered_blue_questions = set(uncovered_blue_questions)  # genuine "not covered" reply
+        self.uncovered_verdict_ids = set(uncovered_verdict_ids)  # judge grades 正确标未覆盖
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
                                  model, effort=None, allowed_read_roots, timeout_secs):
-        if "出题面调研" in user_message:
+        # route on stage keywords in EITHER locale (en is the platform default)
+        if "question-surface survey" in user_message or "出题面调研" in user_message:
             stage = "survey"
-        elif "出题官" in user_message:
+        elif "question officer" in user_message or "出题官" in user_message:
             stage = "questions"
-        elif "判分标准" in user_message:
+        elif "Grading criteria" in user_message or "判分标准" in user_message:
             stage = "verdict"
-        elif "只读的知识消费者" in system_prompt:
+        elif ("read-only knowledge consumer" in system_prompt
+              or "只读的知识消费者" in system_prompt):
             stage = "blue"
         else:
             raise AssertionError(f"unroutable prompt: {user_message[:80]}")
         self.calls[stage] += 1
         self.systems[stage] = system_prompt
+        self.users[stage] = user_message
+        if stage == "verdict":
+            self.verdict_users.append(user_message)
+        self.models[stage] = model
+        self.roots[stage] = list(allowed_read_roots)
+        if stage == "verdict" and self.error_verdict_ids & set(re.findall(r"\[(q\d+)\]", user_message)):
+            raise RuntimeError("judge boom")  # a single chunk fails hard, others must survive
+        if stage == "verdict" and self.slow_verdict_from and self.calls["verdict"] >= self.slow_verdict_from:
+            await asyncio.sleep(30)  # parked until the wall clock cancels us
         if stage in self.broken:
             return "总之就是一段完全不是 JSON 的话。"
         if stage == "survey":
@@ -55,13 +78,23 @@ class FakeEngine:
                   for i in range(1, 8)]
             return json.dumps({"questions": qs})
         if stage == "blue":
+            if user_message in self.error_blue_questions:
+                raise asyncio.TimeoutError("blue infra down")  # engine call timed out
+            if user_message in self.uncovered_blue_questions:
+                # a GENUINE consumer reply: honestly says the wiki has nothing
+                return "This wiki does not cover that.\nSOURCES: []"
             # real-consumer persona: natural prose + a SOURCES line (NOT JSON)
             return "根据 wiki,答案是……\nSOURCES: [\"index.md\"]"
         ids = re.findall(r"\[(q\d+)\]", user_message)
         assert ids, "verdict prompt carries no question ids"
         out = []
         for i in ids:  # verdict: q1 fails as 覆盖, everything else passes
-            if i == "q1":
+            if i in self.drop_verdict_ids:
+                continue  # judge silently omits this id from its JSON
+            if i in self.uncovered_verdict_ids:
+                out.append({"id": i, "score": "正确标未覆盖", "failure_category": "无",
+                            "reason": "honest not-covered", "fix": "-", "page": "-"})
+            elif i == "q1":
                 out.append({"id": i, "score": "错", "failure_category": "覆盖",
                             "reason": "缺", "fix": "补编X", "page": "p1.md"})
             else:
@@ -81,10 +114,24 @@ def _pk_workspace(base: Path):
 
 def test_budget_and_helpers():
     assert redblue.question_budget(2) == 8      # floor
-    assert redblue.question_budget(20) == 30    # 20*1.5
-    assert redblue.question_budget(100) == 40   # cap
+    assert redblue.question_budget(20) == 20    # 20*1.0
+    assert redblue.question_budget(100) == 24   # cap (S2 default: 24 focused > 40 sprawled)
     assert redblue._chunks([1, 2, 3, 4, 5, 6, 7], 5) == [[1, 2, 3, 4, 5], [6, 7]]
-    print("OK  question_budget clamp + chunks")
+    # _summarize: normal path counts a missing verdict as a failure (the judge
+    # dropped it); salvage path skips it (cancelled ≠ failed).
+    qs = [{"id": "q1", "question": "a"}, {"id": "q2", "question": "b"}]
+    vs = {"q1": {"score": "对", "failure_category": "无"}}
+    full = redblue._summarize(qs, vs, missing_as_failure=True)
+    assert full["graded"] == 2 and full["gate_pass"] == 1 and len(full["failures"]) == 1
+    part = redblue._summarize(qs, vs, missing_as_failure=False)
+    assert part["graded"] == 1 and part["gate_pass"] == 1 and not part["failures"]
+    # media block formatting + cap; English by default, Chinese only on locale=zh
+    assert redblue._media_block(None) == ""
+    blk = redblue._media_block({"p1.md": ["s/a.png", "s/b.png"]})
+    assert "Chart-transcribed pages" in blk and "p1.md ← s/a.png, s/b.png" in blk
+    zh_blk = redblue._media_block({"p1.md": ["s/a.png", "s/b.png"]}, locale="zh")
+    assert "图表转写页" in zh_blk and "p1.md ← s/a.png, s/b.png" in zh_blk
+    print("OK  question_budget clamp + chunks + _summarize + _media_block")
 
 
 def test_parse_json_lenient_cases():
@@ -118,20 +165,28 @@ async def test_full_run():
     with tempfile.TemporaryDirectory() as td:
         wiki, raw = _pk_workspace(Path(td))
         fake = FakeEngine()
+        seen = []
         summary, detail = await redblue.run_pk(
-            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7,
+            progress=seen.append)
         # blue = per-question (7); judge = batched (7 → 2 chunks of 5+2)
         assert fake.calls == {"survey": 1, "questions": 1, "blue": 7, "verdict": 2}, fake.calls
         assert summary["state"] == "unconverged" and summary["questions"] == 7, summary
         assert summary["gate_pass"] == 6 and len(summary["failures"]) == 1, summary
         f = summary["failures"][0]
+        # stored tokens are locale-independent: 覆盖 stays 覆盖 in an English run
         assert f["category"] == "覆盖" and f["page"] == "p1.md", f
         assert len(detail["answers"]) == 7 and len(detail["verdicts"]) == 7
         # consumer SOURCES line parsed into structured cited_sources
         assert detail["answers"]["q1"]["cited_sources"] == ["index.md"], detail["answers"]["q1"]
+        # no locale → English everywhere: prompts, blue persona, progress lines
+        assert "read-only knowledge consumer" in fake.systems["blue"], fake.systems["blue"][:120]
+        assert seen and all(s.startswith("Self-check (PK)") for s in seen), seen
         prompt = redblue.build_pk_repair_prompt(summary)
+        assert prompt.startswith("[System self-check · red-blue PK]"), prompt[:80]
+        assert "[coverage]" in prompt  # stored 覆盖 token glossed at render time
         assert "补编X" in prompt and "p1.md" in prompt and "CONTRADICTIONS.json" in prompt
-    print("OK  full run (stage counts / chunking 5+2 / decide / repair prompt)")
+    print("OK  full run (stage counts / chunking 5+2 / decide / repair prompt, en default)")
 
 
 async def test_survey_cache():
@@ -167,6 +222,191 @@ async def test_questions_override_targeted_retest():
     print("OK  questions_override skips survey/questions (targeted retest primitive)")
 
 
+async def test_dropped_verdicts_retry_then_ungraded():
+    """The judge omitting ids from a chunk (seen live: 4/24, twice) gets ONE
+    dedicated re-judge round; persistently missing ids land in `ungraded` —
+    never in failures, never inflating the repair queue."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine(drop_verdict_ids={"q3"})
+        summary, detail = await redblue.run_pk(
+            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+        # 7 questions → 2 verdict chunks + 1 retry chunk for the missing id
+        assert fake.calls["verdict"] == 3, fake.calls
+        assert summary["ungraded"] == ["q3"], summary
+        assert summary["graded"] == 6 and summary["gate_pass"] == 5, summary
+        fails = {f["id"] for f in summary["failures"]}
+        assert fails == {"q1"}, fails                     # only the REAL failure
+        assert summary["pass_rate"] == round(5 / 6, 3)    # graded denominator
+        assert "q3" not in detail["verdicts"]
+    print("OK  dropped verdict ids → one re-judge → ungraded (not failures)")
+
+
+async def test_wall_timeout_salvages_partial():
+    """Wall-clock timeout with graded verdicts on hand → state=partial keeping
+    the graded subset (the spend is sunk); ungraded questions are NOT failures."""
+    import os
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine(slow_verdict_from=2)  # chunk 1 grades, chunk 2 hangs
+        os.environ["KBC_PK_WALL_SECS"] = "2"
+        os.environ["KBC_PK_CONCURRENCY"] = "1"  # serialize so chunk 1 finishes first
+        try:
+            summary, detail = await redblue.run_pk(
+                fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+        finally:
+            del os.environ["KBC_PK_WALL_SECS"], os.environ["KBC_PK_CONCURRENCY"]
+        assert summary["state"] == "partial", summary
+        assert summary["graded"] == 5 and summary["questions"] == 7, summary
+        assert len(summary["failures"]) == 1  # q1 fails in chunk 1; q6/q7 ungraded ≠ failed
+        assert "error" in summary and len(detail["verdicts"]) == 5
+    print("OK  wall timeout → partial salvage (graded kept, cancelled not failed)")
+
+
+async def test_verdict_error_contained_no_workloss():
+    """缺陷2 regression: a verdict chunk that ERRORS must not vaporize the sibling
+    chunks that already graded (the old fail-fast gather did exactly that → 0/24
+    salvaged in prod). The run completes on its own (no wall timeout); the failed
+    chunk's ids land in ungraded WITH a stage=verdict reason. It found a genuine
+    failure (q1) on a completed run → unconverged (repairable); ungraded ≠ partial
+    here — partial is reserved for a run that was itself cut short (salvaged)."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        # 7 questions → chunks q1..q5 (grades) + q6,q7 (raises). concurrency 1 so
+        # chunk 1 is committed before chunk 2 blows up.
+        import os
+        fake = FakeEngine(error_verdict_ids={"q6"})
+        os.environ["KBC_PK_CONCURRENCY"] = "1"
+        try:
+            summary, detail = await redblue.run_pk(
+                fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+        finally:
+            del os.environ["KBC_PK_CONCURRENCY"]
+        # THE regression: chunk 1's five verdicts SURVIVED the sibling's hard error
+        assert len(detail["verdicts"]) == 5, detail["verdicts"]
+        assert summary["graded"] == 5, summary
+        assert set(summary["ungraded"]) == {"q6", "q7"}, summary
+        # the failure is OBSERVABLE: each ungraded id carries why + which stage
+        reasons = summary["ungraded_reasons"]
+        assert reasons["q6"]["stage"] == "verdict" and "boom" in reasons["q6"]["reason"], reasons
+        # the run finished on its own (contained), it did NOT ride the wall clock
+        assert summary["wall_secs"] < 20 and not summary.get("salvaged"), summary
+        # q1's real failure still counts + drives repair; q6/q7 ungraded, NOT failures
+        assert {f["id"] for f in summary["failures"]} == {"q1"}, summary["failures"]
+        assert summary["state"] == "unconverged", summary  # completed run + real failure
+    print("OK  verdict chunk error contained → graded siblings kept, reasons observable")
+
+
+async def test_blue_infra_failure_ungraded_not_judged():
+    """A blue call that crashes/times out is an INFRASTRUCTURE failure, not a KB
+    signal: the question must never reach the judge (who could grade the
+    placeholder answer 正确标未覆盖 and let an outage inflate pass_rate as a
+    PASS). It lands in `ungraded` with a distinguishable blue-infra reason,
+    stays out of the graded denominator, never drives repair, and its per-item
+    error record survives in detail. A blue answer that GENUINELY says
+    not-covered still grades normally (the honest-uncovered contract)."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine(error_blue_questions={"问题3"},          # q3: infra failure
+                          uncovered_blue_questions={"问题2"},      # q2: honest not-covered
+                          uncovered_verdict_ids={"q2"})
+        summary, detail = await redblue.run_pk(
+            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+        # q3 has no recorded answer and is NOT in any judge input:
+        # 6 answered → chunks 5+1, no re-judge round
+        assert fake.calls["blue"] == 7 and fake.calls["verdict"] == 2, fake.calls
+        assert "q3" not in detail["answers"]
+        assert fake.verdict_users and all("[q3]" not in u for u in fake.verdict_users)
+        # ungraded with the infra reason, in the existing {stage, reason} shape
+        assert summary["ungraded"] == ["q3"], summary
+        r = summary["ungraded_reasons"]["q3"]
+        assert r["stage"] == "blue" and r["reason"].startswith("blue infrastructure failure"), r
+        # per-item error record kept (observable), never popped by a verdict landing
+        assert detail["errors"]["q3"]["stage"] == "blue", detail["errors"]
+        assert "q3" not in detail["verdicts"]
+        # denominator excludes the outage: 6 graded, q1 the only REAL failure
+        assert summary["graded"] == 6 and summary["gate_pass"] == 5, summary
+        assert summary["pass_rate"] == round(5 / 6, 3), summary
+        assert {f["id"] for f in summary["failures"]} == {"q1"}, summary["failures"]
+        assert summary["state"] == "unconverged", summary  # repair driven by q1 only
+        # the GENUINE honest-uncovered reply DID reach the judge and passes
+        assert detail["answers"]["q2"]["said_uncovered"] is True, detail["answers"]["q2"]
+        assert detail["verdicts"]["q2"]["score"] == "正确标未覆盖", detail["verdicts"]["q2"]
+    print("OK  blue infra failure → ungraded (never judged, out of denominator); honest-uncovered still passes")
+
+
+async def test_verdict_deagentified():
+    """判官去 agentic (缺陷1 fix): the verdict call runs on the gate tier and is
+    fenced OUT of raw — it grades from the inlined `expected` rubric, never by
+    agentically re-reading raw (the loop that hung). survey/questions stay strong-
+    tier and raw-capable."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine()
+        await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=10,
+                             questions_budget=7,
+                             blue_model="B", judge_model="J")
+        # verdict = gate tier (default sonnet), NOT the strong authoring judge "J"
+        assert fake.models["verdict"] == "claude-sonnet-4-6", fake.models
+        assert fake.models["survey"] == "J" and fake.models["questions"] == "J", fake.models
+        assert fake.models["blue"] == "B", fake.models
+        # verdict is fenced out of raw; survey/questions keep raw for real research
+        assert raw not in fake.roots["verdict"], fake.roots["verdict"]
+        assert raw in fake.roots["survey"] and raw in fake.roots["questions"], fake.roots
+        # the verdict prompt no longer instructs raw reading (en default run)
+        assert "do not attempt to read any files" in fake.users["verdict"], fake.users["verdict"][:200]
+        assert "raw ground-truth points" in fake.users["verdict"]  # grades from the inlined rubric
+        # KBC_PK_VERDICT_MODEL overrides the gate-tier default
+        import os
+        fake2 = FakeEngine()
+        os.environ["KBC_PK_VERDICT_MODEL"] = "opus-override"
+        try:
+            await redblue.run_pk(fake2, wiki_dir=wiki, raw_dir=raw, page_count=3,
+                                 questions_budget=2, judge_model="J")
+        finally:
+            del os.environ["KBC_PK_VERDICT_MODEL"]
+        assert fake2.models["verdict"] == "opus-override", fake2.models
+    print("OK  verdict de-agentified (gate tier, fenced out of raw, inlined rubric)")
+
+
+async def test_media_pages_steer_question_officer():
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine()
+        await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=3,
+                             questions_budget=2,
+                             media_pages={"p1.md": ["s/chart.png"]})
+        assert "Chart-transcribed pages" in fake.users["questions"], fake.users["questions"][:200]
+        assert "p1.md ← s/chart.png" in fake.users["questions"]
+        assert "Chart-transcribed pages" not in fake.users["blue"]  # blue stays ignorant
+    print("OK  media_pages reach the question officer only")
+
+
+async def test_zh_locale_branch():
+    """locale='zh' flips every model-facing prompt, the blue persona, and the
+    progress/repair narration to Chinese; stored tokens (score/category/state)
+    stay identical to the en run — locale never forks the data."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine()
+        seen = []
+        summary, _ = await redblue.run_pk(
+            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7,
+            progress=seen.append, locale="zh")
+        assert "出题面调研" in fake.users["survey"], fake.users["survey"][:120]
+        assert "出题官" in fake.users["questions"]
+        assert "判分标准" in fake.users["verdict"]
+        assert "只读的知识消费者" in fake.systems["blue"]  # zh test-role pack
+        assert seen and all(s.startswith("自检(PK)") for s in seen), seen
+        # stored tokens unchanged by locale
+        assert summary["state"] == "unconverged"
+        assert summary["failures"][0]["category"] == "覆盖", summary["failures"]
+        prompt = redblue.build_pk_repair_prompt(summary, locale="zh")
+        assert prompt.startswith("【系统自检 · 红蓝队】"), prompt[:60]
+        assert "[覆盖]" in prompt and "补编X" in prompt
+    print("OK  locale=zh flips prompts/persona/narration; stored tokens unchanged")
+
+
 async def test_broken_json_fails_open():
     with tempfile.TemporaryDirectory() as td:
         wiki, raw = _pk_workspace(Path(td))
@@ -192,15 +432,16 @@ async def test_contract_artifacts_judge_only():
         await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=3,
                              authoring_dir=str(authoring), questions_budget=2)
         for stage in ("survey", "questions", "verdict"):
-            assert "平台新同事" in fake.systems[stage], stage
-            assert "周报时效性强" in fake.systems[stage] and "声明排除" in fake.systems[stage], stage
+            assert "平台新同事" in fake.systems[stage], stage  # INTENT content quoted verbatim
+            assert "周报时效性强" in fake.systems[stage], stage  # exclusion reason quoted verbatim
+            assert "declared excluded" in fake.systems[stage], stage
         assert "平台新同事" not in fake.systems["blue"]
         assert "周报时效性强" not in fake.systems["blue"]
 
         # without authoring_dir the judge context carries neither
         fake2 = FakeEngine()
         await redblue.run_pk(fake2, wiki_dir=wiki, raw_dir=raw, page_count=3, questions_budget=2)
-        assert "声明排除" not in fake2.systems["survey"]
+        assert "declared excluded" not in fake2.systems["survey"]
     print("OK  INTENT/EXCLUSIONS reach judge stages only, blue stays ignorant")
 
 
@@ -241,6 +482,13 @@ def main():
     asyncio.run(test_full_run())
     asyncio.run(test_survey_cache())
     asyncio.run(test_questions_override_targeted_retest())
+    asyncio.run(test_dropped_verdicts_retry_then_ungraded())
+    asyncio.run(test_wall_timeout_salvages_partial())
+    asyncio.run(test_verdict_error_contained_no_workloss())
+    asyncio.run(test_blue_infra_failure_ungraded_not_judged())
+    asyncio.run(test_verdict_deagentified())
+    asyncio.run(test_media_pages_steer_question_officer())
+    asyncio.run(test_zh_locale_branch())
     asyncio.run(test_broken_json_fails_open())
     asyncio.run(test_contract_artifacts_judge_only())
     test_pk_section_survives_layer1()

@@ -14,10 +14,12 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# claude-agent-sdk + aiohttp = the box runtime; python-pptx/openpyxl/python-docx
-# let office_ingest pre-render .pptx/.xlsx/.docx sources to markdown (pdf/text/
-# images are read natively by the agent's Read tool, so no parser is needed there).
-RUN pip install --no-cache-dir claude-agent-sdk aiohttp python-pptx openpyxl python-docx
+# Pin the SDK: an unpinned install drifts on every rebuild, and the bundled
+# Claude Code CLI drifts with it (API request-shape changes can break the
+# massapi/Bedrock path). 0.2.110 is production-proven on the KB compile path.
+# python-pptx/openpyxl/python-docx let office_ingest pre-render .pptx/.xlsx/.docx
+# sources to markdown (pdf/text/images are read natively by the agent's Read tool).
+RUN pip install --no-cache-dir claude-agent-sdk==0.2.110 aiohttp python-pptx openpyxl python-docx
 
 WORKDIR /app
 # CLAUDE.md is only for the legacy CLI (compile_agent.py walks parents for it).
@@ -25,21 +27,22 @@ WORKDIR /app
 # locale prompt packs (prompts/<locale>/playbook.md); the env is a local-dev
 # escape hatch and setting it in the image would override every locale.
 COPY CLAUDE.md /app/CLAUDE.md
-COPY platform/pod/compile_agent.py /app/compile_agent.py
-COPY platform/pod/compile_box.py /app/compile_box.py
-COPY platform/pod/office_ingest.py /app/office_ingest.py
-COPY platform/pod/selfcheck.py /app/selfcheck.py
-COPY platform/pod/engine.py /app/engine.py
-COPY platform/pod/redblue.py /app/redblue.py
+# All pod modules via a glob so a new one can never be forgotten again (2026-07-07:
+# incremental.py was omitted from the explicit list and crashed the box on startup
+# with ModuleNotFoundError). test_*.py are excluded via kbc/.dockerignore.
+COPY platform/pod/*.py /app/
 COPY platform/pod/prompts/ /app/prompts/
 COPY tools/ /app/tools/
 
 # Tenant isolation: never load external memory (prevents cross-tenant bleed).
 ENV CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
-# massapi/Bedrock rejects the `context_management` field Claude Code attaches on
-# large-context turns (HTTP 400). Disable autocompact so it's never sent. The
-# Python modules also setdefault this; the ENV makes it visible at the image level.
-ENV DISABLE_AUTOCOMPACT=1
+# massapi/Bedrock rejects the `context_management` request field (HTTP 400).
+# Root cause (2026-07-06, see compile_box.py header): the thinking-clear
+# context edit rides the experimental context-management beta — DISABLE_
+# EXPERIMENTAL_BETAS is the real kill switch; autocompact-off stays as
+# belt-and-braces. The Python modules also setdefault these; the ENV makes
+# the posture visible at the image level.
+ENV CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 DISABLE_AUTOCOMPACT=1 DISABLE_AUTO_COMPACT=1
 # Default served port (overridable via SICLAW_AGENTBOX_PORT, aligned with agentbox).
 ENV SICLAW_AGENTBOX_PORT=3000
 

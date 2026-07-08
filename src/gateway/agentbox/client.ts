@@ -343,12 +343,12 @@ export class AgentBoxClient {
    * streams structured events on /events/:runId; agentbox uses /api/stream/:id.
    * Both speak `data: <json>\n\n` with `: heartbeat` comment lines.
    */
-  async *streamPath(path: string): AsyncIterable<unknown> {
+  async *streamPath(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
     const url = `${this.endpoint}${path}`;
 
     // Use https.request for HTTPS with mTLS
     if (this.httpsAgent && this.endpoint.startsWith("https://")) {
-      yield* this.streamPathHttps(path);
+      yield* this.streamPathHttps(path, opts);
       return;
     }
 
@@ -382,14 +382,21 @@ export class AgentBoxClient {
         buffer = lines.pop() || ""; // Retain incomplete line
 
         for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const data = line.slice(6);
+          if (line.startsWith("data:")) {
+            // SSE spec: the value is everything after the colon, minus ONE
+            // optional leading space — "data:x" is as valid as "data: x".
+            const data = line.slice(5).replace(/^ /, "");
             try {
               eventCount++;
               yield JSON.parse(data);
             } catch {
               console.warn(`[agentbox-client] SSE parse error path=${path}: ${data.slice(0, 100)}`);
             }
+          } else if (line.startsWith(":")) {
+            // SSE comment — the box's keep-alive. Callers that watchdog on data
+            // events can opt in to hear it (a healthy-but-quiet compile must not
+            // be reaped as stale); it is never yielded as an event.
+            opts?.onComment?.();
           }
         }
       }
@@ -405,7 +412,7 @@ export class AgentBoxClient {
   /**
    * SSE stream over HTTPS with mTLS, on an arbitrary path.
    */
-  private async *streamPathHttps(path: string): AsyncIterable<unknown> {
+  private async *streamPathHttps(path: string, opts?: { onComment?: () => void }): AsyncIterable<unknown> {
     const urlObj = new URL(path, this.endpoint);
 
     const res = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
@@ -440,14 +447,21 @@ export class AgentBoxClient {
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const data = line.slice(6);
+          if (line.startsWith("data:")) {
+            // SSE spec: the value is everything after the colon, minus ONE
+            // optional leading space — "data:x" is as valid as "data: x".
+            const data = line.slice(5).replace(/^ /, "");
             try {
               eventCount++;
               yield JSON.parse(data);
             } catch {
               console.warn(`[agentbox-client] SSE parse error path=${path}: ${data.slice(0, 100)}`);
             }
+          } else if (line.startsWith(":")) {
+            // SSE comment — the box's keep-alive. Callers that watchdog on data
+            // events can opt in to hear it (a healthy-but-quiet compile must not
+            // be reaped as stale); it is never yielded as an event.
+            opts?.onComment?.();
           }
         }
       }

@@ -49,6 +49,7 @@ async def run(workdir: str, max_turns: int) -> int:
         allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
         permission_mode="bypassPermissions",    # pod 本身就是 sandbox
         max_turns=max_turns,
+        max_buffer_size=int(os.environ.get("KBC_SDK_MAX_BUFFER_BYTES", str(16 * 1024 * 1024))),
         setting_sources=[],                      # 多租户隔离:不加载外部 settings/CLAUDE.md
     )
     # kbc playbook(编译纪律)+ 任务 一起作为 prompt(生产可改 system_prompt 的 preset append 形式)

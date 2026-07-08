@@ -36,6 +36,8 @@ import os
 import re
 import shutil
 import tarfile
+import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -50,15 +52,33 @@ from claude_agent_sdk import (
     InMemorySessionStore,
 )
 
+import batching
+import incremental
+import mediaverify
 import office_ingest
+import redblue
 import selfcheck
+from engine import ClaudeEngine
 
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches
-# once a session's context passes the autocompact buffer (HTTP 400
-# "context_management: Extra inputs are not permitted"). A compile is a long
-# multi-turn session, so it hits this readily. Disable autocompact so the field
-# is never sent. setdefault → an explicit deployment override still wins.
+# (HTTP 400 "context_management: Extra inputs are not permitted").
+# ROOT CAUSE (settled 2026-07-06 by reading bundled CLI 2.1.191): the field is
+# NOT autocompact — it is the thinking-clear context edit, attached whenever a
+# turn has thinking enabled AND the context-management beta is in the betas
+# list. massapi masquerades as a first-party endpoint, so the CLI auto-enables
+# that beta for modern models; adaptive thinking then decides per-turn → the
+# 400 is intermittent (respawn-rehydrate first turns, image-heavy turns).
+# The gate: `if (o1(provider) && !E2e() && enabled) push(contextManagementBeta)`
+# where E2e() = CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS || hipaa. So THIS is the
+# kill switch. Correct posture on a Bedrock-proxied gateway anyway: any
+# experimental beta that changes the request shape is a 400 hazard here.
+os.environ.setdefault("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
+# Autocompact stays off too (kept from the earlier mitigation): a compile is a
+# long multi-turn session and massapi has no compaction affordances. BOTH
+# spellings: CLI 0.2.110 read DISABLE_AUTO_COMPACT (underscored).
+# setdefault → an explicit deployment override still wins.
 os.environ.setdefault("DISABLE_AUTOCOMPACT", "1")
+os.environ.setdefault("DISABLE_AUTO_COMPACT", "1")
 
 # A box usually hosts a single run; a map keeps it clean (and helps health/debugging).
 RUNS: dict[str, "CompileRun"] = {}
@@ -110,6 +130,14 @@ def _playbook_text(locale: str | None) -> str:
     return _prompt("playbook", locale)
 
 
+def _loc(run, en: str, zh: str) -> str:
+    """User/model-facing text in the run's locale (platform default en, zh only
+    when the consumer declares it — same gate as selfcheck narration). Wire
+    tokens and stored data stay locale-independent; never route them through
+    this."""
+    return en if selfcheck._is_en(getattr(run, "locale", None)) else zh
+
+
 # The one-line labels that frame owner instructions inside the system prompt.
 _INSTRUCTION_HEADER = {
     "zh": "# 本次 authoring attempt 的负责人说明",
@@ -136,6 +164,54 @@ def _test_snapshot_root() -> str:
 _COMPILE_IMPL = None  # set at bottom to run_session
 # Same injection seam for the read-only test-session driver (set at bottom).
 _TEST_SESSION_IMPL = None
+
+
+# ── Model-stall watchdog (L1) ────────────────────────────────────────────────
+# A compile turn can wedge on a black-holed model request (massapi/upstream
+# accepts the connection but never responds). The bundled `claude` CLI's own
+# request timeout is ~60min and not tunable from here, so a routine upstream
+# hiccup froze a run for an hour. We own the recovery: a turn-scoped watchdog
+# reaps a wedged model request in seconds and re-issues the turn.
+#
+# Idle is measured as MODEL-response latency — a pending tool (Read/Bash run in
+# the CLI, not the model) relaxes the bound so a long tool never looks like a
+# stall (invariant I4: never false-kill a live turn).
+_MODEL_IDLE_TIMEOUT_S = float(os.environ.get("KBC_MODEL_IDLE_TIMEOUT_S", "90"))
+_MODEL_TOOL_IDLE_TIMEOUT_S = float(os.environ.get("KBC_MODEL_TOOL_IDLE_TIMEOUT_S", "660"))
+_MODEL_MAX_RETRIES = int(os.environ.get("KBC_MODEL_MAX_RETRIES", "3"))
+_MODEL_WATCHDOG_POLL_S = float(os.environ.get("KBC_MODEL_WATCHDOG_POLL_S", "10"))
+
+# ── Rate-limit resilience (C2) ───────────────────────────────────────────────
+# massapi under concurrency (5-10 boxes × the red-blue PK) can return 429/503/529.
+# The bundled CLI retries internally a few times; past that the turn ends with
+# is_error=True and api_error_status set (CLI >= 2.1.110). We back off and re-issue
+# rather than failing the run — massapi's limits are not ours to fix (out of
+# scope), so this is graceful handling, not a fix. Exhaustion ends the turn with a
+# clear owner-facing note instead of a crash.
+_MODEL_RATE_STATUSES = frozenset({429, 503, 529})
+_MODEL_RATE_MAX_RETRIES = int(os.environ.get("KBC_MODEL_RATE_MAX_RETRIES", "5"))
+_MODEL_RATE_BACKOFF_BASE_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_BASE_S", "2"))
+_MODEL_RATE_BACKOFF_CAP_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_CAP_S", "30"))
+
+# ── Graceful-shutdown flush (F3) ─────────────────────────────────────────────
+# SIGTERM stops the box (pod delete / eviction / OOM after the runtime reap).
+# /work is an emptyDir destroyed with the pod, and work reaches the store only via
+# the periodic sync — so without a shutdown flush the last ≤SYNC_INTERVAL_SECS is
+# lost. on_shutdown final-syncs each active run and gives the relay a bounded
+# window to drain. Best-effort within the grace period (F1 is the durable fix).
+_SHUTDOWN_DRAIN_S = float(os.environ.get("KBC_SHUTDOWN_DRAIN_S", "0.5"))
+_SHUTDOWN_DRAIN_MAX_S = float(os.environ.get("KBC_SHUTDOWN_DRAIN_MAX_S", "8"))
+
+
+def _rate_backoff_delay(attempt: int) -> float:
+    """Exponential backoff (attempt is 1-based), capped."""
+    return min(_MODEL_RATE_BACKOFF_BASE_S * (2 ** (attempt - 1)), _MODEL_RATE_BACKOFF_CAP_S)
+
+
+class ModelStallError(Exception):
+    """A turn's model request stalled past the idle bound and exhausted retries.
+    Raised out of the consume loop so _run_wrapper fails the run with a clear
+    reason instead of the box sitting silently."""
 
 
 class CompileRun:
@@ -172,15 +248,65 @@ class CompileRun:
         # loop; reset to 0 whenever the check passes).
         self._selfcheck_key: str | None = None
         self._l1_repairs_used = 0
+        # Batch mode (DESIGN-kb-batch-compile-2026-07-05): when the orchestrator
+        # drives per-batch sessions, ResultMessage must NOT emit turn_done (the
+        # whole batch run is ONE turn to the consumer); the flushed reply is parked
+        # here for the orchestrator instead. _batch_notes queues owner chat that
+        # arrives mid-batch (relayed into the next batch directive).
+        self._suppress_turn_done = False
+        self._last_turn_reply: str = ""
+        # Media blind-verify bookkeeping: pages handed to the in-flight verify
+        # task (subtracted from the due-check) — verified marks land only AFTER
+        # a completed verification (failed pages retry, bounded by attempts).
+        self._media_inflight: set[str] = set()
+        # When the stall watchdog fired interrupt(): bounds the wait for the
+        # interrupted result (a true black-hole can swallow interrupt() too).
+        self._stall_interrupted_at = 0.0
+        self._batch_active = False
+        self._batch_notes: list[str] = []
+        # Scoped incremental (真增量): armed at kickoff with {before: page_hashes,
+        # changeset}; the post-turn seam runs the byte-integrity guard against it,
+        # then clears it. None = this turn is not a scoped incremental.
+        self._incr_pending: dict | None = None
+        # Layer-2 red-blue PK (S2): the in-flight background task, if any.
+        # Single-flight per run; durable state lives in SELFCHECK.json `pk`.
+        self._pk_task: asyncio.Task | None = None
+        # Blind image verify (图像复核 v2): the in-flight background task.
+        self._media_task: asyncio.Task | None = None
+        # Model-stall watchdog (L1) — turn-scoped state, updated by the receive
+        # loop (_consume_turn_stream) and the watchdog task. A turn is "active"
+        # from query() until its real ResultMessage; the watchdog only judges an
+        # active turn, and only against model latency (see _MODEL_* above).
+        self._turn_active = False
+        self._tool_pending = False          # last assistant msg asked for a tool
+        self._last_model_activity = 0.0     # monotonic ts of the last inbound SDK msg / query
+        self._last_directive = ""           # the in-flight turn's text, for retry
+        self._model_retries = 0             # stall retries used on the in-flight turn
+        self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
+        self._stall_fatal = False           # stall retries exhausted → fail this turn
+        self._rate_retries = 0              # rate-limit (429/503/529) retries on the in-flight turn
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
+
+    def _begin_turn(self, directive: str):
+        """Arm the stall watchdog for a new model turn. Called for every turn —
+        the owner's /message AND internal self-check/verify/batch injections."""
+        self._last_directive = directive
+        self._turn_active = True
+        self._tool_pending = False
+        self._model_retries = 0
+        self._stall_retrying = False
+        self._stall_fatal = False
+        self._rate_retries = 0
+        self._last_model_activity = time.monotonic()
 
     async def inject_user_message(self, text: str):
         """Engine seam: push a user turn into the live session. The Claude SDK
         driver is one line; a future engine driver (e.g. Codex) reimplements
         just this method — self-check orchestration stays engine-neutral."""
         if self.client:
+            self._begin_turn(text)
             await self.client.query(text)
 
 
@@ -227,6 +353,10 @@ _pack_candidates_to_wiki = selfcheck.pack_candidates_to_wiki
 WORKSPACE_SYNC_DIRS = ("authoring", "candidate", "eval", "release")
 SYNC_INTERVAL_SECS = int(os.environ.get("KBC_SYNC_INTERVAL_SECS", "20"))
 MAX_SYNC_FILE_BYTES = int(os.environ.get("KBC_MAX_SYNC_FILE_BYTES", str(1024 * 1024)))
+# SDK stdio JSON reader buffer. The SDK default is 1MB, and one oversized tool
+# result (a Read of a big source file) kills the whole session with a fatal
+# "exceeded maximum buffer size" — seen live on a 139-source compile (2026-07-06).
+SDK_MAX_BUFFER_BYTES = int(os.environ.get("KBC_SDK_MAX_BUFFER_BYTES", str(16 * 1024 * 1024)))
 
 
 def _collect_workspace_artifacts(workdir: str) -> list[dict]:
@@ -819,6 +949,402 @@ def _l1_repair_rounds() -> int:
     return int(os.environ.get("KBC_L1_REPAIR_ROUNDS", "1"))
 
 
+def _media_verify_enabled() -> bool:
+    return os.environ.get("KBC_MEDIA_VERIFY", "on") != "off"
+
+
+def _media_verify_max_images() -> int:
+    return int(os.environ.get("KBC_MEDIA_VERIFY_MAX_IMAGES", "8"))
+
+
+def _media_verify_attempts() -> int:
+    """Failed-verification retries per page before it ships with a VISIBLE
+    exhausted flag in SELFCHECK.json (fail-open must never equal false-pass)."""
+    return max(1, int(os.environ.get("KBC_MEDIA_VERIFY_ATTEMPTS", "2")))
+
+
+def _media_verify_rounds() -> int:
+    """Bound on the batch-tail verify/repair loop: repair turns can add new
+    image citations that re-enter pending, so the loop needs a hard cap."""
+    return max(1, int(os.environ.get("KBC_MEDIA_VERIFY_ROUNDS", "3")))
+
+
+def _settle_media_outcome(run, chunk: dict, result: dict | None) -> list[str]:
+    """Post-verify bookkeeping (review fix: pages used to be marked verified
+    BEFORE verification ran, so a total transcription failure shipped image
+    claims unchecked, permanently). Completed pages are marked verified; failed
+    pages get an attempt bump and retry on a later trigger until the budget is
+    spent — then they are marked with a visible `exhausted` flag. result=None
+    means the whole flow failed → every page in the chunk is a failed attempt.
+    Returns the pages exhausted this round."""
+    completed = list((result or {}).get("completed_pages") or [])
+    failed = list((result or {}).get("failed_pages") or [])
+    if result is None:
+        failed = list(chunk)
+    if completed:
+        selfcheck.mark_media_verified(run.workdir, completed)
+    exhausted: list[str] = []
+    if failed:
+        counts = selfcheck.bump_media_attempts(run.workdir, failed)
+        exhausted = [p for p in failed if counts.get(p, 0) >= _media_verify_attempts()]
+        if exhausted:
+            selfcheck.mark_media_verified(run.workdir, exhausted, exhausted=True)
+    return exhausted
+
+
+async def _emit_media_exhausted(run, exhausted: list[str]) -> None:
+    if not exhausted:
+        return
+    await run.emit({"type": "summary", "text": _loc(run,
+        f"Self-check (images): {len(exhausted)} page(s) could not be verified after "
+        f"{_media_verify_attempts()} attempt(s) — shipped with a visible flag in SELFCHECK.json.",
+        f"自检(图像):{len(exhausted)} 页在 {_media_verify_attempts()} 次尝试后仍无法完成复核——已放行并在 SELFCHECK.json 显式标记。")})
+
+
+def _media_verify_due(run) -> dict[str, list[str]] | None:
+    """A ≤max-images chunk of image-citing pages owed a blind verify on the
+    settled draft, else None. Idempotent via media_verify.verified_pages —
+    pages verify once per content lifecycle; the remainder rolls into the next
+    settled turn automatically (only the chunk gets marked)."""
+    workdir = getattr(run, "workdir", None)
+    if not workdir or not _media_verify_enabled():
+        return None
+    task = getattr(run, "_media_task", None)
+    if task is not None and not task.done():
+        return None  # single-flight
+    if not (Path(workdir) / "candidate" / "index.md").is_file():
+        return None
+    sc = selfcheck.read_selfcheck(workdir)
+    if not sc or sc.get("state") != "passed":
+        return None  # ledger repairs first; verify once settled
+    inflight = getattr(run, "_media_inflight", set())  # test doubles may lack it
+    pending = {p: imgs for p, imgs in selfcheck.pending_media_verification(workdir).items()
+               if p not in inflight}
+    if not pending:
+        return None
+    return selfcheck.cap_media_pending(pending, _media_verify_max_images())
+
+
+async def _set_converge_phase(run, phase: str) -> None:
+    """Set the DURABLE verify converge phase (SELFCHECK.json) + sync it, so the
+    frontend reads an authoritative 校对中/修订中/settled signal instead of
+    run_status (the phantom's root). Additive + fail-open — no control-flow
+    change, so it cannot affect the never-stuck turn/repair logic."""
+    wd = getattr(run, "workdir", None)
+    if not wd:
+        return
+    selfcheck.set_converge_phase(wd, phase)
+    sent = getattr(run, "_sync_sent", None)
+    if sent is not None:
+        try:
+            await _sync_workspace(run, sent)
+        except Exception:
+            pass
+
+
+def _maybe_start_media_verify(run) -> bool:
+    """Kick the blind transcribe+compare flow as a background task (图像复核 v2).
+    Verified marks land only AFTER a completed verification (review fix — the
+    old up-front mark turned a total transcription failure into a silent,
+    permanent false-pass); the in-flight set + attempt budget keep it loop-free."""
+    try:
+        chunk = _media_verify_due(run)
+    except Exception:
+        return False  # a broken due-check must never break the turn seam
+    if not chunk:
+        return False
+    run._media_inflight = getattr(run, "_media_inflight", set()) | set(chunk)
+    run._media_task = asyncio.get_running_loop().create_task(
+        _run_media_verify_flow(run, chunk))
+    return True
+
+
+async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
+    """Blind transcription + text-only comparison over one chunk, then ONE
+    repair turn for confirmed findings. De-anchored by construction: the
+    transcriber never sees the page, the comparer never sees the image —
+    the 07-06/07 live failures (MEM 条→GPU-Util, 跨图 H20) were both
+    confirmation-bias artifacts of claim-in-context re-reading. Fail-open."""
+    try:
+        n_imgs = sum(len(v) for v in chunk.values())
+        await run.emit({"type": "summary",
+                        "text": _loc(run,
+                                     f"Self-check (images): blind-verifying {len(chunk)} page(s) / {n_imgs} image(s) (background)…",
+                                     f"自检(图像):盲转写复核 {len(chunk)} 页 / {n_imgs} 张图(后台)…")})
+        await _set_converge_phase(run, "verifying")
+        loop = asyncio.get_running_loop()
+        result = await mediaverify.run_blind_verify(
+            ClaudeEngine(), run.workdir, chunk,
+            progress=lambda s: loop.create_task(run.emit({"type": "summary", "text": s})),
+            locale=getattr(run, "locale", None))
+        await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, result))
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)  # MEDIA_TRANSCRIPTS.json rides along
+            except Exception:
+                pass
+        findings, errors = result["findings"], result["errors"]
+        tail = _loc(run, f"; {len(errors)} transcription/comparison failure(s)",
+                    f";{len(errors)} 项转写/比对失败") if errors else ""
+        if findings:
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Self-check (images): {result['images']} image(s) checked, {len(findings)} claim(s) contradict the image / exceed the source — repair injected{tail}",
+                f"自检(图像):{result['images']} 张图已核,{len(findings)} 条断言与图不符/超源,注入回修{tail}")})
+            await _set_converge_phase(run, "revising")
+            await run.inject_user_message(mediaverify.build_repair_prompt(findings, locale=getattr(run, "locale", None)))
+        else:
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Self-check (images): {result['images']} image(s) checked, claims match the images ✓{tail}",
+                f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓{tail}")})
+    except Exception as e:
+        try:
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Self-check (images) failed, skipping this round: {e!r}",
+                f"自检(图像)执行失败,本轮跳过: {e!r}")})
+            await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, None))
+        except Exception:
+            pass
+    finally:
+        run._media_inflight = getattr(run, "_media_inflight", set()) - set(chunk)
+
+
+# ── Layer-2 red-blue PK wiring (S2, DESIGN-kb-compile-self-verification §9) ──
+# Async post-check shape (option c): turn_done fires normally, the PK runs as a
+# background task over a PINNED snapshot, findings come back as an ordinary
+# injected repair turn, and ONE targeted retest of the failed questions closes
+# the round. Bounded and idempotent by construction: tested_tree_hash in the
+# SELFCHECK `pk` section keys "this draft was already examined"; rounds are
+# capped; every failure path writes an honest terminal pk state (fail-open).
+
+PK_RESULT_PATH = "authoring/PK_RESULT.json"
+_PK_ANSWER_PERSIST_CAP = 4000  # chars per answer in the persisted detail
+
+
+def _pk_mode() -> str:
+    return os.environ.get("KBC_PK_MODE", "auto")
+
+
+def _pk_repair_rounds() -> int:
+    return int(os.environ.get("KBC_PK_REPAIR_ROUNDS", "1"))
+
+
+def _read_pk_result(workdir: str) -> dict | None:
+    p = Path(workdir) / PK_RESULT_PATH
+    if not p.is_file():
+        return None
+    try:
+        v = json.loads(p.read_text(encoding="utf-8"))
+        return v if isinstance(v, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _write_pk_result(workdir: str, detail: dict) -> None:
+    """Persist the full question/answer/verdict detail (rides syncArtifacts, so
+    a respawned box can still run the targeted retest). Answers are truncated —
+    the retest only needs the questions; long answers are debugging color."""
+    slim = {
+        "questions": detail.get("questions", []),
+        "verdicts": detail.get("verdicts", {}),
+        "answers": {
+            qid: {**a, "answer": (a.get("answer") or "")[:_PK_ANSWER_PERSIST_CAP]}
+            for qid, a in (detail.get("answers") or {}).items()
+        },
+    }
+    p = Path(workdir) / PK_RESULT_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(slim, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+
+
+def _pk_due(run) -> str | None:
+    """'full' | 'retest' when the settled draft owes a PK pass, else None.
+    Ordering contract: ledger repairs and the image re-verify own the seam
+    first — PK only examines a draft the cheaper layers are done with."""
+    workdir = getattr(run, "workdir", None)
+    if not workdir or _pk_mode() != "auto":
+        return None
+    if getattr(run, "_batch_active", False):
+        return None  # the train's own end triggers PK
+    task = getattr(run, "_pk_task", None)
+    if task is not None and not task.done():
+        return None  # single-flight
+    if not (Path(workdir) / "candidate" / "index.md").is_file():
+        return None
+    sc = selfcheck.read_selfcheck(workdir) or {}
+    if sc.get("state") != "passed":
+        return None
+    media_task = getattr(run, "_media_task", None)
+    if media_task is not None and not media_task.done():
+        return None  # blind image verify owns the seam first
+    if _media_verify_enabled() and selfcheck.pending_media_verification(workdir):
+        return None
+    pk = sc.get("pk") or {}
+    if pk.get("state") == "repairing":
+        return "retest"
+    if pk.get("tested_tree_hash") == selfcheck.candidate_tree_hash(workdir):
+        return None  # this exact draft was already examined (any terminal state)
+    return "full"
+
+
+def _maybe_start_pk(run) -> bool:
+    """Returns whether a PK round was started (so the turn seam can tell 'a verify
+    is now pending' from 'nothing left to do → settled')."""
+    try:
+        kind = _pk_due(run)
+    except Exception:
+        return False  # a broken due-check must never break the turn seam
+    if kind:
+        run._pk_task = asyncio.get_running_loop().create_task(_run_pk_flow(run, kind))
+        return True
+    return False
+
+
+def _pk_narration(summary: dict, locale: str | None = None) -> str:
+    state = summary.get("state")
+    n, ok = summary.get("questions", 0), summary.get("gate_pass", 0)
+    fails = len(summary.get("failures") or [])
+    wall = summary.get("wall_secs", 0)
+    ung = len(summary.get("ungraded") or [])
+    if selfcheck._is_en(locale):
+        tail = f" (plus {ung} left ungraded by the judge, excluded from scoring)" if ung else ""
+        if state == "passed":
+            return f"Self-check (red-blue PK): {ok}/{n - ung} all passed ✓ ({wall}s){tail}"
+        if state == "partial":
+            return (f"Self-check (red-blue PK): cut off at the wall clock — {summary.get('graded', 0)}/{n} graded, "
+                    f"{fails} failed; results recorded{tail}")
+        if state == "repairing":
+            return f"Self-check (red-blue PK): {ok}/{n - ung} passed, {fails} failed — repair round injected{tail}"
+        if state == "unconverged":
+            return f"Self-check (red-blue PK): {ok}/{n - ung} passed, {fails} failed — the rest on the publish card{tail}"
+        return f"Self-check (red-blue PK) failed: {summary.get('error', '?')}"
+    tail = f"(另 {ung} 题裁判未判,不计分)" if ung else ""
+    if state == "passed":
+        return f"自检(红蓝队):{ok}/{n - ung} 全过 ✓({wall}s){tail}"
+    if state == "partial":
+        return f"自检(红蓝队):超时截断,已判 {summary.get('graded', 0)}/{n},{fails} 项未过——结果已入账{tail}"
+    if state == "repairing":
+        return f"自检(红蓝队):{ok}/{n - ung} 过,{fails} 项未过,已注入回修轮{tail}"
+    if state == "unconverged":
+        return f"自检(红蓝队):{ok}/{n - ung} 过,{fails} 项未过——余项见发布确认卡{tail}"
+    return f"自检(红蓝队)失败:{summary.get('error', '?')}"
+
+
+async def _run_pk_flow(run, kind: str) -> None:
+    """One PK round over a pinned snapshot of the current draft. Fail-open at
+    every boundary — a PK crash costs the PK, never the compile session."""
+    workdir = run.workdir
+    tmp = tempfile.mkdtemp(prefix="kbc-pk-")
+    try:
+        tree = selfcheck.candidate_tree_hash(workdir)
+        _, pages = selfcheck.pack_candidates_to_wiki(workdir, Path(tmp))
+        raw_dir = str(Path(workdir) / "raw")
+        authoring_dir = str(Path(workdir) / "authoring")
+        constitution = Path(workdir) / "constitution.md"
+        sc = selfcheck.read_selfcheck(workdir) or {}
+        prev_pk = sc.get("pk") or {}
+        prev_rounds = int(prev_pk.get("rounds_used") or 0)
+
+        override = None
+        if kind == "retest":
+            prev_detail = _read_pk_result(workdir)
+            failed_ids = {f.get("id") for f in prev_pk.get("failures") or []}
+            override = [q for q in (prev_detail or {}).get("questions", [])
+                        if q.get("id") in failed_ids] or None
+            if override is None:
+                # Detail lost (e.g. pre-sync crash) → full pass, but count the
+                # burned round so this can never oscillate full↔repairing.
+                kind = "full"
+                prev_rounds = max(prev_rounds, _pk_repair_rounds())
+
+        await run.emit({"type": "summary", "text": _loc(run,
+            f"Self-check (red-blue PK): {'targeted re-test of ' + str(len(override)) + ' question(s)' if override else 'full checkup'}"
+            " started (background, does not block the session)…",
+            f"自检(红蓝队):{'定向复测 ' + str(len(override)) + ' 题' if override else '全量体检'}"
+            "开始(后台运行,不影响会话)…")})
+        await _set_converge_phase(run, "verifying")
+        loop = asyncio.get_running_loop()
+        summary, detail = await redblue.run_pk(
+            ClaudeEngine(), wiki_dir=tmp, raw_dir=raw_dir, page_count=pages,
+            authoring_dir=authoring_dir,
+            constitution_path=str(constitution) if constitution.is_file() else None,
+            questions_override=override,
+            media_pages=None if override else selfcheck.media_citing_pages(workdir),
+            progress=lambda s: loop.create_task(
+                run.emit({"type": "summary", "text": s})),
+            locale=getattr(run, "locale", None))
+        summary["tested_tree_hash"] = tree
+        summary["kind"] = kind
+
+        if kind == "retest":
+            # Merge into the standing scoreboard. gate_pass sums (retested
+            # passes were failures before, so no double count); a retest
+            # question the judge again failed to grade KEEPS its previous
+            # failed standing (never counts as resolved); ungraded questions
+            # stay out of the pass-rate denominator.
+            prev_ungraded = sorted(prev_pk.get("ungraded") or [])
+            total_q = int(prev_pk.get("questions") or summary.get("questions") or 0)
+            retest_ungraded = set(summary.get("ungraded") or [])
+            carried = [f for f in (prev_pk.get("failures") or [])
+                       if f.get("id") in retest_ungraded]
+            summary["failures"] = (summary.get("failures") or []) + carried
+            summary["gate_pass"] = int(prev_pk.get("gate_pass") or 0) + int(summary.get("gate_pass") or 0)
+            summary["questions"] = total_q
+            graded_total = max(1, total_q - len(prev_ungraded))
+            summary["pass_rate"] = round(summary["gate_pass"] / graded_total, 3)
+            summary["ungraded"] = prev_ungraded
+            summary["rounds_used"] = prev_rounds + 1
+            if summary.get("state") not in ("failed",):
+                summary["state"] = "passed" if not summary["failures"] else "unconverged"
+        elif (summary.get("state") == "unconverged"
+              and summary.get("failures") and prev_rounds < _pk_repair_rounds()):
+            summary["state"] = "repairing"
+            summary["rounds_used"] = prev_rounds
+        else:
+            summary["rounds_used"] = prev_rounds
+
+        selfcheck.update_pk_section(workdir, summary)
+        if detail.get("questions"):
+            _write_pk_result(workdir, detail)
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)
+            except Exception:
+                pass
+        await run.emit({"type": "summary", "text": _pk_narration(summary, getattr(run, "locale", None))})
+        if summary.get("state") == "repairing":
+            await _set_converge_phase(run, "revising")
+            await run.inject_user_message(redblue.build_pk_repair_prompt(summary, locale=getattr(run, "locale", None)))
+        elif summary.get("state") in ("passed", "partial", "unconverged", "failed"):
+            # `failed` included (review fix): run_pk is fail-open and RETURNS
+            # failed rather than raising — without a terminal here the phase
+            # wedged at "verifying" and the frontend test-step gate never opened.
+            # Converged: red-blue (the final layer) reached a terminal state and
+            # no repair was injected → the draft is stable and testable.
+            await _set_converge_phase(run, "settled")
+    except Exception as e:
+        try:
+            selfcheck.update_pk_section(workdir, {
+                "state": "failed", "error": repr(e),
+                "tested_tree_hash": selfcheck.candidate_tree_hash(workdir)})
+        except Exception:
+            pass
+        try:
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Self-check (red-blue PK) failed, skipping this round: {e!r}",
+                f"自检(红蓝队)执行失败,本轮跳过: {e!r}")})
+        except Exception:
+            pass
+        try:
+            # Fail-open PK must still terminalize the converge gate.
+            await _set_converge_phase(run, "settled")
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def _post_turn_selfcheck(run) -> str | None:
     """Layer-1 deterministic self-check at turn end (coverage ledger + lint;
     design: DESIGN-kb-compile-self-verification-2026-07-03 §8.1). All analysis
@@ -830,6 +1356,11 @@ async def _post_turn_selfcheck(run) -> str | None:
     workdir = getattr(run, "workdir", None)
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
+    # Consume the scoped-incremental guard state once, whatever this turn's outcome
+    # (a tree that didn't change → no violations possible → nothing to guard).
+    # getattr: test doubles / non-incremental runs may not carry the attribute.
+    incr = getattr(run, "_incr_pending", None)
+    run._incr_pending = None
     key = selfcheck.state_key(workdir)
     if key is None or key == run._selfcheck_key:
         return None
@@ -837,7 +1368,18 @@ async def _post_turn_selfcheck(run) -> str | None:
         return None  # mid-Execute: pages exist but the index isn't written yet
     run._selfcheck_key = key
     report = selfcheck.run_layer1(workdir)
-    if report["coverage"]["closed"] and report["lint"]["ok"]:
+    # Scoped-incremental byte-integrity guard: on an incremental turn, pages OUTSIDE
+    # the authorized set (affected ∪ declared added-targets ∪ index) must be byte-
+    # identical to their pre-turn state. A violation forces a repair even if the
+    # ledger passed — "leave the rest untouched" is a hard guarantee, not a hope.
+    incr_violations: list[str] = []
+    if incr:
+        after = incremental.page_hashes(workdir)
+        editable = incremental.authorized_pages(workdir, incr["changeset"])
+        incr_violations = incremental.integrity_violations(incr["before"], after, editable)
+        report["incremental"] = {"out_of_scope_pages": incr_violations}
+    ledger_clean = report["coverage"]["closed"] and report["lint"]["ok"]
+    if ledger_clean and not incr_violations:
         run._l1_repairs_used = 0
         report["state"] = "passed"
     elif run._l1_repairs_used < _l1_repair_rounds():
@@ -850,7 +1392,20 @@ async def _post_turn_selfcheck(run) -> str | None:
     await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
-        return selfcheck.build_repair_prompt(report, locale)
+        if incr:
+            # Re-arm the byte-integrity guard for the repair turn itself —
+            # for ANY incremental turn entering repair, not only one that
+            # already violated: an in-scope turn with an unclean ledger gets a
+            # coverage/lint repair turn too, and THAT turn could drift out of
+            # scope just as easily. Judged against the ORIGINAL baseline (the
+            # repair restores toward it).
+            run._incr_pending = incr
+        parts = []
+        if not ledger_clean:
+            parts.append(selfcheck.build_repair_prompt(report, locale))
+        if incr_violations:
+            parts.append(incremental.build_integrity_repair(incr_violations, locale=locale))
+        return "\n\n".join(parts)
     return None
 
 
@@ -870,6 +1425,18 @@ async def _emit_message(run: CompileRun, msg) -> None:
     elif name == "ResultMessage":
         reply = "\n\n".join(run._turn_text).strip()
         run._turn_text = []
+        if getattr(run, "_suppress_turn_done", False):
+            # Batch mode: this session's turn is an INTERNAL step of one logical
+            # turn. Park the reply, keep the durability sync, skip selfcheck
+            # (the final full-corpus pass owns it) and skip turn_done.
+            run._last_turn_reply = reply
+            sent = getattr(run, "_sync_sent", None)
+            if sent is not None:
+                try:
+                    await _sync_workspace(run, sent)
+                except Exception:
+                    pass
+            return
         # Layer-1 self-check BEFORE the sync so SELFCHECK.json rides the same
         # pre-turn_done sync. Fail-open: a self-check crash must not kill the
         # turn (§4.5) — surface it as a summary line instead of dying silently.
@@ -893,8 +1460,13 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 pass  # periodic loop retries; a sync hiccup must not kill the turn
         await run.emit({"type": "turn_done", "text": reply})
         # Bounded auto-repair AFTER turn_done (async-post-check design, §4.3-c):
-        # the turn ends normally; the repair is an ordinary next turn.
+        # the turn ends normally; the repair is an ordinary next turn. When no
+        # repair is due, a settled draft may instead owe its one-shot image
+        # numeric re-verification (same seam, same never-stuck shape).
         if repair_msg:
+            # A ledger repair is a revision-in-progress: mark it so the frontend
+            # keeps "生成与完善进行中" (converge not done) through the repair turn.
+            await _set_converge_phase(run, "revising")
             try:
                 await run.inject_user_message(repair_msg)
             except Exception as e:
@@ -902,6 +1474,16 @@ async def _emit_message(run: CompileRun, msg) -> None:
                        if selfcheck._is_en(getattr(run, "locale", None))
                        else f"自检回修注入失败: {e!r}")
                 await run.emit({"type": "summary", "text": msg})
+        else:
+            # Seam order: ledger repairs → blind image verify → red-blue PK.
+            # Only a draft the cheaper layers are done with gets examined. When
+            # NOTHING is pending (verify disabled, or all layers already clean on
+            # this exact draft), the draft is stable → settled. This makes
+            # converge_phase authoritative for BOTH verify-on and verify-off, so the
+            # frontend gates the test step on `settled` with no config lookup.
+            started = _maybe_start_media_verify(run) or _maybe_start_pk(run)
+            if not started:
+                await _set_converge_phase(run, "settled")
 
 
 # Default tool whitelist for a kb-compile session, used when the runtime profile
@@ -916,29 +1498,11 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
 ]
 
 
-async def run_session(run: CompileRun):
-    """Persistent driver: host ONE long-lived Claude Code session (ClaudeSDKClient)
-    for this KB. box_role (+ the playbook + the attempt instruction) is the standing
-    system prompt; the session then takes turns via POST /message — continuous
-    prepare + compile in one session, on massapi, with the compile tools.
-    Conversational by construction: connect, then wait for the first /message.
-    (Durable cross-restart resume + a file-backed session store land in P4; v1
-    uses an in-process store.)"""
-    wd = str(Path(run.workdir).resolve())
-    playbook = _playbook_text(run.locale)
-    instruction = (run.instruction or "").strip()
-    role_parts = []
-    if playbook:
-        role_parts.append(playbook)
-    role_parts.append(_prompt("box_role", run.locale))
-    if instruction:
-        header = _INSTRUCTION_HEADER.get((run.locale or DEFAULT_LOCALE).lower(), _INSTRUCTION_HEADER[DEFAULT_LOCALE])
-        role_parts.append(header + "\n\n" + instruction)
-    system_prompt = "\n\n---\n\n".join(role_parts)
-
-    sid = run.session_id or str(uuid.uuid4())
-    run.session_id = sid
-    opts = ClaudeAgentOptions(
+def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, session_id: str) -> "ClaudeAgentOptions":
+    """One options builder for the persistent session AND every batch session —
+    identical role/tools/model so a batch page is written under exactly the same
+    conventions as a single-session page."""
+    return ClaudeAgentOptions(
         cwd=wd,
         # Keep the Claude Code preset (agentic tool conventions) and append the
         # KB authoring role on top, rather than replacing it.
@@ -952,9 +1516,681 @@ async def run_session(run: CompileRun):
         # compile default is opus by product decision. Overridable per-deploy.
         model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
         max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
-        session_id=sid,
+        max_buffer_size=SDK_MAX_BUFFER_BYTES,
+        session_id=session_id,
         session_store=InMemorySessionStore(),
+        # Stream partial deltas so the stall watchdog sees fine-grained model
+        # liveness: a live-but-slow generation keeps emitting StreamEvents (idle
+        # clock stays fresh), while a black-holed request emits nothing at all.
+        # _emit_message ignores StreamEvent by name, so the log/turn stream and
+        # the batch driver's ResultMessage detection are unchanged.
+        include_partial_messages=True,
     )
+
+
+def _compile_system_prompt(run: "CompileRun") -> str:
+    playbook = _playbook_text(run.locale)
+    instruction = (run.instruction or "").strip()
+    role_parts = []
+    if playbook:
+        role_parts.append(playbook)
+    role_parts.append(_prompt("box_role", run.locale))
+    if instruction:
+        header = _INSTRUCTION_HEADER.get((run.locale or DEFAULT_LOCALE).lower(), _INSTRUCTION_HEADER[DEFAULT_LOCALE])
+        role_parts.append(header + "\n\n" + instruction)
+    return "\n\n---\n\n".join(role_parts)
+
+
+# ── batch mode (DESIGN-kb-batch-compile-2026-07-05) ──────────────────────────
+# Large corpora never fit one session (autocompact is off — massapi rejects the
+# context_management field), so the box splits the compile into code-budgeted
+# batches, each a FRESH session over the same workspace. State handoff is the
+# workspace itself (exact files, code-verifiable), never a prose summary. Small
+# KBs stay on the untouched single-session path (threshold gate).
+
+# Machine-canonical only: these exact strings are what UI buttons send (quick
+# start / plan approve / the 07-06 resume button, whose directive prefix-matches
+# "直接开始编译"). Natural-language phrasings deliberately do NOT trigger — a human
+# saying "继续编译前我想先改个要求" must not launch the train.
+_BATCH_TRIGGER_PREFIXES = ("直接开始编译", "批准,按此计划执行")
+_BATCH_TRIGGER_SUBSTR = "请增量重编"
+
+
+def _is_compile_trigger(text: str) -> bool:
+    return text.startswith(_BATCH_TRIGGER_PREFIXES) or _BATCH_TRIGGER_SUBSTR in text
+
+
+def _batch_mode_enabled() -> bool:
+    return os.environ.get("KBC_BATCH_MODE", "on") != "off"
+
+
+def _should_route_to_incremental(run: "CompileRun", text: str) -> bool:
+    """A compile trigger + a machine-computed changeset from the consumer
+    (authoring/RAW_CHANGES.json with real changes) → the SCOPED incremental path,
+    which re-touches only the affected pages instead of re-planning the whole
+    corpus. No changeset (or empty) → fall through to the normal full compile /
+    batch route (backward compatible: the consumer not yet wired = old behavior)."""
+    if run._batch_active or not _is_compile_trigger(text):
+        return False
+    return incremental.has_changes(incremental.load_raw_changes(run.workdir))
+
+
+def _should_route_to_batch(run: "CompileRun", text: str) -> bool:
+    if not _batch_mode_enabled() or run._batch_active or not _is_compile_trigger(text):
+        return False
+    raw_dir = Path(run.workdir) / "raw"
+    inventory = batching.scan_sources(raw_dir)
+    if batching.should_batch(inventory):
+        return True
+    # An interrupted batch run must finish as a batch run even if raw shrank.
+    plan = _load_batch_plan(run)
+    return plan is not None and len(batching.pending_batches(plan)) > 0
+
+
+async def _start_incremental(run: "CompileRun", text: str) -> None:
+    """Scoped incremental kickoff: materialize the model-facing CHANGESET from
+    the consumer's RAW_CHANGES, snapshot page hashes for the post-turn integrity guard,
+    then inject the scoped directive. It is ONE ordinary model turn (not the batch
+    orchestrator), so turn_done + the normal post-turn seam (coverage/charset +,
+    once wired, the byte-integrity guard) apply unchanged."""
+    cs = incremental.materialize_changeset(run.workdir)
+    if cs is None:
+        # Race / empty after the route check → fall back to a normal turn.
+        run._begin_turn(text)
+        await run.client.query(text)
+        return
+    run._incr_pending = {"before": incremental.page_hashes(run.workdir), "changeset": cs}
+    await run.emit({"type": "summary",
+                    "text": _loc(run,
+                     f"Incremental recompile: {len(cs['affected_pages'])} page(s) affected — touching only those, everything else stays untouched.",
+                     f"增量重编:{len(cs['affected_pages'])} 页受影响,只改这些,其余不动。")})
+    directive = incremental.build_scoped_directive(cs, locale=getattr(run, "locale", None))
+    run._begin_turn(directive)  # arm the stall watchdog — same as every other kickoff
+    await run.client.query(directive)
+
+
+def _batch_plan_path(run: "CompileRun") -> Path:
+    return Path(run.workdir) / batching.BATCH_PLAN_PATH
+
+
+def _load_batch_plan(run: "CompileRun") -> dict | None:
+    p = _batch_plan_path(run)
+    if not p.is_file():
+        return None
+    try:
+        plan = json.loads(p.read_text())
+        return plan if isinstance(plan, dict) and isinstance(plan.get("batches"), list) else None
+    except Exception:
+        return None
+
+
+def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
+    p = Path(run.workdir) / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(batching.dump_json(value))
+
+
+async def _drive_batch_session(run: "CompileRun", directive: str, label: str) -> str:
+    """One bounded internal session: fresh session_id, same role/tools/workspace.
+    Streams its output through _emit_message with turn_done suppressed; returns
+    the session's final reply text. run.client points at the live session so the
+    park/ruling MCP tools and the inject seam keep working."""
+    wd = str(Path(run.workdir).resolve())
+    opts = _compile_session_opts(run, wd, _compile_system_prompt(run), str(uuid.uuid4()))
+    client = ClaudeSDKClient(options=opts)
+    prev_client = run.client
+    run._suppress_turn_done = True
+    run._last_turn_reply = ""
+    try:
+        await client.connect()
+        run.client = client
+        await run.emit({"type": "log", "text": _loc(run, f"—— {label} started ——", f"—— {label} 开始 ——")})
+        run._begin_turn(directive)
+        await client.query(directive)
+        await _consume_turn_stream(run, client, stop_on_result=True)
+        return run._last_turn_reply
+    finally:
+        run._suppress_turn_done = False
+        run.client = prev_client
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+def _drain_batch_notes(run: "CompileRun") -> str:
+    if not run._batch_notes:
+        return ""
+    notes = "\n".join(f"- {n}" for n in run._batch_notes)
+    run._batch_notes = []
+    return _loc(run,
+                f"\n\nThe owner added during the compile (take it into account; it affects the remaining batches):\n{notes}",
+                f"\n\n负责人在编译过程中补充说(一并考虑,影响后续各批):\n{notes}")
+
+
+def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
+                             locale: str | None = None) -> str:
+    listing = "\n".join(f"- raw/{p}" for p in batch["sources"])
+    if selfcheck._is_en(locale):
+        return (
+            f"[Batch compile · batch {k}/{n} · {batch['id']}] Compile ONLY the sources below "
+            f"(see the batching discipline in the system prompt):\n{listing}\n"
+            "First read authoring/BRIEF.json, authoring/INTENT.md and candidate/index.md to stay consistent "
+            "in voice and structure; then read every source in this batch closely and fold its content fully "
+            "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
+            "compiled_from must list the sources it was actually compiled from); update the matching "
+            "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
+            "never stop. Do not read ANY raw source outside this batch. When done, report briefly which pages "
+            "this batch produced." + notes
+        )
+    return (
+        f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
+        "先读 authoring/BRIEF.json、authoring/INTENT.md 和 candidate/index.md 保持口径与结构一致;"
+        "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
+        "compiled_from 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
+        "本批之外的 raw 源一个都不要读。完成后简短汇报本批编了哪些页。" + notes
+    )
+
+
+def _dup_reason_en(reason: str) -> str:
+    """Render selfcheck's stored dup reason (zh data token) for an English
+    directive. The stored value stays zh — it is data, not display."""
+    if reason == "标题相同":
+        return "same title"
+    m = re.match(r"共享 (\d+) 个来源", reason or "")
+    return f"{m.group(1)} shared sources" if m else reason
+
+
+def _compose_final_directive(workdir: str, n: int, notes: str,
+                             locale: str | None = None) -> str:
+    """Final-pass directive fed with DETERMINISTIC worklists (dup candidates,
+    orphans, ⚠️ count) computed by code — the A/B showed a prose-only '合并明显
+    重复的主题页' leaves double-height duplicates and orphans standing. Concrete
+    pairs + a merge-or-exempt discipline make silence impossible."""
+    pages = selfcheck.candidate_pages(workdir)
+    dups = selfcheck.dup_candidates(pages)
+    exclusions_, excl_errors = selfcheck.load_exclusions(workdir)
+    orphans = [v["page"] for v in selfcheck.lint_candidate(pages, excl_errors)["violations"]
+               if v["kind"] == "orphan"]
+    suspect = sum((p.get("text") or "").count("⚠️") for p in pages.values())
+    if selfcheck._is_en(locale):
+        lines = [f"[Batch compile · final review] All {n} batches are compiled. Now do the cross-batch "
+                 "close-out (the checklists below are machine-computed — handle every item, silent skipping "
+                 "is not allowed):"]
+        step = 1
+        if dups:
+            lines.append(f"{step}) Duplicate-page candidates ({len(dups)} pairs) — for each pair pick one: "
+                         "merge into a single page (merge compiled_from, fix index links), or give a one-line "
+                         "written exemption in your report (genuinely different topics):")
+            lines += [f"   - {d['pages'][0]} ↔ {d['pages'][1]} ({_dup_reason_en(d['reason'])})" for d in dups]
+            step += 1
+        if orphans:
+            lines.append(f"{step}) Orphan pages ({len(orphans)}, unreachable from index.md) — link them into "
+                         "the index or their parent page; delete only if genuinely dead:")
+            lines += [f"   - {p}" for p in orphans]
+            step += 1
+        lines.append(f"{step}) Read through candidate/index.md and the page titles; unify terminology and "
+                     "structure; repair the index grouping and links;")
+        step += 1
+        lines.append(f"{step}) Cross-batch contradictions (the corpus currently carries {suspect} ⚠️ uncertain "
+                     "marks): where the same fact is stated differently, first converge whatever the "
+                     "constitution/voice can settle (e.g. prefer the newest in a time sequence and keep the "
+                     "history), and only best-guess + ⚠️ + ticket what cannot be settled; also check whether "
+                     "any EXISTING ⚠️ can now be converged;")
+        step += 1
+        lines.append(f"{step}) Check authoring/EXCLUSIONS.json: sources you decided not to compile (including "
+                     "images/PDF and other media) must be explicitly accounted for.")
+        lines.append("Close out only — do not recompile pages that are already fine. When done, report "
+                     "briefly: total pages, which pages this close-out touched, which pairs were "
+                     "merged/exempted and why, and anything worth the owner's attention.")
+        return "\n".join(lines) + notes
+    lines = [f"【分批编译 · 终审】全部 {n} 批已编完。现在做跨批收口(以下清单是系统机械算出的,逐项处理、不许沉默跳过):"]
+    step = 1
+    if dups:
+        lines.append(f"{step}) 重复页候选({len(dups)} 对)——每对二选一:合并成一页(合并 compiled_from、修 index 链接),"
+                     "或在汇报里给一句书面豁免理由(确属不同主题):")
+        lines += [f"   - {d['pages'][0]} ↔ {d['pages'][1]}({d['reason']})" for d in dups]
+        step += 1
+    if orphans:
+        lines.append(f"{step}) 孤儿页({len(orphans)} 个,从 index.md 无链可达)——挂进 index 或相应父页;确属废页则删除:")
+        lines += [f"   - {p}" for p in orphans]
+        step += 1
+    lines.append(f"{step}) 通读 candidate/index.md 与各页标题,统一术语与结构,修补 index 的分组与链接;")
+    step += 1
+    lines.append(f"{step}) 跨批矛盾(全库现有 ⚠️ 存疑 {suspect} 处):同一事实说法不一的,先按宪法/口径能定的直接收敛改齐"
+                 "(如时间序取最新并保留沿革),定不了的才 best-guess+⚠️存疑+落工单;顺带检查既有 ⚠️ 里有没有其实能收敛的;")
+    step += 1
+    lines.append(f"{step}) 核对 authoring/EXCLUSIONS.json:决定不编的源(含图片/PDF 等媒体)必须显式入账。")
+    lines.append("只做收口,不重编已经完好的页。完成后简短汇报:总页数、本次收口动了哪些页、合并/豁免了哪几对及理由、还有什么值得负责人注意。")
+    return "\n".join(lines) + notes
+
+
+def _planner_role(locale: str | None) -> str:
+    if selfcheck._is_en(locale):
+        return (
+            "You are the planner for a batched knowledge-base compile. authoring/SOURCES_INVENTORY.json in the "
+            "workspace lists every raw source; each entry has path, bytes (raw size) and effective (a context-cost "
+            "estimate: text = raw bytes; images/PDF are discounted to their real consumption, far below raw bytes). "
+            "Group them into batches: same topic / same directory together where possible, and **each batch's total "
+            "effective** must stay within the given budget — the budget constraint looks at effective ONLY, never "
+            "pack by bytes (only a single file whose effective alone exceeds the budget gets its own batch). Use as "
+            "few batches as possible: one image has a tiny effective, and a few images plus the documents citing "
+            "them in the SAME batch gives better quality. Write the plan to authoring/BATCH_PLAN.json as "
+            "{\"batches\":[{\"id\":\"b01\",\"sources\":[\"path relative to raw\"]}]}. Every source must appear in "
+            "exactly one batch. Read only the inventory file, never the source contents. Finish as soon as it is "
+            "written."
+        )
+    return (
+        "你是知识库分批编译的规划员。工作区里 authoring/SOURCES_INVENTORY.json 列出了全部 raw 源,"
+        "每项有 path、bytes(原始字节)和 effective(上下文成本估算:文本=原始字节,图片/PDF 已按真实消耗折算,远小于原始字节)。"
+        "把它们分成若干批:同主题/同目录尽量同批,**每批的 effective 总量**不超过给定预算——预算约束只看 effective,绝不要用 bytes 装箱"
+        "(单个 effective 超预算的文件才独占一批)。批数应尽量少:一张图片 effective 很小,几张图和引用它们的文档放同一批反而质量更好。"
+        "把方案写入 authoring/BATCH_PLAN.json,格式 {\"batches\":[{\"id\":\"b01\",\"sources\":[\"相对raw的路径\"]}]}。"
+        "每个源必须恰好出现在一个批里。只读清单文件,不要读源文件内容。写完即结束。"
+    )
+
+
+async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
+    """Code baseline always exists; the model may regroup topically but ONLY a
+    plan that passes deterministic validation replaces the baseline."""
+    budget = batching.batch_budget_bytes()
+    baseline = batching.build_plan(inventory, batching.pack_batches(inventory), planner="code")
+    if os.environ.get("KBC_BATCH_PLANNER", "model") == "code":
+        return baseline
+    try:
+        wd = str(Path(run.workdir).resolve())
+        opts = ClaudeAgentOptions(
+            cwd=wd,
+            system_prompt={"type": "preset", "preset": "claude_code", "append": _planner_role(getattr(run, "locale", None))},
+            allowed_tools=["Read", "Write", "Glob"],
+            permission_mode="bypassPermissions",
+            setting_sources=[],
+            model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
+            max_turns=8,
+            max_buffer_size=SDK_MAX_BUFFER_BYTES,
+            session_id=str(uuid.uuid4()),
+            session_store=InMemorySessionStore(),
+        )
+        client = ClaudeSDKClient(options=opts)
+        prev = run.client
+        run._suppress_turn_done = True
+        try:
+            await client.connect()
+            run.client = client
+            directive = _loc(
+                run,
+                f"Budget: each batch's total effective must not exceed {budget} (pack by the effective field only, ignore bytes). "
+                "Read authoring/SOURCES_INVENTORY.json, write authoring/BATCH_PLAN.json.",
+                f"预算:每批 effective 总量不超过 {budget}(只按 effective 字段装箱,不看 bytes)。"
+                "读 authoring/SOURCES_INVENTORY.json,写 authoring/BATCH_PLAN.json。")
+            run._begin_turn(directive)  # planner is a model call too — arm the stall watchdog
+            await client.query(directive)
+            await _consume_turn_stream(run, client, stop_on_result=True)
+        finally:
+            run._suppress_turn_done = False
+            run.client = prev
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        proposed = batching.normalize_model_plan(_load_batch_plan(run))
+        if proposed:
+            errors = batching.validate_plan(proposed, inventory)
+            if not errors and batching.plan_too_fragmented(proposed["batches"], baseline["batches"]):
+                await run.emit({
+                    "type": "log",
+                    "text": _loc(run,
+                                 f"Planner proposal too fragmented ({len(proposed['batches'])} batches vs baseline {len(baseline['batches'])}), falling back to the code baseline.",
+                                 f"规划方案过碎({len(proposed['batches'])} 批 vs 基线 {len(baseline['batches'])} 批),改用代码基线分批。"),
+                })
+            elif not errors:
+                return batching.build_plan(inventory, proposed["batches"], planner="model")
+            else:
+                await run.emit({"type": "log", "text": _loc(run,
+                    "Planner proposal failed validation, falling back to the code baseline: ",
+                    "规划方案未过校验,改用代码基线分批:") + "; ".join(errors[:3])})
+    except Exception as e:
+        await run.emit({"type": "log", "text": _loc(run,
+            f"Planner session failed, falling back to the code baseline: {e!r}",
+            f"规划会话失败,改用代码基线分批: {e!r}")})
+    return baseline
+
+
+async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
+    """Force a fresh full-corpus selfcheck and drive bounded repair sessions
+    until it stops asking (budget lives in _post_turn_selfcheck)."""
+    run._selfcheck_key = None
+    repair = await _post_turn_selfcheck(run)
+    while repair:
+        fix_reply = await _drive_batch_session(run, repair, _loc(run, "ledger repair", "账本回修"))
+        if fix_reply:
+            replies.append(_loc(run, f"[Repair] {fix_reply}", f"【回修】{fix_reply}"))
+        repair = await _post_turn_selfcheck(run)
+
+
+async def _run_batch_compile(run: "CompileRun", trigger_text: str):
+    """The batch orchestrator: ONE logical turn to the consumer (single turn_done at
+    the end), many bounded sessions inside. Crash-resumable at batch granularity:
+    BATCH_PLAN.json carries per-batch done stamps, and any later compile trigger
+    re-enters here and continues from the first pending batch."""
+    run._batch_active = True
+    replies: list[str] = []
+    try:
+        raw_dir = Path(run.workdir) / "raw"
+        inventory = batching.scan_sources(raw_dir)
+        total_kb = batching.corpus_bytes(inventory) // 1024
+        plan = _load_batch_plan(run)
+        resuming = plan is not None and len(batching.pending_batches(plan)) > 0
+        if not resuming:
+            _write_batch_file(run, batching.SOURCES_INVENTORY_PATH, inventory)
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Corpus {total_kb}KB exceeds the single-session threshold — batch compile engaged.",
+                f"语料 {total_kb}KB 超过单会话阈值,启用分批编译。")})
+            plan = await _plan_batches(run, inventory)
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+        else:
+            # The pinned plan predates this run; a source deleted from raw/ in
+            # between would leave a batch directive pointing at a missing file.
+            # (Added sources are caught later by the coverage ledger.)
+            dropped = batching.prune_missing_sources(plan, {i["path"] for i in inventory})
+            if dropped:
+                _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                await run.emit({"type": "summary",
+                                "text": _loc(run,
+                                             f"Batch resume: {len(dropped)} source(s) no longer in raw/ — removed from pending batches: ",
+                                             f"断点续批:{len(dropped)} 个源已不在 raw/ 中,已从待编批次剔除:")
+                                        + ", ".join(sorted(dropped)[:5])
+                                        + ("…" if len(dropped) > 5 else "")})
+        n = len(plan["batches"])
+        pending = batching.pending_batches(plan)
+        await run.emit({
+            "type": "summary",
+            "text": (_loc(run, f"Resuming batch compile: {len(pending)}/{n} batch(es) remaining.",
+                          f"继续分批编译:剩余 {len(pending)}/{n} 批。") if resuming
+                     else _loc(run,
+                               f"Batch plan ({plan.get('planner')}): {n} batch(es), budget {plan.get('budget', 0) // 1024}KB/batch.",
+                               f"分批计划({plan.get('planner')}):共 {n} 批,预算 {plan.get('budget', 0) // 1024}KB/批。")),
+        })
+        for batch in list(pending):
+            k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
+            directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run), locale=getattr(run, "locale", None))
+            reply = await _drive_batch_session(run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"))
+            if reply:
+                replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
+            batching.stamp_done(plan, batch["id"])
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            # Push the done-stamp (and the batch's pages) to the durable store
+            # NOW: if it only rode the next periodic sync, a crash in that window
+            # would re-run an already-done batch on resume.
+            sent = getattr(run, "_sync_sent", None)
+            if sent is not None:
+                try:
+                    await _sync_workspace(run, sent)
+                except Exception:
+                    pass  # periodic sync will retry; the local stamp is already on disk
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
+        final_reply = await _drive_batch_session(
+            run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
+            _loc(run, "final review", "终审"))
+        if final_reply:
+            replies.append(_loc(run, f"[Final review] {final_reply}", f"【终审】{final_reply}"))
+        # Full-corpus selfcheck + bounded repair rounds, each a fresh bounded
+        # session (the batch analogue of the ordinary post-turn repair loop).
+        await _run_ledger_repairs(run, replies)
+        # Image numeric re-verification AFTER the ledger settles (repairs may
+        # add image-digesting pages), then one more ledger refresh so
+        # SELFCHECK.json reflects the verified final state.
+        if _media_verify_enabled():
+            repaired_any = False
+            rounds = 0
+            while True:
+                pending = selfcheck.pending_media_verification(run.workdir)
+                if not pending:
+                    break
+                rounds += 1
+                if rounds > _media_verify_rounds():
+                    # Repair turns can add new image citations that re-enter
+                    # pending — cap the loop; the remainder rides a later turn.
+                    await run.emit({"type": "summary", "text": _loc(run,
+                        f"Self-check (images): verify/repair round cap ({_media_verify_rounds()}) reached — remaining pages will be picked up on the next trigger.",
+                        f"自检(图像):验修轮达到上限({_media_verify_rounds()} 轮)——剩余页将在下一轮触发时继续复核。")})
+                    break
+                # Blind transcribe+compare per ≤max-images chunk (v2): engine
+                # sessions read one image each — no in-session image pileup.
+                chunk = selfcheck.cap_media_pending(pending, _media_verify_max_images())
+                try:
+                    result = await mediaverify.run_blind_verify(
+                        ClaudeEngine(), run.workdir, chunk,
+                        progress=lambda s: asyncio.get_running_loop().create_task(
+                            run.emit({"type": "summary", "text": s})),
+                        locale=getattr(run, "locale", None))
+                except Exception as e:
+                    await run.emit({"type": "summary", "text": _loc(run,
+                        f"Self-check (images) failed, skipping this chunk: {e!r}",
+                        f"自检(图像)执行失败,跳过本组: {e!r}")})
+                    await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, None))
+                    continue
+                await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, result))
+                if result["errors"]:
+                    await run.emit({"type": "summary",
+                                    "text": _loc(run,
+                                 f"Self-check (images): {len(result['errors'])} transcription/comparison failure(s) (see logs); the rest proceed as usual.",
+                                 f"自检(图像):{len(result['errors'])} 项转写/比对失败(见日志),其余照常。")})
+                if result["findings"]:
+                    verify_reply = await _drive_batch_session(
+                        run, mediaverify.build_repair_prompt(result["findings"], locale=getattr(run, "locale", None)),
+                        _loc(run, "image verification", "图像复核"))
+                    if verify_reply:
+                        replies.append(_loc(run, f"[Image verification] {verify_reply}", f"【图像复核】{verify_reply}"))
+                    repaired_any = True
+                else:
+                    await run.emit({"type": "summary",
+                                    "text": f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓"})
+            if repaired_any:
+                await _run_ledger_repairs(run, replies)
+        # Owner notes that arrived during the tail phases (ledger repair / image
+        # verify) were acked as "will be considered" but have no later batch to
+        # ride — honor the contract with a bounded digest session before the
+        # turn closes. Two passes: a note can land while the first one runs.
+        for _ in range(2):
+            tail_notes = _drain_batch_notes(run)
+            if not tail_notes:
+                break
+            notes_reply = await _drive_batch_session(
+                run,
+                _loc(run,
+                     "The owner left the following notes during the compile's tail phase. Assess whether the "
+                     "draft needs adjusting (make the edits and summarize briefly if so; otherwise explain why "
+                     "not):\n",
+                     "负责人在编译收尾期间的补充留言如下,请评估是否需要据此调整草稿"
+                     "(需要就改并简述,不需要就说明理由):\n") + tail_notes,
+                _loc(run, "note digest", "留言消化"))
+            if notes_reply:
+                replies.append(_loc(run, f"[Note digest] {notes_reply}", f"【留言消化】{notes_reply}"))
+            await _run_ledger_repairs(run, replies)  # the digest may have touched pages
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)
+            except Exception:
+                pass
+        await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
+                        or _loc(run, "Batch compile complete.", "分批编译完成。")})
+    except Exception as e:
+        await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
+        # never-block: the single logical turn must still CLOSE — a consumer
+        # gating on turn_done would otherwise hang on an orchestrator error.
+        # Done batches are stamped in BATCH_PLAN.json, so the honest story is
+        # "interrupted, resumable from the first pending batch".
+        try:
+            await run.emit({"type": "turn_done",
+                            "text": _loc(run,
+                                         "Batch compile interrupted: finished batches are stored; trigger a compile again to resume from the first pending batch.",
+                                         "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。")})
+        except Exception:
+            pass
+    finally:
+        run._batch_active = False
+    # Red-blue PK examines the train's FINAL state, in the background, after the
+    # single logical turn has closed (never inside it — turn_done latency is
+    # user-visible; the PK verdict is not urgent). _pk_due re-checks the settled
+    # gates itself, so a failed train simply doesn't qualify. Nothing pending →
+    # the draft is stable (settled), same authoritative signal as the seam.
+    if not _maybe_start_pk(run):
+        await _set_converge_phase(run, "settled")
+
+
+def _note_model_activity(run: CompileRun, msg) -> None:
+    """Every inbound SDK message (StreamEvent delta, assistant/user turn, result)
+    proves the model link is alive → reset the idle clock. An assistant message
+    that asks for a tool flips tool_pending so the watchdog uses the longer bound
+    while the CLI runs Read/Bash (that gap is not a model stall)."""
+    run._last_model_activity = time.monotonic()
+    if type(msg).__name__ == "AssistantMessage":
+        blocks = getattr(msg, "content", None) or []
+        run._tool_pending = any(type(b).__name__ == "ToolUseBlock" for b in blocks)
+    else:
+        run._tool_pending = False
+
+
+async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool) -> None:
+    """Relay a session's message stream through _emit_message, owning the
+    stall-retry seam. A ResultMessage that the watchdog provoked (via interrupt())
+    is NOT a real turn end: discard it and re-issue the directive (bounded), or
+    raise ModelStallError when retries are spent. A REAL ResultMessage ends the
+    turn — cleared BEFORE _emit_message, which may inject a follow-up turn that
+    re-arms the watchdog. stop_on_result mirrors the batch driver's break."""
+    async for msg in client.receive_messages():
+        _note_model_activity(run, msg)
+        if type(msg).__name__ == "ResultMessage":
+            if run._stall_retrying:
+                run._turn_text = []           # the wedged attempt produced nothing usable
+                run._stall_retrying = False
+                if run._stall_fatal:
+                    run._turn_active = False
+                    raise ModelStallError(
+                        f"model request stalled; exhausted {run._model_retries} attempt(s)"
+                    )
+                run._last_model_activity = time.monotonic()
+                await client.query(run._last_directive)   # retry on a fresh request
+                continue
+            # C2: a rate-limited / overloaded model call ends the turn with
+            # is_error + api_error_status. Back off and re-issue rather than
+            # surfacing it as a finished turn.
+            status = getattr(msg, "api_error_status", None)
+            if getattr(msg, "is_error", False) and status in _MODEL_RATE_STATUSES:
+                if run._rate_retries < _MODEL_RATE_MAX_RETRIES:
+                    run._rate_retries += 1
+                    delay = _rate_backoff_delay(run._rate_retries)
+                    run._turn_text = []
+                    await run.emit({
+                        "type": "rate_limited",
+                        "status": status,
+                        "attempt": run._rate_retries,
+                        "backoff_s": round(delay, 1),
+                    })
+                    run._last_model_activity = time.monotonic()  # backoff isn't a stall
+                    await asyncio.sleep(delay)
+                    run._last_model_activity = time.monotonic()
+                    await client.query(run._last_directive)
+                    continue
+                await run.emit({
+                    "type": "summary",
+                    "text": _loc(run,
+                                 f"Model rate-limited (HTTP {status}); {run._rate_retries} backoff retries did not clear it — stopping this turn, please retry later.",
+                                 f"模型限流(HTTP {status}),退避重试 {run._rate_retries} 次仍未通过,本轮先停,请稍后再开编。"),
+                })
+                # fall through: end the turn (run goes idle), do not crash
+            run._turn_active = False
+            await _emit_message(run, msg)
+            if stop_on_result:
+                return
+            continue
+        await _emit_message(run, msg)
+
+
+_STALL_INTERRUPT_DEADLINE_S = int(os.environ.get("KBC_STALL_INTERRUPT_DEADLINE_S", "120"))
+
+
+async def _model_stall_watchdog(run: CompileRun) -> None:
+    """Reap a turn wedged on a black-holed model request. Interrupt the attempt;
+    _consume_turn_stream then re-issues it (or fails). Only judges an ACTIVE turn,
+    and relaxes to the tool bound while a tool is pending — never false-kills a
+    live turn or a long tool (I4)."""
+    while not run.done:
+        await asyncio.sleep(_MODEL_WATCHDOG_POLL_S)
+        if not run._turn_active:
+            continue
+        if run._stall_retrying:
+            # Interrupted, waiting for the interrupted result. A true black-hole
+            # can swallow interrupt() too — then the latch stays set and the
+            # receive loop blocks forever. Bound the wait; past the deadline,
+            # close the turn honestly and disconnect to unblock the loop.
+            if time.monotonic() - run._stall_interrupted_at > _STALL_INTERRUPT_DEADLINE_S:
+                run._stall_retrying = False
+                run._turn_active = False
+                await run.emit({"type": "error",
+                                "error": f"model stall: interrupt produced nothing within {_STALL_INTERRUPT_DEADLINE_S}s"})
+                # Disconnecting ENDS this box's session (run_session has no
+                # reconnect loop — deliberately: this fires only on a double
+                # black-hole, and recovery is owned by the platform: the run
+                # terminalizes via `end`, and the consumer's next message
+                # find-or-starts a fresh run/box with workspace rehydration).
+                # The turn_done text must promise exactly that — not an
+                # in-place retry this box can no longer serve (/message would
+                # 409 on run.client=None).
+                await run.emit({"type": "turn_done", "text": _loc(run,
+                    "The turn stalled and could not be recovered — nothing was applied. "
+                    "The compile session will be recreated automatically on your next message.",
+                    "本轮模型停滞且中断无响应——未产生结果;编译会话将在你下一条消息时自动重建,届时重发即可。")})
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            continue
+        client = run.client
+        if client is None:
+            continue
+        bound = _MODEL_TOOL_IDLE_TIMEOUT_S if run._tool_pending else _MODEL_IDLE_TIMEOUT_S
+        idle = time.monotonic() - run._last_model_activity
+        if idle <= bound:
+            continue
+        run._stall_fatal = run._model_retries >= _MODEL_MAX_RETRIES
+        run._model_retries += 1
+        run._stall_retrying = True
+        run._stall_interrupted_at = time.monotonic()
+        run._last_model_activity = time.monotonic()   # bridge the interrupt→result gap
+        await run.emit({
+            "type": "turn_stalled",
+            "attempt": run._model_retries,
+            "fatal": run._stall_fatal,
+            "idle_s": round(idle, 1),
+        })
+        try:
+            await client.interrupt()
+        except Exception as e:
+            # No interrupted-result will come → don't leave the loop waiting on it.
+            run._stall_retrying = False
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Model stall: interrupt failed, will retry next round {e!r}",
+                f"模型停滞:中断失败,下一轮重试 {e!r}")})
+
+
+async def run_session(run: CompileRun):
+    """Persistent driver: host ONE long-lived Claude Code session (ClaudeSDKClient)
+    for this KB. BOX_ROLE (+ the playbook + the attempt instruction) is the standing
+    system prompt; the session then takes turns via POST /message — continuous
+    prepare + compile in one session, on massapi, with the compile tools.
+    Conversational by construction: connect, then wait for the first /message.
+    (Durable cross-restart resume + a file-backed session store land in P4; v1
+    uses an in-process store.)"""
+    wd = str(Path(run.workdir).resolve())
+    system_prompt = _compile_system_prompt(run)
+
+    sid = run.session_id or str(uuid.uuid4())
+    run.session_id = sid
+    opts = _compile_session_opts(run, wd, system_prompt, sid)
     client = ClaudeSDKClient(options=opts)
     try:
         # Connect and block for the first /message. Set run.client + signal
@@ -973,8 +2209,7 @@ async def run_session(run: CompileRun):
         # current draft; the owner reviews and publishes separately (deterministic
         # publish, no submit gate). A finished turn is simply finished — no
         # nudging — so a live session can never get stuck "compiling".
-        async for msg in client.receive_messages():
-            await _emit_message(run, msg)
+        await _consume_turn_stream(run, client, stop_on_result=False)
     finally:
         run.connected.set()  # unblock any /message waiters even if connect failed
         run.client = None
@@ -994,17 +2229,30 @@ async def _run_wrapper(run: CompileRun):
     clean = False
     run._sync_sent = sent  # shared with _emit_message's pre-turn_done sync
     syncer = asyncio.create_task(_sync_loop(run, sent))
+    watchdog = asyncio.create_task(_model_stall_watchdog(run))
     try:
         await _COMPILE_IMPL(run)
         clean = True
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
         await run.emit({"type": "error", "error": repr(e)})
+        if getattr(run, "_turn_active", False):
+            # never-block symmetry (review fix): a consumer gating on turn_done
+            # must not hang because the driver died mid-turn (stall-fatal etc.).
+            run._turn_active = False
+            try:
+                await run.emit({"type": "turn_done", "text": _loc(run,
+                    "The turn failed before completing — send the message again to retry.",
+                    "本轮在完成前失败——重新发送消息即可重试。")})
+            except Exception:
+                pass
     finally:
         syncer.cancel()
-        try:
-            await syncer
-        except asyncio.CancelledError:
-            pass
+        watchdog.cancel()
+        for _t in (syncer, watchdog):
+            try:
+                await _t
+            except asyncio.CancelledError:
+                pass
         # Final sync so the last writes are durable even if no tick caught them —
         # especially on the crash path where no bundle was submitted.
         try:
@@ -1015,6 +2263,7 @@ async def _run_wrapper(run: CompileRun):
         if clean:
             await run.emit({"type": "done"})
         await run.emit({"type": "end"})
+        run._ended = True  # shutdown drain skips finished runs
 
 
 # Default tool whitelist for a read-only kb-test session, used when the runtime
@@ -1144,6 +2393,44 @@ async def _teardown_test_session(run: "TestRun"):
 
 # ── HTTP ──
 
+# ── consumer-managed box config (DESIGN-kb-llm-binding-v2-2026-07-07) ────────
+# The consumer owns the credential store and the KB capability policy; both arrive on
+# the /session body and apply IN-PROCESS (the box spawns before fetchInput runs,
+# so pod env is too early — and this keeps the token out of the pod spec).
+# Precedence: consumer config > runtime-env forward (helm fallback) > image
+# defaults. ONE exception: KBC_PK_MODE=off set at the runtime level is the ops
+# KILL SWITCH and must win over consumer config.
+_PK_KILL_AT_BOOT = os.environ.get("KBC_PK_MODE") == "off"
+
+
+def _apply_session_config(body: dict) -> None:
+    """Apply consumer-managed llm/settings from the /session body to os.environ.
+    Never log the token; whitelist settings keys to the box's own vocabulary.
+    INVARIANT: os.environ is process-global, so this leans on the platform's
+    one-pod-per-run spawn (the gateway creates a dedicated box per runId) — a
+    second concurrent /session on the same pod would clobber the first run's
+    credential/tiers. If multi-run pods ever become real, carry llm/settings
+    per-run (SDK client env) instead of mutating the process environment."""
+    llm = body.get("llm")
+    if isinstance(llm, dict):
+        if llm.get("base_url"):
+            os.environ["ANTHROPIC_BASE_URL"] = str(llm["base_url"])
+        if llm.get("auth_token"):
+            os.environ["ANTHROPIC_AUTH_TOKEN"] = str(llm["auth_token"])
+            # The SDK accepts either; clear a stale forwarded API key so the
+            # consumer credential unambiguously wins.
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+    settings = body.get("settings")
+    if isinstance(settings, dict):
+        for key, value in settings.items():
+            k = str(key)
+            if not k.startswith("KBC_") or value is None:
+                continue  # whitelist: only the box's own knob vocabulary
+            if k == "KBC_PK_MODE" and _PK_KILL_AT_BOOT:
+                continue  # ops kill switch outranks consumer config
+            os.environ[k] = str(value)
+
+
 async def handle_session(request: web.Request):
     """Start (or no-op attach to) the run's persistent CONVERSATIONAL session —
     it connects and waits for the first /message (prepare chat; a compile is just
@@ -1153,6 +2440,10 @@ async def handle_session(request: web.Request):
     if run_id in RUNS:
         return web.json_response({"ok": True, "run_id": run_id, "already_live": True})
     body = await request.json() if request.body_exists else {}
+    # Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
+    # applied to os.environ BEFORE any SDK/engine session exists, so the
+    # persistent session, batch sessions, PK and media-verify all inherit them.
+    _apply_session_config(body)
     run = CompileRun(run_id, body.get("workdir", "/work"), int(body.get("round", 1)), body.get("instruction", ""))
     # Tool whitelist from the runtime BoxProfile (None/absent → driver default).
     run.allowed_tools = body.get("allowed_tools")
@@ -1240,6 +2531,40 @@ async def handle_message(request: web.Request):
     # persist it deterministically to authoring/BRIEF.json BEFORE the turn so the
     # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
     _capture_brief(run, text)
+    # Scoped incremental (真增量): a compile trigger + a machine-computed changeset
+    # from the consumer → re-touch only affected pages, NOT a whole-corpus re-plan. Takes
+    # precedence over the batch/full route (which is the "recompile everything"
+    # fallback when no changeset is present).
+    if _should_route_to_incremental(run, text):
+        await _start_incremental(run, text)
+        return web.json_response({"ok": True, "incremental": True})
+    # Batch mode (大库): a compile trigger over an above-threshold corpus (or a
+    # plan with pending batches) runs the orchestrator instead of one giant turn.
+    if _should_route_to_batch(run, text):
+        # Claim batch mode SYNCHRONOUSLY, before spawning the orchestrator task:
+        # _run_batch_compile only sets the flag once it starts running, so a
+        # second /message racing in before the task is scheduled would pass
+        # _should_route_to_batch again and spawn a second orchestrator over the
+        # same workspace. Setting it here closes that window (the task keeps its
+        # own idempotent set, and the task's finally clears it).
+        run._batch_active = True
+        asyncio.create_task(_run_batch_compile(run, text))
+        return web.json_response({"ok": True, "batch": True})
+    if run._batch_active:
+        if _is_compile_trigger(text):
+            # A second trigger mid-batch changes nothing the plan doesn't know.
+            await run.emit({"type": "summary", "text": _loc(run,
+                "Batch compile in progress; start another one after this run finishes.",
+                "分批编译进行中,本轮结束后再发起。")})
+        else:
+            # Owner chat mid-batch: queue it — the next batch/终审 directive
+            # relays it, so nothing lands inside a half-read internal session.
+            run._batch_notes.append(text)
+            await run.emit({"type": "summary", "text": _loc(run,
+                "Noted — it will be passed along to the remaining batches.",
+                "已收到,会带给后续批次一并考虑。")})
+        return web.json_response({"ok": True, "queued": True})
+    run._begin_turn(text)  # arm the stall watchdog — every model turn, incl. the owner's
     await run.client.query(text)
     return web.json_response({"ok": True})
 
@@ -1254,15 +2579,22 @@ async def handle_events(request: web.Request):
         "Connection": "keep-alive",
     })
     await resp.prepare(request)
-    while True:
-        try:
-            ev = await asyncio.wait_for(run.events.get(), timeout=25)
-        except asyncio.TimeoutError:
-            await resp.write(b": heartbeat\n\n")  # keep-alive
-            continue
-        await resp.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode())
-        if ev.get("type") == "end":
-            break
+    run._relays = getattr(run, "_relays", 0) + 1
+    try:
+        while True:
+            try:
+                ev = await asyncio.wait_for(run.events.get(), timeout=25)
+            except asyncio.TimeoutError:
+                await resp.write(b": heartbeat\n\n")  # keep-alive
+                continue
+            await resp.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode())
+            # Delivery mark AFTER the socket write: the shutdown drain gates on
+            # queue.join(), so "drained" means written out, not merely dequeued.
+            run.events.task_done()
+            if ev.get("type") == "end":
+                break
+    finally:
+        run._relays = getattr(run, "_relays", 1) - 1
     return resp
 
 
@@ -1405,8 +2737,40 @@ async def handle_close_test(request: web.Request):
     return web.json_response({"ok": True})
 
 
+async def _flush_on_shutdown(_app) -> None:
+    """aiohttp on_shutdown (F3): SIGTERM is stopping the box. Emit a final
+    workspace sync for every active run so the last unsynced work reaches the
+    store instead of dying with the emptyDir /work, then give the SSE relay a
+    bounded window to drain the queued events before connections close.
+    Best-effort — a store that never acks still loses it; F1 is the durable fix."""
+    runs = [r for r in RUNS.values() if getattr(r, "_sync_sent", None) is not None]
+    for run in runs:
+        try:
+            n = await _sync_workspace(run, run._sync_sent)
+            if n:
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"[shutdown] flushed {n} changed file(s)", f"[shutdown] 落盘 {n} 个改动文件")})
+        except Exception:
+            pass
+    deadline = time.monotonic() + _SHUTDOWN_DRAIN_MAX_S
+    # Drain means DELIVERY (the relay task_done()s after the socket write), not
+    # dequeue — and only runs someone is listening to: an ended run or one with
+    # no live relay would never drain and would burn the whole deadline,
+    # starving the active runs' grace window.
+    to_drain = [r for r in runs
+                if not getattr(r, "_ended", False) and getattr(r, "_relays", 0) > 0]
+    if to_drain:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(r.events.join() for r in to_drain)),
+                timeout=max(0.0, deadline - time.monotonic()))
+        except asyncio.TimeoutError:
+            pass
+
+
 def build_app() -> web.Application:
     app = web.Application(client_max_size=_http_max_request_bytes())
+    app.on_shutdown.append(_flush_on_shutdown)
     app.add_routes([
         web.post("/sources", handle_sources),
         web.post("/authoring", handle_authoring),

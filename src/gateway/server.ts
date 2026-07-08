@@ -445,6 +445,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           instruction: instruction ?? "",
           allowed_tools: allowedTools,
           locale: materialized.locale,
+          // Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
+          // opaque passthrough — the box applies them in-process before its SDK
+          // connects. Never logged here; token stays out of the pod spec.
+          llm: materialized.llm,
+          settings: materialized.settings,
         });
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
           .catch(async (err) => {
@@ -476,8 +481,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     getBoxProfile(profile);
     const orgId = req.org_id;
     const instruction = req.input?.instruction as string | undefined;
-    // siclaw mints the runId + persists a running state (the run is siclaw-owned).
-    const rec = await capabilityRunManager.startRun({ profile, orgId: orgId ?? "", correlationId: req.correlation_id });
+    // siclaw mints the runId (the run is siclaw-owned). Initial status follows
+    // the instruction: a kickoff instruction drives an immediate turn (running);
+    // an instruction-less start (chat arrives via capability.message right
+    // after, or the run only hosts test sessions) starts at rest (idle) — the
+    // first capability.message flips it running.
+    const rec = await capabilityRunManager.startRun({
+      profile,
+      orgId: orgId ?? "",
+      correlationId: req.correlation_id,
+      initialStatus: instruction && instruction.trim() ? "running" : "idle",
+    });
     try {
       await ensureCapabilitySession(rec.runId, rec.profile, orgId, instruction);
     } catch (err) {

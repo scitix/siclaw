@@ -80,6 +80,19 @@ runtime:
   # one LLM stream per target at once (avoids provider 429s / pod pressure).
   # Forwarded to each AgentBox pod as SICLAW_SUBAGENT_CONCURRENCY. Default 5.
   subagentConcurrency: 5
+  # LLM endpoint for LEAN CAPABILITY BOXES (kb-compile / kb-test) ONLY. The chat
+  # path does not read these — agent models come from the Portal/Upstream model
+  # descriptors. They exist so the runtime can forward ANTHROPIC_* into spawned
+  # kb boxes (BoxProfile envForward). Token rotation: update the Secret, then
+  # rollout-restart the runtime (env Secrets resolve at pod start); live kb
+  # boxes keep their spawn-time token until respawned — either keep the old
+  # token valid through a grace window, or delete agentbox pods after rotating.
+  llm:
+    baseUrl: ""            # e.g. https://api.scitix.ai/model-api (massapi proxy)
+    model: ""              # optional ANTHROPIC_MODEL default for the box CLI
+    tokenSecret:
+      name: ""             # existing Secret holding the massapi token
+      key: "ANTHROPIC_AUTH_TOKEN"
   env: {}
 
 # -- Portal (standalone web UI, replaces Upstream)
@@ -170,10 +183,15 @@ ocr:
 # -- AgentBox (spawned at runtime by K8s spawner)
 agentbox:
   debugImage: ""
-  # KB-compile box image (built from this repo's kbc/ — see kbc/platform/pod/
-  # Dockerfile). Consumed by the BoxProfile registry for kb-compile / kb-test
-  # capability boxes. Empty ⇒ the runtime's built-in default tag; pin a
-  # commit-sha tag here for releases, e.g. "registry/.../kbc-compile-box:main-<sha>".
+  # KB compile capability (kb-compile / kb-test boxes; built from this repo's
+  # kbc/, ships with every release via `make docker`). The RELEASE-COUPLED
+  # switch: true ⇒ the runtime spawns {image.registry}/kbc-compile-box:{image.tag}
+  # — same registry/tag convention as every other component. false + no
+  # override ⇒ KB stays dark (fail-closed; compile attempts error, chat
+  # unaffected).
+  compileBoxEnabled: false
+  # Full-image override (implies enabled): hot-fix the compile brain
+  # independently of a release, e.g. "registry/.../kbc-compile-box:main-<sha>".
   compileBoxImage: ""
   # Node selector applied to every spawned AgentBox pod. Constrains pods to
   # nodes carrying all of these labels (e.g. { disktype: ssd, pool: agents }).

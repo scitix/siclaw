@@ -27,7 +27,7 @@ describe("getBoxProfile", () => {
     const p = getBoxProfile("kb-compile");
     expect(p.image).toBe("kbc-compile-box:test-tag");
     expect(p.home).toBe("/work");
-    expect(p.volumes).toEqual([{ name: "work", mountPath: "/work", sizeLimit: "1Gi" }]);
+    expect(p.volumes).toEqual([{ name: "work", mountPath: "/work", sizeLimit: "4Gi" }]);
     expect(p.envForward).toContain("ANTHROPIC_BASE_URL");
     expect(p.allowedTools).toBeNull();
   });

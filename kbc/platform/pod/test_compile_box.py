@@ -176,6 +176,20 @@ class ResultMessage:
     pass
 
 
+# Stand-ins for the SDK's other message/block types — only the class NAME matters
+# to the watchdog (_note_model_activity dispatches on type(msg).__name__).
+class StreamEvent:  # partial-delta liveness (include_partial_messages)
+    pass
+
+
+class UserMessage:  # tool_result carrier
+    pass
+
+
+class ToolUseBlock:  # a content block that requests a tool
+    pass
+
+
 class _FakeSDKClient:
     """Stands in for ClaudeSDKClient: records connect/query, yields preloaded
     messages then stops (the real client blocks for the next turn)."""
@@ -697,6 +711,49 @@ def test_install_wiki_snapshot_size_guard():
 
 # ── Protocol v3: brief consumption + append-only proposed questions ──
 
+def test_apply_session_config():
+    """Consumer-managed llm/settings from /session body (DESIGN-kb-llm-binding-v2):
+    llm applies + clears a stale forwarded API key; settings whitelisted to
+    KBC_*; the boot-time KBC_PK_MODE=off kill switch outranks consumer config."""
+    keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+            "KBC_COMPILE_MODEL", "KBC_PK_MODE")
+    backup = {k: os.environ.get(k) for k in keys}
+    kill_backup = compile_box._PK_KILL_AT_BOOT
+    try:
+        os.environ["ANTHROPIC_API_KEY"] = "stale-forwarded-key"
+        os.environ.pop("KBC_PK_MODE", None)
+        os.environ.pop("KBC_COMPILE_MODEL", None)
+        compile_box._PK_KILL_AT_BOOT = False
+        compile_box._apply_session_config({
+            "llm": {"base_url": "https://massapi.example/model-api", "auth_token": "tok-1"},
+            "settings": {"KBC_COMPILE_MODEL": "claude-opus-4-8",
+                         "KBC_PK_MODE": "auto",
+                         "EVIL_KEY": "nope", "PATH": "/pwn"},
+        })
+        assert os.environ["ANTHROPIC_BASE_URL"] == "https://massapi.example/model-api"
+        assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "tok-1"
+        assert "ANTHROPIC_API_KEY" not in os.environ           # stale key cleared
+        assert os.environ["KBC_COMPILE_MODEL"] == "claude-opus-4-8"
+        assert os.environ["KBC_PK_MODE"] == "auto"
+        assert "EVIL_KEY" not in os.environ and os.environ.get("PATH") != "/pwn"
+
+        # ops kill switch: runtime-level off beats consumer "auto"
+        os.environ["KBC_PK_MODE"] = "off"
+        compile_box._PK_KILL_AT_BOOT = True
+        compile_box._apply_session_config({"settings": {"KBC_PK_MODE": "auto"}})
+        assert os.environ["KBC_PK_MODE"] == "off"
+
+        # absent/None fields are a clean no-op
+        compile_box._apply_session_config({})
+        compile_box._apply_session_config({"llm": None, "settings": None})
+    finally:
+        for k, v in backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        compile_box._PK_KILL_AT_BOOT = kill_backup
+    print("\u2713 _apply_session_config: llm + whitelist + kill-switch precedence")
 def test_parse_brief_block():
     """The wizard's 定调标签 block parses into the BRIEF.json record (tags split on
     Chinese separators, raw kept from the marker); an ordinary message → None."""
@@ -859,6 +916,726 @@ async def test_message_captures_brief():
     print("✓ /message captures 定调 brief → BRIEF.json (ordinary msg leaves it)")
 
 
+
+async def test_incremental_route():
+    """Scoped incremental (DESIGN-kb-incremental-recompile-v2): a compile trigger +
+    the consumer's machine-computed RAW_CHANGES routes to the scoped path — materializes
+    CHANGESET.json (affected pages reverse-looked-up), arms the byte-integrity guard
+    state, injects the scoped directive — instead of a full-corpus re-plan."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "candidate").mkdir(parents=True)
+        (wd / "authoring").mkdir(parents=True)
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntitle: t\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+        run = compile_box.CompileRun("incr1", str(wd), 1)
+        # no RAW_CHANGES yet → NOT incremental (falls through to normal/full route)
+        assert not compile_box._should_route_to_incremental(run, "请增量重编")
+        # the consumer writes the machine-computed changeset input
+        (wd / "authoring" / "RAW_CHANGES.json").write_text(_json.dumps({
+            "modified": ["snap/one.md"], "added": [], "deleted": [],
+            "diffs": {"snap/one.md": "- old fact\n+ new fact"},
+            "snapshot_fingerprint": "SNAP"}))
+        assert compile_box._should_route_to_incremental(run, "请增量重编")
+        assert not compile_box._should_route_to_incremental(run, "随便聊两句")  # non-trigger never routes
+
+        fake = _FakeSDKClient()
+        run.client = fake
+        await compile_box._start_incremental(run, "请增量重编")
+        # CHANGESET.json materialized: affected page reverse-looked-up + the consumer's diff
+        cs = _json.loads((wd / "authoring" / "CHANGESET.json").read_text())
+        assert cs["affected_pages"] == ["a.md"], cs
+        assert cs["modified"][0]["diff"] == "- old fact\n+ new fact"
+        # byte-integrity guard state armed (before-hashes captured for the post-turn check)
+        assert run._incr_pending is not None and "a.md" in run._incr_pending["before"]
+        # the scoped directive was injected (not a batch orchestrator)
+        assert any("[Incremental recompile]" in q and "CHANGESET.json" in q for q in fake.queries), fake.queries
+        # review fix: the incremental kickoff arms the stall watchdog like
+        # every other model-turn injection site
+        assert run._turn_active and "[Incremental recompile]" in run._last_directive
+    print("OK  incremental route (RAW_CHANGES → scoped CHANGESET + guard-armed + scoped directive; absent/non-trigger → no route)")
+
+
+async def test_incremental_integrity_guard():
+    """M3: on an incremental turn a page touched OUTSIDE the authorized set forces a
+    repair even when the coverage ledger is clean — "leave the rest untouched" is
+    enforced by byte comparison, not the model's word. The guard state is one-shot."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md) [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        run = compile_box.CompileRun("incrg", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        # arm the guard: this round's changeset only authorizes a.md
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        run._incr_pending = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
+        # model edits a.md (authorized) AND drifts into c.md (unauthorized)
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        # coverage ledger is clean (both sources still cited) yet integrity forces a repair naming c.md
+        assert repair is not None and "Incremental scope violation" in repair and "c.md" in repair, repair
+        # review fix: on a violation the guard RE-ARMS for the repair turn itself
+        # (the repair restores toward the ORIGINAL baseline) — it used to be
+        # consumed here, leaving the repair turn unguarded.
+        assert run._incr_pending is not None and run._incr_pending["changeset"] is cs
+        # the repair restores c.md → the re-armed guard clears cleanly
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        run._selfcheck_key = None
+        repair2 = await compile_box._post_turn_selfcheck(run)
+        assert repair2 is None, repair2
+        assert run._incr_pending is None  # consumed on the clean pass
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+    print("OK  incremental integrity guard (violation → repair + re-armed guard; clean pass consumes)")
+
+
+async def test_incremental_guard_rearms_on_ledger_repair():
+    """Round-4 review fix: an incremental turn that stayed IN scope but failed
+    the coverage ledger enters repairing too — the guard must re-arm for that
+    ledger-repair turn as well (it used to be gated on violations only)."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "orphaned-src.md").write_text("never cited")  # → unaccounted
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("incrl", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        armed = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
+        run._incr_pending = armed
+        # the turn edits ONLY the authorized page (no byte violations)…
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        # …but the ledger is unclean (orphaned-src.md unaccounted) → repairing
+        assert repair is not None and "orphaned-src.md" in repair, repair
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+        # the guard is re-armed for the ledger-repair turn
+        assert run._incr_pending is not None and run._incr_pending["changeset"] is cs
+    print("OK  incremental guard re-arms on in-scope ledger repair (round-4 fix)")
+
+
+async def test_batch_orchestrator_routing_and_resume():
+    """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
+    the threshold gate (small KBs never batch), the orchestrator stamps batches
+    done and emits exactly ONE turn_done, mid-batch owner chat queues, and an
+    interrupted plan resumes from the first pending batch."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        (raw / "a").mkdir(parents=True)
+        (raw / "b").mkdir(parents=True)
+        (raw / "a" / "one.md").write_bytes(b"x" * 300)
+        (raw / "b" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("rb1", str(wd), 1)
+
+        # threshold gate: big threshold → single-session path untouched
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
+        assert not compile_box._should_route_to_batch(run, "直接开始编译")
+        # over threshold + trigger → batch; non-trigger chat never batches
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+        assert compile_box._should_route_to_batch(run, "直接开始编译")
+        assert compile_box._should_route_to_batch(run, "原料已更新,请增量重编: xx")
+        assert not compile_box._should_route_to_batch(run, "你好")
+
+        # stub the session driver: record directives, pretend each session works
+        driven: list[str] = []
+
+        async def fake_drive(run_, directive, label):
+            driven.append(label + "|" + directive.split("\n")[0])
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        compile_box._drive_batch_session = fake_drive
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        types = [e["type"] for e in events]
+        assert types.count("turn_done") == 1, types
+        turn = next(e for e in events if e["type"] == "turn_done")
+        assert "[Batch 1/2]" in turn["text"] and "[Final review]" in turn["text"], turn
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] == "done" for b in plan["batches"]), plan
+        assert (wd / batching.SOURCES_INVENTORY_PATH).is_file()
+        # two batches + 终审 were driven, in order
+        assert len(driven) == 3 and driven[-1].startswith("final review"), driven
+
+        # resume: mark one batch pending again → next trigger routes to batch even
+        # under a huge threshold, and only the pending batch (+终审) re-runs
+        plan["batches"][1]["status"] = "pending"
+        (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
+        assert compile_box._should_route_to_batch(run, "直接开始编译")
+        driven.clear()
+        compile_box._drive_batch_session = fake_drive
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+        assert len(driven) == 2 and driven[0].startswith("batch 2/2"), driven
+
+        # mid-batch owner chat queues and is relayed into the next directive
+        run._batch_active = True
+        run._batch_notes.append("注意保密条款")
+        note = compile_box._drain_batch_notes(run)
+        assert "注意保密条款" in note and compile_box._drain_batch_notes(run) == ""
+        run._batch_active = False
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
+
+
+async def test_batch_orchestrator_review_fixes():
+    """Review fixes: (a) resume prunes sources deleted from raw/ (no directive
+    points at a missing file; an emptied batch is skipped); (b) an orchestrator
+    error still CLOSES the logical turn (error + turn_done, never-block); (c)
+    owner notes arriving during the tail phases get a bounded digest session
+    instead of being silently abandoned at turn_done."""
+    import batching
+
+    def _events(run):
+        evs = []
+        while not run.events.empty():
+            evs.append(run.events.get_nowait())
+        return evs
+
+    os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+    os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+    os.environ["KBC_BATCH_PLANNER"] = "code"
+    real_drive = compile_box._drive_batch_session
+    try:
+        # (a) resume after a source vanished: plan pins deleted.md in a pending
+        # batch (and a fully-vanished batch) — directives must not mention them.
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            raw = wd / "raw"
+            (raw / "a").mkdir(parents=True)
+            (raw / "a" / "kept.md").write_bytes(b"x" * 300)
+            plan = batching.build_plan(
+                [{"path": "a/kept.md", "bytes": 300, "effective": 300}],
+                [{"id": "b01", "sources": ["a/kept.md", "a/deleted.md"]},
+                 {"id": "b02", "sources": ["a/vanished.md"]}],
+                planner="code")
+            (wd / "authoring").mkdir()
+            (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+            run = compile_box.CompileRun("rf1", str(wd), 1)
+            driven: list[str] = []
+
+            async def fake_drive(run_, directive, label):
+                driven.append(f"{label}|{directive}")
+                return f"done {label}"
+
+            compile_box._drive_batch_session = fake_drive
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            evs = _events(run)
+            assert any("no longer in raw/" in e.get("text", "") for e in evs
+                       if e["type"] == "summary"), evs
+            assert not any("deleted.md" in d or "vanished.md" in d for d in driven), driven
+            assert sum(d.startswith("batch ") for d in driven) == 1, driven  # b02 emptied → skipped
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert all(b["status"] == "done" for b in saved["batches"]), saved
+
+        # (b) orchestrator error → error AND turn_done both emitted
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "a").mkdir(parents=True)
+            (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+            run = compile_box.CompileRun("rf2", str(wd), 1)
+
+            async def boom(run_, directive, label):
+                raise RuntimeError("session exploded")
+
+            compile_box._drive_batch_session = boom
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            types = [e["type"] for e in _events(run)]
+            assert "error" in types and types.count("turn_done") == 1, types
+
+        # (c) a note landing during the tail phases (after the last batch has
+        # drained the queue) gets its own 留言消化 session carrying the text
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "a").mkdir(parents=True)
+            (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+            run = compile_box.CompileRun("rf3", str(wd), 1)
+            driven = []
+
+            async def drive_and_note(run_, directive, label):
+                driven.append(f"{label}|{directive}")
+                if label == "final review":  # owner speaks while the tail is running
+                    run_._batch_notes.append("附录不要发布")
+                return f"done {label}"
+
+            compile_box._drive_batch_session = drive_and_note
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            digest = [d for d in driven if d.startswith("note digest|")]
+            assert len(digest) == 1 and "附录不要发布" in digest[0], driven
+            assert [e for e in _events(run) if e["type"] == "turn_done"], "turn still closes"
+
+        # (d) zh locale branch: the same flow narrates in Chinese when the
+        # consumer declares locale=zh (platform default above was English)
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "a").mkdir(parents=True)
+            (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+            run = compile_box.CompileRun("rf4", str(wd), 1)
+            run.locale = "zh"
+            driven = []
+
+            async def fake_zh(run_, directive, label):
+                driven.append(f"{label}|{directive}")
+                return f"done {label}"
+
+            compile_box._drive_batch_session = fake_zh
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            assert driven and driven[-1].startswith("终审"), driven
+            assert any(d.startswith("批 1/1|【分批编译 · 批 1/1") for d in driven), driven
+            turn = next(e for e in _events(run) if e["type"] == "turn_done")
+            assert "【批 1/1】" in turn["text"] and "【终审】" in turn["text"], turn
+    finally:
+        compile_box._drive_batch_session = real_drive
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch orchestrator review fixes: resume-prune / error turn_done / tail-note digest")
+
+
+async def test_stall_interrupt_deadline_closes_turn():
+    """Review fix: a true black-hole can swallow interrupt() too — the retry
+    latch used to stay set forever (receive loop blocked, watchdog muted). Past
+    the deadline the watchdog closes the turn honestly (error + turn_done) and
+    disconnects to unblock the loop."""
+    class _SwallowingClient(_StallingFakeClient):
+        def __init__(self):
+            super().__init__(produce_on_query=999)
+            self.disconnects = 0
+
+        async def interrupt(self):
+            self.interrupts += 1          # accepted — but nothing ever arrives
+
+        async def disconnect(self):
+            self.disconnects += 1
+            self._closed = True
+            self._gate.set()              # let receive_messages exit
+
+    fake = _SwallowingClient()
+    saved = (compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S)
+    compile_box._MODEL_IDLE_TIMEOUT_S = 0.1
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._MODEL_MAX_RETRIES = 3
+    compile_box._STALL_INTERRUPT_DEADLINE_S = 0.2
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("wdl", td, 1)
+            run._suppress_turn_done = True
+            run.client = fake
+            wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+            try:
+                await run.inject_user_message("批 1/10")
+                await asyncio.wait_for(
+                    compile_box._consume_turn_stream(run, fake, stop_on_result=True),
+                    timeout=5)
+            finally:
+                run.done = True
+                wdog.cancel()
+                try:
+                    await wdog
+                except asyncio.CancelledError:
+                    pass
+            evs = _drain(run)
+            types = [e["type"] for e in evs]
+            assert fake.interrupts >= 1 and fake.disconnects == 1, (fake.interrupts, fake.disconnects)
+            assert "error" in types and "turn_done" in types, types
+            done_text = next(e["text"] for e in evs if e["type"] == "turn_done")
+            assert "recreated automatically" in done_text, done_text  # honest: no in-place retry on this box
+            assert not run._turn_active and not run._stall_retrying
+    finally:
+        (compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S) = saved
+    print("✓ stall interrupt deadline: wedged latch closes the turn (error + turn_done) and unblocks")
+
+
+async def test_run_wrapper_closes_turn_on_driver_crash():
+    """Review fix (never-block symmetry): a driver that dies mid-turn must not
+    leave a consumer gating on turn_done hanging — error AND turn_done both fire."""
+    async def dying_impl(run):
+        run._begin_turn("owner message")   # a turn is in flight…
+        raise compile_box.ModelStallError("exhausted")
+
+    saved_impl = compile_box._COMPILE_IMPL
+    compile_box._COMPILE_IMPL = dying_impl
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("wcr", td, 1)
+            await compile_box._run_wrapper(run)
+            evs = _drain(run)
+            types = [e["type"] for e in evs]
+            assert "error" in types and "turn_done" in types and types[-1] == "end", types
+            assert types.index("error") < types.index("turn_done"), types
+            assert getattr(run, "_ended", False) is True
+    finally:
+        compile_box._COMPILE_IMPL = saved_impl
+    print("✓ run wrapper: driver crash mid-turn still closes the logical turn")
+
+
+# ── Model-stall watchdog (L1) ────────────────────────────────────────────────
+
+
+def _drain(run):
+    evs = []
+    while not run.events.empty():
+        evs.append(run.events.get_nowait())
+    return evs
+
+
+class _StallingFakeClient:
+    """Black-holes each attempt (receive blocks on a gate) until the Nth query;
+    interrupt() unblocks with a bare ResultMessage (the interrupted attempt). The
+    Nth query produces a real reply + ResultMessage. `produce_on_query=999` never
+    recovers (exhaustion path)."""
+
+    def __init__(self, options=None, produce_on_query=2):
+        self.options = options
+        self.queries = []
+        self.interrupts = 0
+        self._produce_on = produce_on_query
+        self._gate = asyncio.Event()
+        self._mode = "blackhole"
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+        if len(self.queries) >= self._produce_on:
+            self._mode = "produce"
+        else:
+            self._mode = "blackhole"          # no gate → receive blocks (the wedge)
+        if self._mode == "produce":
+            self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1
+        self._mode = "interrupted"
+        self._gate.set()
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if self._mode == "interrupted":
+                yield ResultMessage()          # the interrupted attempt ends
+            elif self._mode == "produce":
+                yield AssistantMessage("批 1/10 完成")
+                yield ResultMessage()
+                self._closed = True
+                return
+            # blackhole → loop back and block on the gate again
+
+    async def disconnect(self):
+        self._closed = True
+
+
+class _LiveStreamFake:
+    """A live-but-slow generation: emits StreamEvent liveness faster than the idle
+    bound, so the watchdog must never reap it."""
+
+    def __init__(self, options=None, ticks=6, dt=0.05):
+        self.options = options
+        self.queries = []
+        self.interrupts = 0
+        self._ticks = ticks
+        self._dt = dt
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def receive_messages(self):
+        for _ in range(self._ticks):
+            await asyncio.sleep(self._dt)
+            yield StreamEvent()
+        yield AssistantMessage("done streaming")
+        yield ResultMessage()
+
+    async def disconnect(self):
+        pass
+
+
+class _ToolGapFake:
+    """A tool the CLI runs for a while: after the assistant asks for a tool
+    (tool_pending), there is a model-silent gap longer than the idle bound but
+    shorter than the tool bound — must NOT be reaped."""
+
+    def __init__(self, options=None, gap=0.3):
+        self.options = options
+        self.queries = []
+        self.interrupts = 0
+        self._gap = gap
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def receive_messages(self):
+        am = AssistantMessage("calling read")
+        am.content = [TextBlock("calling read"), ToolUseBlock()]
+        yield am                                # tool_pending = True
+        await asyncio.sleep(self._gap)          # model-silent while the CLI runs the tool
+        yield UserMessage()                     # tool_result → tool_pending = False
+        yield AssistantMessage("read done")
+        yield ResultMessage()
+
+    async def disconnect(self):
+        pass
+
+
+async def _run_stall_scenario(fake, *, idle, poll, max_retries, tool_idle=660.0,
+                              rate_base=None, rate_cap=None, rate_max=None):
+    """Drive one turn through _consume_turn_stream with the watchdog running, at
+    test-tuned knobs (restored after). Returns (run, drained events, raised)."""
+    saved = (
+        compile_box._MODEL_IDLE_TIMEOUT_S,
+        compile_box._MODEL_TOOL_IDLE_TIMEOUT_S,
+        compile_box._MODEL_MAX_RETRIES,
+        compile_box._MODEL_WATCHDOG_POLL_S,
+        compile_box._MODEL_RATE_BACKOFF_BASE_S,
+        compile_box._MODEL_RATE_BACKOFF_CAP_S,
+        compile_box._MODEL_RATE_MAX_RETRIES,
+    )
+    compile_box._MODEL_IDLE_TIMEOUT_S = idle
+    compile_box._MODEL_TOOL_IDLE_TIMEOUT_S = tool_idle
+    compile_box._MODEL_MAX_RETRIES = max_retries
+    compile_box._MODEL_WATCHDOG_POLL_S = poll
+    if rate_base is not None:
+        compile_box._MODEL_RATE_BACKOFF_BASE_S = rate_base
+    if rate_cap is not None:
+        compile_box._MODEL_RATE_BACKOFF_CAP_S = rate_cap
+    if rate_max is not None:
+        compile_box._MODEL_RATE_MAX_RETRIES = rate_max
+    raised = None
+    with tempfile.TemporaryDirectory() as td:
+        run = compile_box.CompileRun("wd", td, 1)
+        run._suppress_turn_done = True          # isolate the watchdog from post-turn machinery
+        run.client = fake
+        wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+        try:
+            await run.inject_user_message("批 1/10")
+            await compile_box._consume_turn_stream(run, fake, stop_on_result=True)
+        except compile_box.ModelStallError as e:
+            raised = e
+        finally:
+            run.done = True
+            wdog.cancel()
+            try:
+                await wdog
+            except asyncio.CancelledError:
+                pass
+            (
+                compile_box._MODEL_IDLE_TIMEOUT_S,
+                compile_box._MODEL_TOOL_IDLE_TIMEOUT_S,
+                compile_box._MODEL_MAX_RETRIES,
+                compile_box._MODEL_WATCHDOG_POLL_S,
+                compile_box._MODEL_RATE_BACKOFF_BASE_S,
+                compile_box._MODEL_RATE_BACKOFF_CAP_S,
+                compile_box._MODEL_RATE_MAX_RETRIES,
+            ) = saved
+    return run, _drain(run), raised
+
+
+async def test_model_stall_retries_then_completes():
+    """A black-holed model request is interrupted and re-issued on a fresh query;
+    the retry produces output and the turn finishes (turn_stalled then completes)."""
+    fake = _StallingFakeClient(produce_on_query=2)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.15, poll=0.03, max_retries=3)
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert fake.interrupts == 1, fake.interrupts
+    assert fake.queries == ["批 1/10", "批 1/10"], fake.queries
+    assert "turn_stalled" in types, types
+    assert run._last_turn_reply == "批 1/10 完成", run._last_turn_reply
+    print("✓ model stall: interrupt + retry recovers a black-holed request")
+
+
+async def test_model_stall_live_stream_not_reaped():
+    """A live-but-slow generation (StreamEvents flowing) is never reaped (I4)."""
+    fake = _LiveStreamFake(ticks=6, dt=0.05)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.15, poll=0.03, max_retries=3)
+    assert raised is None, raised
+    assert fake.interrupts == 0, fake.interrupts
+    assert "turn_stalled" not in [e["type"] for e in evs]
+    print("✓ model stall: a live-but-slow stream is never reaped")
+
+
+async def test_model_stall_tool_gap_not_reaped():
+    """A model-silent gap while the CLI runs a tool (tool_pending) uses the longer
+    tool bound — not mistaken for a model stall (I4)."""
+    fake = _ToolGapFake(gap=0.3)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.15, poll=0.03, max_retries=3, tool_idle=1.0)
+    assert raised is None, raised
+    assert fake.interrupts == 0, fake.interrupts
+    assert "turn_stalled" not in [e["type"] for e in evs]
+    print("✓ model stall: a long tool (tool_pending) is not mistaken for a stall")
+
+
+async def test_model_stall_exhausts_to_error():
+    """A request that never recovers is retried up to the bound, then fails the
+    turn with ModelStallError (the run fails fast instead of hanging for ~1h)."""
+    fake = _StallingFakeClient(produce_on_query=999)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.1, poll=0.03, max_retries=2)
+    types = [e["type"] for e in evs]
+    assert isinstance(raised, compile_box.ModelStallError), raised
+    assert fake.interrupts == 3, fake.interrupts          # 2 retries + the fatal attempt
+    assert types.count("turn_stalled") == 3, types
+    assert any(e["type"] == "turn_stalled" and e.get("fatal") for e in evs), evs
+    print("✓ model stall: retries exhausted → ModelStallError (fails fast, no hang)")
+
+
+# ── Rate-limit resilience (C2) ───────────────────────────────────────────────
+
+
+class _RateLimitedFakeClient:
+    """Ends each turn with a rate-limit error result until the Nth query, which
+    produces a normal completion. `is_error` + `api_error_status` mirror the CLI's
+    ResultMessage on a 429/503/529 (CLI >= 2.1.110)."""
+
+    def __init__(self, options=None, succeed_on_query=2, status=429):
+        self.options = options
+        self.queries = []
+        self.interrupts = 0
+        self._succeed_on = succeed_on_query
+        self._status = status
+        self._gate = asyncio.Event()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append(prompt)
+        self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if len(self.queries) >= self._succeed_on:
+                yield AssistantMessage("compiled ok")
+                yield ResultMessage()
+                self._closed = True
+                return
+            r = ResultMessage()
+            r.is_error = True
+            r.api_error_status = self._status
+            yield r
+            # loop back and wait for the retry query
+
+    async def disconnect(self):
+        self._closed = True
+
+
+async def test_model_rate_limit_backoff_then_completes():
+    """C2: a 429 error result backs off + re-issues; the retry completes."""
+    fake = _RateLimitedFakeClient(succeed_on_query=2, status=429)
+    run, evs, raised = await _run_stall_scenario(
+        fake, idle=90, poll=0.03, max_retries=3, rate_base=0.01, rate_cap=0.02, rate_max=5)
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert fake.queries == ["批 1/10", "批 1/10"], fake.queries
+    assert "rate_limited" in types, types
+    assert next(e for e in evs if e["type"] == "rate_limited")["status"] == 429
+    assert run._last_turn_reply == "compiled ok", run._last_turn_reply
+    print("✓ rate limit: 429 backs off + re-issues, then completes (C2)")
+
+
+async def test_model_rate_limit_exhausts_gracefully():
+    """C2: persistent 529 → after the retry budget the turn ends with a clear note
+    (run idle), not a crash."""
+    fake = _RateLimitedFakeClient(succeed_on_query=999, status=529)
+    run, evs, raised = await _run_stall_scenario(
+        fake, idle=90, poll=0.03, max_retries=3, rate_base=0.01, rate_cap=0.02, rate_max=2)
+    types = [e["type"] for e in evs]
+    assert raised is None, raised                       # graceful, not a crash
+    assert types.count("rate_limited") == 2, types      # rate_max retries
+    assert any(e["type"] == "summary" and "rate-limited" in e.get("text", "") for e in evs), evs
+    print("✓ rate limit: exhausted budget ends gracefully with a note, no crash (C2)")
+
+
+# ── Graceful-shutdown flush (F3) ─────────────────────────────────────────────
+
+
+async def test_shutdown_flush_syncs_active_runs():
+    """F3: on_shutdown final-syncs each active run's unsynced workspace so a pod
+    kill (SIGTERM) doesn't lose the last window of on-disk work."""
+    saved = compile_box._SHUTDOWN_DRAIN_MAX_S
+    compile_box._SHUTDOWN_DRAIN_MAX_S = 0.1
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "candidate").mkdir(parents=True)
+            (wd / "candidate" / "01.md").write_text("# page one\n", "utf-8")
+            run = compile_box.CompileRun("shut1", td, 1)
+            run._sync_sent = {}
+            compile_box.RUNS["shut1"] = run
+            try:
+                await compile_box._flush_on_shutdown(None)
+            finally:
+                compile_box.RUNS.pop("shut1", None)
+            evs = _drain(run)
+            sync = [e for e in evs if e["type"] == "syncArtifacts"]
+            assert sync, evs
+            assert "candidate/01.md" in [a["path"] for a in sync[0]["artifacts"]], sync
+    finally:
+        compile_box._SHUTDOWN_DRAIN_MAX_S = saved
+    print("✓ shutdown flush: final-syncs active runs' unsynced workspace (F3)")
+
+
 def test_pr382_review_fixes():
     """Review fixes: brief guard + capped/last-marker raw (A/C), atomic writer (B),
     question-id parity vector + intentional dedup (D/E)."""
@@ -906,6 +1683,9 @@ def test_pr382_review_fixes():
 
 
 async def main():
+    # PK never fires in these wiring tests — a qualifying fixture must not spawn
+    # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
+    os.environ["KBC_PK_MODE"] = "off"
     test_install_wiki_snapshot_size_guard()
     await test_workspace_sync()
     await test_run_wrapper_terminal_signals()
@@ -920,10 +1700,25 @@ async def main():
     await test_open_close_test_session_http()
     await test_test_message_path()
     await test_propose_plan_never_bounces()
+    test_apply_session_config()
     test_parse_brief_block()
     test_merge_proposed_questions()
     await test_propose_questions_appends_dedup()
     await test_message_captures_brief()
+    await test_incremental_route()
+    await test_incremental_integrity_guard()
+    await test_incremental_guard_rearms_on_ledger_repair()
+    await test_batch_orchestrator_routing_and_resume()
+    await test_batch_orchestrator_review_fixes()
+    await test_model_stall_retries_then_completes()
+    await test_model_stall_live_stream_not_reaped()
+    await test_model_stall_tool_gap_not_reaped()
+    await test_model_stall_exhausts_to_error()
+    await test_stall_interrupt_deadline_closes_turn()
+    await test_run_wrapper_closes_turn_on_driver_crash()
+    await test_model_rate_limit_backoff_then_completes()
+    await test_model_rate_limit_exhausts_gracefully()
+    await test_shutdown_flush_syncs_active_runs()
     test_pr382_review_fixes()
 
     compile_box._COMPILE_IMPL = fake_driver

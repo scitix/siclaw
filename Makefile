@@ -24,6 +24,7 @@ RUNTIME_IMAGE  = $(REGISTRY)/siclaw-runtime:$(TAG)
 AGENTBOX_IMAGE = $(REGISTRY)/siclaw-agentbox:$(TAG)
 PORTAL_IMAGE   = $(REGISTRY)/siclaw-portal:$(TAG)
 OCR_IMAGE      = $(REGISTRY)/siclaw-ocr:$(TAG)
+KBC_IMAGE      = $(REGISTRY)/kbc-compile-box:$(TAG)
 
 # ── OCI labels injected into every image ──
 DOCKER_LABELS = \
@@ -72,7 +73,7 @@ build-portal-web: ## Compile Portal frontend (Vite)
 # ==================== Docker ====================
 ##@ Docker
 
-docker: docker-runtime docker-agentbox docker-portal docker-ocr ## Build all Docker images
+docker: docker-runtime docker-agentbox docker-portal docker-ocr docker-kbc ## Build all Docker images
 
 docker-runtime: ## Build runtime image
 	docker build -f Dockerfile.runtime $(DOCKER_LABELS) -t $(RUNTIME_IMAGE) .
@@ -86,7 +87,10 @@ docker-portal: ## Build portal image
 docker-ocr: ## Build OCR backend image
 	docker build -f Dockerfile.ocr $(DOCKER_LABELS) -t $(OCR_IMAGE) .
 
-push: push-runtime push-agentbox push-portal push-ocr ## Push all images to registry
+docker-kbc: ## Build KB compile-box image (spawned per compile run; helm agentbox.compileBoxEnabled derives this tag)
+	cd kbc && docker build -f platform/pod/Dockerfile $(DOCKER_LABELS) -t $(KBC_IMAGE) .
+
+push: push-runtime push-agentbox push-portal push-ocr push-kbc ## Push all images to registry
 
 push-runtime: ## Push runtime image
 	docker push $(RUNTIME_IMAGE)
@@ -99,6 +103,9 @@ push-portal: ## Push portal image
 
 push-ocr: ## Push OCR backend image
 	docker push $(OCR_IMAGE)
+
+push-kbc: ## Push KB compile-box image
+	docker push $(KBC_IMAGE)
 
 # ==================== Test ====================
 ##@ Test
@@ -124,6 +131,7 @@ info: ## Print build variables
 	@echo "AGENTBOX:    $(AGENTBOX_IMAGE)"
 	@echo "PORTAL:      $(PORTAL_IMAGE)"
 	@echo "OCR:         $(OCR_IMAGE)"
+	@echo "KBC:         $(KBC_IMAGE)"
 
 logs: ## View recent logs (all components)
 	@echo "=== Runtime ===" && \
