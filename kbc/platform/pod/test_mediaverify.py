@@ -29,9 +29,9 @@ class FakeEngine:
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
                                  model, effort=None, allowed_read_roots, timeout_secs):
-        if "图像转写员" in system_prompt:
+        if "You are an image transcriber" in system_prompt or "图像转写员" in system_prompt:
             stage = "transcribe"
-        elif "比对员" in system_prompt:
+        elif "You are the comparer" in system_prompt or "比对员" in system_prompt:
             stage = "compare"
         else:
             raise AssertionError(f"unroutable: {system_prompt[:60]}")
@@ -77,6 +77,12 @@ async def test_blind_flow_and_isolation():
         # comparer sees the page text + transcript inline, never an image path to open
         assert "GPU-Util 94%" in fake.users["compare"][0] or "GPU-Util 94%" in fake.users["compare"][1]
 
+        # default locale (None) renders the ENGLISH prompts, and the en comparison
+        # prompt still demands the exact stored kind tokens
+        assert all("Open this image with Read" in u for u in fake.users["transcribe"])
+        assert all('"不一致" (inconsistent)' in u and '"超出转写范围" (beyond the transcript)' in u
+                   for u in fake.users["compare"])
+
         # transcript cache: second run re-transcribes nothing
         result2 = await mediaverify.run_blind_verify(fake, td, pending)
         assert fake.calls["transcribe"] == 2, fake.calls  # cache hits
@@ -95,10 +101,15 @@ def test_repair_prompt():
     findings = [{"page": "p.md", "image": "s/i1.png", "kind": "超出转写范围",
                  "claim": "GPU 型号 NVIDIA H20", "expected": "转写中无此信息",
                  "fix": "降级⚠️存疑+落工单"}]
+    # default locale (None) = English; the stored kind token renders as its label
     prompt = mediaverify.build_repair_prompt(findings)
-    assert "图像复核" in prompt and "超出转写范围" in prompt and "H20" in prompt
-    assert "落一条工单" in prompt
-    print("OK  repair prompt (kinds + claims + fix lines)")
+    assert prompt.startswith("[System self-check · image verification]"), prompt[:80]
+    assert "beyond what the transcript supports" in prompt and "H20" in prompt
+    assert "file a ticket" in prompt and "Claim:" in prompt
+    # zh branch keeps the original wording
+    zh = mediaverify.build_repair_prompt(findings, locale="zh")
+    assert "【系统自检 · 图像复核】" in zh and "落一条工单" in zh
+    print("OK  repair prompt (en default + zh branch, kinds + claims + fix lines)")
 
 
 def main():

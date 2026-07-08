@@ -952,7 +952,7 @@ async def test_incremental_route():
         # byte-integrity guard state armed (before-hashes captured for the post-turn check)
         assert run._incr_pending is not None and "a.md" in run._incr_pending["before"]
         # the scoped directive was injected (not a batch orchestrator)
-        assert any("增量重编" in q and "CHANGESET.json" in q for q in fake.queries), fake.queries
+        assert any("[Incremental recompile]" in q and "CHANGESET.json" in q for q in fake.queries), fake.queries
     print("OK  incremental route (RAW_CHANGES → scoped CHANGESET + guard-armed + scoped directive; absent/non-trigger → no route)")
 
 
@@ -985,7 +985,7 @@ async def test_incremental_integrity_guard():
         (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         # coverage ledger is clean (both sources still cited) yet integrity forces a repair naming c.md
-        assert repair is not None and "增量越界" in repair and "c.md" in repair, repair
+        assert repair is not None and "Incremental scope violation" in repair and "c.md" in repair, repair
         assert run._incr_pending is None  # one-shot consumed
         sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc["incremental"]["out_of_scope_pages"] == ["c.md"], sc
@@ -1039,12 +1039,12 @@ async def test_batch_orchestrator_routing_and_resume():
         types = [e["type"] for e in events]
         assert types.count("turn_done") == 1, types
         turn = next(e for e in events if e["type"] == "turn_done")
-        assert "【批 1/2】" in turn["text"] and "【终审】" in turn["text"], turn
+        assert "[Batch 1/2]" in turn["text"] and "[Final review]" in turn["text"], turn
         plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
         assert all(b["status"] == "done" for b in plan["batches"]), plan
         assert (wd / batching.SOURCES_INVENTORY_PATH).is_file()
         # two batches + 终审 were driven, in order
-        assert len(driven) == 3 and driven[-1].startswith("终审"), driven
+        assert len(driven) == 3 and driven[-1].startswith("final review"), driven
 
         # resume: mark one batch pending again → next trigger routes to batch even
         # under a huge threshold, and only the pending batch (+终审) re-runs
@@ -1058,7 +1058,7 @@ async def test_batch_orchestrator_routing_and_resume():
             await compile_box._run_batch_compile(run, "直接开始编译")
         finally:
             compile_box._drive_batch_session = real_drive
-        assert len(driven) == 2 and driven[0].startswith("批 2/2"), driven
+        assert len(driven) == 2 and driven[0].startswith("batch 2/2"), driven
 
         # mid-batch owner chat queues and is relayed into the next directive
         run._batch_active = True
@@ -1114,10 +1114,10 @@ async def test_batch_orchestrator_review_fixes():
             compile_box._drive_batch_session = fake_drive
             await compile_box._run_batch_compile(run, "直接开始编译")
             evs = _events(run)
-            assert any("已不在 raw/" in e.get("text", "") for e in evs
+            assert any("no longer in raw/" in e.get("text", "") for e in evs
                        if e["type"] == "summary"), evs
             assert not any("deleted.md" in d or "vanished.md" in d for d in driven), driven
-            assert sum(d.startswith("批") for d in driven) == 1, driven  # b02 emptied → skipped
+            assert sum(d.startswith("batch ") for d in driven) == 1, driven  # b02 emptied → skipped
             saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
             assert all(b["status"] == "done" for b in saved["batches"]), saved
 
@@ -1147,15 +1147,36 @@ async def test_batch_orchestrator_review_fixes():
 
             async def drive_and_note(run_, directive, label):
                 driven.append(f"{label}|{directive}")
-                if label == "终审":  # owner speaks while the tail is running
+                if label == "final review":  # owner speaks while the tail is running
                     run_._batch_notes.append("附录不要发布")
                 return f"done {label}"
 
             compile_box._drive_batch_session = drive_and_note
             await compile_box._run_batch_compile(run, "直接开始编译")
-            digest = [d for d in driven if d.startswith("留言消化|")]
+            digest = [d for d in driven if d.startswith("note digest|")]
             assert len(digest) == 1 and "附录不要发布" in digest[0], driven
             assert [e for e in _events(run) if e["type"] == "turn_done"], "turn still closes"
+
+        # (d) zh locale branch: the same flow narrates in Chinese when the
+        # consumer declares locale=zh (platform default above was English)
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "a").mkdir(parents=True)
+            (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+            run = compile_box.CompileRun("rf4", str(wd), 1)
+            run.locale = "zh"
+            driven = []
+
+            async def fake_zh(run_, directive, label):
+                driven.append(f"{label}|{directive}")
+                return f"done {label}"
+
+            compile_box._drive_batch_session = fake_zh
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            assert driven and driven[-1].startswith("终审"), driven
+            assert any(d.startswith("批 1/1|【分批编译 · 批 1/1") for d in driven), driven
+            turn = next(e for e in _events(run) if e["type"] == "turn_done")
+            assert "【批 1/1】" in turn["text"] and "【终审】" in turn["text"], turn
     finally:
         compile_box._drive_batch_session = real_drive
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
@@ -1456,7 +1477,7 @@ async def test_model_rate_limit_exhausts_gracefully():
     types = [e["type"] for e in evs]
     assert raised is None, raised                       # graceful, not a crash
     assert types.count("rate_limited") == 2, types      # rate_max retries
-    assert any(e["type"] == "summary" and "限流" in e.get("text", "") for e in evs), evs
+    assert any(e["type"] == "summary" and "rate-limited" in e.get("text", "") for e in evs), evs
     print("✓ rate limit: exhausted budget ends gracefully with a note, no crash (C2)")
 
 

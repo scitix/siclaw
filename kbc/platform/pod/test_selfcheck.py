@@ -339,7 +339,7 @@ async def test_media_verify_wiring():
 
         calls: list[dict] = []
 
-        async def fake_verify(engine, workdir, pending, progress=None):
+        async def fake_verify(engine, workdir, pending, progress=None, locale=None):
             calls.append(dict(pending))
             if len(calls) == 1:  # first chunk: one confirmed misread
                 return {"findings": [{"page": "p.md", "image": "s/i1.png", "kind": "不一致",
@@ -359,7 +359,7 @@ async def test_media_verify_wiring():
             assert _maybe_start_media_verify(run)           # chunk 1 (p.md, cap 1 image)
             await run._media_task
             assert calls[0] == {"p.md": ["s/i1.png"]}, calls
-            assert run.injected and "图像复核" in run.injected[-1] and "94% 是 MEM 条" in run.injected[-1]
+            assert run.injected and "[System self-check · image verification]" in run.injected[-1] and "94% 是 MEM 条" in run.injected[-1]
             assert compile_box._pk_due(run) is None         # q.md still pending → PK waits
             assert _maybe_start_media_verify(run)           # remainder rolls: chunk 2 (q.md)
             await run._media_task
@@ -413,7 +413,7 @@ async def test_pk_wiring():
             assert sc["pk"]["state"] == "repairing" and sc["pk"]["rounds_used"] == 0, sc["pk"]
             # converge phase = revising (verify found issues → a repair was injected)
             assert sc["converge_phase"] == "revising", sc.get("converge_phase")
-            assert run.injected and "红蓝队" in run.injected[-1] and "补" in run.injected[-1]
+            assert run.injected and "[System self-check · red-blue PK]" in run.injected[-1] and "补" in run.injected[-1]
             detail = json.loads((base / "authoring/PK_RESULT.json").read_text())
             assert len(detail["answers"]["q1"]["answer"]) == 4000  # persisted truncated
 

@@ -18,6 +18,12 @@ screenshot). De-anchor by splitting perceive from judge:
 Deterministic code owns orchestration, caching and the repair prompt; models
 only ever transcribe or compare. Engine-neutral: depends on
 engine.ReadonlyAgentEngine only (same seam as redblue.py).
+
+Locale: prompts and progress strings render in English by default (locale of
+None/'en') and in Chinese for locale='zh'. The finding "kind" values above are
+STORED tokens compared downstream — both locales instruct the model to emit
+those exact tokens; only build_repair_prompt translates them into display
+labels at render time.
 """
 
 from __future__ import annotations
@@ -30,8 +36,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
-import selfcheck
 from redblue import _agent_json  # JSON call + one lenient retry, shared shape
+from selfcheck import _is_en  # locale gate: None/en → English, zh → Chinese
 
 TRANSCRIPTS_PATH = "authoring/MEDIA_TRANSCRIPTS.json"
 _TRANSCRIPT_CHAR_CAP = 6000  # per image, persisted
@@ -49,12 +55,28 @@ def _compare_model() -> str:
     return _env("KBC_MV_COMPARE_MODEL", "claude-opus-4-6")
 
 
-TRANSCRIBE_SYSTEM = """你是图像转写员。你只看眼前这一张图,把图里**可见**的信息转写成结构化 JSON。
+TRANSCRIBE_SYSTEM_EN = """You are an image transcriber. You look at this one image only and transcribe the information **visible** in it into structured JSON.
+Iron rules: do not write a single word of information the image does not contain (no inference, no filling in, no free association); mark values you cannot read as "unreadable";
+every number in a table or monitoring screenshot must sit under its column header; for bar/line charts, write out the legend (color → series) and the axes first,
+then transcribe bar by bar / point by point, tagging each value with its series; record N/A or offline rows exactly as shown."""
+
+TRANSCRIBE_SYSTEM_ZH = """你是图像转写员。你只看眼前这一张图,把图里**可见**的信息转写成结构化 JSON。
 铁则:图里没有的信息一个字都不要写(不要推断、不要补全、不要联想);读不清的值标 "不可读";
 表格/监控截图的每个数值必须挂在它的列名下;柱状图/折线图必须先写出图例(颜色→系列)与坐标轴,
 再逐柱/逐点转写,每个值标它属于哪个系列;N/A 或离线的行照原样记录。"""
 
-TRANSCRIBE_USER = """用 Read 打开这张图并转写:{img}
+TRANSCRIBE_USER_EN = """Open this image with Read and transcribe it: {img}
+
+Output valid JSON only (no other text), structured as:
+{{"chart_type": "table/bar chart/line chart/UI screenshot/flow diagram/other",
+  "title_or_header": "the title or header visible in the image, else null",
+  "legend": {{"series name": "color description", ...}} or null,
+  "axes": "axis meanings and units, else null",
+  "facts": [{{"label": "row/column/series locator", "value": "visible value"}}, ...],
+  "illegible": ["parts you cannot read", ...],
+  "notes": "other visible points (still only what the image shows)"}}"""
+
+TRANSCRIBE_USER_ZH = """用 Read 打开这张图并转写:{img}
 
 只输出合法 JSON(不要其他文字),结构:
 {{"chart_type": "表格/柱状图/折线图/界面截图/流程图/其他",
@@ -65,7 +87,19 @@ TRANSCRIBE_USER = """用 Read 打开这张图并转写:{img}
   "illegible": ["读不清的部分", ...],
   "notes": "其他可见要点(仍然只写图里有的)"}}"""
 
-COMPARE_SYSTEM = """你是知识库图像断言的【比对员】。你看不到图片本身——只有另一位转写员产出的
+COMPARE_SYSTEM_EN = """You are the comparer for knowledge-base image claims. You cannot see the images themselves — only the
+structured transcripts produced by a separate transcriber (each is the complete inventory of what is visible in its image)
+and the body text of the knowledge page that cites those images.
+Your job: check every claim on the page whose source annotation names one of these images, and report exactly two kinds of problems:
+- "不一致" (inconsistent): the claim conflicts with the transcript's value or attribution (e.g. a memory-column
+  number reported as utilization, or a P0 series written up as P1);
+- "超出转写范围" (beyond the transcript): the claim carries this image as its source tag, but nothing in the
+  transcript can support it (typical: the image shows no model name, yet the page says "the model is X" and cites
+  this image — an inference dressed up as a sourced fact).
+Do not report claims that agree with the transcript; content citing other, non-image sources is not yours to check;
+when unsure whether something qualifies, lean toward reporting it and let a human decide."""
+
+COMPARE_SYSTEM_ZH = """你是知识库图像断言的【比对员】。你看不到图片本身——只有另一位转写员产出的
 结构化转写(它是图内可见信息的完整清单)和引用了该图的知识页正文。
 你的任务:逐条核对页面里标注来源为这些图片的断言,只报两类问题:
 - 不一致:断言与转写的值/归属冲突(如把显存列的数值写成利用率、把 P0 系列写成 P1);
@@ -73,7 +107,23 @@ COMPARE_SYSTEM = """你是知识库图像断言的【比对员】。你看不到
   (典型:图里没有型号名,页面却说"型号是 X"并引用该图——这是把推断伪装成带源事实)。
 与转写一致的断言不要报;页面引用其他非图片来源的内容不归你管;拿不准算不算的,倾向于报出来让人裁。"""
 
-COMPARE_USER = """知识页:{page}
+COMPARE_USER_EN = """Knowledge page: {page}
+Full page text:
+--------
+{page_text}
+--------
+
+Transcripts of the images this page cites (produced by a transcriber who saw only the image — the complete inventory of what is visible):
+{transcripts_json}
+
+Output valid JSON only (no other text):
+{{"findings": [{{"image": "image path relative to raw", "claim": "the page's original claim (quoted)",
+   "kind": set kind to exactly "不一致" (inconsistent) or "超出转写范围" (beyond the transcript),
+   "expected": "the matching fact from the transcript; for beyond-the-transcript findings write \\"not in the transcript\\"",
+   "fix": "one-line fix (change to the transcribed value / downgrade to ⚠️ uncertain + file a ticket / re-attribute to the correct source)"}}]}}
+If there are no problems, output {{"findings": []}}."""
+
+COMPARE_USER_ZH = """知识页:{page}
 页面全文:
 --------
 {page_text}
@@ -88,6 +138,18 @@ COMPARE_USER = """知识页:{page}
    "expected": "转写里的对应事实;超出范围时写「转写中无此信息」",
    "fix": "一句话修法(改成什么值 / 降级⚠️存疑+落工单 / 改挂正确来源)"}}]}}
 没有问题就输出 {{"findings": []}}。"""
+
+
+def _transcribe_prompts(locale: str | None) -> tuple[str, str]:
+    if _is_en(locale):
+        return TRANSCRIBE_SYSTEM_EN, TRANSCRIBE_USER_EN
+    return TRANSCRIBE_SYSTEM_ZH, TRANSCRIBE_USER_ZH
+
+
+def _compare_prompts(locale: str | None) -> tuple[str, str]:
+    if _is_en(locale):
+        return COMPARE_SYSTEM_EN, COMPARE_USER_EN
+    return COMPARE_SYSTEM_ZH, COMPARE_USER_ZH
 
 
 def _sha8(path: Path) -> str:
@@ -115,7 +177,8 @@ def save_transcripts(workdir: str, cache: dict) -> None:
     p.write_text(json.dumps(cache, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
 
-async def transcribe_image(engine, workdir: str, img_rel: str, cache: dict) -> dict | None:
+async def transcribe_image(engine, workdir: str, img_rel: str, cache: dict,
+                           locale: str | None = None) -> dict | None:
     """One blind transcription, cached by image content hash (incremental
     recompiles re-verify for free). None on failure (caller records the error)."""
     img_path = Path(workdir) / "raw" / img_rel
@@ -126,9 +189,10 @@ async def transcribe_image(engine, workdir: str, img_rel: str, cache: dict) -> d
     if hit and hit.get("sha8") == sha and isinstance(hit.get("transcript"), dict):
         return hit["transcript"]
     raw_dir = str(Path(workdir) / "raw")
+    system, user = _transcribe_prompts(locale)
     data = await _agent_json(
-        engine, stage="transcribe", system=TRANSCRIBE_SYSTEM,
-        user=TRANSCRIBE_USER.format(img=f"raw/{img_rel}"),
+        engine, stage="transcribe", system=system,
+        user=user.format(img=f"raw/{img_rel}"),
         model=_transcribe_model(), cwd=raw_dir, roots=[raw_dir],
         timeout=float(_env("KBC_MV_TRANSCRIBE_TIMEOUT", "240")))
     if not isinstance(data, dict):
@@ -137,19 +201,21 @@ async def transcribe_image(engine, workdir: str, img_rel: str, cache: dict) -> d
         data = {"chart_type": data.get("chart_type"), "legend": data.get("legend"),
                 "axes": data.get("axes"),
                 "facts": (data.get("facts") or [])[:80],
-                "notes": "(转写超长已截断)"}
+                "notes": ("(transcript truncated — over the length cap)" if _is_en(locale)
+                          else "(转写超长已截断)")}
     cache[img_rel] = {"sha8": sha, "transcript": data}
     return data
 
 
 async def compare_page(engine, tmp_dir: str, page_rel: str, page_text: str,
-                       transcripts: dict[str, dict]) -> list[dict]:
+                       transcripts: dict[str, dict], locale: str | None = None) -> list[dict]:
     """Text-only comparison — cwd/roots point at an EMPTY dir so the comparer
     cannot open the image (or anything else); everything it may see is inline."""
+    system, user = _compare_prompts(locale)
     data = await _agent_json(
-        engine, stage="compare", system=COMPARE_SYSTEM,
-        user=COMPARE_USER.format(page=page_rel, page_text=page_text[:24000],
-                                 transcripts_json=json.dumps(transcripts, ensure_ascii=False)),
+        engine, stage="compare", system=system,
+        user=user.format(page=page_rel, page_text=page_text[:24000],
+                         transcripts_json=json.dumps(transcripts, ensure_ascii=False)),
         model=_compare_model(), cwd=tmp_dir, roots=[tmp_dir],
         timeout=float(_env("KBC_MV_COMPARE_TIMEOUT", "300")))
     findings = data.get("findings") if isinstance(data, dict) else None
@@ -165,11 +231,12 @@ async def compare_page(engine, tmp_dir: str, page_rel: str, page_text: str,
 
 
 async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
-                           progress=None) -> dict:
+                           progress=None, locale: str | None = None) -> dict:
     """Transcribe every image in `pending` (cache-aware, concurrent), then
     compare each page against its transcripts. Fail-open per item: a failed
     transcript/compare is recorded in errors, never raises."""
     say = progress or (lambda s: None)
+    en = _is_en(locale)
     sem = asyncio.Semaphore(int(_env("KBC_MV_CONCURRENCY", "3")))
     cache = load_transcripts(workdir)
     images = sorted({img for imgs in pending.values() for img in imgs})
@@ -182,18 +249,21 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
         pre = img in cache and cache[img].get("transcript")
         async with sem:
             try:
-                t = await transcribe_image(engine, workdir, img, cache)
+                t = await transcribe_image(engine, workdir, img, cache, locale=locale)
             except Exception as e:
-                errors.append(f"转写失败 {img}: {e!r}")
+                errors.append(f"transcription failed {img}: {e!r}" if en
+                              else f"转写失败 {img}: {e!r}")
                 return
         if t is not None:
             transcripts[img] = t
             if pre and cache[img].get("transcript") is t:
                 hits += 1
         else:
-            errors.append(f"转写失败 {img}: 无法解析/文件缺失")
+            errors.append(f"transcription failed {img}: unparsable output / file missing" if en
+                          else f"转写失败 {img}: 无法解析/文件缺失")
 
-    say(f"自检(图像·盲转写):{len(images)} 张图转写中…")
+    say(f"Self-check (image · blind transcription): transcribing {len(images)} image(s)…" if en
+        else f"自检(图像·盲转写):{len(images)} 张图转写中…")
     await asyncio.gather(*(_one(i) for i in images))
     save_transcripts(workdir, cache)
 
@@ -208,24 +278,49 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
         try:
             text = (cand / page).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as e:
-            errors.append(f"读页失败 {page}: {e!r}")
+            errors.append(f"failed to read page {page}: {e!r}" if en
+                          else f"读页失败 {page}: {e!r}")
             return
         async with sem:
             try:
-                findings.extend(await compare_page(engine, empty, page, text, ts))
+                findings.extend(await compare_page(engine, empty, page, text, ts, locale=locale))
             except Exception as e:
-                errors.append(f"比对失败 {page}: {e!r}")
+                errors.append(f"comparison failed {page}: {e!r}" if en
+                              else f"比对失败 {page}: {e!r}")
 
-    say(f"自检(图像·比对):{len(pending)} 页比对中…")
+    say(f"Self-check (image · comparison): comparing {len(pending)} page(s)…" if en
+        else f"自检(图像·比对):{len(pending)} 页比对中…")
     await asyncio.gather(*(_page(p, imgs) for p, imgs in pending.items()))
     shutil.rmtree(empty, ignore_errors=True)
     return {"findings": findings, "errors": errors,
             "images": len(images), "cache_hits": hits}
 
 
-def build_repair_prompt(findings: list[dict]) -> str:
+# Stored finding kinds → English display labels (render-time only; the stored
+# values themselves are never translated).
+_KIND_LABELS_EN = {"不一致": "inconsistent with the image",
+                   "超出转写范围": "beyond what the transcript supports"}
+
+
+def build_repair_prompt(findings: list[dict], locale: str | None = None) -> str:
     """The bounded repair turn for blind-verify findings — concrete claims,
-    concrete expected values, BOX_ROLE contract language."""
+    concrete expected values, BOX_ROLE contract language. Rendered in the run's
+    locale (see _is_en); stored kind tokens are mapped to display labels for en."""
+    if _is_en(locale):
+        lines = ["[System self-check · image verification] The system blind-transcribed each cited image "
+                 "independently and mechanically compared the transcripts against the page claims; the claims "
+                 "below contradict the image or go beyond what it can support. Handle each item: if the value "
+                 "is wrong, change it to the transcribed value; if it is beyond the transcript (the image simply "
+                 "does not contain the information it is cited for) — re-attribute the claim to a real source if "
+                 "one exists, otherwise downgrade it to ⚠️ uncertain and file a ticket through the "
+                 "contradiction-ticket flow. Touch only the affected claims; do not rewrite unrelated content:"]
+        for f in findings[:40]:
+            kind = _KIND_LABELS_EN.get(f["kind"], f["kind"])
+            lines.append(f"- [{kind}] {f['page']} ← raw/{f['image']}\n"
+                         f"  Claim: {f['claim']}\n  Transcript: {f['expected']}\n  Fix: {f['fix']}")
+        if len(findings) > 40:
+            lines.append(f"- …{len(findings)} total (see authoring/SELFCHECK.json for the rest)")
+        return "\n".join(lines)
     lines = ["【系统自检 · 图像复核】系统对图片做了独立盲转写并与页面断言机械比对,以下断言与图不符"
              "或超出该图可支持的范围。逐条处理:值错的改成转写值;超出范围的(图里根本没有的信息被"
              "标注成该图来源)——有其他真实来源就改挂正确来源,没有就降级为 ⚠️ 存疑并按矛盾工单流程"

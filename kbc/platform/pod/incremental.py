@@ -21,7 +21,7 @@ import json
 import posixpath
 from pathlib import Path
 
-from selfcheck import candidate_pages
+from selfcheck import _is_en, candidate_pages
 
 # 消费方 → box(管控面把机器算的变更交给执行面):变更源集 + 每个 modified 的 unified
 # diff + 基线/快照指纹。box 读它、富集 affected_pages,再落下面的 CHANGESET(给模型)。
@@ -231,12 +231,34 @@ def authorized_pages(workdir: str, changeset: dict) -> set[str]:
     return set(changeset.get("affected_pages", [])) | set(load_added_targets(workdir)) | {INDEX_PAGE}
 
 
-def build_scoped_directive(changeset: dict) -> str:
+def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
     """scoped 增量 turn 的 kickoff 指令。把机器算好的范围 + 三类规则交给模型;细节
     (每处 diff、受影响页)在 authoring/CHANGESET.json 里,让模型先读它。"""
     n_add = len(changeset.get("added", []))
     n_mod = len(changeset.get("modified", []))
     n_del = len(changeset.get("deleted", []))
+    if _is_en(locale):
+        lines = [
+            "[Incremental recompile] This round's changes were computed by code and written to"
+            " authoring/CHANGESET.json. **Read it first**, then work strictly within scope:",
+            f"· {n_mod} modified source(s) → open each one's affected_pages and **edit only the facts"
+            " the diff (+/−) touches — do not rewrite whole pages**; if a diff is empty (not provided),"
+            " re-read that source and update the related facts in its affected pages"
+            " (still touching only those pages).",
+            f"· {n_add} added source(s) → fold each into the most relevant existing page, or create a"
+            " new page, per cascading-ingest; **if you merge into an existing page, you must append"
+            " that page name to authoring/ADDED_TARGETS.json (a JSON array of page names)** —"
+            " otherwise the closing integrity guard will flag it as out of scope.",
+            f"· {n_del} deleted source(s) → remove that source's content/references from its"
+            " affected_pages; if a page ends up empty, delete it.",
+            "· If the page set changes (pages created/deleted) → refresh index.md.",
+            "· **Do not touch a single byte of any page outside affected_pages (plus your declared"
+            " added-target pages and index)** — the closing guard compares per-page sha256 hashes,"
+            " and any out-of-scope edit triggers a repair round.",
+            "· Domain rulings follow constitution.md as usual; file a ticket for any new contradiction"
+            " as usual. When done, briefly state which pages you changed.",
+        ]
+        return "\n".join(lines)
     lines = [
         "【增量重编】本轮变更已由代码算好,写在 authoring/CHANGESET.json。**先读它**,只做范围内的事:",
         f"· 改动源 {n_mod} 个 → 打开各自 affected_pages,**按 diff(+/−)只改动到的那几处事实,不重写整页**;"
@@ -254,10 +276,22 @@ def build_scoped_directive(changeset: dict) -> str:
 _VIOLATION_CAP = 20
 
 
-def build_integrity_repair(violations: list[str]) -> str:
+def build_integrity_repair(violations: list[str], locale: str | None = None) -> str:
     """越界回修指令:本轮改动了授权范围外的页(收尾逐页 sha256 比对发现)。要求模型把
     它们**还原到本轮开始前的内容**,只保留 affected_pages(+ 申报的 added 落笔页 + index)
     的改动。这让"其余不动"从愿望变成有回修闭环的硬约束。"""
+    if _is_en(locale):
+        shown = ", ".join(violations[:_VIOLATION_CAP])
+        more = f" … {len(violations)} pages in total" if len(violations) > _VIOLATION_CAP else ""
+        return (
+            "[Incremental scope violation] This round you modified pages **outside the authorized"
+            " set** (caught by the closing per-page sha256 comparison):\n"
+            f"- {shown}{more}\n"
+            "These pages were off-limits this round. **Restore each one to its content from before"
+            " this round started**, keeping only the changes to CHANGESET.json's affected_pages"
+            " (plus the added-target pages you declared in ADDED_TARGETS.json, plus index.md);"
+            " do not \"improve\" out-of-scope pages along the way."
+        )
     shown = "、".join(violations[:_VIOLATION_CAP])
     more = f" 等共 {len(violations)} 页" if len(violations) > _VIOLATION_CAP else ""
     return (

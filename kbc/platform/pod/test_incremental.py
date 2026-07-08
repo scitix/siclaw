@@ -147,17 +147,20 @@ def test_added_targets_and_authorized():
 
 def test_scoped_directive():
     cs = {"added": [1], "modified": [1, 1], "deleted": []}
-    d = incremental.build_scoped_directive(cs)
-    assert "CHANGESET.json" in d and "改动源 2 个" in d and "新增源 1 个" in d
+    d = incremental.build_scoped_directive(cs)                # default locale = English
+    assert "CHANGESET.json" in d and "2 modified source(s)" in d and "1 added source(s)" in d
     assert "ADDED_TARGETS.json" in d and "sha256" in d  # declares the two contracts the guard depends on
     print("OK  scoped directive (counts + CHANGESET + added-target + byte-guard mentioned)")
 
 
 def test_integrity_repair_directive():
-    d = incremental.build_integrity_repair(["c.md", "d.md"])
-    assert "增量越界" in d and "c.md" in d and "d.md" in d
-    assert "还原到本轮开始前" in d and "ADDED_TARGETS.json" in d
-    print("OK  integrity repair directive (names violating pages + restore instruction)")
+    d = incremental.build_integrity_repair(["c.md", "d.md"])  # default locale = English
+    assert "Incremental scope violation" in d and "c.md" in d and "d.md" in d
+    assert "Restore each one to its content from before" in d and "ADDED_TARGETS.json" in d
+    # zh branch: full Chinese variant when the consumer declares locale=zh
+    dz = incremental.build_integrity_repair(["c.md"], locale="zh")
+    assert "增量越界" in dz and "还原到本轮开始前" in dz and "c.md" in dz
+    print("OK  integrity repair directive (names violating pages + restore instruction, en default + zh branch)")
 
 
 if __name__ == "__main__":

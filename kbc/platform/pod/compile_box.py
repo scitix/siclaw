@@ -130,6 +130,14 @@ def _playbook_text(locale: str | None) -> str:
     return _prompt("playbook", locale)
 
 
+def _loc(run, en: str, zh: str) -> str:
+    """User/model-facing text in the run's locale (platform default en, zh only
+    when the consumer declares it — same gate as selfcheck narration). Wire
+    tokens and stored data stay locale-independent; never route them through
+    this."""
+    return en if selfcheck._is_en(getattr(run, "locale", None)) else zh
+
+
 # The one-line labels that frame owner instructions inside the system prompt.
 _INSTRUCTION_HEADER = {
     "zh": "# 本次 authoring attempt 的负责人说明",
@@ -1006,12 +1014,15 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
     try:
         n_imgs = sum(len(v) for v in chunk.values())
         await run.emit({"type": "summary",
-                        "text": f"自检(图像):盲转写复核 {len(chunk)} 页 / {n_imgs} 张图(后台)…"})
+                        "text": _loc(run,
+                                     f"Self-check (images): blind-verifying {len(chunk)} page(s) / {n_imgs} image(s) (background)…",
+                                     f"自检(图像):盲转写复核 {len(chunk)} 页 / {n_imgs} 张图(后台)…")})
         await _set_converge_phase(run, "verifying")
         loop = asyncio.get_running_loop()
         result = await mediaverify.run_blind_verify(
             ClaudeEngine(), run.workdir, chunk,
-            progress=lambda s: loop.create_task(run.emit({"type": "summary", "text": s})))
+            progress=lambda s: loop.create_task(run.emit({"type": "summary", "text": s})),
+            locale=getattr(run, "locale", None))
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
             try:
@@ -1019,18 +1030,23 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             except Exception:
                 pass
         findings, errors = result["findings"], result["errors"]
-        tail = f";{len(errors)} 项转写/比对失败" if errors else ""
+        tail = _loc(run, f"; {len(errors)} transcription/comparison failure(s)",
+                    f";{len(errors)} 项转写/比对失败") if errors else ""
         if findings:
-            await run.emit({"type": "summary", "text": (
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Self-check (images): {result['images']} image(s) checked, {len(findings)} claim(s) contradict the image / exceed the source — repair injected{tail}",
                 f"自检(图像):{result['images']} 张图已核,{len(findings)} 条断言与图不符/超源,注入回修{tail}")})
             await _set_converge_phase(run, "revising")
-            await run.inject_user_message(mediaverify.build_repair_prompt(findings))
+            await run.inject_user_message(mediaverify.build_repair_prompt(findings, locale=getattr(run, "locale", None)))
         else:
-            await run.emit({"type": "summary", "text": (
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Self-check (images): {result['images']} image(s) checked, claims match the images ✓{tail}",
                 f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓{tail}")})
     except Exception as e:
         try:
-            await run.emit({"type": "summary", "text": f"自检(图像)执行失败,本轮跳过: {e!r}"})
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Self-check (images) failed, skipping this round: {e!r}",
+                f"自检(图像)执行失败,本轮跳过: {e!r}")})
         except Exception:
             pass
 
@@ -1126,12 +1142,24 @@ def _maybe_start_pk(run) -> bool:
     return False
 
 
-def _pk_narration(summary: dict) -> str:
+def _pk_narration(summary: dict, locale: str | None = None) -> str:
     state = summary.get("state")
     n, ok = summary.get("questions", 0), summary.get("gate_pass", 0)
     fails = len(summary.get("failures") or [])
     wall = summary.get("wall_secs", 0)
     ung = len(summary.get("ungraded") or [])
+    if selfcheck._is_en(locale):
+        tail = f" (plus {ung} left ungraded by the judge, excluded from scoring)" if ung else ""
+        if state == "passed":
+            return f"Self-check (red-blue PK): {ok}/{n - ung} all passed ✓ ({wall}s){tail}"
+        if state == "partial":
+            return (f"Self-check (red-blue PK): cut off at the wall clock — {summary.get('graded', 0)}/{n} graded, "
+                    f"{fails} failed; results recorded{tail}")
+        if state == "repairing":
+            return f"Self-check (red-blue PK): {ok}/{n - ung} passed, {fails} failed — repair round injected{tail}"
+        if state == "unconverged":
+            return f"Self-check (red-blue PK): {ok}/{n - ung} passed, {fails} failed — the rest on the publish card{tail}"
+        return f"Self-check (red-blue PK) failed: {summary.get('error', '?')}"
     tail = f"(另 {ung} 题裁判未判,不计分)" if ung else ""
     if state == "passed":
         return f"自检(红蓝队):{ok}/{n - ung} 全过 ✓({wall}s){tail}"
@@ -1171,7 +1199,9 @@ async def _run_pk_flow(run, kind: str) -> None:
                 kind = "full"
                 prev_rounds = max(prev_rounds, _pk_repair_rounds())
 
-        await run.emit({"type": "summary", "text": (
+        await run.emit({"type": "summary", "text": _loc(run,
+            f"Self-check (red-blue PK): {'targeted re-test of ' + str(len(override)) + ' question(s)' if override else 'full checkup'}"
+            " started (background, does not block the session)…",
             f"自检(红蓝队):{'定向复测 ' + str(len(override)) + ' 题' if override else '全量体检'}"
             "开始(后台运行,不影响会话)…")})
         await _set_converge_phase(run, "verifying")
@@ -1183,7 +1213,8 @@ async def _run_pk_flow(run, kind: str) -> None:
             questions_override=override,
             media_pages=None if override else selfcheck.media_citing_pages(workdir),
             progress=lambda s: loop.create_task(
-                run.emit({"type": "summary", "text": s})))
+                run.emit({"type": "summary", "text": s})),
+            locale=getattr(run, "locale", None))
         summary["tested_tree_hash"] = tree
         summary["kind"] = kind
 
@@ -1223,10 +1254,10 @@ async def _run_pk_flow(run, kind: str) -> None:
                 await _sync_workspace(run, sent)
             except Exception:
                 pass
-        await run.emit({"type": "summary", "text": _pk_narration(summary)})
+        await run.emit({"type": "summary", "text": _pk_narration(summary, getattr(run, "locale", None))})
         if summary.get("state") == "repairing":
             await _set_converge_phase(run, "revising")
-            await run.inject_user_message(redblue.build_pk_repair_prompt(summary))
+            await run.inject_user_message(redblue.build_pk_repair_prompt(summary, locale=getattr(run, "locale", None)))
         elif summary.get("state") in ("passed", "partial", "unconverged"):
             # Converged: red-blue (the final layer) reached a terminal state and
             # no repair was injected → the draft is stable and testable.
@@ -1239,7 +1270,9 @@ async def _run_pk_flow(run, kind: str) -> None:
         except Exception:
             pass
         try:
-            await run.emit({"type": "summary", "text": f"自检(红蓝队)执行失败,本轮跳过: {e!r}"})
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Self-check (red-blue PK) failed, skipping this round: {e!r}",
+                f"自检(红蓝队)执行失败,本轮跳过: {e!r}")})
         except Exception:
             pass
     finally:
@@ -1297,7 +1330,7 @@ async def _post_turn_selfcheck(run) -> str | None:
         if not ledger_clean:
             parts.append(selfcheck.build_repair_prompt(report, locale))
         if incr_violations:
-            parts.append(incremental.build_integrity_repair(incr_violations))
+            parts.append(incremental.build_integrity_repair(incr_violations, locale=locale))
         return "\n\n".join(parts)
     return None
 
@@ -1493,8 +1526,10 @@ async def _start_incremental(run: "CompileRun", text: str) -> None:
         return
     run._incr_pending = {"before": incremental.page_hashes(run.workdir), "changeset": cs}
     await run.emit({"type": "summary",
-                    "text": f"增量重编:{len(cs['affected_pages'])} 页受影响,只改这些,其余不动。"})
-    await run.client.query(incremental.build_scoped_directive(cs))
+                    "text": _loc(run,
+                     f"Incremental recompile: {len(cs['affected_pages'])} page(s) affected — touching only those, everything else stays untouched.",
+                     f"增量重编:{len(cs['affected_pages'])} 页受影响,只改这些,其余不动。")})
+    await run.client.query(incremental.build_scoped_directive(cs, locale=getattr(run, "locale", None)))
 
 
 def _batch_plan_path(run: "CompileRun") -> Path:
@@ -1532,7 +1567,7 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str) ->
     try:
         await client.connect()
         run.client = client
-        await run.emit({"type": "log", "text": f"—— {label} 开始 ——"})
+        await run.emit({"type": "log", "text": _loc(run, f"—— {label} started ——", f"—— {label} 开始 ——")})
         run._begin_turn(directive)
         await client.query(directive)
         await _consume_turn_stream(run, client, stop_on_result=True)
@@ -1551,11 +1586,26 @@ def _drain_batch_notes(run: "CompileRun") -> str:
         return ""
     notes = "\n".join(f"- {n}" for n in run._batch_notes)
     run._batch_notes = []
-    return f"\n\n负责人在编译过程中补充说(一并考虑,影响后续各批):\n{notes}"
+    return _loc(run,
+                f"\n\nThe owner added during the compile (take it into account; it affects the remaining batches):\n{notes}",
+                f"\n\n负责人在编译过程中补充说(一并考虑,影响后续各批):\n{notes}")
 
 
-def _compose_batch_directive(batch: dict, k: int, n: int, notes: str) -> str:
+def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
+                             locale: str | None = None) -> str:
     listing = "\n".join(f"- raw/{p}" for p in batch["sources"])
+    if selfcheck._is_en(locale):
+        return (
+            f"[Batch compile · batch {k}/{n} · {batch['id']}] Compile ONLY the sources below "
+            f"(see the batching discipline in the system prompt):\n{listing}\n"
+            "First read authoring/BRIEF.json, authoring/INTENT.md and candidate/index.md to stay consistent "
+            "in voice and structure; then read every source in this batch closely and fold its content fully "
+            "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
+            "compiled_from must list the sources it was actually compiled from); update the matching "
+            "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
+            "never stop. Do not read ANY raw source outside this batch. When done, report briefly which pages "
+            "this batch produced." + notes
+        )
     return (
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
         "先读 authoring/BRIEF.json、authoring/INTENT.md 和 candidate/index.md 保持口径与结构一致;"
@@ -1565,7 +1615,17 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str) -> str:
     )
 
 
-def _compose_final_directive(workdir: str, n: int, notes: str) -> str:
+def _dup_reason_en(reason: str) -> str:
+    """Render selfcheck's stored dup reason (zh data token) for an English
+    directive. The stored value stays zh — it is data, not display."""
+    if reason == "标题相同":
+        return "same title"
+    m = re.match(r"共享 (\d+) 个来源", reason or "")
+    return f"{m.group(1)} shared sources" if m else reason
+
+
+def _compose_final_directive(workdir: str, n: int, notes: str,
+                             locale: str | None = None) -> str:
     """Final-pass directive fed with DETERMINISTIC worklists (dup candidates,
     orphans, ⚠️ count) computed by code — the A/B showed a prose-only '合并明显
     重复的主题页' leaves double-height duplicates and orphans standing. Concrete
@@ -1576,6 +1636,37 @@ def _compose_final_directive(workdir: str, n: int, notes: str) -> str:
     orphans = [v["page"] for v in selfcheck.lint_candidate(pages, excl_errors)["violations"]
                if v["kind"] == "orphan"]
     suspect = sum((p.get("text") or "").count("⚠️") for p in pages.values())
+    if selfcheck._is_en(locale):
+        lines = [f"[Batch compile · final review] All {n} batches are compiled. Now do the cross-batch "
+                 "close-out (the checklists below are machine-computed — handle every item, silent skipping "
+                 "is not allowed):"]
+        step = 1
+        if dups:
+            lines.append(f"{step}) Duplicate-page candidates ({len(dups)} pairs) — for each pair pick one: "
+                         "merge into a single page (merge compiled_from, fix index links), or give a one-line "
+                         "written exemption in your report (genuinely different topics):")
+            lines += [f"   - {d['pages'][0]} ↔ {d['pages'][1]} ({_dup_reason_en(d['reason'])})" for d in dups]
+            step += 1
+        if orphans:
+            lines.append(f"{step}) Orphan pages ({len(orphans)}, unreachable from index.md) — link them into "
+                         "the index or their parent page; delete only if genuinely dead:")
+            lines += [f"   - {p}" for p in orphans]
+            step += 1
+        lines.append(f"{step}) Read through candidate/index.md and the page titles; unify terminology and "
+                     "structure; repair the index grouping and links;")
+        step += 1
+        lines.append(f"{step}) Cross-batch contradictions (the corpus currently carries {suspect} ⚠️ uncertain "
+                     "marks): where the same fact is stated differently, first converge whatever the "
+                     "constitution/voice can settle (e.g. prefer the newest in a time sequence and keep the "
+                     "history), and only best-guess + ⚠️ + ticket what cannot be settled; also check whether "
+                     "any EXISTING ⚠️ can now be converged;")
+        step += 1
+        lines.append(f"{step}) Check authoring/EXCLUSIONS.json: sources you decided not to compile (including "
+                     "images/PDF and other media) must be explicitly accounted for.")
+        lines.append("Close out only — do not recompile pages that are already fine. When done, report "
+                     "briefly: total pages, which pages this close-out touched, which pairs were "
+                     "merged/exempted and why, and anything worth the owner's attention.")
+        return "\n".join(lines) + notes
     lines = [f"【分批编译 · 终审】全部 {n} 批已编完。现在做跨批收口(以下清单是系统机械算出的,逐项处理、不许沉默跳过):"]
     step = 1
     if dups:
@@ -1597,14 +1688,29 @@ def _compose_final_directive(workdir: str, n: int, notes: str) -> str:
     return "\n".join(lines) + notes
 
 
-_PLANNER_ROLE = (
-    "你是知识库分批编译的规划员。工作区里 authoring/SOURCES_INVENTORY.json 列出了全部 raw 源,"
-    "每项有 path、bytes(原始字节)和 effective(上下文成本估算:文本=原始字节,图片/PDF 已按真实消耗折算,远小于原始字节)。"
-    "把它们分成若干批:同主题/同目录尽量同批,**每批的 effective 总量**不超过给定预算——预算约束只看 effective,绝不要用 bytes 装箱"
-    "(单个 effective 超预算的文件才独占一批)。批数应尽量少:一张图片 effective 很小,几张图和引用它们的文档放同一批反而质量更好。"
-    "把方案写入 authoring/BATCH_PLAN.json,格式 {\"batches\":[{\"id\":\"b01\",\"sources\":[\"相对raw的路径\"]}]}。"
-    "每个源必须恰好出现在一个批里。只读清单文件,不要读源文件内容。写完即结束。"
-)
+def _planner_role(locale: str | None) -> str:
+    if selfcheck._is_en(locale):
+        return (
+            "You are the planner for a batched knowledge-base compile. authoring/SOURCES_INVENTORY.json in the "
+            "workspace lists every raw source; each entry has path, bytes (raw size) and effective (a context-cost "
+            "estimate: text = raw bytes; images/PDF are discounted to their real consumption, far below raw bytes). "
+            "Group them into batches: same topic / same directory together where possible, and **each batch's total "
+            "effective** must stay within the given budget — the budget constraint looks at effective ONLY, never "
+            "pack by bytes (only a single file whose effective alone exceeds the budget gets its own batch). Use as "
+            "few batches as possible: one image has a tiny effective, and a few images plus the documents citing "
+            "them in the SAME batch gives better quality. Write the plan to authoring/BATCH_PLAN.json as "
+            "{\"batches\":[{\"id\":\"b01\",\"sources\":[\"path relative to raw\"]}]}. Every source must appear in "
+            "exactly one batch. Read only the inventory file, never the source contents. Finish as soon as it is "
+            "written."
+        )
+    return (
+        "你是知识库分批编译的规划员。工作区里 authoring/SOURCES_INVENTORY.json 列出了全部 raw 源,"
+        "每项有 path、bytes(原始字节)和 effective(上下文成本估算:文本=原始字节,图片/PDF 已按真实消耗折算,远小于原始字节)。"
+        "把它们分成若干批:同主题/同目录尽量同批,**每批的 effective 总量**不超过给定预算——预算约束只看 effective,绝不要用 bytes 装箱"
+        "(单个 effective 超预算的文件才独占一批)。批数应尽量少:一张图片 effective 很小,几张图和引用它们的文档放同一批反而质量更好。"
+        "把方案写入 authoring/BATCH_PLAN.json,格式 {\"batches\":[{\"id\":\"b01\",\"sources\":[\"相对raw的路径\"]}]}。"
+        "每个源必须恰好出现在一个批里。只读清单文件,不要读源文件内容。写完即结束。"
+    )
 
 
 async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
@@ -1618,7 +1724,7 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
         wd = str(Path(run.workdir).resolve())
         opts = ClaudeAgentOptions(
             cwd=wd,
-            system_prompt={"type": "preset", "preset": "claude_code", "append": _PLANNER_ROLE},
+            system_prompt={"type": "preset", "preset": "claude_code", "append": _planner_role(getattr(run, "locale", None))},
             allowed_tools=["Read", "Write", "Glob"],
             permission_mode="bypassPermissions",
             setting_sources=[],
@@ -1634,10 +1740,12 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
         try:
             await client.connect()
             run.client = client
-            directive = (
+            directive = _loc(
+                run,
+                f"Budget: each batch's total effective must not exceed {budget} (pack by the effective field only, ignore bytes). "
+                "Read authoring/SOURCES_INVENTORY.json, write authoring/BATCH_PLAN.json.",
                 f"预算:每批 effective 总量不超过 {budget}(只按 effective 字段装箱,不看 bytes)。"
-                "读 authoring/SOURCES_INVENTORY.json,写 authoring/BATCH_PLAN.json。"
-            )
+                "读 authoring/SOURCES_INVENTORY.json,写 authoring/BATCH_PLAN.json。")
             run._begin_turn(directive)  # planner is a model call too — arm the stall watchdog
             await client.query(directive)
             await _consume_turn_stream(run, client, stop_on_result=True)
@@ -1654,14 +1762,20 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             if not errors and batching.plan_too_fragmented(proposed["batches"], baseline["batches"]):
                 await run.emit({
                     "type": "log",
-                    "text": f"规划方案过碎({len(proposed['batches'])} 批 vs 基线 {len(baseline['batches'])} 批),改用代码基线分批。",
+                    "text": _loc(run,
+                                 f"Planner proposal too fragmented ({len(proposed['batches'])} batches vs baseline {len(baseline['batches'])}), falling back to the code baseline.",
+                                 f"规划方案过碎({len(proposed['batches'])} 批 vs 基线 {len(baseline['batches'])} 批),改用代码基线分批。"),
                 })
             elif not errors:
                 return batching.build_plan(inventory, proposed["batches"], planner="model")
             else:
-                await run.emit({"type": "log", "text": "规划方案未过校验,改用代码基线分批:" + "; ".join(errors[:3])})
+                await run.emit({"type": "log", "text": _loc(run,
+                    "Planner proposal failed validation, falling back to the code baseline: ",
+                    "规划方案未过校验,改用代码基线分批:") + "; ".join(errors[:3])})
     except Exception as e:
-        await run.emit({"type": "log", "text": f"规划会话失败,改用代码基线分批: {e!r}"})
+        await run.emit({"type": "log", "text": _loc(run,
+            f"Planner session failed, falling back to the code baseline: {e!r}",
+            f"规划会话失败,改用代码基线分批: {e!r}")})
     return baseline
 
 
@@ -1671,9 +1785,9 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
     run._selfcheck_key = None
     repair = await _post_turn_selfcheck(run)
     while repair:
-        fix_reply = await _drive_batch_session(run, repair, "账本回修")
+        fix_reply = await _drive_batch_session(run, repair, _loc(run, "ledger repair", "账本回修"))
         if fix_reply:
-            replies.append(f"【回修】{fix_reply}")
+            replies.append(_loc(run, f"[Repair] {fix_reply}", f"【回修】{fix_reply}"))
         repair = await _post_turn_selfcheck(run)
 
 
@@ -1692,7 +1806,9 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         resuming = plan is not None and len(batching.pending_batches(plan)) > 0
         if not resuming:
             _write_batch_file(run, batching.SOURCES_INVENTORY_PATH, inventory)
-            await run.emit({"type": "summary", "text": f"语料 {total_kb}KB 超过单会话阈值,启用分批编译。"})
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Corpus {total_kb}KB exceeds the single-session threshold — batch compile engaged.",
+                f"语料 {total_kb}KB 超过单会话阈值,启用分批编译。")})
             plan = await _plan_batches(run, inventory)
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         else:
@@ -1703,22 +1819,27 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             if dropped:
                 _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
                 await run.emit({"type": "summary",
-                                "text": f"断点续批:{len(dropped)} 个源已不在 raw/ 中,已从待编批次剔除:"
+                                "text": _loc(run,
+                                             f"Batch resume: {len(dropped)} source(s) no longer in raw/ — removed from pending batches: ",
+                                             f"断点续批:{len(dropped)} 个源已不在 raw/ 中,已从待编批次剔除:")
                                         + ", ".join(sorted(dropped)[:5])
                                         + ("…" if len(dropped) > 5 else "")})
         n = len(plan["batches"])
         pending = batching.pending_batches(plan)
         await run.emit({
             "type": "summary",
-            "text": (f"继续分批编译:剩余 {len(pending)}/{n} 批。" if resuming
-                     else f"分批计划({plan.get('planner')}):共 {n} 批,预算 {plan.get('budget', 0) // 1024}KB/批。"),
+            "text": (_loc(run, f"Resuming batch compile: {len(pending)}/{n} batch(es) remaining.",
+                          f"继续分批编译:剩余 {len(pending)}/{n} 批。") if resuming
+                     else _loc(run,
+                               f"Batch plan ({plan.get('planner')}): {n} batch(es), budget {plan.get('budget', 0) // 1024}KB/batch.",
+                               f"分批计划({plan.get('planner')}):共 {n} 批,预算 {plan.get('budget', 0) // 1024}KB/批。")),
         })
         for batch in list(pending):
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
-            directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run))
-            reply = await _drive_batch_session(run, directive, f"批 {k}/{n}")
+            directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run), locale=getattr(run, "locale", None))
+            reply = await _drive_batch_session(run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"))
             if reply:
-                replies.append(f"【批 {k}/{n}】{reply}")
+                replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
             batching.stamp_done(plan, batch["id"])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
             # Push the done-stamp (and the batch's pages) to the durable store
@@ -1730,11 +1851,13 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     await _sync_workspace(run, sent)
                 except Exception:
                     pass  # periodic sync will retry; the local stamp is already on disk
-            await run.emit({"type": "summary", "text": f"批 {k}/{n} 完成,已落库。"})
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
         final_reply = await _drive_batch_session(
-            run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run)), "终审")
+            run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
+            _loc(run, "final review", "终审"))
         if final_reply:
-            replies.append(f"【终审】{final_reply}")
+            replies.append(_loc(run, f"[Final review] {final_reply}", f"【终审】{final_reply}"))
         # Full-corpus selfcheck + bounded repair rounds, each a fresh bounded
         # session (the batch analogue of the ordinary post-turn repair loop).
         await _run_ledger_repairs(run, replies)
@@ -1755,18 +1878,24 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     result = await mediaverify.run_blind_verify(
                         ClaudeEngine(), run.workdir, chunk,
                         progress=lambda s: asyncio.get_running_loop().create_task(
-                            run.emit({"type": "summary", "text": s})))
+                            run.emit({"type": "summary", "text": s})),
+                        locale=getattr(run, "locale", None))
                 except Exception as e:
-                    await run.emit({"type": "summary", "text": f"自检(图像)执行失败,跳过本组: {e!r}"})
+                    await run.emit({"type": "summary", "text": _loc(run,
+                        f"Self-check (images) failed, skipping this chunk: {e!r}",
+                        f"自检(图像)执行失败,跳过本组: {e!r}")})
                     continue
                 if result["errors"]:
                     await run.emit({"type": "summary",
-                                    "text": f"自检(图像):{len(result['errors'])} 项转写/比对失败(见日志),其余照常。"})
+                                    "text": _loc(run,
+                                 f"Self-check (images): {len(result['errors'])} transcription/comparison failure(s) (see logs); the rest proceed as usual.",
+                                 f"自检(图像):{len(result['errors'])} 项转写/比对失败(见日志),其余照常。")})
                 if result["findings"]:
                     verify_reply = await _drive_batch_session(
-                        run, mediaverify.build_repair_prompt(result["findings"]), "图像复核")
+                        run, mediaverify.build_repair_prompt(result["findings"], locale=getattr(run, "locale", None)),
+                        _loc(run, "image verification", "图像复核"))
                     if verify_reply:
-                        replies.append(f"【图像复核】{verify_reply}")
+                        replies.append(_loc(run, f"[Image verification] {verify_reply}", f"【图像复核】{verify_reply}"))
                     repaired_any = True
                 else:
                     await run.emit({"type": "summary",
@@ -1783,11 +1912,15 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 break
             notes_reply = await _drive_batch_session(
                 run,
-                "负责人在编译收尾期间的补充留言如下,请评估是否需要据此调整草稿"
-                "(需要就改并简述,不需要就说明理由):\n" + tail_notes,
-                "留言消化")
+                _loc(run,
+                     "The owner left the following notes during the compile's tail phase. Assess whether the "
+                     "draft needs adjusting (make the edits and summarize briefly if so; otherwise explain why "
+                     "not):\n",
+                     "负责人在编译收尾期间的补充留言如下,请评估是否需要据此调整草稿"
+                     "(需要就改并简述,不需要就说明理由):\n") + tail_notes,
+                _loc(run, "note digest", "留言消化"))
             if notes_reply:
-                replies.append(f"【留言消化】{notes_reply}")
+                replies.append(_loc(run, f"[Note digest] {notes_reply}", f"【留言消化】{notes_reply}"))
             await _run_ledger_repairs(run, replies)  # the digest may have touched pages
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
@@ -1795,7 +1928,8 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 await _sync_workspace(run, sent)
             except Exception:
                 pass
-        await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip() or "分批编译完成。"})
+        await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
+                        or _loc(run, "Batch compile complete.", "分批编译完成。")})
     except Exception as e:
         await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
         # never-block: the single logical turn must still CLOSE — a consumer
@@ -1804,7 +1938,9 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # "interrupted, resumable from the first pending batch".
         try:
             await run.emit({"type": "turn_done",
-                            "text": "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。"})
+                            "text": _loc(run,
+                                         "Batch compile interrupted: finished batches are stored; trigger a compile again to resume from the first pending batch.",
+                                         "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。")})
         except Exception:
             pass
     finally:
@@ -1874,7 +2010,9 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
                     continue
                 await run.emit({
                     "type": "summary",
-                    "text": f"模型限流(HTTP {status}),退避重试 {run._rate_retries} 次仍未通过,本轮先停,请稍后再开编。",
+                    "text": _loc(run,
+                                 f"Model rate-limited (HTTP {status}); {run._rate_retries} backoff retries did not clear it — stopping this turn, please retry later.",
+                                 f"模型限流(HTTP {status}),退避重试 {run._rate_retries} 次仍未通过,本轮先停,请稍后再开编。"),
                 })
                 # fall through: end the turn (run goes idle), do not crash
             run._turn_active = False
@@ -1916,7 +2054,9 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
         except Exception as e:
             # No interrupted-result will come → don't leave the loop waiting on it.
             run._stall_retrying = False
-            await run.emit({"type": "summary", "text": f"模型停滞:中断失败,下一轮重试 {e!r}"})
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Model stall: interrupt failed, will retry next round {e!r}",
+                f"模型停滞:中断失败,下一轮重试 {e!r}")})
 
 
 async def run_session(run: CompileRun):
@@ -2279,12 +2419,16 @@ async def handle_message(request: web.Request):
     if run._batch_active:
         if _is_compile_trigger(text):
             # A second trigger mid-batch changes nothing the plan doesn't know.
-            await run.emit({"type": "summary", "text": "分批编译进行中,本轮结束后再发起。"})
+            await run.emit({"type": "summary", "text": _loc(run,
+                "Batch compile in progress; start another one after this run finishes.",
+                "分批编译进行中,本轮结束后再发起。")})
         else:
             # Owner chat mid-batch: queue it — the next batch/终审 directive
             # relays it, so nothing lands inside a half-read internal session.
             run._batch_notes.append(text)
-            await run.emit({"type": "summary", "text": "已收到,会带给后续批次一并考虑。"})
+            await run.emit({"type": "summary", "text": _loc(run,
+                "Noted — it will be passed along to the remaining batches.",
+                "已收到,会带给后续批次一并考虑。")})
         return web.json_response({"ok": True, "queued": True})
     await run.client.query(text)
     return web.json_response({"ok": True})
@@ -2462,7 +2606,8 @@ async def _flush_on_shutdown(_app) -> None:
         try:
             n = await _sync_workspace(run, run._sync_sent)
             if n:
-                await run.emit({"type": "summary", "text": f"[shutdown] 落盘 {n} 个改动文件"})
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"[shutdown] flushed {n} changed file(s)", f"[shutdown] 落盘 {n} 个改动文件")})
         except Exception:
             pass
     deadline = time.monotonic() + _SHUTDOWN_DRAIN_MAX_S

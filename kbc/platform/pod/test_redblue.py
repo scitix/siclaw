@@ -39,13 +39,15 @@ class FakeEngine:
 
     async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
                                  model, effort=None, allowed_read_roots, timeout_secs):
-        if "出题面调研" in user_message:
+        # route on stage keywords in EITHER locale (en is the platform default)
+        if "question-surface survey" in user_message or "出题面调研" in user_message:
             stage = "survey"
-        elif "出题官" in user_message:
+        elif "question officer" in user_message or "出题官" in user_message:
             stage = "questions"
-        elif "判分标准" in user_message:
+        elif "Grading criteria" in user_message or "判分标准" in user_message:
             stage = "verdict"
-        elif "只读的知识消费者" in system_prompt:
+        elif ("read-only knowledge consumer" in system_prompt
+              or "只读的知识消费者" in system_prompt):
             stage = "blue"
         else:
             raise AssertionError(f"unroutable prompt: {user_message[:80]}")
@@ -108,10 +110,12 @@ def test_budget_and_helpers():
     assert full["graded"] == 2 and full["gate_pass"] == 1 and len(full["failures"]) == 1
     part = redblue._summarize(qs, vs, missing_as_failure=False)
     assert part["graded"] == 1 and part["gate_pass"] == 1 and not part["failures"]
-    # media block formatting + cap
+    # media block formatting + cap; English by default, Chinese only on locale=zh
     assert redblue._media_block(None) == ""
     blk = redblue._media_block({"p1.md": ["s/a.png", "s/b.png"]})
-    assert "图表转写页" in blk and "p1.md ← s/a.png, s/b.png" in blk
+    assert "Chart-transcribed pages" in blk and "p1.md ← s/a.png, s/b.png" in blk
+    zh_blk = redblue._media_block({"p1.md": ["s/a.png", "s/b.png"]}, locale="zh")
+    assert "图表转写页" in zh_blk and "p1.md ← s/a.png, s/b.png" in zh_blk
     print("OK  question_budget clamp + chunks + _summarize + _media_block")
 
 
@@ -146,20 +150,28 @@ async def test_full_run():
     with tempfile.TemporaryDirectory() as td:
         wiki, raw = _pk_workspace(Path(td))
         fake = FakeEngine()
+        seen = []
         summary, detail = await redblue.run_pk(
-            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7)
+            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7,
+            progress=seen.append)
         # blue = per-question (7); judge = batched (7 → 2 chunks of 5+2)
         assert fake.calls == {"survey": 1, "questions": 1, "blue": 7, "verdict": 2}, fake.calls
         assert summary["state"] == "unconverged" and summary["questions"] == 7, summary
         assert summary["gate_pass"] == 6 and len(summary["failures"]) == 1, summary
         f = summary["failures"][0]
+        # stored tokens are locale-independent: 覆盖 stays 覆盖 in an English run
         assert f["category"] == "覆盖" and f["page"] == "p1.md", f
         assert len(detail["answers"]) == 7 and len(detail["verdicts"]) == 7
         # consumer SOURCES line parsed into structured cited_sources
         assert detail["answers"]["q1"]["cited_sources"] == ["index.md"], detail["answers"]["q1"]
+        # no locale → English everywhere: prompts, blue persona, progress lines
+        assert "read-only knowledge consumer" in fake.systems["blue"], fake.systems["blue"][:120]
+        assert seen and all(s.startswith("Self-check (PK)") for s in seen), seen
         prompt = redblue.build_pk_repair_prompt(summary)
+        assert prompt.startswith("[System self-check · red-blue PK]"), prompt[:80]
+        assert "[coverage]" in prompt  # stored 覆盖 token glossed at render time
         assert "补编X" in prompt and "p1.md" in prompt and "CONTRADICTIONS.json" in prompt
-    print("OK  full run (stage counts / chunking 5+2 / decide / repair prompt)")
+    print("OK  full run (stage counts / chunking 5+2 / decide / repair prompt, en default)")
 
 
 async def test_survey_cache():
@@ -288,9 +300,9 @@ async def test_verdict_deagentified():
         # verdict is fenced out of raw; survey/questions keep raw for real research
         assert raw not in fake.roots["verdict"], fake.roots["verdict"]
         assert raw in fake.roots["survey"] and raw in fake.roots["questions"], fake.roots
-        # the verdict prompt no longer instructs raw reading
-        assert "回原始语料核对" not in fake.users["verdict"], fake.users["verdict"][:200]
-        assert "raw 真值要点" in fake.users["verdict"]  # grades from the inlined rubric
+        # the verdict prompt no longer instructs raw reading (en default run)
+        assert "do not attempt to read any files" in fake.users["verdict"], fake.users["verdict"][:200]
+        assert "raw ground-truth points" in fake.users["verdict"]  # grades from the inlined rubric
         # KBC_PK_VERDICT_MODEL overrides the gate-tier default
         import os
         fake2 = FakeEngine()
@@ -311,10 +323,35 @@ async def test_media_pages_steer_question_officer():
         await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=3,
                              questions_budget=2,
                              media_pages={"p1.md": ["s/chart.png"]})
-        assert "图表转写页" in fake.users["questions"], fake.users["questions"][:200]
+        assert "Chart-transcribed pages" in fake.users["questions"], fake.users["questions"][:200]
         assert "p1.md ← s/chart.png" in fake.users["questions"]
-        assert "图表转写页" not in fake.users["blue"]  # blue stays ignorant
+        assert "Chart-transcribed pages" not in fake.users["blue"]  # blue stays ignorant
     print("OK  media_pages reach the question officer only")
+
+
+async def test_zh_locale_branch():
+    """locale='zh' flips every model-facing prompt, the blue persona, and the
+    progress/repair narration to Chinese; stored tokens (score/category/state)
+    stay identical to the en run — locale never forks the data."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki, raw = _pk_workspace(Path(td))
+        fake = FakeEngine()
+        seen = []
+        summary, _ = await redblue.run_pk(
+            fake, wiki_dir=wiki, raw_dir=raw, page_count=10, questions_budget=7,
+            progress=seen.append, locale="zh")
+        assert "出题面调研" in fake.users["survey"], fake.users["survey"][:120]
+        assert "出题官" in fake.users["questions"]
+        assert "判分标准" in fake.users["verdict"]
+        assert "只读的知识消费者" in fake.systems["blue"]  # zh test-role pack
+        assert seen and all(s.startswith("自检(PK)") for s in seen), seen
+        # stored tokens unchanged by locale
+        assert summary["state"] == "unconverged"
+        assert summary["failures"][0]["category"] == "覆盖", summary["failures"]
+        prompt = redblue.build_pk_repair_prompt(summary, locale="zh")
+        assert prompt.startswith("【系统自检 · 红蓝队】"), prompt[:60]
+        assert "[覆盖]" in prompt and "补编X" in prompt
+    print("OK  locale=zh flips prompts/persona/narration; stored tokens unchanged")
 
 
 async def test_broken_json_fails_open():
@@ -342,15 +379,16 @@ async def test_contract_artifacts_judge_only():
         await redblue.run_pk(fake, wiki_dir=wiki, raw_dir=raw, page_count=3,
                              authoring_dir=str(authoring), questions_budget=2)
         for stage in ("survey", "questions", "verdict"):
-            assert "平台新同事" in fake.systems[stage], stage
-            assert "周报时效性强" in fake.systems[stage] and "声明排除" in fake.systems[stage], stage
+            assert "平台新同事" in fake.systems[stage], stage  # INTENT content quoted verbatim
+            assert "周报时效性强" in fake.systems[stage], stage  # exclusion reason quoted verbatim
+            assert "declared excluded" in fake.systems[stage], stage
         assert "平台新同事" not in fake.systems["blue"]
         assert "周报时效性强" not in fake.systems["blue"]
 
         # without authoring_dir the judge context carries neither
         fake2 = FakeEngine()
         await redblue.run_pk(fake2, wiki_dir=wiki, raw_dir=raw, page_count=3, questions_budget=2)
-        assert "声明排除" not in fake2.systems["survey"]
+        assert "declared excluded" not in fake2.systems["survey"]
     print("OK  INTENT/EXCLUSIONS reach judge stages only, blue stays ignorant")
 
 
@@ -396,6 +434,7 @@ def main():
     asyncio.run(test_verdict_error_contained_no_workloss())
     asyncio.run(test_verdict_deagentified())
     asyncio.run(test_media_pages_steer_question_officer())
+    asyncio.run(test_zh_locale_branch())
     asyncio.run(test_broken_json_fails_open())
     asyncio.run(test_contract_artifacts_judge_only())
     test_pk_section_survives_layer1()
