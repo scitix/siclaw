@@ -457,19 +457,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
           .catch(async (err) => {
             console.error(`[capability] session relay failed run=${runId}:`, err);
-            // The run is terminal from here (endRun below) and can never be
-            // re-adopted, so its box is unreachable garbage — stop it, or every
-            // relay crash leaks a pod (4 live boxes for one repo, seen 07-09).
-            await agentBoxManager.stop(runId).catch((stopErr) =>
-              console.error(
-                `[capability] stop box after relay failure run=${runId}:`,
-                stopErr instanceof Error ? stopErr.message : String(stopErr),
-              ),
-            );
             await capabilityRunManager.endRun(runId, "failed").catch(() => {});
           })
           .finally(() => {
             capabilitySessions.delete(runId);
+            // The relay ending — cleanly (`end`: the box's session coroutine
+            // exited and can never take another turn) or by crash (the catch
+            // above) — means this one-run pod is unreachable garbage either
+            // way. Stop it here, or every NORMALLY-completed run leaks a
+            // running pod + cert Secret forever (audit finding; the crash
+            // path was covered piecemeal before, this owns both). stop() is
+            // 404-tolerant, so the idle-reap double-stop stays quiet.
+            void agentBoxManager.stop(runId).catch((stopErr) =>
+              console.error(
+                `[capability] stop box after relay close run=${runId}:`,
+                stopErr instanceof Error ? stopErr.message : String(stopErr),
+              ),
+            );
           });
         return { client };
       })();
@@ -482,6 +486,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // Recover AFTER ensureCapabilitySession exists — onAdopt re-attaches through it.
   void capabilityRunManager.recover();
   capabilityRunManager.startWatchdog();
+  // Capability-box orphan GC: a box is live iff its run is tracked and
+  // non-terminal. Pod names are `agentbox-<runId>` (podName sanitizes the id;
+  // capability run ids are lowercase uuids, so the strip is exact).
+  agentBoxManager.startOrphanSweep((boxId) => {
+    const runId = boxId.startsWith("agentbox-") ? boxId.slice("agentbox-".length) : boxId;
+    const rec = capabilityRunManager.get(runId);
+    return !!rec && !isTerminalCapabilityStatus(rec.status);
+  });
 
   rpcMethods.set("capability.start", async (params) => {
     const req = params as unknown as CapabilityStartRequest;

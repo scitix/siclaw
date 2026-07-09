@@ -56,6 +56,24 @@ export class AgentBoxManager {
   }
 
   /**
+   * Periodic capability-box orphan GC (K8s spawner only; duck-typed like
+   * setCertManager). `isLive(boxId)` is the caller's run-liveness oracle —
+   * the manager/spawner have no knowledge of capability runs. First pass runs
+   * one minute after boot (post-recovery, so live runs are known), then every
+   * `intervalMs`. Without it, completed/crashed runs' pods + cert Secrets
+   * accumulate forever (audit finding).
+   */
+  startOrphanSweep(isLive: (boxId: string) => boolean, intervalMs = 10 * 60_000): void {
+    const s: any = this.spawner;
+    if (typeof s.sweepOrphans !== "function") return;
+    const tick = () =>
+      void s.sweepOrphans(isLive).catch((err: any) =>
+        console.warn("[agentbox-manager] orphan sweep failed:", err?.message ?? err));
+    setTimeout(tick, 60_000);
+    setInterval(tick, intervalMs);
+  }
+
+  /**
    * Inject a resolver for per-agent spawn env. Applied on EVERY cold spawn from
    * any entry point — chat RPCs, channel webhooks (Lark/DingTalk), cron tasks —
    * because they all share this single manager instance (bootstrap-runtime).

@@ -38,8 +38,13 @@ export interface BoxProfile {
   volumes?: BoxProfileVolume[];
   /** Tool/trust profile: allowed tool names (null = all). Enforced end-to-end in A.3. */
   allowedTools?: string[] | null;
-  /** Resource requests/limits override. */
-  resources?: { cpu?: string; memory?: string };
+  /**
+   * Resource override. `cpu`/`memory` set BOTH request and limit (guaranteed
+   * shape); `cpuRequest`/`memoryRequest` set only the request, leaving the
+   * limit at its default (or `cpu`/`memory`) — the burstable shape a compile
+   * box needs: schedule honestly near real usage, keep headroom to the limit.
+   */
+  resources?: { cpu?: string; memory?: string; cpuRequest?: string; memoryRequest?: string };
 }
 
 /** Default profile: a normal agentbox (spawner-config image, no extra env/volumes, all tools). */
@@ -74,6 +79,11 @@ function kbCompileProfile(): BoxProfile {
     envForward: ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_*"],
     home: "/work",
     volumes: [{ name: "work", mountPath: "/work", sizeLimit: "4Gi" }], // installer allows 2GB unpacked raw + candidate output — 1Gi evicted large-corpus pods
+    // A compile box realistically runs 1-2Gi (Claude Code + candidate tree +
+    // snapshots); the 256Mi default request let the scheduler bin-pack ~10 hot
+    // compiles onto a node they then burst to 4Gi each on (audit finding:
+    // oversubscription → OOMKills). Request near real usage; limit stays 4Gi.
+    resources: { memoryRequest: "1Gi" },
     // null = the box's default compile toolset (posted as allowed_tools on
     // /session; the box falls back to its own DEFAULT_COMPILE_ALLOWED_TOOLS).
     allowedTools: null,

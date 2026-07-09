@@ -26,10 +26,16 @@ export interface AgentBoxConfig {
   allowedTools?: string[] | null;
   /** Environment variables */
   env?: Record<string, string>;
-  /** Resource limits */
+  /**
+   * Resource override. `cpu`/`memory` set BOTH request and limit;
+   * `cpuRequest`/`memoryRequest` set only the request (burstable shape) —
+   * same semantics as BoxProfile.resources.
+   */
   resources?: {
     cpu?: string;
     memory?: string;
+    cpuRequest?: string;
+    memoryRequest?: string;
   };
   /**
    * Per-agent session/memory persistence override.

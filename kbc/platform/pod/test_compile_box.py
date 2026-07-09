@@ -1518,6 +1518,28 @@ async def test_stall_interrupt_deadline_closes_turn():
     print("✓ stall interrupt deadline: wedged latch closes the turn (error + turn_done) and unblocks")
 
 
+async def test_run_wrapper_cancels_detached_verify_tasks():
+    """Audit batch B: a media/PK verify task mid-flight when the run ends kept
+    burning model calls for minutes, then no-op'd its injection into a dead
+    session. The wrapper's teardown now cancels both."""
+    async def impl(run):
+        loop = asyncio.get_running_loop()
+        run._media_task = loop.create_task(asyncio.sleep(999))
+        run._pk_task = loop.create_task(asyncio.sleep(999))
+
+    saved = compile_box._COMPILE_IMPL
+    compile_box._COMPILE_IMPL = impl
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("bgc", td, 1)
+            await compile_box._run_wrapper(run)
+            assert run._media_task.cancelled(), run._media_task
+            assert run._pk_task.cancelled(), run._pk_task
+    finally:
+        compile_box._COMPILE_IMPL = saved
+    print("✓ run wrapper cancels detached media/PK tasks (no token burn after run end)")
+
+
 async def test_run_wrapper_closes_turn_on_driver_crash():
     """Review fix (never-block symmetry): a driver that dies mid-turn must not
     leave a consumer gating on turn_done hanging — error AND turn_done both fire."""
@@ -1953,6 +1975,7 @@ async def main():
     await test_model_stall_exhausts_to_error()
     await test_stall_interrupt_deadline_closes_turn()
     await test_run_wrapper_closes_turn_on_driver_crash()
+    await test_run_wrapper_cancels_detached_verify_tasks()
     await test_model_rate_limit_backoff_then_completes()
     await test_model_rate_limit_exhausts_gracefully()
     await test_shutdown_flush_syncs_active_runs()
