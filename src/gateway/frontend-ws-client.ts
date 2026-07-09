@@ -23,6 +23,14 @@ export interface FrontendWsClientOptions {
   agentId: string;
   /** RPC timeout in ms (default 30000) */
   timeoutMs?: number;
+  /**
+   * Runtime capabilities advertised to the consumer on every (re)connect via a
+   * best-effort `runtime.register` RPC (e.g. `{ compile: true }`). Lets the
+   * consumer route capability work here without any consumer-side config. Empty
+   * ⇒ nothing advertised. A consumer that predates `runtime.register` replies
+   * "unknown method"; that is ignored (advisory, non-fatal).
+   */
+  capabilities?: Record<string, boolean>;
 }
 
 // ── Internal types ───────────────────────────────────────────
@@ -63,6 +71,7 @@ export class FrontendWsClient {
       portalSecret: options.portalSecret,
       agentId: options.agentId,
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      capabilities: options.capabilities ?? {},
     };
   }
 
@@ -159,6 +168,21 @@ export class FrontendWsClient {
 
   // ── Private ──────────────────────────────────────────────────
 
+  /**
+   * Best-effort advertise of this Runtime's capabilities to the consumer.
+   * Fire-and-forget: a consumer that predates `runtime.register` replies
+   * "unknown method" and keeps the connection — capabilities are advisory, so a
+   * failed ack must not break the connection or the initial connect().
+   */
+  private advertiseCapabilities(): void {
+    const caps = this.opts.capabilities;
+    if (!caps || Object.keys(caps).length === 0) return;
+    this.request("runtime.register", { capabilities: caps }).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[frontend-ws] capability advertise not acked (ok on older consumer): ${message}`);
+    });
+  }
+
   private buildWsUrl(): string {
     let url = this.opts.serverUrl;
     // Convert http(s):// to ws(s)://
@@ -189,6 +213,10 @@ export class FrontendWsClient {
         this.connectResolve = null;
         this.connectReject = null;
       }
+
+      // Advertise capabilities on every (re)connect so the consumer's routing
+      // reflects the current connection, not a stale record.
+      this.advertiseCapabilities();
     });
 
     ws.on("message", (raw: WebSocket.Data) => {

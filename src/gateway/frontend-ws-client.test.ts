@@ -391,4 +391,75 @@ describe("FrontendWsClient", () => {
     await expect(p1).rejects.toThrow("closed");
     await expect(p2).rejects.toThrow("closed");
   });
+
+  // ── capability advertisement (runtime.register on open) ──────
+
+  it("advertises capabilities via runtime.register on open", async () => {
+    const client = await createClient({ capabilities: { compile: true } });
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(ws._sent).toHaveLength(1);
+    const frame = JSON.parse(ws._sent[0]);
+    expect(frame.type).toBe("req");
+    expect(frame.method).toBe("runtime.register");
+    expect(frame.params).toEqual({ capabilities: { compile: true } });
+
+    client.close();
+  });
+
+  it("does not advertise when capabilities are empty", async () => {
+    const client = await createClient(); // defaultOpts has no capabilities
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(ws._sent).toHaveLength(0);
+    client.close();
+  });
+
+  it("re-advertises on every reconnect", async () => {
+    const client = await createClient({ capabilities: { compile: true } });
+    const connectPromise = client.connect();
+    const ws1 = openLatestWs();
+    await connectPromise;
+    expect(JSON.parse(ws1._sent[0]).method).toBe("runtime.register");
+
+    // Drop the connection and let the backoff timer fire a reconnect.
+    // First reconnect delay = base(1000) * 2^0 + jitter(0..2000) ≤ 3000ms.
+    ws1.emit("close");
+    await vi.advanceTimersByTimeAsync(3100);
+    const ws2 = openLatestWs();
+    expect(ws2).not.toBe(ws1);
+    expect(ws2._sent).toHaveLength(1);
+    expect(JSON.parse(ws2._sent[0]).method).toBe("runtime.register");
+
+    client.close();
+  });
+
+  it("survives an 'unknown method' ack from an older consumer (best-effort)", async () => {
+    const client = await createClient({ capabilities: { compile: true } });
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    // Older consumer replies with an error for the unknown method.
+    const frame = JSON.parse(ws._sent[0]);
+    ws.emit("message", JSON.stringify({
+      type: "res",
+      id: frame.id,
+      ok: false,
+      error: "unknown method: runtime.register",
+    }));
+
+    // Connection stays up; a normal RPC still works afterwards.
+    expect(client.connected).toBe(true);
+    const p = client.request("config.getSettings");
+    const req = JSON.parse(ws._sent[ws._sent.length - 1]);
+    ws.emit("message", JSON.stringify({ type: "res", id: req.id, ok: true, payload: { ok: 1 } }));
+    await expect(p).resolves.toEqual({ ok: 1 });
+
+    client.close();
+  });
 });

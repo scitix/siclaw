@@ -48,6 +48,19 @@ export const AGENT_PROFILE: BoxProfile = {
 };
 
 /**
+ * Whether this Runtime can host KB compile/test boxes — i.e. it was given an
+ * explicit compile-box image (helm `agentbox.compileBoxEnabled` ⇒ the
+ * SICLAW_COMPILE_BOX_IMAGE env). This is the single source of truth the Runtime
+ * advertises to its consumer on connect so the consumer can route compile runs
+ * here WITHOUT any consumer-side config. The bare `kbc-compile-box:latest`
+ * fallback in the profiles above is deliberately NOT treated as capable: an
+ * unset env means KB stays dark (fail-closed), so we must not claim capability.
+ */
+export function isCompileCapable(): boolean {
+  return !!process.env.SICLAW_COMPILE_BOX_IMAGE?.trim();
+}
+
+/**
  * kb-compile — a KB compile box. Reproduces the pre-refactor compile special-case
  * DECLARATIVELY: dedicated image, Anthropic-compatible LLM env (the lean box does
  * not phone home for settings), a writable /work with HOME pointed at it.
