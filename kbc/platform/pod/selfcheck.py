@@ -563,6 +563,10 @@ def run_layer1(workdir: str) -> dict:
         "dup_candidates": dup_candidates(pages),
         "pk": previous.get("pk"),  # Layer-2 results survive L1 re-checks
         "media_verify": previous.get("media_verify"),
+        # The converge signal survives too: _post_turn_selfcheck overwrites the
+        # whole file with this report, and dropping the phase left a per-turn
+        # window with no converge_phase before the seam re-set it (review).
+        "converge_phase": previous.get("converge_phase"),
     }
 
 
@@ -726,6 +730,11 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
             lines.append(f"\ncompiled_from cites nonexistent sources (dangling, {len(cov['dangling_citations'])}):")
             lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
             lines.append("Change them to real raw-relative paths.")
+        if cov.get("noop_exclusions"):
+            lines.append(f"\nExclusion patterns that matched NO source ({len(cov['noop_exclusions'])}) — likely a typo or wrong glob shape:")
+            lines += [f"- {p}" for p in cov["noop_exclusions"][:_REPAIR_LIST_CAP]]
+            lines.append("Matching is SEGMENT-aware: a bare `logs` matches only a file literally named logs; "
+                         "`logs/*` matches only direct children; a whole subtree needs `logs/**` (or the `logs/` prefix form). Fix the pattern.")
         if not lint["ok"]:
             lines.append(f"\nLint issues ({len(lint['violations'])}):")
             lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
@@ -747,6 +756,11 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
         lines.append(f"\ncompiled_from 引用了不存在的源(悬空引用,{len(cov['dangling_citations'])} 处):")
         lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
         lines.append("请改成真实的 raw 相对路径。")
+    if cov.get("noop_exclusions"):
+        lines.append(f"\n没有命中任何源的排除模式({len(cov['noop_exclusions'])} 条)——多半是写错了:")
+        lines += [f"- {p}" for p in cov["noop_exclusions"][:_REPAIR_LIST_CAP]]
+        lines.append("匹配是按路径段的:裸 `logs` 只匹配名字恰为 logs 的文件;`logs/*` 只匹配直接子级;"
+                     "整个子树要写 `logs/**`(或 `logs/` 前缀形式)。请修正模式。")
     if not lint["ok"]:
         lines.append(f"\nlint 问题({len(lint['violations'])} 处):")
         lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"

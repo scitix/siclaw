@@ -190,6 +190,22 @@ def test_restore_skips_unrestorable_page():
         print("OK  restore skips unrestorable page, restores the rest")
 
 
+def test_diff_cap_degrades_oversized_diffs():
+    """Batch C: an uncapped per-source diff could push CHANGESET.json past the
+    1MB sync cap — absent from the store, a mid-round respawn loses the round.
+    Oversized diffs degrade to "" (= the documented re-read-the-source path)."""
+    with tempfile.TemporaryDirectory() as td:
+        _kb(Path(td))
+        big = "+x\n" * 40000  # ~120KB > default 64KB cap
+        cs = incremental.build_changeset(
+            td, {"modified": ["snap/one.md", "snap/two.md"]},
+            diffs={"snap/one.md": big, "snap/two.md": "- old\n+ new"})
+        by_path = {m["path"]: m["diff"] for m in cs["modified"]}
+        assert by_path["snap/one.md"] == ""          # degraded, not shipped oversized
+        assert by_path["snap/two.md"] == "- old\n+ new"  # small diff untouched
+    print("OK  oversized per-source diffs degrade to re-read (CHANGESET stays syncable)")
+
+
 def test_protocol_raw_changes_to_changeset():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -261,6 +277,7 @@ if __name__ == "__main__":
     test_integrity_guard()
     test_page_bytes_and_restore()
     test_restore_skips_unrestorable_page()
+    test_diff_cap_degrades_oversized_diffs()
     test_protocol_raw_changes_to_changeset()
     test_added_targets_and_authorized()
     test_scoped_directive()

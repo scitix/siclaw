@@ -1270,6 +1270,36 @@ async def test_noop_repair_turn_reaches_the_gate():
     print("OK  no-op repair turn reaches the gate (unconverged + residual ticket, not silent)")
 
 
+async def test_batch_final_ledger_check_requires_index():
+    """Batch C: the mid-Execute index exemption wrongly applied to the batch-
+    final ledger pass — a train that finished without an index settled an
+    unroutable draft. With _ledger_forced the pass falls through and the
+    index_missing lint orders the rebuild."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("bfx", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        # plain call (mid-Execute shape): exemption applies → no check
+        assert await compile_box._post_turn_selfcheck(run) is None
+        # batch-final shape: forced → index_missing repair ordered
+        run._selfcheck_key = None
+        run._ledger_forced = True
+        try:
+            repair = await compile_box._post_turn_selfcheck(run)
+        finally:
+            run._ledger_forced = False
+        assert repair is not None and "index_missing" in repair, repair
+    print("OK  batch-final ledger pass requires the index (exemption is mid-Execute only)")
+
+
 async def test_batch_orchestrator_routing_and_resume():
     """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
     the threshold gate (small KBs never batch), the orchestrator stamps batches
@@ -1967,6 +1997,7 @@ async def main():
     await test_incremental_index_deletion_cannot_escape_guard()
     await test_incremental_arm_cleared_when_dispatch_fails()
     await test_noop_repair_turn_reaches_the_gate()
+    await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()

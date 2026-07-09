@@ -1400,8 +1400,13 @@ async def _post_turn_selfcheck(run) -> str | None:
     elif incr is None:
         if key is None:
             return None
-        if not (Path(workdir) / "candidate" / "index.md").is_file():
-            return None  # mid-Execute: pages exist but the index isn't written yet
+        # mid-Execute exemption: pages exist but the index isn't written yet.
+        # NOT for the batch-final ledger pass (_ledger_forced): all batches are
+        # done there, so a missing index is real damage — fall through and let
+        # the index_missing lint order the rebuild (review finding: the train
+        # used to settle an unroutable draft).
+        if not (Path(workdir) / "candidate" / "index.md").is_file() and not getattr(run, "_ledger_forced", False):
+            return None
     # An INCREMENTAL turn falls through even with index.md (or the whole tree)
     # missing: on an incremental turn the index always pre-existed, so its
     # absence IS out-of-scope damage — the guard below restores what the
@@ -1971,12 +1976,16 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
     """Force a fresh full-corpus selfcheck and drive bounded repair sessions
     until it stops asking (budget lives in _post_turn_selfcheck)."""
     run._selfcheck_key = None
-    repair = await _post_turn_selfcheck(run)
-    while repair:
-        fix_reply = await _drive_batch_session(run, repair, _loc(run, "ledger repair", "账本回修"))
-        if fix_reply:
-            replies.append(_loc(run, f"[Repair] {fix_reply}", f"【回修】{fix_reply}"))
+    run._ledger_forced = True  # batch-final: the mid-Execute index exemption is off
+    try:
         repair = await _post_turn_selfcheck(run)
+        while repair:
+            fix_reply = await _drive_batch_session(run, repair, _loc(run, "ledger repair", "账本回修"))
+            if fix_reply:
+                replies.append(_loc(run, f"[Repair] {fix_reply}", f"【回修】{fix_reply}"))
+            repair = await _post_turn_selfcheck(run)
+    finally:
+        run._ledger_forced = False
 
 
 async def _run_batch_compile(run: "CompileRun", trigger_text: str):
@@ -2660,6 +2669,17 @@ async def handle_message(request: web.Request):
     if _should_route_to_incremental(run, text):
         await _start_incremental(run, text)
         return web.json_response({"ok": True, "incremental": True})
+    if _is_compile_trigger(text):
+        # A FULL recompile kickoff (compile trigger, no RAW_CHANGES) voids any
+        # stale scoped changeset: only the incremental route READS it, but the
+        # model reads authoring/ proactively and the prompt's "no CHANGESET =
+        # not an incremental round" biconditional could make it self-restrict
+        # a full round to a stale scope (review finding). Clearing here also
+        # keeps the consumer's round-summary counts honest after a full round.
+        try:
+            (Path(run.workdir) / incremental.CHANGESET_PATH).unlink(missing_ok=True)
+        except OSError:
+            pass
     # Batch mode (大库): a compile trigger over an above-threshold corpus (or a
     # plan with pending batches) runs the orchestrator instead of one giant turn.
     if _should_route_to_batch(run, text):

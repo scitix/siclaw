@@ -426,6 +426,39 @@ def test_page_too_large_lint():
     print("OK  page_too_large lint (sync-cap divergence made loud, env-tunable)")
 
 
+def test_repair_prompt_names_noop_exclusions_and_glob_shape():
+    """Batch C: a pattern matching no source was shown to the HUMAN (narration)
+    but withheld from the repair loop — the model could never converge an
+    exclusion it wrote with the wrong glob shape. The repair prompt now names
+    the noop patterns and teaches the segment-wise matching rule."""
+    report = {
+        "coverage": {"unaccounted": ["snap/x.md"], "dangling_citations": [],
+                     "noop_exclusions": ["logs"]},
+        "lint": {"ok": True, "violations": []},
+        "state": "repairing",
+    }
+    zh = selfcheck.build_repair_prompt(report, "zh")
+    assert "logs" in zh and "logs/**" in zh and "按路径段" in zh, zh
+    en = selfcheck.build_repair_prompt(report, "en")
+    assert "logs/**" in en and "SEGMENT" in en, en
+    print("OK  repair prompt names noop exclusions + segment-glob rule (zh/en)")
+
+
+def test_run_layer1_carries_converge_phase():
+    """Batch C: _post_turn_selfcheck overwrites SELFCHECK.json with run_layer1's
+    report; dropping converge_phase left a per-turn window with no phase."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/snap/one.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+        selfcheck.write_selfcheck(td, selfcheck.run_layer1(td))
+        selfcheck.set_converge_phase(td, "settled")
+        report = selfcheck.run_layer1(td)
+        assert report.get("converge_phase") == "settled", report.get("converge_phase")
+    print("OK  run_layer1 carries converge_phase forward (no per-turn blank window)")
+
+
 def test_state_key():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -919,6 +952,8 @@ def main():
     test_citation_path_normalization()
     test_residual_fingerprint_full_set()
     test_page_too_large_lint()
+    test_repair_prompt_names_noop_exclusions_and_glob_shape()
+    test_run_layer1_carries_converge_phase()
     test_state_key()
     test_candidate_tree_hash_unreadable()
     test_pack_hash_is_relposix_sorted()
