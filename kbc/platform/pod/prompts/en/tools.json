@@ -8,7 +8,7 @@
     "reminder": " (Reminder: while you are at it, maintain the candidate-page list as `- [ ] page — one line` in the ## Next Pages section of authoring/PLAN.md as your working state, to make progress easy to track; this does not affect the plan you just submitted.)"
   },
   "resolve_ticket": {
-    "desc": "Call once per contradiction ticket you have patched (one call per ticket, no batching): register which ticket (ticket_id), the value you applied (applied_value), the candidate files you actually edited (pages_edited — must cover the ticket's affected_pages), and a one-line note. This marks the ticket as patched and writes an auditable agent_report — the basis for the contradiction view showing 'AI patched' for the owner to verify.",
+    "desc": "Call once per contradiction ticket you have patched (one call per ticket, no batching): register which ticket (ticket_id), the value you applied (applied_value), the candidate files you actually edited (pages_edited — must cover the ticket's affected_pages), and a one-line note. This marks the ticket as patched and writes an auditable agent_report — the basis for the contradiction view showing 'AI patched' for the owner to verify. Echo dispatch_nonce verbatim from the apply directive's `nonce:` line (empty string when the directive carries none) — it matches this receipt to the exact dispatch round.",
     "need_id": "resolve_ticket requires ticket_id",
     "read_failed": "failed to read CONTRADICTIONS.json: {e}",
     "not_found": "ticket {tid} not found; existing ids: {ids}",
