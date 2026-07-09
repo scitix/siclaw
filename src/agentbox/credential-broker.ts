@@ -29,6 +29,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import type {
   CredentialTransport,
   ClusterMeta,
@@ -440,12 +441,19 @@ export class CredentialBroker {
   }
 
   /**
-   * Force a cache-bypassing acquire and probe the cluster connectivity with
-   * `kubectl version`. Used by the cluster_probe tool.
+   * Probe a single cluster's connectivity with `kubectl version`.
+   *
+   * Reuses the cached kubeconfig when still valid (ensureCluster), acquiring
+   * only on miss/expiry — a reachability check does not need FRESH credentials,
+   * and reuse avoids a credential.get round-trip on every probe (also warming
+   * the cache for the kubectl/script tools that follow). Any acquire failure
+   * (unbound, credential error) is folded into an unreachable result rather
+   * than thrown, so a batch probe never fails as a whole on one bad cluster.
    */
   async probeCluster(clusterName: string): Promise<ProbeResult> {
+    let info: ClusterLocalInfo;
     try {
-      await this.acquireCluster(clusterName, "cluster_probe", { bypassCache: true });
+      info = await this.ensureCluster(clusterName, "cluster_probe");
     } catch (err) {
       return {
         name: clusterName,
@@ -453,7 +461,6 @@ export class CredentialBroker {
         probe_error: err instanceof Error ? err.message : String(err),
       };
     }
-    const info = this.clusters.get(clusterName);
     if (!info?.path) {
       return {
         name: clusterName,
@@ -462,6 +469,20 @@ export class CredentialBroker {
       };
     }
     return probeKubeconfig(clusterName, info.path);
+  }
+
+  /**
+   * Probe several clusters concurrently, bounded so an agent with many bound
+   * clusters can't spawn an unbounded fan-out of kubectl processes. Each probe
+   * is independent — a per-cluster failure yields an unreachable ProbeResult in
+   * place, never a rejected batch. Results preserve input order.
+   */
+  async probeClusters(
+    clusterNames: string[],
+    opts: { concurrency?: number } = {},
+  ): Promise<ProbeResult[]> {
+    const limiter = new ConcurrencyLimiter(opts.concurrency ?? 8);
+    return Promise.all(clusterNames.map((name) => limiter.run(() => this.probeCluster(name))));
   }
 
   getClusterLocalInfo(clusterName: string): ClusterLocalInfo | undefined {

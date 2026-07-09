@@ -28,7 +28,7 @@
 export const CAPABILITY_GROUPS: Record<string, string[]> = {
   read_files:      ["read", "grep", "find", "ls"],
   write_sandbox:   ["write", "edit", "skill_preview"],   // includes skill authoring
-  inspect_infra:   ["cluster_list", "cluster_probe", "host_list", "resolve_pod_netns"],
+  inspect_infra:   ["cluster_list", "host_list", "resolve_pod_netns"],
   run_commands:    ["bash", "node_exec", "pod_exec", "host_exec"],
   run_scripts:     ["node_script", "pod_script", "local_script", "host_script"],
   search_memory:   ["memory_search", "memory_get"],

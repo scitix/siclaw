@@ -518,3 +518,43 @@ describe("CredentialBroker — sync read + refresh API", () => {
     expect(broker.listHostsLocalInfo()).toHaveLength(0);
   });
 });
+
+describe("CredentialBroker — probeClusters batch", () => {
+  // probeCluster runs real `kubectl version`; stub it so these tests exercise
+  // only the batch contract (order, per-item fold pass-through, concurrency
+  // bound) rather than kubectl.
+  it("preserves input order and folds each per-cluster result (batch never rejects)", async () => {
+    broker.probeCluster = (async (name: string) =>
+      name === "bad"
+        ? { name, reachable: false, probe_error: "boom" }
+        : { name, reachable: true, server_version: "v1.29.0" }) as any;
+
+    const results = await broker.probeClusters(["good1", "bad", "good2"]);
+
+    expect(results.map((r) => r.name)).toEqual(["good1", "bad", "good2"]);
+    expect(results[1]).toEqual({ name: "bad", reachable: false, probe_error: "boom" });
+    expect(results[0].reachable).toBe(true);
+    expect(results[2].reachable).toBe(true);
+  });
+
+  it("bounds in-flight probes to the given concurrency", async () => {
+    let active = 0;
+    let maxActive = 0;
+    broker.probeCluster = ((name: string) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          active -= 1;
+          resolve({ name, reachable: true });
+        }, 5);
+      });
+    }) as any;
+
+    const names = ["a", "b", "c", "d", "e"];
+    const results = await broker.probeClusters(names, { concurrency: 2 });
+
+    expect(maxActive).toBe(2); // never more than the cap in flight at once
+    expect(results.map((r) => r.name)).toEqual(names); // order still preserved
+  });
+});
