@@ -17,6 +17,7 @@ import { ChannelManager } from "../gateway/channel-manager.js";
 import { TaskCoordinator } from "../gateway/task-coordinator.js";
 import { createCredentialService } from "../gateway/credential-service.js";
 import { FrontendWsClient } from "../gateway/frontend-ws-client.js";
+import { isCompileCapable } from "../gateway/agentbox/box-profile.js";
 import { initChatRepo } from "../gateway/chat-repo.js";
 import { CertificateManager } from "../gateway/security/cert-manager.js";
 import { reinitTracing } from "../shared/tracing/otel-provider.js";
@@ -52,6 +53,10 @@ export async function bootstrapRuntime(opts: BootstrapRuntimeOptions): Promise<R
     serverUrl: config.serverUrl,
     portalSecret: config.portalSecret,
     agentId: process.env.SICLAW_AGENT_ID || "runtime",
+    // Advertise KB-compile capability so the consumer can route compile runs to
+    // this Runtime with no consumer-side config. True iff a compile-box image
+    // was configured (helm agentbox.compileBoxEnabled ⇒ SICLAW_COMPILE_BOX_IMAGE).
+    capabilities: { compile: isCompileCapable() },
   });
   if (config.serverUrl) {
     try {
