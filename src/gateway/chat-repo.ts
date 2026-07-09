@@ -35,6 +35,8 @@ export interface AppendMessageInput {
   parentSessionId?: string | null;
   delegationId?: string | null;
   targetAgentId?: string | null;
+  /** per-prompt root trace id (OTel 32-hex) for message-level trace filtering. */
+  traceId?: string | null;
 }
 
 export interface UpdateMessageInput {
@@ -165,6 +167,7 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
     parent_session_id: msg.parentSessionId ?? null,
     delegation_id: msg.delegationId ?? null,
     target_agent_id: msg.targetAgentId ?? null,
+    trace_id: msg.traceId ?? null,
   });
   return result.id;
 }

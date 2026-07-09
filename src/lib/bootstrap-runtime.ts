@@ -19,6 +19,8 @@ import { createCredentialService } from "../gateway/credential-service.js";
 import { FrontendWsClient } from "../gateway/frontend-ws-client.js";
 import { initChatRepo } from "../gateway/chat-repo.js";
 import { CertificateManager } from "../gateway/security/cert-manager.js";
+import { reinitTracing } from "../shared/tracing/otel-provider.js";
+import type { SiclawConfig } from "../core/config.js";
 
 export type SpawnerKind = "local" | "process" | "k8s";
 
@@ -59,6 +61,30 @@ export async function bootstrapRuntime(opts: BootstrapRuntimeOptions): Promise<R
       throw new Error(
         `[runtime] Failed to connect to Portal at ${config.serverUrl}: ${cause}. ` +
         `Check that Portal is running and SICLAW_SERVER_URL points at its WS endpoint.`,
+      );
+    }
+  }
+
+  // Cold-start tracing alignment for in-process AgentBoxes. Under the "local"
+  // spawner the boxes run inside THIS process (LocalSpawner), sharing the single
+  // process-global OTel provider — and nothing has aligned it with the DB yet:
+  // unlike a K8s/Process AgentBox pod (which pulls settings.json at its own
+  // startup, and tracing config rides along in config.getSettings), an in-process
+  // box never does that per-box fetch. So pull the global tracing config from
+  // Portal once here — over the WS connection just established — and (re)build the
+  // provider. Both local entry points (`gateway-main` default + the single-process
+  // launcher) flow through bootstrapRuntime, so this one spot covers them. The
+  // "process"/"k8s" spawners run no in-process brains, so they neither need nor
+  // get this. Fail-safe: on error the provider is left as-is (tracing off, or the
+  // launcher's settings.json baseline) rather than crashing the runtime — a later
+  // admin mutation still hot-reloads it via the reload broadcast.
+  if (spawnerKind === "local" && config.serverUrl) {
+    try {
+      const tracing = await frontendClient.request("config.getTracingConfig", {});
+      await reinitTracing({ tracing } as SiclawConfig);
+    } catch (err) {
+      console.warn(
+        `[runtime] Initial tracing pull failed (tracing stays off until next reload): ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }

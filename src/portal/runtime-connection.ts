@@ -42,6 +42,13 @@ export interface RuntimeConnectionMap {
   ): Promise<RpcResult>;
   notify(agentId: string, method: string, params: unknown): void;
   notifyMany(agentIds: string[], method: string, params: unknown): void;
+  /**
+   * Fire-and-forget a notification to EVERY connected Runtime, once per
+   * connection (not per agentId). Used for global, agent-agnostic reloads such
+   * as tracing config — `notify(agentId, …)` would only reach one Runtime.
+   * Optional so existing literal mocks of this interface stay valid.
+   */
+  notifyAll?(method: string, params: unknown): void;
   subscribe(
     agentId: string,
     channel: string,
@@ -206,6 +213,21 @@ export function createConnectionMap(): RuntimeConnectionMap {
     notifyMany(agentIds, method, params) {
       for (const id of agentIds) {
         map.notify(id, method, params);
+      }
+    },
+
+    notifyAll(method, params) {
+      // One frame per distinct WebSocket across all agentId buckets. A single
+      // Runtime process may be registered under several agentIds but shares one
+      // socket; dedupe so a global reload isn't sent to it twice.
+      const frame = JSON.stringify({ type: "req", id: crypto.randomUUID().slice(0, 8), method, params });
+      const seen = new Set<WebSocket>();
+      for (const set of connections.values()) {
+        for (const ws of set) {
+          if (seen.has(ws)) continue;
+          seen.add(ws);
+          ws.send(frame);
+        }
       }
     },
 

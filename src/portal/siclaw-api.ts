@@ -27,6 +27,7 @@ import {
   type AuthContext,
 } from "../gateway/rest-router.js";
 import { getDb, type Db } from "../gateway/db.js";
+import { ALLOWED_CONFIG_KEYS } from "../gateway/system-config-repo.js";
 import {
   buildUpsert,
   jsonArrayContains,
@@ -56,6 +57,13 @@ import {
 } from "./chat-session-fields.js";
 import { normalizeEntry, entrySessionPredicate, entryMessagePredicate, actorUserColumn, channelColExpr } from "./metrics-entry.js";
 import { summariseLatency, extractTimingMs } from "./metrics-timing.js";
+import {
+  assembleExporterHeaders,
+  maskExporterAuth,
+  mergeExporterAuthForUpdate,
+  tracingTestSsrfGuard,
+  type ExporterAuth,
+} from "./tracing-exporters.js";
 
 /** Trace viewer message limit — matches siclaw.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
@@ -1776,6 +1784,246 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     // Notify bound agents to reload MCP config
     ctx?.notifyMcpAgents?.(params.id, ["mcp"]);
+  });
+
+  // ================================================================
+  // Tracing Exporters (admin-managed, GLOBAL — no org scoping)
+  // ================================================================
+  //
+  // Third-party analysis platforms (Langfuse / Phoenix / generic OTLP) the
+  // agent-behaviour tracing layer fans out to. One global set shared by every
+  // agent, so every query is org-agnostic (NO `org_id` column / WHERE filter).
+  // Secrets are masked on read and preserved on write (a masked echo is never
+  // persisted). Any mutation triggers a global hot-reload broadcast so live
+  // AgentBoxes rebuild their OTel exporters without a restart.
+
+  /** Broadcast a tracing hot-reload to every connected Runtime (global, not per-agent). */
+  function triggerTracingReload(): void {
+    config.connectionMap.notifyAll?.("tracing.reloadAll", {});
+  }
+
+  /** Serialise a DB row for the API: parse JSON auth, mask secrets, drop nothing else. */
+  function serializeExporter(row: any): Record<string, unknown> {
+    const auth = safeParseJson<ExporterAuth>(row.auth, {});
+    return {
+      id: row.id,
+      name: row.name,
+      platform_type: row.platform_type,
+      url: row.url,
+      auth: maskExporterAuth(row.platform_type, auth),
+      enabled: !!row.enabled,
+      sort_order: row.sort_order,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+  }
+
+  // List exporters (secrets masked)
+  router.get(`${P}/tracing/exporters`, async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT * FROM tracing_exporters ORDER BY sort_order, created_at",
+    ) as any;
+    sendJson(res, 200, { data: (rows as any[]).map(serializeExporter) });
+  });
+
+  // Create exporter
+  router.post(`${P}/tracing/exporters`, async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const body = await parseBody<{
+      name?: string; platformType?: string; url?: string;
+      auth?: ExporterAuth; enabled?: boolean; sortOrder?: number;
+    }>(req);
+    if (!body.name || !body.name.trim()) { sendJson(res, 400, { error: "name is required" }); return; }
+    if (!body.platformType) { sendJson(res, 400, { error: "platformType is required" }); return; }
+    if (!body.url || !body.url.trim()) { sendJson(res, 400, { error: "url is required" }); return; }
+    const urlCheck = tracingTestSsrfGuard(body.url);
+    if (!urlCheck.ok) { sendJson(res, 400, { error: `url: ${urlCheck.error}` }); return; }
+
+    const id = crypto.randomUUID();
+    const db = getDb();
+    await db.query(
+      `INSERT INTO tracing_exporters (id, name, platform_type, url, auth, enabled, sort_order, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, body.name, body.platformType, body.url,
+        JSON.stringify(body.auth ?? {}),
+        body.enabled !== false ? 1 : 0,
+        typeof body.sortOrder === "number" ? body.sortOrder : 0,
+        admin.userId,
+      ],
+    );
+
+    const [rows] = await db.query("SELECT * FROM tracing_exporters WHERE id = ?", [id]) as any;
+    sendJson(res, 201, serializeExporter(rows[0]));
+    triggerTracingReload();
+  });
+
+  // Get one exporter (secrets masked)
+  router.get(`${P}/tracing/exporters/:id`, async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query("SELECT * FROM tracing_exporters WHERE id = ?", [params.id]) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "Exporter not found" }); return; }
+    sendJson(res, 200, serializeExporter(rows[0]));
+  });
+
+  // Update exporter — auth fields left empty / sent as a masked echo keep the
+  // stored secret (mergeExporterAuthForUpdate refuses to persist a masked string).
+  router.put(`${P}/tracing/exporters/:id`, async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const body = await parseBody<{
+      name?: string; url?: string; auth?: ExporterAuth;
+      enabled?: boolean; sortOrder?: number;
+    }>(req);
+    const db = getDb();
+    const [existing] = await db.query("SELECT * FROM tracing_exporters WHERE id = ?", [params.id]) as any;
+    if (existing.length === 0) { sendJson(res, 404, { error: "Exporter not found" }); return; }
+    const row = existing[0];
+
+    if (body.url !== undefined) {
+      const urlCheck = tracingTestSsrfGuard(body.url);
+      if (!urlCheck.ok) { sendJson(res, 400, { error: `url: ${urlCheck.error}` }); return; }
+    }
+
+    // platform_type is immutable on update; merge auth against it.
+    const storedAuth = safeParseJson<ExporterAuth>(row.auth, {});
+    const mergedAuth = mergeExporterAuthForUpdate(row.platform_type, body.auth, storedAuth);
+
+    await db.query(
+      `UPDATE tracing_exporters SET
+         name = COALESCE(?, name),
+         url = COALESCE(?, url),
+         auth = ?,
+         enabled = COALESCE(?, enabled),
+         sort_order = COALESCE(?, sort_order),
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [
+        body.name ?? null,
+        body.url ?? null,
+        JSON.stringify(mergedAuth),
+        body.enabled === undefined ? null : (body.enabled ? 1 : 0),
+        typeof body.sortOrder === "number" ? body.sortOrder : null,
+        params.id,
+      ],
+    );
+
+    const [rows] = await db.query("SELECT * FROM tracing_exporters WHERE id = ?", [params.id]) as any;
+    sendJson(res, 200, serializeExporter(rows[0]));
+    triggerTracingReload();
+  });
+
+  // Delete exporter
+  router.delete(`${P}/tracing/exporters/:id`, async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const db = getDb();
+    const [existing] = await db.query("SELECT id FROM tracing_exporters WHERE id = ?", [params.id]) as any;
+    if (existing.length === 0) { sendJson(res, 404, { error: "Exporter not found" }); return; }
+
+    await db.query("DELETE FROM tracing_exporters WHERE id = ?", [params.id]);
+    sendJson(res, 200, { ok: true });
+    triggerTracingReload();
+  });
+
+  // Toggle exporter enabled/disabled
+  router.put(`${P}/tracing/exporters/:id/toggle`, async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const body = await parseBody<{ enabled: boolean }>(req);
+    const db = getDb();
+    const [existing] = await db.query("SELECT id FROM tracing_exporters WHERE id = ?", [params.id]) as any;
+    if (existing.length === 0) { sendJson(res, 404, { error: "Exporter not found" }); return; }
+
+    await db.query(
+      "UPDATE tracing_exporters SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [body.enabled ? 1 : 0, params.id],
+    );
+
+    const [rows] = await db.query("SELECT * FROM tracing_exporters WHERE id = ?", [params.id]) as any;
+    sendJson(res, 200, serializeExporter(rows[0]));
+    triggerTracingReload();
+  });
+
+  // Shared OTLP probe: SSRF-guard the url, assemble headers, fire an empty OTLP
+  // POST. non-401/403 = auth accepted. Returns a status+payload (caller sends).
+  // Never logs auth material; the message carries only HTTP status / conn error.
+  async function probeExporter(
+    platformType: string | undefined,
+    url: string | undefined,
+    auth: ExporterAuth | undefined,
+  ): Promise<{ httpStatus: number; payload: Record<string, unknown> }> {
+    if (!url || !url.trim()) return { httpStatus: 400, payload: { error: "url is required" } };
+    const guard = tracingTestSsrfGuard(url);
+    if (!guard.ok) return { httpStatus: 200, payload: { ok: false, status: 0, message: guard.error } };
+
+    const headers = assembleExporterHeaders(platformType ?? "otlp", auth);
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      let resp: Response;
+      try {
+        resp = await fetch(url, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/x-protobuf" },
+          body: new Uint8Array(0),
+          signal: controller.signal,
+          redirect: "manual",
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      const authOk = resp.status !== 401 && resp.status !== 403;
+      return {
+        httpStatus: 200,
+        payload: {
+          ok: authOk,
+          status: resp.status,
+          message: authOk ? `Endpoint reachable (HTTP ${resp.status})` : `Authentication rejected (HTTP ${resp.status})`,
+        },
+      };
+    } catch (err: any) {
+      const message = err?.name === "AbortError" ? "Connection timed out" : (err?.message ?? String(err));
+      return { httpStatus: 200, payload: { ok: false, status: 0, message } };
+    }
+  }
+
+  // Test probe with the SUBMITTED auth (add/edit form, where the admin just
+  // typed the real secret). Masked echoes won't authenticate.
+  router.post(`${P}/tracing/exporters/test`, async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+    const body = await parseBody<{ platformType?: string; url?: string; auth?: ExporterAuth }>(req);
+    const r = await probeExporter(body.platformType, body.url, body.auth);
+    sendJson(res, r.httpStatus, r.payload);
+  });
+
+  // Test probe for an EXISTING row using the STORED plaintext auth — lets the
+  // list-row Test button verify a saved langfuse/phoenix platform whose secret
+  // is masked in the API (and so cannot be resent from the client). Same SSRF
+  // guard; url + auth come from the DB, not the request body.
+  router.post(`${P}/tracing/exporters/:id/test`, async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+    const db = getDb();
+    const [rows] = await db.query("SELECT * FROM tracing_exporters WHERE id = ?", [params.id]) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "Exporter not found" }); return; }
+    const row = rows[0];
+    const auth = safeParseJson<ExporterAuth>(row.auth, {});
+    const r = await probeExporter(row.platform_type, row.url, auth);
+    sendJson(res, r.httpStatus, r.payload);
   });
 
   // ================================================================
@@ -3514,7 +3762,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   // System config — admin-managed key-value store
   // ================================================================
 
-  const ALLOWED_CONFIG_KEYS = new Set<string>(["system.grafanaUrl"]);
+  // Whitelist single-sourced from system-config-repo.ts (imported at module top)
+  // so a new key can't be accepted by one path and rejected by the other.
 
   /** Reject dangerous URL schemes. Only http/https allowed. */
   function validateHttpUrl(value: string): { ok: true } | { ok: false; error: string } {
@@ -3582,6 +3831,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       await db.query(upsert.sql, upsert.params);
     }
     sendJson(res, 200, { ok: true });
+    // Global tracing scalars (tracing.enabled / serviceName / sendContent) feed
+    // buildTracingConfig, so a change here must hot-reload every active AgentBox
+    // — otherwise the master switch / sendContent only takes effect on the next
+    // respawn (running agents keep their old provider). Mirrors the exporter
+    // CRUD handlers, which already call triggerTracingReload.
+    if (Object.keys(values).some((k) => k.startsWith("tracing."))) {
+      triggerTracingReload();
+    }
   });
 
   // ================================================================

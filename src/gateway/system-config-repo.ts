@@ -7,7 +7,15 @@
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 
 /** Whitelist of config keys that are allowed to be written via the REST API. */
-export const ALLOWED_CONFIG_KEYS = new Set<string>(["system.grafanaUrl"]);
+export const ALLOWED_CONFIG_KEYS = new Set<string>([
+  "system.grafanaUrl",
+  // Global tracing scalars (per-exporter rows live in the tracing_exporters
+  // table). Assembled into TracingConfig by adapter.ts buildTracingConfig().
+  // NOTE: there is no "tracing.enabled" master switch — tracing is on iff at
+  // least one platform is enabled (per-platform toggle is the only on/off).
+  "tracing.serviceName",
+  "tracing.sendContent",
+]);
 
 export class SystemConfigRepo {
   constructor(private readonly frontendClient: FrontendWsClient) {}
