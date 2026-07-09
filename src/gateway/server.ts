@@ -457,6 +457,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
           .catch(async (err) => {
             console.error(`[capability] session relay failed run=${runId}:`, err);
+            // The run is terminal from here (endRun below) and can never be
+            // re-adopted, so its box is unreachable garbage — stop it, or every
+            // relay crash leaks a pod (4 live boxes for one repo, seen 07-09).
+            await agentBoxManager.stop(runId).catch((stopErr) =>
+              console.error(
+                `[capability] stop box after relay failure run=${runId}:`,
+                stopErr instanceof Error ? stopErr.message : String(stopErr),
+              ),
+            );
             await capabilityRunManager.endRun(runId, "failed").catch(() => {});
           })
           .finally(() => {
@@ -534,7 +543,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   rpcMethods.set("capability.cancel", async (params) => {
     const runId = (params as unknown as CapabilityCancelRequest).run_id;
     if (!runId) throw new Error("run_id is required");
-    await agentBoxManager.stop(runId).catch(() => {});
+    // Best-effort by design (the cancel must terminalize the run regardless),
+    // but a swallowed stop is how box pods leak — log it loudly.
+    await agentBoxManager.stop(runId).catch((err) =>
+      console.error(
+        `[capability] cancel: stop box run=${runId} failed (pod may leak):`,
+        err instanceof Error ? err.message : String(err),
+      ),
+    );
     await capabilityRunManager.endRun(runId, "done");
     return { ok: true, run_id: runId };
   });
