@@ -26,6 +26,7 @@ vi.mock("@kubernetes/client-node", () => {
     createNamespacedSecret: [],
     deleteNamespacedSecret: [],
     listNamespacedPod: [],
+    listNamespacedSecret: [],
     deleteCollectionNamespacedPod: [],
     deleteCollectionNamespacedSecret: [],
   };
@@ -36,6 +37,7 @@ vi.mock("@kubernetes/client-node", () => {
     createNamespacedSecret: async () => ({}),
     deleteNamespacedSecret: async () => ({}),
     listNamespacedPod: async () => ({ items: [] }),
+    listNamespacedSecret: async () => ({ items: [] }),
     deleteCollectionNamespacedPod: async () => ({}),
     deleteCollectionNamespacedSecret: async () => ({}),
   };
@@ -47,6 +49,7 @@ vi.mock("@kubernetes/client-node", () => {
     async createNamespacedSecret(args: any) { g.__k8sCalls.createNamespacedSecret.push(args); return g.__k8sImpls.createNamespacedSecret(args); }
     async deleteNamespacedSecret(args: any) { g.__k8sCalls.deleteNamespacedSecret.push(args); return g.__k8sImpls.deleteNamespacedSecret(args); }
     async listNamespacedPod(args: any) { g.__k8sCalls.listNamespacedPod.push(args); return g.__k8sImpls.listNamespacedPod(args); }
+    async listNamespacedSecret(args: any) { g.__k8sCalls.listNamespacedSecret.push(args); return g.__k8sImpls.listNamespacedSecret(args); }
     async deleteCollectionNamespacedPod(args: any) { g.__k8sCalls.deleteCollectionNamespacedPod.push(args); return g.__k8sImpls.deleteCollectionNamespacedPod(args); }
     async deleteCollectionNamespacedSecret(args: any) { g.__k8sCalls.deleteCollectionNamespacedSecret.push(args); return g.__k8sImpls.deleteCollectionNamespacedSecret(args); }
   }
@@ -87,7 +90,7 @@ const originalGatewayEnv = {
 };
 
 // Import SUT after mocks.
-import { K8sSpawner } from "./k8s-spawner.js";
+import { K8sSpawner, parseK8sQuantity, clampRequestToLimit } from "./k8s-spawner.js";
 
 // ── Fake cert manager ─────────────────────────────────────────────────
 
@@ -125,6 +128,8 @@ beforeEach(() => {
   g.__k8sImpls.createNamespacedSecret = async () => ({});
   g.__k8sImpls.deleteNamespacedSecret = async () => ({});
   g.__k8sImpls.listNamespacedPod = async () => ({ items: [] });
+  g.__k8sImpls.listNamespacedSecret = async () => ({ items: [] });
+  g.__k8sCalls.listNamespacedSecret.length = 0;
   g.__k8sImpls.deleteCollectionNamespacedPod = async () => ({});
   g.__k8sImpls.deleteCollectionNamespacedSecret = async () => ({});
   vi.spyOn(console, "log").mockImplementation(() => {});
@@ -844,5 +849,138 @@ describe("K8sSpawner — nodeSelector", () => {
     await s.spawn({ agentId: "default" });
 
     expect(podSpec().nodeSelector).toBeUndefined();
+  });
+});
+
+describe("K8sSpawner — capability-box orphan sweep + burstable resources (audit batch B)", () => {
+  const g = globalThis as any;
+  const mkPod = (name: string, boxType: string, phase: string) => ({
+    metadata: { name, labels: { "siclaw.io/app": "agentbox", "siclaw.io/boxType": boxType } },
+    status: { phase },
+  });
+
+  it("sweep removes terminal + run-dead capability pods and orphaned Secrets; never touches chat boxes or live runs", async () => {
+    g.__k8sImpls.listNamespacedPod = async () => ({
+      items: [
+        mkPod("agentbox-live-run", "kb-compile", "Running"),   // run live → keep
+        mkPod("agentbox-dead-run", "kb-compile", "Running"),   // pod alive, run ended → the NORMAL-completion leak shape
+        mkPod("agentbox-done-run", "kb-test", "Succeeded"),    // terminal phase
+        mkPod("agentbox-chat-1", "agent", "Running"),          // chat box: own lifecycle, never ours
+      ],
+    });
+    const oldTs = new Date(Date.now() - 3600_000).toISOString();
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [
+        { metadata: { name: "agentbox-live-run-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-compile" } } },
+        { metadata: { name: "agentbox-ghost-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-compile" } } }, // no pod at all → orphan
+        { metadata: { name: "agentbox-chat-gone-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "agent" } } },  // chat box's orphan Secret: NOT ours
+        { metadata: { name: "agentbox-fresh-cert", creationTimestamp: new Date().toISOString(), labels: { "siclaw.io/boxType": "kb-compile" } } }, // just spawning (Secret precedes pod): TOCTOU guard
+      ],
+    });
+    const s = new K8sSpawner();
+    // async oracle (the production oracle is store-backed and async)
+    await (s as any).sweepOrphans(async (boxId: string) => boxId === "agentbox-live-run");
+
+    const deletedPods = g.__k8sCalls.deleteNamespacedPod.map((c: any) => c.name);
+    expect(deletedPods).toEqual(expect.arrayContaining(["agentbox-dead-run", "agentbox-done-run"]));
+    expect(deletedPods).not.toContain("agentbox-live-run");
+    expect(deletedPods).not.toContain("agentbox-chat-1");
+    const deletedSecrets = g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name);
+    expect(deletedSecrets).toEqual(expect.arrayContaining(["agentbox-dead-run-cert", "agentbox-done-run-cert", "agentbox-ghost-cert"]));
+    expect(deletedSecrets).not.toContain("agentbox-live-run-cert");
+    expect(deletedSecrets).not.toContain("agentbox-chat-1-cert");
+    expect(deletedSecrets).not.toContain("agentbox-chat-gone-cert"); // chat Secrets are never this sweep's business
+    expect(deletedSecrets).not.toContain("agentbox-fresh-cert");     // Secret-before-pod TOCTOU guarded by age
+  });
+
+  it("sweep hands the oracle the RAW run id from the pod's agent label (non-UUID ids survive)", async () => {
+    // podName() would have lowercased/sanitized this id — a prefix-strip of the
+    // pod name can never recover it, and a mis-keyed oracle reaps a LIVE box.
+    const rawId = "Adopted_Run.7";
+    g.__k8sImpls.listNamespacedPod = async () => ({
+      items: [
+        {
+          metadata: {
+            name: "agentbox-adopted-run-7",
+            labels: { "siclaw.io/app": "agentbox", "siclaw.io/boxType": "kb-compile", "siclaw.io/agent": rawId },
+          },
+          status: { phase: "Running" },
+        },
+        mkPod("agentbox-labelless", "kb-compile", "Running"), // legacy debris: falls back to the pod name
+      ],
+    });
+    g.__k8sImpls.listNamespacedSecret = async () => ({ items: [] });
+    const seen: string[] = [];
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async (ref: string) => { seen.push(ref); return ref === rawId; });
+    expect(seen).toEqual(expect.arrayContaining([rawId, "agentbox-labelless"]));
+    const deletedPods = g.__k8sCalls.deleteNamespacedPod.map((c: any) => c.name);
+    expect(deletedPods).not.toContain("agentbox-adopted-run-7"); // live by RAW id → kept
+    expect(deletedPods).toContain("agentbox-labelless");
+  });
+
+  it("Secret age guard treats a missing creationTimestamp as young, not ancient", async () => {
+    g.__k8sImpls.listNamespacedPod = async () => ({ items: [] });
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [
+        { metadata: { name: "agentbox-no-ts-cert", labels: { "siclaw.io/boxType": "kb-compile" } } }, // no creationTimestamp
+      ],
+    });
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async () => false);
+    const deletedSecrets = g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name);
+    expect(deletedSecrets).not.toContain("agentbox-no-ts-cert"); // TOCTOU guard NOT bypassed
+  });
+
+  it("clamps a request above the (default) limit instead of shipping an API-rejected pod", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+    await s.spawn({ agentId: "clamp-test", profile: "agent", resources: { memoryRequest: "8Gi", cpuRequest: "4" } } as any);
+    const created = g.__k8sCalls.createNamespacedPod.at(-1);
+    const res = created.body.spec.containers[0].resources;
+    expect(res.requests.memory).toBe("4Gi"); // clamped to the default limit
+    expect(res.requests.cpu).toBe("2000m");  // clamped to the default limit
+    expect(res.limits.memory).toBe("4Gi");
+  });
+
+  it("parseK8sQuantity + clampRequestToLimit cover the profile shapes", () => {
+    expect(parseK8sQuantity("500m")).toBeCloseTo(0.5);
+    expect(parseK8sQuantity("2")).toBe(2);
+    expect(parseK8sQuantity("1Gi")).toBe(2 ** 30);
+    expect(parseK8sQuantity("256Mi")).toBe(256 * 2 ** 20);
+    expect(Number.isNaN(parseK8sQuantity("weird"))).toBe(true);
+    expect(clampRequestToLimit("1Gi", "4Gi", "p", "memory")).toBe("1Gi");
+    expect(clampRequestToLimit("8Gi", "4Gi", "p", "memory")).toBe("4Gi");
+    expect(clampRequestToLimit("junk", "4Gi", "p", "memory")).toBe("junk"); // API server stays the authority
+  });
+
+  it("memoryRequest splits the request from the limit (burstable compile shape)", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+    process.env.SICLAW_COMPILE_BOX_IMAGE = "kbc-compile-box:test";
+    try {
+      await s.spawn({ agentId: "res-test", profile: "kb-compile" });
+    } finally {
+      delete process.env.SICLAW_COMPILE_BOX_IMAGE;
+    }
+    const created = g.__k8sCalls.createNamespacedPod.at(-1);
+    const res = created.body.spec.containers[0].resources;
+    expect(res.requests.memory).toBe("1Gi");
+    expect(res.limits.memory).toBe("4Gi");   // limit stays at the default
+    expect(res.requests.cpu).toBe("100m");
   });
 });

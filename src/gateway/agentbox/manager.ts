@@ -38,6 +38,7 @@ export class AgentBoxManager {
   private config: Required<AgentBoxManagerConfig>;
   private boxes = new Map<string, ManagedBox>();
   private healthCheckTimer?: ReturnType<typeof setInterval>;
+  private orphanSweepTimer?: ReturnType<typeof setInterval>;
   private readonly isK8s: boolean;
   private spawnEnvResolver?: (agentId: string) => Promise<Record<string, string> | undefined>;
   private persistenceResolver?: (agentId: string) => Promise<boolean | undefined>;
@@ -53,6 +54,27 @@ export class AgentBoxManager {
     if ('setCertManager' in this.spawner) {
       (this.spawner as any).setCertManager(cm);
     }
+  }
+
+  /**
+   * Periodic capability-box orphan GC (K8s spawner only; duck-typed like
+   * setCertManager). `isLive(boxId)` is the caller's run-liveness oracle —
+   * the manager/spawner have no knowledge of capability runs. First pass runs
+   * one minute after boot (post-recovery, so live runs are known), then every
+   * `intervalMs`. Without it, completed/crashed runs' pods + cert Secrets
+   * accumulate forever (audit finding).
+   */
+  startOrphanSweep(isLive: (boxId: string) => boolean | Promise<boolean>, intervalMs = 10 * 60_000): void {
+    const s: any = this.spawner;
+    if (typeof s.sweepOrphans !== "function") return;
+    const tick = () =>
+      void s.sweepOrphans(isLive).catch((err: any) =>
+        console.warn("[agentbox-manager] orphan sweep failed:", err?.message ?? err));
+    // unref'd + stored (review finding): the sweep must never pin the event
+    // loop or outlive cleanup() — same discipline as the run watchdog.
+    (setTimeout(tick, 60_000) as any).unref?.();
+    this.orphanSweepTimer = setInterval(tick, intervalMs);
+    (this.orphanSweepTimer as any).unref?.();
   }
 
   /**
@@ -300,6 +322,13 @@ export class AgentBoxManager {
 
   async cleanup(): Promise<void> {
     this.stopHealthCheck();
+    // The orphan-sweep interval dies with the manager (review: the clear had
+    // landed in setSpawnEnvResolver, which both left it running post-cleanup
+    // and silently disabled GC if a resolver was ever re-set after boot).
+    if (this.orphanSweepTimer) {
+      clearInterval(this.orphanSweepTimer);
+      this.orphanSweepTimer = undefined;
+    }
     for (const [, managed] of this.boxes) {
       await this.spawner.stop(managed.handle.boxId);
     }
