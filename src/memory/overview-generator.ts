@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { sanitizeKnowledgeRepoDir } from "../shared/knowledge-package.js";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -81,8 +82,156 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
   return parts.join("");
 }
 
-/** Max chars of the knowledge wiki index injected into the prompt before truncation. */
+/** Max chars of the knowledge wiki catalog (per-KB consumer meta + index) injected into the prompt. */
 const KNOWLEDGE_WIKI_BUDGET = 4000;
+
+/**
+ * Consumer-facing meta a publish injects into a knowledge bundle's root as
+ * `_consumer_meta.json` (DESIGN-kb-consumer-meta-2026-07-10): a model-written,
+ * owner-approved routing summary generated at compile settle. First layer of
+ * the KB's progressive disclosure — it stays resident in the consumer agent's
+ * context and decides WHEN to open the wiki at all; the pages stay on-demand.
+ */
+interface BundleConsumerMeta {
+  /** KB display name (from the sync manifest; falls back to the bundle dir). */
+  name?: string;
+  /** published_version from the meta file, else the sync-manifest version. */
+  version?: string;
+  summary: string;
+  whenToUse: string[];
+  notFor: string[];
+}
+
+const CONSUMER_META_FILENAME = "_consumer_meta.json";
+
+/**
+ * Read one bundle root's `_consumer_meta.json`. TOLERANT by contract: missing,
+ * unreadable, invalid JSON, or an empty summary all return null so the caller
+ * falls back to exactly the pre-meta catalog behavior (old published versions
+ * and hand-uploaded bundles carry no meta — design D2).
+ */
+function readBundleConsumerMeta(bundleRoot: string): {
+  summary: string; whenToUse: string[]; notFor: string[]; publishedVersion?: string;
+} | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(bundleRoot, CONSUMER_META_FILENAME), "utf-8");
+  } catch {
+    return null;
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const obj = data as Record<string, unknown>;
+  const summary = typeof obj.summary === "string" ? obj.summary.trim() : "";
+  if (!summary) return null;
+  const strList = (v: unknown): string[] =>
+    Array.isArray(v)
+      ? v.filter((i): i is string => typeof i === "string" && i.trim().length > 0).map((i) => i.trim())
+      : [];
+  const pv = obj.published_version;
+  return {
+    summary,
+    whenToUse: strList(obj.when_to_use),
+    notFor: strList(obj.not_for),
+    publishedVersion: typeof pv === "string" || typeof pv === "number" ? String(pv) : undefined,
+  };
+}
+
+/** repos[] of the sync-handler's `.sync-manifest.json` (name/version per bundle); [] when absent. */
+function readSyncManifestRepos(knowledgeDir: string): Array<{ name?: string; version?: number | string }> {
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(knowledgeDir, ".sync-manifest.json"), "utf-8"));
+    return Array.isArray(data?.repos) ? data.repos : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Collect consumer metas for every bound bundle. Bundle roots mirror the sync
+ * handler's two layouts: a single repo unpacks at `knowledgeDir` itself; multiple
+ * repos unpack under `knowledgeDir/repos/<sanitized-name>/` behind a synthetic
+ * root index. (The portal flat-merge path also lands at the root — same-name
+ * last-wins there, consistent with every other file in that path.)
+ */
+function collectBundleConsumerMetas(knowledgeDir: string): BundleConsumerMeta[] {
+  const manifest = readSyncManifestRepos(knowledgeDir);
+  const out: BundleConsumerMeta[] = [];
+  const rootMeta = readBundleConsumerMeta(knowledgeDir);
+  if (rootMeta) {
+    const m = manifest.length === 1 ? manifest[0] : undefined;
+    out.push({
+      name: m?.name,
+      version: rootMeta.publishedVersion ?? (m?.version != null ? String(m.version) : undefined),
+      summary: rootMeta.summary,
+      whenToUse: rootMeta.whenToUse,
+      notFor: rootMeta.notFor,
+    });
+  }
+  const reposRoot = path.join(knowledgeDir, "repos");
+  let entries: fs.Dirent[] = [];
+  try {
+    entries = fs.readdirSync(reposRoot, { withFileTypes: true });
+  } catch {
+    return out; // single-bundle layout — no repos/ subtree
+  }
+  const byDir = new Map<string, { name?: string; version?: number | string }>();
+  for (const r of manifest) {
+    if (r?.name) byDir.set(sanitizeKnowledgeRepoDir(r.name), r);
+  }
+  for (const entry of entries.filter((e) => isDir(reposRoot, e)).sort((a, b) => a.name.localeCompare(b.name))) {
+    const meta = readBundleConsumerMeta(path.join(reposRoot, entry.name));
+    if (!meta) continue; // this bundle has no (valid) meta → its synthetic index line stays its only entry
+    const m = byDir.get(entry.name);
+    out.push({
+      name: m?.name ?? entry.name,
+      version: meta.publishedVersion ?? (m?.version != null ? String(m.version) : undefined),
+      summary: meta.summary,
+      whenToUse: meta.whenToUse,
+      notFor: meta.notFor,
+    });
+  }
+  return out;
+}
+
+/** Truncate to ~maxLen UTF-16 units without splitting a code point; appends an ellipsis. */
+function truncateRuneSafe(s: string, maxLen: number): string {
+  if (s.length <= maxLen) return s;
+  let out = "";
+  for (const cp of s) { // for..of iterates code points — never splits a surrogate pair
+    if (out.length + cp.length + 1 > maxLen) break; // +1 reserves the ellipsis
+    out += cp;
+  }
+  return out + "…";
+}
+
+/**
+ * Render one KB's meta entry within `budget` chars. Degradation order is the
+ * design's: drop not_for first, then when_to_use; the summary is truncated
+ * last (rune-safe) — the routing signal survives longest.
+ */
+function formatConsumerMetaEntry(meta: BundleConsumerMeta, budget: number): string {
+  const heading = `### ${meta.name ?? "Knowledge base"}${meta.version ? ` (v${meta.version})` : ""}`;
+  const build = (summary: string, withWhen: boolean, withNotFor: boolean): string => {
+    const lines = [heading, summary];
+    if (withWhen && meta.whenToUse.length > 0) lines.push(`Use when: ${meta.whenToUse.join("; ")}`);
+    if (withNotFor && meta.notFor.length > 0) lines.push(`Not for: ${meta.notFor.join("; ")}`);
+    return lines.join("\n");
+  };
+  let entry = build(meta.summary, true, true);
+  if (entry.length <= budget) return entry;
+  entry = build(meta.summary, true, false); // drop not_for first
+  if (entry.length <= budget) return entry;
+  entry = build(meta.summary, false, false); // then when_to_use
+  if (entry.length <= budget) return entry;
+  const overhead = build("", false, false).length;
+  return build(truncateRuneSafe(meta.summary, Math.max(0, budget - overhead)), false, false);
+}
 
 /**
  * Inject the knowledge wiki's page catalog into the system prompt.
@@ -92,8 +241,16 @@ const KNOWLEDGE_WIKI_BUDGET = 4000;
  * directly so the agent sees the catalog in context — no eager Read of index.md,
  * no search tool — and then Reads only the specific page(s) it needs on demand.
  *
- * Returns "" when there is no wiki (no index.md). Budgeted: an oversized index is
- * truncated with a pointer to read the full file.
+ * When a bound bundle carries a published `_consumer_meta.json`, a "Knowledge
+ * Bases" section (name + version + summary + use-when/not-for per KB) precedes
+ * the index — the resident routing layer of the KB's progressive disclosure.
+ * Bundles without meta keep exactly the pre-meta behavior (fallback, design D2).
+ *
+ * Returns "" when there is no wiki (no index.md). Budgeted to
+ * KNOWLEDGE_WIKI_BUDGET overall: the meta section splits the budget evenly
+ * across bound KBs (each entry degrades not_for → when_to_use → summary
+ * truncation), and the index is truncated within whatever remains, with a
+ * pointer to read the full file.
  */
 export function buildKnowledgeWikiCatalog(knowledgeDir?: string): string {
   if (!knowledgeDir) return "";
@@ -106,10 +263,19 @@ export function buildKnowledgeWikiCatalog(knowledgeDir?: string): string {
   }
   if (!index) return "";
 
+  let metaSection = "";
+  let indexBudget = KNOWLEDGE_WIKI_BUDGET;
+  const metas = collectBundleConsumerMetas(knowledgeDir);
+  if (metas.length > 0) {
+    const perKb = Math.floor(KNOWLEDGE_WIKI_BUDGET / metas.length);
+    metaSection = metas.map((m) => formatConsumerMetaEntry(m, perKb)).join("\n\n");
+    indexBudget = Math.max(0, KNOWLEDGE_WIKI_BUDGET - metaSection.length);
+  }
+
   let catalog = index;
   let truncated = false;
-  if (catalog.length > KNOWLEDGE_WIKI_BUDGET) {
-    catalog = catalog.slice(0, KNOWLEDGE_WIKI_BUDGET);
+  if (catalog.length > indexBudget) {
+    catalog = catalog.slice(0, indexBudget);
     // Drop a trailing partial line so the catalog ends cleanly.
     const lastNl = catalog.lastIndexOf("\n");
     if (lastNl > 0) catalog = catalog.slice(0, lastNl);
@@ -125,6 +291,7 @@ export function buildKnowledgeWikiCatalog(knowledgeDir?: string): string {
     "follow any `[[other-page]]` link the same way. Don't read unrelated pages. Pages are semantic — they " +
     "describe what components are and how they fail, not the commands to run; translate what you learn into " +
     "concrete checks using skills (preferred) and bash.",
+    ...(metaSection ? ["", "## Knowledge Bases", "", metaSection] : []),
     "",
     catalog,
     ...(truncated

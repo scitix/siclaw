@@ -310,4 +310,119 @@ describe("buildKnowledgeWikiCatalog", () => {
     // Budgeted: well under the full size.
     expect(out.length).toBeLessThan(big.length);
   });
+
+  // --- Consumer meta (_consumer_meta.json, DESIGN-kb-consumer-meta) ---
+
+  const writeMeta = (dir: string, meta: unknown) =>
+    fs.writeFileSync(path.join(dir, "_consumer_meta.json"), JSON.stringify(meta));
+
+  it("keeps EXACTLY the pre-meta output when no bundle carries a meta file", () => {
+    const index = "- [[roce-modes]] — RoCE modes";
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
+    const before = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(before).not.toContain("## Knowledge Bases");
+    expect(before).toContain("[[roce-modes]]");
+  });
+
+  it("tolerates an invalid or summary-less meta file: exactly current behavior, no error", () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[a]] — x");
+    fs.writeFileSync(path.join(knowledgeDir, "_consumer_meta.json"), "{not json");
+    const broken = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(broken).not.toContain("## Knowledge Bases");
+    writeMeta(knowledgeDir, { version: 1, summary: "   " });
+    expect(buildKnowledgeWikiCatalog(knowledgeDir)).not.toContain("## Knowledge Bases");
+    writeMeta(knowledgeDir, { version: 1, summary: 42, when_to_use: "nope" });
+    expect(buildKnowledgeWikiCatalog(knowledgeDir)).not.toContain("## Knowledge Bases");
+  });
+
+  it("renders a single bundle's meta: name + published version + summary + use-when/not-for, index kept", () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[roce-modes]] — RoCE modes");
+    fs.writeFileSync(path.join(knowledgeDir, ".sync-manifest.json"), JSON.stringify({
+      syncedAt: "t", version: "1", repos: [{ id: "1", name: "GPU 集群运维", version: 7 }],
+    }));
+    writeMeta(knowledgeDir, {
+      version: 1, summary: "覆盖 GPU 集群排障口径", when_to_use: ["XID 报错", "RoCE 掉速"],
+      not_for: ["计费问题"], topics: ["gpu"], entry_pages: [], locale: "zh",
+      generated_by: "m", published_version: 9,
+    });
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(out).toContain("## Knowledge Bases");
+    expect(out).toContain("### GPU 集群运维 (v9)"); // published_version wins over manifest v7
+    expect(out).toContain("覆盖 GPU 集群排障口径");
+    expect(out).toContain("Use when: XID 报错; RoCE 掉速");
+    expect(out).toContain("Not for: 计费问题");
+    expect(out).toContain("[[roce-modes]]"); // second disclosure layer (index) still routed
+    // never inlines the JSON file itself as a page
+    expect(out).not.toContain("generated_by");
+  });
+
+  it("falls back to the sync-manifest version when the meta has no published_version", () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[a]] — x");
+    fs.writeFileSync(path.join(knowledgeDir, ".sync-manifest.json"), JSON.stringify({
+      repos: [{ id: "1", name: "wiki-a", version: 3 }],
+    }));
+    writeMeta(knowledgeDir, { version: 1, summary: "s" });
+    expect(buildKnowledgeWikiCatalog(knowledgeDir)).toContain("### wiki-a (v3)");
+  });
+
+  it("reads each bundle root in the multi-repo layout; metaless bundles keep only their index line", () => {
+    // Mirrors sync-handlers' multi-repo layout: synthetic root index + repos/<dir>/
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"),
+      "- [[repos/wiki-a/index]] - wiki-a v3\n- [[repos/wiki-b/index]] - wiki-b v1");
+    fs.writeFileSync(path.join(knowledgeDir, ".sync-manifest.json"), JSON.stringify({
+      repos: [{ id: "1", name: "Wiki-A", version: 3 }, { id: "2", name: "wiki-b", version: 1 }],
+    }));
+    const dirA = path.join(knowledgeDir, "repos", "wiki-a"); // sanitize("Wiki-A") → wiki-a
+    const dirB = path.join(knowledgeDir, "repos", "wiki-b");
+    fs.mkdirSync(dirA, { recursive: true });
+    fs.mkdirSync(dirB, { recursive: true });
+    writeMeta(dirA, { version: 1, summary: "A 的口径", when_to_use: ["问A"], published_version: 4 });
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(out).toContain("### Wiki-A (v4)"); // manifest display name, meta's published version
+    expect(out).toContain("A 的口径");
+    expect(out).toContain("Use when: 问A");
+    expect(out).not.toContain("### wiki-b"); // no meta → fallback: only its synthetic index line
+    expect(out).toContain("[[repos/wiki-b/index]]");
+  });
+
+  it("degrades within budget: not_for dropped first, then when_to_use, summary truncated last (rune-safe)", () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[a]] — x");
+    // Sized so: summary+when+not_for > 4000 AND summary+when > 4000 AND summary ≤ 4000
+    // → exercises both drop steps while the summary itself survives untruncated.
+    const summary = "夏".repeat(300);
+    writeMeta(knowledgeDir, {
+      version: 1, summary,
+      when_to_use: Array.from({ length: 6 }, (_, i) => `use-case-${i}-${"w".repeat(750)}`),
+      not_for: Array.from({ length: 4 }, (_, i) => `not-${i}-${"n".repeat(300)}`),
+    });
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(out).not.toContain("Not for:");   // dropped first (entry would blow the per-KB budget)
+    expect(out).not.toContain("Use when:");  // then when_to_use
+    expect(out).toContain("夏".repeat(100)); // summary head survives
+    expect(out.length).toBeLessThan(4000 + 700); // instructions overhead only
+    // extreme: summary alone larger than the whole budget → rune-safe truncation, no lone surrogate
+    writeMeta(knowledgeDir, { version: 1, summary: "🀄".repeat(5000) });
+    const out2 = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(out2).toContain("…");
+    expect(out2).not.toMatch(/[\uD800-\uDBFF]$/m); // no split surrogate pair at any line end
+    expect(out2.length).toBeLessThan(4000 + 700);
+  });
+
+  it("splits the budget across bound KBs and still fits the total", () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[repos/a/index]] - a\n- [[repos/b/index]] - b");
+    for (const name of ["a", "b"]) {
+      const dir = path.join(knowledgeDir, "repos", name);
+      fs.mkdirSync(dir, { recursive: true });
+      writeMeta(dir, {
+        version: 1, summary: `${name}-${"s".repeat(3000)}`,
+        when_to_use: [`${name}-when`], not_for: [`${name}-not`],
+      });
+    }
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(out).toContain("### a");
+    expect(out).toContain("### b");
+    expect(out).toContain("a-ss");
+    expect(out).toContain("b-ss");
+    expect(out.length).toBeLessThan(4000 + 700); // 4000 catalog budget + fixed instructions
+  });
 });
