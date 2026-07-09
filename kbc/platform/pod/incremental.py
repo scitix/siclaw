@@ -141,6 +141,46 @@ def page_hashes(workdir: str) -> dict[str, str]:
     return out
 
 
+def page_bytes(workdir: str) -> dict[str, bytes]:
+    """每个 candidate/**/*.md 的原始 bytes(rel → bytes)。turn 前拍一次,给越界
+    还原用:模型拿着 sha256 还原不出字节(重写永远不逐字节相等),曾让每次越界都
+    必然耗尽回修额度落 unconverged;整库 markdown 也就 MB 级,快照换确定性。"""
+    cand = Path(workdir) / "candidate"
+    out: dict[str, bytes] = {}
+    if not cand.is_dir():
+        return out
+    for f in sorted(cand.rglob("*.md")):
+        if f.is_file():
+            out[f.relative_to(cand).as_posix()] = f.read_bytes()
+    return out
+
+
+def restore_pages(workdir: str, before_bytes: dict[str, bytes], pages: list[str]) -> list[str]:
+    """把越界页机械还原到 turn 前的字节(改动的写回、删掉的重建)。确定性、零模型
+    参与 —— 能用代码修的违规不进回修 prompt。turn 前不存在的页(=新建页,不属于
+    本护栏;或快照缺失)防御性跳过,留给回修指令兜底。返回实际还原的页。"""
+    restored: list[str] = []
+    cand = Path(workdir) / "candidate"
+    for rel in pages:
+        original = before_bytes.get(rel)
+        if original is None:
+            continue
+        target = cand / rel
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(original)
+        except OSError as e:
+            # One unrestorable page (path became a directory, perm/IO error)
+            # must not abort the rest: it stays an unrestored violation and
+            # falls to the repair-prompt fallback, while every other page is
+            # still restored (review finding: a mid-loop throw used to skip
+            # the remaining restores AND the whole ledger pass).
+            print(f"[incremental] restore {rel} failed, left for repair: {e!r}")
+            continue
+        restored.append(rel)
+    return restored
+
+
 def changed_pages(before: dict[str, str], after: dict[str, str]) -> dict[str, str]:
     """turn 前后有差异的页 → 变更类型(created/deleted/modified)。"""
     out: dict[str, str] = {}

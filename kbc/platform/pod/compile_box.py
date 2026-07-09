@@ -1362,22 +1362,48 @@ async def _post_turn_selfcheck(run) -> str | None:
     incr = getattr(run, "_incr_pending", None)
     run._incr_pending = None
     key = selfcheck.state_key(workdir)
-    if key is None or key == run._selfcheck_key:
-        return None
-    if not (Path(workdir) / "candidate" / "index.md").is_file():
-        return None  # mid-Execute: pages exist but the index isn't written yet
+    if incr is None:
+        if key is None or key == run._selfcheck_key:
+            return None
+        if not (Path(workdir) / "candidate" / "index.md").is_file():
+            return None  # mid-Execute: pages exist but the index isn't written yet
+    elif key is not None and key == run._selfcheck_key:
+        return None  # byte-unchanged tree → no out-of-scope edits possible
+    # An INCREMENTAL turn falls through even with index.md (or the whole tree)
+    # missing: on an incremental turn the index always pre-existed, so its
+    # absence IS out-of-scope damage — the guard below restores what the
+    # snapshot covers and the ledger/lint flags the rest. The early-returns
+    # used to fire after the guard state was already consumed, letting an
+    # index-deleting turn escape the byte freeze entirely (review finding).
     run._selfcheck_key = key
-    report = selfcheck.run_layer1(workdir)
     # Scoped-incremental byte-integrity guard: on an incremental turn, pages OUTSIDE
     # the authorized set (affected ∪ declared added-targets ∪ index) must be byte-
-    # identical to their pre-turn state. A violation forces a repair even if the
-    # ledger passed — "leave the rest untouched" is a hard guarantee, not a hope.
+    # identical to their pre-turn state. Violations are RESTORED BY CODE first —
+    # byte-exact from the pre-turn snapshot, BEFORE the ledger runs so it judges
+    # the restored tree. The model cannot un-edit toward a hash, so routing these
+    # through the repair prompt burned the whole budget and always landed
+    # unconverged (3/3 live rounds, 07-09). Only what code could not restore
+    # (a snapshot miss) is left for a repair turn.
     incr_violations: list[str] = []
+    restored_pages: list[str] = []
     if incr:
         after = incremental.page_hashes(workdir)
-        editable = incremental.authorized_pages(workdir, incr["changeset"])
+        # repair_pages (set on re-arm): a ledger/lint repair turn legitimately
+        # edits pages OUTSIDE the round's authorized set — dangling-citing pages,
+        # charset/orphan pages. Without widening, the mechanical restore reverts
+        # the repair itself and the round can never converge.
+        editable = set(incremental.authorized_pages(workdir, incr["changeset"])) | set(
+            incr.get("repair_pages") or [])
         incr_violations = incremental.integrity_violations(incr["before"], after, editable)
-        report["incremental"] = {"out_of_scope_pages": incr_violations}
+        if incr_violations:
+            restored_pages = incremental.restore_pages(
+                workdir, incr.get("before_bytes") or {}, incr_violations)
+            if restored_pages:
+                after = incremental.page_hashes(workdir)
+                incr_violations = incremental.integrity_violations(incr["before"], after, editable)
+    report = selfcheck.run_layer1(workdir)
+    if incr:
+        report["incremental"] = {"out_of_scope_pages": incr_violations, "restored_pages": restored_pages}
     ledger_clean = report["coverage"]["closed"] and report["lint"]["ok"]
     if ledger_clean and not incr_violations:
         run._l1_repairs_used = 0
@@ -1389,7 +1415,23 @@ async def _post_turn_selfcheck(run) -> str | None:
     report["repair_rounds_used"] = run._l1_repairs_used
     selfcheck.write_selfcheck(workdir, report)
     locale = getattr(run, "locale", None)
+    if restored_pages:
+        shown = ", ".join(restored_pages[:5]) + ("…" if len(restored_pages) > 5 else "")
+        await run.emit({"type": "summary", "text": _loc(run,
+            f"[Incremental guard] {len(restored_pages)} out-of-scope page(s) auto-restored byte-exact: {shown}",
+            f"【增量护栏】{len(restored_pages)} 页越界改动已自动按字节还原:{shown}")})
     await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
+    if report["state"] == "unconverged":
+        # Budget spent with residuals → land a ticket in the owner's question
+        # queue by CODE (same schema the model uses). The publish page only
+        # DISPLAYS residuals; it must never be where the owner discovers work.
+        try:
+            if selfcheck.file_residual_ticket(workdir, report, locale):
+                await run.emit({"type": "summary", "text": _loc(run,
+                    "Self-check residuals filed as a ticket in the question queue.",
+                    "自检残留已落为疑问工单,待负责人裁决。")})
+        except Exception:
+            pass  # ticket filing must never break the turn seam (fail-open, §4.5)
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
         if incr:
@@ -1399,6 +1441,17 @@ async def _post_turn_selfcheck(run) -> str | None:
             # coverage/lint repair turn too, and THAT turn could drift out of
             # scope just as easily. Judged against the ORIGINAL baseline (the
             # repair restores toward it).
+            #
+            # …but widened by exactly the pages the LEDGER repair targets:
+            # the repair prompt orders edits on dangling-citing / lint-violation
+            # pages that the round's changeset never authorized, and without
+            # this the closing restore reverts the repair itself (live 07-09:
+            # 4 charset fixes + 1 orphan deletion, all undone → unconverged).
+            incr = dict(incr)
+            try:
+                incr["repair_pages"] = selfcheck.ledger_repair_pages(workdir, report)
+            except Exception:
+                incr["repair_pages"] = []  # fail-open: worst case = old strictness
             run._incr_pending = incr
         parts = []
         if not ledger_clean:
@@ -1599,7 +1652,14 @@ async def _start_incremental(run: "CompileRun", text: str) -> None:
         run._begin_turn(text)
         await run.client.query(text)
         return
-    run._incr_pending = {"before": incremental.page_hashes(run.workdir), "changeset": cs}
+    run._incr_pending = {
+        "before": incremental.page_hashes(run.workdir),
+        # bytes ride along for the closing guard's MECHANICAL restore — the model
+        # cannot rebuild a byte-exact page from a hash, so asking it to burned
+        # the whole repair budget and always landed unconverged (3/3 live 07-09).
+        "before_bytes": incremental.page_bytes(run.workdir),
+        "changeset": cs,
+    }
     await run.emit({"type": "summary",
                     "text": _loc(run,
                      f"Incremental recompile: {len(cs['affected_pages'])} page(s) affected — touching only those, everything else stays untouched.",

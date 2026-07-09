@@ -142,6 +142,54 @@ def test_integrity_guard():
         print("OK  integrity guard (affected+index allowed, out-of-scope edit/delete flagged, created page allowed, added-target honored)")
 
 
+def test_page_bytes_and_restore():
+    """L0: out-of-scope violations are restored BY CODE from the pre-turn byte
+    snapshot — modified pages written back, deleted pages recreated, byte-exact.
+    A page absent from the snapshot (created out-of-scope / snapshot miss) is
+    skipped, left for the repair-prompt fallback."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _kb(base)
+        before = incremental.page_hashes(td)
+        snap = incremental.page_bytes(td)
+        assert set(snap) == set(before)
+        assert all(isinstance(v, bytes) for v in snap.values())
+        # model drifts: modifies c.md, deletes b.md, creates new.md
+        _mk(base, "candidate/c.md", _page(["snap/four.md"]) + "\n擅自改动。")
+        (base / "candidate/b.md").unlink()
+        _mk(base, "candidate/new.md", _page(["snap/five.md"]) + "\n新页。")
+        after = incremental.page_hashes(td)
+        violations = incremental.integrity_violations(before, after, {"a.md"})
+        assert set(violations) == {"b.md", "c.md"}, violations
+        restored = incremental.restore_pages(td, snap, violations + ["new.md"])
+        assert set(restored) == {"b.md", "c.md"}, restored  # new.md: no snapshot → skipped
+        # byte-exact: the guard judges the restored tree clean
+        after2 = incremental.page_hashes(td)
+        assert incremental.integrity_violations(before, after2, {"a.md"}) == []
+        assert (base / "candidate/b.md").read_bytes() == snap["b.md"]
+        assert (base / "candidate/c.md").read_bytes() == snap["c.md"]
+        print("OK  page_bytes + restore_pages (modified written back, deleted recreated, created skipped)")
+
+
+def test_restore_skips_unrestorable_page():
+    """Review fix: one unrestorable page (its path became a directory) must not
+    abort the rest of the restore — it stays a violation for the repair prompt
+    while every other page is still restored."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _kb(base)
+        snap = incremental.page_bytes(td)
+        # model drifts on b.md and c.md; b.md is then unrestorable (now a dir)
+        (base / "candidate/b.md").unlink()
+        (base / "candidate/b.md").mkdir()
+        _mk(base, "candidate/c.md", _page(["snap/four.md"]) + "\n擅自改动。")
+        restored = incremental.restore_pages(td, snap, ["b.md", "c.md"])
+        assert restored == ["c.md"], restored  # c.md restored despite b.md failing
+        assert (base / "candidate/c.md").read_bytes() == snap["c.md"]
+        assert (base / "candidate/b.md").is_dir()  # left for the repair fallback
+        print("OK  restore skips unrestorable page, restores the rest")
+
+
 def test_protocol_raw_changes_to_changeset():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -211,6 +259,8 @@ if __name__ == "__main__":
     test_raw_prefix_normalization()
     test_build_changeset()
     test_integrity_guard()
+    test_page_bytes_and_restore()
+    test_restore_skips_unrestorable_page()
     test_protocol_raw_changes_to_changeset()
     test_added_targets_and_authorized()
     test_scoped_directive()

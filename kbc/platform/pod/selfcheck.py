@@ -18,8 +18,10 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import os
 import posixpath
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,11 +94,20 @@ def _strip_source_prefix(entry: str) -> str:
 
 def _norm_source_entry(raw: str) -> str:
     """One compiled_from list entry → a raw-relative source path. Tolerates
-    `"<hash8> · <path>"`, surrounding quotes, and a raw/ or drop/ prefix."""
+    `"<hash8> · <path>"`, surrounding quotes, and a raw/ or drop/ prefix.
+    Canonicalized with posixpath.normpath, the same way intra-wiki link targets
+    are resolved: an un-normalized citation (`./live.csv`, `sub/../x.md`) used
+    to double-report as unaccounted AND dangling — cosmetic while dangling was
+    display-only, a permanent convergence wedge once it gates `closed` (review
+    finding: the model would get contradictory repair orders forever)."""
     entry = raw.strip().strip("\"'").strip()
     if "·" in entry:
         entry = entry.rsplit("·", 1)[1].strip()
-    return _strip_source_prefix(entry.strip("\"'").strip())
+    entry = _strip_source_prefix(entry.strip("\"'").strip())
+    if not entry:
+        return entry
+    entry = posixpath.normpath(entry)
+    return "" if entry == "." else entry
 
 
 def parse_compiled_from(md_text: str) -> tuple[list[str], bool, bool]:
@@ -361,6 +372,14 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
                                "detail": (f"含 U+FFFD 替换字符({shown}{more})——这是编码损坏"
                                           "(多字节字符在传输中被截断),不是内容笔误;逐处定位 �,"
                                           "对照 raw 原文判断本应是哪个字并改回,切勿照抄损坏文本、勿删字略过")})
+    if pages and "index.md" not in pages:
+        # Any tree that reaches lint must have its routing page: the full-compile
+        # mid-Execute case (index legitimately not written yet) never gets here
+        # (early-return), and an incremental turn started WITH an index — its
+        # absence is model damage. Without this rule the orphan walk silently
+        # returns [] ("no root") and an index-deleting turn settles green.
+        violations.append({"page": "index.md", "kind": "index_missing",
+                           "detail": "candidate/index.md 不存在——路由页被删;重建它并把全部页面挂回可达链"})
     for rel in _orphan_pages(pages):
         violations.append({"page": rel, "kind": "orphan",
                            "detail": "从 index.md 无链可达——把它挂进 index 或相应父页;确属废页则删除"})
@@ -434,7 +453,12 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
         "unaccounted": unaccounted,
         "dangling_citations": dangling,
         "noop_exclusions": noop_exclusions,
-        "closed": not unaccounted,
+        # closed = the ledger is consistent in BOTH directions: every source
+        # accounted AND every citation real. dangling used to be display-only —
+        # the repair prompt listed the fix, but the gate (ledger_clean) never
+        # fired on it, so a lone dangling citation sailed through settle and
+        # surfaced as owner homework on the publish page.
+        "closed": not unaccounted and not dangling,
     }
 
 
@@ -642,6 +666,8 @@ def narration(report: dict, locale: str | None = None) -> str:
         parts = []
         if cov["unaccounted"]:
             parts.append(f"{len(cov['unaccounted'])} source file(s) unaccounted")
+        if cov["dangling_citations"]:
+            parts.append(f"{len(cov['dangling_citations'])} dangling citation(s)")
         if not lint["ok"]:
             parts.append(f"{len(lint['violations'])} lint issue(s)")
         tail = "repair requested" if report["state"] == "repairing" else "repair budget spent; remaining items left for the owner"
@@ -652,6 +678,8 @@ def narration(report: dict, locale: str | None = None) -> str:
     parts = []
     if cov["unaccounted"]:
         parts.append(f"{len(cov['unaccounted'])} 个源文件未入账")
+    if cov["dangling_citations"]:
+        parts.append(f"{len(cov['dangling_citations'])} 处悬空引用")
     if not lint["ok"]:
         parts.append(f"{len(lint['violations'])} 处 lint 问题")
     tail = "已请求回修" if report["state"] == "repairing" else "回修额度用尽,余项待负责人处理"
@@ -708,6 +736,114 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
         lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
                   for v in lint["violations"][:_REPAIR_LIST_CAP]]
     return "\n".join(lines)
+
+
+def ledger_repair_pages(workdir: str, report: dict) -> list[str]:
+    """Pages a LEDGER/LINT repair turn legitimately edits — on an incremental
+    round the byte-integrity guard must authorize exactly these for the repair
+    turn, or its mechanical restore reverts the repair itself and the round can
+    never converge (seen live 07-09: a repair fixed 4 charset pages + deleted a
+    sourceless orphan, and the re-armed guard restored all 5 → unconverged +
+    a residual ticket for work that had in fact been done).
+
+    = lint violation pages (charset/orphan/… name their page) ∪ pages whose
+    compiled_from cites a dangling path (they must be edited to fix or drop the
+    citation). Unaccounted-source merges are NOT here — the model declares
+    those via ADDED_TARGETS.json, which the guard already honors live."""
+    pages: set[str] = set()
+    lint = report.get("lint") or {}
+    for v in lint.get("violations") or []:
+        p = v.get("page")
+        if p and p != EXCLUSIONS_PATH:
+            pages.add(str(p))
+    dangling = set((report.get("coverage") or {}).get("dangling_citations") or [])
+    if dangling:
+        for rel, info in candidate_pages(workdir).items():
+            if any(s in dangling for s in info.get("sources") or []):
+                pages.add(rel)
+    return sorted(pages)
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Temp file in the same dir + os.replace (mirrors the driver's helper —
+    selfcheck cannot import compile_box without a cycle). CONTRADICTIONS.json
+    is the SHARED ticket queue: a torn read-modify-write here would drop the
+    model's own tickets and wedge every later ticket read (review finding)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text, "utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+# ── L2: budget spent with residuals → a ticket, never owner homework ─────────
+# The publish page only DISPLAYS residual state; the owner must never discover
+# work there. When the bounded repair loop gives up (state=unconverged), CODE
+# files one contradiction ticket — same schema, same queue, same rule/dispatch/
+# resolve_ticket loop the model's own tickets ride (box_role.md 「矛盾工单」).
+
+def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) -> bool:
+    """Append ONE residual ticket to authoring/CONTRADICTIONS.json, model-free.
+    Stable id = fingerprint of the residual list: the same residuals repeatedly
+    unconverging never duplicate the ticket; different residuals open a fresh
+    one. An existing same-id ticket (open or already ruled) is left untouched.
+    Returns whether a ticket was filed."""
+    cov = report.get("coverage") or {}
+    lint = report.get("lint") or {}
+    incr = report.get("incremental") or {}
+    # The FULL residual set — both the fingerprint and the quote derive from it.
+    # Fingerprinting a truncated view (the old [:10] caps) made two genuinely
+    # different residual sets sharing a prefix collide to one ticket id, so the
+    # second was silently deduped away (review finding). Only the DISPLAY quote
+    # is truncated, below.
+    residuals: list[str] = []
+    pages: set[str] = set()
+    for p in (cov.get("unaccounted") or []):
+        residuals.append(f"未入账源: {p}")
+    for p in (cov.get("dangling_citations") or []):
+        residuals.append(f"悬空引用: {p}")
+    for v in (lint.get("violations") or []):
+        residuals.append(f"lint {v.get('kind')}: {v.get('page')} — {str(v.get('detail', ''))[:80]}")
+        if v.get("page"):
+            pages.add(str(v["page"]))
+    for p in (incr.get("out_of_scope_pages") or []):
+        residuals.append(f"越界未还原: {p}")
+        pages.add(str(p))
+    if not residuals:
+        return False
+    digest = hashlib.sha256("\n".join(sorted(residuals)).encode("utf-8")).hexdigest()[:8]
+    tid = f"selfcheck-residual-{digest}"
+    path = Path(workdir) / "authoring" / "CONTRADICTIONS.json"
+    tickets: list = []
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            # Unreadable ledger: bail rather than clobber the model's tickets.
+            return False
+        if not isinstance(data, list):
+            return False
+        tickets = data
+    if any(isinstance(t, dict) and t.get("id") == tid for t in tickets):
+        return False
+    en = _is_en(locale)
+    tickets.append({
+        "id": tid,
+        "title": "Self-check residuals" if en else "自检残留待处理",
+        "question": ("The automatic self-check repair budget is spent and the items below remain unfixed — how should they be handled?"
+                     if en else "自检自动回修额度已用完,以下残留没有修完,要怎么处理?"),
+        "sources": [{"doc": "authoring/SELFCHECK.json", "quote": "; ".join(residuals)[:600]}],
+        "options": (["Run another repair round", "Accept as-is"] if en else ["再修一轮", "接受现状"]),
+        "current_value": "unresolved residuals" if en else "残留未处理",
+        "affected_pages": sorted(pages)[:20],
+        "status": "open",
+        "answer": None,
+    })
+    _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
+    return True
 
 
 # ── image re-verification (fresh-eyes numeric check) ─────────────────────────
