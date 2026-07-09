@@ -243,6 +243,74 @@ def test_cap_media_pending():
     print("OK  cap_media_pending (whole pages / oversized-single)")
 
 
+def test_dangling_alone_blocks_closed():
+    """L1: closed = consistent in BOTH directions. A lone dangling citation (all
+    sources accounted, lint clean) used to sail through settle as display-only
+    owner homework on the publish page — it must gate the repair loop instead."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/snap/one.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md)")
+        _mk(base, "candidate/p1.md",
+            "---\ncompiled_from:\n  - snap/one.md\n  - snap/deleted-long-ago.md\n---\n正文。")
+        cov = selfcheck.run_layer1(td)["coverage"]
+        assert cov["unaccounted"] == [] and cov["dangling_citations"] == ["snap/deleted-long-ago.md"], cov
+        assert not cov["closed"], "a dangling citation alone must keep the ledger open"
+        # narration names the dangling count so a dangling-only repair round is explained
+        report = {"coverage": cov, "lint": {"ok": True, "violations": []}, "state": "repairing"}
+        assert "悬空引用" in selfcheck.narration(report, "zh")
+        assert "dangling" in selfcheck.narration(report, "en")
+        # fix the citation → closed
+        _mk(base, "candidate/p1.md", "---\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+        cov2 = selfcheck.run_layer1(td)["coverage"]
+        assert cov2["closed"], cov2
+        print("OK  dangling alone blocks closed (bidirectional ledger) + narration names it")
+
+
+def test_file_residual_ticket():
+    """L2: budget spent with residuals → CODE files ONE ticket in the owner's
+    queue (model schema, stable content-fingerprint id). Dedupes on repeat,
+    preserves the model's tickets, refuses to clobber an unreadable ledger."""
+    report = {
+        "coverage": {"unaccounted": ["snap/two.md"], "dangling_citations": []},
+        "lint": {"ok": False, "violations": [{"page": "p1.md", "kind": "orphan", "detail": "unreachable"}]},
+        "incremental": {"out_of_scope_pages": ["c.md"]},
+        "state": "unconverged",
+    }
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/CONTRADICTIONS.json",
+            json.dumps([{"id": "model-1", "title": "既有工单", "status": "open"}]))
+        assert selfcheck.file_residual_ticket(td, report, "zh") is True
+        tickets = json.loads((base / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8"))
+        assert len(tickets) == 2 and tickets[0]["id"] == "model-1"  # model ticket preserved
+        t = tickets[1]
+        assert t["id"].startswith("selfcheck-residual-") and t["status"] == "open" and t["answer"] is None
+        assert "未入账源: snap/two.md" in t["sources"][0]["quote"]
+        assert sorted(t["affected_pages"]) == ["c.md", "p1.md"]
+        assert t["options"] and t["current_value"]
+        # same residuals again → dedupe, no second ticket
+        assert selfcheck.file_residual_ticket(td, report, "zh") is False
+        assert len(json.loads((base / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8"))) == 2
+        # different residuals → a fresh ticket (new fingerprint)
+        report2 = {"coverage": {"unaccounted": [], "dangling_citations": ["snap/ghost.md"]},
+                   "lint": {"ok": True, "violations": []}, "state": "unconverged"}
+        assert selfcheck.file_residual_ticket(td, report2, "en") is True
+        assert len(json.loads((base / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8"))) == 3
+    with tempfile.TemporaryDirectory() as td:
+        # nothing residual → no ticket
+        clean = {"coverage": {"unaccounted": [], "dangling_citations": []},
+                 "lint": {"ok": True, "violations": []}}
+        assert selfcheck.file_residual_ticket(td, clean) is False
+        assert not (Path(td) / "authoring/CONTRADICTIONS.json").exists()
+    with tempfile.TemporaryDirectory() as td:
+        # unreadable ledger → bail rather than clobber the model's tickets
+        _mk(Path(td), "authoring/CONTRADICTIONS.json", "{oops")
+        assert selfcheck.file_residual_ticket(td, report) is False
+        assert (Path(td) / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8") == "{oops"
+    print("OK  file_residual_ticket (files/dedupes/preserves/bails, fingerprint id)")
+
+
 def test_state_key():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -730,6 +798,8 @@ def main():
     test_media_ledger_and_new_lint()
     test_media_verify_helpers()
     test_cap_media_pending()
+    test_dangling_alone_blocks_closed()
+    test_file_residual_ticket()
     test_state_key()
     test_candidate_tree_hash_unreadable()
     test_pack_hash_is_relposix_sorted()
