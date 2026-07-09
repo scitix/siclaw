@@ -106,6 +106,182 @@ export interface CardSession {
   sequence: number;
 }
 
+// ── 👍/👎 feedback buttons ──────────────────────────────────────────
+//
+// The final answer card carries a feedback row. Clicks arrive as a
+// `card.action.trigger` callback over the SAME long connection as messages;
+// the button's `value` payload is self-contained (session/card/channel), so
+// persistence never needs a Feishu-message-id → session mapping.
+
+/** Discriminator inside `action.value` so unrelated card actions are ignored. */
+export const FEEDBACK_ACTION_KIND = "siclaw_feedback";
+
+/** Stable element id of the feedback row (needed for the post-click echo). */
+const FEEDBACK_ELEMENT_ID = "fb_row";
+
+export type FeedbackRating = "up" | "down";
+
+export interface FeedbackContext {
+  sessionId: string;
+  channelId: string;
+}
+
+/** Payload embedded in each button; comes back verbatim in the callback. */
+export interface FeedbackActionValue {
+  kind: typeof FEEDBACK_ACTION_KIND;
+  rating: FeedbackRating;
+  session_id: string;
+  card_id: string;
+  channel_id: string;
+  locale: LarkLocale;
+}
+
+const FEEDBACK_LABELS: Record<LarkLocale, Record<FeedbackRating, { idle: string; selected: string }>> = {
+  "zh-CN": {
+    up: { idle: "👍 有帮助", selected: "👍 已反馈" },
+    down: { idle: "👎 没帮助", selected: "👎 已反馈" },
+  },
+  "en-US": {
+    up: { idle: "👍 Helpful", selected: "👍 Thanks!" },
+    down: { idle: "👎 Not helpful", selected: "👎 Thanks!" },
+  },
+};
+
+/** Schema-2.0 feedback row: two callback buttons side by side. */
+function buildFeedbackRow(
+  cardId: string,
+  ctx: FeedbackContext,
+  locale: LarkLocale,
+  selected?: FeedbackRating,
+): Record<string, unknown> {
+  const button = (rating: FeedbackRating) => {
+    const label = FEEDBACK_LABELS[locale][rating];
+    const value: FeedbackActionValue = {
+      kind: FEEDBACK_ACTION_KIND,
+      rating,
+      session_id: ctx.sessionId,
+      card_id: cardId,
+      channel_id: ctx.channelId,
+      locale,
+    };
+    return {
+      tag: "button",
+      element_id: `fb_${rating}`,
+      text: { tag: "plain_text", content: selected === rating ? label.selected : label.idle },
+      type: selected === rating ? "primary" : "default",
+      behaviors: [{ type: "callback", value }],
+    };
+  };
+  return {
+    tag: "column_set",
+    element_id: FEEDBACK_ELEMENT_ID,
+    columns: [
+      { tag: "column", width: "auto", elements: [button("up")] },
+      { tag: "column", width: "auto", elements: [button("down")] },
+    ],
+  };
+}
+
+// Cards whose feedback row we can still edit (sequence must keep increasing
+// per card, and CardKit gives no way to read it back). Only the CardSession is
+// remembered — everything else the echo needs comes back verbatim in the
+// button's self-contained action.value. In-memory and bounded: after a gateway
+// restart the click still persists + toasts, only the visual button-state echo
+// is skipped.
+const FEEDBACK_ECHO_CAP = 500;
+const feedbackEchoSessions = new Map<string, CardSession>();
+
+function rememberFeedbackCard(session: CardSession): void {
+  if (feedbackEchoSessions.size >= FEEDBACK_ECHO_CAP) {
+    const oldest = feedbackEchoSessions.keys().next().value;
+    if (oldest !== undefined) feedbackEchoSessions.delete(oldest);
+  }
+  feedbackEchoSessions.set(session.cardId, session);
+}
+
+/** Test hook — echo state is process-global. */
+export function resetFeedbackEchoForTest(): void {
+  feedbackEchoSessions.clear();
+}
+
+/** The Lark SDK does NOT throw on a non-zero API code — check explicitly. */
+function cardApiFailed(res: unknown): boolean {
+  const code = (res as { code?: unknown } | undefined)?.code;
+  return typeof code === "number" && code !== 0;
+}
+
+/**
+ * Append the feedback row to a finalized card. Best-effort: a failure only
+ * loses the buttons, never the answer. Only a verified success registers the
+ * card for the post-click echo — a rejected append must not leave a phantom
+ * fb_row registration behind.
+ */
+async function appendFeedbackRow(
+  larkClient: any,
+  session: CardSession,
+  ctx: FeedbackContext,
+  locale: LarkLocale,
+): Promise<void> {
+  try {
+    const res = await larkClient.cardkit.v1.cardElement.create({
+      path: { card_id: session.cardId },
+      data: {
+        type: "append",
+        sequence: ++session.sequence,
+        elements: JSON.stringify([buildFeedbackRow(session.cardId, ctx, locale)]),
+      },
+    });
+    if (cardApiFailed(res)) {
+      console.warn(`[lark-card] appending feedback buttons rejected for cardId=${session.cardId}: code=${(res as any).code} msg=${(res as any).msg}`);
+      return;
+    }
+    rememberFeedbackCard(session);
+  } catch (err) {
+    console.warn(`[lark-card] appending feedback buttons failed for cardId=${session.cardId}:`, err);
+  }
+}
+
+/**
+ * Post-click echo: re-render the feedback row with the chosen button
+ * highlighted, rebuilt entirely from the callback's own value payload (the
+ * single source of truth). Note the echo reflects the LATEST click — on a
+ * shared group card another member's later vote replaces the highlight; the
+ * DB keeps one row per person regardless. Returns false when this process no
+ * longer knows the card's sequence (e.g. after a restart) — the caller's
+ * toast is then the only confirmation, which is acceptable.
+ */
+export async function applyFeedbackSelection(
+  larkClient: any,
+  value: Pick<FeedbackActionValue, "card_id" | "session_id" | "channel_id" | "locale">,
+  rating: FeedbackRating,
+): Promise<boolean> {
+  const session = feedbackEchoSessions.get(value.card_id);
+  if (!session) return false;
+  const locale: LarkLocale = value.locale === "en-US" ? "en-US" : "zh-CN";
+  try {
+    const res = await larkClient.cardkit.v1.cardElement.update({
+      path: { card_id: value.card_id, element_id: FEEDBACK_ELEMENT_ID },
+      data: {
+        element: JSON.stringify(buildFeedbackRow(
+          value.card_id,
+          { sessionId: value.session_id, channelId: value.channel_id },
+          locale,
+          rating,
+        )),
+        sequence: ++session.sequence,
+      },
+    });
+    if (cardApiFailed(res)) {
+      console.warn(`[lark-card] feedback echo rejected for cardId=${value.card_id}: code=${(res as any).code} msg=${(res as any).msg}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[lark-card] feedback echo failed for cardId=${value.card_id}:`, err);
+    return false;
+  }
+}
+
 /**
  * Convert markdown to the subset Feishu's card `markdown` element renders.
  *
@@ -249,11 +425,15 @@ export async function updateCardContent(
  * succeeded; `false` if either step failed (caller should log — at this
  * point the card is already visible, so a plain-text fallback would create
  * duplicate replies).
+ *
+ * When `feedback` is passed, a 👍/👎 button row is appended after the final
+ * content (best-effort — losing the buttons never fails the finalize).
  */
 export async function finalizeCard(
   larkClient: any,
   session: CardSession,
   finalText: string,
+  feedback?: { ctx: FeedbackContext; locale: LarkLocale },
 ): Promise<boolean> {
   const sanitized = sanitizeMarkdownForFeishu(finalText);
   let contentOk = false;
@@ -279,6 +459,13 @@ export async function finalizeCard(
     settingsOk = true;
   } catch (err) {
     console.error(`[lark-card] card.settings(streaming_mode=false) failed for cardId=${session.cardId}:`, err);
+  }
+
+  // Buttons go in AFTER streaming mode is off: structural element ops on a
+  // streaming card risk rejection, and this keeps the user-visible finalize
+  // (content + settings) off the extra round-trip.
+  if (feedback && contentOk && settingsOk) {
+    await appendFeedbackRow(larkClient, session, feedback.ctx, feedback.locale);
   }
 
   return contentOk && settingsOk;

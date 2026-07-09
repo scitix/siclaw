@@ -1025,6 +1025,58 @@ describe("chat.appendMessage", () => {
   });
 });
 
+describe("chat.recordFeedback", () => {
+  it("upserts a vote keyed by (message_ref, sender)", async () => {
+    const query = mockQuery([]);
+
+    const result = await getHandler("chat.recordFeedback")({
+      session_id: "sess-1",
+      message_ref: "CARD-1",
+      rating: "up",
+      sender_external_id: "ou_clicker",
+      channel_id: "lark",
+      source: "lark",
+    }, "a1");
+
+    expect(result).toEqual({ success: true });
+    const sql: string = query.mock.calls[0][0];
+    expect(sql).toContain("message_feedback");
+    // Repeat clicks must flip the stored rating, not error on the unique key.
+    expect(sql.toLowerCase()).toMatch(/on (duplicate key update|conflict)/);
+    expect(query.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      "sess-1", "CARD-1", "up", "ou_clicker", "lark",
+    ]));
+  });
+
+  it("rejects an invalid rating without touching the DB", async () => {
+    const query = mockQuery();
+    const result = await getHandler("chat.recordFeedback")({
+      session_id: "sess-1", message_ref: "CARD-1", rating: "meh", sender_external_id: "ou_1",
+    }, "a1");
+    expect(result.success).toBe(false);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing sender without touching the DB", async () => {
+    const query = mockQuery();
+    const result = await getHandler("chat.recordFeedback")({
+      session_id: "sess-1", message_ref: "CARD-1", rating: "down", sender_external_id: "  ",
+    }, "a1");
+    expect(result.success).toBe(false);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("returns {success:false} instead of throwing when the upsert fails (e.g. stale session FK)", async () => {
+    const query = vi.fn().mockRejectedValueOnce(new Error("FOREIGN KEY constraint failed"));
+    (getDb as any).mockReturnValue({ query, getConnection: vi.fn() });
+    const result = await getHandler("chat.recordFeedback")({
+      session_id: "deleted-sess", message_ref: "CARD-1", rating: "up", sender_external_id: "ou_1",
+    }, "a1");
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("FOREIGN KEY");
+  });
+});
+
 describe("chat.updateMessage", () => {
   it("updates message fields without bumping session count", async () => {
     const query = mockQuery([], []);
@@ -1831,9 +1883,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 49 handlers", () => {
+  it("registers exactly 50 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(49);
+    expect(handlers.size).toBe(50);
   });
 
   it("all expected handler names are registered", () => {
@@ -1844,7 +1896,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
-      "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
+      "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.recordFeedback", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",

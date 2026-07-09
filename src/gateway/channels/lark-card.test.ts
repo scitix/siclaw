@@ -5,6 +5,9 @@ import {
   updateCardContent,
   finalizeCard,
   buildMilestoneCardMarkdown,
+  applyFeedbackSelection,
+  resetFeedbackEchoForTest,
+  FEEDBACK_ACTION_KIND,
   DEFAULT_PLACEHOLDER,
   EMPTY_RESULT_NOTICE,
   PLACEHOLDER_BY_LOCALE,
@@ -123,6 +126,9 @@ function makeLarkClient(overrides: Partial<{
   replyThrows: Error;
   contentThrows: Error;
   settingsThrows: Error;
+  elementCreateRes: unknown;
+  elementCreateThrows: Error;
+  elementUpdateThrows: Error;
 }> = {}) {
   const createSpy = vi.fn(async () =>
     overrides.createThrows ? Promise.reject(overrides.createThrows) : overrides.createRes ?? { data: { card_id: "CARD-1" } },
@@ -136,12 +142,18 @@ function makeLarkClient(overrides: Partial<{
   const settingsSpy = vi.fn(async () =>
     overrides.settingsThrows ? Promise.reject(overrides.settingsThrows) : ({ code: 0 }),
   );
+  const elementCreateSpy = vi.fn(async () =>
+    overrides.elementCreateThrows ? Promise.reject(overrides.elementCreateThrows) : (overrides.elementCreateRes ?? { code: 0 }),
+  );
+  const elementUpdateSpy = vi.fn(async () =>
+    overrides.elementUpdateThrows ? Promise.reject(overrides.elementUpdateThrows) : ({ code: 0 }),
+  );
   return {
     client: {
       cardkit: {
         v1: {
           card: { create: createSpy, settings: settingsSpy },
-          cardElement: { content: contentSpy },
+          cardElement: { content: contentSpy, create: elementCreateSpy, update: elementUpdateSpy },
         },
       },
       im: {
@@ -152,6 +164,8 @@ function makeLarkClient(overrides: Partial<{
     replySpy,
     contentSpy,
     settingsSpy,
+    elementCreateSpy,
+    elementUpdateSpy,
   };
 }
 
@@ -282,6 +296,118 @@ describe("finalizeCard", () => {
     expect(contentSpy.mock.calls[0][0].data.content).toBe(EMPTY_RESULT_NOTICE);
   });
 });
+
+// ── 👍/👎 feedback buttons ─────────────────────────────────────
+
+describe("feedback buttons", () => {
+  it("finalizeCard with feedback appends a self-contained button row after the content", async () => {
+    resetFeedbackEchoForTest();
+    const { client, contentSpy, settingsSpy, elementCreateSpy } = makeLarkClient();
+    const session = { cardId: "CARD-FB-1", elementId: "md_main", sequence: 0 };
+
+    const ok = await finalizeCard(client as any, session, "done", {
+      ctx: { sessionId: "sess-1", channelId: "ch-1" },
+      locale: "zh-CN",
+    });
+    expect(ok).toBe(true);
+
+    expect(elementCreateSpy).toHaveBeenCalledTimes(1);
+    const arg = elementCreateSpy.mock.calls[0][0];
+    expect(arg.path.card_id).toBe("CARD-FB-1");
+    expect(arg.data.type).toBe("append");
+    // Sequence keeps increasing across content → settings → append (buttons
+    // are added only after streaming mode is off).
+    expect(contentSpy.mock.calls[0][0].data.sequence).toBe(1);
+    expect(settingsSpy.mock.calls[0][0].data.sequence).toBe(2);
+    expect(arg.data.sequence).toBe(3);
+
+    const [row] = JSON.parse(arg.data.elements);
+    expect(row.tag).toBe("column_set");
+    expect(row.element_id).toBe("fb_row");
+    const buttons = row.columns.map((c: any) => c.elements[0]);
+    expect(buttons.map((b: any) => b.element_id)).toEqual(["fb_up", "fb_down"]);
+    // The value payload is self-contained — persistence needs no message-id map.
+    expect(buttons[0].behaviors[0]).toEqual({
+      type: "callback",
+      value: {
+        kind: FEEDBACK_ACTION_KIND,
+        rating: "up",
+        session_id: "sess-1",
+        card_id: "CARD-FB-1",
+        channel_id: "ch-1",
+        locale: "zh-CN",
+      },
+    });
+    expect(buttons[1].behaviors[0].value.rating).toBe("down");
+    expect(buttons[0].text.content).toBe("👍 有帮助");
+  });
+
+  it("a failed button append does not fail the finalize", async () => {
+    resetFeedbackEchoForTest();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { client } = makeLarkClient({ elementCreateThrows: new Error("500") });
+    const session = { cardId: "CARD-FB-2", elementId: "md_main", sequence: 0 };
+
+    const ok = await finalizeCard(client as any, session, "done", {
+      ctx: { sessionId: "s", channelId: "c" },
+      locale: "en-US",
+    });
+    expect(ok).toBe(true);
+    // Not remembered → no echo possible either.
+    expect(await applyFeedbackSelection(client as any, feedbackValue("CARD-FB-2"), "up")).toBe(false);
+  });
+
+  it("a non-zero API code on append (SDK does not throw) is treated as failure — no echo registration", async () => {
+    resetFeedbackEchoForTest();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { client, elementUpdateSpy } = makeLarkClient({ elementCreateRes: { code: 300301, msg: "invalid element" } });
+    const session = { cardId: "CARD-FB-CODE", elementId: "md_main", sequence: 0 };
+
+    const ok = await finalizeCard(client as any, session, "done", {
+      ctx: { sessionId: "s", channelId: "c" },
+      locale: "zh-CN",
+    });
+    expect(ok).toBe(true);
+    expect(await applyFeedbackSelection(client as any, feedbackValue("CARD-FB-CODE"), "up")).toBe(false);
+    expect(elementUpdateSpy).not.toHaveBeenCalled();
+  });
+
+  it("applyFeedbackSelection re-renders the row with the chosen button highlighted", async () => {
+    resetFeedbackEchoForTest();
+    const { client, elementUpdateSpy } = makeLarkClient();
+    const session = { cardId: "CARD-FB-3", elementId: "md_main", sequence: 0 };
+    await finalizeCard(client as any, session, "done", {
+      ctx: { sessionId: "sess-3", channelId: "ch-3" },
+      locale: "zh-CN",
+    });
+
+    const echoed = await applyFeedbackSelection(client as any, feedbackValue("CARD-FB-3", "sess-3", "ch-3"), "down");
+    expect(echoed).toBe(true);
+    const arg = elementUpdateSpy.mock.calls[0][0];
+    expect(arg.path).toEqual({ card_id: "CARD-FB-3", element_id: "fb_row" });
+    // Continues the card's sequence after finalize (content 1, settings 2, append 3).
+    expect(arg.data.sequence).toBe(4);
+    const row = JSON.parse(arg.data.element);
+    const down = row.columns[1].elements[0];
+    expect(down.type).toBe("primary");
+    expect(down.text.content).toBe("👎 已反馈");
+    const up = row.columns[0].elements[0];
+    expect(up.type).toBe("default");
+    // The echo rebuilds the buttons from the callback value — payloads intact.
+    expect(up.behaviors[0].value.session_id).toBe("sess-3");
+  });
+
+  it("applyFeedbackSelection returns false for a card this process never finalized", async () => {
+    resetFeedbackEchoForTest();
+    const { client, elementUpdateSpy } = makeLarkClient();
+    expect(await applyFeedbackSelection(client as any, feedbackValue("CARD-UNKNOWN"), "up")).toBe(false);
+    expect(elementUpdateSpy).not.toHaveBeenCalled();
+  });
+});
+
+function feedbackValue(cardId: string, sessionId = "s", channelId = "c") {
+  return { card_id: cardId, session_id: sessionId, channel_id: channelId, locale: "zh-CN" as const };
+}
 
 describe("buildMilestoneCardMarkdown", () => {
   it("marks earlier milestones done (✅) and the latest in progress (⏳) while streaming", () => {
