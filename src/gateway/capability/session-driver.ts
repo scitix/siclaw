@@ -99,17 +99,31 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         // content hash, so this exact version is only re-sent if the file changes
         // again. Hence one retry, then a loud log.
         for (const a of evt.artifacts ?? []) {
-          const artifact: CapabilityPersistArtifactRequest = a.deleted
-            ? // Tombstone: the box deleted this file (page merge/rename/restructure).
-              // Without propagating it, the consumer's row outlives the file —
-              // publish ships the deleted page and the next respawn's workspace
-              // rehydration resurrects it onto the box's disk.
-              { run_id: runId, path: a.path, deleted: true }
-            : {
-                run_id: runId,
-                path: a.path,
-                content: { inline_base64: Buffer.from(a.content ?? "", "utf8").toString("base64") },
-              };
+          let artifact: CapabilityPersistArtifactRequest;
+          try {
+            artifact = a.deleted
+              ? // Tombstone: the box deleted this file (page merge/rename/restructure).
+                // Without propagating it, the consumer's row outlives the file —
+                // publish ships the deleted page and the next respawn's workspace
+                // rehydration resurrects it onto the box's disk.
+                { run_id: runId, path: a.path, deleted: true }
+              : {
+                  run_id: runId,
+                  path: a.path,
+                  content: { inline_base64: Buffer.from(a.content ?? "", "utf8").toString("base64") },
+                };
+          } catch (err) {
+            // One malformed entry must not kill the relay: everything after it —
+            // later artifacts, the final SELFCHECK sync, settled, end — would be
+            // lost and the run stranded mid-state (seen live 07-09: a runtime
+            // predating the tombstone branch threw here on {deleted:true} and
+            // every incremental round wedged DIRTY with a leaked box).
+            console.error(
+              `[capability] run=${runId} malformed artifact entry (${String(a?.path ?? "?")}) skipped:`,
+              err instanceof Error ? err.message : String(err),
+            );
+            continue;
+          }
           try {
             await frontendClient.request(CAPABILITY_PERSIST_ARTIFACT, artifact);
           } catch {

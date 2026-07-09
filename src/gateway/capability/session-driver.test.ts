@@ -128,6 +128,57 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(artifactCalls).toHaveLength(2);
   }, 10_000);
 
+  it("a malformed artifact entry is skipped loudly — the relay and later artifacts survive", async () => {
+    // Live 07-09: a runtime predating the tombstone branch threw in artifact
+    // construction (Buffer.from(undefined)) and the WHOLE relay died right after
+    // turn_done — the final SELFCHECK sync, settled, and end were lost, every
+    // incremental round wedged DIRTY, and the box pod leaked. Construction is
+    // still throwable today (a box bug sending a non-string content), so the
+    // guard is a boundary rule, not a legacy patch: skip the bad entry, keep
+    // the stream.
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([
+          {
+            type: "syncArtifacts",
+            artifacts: [
+              { path: "authoring/BAD.json", content: 42 as any }, // non-string → Buffer.from throws
+              { path: "authoring/SELFCHECK.json", content: '{"state":"passed"}' },
+            ],
+          },
+          { type: "end" },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACT);
+    expect(artifactCalls).toHaveLength(1); // the good one after the bad one still landed
+    expect(artifactCalls[0][1]).toMatchObject({ run_id: "r1", path: "authoring/SELFCHECK.json" });
+    expect(mgr.endRun).not.toHaveBeenCalledWith("r1", "failed");
+  });
+
+  it("a deletion tombstone persists as {deleted:true} with no content", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    await driveCapabilitySession({
+      client: fakeClient([
+        { type: "syncArtifacts", artifacts: [{ path: "candidate/gone.md", deleted: true }] },
+        { type: "end" },
+      ]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACT, {
+      run_id: "r1",
+      path: "candidate/gone.md",
+      deleted: true,
+    });
+  });
+
   it("an unhandled box event (e.g. the retired 'parked') is ignored, not fatal", async () => {
     // The box never emits 'parked' (the handler was removed as dead code); a stray
     // one must fall through harmlessly — no turn, no status change, no crash.
