@@ -2364,6 +2364,17 @@ async def _run_wrapper(run: CompileRun):
                 await _t
             except asyncio.CancelledError:
                 pass
+        # Detached verify tasks die with the run (audit finding): a media/PK
+        # pass mid-flight on a run that just ended kept burning model calls
+        # for minutes, then no-op'd its repair injection into a dead session.
+        for _name in ("_media_task", "_pk_task"):
+            _bg = getattr(run, _name, None)
+            if _bg is not None and not _bg.done():
+                _bg.cancel()
+                try:
+                    await _bg
+                except BaseException:
+                    pass  # cancellation/teardown errors must not mask the run's outcome
         # Final sync so the last writes are durable even if no tick caught them —
         # especially on the crash path where no bundle was submitted.
         try:

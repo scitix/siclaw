@@ -460,8 +460,8 @@ export class K8sSpawner implements BoxSpawner {
               const res = boxConfig.resources ?? profile.resources;
               return {
                 requests: {
-                  cpu: res?.cpu || "100m",
-                  memory: res?.memory || "256Mi",
+                  cpu: res?.cpuRequest || res?.cpu || "100m",
+                  memory: res?.memoryRequest || res?.memory || "256Mi",
                 },
                 limits: {
                   cpu: res?.cpu || "2000m",
@@ -606,6 +606,65 @@ export class K8sSpawner implements BoxSpawner {
         throw err;
       }
       // Pod does not exist, ignore
+    }
+  }
+
+  /**
+   * Periodic orphan GC for CAPABILITY boxes (kb-compile / kb-test) + their cert
+   * Secrets. Two orphan shapes (audit finding — both accumulate forever):
+   *   - a pod in a terminal phase (Succeeded/Failed): its process exited, a
+   *     capability run never reuses a pod;
+   *   - a RUNNING pod whose run is no longer live (`isLive(boxId)` false): the
+   *     aiohttp server idles on after its run ended — the shape a normally-
+   *     completed run used to leave behind (the relay-close stop now covers
+   *     the common path; this sweep covers crashes, runtime restarts, and
+   *     pre-existing debris).
+   * Chat agent boxes (boxType "agent") are NEVER touched — they have their own
+   * idle self-destruct lifecycle.
+   */
+  async sweepOrphans(isLive: (boxId: string) => boolean): Promise<void> {
+    const { namespace, labelPrefix } = this.config;
+    const selector = `${labelPrefix}/app=agentbox`;
+    const capabilityTypes = new Set(["kb-compile", "kb-test"]);
+    const pods = await this.coreApi.listNamespacedPod({ namespace, labelSelector: selector });
+    const keptPods = new Set<string>();
+    for (const pod of pods.items ?? []) {
+      const name = pod.metadata?.name;
+      if (!name) continue;
+      const boxType = pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent";
+      if (!capabilityTypes.has(boxType)) {
+        keptPods.add(name); // not ours to manage — its Secret is kept too
+        continue;
+      }
+      const phase = pod.status?.phase;
+      const terminal = phase === "Succeeded" || phase === "Failed";
+      if (!terminal && isLive(name)) {
+        keptPods.add(name);
+        continue;
+      }
+      console.log(`[k8s-spawner] orphan sweep: removing ${name} (phase=${phase ?? "?"}, live=${!terminal && isLive(name)})`);
+      try {
+        await this.stop(name); // deletes the pod + its cert Secret, 404-tolerant
+      } catch (err: any) {
+        console.warn(`[k8s-spawner] orphan sweep: stop ${name} failed:`, err?.message ?? err);
+        keptPods.add(name); // keep its Secret this round; retry next sweep
+      }
+    }
+    // Cert Secrets whose pod is gone entirely (e.g. pod deleted out-of-band).
+    const secrets = await this.coreApi.listNamespacedSecret({ namespace, labelSelector: selector });
+    for (const s of secrets.items ?? []) {
+      const name = s.metadata?.name;
+      if (!name || !name.endsWith("-cert")) continue;
+      if (keptPods.has(name.slice(0, -"-cert".length))) continue;
+      if (pods.items?.some((p: any) => p.metadata?.name === name.slice(0, -"-cert".length))) continue;
+      console.log(`[k8s-spawner] orphan sweep: removing orphaned Secret ${name}`);
+      try {
+        await this.coreApi.deleteNamespacedSecret({ name, namespace });
+      } catch (err: any) {
+        if (err?.code !== 404 && err?.statusCode !== 404) {
+          console.warn(`[k8s-spawner] orphan sweep: delete Secret ${name} failed:`, err?.message ?? err);
+        }
+      }
     }
   }
 
