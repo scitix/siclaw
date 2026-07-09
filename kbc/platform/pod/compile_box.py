@@ -1362,10 +1362,19 @@ async def _post_turn_selfcheck(run) -> str | None:
     incr = getattr(run, "_incr_pending", None)
     run._incr_pending = None
     key = selfcheck.state_key(workdir)
-    if key is None or key == run._selfcheck_key:
-        return None
-    if not (Path(workdir) / "candidate" / "index.md").is_file():
-        return None  # mid-Execute: pages exist but the index isn't written yet
+    if incr is None:
+        if key is None or key == run._selfcheck_key:
+            return None
+        if not (Path(workdir) / "candidate" / "index.md").is_file():
+            return None  # mid-Execute: pages exist but the index isn't written yet
+    elif key is not None and key == run._selfcheck_key:
+        return None  # byte-unchanged tree → no out-of-scope edits possible
+    # An INCREMENTAL turn falls through even with index.md (or the whole tree)
+    # missing: on an incremental turn the index always pre-existed, so its
+    # absence IS out-of-scope damage — the guard below restores what the
+    # snapshot covers and the ledger/lint flags the rest. The early-returns
+    # used to fire after the guard state was already consumed, letting an
+    # index-deleting turn escape the byte freeze entirely (review finding).
     run._selfcheck_key = key
     # Scoped-incremental byte-integrity guard: on an incremental turn, pages OUTSIDE
     # the authorized set (affected ∪ declared added-targets ∪ index) must be byte-

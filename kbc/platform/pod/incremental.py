@@ -166,8 +166,17 @@ def restore_pages(workdir: str, before_bytes: dict[str, bytes], pages: list[str]
         if original is None:
             continue
         target = cand / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(original)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(original)
+        except OSError as e:
+            # One unrestorable page (path became a directory, perm/IO error)
+            # must not abort the rest: it stays an unrestored violation and
+            # falls to the repair-prompt fallback, while every other page is
+            # still restored (review finding: a mid-loop throw used to skip
+            # the remaining restores AND the whole ledger pass).
+            print(f"[incremental] restore {rel} failed, left for repair: {e!r}")
+            continue
         restored.append(rel)
     return restored
 

@@ -171,6 +171,25 @@ def test_page_bytes_and_restore():
         print("OK  page_bytes + restore_pages (modified written back, deleted recreated, created skipped)")
 
 
+def test_restore_skips_unrestorable_page():
+    """Review fix: one unrestorable page (its path became a directory) must not
+    abort the rest of the restore — it stays a violation for the repair prompt
+    while every other page is still restored."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _kb(base)
+        snap = incremental.page_bytes(td)
+        # model drifts on b.md and c.md; b.md is then unrestorable (now a dir)
+        (base / "candidate/b.md").unlink()
+        (base / "candidate/b.md").mkdir()
+        _mk(base, "candidate/c.md", _page(["snap/four.md"]) + "\n擅自改动。")
+        restored = incremental.restore_pages(td, snap, ["b.md", "c.md"])
+        assert restored == ["c.md"], restored  # c.md restored despite b.md failing
+        assert (base / "candidate/c.md").read_bytes() == snap["c.md"]
+        assert (base / "candidate/b.md").is_dir()  # left for the repair fallback
+        print("OK  restore skips unrestorable page, restores the rest")
+
+
 def test_protocol_raw_changes_to_changeset():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -241,6 +260,7 @@ if __name__ == "__main__":
     test_build_changeset()
     test_integrity_guard()
     test_page_bytes_and_restore()
+    test_restore_skips_unrestorable_page()
     test_protocol_raw_changes_to_changeset()
     test_added_targets_and_authorized()
     test_scoped_directive()
