@@ -170,6 +170,30 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
 }
 
 /**
+ * Record (or re-vote) end-user feedback on a channel reply. `messageRef` is a
+ * channel-level reply reference (Feishu CardKit card_id), not a chat_messages
+ * id — see the message_feedback DDL comment. One vote per (reply, person);
+ * the server upserts on repeat clicks.
+ */
+export async function recordChannelFeedback(params: {
+  sessionId: string;
+  messageRef: string;
+  rating: "up" | "down";
+  senderExternalId: string;
+  channelId?: string | null;
+  source?: string;
+}): Promise<{ success: boolean; error?: string }> {
+  return getClient().request("chat.recordFeedback", {
+    session_id: params.sessionId,
+    message_ref: params.messageRef,
+    rating: params.rating,
+    sender_external_id: params.senderExternalId,
+    channel_id: params.channelId ?? null,
+    source: params.source ?? "lark",
+  });
+}
+
+/**
  * Persist a parent-session notification that records a delegated child run
  * result. Today this is audit/event metadata only; the frontend hides it so
  * the synchronous delegation tool card remains the only visible user surface.

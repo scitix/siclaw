@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { ArrowDown, ArrowUp, Loader2, Plus, Save, Trash2 } from "lucide-react"
+import { ArrowDown, ArrowUp, ChevronRight, Loader2, Plus, Save, Trash2, Users } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
 import { AgentTasks } from "./AgentTasks"
@@ -769,26 +769,94 @@ function ResourcesTab({ allClusters, allHosts, selectedClusterIds, setSelectedCl
   )
 }
 
+interface PersonalBotInfo {
+  id: string
+  agent_id: string
+  domain: "feishu" | "lark"
+  app_id: string
+  access_mode: string
+  group_auto_bind: boolean
+  status: string
+}
+
 function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
   agentId: string; selectedChannelIds: Set<string>; setSelectedChannelIds: (v: Set<string>) => void
 }) {
   const toast = useToast()
   const [bindings, setBindings] = useState<{ id: string; channel_id: string; channel_name: string; channel_type: string; route_key: string; route_type: string; display_name?: string | null }[]>([])
-  const [allChannels, setAllChannels] = useState<{ id: string; name: string; type: string }[]>([])
+  const [allChannels, setAllChannels] = useState<{ id: string; name: string; type: string; is_personal_bot?: boolean }[]>([])
   const [loading, setLoading] = useState(true)
   const [pairingCode, setPairingCode] = useState<string | null>(null)
   const [pairingChannel, setPairingChannel] = useState("")
   const [generating, setGenerating] = useState(false)
+  const [isAdmin, setIsAdmin] = useState(false)
+
+  // The agent's dedicated Feishu bot (channels row with config.personal_bot).
+  // Collapsed to a summary line once active; only admins can edit.
+  const [bot, setBot] = useState<PersonalBotInfo | null>(null)
+  const [botExpanded, setBotExpanded] = useState(false)
+  const [botForm, setBotForm] = useState({ domain: "feishu", app_id: "", app_secret: "", group_auto_bind: true })
+  const [savingBot, setSavingBot] = useState(false)
+
+  const applyBot = (b: PersonalBotInfo | null) => {
+    setBot(b)
+    setBotForm({
+      domain: b?.domain ?? "feishu",
+      app_id: b?.app_id ?? "",
+      app_secret: "",
+      group_auto_bind: b ? b.group_auto_bind : true,
+    })
+    setBotExpanded(!(b && b.status === "active"))
+  }
 
   useEffect(() => {
     Promise.all([
-      api<{ data: typeof bindings }>(`/siclaw/agents/${agentId}/channel-bindings`),
-      api<{ data: typeof allChannels }>("/channels"),
-    ]).then(([b, c]) => {
+      api<{ data: typeof bindings }>(`/siclaw/agents/${agentId}/channel-bindings`).catch(() => ({ data: [] })),
+      // Admin-only endpoint — non-admins just see the advanced section empty.
+      api<{ data: typeof allChannels }>("/channels").catch(() => ({ data: [] })),
+      api<{ role: string }>("/auth/me").catch(() => ({ role: "" })),
+      api<{ data: PersonalBotInfo | null }>(`/siclaw/agents/${agentId}/personal-bot`).catch(() => ({ data: null })),
+    ]).then(([b, c, me, pb]) => {
       setBindings(Array.isArray(b.data) ? b.data : [])
-      setAllChannels(Array.isArray(c.data) ? c.data : [])
+      // Dedicated per-agent bots are managed right here, not via the shared list.
+      setAllChannels((Array.isArray(c.data) ? c.data : []).filter(ch => !ch.is_personal_bot))
+      setIsAdmin(me.role === "admin")
+      applyBot(pb.data ?? null)
     }).catch(() => {}).finally(() => setLoading(false))
   }, [agentId])
+
+  const refetchBot = async () => {
+    try {
+      const pb = await api<{ data: PersonalBotInfo | null }>(`/siclaw/agents/${agentId}/personal-bot`)
+      applyBot(pb.data ?? null)
+    } catch { /* keep current view */ }
+  }
+
+  const handleSaveBot = async () => {
+    setSavingBot(true)
+    try {
+      await api(`/siclaw/agents/${agentId}/personal-bot`, {
+        method: "PUT",
+        body: {
+          domain: botForm.domain,
+          app_id: botForm.app_id,
+          app_secret: botForm.app_secret,
+          group_auto_bind: botForm.group_auto_bind,
+        },
+      })
+      toast.success("Bot saved and enabled")
+      await refetchBot()
+    } catch (err: any) { toast.error(err.message) } finally { setSavingBot(false) }
+  }
+
+  const handleDisableBot = async () => {
+    setSavingBot(true)
+    try {
+      await api(`/siclaw/agents/${agentId}/personal-bot`, { method: "DELETE" })
+      toast.success("Bot disabled")
+      await refetchBot()
+    } catch (err: any) { toast.error(err.message) } finally { setSavingBot(false) }
+  }
 
   const handlePair = async () => {
     if (!pairingChannel) return
@@ -814,14 +882,126 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
 
   if (loading) return <div className="flex items-center justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
 
+  const botActive = bot?.status === "active"
+
   return (
     <div className="px-6 py-6 space-y-6">
-      {/* Section 1: Admin — authorize which channels this agent can use */}
+      {/* ── 1. This agent's Feishu bot (dedicated app; admin-managed) ── */}
+      <div className="rounded-lg border border-border bg-card">
+        <button
+          type="button"
+          onClick={() => setBotExpanded(v => !v)}
+          className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left hover:bg-secondary/20"
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <ChevronRight className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${botExpanded ? "rotate-90" : ""}`} />
+            <div className="min-w-0">
+              <h4 className="text-[13px] font-medium text-foreground">This agent's Feishu bot</h4>
+              {botExpanded || !bot ? (
+                <p className="mt-0.5 text-[11px] text-muted-foreground/70">A dedicated Feishu app — serves direct messages and every group it joins. Open access; admin-configured.</p>
+              ) : (
+                <p className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                  <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] font-medium">open</span>
+                  <span className="font-mono">{bot.app_id}</span>
+                </p>
+              )}
+            </div>
+          </div>
+          {botActive && (
+            <span className="shrink-0 rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">Active</span>
+          )}
+        </button>
+
+        {botExpanded && (
+          <div className="space-y-3 border-t border-border px-4 py-4">
+            {isAdmin ? (<>
+              <div className="grid gap-3 md:grid-cols-3">
+                <div className="space-y-1">
+                  <label className="text-[11px] text-muted-foreground">Region</label>
+                  <select value={botForm.domain} onChange={e => setBotForm(p => ({ ...p, domain: e.target.value }))} className="w-full h-8 px-2 text-[13px] rounded-md border border-border bg-background">
+                    <option value="feishu">Feishu (China)</option>
+                    <option value="lark">Lark (Global)</option>
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[11px] text-muted-foreground">App ID</label>
+                  <input value={botForm.app_id} onChange={e => setBotForm(p => ({ ...p, app_id: e.target.value }))} placeholder="cli_xxx" className="w-full h-8 px-3 text-[13px] rounded-md border border-border bg-background" />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[11px] text-muted-foreground">App Secret</label>
+                  <input type="password" value={botForm.app_secret} onChange={e => setBotForm(p => ({ ...p, app_secret: e.target.value }))} placeholder={bot ? "(unchanged)" : "app_secret"} className="w-full h-8 px-3 text-[13px] rounded-md border border-border bg-background" />
+                </div>
+              </div>
+              <label className="flex items-center gap-2 text-[12px] cursor-pointer">
+                <input type="checkbox" checked={botForm.group_auto_bind} onChange={e => setBotForm(p => ({ ...p, group_auto_bind: e.target.checked }))} className="rounded" />
+                <span>Auto-serve groups — just add the bot to a group and it works, no pairing. When off, it serves direct messages only.</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <button onClick={handleSaveBot} disabled={savingBot || !botForm.app_id} className="h-8 px-4 text-[12px] rounded-md bg-primary text-primary-foreground disabled:opacity-50">
+                  {savingBot ? "..." : botActive ? "Save" : "Save and enable"}
+                </button>
+                {botActive && (
+                  <button onClick={handleDisableBot} disabled={savingBot} className="h-8 px-4 text-[12px] rounded-md border border-border text-muted-foreground hover:text-foreground">
+                    Disable
+                  </button>
+                )}
+              </div>
+            </>) : (
+              <p className="text-[11px] text-muted-foreground/70">
+                {bot ? `Bot ${bot.app_id} is ${bot.status}. ` : "No dedicated bot configured. "}
+                Configuring the bot requires an admin.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── 2. Active groups ── */}
+      <div className="space-y-3">
+        <h4 className="text-[12px] font-medium text-muted-foreground">Active groups ({bindings.length})</h4>
+        {bindings.length === 0 ? (
+          <p className="text-[11px] text-muted-foreground/60">
+            {botActive
+              ? "No groups yet. Add the bot to a group and @-mention it once to auto-connect."
+              : "No groups yet. Enable the agent's bot above, or pair via the advanced shared-app flow below."}
+          </p>
+        ) : (
+          <div className="space-y-1.5">
+            {bindings.map(b => (
+              <div key={b.id} className="flex items-center justify-between px-3 py-2 rounded-md border border-border/50">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-secondary text-muted-foreground">
+                    <Users className="h-3.5 w-3.5" />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="truncate text-[12px]">{b.display_name || <span className="font-mono">{b.route_key}</span>}</p>
+                    <p className="truncate text-[10px] text-muted-foreground font-mono">{b.channel_name || b.channel_id} · {b.route_type}: {b.route_key}</p>
+                  </div>
+                </div>
+                <button onClick={() => handleUnbind(b.id)} title="Unbind" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── 3. Advanced: shared app & manual pairing (legacy flow) ──
+          Several agents sharing one org-level app, connected per group via a
+          PAIR code. Irrelevant once the agent has its own bot — hidden then. */}
+      {!botActive && (
+      <details className="group rounded-lg border border-border">
+        <summary className="cursor-pointer list-none px-4 py-2.5 text-[12px] font-medium text-muted-foreground hover:bg-secondary/20">
+          <span className="select-none">▸ Advanced: shared app & manual pairing</span>
+        </summary>
+        <div className="space-y-5 border-t border-border px-4 py-4">
+      {/* Admin — authorize which shared channels this agent can use */}
       <div className="space-y-3">
         <h4 className="text-[12px] font-medium text-muted-foreground">Authorized Channels (admin)</h4>
-        <p className="text-[11px] text-muted-foreground/70">Select which channels this agent can use. Users can only pair within authorized channels.</p>
+        <p className="text-[11px] text-muted-foreground/70">Select which shared channels this agent can use. Users can only pair within authorized channels.</p>
         {allChannels.length === 0 ? (
-          <p className="text-[11px] text-muted-foreground/60">No channels configured. Add channels in Settings → Channels.</p>
+          <p className="text-[11px] text-muted-foreground/60">No shared channels configured. Admins can add them in Settings → Channels.</p>
         ) : (
           <div className="max-h-48 overflow-auto border border-border rounded-md">
             {allChannels.map(c => (
@@ -839,7 +1019,7 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
         )}
       </div>
 
-      {/* Section 2: Pair a chat group (using authorized channels only) */}
+      {/* Pair a chat group (using authorized channels only) */}
       <div className="space-y-3 border-t border-border pt-5">
         <h4 className="text-[12px] font-medium text-muted-foreground">Pair a Chat Group</h4>
         <div className="flex items-center gap-2">
@@ -864,28 +1044,9 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
           </div>
         )}
       </div>
-
-      {/* Section 3: Active bindings */}
-      <div className="space-y-3 border-t border-border pt-5">
-        <h4 className="text-[12px] font-medium text-muted-foreground">My Bindings ({bindings.length})</h4>
-        {bindings.length === 0 ? (
-          <p className="text-[11px] text-muted-foreground/60">No bindings yet. Use pairing to connect chat groups.</p>
-        ) : (
-          <div className="space-y-1.5">
-            {bindings.map(b => (
-              <div key={b.id} className="flex items-center justify-between px-3 py-2 rounded-md border border-border/50">
-                <div>
-                  <p className="text-[12px]">{b.display_name || <span className="font-mono">{b.route_key}</span>}</p>
-                  <p className="text-[10px] text-muted-foreground font-mono">{b.channel_name || b.channel_id} · {b.route_type}: {b.route_key}</p>
-                </div>
-                <button onClick={() => handleUnbind(b.id)} title="Unbind" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+        </div>
+      </details>
+      )}
     </div>
   )
 }

@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { RestRouter } from "../gateway/rest-router.js";
-import type { RuntimeConnectionMap } from "./runtime-connection.js";
+import { broadcastChannelReload, type RuntimeConnectionMap } from "./runtime-connection.js";
 
 /** Subset of config needed by siclaw API routes */
 interface SiclawConfig {
@@ -2419,6 +2419,135 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     }
 
     await db.query("DELETE FROM channel_bindings WHERE id = ?", [params.bindingId]);
+    sendJson(res, 200, { ok: true });
+  });
+
+  // ================================================================
+  // Personal bot (Agent sub-resource) — the agent's dedicated Feishu app.
+  //
+  // Stored as a regular `channels` row whose config carries
+  // `personal_bot: { agent_id, access_mode: "open", ... }` — the adapter's
+  // channel.list / resolvePersonalChannelBinding already understand that
+  // shape, so the gateway serves the bot with zero extra plumbing.
+  // Standalone supports OPEN access only (authorized mode is Sicore-only).
+  // Reads are open to any authenticated user; writes are ADMIN ONLY.
+  // ================================================================
+
+  /** channels row carrying config.personal_bot for this agent, or null. */
+  async function findPersonalBotChannel(
+    db: Db,
+    agentId: string,
+  ): Promise<{ id: string; name: string; status: string; config: Record<string, any> } | null> {
+    const [rows] = await db.query(
+      "SELECT id, name, status, config FROM channels WHERE type = 'lark' ORDER BY created_at, id",
+    ) as any;
+    for (const row of rows as any[]) {
+      const cfg = safeParseJson(row.config, null) as Record<string, any> | null;
+      if (cfg?.personal_bot?.agent_id === agentId) {
+        return { id: row.id, name: row.name, status: row.status, config: cfg };
+      }
+    }
+    return null;
+  }
+
+  /** Best-effort: ask every connected runtime to re-pull the channel list. */
+  function pushChannelReload(): void {
+    broadcastChannelReload(config.connectionMap);
+  }
+
+  // GET the agent's personal bot config (no secret in the response)
+  router.get(`${P}/agents/:id/personal-bot`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const row = await findPersonalBotChannel(getDb(), params.id);
+    if (!row) { sendJson(res, 200, { data: null }); return; }
+    sendJson(res, 200, {
+      data: {
+        id: row.id,
+        agent_id: params.id,
+        domain: row.config.domain === "lark" ? "lark" : "feishu",
+        app_id: row.config.app_id ?? "",
+        access_mode: "open",
+        group_auto_bind: row.config.personal_bot?.group_auto_bind !== false,
+        status: row.status,
+      },
+    });
+  });
+
+  // PUT — create or update the agent's personal bot (ADMIN ONLY)
+  router.put(`${P}/agents/:id/personal-bot`, async (req, res, params) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+
+    const body = await parseBody<{
+      domain?: string; app_id?: string; app_secret?: string; group_auto_bind?: boolean;
+    }>(req);
+    const appId = typeof body.app_id === "string" ? body.app_id.trim() : "";
+    if (!appId) { sendJson(res, 400, { error: "app_id is required" }); return; }
+
+    const db = getDb();
+    const [agentRows] = await db.query(
+      "SELECT id, name, created_by FROM agents WHERE id = ?", [params.id],
+    ) as any;
+    if (agentRows.length === 0) { sendJson(res, 404, { error: "Agent not found" }); return; }
+    const agent = agentRows[0];
+
+    const existing = await findPersonalBotChannel(db, params.id);
+    const newSecret = typeof body.app_secret === "string" ? body.app_secret.trim() : "";
+    // A blank secret on update keeps the stored one; require a non-empty
+    // secret to exist one way or the other (never write an active bot with no
+    // credential, which would fail every token fetch silently).
+    const effectiveSecret = newSecret || (typeof existing?.config.app_secret === "string" ? existing.config.app_secret : "");
+    if (!effectiveSecret) {
+      sendJson(res, 400, { error: "app_secret is required" });
+      return;
+    }
+
+    const cfg: Record<string, any> = {
+      ...(existing?.config ?? {}),
+      domain: body.domain === "lark" ? "lark" : "feishu",
+      app_id: appId,
+      app_secret: effectiveSecret,
+      personal_bot: {
+        ...(existing?.config.personal_bot ?? {}),
+        agent_id: params.id,
+        access_mode: "open",
+        // Turns run as the agent owner; keep the stored owner on update,
+        // else the agent creator, else the configuring admin.
+        owner_user_id: existing?.config.personal_bot?.owner_user_id ?? agent.created_by ?? auth.userId,
+        group_auto_bind: body.group_auto_bind !== false,
+      },
+    };
+
+    if (existing) {
+      await db.query(
+        "UPDATE channels SET config = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [JSON.stringify(cfg), existing.id],
+      );
+    } else {
+      await db.query(
+        "INSERT INTO channels (id, name, type, config, status, created_by) VALUES (?, ?, 'lark', ?, 'active', ?)",
+        [crypto.randomUUID(), `${agent.name} Bot`, JSON.stringify(cfg), auth.userId],
+      );
+    }
+    pushChannelReload();
+    sendJson(res, 200, { ok: true });
+  });
+
+  // DELETE — disable the agent's personal bot, keeping credentials (ADMIN ONLY)
+  router.delete(`${P}/agents/:id/personal-bot`, async (req, res, params) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+
+    const db = getDb();
+    const existing = await findPersonalBotChannel(db, params.id);
+    if (!existing) { sendJson(res, 404, { error: "Personal bot not found" }); return; }
+    await db.query(
+      "UPDATE channels SET status = 'inactive', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [existing.id],
+    );
+    pushChannelReload();
     sendJson(res, 200, { ok: true });
   });
 
