@@ -32,6 +32,7 @@ A hosted preview of the Portal UI — 4 specialist agents, recorded investigatio
 - **Reusable Skills** — Turn repeated diagnostic playbooks into reviewable runbooks
 - **Extensible** — Connect external tools and data sources through [MCP](https://modelcontextprotocol.io)
 - **Multi-Channel Access** — Use Siclaw from the terminal, web UI, or chat channels
+- **Agent Tracing** — Export agent behavior (LLM calls, tools, tokens) to [Langfuse](https://langfuse.com), [Phoenix](https://phoenix.arize.com), or any OTLP backend; configured in the web UI and hot-reloaded live
 
 ## Architecture
 
@@ -255,6 +256,7 @@ All configuration happens through the web UI:
 - [Kubernetes Deployment](https://docs.siclaw.ai/install/kubernetes)
 - [LLM Providers](https://docs.siclaw.ai/configuration/providers)
 - [MCP Servers](https://docs.siclaw.ai/configuration/mcp)
+- [Agent Tracing](https://docs.siclaw.ai/features/tracing)
 
 ## Tech Stack
 

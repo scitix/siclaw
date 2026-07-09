@@ -50,6 +50,9 @@ import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
+import { isTracingEnabled } from "../shared/tracing/otel-provider.js";
+import type { SpanContext } from "@opentelemetry/api";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
 import { detectLanguage } from "../shared/detect-language.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
@@ -75,6 +78,13 @@ import {
 } from "../core/model-routing.js";
 import type { GatewayClient } from "./gateway-client.js";
 // topic-consolidator import removed — consolidation disabled
+
+/**
+ * Parent trace context captured once at spawn dispatch and threaded to every child run.
+ * `mainTraceId` stamps chat_messages.trace_id (DB audit); `spawnSpanContext` nests the child
+ * ROOT under the parent's spawn_subagent tool span (Langfuse). Both undefined when tracing is off.
+ */
+type SubagentTraceContext = { mainTraceId?: string; spawnSpanContext?: SpanContext };
 
 export interface ManagedSession {
   id: string;
@@ -159,6 +169,8 @@ export interface ManagedSession {
    */
   _pendingNotifications: TaskNotification[];
   _coalesceTimer: ReturnType<typeof setTimeout> | null;
+  /** Unsubscribe for the gated tracing brain.subscribe; called + nulled on detach. */
+  _tracingUnsub: (() => void) | null;
 }
 
 export interface PersistedDpStateSnapshot {
@@ -491,6 +503,17 @@ export class AgentBoxSessionManager {
    */
   private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
     return async (request, onProgress, signal) => {
+      // Capture the parent's trace context ONCE at dispatch — synchronously, while the parent
+      // turn's trace is still live (a background parent may end its prompt before the child
+      // starts). request.spawnId === the tool-call id BOTH here and as the batch groupId, so this
+      // ensureToolSpan resolves the ONE spawn_subagent tool span; every child (collapse / map /
+      // reduce) nests under it (spawnSpanContext) and shares the DB trace_id (mainTraceId).
+      // ⚠️ Never re-capture per child with a derived `${groupId}#i` id — that mints phantom spans.
+      const traceCtx = {
+        mainTraceId: tracingRecorder.getRootTraceId(request.parentSessionId),
+        spawnSpanContext: tracingRecorder.ensureToolSpan(request.parentSessionId, request.spawnId, "spawn_subagent"),
+      };
+
       const isCollapse = request.renderedTasks.length === 1 && !request.reducePrompt;
 
       if (isCollapse) {
@@ -508,7 +531,7 @@ export class AgentBoxSessionManager {
           taskListId: request.taskListId,
           spawnId: request.spawnId,
         };
-        if (childReq.runInBackground) return this.startBackgroundSubagent(childReq);
+        if (childReq.runInBackground) return this.startBackgroundSubagent(childReq, traceCtx);
         // Already aborted before we even queue (e.g. the whole turn was cancelled): don't
         // acquire a slot or spin up a throwaway child session — short-circuit cleanly.
         if (signal?.aborted) {
@@ -536,13 +559,13 @@ export class AgentBoxSessionManager {
           // Flip a previously-queued card to "running" immediately on slot acquisition,
           // before the child's first tool call emits progress (avoids a stale "Queued").
           onProgress?.({ status: "running", toolCalls: 0, steps: [] });
-          return this.runSpawnedSubagent(childReq, undefined, onProgress, signal);
+          return this.runSpawnedSubagent(childReq, { ...traceCtx }, onProgress, signal);
         });
       }
 
       // ── Batch (map→reduce): background (default for a multi-item batch) → register a job, return
       //    "launched", notify on completion; foreground → run the whole group and return inline. ──
-      if (request.runInBackground) return this.startBackgroundSubagentGroup(request);
+      if (request.runInBackground) return this.startBackgroundSubagentGroup(request, traceCtx);
       // Already aborted before we queue anything (whole turn cancelled): short-circuit
       // without creating any child session — every item is skipped.
       if (signal?.aborted) {
@@ -564,7 +587,7 @@ export class AgentBoxSessionManager {
       // separate throttled group_progress emitter instead.
       const throttled = onProgress ? throttleTrailing(onProgress, GROUP_PROGRESS_THROTTLE_MS) : undefined;
       try {
-        return await this.runSubagentGroup(request, throttled?.call, signal);
+        return await this.runSubagentGroup(request, throttled?.call, signal, traceCtx);
       } finally {
         throttled?.cancel();
       }
@@ -595,6 +618,7 @@ export class AgentBoxSessionManager {
     request: SpawnSubagentGroupRequest,
     onProgress?: (progress: SubagentGroupProgress) => void,
     signal?: AbortSignal,
+    traceCtx?: SubagentTraceContext,
   ): Promise<SubagentGroupReport> {
     const startedAt = Date.now();
     const groupId = request.spawnId;
@@ -681,7 +705,7 @@ export class AgentBoxSessionManager {
           // limiter slot must stay `queued`, not report as running.
           state.status = "running";
           emit("map");
-          return this.runSpawnedSubagent(childReq, undefined, undefined, mapAbort.signal);
+          return this.runSpawnedSubagent(childReq, { ...traceCtx }, undefined, mapAbort.signal);
         }));
       } catch (err) {
         res = {
@@ -782,7 +806,7 @@ export class AgentBoxSessionManager {
         };
         try {
           const reduceRes = await this.groupChildLimiter.run(() => this.subagentLimiter.run(() =>
-            this.runSpawnedSubagent(reduceReq, undefined, undefined, userAbort.signal),
+            this.runSpawnedSubagent(reduceReq, { ...traceCtx }, undefined, userAbort.signal),
           ));
           if (reduceRes.status === "done") {
             // Use the FULL reduce report, not the 1800-char capsule, before applying the group's
@@ -858,6 +882,7 @@ export class AgentBoxSessionManager {
       reduceChildSessionId,
       itemStatuses: itemResults.map((r, i) => ({ index: i, status: r.status })),
       durationMs,
+      traceId: traceCtx?.mainTraceId,
     });
 
     return {
@@ -881,6 +906,7 @@ export class AgentBoxSessionManager {
       reduceChildSessionId?: string;
       itemStatuses?: Array<{ index: number; status: GroupItemStatus }>;
       durationMs: number;
+      traceId?: string;
     },
   ): Promise<void> {
     const agentId = request.parentAgentId ?? this.agentId ?? null;
@@ -902,6 +928,7 @@ export class AgentBoxSessionManager {
         scope: request.description,
         toolCalls: 0,
         durationMs: outcome.durationMs,
+        traceId: outcome.traceId,
       });
     } catch (err) {
       console.warn(`[agentbox-session] group terminal delegation event persist failed for ${request.spawnId}:`, err);
@@ -913,7 +940,7 @@ export class AgentBoxSessionManager {
    * (reusing type "subagent" + isGroup), returns "launched" immediately, and notifies the
    * parent on completion. Background work blocks session release until it finishes.
    */
-  private startBackgroundSubagentGroup(request: SpawnSubagentGroupRequest): SubagentGroupResult {
+  private startBackgroundSubagentGroup(request: SpawnSubagentGroupRequest, traceCtx?: SubagentTraceContext): SubagentGroupResult {
     const jobId = request.spawnId;
     const controller = new AbortController();
 
@@ -944,6 +971,7 @@ export class AgentBoxSessionManager {
         summaryTruncated: false,
         itemStatuses: request.renderedTasks.map((_, i) => ({ index: i, status: "skipped" as GroupItemStatus })),
         durationMs: 0,
+        traceId: traceCtx?.mainTraceId,
       });
       void this.notifyParent(request.parentSessionId, jobId, {
         taskId: jobId,
@@ -983,7 +1011,7 @@ export class AgentBoxSessionManager {
     // (unknown event type ignored) and no-ops when persistence isn't wired (gatewayClient absent).
     const onProgress = this.makeGroupProgressEmitter(request.parentSessionId, jobId);
 
-    void this.runSubagentGroup(request, onProgress.emit, controller.signal)
+    void this.runSubagentGroup(request, onProgress.emit, controller.signal, traceCtx)
       .then((report) => {
         onProgress.settle();
         const job = this.jobs.get(jobId);
@@ -1221,7 +1249,7 @@ export class AgentBoxSessionManager {
    * "launched"; on completion notifyParent injects a <task_notification> into the
    * parent model. Background work blocks session release until it finishes.
    */
-  private startBackgroundSubagent(request: SpawnSubagentRequest): SpawnSubagentResult {
+  private startBackgroundSubagent(request: SpawnSubagentRequest, traceCtx?: SubagentTraceContext): SpawnSubagentResult {
     const childSessionId = randomUUID();
     const jobId = request.spawnId;
     // Stop latch: the user pressed Stop before this sub-agent launched; register it terminal
@@ -1273,6 +1301,7 @@ export class AgentBoxSessionManager {
               scope: request.prompt,
               toolCalls: 0,
               durationMs: 0,
+              traceId: traceCtx?.mainTraceId,
             });
           } catch { /* best-effort */ }
         })();
@@ -1304,7 +1333,7 @@ export class AgentBoxSessionManager {
       }
     }
 
-    void this.runSpawnedSubagent(request, { childSessionId, jobId })
+    void this.runSpawnedSubagent(request, { childSessionId, jobId, ...traceCtx })
       .then((res) => {
         const job = this.jobs.get(jobId);
         const status: JobStatus =
@@ -1899,12 +1928,20 @@ export class AgentBoxSessionManager {
    */
   private async runSpawnedSubagent(
     request: SpawnSubagentRequest,
-    opts?: { childSessionId?: string; jobId?: string },
+    opts?: { childSessionId?: string; jobId?: string; mainTraceId?: string; spawnSpanContext?: SpanContext },
     onProgress?: (progress: SpawnSubagentProgress) => void,
     signal?: AbortSignal,
   ): Promise<SpawnSubagentResult> {
     const startedAt = Date.now();
     const childSessionId = opts?.childSessionId ?? randomUUID();
+    // Trace context captured at dispatch by createSpawnSubagentExecutor (see there):
+    //  - mainTraceId: the parent interaction's root trace id → stamps chat_messages.trace_id
+    //    on every child row so a whole interaction shares one trace_id (DB audit).
+    //  - spawnSpanContext: the parent's spawn_subagent tool span → the child ROOT nests UNDER
+    //    it (span tree). Undefined when tracing is off / uncapturable → startPrompt falls back
+    //    to a sibling root via mainTraceId, or id-only. Both are span/DB-only, never affect logic.
+    const mainTraceId = opts?.mainTraceId;
+    const spawnSpanContext = opts?.spawnSpanContext;
     const childSessionDir = this.getSessionDir(childSessionId);
     const childSessionManager = SessionManager.continueRecent(process.cwd(), childSessionDir);
     const config = loadConfig();
@@ -1948,6 +1985,14 @@ export class AgentBoxSessionManager {
       const model = child.brain.findModel(this.delegationModelProvider, this.delegationModelId);
       if (model) await child.brain.setModel(model);
     }
+
+    // Sub-agent trace: open a ROOT span that NESTS under the parent's spawn_subagent tool
+    // span (spawnSpanContext) so its tree hangs beneath that tool call in Langfuse; falls back
+    // to a sibling root under T1 via mainTraceId when the spawn span could not be captured.
+    // Placed AFTER model setup so the ROOT captures llm.model_name; attach must precede
+    // startPrompt (else startPrompt takes the id-only branch). Both self-gate on tracing state.
+    tracingRecorder.attach(childSessionId, child.brain, { userId: request.userId, agentId });
+    tracingRecorder.startPrompt(childSessionId, request.prompt, request.userId, mainTraceId, spawnSpanContext);
 
     // Cancellation: stopRequested is set by either the parent's abort signal
     // (main "stop" button → the spawn_subagent tool's signal) or job_stop.
@@ -2016,6 +2061,7 @@ export class AgentBoxSessionManager {
           parentSessionId: request.parentSessionId,
           delegationId,
           targetAgentId: agentId,
+          traceId: mainTraceId,
         });
       } catch (err) {
         persistTrace = false;
@@ -2039,6 +2085,9 @@ export class AgentBoxSessionManager {
       onProgress?.({ status: "running", toolCalls, steps: liveSteps.map((s) => ({ ...s })), activity });
 
     const unsubscribe = child.brain.subscribe((event: any) => {
+      // Feed the recorder FIRST, unconditionally (gated on tracing state), so the child's
+      // span tree captures every turn/llm/tool before the progress/persist bookkeeping below.
+      if (isTracingEnabled()) tracingRecorder.handleEvent(childSessionId, event);
       if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
         toolCalls++;
         const toolName = (event.toolName as string) || (event.name as string) || "tool";
@@ -2073,6 +2122,7 @@ export class AgentBoxSessionManager {
             parentSessionId: request.parentSessionId,
             delegationId,
             targetAgentId: agentId,
+            traceId: mainTraceId,
           });
         });
       }
@@ -2091,6 +2141,7 @@ export class AgentBoxSessionManager {
               parentSessionId: request.parentSessionId,
               delegationId,
               targetAgentId: agentId,
+              traceId: mainTraceId,
             });
           });
         }
@@ -2145,48 +2196,58 @@ export class AgentBoxSessionManager {
       finalText = "(sub-agent produced no output)";
     }
 
-    const bundle = buildDelegateSummaryBundle(finalText);
-    const durationMs = Date.now() - startedAt;
+    // Status is FINAL here → close the child's trace ROOT (span export). detach in the
+    // finally below is the structural safety net: it ALWAYS runs even if a persist throws,
+    // so no child trace is left open. endPrompt stays outside the try so it runs before the
+    // terminal persist, mirroring the main-prompt ordering.
+    tracingRecorder.endPrompt(childSessionId, status === "done" ? "completed" : "error");
+    try {
+      const bundle = buildDelegateSummaryBundle(finalText);
+      const durationMs = Date.now() - startedAt;
 
-    // Drain prior (best-effort) trace writes, then emit the terminal event.
-    await persistQueue;
-    // Terminal event ALWAYS — including failure/timeout (design §13 hard requirement).
-    // Routed OFF the persistTrace latch: a transient failure on an earlier trace write
-    // must not drop this, or the child is left stuck "running" in the UI forever. It
-    // still respects whether persistence is configured at all (canPersist).
-    if (canPersist) {
-      try {
-        await this.persistAppendDelegationEvent({
-          parentSessionId: request.parentSessionId,
-          parentAgentId: agentId,
-          userId: request.userId,
-          delegationId,
-          childSessionId,
-          targetAgentId: agentId,
-          status,
-          capsule: bundle.capsule,
-          fullSummary: bundle.fullSummary,
-          summaryTruncated: bundle.truncated,
-          scope: request.prompt,
-          toolCalls,
-          durationMs,
-          interruptedTool,
-        });
-      } catch (err) {
-        console.warn(`[agentbox-session] terminal delegation event persist failed for ${childSessionId}:`, err);
+      // Drain prior (best-effort) trace writes, then emit the terminal event.
+      await persistQueue;
+      // Terminal event ALWAYS — including failure/timeout (design §13 hard requirement).
+      // Routed OFF the persistTrace latch: a transient failure on an earlier trace write
+      // must not drop this, or the child is left stuck "running" in the UI forever. It
+      // still respects whether persistence is configured at all (canPersist).
+      if (canPersist) {
+        try {
+          await this.persistAppendDelegationEvent({
+            parentSessionId: request.parentSessionId,
+            parentAgentId: agentId,
+            userId: request.userId,
+            delegationId,
+            childSessionId,
+            targetAgentId: agentId,
+            status,
+            capsule: bundle.capsule,
+            fullSummary: bundle.fullSummary,
+            summaryTruncated: bundle.truncated,
+            scope: request.prompt,
+            toolCalls,
+            durationMs,
+            interruptedTool,
+            traceId: mainTraceId,
+          });
+        } catch (err) {
+          console.warn(`[agentbox-session] terminal delegation event persist failed for ${childSessionId}:`, err);
+        }
       }
-    }
 
-    return {
-      status,
-      summary: bundle.capsule,
-      fullSummary: bundle.fullSummary,
-      childSessionId,
-      toolCalls,
-      durationMs,
-      interruptedTool,
-      steps: liveSteps,
-    };
+      return {
+        status,
+        summary: bundle.capsule,
+        fullSummary: bundle.fullSummary,
+        childSessionId,
+        toolCalls,
+        durationMs,
+        interruptedTool,
+        steps: liveSteps,
+      };
+    } finally {
+      tracingRecorder.detach(childSessionId);
+    }
   }
 
   private buildSpawnedSubagentPrompt(request: SpawnSubagentRequest): string {
@@ -2384,10 +2445,30 @@ export class AgentBoxSessionManager {
       _extraEventBuffer: extraEventBuffer,
       _pendingNotifications: [],
       _coalesceTimer: null,
+      _tracingUnsub: null,
     };
 
     this.sessions.set(id, managed);
     emitDiagnostic({ type: "session_created", sessionId: id });
+
+    // OpenTelemetry trace recorder. Gated on isTracingEnabled() so that when
+    // tracing is disabled there is ZERO per-event overhead — no attach, no
+    // brain subscription, no closure on the hot path. initTracing() runs in
+    // main() before any session is built, so the flag is settled here.
+    // When disabled, _tracingUnsub stays null and teardownTracing tolerates it.
+    //
+    // The subscription is GATED to mirror the SSE consumer: brain events flow to
+    // the recorder only when routing is NOT rewriting them through the extra-event
+    // channel (same _routeBrainEventsThroughExtra gate as http-server.ts). During
+    // routing, brain events + model_route_* events reach the recorder via
+    // emitSessionExtraEvent → handleEvent instead.
+    if (isTracingEnabled()) {
+      tracingRecorder.attach(id, result.brain, { userId: this.userId, agentId: this.agentId });
+      managed._tracingUnsub = result.brain.subscribe((event: any) => {
+        if (managed._routeBrainEventsThroughExtra) return;
+        tracingRecorder.handleEvent(id, event);
+      });
+    }
 
     // Tool execution timing (for tool_call diagnostic events).
     // NOTE: tool_execution_start/end events depend on pi-agent's event stream —
@@ -2601,6 +2682,17 @@ export class AgentBoxSessionManager {
    *
    * The session can be transparently restored from JSONL on the next getOrCreate().
    */
+  /**
+   * Tear down the tracing recorder for a session: unsubscribe the gated brain
+   * listener and force-end any in-flight span tree. Idempotent — safe to call
+   * from release / close / closeAll (a session passes through at most one).
+   */
+  private teardownTracing(sessionId: string, managed: ManagedSession): void {
+    try { managed._tracingUnsub?.(); } catch { /* best-effort */ }
+    managed._tracingUnsub = null;
+    tracingRecorder.detach(sessionId);
+  }
+
   async release(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId);
     if (!managed) return;
@@ -2652,6 +2744,7 @@ export class AgentBoxSessionManager {
     if (this.sessions.get(sessionId) === managed) {
       if (managed._coalesceTimer) { clearTimeout(managed._coalesceTimer); managed._coalesceTimer = null; }
       this.sessions.delete(sessionId);
+      this.teardownTracing(sessionId, managed);
       emitDiagnostic({ type: "session_released", sessionId });
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
       // Notify http-server to check idle status
@@ -2737,6 +2830,7 @@ export class AgentBoxSessionManager {
         this.ledgerHideTimers.delete(sessionId);
       }
       deleteLedger(sessionId);
+      this.teardownTracing(sessionId, managed);
       emitDiagnostic({ type: "session_released", sessionId });
     }
   }
@@ -2765,6 +2859,7 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] MCP shutdown failed for ${id} during closeAll:`, err);
         }
       }
+      this.teardownTracing(id, managed);
       emitDiagnostic({ type: "session_released", sessionId: id });
     }
 

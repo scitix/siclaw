@@ -53,6 +53,12 @@ export interface ConsumeAgentSseOptions {
    * the runtime cannot otherwise see.
    */
   turnStartTime?: number;
+  /**
+   * per-prompt root trace id (from the /api/prompt ack). Stamped onto every
+   * assistant/tool row this consumer persists so a whole interaction's agent
+   * output shares one trace_id in chat_messages. Absent → rows keep NULL.
+   */
+  traceId?: string;
 }
 
 export interface SseConsumptionResult {
@@ -288,6 +294,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   const { client, sessionId, userId, onEvent, signal } = opts;
   const persist = opts.persistMessages === true;
   const redactionConfig = opts.redactionConfig ?? EMPTY_REDACTION;
+  // Stamp this turn's root trace id onto every persisted row. traceId is constant
+  // for the whole consume run (one prompt = one root trace), so one wrapper covers
+  // all append sites; updateMessage is untouched (rows are stamped at append time).
+  const appendRow = (input: Parameters<typeof appendMessage>[0]) =>
+    appendMessage({ ...input, traceId: opts.traceId ?? null });
 
   let assistantContent = "";
   let currentMsgText = "";
@@ -460,7 +471,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       if (metadata) {
         latestModelRouteSwitch = metadata;
         if (persist) {
-          dbMessageId = await appendMessage({
+          dbMessageId = await appendRow({
             sessionId,
             role: "assistant",
             content: modelRouteNoticeContent(metadata),
@@ -484,7 +495,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       if (recoveryMetadata) {
         latestModelRouteSwitch = null;
         if (persist) {
-          dbMessageId = await appendMessage({
+          dbMessageId = await appendRow({
             sessionId,
             role: "assistant",
             content: modelRouteNoticeContent(recoveryMetadata),
@@ -565,7 +576,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           await updateMessage({ ...payload, messageId: existingMessageId });
           dbMessageId = existingMessageId;
         } else {
-          dbMessageId = await appendMessage({ ...payload, role: "tool" });
+          dbMessageId = await appendRow({ ...payload, role: "tool" });
           await incrementMessageCount(sessionId);
         }
       }
@@ -661,7 +672,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           startMetadata.pre_thinking_ms = preThinkingMs;
         }
         const startMetadataWithRoute = attachModelRouteMetadata(startMetadata, currentModelRouteMetadata);
-        dbMessageId = await appendMessage({
+        dbMessageId = await appendRow({
           sessionId,
           role: "tool",
           content: "",
@@ -715,7 +726,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
             errorPersisted = true;
             const errorContent = redactText(errorMessage, redactionConfig);
             const persistError = async () => {
-              await appendMessage({
+              await appendRow({
                 sessionId,
                 role: "assistant",
                 content: errorContent,
@@ -813,7 +824,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               const rowMetadata = capturedContextUsage
                 ? { ...assistantRowMetadata, context_usage: capturedContextUsage }
                 : assistantRowMetadata;
-              const id = await appendMessage({
+              const id = await appendRow({
                 sessionId,
                 role: "assistant",
                 content: assistantRowContent,
@@ -912,7 +923,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       const cleaned = stripEmptyResponseMarkers(assistantContent);
       if (cleaned.length > 0) {
         try {
-          await appendMessage({
+          await appendRow({
             sessionId,
             role: "assistant",
             content: redactText(cleaned, redactionConfig),

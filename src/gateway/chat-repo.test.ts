@@ -132,6 +132,7 @@ describe("appendMessage", () => {
       parent_session_id: null,
       delegation_id: null,
       target_agent_id: null,
+      trace_id: null,
     });
   });
 
@@ -162,6 +163,7 @@ describe("appendMessage", () => {
       parent_session_id: null,
       delegation_id: null,
       target_agent_id: null,
+      trace_id: null,
     });
   });
 

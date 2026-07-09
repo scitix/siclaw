@@ -12,8 +12,11 @@ import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
 import type { AgentMode } from "../core/tool-registry.js";
-import { loadConfig } from "../core/config.js";
+import { loadConfig, resolveTracingEnvironment } from "../core/config.js";
+import type { SiclawConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
+import { reinitTracing } from "../shared/tracing/otel-provider.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
 import { CredentialBroker } from "./credential-broker.js";
@@ -55,6 +58,9 @@ interface Route {
 
 interface PromptRequestBody {
   sessionId?: string;
+  /** User who initiated this prompt (per-request), forwarded to the trace
+   *  recorder as the root span's user.id. */
+  userId?: string;
   text?: string;
   mode?: SessionMode;
   modelProvider?: string;
@@ -110,7 +116,7 @@ const DP_EXIT_MARKER = "[DP_EXIT]";
 // We prepend a `[System: respond in X]` language directive to the user's prompt so
 // the model follows the input language. pi-agent records that as the user turn and
 // re-emits it as a `message_start`/`message_end` brain event, which is streamed LIVE
-// to the frontend (and forwarded to portals like sicore as chat.event) — leaking the
+// to the frontend (and forwarded to a connected portal as chat.event) — leaking the
 // internal directive into the displayed user bubble. The user message persisted by
 // the gateway is the original text, so this only affects the live render. Strip the
 // directive from the first text block of any user-role message event before it leaves
@@ -838,6 +844,13 @@ export function createHttpServer(
     const promptStartTime = Date.now();
     let promptOutcome: "completed" | "error" = "completed";
 
+    // Open the trace ROOT for this user prompt (no-op when tracing disabled).
+    // Explicit prompt boundary — NOT agent_start — so auto-retry / model-routing
+    // (which emit multiple agent_start/end pairs) stay inside one ROOT. Placed
+    // after model setup so a setModel switch is not captured as prompt activity;
+    // closed in actuallyFinish, which every terminal path funnels through.
+    tracingRecorder.startPrompt(managed.id, promptText, body.userId);
+
     const actuallyFinish = () => {
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
@@ -871,6 +884,10 @@ export function createHttpServer(
       // per spec — re-calling on an already-resolved promise is a no-op.
       managed._promptInflight = null;
       releasePromptInflight();
+
+      // Close the trace ROOT, attaching authoritative token/cost deltas
+      // (getSessionStats post − pre). No-op when tracing disabled.
+      tracingRecorder.endPrompt(managed.id, promptOutcome);
 
       // Schedule delayed release — gives frontend time to query context/model
       // after SSE closes. If a new prompt arrives before the TTL, the timer is
@@ -906,6 +923,10 @@ export function createHttpServer(
         event && typeof event === "object" && !Array.isArray(event)
           ? event as Record<string, unknown>
           : { type: "model_route_event", value: event };
+      // Feed the trace recorder before the SSE fan-out, and unconditionally —
+      // this is the routing path's brain-event + model_route_* source, and it
+      // must reach the recorder even when no SSE client is connected yet.
+      tracingRecorder.handleEvent(managed.id, payload);
       if (managed._extraEventSubs.size === 0) {
         managed._extraEventBuffer.push(payload);
         return;
@@ -982,7 +1003,7 @@ export function createHttpServer(
       onPromptFinish();
     });
 
-    sendJson(res, 200, { ok: true, sessionId: managed.id });
+    sendJson(res, 200, { ok: true, sessionId: managed.id, traceId: tracingRecorder.getRootTraceId(managed.id) });
   });
 
   /**
@@ -1384,6 +1405,47 @@ export function createHttpServer(
       }
     });
   }
+
+  /**
+   * POST /api/reload-tracing — GLOBAL tracing hot-reload.
+   *
+   * Deliberately registered standalone, OUTSIDE the GATEWAY_SYNC_DESCRIPTORS
+   * loop above: tracing config never lands on disk, so the generic
+   * fetch→materialize→postReload contract does not apply. Instead we pull the
+   * latest TracingConfig from the Gateway (config.getTracingConfig, no agentId)
+   * and rebuild the in-process OTel provider via reinitTracing (serialised so
+   * concurrent local-mode boxes can't interleave shutdown+init).
+   */
+  addRoute("POST", "/api/reload-tracing", async (_req, res) => {
+    const client = getReloadGatewayClient();
+    if (!client) {
+      // Local mode without a Gateway URL: tracing is config-file driven, there
+      // is nothing to pull. Treat as a clean no-op rather than an error.
+      console.warn("[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping tracing reload");
+      sendJson(res, 200, { ok: true, skipped: true });
+      return;
+    }
+    try {
+      const tracing = await client.fetchTracingConfig();
+      // `environment` is pod-env-sourced (SICLAW_TRACING_ENVIRONMENT), NOT part of
+      // the DB-only fetchTracingConfig payload. Re-merge it so the reload rebuilds
+      // the provider WITH the deployment.environment.name — matching the startup
+      // path (loadConfig). Without this, any exporter CRUD → reload → every span
+      // silently lands in Langfuse's `default` until the pod cold-restarts.
+      const environment = resolveTracingEnvironment();
+      const merged = environment ? { ...tracing, environment } : tracing;
+      // Close any in-flight traces on the CURRENT provider BEFORE the swap, so
+      // reinitTracing's teardown doesn't orphan their open spans onto a dead
+      // provider (reinit forceFlushes, so the closed spans still export).
+      tracingRecorder.abortAll();
+      await reinitTracing({ tracing: merged } as SiclawConfig);
+      console.log("[agentbox-http] tracing config reloaded");
+      sendJson(res, 200, { ok: true });
+    } catch (err: any) {
+      console.error(`[agentbox-http] Failed to reload tracing: ${err.message}`);
+      sendJson(res, 500, { error: `tracing reload failed: ${err.message}` });
+    }
+  });
 
   /**
    * GET /api/models - list available models (read from settings.json)

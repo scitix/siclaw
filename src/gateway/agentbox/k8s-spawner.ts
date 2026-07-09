@@ -235,6 +235,10 @@ export class K8sSpawner implements BoxSpawner {
       "SICLAW_EMBEDDING_MODEL",
       "SICLAW_EMBEDDING_DIMENSIONS",
       "SICLAW_EMBEDDING_API_KEY",
+      // Trace deployment environment (Langfuse deployment.environment.name). The
+      // agentbox reads it via loadConfig() env override → config.tracing.environment.
+      // Per-runtime: set on the runtime deployment to tag every agentbox it spawns.
+      "SICLAW_TRACING_ENVIRONMENT",
     ];
     for (const name of AGENTBOX_FORWARDED_ENV) {
       const value = process.env[name];

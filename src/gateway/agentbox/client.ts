@@ -18,6 +18,10 @@ export interface AgentBoxTlsOptions {
 
 export interface PromptOptions {
   sessionId?: string;
+  /** User who initiated this prompt. Forwarded per-request to the trace
+   *  recorder as the root span's user.id (mirrors sessionId's per-request
+   *  path), so tracing carries the user dimension in every deployment mode. */
+  userId?: string;
   text: string;
   /** string = use this env, null = explicitly no env, undefined = keep current */
   kubeconfigPath?: string | null;
@@ -62,6 +66,9 @@ export type PromptMediaOptions = Pick<PromptOptions, "images" | "files">;
 export interface PromptResponse {
   ok: boolean;
   sessionId: string;
+  /** per-prompt root trace id (OTel 32-hex) echoed from the /api/prompt ack, for
+   *  stamping chat_messages.trace_id on this turn's persisted rows. */
+  traceId?: string;
 }
 
 export interface SessionInfo {
