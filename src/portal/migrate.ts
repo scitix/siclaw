@@ -316,6 +316,25 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
   )`,
 
+  // End-user feedback on channel replies (Feishu card 👍/👎). One row per
+  // (reply, person); a re-vote upserts rating. message_ref is a channel-level
+  // reply reference (Feishu CardKit card_id today) rather than a chat_messages
+  // FK — the card is finalized concurrently with message persistence, so the
+  // DB row id may not exist yet when the button payload is built.
+  `CREATE TABLE IF NOT EXISTS message_feedback (
+    id CHAR(36) PRIMARY KEY,
+    session_id CHAR(36) NOT NULL,
+    message_ref VARCHAR(64) NOT NULL,
+    rating VARCHAR(10) NOT NULL,
+    sender_external_id VARCHAR(128) NOT NULL,
+    channel_id VARCHAR(128) DEFAULT NULL,
+    source VARCHAR(20) NOT NULL DEFAULT 'lark',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (message_ref, sender_external_id),
+    CONSTRAINT fk_message_feedback_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+  )`,
+
   // A2A task projection. This is protocol state for external agent clients,
   // not an AgentBox/pi-agent checkpoint.
   `CREATE TABLE IF NOT EXISTS a2a_tasks (
@@ -507,6 +526,8 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "chat_messages", "idx_chat_messages_audit", "role, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_parent", "parent_session_id, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_delegation", "delegation_id");
+  // message_feedback — Metrics aggregates by session.
+  await ensureIndex(db, "message_feedback", "idx_message_feedback_session", "session_id, created_at");
   // a2a_tasks — every A2A query is scoped by (agent_id, api_key_id), so lead the composite
   // indexes with that prefix. #340 already created idx_a2a_tasks_agent/_context (older column
   // lists) on every deployed DB, and ensureIndex is name-only — so we must drop those and

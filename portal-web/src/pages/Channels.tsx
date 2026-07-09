@@ -6,6 +6,8 @@ import { useConfirm } from "../components/confirm-dialog"
 
 interface Channel {
   id: string; name: string; type: string; config: Record<string, unknown>; status: string; created_at: string
+  // Per-agent dedicated bots are managed from the agent's Channels tab, not here.
+  is_personal_bot?: boolean
 }
 
 const CHANNEL_TYPES = [
@@ -103,7 +105,9 @@ export function Channels() {
 
   useEffect(() => {
     api<{ data: Channel[] }>("/channels")
-      .then(r => setChannels(Array.isArray(r.data) ? r.data : []))
+      // Per-agent dedicated bots live on the agent's Channels tab; this page
+      // manages only shared apps (multiple agents pair into one app).
+      .then(r => setChannels((Array.isArray(r.data) ? r.data : []).filter(c => !c.is_personal_bot)))
       .catch(() => setChannels([]))
       .finally(() => setLoading(false))
   }, [])
@@ -162,7 +166,7 @@ export function Channels() {
       <div className="flex items-center justify-between px-6 py-4 border-b border-border">
         <div>
           <h1 className="text-lg font-semibold">Channels</h1>
-          <p className="text-sm text-muted-foreground">Manage messaging platform connections (Lark, Slack, etc.)</p>
+          <p className="text-sm text-muted-foreground">Shared messaging apps used by multiple agents via pairing. Each agent's dedicated Feishu bot is configured on the agent's Channels tab.</p>
         </div>
         <button onClick={() => setShowCreate(true)} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground hover:opacity-90">
           <Plus className="h-3.5 w-3.5" /> Add Channel

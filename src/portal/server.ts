@@ -83,7 +83,6 @@ export function startPortal(config: PortalConfig): http.Server {
     registerCliSnapshotRoute(router, config.cliSnapshotSecret);
   }
   registerAdapterRoutes(router, config.portalSecret);
-  registerChannelRoutes(router, config.jwtSecret);
   registerNotificationRoutes(router, config.jwtSecret, config.portalSecret);
 
   const server = http.createServer(async (req, res) => {
@@ -178,6 +177,8 @@ export function startPortal(config: PortalConfig): http.Server {
 
   // Register routes that need the connectionMap (requires server to exist for WS)
   registerAgentRoutes(router, config.jwtSecret, connectionMap);
+  // Channel CRUD pushes channel.reload to connected runtimes on every write.
+  registerChannelRoutes(router, config.jwtSecret, connectionMap);
   registerClusterRoutes(router, config.jwtSecret, connectionMap);
   registerHostRoutes(router, config.jwtSecret, connectionMap);
   registerChatRoutes(router, connectionMap, config.jwtSecret);

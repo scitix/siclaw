@@ -54,6 +54,20 @@ export interface RuntimeConnectionMap {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+/**
+ * Best-effort: ask every connected runtime to re-pull the channel list.
+ * Call after ANY write that changes what channel.list returns (shared-app
+ * CRUD, personal-bot upsert/disable) — without it the gateway keeps serving
+ * deleted channels on stale WS connections until a restart.
+ */
+export function broadcastChannelReload(map: RuntimeConnectionMap): void {
+  for (const runtimeId of map.connectedAgentIds()) {
+    void map.sendCommand(runtimeId, "channel.reload", {})
+      .then((r) => { if (!r.ok) console.warn(`[channels] channel.reload rejected by runtime=${runtimeId}: ${r.error}`); })
+      .catch((err) => console.warn(`[channels] channel.reload push failed runtime=${runtimeId}:`, err));
+  }
+}
+
 export function createConnectionMap(): RuntimeConnectionMap {
   const connections = new Map<string, Set<WebSocket>>();
   const pending = new Map<string, PendingRpc>();

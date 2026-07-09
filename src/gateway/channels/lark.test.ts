@@ -4,6 +4,7 @@ import {
   buildChannelTurnPrompt,
   createLarkHandler,
   handleLarkMessage,
+  handleLarkCardAction,
   collectResponse,
   collectChannelResponse,
   extractInbound,
@@ -61,9 +62,12 @@ vi.mock("../agent-model-binding.js", () => ({
 const ensureChatSessionMock = vi.fn();
 const appendMessageMock = vi.fn();
 
+const recordChannelFeedbackMock = vi.fn();
+
 vi.mock("../chat-repo.js", () => ({
   ensureChatSession: (...args: unknown[]) => ensureChatSessionMock(...args),
   appendMessage: (...args: unknown[]) => appendMessageMock(...args),
+  recordChannelFeedback: (...args: unknown[]) => recordChannelFeedbackMock(...args),
 }));
 
 // ── Existing behaviour: degraded boot when SDK missing (kept from old suite) ─
@@ -1035,6 +1039,96 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     releaseFirst();
     await Promise.all([first, ...queued]);
     expect(promptMock).toHaveBeenCalledTimes(21);
+  });
+});
+
+describe("handleLarkCardAction — 👍/👎 feedback", () => {
+  function makeCardAction(overrides: Record<string, unknown> = {}) {
+    return {
+      operator: { open_id: "ou_clicker" },
+      action: {
+        tag: "button",
+        value: {
+          kind: "siclaw_feedback",
+          rating: "up",
+          session_id: "sess-1",
+          card_id: "CARD-1",
+          channel_id: "lark",
+          locale: "zh-CN",
+        },
+      },
+      ...overrides,
+    };
+  }
+
+  it("persists the vote keyed by the clicker's open_id and returns a success toast", async () => {
+    recordChannelFeedbackMock.mockResolvedValue({ success: true });
+    const result = await handleLarkCardAction(makeCardAction(), makeLarkClient());
+
+    expect(recordChannelFeedbackMock).toHaveBeenCalledWith({
+      sessionId: "sess-1",
+      messageRef: "CARD-1",
+      rating: "up",
+      senderExternalId: "ou_clicker",
+      channelId: "lark",
+      source: "lark",
+    });
+    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("反馈") } });
+  });
+
+  it("ignores card actions that are not feedback buttons", async () => {
+    recordChannelFeedbackMock.mockClear();
+    const data = makeCardAction({ action: { tag: "button", value: { kind: "something_else" } } });
+    const result = await handleLarkCardAction(data, makeLarkClient());
+    expect(result).toBeUndefined();
+    expect(recordChannelFeedbackMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts action.value delivered as a JSON string (some CardKit versions)", async () => {
+    recordChannelFeedbackMock.mockClear();
+    recordChannelFeedbackMock.mockResolvedValue({ success: true });
+    const data = makeCardAction();
+    (data.action as any).value = JSON.stringify((data.action as any).value);
+    const result = await handleLarkCardAction(data, makeLarkClient());
+    expect(recordChannelFeedbackMock).toHaveBeenCalledWith(expect.objectContaining({ rating: "up", messageRef: "CARD-1" }));
+    expect(result).toEqual({ toast: { type: "success", content: expect.any(String) } });
+  });
+
+  it("missing operator open_id → error toast, nothing persisted", async () => {
+    recordChannelFeedbackMock.mockClear();
+    const data = makeCardAction({ operator: {} });
+    const result = await handleLarkCardAction(data, makeLarkClient());
+    expect(result).toEqual({ toast: { type: "error", content: expect.any(String) } });
+    expect(recordChannelFeedbackMock).not.toHaveBeenCalled();
+  });
+
+  it("a persist failure surfaces as an error toast", async () => {
+    recordChannelFeedbackMock.mockRejectedValueOnce(new Error("db down"));
+    const result = await handleLarkCardAction(makeCardAction(), makeLarkClient());
+    expect(result).toEqual({ toast: { type: "error", content: expect.any(String) } });
+  });
+
+  it("down votes and en-US locale flow through", async () => {
+    recordChannelFeedbackMock.mockResolvedValue({ success: true });
+    const data = makeCardAction();
+    (data.action as any).value.rating = "down";
+    (data.action as any).value.locale = "en-US";
+    const result = await handleLarkCardAction(data, makeLarkClient());
+    expect(recordChannelFeedbackMock).toHaveBeenLastCalledWith(expect.objectContaining({ rating: "down" }));
+    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("thanks") } });
+  });
+
+  it("a hung persist RPC is deadline-raced into an error toast instead of blocking the callback", async () => {
+    vi.useFakeTimers();
+    try {
+      recordChannelFeedbackMock.mockImplementation(() => new Promise(() => { /* never settles */ }));
+      const pending = handleLarkCardAction(makeCardAction(), makeLarkClient());
+      await vi.advanceTimersByTimeAsync(2600);
+      const result = await pending;
+      expect(result).toEqual({ toast: { type: "error", content: expect.any(String) } });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
