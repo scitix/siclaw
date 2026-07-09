@@ -1039,6 +1039,79 @@ async def test_incremental_guard_rearms_on_ledger_repair():
     print("OK  incremental guard re-arms on in-scope ledger repair (round-4 fix)")
 
 
+async def test_incremental_violation_auto_restored():
+    """L0: with the byte snapshot armed, an out-of-scope edit is restored BY CODE
+    before the ledger runs — no repair turn, byte-exact tree, restored_pages in
+    the report. The model cannot un-edit toward a hash; asking it to burned the
+    whole repair budget and always landed unconverged (3/3 live rounds, 07-09)."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md) [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        c_original = "---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "c.md").write_text(c_original)
+        run = compile_box.CompileRun("incrr", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        run._incr_pending = {"before": incremental.page_hashes(str(wd)),
+                             "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
+        # model edits a.md (authorized) AND drifts into c.md (unauthorized)
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is None, repair  # violation auto-restored, ledger clean → no repair turn
+        assert (wd / "candidate" / "c.md").read_text() == c_original  # byte-exact restore
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "passed", sc
+        assert sc["incremental"] == {"out_of_scope_pages": [], "restored_pages": ["c.md"]}, sc
+        assert run._incr_pending is None  # consumed: nothing left to guard
+    print("OK  incremental violation auto-restored by code (no repair turn, byte-exact, reported)")
+
+
+async def test_unconverged_files_residual_ticket():
+    """L2: repair budget spent with residuals → the driver files ONE ticket in
+    the owner's question queue by code. The publish page only displays residual
+    state — it must never be where the owner discovers work."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # → unaccounted forever
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("uncv", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 99  # budget long spent → unconverged, not repairing
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is None, repair  # unconverged does not inject another repair
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "unconverged", sc
+        tickets = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
+        assert len(tickets) == 1 and tickets[0]["id"].startswith("selfcheck-residual-"), tickets
+        assert "never-compiled.md" in tickets[0]["sources"][0]["quote"]
+        # a second settle with the same residuals does not duplicate the ticket
+        run._selfcheck_key = None
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 又动了。")
+        await compile_box._post_turn_selfcheck(run)
+        tickets2 = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
+        assert len(tickets2) == 1, tickets2
+    print("OK  unconverged files a residual ticket (once, code-written, question queue)")
+
+
 async def test_batch_orchestrator_routing_and_resume():
     """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
     the threshold gate (small KBs never batch), the orchestrator stamps batches
@@ -1708,6 +1781,8 @@ async def main():
     await test_incremental_route()
     await test_incremental_integrity_guard()
     await test_incremental_guard_rearms_on_ledger_repair()
+    await test_incremental_violation_auto_restored()
+    await test_unconverged_files_residual_ticket()
     await test_batch_orchestrator_routing_and_resume()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()

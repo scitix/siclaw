@@ -434,7 +434,12 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
         "unaccounted": unaccounted,
         "dangling_citations": dangling,
         "noop_exclusions": noop_exclusions,
-        "closed": not unaccounted,
+        # closed = the ledger is consistent in BOTH directions: every source
+        # accounted AND every citation real. dangling used to be display-only —
+        # the repair prompt listed the fix, but the gate (ledger_clean) never
+        # fired on it, so a lone dangling citation sailed through settle and
+        # surfaced as owner homework on the publish page.
+        "closed": not unaccounted and not dangling,
     }
 
 
@@ -642,6 +647,8 @@ def narration(report: dict, locale: str | None = None) -> str:
         parts = []
         if cov["unaccounted"]:
             parts.append(f"{len(cov['unaccounted'])} source file(s) unaccounted")
+        if cov["dangling_citations"]:
+            parts.append(f"{len(cov['dangling_citations'])} dangling citation(s)")
         if not lint["ok"]:
             parts.append(f"{len(lint['violations'])} lint issue(s)")
         tail = "repair requested" if report["state"] == "repairing" else "repair budget spent; remaining items left for the owner"
@@ -652,6 +659,8 @@ def narration(report: dict, locale: str | None = None) -> str:
     parts = []
     if cov["unaccounted"]:
         parts.append(f"{len(cov['unaccounted'])} 个源文件未入账")
+    if cov["dangling_citations"]:
+        parts.append(f"{len(cov['dangling_citations'])} 处悬空引用")
     if not lint["ok"]:
         parts.append(f"{len(lint['violations'])} 处 lint 问题")
     tail = "已请求回修" if report["state"] == "repairing" else "回修额度用尽,余项待负责人处理"
@@ -708,6 +717,69 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
         lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
                   for v in lint["violations"][:_REPAIR_LIST_CAP]]
     return "\n".join(lines)
+
+
+# ── L2: budget spent with residuals → a ticket, never owner homework ─────────
+# The publish page only DISPLAYS residual state; the owner must never discover
+# work there. When the bounded repair loop gives up (state=unconverged), CODE
+# files one contradiction ticket — same schema, same queue, same rule/dispatch/
+# resolve_ticket loop the model's own tickets ride (box_role.md 「矛盾工单」).
+
+def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) -> bool:
+    """Append ONE residual ticket to authoring/CONTRADICTIONS.json, model-free.
+    Stable id = fingerprint of the residual list: the same residuals repeatedly
+    unconverging never duplicate the ticket; different residuals open a fresh
+    one. An existing same-id ticket (open or already ruled) is left untouched.
+    Returns whether a ticket was filed."""
+    cov = report.get("coverage") or {}
+    lint = report.get("lint") or {}
+    incr = report.get("incremental") or {}
+    residuals: list[str] = []
+    pages: set[str] = set()
+    for p in (cov.get("unaccounted") or [])[:10]:
+        residuals.append(f"未入账源: {p}")
+    for p in (cov.get("dangling_citations") or [])[:10]:
+        residuals.append(f"悬空引用: {p}")
+    for v in (lint.get("violations") or [])[:10]:
+        residuals.append(f"lint {v.get('kind')}: {v.get('page')} — {str(v.get('detail', ''))[:80]}")
+        if v.get("page"):
+            pages.add(str(v["page"]))
+    for p in (incr.get("out_of_scope_pages") or [])[:10]:
+        residuals.append(f"越界未还原: {p}")
+        pages.add(str(p))
+    if not residuals:
+        return False
+    digest = hashlib.sha256("\n".join(residuals).encode("utf-8")).hexdigest()[:8]
+    tid = f"selfcheck-residual-{digest}"
+    path = Path(workdir) / "authoring" / "CONTRADICTIONS.json"
+    tickets: list = []
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            # Unreadable ledger: bail rather than clobber the model's tickets.
+            return False
+        if not isinstance(data, list):
+            return False
+        tickets = data
+    if any(isinstance(t, dict) and t.get("id") == tid for t in tickets):
+        return False
+    en = _is_en(locale)
+    tickets.append({
+        "id": tid,
+        "title": "Self-check residuals" if en else "自检残留待处理",
+        "question": ("The automatic self-check repair budget is spent and the items below remain unfixed — how should they be handled?"
+                     if en else "自检自动回修额度已用完,以下残留没有修完,要怎么处理?"),
+        "sources": [{"doc": "authoring/SELFCHECK.json", "quote": "; ".join(residuals)[:600]}],
+        "options": (["Run another repair round", "Accept as-is"] if en else ["再修一轮", "接受现状"]),
+        "current_value": "unresolved residuals" if en else "残留未处理",
+        "affected_pages": sorted(pages)[:20],
+        "status": "open",
+        "answer": None,
+    })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(tickets, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
 
 
 # ── image re-verification (fresh-eyes numeric check) ─────────────────────────
