@@ -1379,7 +1379,12 @@ async def _post_turn_selfcheck(run) -> str | None:
     restored_pages: list[str] = []
     if incr:
         after = incremental.page_hashes(workdir)
-        editable = incremental.authorized_pages(workdir, incr["changeset"])
+        # repair_pages (set on re-arm): a ledger/lint repair turn legitimately
+        # edits pages OUTSIDE the round's authorized set — dangling-citing pages,
+        # charset/orphan pages. Without widening, the mechanical restore reverts
+        # the repair itself and the round can never converge.
+        editable = set(incremental.authorized_pages(workdir, incr["changeset"])) | set(
+            incr.get("repair_pages") or [])
         incr_violations = incremental.integrity_violations(incr["before"], after, editable)
         if incr_violations:
             restored_pages = incremental.restore_pages(
@@ -1427,6 +1432,17 @@ async def _post_turn_selfcheck(run) -> str | None:
             # coverage/lint repair turn too, and THAT turn could drift out of
             # scope just as easily. Judged against the ORIGINAL baseline (the
             # repair restores toward it).
+            #
+            # …but widened by exactly the pages the LEDGER repair targets:
+            # the repair prompt orders edits on dangling-citing / lint-violation
+            # pages that the round's changeset never authorized, and without
+            # this the closing restore reverts the repair itself (live 07-09:
+            # 4 charset fixes + 1 orphan deletion, all undone → unconverged).
+            incr = dict(incr)
+            try:
+                incr["repair_pages"] = selfcheck.ledger_repair_pages(workdir, report)
+            except Exception:
+                incr["repair_pages"] = []  # fail-open: worst case = old strictness
             run._incr_pending = incr
         parts = []
         if not ledger_clean:

@@ -1112,6 +1112,52 @@ async def test_unconverged_files_residual_ticket():
     print("OK  unconverged files a residual ticket (once, code-written, question queue)")
 
 
+async def test_repair_turn_may_edit_ledger_target_pages():
+    """Interlock (live 07-09): the ledger repair ordered edits on pages OUTSIDE
+    the round's authorized set (a dangling-citing page) and the re-armed guard's
+    mechanical restore reverted the repair itself → unconverged forever. The
+    re-arm now widens the authorized set by exactly the repair's target pages."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md) [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        # c.md cites a source that no longer exists → dangling (out of this round's scope)
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/ghost.md\n---\n正文c。")
+        run = compile_box.CompileRun("interlock", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        run._incr_pending = {"before": incremental.page_hashes(str(wd)),
+                             "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
+        # turn 1: model edits ONLY the authorized page — in scope, but the ledger
+        # is unclean (dangling citation on c.md) → repairing, guard re-armed
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is not None and "ghost.md" in repair, repair
+        assert run._incr_pending is not None
+        assert run._incr_pending.get("repair_pages") == ["c.md"], run._incr_pending.get("repair_pages")
+        # repair turn: model fixes the dangling citation on the OUT-OF-SCOPE page
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        run._selfcheck_key = None
+        repair2 = await compile_box._post_turn_selfcheck(run)
+        assert repair2 is None, repair2
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "passed", sc
+        # the guard did NOT restore the repair's edit
+        assert sc["incremental"] == {"out_of_scope_pages": [], "restored_pages": []}, sc
+        assert "snap/two.md" in (wd / "candidate" / "c.md").read_text()
+    print("OK  repair turn may edit ledger-target pages (guard widened, repair survives)")
+
+
 async def test_batch_orchestrator_routing_and_resume():
     """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
     the threshold gate (small KBs never batch), the orchestrator stamps batches
@@ -1783,6 +1829,7 @@ async def main():
     await test_incremental_guard_rearms_on_ledger_repair()
     await test_incremental_violation_auto_restored()
     await test_unconverged_files_residual_ticket()
+    await test_repair_turn_may_edit_ledger_target_pages()
     await test_batch_orchestrator_routing_and_resume()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()

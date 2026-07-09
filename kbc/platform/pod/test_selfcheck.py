@@ -311,6 +311,31 @@ def test_file_residual_ticket():
     print("OK  file_residual_ticket (files/dedupes/preserves/bails, fingerprint id)")
 
 
+def test_ledger_repair_pages():
+    """Interlock: the pages a ledger/lint repair legitimately edits — the byte
+    guard must authorize exactly these on the repair turn, or the mechanical
+    restore reverts the repair itself (live 07-09: 4 charset fixes + 1 orphan
+    deletion all undone → unconverged)."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[a](a.md) [c](c.md)")
+        _mk(base, "candidate/a.md", "---\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        _mk(base, "candidate/c.md", "---\ncompiled_from:\n  - snap/ghost.md\n---\n正文c。")
+        report = {
+            "coverage": {"dangling_citations": ["snap/ghost.md"]},
+            "lint": {"ok": False, "violations": [
+                {"page": "b.md", "kind": "charset_corruption", "detail": "…"},
+                {"page": selfcheck.EXCLUSIONS_PATH, "kind": "exclusions_invalid", "detail": "…"},
+            ]},
+        }
+        pages = selfcheck.ledger_repair_pages(td, report)
+        # lint page in; EXCLUSIONS pseudo-page out; dangling-citing page resolved
+        assert pages == ["b.md", "c.md"], pages
+        # clean report → nothing to widen
+        assert selfcheck.ledger_repair_pages(td, {"coverage": {}, "lint": {"ok": True, "violations": []}}) == []
+        print("OK  ledger_repair_pages (lint pages + dangling-citing pages, pseudo-entries excluded)")
+
+
 def test_state_key():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -800,6 +825,7 @@ def main():
     test_cap_media_pending()
     test_dangling_alone_blocks_closed()
     test_file_residual_ticket()
+    test_ledger_repair_pages()
     test_state_key()
     test_candidate_tree_hash_unreadable()
     test_pack_hash_is_relposix_sorted()

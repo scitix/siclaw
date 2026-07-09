@@ -719,6 +719,32 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def ledger_repair_pages(workdir: str, report: dict) -> list[str]:
+    """Pages a LEDGER/LINT repair turn legitimately edits — on an incremental
+    round the byte-integrity guard must authorize exactly these for the repair
+    turn, or its mechanical restore reverts the repair itself and the round can
+    never converge (seen live 07-09: a repair fixed 4 charset pages + deleted a
+    sourceless orphan, and the re-armed guard restored all 5 → unconverged +
+    a residual ticket for work that had in fact been done).
+
+    = lint violation pages (charset/orphan/… name their page) ∪ pages whose
+    compiled_from cites a dangling path (they must be edited to fix or drop the
+    citation). Unaccounted-source merges are NOT here — the model declares
+    those via ADDED_TARGETS.json, which the guard already honors live."""
+    pages: set[str] = set()
+    lint = report.get("lint") or {}
+    for v in lint.get("violations") or []:
+        p = v.get("page")
+        if p and p != EXCLUSIONS_PATH:
+            pages.add(str(p))
+    dangling = set((report.get("coverage") or {}).get("dangling_citations") or [])
+    if dangling:
+        for rel, info in candidate_pages(workdir).items():
+            if any(s in dangling for s in info.get("sources") or []):
+                pages.add(rel)
+    return sorted(pages)
+
+
 # ── L2: budget spent with residuals → a ticket, never owner homework ─────────
 # The publish page only DISPLAYS residual state; the owner must never discover
 # work there. When the bounded repair loop gives up (state=unconverged), CODE
