@@ -20,7 +20,7 @@ export interface CapabilityGroup {
 export const CAPABILITY_GROUPS: CapabilityGroup[] = [
   { key: "read_files", name: "Read files", description: "Read & search files and knowledge pages", tools: ["read", "grep", "find", "ls"] },
   { key: "write_sandbox", name: "Write & author skills", description: "Write/edit scratch files and author skills (sandboxed to user-data)", tools: ["write", "edit", "skill_preview"] },
-  { key: "inspect_infra", name: "Inspect infrastructure", description: "Read-only probes of clusters and hosts", tools: ["cluster_list", "cluster_probe", "host_list", "resolve_pod_netns"] },
+  { key: "inspect_infra", name: "Inspect infrastructure", description: "Read-only probes of clusters and hosts", tools: ["cluster_list", "host_list", "resolve_pod_netns"] },
   { key: "run_commands", name: "Run commands", description: "Execute whitelisted shell commands (kubectl read-only)", tools: ["bash", "node_exec", "pod_exec", "host_exec"] },
   { key: "run_scripts", name: "Run scripts", description: "Execute scripts on node / pod / host", tools: ["node_script", "pod_script", "local_script", "host_script"] },
   { key: "search_memory", name: "Search memory", description: "Semantic search over long-term memory", tools: ["memory_search", "memory_get"] },

@@ -8,13 +8,19 @@ import type { KubeconfigRef } from "../../core/types.js";
 
 /**
  * cluster_list — list and search the clusters bound to the current agent.
- * The single tool for cluster info (absorbed the former cluster_info).
+ * The single tool for cluster info (absorbed the former cluster_info and,
+ * as an opt-in `probe` flag, the former cluster_probe).
  *
  * Pulls metadata from the gateway-side CredentialService through the
  * CredentialBroker. Only clusters explicitly bound via agent_clusters are
  * returned. Optional `name` filters by case-insensitive substring of the
- * cluster name. Emits admin-maintained structured `meta` when present. Does
- * NOT probe connectivity — use cluster_probe for that.
+ * cluster name. Emits admin-maintained structured `meta` when present.
+ *
+ * Connectivity is NOT tested by default (metadata is a cheap cached read that
+ * touches no cluster). Pass `probe:true` to additionally run `kubectl version`
+ * against every returned cluster in parallel and fold reachability into each
+ * entry — use this only when reachability is actually the question, since the
+ * first real kubectl/script command already surfaces an unreachable cluster.
  */
 export function createClusterListTool(kubeconfigRef: KubeconfigRef): ToolDefinition {
   return {
@@ -33,14 +39,19 @@ when set: \`description\`, \`api_server\`, kube-context names (\`contexts\`/
 maintains that are NOT discoverable via kubectl (e.g. RDMA type, GPU scheduler,
 CNI plugin, node model, storage backend), given as key→value pairs.
 Pass \`name\` to narrow the list to clusters whose NAME contains that substring
-(case-insensitive). This does NOT test connectivity — use \`cluster_probe\` for
-reachability. Call it before any kubectl/script work to discover the available
-clusters; when several remain, ask the user which to use rather than guessing.`,
+(case-insensitive). By default this does NOT test connectivity; pass
+\`probe:true\` to also run \`kubectl version\` against each returned cluster and
+add \`reachable\` (plus \`server_version\`/\`probe_error\`) to every entry — reach
+for it only when reachability is the question, as the first real kubectl/script
+command already reveals an unreachable cluster. Call it before any kubectl/script
+work to discover the available clusters; when several remain, ask the user which
+to use rather than guessing.`,
     parameters: Type.Object({
       name: Type.Optional(Type.String({ description: "Narrow to clusters whose name contains this substring (case-insensitive). Omit to list all bound clusters." })),
+      probe: Type.Optional(Type.Boolean({ description: "When true, actively test connectivity to each returned cluster (kubectl version, in parallel) and include reachable/server_version/probe_error per entry. Default false: metadata only, no cluster contact." })),
     }),
     async execute(_toolCallId, rawParams) {
-      const params = rawParams as { name?: string };
+      const params = rawParams as { name?: string; probe?: boolean };
       const broker = kubeconfigRef.credentialBroker;
       if (!broker) {
         return {
@@ -71,15 +82,34 @@ clusters; when several remain, ask the user which to use rather than guessing.`,
         metas = metas.filter((meta) => meta.name.toLowerCase().includes(needle));
       }
 
-      const entries = metas.map((meta) => ({
-        name: meta.name,
-        description: meta.description ?? null,
-        api_server: meta.api_server ?? null,
-        is_production: meta.is_production,
-        ...(meta.contexts ? { contexts: meta.contexts } : {}),
-        ...(meta.current_context ? { current_context: meta.current_context } : {}),
-        ...flattenClusterMeta(meta.meta),
-      }));
+      // Opt-in connectivity: probe only the clusters we're about to return,
+      // in parallel (bounded in the broker). A probe failure lands as an
+      // unreachable entry, never an error for the whole call.
+      let probeByName: Map<string, { reachable: boolean; server_version?: string; probe_error?: string }> | undefined;
+      if (params.probe && metas.length > 0) {
+        const results = await broker.probeClusters(metas.map((meta) => meta.name));
+        probeByName = new Map(results.map((r) => [r.name, r] as const));
+      }
+
+      const entries = metas.map((meta) => {
+        const probe = probeByName?.get(meta.name);
+        return {
+          name: meta.name,
+          description: meta.description ?? null,
+          api_server: meta.api_server ?? null,
+          is_production: meta.is_production,
+          ...(meta.contexts ? { contexts: meta.contexts } : {}),
+          ...(meta.current_context ? { current_context: meta.current_context } : {}),
+          ...flattenClusterMeta(meta.meta),
+          ...(probe
+            ? {
+                reachable: probe.reachable,
+                ...(probe.server_version ? { server_version: probe.server_version } : {}),
+                ...(probe.probe_error ? { probe_error: probe.probe_error } : {}),
+              }
+            : {}),
+        };
+      });
 
       let hint = "";
       if (boundTotal === 0) {
