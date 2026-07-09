@@ -216,7 +216,10 @@ function truncateRuneSafe(s: string, maxLen: number): string {
  * last (rune-safe) — the routing signal survives longest.
  */
 function formatConsumerMetaEntry(meta: BundleConsumerMeta, budget: number): string {
-  const heading = `### ${meta.name ?? "Knowledge base"}${meta.version ? ` (v${meta.version})` : ""}`;
+  // sicore injects published_version already prefixed ("v1"); sync-manifest
+  // versions are bare numbers. Normalize so neither renders as "vv1".
+  const versionLabel = meta.version ? (meta.version.startsWith("v") ? meta.version : `v${meta.version}`) : "";
+  const heading = `### ${meta.name ?? "Knowledge base"}${versionLabel ? ` (${versionLabel})` : ""}`;
   const build = (summary: string, withWhen: boolean, withNotFor: boolean): string => {
     const lines = [heading, summary];
     if (withWhen && meta.whenToUse.length > 0) lines.push(`Use when: ${meta.whenToUse.join("; ")}`);

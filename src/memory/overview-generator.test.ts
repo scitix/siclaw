@@ -356,6 +356,17 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).not.toContain("generated_by");
   });
 
+  it("does not double the v prefix when published_version is already prefixed (sicore wire format)", () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[a]] — x");
+    fs.writeFileSync(path.join(knowledgeDir, ".sync-manifest.json"), JSON.stringify({
+      repos: [{ id: "1", name: "wiki-a", version: 3 }],
+    }));
+    writeMeta(knowledgeDir, { version: 1, summary: "口径", published_version: "v9" });
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(out).toContain("### wiki-a (v9)");
+    expect(out).not.toContain("(vv9)");
+  });
+
   it("falls back to the sync-manifest version when the meta has no published_version", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[a]] — x");
     fs.writeFileSync(path.join(knowledgeDir, ".sync-manifest.json"), JSON.stringify({
