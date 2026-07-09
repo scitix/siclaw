@@ -370,6 +370,62 @@ def test_residual_fingerprint_full_set():
     print("OK  residual fingerprint covers the full set (no prefix collision)")
 
 
+async def test_media_clean_pass_settles_converge():
+    """Review HIGH: the clean/failed media-verify paths used to stop dead —
+    converge_phase parked at "verifying" forever in the single-session case.
+    The flow must hand back to the seam: chain PK, else settle."""
+    import mediaverify as mv
+    from compile_box import _maybe_start_media_verify, _post_turn_selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/i1.png")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        run = _FakeRun(td)
+
+        async def clean_verify(engine, workdir, pending, progress=None, locale=None):
+            return {"findings": [], "errors": [], "images": 1, "cache_hits": 0,
+                    "completed_pages": sorted(pending), "failed_pages": []}
+
+        os.environ["KBC_PK_MODE"] = "off"
+        orig = mv.run_blind_verify
+        mv.run_blind_verify = clean_verify
+        try:
+            assert await _post_turn_selfcheck(run) is None  # ledger passes
+            assert _maybe_start_media_verify(run)
+            await run._media_task
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            assert sc.get("converge_phase") == "settled", sc  # NOT parked at "verifying"
+        finally:
+            mv.run_blind_verify = orig
+    print("OK  clean media pass settles converge (no verifying wedge)")
+
+
+def test_page_too_large_lint():
+    """Review fix: a page crossing the sync cap is silently absent/stale in the
+    store and the published version while all checks stay green — lint now
+    turns that into a model-fixable violation."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/snap/one.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[big](big.md)")
+        _mk(base, "candidate/big.md",
+            "---\ncompiled_from:\n  - snap/one.md\n---\n" + "长内容。" * 200)
+        os.environ["KBC_MAX_SYNC_FILE_BYTES"] = "512"
+        try:
+            report = selfcheck.run_layer1(td)
+            kinds = {v["kind"] for v in report["lint"]["violations"]}
+            assert "page_too_large" in kinds, report["lint"]
+        finally:
+            del os.environ["KBC_MAX_SYNC_FILE_BYTES"]
+        # default cap (1MB): the same page is fine
+        report2 = selfcheck.run_layer1(td)
+        assert "page_too_large" not in {v["kind"] for v in report2["lint"]["violations"]}
+    print("OK  page_too_large lint (sync-cap divergence made loud, env-tunable)")
+
+
 def test_state_key():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -862,12 +918,14 @@ def main():
     test_ledger_repair_pages()
     test_citation_path_normalization()
     test_residual_fingerprint_full_set()
+    test_page_too_large_lint()
     test_state_key()
     test_candidate_tree_hash_unreadable()
     test_pack_hash_is_relposix_sorted()
     test_content_hash_shared_formula()
     asyncio.run(test_wiring())
     asyncio.run(test_media_verify_wiring())
+    asyncio.run(test_media_clean_pass_settles_converge())
     asyncio.run(test_media_failed_pages_retry_then_exhaust())
     asyncio.run(test_media_attempt_count_resets_on_success())
     asyncio.run(test_pk_failed_state_settles_converge())

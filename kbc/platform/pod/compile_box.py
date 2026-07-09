@@ -850,7 +850,12 @@ def _make_compile_tools(run: CompileRun):
     @tool(
         "resolve_ticket",
         ts["resolve_ticket"]["desc"],
-        {"ticket_id": str, "applied_value": str, "pages_edited": list, "note": str},
+        # dispatch_nonce IS part of the schema: the prompt orders the echo and
+        # the consumer matches receipts to dispatch rounds by it — but a model
+        # follows the declared parameter list, so leaving it out guaranteed the
+        # echo was omitted (review finding). Empty string when the directive
+        # carried no nonce.
+        {"ticket_id": str, "applied_value": str, "pages_edited": list, "note": str, "dispatch_nonce": str},
     )
     async def resolve_ticket(args):
         rt = ts["resolve_ticket"]
@@ -946,7 +951,11 @@ async def _smoke_compile(run: CompileRun):
 
 
 def _l1_repair_rounds() -> int:
-    return int(os.environ.get("KBC_L1_REPAIR_ROUNDS", "1"))
+    # Default 2 (was 1): with the gateway's per-chunk SSE decoding bug, a long
+    # Chinese repair turn's OWN output can pick up fresh U+FFFD corruption —
+    # one round was structurally a coin-flip on large zh KBs (review finding).
+    # Still bounded; drop back to 1 once the gateway does cross-chunk decoding.
+    return int(os.environ.get("KBC_L1_REPAIR_ROUNDS", "2"))
 
 
 def _media_verify_enabled() -> bool:
@@ -1065,6 +1074,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
     transcriber never sees the page, the comparer never sees the image —
     the 07-06/07 live failures (MEM 条→GPU-Util, 跨图 H20) were both
     confirmation-bias artifacts of claim-in-context re-reading. Fail-open."""
+    injected_repair = False
     try:
         n_imgs = sum(len(v) for v in chunk.values())
         await run.emit({"type": "summary",
@@ -1092,6 +1102,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
                 f"Self-check (images): {result['images']} image(s) checked, {len(findings)} claim(s) contradict the image / exceed the source — repair injected{tail}",
                 f"自检(图像):{result['images']} 张图已核,{len(findings)} 条断言与图不符/超源,注入回修{tail}")})
             await _set_converge_phase(run, "revising")
+            injected_repair = True
             await run.inject_user_message(mediaverify.build_repair_prompt(findings, locale=getattr(run, "locale", None)))
         else:
             await run.emit({"type": "summary", "text": _loc(run,
@@ -1107,6 +1118,18 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             pass
     finally:
         run._media_inflight = getattr(run, "_media_inflight", set()) - set(chunk)
+        # Hand back to the seam (review HIGH): the findings path re-enters it via
+        # its repair turn, but the CLEAN and failed paths used to just stop —
+        # converge_phase parked at "verifying" forever in the single-session
+        # case (test step never unlocked, PK never ran). Mirror the seam: chain
+        # PK, else settle. Failed passes settle too (never-stuck — the next
+        # turn's seam retries media while attempts remain).
+        if not injected_repair:
+            try:
+                if not _maybe_start_pk(run):
+                    await _set_converge_phase(run, "settled")
+            except Exception:
+                pass
 
 
 # ── Layer-2 red-blue PK wiring (S2, DESIGN-kb-compile-self-verification §9) ──
@@ -1362,13 +1385,23 @@ async def _post_turn_selfcheck(run) -> str | None:
     incr = getattr(run, "_incr_pending", None)
     run._incr_pending = None
     key = selfcheck.state_key(workdir)
-    if incr is None:
-        if key is None or key == run._selfcheck_key:
+    unchanged = key is not None and key == run._selfcheck_key
+    if unchanged:
+        # A NO-OP repair turn must still reach the gate: the dedup early-return
+        # used to let a repair turn that changed nothing ledger-relevant keep
+        # state="repairing" forever with NO residual ticket while the seam
+        # settled (review finding). Falling through re-runs the gate on the
+        # same tree — spends the budget honestly and files the ticket. A
+        # byte-unchanged tree still cannot have out-of-scope edits, so the
+        # incremental guard stays trivially clean either way.
+        last_state = (selfcheck.read_selfcheck(workdir) or {}).get("state")
+        if last_state != "repairing":
+            return None
+    elif incr is None:
+        if key is None:
             return None
         if not (Path(workdir) / "candidate" / "index.md").is_file():
             return None  # mid-Execute: pages exist but the index isn't written yet
-    elif key is not None and key == run._selfcheck_key:
-        return None  # byte-unchanged tree → no out-of-scope edits possible
     # An INCREMENTAL turn falls through even with index.md (or the whole tree)
     # missing: on an incremental turn the index always pre-existed, so its
     # absence IS out-of-scope damage — the guard below restores what the
@@ -1523,6 +1556,10 @@ async def _emit_message(run: CompileRun, msg) -> None:
             try:
                 await run.inject_user_message(repair_msg)
             except Exception as e:
+                # The repair turn never started — a re-armed guard left behind
+                # would judge the next unrelated turn against this round's
+                # snapshot and restore over the owner's edits (review finding).
+                run._incr_pending = None
                 msg = (f"Self-check repair injection failed: {e!r}"
                        if selfcheck._is_en(getattr(run, "locale", None))
                        else f"自检回修注入失败: {e!r}")
@@ -1652,6 +1689,11 @@ async def _start_incremental(run: "CompileRun", text: str) -> None:
         run._begin_turn(text)
         await run.client.query(text)
         return
+    # ADDED_TARGETS is a PER-ROUND declaration (pages the model merges added
+    # sources into). Nothing box-side cleared it, so declarations from earlier
+    # rounds stayed authorized forever and eroded the byte-freeze guarantee
+    # round over round (review finding). A new round starts blank.
+    (Path(run.workdir) / incremental.ADDED_TARGETS_PATH).unlink(missing_ok=True)
     run._incr_pending = {
         "before": incremental.page_hashes(run.workdir),
         # bytes ride along for the closing guard's MECHANICAL restore — the model
@@ -1666,7 +1708,16 @@ async def _start_incremental(run: "CompileRun", text: str) -> None:
                      f"增量重编:{len(cs['affected_pages'])} 页受影响,只改这些,其余不动。")})
     directive = incremental.build_scoped_directive(cs, locale=getattr(run, "locale", None))
     run._begin_turn(directive)  # arm the stall watchdog — same as every other kickoff
-    await run.client.query(directive)
+    try:
+        await run.client.query(directive)
+    except BaseException:
+        # A turn that never started must not leave a stale arm: the next
+        # UNRELATED turn would be judged against this round's snapshot and the
+        # mechanical restore would silently revert the owner's edits (review
+        # finding). The snapshot must precede query (edits begin right after
+        # send), so clear-on-failure is the correct half of arm/dispatch.
+        run._incr_pending = None
+        raise
 
 
 def _batch_plan_path(run: "CompileRun") -> Path:

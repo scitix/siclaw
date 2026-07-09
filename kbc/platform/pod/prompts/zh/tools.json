@@ -8,7 +8,7 @@
     "reminder": "(提醒:顺手把候选页清单以 `- [ ] 页名 — 一句话` 维护进 authoring/PLAN.md 的 ## Next Pages 作为你的工作状态,便于追踪进度;这不影响本次计划已抛出。)"
   },
   "resolve_ticket": {
-    "desc": "回修完一条矛盾工单后逐条调用(一条一次,别批量):登记你把哪条(ticket_id)按什么值(applied_value)回修了、实际改了哪几个 candidate 文件(pages_edited,必须覆盖该工单的 affected_pages)、一句话备注(note)。这会把该工单标为已回修并写下可审计的 agent_report —— 是「矛盾处理」显示「AI 已回修」、并让负责人核对的依据。",
+    "desc": "回修完一条矛盾工单后逐条调用(一条一次,别批量):登记你把哪条(ticket_id)按什么值(applied_value)回修了、实际改了哪几个 candidate 文件(pages_edited,必须覆盖该工单的 affected_pages)、一句话备注(note)。这会把该工单标为已回修并写下可审计的 agent_report —— 是「矛盾处理」显示「AI 已回修」、并让负责人核对的依据。 dispatch_nonce 原样回传指令里该工单的 nonce:(指令没带就传空字符串)——它把这份回执对到确切的派发轮。",
     "need_id": "resolve_ticket 需要 ticket_id",
     "read_failed": "读 CONTRADICTIONS.json 失败: {e}",
     "not_found": "没找到工单 {tid};现有 id: {ids}",

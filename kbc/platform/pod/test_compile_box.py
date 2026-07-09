@@ -1199,6 +1199,77 @@ async def test_incremental_index_deletion_cannot_escape_guard():
     print("OK  index deletion on an incremental turn cannot escape the guard")
 
 
+async def test_incremental_arm_cleared_when_dispatch_fails():
+    """Review fix: the snapshot must precede query (edits begin right after
+    send), so a query that RAISES must clear the arm — a stale arm would judge
+    the next unrelated turn against this round's snapshot and silently restore
+    over the owner's edits. Also: ADDED_TARGETS is a per-round declaration and
+    resets at round start."""
+    import json as _json
+
+    class _ExplodingClient:
+        async def query(self, text):
+            raise RuntimeError("stdin write failed")
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "candidate").mkdir(parents=True)
+        (wd / "authoring").mkdir(parents=True)
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntitle: t\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+        # stale per-round declaration from an earlier round must not survive
+        (wd / "authoring" / "ADDED_TARGETS.json").write_text('["stale-page.md"]')
+        (wd / "authoring" / "RAW_CHANGES.json").write_text(_json.dumps({
+            "modified": ["snap/one.md"], "added": [], "deleted": [],
+            "diffs": {}, "snapshot_fingerprint": "SNAP"}))
+        run = compile_box.CompileRun("incrfail", str(wd), 1)
+        run.client = _ExplodingClient()
+        try:
+            await compile_box._start_incremental(run, "请增量重编")
+            assert False, "query failure must propagate"
+        except RuntimeError:
+            pass
+        assert run._incr_pending is None  # no stale arm on a turn that never started
+        assert not (wd / "authoring" / "ADDED_TARGETS.json").exists()  # per-round reset
+    print("OK  incremental arm cleared on dispatch failure + ADDED_TARGETS per-round reset")
+
+
+async def test_noop_repair_turn_reaches_the_gate():
+    """Review fix: a repair turn that changes nothing ledger-relevant used to
+    hit the state_key dedup early-return — state stayed 'repairing' forever,
+    NO residual ticket, while the seam settled. It must fall through, spend
+    the budget, and file the ticket."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # unaccounted forever
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("noop", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"  # pin: the default is now 2
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is not None and "never-compiled.md" in repair  # round 1: repairing
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "repairing", sc
+        # the repair turn does NOTHING ledger-relevant (tree unchanged, key matches)
+        repair2 = await compile_box._post_turn_selfcheck(run)
+        assert repair2 is None, repair2
+        sc2 = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc2["state"] == "unconverged", sc2  # budget spent honestly, not stuck 'repairing'
+        tickets = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
+        assert any(str(tk.get("id", "")).startswith("selfcheck-residual-") for tk in tickets), tickets
+        del os.environ["KBC_L1_REPAIR_ROUNDS"]
+    print("OK  no-op repair turn reaches the gate (unconverged + residual ticket, not silent)")
+
+
 async def test_batch_orchestrator_routing_and_resume():
     """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
     the threshold gate (small KBs never batch), the orchestrator stamps batches
@@ -1872,6 +1943,8 @@ async def main():
     await test_unconverged_files_residual_ticket()
     await test_repair_turn_may_edit_ledger_target_pages()
     await test_incremental_index_deletion_cannot_escape_guard()
+    await test_incremental_arm_cleared_when_dispatch_fails()
+    await test_noop_repair_turn_reaches_the_gate()
     await test_batch_orchestrator_routing_and_resume()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()

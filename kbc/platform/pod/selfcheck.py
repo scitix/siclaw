@@ -325,6 +325,13 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
     provenance requirement."""
     violations: list[dict] = []
     names = set(pages.keys())
+    # Same cap as the workspace sync (compile_box.MAX_SYNC_FILE_BYTES): a page
+    # crossing it is SILENTLY skipped by the sync — absent (or stale) in the
+    # consumer store and therefore in the published version, while every local
+    # check stays green (review finding). Making it a lint violation turns the
+    # silent divergence into a model-fixable signal — an over-1MB wiki page
+    # needs splitting regardless.
+    sync_cap = int(os.environ.get("KBC_MAX_SYNC_FILE_BYTES", str(1024 * 1024)))
     for rel, page in pages.items():
         if "error" in page:
             violations.append({"page": rel, "kind": "unreadable", "detail": page["error"]})
@@ -333,6 +340,12 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
             violations.append({"page": rel, "kind": "no_provenance",
                                "detail": "frontmatter 缺 compiled_from(纯综合页请标 derived: true)"})
         text = page.get("text", "")
+        page_bytes_len = len(text.encode("utf-8"))
+        if page_bytes_len > sync_cap:
+            violations.append({"page": rel, "kind": "page_too_large",
+                               "detail": (f"页面 {page_bytes_len // 1024}KB 超过同步上限"
+                                          f"({sync_cap // 1024}KB)——超限页不会被持久化/发布(静默丢失);"
+                                          "按主题拆成多页并挂回 index")})
         base = Path(rel).parent
         for target in _MD_LINK_RE.findall(text):
             if target.startswith(("http://", "https://", "/")):
@@ -554,9 +567,12 @@ def run_layer1(workdir: str) -> dict:
 
 
 def write_selfcheck(workdir: str, report: dict) -> None:
-    path = Path(workdir) / SELFCHECK_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # Atomic (temp + os.replace): SELFCHECK.json is the sole carrier of the
+    # converge signal and is written exactly at the turn-end seam — the same
+    # SIGTERM/OOM window that motivated the ticket-file fix. A torn write reads
+    # back as absent and silently drops state + converge_phase.
+    _write_text_atomic(Path(workdir) / SELFCHECK_PATH,
+                       json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
 
 def update_pk_section(workdir: str, pk: dict) -> None:
