@@ -187,15 +187,19 @@ export function createLarkHandler(
           });
           return Promise.resolve();
         },
-        // Card button clicks (👍/👎 feedback). Unlike messages, the handler's
-        // return value IS the callback response (toast shown to the clicker),
-        // so this one is awaited — persistence is deadline-raced inside the
-        // handler to stay within Feishu's callback window.
-        "card.action.trigger": (data: any) =>
-          handleLarkCardAction(data, larkClient).catch((err) => {
+        // Card button clicks (👍/👎 feedback). The handler's return value IS
+        // the callback response (toast shown to the clicker), so it resolves
+        // synchronously and immediately — persistence runs detached inside the
+        // handler to stay well within Feishu's ~3s callback window (see the
+        // handleLarkCardAction doc comment / the 200671 fix).
+        "card.action.trigger": (data: any) => {
+          try {
+            return handleLarkCardAction(data, larkClient);
+          } catch (err) {
             console.error(`[lark] Error handling card action for channel=${channelId}:`, err);
             return undefined;
-          }),
+          }
+        },
       });
 
       const ws = new lark.WSClient({
@@ -340,28 +344,27 @@ const FEEDBACK_TOAST_BY_LOCALE: Record<LarkLocale, { ok: string; fail: string }>
   "en-US": { ok: "Feedback recorded — thanks!", fail: "Could not record feedback. Please try again." },
 };
 
-// Feishu expects the card-callback response within a few seconds; the WS RPC's
-// own timeout is 30s. Race the persist so a degraded Portal degrades to a
-// quick error toast instead of a hung click + Feishu redelivery storm. A
-// persist that lands after the deadline is absorbed by the upsert when the
-// user retries.
-const FEEDBACK_PERSIST_DEADLINE_MS = 2500;
-
 /**
  * Handle a `card.action.trigger` callback. Only feedback buttons (our
  * FEEDBACK_ACTION_KIND discriminator) are processed; anything else returns
  * undefined so future card actions can add their own handling.
  *
- * The return value is sent back to Feishu as the callback response — a toast
- * shown to the clicker. Persistence goes through chat-repo's module-global
- * RPC client (same path as message persistence); the button-state echo on the
- * card itself is best-effort (needs this process to still know the card's
- * sequence).
+ * The return value is the card-callback response Feishu shows as a toast.
+ * Feishu enforces a hard ~3s budget on that response measured END-TO-END
+ * (its edge → this pod → back). We MUST NOT block it on the persist RPC:
+ * persistence hops to Portal/sicore over WS, and that latency plus the two
+ * network legs intermittently blew the 3s budget — Feishu then rejected an
+ * otherwise-valid response with business error 200671, even though the vote
+ * had already been written. So respond OPTIMISTICALLY and immediately, and
+ * run persistence + the button-state echo fully detached. Feedback is
+ * best-effort (and confirmed reliable in practice); a rare persist failure is
+ * logged rather than surfaced, which is strictly better than showing 200671
+ * on a click that did save.
  */
-export async function handleLarkCardAction(
+export function handleLarkCardAction(
   data: any,
   larkClient: any,
-): Promise<{ toast: { type: string; content: string } } | undefined> {
+): { toast: { type: string; content: string } } | undefined {
   // EventDispatcher flattens `event.*` onto the top level (same as messages).
   // Some Feishu/CardKit versions deliver `action.value` as a JSON string
   // rather than a parsed object — accept both so feedback doesn't silently
@@ -383,44 +386,32 @@ export async function handleLarkCardAction(
     console.warn(`[lark] Dropping malformed feedback action card=${value.card_id ?? "?"} rating=${value.rating ?? "?"} operator=${operatorOpenId ?? "?"}`);
     return { toast: { type: "error", content: toasts.fail } };
   }
+  const { session_id: sessionId, card_id: cardId, channel_id: channelId } = value;
 
-  // Never rejects — failures collapse to {success:false} so a late settle
-  // after the deadline below can't surface as an unhandled rejection.
-  const persist = recordChannelFeedback({
-    sessionId: value.session_id,
-    messageRef: value.card_id,
-    rating,
-    senderExternalId: operatorOpenId,
-    channelId: value.channel_id ?? null,
-    source: "lark",
-  }).catch((err): { success: boolean; error?: string } => {
-    console.error(`[lark] Feedback persist failed card=${value.card_id}:`, err);
-    return { success: false, error: err instanceof Error ? err.message : String(err) };
-  });
-  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-  const result = await Promise.race([
-    persist,
-    new Promise<null>((resolve) => {
-      deadlineTimer = setTimeout(() => resolve(null), FEEDBACK_PERSIST_DEADLINE_MS);
-      (deadlineTimer as { unref?: () => void }).unref?.();
-    }),
-  ]);
-  // Clear the timer once the race settles — on the common fast-persist path it
-  // would otherwise stay armed (harmlessly, thanks to unref) for the full deadline.
-  if (deadlineTimer) clearTimeout(deadlineTimer);
-  if (!result?.success) {
-    if (result == null) {
-      console.warn(`[lark] Feedback persist timed out (${FEEDBACK_PERSIST_DEADLINE_MS}ms) card=${value.card_id}`);
-    } else if (result.error) {
-      console.warn(`[lark] Feedback persist rejected card=${value.card_id}: ${result.error}`);
+  // Detached: persist the vote, then echo the button highlight. Neither is on
+  // the callback-response critical path (see the 3s-budget note above).
+  void (async () => {
+    try {
+      const result = await recordChannelFeedback({
+        sessionId,
+        messageRef: cardId,
+        rating,
+        senderExternalId: operatorOpenId,
+        channelId: channelId ?? null,
+        source: "lark",
+      });
+      if (!result?.success) {
+        console.warn(`[lark] Feedback persist rejected card=${cardId}: ${result?.error ?? "unknown"}`);
+        return;
+      }
+      console.log(`[lark] Feedback recorded card=${cardId} session=${sessionId} rating=${rating} sender=${operatorOpenId}`);
+      // Cosmetic: highlight the chosen button. Never rejects (best-effort boolean).
+      void applyFeedbackSelection(larkClient, value as FeedbackActionValue, rating);
+    } catch (err) {
+      console.error(`[lark] Feedback persist failed card=${cardId}:`, err);
     }
-    return { toast: { type: "error", content: toasts.fail } };
-  }
+  })();
 
-  console.log(`[lark] Feedback recorded card=${value.card_id} session=${value.session_id} rating=${rating} sender=${operatorOpenId}`);
-  // Detached: highlighting the chosen button is cosmetic; the toast below is
-  // the authoritative confirmation. Never rejects (best-effort boolean).
-  void applyFeedbackSelection(larkClient, value as FeedbackActionValue, rating);
   return { toast: { type: "success", content: toasts.ok } };
 }
 

@@ -1061,10 +1061,16 @@ describe("handleLarkCardAction — 👍/👎 feedback", () => {
     };
   }
 
-  it("persists the vote keyed by the clicker's open_id and returns a success toast", async () => {
-    recordChannelFeedbackMock.mockResolvedValue({ success: true });
-    const result = await handleLarkCardAction(makeCardAction(), makeLarkClient());
+  // Flush the detached persist/echo IIFE queued by the (synchronous) handler.
+  const flush = () => new Promise((r) => setImmediate(r));
 
+  it("returns the success toast synchronously and persists the vote detached", async () => {
+    recordChannelFeedbackMock.mockResolvedValue({ success: true });
+    // Synchronous return — the callback response must not await persistence.
+    const result = handleLarkCardAction(makeCardAction(), makeLarkClient());
+    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("反馈") } });
+
+    await flush();
     expect(recordChannelFeedbackMock).toHaveBeenCalledWith({
       sessionId: "sess-1",
       messageRef: "CARD-1",
@@ -1073,14 +1079,14 @@ describe("handleLarkCardAction — 👍/👎 feedback", () => {
       channelId: "lark",
       source: "lark",
     });
-    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("反馈") } });
   });
 
   it("ignores card actions that are not feedback buttons", async () => {
     recordChannelFeedbackMock.mockClear();
     const data = makeCardAction({ action: { tag: "button", value: { kind: "something_else" } } });
-    const result = await handleLarkCardAction(data, makeLarkClient());
+    const result = handleLarkCardAction(data, makeLarkClient());
     expect(result).toBeUndefined();
+    await flush();
     expect(recordChannelFeedbackMock).not.toHaveBeenCalled();
   });
 
@@ -1089,23 +1095,38 @@ describe("handleLarkCardAction — 👍/👎 feedback", () => {
     recordChannelFeedbackMock.mockResolvedValue({ success: true });
     const data = makeCardAction();
     (data.action as any).value = JSON.stringify((data.action as any).value);
-    const result = await handleLarkCardAction(data, makeLarkClient());
-    expect(recordChannelFeedbackMock).toHaveBeenCalledWith(expect.objectContaining({ rating: "up", messageRef: "CARD-1" }));
+    const result = handleLarkCardAction(data, makeLarkClient());
     expect(result).toEqual({ toast: { type: "success", content: expect.any(String) } });
+    await flush();
+    expect(recordChannelFeedbackMock).toHaveBeenCalledWith(expect.objectContaining({ rating: "up", messageRef: "CARD-1" }));
   });
 
   it("missing operator open_id → error toast, nothing persisted", async () => {
     recordChannelFeedbackMock.mockClear();
     const data = makeCardAction({ operator: {} });
-    const result = await handleLarkCardAction(data, makeLarkClient());
+    const result = handleLarkCardAction(data, makeLarkClient());
     expect(result).toEqual({ toast: { type: "error", content: expect.any(String) } });
+    await flush();
     expect(recordChannelFeedbackMock).not.toHaveBeenCalled();
   });
 
-  it("a persist failure surfaces as an error toast", async () => {
+  it("a slow persist does NOT block the callback response (200671 fix)", async () => {
+    // Persistence hangs; the handler must still return its toast synchronously
+    // so Feishu gets a response well inside its ~3s budget.
+    recordChannelFeedbackMock.mockImplementation(() => new Promise(() => { /* never settles */ }));
+    const result = handleLarkCardAction(makeCardAction(), makeLarkClient());
+    expect(result).toEqual({ toast: { type: "success", content: expect.any(String) } });
+  });
+
+  it("a persist failure is swallowed (optimistic toast already returned)", async () => {
     recordChannelFeedbackMock.mockRejectedValueOnce(new Error("db down"));
-    const result = await handleLarkCardAction(makeCardAction(), makeLarkClient());
-    expect(result).toEqual({ toast: { type: "error", content: expect.any(String) } });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // Still an optimistic success toast — the click did reach us; a rare
+    // persist failure is logged, never shown as 200671 on a saved vote.
+    const result = handleLarkCardAction(makeCardAction(), makeLarkClient());
+    expect(result).toEqual({ toast: { type: "success", content: expect.any(String) } });
+    await flush();
+    expect(console.error).toHaveBeenCalled();
   });
 
   it("down votes and en-US locale flow through", async () => {
@@ -1113,22 +1134,10 @@ describe("handleLarkCardAction — 👍/👎 feedback", () => {
     const data = makeCardAction();
     (data.action as any).value.rating = "down";
     (data.action as any).value.locale = "en-US";
-    const result = await handleLarkCardAction(data, makeLarkClient());
-    expect(recordChannelFeedbackMock).toHaveBeenLastCalledWith(expect.objectContaining({ rating: "down" }));
+    const result = handleLarkCardAction(data, makeLarkClient());
     expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("thanks") } });
-  });
-
-  it("a hung persist RPC is deadline-raced into an error toast instead of blocking the callback", async () => {
-    vi.useFakeTimers();
-    try {
-      recordChannelFeedbackMock.mockImplementation(() => new Promise(() => { /* never settles */ }));
-      const pending = handleLarkCardAction(makeCardAction(), makeLarkClient());
-      await vi.advanceTimersByTimeAsync(2600);
-      const result = await pending;
-      expect(result).toEqual({ toast: { type: "error", content: expect.any(String) } });
-    } finally {
-      vi.useRealTimers();
-    }
+    await flush();
+    expect(recordChannelFeedbackMock).toHaveBeenLastCalledWith(expect.objectContaining({ rating: "down" }));
   });
 });
 
