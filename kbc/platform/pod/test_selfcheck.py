@@ -336,6 +336,40 @@ def test_ledger_repair_pages():
         print("OK  ledger_repair_pages (lint pages + dangling-citing pages, pseudo-entries excluded)")
 
 
+def test_citation_path_normalization():
+    """Review fix: `./live.csv` / `sub/../x.md` citations must canonicalize like
+    link targets do — un-normalized they double-reported as unaccounted AND
+    dangling, which the dangling→closed gate turns into a permanent wedge."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/snap/live.csv")
+        _mk(base, "raw/snap/sub/x.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md)")
+        _mk(base, "candidate/p1.md",
+            "---\ncompiled_from:\n  - ./snap/live.csv\n  - snap/sub/../sub/x.md\n---\n正文。")
+        cov = selfcheck.run_layer1(td)["coverage"]
+        assert cov["unaccounted"] == [] and cov["dangling_citations"] == [], cov
+        assert cov["closed"], cov
+        print("OK  citation path normalization (./ and a/../ canonicalize; no double-report wedge)")
+
+
+def test_residual_fingerprint_full_set():
+    """Review fix: the ticket id fingerprints the FULL residual set — two sets
+    sharing a 10-item prefix must not collide (the old [:10] cap silently
+    deduped the second, genuinely different, ticket away)."""
+    base_items = [f"snap/s{i:02d}.md" for i in range(10)]
+    r1 = {"coverage": {"unaccounted": base_items + ["snap/only-in-one.md"], "dangling_citations": []},
+          "lint": {"ok": True, "violations": []}}
+    r2 = {"coverage": {"unaccounted": base_items + ["snap/only-in-two.md"], "dangling_citations": []},
+          "lint": {"ok": True, "violations": []}}
+    with tempfile.TemporaryDirectory() as td:
+        assert selfcheck.file_residual_ticket(td, r1) is True
+        assert selfcheck.file_residual_ticket(td, r2) is True  # distinct id → files, not deduped
+        tickets = json.loads((Path(td) / "authoring/CONTRADICTIONS.json").read_text(encoding="utf-8"))
+        assert len(tickets) == 2 and tickets[0]["id"] != tickets[1]["id"], tickets
+    print("OK  residual fingerprint covers the full set (no prefix collision)")
+
+
 def test_state_key():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -826,6 +860,8 @@ def main():
     test_dangling_alone_blocks_closed()
     test_file_residual_ticket()
     test_ledger_repair_pages()
+    test_citation_path_normalization()
+    test_residual_fingerprint_full_set()
     test_state_key()
     test_candidate_tree_hash_unreadable()
     test_pack_hash_is_relposix_sorted()

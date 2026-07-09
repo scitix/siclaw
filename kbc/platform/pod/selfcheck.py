@@ -18,8 +18,10 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import os
 import posixpath
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,11 +94,20 @@ def _strip_source_prefix(entry: str) -> str:
 
 def _norm_source_entry(raw: str) -> str:
     """One compiled_from list entry → a raw-relative source path. Tolerates
-    `"<hash8> · <path>"`, surrounding quotes, and a raw/ or drop/ prefix."""
+    `"<hash8> · <path>"`, surrounding quotes, and a raw/ or drop/ prefix.
+    Canonicalized with posixpath.normpath, the same way intra-wiki link targets
+    are resolved: an un-normalized citation (`./live.csv`, `sub/../x.md`) used
+    to double-report as unaccounted AND dangling — cosmetic while dangling was
+    display-only, a permanent convergence wedge once it gates `closed` (review
+    finding: the model would get contradictory repair orders forever)."""
     entry = raw.strip().strip("\"'").strip()
     if "·" in entry:
         entry = entry.rsplit("·", 1)[1].strip()
-    return _strip_source_prefix(entry.strip("\"'").strip())
+    entry = _strip_source_prefix(entry.strip("\"'").strip())
+    if not entry:
+        return entry
+    entry = posixpath.normpath(entry)
+    return "" if entry == "." else entry
 
 
 def parse_compiled_from(md_text: str) -> tuple[list[str], bool, bool]:
@@ -361,6 +372,14 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
                                "detail": (f"含 U+FFFD 替换字符({shown}{more})——这是编码损坏"
                                           "(多字节字符在传输中被截断),不是内容笔误;逐处定位 �,"
                                           "对照 raw 原文判断本应是哪个字并改回,切勿照抄损坏文本、勿删字略过")})
+    if pages and "index.md" not in pages:
+        # Any tree that reaches lint must have its routing page: the full-compile
+        # mid-Execute case (index legitimately not written yet) never gets here
+        # (early-return), and an incremental turn started WITH an index — its
+        # absence is model damage. Without this rule the orphan walk silently
+        # returns [] ("no root") and an index-deleting turn settles green.
+        violations.append({"page": "index.md", "kind": "index_missing",
+                           "detail": "candidate/index.md 不存在——路由页被删;重建它并把全部页面挂回可达链"})
     for rel in _orphan_pages(pages):
         violations.append({"page": rel, "kind": "orphan",
                            "detail": "从 index.md 无链可达——把它挂进 index 或相应父页;确属废页则删除"})
@@ -745,6 +764,21 @@ def ledger_repair_pages(workdir: str, report: dict) -> list[str]:
     return sorted(pages)
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Temp file in the same dir + os.replace (mirrors the driver's helper —
+    selfcheck cannot import compile_box without a cycle). CONTRADICTIONS.json
+    is the SHARED ticket queue: a torn read-modify-write here would drop the
+    model's own tickets and wedge every later ticket read (review finding)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text, "utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 # ── L2: budget spent with residuals → a ticket, never owner homework ─────────
 # The publish page only DISPLAYS residual state; the owner must never discover
 # work there. When the bounded repair loop gives up (state=unconverged), CODE
@@ -760,22 +794,27 @@ def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) 
     cov = report.get("coverage") or {}
     lint = report.get("lint") or {}
     incr = report.get("incremental") or {}
+    # The FULL residual set — both the fingerprint and the quote derive from it.
+    # Fingerprinting a truncated view (the old [:10] caps) made two genuinely
+    # different residual sets sharing a prefix collide to one ticket id, so the
+    # second was silently deduped away (review finding). Only the DISPLAY quote
+    # is truncated, below.
     residuals: list[str] = []
     pages: set[str] = set()
-    for p in (cov.get("unaccounted") or [])[:10]:
+    for p in (cov.get("unaccounted") or []):
         residuals.append(f"未入账源: {p}")
-    for p in (cov.get("dangling_citations") or [])[:10]:
+    for p in (cov.get("dangling_citations") or []):
         residuals.append(f"悬空引用: {p}")
-    for v in (lint.get("violations") or [])[:10]:
+    for v in (lint.get("violations") or []):
         residuals.append(f"lint {v.get('kind')}: {v.get('page')} — {str(v.get('detail', ''))[:80]}")
         if v.get("page"):
             pages.add(str(v["page"]))
-    for p in (incr.get("out_of_scope_pages") or [])[:10]:
+    for p in (incr.get("out_of_scope_pages") or []):
         residuals.append(f"越界未还原: {p}")
         pages.add(str(p))
     if not residuals:
         return False
-    digest = hashlib.sha256("\n".join(residuals).encode("utf-8")).hexdigest()[:8]
+    digest = hashlib.sha256("\n".join(sorted(residuals)).encode("utf-8")).hexdigest()[:8]
     tid = f"selfcheck-residual-{digest}"
     path = Path(workdir) / "authoring" / "CONTRADICTIONS.json"
     tickets: list = []
@@ -803,8 +842,7 @@ def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) 
         "status": "open",
         "answer": None,
     })
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(tickets, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_text_atomic(path, json.dumps(tickets, ensure_ascii=False, indent=2))
     return True
 
 

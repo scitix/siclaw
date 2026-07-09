@@ -1158,6 +1158,47 @@ async def test_repair_turn_may_edit_ledger_target_pages():
     print("OK  repair turn may edit ledger-target pages (guard widened, repair survives)")
 
 
+async def test_incremental_index_deletion_cannot_escape_guard():
+    """Review fix: an incremental turn that deletes candidate/index.md used to
+    hit the mid-Execute early-return AFTER the guard state was consumed — the
+    deletion escaped the byte freeze entirely. The turn must fall through: the
+    guard restores out-of-scope damage and the ledger runs on the real tree."""
+    import json as _json
+    import incremental
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md) [c](c.md)")
+        c_original = "---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "c.md").write_text(c_original)
+        run = compile_box.CompileRun("incrx", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+        run._incr_pending = {"before": incremental.page_hashes(str(wd)),
+                             "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
+        # model edits a.md (authorized), DELETES index.md and drifts into c.md
+        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "index.md").unlink()
+        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n擅自改。")
+        repair = await compile_box._post_turn_selfcheck(run)
+        # the guard ran: c.md restored byte-exact; index.md (always-editable, no
+        # snapshot restore) leaves the tree index-less → orphan lint → repair
+        assert (wd / "candidate" / "c.md").read_text() == c_original
+        assert repair is not None and "index_missing" in repair, repair
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["incremental"]["restored_pages"] == ["c.md"], sc
+        assert sc["state"] == "repairing", sc
+    print("OK  index deletion on an incremental turn cannot escape the guard")
+
+
 async def test_batch_orchestrator_routing_and_resume():
     """Batch mode (DESIGN-kb-batch-compile-2026-07-05): trigger routing honors
     the threshold gate (small KBs never batch), the orchestrator stamps batches
@@ -1830,6 +1871,7 @@ async def main():
     await test_incremental_violation_auto_restored()
     await test_unconverged_files_residual_ticket()
     await test_repair_turn_may_edit_ledger_target_pages()
+    await test_incremental_index_deletion_cannot_escape_guard()
     await test_batch_orchestrator_routing_and_resume()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()
