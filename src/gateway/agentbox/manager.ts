@@ -87,7 +87,6 @@ export class AgentBoxManager {
    * pays nothing. Currently supplies SICLAW_AGENTBOX_IDLE_TIMEOUT.
    */
   setSpawnEnvResolver(fn: (agentId: string) => Promise<Record<string, string> | undefined>): void {
-    if (this.orphanSweepTimer) { clearInterval(this.orphanSweepTimer); this.orphanSweepTimer = undefined; }
     this.spawnEnvResolver = fn;
   }
 
@@ -323,6 +322,13 @@ export class AgentBoxManager {
 
   async cleanup(): Promise<void> {
     this.stopHealthCheck();
+    // The orphan-sweep interval dies with the manager (review: the clear had
+    // landed in setSpawnEnvResolver, which both left it running post-cleanup
+    // and silently disabled GC if a resolver was ever re-set after boot).
+    if (this.orphanSweepTimer) {
+      clearInterval(this.orphanSweepTimer);
+      this.orphanSweepTimer = undefined;
+    }
     for (const [, managed] of this.boxes) {
       await this.spawner.stop(managed.handle.boxId);
     }

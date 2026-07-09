@@ -374,6 +374,34 @@ describe("AgentBoxManager — health check timer", () => {
   });
 });
 
+describe("AgentBoxManager — orphan-sweep timer lifecycle", () => {
+  it("survives setSpawnEnvResolver and dies with cleanup() (review: the clear was misplaced)", async () => {
+    vi.useFakeTimers();
+    try {
+      const spawner = new FakeSpawner("k8s") as any;
+      let sweeps = 0;
+      spawner.sweepOrphans = async () => { sweeps++; };
+      const mgr = new AgentBoxManager(spawner);
+      mgr.startOrphanSweep(() => true, 10_000);
+      await vi.advanceTimersByTimeAsync(60_000); // boot pass + interval ticks
+      const afterBoot = sweeps;
+      expect(afterBoot).toBeGreaterThan(0);
+      // Re-setting the spawn-env resolver must NOT silently disable GC
+      mgr.setSpawnEnvResolver(async () => undefined);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(sweeps).toBeGreaterThan(afterBoot);
+      // cleanup() owns the clear
+      await mgr.cleanup();
+      const afterCleanup = sweeps;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sweeps).toBe(afterCleanup);
+      expect((mgr as any).orphanSweepTimer).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("AgentBoxManager — setCertManager passthrough", () => {
   it("forwards to spawner when spawner exposes setCertManager", () => {
     const spawner = new FakeSpawner("k8s") as any;

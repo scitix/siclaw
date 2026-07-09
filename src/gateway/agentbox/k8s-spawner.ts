@@ -43,6 +43,40 @@ const DEFAULT_CONFIG: Required<Omit<K8sSpawnerConfig, "persistence" | "nodeSelec
   labelPrefix: "siclaw.io",
 };
 
+/** K8s resource quantity → number (comparable within one resource kind).
+ *  Handles the shapes our profiles use: bare numbers, cpu millicores ("500m"),
+ *  and binary/decimal byte suffixes. Unknown shapes → NaN (caller skips). */
+export function parseK8sQuantity(q: string): number {
+  const m = /^(\d+(?:\.\d+)?)([A-Za-z]*)$/.exec(q.trim());
+  if (!m) return NaN;
+  const n = Number(m[1]);
+  const suffix = m[2];
+  if (suffix === "") return n;
+  if (suffix === "m") return n / 1000; // cpu millicores
+  const scale: Record<string, number> = {
+    Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40,
+    k: 1e3, K: 1e3, M: 1e6, G: 1e9, T: 1e12,
+  };
+  return suffix in scale ? n * scale[suffix] : NaN;
+}
+
+/** requests ≤ limits guard (review): the request/limit split lets a profile
+ *  declare a request ABOVE the (possibly default) limit — the API server
+ *  rejects such a pod outright, taking the capability down on a config typo.
+ *  Clamp the request down to the limit and say so; unparseable values pass
+ *  through untouched (the API server remains the authority). */
+export function clampRequestToLimit(request: string, limit: string, podName: string, kind: string): string {
+  const req = parseK8sQuantity(request);
+  const lim = parseK8sQuantity(limit);
+  if (Number.isFinite(req) && Number.isFinite(lim) && req > lim) {
+    console.warn(
+      `[k8s-spawner] ${podName}: ${kind} request ${request} exceeds limit ${limit}; clamping request to the limit`,
+    );
+    return limit;
+  }
+  return request;
+}
+
 export class K8sSpawner implements BoxSpawner {
   readonly name = "k8s";
 
@@ -463,8 +497,8 @@ export class K8sSpawner implements BoxSpawner {
               const res = boxConfig.resources ?? profile.resources;
               return {
                 requests: {
-                  cpu: res?.cpuRequest || res?.cpu || "100m",
-                  memory: res?.memoryRequest || res?.memory || "256Mi",
+                  cpu: clampRequestToLimit(res?.cpuRequest || res?.cpu || "100m", res?.cpu || "2000m", podName, "cpu"),
+                  memory: clampRequestToLimit(res?.memoryRequest || res?.memory || "256Mi", res?.memory || "4Gi", podName, "memory"),
                 },
                 limits: {
                   cpu: res?.cpu || "2000m",
@@ -625,7 +659,7 @@ export class K8sSpawner implements BoxSpawner {
    * Chat agent boxes (boxType "agent") are NEVER touched — they have their own
    * idle self-destruct lifecycle.
    */
-  async sweepOrphans(isLive: (boxId: string) => boolean | Promise<boolean>): Promise<void> {
+  async sweepOrphans(isLive: (runRef: string) => boolean | Promise<boolean>): Promise<void> {
     const { namespace, labelPrefix } = this.config;
     const selector = `${labelPrefix}/app=agentbox`;
     const capabilityTypes = new Set(["kb-compile", "kb-test"]);
@@ -641,7 +675,14 @@ export class K8sSpawner implements BoxSpawner {
       }
       const phase = pod.status?.phase;
       const terminal = phase === "Succeeded" || phase === "Failed";
-      const live = !terminal && (await isLive(name));
+      // Hand the oracle the RAW run id from the pod's `agent` label (stamped at
+      // spawn), not the pod name: podName() sanitizes/lowercases/truncates, so
+      // reconstructing the id by prefix-strip is exact only for the minted
+      // lowercase-UUID shape — an adopted/consumer-recovered id that doesn't
+      // round-trip would miss both the memory and store lookups and reap a
+      // LIVE box (review). Name stays the fallback for label-less debris.
+      const runRef = pod.metadata?.labels?.[`${labelPrefix}/agent`] || name;
+      const live = !terminal && (await isLive(runRef));
       if (live) {
         keptPods.add(name);
         continue;
@@ -666,8 +707,12 @@ export class K8sSpawner implements BoxSpawner {
       const name = s.metadata?.name;
       if (!name || !name.endsWith("-cert")) continue;
       if (!capabilityTypes.has(s.metadata?.labels?.[`${labelPrefix}/boxType`] ?? "")) continue;
-      const createdMs = s.metadata?.creationTimestamp ? new Date(s.metadata.creationTimestamp).getTime() : 0;
-      if (Date.now() - createdMs < minAgeMs) continue;
+      // Missing/unparseable creationTimestamp must read as YOUNG, not ancient
+      // (review: the `: 0` fallback made it look infinitely old, silently
+      // bypassing the TOCTOU age guard). Skip it this round — a real orphan
+      // will still be old next sweep.
+      const createdMs = s.metadata?.creationTimestamp ? new Date(s.metadata.creationTimestamp).getTime() : NaN;
+      if (!Number.isFinite(createdMs) || Date.now() - createdMs < minAgeMs) continue;
       if (keptPods.has(name.slice(0, -"-cert".length))) continue;
       if (pods.items?.some((p: any) => p.metadata?.name === name.slice(0, -"-cert".length))) continue;
       console.log(`[k8s-spawner] orphan sweep: removing orphaned Secret ${name}`);
