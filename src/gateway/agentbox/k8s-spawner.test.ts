@@ -90,7 +90,7 @@ const originalGatewayEnv = {
 };
 
 // Import SUT after mocks.
-import { K8sSpawner } from "./k8s-spawner.js";
+import { K8sSpawner, parseK8sQuantity, clampRequestToLimit } from "./k8s-spawner.js";
 
 // ── Fake cert manager ─────────────────────────────────────────────────
 
@@ -891,6 +891,74 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
     expect(deletedSecrets).not.toContain("agentbox-chat-1-cert");
     expect(deletedSecrets).not.toContain("agentbox-chat-gone-cert"); // chat Secrets are never this sweep's business
     expect(deletedSecrets).not.toContain("agentbox-fresh-cert");     // Secret-before-pod TOCTOU guarded by age
+  });
+
+  it("sweep hands the oracle the RAW run id from the pod's agent label (non-UUID ids survive)", async () => {
+    // podName() would have lowercased/sanitized this id — a prefix-strip of the
+    // pod name can never recover it, and a mis-keyed oracle reaps a LIVE box.
+    const rawId = "Adopted_Run.7";
+    g.__k8sImpls.listNamespacedPod = async () => ({
+      items: [
+        {
+          metadata: {
+            name: "agentbox-adopted-run-7",
+            labels: { "siclaw.io/app": "agentbox", "siclaw.io/boxType": "kb-compile", "siclaw.io/agent": rawId },
+          },
+          status: { phase: "Running" },
+        },
+        mkPod("agentbox-labelless", "kb-compile", "Running"), // legacy debris: falls back to the pod name
+      ],
+    });
+    g.__k8sImpls.listNamespacedSecret = async () => ({ items: [] });
+    const seen: string[] = [];
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async (ref: string) => { seen.push(ref); return ref === rawId; });
+    expect(seen).toEqual(expect.arrayContaining([rawId, "agentbox-labelless"]));
+    const deletedPods = g.__k8sCalls.deleteNamespacedPod.map((c: any) => c.name);
+    expect(deletedPods).not.toContain("agentbox-adopted-run-7"); // live by RAW id → kept
+    expect(deletedPods).toContain("agentbox-labelless");
+  });
+
+  it("Secret age guard treats a missing creationTimestamp as young, not ancient", async () => {
+    g.__k8sImpls.listNamespacedPod = async () => ({ items: [] });
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [
+        { metadata: { name: "agentbox-no-ts-cert", labels: { "siclaw.io/boxType": "kb-compile" } } }, // no creationTimestamp
+      ],
+    });
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async () => false);
+    const deletedSecrets = g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name);
+    expect(deletedSecrets).not.toContain("agentbox-no-ts-cert"); // TOCTOU guard NOT bypassed
+  });
+
+  it("clamps a request above the (default) limit instead of shipping an API-rejected pod", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+    await s.spawn({ agentId: "clamp-test", profile: "agent", resources: { memoryRequest: "8Gi", cpuRequest: "4" } } as any);
+    const created = g.__k8sCalls.createNamespacedPod.at(-1);
+    const res = created.body.spec.containers[0].resources;
+    expect(res.requests.memory).toBe("4Gi"); // clamped to the default limit
+    expect(res.requests.cpu).toBe("2000m");  // clamped to the default limit
+    expect(res.limits.memory).toBe("4Gi");
+  });
+
+  it("parseK8sQuantity + clampRequestToLimit cover the profile shapes", () => {
+    expect(parseK8sQuantity("500m")).toBeCloseTo(0.5);
+    expect(parseK8sQuantity("2")).toBe(2);
+    expect(parseK8sQuantity("1Gi")).toBe(2 ** 30);
+    expect(parseK8sQuantity("256Mi")).toBe(256 * 2 ** 20);
+    expect(Number.isNaN(parseK8sQuantity("weird"))).toBe(true);
+    expect(clampRequestToLimit("1Gi", "4Gi", "p", "memory")).toBe("1Gi");
+    expect(clampRequestToLimit("8Gi", "4Gi", "p", "memory")).toBe("4Gi");
+    expect(clampRequestToLimit("junk", "4Gi", "p", "memory")).toBe("junk"); // API server stays the authority
   });
 
   it("memoryRequest splits the request from the limit (burstable compile shape)", async () => {

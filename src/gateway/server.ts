@@ -438,22 +438,37 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!pending) {
       pending = (async () => {
         const client = await capabilityBoxClient(runId, profile, orgId);
-        // Raw sources + (fresh box only) the durable authoring workspace, both
-        // from the consumer's store. Best-effort — see materializeCapabilityInputs.
-        // The consumer also declares the run's LOCALE through the same channel;
-        // the box selects its prompt pack with it (absent ⇒ English default).
-        const materialized = await materializeCapabilityInputs({ client, backend: frontendClient, runId });
-        const allowedTools = getBoxProfile(profile).allowedTools ?? null;
-        await client.postJson(`/session/${runId}`, {
-          instruction: instruction ?? "",
-          allowed_tools: allowedTools,
-          locale: materialized.locale,
-          // Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
-          // opaque passthrough — the box applies them in-process before its SDK
-          // connects. Never logged here; token stays out of the pod spec.
-          llm: materialized.llm,
-          settings: materialized.settings,
-        });
+        try {
+          // Raw sources + (fresh box only) the durable authoring workspace, both
+          // from the consumer's store. Best-effort — see materializeCapabilityInputs.
+          // The consumer also declares the run's LOCALE through the same channel;
+          // the box selects its prompt pack with it (absent ⇒ English default).
+          const materialized = await materializeCapabilityInputs({ client, backend: frontendClient, runId });
+          const allowedTools = getBoxProfile(profile).allowedTools ?? null;
+          await client.postJson(`/session/${runId}`, {
+            instruction: instruction ?? "",
+            allowed_tools: allowedTools,
+            locale: materialized.locale,
+            // Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
+            // opaque passthrough — the box applies them in-process before its SDK
+            // connects. Never logged here; token stays out of the pod spec.
+            llm: materialized.llm,
+            settings: materialized.settings,
+          });
+        } catch (err) {
+          // Setup failed AFTER the pod was spawned (review): the relay's
+          // finally below — the normal stop owner — never attaches on this
+          // path, so without this stop a spawn-succeeded-but-setup-failed run
+          // leaks its pod + cert Secret until the orphan sweep. stop() is
+          // 404-tolerant (local escape-hatch boxes aren't spawner-managed).
+          void agentBoxManager.stop(runId).catch((stopErr) =>
+            console.error(
+              `[capability] stop box after setup failure run=${runId}:`,
+              stopErr instanceof Error ? stopErr.message : String(stopErr),
+            ),
+          );
+          throw err;
+        }
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
           .catch(async (err) => {
             console.error(`[capability] session relay failed run=${runId}:`, err);
@@ -487,15 +502,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   void capabilityRunManager.recover();
   capabilityRunManager.startWatchdog();
   // Capability-box orphan GC: a box is live iff its run is tracked and
-  // non-terminal. Pod names are `agentbox-<runId>` (podName sanitizes the id;
-  // capability run ids are lowercase uuids, so the strip is exact).
+  // non-terminal. The sweep resolves the RAW run id from the pod's `agent`
+  // label (stamped at spawn), so the oracle keys correctly for ANY id shape.
   // Optional-call: startRuntime tests inject minimal manager fakes that predate
   // this method — the sweep is an ops concern, never a boot requirement.
-  agentBoxManager.startOrphanSweep?.(async (boxId) => {
-    // Prefix-strip inverts podName ONLY because capability run ids are minted
-    // 36-char lowercase UUIDs (sanitize + slice are no-ops). If run ids ever
-    // stop being UUIDs, stamp the raw id as a pod annotation instead.
-    const runId = boxId.startsWith("agentbox-") ? boxId.slice("agentbox-".length) : boxId;
+  agentBoxManager.startOrphanSweep?.(async (runRef) => {
+    // Fallback only (label-less debris hands us a pod name): strip the pod
+    // prefix. That inversion is exact only for minted lowercase-UUID run ids —
+    // which is why the label, not this strip, is the primary channel (review).
+    const runId = runRef.startsWith("agentbox-") ? runRef.slice("agentbox-".length) : runRef;
     const rec = capabilityRunManager.get(runId);
     if (rec) return !isTerminalCapabilityStatus(rec.status);
     // Memory miss ≠ dead. Boot recovery can race the consumer (the exact
