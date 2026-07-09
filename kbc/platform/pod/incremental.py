@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import posixpath
 from pathlib import Path
 
@@ -103,6 +104,13 @@ def build_changeset(
     时降级为"重读该源",仍是范围化的(只是没有 +/− 精度)。
     """
     diffs = diffs or {}
+    # Per-source diff cap: an oversized diff degrades to "" (= the documented
+    # "re-read the source" fallback — still scoped, just without +/− precision).
+    # Uncapped diffs could push CHANGESET.json past the 1MB sync cap, where a
+    # mid-round respawn could no longer rehydrate the round from the store
+    # (RAW_CHANGES is consumed at materialization) — review finding.
+    diff_cap = int(os.environ.get("KBC_MAX_DIFF_BYTES", str(64 * 1024)))
+    diffs = {p: (d if len(d.encode("utf-8")) <= diff_cap else "") for p, d in diffs.items()}
     pages = candidate_pages(workdir)
     added = list(changed_sources.get("added", []))
     modified = list(changed_sources.get("modified", []))

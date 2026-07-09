@@ -43,6 +43,40 @@ const DEFAULT_CONFIG: Required<Omit<K8sSpawnerConfig, "persistence" | "nodeSelec
   labelPrefix: "siclaw.io",
 };
 
+/** K8s resource quantity → number (comparable within one resource kind).
+ *  Handles the shapes our profiles use: bare numbers, cpu millicores ("500m"),
+ *  and binary/decimal byte suffixes. Unknown shapes → NaN (caller skips). */
+export function parseK8sQuantity(q: string): number {
+  const m = /^(\d+(?:\.\d+)?)([A-Za-z]*)$/.exec(q.trim());
+  if (!m) return NaN;
+  const n = Number(m[1]);
+  const suffix = m[2];
+  if (suffix === "") return n;
+  if (suffix === "m") return n / 1000; // cpu millicores
+  const scale: Record<string, number> = {
+    Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40,
+    k: 1e3, K: 1e3, M: 1e6, G: 1e9, T: 1e12,
+  };
+  return suffix in scale ? n * scale[suffix] : NaN;
+}
+
+/** requests ≤ limits guard (review): the request/limit split lets a profile
+ *  declare a request ABOVE the (possibly default) limit — the API server
+ *  rejects such a pod outright, taking the capability down on a config typo.
+ *  Clamp the request down to the limit and say so; unparseable values pass
+ *  through untouched (the API server remains the authority). */
+export function clampRequestToLimit(request: string, limit: string, podName: string, kind: string): string {
+  const req = parseK8sQuantity(request);
+  const lim = parseK8sQuantity(limit);
+  if (Number.isFinite(req) && Number.isFinite(lim) && req > lim) {
+    console.warn(
+      `[k8s-spawner] ${podName}: ${kind} request ${request} exceeds limit ${limit}; clamping request to the limit`,
+    );
+    return limit;
+  }
+  return request;
+}
+
 export class K8sSpawner implements BoxSpawner {
   readonly name = "k8s";
 
@@ -169,6 +203,9 @@ export class K8sSpawner implements BoxSpawner {
       [`${labelPrefix}/app`]: "agentbox",
       [`${labelPrefix}/agent`]: agentId,
       [caFpLabel]: caFp,
+      // boxType scopes the orphan sweep: without it the Secret pass could not
+      // tell a capability box's cert from a chat box's (review finding).
+      [`${labelPrefix}/boxType`]: profile.name,
     };
     try {
       await this.coreApi.createNamespacedSecret({
@@ -460,8 +497,8 @@ export class K8sSpawner implements BoxSpawner {
               const res = boxConfig.resources ?? profile.resources;
               return {
                 requests: {
-                  cpu: res?.cpu || "100m",
-                  memory: res?.memory || "256Mi",
+                  cpu: clampRequestToLimit(res?.cpuRequest || res?.cpu || "100m", res?.cpu || "2000m", podName, "cpu"),
+                  memory: clampRequestToLimit(res?.memoryRequest || res?.memory || "256Mi", res?.memory || "4Gi", podName, "memory"),
                 },
                 limits: {
                   cpu: res?.cpu || "2000m",
@@ -606,6 +643,86 @@ export class K8sSpawner implements BoxSpawner {
         throw err;
       }
       // Pod does not exist, ignore
+    }
+  }
+
+  /**
+   * Periodic orphan GC for CAPABILITY boxes (kb-compile / kb-test) + their cert
+   * Secrets. Two orphan shapes (audit finding — both accumulate forever):
+   *   - a pod in a terminal phase (Succeeded/Failed): its process exited, a
+   *     capability run never reuses a pod;
+   *   - a RUNNING pod whose run is no longer live (`isLive(boxId)` false): the
+   *     aiohttp server idles on after its run ended — the shape a normally-
+   *     completed run used to leave behind (the relay-close stop now covers
+   *     the common path; this sweep covers crashes, runtime restarts, and
+   *     pre-existing debris).
+   * Chat agent boxes (boxType "agent") are NEVER touched — they have their own
+   * idle self-destruct lifecycle.
+   */
+  async sweepOrphans(isLive: (runRef: string) => boolean | Promise<boolean>): Promise<void> {
+    const { namespace, labelPrefix } = this.config;
+    const selector = `${labelPrefix}/app=agentbox`;
+    const capabilityTypes = new Set(["kb-compile", "kb-test"]);
+    const pods = await this.coreApi.listNamespacedPod({ namespace, labelSelector: selector });
+    const keptPods = new Set<string>();
+    for (const pod of pods.items ?? []) {
+      const name = pod.metadata?.name;
+      if (!name) continue;
+      const boxType = pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent";
+      if (!capabilityTypes.has(boxType)) {
+        keptPods.add(name); // not ours to manage — its Secret is kept too
+        continue;
+      }
+      const phase = pod.status?.phase;
+      const terminal = phase === "Succeeded" || phase === "Failed";
+      // Hand the oracle the RAW run id from the pod's `agent` label (stamped at
+      // spawn), not the pod name: podName() sanitizes/lowercases/truncates, so
+      // reconstructing the id by prefix-strip is exact only for the minted
+      // lowercase-UUID shape — an adopted/consumer-recovered id that doesn't
+      // round-trip would miss both the memory and store lookups and reap a
+      // LIVE box (review). Name stays the fallback for label-less debris.
+      const runRef = pod.metadata?.labels?.[`${labelPrefix}/agent`] || name;
+      const live = !terminal && (await isLive(runRef));
+      if (live) {
+        keptPods.add(name);
+        continue;
+      }
+      console.log(`[k8s-spawner] orphan sweep: removing ${name} (phase=${phase ?? "?"}, live=${live})`);
+      try {
+        await this.stop(name); // deletes the pod + its cert Secret, 404-tolerant
+      } catch (err: any) {
+        console.warn(`[k8s-spawner] orphan sweep: stop ${name} failed:`, err?.message ?? err);
+        keptPods.add(name); // keep its Secret this round; retry next sweep
+      }
+    }
+    // Cert Secrets whose pod is gone entirely (e.g. pod deleted out-of-band).
+    // Scoped like the pod pass (review finding): pre-boxType-label Secrets and
+    // chat-box Secrets are skipped — a chat box's idle self-destruct may leave
+    // an orphan Secret, but deleting it is not this sweep's contract. The age
+    // guard closes the spawn TOCTOU: Secrets are created BEFORE their pod, so
+    // a just-spawned box's cert must never be swept between the two creates.
+    const secrets = await this.coreApi.listNamespacedSecret({ namespace, labelSelector: selector });
+    const minAgeMs = 10 * 60_000;
+    for (const s of secrets.items ?? []) {
+      const name = s.metadata?.name;
+      if (!name || !name.endsWith("-cert")) continue;
+      if (!capabilityTypes.has(s.metadata?.labels?.[`${labelPrefix}/boxType`] ?? "")) continue;
+      // Missing/unparseable creationTimestamp must read as YOUNG, not ancient
+      // (review: the `: 0` fallback made it look infinitely old, silently
+      // bypassing the TOCTOU age guard). Skip it this round — a real orphan
+      // will still be old next sweep.
+      const createdMs = s.metadata?.creationTimestamp ? new Date(s.metadata.creationTimestamp).getTime() : NaN;
+      if (!Number.isFinite(createdMs) || Date.now() - createdMs < minAgeMs) continue;
+      if (keptPods.has(name.slice(0, -"-cert".length))) continue;
+      if (pods.items?.some((p: any) => p.metadata?.name === name.slice(0, -"-cert".length))) continue;
+      console.log(`[k8s-spawner] orphan sweep: removing orphaned Secret ${name}`);
+      try {
+        await this.coreApi.deleteNamespacedSecret({ name, namespace });
+      } catch (err: any) {
+        if (err?.code !== 404 && err?.statusCode !== 404) {
+          console.warn(`[k8s-spawner] orphan sweep: delete Secret ${name} failed:`, err?.message ?? err);
+        }
+      }
     }
   }
 

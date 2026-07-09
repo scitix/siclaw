@@ -182,8 +182,15 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
                           "error": f"unreadable: {e}"}
             continue
         sources, derived, has_key = parse_compiled_from(text)
+        try:
+            raw_bytes = f.stat().st_size
+        except OSError:
+            raw_bytes = len(text.encode("utf-8"))
+        # bytes = ON-DISK size, matching the sync gate's f.stat().st_size — the
+        # decoded text under-measures CRLF pages (read_text translates newlines),
+        # so an encode()-based lint could pass a page the sync then skips (review).
         pages[rel] = {"sources": sources, "derived": derived,
-                      "has_compiled_from": has_key, "text": text}
+                      "has_compiled_from": has_key, "text": text, "bytes": raw_bytes}
     return pages
 
 
@@ -325,6 +332,13 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
     provenance requirement."""
     violations: list[dict] = []
     names = set(pages.keys())
+    # Same cap as the workspace sync (compile_box.MAX_SYNC_FILE_BYTES): a page
+    # crossing it is SILENTLY skipped by the sync — absent (or stale) in the
+    # consumer store and therefore in the published version, while every local
+    # check stays green (review finding). Making it a lint violation turns the
+    # silent divergence into a model-fixable signal — an over-1MB wiki page
+    # needs splitting regardless.
+    sync_cap = int(os.environ.get("KBC_MAX_SYNC_FILE_BYTES", str(1024 * 1024)))
     for rel, page in pages.items():
         if "error" in page:
             violations.append({"page": rel, "kind": "unreadable", "detail": page["error"]})
@@ -333,6 +347,17 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
             violations.append({"page": rel, "kind": "no_provenance",
                                "detail": "frontmatter 缺 compiled_from(纯综合页请标 derived: true)"})
         text = page.get("text", "")
+        # Same byte METHOD as the sync gate (stat().st_size), not the decoded
+        # text re-encoded: read_text's newline translation under-measures CRLF
+        # pages, so a page just over the cap could lint green while the sync
+        # silently skips it (review). Fallback covers callers that build the
+        # pages dict by hand (tests).
+        page_bytes_len = page.get("bytes") or len(text.encode("utf-8"))
+        if page_bytes_len > sync_cap:
+            violations.append({"page": rel, "kind": "page_too_large",
+                               "detail": (f"页面 {page_bytes_len // 1024}KB 超过同步上限"
+                                          f"({sync_cap // 1024}KB)——超限页不会被持久化/发布(静默丢失);"
+                                          "按主题拆成多页并挂回 index")})
         base = Path(rel).parent
         for target in _MD_LINK_RE.findall(text):
             if target.startswith(("http://", "https://", "/")):
@@ -550,13 +575,20 @@ def run_layer1(workdir: str) -> dict:
         "dup_candidates": dup_candidates(pages),
         "pk": previous.get("pk"),  # Layer-2 results survive L1 re-checks
         "media_verify": previous.get("media_verify"),
+        # The converge signal survives too: _post_turn_selfcheck overwrites the
+        # whole file with this report, and dropping the phase left a per-turn
+        # window with no converge_phase before the seam re-set it (review).
+        "converge_phase": previous.get("converge_phase"),
     }
 
 
 def write_selfcheck(workdir: str, report: dict) -> None:
-    path = Path(workdir) / SELFCHECK_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # Atomic (temp + os.replace): SELFCHECK.json is the sole carrier of the
+    # converge signal and is written exactly at the turn-end seam — the same
+    # SIGTERM/OOM window that motivated the ticket-file fix. A torn write reads
+    # back as absent and silently drops state + converge_phase.
+    _write_text_atomic(Path(workdir) / SELFCHECK_PATH,
+                       json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
 
 def update_pk_section(workdir: str, pk: dict) -> None:
@@ -710,6 +742,11 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
             lines.append(f"\ncompiled_from cites nonexistent sources (dangling, {len(cov['dangling_citations'])}):")
             lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
             lines.append("Change them to real raw-relative paths.")
+        if cov.get("noop_exclusions"):
+            lines.append(f"\nExclusion patterns that matched NO source ({len(cov['noop_exclusions'])}) — likely a typo or wrong glob shape:")
+            lines += [f"- {p}" for p in cov["noop_exclusions"][:_REPAIR_LIST_CAP]]
+            lines.append("Matching is SEGMENT-aware: a bare `logs` matches only a file literally named logs; "
+                         "`logs/*` matches only direct children; a whole subtree needs `logs/**` (or the `logs/` prefix form). Fix the pattern.")
         if not lint["ok"]:
             lines.append(f"\nLint issues ({len(lint['violations'])}):")
             lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
@@ -731,6 +768,11 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
         lines.append(f"\ncompiled_from 引用了不存在的源(悬空引用,{len(cov['dangling_citations'])} 处):")
         lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
         lines.append("请改成真实的 raw 相对路径。")
+    if cov.get("noop_exclusions"):
+        lines.append(f"\n没有命中任何源的排除模式({len(cov['noop_exclusions'])} 条)——多半是写错了:")
+        lines += [f"- {p}" for p in cov["noop_exclusions"][:_REPAIR_LIST_CAP]]
+        lines.append("匹配是按路径段的:裸 `logs` 只匹配名字恰为 logs 的文件;`logs/*` 只匹配直接子级;"
+                     "整个子树要写 `logs/**`(或 `logs/` 前缀形式)。请修正模式。")
     if not lint["ok"]:
         lines.append(f"\nlint 问题({len(lint['violations'])} 处):")
         lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"

@@ -29,7 +29,7 @@ import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { driveTestSession } from "./capability/test-relay.js";
-import { isTerminalCapabilityStatus } from "./capability/contract.js";
+import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
   CapabilityMessageRequest,
@@ -438,38 +438,57 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!pending) {
       pending = (async () => {
         const client = await capabilityBoxClient(runId, profile, orgId);
-        // Raw sources + (fresh box only) the durable authoring workspace, both
-        // from the consumer's store. Best-effort — see materializeCapabilityInputs.
-        // The consumer also declares the run's LOCALE through the same channel;
-        // the box selects its prompt pack with it (absent ⇒ English default).
-        const materialized = await materializeCapabilityInputs({ client, backend: frontendClient, runId });
-        const allowedTools = getBoxProfile(profile).allowedTools ?? null;
-        await client.postJson(`/session/${runId}`, {
-          instruction: instruction ?? "",
-          allowed_tools: allowedTools,
-          locale: materialized.locale,
-          // Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
-          // opaque passthrough — the box applies them in-process before its SDK
-          // connects. Never logged here; token stays out of the pod spec.
-          llm: materialized.llm,
-          settings: materialized.settings,
-        });
+        try {
+          // Raw sources + (fresh box only) the durable authoring workspace, both
+          // from the consumer's store. Best-effort — see materializeCapabilityInputs.
+          // The consumer also declares the run's LOCALE through the same channel;
+          // the box selects its prompt pack with it (absent ⇒ English default).
+          const materialized = await materializeCapabilityInputs({ client, backend: frontendClient, runId });
+          const allowedTools = getBoxProfile(profile).allowedTools ?? null;
+          await client.postJson(`/session/${runId}`, {
+            instruction: instruction ?? "",
+            allowed_tools: allowedTools,
+            locale: materialized.locale,
+            // Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
+            // opaque passthrough — the box applies them in-process before its SDK
+            // connects. Never logged here; token stays out of the pod spec.
+            llm: materialized.llm,
+            settings: materialized.settings,
+          });
+        } catch (err) {
+          // Setup failed AFTER the pod was spawned (review): the relay's
+          // finally below — the normal stop owner — never attaches on this
+          // path, so without this stop a spawn-succeeded-but-setup-failed run
+          // leaks its pod + cert Secret until the orphan sweep. stop() is
+          // 404-tolerant (local escape-hatch boxes aren't spawner-managed).
+          void agentBoxManager.stop(runId).catch((stopErr) =>
+            console.error(
+              `[capability] stop box after setup failure run=${runId}:`,
+              stopErr instanceof Error ? stopErr.message : String(stopErr),
+            ),
+          );
+          throw err;
+        }
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
           .catch(async (err) => {
             console.error(`[capability] session relay failed run=${runId}:`, err);
-            // The run is terminal from here (endRun below) and can never be
-            // re-adopted, so its box is unreachable garbage — stop it, or every
-            // relay crash leaks a pod (4 live boxes for one repo, seen 07-09).
-            await agentBoxManager.stop(runId).catch((stopErr) =>
-              console.error(
-                `[capability] stop box after relay failure run=${runId}:`,
-                stopErr instanceof Error ? stopErr.message : String(stopErr),
-              ),
-            );
             await capabilityRunManager.endRun(runId, "failed").catch(() => {});
           })
           .finally(() => {
             capabilitySessions.delete(runId);
+            // The relay ending — cleanly (`end`: the box's session coroutine
+            // exited and can never take another turn) or by crash (the catch
+            // above) — means this one-run pod is unreachable garbage either
+            // way. Stop it here, or every NORMALLY-completed run leaks a
+            // running pod + cert Secret forever (audit finding; the crash
+            // path was covered piecemeal before, this owns both). stop() is
+            // 404-tolerant, so the idle-reap double-stop stays quiet.
+            void agentBoxManager.stop(runId).catch((stopErr) =>
+              console.error(
+                `[capability] stop box after relay close run=${runId}:`,
+                stopErr instanceof Error ? stopErr.message : String(stopErr),
+              ),
+            );
           });
         return { client };
       })();
@@ -482,6 +501,33 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // Recover AFTER ensureCapabilitySession exists — onAdopt re-attaches through it.
   void capabilityRunManager.recover();
   capabilityRunManager.startWatchdog();
+  // Capability-box orphan GC: a box is live iff its run is tracked and
+  // non-terminal. The sweep resolves the RAW run id from the pod's `agent`
+  // label (stamped at spawn), so the oracle keys correctly for ANY id shape.
+  // Optional-call: startRuntime tests inject minimal manager fakes that predate
+  // this method — the sweep is an ops concern, never a boot requirement.
+  agentBoxManager.startOrphanSweep?.(async (runRef) => {
+    // Fallback only (label-less debris hands us a pod name): strip the pod
+    // prefix. That inversion is exact only for minted lowercase-UUID run ids —
+    // which is why the label, not this strip, is the primary channel (review).
+    const runId = runRef.startsWith("agentbox-") ? runRef.slice("agentbox-".length) : runRef;
+    const rec = capabilityRunManager.get(runId);
+    if (rec) return !isTerminalCapabilityStatus(rec.status);
+    // Memory miss ≠ dead. Boot recovery can race the consumer (the exact
+    // scenario adopt() exists for — e.g. a helm upgrade restarting both):
+    // recover() fails soft, memory stays empty, and a memory-only oracle
+    // would let the first sweep kill every LIVE idle box. Ask the store;
+    // unknown/error counts as live — the sweep must fail safe (a leaked pod
+    // survives one more cycle; a killed live box loses the owner's session).
+    try {
+      const row = (await frontendClient.request(CAPABILITY_GET_RUN, { run_id: runId })) as
+        | { id?: string; status?: string }
+        | null;
+      return !!row?.id && !isTerminalCapabilityStatus((row.status as any) || "running");
+    } catch {
+      return true;
+    }
+  });
 
   rpcMethods.set("capability.start", async (params) => {
     const req = params as unknown as CapabilityStartRequest;
