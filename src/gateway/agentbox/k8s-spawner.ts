@@ -169,6 +169,9 @@ export class K8sSpawner implements BoxSpawner {
       [`${labelPrefix}/app`]: "agentbox",
       [`${labelPrefix}/agent`]: agentId,
       [caFpLabel]: caFp,
+      // boxType scopes the orphan sweep: without it the Secret pass could not
+      // tell a capability box's cert from a chat box's (review finding).
+      [`${labelPrefix}/boxType`]: profile.name,
     };
     try {
       await this.coreApi.createNamespacedSecret({
@@ -622,7 +625,7 @@ export class K8sSpawner implements BoxSpawner {
    * Chat agent boxes (boxType "agent") are NEVER touched — they have their own
    * idle self-destruct lifecycle.
    */
-  async sweepOrphans(isLive: (boxId: string) => boolean): Promise<void> {
+  async sweepOrphans(isLive: (boxId: string) => boolean | Promise<boolean>): Promise<void> {
     const { namespace, labelPrefix } = this.config;
     const selector = `${labelPrefix}/app=agentbox`;
     const capabilityTypes = new Set(["kb-compile", "kb-test"]);
@@ -638,11 +641,12 @@ export class K8sSpawner implements BoxSpawner {
       }
       const phase = pod.status?.phase;
       const terminal = phase === "Succeeded" || phase === "Failed";
-      if (!terminal && isLive(name)) {
+      const live = !terminal && (await isLive(name));
+      if (live) {
         keptPods.add(name);
         continue;
       }
-      console.log(`[k8s-spawner] orphan sweep: removing ${name} (phase=${phase ?? "?"}, live=${!terminal && isLive(name)})`);
+      console.log(`[k8s-spawner] orphan sweep: removing ${name} (phase=${phase ?? "?"}, live=${live})`);
       try {
         await this.stop(name); // deletes the pod + its cert Secret, 404-tolerant
       } catch (err: any) {
@@ -651,10 +655,19 @@ export class K8sSpawner implements BoxSpawner {
       }
     }
     // Cert Secrets whose pod is gone entirely (e.g. pod deleted out-of-band).
+    // Scoped like the pod pass (review finding): pre-boxType-label Secrets and
+    // chat-box Secrets are skipped — a chat box's idle self-destruct may leave
+    // an orphan Secret, but deleting it is not this sweep's contract. The age
+    // guard closes the spawn TOCTOU: Secrets are created BEFORE their pod, so
+    // a just-spawned box's cert must never be swept between the two creates.
     const secrets = await this.coreApi.listNamespacedSecret({ namespace, labelSelector: selector });
+    const minAgeMs = 10 * 60_000;
     for (const s of secrets.items ?? []) {
       const name = s.metadata?.name;
       if (!name || !name.endsWith("-cert")) continue;
+      if (!capabilityTypes.has(s.metadata?.labels?.[`${labelPrefix}/boxType`] ?? "")) continue;
+      const createdMs = s.metadata?.creationTimestamp ? new Date(s.metadata.creationTimestamp).getTime() : 0;
+      if (Date.now() - createdMs < minAgeMs) continue;
       if (keptPods.has(name.slice(0, -"-cert".length))) continue;
       if (pods.items?.some((p: any) => p.metadata?.name === name.slice(0, -"-cert".length))) continue;
       console.log(`[k8s-spawner] orphan sweep: removing orphaned Secret ${name}`);

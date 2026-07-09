@@ -38,6 +38,7 @@ export class AgentBoxManager {
   private config: Required<AgentBoxManagerConfig>;
   private boxes = new Map<string, ManagedBox>();
   private healthCheckTimer?: ReturnType<typeof setInterval>;
+  private orphanSweepTimer?: ReturnType<typeof setInterval>;
   private readonly isK8s: boolean;
   private spawnEnvResolver?: (agentId: string) => Promise<Record<string, string> | undefined>;
   private persistenceResolver?: (agentId: string) => Promise<boolean | undefined>;
@@ -63,14 +64,17 @@ export class AgentBoxManager {
    * `intervalMs`. Without it, completed/crashed runs' pods + cert Secrets
    * accumulate forever (audit finding).
    */
-  startOrphanSweep(isLive: (boxId: string) => boolean, intervalMs = 10 * 60_000): void {
+  startOrphanSweep(isLive: (boxId: string) => boolean | Promise<boolean>, intervalMs = 10 * 60_000): void {
     const s: any = this.spawner;
     if (typeof s.sweepOrphans !== "function") return;
     const tick = () =>
       void s.sweepOrphans(isLive).catch((err: any) =>
         console.warn("[agentbox-manager] orphan sweep failed:", err?.message ?? err));
-    setTimeout(tick, 60_000);
-    setInterval(tick, intervalMs);
+    // unref'd + stored (review finding): the sweep must never pin the event
+    // loop or outlive cleanup() — same discipline as the run watchdog.
+    (setTimeout(tick, 60_000) as any).unref?.();
+    this.orphanSweepTimer = setInterval(tick, intervalMs);
+    (this.orphanSweepTimer as any).unref?.();
   }
 
   /**
@@ -83,6 +87,7 @@ export class AgentBoxManager {
    * pays nothing. Currently supplies SICLAW_AGENTBOX_IDLE_TIMEOUT.
    */
   setSpawnEnvResolver(fn: (agentId: string) => Promise<Record<string, string> | undefined>): void {
+    if (this.orphanSweepTimer) { clearInterval(this.orphanSweepTimer); this.orphanSweepTimer = undefined; }
     this.spawnEnvResolver = fn;
   }
 

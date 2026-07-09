@@ -29,7 +29,7 @@ import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
 import { driveTestSession } from "./capability/test-relay.js";
-import { isTerminalCapabilityStatus } from "./capability/contract.js";
+import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
   CapabilityMessageRequest,
@@ -489,10 +489,27 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // Capability-box orphan GC: a box is live iff its run is tracked and
   // non-terminal. Pod names are `agentbox-<runId>` (podName sanitizes the id;
   // capability run ids are lowercase uuids, so the strip is exact).
-  agentBoxManager.startOrphanSweep((boxId) => {
+  agentBoxManager.startOrphanSweep(async (boxId) => {
+    // Prefix-strip inverts podName ONLY because capability run ids are minted
+    // 36-char lowercase UUIDs (sanitize + slice are no-ops). If run ids ever
+    // stop being UUIDs, stamp the raw id as a pod annotation instead.
     const runId = boxId.startsWith("agentbox-") ? boxId.slice("agentbox-".length) : boxId;
     const rec = capabilityRunManager.get(runId);
-    return !!rec && !isTerminalCapabilityStatus(rec.status);
+    if (rec) return !isTerminalCapabilityStatus(rec.status);
+    // Memory miss ≠ dead. Boot recovery can race the consumer (the exact
+    // scenario adopt() exists for — e.g. a helm upgrade restarting both):
+    // recover() fails soft, memory stays empty, and a memory-only oracle
+    // would let the first sweep kill every LIVE idle box. Ask the store;
+    // unknown/error counts as live — the sweep must fail safe (a leaked pod
+    // survives one more cycle; a killed live box loses the owner's session).
+    try {
+      const row = (await frontendClient.request(CAPABILITY_GET_RUN, { run_id: runId })) as
+        | { id?: string; status?: string }
+        | null;
+      return !!row?.id && !isTerminalCapabilityStatus((row.status as any) || "running");
+    } catch {
+      return true;
+    }
   });
 
   rpcMethods.set("capability.start", async (params) => {

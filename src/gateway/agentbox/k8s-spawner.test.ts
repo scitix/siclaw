@@ -868,14 +868,18 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
         mkPod("agentbox-chat-1", "agent", "Running"),          // chat box: own lifecycle, never ours
       ],
     });
+    const oldTs = new Date(Date.now() - 3600_000).toISOString();
     g.__k8sImpls.listNamespacedSecret = async () => ({
       items: [
-        { metadata: { name: "agentbox-live-run-cert" } },
-        { metadata: { name: "agentbox-ghost-cert" } },         // no pod at all → orphan
+        { metadata: { name: "agentbox-live-run-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-compile" } } },
+        { metadata: { name: "agentbox-ghost-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-compile" } } }, // no pod at all → orphan
+        { metadata: { name: "agentbox-chat-gone-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "agent" } } },  // chat box's orphan Secret: NOT ours
+        { metadata: { name: "agentbox-fresh-cert", creationTimestamp: new Date().toISOString(), labels: { "siclaw.io/boxType": "kb-compile" } } }, // just spawning (Secret precedes pod): TOCTOU guard
       ],
     });
     const s = new K8sSpawner();
-    await (s as any).sweepOrphans((boxId: string) => boxId === "agentbox-live-run");
+    // async oracle (the production oracle is store-backed and async)
+    await (s as any).sweepOrphans(async (boxId: string) => boxId === "agentbox-live-run");
 
     const deletedPods = g.__k8sCalls.deleteNamespacedPod.map((c: any) => c.name);
     expect(deletedPods).toEqual(expect.arrayContaining(["agentbox-dead-run", "agentbox-done-run"]));
@@ -885,6 +889,8 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
     expect(deletedSecrets).toEqual(expect.arrayContaining(["agentbox-dead-run-cert", "agentbox-done-run-cert", "agentbox-ghost-cert"]));
     expect(deletedSecrets).not.toContain("agentbox-live-run-cert");
     expect(deletedSecrets).not.toContain("agentbox-chat-1-cert");
+    expect(deletedSecrets).not.toContain("agentbox-chat-gone-cert"); // chat Secrets are never this sweep's business
+    expect(deletedSecrets).not.toContain("agentbox-fresh-cert");     // Secret-before-pod TOCTOU guarded by age
   });
 
   it("memoryRequest splits the request from the limit (burstable compile shape)", async () => {

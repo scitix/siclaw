@@ -43,6 +43,8 @@ export interface BoxProfile {
    * shape); `cpuRequest`/`memoryRequest` set only the request, leaving the
    * limit at its default (or `cpu`/`memory`) — the burstable shape a compile
    * box needs: schedule honestly near real usage, keep headroom to the limit.
+   * A request override ABOVE the effective limit must also set the limit, or
+   * K8s rejects the pod (request > limit).
    */
   resources?: { cpu?: string; memory?: string; cpuRequest?: string; memoryRequest?: string };
 }
