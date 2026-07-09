@@ -1027,8 +1027,9 @@ def _media_verify_due(run) -> dict[str, list[str]] | None:
     if not sc or sc.get("state") != "passed":
         return None  # ledger repairs first; verify once settled
     inflight = getattr(run, "_media_inflight", set())  # test doubles may lack it
+    deferred = getattr(run, "_media_deferred", set())  # failed-this-drain pages (see _maybe_start_media_verify)
     pending = {p: imgs for p, imgs in selfcheck.pending_media_verification(workdir).items()
-               if p not in inflight}
+               if p not in inflight and p not in deferred}
     if not pending:
         return None
     return selfcheck.cap_media_pending(pending, _media_verify_max_images())
@@ -1051,11 +1052,19 @@ async def _set_converge_phase(run, phase: str) -> None:
             pass
 
 
-def _maybe_start_media_verify(run) -> bool:
+def _maybe_start_media_verify(run, drain: bool = False) -> bool:
     """Kick the blind transcribe+compare flow as a background task (图像复核 v2).
     Verified marks land only AFTER a completed verification (review fix — the
     old up-front mark turned a total transcription failure into a silent,
-    permanent false-pass); the in-flight set + attempt budget keep it loop-free."""
+    permanent false-pass); the in-flight set + attempt budget keep it loop-free.
+    drain=True is the flow's own next-chunk chaining: pages that failed THIS
+    drain stay deferred (excluded from the due-check) so a failed chunk moves
+    the drain on to the not-yet-attempted chunks instead of hot-looping the
+    failed pages through the attempt budget. A fresh (default) trigger — the
+    turn seam, i.e. a genuinely later turn — clears the deferral, which is
+    exactly the designed per-page retry cadence."""
+    if not drain:
+        run._media_deferred = set()
     try:
         chunk = _media_verify_due(run)
     except Exception:
@@ -1075,7 +1084,9 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
     the 07-06/07 live failures (MEM 条→GPU-Util, 跨图 H20) were both
     confirmation-bias artifacts of claim-in-context re-reading. Fail-open."""
     injected_repair = False
-    chunk_clean = False  # this pass completed all its pages with zero failures
+    settled = False        # the primary settle ran — the except must never settle AGAIN
+    failed_pages: list[str] = []
+    exhausted: list[str] = []
     try:
         n_imgs = sum(len(v) for v in chunk.values())
         await run.emit({"type": "summary",
@@ -1088,7 +1099,10 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             ClaudeEngine(), run.workdir, chunk,
             progress=lambda s: loop.create_task(run.emit({"type": "summary", "text": s})),
             locale=getattr(run, "locale", None))
-        await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, result))
+        failed_pages = list(result.get("failed_pages") or [])
+        exhausted = _settle_media_outcome(run, chunk, result)
+        settled = True
+        await _emit_media_exhausted(run, exhausted)
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
             try:
@@ -1096,7 +1110,6 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             except Exception:
                 pass
         findings, errors = result["findings"], result["errors"]
-        chunk_clean = bool(result.get("completed_pages")) and not result.get("failed_pages")
         tail = _loc(run, f"; {len(errors)} transcription/comparison failure(s)",
                     f";{len(errors)} 项转写/比对失败") if errors else ""
         if findings:
@@ -1115,10 +1128,24 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Self-check (images) failed, skipping this round: {e!r}",
                 f"自检(图像)执行失败,本轮跳过: {e!r}")})
-            await _emit_media_exhausted(run, _settle_media_outcome(run, chunk, None))
+            # Settle ONLY if the primary settle never ran (review): a throw
+            # AFTER it — e.g. the findings inject failing — used to re-settle
+            # the chunk with result=None, double-bumping just-verified pages
+            # toward a spurious `exhausted` and mis-charging failed pages two
+            # attempts for one real failure.
+            if not settled:
+                failed_pages = list(chunk)
+                exhausted = _settle_media_outcome(run, chunk, None)
+                await _emit_media_exhausted(run, exhausted)
         except Exception:
             pass
     finally:
+        # Pages that FAILED this pass sit out the rest of the drain (exhausted
+        # ones are marked verified and leave pending on their own): the chain
+        # below then moves on to the not-yet-attempted chunks instead of
+        # hot-looping the failed pages through the attempt budget.
+        run._media_deferred = getattr(run, "_media_deferred", set()) | (
+            set(failed_pages) - set(exhausted))
         run._media_inflight = getattr(run, "_media_inflight", set()) - set(chunk)
         # We ARE run._media_task and are completing: release the single-flight
         # reference first, or _media_verify_due's not-done() guard blocks the
@@ -1130,15 +1157,14 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
         # case (test step never unlocked, PK never ran). Mirror the FULL seam:
         # first the NEXT media chunk (a >cap image set self-drains chunk by
         # chunk — settling after chunk 1 silently skipped the rest AND PK,
-        # review finding), then PK, else settle. Failed passes settle too
-        # (never-stuck — a later turn's seam retries while attempts remain).
+        # review finding), then PK, else settle. The drain chains even after a
+        # FAILED pass (review round 2): a chunk-1 blip must not skip chunks
+        # 2..N's first attempt — the deferral above keeps this loop-free, and
+        # the failed pages retry on a later turn's fresh trigger while their
+        # attempt budget lasts (never-stuck).
         if not injected_repair:
             try:
-                # Chain the next chunk only after a CLEAN pass: failed pages
-                # retry on later triggers (the designed cadence) — chaining them
-                # here would hot-loop a transient outage straight through the
-                # attempt budget and ship an instant exhausted-pass.
-                if not ((chunk_clean and _maybe_start_media_verify(run)) or _maybe_start_pk(run)):
+                if not (_maybe_start_media_verify(run, drain=True) or _maybe_start_pk(run)):
                     await _set_converge_phase(run, "settled")
             except Exception:
                 pass
@@ -1406,8 +1432,13 @@ async def _post_turn_selfcheck(run) -> str | None:
         # same tree — spends the budget honestly and files the ticket. A
         # byte-unchanged tree still cannot have out-of-scope edits, so the
         # incremental guard stays trivially clean either way.
+        # None (SELFCHECK.json missing/corrupt — e.g. the model's own Bash
+        # damaged it on a tree-unchanged turn) must fall through too: an early
+        # return here would leave whatever state the file last carried (or no
+        # state at all) with the gate never re-run — recomputing heals the file
+        # and spends the budget honestly (review).
         last_state = (selfcheck.read_selfcheck(workdir) or {}).get("state")
-        if last_state != "repairing":
+        if last_state is not None and last_state != "repairing":
             return None
     elif incr is None:
         if key is None:
@@ -1998,6 +2029,12 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
     """Force a fresh full-corpus selfcheck and drive bounded repair sessions
     until it stops asking (budget lives in _post_turn_selfcheck)."""
     run._selfcheck_key = None
+    # Fresh episode, fresh budget (review): the counter only resets on a CLEAN
+    # check, so a batch ledger phase entered after earlier turns spent the
+    # persistent budget would file a residual ticket with ZERO repair attempts
+    # for this phase's own findings. Each _run_ledger_repairs call is bounded
+    # by its own budget; the batch tail calls it a bounded number of times.
+    run._l1_repairs_used = 0
     run._ledger_forced = True  # batch-final: the mid-Execute index exemption is off
     try:
         repair = await _post_turn_selfcheck(run)

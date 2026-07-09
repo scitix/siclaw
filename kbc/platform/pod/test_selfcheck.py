@@ -426,6 +426,99 @@ def test_page_too_large_lint():
     print("OK  page_too_large lint (sync-cap divergence made loud, env-tunable)")
 
 
+def test_page_too_large_uses_raw_bytes():
+    """Round-3 review (low): the lint measured len(text.encode()) over read_text's
+    newline-TRANSLATED text while the sync gate compares stat().st_size — a CRLF
+    page just over the cap linted green while the sync silently skipped it."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/snap/one.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[big](big.md)")
+        head = "---\ncompiled_from:\n  - snap/one.md\n---\n"
+        body = "ab\r\n" * 140  # raw 560B vs decoded 420B — the divergence window
+        (base / "candidate/big.md").write_bytes((head + body).encode("utf-8"))
+        raw = (base / "candidate/big.md").stat().st_size
+        decoded = len((head + body).replace("\r\n", "\n").encode("utf-8"))
+        assert decoded < 512 < raw, (decoded, raw)  # the test premise itself
+        os.environ["KBC_MAX_SYNC_FILE_BYTES"] = "512"
+        try:
+            report = selfcheck.run_layer1(td)
+            kinds = {v["kind"] for v in report["lint"]["violations"]}
+            assert "page_too_large" in kinds, report["lint"]
+        finally:
+            del os.environ["KBC_MAX_SYNC_FILE_BYTES"]
+    print("OK  page_too_large measures raw on-disk bytes (CRLF false-green closed)")
+
+
+async def test_noop_gate_survives_missing_selfcheck():
+    """Round-3 review (low): the unchanged-tree fall-through read state from a
+    SECOND read_selfcheck — a missing/corrupt SELFCHECK.json (None) silently
+    dropped the gate. None must fall through: recomputing heals the file and
+    spends the budget honestly."""
+    from compile_box import _post_turn_selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/b.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        run = _FakeRun(td)
+        msg1 = await _post_turn_selfcheck(run)      # b.md unaccounted → repairing
+        assert msg1 and run._l1_repairs_used == 1
+        (base / "authoring/SELFCHECK.json").unlink()
+        # Tree unchanged + file gone: the OLD early-return left NO file and no
+        # honest state behind (gate silently dropped). The fall-through must
+        # re-run the gate — with the suite's 1-round budget already spent that
+        # lands unconverged + residual ticket, i.e. the file HEALS.
+        msg2 = await _post_turn_selfcheck(run)
+        sc = json.loads((base / "authoring/SELFCHECK.json").read_text())  # healed, not absent
+        assert sc["state"] in ("repairing", "unconverged"), sc
+        if sc["state"] == "unconverged":
+            assert msg2 is None  # budget spent → ticket, not another inject
+        else:
+            assert msg2 is not None
+    print("OK  no-op gate falls through on a missing/corrupt SELFCHECK.json")
+
+
+async def test_ledger_repairs_reset_budget():
+    """Round-3 review (low): _run_ledger_repairs forces a fresh check but kept
+    the session-lifetime repair counter — a batch ledger phase entered after
+    the persistent budget was spent filed a residual ticket with ZERO repair
+    attempts for its own findings. Each call is its own bounded episode."""
+    import compile_box
+    from compile_box import _run_ledger_repairs
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/b.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        run = _FakeRun(td)
+        run._l1_repairs_used = 99  # earlier interactive turns spent the budget
+
+        drove: list[str] = []
+
+        async def fake_drive(run_, directive, label):
+            drove.append(label)
+            # the repair session accounts for the missing source
+            _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/b.md\n---\ny")
+            _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
+            return "fixed"
+
+        real_drive = compile_box._drive_batch_session
+        compile_box._drive_batch_session = fake_drive
+        try:
+            await _run_ledger_repairs(run, [])
+        finally:
+            compile_box._drive_batch_session = real_drive
+        assert drove, "no repair session ran — budget was not reset"
+        sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+        assert sc["state"] == "passed", sc
+    print("OK  _run_ledger_repairs grants a fresh repair budget per episode")
+
+
 def test_repair_prompt_names_noop_exclusions_and_glob_shape():
     """Batch C: a pattern matching no source was shown to the HUMAN (narration)
     but withheld from the repair loop — the model could never converge an
@@ -642,6 +735,113 @@ async def test_media_verify_wiring():
     print("OK  blind media-verify wiring (gate / chunk+roll / findings→repair / PK yields)")
 
 
+
+
+async def test_media_inject_failure_does_not_double_settle():
+    """Round-3 review (med-high): a findings-path inject throwing AFTER the
+    primary settle used to re-settle the chunk with result=None — bumping the
+    just-verified pages' attempt counts (toward a spurious `exhausted`) and
+    charging failed pages two attempts for one real failure. The except must
+    settle only when the primary settle never ran."""
+    import mediaverify as mv
+    from compile_box import _maybe_start_media_verify, _post_turn_selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/i1.png")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        run = _FakeRun(td)
+
+        async def broken_inject(text):
+            raise RuntimeError("session gone")
+        run.inject_user_message = broken_inject
+
+        async def verify_with_findings(engine, workdir, pending, progress=None, locale=None):
+            return {"findings": [{"page": "p.md", "image": "s/i1.png", "kind": "不一致",
+                                  "claim": "x", "expected": "y", "fix": "z"}],
+                    "errors": [], "images": 1, "cache_hits": 0,
+                    "completed_pages": sorted(pending), "failed_pages": []}
+
+        os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "1"  # one spurious bump would exhaust
+        os.environ["KBC_PK_MODE"] = "off"
+        orig = mv.run_blind_verify
+        mv.run_blind_verify = verify_with_findings
+        try:
+            assert await _post_turn_selfcheck(run) is None
+            assert _maybe_start_media_verify(run)
+            await run._media_task
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            mvsec = sc["media_verify"]
+            assert "p.md" in mvsec["verified_pages"], mvsec       # the completed verification stands
+            assert "p.md" not in (mvsec.get("exhausted") or []), mvsec   # no spurious exhausted
+            assert not (mvsec.get("attempts") or {}), mvsec       # no phantom failed-attempt bump
+            assert sc.get("converge_phase") == "settled", sc      # inject failure falls through to the seam
+        finally:
+            mv.run_blind_verify = orig
+            del os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"]
+    print("OK  findings-inject failure settles once (no double-settle, no phantom exhausted)")
+
+
+async def test_media_failed_chunk_still_drains_later_chunks():
+    """Round-3 review (med): a transient failure on chunk 1 used to skip chunks
+    2..N AND PK, then settle green — the unattempted chunks were never verified
+    in a single session. The drain now chains past a failed chunk (its pages
+    deferred, not hot-looped); a later FRESH trigger retries the failed pages."""
+    import mediaverify as mv
+    from compile_box import _maybe_start_media_verify, _post_turn_selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/i1.png")
+        _mk(base, "raw/s/i2.png")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/i2.png\n---\ny")
+        run = _FakeRun(td)
+
+        calls: list[dict] = []
+
+        async def p_fails_q_verifies(engine, workdir, pending, progress=None, locale=None):
+            calls.append(dict(pending))
+            done = [p for p in pending if p != "p.md"]
+            failed = [p for p in pending if p == "p.md"]
+            return {"findings": [], "errors": ["boom"] if failed else [],
+                    "images": 1, "cache_hits": 0,
+                    "completed_pages": done, "failed_pages": failed}
+
+        os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"] = "1"  # p.md is chunk 1, q.md chunk 2
+        os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "2"
+        os.environ["KBC_PK_MODE"] = "off"
+        orig = mv.run_blind_verify
+        mv.run_blind_verify = p_fails_q_verifies
+        try:
+            assert await _post_turn_selfcheck(run) is None
+            assert _maybe_start_media_verify(run)               # chunk 1 (p.md) — will fail
+            await run._media_task
+            second = run._media_task                            # chunk 2 must have self-started
+            if second is not None:
+                await second
+            await asyncio.sleep(0)
+            assert [sorted(c) for c in calls] == [["p.md"], ["q.md"]], calls
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            mvsec = sc["media_verify"]
+            assert "q.md" in mvsec["verified_pages"], mvsec     # chunk 2 verified in the SAME drain
+            assert mvsec["attempts"].get("p.md") == 1, mvsec    # deferred, not hot-looped
+            assert sc.get("converge_phase") == "settled", sc
+            run._media_task = None
+            assert _maybe_start_media_verify(run)               # fresh trigger → p.md retries
+            await run._media_task
+            assert [sorted(c) for c in calls][-1] == ["p.md"], calls
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            assert sc["media_verify"]["attempts"]["p.md"] == 2, sc["media_verify"]
+        finally:
+            mv.run_blind_verify = orig
+            del os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"]
+            del os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"]
+    print("OK  failed chunk defers, later chunks still drain; fresh trigger retries")
 
 
 async def test_media_failed_pages_retry_then_exhaust():
@@ -1008,10 +1208,15 @@ def main():
     test_candidate_tree_hash_unreadable()
     test_pack_hash_is_relposix_sorted()
     test_content_hash_shared_formula()
+    test_page_too_large_uses_raw_bytes()
     asyncio.run(test_wiring())
+    asyncio.run(test_noop_gate_survives_missing_selfcheck())
+    asyncio.run(test_ledger_repairs_reset_budget())
     asyncio.run(test_media_verify_wiring())
     asyncio.run(test_media_clean_pass_settles_converge())
     asyncio.run(test_media_chunks_self_drain_then_settle())
+    asyncio.run(test_media_inject_failure_does_not_double_settle())
+    asyncio.run(test_media_failed_chunk_still_drains_later_chunks())
     asyncio.run(test_media_failed_pages_retry_then_exhaust())
     asyncio.run(test_media_attempt_count_resets_on_success())
     asyncio.run(test_pk_failed_state_settles_converge())

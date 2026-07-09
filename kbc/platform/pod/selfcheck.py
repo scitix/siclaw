@@ -182,8 +182,15 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
                           "error": f"unreadable: {e}"}
             continue
         sources, derived, has_key = parse_compiled_from(text)
+        try:
+            raw_bytes = f.stat().st_size
+        except OSError:
+            raw_bytes = len(text.encode("utf-8"))
+        # bytes = ON-DISK size, matching the sync gate's f.stat().st_size — the
+        # decoded text under-measures CRLF pages (read_text translates newlines),
+        # so an encode()-based lint could pass a page the sync then skips (review).
         pages[rel] = {"sources": sources, "derived": derived,
-                      "has_compiled_from": has_key, "text": text}
+                      "has_compiled_from": has_key, "text": text, "bytes": raw_bytes}
     return pages
 
 
@@ -340,7 +347,12 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
             violations.append({"page": rel, "kind": "no_provenance",
                                "detail": "frontmatter 缺 compiled_from(纯综合页请标 derived: true)"})
         text = page.get("text", "")
-        page_bytes_len = len(text.encode("utf-8"))
+        # Same byte METHOD as the sync gate (stat().st_size), not the decoded
+        # text re-encoded: read_text's newline translation under-measures CRLF
+        # pages, so a page just over the cap could lint green while the sync
+        # silently skips it (review). Fallback covers callers that build the
+        # pages dict by hand (tests).
+        page_bytes_len = page.get("bytes") or len(text.encode("utf-8"))
         if page_bytes_len > sync_cap:
             violations.append({"page": rel, "kind": "page_too_large",
                                "detail": (f"页面 {page_bytes_len // 1024}KB 超过同步上限"
