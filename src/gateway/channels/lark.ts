@@ -23,7 +23,7 @@ import {
 } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
-import { appendMessage, ensureChatSession } from "../chat-repo.js";
+import { appendMessage, ensureChatSession, recordChannelFeedback } from "../chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
 import { resolveAgentModelBinding } from "../agent-model-binding.js";
 import {
@@ -31,9 +31,13 @@ import {
   updateCardContent,
   finalizeCard,
   buildMilestoneCardMarkdown,
+  applyFeedbackSelection,
+  FEEDBACK_ACTION_KIND,
   PLACEHOLDER_BY_LOCALE,
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
+  type FeedbackActionValue,
+  type LarkLocale,
 } from "./lark-card.js";
 import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 import { replyImageToLark } from "./lark-image.js";
@@ -183,6 +187,15 @@ export function createLarkHandler(
           });
           return Promise.resolve();
         },
+        // Card button clicks (👍/👎 feedback). Unlike messages, the handler's
+        // return value IS the callback response (toast shown to the clicker),
+        // so this one is awaited — persistence is deadline-raced inside the
+        // handler to stay within Feishu's callback window.
+        "card.action.trigger": (data: any) =>
+          handleLarkCardAction(data, larkClient).catch((err) => {
+            console.error(`[lark] Error handling card action for channel=${channelId}:`, err);
+            return undefined;
+          }),
       });
 
       const ws = new lark.WSClient({
@@ -320,6 +333,95 @@ function backfillBindingDisplayName(
       console.warn(`[lark] Failed to update binding name for chat=${chatId}:`, err);
     }
   })();
+}
+
+const FEEDBACK_TOAST_BY_LOCALE: Record<LarkLocale, { ok: string; fail: string }> = {
+  "zh-CN": { ok: "已收到你的反馈，谢谢！", fail: "反馈记录失败，请稍后再试。" },
+  "en-US": { ok: "Feedback recorded — thanks!", fail: "Could not record feedback. Please try again." },
+};
+
+// Feishu expects the card-callback response within a few seconds; the WS RPC's
+// own timeout is 30s. Race the persist so a degraded Portal degrades to a
+// quick error toast instead of a hung click + Feishu redelivery storm. A
+// persist that lands after the deadline is absorbed by the upsert when the
+// user retries.
+const FEEDBACK_PERSIST_DEADLINE_MS = 2500;
+
+/**
+ * Handle a `card.action.trigger` callback. Only feedback buttons (our
+ * FEEDBACK_ACTION_KIND discriminator) are processed; anything else returns
+ * undefined so future card actions can add their own handling.
+ *
+ * The return value is sent back to Feishu as the callback response — a toast
+ * shown to the clicker. Persistence goes through chat-repo's module-global
+ * RPC client (same path as message persistence); the button-state echo on the
+ * card itself is best-effort (needs this process to still know the card's
+ * sequence).
+ */
+export async function handleLarkCardAction(
+  data: any,
+  larkClient: any,
+): Promise<{ toast: { type: string; content: string } } | undefined> {
+  // EventDispatcher flattens `event.*` onto the top level (same as messages).
+  // Some Feishu/CardKit versions deliver `action.value` as a JSON string
+  // rather than a parsed object — accept both so feedback doesn't silently
+  // no-op on those clients.
+  const rawValue = data?.action?.value;
+  let value: Partial<FeedbackActionValue> | undefined;
+  if (typeof rawValue === "string") {
+    try { value = JSON.parse(rawValue); } catch { value = undefined; }
+  } else {
+    value = rawValue as Partial<FeedbackActionValue> | undefined;
+  }
+  if (!value || value.kind !== FEEDBACK_ACTION_KIND) return undefined;
+
+  const locale: LarkLocale = value.locale === "en-US" ? "en-US" : "zh-CN";
+  const toasts = FEEDBACK_TOAST_BY_LOCALE[locale];
+  const rating = value.rating === "up" || value.rating === "down" ? value.rating : null;
+  const operatorOpenId: string | undefined = data?.operator?.open_id;
+  if (!rating || !value.session_id || !value.card_id || !operatorOpenId) {
+    console.warn(`[lark] Dropping malformed feedback action card=${value.card_id ?? "?"} rating=${value.rating ?? "?"} operator=${operatorOpenId ?? "?"}`);
+    return { toast: { type: "error", content: toasts.fail } };
+  }
+
+  // Never rejects — failures collapse to {success:false} so a late settle
+  // after the deadline below can't surface as an unhandled rejection.
+  const persist = recordChannelFeedback({
+    sessionId: value.session_id,
+    messageRef: value.card_id,
+    rating,
+    senderExternalId: operatorOpenId,
+    channelId: value.channel_id ?? null,
+    source: "lark",
+  }).catch((err): { success: boolean; error?: string } => {
+    console.error(`[lark] Feedback persist failed card=${value.card_id}:`, err);
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  });
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const result = await Promise.race([
+    persist,
+    new Promise<null>((resolve) => {
+      deadlineTimer = setTimeout(() => resolve(null), FEEDBACK_PERSIST_DEADLINE_MS);
+      (deadlineTimer as { unref?: () => void }).unref?.();
+    }),
+  ]);
+  // Clear the timer once the race settles — on the common fast-persist path it
+  // would otherwise stay armed (harmlessly, thanks to unref) for the full deadline.
+  if (deadlineTimer) clearTimeout(deadlineTimer);
+  if (!result?.success) {
+    if (result == null) {
+      console.warn(`[lark] Feedback persist timed out (${FEEDBACK_PERSIST_DEADLINE_MS}ms) card=${value.card_id}`);
+    } else if (result.error) {
+      console.warn(`[lark] Feedback persist rejected card=${value.card_id}: ${result.error}`);
+    }
+    return { toast: { type: "error", content: toasts.fail } };
+  }
+
+  console.log(`[lark] Feedback recorded card=${value.card_id} session=${value.session_id} rating=${rating} sender=${operatorOpenId}`);
+  // Detached: highlighting the chosen button is cosmetic; the toast below is
+  // the authoritative confirmation. Never rejects (best-effort boolean).
+  void applyFeedbackSelection(larkClient, value as FeedbackActionValue, rating);
+  return { toast: { type: "success", content: toasts.ok } };
 }
 
 /**
@@ -871,7 +973,12 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   if (cardFlushPromise) { try { await cardFlushPromise; } catch { /* logged in flush */ } }
 
   if (cardSession) {
-    const ok = await finalizeCard(larkClient, cardSession, finalCardBody);
+    // Only solicit 👍/👎 on a real answer — never under an error or
+    // empty-result notice, where a click would write a rating against a
+    // non-answer and skew the feedback signal Metrics aggregates.
+    const isAnswer = !agentError && resultText.trim().length > 0;
+    const ok = await finalizeCard(larkClient, cardSession, finalCardBody,
+      isAnswer ? { ctx: { sessionId, channelId }, locale } : undefined);
     deliveredTextChars = finalCardBody.length;
     if (!ok) {
       // Partial-failure path: the card is visible but stuck in streaming

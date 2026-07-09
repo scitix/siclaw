@@ -270,6 +270,51 @@ async function resetChannelBindingSession(
 }
 
 /**
+ * Record (or re-vote) end-user feedback on a channel reply. Upsert keyed by
+ * (message_ref, sender_external_id) — one vote per person per reply; a repeat
+ * click with a different rating flips the stored vote.
+ */
+async function recordMessageFeedback(
+  db: Db,
+  params: {
+    session_id?: string;
+    message_ref?: string;
+    rating?: string;
+    sender_external_id?: string;
+    channel_id?: string | null;
+    source?: string | null;
+  },
+): Promise<{ success: boolean; error?: string }> {
+  const sessionId = typeof params.session_id === "string" ? params.session_id.trim() : "";
+  const messageRef = typeof params.message_ref === "string" ? params.message_ref.trim() : "";
+  const rating = params.rating === "up" || params.rating === "down" ? params.rating : "";
+  const sender = typeof params.sender_external_id === "string" ? params.sender_external_id.trim() : "";
+  if (!sessionId || !messageRef || !rating || !sender) {
+    return { success: false, error: "session_id, message_ref, rating (up|down) and sender_external_id are required" };
+  }
+  const upsert = buildUpsert(
+    db,
+    "message_feedback",
+    ["id", "session_id", "message_ref", "rating", "sender_external_id", "channel_id", "source"],
+    [crypto.randomUUID(), sessionId, messageRef.slice(0, 64), rating, sender.slice(0, 128),
+     typeof params.channel_id === "string" ? params.channel_id.slice(0, 128) : null,
+     (typeof params.source === "string" && params.source.trim() ? params.source.trim() : "lark").slice(0, 20)],
+    ["message_ref", "sender_external_id"],
+    ["rating", { col: "updated_at", expr: "CURRENT_TIMESTAMP" }],
+  );
+  try {
+    await db.query(upsert.sql, upsert.params);
+  } catch (err) {
+    // session_id rides in from the (stale-able) card button — a click on a
+    // card whose chat_sessions row was since deleted trips the FK. Report it
+    // as a clean failure so the RPC/HTTP mirror answers {success:false}
+    // instead of throwing an unhandled error frame at the caller.
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  return { success: true };
+}
+
+/**
  * Update display-only metadata on a binding (currently just the chat title).
  * Called by the gateway when it observes a fresh name from the platform API.
  */
@@ -1065,6 +1110,20 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     );
     await db.query(upsert.sql, upsert.params);
     sendJson(res, 200, { ok: true });
+  });
+
+  // POST /api/internal/siclaw/chat/record-feedback
+  router.post("/api/internal/siclaw/chat/record-feedback", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{
+      session_id: string; message_ref: string; rating: string;
+      sender_external_id: string; channel_id?: string | null; source?: string | null;
+    }>(req);
+    const db = getDb();
+    sendJson(res, 200, await recordMessageFeedback(db, body));
   });
 
   // POST /api/internal/siclaw/chat/append-message
@@ -2405,6 +2464,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       [params.session_id],
     );
     return { id };
+  });
+
+  handlers.set("chat.recordFeedback", async (params) => {
+    const db = getDb();
+    return recordMessageFeedback(db, params);
   });
 
   handlers.set("chat.updateMessage", async (params) => {

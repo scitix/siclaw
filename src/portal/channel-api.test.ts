@@ -9,6 +9,7 @@ import { getDb } from "../gateway/db.js";
 import { createRestRouter } from "../gateway/rest-router.js";
 import { signToken } from "./auth.js";
 import { registerChannelRoutes } from "./channel-api.js";
+import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 const JWT_SECRET = "test-channel-secret";
 const ADMIN_TOKEN = signToken("admin-1", "admin", "admin", JWT_SECRET);
@@ -79,10 +80,21 @@ function parseBody(res: any): any {
 describe("registerChannelRoutes", () => {
   let router: ReturnType<typeof createRestRouter>;
   let query: ReturnType<typeof vi.fn>;
+  let connMap: RuntimeConnectionMap;
 
   beforeEach(() => {
     router = createRestRouter();
-    registerChannelRoutes(router, JWT_SECRET);
+    connMap = {
+      register: vi.fn(),
+      unregister: vi.fn(),
+      isConnected: vi.fn().mockReturnValue(false),
+      sendCommand: vi.fn().mockResolvedValue({ ok: true }),
+      notify: vi.fn(),
+      notifyMany: vi.fn(),
+      subscribe: vi.fn().mockReturnValue(() => {}),
+      connectedAgentIds: vi.fn().mockReturnValue(["runtime-1"]),
+    };
+    registerChannelRoutes(router, JWT_SECRET, connMap);
     query = vi.fn();
     (getDb as any).mockReturnValue({ query });
   });
@@ -112,6 +124,32 @@ describe("registerChannelRoutes", () => {
       await runRoute(router, req, res);
       expect(res._status).toBe(200);
       expect(parseBody(res)).toEqual({ data: [expect.objectContaining({ id: "c1" })] });
+    });
+
+    it("flags per-agent dedicated bots and never leaks config on the list path", async () => {
+      query.mockResolvedValueOnce([[
+        {
+          id: "c-shared", name: "org app", type: "lark", status: "active",
+          config: JSON.stringify({ app_id: "cli_shared", app_secret: "sh" }),
+          created_by: "u1", created_at: "2024-01-01", updated_at: "2024-01-02",
+        },
+        {
+          id: "c-bot", name: "cks Bot", type: "lark", status: "active",
+          config: JSON.stringify({ app_id: "cli_bot", app_secret: "sb", personal_bot: { agent_id: "agent-1", access_mode: "open" } }),
+          created_by: "u1", created_at: "2024-01-01", updated_at: "2024-01-02",
+        },
+      ], []]);
+      const req = fakeReq({ url: "/api/v1/channels", method: "GET" });
+      const res = fakeRes();
+      await runRoute(router, req, res);
+      const body = parseBody(res);
+      expect(body.data).toEqual([
+        expect.objectContaining({ id: "c-shared", is_personal_bot: false, personal_bot_agent_id: null }),
+        expect.objectContaining({ id: "c-bot", is_personal_bot: true, personal_bot_agent_id: "agent-1" }),
+      ]);
+      // Credentials must not ride along on the list response.
+      expect(JSON.stringify(body)).not.toContain("app_secret");
+      expect(body.data[0].config).toBeUndefined();
     });
   });
 
@@ -244,6 +282,10 @@ describe("registerChannelRoutes", () => {
         expect.stringContaining("DELETE FROM agent_channel_auth"),
         expect.stringContaining("DELETE FROM channels"),
       ]));
+
+      // Every channel write must push channel.reload — otherwise the gateway
+      // keeps serving the deleted channel on a stale WS until a restart.
+      expect(connMap.sendCommand).toHaveBeenCalledWith("runtime-1", "channel.reload", {});
     });
   });
 });

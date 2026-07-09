@@ -88,6 +88,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_channel_binding_sessions_session",
       "idx_kpe_created",
       "idx_kpe_repo",
+      "idx_message_feedback_session",
       "idx_skills_overlay",
       "idx_skills_org_name",
       "idx_hosts_jump",

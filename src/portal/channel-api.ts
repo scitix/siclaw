@@ -15,8 +15,9 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
+import { broadcastChannelReload, type RuntimeConnectionMap } from "./runtime-connection.js";
 
-export function registerChannelRoutes(router: RestRouter, jwtSecret: string): void {
+export function registerChannelRoutes(router: RestRouter, jwtSecret: string, connectionMap: RuntimeConnectionMap): void {
   // GET /api/v1/channels — list all
   router.get("/api/v1/channels", async (req, res) => {
     const auth = requireAdmin(req, res, jwtSecret);
@@ -24,9 +25,21 @@ export function registerChannelRoutes(router: RestRouter, jwtSecret: string): vo
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT id, name, type, status, created_by, created_at, updated_at FROM channels ORDER BY created_at DESC, id DESC",
+      "SELECT id, name, type, status, config, created_by, created_at, updated_at FROM channels ORDER BY created_at DESC, id DESC",
     ) as any;
-    sendJson(res, 200, { data: rows });
+    // Flag per-agent dedicated bots (config.personal_bot) so the Settings page
+    // can hide them — they are managed from the owning agent's Channels tab.
+    // The config itself (credentials) never leaves this handler on the list path.
+    const data = (rows as any[]).map((row) => {
+      const cfg = safeParseJson(row.config, null) as { personal_bot?: { agent_id?: string } } | null;
+      const { config: _config, ...rest } = row;
+      return {
+        ...rest,
+        is_personal_bot: Boolean(cfg?.personal_bot?.agent_id),
+        personal_bot_agent_id: cfg?.personal_bot?.agent_id ?? null,
+      };
+    });
+    sendJson(res, 200, { data });
   });
 
   // POST /api/v1/channels — create
@@ -56,6 +69,7 @@ export function registerChannelRoutes(router: RestRouter, jwtSecret: string): vo
       "SELECT id, name, type, status, created_by, created_at, updated_at FROM channels WHERE id = ?",
       [id],
     ) as any;
+    broadcastChannelReload(connectionMap);
     sendJson(res, 201, rows[0]);
   });
 
@@ -118,6 +132,7 @@ export function registerChannelRoutes(router: RestRouter, jwtSecret: string): vo
       sendJson(res, 404, { error: "Channel not found" });
       return;
     }
+    broadcastChannelReload(connectionMap);
     sendJson(res, 200, rows[0]);
   });
 
@@ -138,6 +153,7 @@ export function registerChannelRoutes(router: RestRouter, jwtSecret: string): vo
     await db.query("DELETE FROM channel_pairing_codes WHERE channel_id = ?", [params.id]);
     await db.query("DELETE FROM agent_channel_auth WHERE channel_id = ?", [params.id]);
     await db.query("DELETE FROM channels WHERE id = ?", [params.id]);
+    broadcastChannelReload(connectionMap);
     sendJson(res, 200, { deleted: true });
   });
 }
