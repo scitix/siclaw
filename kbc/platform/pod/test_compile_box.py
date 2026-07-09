@@ -678,6 +678,27 @@ async def test_propose_plan_never_bounces():
     print("✓ propose_plan always signals; PROPOSED_PLAN.json written by code")
 
 
+def test_install_wiki_snapshot_skips_consumer_meta():
+    """DESIGN-kb-consumer-meta S3: a published bundle carries a root
+    `_consumer_meta.json` (sicore injects it at publish). It is catalog routing
+    data, never a wiki page — the test-snapshot installer must skip it from the
+    install AND the content hash, so draft and published snapshots of
+    byte-identical pages keep the SAME snapshot hash (grading comparability)."""
+    import tempfile as _tf
+    plain = make_source_bundle({"index.md": "# i\n", "p.md": "x"})
+    with_meta = make_source_bundle({"index.md": "# i\n", "p.md": "x",
+                                    "_consumer_meta.json": '{"version":1,"summary":"s"}'})
+    with _tf.TemporaryDirectory() as d:
+        dest = Path(d)
+        h_plain, n_plain = compile_box._install_wiki_snapshot(plain, dest / "a")
+        h_meta, n_meta = compile_box._install_wiki_snapshot(with_meta, dest / "b")
+        assert (h_plain, n_plain) == (h_meta, n_meta) == (h_plain, 2), (h_plain, h_meta, n_plain, n_meta)
+        assert not (dest / "b" / ".siclaw" / "knowledge" / "_consumer_meta.json").exists()
+        # other .json files (page data) still install as before
+        assert (dest / "a" / ".siclaw" / "knowledge" / "index.md").is_file()
+    print("✓ install_wiki_snapshot skips _consumer_meta.json (hash parity draft↔published)")
+
+
 def test_install_wiki_snapshot_size_guard():
     """Fix A: the published-snapshot installer rejects an oversized compressed
     bundle AND a decompression bomb (accumulated-unpacked cap), like its sibling
@@ -1969,6 +1990,9 @@ async def main():
     # PK never fires in these wiring tests — a qualifying fixture must not spawn
     # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
     os.environ["KBC_PK_MODE"] = "off"
+    # Same for consumer-meta generation (test_selfcheck covers its wiring).
+    os.environ["KBC_CONSUMER_META_MODE"] = "off"
+    test_install_wiki_snapshot_skips_consumer_meta()
     test_install_wiki_snapshot_size_guard()
     await test_workspace_sync()
     await test_run_wrapper_terminal_signals()

@@ -53,6 +53,7 @@ from claude_agent_sdk import (
 )
 
 import batching
+import consumermeta
 import incremental
 import mediaverify
 import office_ingest
@@ -273,6 +274,9 @@ class CompileRun:
         self._pk_task: asyncio.Task | None = None
         # Blind image verify (图像复核 v2): the in-flight background task.
         self._media_task: asyncio.Task | None = None
+        # Consumer-meta generation (DESIGN-kb-consumer-meta S1): the in-flight
+        # background task; durable state lives in SELFCHECK.json `consumer_meta`.
+        self._meta_task: asyncio.Task | None = None
         # Model-stall watchdog (L1) — turn-scoped state, updated by the receive
         # loop (_consume_turn_stream) and the watchdog task. A turn is "active"
         # from query() until its real ResultMessage; the watchdog only judges an
@@ -1048,6 +1052,112 @@ async def _set_converge_phase(run, phase: str) -> None:
     if sent is not None:
         try:
             await _sync_workspace(run, sent)
+        except Exception:
+            pass
+    if phase == "settled":
+        # Consumer-meta generation rides the settle transition — EVERY settle
+        # site (seam / media drain / PK terminal / batch end) funnels through
+        # here, so one hook covers them all. Additive + fail-open background
+        # task; keyed by candidate_tree_hash, so incremental rounds regenerate
+        # exactly when content changed and an unchanged settle is a no-op.
+        _maybe_start_consumer_meta(run)
+
+
+# ── consumer-facing meta wiring (S1, DESIGN-kb-consumer-meta-2026-07-10) ─────
+# A settled draft owes ONE blind consumer-meta pass per candidate tree: a
+# background one-shot LLM read of candidate/ ONLY (raw structurally invisible,
+# see consumermeta.py) whose result lands in authoring/CONSUMER_META.json and
+# rides the ordinary workspace sync — zero new API. Never gates anything:
+# generation failure is recorded (SELFCHECK `consumer_meta`) and consumers fall
+# back to the owner description (design D2). Bounded by construction: one
+# attempt per tree hash (success OR failure stamps the hash).
+
+
+def _consumer_meta_mode() -> str:
+    return os.environ.get("KBC_CONSUMER_META_MODE", "auto")
+
+
+def _consumer_meta_due(run) -> bool:
+    """True when the settled draft owes a consumer-meta pass. Runs only on a
+    terminal-ledger draft (passed OR unconverged — an unconverged draft is
+    still publishable owner-side, and residuals don't invalidate a routing
+    summary of what the pages contain)."""
+    workdir = getattr(run, "workdir", None)
+    if not workdir or _consumer_meta_mode() != "auto":
+        return False
+    task = getattr(run, "_meta_task", None)
+    if task is not None and not task.done():
+        return False  # single-flight
+    if not (Path(workdir) / "candidate" / "index.md").is_file():
+        return False
+    sc = selfcheck.read_selfcheck(workdir) or {}
+    if sc.get("state") not in ("passed", "unconverged"):
+        return False
+    tree = selfcheck.candidate_tree_hash(workdir)
+    if tree is None:
+        return False
+    cm = sc.get("consumer_meta") or {}
+    if cm.get("tree_hash") == tree:
+        # This exact draft was already attempted. Regenerate only to self-heal
+        # a generated-then-deleted file (e.g. the model's own Bash damaged it);
+        # a failed attempt is NOT retried on the same tree (bounded cost).
+        return (cm.get("state") == "generated"
+                and not (Path(workdir) / selfcheck.CONSUMER_META_PATH).is_file())
+    return True
+
+
+def _maybe_start_consumer_meta(run) -> None:
+    """Kick the blind meta generation as a background task. Unlike media/PK it
+    does not gate the settle (the phase is already terminal when this fires);
+    it only tops the settled draft up with its routing summary."""
+    try:
+        due = _consumer_meta_due(run)
+    except Exception:
+        return  # a broken due-check must never break the settle transition
+    if due:
+        run._meta_task = asyncio.get_running_loop().create_task(
+            _run_consumer_meta_flow(run))
+
+
+async def _run_consumer_meta_flow(run) -> None:
+    """Generate + persist CONSUMER_META.json for the settled draft. Fail-open at
+    every boundary — a meta crash costs the meta, never the session. The tree
+    hash captured BEFORE generation is what gets stamped: if the draft changes
+    mid-flight, the stamp mismatches the new tree and the next settle
+    regenerates (content-keyed idempotency, same shape as PK's
+    tested_tree_hash)."""
+    workdir = run.workdir
+    tree = None
+    try:
+        tree = selfcheck.candidate_tree_hash(workdir)
+        await run.emit({"type": "summary", "text": _loc(run,
+            "Consumer summary: generating the KB's routing summary from the compiled pages (background)…",
+            "消费摘要:正在从已编译页面生成本库的口径摘要(后台)…")})
+        meta = await consumermeta.generate_consumer_meta(
+            ClaudeEngine(), workdir=workdir, locale=getattr(run, "locale", None))
+        selfcheck.write_consumer_meta(workdir, meta)
+        selfcheck.update_consumer_meta_section(workdir, {
+            "state": "generated", "tree_hash": tree,
+            "generated_by": meta.get("generated_by"), "error": None})
+        sent = getattr(run, "_sync_sent", None)
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)  # CONSUMER_META.json rides along
+            except Exception:
+                pass
+        await run.emit({"type": "summary", "text": _loc(run,
+            "Consumer summary written to authoring/CONSUMER_META.json ✓ (shown on the publish card; owner-editable)",
+            "消费摘要已写入 authoring/CONSUMER_META.json ✓(发布确认卡展示,负责人可改)")})
+    except Exception as e:
+        try:
+            selfcheck.update_consumer_meta_section(workdir, {
+                "state": "failed", "tree_hash": tree, "error": repr(e)})
+        except Exception:
+            pass
+        try:
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Consumer-summary generation failed (non-blocking, publish falls back to the description): {e!r}",
+                f"消费摘要生成失败(不阻塞,发布回退用库描述): {e!r}")})
         except Exception:
             pass
 
@@ -2435,7 +2545,7 @@ async def _run_wrapper(run: CompileRun):
         # Detached verify tasks die with the run (audit finding): a media/PK
         # pass mid-flight on a run that just ended kept burning model calls
         # for minutes, then no-op'd its repair injection into a dead session.
-        for _name in ("_media_task", "_pk_task"):
+        for _name in ("_media_task", "_pk_task", "_meta_task"):
             _bg = getattr(run, _name, None)
             if _bg is not None and not _bg.done():
                 _bg.cancel()
@@ -2839,6 +2949,14 @@ def _install_wiki_snapshot(bundle: bytes, dest: Path, expected_sha256: str | Non
             rel = _safe_tar_path(member.name)
             rel_posix = rel.as_posix()
             if not (rel_posix.endswith(".md") or rel_posix.endswith(".json")):
+                continue
+            if rel_posix == "_consumer_meta.json":
+                # Publish-time injected consumer meta (DESIGN-kb-consumer-meta
+                # S2): catalog routing data, not a wiki page. Skipped from the
+                # install AND the hash so a published bundle carrying it keeps
+                # the SAME snapshot hash as the byte-identical draft
+                # (pack_candidates_to_wiki) — (question × snapshot) grading
+                # stays comparable across draft and published sources.
                 continue
             src = tf.extractfile(member)
             if src is None:

@@ -1170,6 +1170,247 @@ def test_candidate_tree_hash_unreadable():
     print("OK  candidate_tree_hash tolerates a perm-denied file (fix C)")
 
 
+def test_normalize_consumer_meta():
+    """Pinned v1 envelope: code owns version/locale/generated_by + every cap;
+    entry_pages filtered to real pages (index.md excluded); unusable payloads
+    (no summary / non-object / U+FFFD) raise for the caller's bounded retry."""
+    pages = ["index.md", "a.md", "sub/b.md"]
+    meta = selfcheck.normalize_consumer_meta(
+        {"summary": "  摘要  ", "when_to_use": ["问A", "", "问A", "问B"],
+         "not_for": "not-a-list", "topics": ["t"] * 20,
+         "entry_pages": ["candidate/a.md", "sub/b", "index.md", "ghost.md", "./a.md"]},
+        locale="zh", generated_by="m1", page_names=pages)
+    assert meta["version"] == 1 and meta["summary"] == "摘要", meta
+    assert meta["when_to_use"] == ["问A", "问B"]          # stripped, deduped, empties dropped
+    assert meta["not_for"] == []                          # wrong type → empty, never a crash
+    assert len(meta["topics"]) == 1                       # dedup collapses the spam
+    assert meta["entry_pages"] == ["a.md", "sub/b.md"]    # prefix/extension healed, ghost+index dropped
+    assert meta["locale"] == "zh" and meta["generated_by"] == "m1"
+    assert list(meta) == ["version", "summary", "when_to_use", "not_for",
+                          "topics", "entry_pages", "locale", "generated_by"]
+    caps = selfcheck.normalize_consumer_meta(
+        {"summary": "s", "topics": [f"t{i}" for i in range(20)]},
+        locale="zh", generated_by="m")
+    assert len(caps["topics"]) == 8                       # list cap
+    # summary cap is code-point safe; en locale normalizes to "en"
+    long = selfcheck.normalize_consumer_meta(
+        {"summary": "汉" * 500}, locale="en-US", generated_by="m", page_names=None)
+    assert len(long["summary"]) == selfcheck.CONSUMER_META_SUMMARY_MAX
+    assert long["locale"] == "en" and long["entry_pages"] == []
+    for bad in [None, [], {"summary": "  "}, {"summary": "好�坏"},
+                {"summary": "ok", "topics": ["x�"]}]:
+        try:
+            selfcheck.normalize_consumer_meta(bad, locale="zh", generated_by="m")
+            assert False, f"should reject {bad!r}"
+        except ValueError:
+            pass
+    print("OK  normalize_consumer_meta (envelope / caps / entry filter / charset+empty rejection)")
+
+
+def test_validate_consumer_meta():
+    """File-facts channel: absent = fine (present False, no problems — old
+    workspaces/never-stuck); malformed = problems listed, incl. the U+FFFD
+    charset guard over ALL text fields; a good file = clean."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        assert selfcheck.validate_consumer_meta(td) == {"present": False, "problems": []}
+        _mk(base, "authoring/CONSUMER_META.json", "{broken")
+        v = selfcheck.validate_consumer_meta(td)
+        assert v["present"] and any("invalid JSON" in p for p in v["problems"]), v
+        _mk(base, "authoring/CONSUMER_META.json", json.dumps(
+            {"version": 2, "summary": "", "when_to_use": [1], "topics": ["坏�"]}))
+        v = selfcheck.validate_consumer_meta(td)
+        assert any("version" in p for p in v["problems"]), v
+        assert any("summary" in p for p in v["problems"]), v
+        assert any("when_to_use" in p for p in v["problems"]), v
+        assert any("U+FFFD" in p for p in v["problems"]), v
+        good = selfcheck.normalize_consumer_meta(
+            {"summary": "s", "topics": ["t"]}, locale="zh", generated_by="m")
+        selfcheck.write_consumer_meta(td, good)
+        assert selfcheck.validate_consumer_meta(td) == {"present": True, "problems": []}
+    print("OK  validate_consumer_meta (absent clean / JSON+schema+charset problems / good file)")
+
+
+def test_consumer_meta_report_carry_and_narration():
+    """run_layer1 carries the generator's bookkeeping (state/tree_hash) forward
+    like `pk`, refreshes file-facts, and narration warns — non-blocking — only
+    when the file exists AND is malformed. Problems never gate lint/coverage."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        report = selfcheck.run_layer1(td)
+        assert report["consumer_meta"] == {"present": False, "problems": []}, report["consumer_meta"]
+        report["state"] = "passed"
+        selfcheck.write_selfcheck(td, report)
+        # generator stamps its section; a later L1 re-check must carry it
+        selfcheck.update_consumer_meta_section(td, {"state": "generated", "tree_hash": "T1"})
+        report2 = selfcheck.run_layer1(td)
+        cm = report2["consumer_meta"]
+        assert cm["state"] == "generated" and cm["tree_hash"] == "T1", cm
+        assert cm["present"] is False                     # file-facts stay fresh from disk
+        # malformed file → ⚠ in narration, but coverage/lint unaffected
+        _mk(base, "authoring/CONSUMER_META.json", json.dumps({"version": 1, "summary": ""}))
+        report3 = selfcheck.run_layer1(td)
+        assert report3["consumer_meta"]["present"] and report3["consumer_meta"]["problems"]
+        assert report3["coverage"]["closed"] and report3["lint"]["ok"]  # WARNING only, never a gate
+        report3["state"] = "passed"
+        for loc in ("en", "zh"):
+            line = selfcheck.narration(report3, loc)
+            assert "CONSUMER_META.json" in line, line
+        # absent file → no warning
+        (base / "authoring/CONSUMER_META.json").unlink()
+        report4 = selfcheck.run_layer1(td)
+        report4["state"] = "passed"
+        assert "CONSUMER_META" not in selfcheck.narration(report4, "en")
+    print("OK  consumer_meta report carry + narration warning (non-blocking)")
+
+
+async def test_consumer_meta_generation():
+    """consumermeta.generate_consumer_meta: BLIND by construction (cwd + only
+    read root = candidate/), locale-threaded prompts, one bounded retry on
+    unusable output, normalized result; total failure raises for the caller's
+    fail-open."""
+    import consumermeta
+
+    class FakeEngine:
+        def __init__(self, outputs):
+            self.outputs = list(outputs)
+            self.calls: list[dict] = []
+
+        async def run_readonly_agent(self, *, cwd, system_prompt, user_message,
+                                     model, effort=None, allowed_read_roots,
+                                     timeout_secs):
+            self.calls.append({"cwd": cwd, "roots": allowed_read_roots,
+                               "system": system_prompt, "user": user_message,
+                               "model": model})
+            return self.outputs.pop(0)
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/secret.md", "raw stays invisible")
+        _mk(base, "candidate/index.md", "i")
+        _mk(base, "candidate/p.md", "p")
+        # first output unparseable → ONE retry with an explicit re-emit note
+        eng = FakeEngine(["not json at all",
+                          '{"summary": "覆盖X", "when_to_use": ["问X"], "entry_pages": ["p.md"]}'])
+        meta = await consumermeta.generate_consumer_meta(eng, workdir=td, locale="zh")
+        assert meta["summary"] == "覆盖X" and meta["entry_pages"] == ["p.md"], meta
+        assert meta["locale"] == "zh" and meta["generated_by"] == consumermeta._meta_model()
+        assert len(eng.calls) == 2
+        cand = str(Path(td) / "candidate")
+        for call in eng.calls:
+            assert call["cwd"] == cand and call["roots"] == [cand], call  # blind: candidate/ only
+        assert "index.md" in eng.calls[0]["user"] and "p.md" in eng.calls[0]["user"]
+        assert "JSON" in eng.calls[1]["user"] and eng.calls[1]["user"] != eng.calls[0]["user"]
+        # both attempts unusable → raises (caller records failed, fail-open)
+        eng2 = FakeEngine(["junk", '{"summary": ""}'])
+        try:
+            await consumermeta.generate_consumer_meta(eng2, workdir=td, locale="en")
+            assert False, "should raise after retry"
+        except ValueError as e:
+            assert "after retry" in str(e), e
+        assert "Read index.md" in eng2.calls[0]["user"]  # en prompt pack
+        # no candidate pages → refuse up front (nothing to summarize)
+        with tempfile.TemporaryDirectory() as empty:
+            try:
+                await consumermeta.generate_consumer_meta(FakeEngine([]), workdir=empty)
+                assert False, "should refuse an empty tree"
+            except ValueError:
+                pass
+    print("OK  consumer-meta generation (blind roots / locale / bounded retry / refusal)")
+
+
+async def test_consumer_meta_wiring():
+    """S1 settle wiring: settle → one blind generation per tree hash (file
+    written + SELFCHECK stamped + summary emitted), idempotent on the same
+    tree, regenerates when content changes, failure stamps `failed` (no retry
+    on the same tree, settle unharmed), and mode=off kills it."""
+    import compile_box
+    import consumermeta as cm_mod
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        run = _FakeRun(td)
+        os.environ["KBC_PK_MODE"] = "off"
+        assert await compile_box._post_turn_selfcheck(run) is None  # ledger passes
+
+        calls: list[str] = []
+
+        async def fake_generate(engine, *, workdir, locale=None):
+            calls.append(workdir)
+            return selfcheck.normalize_consumer_meta(
+                {"summary": "口径摘要", "when_to_use": ["问法"], "topics": ["主题"],
+                 "entry_pages": ["p.md"]},
+                locale=locale, generated_by="fake-model", page_names=["index.md", "p.md"])
+
+        orig = cm_mod.generate_consumer_meta
+        cm_mod.generate_consumer_meta = fake_generate
+        os.environ["KBC_CONSUMER_META_MODE"] = "off"
+        try:
+            await compile_box._set_converge_phase(run, "settled")
+            assert getattr(run, "_meta_task", None) is None  # mode off → never fires
+            os.environ["KBC_CONSUMER_META_MODE"] = "auto"
+            await compile_box._set_converge_phase(run, "settled")
+            assert run._meta_task is not None
+            await run._meta_task
+            assert calls == [td]
+            meta = json.loads((base / "authoring/CONSUMER_META.json").read_text())
+            assert meta["summary"] == "口径摘要" and meta["version"] == 1, meta
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            assert sc["consumer_meta"]["state"] == "generated", sc["consumer_meta"]
+            assert sc["consumer_meta"]["tree_hash"] == selfcheck.candidate_tree_hash(td)
+            assert sc["consumer_meta"]["present"] and not sc["consumer_meta"]["problems"]
+            assert any("CONSUMER_META" in s for s in run.summaries), run.summaries
+
+            # same tree → idempotent (no second generation)
+            await compile_box._set_converge_phase(run, "settled")
+            if run._meta_task is not None:
+                await run._meta_task
+            assert calls == [td]
+
+            # content change → the next settle regenerates
+            _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx v2")
+            assert await compile_box._post_turn_selfcheck(run) is None
+            await compile_box._set_converge_phase(run, "settled")
+            await run._meta_task
+            assert calls == [td, td]
+
+            # generated file deleted (model damage) → same tree self-heals
+            (base / "authoring/CONSUMER_META.json").unlink()
+            await compile_box._set_converge_phase(run, "settled")
+            await run._meta_task
+            assert calls == [td, td, td]
+            assert (base / "authoring/CONSUMER_META.json").is_file()
+
+            # failure path: stamps failed, never raises, no retry on the same tree
+            async def broken_generate(engine, *, workdir, locale=None):
+                raise RuntimeError("model down")
+
+            cm_mod.generate_consumer_meta = broken_generate
+            _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx v3")
+            assert await compile_box._post_turn_selfcheck(run) is None
+            await compile_box._set_converge_phase(run, "settled")
+            await run._meta_task
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            assert sc["consumer_meta"]["state"] == "failed", sc["consumer_meta"]
+            assert "model down" in sc["consumer_meta"]["error"]
+            assert sc.get("converge_phase") == "settled"  # settle unharmed (fail-open)
+            n = len(calls)
+            await compile_box._set_converge_phase(run, "settled")
+            if run._meta_task is not None:
+                await run._meta_task
+            assert len(calls) == n  # failed tree is not retried (bounded)
+        finally:
+            cm_mod.generate_consumer_meta = orig
+            os.environ["KBC_CONSUMER_META_MODE"] = "off"
+    print("OK  consumer-meta wiring (settle trigger / tree-hash idempotency / regen / self-heal / fail-open)")
+
+
 def test_content_hash_shared_formula():
     """Design: pack / tree / canonical must agree for byte-identical content (nested)."""
     with tempfile.TemporaryDirectory() as td:
@@ -1187,6 +1428,9 @@ def test_content_hash_shared_formula():
 def main():
     os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
     os.environ.setdefault("KBC_PK_MODE", "off")  # PK never fires in unrelated wiring tests
+    # Consumer-meta generation never fires in unrelated wiring tests either — a
+    # settle in any fixture must not spawn a real ClaudeEngine in the background.
+    os.environ.setdefault("KBC_CONSUMER_META_MODE", "off")
     test_parse_compiled_from()
     test_parse_compiled_from_inline()
     test_inventory_and_exclusions()
@@ -1223,6 +1467,11 @@ def main():
     asyncio.run(test_pk_wiring())
     asyncio.run(test_seam_settles_when_nothing_pending())
     test_converge_phase_helper()
+    test_normalize_consumer_meta()
+    test_validate_consumer_meta()
+    test_consumer_meta_report_carry_and_narration()
+    asyncio.run(test_consumer_meta_generation())
+    asyncio.run(test_consumer_meta_wiring())
     print("ALL OK  test_selfcheck")
 
 

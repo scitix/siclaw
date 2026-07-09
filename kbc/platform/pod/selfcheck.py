@@ -39,6 +39,7 @@ KNOWN_SOURCE_EXTS = TEXT_SOURCE_EXTS | MEDIA_SOURCE_EXTS
 
 EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
 SELFCHECK_PATH = "authoring/SELFCHECK.json"
+CONSUMER_META_PATH = "authoring/CONSUMER_META.json"
 
 # TEST_ROLE = the standing identity of a read-only knowledge CONSUMER over a
 # pinned wiki snapshot. Single-sourced in the locale prompt packs
@@ -566,6 +567,16 @@ def run_layer1(workdir: str) -> dict:
     cov = coverage(workdir, pages, exclusions)
     lint = lint_candidate(pages, exclusion_errors)
     previous = read_selfcheck(workdir) or {}
+    # consumer_meta = fresh file-facts (present/problems, a WARNING-only channel
+    # that never gates `closed`/lint) + the settle-time generator's bookkeeping
+    # (state/tree_hash/at) carried forward like `pk` — an L1 re-check must never
+    # wipe the "this tree already has its meta" key or the seam regenerates on
+    # every turn.
+    consumer_meta = validate_consumer_meta(workdir)
+    prev_meta = previous.get("consumer_meta") or {}
+    for key in ("state", "tree_hash", "at", "generated_by", "error"):
+        if key in prev_meta:
+            consumer_meta[key] = prev_meta[key]
     return {
         "version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -573,6 +584,7 @@ def run_layer1(workdir: str) -> dict:
         "coverage": cov,
         "lint": {"ok": lint["ok"], "violations": lint["violations"]},
         "dup_candidates": dup_candidates(pages),
+        "consumer_meta": consumer_meta,
         "pk": previous.get("pk"),  # Layer-2 results survive L1 re-checks
         "media_verify": previous.get("media_verify"),
         # The converge signal survives too: _post_turn_selfcheck overwrites the
@@ -691,6 +703,12 @@ def narration(report: dict, locale: str | None = None) -> str:
     if noop:
         warn = (f" ⚠ {len(noop)} exclusion(s) match no source — likely a typo" if en
                 else f" ⚠ {len(noop)} 条排除未命中任何源——疑似写错")
+    # WARNING only, never a gate (old images/bundles have no meta — never-stuck):
+    # a malformed CONSUMER_META.json is surfaced but does not block settle.
+    cm = report.get("consumer_meta") or {}
+    if cm.get("present") and cm.get("problems"):
+        warn += (f" ⚠ CONSUMER_META.json has {len(cm['problems'])} schema issue(s) (non-blocking)" if en
+                 else f" ⚠ CONSUMER_META.json 有 {len(cm['problems'])} 处结构问题(不阻塞)")
     if en:
         if report["state"] == "passed":
             return (f"Self-check (ledger): closed ✓ — {cov['cited']} sources compiled"
@@ -998,3 +1016,143 @@ def cap_media_pending(pending: dict[str, list[str]], max_images: int) -> dict[st
 # mediaverify.py — claim-in-context re-reading is a confirmation check, proven
 # twice live (MEM 条→GPU-Util survived it; 跨图 H20 survived it). The
 # deterministic halves (media_citing_pages / pending / mark / cap) stay here.
+
+
+# ── consumer-facing meta (CONSUMER_META.json, S1 of DESIGN-kb-consumer-meta) ──
+# The skill-style first disclosure layer for a knowledge base: a model-written
+# routing summary generated at settle from candidate/ ONLY (raw isolation is
+# structural — see consumermeta.py), pinned per published version by the
+# consumer (sicore injects it into the bundle root as _consumer_meta.json).
+# These are the DETERMINISTIC halves: the pinned v1 schema envelope + caps
+# (code-owned, model writes only the prose), the file-facts validation that
+# feeds the lint WARNING channel, and the atomic writer. Presence is NEVER a
+# gate: old box images and hand-uploaded bundles have no meta, and consumers
+# fall back to the owner description (design D2) — never-stuck holds.
+
+CONSUMER_META_VERSION = 1
+CONSUMER_META_SUMMARY_MAX = 300  # code points — the pinned contract's ≤300字
+_CONSUMER_META_LIST_KEYS = ("when_to_use", "not_for", "topics", "entry_pages")
+_CONSUMER_META_LIST_CAP = 8
+_CONSUMER_META_ITEM_CAP = 160
+
+
+def _norm_entry_page(entry) -> str:
+    """One model-emitted entry_pages item → a wiki-root-relative page path
+    (candidate// ./ prefixes stripped, normalized like intra-wiki links)."""
+    e = str(entry).strip().strip("\"'").strip()
+    for prefix in ("candidate/", "./"):
+        if e.startswith(prefix):
+            e = e[len(prefix):]
+    if not e:
+        return ""
+    e = posixpath.normpath(e)
+    return "" if e == "." else e
+
+
+def normalize_consumer_meta(data, *, locale: str | None, generated_by: str,
+                            page_names: list[str] | None = None) -> dict:
+    """Coerce a model-emitted payload into the PINNED v1 schema (cross-repo
+    contract: sicore lifts this dict verbatim into the published bundle as
+    `_consumer_meta.json`, adding only `published_version`). Code owns the
+    envelope (version/locale/generated_by) and every cap; the model owns only
+    the prose. entry_pages are filtered to pages that actually exist (index.md
+    excluded — it is the default entry). Raises ValueError when the payload is
+    unusable, INCLUDING charset corruption (U+FFFD — the same lossy-decode
+    fingerprint the page lint hunts; a corrupted meta must not ship silently).
+    The caller retries once, then fails open (meta stays absent = lint WARNING,
+    never a settle blocker)."""
+    if not isinstance(data, dict):
+        raise ValueError("consumer meta must be a JSON object")
+    summary = str(data.get("summary") or "").strip()
+    if not summary:
+        raise ValueError("consumer meta needs a non-empty summary")
+    meta: dict = {
+        "version": CONSUMER_META_VERSION,
+        "summary": summary[:CONSUMER_META_SUMMARY_MAX],
+    }
+    for key in _CONSUMER_META_LIST_KEYS:
+        items: list[str] = []
+        raw_list = data.get(key)
+        if isinstance(raw_list, (list, tuple)):
+            for item in raw_list:
+                s = str(item).strip()
+                if s and s[:_CONSUMER_META_ITEM_CAP] not in items:
+                    items.append(s[:_CONSUMER_META_ITEM_CAP])
+                if len(items) >= _CONSUMER_META_LIST_CAP:
+                    break
+        meta[key] = items
+    if page_names is not None:
+        known = set(page_names)
+        pages: list[str] = []
+        for entry in meta["entry_pages"]:
+            n = _norm_entry_page(entry)
+            if n and n not in known and f"{n}.md" in known:
+                n = f"{n}.md"
+            if n and n in known and n != "index.md" and n not in pages:
+                pages.append(n)
+        meta["entry_pages"] = pages
+    meta["locale"] = "en" if _is_en(locale) else "zh"
+    meta["generated_by"] = str(generated_by)
+    joined = "\n".join([meta["summary"]] + [i for k in _CONSUMER_META_LIST_KEYS for i in meta[k]])
+    if "\ufffd" in joined:
+        raise ValueError("charset corruption: consumer meta text contains U+FFFD (lossy decode upstream)")
+    return meta
+
+
+def validate_consumer_meta(workdir: str) -> dict:
+    """File-facts for the WARNING-only channel: {"present": bool, "problems":
+    [...]}, carried in the SELFCHECK report's `consumer_meta` section. Never a
+    lint violation, never gates settle — absence is expected before the first
+    settle and on pre-meta workspaces; problems only surface (narration ⚠ +
+    publish surface) so the owner/next round can heal them."""
+    path = Path(workdir) / CONSUMER_META_PATH
+    if not path.is_file():
+        return {"present": False, "problems": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return {"present": True, "problems": [f"unreadable/invalid JSON: {e}"]}
+    if not isinstance(data, dict):
+        return {"present": True, "problems": ["must be a JSON object"]}
+    problems: list[str] = []
+    if data.get("version") != CONSUMER_META_VERSION:
+        problems.append(f"version must be {CONSUMER_META_VERSION}")
+    summary = data.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        problems.append("summary must be a non-empty string")
+    elif len(summary) > CONSUMER_META_SUMMARY_MAX:
+        problems.append(f"summary exceeds {CONSUMER_META_SUMMARY_MAX} chars")
+    texts = [summary] if isinstance(summary, str) else []
+    for key in _CONSUMER_META_LIST_KEYS:
+        v = data.get(key)
+        if v is None:
+            continue
+        if not isinstance(v, list) or any(not isinstance(i, str) for i in v):
+            problems.append(f"{key} must be a list of strings")
+        else:
+            texts += v
+    if any("\ufffd" in t for t in texts):
+        problems.append("charset corruption: text fields contain U+FFFD (lossy decode upstream)")
+    return {"present": True, "problems": problems}
+
+
+def write_consumer_meta(workdir: str, meta: dict) -> None:
+    """Atomic write (same rationale as SELFCHECK: this file rides the same
+    turn-end workspace sync and a torn write reads back as absent)."""
+    _write_text_atomic(Path(workdir) / CONSUMER_META_PATH,
+                       json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+
+
+def update_consumer_meta_section(workdir: str, section: dict) -> None:
+    """Single write-point for the SELFCHECK `consumer_meta` bookkeeping
+    (state/tree_hash/at/… stamped by the settle-time generator). Read-modify-
+    write like update_pk_section so L1 fields survive; file-facts are refreshed
+    from disk so the durable report never contradicts the file it describes."""
+    report = read_selfcheck(workdir) or {"version": 1, "coverage": None, "lint": None, "state": None}
+    cm = dict(report.get("consumer_meta") or {})
+    cm.update(section)
+    cm.update(validate_consumer_meta(workdir))
+    cm["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    report["consumer_meta"] = cm
+    report["generated_at"] = cm["at"]
+    write_selfcheck(workdir, report)
