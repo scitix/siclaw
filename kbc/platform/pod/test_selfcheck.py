@@ -459,6 +459,56 @@ def test_run_layer1_carries_converge_phase():
     print("OK  run_layer1 carries converge_phase forward (no per-turn blank window)")
 
 
+async def test_media_chunks_self_drain_then_settle():
+    """Review fix: with >cap images, settling after chunk 1 silently skipped
+    the remaining chunks AND PK. The finally now mirrors the full seam — each
+    chunk's completion starts the next; only a fully-drained set settles."""
+    import mediaverify as mv
+    from compile_box import _maybe_start_media_verify, _post_turn_selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "raw/s/i1.png")
+        _mk(base, "raw/s/i2.png")
+        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
+        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/i2.png\n---\ny")
+        run = _FakeRun(td)
+
+        calls: list[dict] = []
+
+        async def clean_verify(engine, workdir, pending, progress=None, locale=None):
+            calls.append(dict(pending))
+            return {"findings": [], "errors": [], "images": 1, "cache_hits": 0,
+                    "completed_pages": sorted(pending), "failed_pages": []}
+
+        os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"] = "1"  # force 2 chunks
+        os.environ["KBC_PK_MODE"] = "off"
+        orig = mv.run_blind_verify
+        mv.run_blind_verify = clean_verify
+        try:
+            assert await _post_turn_selfcheck(run) is None  # ledger passes
+            assert _maybe_start_media_verify(run)           # chunk 1
+            first = run._media_task
+            await first
+            # chunk 1's finally released the single-flight ref and started
+            # chunk 2 WITHOUT a new owner turn. With fast fakes chunk 2 may
+            # already be done (ref back to None) — both timings are the drain.
+            second = run._media_task
+            assert second is not first, "second chunk must self-start"
+            if second is not None:
+                await second
+            await asyncio.sleep(0)  # flush any residual scheduled steps
+            assert len(calls) == 2, calls
+            sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
+            assert sc.get("converge_phase") == "settled", sc  # settled only after full drain
+        finally:
+            mv.run_blind_verify = orig
+            del os.environ["KBC_MEDIA_VERIFY_MAX_IMAGES"]
+    print("OK  media chunks self-drain then settle (no silent skip of chunks 2..N)")
+
+
 def test_state_key():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -961,6 +1011,7 @@ def main():
     asyncio.run(test_wiring())
     asyncio.run(test_media_verify_wiring())
     asyncio.run(test_media_clean_pass_settles_converge())
+    asyncio.run(test_media_chunks_self_drain_then_settle())
     asyncio.run(test_media_failed_pages_retry_then_exhaust())
     asyncio.run(test_media_attempt_count_resets_on_success())
     asyncio.run(test_pk_failed_state_settles_converge())

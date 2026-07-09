@@ -1075,6 +1075,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
     the 07-06/07 live failures (MEM 条→GPU-Util, 跨图 H20) were both
     confirmation-bias artifacts of claim-in-context re-reading. Fail-open."""
     injected_repair = False
+    chunk_clean = False  # this pass completed all its pages with zero failures
     try:
         n_imgs = sum(len(v) for v in chunk.values())
         await run.emit({"type": "summary",
@@ -1095,6 +1096,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             except Exception:
                 pass
         findings, errors = result["findings"], result["errors"]
+        chunk_clean = bool(result.get("completed_pages")) and not result.get("failed_pages")
         tail = _loc(run, f"; {len(errors)} transcription/comparison failure(s)",
                     f";{len(errors)} 项转写/比对失败") if errors else ""
         if findings:
@@ -1102,8 +1104,8 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
                 f"Self-check (images): {result['images']} image(s) checked, {len(findings)} claim(s) contradict the image / exceed the source — repair injected{tail}",
                 f"自检(图像):{result['images']} 张图已核,{len(findings)} 条断言与图不符/超源,注入回修{tail}")})
             await _set_converge_phase(run, "revising")
-            injected_repair = True
             await run.inject_user_message(mediaverify.build_repair_prompt(findings, locale=getattr(run, "locale", None)))
+            injected_repair = True  # only after a SUCCESSFUL inject — a failed one must fall through to the chain below (review)
         else:
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Self-check (images): {result['images']} image(s) checked, claims match the images ✓{tail}",
@@ -1118,15 +1120,25 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             pass
     finally:
         run._media_inflight = getattr(run, "_media_inflight", set()) - set(chunk)
+        # We ARE run._media_task and are completing: release the single-flight
+        # reference first, or _media_verify_due's not-done() guard blocks the
+        # very chain below from starting the next chunk (self-drain).
+        run._media_task = None
         # Hand back to the seam (review HIGH): the findings path re-enters it via
         # its repair turn, but the CLEAN and failed paths used to just stop —
         # converge_phase parked at "verifying" forever in the single-session
-        # case (test step never unlocked, PK never ran). Mirror the seam: chain
-        # PK, else settle. Failed passes settle too (never-stuck — the next
-        # turn's seam retries media while attempts remain).
+        # case (test step never unlocked, PK never ran). Mirror the FULL seam:
+        # first the NEXT media chunk (a >cap image set self-drains chunk by
+        # chunk — settling after chunk 1 silently skipped the rest AND PK,
+        # review finding), then PK, else settle. Failed passes settle too
+        # (never-stuck — a later turn's seam retries while attempts remain).
         if not injected_repair:
             try:
-                if not _maybe_start_pk(run):
+                # Chain the next chunk only after a CLEAN pass: failed pages
+                # retry on later triggers (the designed cadence) — chaining them
+                # here would hot-loop a transient outage straight through the
+                # attempt budget and ship an instant exhausted-pass.
+                if not ((chunk_clean and _maybe_start_media_verify(run)) or _maybe_start_pk(run)):
                     await _set_converge_phase(run, "settled")
             except Exception:
                 pass
@@ -1448,6 +1460,12 @@ async def _post_turn_selfcheck(run) -> str | None:
         report["state"] = "passed"
     elif run._l1_repairs_used < _l1_repair_rounds():
         report["state"] = "repairing"
+        # The report carries the PREVIOUS converge_phase (possibly "settled");
+        # the pre-turn_done sync would ship repairing+settled for one window
+        # before the seam re-sets revising — momentarily unlocking the test
+        # step on a draft about to be revised (review). Stamp revising now;
+        # the seam's later set is idempotent.
+        report["converge_phase"] = "revising"
     else:
         report["state"] = "unconverged"  # budget spent: publish card shows the rest
     report["repair_rounds_used"] = run._l1_repairs_used
@@ -1691,6 +1709,10 @@ async def _start_incremental(run: "CompileRun", text: str) -> None:
     cs = incremental.materialize_changeset(run.workdir)
     if cs is None:
         # Race / empty after the route check → fall back to a normal turn.
+        # This fallback bypasses the full-kickoff unlink in the message handler,
+        # so clear any stale CHANGESET here too (review): the turn is NOT
+        # incremental and the model must not self-restrict to an old scope.
+        (Path(run.workdir) / incremental.CHANGESET_PATH).unlink(missing_ok=True)
         run._begin_turn(text)
         await run.client.query(text)
         return
