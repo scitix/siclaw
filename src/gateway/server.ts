@@ -489,7 +489,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // Capability-box orphan GC: a box is live iff its run is tracked and
   // non-terminal. Pod names are `agentbox-<runId>` (podName sanitizes the id;
   // capability run ids are lowercase uuids, so the strip is exact).
-  agentBoxManager.startOrphanSweep(async (boxId) => {
+  // Optional-call: startRuntime tests inject minimal manager fakes that predate
+  // this method — the sweep is an ops concern, never a boot requirement.
+  agentBoxManager.startOrphanSweep?.(async (boxId) => {
     // Prefix-strip inverts podName ONLY because capability run ids are minted
     // 36-char lowercase UUIDs (sanitize + slice are no-ops). If run ids ever
     // stop being UUIDs, stamp the raw id as a pod annotation instead.
