@@ -41,6 +41,32 @@ EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
 SELFCHECK_PATH = "authoring/SELFCHECK.json"
 CONSUMER_META_PATH = "authoring/CONSUMER_META.json"
 
+# ── consumer-meta caps (SOURCE OF TRUTH, cross-repo) ─────────────────────────
+# sicore's owner-edit validator (repo-settings PUT) mirrors these exact
+# numbers — change them here and there together. All limits are CODE POINTS
+# (Python slicing is rune-safe by construction). The meta is a terse ROUTING
+# NOTE — "what this KB is + when to consult it" — never a content inventory:
+# the 2026-07-10 live review showed a loose 300-char cap invites a page-by-page
+# inventory that gets hard-cut mid-sentence; the prompt aims well under these
+# caps so truncation should never actually fire.
+CONSUMER_META_VERSION = 1
+CONSUMER_META_SUMMARY_MAX = 80          # one to two sentences
+CONSUMER_META_WHEN_MAX_ITEMS = 4
+CONSUMER_META_WHEN_ITEM_MAX = 16        # keyword-style, no "需要知道/查询" boilerplate
+CONSUMER_META_NOT_FOR_MAX_ITEMS = 3
+CONSUMER_META_NOT_FOR_ITEM_MAX = 12
+CONSUMER_META_TOPICS_MAX_ITEMS = 8      # kept in schema/file; not rendered in the catalog
+CONSUMER_META_TOPICS_ITEM_MAX = 160
+CONSUMER_META_ENTRY_MAX_ITEMS = 8
+CONSUMER_META_ENTRY_ITEM_MAX = 160
+# key → (max items, max code points per item); iteration order = schema order.
+CONSUMER_META_LIST_CAPS = {
+    "when_to_use": (CONSUMER_META_WHEN_MAX_ITEMS, CONSUMER_META_WHEN_ITEM_MAX),
+    "not_for": (CONSUMER_META_NOT_FOR_MAX_ITEMS, CONSUMER_META_NOT_FOR_ITEM_MAX),
+    "topics": (CONSUMER_META_TOPICS_MAX_ITEMS, CONSUMER_META_TOPICS_ITEM_MAX),
+    "entry_pages": (CONSUMER_META_ENTRY_MAX_ITEMS, CONSUMER_META_ENTRY_ITEM_MAX),
+}
+
 # TEST_ROLE = the standing identity of a read-only knowledge CONSUMER over a
 # pinned wiki snapshot. Single-sourced in the locale prompt packs
 # (prompts/<locale>/test_role.md) — the SAME text the user-facing test session
@@ -1029,11 +1055,9 @@ def cap_media_pending(pending: dict[str, list[str]], max_images: int) -> dict[st
 # gate: old box images and hand-uploaded bundles have no meta, and consumers
 # fall back to the owner description (design D2) — never-stuck holds.
 
-CONSUMER_META_VERSION = 1
-CONSUMER_META_SUMMARY_MAX = 300  # code points — the pinned contract's ≤300字
-_CONSUMER_META_LIST_KEYS = ("when_to_use", "not_for", "topics", "entry_pages")
-_CONSUMER_META_LIST_CAP = 8
-_CONSUMER_META_ITEM_CAP = 160
+# Caps live at the top of this module (CONSUMER_META_* — the cross-repo source
+# of truth sicore's owner-edit validator mirrors).
+_CONSUMER_META_LIST_KEYS = tuple(CONSUMER_META_LIST_CAPS)
 
 
 def _norm_entry_page(entry) -> str:
@@ -1070,15 +1094,15 @@ def normalize_consumer_meta(data, *, locale: str | None, generated_by: str,
         "version": CONSUMER_META_VERSION,
         "summary": summary[:CONSUMER_META_SUMMARY_MAX],
     }
-    for key in _CONSUMER_META_LIST_KEYS:
+    for key, (max_items, item_max) in CONSUMER_META_LIST_CAPS.items():
         items: list[str] = []
         raw_list = data.get(key)
         if isinstance(raw_list, (list, tuple)):
             for item in raw_list:
                 s = str(item).strip()
-                if s and s[:_CONSUMER_META_ITEM_CAP] not in items:
-                    items.append(s[:_CONSUMER_META_ITEM_CAP])
-                if len(items) >= _CONSUMER_META_LIST_CAP:
+                if s and s[:item_max] not in items:
+                    items.append(s[:item_max])
+                if len(items) >= max_items:
                     break
         meta[key] = items
     if page_names is not None:
@@ -1123,14 +1147,18 @@ def validate_consumer_meta(workdir: str) -> dict:
     elif len(summary) > CONSUMER_META_SUMMARY_MAX:
         problems.append(f"summary exceeds {CONSUMER_META_SUMMARY_MAX} chars")
     texts = [summary] if isinstance(summary, str) else []
-    for key in _CONSUMER_META_LIST_KEYS:
+    for key, (max_items, item_max) in CONSUMER_META_LIST_CAPS.items():
         v = data.get(key)
         if v is None:
             continue
         if not isinstance(v, list) or any(not isinstance(i, str) for i in v):
             problems.append(f"{key} must be a list of strings")
-        else:
-            texts += v
+            continue
+        texts += v
+        if len(v) > max_items:
+            problems.append(f"{key} exceeds {max_items} items")
+        if any(len(i) > item_max for i in v):
+            problems.append(f"{key} items exceed {item_max} chars")
     if any("\ufffd" in t for t in texts):
         problems.append("charset corruption: text fields contain U+FFFD (lossy decode upstream)")
     return {"present": True, "problems": problems}

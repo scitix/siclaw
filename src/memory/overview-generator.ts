@@ -86,6 +86,16 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
 const KNOWLEDGE_WIKI_BUDGET = 4000;
 
 /**
+ * Hard cap per KB meta entry, regardless of how much of the total budget is
+ * free — a routing note must stay a road sign even when only one KB is bound
+ * (2026-07-10 live review: an even 4000-split let a lone KB balloon into a
+ * page inventory). The box-side generation caps (selfcheck CONSUMER_META_*:
+ * summary ≤80 cp, ≤4 use-when items ×16, ≤3 not-for ×12) keep a well-formed
+ * entry comfortably under this; the cap only bites on hand-made/legacy metas.
+ */
+const CONSUMER_META_ENTRY_BUDGET = 200;
+
+/**
  * Consumer-facing meta a publish injects into a knowledge bundle's root as
  * `_consumer_meta.json` (DESIGN-kb-consumer-meta-2026-07-10): a model-written,
  * owner-approved routing summary generated at compile settle. First layer of
@@ -250,10 +260,11 @@ function formatConsumerMetaEntry(meta: BundleConsumerMeta, budget: number): stri
  * Bundles without meta keep exactly the pre-meta behavior (fallback, design D2).
  *
  * Returns "" when there is no wiki (no index.md). Budgeted to
- * KNOWLEDGE_WIKI_BUDGET overall: the meta section splits the budget evenly
- * across bound KBs (each entry degrades not_for → when_to_use → summary
- * truncation), and the index is truncated within whatever remains, with a
- * pointer to read the full file.
+ * KNOWLEDGE_WIKI_BUDGET overall: each meta entry gets min(the even split,
+ * CONSUMER_META_ENTRY_BUDGET) — the hard per-entry cap keeps a lone bound KB
+ * from ballooning — degrading not_for → when_to_use → summary truncation;
+ * the index is truncated within whatever remains, with a pointer to read the
+ * full file. topics is deliberately NOT rendered (file-only metadata).
  */
 export function buildKnowledgeWikiCatalog(knowledgeDir?: string): string {
   if (!knowledgeDir) return "";
@@ -270,7 +281,7 @@ export function buildKnowledgeWikiCatalog(knowledgeDir?: string): string {
   let indexBudget = KNOWLEDGE_WIKI_BUDGET;
   const metas = collectBundleConsumerMetas(knowledgeDir);
   if (metas.length > 0) {
-    const perKb = Math.floor(KNOWLEDGE_WIKI_BUDGET / metas.length);
+    const perKb = Math.min(CONSUMER_META_ENTRY_BUDGET, Math.floor(KNOWLEDGE_WIKI_BUDGET / metas.length));
     metaSection = metas.map((m) => formatConsumerMetaEntry(m, perKb)).join("\n\n");
     indexBudget = Math.max(0, KNOWLEDGE_WIKI_BUDGET - metaSection.length);
   }

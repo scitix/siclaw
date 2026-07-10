@@ -51,37 +51,53 @@ def _read_all_cap() -> int:
 # A pathological page census must not blow up the prompt.
 _PAGE_LIST_CAP = 200
 
-ROLE_EN = """You write the consumer-facing routing summary for one compiled knowledge base (an LLM wiki of markdown pages).
-Your reader is another AI agent that keeps your summary permanently in its context and uses it to decide WHEN to open this knowledge base at all.
-You can read ONLY the compiled wiki pages in the working directory. Describe strictly what the pages actually contain — never advertise coverage they do not have, and never guess at material you cannot see."""
+ROLE_EN = """You write the consumer-facing ROUTING NOTE for one compiled knowledge base (an LLM wiki of markdown pages).
+Your reader is another AI agent that keeps your note permanently in its context and uses it only to decide WHEN to open this knowledge base at all — it is a road sign, not a table of contents.
+You can read ONLY the compiled wiki pages in the working directory. Describe strictly what the pages actually contain — never advertise coverage they do not have, and never inventory the pages one by one."""
 
-ROLE_ZH = """你为一个已编译的知识库(由 markdown 页面组成的 LLM wiki)撰写【消费侧口径摘要】。
-读者是另一个 AI agent:它会把你的摘要常驻在上下文里,用它来判断"什么时候才需要打开这个知识库"。
-你只能读工作目录里已编译的 wiki 页面。严格按页面实际内容描述——页面没有的覆盖面绝不夸大,看不到的材料绝不脑补。"""
+ROLE_ZH = """你为一个已编译的知识库(由 markdown 页面组成的 LLM wiki)撰写【消费侧路由提示】。
+读者是另一个 AI agent:它把这段提示常驻在上下文里,只用来判断"什么时候才需要打开这个库"——这是路牌,不是目录。
+你只能读工作目录里已编译的 wiki 页面。严格按页面实际内容描述——页面没有的覆盖面绝不夸大,也绝不逐页罗列内容清单。"""
 
 USER_EN = """The compiled knowledge base has {n} page(s):
 {page_list}
 
 {read_directive}
 
-Then output ONE JSON object (no other text), with all prose in English:
-{{"summary": "≤{summary_max} characters: what this KB actually covers, written for a consuming agent deciding whether to look here",
- "when_to_use": ["question types this KB answers well (3-6 items)"],
- "not_for": ["adjacent question types it deliberately does NOT cover (0-4 items — only what the pages themselves make clear)"],
- "topics": ["main topic keywords (3-8)"],
- "entry_pages": ["key entry page paths besides index.md (0-5; must be existing page paths relative to the wiki root)"]}}"""
+Then output ONE JSON object (no other text), with all prose in English. You are writing a one-line routing note for a consuming agent deciding whether to open this KB — NOT a table of contents. Keep it terse:
+{{"summary": "≤{summary_max} characters, one or two sentences: what this KB is + when to consult it — never a list of its contents",
+ "when_to_use": ["≤{when_items} keyword-style topics it answers well, ≤{when_chars} characters each — bare topic phrases, never 'need to know / look up / check …' sentences"],
+ "not_for": ["≤{not_items} adjacent topics it deliberately does NOT cover, ≤{not_chars} characters each — only what the pages themselves make clear"],
+ "topics": ["3-8 topic keywords"],
+ "entry_pages": ["key entry page paths besides index.md (0-5; must be existing page paths relative to the wiki root)"]}}
+
+Terseness example — match its SHAPE and brevity, not its content:
+{{"summary": "GPU-cluster hardware fault runbook: symptom to failing part to action.",
+ "when_to_use": ["XID triage", "ECC thresholds", "NVLink faults"],
+ "not_for": ["CUDA install", "billing"],
+ "topics": ["gpu", "hardware", "xid"],
+ "entry_pages": ["xid-codes.md"]}}
+Stay well under every cap — over-cap text gets hard-truncated mid-sentence."""
 
 USER_ZH = """这个已编译知识库共 {n} 页:
 {page_list}
 
 {read_directive}
 
-然后只输出一个 JSON 对象(不要任何其他文字),所有文案用中文:
-{{"summary": "≤{summary_max} 字:这个库实际覆盖什么,写给正在判断'要不要进这个库查'的消费 agent",
- "when_to_use": ["这个库擅长回答的问题类型(3-6 条)"],
- "not_for": ["相邻但刻意不覆盖的问题类型(0-4 条——只写页面本身能看出来的)"],
- "topics": ["主题关键词(3-8 个)"],
- "entry_pages": ["index.md 之外的关键入口页路径(0-5 个;必须是相对 wiki 根的真实页面路径)"]}}"""
+然后只输出一个 JSON 对象(不要任何其他文字),所有文案用中文。你在写一条给消费 agent 的路由提示,供它判断"要不要打开这个库"——不是内容目录,务必克制:
+{{"summary": "≤{summary_max} 字,一到两句:这个库是什么 + 什么时候来查——绝不罗列内容清单",
+ "when_to_use": ["≤{when_items} 条它擅长的主题关键词,每条 ≤{when_chars} 字——裸主题短语,禁用「需要知道/需要查询/需要确认」这类开头"],
+ "not_for": ["≤{not_items} 条相邻但刻意不覆盖的主题,每条 ≤{not_chars} 字——只写页面本身能看出来的"],
+ "topics": ["3-8 个主题关键词"],
+ "entry_pages": ["index.md 之外的关键入口页路径(0-5 个;必须是相对 wiki 根的真实页面路径)"]}}
+
+简洁度示例——学它的形态与克制,不是内容:
+{{"summary": "GPU 集群硬件故障排障手册:按报错现象定位故障部件并给出处置动作。",
+ "when_to_use": ["XID 错误码处置", "ECC 换卡阈值", "NVLink 故障定位"],
+ "not_for": ["驱动/CUDA 安装", "计费"],
+ "topics": ["gpu", "硬件", "xid"],
+ "entry_pages": ["xid-codes.md"]}}
+每一项都留在上限之内——超限文本会被硬截断在半句。"""
 
 READ_ALL_EN = "Read index.md first, then read every page."
 READ_ALL_ZH = "先读 index.md,然后逐页读完全部页面。"
@@ -118,7 +134,13 @@ async def generate_consumer_meta(engine: ReadonlyAgentEngine, *, workdir: str,
     role = ROLE_EN if en else ROLE_ZH
     user = (USER_EN if en else USER_ZH).format(
         n=len(page_names), page_list=page_list, read_directive=read_directive,
-        summary_max=selfcheck.CONSUMER_META_SUMMARY_MAX)
+        # Caps come from selfcheck's CONSUMER_META_* source of truth — the
+        # prompt and the enforcing normalizer can never drift apart.
+        summary_max=selfcheck.CONSUMER_META_SUMMARY_MAX,
+        when_items=selfcheck.CONSUMER_META_WHEN_MAX_ITEMS,
+        when_chars=selfcheck.CONSUMER_META_WHEN_ITEM_MAX,
+        not_items=selfcheck.CONSUMER_META_NOT_FOR_MAX_ITEMS,
+        not_chars=selfcheck.CONSUMER_META_NOT_FOR_ITEM_MAX)
     model = _meta_model()
     last_err = "?"
     for _attempt in range(2):

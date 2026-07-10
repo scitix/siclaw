@@ -1188,14 +1188,25 @@ def test_normalize_consumer_meta():
     assert meta["locale"] == "zh" and meta["generated_by"] == "m1"
     assert list(meta) == ["version", "summary", "when_to_use", "not_for",
                           "topics", "entry_pages", "locale", "generated_by"]
+    # Per-field caps (2026-07-10 terseness revision — the CONSUMER_META_*
+    # constants are the cross-repo SOURCE OF TRUTH sicore's validator mirrors):
+    # summary 80 cp, when_to_use 4×16, not_for 3×12, topics 8×160 (unchanged).
     caps = selfcheck.normalize_consumer_meta(
-        {"summary": "s", "topics": [f"t{i}" for i in range(20)]},
+        {"summary": "s", "topics": [f"t{i}" for i in range(20)],
+         "when_to_use": [f"第{i}条需要知道的非常长的问法到底该怎么处理" for i in range(6)],
+         "not_for": [f"第{i}条相邻但明确不覆盖的主题条目" for i in range(5)]},
         locale="zh", generated_by="m")
-    assert len(caps["topics"]) == 8                       # list cap
+    assert len(caps["topics"]) == selfcheck.CONSUMER_META_TOPICS_MAX_ITEMS == 8
+    assert len(caps["when_to_use"]) == selfcheck.CONSUMER_META_WHEN_MAX_ITEMS == 4
+    assert all(len(i) <= selfcheck.CONSUMER_META_WHEN_ITEM_MAX for i in caps["when_to_use"]), caps
+    assert selfcheck.CONSUMER_META_WHEN_ITEM_MAX == 16
+    assert len(caps["not_for"]) == selfcheck.CONSUMER_META_NOT_FOR_MAX_ITEMS == 3
+    assert all(len(i) <= selfcheck.CONSUMER_META_NOT_FOR_ITEM_MAX for i in caps["not_for"]), caps
+    assert selfcheck.CONSUMER_META_NOT_FOR_ITEM_MAX == 12
     # summary cap is code-point safe; en locale normalizes to "en"
     long = selfcheck.normalize_consumer_meta(
         {"summary": "汉" * 500}, locale="en-US", generated_by="m", page_names=None)
-    assert len(long["summary"]) == selfcheck.CONSUMER_META_SUMMARY_MAX
+    assert len(long["summary"]) == selfcheck.CONSUMER_META_SUMMARY_MAX == 80
     assert long["locale"] == "en" and long["entry_pages"] == []
     for bad in [None, [], {"summary": "  "}, {"summary": "好�坏"},
                 {"summary": "ok", "topics": ["x�"]}]:
@@ -1224,11 +1235,21 @@ def test_validate_consumer_meta():
         assert any("summary" in p for p in v["problems"]), v
         assert any("when_to_use" in p for p in v["problems"]), v
         assert any("U+FFFD" in p for p in v["problems"]), v
+        # Over-cap fields (e.g. a hand-made / pre-revision file) → warned, so the
+        # box-side facts cross-check sicore's owner-edit validator (same caps).
+        _mk(base, "authoring/CONSUMER_META.json", json.dumps(
+            {"version": 1, "summary": "长" * 100,
+             "when_to_use": ["超" * 20] * 6, "not_for": ["y"]}))
+        v = selfcheck.validate_consumer_meta(td)
+        assert any("summary exceeds 80" in p for p in v["problems"]), v
+        assert any("when_to_use exceeds 4 items" in p for p in v["problems"]), v
+        assert any("when_to_use items exceed 16" in p for p in v["problems"]), v
+        assert not any("not_for" in p for p in v["problems"]), v
         good = selfcheck.normalize_consumer_meta(
             {"summary": "s", "topics": ["t"]}, locale="zh", generated_by="m")
         selfcheck.write_consumer_meta(td, good)
         assert selfcheck.validate_consumer_meta(td) == {"present": True, "problems": []}
-    print("OK  validate_consumer_meta (absent clean / JSON+schema+charset problems / good file)")
+    print("OK  validate_consumer_meta (absent clean / JSON+schema+charset+cap problems / good file)")
 
 
 def test_consumer_meta_report_carry_and_narration():

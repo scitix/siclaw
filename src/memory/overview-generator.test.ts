@@ -396,30 +396,33 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).toContain("[[repos/wiki-b/index]]");
   });
 
-  it("degrades within budget: not_for dropped first, then when_to_use, summary truncated last (rune-safe)", () => {
+  it("degrades within the 200-char entry budget: not_for dropped first, then when_to_use, summary truncated last (rune-safe)", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[a]] — x");
-    // Sized so: summary+when+not_for > 4000 AND summary+when > 4000 AND summary ≤ 4000
+    // Sized so: summary+when+not_for > 200 AND summary+when > 200 AND summary ≤ 200
     // → exercises both drop steps while the summary itself survives untruncated.
-    const summary = "夏".repeat(300);
+    const summary = "夏".repeat(150);
     writeMeta(knowledgeDir, {
       version: 1, summary,
-      when_to_use: Array.from({ length: 6 }, (_, i) => `use-case-${i}-${"w".repeat(750)}`),
-      not_for: Array.from({ length: 4 }, (_, i) => `not-${i}-${"n".repeat(300)}`),
+      when_to_use: Array.from({ length: 2 }, (_, i) => `use-case-${i}-${"w".repeat(100)}`),
+      not_for: Array.from({ length: 2 }, (_, i) => `not-${i}-${"n".repeat(50)}`),
     });
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).not.toContain("Not for:");   // dropped first (entry would blow the per-KB budget)
     expect(out).not.toContain("Use when:");  // then when_to_use
     expect(out).toContain("夏".repeat(100)); // summary head survives
     expect(out.length).toBeLessThan(4000 + 700); // instructions overhead only
-    // extreme: summary alone larger than the whole budget → rune-safe truncation, no lone surrogate
+    // extreme: a ballooned summary (hand-made/legacy meta) → the HARD 200-char
+    // per-entry cap holds even though the whole 4000 budget is free (one KB
+    // bound); rune-safe truncation, no lone surrogate
     writeMeta(knowledgeDir, { version: 1, summary: "🀄".repeat(5000) });
     const out2 = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out2).toContain("…");
     expect(out2).not.toMatch(/[\uD800-\uDBFF]$/m); // no split surrogate pair at any line end
-    expect(out2.length).toBeLessThan(4000 + 700);
+    const entry = out2.split("## Knowledge Bases\n\n")[1].split("\n\n")[0];
+    expect(entry.length).toBeLessThanOrEqual(200); // per-entry cap, NOT the even 4000-split
   });
 
-  it("splits the budget across bound KBs and still fits the total", () => {
+  it("caps every bound KB's entry at 200 and still fits the total", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[repos/a/index]] - a\n- [[repos/b/index]] - b");
     for (const name of ["a", "b"]) {
       const dir = path.join(knowledgeDir, "repos", name);
@@ -434,6 +437,8 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).toContain("### b");
     expect(out).toContain("a-ss");
     expect(out).toContain("b-ss");
-    expect(out.length).toBeLessThan(4000 + 700); // 4000 catalog budget + fixed instructions
+    const metaSection = out.split("## Knowledge Bases\n\n")[1].split("\n\n- [[")[0];
+    expect(metaSection.length).toBeLessThanOrEqual(2 * 200 + 2); // two capped entries + blank-line join
+    expect(out.length).toBeLessThan(2000); // capped entries + tiny index + fixed instructions
   });
 });
