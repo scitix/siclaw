@@ -303,12 +303,20 @@ export class PiAgentBrain implements BrainSession {
       Math.max(0, Math.floor(contextWindow * 0.02)),
     );
     const budget = contextWindow - reserveTokens;
-    if (contextWindow <= 0 || budget <= 0) {
+    if (contextWindow <= 0) {
       return {
         ok: false,
         compacted: false,
         contextWindow,
-        errorMessage: `Context preflight failed: invalid context window for ${model.provider}/${model.id}`,
+        errorMessage: `Context preflight failed for ${model.provider}/${model.id}: context window must be greater than 0 tokens (received ${contextWindow}). Configure a positive context window for this model.`,
+      };
+    }
+    if (budget <= 0) {
+      return {
+        ok: false,
+        compacted: false,
+        contextWindow,
+        errorMessage: `Context preflight failed for ${model.provider}/${model.id}: context window ${contextWindow} tokens must exceed compaction reserve ${reserveTokens} tokens. Increase the model context window or lower compaction.reserveTokens.`,
       };
     }
 

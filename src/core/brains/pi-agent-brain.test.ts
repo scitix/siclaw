@@ -296,6 +296,42 @@ describe("PiAgentBrain", () => {
     expect(session.compact).not.toHaveBeenCalled();
   });
 
+  it("context preflight explains a missing or invalid model window", async () => {
+    const session = makeFakeSession();
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "gpt-5.5", name: "GPT-5.5", provider: "sicore-custom-model", contextWindow: 0, maxTokens: 100, reasoning: false },
+      "hello",
+    );
+
+    expect(result).toMatchObject({ ok: false, compacted: false, contextWindow: 0 });
+    expect(result.errorMessage).toBe(
+      "Context preflight failed for sicore-custom-model/gpt-5.5: context window must be greater than 0 tokens (received 0). Configure a positive context window for this model.",
+    );
+    expect(session.compact).not.toHaveBeenCalled();
+  });
+
+  it("context preflight reports the window and reserve when no token budget remains", async () => {
+    const session = makeFakeSession({
+      settingsManager: {
+        getCompactionSettings: vi.fn(() => ({ enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 })),
+      },
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "DeepSeek-V4-Pro", name: "DeepSeek V4 Pro", provider: "sicore-custom-model", contextWindow: 10_000, maxTokens: 8172, reasoning: true },
+      "hello",
+    );
+
+    expect(result).toMatchObject({ ok: false, compacted: false, contextWindow: 10_000 });
+    expect(result.errorMessage).toBe(
+      "Context preflight failed for sicore-custom-model/DeepSeek-V4-Pro: context window 10000 tokens must exceed compaction reserve 16384 tokens. Increase the model context window or lower compaction.reserveTokens.",
+    );
+    expect(session.compact).not.toHaveBeenCalled();
+  });
+
   it("context preflight does not compact when fallback target has a larger window", async () => {
     const session = makeFakeSession({
       getContextUsage: vi.fn(() => ({ tokens: 1_000_000, contextWindow: 1_000_000, percent: 100 })),
