@@ -90,8 +90,8 @@ const KNOWLEDGE_WIKI_BUDGET = 4000;
  * free — a routing note must stay a road sign even when only one KB is bound
  * (2026-07-10 live review: an even 4000-split let a lone KB balloon into a
  * page inventory). The box-side generation caps (selfcheck CONSUMER_META_*:
- * summary ≤80 cp, ≤4 use-when items ×16, ≤3 not-for ×12) keep a well-formed
- * entry comfortably under this; the cap only bites on hand-made/legacy metas.
+ * summary ≤80 cp, ≤3 not-for ×20) keep a well-formed entry comfortably under
+ * this; the cap only bites on hand-made/legacy metas.
  */
 const CONSUMER_META_ENTRY_BUDGET = 200;
 
@@ -108,7 +108,12 @@ interface BundleConsumerMeta {
   /** published_version from the meta file, else the sync-manifest version. */
   version?: string;
   summary: string;
-  whenToUse: string[];
+  /**
+   * Grounded exclusions only (box-side generation traces each to explicit wiki
+   * text or the compile exclusion ledger). `when_to_use` was retired 2026-07-10
+   * (every item paraphrased the summary); old artifacts may still carry the
+   * key — it parses fine (unknown keys are simply not read) and never renders.
+   */
   notFor: string[];
 }
 
@@ -121,7 +126,7 @@ const CONSUMER_META_FILENAME = "_consumer_meta.json";
  * and hand-uploaded bundles carry no meta — design D2).
  */
 function readBundleConsumerMeta(bundleRoot: string): {
-  summary: string; whenToUse: string[]; notFor: string[]; publishedVersion?: string;
+  summary: string; notFor: string[]; publishedVersion?: string;
 } | null {
   let raw: string;
   try {
@@ -146,7 +151,6 @@ function readBundleConsumerMeta(bundleRoot: string): {
   const pv = obj.published_version;
   return {
     summary,
-    whenToUse: strList(obj.when_to_use),
     notFor: strList(obj.not_for),
     publishedVersion: typeof pv === "string" || typeof pv === "number" ? String(pv) : undefined,
   };
@@ -179,7 +183,6 @@ function collectBundleConsumerMetas(knowledgeDir: string): BundleConsumerMeta[] 
       name: m?.name,
       version: rootMeta.publishedVersion ?? (m?.version != null ? String(m.version) : undefined),
       summary: rootMeta.summary,
-      whenToUse: rootMeta.whenToUse,
       notFor: rootMeta.notFor,
     });
   }
@@ -202,7 +205,6 @@ function collectBundleConsumerMetas(knowledgeDir: string): BundleConsumerMeta[] 
       name: m?.name ?? entry.name,
       version: meta.publishedVersion ?? (m?.version != null ? String(m.version) : undefined),
       summary: meta.summary,
-      whenToUse: meta.whenToUse,
       notFor: meta.notFor,
     });
   }
@@ -221,29 +223,26 @@ function truncateRuneSafe(s: string, maxLen: number): string {
 }
 
 /**
- * Render one KB's meta entry within `budget` chars. Degradation order is the
- * design's: drop not_for first, then when_to_use; the summary is truncated
- * last (rune-safe) — the routing signal survives longest.
+ * Render one KB's meta entry within `budget` chars. Degradation order: drop
+ * not_for first, then truncate the summary (rune-safe) — the routing signal
+ * survives longest. (`when_to_use` retired 2026-07-10; never rendered.)
  */
 function formatConsumerMetaEntry(meta: BundleConsumerMeta, budget: number): string {
   // sicore injects published_version already prefixed ("v1"); sync-manifest
   // versions are bare numbers. Normalize so neither renders as "vv1".
   const versionLabel = meta.version ? (meta.version.startsWith("v") ? meta.version : `v${meta.version}`) : "";
   const heading = `### ${meta.name ?? "Knowledge base"}${versionLabel ? ` (${versionLabel})` : ""}`;
-  const build = (summary: string, withWhen: boolean, withNotFor: boolean): string => {
+  const build = (summary: string, withNotFor: boolean): string => {
     const lines = [heading, summary];
-    if (withWhen && meta.whenToUse.length > 0) lines.push(`Use when: ${meta.whenToUse.join("; ")}`);
     if (withNotFor && meta.notFor.length > 0) lines.push(`Not for: ${meta.notFor.join("; ")}`);
     return lines.join("\n");
   };
-  let entry = build(meta.summary, true, true);
+  let entry = build(meta.summary, true);
   if (entry.length <= budget) return entry;
-  entry = build(meta.summary, true, false); // drop not_for first
+  entry = build(meta.summary, false); // drop not_for first
   if (entry.length <= budget) return entry;
-  entry = build(meta.summary, false, false); // then when_to_use
-  if (entry.length <= budget) return entry;
-  const overhead = build("", false, false).length;
-  return build(truncateRuneSafe(meta.summary, Math.max(0, budget - overhead)), false, false);
+  const overhead = build("", false).length;
+  return build(truncateRuneSafe(meta.summary, Math.max(0, budget - overhead)), false);
 }
 
 /**
@@ -255,14 +254,14 @@ function formatConsumerMetaEntry(meta: BundleConsumerMeta, budget: number): stri
  * no search tool — and then Reads only the specific page(s) it needs on demand.
  *
  * When a bound bundle carries a published `_consumer_meta.json`, a "Knowledge
- * Bases" section (name + version + summary + use-when/not-for per KB) precedes
+ * Bases" section (name + version + summary + grounded not-for per KB) precedes
  * the index — the resident routing layer of the KB's progressive disclosure.
  * Bundles without meta keep exactly the pre-meta behavior (fallback, design D2).
  *
  * Returns "" when there is no wiki (no index.md). Budgeted to
  * KNOWLEDGE_WIKI_BUDGET overall: each meta entry gets min(the even split,
  * CONSUMER_META_ENTRY_BUDGET) — the hard per-entry cap keeps a lone bound KB
- * from ballooning — degrading not_for → when_to_use → summary truncation;
+ * from ballooning — degrading not_for → summary truncation;
  * the index is truncated within whatever remains, with a pointer to read the
  * full file. topics is deliberately NOT rendered (file-only metadata).
  */

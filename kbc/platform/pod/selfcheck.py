@@ -51,17 +51,19 @@ CONSUMER_META_PATH = "authoring/CONSUMER_META.json"
 # caps so truncation should never actually fire.
 CONSUMER_META_VERSION = 1
 CONSUMER_META_SUMMARY_MAX = 80          # one to two sentences
-CONSUMER_META_WHEN_MAX_ITEMS = 4
-CONSUMER_META_WHEN_ITEM_MAX = 24        # keyword-style, no "需要知道/查询" boilerplate
 CONSUMER_META_NOT_FOR_MAX_ITEMS = 3
-CONSUMER_META_NOT_FOR_ITEM_MAX = 20
+CONSUMER_META_NOT_FOR_ITEM_MAX = 20     # grounded exclusions only — see consumermeta.py
 CONSUMER_META_TOPICS_MAX_ITEMS = 8      # kept in schema/file; not rendered in the catalog
 CONSUMER_META_TOPICS_ITEM_MAX = 160
 CONSUMER_META_ENTRY_MAX_ITEMS = 8
 CONSUMER_META_ENTRY_ITEM_MAX = 160
+# `when_to_use` is RETIRED (2026-07-10 field redesign): live generations showed
+# every item was a paraphrase of the summary — zero routing gain, one more
+# hallucination/truncation surface. It stays in the wire shape as an
+# always-empty list (old artifacts still parse; nothing validates, grounds, or
+# renders it anymore).
 # key → (max items, max code points per item); iteration order = schema order.
 CONSUMER_META_LIST_CAPS = {
-    "when_to_use": (CONSUMER_META_WHEN_MAX_ITEMS, CONSUMER_META_WHEN_ITEM_MAX),
     "not_for": (CONSUMER_META_NOT_FOR_MAX_ITEMS, CONSUMER_META_NOT_FOR_ITEM_MAX),
     "topics": (CONSUMER_META_TOPICS_MAX_ITEMS, CONSUMER_META_TOPICS_ITEM_MAX),
     "entry_pages": (CONSUMER_META_ENTRY_MAX_ITEMS, CONSUMER_META_ENTRY_ITEM_MAX),
@@ -1138,6 +1140,10 @@ def normalize_consumer_meta(data, *, locale: str | None, generated_by: str,
     meta: dict = {
         "version": CONSUMER_META_VERSION,
         "summary": _fit_summary(summary, CONSUMER_META_SUMMARY_MAX),
+        # Retired field: always empty going forward, input deliberately ignored
+        # (see the CONSUMER_META_LIST_CAPS comment). Kept so the wire shape —
+        # and every old reader — stays stable.
+        "when_to_use": [],
     }
     for key, (max_items, item_max) in CONSUMER_META_LIST_CAPS.items():
         items: list[str] = []

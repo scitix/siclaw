@@ -1181,25 +1181,23 @@ def test_normalize_consumer_meta():
          "entry_pages": ["candidate/a.md", "sub/b", "index.md", "ghost.md", "./a.md"]},
         locale="zh", generated_by="m1", page_names=pages)
     assert meta["version"] == 1 and meta["summary"] == "摘要", meta
-    assert meta["when_to_use"] == ["问A", "问B"]          # stripped, deduped, empties dropped
+    assert meta["when_to_use"] == []                      # RETIRED field: input ignored, wire shape kept
     assert meta["not_for"] == []                          # wrong type → empty, never a crash
     assert len(meta["topics"]) == 1                       # dedup collapses the spam
     assert meta["entry_pages"] == ["a.md", "sub/b.md"]    # prefix/extension healed, ghost+index dropped
     assert meta["locale"] == "zh" and meta["generated_by"] == "m1"
     assert list(meta) == ["version", "summary", "when_to_use", "not_for",
                           "topics", "entry_pages", "locale", "generated_by"]
-    # Per-field caps (2026-07-10 terseness revision — the CONSUMER_META_*
-    # constants are the cross-repo SOURCE OF TRUTH sicore's validator mirrors):
-    # summary 80 cp, when_to_use 4×24, not_for 3×20, topics 8×160 (unchanged).
+    # Per-field caps (2026-07-10 revisions — the CONSUMER_META_* constants are
+    # the cross-repo SOURCE OF TRUTH sicore's validator mirrors): summary 80 cp,
+    # not_for 3×20, topics 8×160; when_to_use retired (always []).
     caps = selfcheck.normalize_consumer_meta(
         {"summary": "s", "topics": [f"t{i}" for i in range(20)],
          "when_to_use": [f"第{i}条需要知道的非常长的问法到底该怎么处理" for i in range(6)],
          "not_for": [f"第{i}条相邻但明确不覆盖的主题条目" for i in range(5)]},
         locale="zh", generated_by="m")
     assert len(caps["topics"]) == selfcheck.CONSUMER_META_TOPICS_MAX_ITEMS == 8
-    assert len(caps["when_to_use"]) == selfcheck.CONSUMER_META_WHEN_MAX_ITEMS == 4
-    assert all(len(i) <= selfcheck.CONSUMER_META_WHEN_ITEM_MAX for i in caps["when_to_use"]), caps
-    assert selfcheck.CONSUMER_META_WHEN_ITEM_MAX == 24
+    assert caps["when_to_use"] == []                      # retired: never populated
     assert len(caps["not_for"]) == selfcheck.CONSUMER_META_NOT_FOR_MAX_ITEMS == 3
     assert all(len(i) <= selfcheck.CONSUMER_META_NOT_FOR_ITEM_MAX for i in caps["not_for"]), caps
     assert selfcheck.CONSUMER_META_NOT_FOR_ITEM_MAX == 20
@@ -1229,26 +1227,22 @@ def test_consumer_meta_graceful_fit():
     def N(data):
         return selfcheck.normalize_consumer_meta(data, locale="zh", generated_by="m")
 
-    # mixed zh-en item under the 24 cap survives intact (20 cp)
+    # mixed zh-en item under the 20 cap survives intact, byte-for-byte (20 cp)
     mixed = "训练任务提交、PyTorchJob 调试"
-    assert len(mixed) == 20 <= selfcheck.CONSUMER_META_WHEN_ITEM_MAX
-    m = N({"summary": "s", "when_to_use": [mixed]})
-    assert m["when_to_use"] == [mixed], m["when_to_use"]
+    assert len(mixed) == 20 <= selfcheck.CONSUMER_META_NOT_FOR_ITEM_MAX
+    m = N({"summary": "s", "not_for": [mixed]})
+    assert m["not_for"] == [mixed], m["not_for"]
 
-    # over-cap item (25 cp) trims back to the last natural boundary within 24
-    m = N({"summary": "s", "when_to_use": ["训练任务提交与调度、PyTorchJob 调试排障"]})
-    assert m["when_to_use"] == ["训练任务提交与调度、PyTorchJob"], m["when_to_use"]
+    # over-cap item (22 cp) trims back to the last natural boundary within 20
+    # (boundary at 11 ≥ half the cap → trimmed clause kept)
+    m = N({"summary": "s", "not_for": ["驱动/CUDA 安装", "计费配额与账单管理规则、明细导出流程说明文档"]})
+    assert m["not_for"] == ["驱动/CUDA 安装", "计费配额与账单管理规则"], m["not_for"]
 
     # trim keeping less than HALF the cap drops the item; so does a
     # boundary-less over-cap item — a complete shorter list beats a chopped one
     m = N({"summary": "s",
-           "when_to_use": ["短语、" + "补" * 30, "无边界" + "词" * 25, "保留项"]})
-    assert m["when_to_use"] == ["保留项"], m["when_to_use"]
-
-    # not_for gets the same treatment under its own 20-cp cap (fixture: 22 cp,
-    # boundary at 11 ≥ half the cap → trimmed clause kept)
-    m = N({"summary": "s", "not_for": ["驱动/CUDA 安装", "计费配额与账单管理规则、明细导出流程说明文档"]})
-    assert m["not_for"] == ["驱动/CUDA 安装", "计费配额与账单管理规则"], m["not_for"]
+           "not_for": ["短语、" + "补" * 30, "无边界" + "词" * 25, "保留项"]})
+    assert m["not_for"] == ["保留项"], m["not_for"]
 
     # summary: prefer the last sentence-final inside the cap — kept, ends clean
     m = N({"summary": ("句" * 30 + "。") * 3})
@@ -1276,22 +1270,24 @@ def test_validate_consumer_meta():
         v = selfcheck.validate_consumer_meta(td)
         assert v["present"] and any("invalid JSON" in p for p in v["problems"]), v
         _mk(base, "authoring/CONSUMER_META.json", json.dumps(
-            {"version": 2, "summary": "", "when_to_use": [1], "topics": ["坏�"]}))
+            {"version": 2, "summary": "", "not_for": [1], "topics": ["坏�"]}))
         v = selfcheck.validate_consumer_meta(td)
         assert any("version" in p for p in v["problems"]), v
         assert any("summary" in p for p in v["problems"]), v
-        assert any("when_to_use" in p for p in v["problems"]), v
+        assert any("not_for" in p for p in v["problems"]), v
         assert any("U+FFFD" in p for p in v["problems"]), v
         # Over-cap fields (e.g. a hand-made / pre-revision file) → warned, so the
         # box-side facts cross-check sicore's owner-edit validator (same caps).
+        # `when_to_use` is RETIRED: an old artifact carrying it — even wildly
+        # over the historical caps — draws no warning at all.
         _mk(base, "authoring/CONSUMER_META.json", json.dumps(
             {"version": 1, "summary": "长" * 100,
-             "when_to_use": ["超" * 30] * 6, "not_for": ["y"]}))
+             "not_for": ["超" * 30] * 6, "when_to_use": ["旧" * 99] * 9}))
         v = selfcheck.validate_consumer_meta(td)
         assert any("summary exceeds 80" in p for p in v["problems"]), v
-        assert any("when_to_use exceeds 4 items" in p for p in v["problems"]), v
-        assert any("when_to_use items exceed 24" in p for p in v["problems"]), v
-        assert not any("not_for" in p for p in v["problems"]), v
+        assert any("not_for exceeds 3 items" in p for p in v["problems"]), v
+        assert any("not_for items exceed 20" in p for p in v["problems"]), v
+        assert not any("when_to_use" in p for p in v["problems"]), v
         good = selfcheck.normalize_consumer_meta(
             {"summary": "s", "topics": ["t"]}, locale="zh", generated_by="m")
         selfcheck.write_consumer_meta(td, good)
@@ -1360,18 +1356,30 @@ async def test_consumer_meta_generation():
         _mk(base, "raw/secret.md", "raw stays invisible")
         _mk(base, "candidate/index.md", "i")
         _mk(base, "candidate/p.md", "p")
-        # first output unparseable → ONE retry with an explicit re-emit note
+        # Exclusion ledger present → its owner-readable REASONS ground not_for;
+        # the PATTERNS (raw file paths) must never reach the prompt.
+        _mk(base, "authoring/EXCLUSIONS.json", json.dumps(
+            [{"pattern": "secret-live-data.csv", "reason": "活数据,随时变化"},
+             {"pattern": "creds/**", "reason": "账密类内容,不入库"}]))
+        # first output unparseable → ONE retry with an explicit re-emit note;
+        # an old-model output still carrying when_to_use parses fine — ignored.
         eng = FakeEngine(["not json at all",
                           '{"summary": "覆盖X", "when_to_use": ["问X"], "entry_pages": ["p.md"]}'])
         meta = await consumermeta.generate_consumer_meta(eng, workdir=td, locale="zh")
         assert meta["summary"] == "覆盖X" and meta["entry_pages"] == ["p.md"], meta
+        assert meta["when_to_use"] == []                  # retired field: tolerated, never populated
         assert meta["locale"] == "zh" and meta["generated_by"] == consumermeta._meta_model()
         assert len(eng.calls) == 2
         cand = str(Path(td) / "candidate")
         for call in eng.calls:
             assert call["cwd"] == cand and call["roots"] == [cand], call  # blind: candidate/ only
-        assert "index.md" in eng.calls[0]["user"] and "p.md" in eng.calls[0]["user"]
-        assert "JSON" in eng.calls[1]["user"] and eng.calls[1]["user"] != eng.calls[0]["user"]
+        user0 = eng.calls[0]["user"]
+        assert "index.md" in user0 and "p.md" in user0
+        assert '"when_to_use"' not in user0               # retired: no longer requested
+        assert "活数据,随时变化" in user0 and "账密类内容,不入库" in user0  # grounded candidates injected
+        assert "secret-live-data" not in user0 and "creds" not in user0    # patterns (source names) never leak
+        assert "宁缺勿滥" in user0                        # grounding rule: sparse over speculative
+        assert "JSON" in eng.calls[1]["user"] and eng.calls[1]["user"] != user0
         # both attempts unusable → raises (caller records failed, fail-open)
         eng2 = FakeEngine(["junk", '{"summary": ""}'])
         try:
@@ -1380,6 +1388,7 @@ async def test_consumer_meta_generation():
         except ValueError as e:
             assert "after retry" in str(e), e
         assert "Read index.md" in eng2.calls[0]["user"]  # en prompt pack
+        assert "活数据,随时变化" in eng2.calls[0]["user"]  # grounding rides the en prompt too
         # no candidate pages → refuse up front (nothing to summarize)
         with tempfile.TemporaryDirectory() as empty:
             try:
@@ -1387,7 +1396,14 @@ async def test_consumer_meta_generation():
                 assert False, "should refuse an empty tree"
             except ValueError:
                 pass
-    print("OK  consumer-meta generation (blind roots / locale / bounded retry / refusal)")
+    # no exclusion ledger → no grounding block at all (the block header —
+    # "来自编译期排除台账" — appears only when candidates are injected)
+    with tempfile.TemporaryDirectory() as td2:
+        _mk(Path(td2), "candidate/index.md", "i")
+        eng3 = FakeEngine(['{"summary": "干净"}'])
+        await consumermeta.generate_consumer_meta(eng3, workdir=td2, locale="zh")
+        assert "来自编译期排除台账" not in eng3.calls[0]["user"]
+    print("OK  consumer-meta generation (blind roots / locale / retry / grounded not_for, no pattern leak)")
 
 
 async def test_consumer_meta_wiring():

@@ -335,11 +335,13 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(buildKnowledgeWikiCatalog(knowledgeDir)).not.toContain("## Knowledge Bases");
   });
 
-  it("renders a single bundle's meta: name + published version + summary + use-when/not-for, index kept", () => {
+  it("renders a single bundle's meta: name + published version + summary + not-for, index kept", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[roce-modes]] — RoCE modes");
     fs.writeFileSync(path.join(knowledgeDir, ".sync-manifest.json"), JSON.stringify({
       syncedAt: "t", version: "1", repos: [{ id: "1", name: "GPU 集群运维", version: 7 }],
     }));
+    // Old artifact shape: still carries the retired when_to_use — parses fine,
+    // never renders (2026-07-10 field redesign).
     writeMeta(knowledgeDir, {
       version: 1, summary: "覆盖 GPU 集群排障口径", when_to_use: ["XID 报错", "RoCE 掉速"],
       not_for: ["计费问题"], topics: ["gpu"], entry_pages: [], locale: "zh",
@@ -349,7 +351,8 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).toContain("## Knowledge Bases");
     expect(out).toContain("### GPU 集群运维 (v9)"); // published_version wins over manifest v7
     expect(out).toContain("覆盖 GPU 集群排障口径");
-    expect(out).toContain("Use when: XID 报错; RoCE 掉速");
+    expect(out).not.toContain("Use when:"); // retired field: tolerated in the file, never rendered
+    expect(out).not.toContain("XID 报错");
     expect(out).toContain("Not for: 计费问题");
     expect(out).toContain("[[roce-modes]]"); // second disclosure layer (index) still routed
     // never inlines the JSON file itself as a page
@@ -387,28 +390,30 @@ describe("buildKnowledgeWikiCatalog", () => {
     const dirB = path.join(knowledgeDir, "repos", "wiki-b");
     fs.mkdirSync(dirA, { recursive: true });
     fs.mkdirSync(dirB, { recursive: true });
-    writeMeta(dirA, { version: 1, summary: "A 的口径", when_to_use: ["问A"], published_version: 4 });
+    writeMeta(dirA, { version: 1, summary: "A 的口径", not_for: ["计费"], published_version: 4 });
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).toContain("### Wiki-A (v4)"); // manifest display name, meta's published version
     expect(out).toContain("A 的口径");
-    expect(out).toContain("Use when: 问A");
+    expect(out).toContain("Not for: 计费");
     expect(out).not.toContain("### wiki-b"); // no meta → fallback: only its synthetic index line
     expect(out).toContain("[[repos/wiki-b/index]]");
   });
 
-  it("degrades within the 200-char entry budget: not_for dropped first, then when_to_use, summary truncated last (rune-safe)", () => {
+  it("degrades within the 200-char entry budget: not_for dropped first, summary truncated last (rune-safe)", () => {
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), "- [[a]] — x");
-    // Sized so: summary+when+not_for > 200 AND summary+when > 200 AND summary ≤ 200
-    // → exercises both drop steps while the summary itself survives untruncated.
+    // Sized so: summary+not_for > 200 AND summary ≤ 200 → the drop step fires
+    // while the summary itself survives untruncated. The retired when_to_use
+    // stays in the file to prove it is inert (never rendered, never budgeted).
     const summary = "夏".repeat(150);
     writeMeta(knowledgeDir, {
       version: 1, summary,
-      when_to_use: Array.from({ length: 2 }, (_, i) => `use-case-${i}-${"w".repeat(100)}`),
+      when_to_use: ["legacy-item-should-never-render"],
       not_for: Array.from({ length: 2 }, (_, i) => `not-${i}-${"n".repeat(50)}`),
     });
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).not.toContain("Not for:");   // dropped first (entry would blow the per-KB budget)
-    expect(out).not.toContain("Use when:");  // then when_to_use
+    expect(out).not.toContain("Use when:");  // retired field: never rendered at all
+    expect(out).not.toContain("legacy-item-should-never-render");
     expect(out).toContain("夏".repeat(100)); // summary head survives
     expect(out.length).toBeLessThan(4000 + 700); // instructions overhead only
     // extreme: a ballooned summary (hand-made/legacy meta) → the HARD 200-char
