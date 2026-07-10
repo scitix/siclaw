@@ -115,6 +115,64 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     });
   });
 
+  it("downgrades a commit without an input revision while preserving artifact content", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([
+          {
+            type: "syncArtifacts",
+            artifacts: [{ path: "candidate/index.md", content: "# Index" }],
+            commit_input: true,
+          },
+          { type: "end" },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
+      run_id: "r1",
+      artifacts: [{
+        path: "candidate/index.md",
+        content: { inline_base64: Buffer.from("# Index", "utf8").toString("base64") },
+      }],
+    });
+    expect(emits(fe)).toContainEqual({
+      run_id: "r1",
+      type: "summary",
+      payload: { text: expect.stringContaining("provenance was not advanced") },
+    });
+  });
+
+  it("does not send an empty commit when the run has no input revision", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ status: "running" });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([
+          { type: "syncArtifacts", artifacts: [], commit_input: true },
+          { type: "end" },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(fe.request).not.toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, expect.anything());
+    expect(emits(fe)).toContainEqual({
+      run_id: "r1",
+      type: "summary",
+      payload: { text: expect.stringContaining("provenance was not advanced") },
+    });
+  });
+
   it("done → lifecycle done + endRun(done)", async () => {
     const fe = fakeFrontend();
     const mgr = fakeManager();

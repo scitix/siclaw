@@ -3,7 +3,7 @@
  *
  * Consumes a box's `/events/:runId` SSE and speaks the GENERIC capability wire:
  *   - live frames  → capability.event {runId, type: log|turn|summary|lifecycle}
- *   - knowledge    → capability.persistArtifact (content → the consumer's store)
+ *   - knowledge    → capability.persistArtifacts (one all-or-nothing consumer batch)
  *   - lifecycle    → writes back to the CapabilityRunManager (idle/done/failed)
  *
  * This is the capability-native replacement for compile-driver's relayBoxEvents
@@ -117,11 +117,19 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
                   content: { inline_base64: Buffer.from(a.content ?? "", "utf8").toString("base64") },
                 }];
           });
-          if (artifacts.length === 0 && !evt.commit_input) break;
+          const inputRevision = manager.get(runId)?.inputRevision?.trim();
+          const commitInput = evt.commit_input === true && Boolean(inputRevision);
+          if (evt.commit_input && !commitInput) {
+            const warning =
+              "Source provenance was not advanced because this run has no pinned input revision. Any artifact changes will be saved without committing the input baseline; start a new compile run after source materialization recovers.";
+            console.error(`[capability] run=${runId} commit_input downgraded to content-only persistence: missing input revision`);
+            emit("summary", { text: warning });
+          }
+          if (artifacts.length === 0 && !commitInput) break;
           const request: CapabilityPersistArtifactsRequest = {
             run_id: runId,
-            input_revision: manager.get(runId)?.inputRevision,
-            ...(evt.commit_input ? { commit_input: true } : {}),
+            ...(inputRevision ? { input_revision: inputRevision } : {}),
+            ...(commitInput ? { commit_input: true } : {}),
             artifacts,
           };
           let delayMs = 250;

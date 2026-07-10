@@ -1752,11 +1752,11 @@ def _compile_system_prompt(run: "CompileRun") -> str:
 # "直接开始编译"). Natural-language phrasings deliberately do NOT trigger — a human
 # saying "继续编译前我想先改个要求" must not launch the train.
 _BATCH_TRIGGER_PREFIXES = ("直接开始编译", "批准,按此计划执行")
-_BATCH_TRIGGER_SUBSTR = "请增量重编"
+_INCREMENTAL_TRIGGER_PREFIXES = ("原料已更新,请增量重编", "请增量重编")
 
 
 def _is_compile_trigger(text: str) -> bool:
-    return text.startswith(_BATCH_TRIGGER_PREFIXES) or _BATCH_TRIGGER_SUBSTR in text
+    return text.startswith(_BATCH_TRIGGER_PREFIXES + _INCREMENTAL_TRIGGER_PREFIXES)
 
 
 def _batch_mode_enabled() -> bool:
@@ -2033,6 +2033,7 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             system_prompt={"type": "preset", "preset": "claude_code", "append": _planner_role(getattr(run, "locale", None))},
             allowed_tools=["Read", "Write", "Glob"],
             permission_mode="bypassPermissions",
+            hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(Path(wd), run.locale)])]},
             setting_sources=[],
             model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
             max_turns=8,
@@ -2561,35 +2562,15 @@ def _test_path_escape(root: Path, tool_name: str, tool_input: dict) -> str | Non
     return None
 
 
-def _make_test_path_guard(root: Path, locale: str | None = None):
-    """PreToolUse hook confining a test session to its snapshot. A hook (not a
-    can_use_tool callback) because hooks fire under bypassPermissions too. The
-    steering message comes from the locale's prompt pack — it is model-facing."""
-    deny_template = _prompt("guard_deny", locale).strip()
-
-    async def guard(input_data, tool_use_id, context):
-        offender = _test_path_escape(root, str(input_data.get("tool_name", "")), input_data.get("tool_input") or {})
-        if offender:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": deny_template.format(root=root, offender=offender),
-                }
-            }
-        return {}
-
-    return guard
-
-
-def _make_compile_path_guard(root: Path, locale: str | None = None):
-    """Constrain compiler file tools to /work and deny Bash even if a future
-    runtime profile accidentally adds it back to allowed_tools."""
+def _make_path_guard(root: Path, locale: str | None = None, *, deny_bash: bool = False):
+    """PreToolUse hook confining one SDK session to its workspace. Hooks fire
+    under bypassPermissions; compiler sessions also deny Bash as defense in
+    depth if a future profile accidentally adds it back."""
     deny_template = _prompt("guard_deny", locale).strip()
 
     async def guard(input_data, tool_use_id, context):
         tool_name = str(input_data.get("tool_name", ""))
-        offender = "tool=Bash" if tool_name == "Bash" else _test_path_escape(
+        offender = "tool=Bash" if deny_bash and tool_name == "Bash" else _test_path_escape(
             root, tool_name, input_data.get("tool_input") or {}
         )
         if offender:
@@ -2603,6 +2584,16 @@ def _make_compile_path_guard(root: Path, locale: str | None = None):
         return {}
 
     return guard
+
+
+def _make_test_path_guard(root: Path, locale: str | None = None):
+    """Constrain a read-only test consumer to its pinned snapshot."""
+    return _make_path_guard(root, locale)
+
+
+def _make_compile_path_guard(root: Path, locale: str | None = None):
+    """Constrain compiler and planner sessions to their /work workspace."""
+    return _make_path_guard(root, locale, deny_bash=True)
 
 
 async def test_session_driver(run: "TestRun"):

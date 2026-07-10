@@ -97,6 +97,8 @@ export interface CapabilityRunManagerOptions {
 // defer forever and pin its box. After this many consecutive failed re-checks we
 // stop deferring and reap the run anyway.
 const MAX_REAP_DEFERRALS = 5;
+const INPUT_REVISION_PERSIST_ATTEMPTS = 4;
+const INPUT_REVISION_RETRY_BASE_MS = 250;
 
 export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
@@ -218,8 +220,31 @@ export class CapabilityRunManager {
     const rec = this.runs.get(runId);
     const revision = inputRevision.trim();
     if (!rec || !revision || rec.inputRevision === revision) return;
+    const previousRevision = rec.inputRevision;
     rec.inputRevision = revision;
-    await this.persist(rec, { failFast: true });
+    try {
+      for (let attempt = 1; attempt <= INPUT_REVISION_PERSIST_ATTEMPTS; attempt += 1) {
+        try {
+          await this.persist(rec, { failFast: true });
+          return;
+        } catch (err) {
+          if (attempt === INPUT_REVISION_PERSIST_ATTEMPTS) throw err;
+          const delayMs = INPUT_REVISION_RETRY_BASE_MS * 2 ** (attempt - 1);
+          console.warn(
+            `[capability] checkpoint input revision for ${runId} failed ` +
+            `(attempt ${attempt}/${INPUT_REVISION_PERSIST_ATTEMPTS}); retrying in ${delayMs}ms: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+    } catch (err) {
+      // Never retain an in-memory checkpoint the consumer did not durably ack.
+      // A later session setup must retry instead of returning early on a value
+      // that exists only in this process.
+      rec.inputRevision = previousRevision;
+      throw err;
+    }
   }
 
   /** Bump last-DATA activity so the watchdog doesn't reap an actively-used run. */

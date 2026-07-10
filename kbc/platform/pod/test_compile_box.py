@@ -380,6 +380,30 @@ async def test_test_path_escape_guard():
     print("✓ test-session path guard (C4): snapshot-confined, live /work denied")
 
 
+async def test_batch_planner_uses_compile_path_guard():
+    """The model planner can Write under bypassPermissions, so it must carry the
+    same workspace confinement hook as every other compiler session."""
+    orig = compile_box.ClaudeSDKClient
+    previous_mode = os.environ.get("KBC_BATCH_PLANNER")
+    compile_box.ClaudeSDKClient = _FakeSDKClient
+    os.environ["KBC_BATCH_PLANNER"] = "model"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("planner-guard", td, 1)
+            inventory = [{"path": "a.md", "bytes": 10, "effective": 10}]
+            await compile_box._plan_batches(run, inventory)
+            opts = _FakeSDKClient.last.options
+            assert opts.allowed_tools == ["Read", "Write", "Glob"], opts.allowed_tools
+            assert opts.hooks and opts.hooks.get("PreToolUse"), opts.hooks
+    finally:
+        compile_box.ClaudeSDKClient = orig
+        if previous_mode is None:
+            os.environ.pop("KBC_BATCH_PLANNER", None)
+        else:
+            os.environ["KBC_BATCH_PLANNER"] = previous_mode
+    print("✓ batch planner uses compile workspace path guard")
+
+
 
 def test_pack_candidates_to_wiki():
     """_pack_candidates_to_wiki mirrors buildPublishBundleFromCandidates: candidate/
@@ -1362,6 +1386,7 @@ async def test_batch_orchestrator_routing_and_resume():
         assert compile_box._should_route_to_batch(run, "直接开始编译")
         assert compile_box._should_route_to_batch(run, "原料已更新,请增量重编: xx")
         assert not compile_box._should_route_to_batch(run, "你好")
+        assert not compile_box._should_route_to_batch(run, "请解释一下“请增量重编”是什么意思")
 
         # stub the session driver: record directives, pretend each session works
         driven: list[str] = []
@@ -2014,6 +2039,7 @@ async def main():
     test_pack_candidates_to_wiki()
     test_pack_candidates_symlink_confinement()
     await test_test_path_escape_guard()
+    await test_batch_planner_uses_compile_path_guard()
     await test_prompt_packs_locale()
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()

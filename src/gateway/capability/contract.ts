@@ -45,7 +45,6 @@ export const CAPABILITY_TEST_CLOSE = "capability.testClose" as const;
 
 /** siclaw → consumer: live stream + content sink + input fetch. */
 export const CAPABILITY_EVENT = "capability.event" as const;
-export const CAPABILITY_PERSIST_ARTIFACT = "capability.persistArtifact" as const;
 export const CAPABILITY_PERSIST_ARTIFACTS = "capability.persistArtifacts" as const;
 export const CAPABILITY_FETCH_INPUT = "capability.fetchInput" as const;
 
