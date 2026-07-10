@@ -52,9 +52,9 @@ CONSUMER_META_PATH = "authoring/CONSUMER_META.json"
 CONSUMER_META_VERSION = 1
 CONSUMER_META_SUMMARY_MAX = 80          # one to two sentences
 CONSUMER_META_WHEN_MAX_ITEMS = 4
-CONSUMER_META_WHEN_ITEM_MAX = 16        # keyword-style, no "需要知道/查询" boilerplate
+CONSUMER_META_WHEN_ITEM_MAX = 24        # keyword-style, no "需要知道/查询" boilerplate
 CONSUMER_META_NOT_FOR_MAX_ITEMS = 3
-CONSUMER_META_NOT_FOR_ITEM_MAX = 12
+CONSUMER_META_NOT_FOR_ITEM_MAX = 20
 CONSUMER_META_TOPICS_MAX_ITEMS = 8      # kept in schema/file; not rendered in the catalog
 CONSUMER_META_TOPICS_ITEM_MAX = 160
 CONSUMER_META_ENTRY_MAX_ITEMS = 8
@@ -66,6 +66,13 @@ CONSUMER_META_LIST_CAPS = {
     "topics": (CONSUMER_META_TOPICS_MAX_ITEMS, CONSUMER_META_TOPICS_ITEM_MAX),
     "entry_pages": (CONSUMER_META_ENTRY_MAX_ITEMS, CONSUMER_META_ENTRY_ITEM_MAX),
 }
+# Graceful over-cap handling (2026-07-10 live defect, siflow-kb-test-2: blind
+# hard slicing chopped tokens mid-word — "PyTorchJo", "通用 Kubernete",
+# "CLI/Python SDK/R" — and left the summary dangling at exactly the cap).
+# These boundary sets are part of the mirrored behavior, not just the numbers:
+CONSUMER_META_ITEM_BOUNDARIES = "、・／/, "      # natural breaks inside a list item
+CONSUMER_META_SENTENCE_FINALS = "。！？；.!?;"   # preferred summary cut points (kept)
+CONSUMER_META_CLAUSE_BREAKS = "，,、"            # fallback summary cut points (dropped)
 
 # TEST_ROLE = the standing identity of a read-only knowledge CONSUMER over a
 # pinned wiki snapshot. Single-sourced in the locale prompt packs
@@ -1073,6 +1080,44 @@ def _norm_entry_page(entry) -> str:
     return "" if e == "." else e
 
 
+def _fit_list_item(s: str, cap: int) -> str | None:
+    """Fit one list item into `cap` code points GRACEFULLY (2026-07-10 live
+    defect: a blind hard slice shipped "PyTorchJo" / "通用 Kubernete"). Over
+    cap: trim back to the last natural boundary (、・／/ , space) within the
+    cap window; when the trimmed result is shorter than HALF the cap — or no
+    boundary exists at all — drop the item entirely: a complete shorter list
+    beats a chopped keyword. Returns None for a dropped/empty item."""
+    if len(s) <= cap:
+        return s or None
+    window = s[:cap]
+    idx = max(window.rfind(ch) for ch in CONSUMER_META_ITEM_BOUNDARIES)
+    if idx < 0:
+        return None
+    trimmed = window[:idx].rstrip(CONSUMER_META_ITEM_BOUNDARIES).rstrip()
+    if not trimmed or len(trimmed) < cap / 2:
+        return None
+    return trimmed
+
+
+def _fit_summary(s: str, cap: int) -> str:
+    """Fit the summary into `cap` code points at a natural boundary: prefer the
+    last sentence-final punctuation within the cap (kept — the summary ends as
+    a sentence), else the last clause comma (dropped), else a hard cut. Never
+    a dangling half-word ending when a boundary exists."""
+    if len(s) <= cap:
+        return s
+    window = s[:cap]
+    for i in range(len(window) - 1, -1, -1):
+        if window[i] in CONSUMER_META_SENTENCE_FINALS:
+            return window[:i + 1]
+    for i in range(len(window) - 1, -1, -1):
+        if window[i] in CONSUMER_META_CLAUSE_BREAKS:
+            cut = window[:i].rstrip()
+            if cut:
+                return cut
+    return window
+
+
 def normalize_consumer_meta(data, *, locale: str | None, generated_by: str,
                             page_names: list[str] | None = None) -> dict:
     """Coerce a model-emitted payload into the PINNED v1 schema (cross-repo
@@ -1092,16 +1137,16 @@ def normalize_consumer_meta(data, *, locale: str | None, generated_by: str,
         raise ValueError("consumer meta needs a non-empty summary")
     meta: dict = {
         "version": CONSUMER_META_VERSION,
-        "summary": summary[:CONSUMER_META_SUMMARY_MAX],
+        "summary": _fit_summary(summary, CONSUMER_META_SUMMARY_MAX),
     }
     for key, (max_items, item_max) in CONSUMER_META_LIST_CAPS.items():
         items: list[str] = []
         raw_list = data.get(key)
         if isinstance(raw_list, (list, tuple)):
             for item in raw_list:
-                s = str(item).strip()
-                if s and s[:item_max] not in items:
-                    items.append(s[:item_max])
+                s = _fit_list_item(str(item).strip(), item_max)
+                if s and s not in items:
+                    items.append(s)
                 if len(items) >= max_items:
                     break
         meta[key] = items

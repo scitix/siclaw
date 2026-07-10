@@ -77,7 +77,7 @@ Terseness example — match its SHAPE and brevity, not its content:
  "not_for": ["CUDA install", "billing"],
  "topics": ["gpu", "hardware", "xid"],
  "entry_pages": ["xid-codes.md"]}}
-Stay well under every cap — over-cap text gets hard-truncated mid-sentence."""
+Aim for at most two-thirds of each limit — the limits are hard caps, not targets; every item must be a complete phrase. Over-cap text gets trimmed back to a boundary or the whole item dropped."""
 
 USER_ZH = """这个已编译知识库共 {n} 页:
 {page_list}
@@ -97,7 +97,7 @@ USER_ZH = """这个已编译知识库共 {n} 页:
  "not_for": ["驱动/CUDA 安装", "计费"],
  "topics": ["gpu", "硬件", "xid"],
  "entry_pages": ["xid-codes.md"]}}
-每一项都留在上限之内——超限文本会被硬截断在半句。"""
+各项以不超过上限三分之二为目标——上限是硬截断线,不是要写满的指标;每一条都必须是完整短语。超限文本会被裁剪回边界,甚至整条丢弃。"""
 
 READ_ALL_EN = "Read index.md first, then read every page."
 READ_ALL_ZH = "先读 index.md,然后逐页读完全部页面。"

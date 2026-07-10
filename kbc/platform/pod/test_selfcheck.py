@@ -1190,7 +1190,7 @@ def test_normalize_consumer_meta():
                           "topics", "entry_pages", "locale", "generated_by"]
     # Per-field caps (2026-07-10 terseness revision — the CONSUMER_META_*
     # constants are the cross-repo SOURCE OF TRUTH sicore's validator mirrors):
-    # summary 80 cp, when_to_use 4×16, not_for 3×12, topics 8×160 (unchanged).
+    # summary 80 cp, when_to_use 4×24, not_for 3×20, topics 8×160 (unchanged).
     caps = selfcheck.normalize_consumer_meta(
         {"summary": "s", "topics": [f"t{i}" for i in range(20)],
          "when_to_use": [f"第{i}条需要知道的非常长的问法到底该怎么处理" for i in range(6)],
@@ -1199,10 +1199,10 @@ def test_normalize_consumer_meta():
     assert len(caps["topics"]) == selfcheck.CONSUMER_META_TOPICS_MAX_ITEMS == 8
     assert len(caps["when_to_use"]) == selfcheck.CONSUMER_META_WHEN_MAX_ITEMS == 4
     assert all(len(i) <= selfcheck.CONSUMER_META_WHEN_ITEM_MAX for i in caps["when_to_use"]), caps
-    assert selfcheck.CONSUMER_META_WHEN_ITEM_MAX == 16
+    assert selfcheck.CONSUMER_META_WHEN_ITEM_MAX == 24
     assert len(caps["not_for"]) == selfcheck.CONSUMER_META_NOT_FOR_MAX_ITEMS == 3
     assert all(len(i) <= selfcheck.CONSUMER_META_NOT_FOR_ITEM_MAX for i in caps["not_for"]), caps
-    assert selfcheck.CONSUMER_META_NOT_FOR_ITEM_MAX == 12
+    assert selfcheck.CONSUMER_META_NOT_FOR_ITEM_MAX == 20
     # summary cap is code-point safe; en locale normalizes to "en"
     long = selfcheck.normalize_consumer_meta(
         {"summary": "汉" * 500}, locale="en-US", generated_by="m", page_names=None)
@@ -1216,6 +1216,53 @@ def test_normalize_consumer_meta():
         except ValueError:
             pass
     print("OK  normalize_consumer_meta (envelope / caps / entry filter / charset+empty rejection)")
+
+
+def test_consumer_meta_graceful_fit():
+    """2026-07-10 live defect (siflow-kb-test-2): blind hard slicing shipped
+    chopped tokens ("PyTorchJo", "通用 Kubernete", "CLI/Python SDK/R") and a
+    summary dangling mid-word at exactly the cap. Over-cap now heals at natural
+    boundaries: list items trim back to 、・／/ , space (drop entirely when the
+    trim loses more than half the cap, or no boundary exists); the summary cuts
+    at the last sentence-final (kept), else the last comma (dropped), else a
+    hard cut. Under-cap text is untouched, byte-for-byte."""
+    def N(data):
+        return selfcheck.normalize_consumer_meta(data, locale="zh", generated_by="m")
+
+    # mixed zh-en item under the 24 cap survives intact (20 cp)
+    mixed = "训练任务提交、PyTorchJob 调试"
+    assert len(mixed) == 20 <= selfcheck.CONSUMER_META_WHEN_ITEM_MAX
+    m = N({"summary": "s", "when_to_use": [mixed]})
+    assert m["when_to_use"] == [mixed], m["when_to_use"]
+
+    # over-cap item (25 cp) trims back to the last natural boundary within 24
+    m = N({"summary": "s", "when_to_use": ["训练任务提交与调度、PyTorchJob 调试排障"]})
+    assert m["when_to_use"] == ["训练任务提交与调度、PyTorchJob"], m["when_to_use"]
+
+    # trim keeping less than HALF the cap drops the item; so does a
+    # boundary-less over-cap item — a complete shorter list beats a chopped one
+    m = N({"summary": "s",
+           "when_to_use": ["短语、" + "补" * 30, "无边界" + "词" * 25, "保留项"]})
+    assert m["when_to_use"] == ["保留项"], m["when_to_use"]
+
+    # not_for gets the same treatment under its own 20-cp cap (fixture: 22 cp,
+    # boundary at 11 ≥ half the cap → trimmed clause kept)
+    m = N({"summary": "s", "not_for": ["驱动/CUDA 安装", "计费配额与账单管理规则、明细导出流程说明文档"]})
+    assert m["not_for"] == ["驱动/CUDA 安装", "计费配额与账单管理规则"], m["not_for"]
+
+    # summary: prefer the last sentence-final inside the cap — kept, ends clean
+    m = N({"summary": ("句" * 30 + "。") * 3})
+    assert m["summary"] == ("句" * 30 + "。") * 2, len(m["summary"])
+    assert m["summary"].endswith("。")
+
+    # no sentence-final inside the cap → cut at the last comma, comma dropped
+    m = N({"summary": "词" * 40 + "，" + "词" * 60})
+    assert m["summary"] == "词" * 40, len(m["summary"])
+
+    # no boundary at all → hard cut at exactly the cap (last resort)
+    m = N({"summary": "汉" * 500})
+    assert len(m["summary"]) == selfcheck.CONSUMER_META_SUMMARY_MAX
+    print("OK  consumer-meta graceful fit (boundary trim / drop-below-half / sentence cut / comma cut / hard cut)")
 
 
 def test_validate_consumer_meta():
@@ -1239,11 +1286,11 @@ def test_validate_consumer_meta():
         # box-side facts cross-check sicore's owner-edit validator (same caps).
         _mk(base, "authoring/CONSUMER_META.json", json.dumps(
             {"version": 1, "summary": "长" * 100,
-             "when_to_use": ["超" * 20] * 6, "not_for": ["y"]}))
+             "when_to_use": ["超" * 30] * 6, "not_for": ["y"]}))
         v = selfcheck.validate_consumer_meta(td)
         assert any("summary exceeds 80" in p for p in v["problems"]), v
         assert any("when_to_use exceeds 4 items" in p for p in v["problems"]), v
-        assert any("when_to_use items exceed 16" in p for p in v["problems"]), v
+        assert any("when_to_use items exceed 24" in p for p in v["problems"]), v
         assert not any("not_for" in p for p in v["problems"]), v
         good = selfcheck.normalize_consumer_meta(
             {"summary": "s", "topics": ["t"]}, locale="zh", generated_by="m")
@@ -1489,6 +1536,7 @@ def main():
     asyncio.run(test_seam_settles_when_nothing_pending())
     test_converge_phase_helper()
     test_normalize_consumer_meta()
+    test_consumer_meta_graceful_fit()
     test_validate_consumer_meta()
     test_consumer_meta_report_carry_and_narration()
     asyncio.run(test_consumer_meta_generation())
