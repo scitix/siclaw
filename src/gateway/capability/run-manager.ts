@@ -41,6 +41,8 @@ export interface CapabilityRunRecord {
   correlationId?: string;
   status: CapabilityLifecycleStatus;
   runtimeId?: string;
+  /** Frozen consumer input installed into this run's box. */
+  inputRevision?: string;
   /** Wall-clock ms of the last DATA event; drives the stale-run watchdog. */
   lastActivityMs: number;
   /**
@@ -196,6 +198,7 @@ export class CapabilityRunManager {
         orgId: row.org_id ?? "",
         correlationId: row.correlation_id || undefined,
         runtimeId: row.runtime_id || undefined,
+        inputRevision: inputRevisionFromCheckpoint(row.checkpoint),
         status,
         lastActivityMs: this.now(),
         lastHeartbeatMs: this.now(),
@@ -208,6 +211,15 @@ export class CapabilityRunManager {
       console.warn(`[capability] adopt(${runId}) failed: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
     }
+  }
+
+  /** Checkpoint the exact input before the box session is allowed to run. */
+  async setInputRevision(runId: string, inputRevision: string): Promise<void> {
+    const rec = this.runs.get(runId);
+    const revision = inputRevision.trim();
+    if (!rec || !revision || rec.inputRevision === revision) return;
+    rec.inputRevision = revision;
+    await this.persist(rec, { failFast: true });
   }
 
   /** Bump last-DATA activity so the watchdog doesn't reap an actively-used run. */
@@ -303,6 +315,7 @@ export class CapabilityRunManager {
           orgId: r.org_id ?? "",
           correlationId: r.correlation_id || undefined,
           runtimeId: r.runtime_id || undefined,
+          inputRevision: inputRevisionFromCheckpoint(r.checkpoint),
           status: r.status || "running",
           lastActivityMs: this.now(),
           lastHeartbeatMs: this.now(),
@@ -478,6 +491,7 @@ export class CapabilityRunManager {
       correlation_id: rec.correlationId ?? "",
       profile: rec.profile,
       status: rec.status,
+      ...(rec.inputRevision ? { checkpoint: { input_revision: rec.inputRevision } } : {}),
       // Reserved wire field, always "" — the runtime does not track a box session
       // id (see the note above adopt()); a future persistent-session design would
       // re-introduce the mirror + carry-through.
@@ -493,4 +507,18 @@ export class CapabilityRunManager {
       );
     }
   }
+}
+
+function inputRevisionFromCheckpoint(checkpoint: unknown): string | undefined {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const revision = (value as { input_revision?: unknown }).input_revision;
+  return typeof revision === "string" && revision.trim() ? revision.trim() : undefined;
 }

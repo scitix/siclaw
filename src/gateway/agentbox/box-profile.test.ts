@@ -22,7 +22,7 @@ describe("getBoxProfile", () => {
     expect(p.allowedTools).toBeUndefined();
   });
 
-  it("kb-compile → dedicated image + LLM env + writable /work + HOME, all tools", () => {
+  it("kb-compile → dedicated image + LLM env + writable /work + box-owned restricted tools", () => {
     process.env.SICLAW_COMPILE_BOX_IMAGE = "kbc-compile-box:test-tag";
     const p = getBoxProfile("kb-compile");
     expect(p.image).toBe("kbc-compile-box:test-tag");

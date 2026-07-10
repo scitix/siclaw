@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { driveCapabilitySession } from "./session-driver.js";
-import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACT } from "./contract.js";
+import { CAPABILITY_EVENT, CAPABILITY_PERSIST_ARTIFACTS } from "./contract.js";
 
 // Fake box client that yields a fixed sequence of box events over streamPath.
 function fakeClient(events: any[]) {
@@ -32,6 +32,23 @@ function fakeManager() {
 const emits = (fe: any) => fe.emitEvent.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_EVENT).map((c: any[]) => c[1]);
 
 describe("driveCapabilitySession — box event → capability wire mapping", () => {
+  it("requests workspace replay only when re-attaching to a live box", async () => {
+    const paths: string[] = [];
+    const client = {
+      async *streamPath(path: string) {
+        paths.push(path);
+      },
+    } as any;
+    await driveCapabilitySession({
+      client,
+      runId: "r1",
+      frontendClient: fakeFrontend(),
+      manager: fakeManager(),
+      replayWorkspace: true,
+    });
+    expect(paths).toEqual(["/events/r1?replay=1"]);
+  });
+
   it("log/summary/turn_done map to capability.event and drive manager state", async () => {
     const fe = fakeFrontend();
     const mgr = fakeManager();
@@ -58,9 +75,10 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(mgr.setStatus).toHaveBeenCalledWith("r1", "idle"); // turn ended → idle
   });
 
-  it("syncArtifacts persists each file as base64 via capability.persistArtifact", async () => {
+  it("syncArtifacts persists one atomic batch with the run input revision", async () => {
     const fe = fakeFrontend();
     const mgr = fakeManager();
+    mgr.get.mockReturnValue({ inputRevision: "manifest-1", status: "running" });
     await driveCapabilitySession({
       client: fakeClient([
         { type: "syncArtifacts", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
@@ -68,10 +86,32 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
       ]),
       runId: "r1", frontendClient: fe, manager: mgr,
     });
-    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACT, {
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
       run_id: "r1",
-      path: "candidate/a.md",
-      content: { inline_base64: Buffer.from("# A", "utf8").toString("base64") },
+      input_revision: "manifest-1",
+      artifacts: [{
+        path: "candidate/a.md",
+        content: { inline_base64: Buffer.from("# A", "utf8").toString("base64") },
+      }],
+    });
+  });
+
+  it("persists an explicit input commit even when no files changed", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ inputRevision: "manifest-1", status: "running" });
+    await driveCapabilitySession({
+      client: fakeClient([
+        { type: "syncArtifacts", artifacts: [], commit_input: true },
+        { type: "end" },
+      ]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
+      run_id: "r1",
+      input_revision: "manifest-1",
+      commit_input: true,
+      artifacts: [],
     });
   });
 
@@ -97,13 +137,15 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed");
   });
 
-  it("a persistArtifact outage never kills the relay — later events still flow", async () => {
+  it("a persistArtifacts outage retries until acknowledged before later events flow", async () => {
     const fe = fakeFrontend();
+    let attempts = 0;
     fe.request = vi.fn().mockImplementation(async (method: string) => {
-      if (method === CAPABILITY_PERSIST_ARTIFACT) throw new Error("ws blip");
+      if (method === CAPABILITY_PERSIST_ARTIFACTS && ++attempts < 3) throw new Error("ws blip");
       return { ok: true };
     });
     const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running" });
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       await driveCapabilitySession({
@@ -123,10 +165,36 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(emits(fe)).toContainEqual({ run_id: "r1", type: "turn", payload: { text: "still here" } });
     expect(mgr.setStatus).toHaveBeenCalledWith("r1", "idle");
     expect(mgr.endRun).not.toHaveBeenCalledWith("r1", "failed");
-    // It retried once before giving up on the artifact.
-    const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACT);
-    expect(artifactCalls).toHaveLength(2);
+    const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACTS);
+    expect(artifactCalls).toHaveLength(3);
+    expect(artifactCalls[0][1]).toEqual(artifactCalls[2][1]);
   }, 10_000);
+
+  it("stops retrying when the run is cancelled or reaped", async () => {
+    const fe = fakeFrontend();
+    let attempts = 0;
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) {
+        attempts += 1;
+        throw new Error("consumer unavailable");
+      }
+      return { ok: true };
+    });
+    const mgr = fakeManager();
+    mgr.get.mockImplementation(() => attempts < 2 ? { runId: "r1", status: "running" } : undefined);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(driveCapabilitySession({
+        client: fakeClient([
+          { type: "syncArtifacts", artifacts: [{ path: "candidate/a.md", content: "# A" }] },
+        ]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      })).rejects.toThrow("no longer active");
+    } finally {
+      errSpy.mockRestore();
+    }
+    expect(attempts).toBe(2);
+  });
 
   it("a malformed artifact entry is skipped loudly — the relay and later artifacts survive", async () => {
     // Live 07-09: a runtime predating the tombstone branch threw in artifact
@@ -156,9 +224,12 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     } finally {
       errSpy.mockRestore();
     }
-    const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACT);
+    const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACTS);
     expect(artifactCalls).toHaveLength(1); // the good one after the bad one still landed
-    expect(artifactCalls[0][1]).toMatchObject({ run_id: "r1", path: "authoring/SELFCHECK.json" });
+    expect(artifactCalls[0][1]).toMatchObject({
+      run_id: "r1",
+      artifacts: [{ path: "authoring/SELFCHECK.json" }],
+    });
     expect(mgr.endRun).not.toHaveBeenCalledWith("r1", "failed");
   });
 
@@ -172,10 +243,10 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
       ]),
       runId: "r1", frontendClient: fe, manager: mgr,
     });
-    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACT, {
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
       run_id: "r1",
-      path: "candidate/gone.md",
-      deleted: true,
+      input_revision: undefined,
+      artifacts: [{ path: "candidate/gone.md", deleted: true }],
     });
   });
 
@@ -232,10 +303,10 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
       ]),
       runId: "r1", frontendClient: fe, manager: mgr,
     });
-    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACT, {
+    expect(fe.request).toHaveBeenCalledWith(CAPABILITY_PERSIST_ARTIFACTS, {
       run_id: "r1",
-      path: "candidate/dup.md",
-      deleted: true,
+      input_revision: undefined,
+      artifacts: [{ path: "candidate/dup.md", deleted: true }],
     });
   });
 });

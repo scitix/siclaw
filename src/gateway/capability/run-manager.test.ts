@@ -69,6 +69,38 @@ describe("CapabilityRunManager", () => {
     expect(be.persists().at(-1)?.params).toMatchObject({ status: "idle" });
   });
 
+  it("checkpoints the installed input revision and restores it after restart", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.setInputRevision(runId, "manifest-1");
+    expect(mgr.get(runId)?.inputRevision).toBe("manifest-1");
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      checkpoint: { input_revision: "manifest-1" },
+    });
+
+    const recoveredBackend = new FakeBackend();
+    recoveredBackend.activeRuns = [{
+      id: runId,
+      profile: "kb-compile",
+      org_id: "o1",
+      status: "running",
+      checkpoint: JSON.stringify({ input_revision: "manifest-1" }),
+    }];
+    const recovered = new CapabilityRunManager(recoveredBackend);
+    await recovered.recover();
+    expect(recovered.get(runId)?.inputRevision).toBe("manifest-1");
+  });
+
+  it("fails closed when the installed input revision cannot be checkpointed", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    be.failPersist = true;
+    await expect(mgr.setInputRevision(runId, "manifest-1")).rejects.toThrow("ws down");
+  });
+
   it("endRun persists the terminal state then drops the run from the live map", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);

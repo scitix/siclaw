@@ -19,12 +19,12 @@ import type {
   CapabilityEventFrame,
   CapabilityEventPayload,
   CapabilityEventType,
-  CapabilityPersistArtifactRequest,
+  CapabilityPersistArtifactsRequest,
   CapabilityPersistTurnRequest,
 } from "./contract.js";
 import {
   CAPABILITY_EVENT,
-  CAPABILITY_PERSIST_ARTIFACT,
+  CAPABILITY_PERSIST_ARTIFACTS,
   CAPABILITY_PERSIST_TURN,
   isTerminalCapabilityStatus,
 } from "./contract.js";
@@ -37,6 +37,8 @@ interface BoxEvent {
   error?: string;
   /** `deleted` entries are tombstones — the box removed a previously-synced file. */
   artifacts?: Array<{ path: string; content?: string; deleted?: boolean }>;
+  /** Explicit full-compile commit. Replayed file presence alone is not a commit. */
+  commit_input?: boolean;
 }
 
 export interface DriveCapabilitySessionOptions {
@@ -44,6 +46,8 @@ export interface DriveCapabilitySessionOptions {
   runId: string;
   frontendClient: FrontendWsClient;
   manager: CapabilityRunManager;
+  /** Re-attaching to a live box after relay/runtime loss: request full replay. */
+  replayWorkspace?: boolean;
 }
 
 /**
@@ -63,7 +67,8 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   // must count as liveness (touchHeartbeat, the separate clock) or the watchdog
   // reaps a healthy run and kills its box. It is deliberately NOT touch(): a box
   // that ONLY heartbeats (a wedged turn) must still be reaped at dataStaleMs.
-  for await (const raw of client.streamPath(`/events/${runId}`, { onComment: () => manager.touchHeartbeat(runId) })) {
+  const eventPath = `/events/${runId}${opts.replayWorkspace ? "?replay=1" : ""}`;
+  for await (const raw of client.streamPath(eventPath, { onComment: () => manager.touchHeartbeat(runId) })) {
     const evt = raw as BoxEvent;
     // ANY box event means the box is alive → bump activity so the watchdog never
     // reaps an actively-working run (e.g. a long compile emitting only `log`).
@@ -92,49 +97,52 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         await manager.setStatus(runId, "idle");
         break;
       case "syncArtifacts":
-        // Knowledge content the box produced → the consumer's store, one artifact
-        // at a time. Content is inline base64 (opaque to the transport). A failed
-        // persist must not fail the run (a transient WS blip would kill a healthy
-        // compile), but it IS real potential loss — the box's sync dedups by
-        // content hash, so this exact version is only re-sent if the file changes
-        // again. Hence one retry, then a loud log.
-        for (const a of evt.artifacts ?? []) {
-          let artifact: CapabilityPersistArtifactRequest;
-          try {
-            artifact = a.deleted
-              ? // Tombstone: the box deleted this file (page merge/rename/restructure).
-                // Without propagating it, the consumer's row outlives the file —
-                // publish ships the deleted page and the next respawn's workspace
-                // rehydration resurrects it onto the box's disk.
-                { run_id: runId, path: a.path, deleted: true }
+        // One box sync event is one consumer transaction. Keep retrying the
+        // SAME batch until acknowledged; consuming later turn_done/done frames
+        // before its workspace is durable would expose a torn draft.
+        {
+          const artifacts = (evt.artifacts ?? []).flatMap((a) => {
+            if (!a || typeof a.path !== "string" || !a.path) {
+              console.error(`[capability] run=${runId} malformed artifact entry skipped`);
+              return [];
+            }
+            if (!a.deleted && a.content !== undefined && typeof a.content !== "string") {
+              console.error(`[capability] run=${runId} malformed artifact entry (${a.path}) skipped`);
+              return [];
+            }
+            return [a.deleted
+              ? { path: a.path, deleted: true }
               : {
-                  run_id: runId,
                   path: a.path,
                   content: { inline_base64: Buffer.from(a.content ?? "", "utf8").toString("base64") },
-                };
-          } catch (err) {
-            // One malformed entry must not kill the relay: everything after it —
-            // later artifacts, the final SELFCHECK sync, settled, end — would be
-            // lost and the run stranded mid-state (seen live 07-09: a runtime
-            // predating the tombstone branch threw here on {deleted:true} and
-            // every incremental round wedged DIRTY with a leaked box).
-            console.error(
-              `[capability] run=${runId} malformed artifact entry (${String(a?.path ?? "?")}) skipped:`,
-              err instanceof Error ? err.message : String(err),
-            );
-            continue;
-          }
-          try {
-            await frontendClient.request(CAPABILITY_PERSIST_ARTIFACT, artifact);
-          } catch {
+                }];
+          });
+          if (artifacts.length === 0 && !evt.commit_input) break;
+          const request: CapabilityPersistArtifactsRequest = {
+            run_id: runId,
+            input_revision: manager.get(runId)?.inputRevision,
+            ...(evt.commit_input ? { commit_input: true } : {}),
+            artifacts,
+          };
+          let delayMs = 250;
+          for (;;) {
             try {
-              await new Promise((r) => setTimeout(r, 1000));
-              await frontendClient.request(CAPABILITY_PERSIST_ARTIFACT, artifact);
+              await frontendClient.request(CAPABILITY_PERSIST_ARTIFACTS, request);
+              break;
             } catch (err) {
+              const rec = manager.get(runId);
+              if (!rec || isTerminalCapabilityStatus(rec.status)) {
+                throw new Error(
+                  `persistArtifacts retry aborted because run ${runId} is no longer active: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
               console.error(
-                `[capability] run=${runId} persistArtifact(${a.path}) DROPPED after retry (box only re-sends on content change):`,
+                `[capability] run=${runId} persistArtifacts failed; retrying in ${delayMs}ms:`,
                 err instanceof Error ? err.message : String(err),
               );
+              manager.touchHeartbeat(runId);
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+              delayMs = Math.min(delayMs * 2, 5000);
             }
           }
         }

@@ -264,6 +264,12 @@ class CompileRun:
         self._stall_interrupted_at = 0.0
         self._batch_active = False
         self._batch_notes: list[str] = []
+        # Full compile provenance is an explicit commit, never inferred from a
+        # replayed or rehydrated candidate/index.md.
+        self._full_compile_pending = False
+        # Keep the last full-compile commit replayable across relay restarts.
+        # The consumer dedupes it by immutable input revision.
+        self._commit_input_replay = False
         # Scoped incremental (真增量): armed at kickoff with {before: page_hashes,
         # changeset}; the post-turn seam runs the byte-integrity guard against it,
         # then clears it. None = this turn is not a scoped incremental.
@@ -357,6 +363,7 @@ MAX_SYNC_FILE_BYTES = int(os.environ.get("KBC_MAX_SYNC_FILE_BYTES", str(1024 * 1
 # result (a Read of a big source file) kills the whole session with a fatal
 # "exceeded maximum buffer size" — seen live on a 139-source compile (2026-07-06).
 SDK_MAX_BUFFER_BYTES = int(os.environ.get("KBC_SDK_MAX_BUFFER_BYTES", str(16 * 1024 * 1024)))
+_SYNC_TOMBSTONE = "__deleted__"
 
 
 def _collect_workspace_artifacts(workdir: str) -> list[dict]:
@@ -382,19 +389,31 @@ def _collect_workspace_artifacts(workdir: str) -> list[dict]:
     return out
 
 
-async def _sync_workspace(run: CompileRun, sent: dict) -> int:
+def _workspace_sync_cursor(workdir: str) -> dict[str, str]:
+    """Hash the workspace state already installed by the consumer."""
+    return {
+        art["path"]: hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
+        for art in _collect_workspace_artifacts(workdir)
+    }
+
+
+async def _sync_workspace(run: CompileRun, sent: dict, *, commit_input: bool = False) -> int:
     """Emit a syncArtifacts event for workspace files changed since `sent`
     (path → content sha), plus TOMBSTONES ({path, deleted: true}) for
-    previously-synced files that no longer exist on disk. Updates `sent`;
+    previously-synced files that no longer exist on disk. Updates `sent` after
+    enqueue and retains tombstone markers for reconnect replay;
     returns the number of changed entries."""
+    if commit_input and not (Path(run.workdir) / "candidate" / "index.md").is_file():
+        raise FileNotFoundError("cannot commit compile input without candidate/index.md")
     changed = []
+    next_sent = dict(sent)
     collected = set()
     for art in _collect_workspace_artifacts(run.workdir):
         collected.add(art["path"])
         sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
         if sent.get(art["path"]) == sha:
             continue
-        sent[art["path"]] = sha
+        next_sent[art["path"]] = sha
         changed.append(art)
     # Tombstones: a previously-synced file the agent deleted (page merge, rename,
     # restructure) must be deleted from the consumer's store too — otherwise the
@@ -408,11 +427,37 @@ async def _sync_workspace(run: CompileRun, sent: dict) -> int:
     for path in [p for p in sent if p not in collected]:
         if (wd / path).is_file():
             continue  # still on disk, just not collectable — keep the row
-        del sent[path]
-        changed.append({"path": path, "deleted": True})
-    if changed:
-        await run.emit({"type": "syncArtifacts", "artifacts": changed})
+        if sent.get(path) != _SYNC_TOMBSTONE:
+            next_sent[path] = _SYNC_TOMBSTONE
+            changed.append({"path": path, "deleted": True})
+    if changed or commit_input:
+        event = {"type": "syncArtifacts", "artifacts": changed}
+        if commit_input:
+            event["commit_input"] = True
+        await run.emit(event)
+        # Advance the dedup cursor only after the event is queued. Tombstone
+        # markers are retained so an SSE re-attach can replay deletions too.
+        if changed:
+            sent.clear()
+            sent.update(next_sent)
+        if commit_input:
+            run._commit_input_replay = True
     return len(changed)
+
+
+def _workspace_replay_artifacts(run: CompileRun, sent: dict) -> list[dict]:
+    """Authoritative workspace replay for a newly attached SSE relay.
+
+    A runtime can crash after dequeuing syncArtifacts but before the consumer
+    acknowledges it. Re-send every current file and every remembered tombstone
+    on attach; consumer upserts/deletes are idempotent.
+    """
+    artifacts = _collect_workspace_artifacts(run.workdir)
+    current = {item["path"] for item in artifacts}
+    for path, value in sorted(sent.items()):
+        if value == _SYNC_TOMBSTONE and path not in current:
+            artifacts.append({"path": path, "deleted": True})
+    return artifacts
 
 
 async def _sync_loop(run: CompileRun, sent: dict):
@@ -1594,10 +1639,18 @@ async def _emit_message(run: CompileRun, msg) -> None:
         # alone can land seconds later and lose that race.
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
-            try:
-                await _sync_workspace(run, sent)
-            except Exception:
-                pass  # periodic loop retries; a sync hiccup must not kill the turn
+            if getattr(run, "_full_compile_pending", False) and repair_msg is None:
+                # Provenance commit is ordered in the same atomic consumer batch
+                # as the final content. Unlike ordinary sync, it fails closed:
+                # announcing turn_done before this is durable would lie about the
+                # input the draft was compiled from.
+                await _sync_workspace(run, sent, commit_input=True)
+                run._full_compile_pending = False
+            else:
+                try:
+                    await _sync_workspace(run, sent)
+                except Exception:
+                    pass  # periodic loop retries; a sync hiccup must not kill the turn
         await run.emit({"type": "turn_done", "text": reply})
         # Bounded auto-repair AFTER turn_done (async-post-check design, §4.3-c):
         # the turn ends normally; the repair is an ordinary next turn. When no
@@ -1614,6 +1667,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 # would judge the next unrelated turn against this round's
                 # snapshot and restore over the owner's edits (review finding).
                 run._incr_pending = None
+                run._full_compile_pending = False
                 msg = (f"Self-check repair injection failed: {e!r}"
                        if selfcheck._is_en(getattr(run, "locale", None))
                        else f"自检回修注入失败: {e!r}")
@@ -1634,7 +1688,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
 # declares no allowed_tools (profile.allowedTools = null → box default). A profile
 # that DOES declare a list (e.g. kb-test) overrides this.
 DEFAULT_COMPILE_ALLOWED_TOOLS = [
-    "Read", "Write", "Edit", "Glob", "Grep", "Bash",
+    "Read", "Write", "Edit", "Glob", "Grep",
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
     "mcp__compile__resolve_ticket",
@@ -1663,6 +1717,7 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=session_id,
         session_store=InMemorySessionStore(),
+        hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(Path(wd), run.locale)])]},
         # Stream partial deltas so the stall watchdog sees fine-grained model
         # liveness: a live-but-slow generation keeps emitting StreamEvents (idle
         # clock stays fresh), while a black-holed request emits nothing at all.
@@ -1744,8 +1799,13 @@ async def _start_incremental(run: "CompileRun", text: str) -> None:
         # so clear any stale CHANGESET here too (review): the turn is NOT
         # incremental and the model must not self-restrict to an old scope.
         (Path(run.workdir) / incremental.CHANGESET_PATH).unlink(missing_ok=True)
+        run._full_compile_pending = True
         run._begin_turn(text)
-        await run.client.query(text)
+        try:
+            await run.client.query(text)
+        except BaseException:
+            run._full_compile_pending = False
+            raise
         return
     # ADDED_TARGETS is a PER-ROUND declaration (pages the model merges added
     # sources into). Nothing box-side cleared it, so declarations from earlier
@@ -2190,10 +2250,9 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             await _run_ledger_repairs(run, replies)  # the digest may have touched pages
         sent = getattr(run, "_sync_sent", None)
         if sent is not None:
-            try:
-                await _sync_workspace(run, sent)
-            except Exception:
-                pass
+            # Successful batch completion is one full-compile provenance commit.
+            # Content and input revision must land atomically before turn_done.
+            await _sync_workspace(run, sent, commit_input=True)
         await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
                         or _loc(run, "Batch compile complete.", "分批编译完成。")})
     except Exception as e:
@@ -2404,7 +2463,10 @@ async def _run_wrapper(run: CompileRun):
     eventually mislabeled by the idle watchdog. Cancellation (CancelledError)
     bypasses both the except and the `clean` flag, so a cancelled run still
     closes with just `end`."""
-    sent: dict = {}
+    # The consumer just rehydrated these files into a fresh box. Prime the diff
+    # cursor from that installed state so the first periodic tick cannot echo an
+    # unchanged candidate/index.md and impersonate a completed compile.
+    sent: dict = _workspace_sync_cursor(run.workdir)
     clean = False
     run._sync_sent = sent  # shared with _emit_message's pre-turn_done sync
     syncer = asyncio.create_task(_sync_loop(run, sent))
@@ -2481,14 +2543,19 @@ def _test_path_escape(root: Path, tool_name: str, tool_input: dict) -> str | Non
             target.resolve().relative_to(root)
         except ValueError:
             return f"{key}={v}"
-    # Glob's pattern is itself a path expression; an absolute pattern escapes even
-    # with `path` unset. (Grep's pattern is regex CONTENT — not a path; skip it.)
+    # Glob's pattern is itself a path expression even with `path` unset. Reject
+    # lexical parent traversal for relative patterns and resolve absolute bases.
+    # (Grep's pattern is regex CONTENT — not a path; skip it.)
     if tool_name == "Glob":
         pattern = tool_input.get("pattern")
-        if isinstance(pattern, str) and pattern.startswith("/"):
-            base = pattern.split("*", 1)[0]
+        if isinstance(pattern, str) and pattern.strip():
+            if ".." in PurePosixPath(pattern).parts:
+                return f"pattern={pattern}"
+            wildcard_positions = [pattern.find(ch) for ch in ("*", "?", "[") if ch in pattern]
+            base = pattern[:min(wildcard_positions)] if wildcard_positions else pattern
+            target = Path(base) if pattern.startswith("/") else root / base
             try:
-                Path(base).resolve().relative_to(root)
+                target.resolve().relative_to(root)
             except ValueError:
                 return f"pattern={pattern}"
     return None
@@ -2502,6 +2569,29 @@ def _make_test_path_guard(root: Path, locale: str | None = None):
 
     async def guard(input_data, tool_use_id, context):
         offender = _test_path_escape(root, str(input_data.get("tool_name", "")), input_data.get("tool_input") or {})
+        if offender:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": deny_template.format(root=root, offender=offender),
+                }
+            }
+        return {}
+
+    return guard
+
+
+def _make_compile_path_guard(root: Path, locale: str | None = None):
+    """Constrain compiler file tools to /work and deny Bash even if a future
+    runtime profile accidentally adds it back to allowed_tools."""
+    deny_template = _prompt("guard_deny", locale).strip()
+
+    async def guard(input_data, tool_use_id, context):
+        tool_name = str(input_data.get("tool_name", ""))
+        offender = "tool=Bash" if tool_name == "Bash" else _test_path_escape(
+            root, tool_name, input_data.get("tool_input") or {}
+        )
         if offender:
             return {
                 "hookSpecificOutput": {
@@ -2765,8 +2855,16 @@ async def handle_message(request: web.Request):
                 "Noted — it will be passed along to the remaining batches.",
                 "已收到,会带给后续批次一并考虑。")})
         return web.json_response({"ok": True, "queued": True})
+    full_compile = _is_compile_trigger(text)
+    if full_compile:
+        run._full_compile_pending = True
     run._begin_turn(text)  # arm the stall watchdog — every model turn, incl. the owner's
-    await run.client.query(text)
+    try:
+        await run.client.query(text)
+    except BaseException:
+        if full_compile:
+            run._full_compile_pending = False
+        raise
     return web.json_response({"ok": True})
 
 
@@ -2782,6 +2880,18 @@ async def handle_events(request: web.Request):
     await resp.prepare(request)
     run._relays = getattr(run, "_relays", 0) + 1
     try:
+        # Replay BEFORE consuming the queue. This closes the crash window where
+        # a previous runtime dequeued a sync event but died before persisting it;
+        # it also works when the run already queued its terminal `end` frame.
+        wants_replay = request.query.get("replay") == "1"
+        replay = (_workspace_replay_artifacts(run, getattr(run, "_sync_sent", {}))
+                  if wants_replay else [])
+        replay_commit = wants_replay and getattr(run, "_commit_input_replay", False)
+        if replay or replay_commit:
+            ev = {"type": "syncArtifacts", "artifacts": replay}
+            if replay_commit:
+                ev["commit_input"] = True
+            await resp.write(("data: " + json.dumps(ev, ensure_ascii=False) + "\n\n").encode())
         while True:
             try:
                 ev = await asyncio.wait_for(run.events.get(), timeout=25)

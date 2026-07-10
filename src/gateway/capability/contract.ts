@@ -46,6 +46,7 @@ export const CAPABILITY_TEST_CLOSE = "capability.testClose" as const;
 /** siclaw → consumer: live stream + content sink + input fetch. */
 export const CAPABILITY_EVENT = "capability.event" as const;
 export const CAPABILITY_PERSIST_ARTIFACT = "capability.persistArtifact" as const;
+export const CAPABILITY_PERSIST_ARTIFACTS = "capability.persistArtifacts" as const;
 export const CAPABILITY_FETCH_INPUT = "capability.fetchInput" as const;
 
 /**
@@ -193,7 +194,7 @@ export interface CapabilityRunState {
   correlation_id: string;
   profile: string;
   status: CapabilityLifecycleStatus;
-  /** Opaque resume blob (JSON-serializable). Reserved — no writer yet. */
+  /** Opaque resume blob; KB runs currently checkpoint their installed input revision here. */
   checkpoint?: unknown;
   /**
    * Box session id, reserved for a future where the box persists its session and
@@ -254,12 +255,23 @@ export interface CapabilityPersistTurnRequest {
  */
 export interface CapabilityPersistArtifactRequest {
   run_id: string;
+  /** Immutable input revision materialized into this run. */
+  input_revision?: string;
   /** Logical path within the capability workspace, e.g. "candidate/00-intro.md". */
   path: string;
   /** Present on add/update; absent when `deleted` is set. */
   content?: CapabilityContentRef;
   /** Tombstone: delete the row for `path` from the consumer's store. */
   deleted?: boolean;
+}
+
+/** Atomic content batch. One box sync event is committed all-or-nothing. */
+export interface CapabilityPersistArtifactsRequest {
+  run_id: string;
+  input_revision?: string;
+  /** Explicit full-compile commit; replay/content presence alone never advances provenance. */
+  commit_input?: boolean;
+  artifacts: Array<Omit<CapabilityPersistArtifactRequest, "run_id" | "input_revision">>;
 }
 
 export interface CapabilityContentRef {
@@ -283,11 +295,15 @@ export interface CapabilityFetchInputRequest {
   run_id: string;
   /** Input kind: "" = frozen raw sources; CAPABILITY_INPUT_WORKSPACE_REF = durable workspace. */
   ref?: string;
+  /** Recovery pin: return this exact immutable source manifest instead of freezing current raw. */
+  input_revision?: string;
 }
 
 export interface CapabilityFetchInputResponse {
   bundle_base64?: string;
   bundle_sha256?: string;
+  /** Immutable consumer input revision represented by the source bundle. */
+  input_revision?: string;
   /**
    * Consumer-declared prompt/output locale for the run's box (e.g. "zh").
    * Locale is DOMAIN config — the tenant/KB's language — so it rides this
