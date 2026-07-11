@@ -62,8 +62,8 @@ docker run --rm -p 3000:3000 \
 
 ## Auth / mTLS
 
-- **LLM**: locally reuses the `~/.claude` subscription (no key needed); container/production must use `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL`→massapi (credentials do not enter the sandbox).
-- **Transport**: if `tls.crt/tls.key/ca.crt` exist under `SICLAW_CERT_PATH` (default `/etc/siclaw/certs`) → serve HTTPS and require a client certificate (runtime/gateway); otherwise HTTP (local). Reuses agentbox's per-box mTLS shell.
+- **LLM**: locally reuses the `~/.claude` subscription (no key needed). In production the consumer sends the selected `base_url` and auth token in the authenticated `/session` body after input materialization; the Runtime token is not copied into the pod spec.
+- **Transport**: if `tls.crt/tls.key/ca.crt` exist under `SICLAW_CERT_PATH` (default `/etc/siclaw/certs`), the box serves HTTPS. `/health` remains certificate-optional for the in-container Kubernetes probe; every data/session/event route requires a verified client certificate whose OU is `Runtime` or `Gateway`. Partial TLS material fails startup. Without TLS material the server uses HTTP for explicit local development only.
 
 ## Layer-1 self-check: coverage ledger + lint (`selfcheck.py`)
 

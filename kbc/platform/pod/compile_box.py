@@ -56,6 +56,10 @@ import batching
 import incremental
 import mediaverify
 import office_ingest
+from mtls_auth import (
+    client_certificate_error as _client_certificate_error,
+    server_ssl_context,
+)
 import redblue
 import selfcheck
 from engine import ClaudeEngine
@@ -3070,8 +3074,19 @@ async def _flush_on_shutdown(_app) -> None:
             pass
 
 
+@web.middleware
+async def _client_certificate_middleware(request: web.Request, handler):
+    error = _client_certificate_error(request)
+    if error is not None:
+        return web.json_response({"error": error}, status=403)
+    return await handler(request)
+
+
 def build_app() -> web.Application:
-    app = web.Application(client_max_size=_http_max_request_bytes())
+    app = web.Application(
+        client_max_size=_http_max_request_bytes(),
+        middlewares=[_client_certificate_middleware],
+    )
     app.on_shutdown.append(_flush_on_shutdown)
     app.add_routes([
         web.post("/sources", handle_sources),
@@ -3090,25 +3105,9 @@ def build_app() -> web.Application:
 
 
 def _ssl_context():
-    """Production mTLS: with certs, HTTPS + required client cert (only the
-    runtime/gateway can drive the box). No certs locally → plain HTTP."""
+    """Production mTLS, or intentional plain HTTP when no certs exist locally."""
     cert_dir = Path(os.environ.get("SICLAW_CERT_PATH", "/etc/siclaw/certs"))
-    crt, key, ca = cert_dir / "tls.crt", cert_dir / "tls.key", cert_dir / "ca.crt"
-    if not (crt.exists() and key.exists()):
-        return None
-    import ssl
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(str(crt), str(key))
-    if ca.exists():
-        ctx.load_verify_locations(str(ca))
-        # CERT_OPTIONAL, not CERT_REQUIRED: the k8s readiness/liveness probes hit
-        # /health over HTTPS WITHOUT a client cert; requiring one fails the TLS
-        # handshake so the probes never pass and kubelet kills the box. The box is
-        # only addressed by the runtime in-cluster, so requesting-but-not-requiring
-        # the client cert is acceptable for v1. (Production: exempt /health + check
-        # the cert per-route, like agentbox does.)
-        ctx.verify_mode = ssl.CERT_OPTIONAL
-    return ctx
+    return server_ssl_context(cert_dir)
 
 
 def main():

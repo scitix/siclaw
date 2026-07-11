@@ -1,0 +1,38 @@
+{{- $agentbox := .Values.agentbox | default dict -}}
+{{- $networkPolicy := $agentbox.networkPolicy | default dict -}}
+{{- if and (eq (include "siclaw.runtime.enabled" .) "true") $networkPolicy.enabled }}
+{{- $extraIngressFrom := $networkPolicy.ingressFrom | default list -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "siclaw.fullname" . }}-kb-box
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "kb-box") | nindent 4 }}
+spec:
+  # These labels are stamped by K8sSpawner on its runtime-created Pods. Keep
+  # this selector aligned with K8sSpawner's default labelPrefix (siclaw.io).
+  podSelector:
+    matchExpressions:
+      - key: siclaw.io/boxType
+        operator: In
+        values:
+          - kb-compile
+          - kb-test
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Runtime owns capability sessions and is the normal caller. Restrict
+        # by release-scoped pod labels; mTLS in compile_box verifies the caller
+        # certificate again before every non-health route.
+        - podSelector:
+            matchLabels:
+              {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 14 }}
+        {{- with $extraIngressFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 3000
+{{- end }}

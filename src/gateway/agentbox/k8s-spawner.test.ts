@@ -286,6 +286,26 @@ describe("K8sSpawner — spawn branches", () => {
     }
   });
 
+  it("uses in-container exec probes for KB boxes so NetworkPolicy need not admit kubelet traffic", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.23", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "kb-probe", profile: "kb-compile" });
+    const container = calls.createNamespacedPod[0].body.spec.containers[0];
+    expect(container.readinessProbe.httpGet).toBeUndefined();
+    expect(container.livenessProbe.httpGet).toBeUndefined();
+    expect(container.readinessProbe.exec.command.join(" ")).toContain("/health");
+    expect(container.livenessProbe.exec.command).toEqual(container.readinessProbe.exec.command);
+  });
+
   it("refuses to forward secret-shaped names through the prefix glob (ops knobs only)", async () => {
     process.env.KBC_PK_MODE = "off";                       // knob → forwarded
     process.env.KBC_MASSAPI_TOKEN = "sk-parked";           // secret-shaped → refused

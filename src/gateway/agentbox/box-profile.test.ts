@@ -29,6 +29,8 @@ describe("getBoxProfile", () => {
     expect(p.home).toBe("/work");
     expect(p.volumes).toEqual([{ name: "work", mountPath: "/work", sizeLimit: "4Gi" }]);
     expect(p.envForward).toContain("ANTHROPIC_BASE_URL");
+    expect(p.envForward).not.toContain("ANTHROPIC_API_KEY");
+    expect(p.envForward).not.toContain("ANTHROPIC_AUTH_TOKEN");
     expect(p.allowedTools).toBeNull();
   });
 

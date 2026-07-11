@@ -506,16 +506,38 @@ export class K8sSpawner implements BoxSpawner {
                 },
               };
             })(),
-            readinessProbe: {
-              httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
-              initialDelaySeconds: 2,
-              periodSeconds: 2,
-            },
-            livenessProbe: {
-              httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
-              initialDelaySeconds: 10,
-              periodSeconds: 10,
-            },
+            // NetworkPolicy for capability boxes admits only Runtime ingress.
+            // Kubelet HTTP probes originate outside that podSelector on several
+            // CNIs, so use an in-container HTTPS check for KB profiles. The
+            // endpoint is deliberately the sole route that needs no client cert.
+            readinessProbe: profile.name === "kb-compile" || profile.name === "kb-test"
+              ? {
+                  exec: { command: [
+                    "python", "-c",
+                    "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:3000/health', context=ssl._create_unverified_context(), timeout=2).read()",
+                  ] },
+                  initialDelaySeconds: 2,
+                  periodSeconds: 2,
+                }
+              : {
+                  httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
+                  initialDelaySeconds: 2,
+                  periodSeconds: 2,
+                },
+            livenessProbe: profile.name === "kb-compile" || profile.name === "kb-test"
+              ? {
+                  exec: { command: [
+                    "python", "-c",
+                    "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:3000/health', context=ssl._create_unverified_context(), timeout=2).read()",
+                  ] },
+                  initialDelaySeconds: 10,
+                  periodSeconds: 10,
+                }
+              : {
+                  httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
+                  initialDelaySeconds: 10,
+                  periodSeconds: 10,
+                },
           },
         ],
       },

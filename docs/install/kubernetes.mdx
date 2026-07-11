@@ -108,6 +108,14 @@ On first launch, open the Portal UI and register the first user — that account
 
 Runtime and Portal both expose Prometheus metrics at `/metrics`. The chart can create ServiceMonitor, PodMonitor, Grafana dashboard, and PrometheusRule resources under the `metrics.*` values block.
 
+The Runtime endpoint also exposes bounded KB capability lifecycle series such as
+`siclaw_gateway_capability_starts_total`,
+`siclaw_gateway_capability_start_duration_ms`,
+`siclaw_gateway_capability_active_runs`,
+`siclaw_gateway_capability_materialization_failures_total`, and
+`siclaw_gateway_capability_relay_failures_total`. They intentionally carry no
+run, repository, user, or operation identifiers; use logs/traces for drill-down.
+
 Common settings:
 
 ```yaml
@@ -144,4 +152,10 @@ runtime:
 - Kubernetes mode requires MySQL. SQLite is only for single-process local use.
 - AgentBox pods are created on demand by the Runtime.
 - Runtime ↔ AgentBox traffic is secured with mTLS automatically.
+- KB compile/test boxes additionally receive a default-on ingress NetworkPolicy;
+  the chart's Runtime pod is the only default caller on port 3000. Extend
+  `agentbox.networkPolicy.ingressFrom` only for an intentional extra caller.
+- A Runtime rolling restart preserves K8s AgentBox pods so the replacement can
+  re-adopt live capability runs. Cluster-wide box deletion remains an explicit
+  cleanup operation, not a process-shutdown side effect.
 - If you deploy monitoring resources from the chart, do not also apply duplicate monitor manifests manually.

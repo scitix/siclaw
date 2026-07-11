@@ -38,6 +38,7 @@ export class AgentBoxManager {
   private config: Required<AgentBoxManagerConfig>;
   private boxes = new Map<string, ManagedBox>();
   private healthCheckTimer?: ReturnType<typeof setInterval>;
+  private orphanSweepInitialTimer?: ReturnType<typeof setTimeout>;
   private orphanSweepTimer?: ReturnType<typeof setInterval>;
   private readonly isK8s: boolean;
   private spawnEnvResolver?: (agentId: string) => Promise<Record<string, string> | undefined>;
@@ -72,7 +73,8 @@ export class AgentBoxManager {
         console.warn("[agentbox-manager] orphan sweep failed:", err?.message ?? err));
     // unref'd + stored (review finding): the sweep must never pin the event
     // loop or outlive cleanup() — same discipline as the run watchdog.
-    (setTimeout(tick, 60_000) as any).unref?.();
+    this.orphanSweepInitialTimer = setTimeout(tick, 60_000);
+    (this.orphanSweepInitialTimer as any).unref?.();
     this.orphanSweepTimer = setInterval(tick, intervalMs);
     (this.orphanSweepTimer as any).unref?.();
   }
@@ -321,18 +323,41 @@ export class AgentBoxManager {
   }
 
   async cleanup(): Promise<void> {
-    this.stopHealthCheck();
-    // The orphan-sweep interval dies with the manager (review: the clear had
-    // landed in setSpawnEnvResolver, which both left it running post-cleanup
-    // and silently disabled GC if a resolver was ever re-set after boot).
-    if (this.orphanSweepTimer) {
-      clearInterval(this.orphanSweepTimer);
-      this.orphanSweepTimer = undefined;
-    }
+    this.stopBackgroundLoops();
     for (const [, managed] of this.boxes) {
       await this.spawner.stop(managed.handle.boxId);
     }
     this.boxes.clear();
     await this.spawner.cleanup();
+  }
+
+  /**
+   * Process shutdown is not cluster teardown. In K8s mode boxes and their
+   * durable run rows outlive a Runtime pod and are adopted by the replacement;
+   * deleting every labelled pod here destroys that hand-off window. Local and
+   * child-process spawners still own their children, so they use full cleanup.
+   */
+  async shutdown(): Promise<void> {
+    if (!this.isK8s) {
+      await this.cleanup();
+      return;
+    }
+    this.stopBackgroundLoops();
+    this.boxes.clear();
+  }
+
+  private stopBackgroundLoops(): void {
+    this.stopHealthCheck();
+    // The orphan-sweep interval dies with the manager (review: the clear had
+    // landed in setSpawnEnvResolver, which both left it running post-cleanup
+    // and silently disabled GC if a resolver was ever re-set after boot).
+    if (this.orphanSweepInitialTimer) {
+      clearTimeout(this.orphanSweepInitialTimer);
+      this.orphanSweepInitialTimer = undefined;
+    }
+    if (this.orphanSweepTimer) {
+      clearInterval(this.orphanSweepTimer);
+      this.orphanSweepTimer = undefined;
+    }
   }
 }
