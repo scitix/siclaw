@@ -15,7 +15,7 @@ structured signals:
 Surface (driven by the runtime):
   POST /sources            {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install the frozen raw bundle → workdir/raw
   POST /authoring          {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install authoring/candidate/eval/release assets → workdir/
-  POST /session/{run_id}   {workdir?, instruction?, allowed_tools?, locale?} start the run's persistent conversational session (waits for the first /message); idempotent
+  POST /session/{run_id}   {workdir?, instruction?, allowed_tools?, locale?, llm?, settings?} start the run's persistent conversational session (waits for the first /message); idempotent
   POST /message/{run_id}   {message} inject one user turn into the persistent session (prepare/compile/patch are all ordinary turns)
   GET  /events/{run_id}    structured SSE stream (session/log/summary/turn_done/syncArtifacts/plan_proposed/error/end)
   POST /test-session/{run_id}  start a test session: pin the current draft as an immutable snapshot + a read-only consumer session (reuses this pod)
@@ -23,7 +23,8 @@ Surface (driven by the runtime):
   GET  /health
 
 LLM auth: local runs reuse the subscription (the SDK ships the claude binary);
-production pods set ANTHROPIC_BASE_URL → massapi (keys injected outside the container).
+production config arrives as one authoritative /session llm block (consumer, or
+Runtime Helm fallback when absent), keeping credentials out of the KB PodSpec.
 mTLS: with SICLAW_CERT_PATH certs present the box serves HTTPS and requires a
 client cert (runtime/gateway); otherwise plain HTTP (local).
 """
@@ -1716,7 +1717,9 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         # Pin the compile model explicitly: the box talks to massapi (Bedrock),
         # which serves specific ids — the SDK default may not be one, and the KB
         # compile default is opus by product decision. Overridable per-deploy.
-        model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
+        model=(os.environ.get("KBC_COMPILE_MODEL")
+               or os.environ.get("ANTHROPIC_MODEL")
+               or "claude-opus-4-6"),
         max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=session_id,
@@ -2672,9 +2675,10 @@ async def _teardown_test_session(run: "TestRun"):
 # The consumer owns the credential store and the KB capability policy; both arrive on
 # the /session body and apply IN-PROCESS (the box spawns before fetchInput runs,
 # so pod env is too early — and this keeps the token out of the pod spec).
-# Precedence: consumer config > runtime-env forward (helm fallback) > image
-# defaults. ONE exception: KBC_PK_MODE=off set at the runtime level is the ops
-# KILL SWITCH and must win over consumer config.
+# LLM authority is whole-block: consumer object, else Runtime's Helm fallback;
+# omitted fields in a present object never inherit another authority's token.
+# ONE settings exception: KBC_PK_MODE=off set at the runtime level is the ops
+# KILL SWITCH and must win over consumer settings.
 _PK_KILL_AT_BOOT = os.environ.get("KBC_PK_MODE") == "off"
 
 
@@ -2688,12 +2692,29 @@ def _apply_session_config(body: dict) -> None:
     per-run (SDK client env) instead of mutating the process environment."""
     llm = body.get("llm")
     if isinstance(llm, dict):
-        if llm.get("base_url"):
-            os.environ["ANTHROPIC_BASE_URL"] = str(llm["base_url"])
-        if llm.get("auth_token"):
-            os.environ["ANTHROPIC_AUTH_TOKEN"] = str(llm["auth_token"])
-            # The SDK accepts either; clear a stale forwarded API key so the
-            # consumer credential unambiguously wins.
+        # The LLM object is one authority block, not field-level overrides. If
+        # the consumer supplied it, omitted fields must not inherit a Runtime or
+        # image credential that belongs to another endpoint.
+        for field, env_name in (
+            ("base_url", "ANTHROPIC_BASE_URL"),
+            ("model", "ANTHROPIC_MODEL"),
+        ):
+            value = llm.get(field)
+            if value:
+                os.environ[env_name] = str(value)
+            else:
+                os.environ.pop(env_name, None)
+
+        auth_token = llm.get("auth_token")
+        api_key = llm.get("api_key")
+        if auth_token:
+            os.environ["ANTHROPIC_AUTH_TOKEN"] = str(auth_token)
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        elif api_key:
+            os.environ["ANTHROPIC_API_KEY"] = str(api_key)
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+        else:
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
             os.environ.pop("ANTHROPIC_API_KEY", None)
     settings = body.get("settings")
     if isinstance(settings, dict):
@@ -2710,7 +2731,10 @@ async def handle_session(request: web.Request):
     """Start (or no-op attach to) the run's persistent CONVERSATIONAL session —
     it connects and waits for the first /message (prepare chat; a compile is just
     a later turn). Idempotent: a second call for a live run is a no-op, so the
-    runtime can safely ensure-then-message."""
+    runtime can safely ensure-then-message. A live attach deliberately does not
+    hot-apply a new LLM block: its already-connected SDK child captured the
+    original environment. Rotate with the documented grace window + box respawn
+    until an idle-boundary client reconnect protocol exists."""
     run_id = request.match_info["run_id"]
     if run_id in RUNS:
         return web.json_response({"ok": True, "run_id": run_id, "already_live": True})

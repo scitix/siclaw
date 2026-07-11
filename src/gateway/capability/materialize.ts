@@ -22,7 +22,11 @@
  */
 
 import { CAPABILITY_FETCH_INPUT, CAPABILITY_INPUT_WORKSPACE_REF } from "./contract.js";
-import type { CapabilityFetchInputRequest, CapabilityFetchInputResponse } from "./contract.js";
+import type {
+  CapabilityFetchInputRequest,
+  CapabilityFetchInputResponse,
+  CapabilityLlmConfig,
+} from "./contract.js";
 
 /** Just the surfaces this needs (so tests can pass fakes). */
 export interface MaterializeBoxClient {
@@ -39,8 +43,8 @@ export interface MaterializeResult {
   reattached?: boolean;
   /** Consumer-declared locale for the run's box (fetchInput), if any. */
   locale?: string;
-  /** Consumer-managed LLM endpoint for the box (opaque passthrough; never logged). */
-  llm?: { base_url?: string; auth_token?: string };
+  /** Consumer-managed LLM block for the box (opaque whole-block passthrough; never logged). */
+  llm?: CapabilityLlmConfig;
   /** Consumer-managed KBC_* behavior knobs for the box (opaque passthrough). */
   settings?: Record<string, string>;
 }

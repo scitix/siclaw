@@ -10,7 +10,7 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
 - **`compile_box.py` (served, production form)** — an aiohttp service, driven by the runtime over the **box's own HTTP+SSE contract**:
   - `POST /sources`  `{run_id?, workdir?, bundle_base64, bundle_sha256?}` → upload the frozen raw bundle, safely unpack into `workdir/raw/` (`drop/` kept as a compatibility alias); calling it after the run has started returns 409
   - `POST /authoring` `{run_id?, workdir?, bundle_base64, bundle_sha256?}` → upload authoring/candidate/eval/release assets, safely unpack into `workdir/`; also allowed on a live run (workspace re-hydration goes through here)
-  - `POST /session/{run_id}` `{workdir?, instruction?, allowed_tools?}` → start this run's persistent conversation session (waits for the first /message); idempotent, on a live run it is a no-op attach
+  - `POST /session/{run_id}` `{workdir?, instruction?, allowed_tools?, llm?, settings?}` → start this run's persistent conversation session (waits for the first /message); idempotent, on a live run it is a no-op attach and does not hot-rotate the connected SDK client
   - `POST /message/{run_id}` `{message}` → inject one round of user message into the persistent session; prepare, compile, and adjudication-driven fix-up are all **ordinary turns**
   - `GET  /events/{run_id}` → SSE structured events: `session` / `log` / `summary` / `turn_done` / `syncArtifacts` / `plan_proposed` / `error` / `end`
   - `POST /test-session/{run_id}` → **start a test session**: pin the parent run's current draft (`candidate/`) into an immutable snapshot + start a read-only consumer session (reuses this pod, zero new infra); returns `test_session_id` + `snapshot_hash` + `pages`
@@ -62,7 +62,7 @@ docker run --rm -p 3000:3000 \
 
 ## Auth / mTLS
 
-- **LLM**: locally reuses the `~/.claude` subscription (no key needed). In production the consumer sends the selected `base_url` and auth token in the authenticated `/session` body after input materialization; the Runtime token is not copied into the pod spec.
+- **LLM**: locally reuses the `~/.claude` subscription (no key needed). In production the consumer's whole `llm` block is authoritative; only when it is absent does Runtime send its Helm `ANTHROPIC_*` fallback in the authenticated `/session` body. Runtime credentials are never merged into a consumer block or copied into the KB PodSpec. A live SDK client keeps its session-start credential until the documented grace-window + box-respawn rotation.
 - **Transport**: if `tls.crt/tls.key/ca.crt` exist under `SICLAW_CERT_PATH` (default `/etc/siclaw/certs`), the box serves HTTPS. `/health` remains certificate-optional for the in-container Kubernetes probe; every data/session/event route requires a verified client certificate whose OU is `Runtime` or `Gateway`. Partial TLS material fails startup. Without TLS material the server uses HTTP for explicit local development only.
 
 ## Layer-1 self-check: coverage ledger + lint (`selfcheck.py`)

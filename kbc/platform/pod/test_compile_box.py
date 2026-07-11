@@ -775,7 +775,7 @@ def test_apply_session_config():
     """Consumer-managed llm/settings from /session body (DESIGN-kb-llm-binding-v2):
     llm applies + clears a stale forwarded API key; settings whitelisted to
     KBC_*; the boot-time KBC_PK_MODE=off kill switch outranks consumer config."""
-    keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+    keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
             "KBC_COMPILE_MODEL", "KBC_PK_MODE")
     backup = {k: os.environ.get(k) for k in keys}
     kill_backup = compile_box._PK_KILL_AT_BOOT
@@ -785,17 +785,34 @@ def test_apply_session_config():
         os.environ.pop("KBC_COMPILE_MODEL", None)
         compile_box._PK_KILL_AT_BOOT = False
         compile_box._apply_session_config({
-            "llm": {"base_url": "https://massapi.example/model-api", "auth_token": "tok-1"},
+            "llm": {"base_url": "https://massapi.example/model-api",
+                    "auth_token": "tok-1", "model": "claude-sonnet-4-6"},
             "settings": {"KBC_COMPILE_MODEL": "claude-opus-4-8",
                          "KBC_PK_MODE": "auto",
                          "EVIL_KEY": "nope", "PATH": "/pwn"},
         })
         assert os.environ["ANTHROPIC_BASE_URL"] == "https://massapi.example/model-api"
+        assert os.environ["ANTHROPIC_MODEL"] == "claude-sonnet-4-6"
         assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "tok-1"
         assert "ANTHROPIC_API_KEY" not in os.environ           # stale key cleared
         assert os.environ["KBC_COMPILE_MODEL"] == "claude-opus-4-8"
         assert os.environ["KBC_PK_MODE"] == "auto"
         assert "EVIL_KEY" not in os.environ and os.environ.get("PATH") != "/pwn"
+
+        run = compile_box.CompileRun("config-test", "/tmp", 1, "")
+        opts = compile_box._compile_session_opts(run, "/tmp", "role", "session-1")
+        assert opts.model == "claude-opus-4-8"                 # explicit KBC setting wins
+        os.environ.pop("KBC_COMPILE_MODEL")
+        opts = compile_box._compile_session_opts(run, "/tmp", "role", "session-2")
+        assert opts.model == "claude-sonnet-4-6"               # Helm LLM model fallback
+
+        # A present consumer block is authoritative as a whole: absent fields
+        # clear the previous endpoint/token instead of mixing authorities.
+        compile_box._apply_session_config({"llm": {"api_key": "api-key-2"}})
+        assert "ANTHROPIC_BASE_URL" not in os.environ
+        assert "ANTHROPIC_MODEL" not in os.environ
+        assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+        assert os.environ["ANTHROPIC_API_KEY"] == "api-key-2"
 
         # ops kill switch: runtime-level off beats consumer "auto"
         os.environ["KBC_PK_MODE"] = "off"

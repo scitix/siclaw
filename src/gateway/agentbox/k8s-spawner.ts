@@ -253,34 +253,32 @@ export class K8sSpawner implements BoxSpawner {
       { name: "SICLAW_GATEWAY_URL", value: this.gatewayUrl(namespace) },
       { name: "SICLAW_AGENT_ID", value: agentId },
     ];
-    if (process.env.SICLAW_MEMORY_ENABLED !== undefined) {
-      env.push({ name: "SICLAW_MEMORY_ENABLED", value: process.env.SICLAW_MEMORY_ENABLED });
-    }
+    // Normal AgentBoxes need Runtime-level memory/embedding/sub-agent settings.
+    // Lean capability profiles do not use those features, and inheriting this
+    // base allowlist would copy SICLAW_EMBEDDING_API_KEY into an unrelated KB
+    // PodSpec. Capability boxes receive only their profile-declared env below.
+    if (profile.name === "agent") {
+      if (process.env.SICLAW_MEMORY_ENABLED !== undefined) {
+        env.push({ name: "SICLAW_MEMORY_ENABLED", value: process.env.SICLAW_MEMORY_ENABLED });
+      }
 
-    // Forward agentbox-relevant runtime knobs into the agentbox pod. The agentbox
-    // runs in its own pod and does NOT inherit the runtime process env, yet this
-    // flag is read inside the agentbox (sub-agent fan-out limiter, design §3).
-    // Curated allowlist only — never forward arbitrary env. Set the value on the
-    // runtime deployment to control every agentbox it spawns.
-    const AGENTBOX_FORWARDED_ENV = [
-      "SICLAW_SUBAGENT_CONCURRENCY",
-      // Embedding endpoint for the memory indexer. The agentbox reads these via
-      // loadConfig() env overrides (config.ts); set on the runtime deployment to
-      // configure every agentbox it spawns. API key is optional (TEI-style
-      // self-hosted endpoints are usually unauthenticated).
-      "SICLAW_EMBEDDING_BASE_URL",
-      "SICLAW_EMBEDDING_MODEL",
-      "SICLAW_EMBEDDING_DIMENSIONS",
-      "SICLAW_EMBEDDING_API_KEY",
-      // Trace deployment environment (Langfuse deployment.environment.name). The
-      // agentbox reads it via loadConfig() env override → config.tracing.environment.
-      // Per-runtime: set on the runtime deployment to tag every agentbox it spawns.
-      "SICLAW_TRACING_ENVIRONMENT",
-    ];
-    for (const name of AGENTBOX_FORWARDED_ENV) {
-      const value = process.env[name];
-      if (value !== undefined && value !== "") {
-        env.push({ name, value });
+      const AGENTBOX_FORWARDED_ENV = [
+        "SICLAW_SUBAGENT_CONCURRENCY",
+        // Embedding endpoint for the memory indexer. The agentbox reads these via
+        // loadConfig() env overrides (config.ts); set on the runtime deployment to
+        // configure every normal AgentBox it spawns.
+        "SICLAW_EMBEDDING_BASE_URL",
+        "SICLAW_EMBEDDING_MODEL",
+        "SICLAW_EMBEDDING_DIMENSIONS",
+        "SICLAW_EMBEDDING_API_KEY",
+        // Trace deployment environment (Langfuse deployment.environment.name).
+        "SICLAW_TRACING_ENVIRONMENT",
+      ];
+      for (const name of AGENTBOX_FORWARDED_ENV) {
+        const value = process.env[name];
+        if (value !== undefined && value !== "") {
+          env.push({ name, value });
+        }
       }
     }
 

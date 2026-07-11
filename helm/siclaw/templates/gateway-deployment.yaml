@@ -147,9 +147,9 @@ spec:
                   key: tls.key
             {{- end }}
             {{- with .Values.runtime.llm }}
-            # LLM endpoint for lean capability boxes (kb-compile / kb-test) —
-            # forwarded into spawned kb boxes via BoxProfile envForward. The
-            # chat path does not read these (agent models come from the Portal).
+            # LLM fallback for lean capability boxes (kb-compile / kb-test).
+            # Runtime sends it through the mTLS /session payload only when the
+            # consumer omitted its own LLM block; the chat path does not read it.
             {{- if .baseUrl }}
             - name: ANTHROPIC_BASE_URL
               value: {{ .baseUrl | quote }}
