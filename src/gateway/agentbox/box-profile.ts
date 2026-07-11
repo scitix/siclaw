@@ -78,7 +78,11 @@ function kbCompileProfile(): BoxProfile {
   return {
     name: "kb-compile",
     image: process.env.SICLAW_COMPILE_BOX_IMAGE || "kbc-compile-box:latest",
-    envForward: ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_*"],
+    // LLM credentials arrive in the consumer-managed /session payload after
+    // fail-closed input materialization. Never duplicate a Runtime secret into
+    // the pod spec; only the non-secret endpoint and ops KBC_* kill switches
+    // are inherited as rolling-upgrade fallbacks.
+    envForward: ["ANTHROPIC_BASE_URL", "KBC_*"],
     home: "/work",
     volumes: [{ name: "work", mountPath: "/work", sizeLimit: "4Gi" }], // installer allows 2GB unpacked raw + candidate output — 1Gi evicted large-corpus pods
     // A compile box realistically runs 1-2Gi (Claude Code + candidate tree +
@@ -104,7 +108,7 @@ function kbTestProfile(): BoxProfile {
   return {
     name: "kb-test",
     image: process.env.SICLAW_COMPILE_BOX_IMAGE || "kbc-compile-box:latest",
-    envForward: ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "KBC_*"],
+    envForward: ["ANTHROPIC_BASE_URL", "KBC_*"],
     home: "/work",
     // Same cap as kb-compile — the profiles' documented invariant is "identical
     // box shape, trust differs only in allowedTools" (a sizeLimit is a ceiling,

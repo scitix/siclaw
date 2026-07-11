@@ -430,6 +430,23 @@ describe("AgentBoxManager — cleanup", () => {
     expect(spawner.cleanupCalls).toBe(1);
     expect(mgr.stats().total).toBe(0);
   });
+
+  it("shutdown preserves K8s boxes for another Runtime replica to adopt", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.shutdown();
+    expect(spawner.stopCalls).toEqual([]);
+    expect(spawner.cleanupCalls).toBe(0);
+  });
+
+  it("shutdown still cleans up process-local boxes", async () => {
+    const spawner = new FakeSpawner("local");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.getOrCreate("agent-a");
+    await mgr.shutdown();
+    expect(spawner.stopCalls).toEqual(["box-agent-a"]);
+    expect(spawner.cleanupCalls).toBe(1);
+  });
 });
 
 describe("AgentBoxManager — K8s CA-fingerprint self-heal", () => {

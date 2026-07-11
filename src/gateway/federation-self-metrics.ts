@@ -1,11 +1,11 @@
 /**
- * Gateway-side self-monitoring registry for the Prometheus federation (K8s mode).
+ * Gateway-native monitoring registry exposed beside federated box metrics.
  *
  * 🔴 DEDUP CONTRACT (metrics-federation-DESIGN.md module 3): this registry is the
- * ONLY local-registry content the gateway exposes on /metrics in K8s mode. It must
- * contain ONLY gateway-native / federation self-monitoring metrics (all
- * `siclaw_federation_*`), which have ZERO name overlap with the federated business
- * metrics (`siclaw_tokens_total`, …) emitted by PromFederationAggregator.
+ * ONLY local-registry content the gateway exposes on /metrics in K8s mode. It
+ * contains gateway-native federation (`siclaw_federation_*`) and capability
+ * lifecycle (`siclaw_gateway_*`) metrics, which have ZERO name overlap with the
+ * federated box business metrics (`siclaw_tokens_total`, …).
  *
  * The 13 business-metric definitions registered in shared/metrics.js
  * (`metricsRegistry`) are deliberately NOT exposed in K8s mode — the gateway process
@@ -19,7 +19,7 @@
 
 import { Counter, Gauge, Histogram, Registry } from "prom-client";
 
-/** Dedicated registry for federation self-monitoring metrics (K8s mode). */
+/** Dedicated registry for gateway-native metrics (K8s mode). */
 export const federationSelfRegistry = new Registry();
 
 /**

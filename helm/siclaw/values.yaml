@@ -202,6 +202,15 @@ agentbox:
   # nodes carrying all of these labels (e.g. { disktype: ssd, pool: agents }).
   # Empty ⇒ no constraint; the scheduler picks any eligible node.
   nodeSelector: {}
+  # Ingress isolation for dynamically spawned KB compile/test boxes. The
+  # Runtime is the only built-in caller; mTLS remains the identity boundary.
+  # KB pods use exec health probes, so kubelet/node CIDRs do not need a broad
+  # NetworkPolicy exception (behavior differs across CNIs for HTTP probes).
+  networkPolicy:
+    enabled: true
+    # Extra trusted callers, e.g. a separately deployed Gateway in the same or
+    # another namespace. Entries are appended to the Runtime podSelector.
+    ingressFrom: []
   persistence:
     # PVC persistence has two independent concepts:
     #   1. PVC availability (infrastructure) — is a shared RWX PVC present that

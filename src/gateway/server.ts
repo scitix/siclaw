@@ -40,7 +40,14 @@ import type {
   CapabilityTestStartRequest,
   CapabilityTestStartResponse,
 } from "./capability/contract.js";
-import { materializeCapabilityInputs } from "./capability/materialize.js";
+import { CapabilityMaterializationError, materializeCapabilityInputs } from "./capability/materialize.js";
+import {
+  capabilityActiveRuns,
+  capabilityMaterializationFailuresTotal,
+  capabilityRelayFailuresTotal,
+  capabilityStartDurationMs,
+  capabilityStartsTotal,
+} from "./capability/capability-metrics.js";
 import {
   type RpcHandler,
   type RpcContext,
@@ -292,6 +299,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         try {
           promptResult = await client.prompt(promptOpts);
         } catch (err) {
+          if (err instanceof CapabilityMaterializationError) {
+            capabilityMaterializationFailuresTotal.inc({ stage: err.stage });
+          }
           // Concurrent send: agentbox returns 409 "Session is already
           // running. Use the steer endpoint to add input to the active
           // prompt." when the user double-taps send before the previous
@@ -481,6 +491,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         }
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager, replayWorkspace })
           .catch(async (err) => {
+            capabilityRelayFailuresTotal.inc();
             console.error(`[capability] session relay failed run=${runId}:`, err);
             await capabilityRunManager.endRun(runId, "failed").catch(() => {});
           })
@@ -540,6 +551,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   });
 
   rpcMethods.set("capability.start", async (params) => {
+    const startedAt = Date.now();
+    let startedRunId = "";
     const req = params as unknown as CapabilityStartRequest;
     const profile = req.profile?.trim();
     if (!profile) throw new Error("profile is required");
@@ -554,20 +567,25 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // an instruction-less start (chat arrives via capability.message right
     // after, or the run only hosts test sessions) starts at rest (idle) — the
     // first capability.message flips it running.
-    const rec = await capabilityRunManager.startRun({
-      profile,
-      orgId: orgId ?? "",
-      correlationId: req.correlation_id,
-      initialStatus: instruction && instruction.trim() ? "running" : "idle",
-    });
     try {
+      const rec = await capabilityRunManager.startRun({
+        profile,
+        orgId: orgId ?? "",
+        correlationId: req.correlation_id,
+        initialStatus: instruction && instruction.trim() ? "running" : "idle",
+      });
+      startedRunId = rec.runId;
       await ensureCapabilitySession(rec.runId, rec.profile, orgId, instruction);
+      capabilityStartsTotal.inc({ outcome: "success" });
+      capabilityStartDurationMs.observe({ outcome: "success" }, Date.now() - startedAt);
+      const res: CapabilityStartResponse = { run_id: rec.runId };
+      return res;
     } catch (err) {
-      await capabilityRunManager.endRun(rec.runId, "failed");
+      capabilityStartsTotal.inc({ outcome: "failure" });
+      capabilityStartDurationMs.observe({ outcome: "failure" }, Date.now() - startedAt);
+      if (startedRunId) await capabilityRunManager.endRun(startedRunId, "failed");
       throw err;
     }
-    const res: CapabilityStartResponse = { run_id: rec.runId };
-    return res;
   });
 
   rpcMethods.set("capability.message", async (params) => {
@@ -984,6 +1002,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       (async () => {
         try {
           const { metricsRegistry } = await import("../shared/metrics.js");
+          capabilityActiveRuns.set(capabilityRunManager.activeCount());
           if (promFederation && federationSelfMetrics) {
             // K8s mode: business metrics come from federation. The gateway's own
             // metricsRegistry holds the same metric *names* with empty values, so we
@@ -1189,7 +1208,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     async close() {
       metricsAggregator?.destroy();
       frontendClient.close();
-      await agentBoxManager.cleanup();
+      // Older embedded test/adapter managers may only implement cleanup(); the
+      // concrete manager's shutdown() preserves K8s boxes across Runtime rolls.
+      const manager = agentBoxManager as AgentBoxManager & { shutdown?: () => Promise<void> };
+      if (typeof manager.shutdown === "function") await manager.shutdown();
+      else await manager.cleanup();
       httpServer.close();
       httpsServer?.close();
     },

@@ -178,6 +178,15 @@ export class CapabilityRunManager {
     return this.runs.get(runId);
   }
 
+  /** Current non-terminal runs, sampled by the gateway Prometheus endpoint. */
+  activeCount(): number {
+    let count = 0;
+    for (const rec of this.runs.values()) {
+      if (!isTerminalCapabilityStatus(rec.status)) count++;
+    }
+    return count;
+  }
+
   /**
    * Adopt a run this runtime doesn't hold in memory by reading it back from the
    * consumer's store — heals the drift where boot-time recovery missed it (e.g.
