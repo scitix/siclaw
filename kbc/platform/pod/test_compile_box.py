@@ -84,6 +84,13 @@ async def test_workspace_sync():
         paths = sorted(a["path"] for a in compile_box._collect_workspace_artifacts(str(wd)))
         assert paths == ["candidate/01.md", "eval/TESTS.md"], paths
 
+        # A fresh box starts from consumer-rehydrated files. Priming the cursor
+        # must prevent that unchanged index/workspace from being echoed as new.
+        primed = compile_box._workspace_sync_cursor(str(wd))
+        primed_run = compile_box.CompileRun("primed-run", str(wd), 1)
+        assert await compile_box._sync_workspace(primed_run, primed) == 0
+        assert primed_run.events.empty()
+
         run = compile_box.CompileRun("sync-run", str(wd), 1)
         sent: dict = {}
         assert await compile_box._sync_workspace(run, sent) == 2
@@ -101,9 +108,24 @@ async def test_workspace_sync():
         assert await compile_box._sync_workspace(run, sent) == 1
         ev = run.events.get_nowait()
         assert ev["artifacts"] == [{"path": "candidate/01.md", "deleted": True}], ev
-        assert "candidate/01.md" not in sent
+        assert sent["candidate/01.md"] == compile_box._SYNC_TOMBSTONE
         # steady state after the tombstone → no re-emit
         assert await compile_box._sync_workspace(run, sent) == 0 and run.events.empty()
+        replay = compile_box._workspace_replay_artifacts(run, sent)
+        assert {"path": "candidate/01.md", "deleted": True} in replay
+        # A full-compile commit is explicit and replayable even if its final
+        # content was already caught by a periodic sync.
+        try:
+            await compile_box._sync_workspace(run, sent, commit_input=True)
+            assert False, "compile commit without candidate/index.md must fail"
+        except FileNotFoundError:
+            pass
+        (wd / "candidate" / "index.md").write_text("# Index\n")
+        assert await compile_box._sync_workspace(run, sent, commit_input=True) == 1
+        ev = run.events.get_nowait()
+        assert ev["type"] == "syncArtifacts" and ev["commit_input"] is True, ev
+        assert [a["path"] for a in ev["artifacts"]] == ["candidate/index.md"], ev
+        assert run._commit_input_replay is True
         # a file that becomes UNCOLLECTABLE (oversized) but still exists on disk
         # must NOT be tombstoned — deletion is judged by is_file(), not by
         # absence from the collection.
@@ -334,6 +356,7 @@ async def test_test_path_escape_guard():
         assert ok(root, "Read", {"file_path": "../../work/raw/src.md"}) is not None
         assert ok(root, "Grep", {"path": "/work"}) == "path=/work"
         assert ok(root, "Glob", {"pattern": "/work/**/*.md"}) == "pattern=/work/**/*.md"
+        assert ok(root, "Glob", {"pattern": "../../etc/*.conf"}) == "pattern=../../etc/*.conf"
 
         # the PreToolUse hook wraps the predicate into a deny decision
         guard = compile_box._make_test_path_guard(root)
@@ -341,7 +364,44 @@ async def test_test_path_escape_guard():
         assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
         allow = await guard({"tool_name": "Read", "tool_input": {"file_path": "index.md"}}, "t2", None)
         assert allow == {}, allow
+
+        # Compile sessions use the same confinement over /work and do not expose
+        # Bash. The hook denies it too as defense-in-depth against profile drift.
+        assert "Bash" not in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+        compile_guard = compile_box._make_compile_path_guard(root)
+        deny = await compile_guard({"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}}, "c1", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        deny = await compile_guard({"tool_name": "Bash", "tool_input": {"command": "env"}}, "c2", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        deny = await compile_guard({"tool_name": "Glob", "tool_input": {"pattern": "../outside/*"}}, "c2b", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await compile_guard({"tool_name": "Write", "tool_input": {"file_path": "candidate/a.md"}}, "c3", None)
+        assert allow == {}, allow
     print("✓ test-session path guard (C4): snapshot-confined, live /work denied")
+
+
+async def test_batch_planner_uses_compile_path_guard():
+    """The model planner can Write under bypassPermissions, so it must carry the
+    same workspace confinement hook as every other compiler session."""
+    orig = compile_box.ClaudeSDKClient
+    previous_mode = os.environ.get("KBC_BATCH_PLANNER")
+    compile_box.ClaudeSDKClient = _FakeSDKClient
+    os.environ["KBC_BATCH_PLANNER"] = "model"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("planner-guard", td, 1)
+            inventory = [{"path": "a.md", "bytes": 10, "effective": 10}]
+            await compile_box._plan_batches(run, inventory)
+            opts = _FakeSDKClient.last.options
+            assert opts.allowed_tools == ["Read", "Write", "Glob"], opts.allowed_tools
+            assert opts.hooks and opts.hooks.get("PreToolUse"), opts.hooks
+    finally:
+        compile_box.ClaudeSDKClient = orig
+        if previous_mode is None:
+            os.environ.pop("KBC_BATCH_PLANNER", None)
+        else:
+            os.environ["KBC_BATCH_PLANNER"] = previous_mode
+    print("✓ batch planner uses compile workspace path guard")
 
 
 
@@ -393,7 +453,7 @@ def test_pack_candidates_to_wiki():
 
 
 def test_pack_candidates_symlink_confinement():
-    """Security: the compile session has Write+Bash, so it could ln -s a host file
+    """Security: a compromised workspace can still contain a symlink, so a host file
     into candidate/. The pinner must NOT copy content whose real path escapes
     candidate/ — neither a file symlink nor a symlinked directory."""
     with tempfile.TemporaryDirectory() as wd, tempfile.TemporaryDirectory() as dest_root, tempfile.TemporaryDirectory() as outside:
@@ -1326,6 +1386,7 @@ async def test_batch_orchestrator_routing_and_resume():
         assert compile_box._should_route_to_batch(run, "直接开始编译")
         assert compile_box._should_route_to_batch(run, "原料已更新,请增量重编: xx")
         assert not compile_box._should_route_to_batch(run, "你好")
+        assert not compile_box._should_route_to_batch(run, "请解释一下“请增量重编”是什么意思")
 
         # stub the session driver: record directives, pretend each session works
         driven: list[str] = []
@@ -1978,6 +2039,7 @@ async def main():
     test_pack_candidates_to_wiki()
     test_pack_candidates_symlink_confinement()
     await test_test_path_escape_guard()
+    await test_batch_planner_uses_compile_path_guard()
     await test_prompt_packs_locale()
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
