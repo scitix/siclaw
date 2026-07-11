@@ -53,11 +53,42 @@ def test_parse_compiled_from():
     assert src == [] and derived and not has
     src, derived, has = selfcheck.parse_compiled_from(PAGE_BARE)
     assert src == [] and not derived and not has
-    src, _, has = selfcheck.parse_compiled_from("---\ncompiled_from: []\n---\nx")
+    src, _, has = selfcheck.parse_compiled_from("---\ntype: Topic\ncompiled_from: []\n---\nx")
     assert src == [] and has
     src, _, has = selfcheck.parse_compiled_from("no frontmatter at all")
     assert src == [] and not has
     print("OK  parse_compiled_from (hash·path / plain / quoted / raw-prefix / derived / inline-empty)")
+
+
+def test_okf_v01_conformance():
+    valid = "---\ntype: Topic\ntitle: T\ndescription: 'why: open this'\n---\nBody"
+    fm, body, error = selfcheck.parse_okf_frontmatter(valid)
+    assert not error and fm["type"] == "Topic" and body == "Body", (fm, body, error)
+    assert selfcheck.parse_okf_frontmatter("# no metadata")[2]
+    assert selfcheck.parse_okf_frontmatter("---\ntype: [\n---\nx")[2]
+    assert selfcheck.parse_okf_frontmatter("---\n- not\n- a mapping\n---\nx")[2]
+
+    pages = {
+        "index.md": {"text": '---\nokf_version: "0.1"\n---\n# Contents\n- [Topic](topic.md) - summary'},
+        "topic.md": {"text": valid},
+        "log.md": {"text": "# Update log\n## 2026-07-11\n- **Creation**: Added [Topic](topic.md)."},
+    }
+    assert selfcheck.okf_v01_violations(pages) == []
+
+    broken = {
+        "index.md": {"text": "---\nokf_version: \"0.1\"\n---\n# Index\n- [[bad]]"},
+        "missing.md": {"text": "# no frontmatter"},
+        "empty.md": {"text": "---\ntype: '  '\n---\nx"},
+        "links.md": {"text": "---\ntype: Topic\n---\n[[old]] [root](/root.md)"},
+        "sub/index.md": {"text": "---\nokf_version: '0.1'\n---\n# Nested"},
+        "log.md": {"text": "---\ntype: log\n---\n# Log\n## 2026-99-99\nentry"},
+    }
+    kinds = {v["kind"] for v in selfcheck.okf_v01_violations(broken)}
+    assert {
+        "okf_index_frontmatter", "okf_index_structure", "okf_frontmatter", "okf_type",
+        "okf_wikilink", "okf_nonportable_link", "okf_log_frontmatter", "okf_log_structure",
+    } <= kinds, kinds
+    print("OK  OKF v0.1 conformance (YAML/type/reserved files/portable links)")
 
 
 def test_inventory_and_exclusions():
@@ -94,9 +125,9 @@ def test_coverage_and_lint():
         _mk(base, "raw/snapshot-a/one.md")
         _mk(base, "raw/snapshot-a/two.md")
         _mk(base, "raw/snapshot-a/ticket.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p1](p1.md)")
         _mk(base, "candidate/p1.md",
-            "---\ncompiled_from:\n  - snapshot-a/one.md\n  - snapshot-a/ghost.md\n---\n[[nope]]")
+            "---\ntype: Topic\ncompiled_from:\n  - snapshot-a/one.md\n  - snapshot-a/ghost.md\n---\n[[nope]]")
         _mk(base, "candidate/bare.md", PAGE_BARE)
         _mk(base, "authoring/EXCLUSIONS.json",
             json.dumps([{"pattern": "snapshot-a/ticket.md", "reason": "工单周报"}]))
@@ -109,7 +140,7 @@ def test_coverage_and_lint():
         kinds = sorted(v["kind"] for v in report["lint"]["violations"])
         # bare.md lacks provenance AND is unreachable from index; p1 has a
         # broken wikilink; index is exempt
-        assert kinds == ["broken_wikilink", "no_provenance", "orphan"], kinds
+        assert kinds == ["broken_wikilink", "no_provenance", "okf_wikilink", "orphan"], kinds
 
         # repair prompt names the concrete gaps — locale-threaded, platform default = en
         report["state"] = "repairing"
@@ -122,8 +153,8 @@ def test_coverage_and_lint():
         assert "未入账" in selfcheck.narration(report, "zh")
 
         # close the ledger: cite two.md from bare.md (also fixes its provenance) + fix link
-        _mk(base, "candidate/bare.md", "---\ncompiled_from:\n  - snapshot-a/two.md\n---\nok")
-        _mk(base, "candidate/p1.md", "---\ncompiled_from:\n  - snapshot-a/one.md\n---\n[[bare]]")
+        _mk(base, "candidate/bare.md", "---\ntype: Topic\ncompiled_from:\n  - snapshot-a/two.md\n---\nok")
+        _mk(base, "candidate/p1.md", "---\ntype: Topic\ncompiled_from:\n  - snapshot-a/one.md\n---\n[bare](bare.md)")
         report = selfcheck.run_layer1(td)
         assert report["coverage"]["closed"] and report["lint"]["ok"], report
         report["state"] = "passed"
@@ -137,11 +168,11 @@ def test_media_ledger_and_new_lint():
         base = Path(td)
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/chart.png")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p1](p1.md)")
         # body cites the image but compiled_from omits it → body_source_uncited;
         # the image itself is unaccounted (media is in the ledger now)
         _mk(base, "candidate/p1.md",
-            "---\ntitle: 监控\ncompiled_from:\n  - s/a.md\n---\n利用率 94%。(source: chart.png)")
+            "---\ntype: Topic\ntitle: 监控\ncompiled_from:\n  - s/a.md\n---\n利用率 94%。(source: chart.png)")
         report = selfcheck.run_layer1(td)
         assert report["coverage"]["unaccounted"] == ["s/chart.png"], report["coverage"]
         kinds = sorted(v["kind"] for v in report["lint"]["violations"])
@@ -151,7 +182,7 @@ def test_media_ledger_and_new_lint():
 
         # register the image → ledger closes, lint clean, dangling stays empty
         _mk(base, "candidate/p1.md",
-            "---\ntitle: 监控\ncompiled_from:\n  - s/a.md\n  - s/chart.png\n---\n利用率 94%。(source: chart.png)")
+            "---\ntype: Topic\ntitle: 监控\ncompiled_from:\n  - s/a.md\n  - s/chart.png\n---\n利用率 94%。(source: chart.png)")
         report = selfcheck.run_layer1(td)
         assert report["coverage"]["closed"] and report["lint"]["ok"], report
         assert report["coverage"]["dangling_citations"] == [], report["coverage"]
@@ -159,8 +190,8 @@ def test_media_ledger_and_new_lint():
         # dup candidates: same normalized title / heavy source overlap
         _mk(base, "raw/s/b.md")
         _mk(base, "candidate/p2.md",
-            "---\ntitle: 监控\ncompiled_from:\n  - s/b.md\n---\n[p1](p1.md)")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md) [p2](p2.md)")
+            "---\ntype: Topic\ntitle: 监控\ncompiled_from:\n  - s/b.md\n---\n[p1](p1.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p1](p1.md)\n- [p2](p2.md)")
         report = selfcheck.run_layer1(td)
         dups = report["dup_candidates"]
         assert len(dups) == 1 and sorted(dups[0]["pages"]) == ["p1.md", "p2.md"], dups
@@ -177,10 +208,10 @@ def test_charset_corruption_detection():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/s/a.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p1](p1.md)")
         # U+FFFD in BODY prose only — paths are clean, so coverage closes.
         _mk(base, "candidate/p1.md",
-            "---\ntitle: t\ncompiled_from:\n  - s/a.md\n---\n基\ufffd设施层说明。(source: a.md)")
+            "---\ntype: Topic\ntitle: t\ncompiled_from:\n  - s/a.md\n---\n基\ufffd设施层说明。(source: a.md)")
         report = selfcheck.run_layer1(td)
         # The ledger alone would ship it: coverage is closed (corruption is prose).
         assert report["coverage"]["closed"], report["coverage"]
@@ -194,12 +225,12 @@ def test_charset_corruption_detection():
         # A corrupted PATH is caught too (redundant with coverage's dangling, but
         # with actionable "restore from raw" guidance instead of "fix the path").
         _mk(base, "candidate/p1.md",
-            "---\ntitle: t\ncompiled_from:\n  - s/\ufffd.md\n---\nclean body。(source: a.md)")
+            "---\ntype: Topic\ntitle: t\ncompiled_from:\n  - s/\ufffd.md\n---\nclean body。(source: a.md)")
         report = selfcheck.run_layer1(td)
         assert any(v["kind"] == "charset_corruption" for v in report["lint"]["violations"])
         # Clean page → no charset violation, ledger closes, lint ok.
         _mk(base, "candidate/p1.md",
-            "---\ntitle: t\ncompiled_from:\n  - s/a.md\n---\n基础设施层说明。(source: a.md)")
+            "---\ntype: Topic\ntitle: t\ncompiled_from:\n  - s/a.md\n---\n基础设施层说明。(source: a.md)")
         report = selfcheck.run_layer1(td)
         assert all(v["kind"] != "charset_corruption" for v in report["lint"]["violations"])
         assert report["lint"]["ok"] and report["coverage"]["closed"], report
@@ -212,11 +243,11 @@ def test_media_verify_helpers():
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/chart.png")
         _mk(base, "raw/s/other.png")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md) [t](text-only.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p1](p1.md)\n- [t](text-only.md)")
         # compiled_from full path + body basename citation both resolve
         _mk(base, "candidate/p1.md",
-            "---\ncompiled_from:\n  - s/a.md\n  - s/chart.png\n---\n94%。(source: other.png)")
-        _mk(base, "candidate/text-only.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+            "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n  - s/chart.png\n---\n94%。(source: other.png)")
+        _mk(base, "candidate/text-only.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx")
         citing = selfcheck.media_citing_pages(td)
         assert citing == {"p1.md": ["s/chart.png", "s/other.png"]}, citing
 
@@ -250,9 +281,9 @@ def test_dangling_alone_blocks_closed():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/snap/one.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p1](p1.md)")
         _mk(base, "candidate/p1.md",
-            "---\ncompiled_from:\n  - snap/one.md\n  - snap/deleted-long-ago.md\n---\n正文。")
+            "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n  - snap/deleted-long-ago.md\n---\n正文。")
         cov = selfcheck.run_layer1(td)["coverage"]
         assert cov["unaccounted"] == [] and cov["dangling_citations"] == ["snap/deleted-long-ago.md"], cov
         assert not cov["closed"], "a dangling citation alone must keep the ledger open"
@@ -261,7 +292,7 @@ def test_dangling_alone_blocks_closed():
         assert "悬空引用" in selfcheck.narration(report, "zh")
         assert "dangling" in selfcheck.narration(report, "en")
         # fix the citation → closed
-        _mk(base, "candidate/p1.md", "---\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+        _mk(base, "candidate/p1.md", "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\n正文。")
         cov2 = selfcheck.run_layer1(td)["coverage"]
         assert cov2["closed"], cov2
         print("OK  dangling alone blocks closed (bidirectional ledger) + narration names it")
@@ -318,9 +349,9 @@ def test_ledger_repair_pages():
     deletion all undone → unconverged)."""
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[a](a.md) [c](c.md)")
-        _mk(base, "candidate/a.md", "---\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
-        _mk(base, "candidate/c.md", "---\ncompiled_from:\n  - snap/ghost.md\n---\n正文c。")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        _mk(base, "candidate/a.md", "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        _mk(base, "candidate/c.md", "---\ntype: Topic\ncompiled_from:\n  - snap/ghost.md\n---\n正文c。")
         report = {
             "coverage": {"dangling_citations": ["snap/ghost.md"]},
             "lint": {"ok": False, "violations": [
@@ -344,9 +375,9 @@ def test_citation_path_normalization():
         base = Path(td)
         _mk(base, "raw/snap/live.csv")
         _mk(base, "raw/snap/sub/x.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p1](p1.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p1](p1.md)")
         _mk(base, "candidate/p1.md",
-            "---\ncompiled_from:\n  - ./snap/live.csv\n  - snap/sub/../sub/x.md\n---\n正文。")
+            "---\ntype: Topic\ncompiled_from:\n  - ./snap/live.csv\n  - snap/sub/../sub/x.md\n---\n正文。")
         cov = selfcheck.run_layer1(td)["coverage"]
         assert cov["unaccounted"] == [] and cov["dangling_citations"] == [], cov
         assert cov["closed"], cov
@@ -381,8 +412,8 @@ async def test_media_clean_pass_settles_converge():
         base = Path(td)
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/i1.png")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
         run = _FakeRun(td)
 
         async def clean_verify(engine, workdir, pending, progress=None, locale=None):
@@ -410,9 +441,9 @@ def test_page_too_large_lint():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/snap/one.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[big](big.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [big](big.md)")
         _mk(base, "candidate/big.md",
-            "---\ncompiled_from:\n  - snap/one.md\n---\n" + "长内容。" * 200)
+            "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\n" + "长内容。" * 200)
         os.environ["KBC_MAX_SYNC_FILE_BYTES"] = "512"
         try:
             report = selfcheck.run_layer1(td)
@@ -433,8 +464,8 @@ def test_page_too_large_uses_raw_bytes():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/snap/one.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[big](big.md)")
-        head = "---\ncompiled_from:\n  - snap/one.md\n---\n"
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [big](big.md)")
+        head = "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\n"
         body = "ab\r\n" * 140  # raw 560B vs decoded 420B — the divergence window
         (base / "candidate/big.md").write_bytes((head + body).encode("utf-8"))
         raw = (base / "candidate/big.md").stat().st_size
@@ -461,8 +492,8 @@ async def test_noop_gate_survives_missing_selfcheck():
         base = Path(td)
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/b.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx")
         run = _FakeRun(td)
         msg1 = await _post_turn_selfcheck(run)      # b.md unaccounted → repairing
         assert msg1 and run._l1_repairs_used == 1
@@ -493,8 +524,8 @@ async def test_ledger_repairs_reset_budget():
         base = Path(td)
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/b.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx")
         run = _FakeRun(td)
         run._l1_repairs_used = 99  # earlier interactive turns spent the budget
 
@@ -503,8 +534,8 @@ async def test_ledger_repairs_reset_budget():
         async def fake_drive(run_, directive, label):
             drove.append(label)
             # the repair session accounts for the missing source
-            _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/b.md\n---\ny")
-            _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
+            _mk(base, "candidate/q.md", "---\ntype: Topic\ncompiled_from:\n  - s/b.md\n---\ny")
+            _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)\n- [q](q.md)")
             return "fixed"
 
         real_drive = compile_box._drive_batch_session
@@ -543,8 +574,8 @@ def test_run_layer1_carries_converge_phase():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/snap/one.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\n正文。")
         selfcheck.write_selfcheck(td, selfcheck.run_layer1(td))
         selfcheck.set_converge_phase(td, "settled")
         report = selfcheck.run_layer1(td)
@@ -564,9 +595,9 @@ async def test_media_chunks_self_drain_then_settle():
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/i1.png")
         _mk(base, "raw/s/i2.png")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
-        _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/i2.png\n---\ny")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)\n- [q](q.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/q.md", "---\ntype: Topic\ncompiled_from:\n  - s/i2.png\n---\ny")
         run = _FakeRun(td)
 
         calls: list[dict] = []
@@ -648,8 +679,8 @@ async def test_wiring():
         assert await _post_turn_selfcheck(run) is None
 
         # index exists, b.md unaccounted → repairing + repair prompt returned
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx")
         msg = await _post_turn_selfcheck(run)
         assert msg and "s/b.md" in msg, msg
         assert run._l1_repairs_used == 1
@@ -669,9 +700,9 @@ async def test_wiring():
 
         # budget exhaustion: reopen the gap twice without fixing → unconverged, no injection
         _mk(base, "raw/s/c.md")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx2")  # rotate key
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx2")  # rotate key
         assert await _post_turn_selfcheck(run) is not None      # round 1 → repairing
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx3")  # agent "fixed" nothing
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx3")  # agent "fixed" nothing
         assert await _post_turn_selfcheck(run) is None          # budget spent → unconverged
         sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
         assert sc["state"] == "unconverged", sc
@@ -691,9 +722,9 @@ async def test_media_verify_wiring():
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/i1.png")
         _mk(base, "raw/s/i2.png")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
-        _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/i2.png\n---\ny")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)\n- [q](q.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/q.md", "---\ntype: Topic\ncompiled_from:\n  - s/i2.png\n---\ny")
         run = _FakeRun(td)
 
         calls: list[dict] = []
@@ -750,8 +781,8 @@ async def test_media_inject_failure_does_not_double_settle():
         base = Path(td)
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/i1.png")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
         run = _FakeRun(td)
 
         async def broken_inject(text):
@@ -797,9 +828,9 @@ async def test_media_failed_chunk_still_drains_later_chunks():
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/i1.png")
         _mk(base, "raw/s/i2.png")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
-        _mk(base, "candidate/q.md", "---\ncompiled_from:\n  - s/i2.png\n---\ny")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)\n- [q](q.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/q.md", "---\ntype: Topic\ncompiled_from:\n  - s/i2.png\n---\ny")
         run = _FakeRun(td)
 
         calls: list[dict] = []
@@ -856,8 +887,8 @@ async def test_media_failed_pages_retry_then_exhaust():
         base = Path(td)
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/i1.png")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
         run = _FakeRun(td)
 
         async def failing_verify(engine, workdir, pending, progress=None, locale=None):
@@ -904,8 +935,8 @@ async def test_media_attempt_count_resets_on_success():
         base = Path(td)
         _mk(base, "raw/s/a.md")
         _mk(base, "raw/s/i1.png")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n  - s/i1.png\n---\nx")
         run = _FakeRun(td)
         calls = [0]
 
@@ -952,8 +983,8 @@ async def test_pk_failed_state_settles_converge():
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             _mk(base, "raw/s/a.md")
-            _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-            _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+            _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+            _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx")
             run = _FakeRun(td)
             os.environ["KBC_PK_MODE"] = "off"
             assert await compile_box._post_turn_selfcheck(run) is None
@@ -988,8 +1019,8 @@ async def test_pk_wiring():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/s/a.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx")
         run = _FakeRun(td)
         os.environ["KBC_PK_MODE"] = "off"
         assert await compile_box._post_turn_selfcheck(run) is None  # ledger passes
@@ -1047,8 +1078,8 @@ async def test_seam_settles_when_nothing_pending():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/s/a.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md)")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx")
 
         class _R:  # just what _emit_message touches
             workdir = td
@@ -1083,8 +1114,8 @@ def test_converge_phase_helper():
     import selfcheck
     with tempfile.TemporaryDirectory() as td:
         _mk(Path(td), "raw/s/a.md")
-        _mk(Path(td), "candidate/index.md", "---\ntype: index\n---\ni")
-        _mk(Path(td), "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx")
+        _mk(Path(td), "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [P](p.md)")
+        _mk(Path(td), "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\nx")
         selfcheck.write_selfcheck(td, selfcheck.run_layer1(td))  # L1 first
         selfcheck.set_converge_phase(td, "verifying")
         sc = json.loads((Path(td) / "authoring/SELFCHECK.json").read_text())
@@ -1120,11 +1151,11 @@ def test_pack_hash_is_relposix_sorted():
 
 def test_parse_compiled_from_inline():
     """Fix D: an inline flow list must parse to sources (previously → [] → spurious repair)."""
-    src, _, has = selfcheck.parse_compiled_from('---\ncompiled_from: [raw/a.md, "b.md"]\n---\nx')
+    src, _, has = selfcheck.parse_compiled_from('---\ntype: Topic\ncompiled_from: [raw/a.md, "b.md"]\n---\nx')
     assert has and src == ["a.md", "b.md"], src
-    src, _, has = selfcheck.parse_compiled_from("---\ncompiled_from: [snapshot/x.md]\n---\ny")
+    src, _, has = selfcheck.parse_compiled_from("---\ntype: Topic\ncompiled_from: [snapshot/x.md]\n---\ny")
     assert has and src == ["snapshot/x.md"], src
-    src, _, has = selfcheck.parse_compiled_from("---\ncompiled_from: []\n---\nz")  # still empty-but-present
+    src, _, has = selfcheck.parse_compiled_from("---\ntype: Topic\ncompiled_from: []\n---\nz")  # still empty-but-present
     assert has and src == [], src
     print("OK  parse_compiled_from inline flow list (fix D)")
 
@@ -1144,8 +1175,8 @@ def test_noop_exclusion_warning():
     """Fix B#3: an exclusion matching no source is surfaced as a warning (not blocking)."""
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
-        _mk(base, "raw/a.md"); _mk(base, "candidate/index.md", "---\ntype: index\n---\ni")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - a.md\n---\nx")
+        _mk(base, "raw/a.md"); _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [P](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - a.md\n---\nx")
         _mk(base, "authoring/EXCLUSIONS.json",
             json.dumps([{"pattern": "nope/*.md", "reason": "typo, matches nothing"}]))
         report = selfcheck.run_layer1(td)
@@ -1188,6 +1219,7 @@ def main():
     os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
     os.environ.setdefault("KBC_PK_MODE", "off")  # PK never fires in unrelated wiring tests
     test_parse_compiled_from()
+    test_okf_v01_conformance()
     test_parse_compiled_from_inline()
     test_inventory_and_exclusions()
     test_matches_segment_aware()

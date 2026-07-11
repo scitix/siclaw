@@ -28,8 +28,11 @@ Each page:
 ---
 type: <one or two words you choose from the content, e.g. entity/list/topic>
 title: <title>
+description: <one sentence that lets an index or agent decide when to open this page>
 ---
 <Body. Every statement cites (source: filename). Ruled contradictions become conclusions that keep their sources; unruled ones are marked "⚠️ 存疑: …">
 ```
 
-`index.md` carries `okf_version: "0.1"` and lists the page links (it is a reserved name and not counted as an orphan).
+These are OKF v0.1 concept documents: the YAML must parse and `type` must be a non-empty string. Keep Siclaw provenance fields such as `compiled_from`, `snapshot`, `timestamp`/`last_updated`, and `confidence|status` alongside the OKF fields.
+
+The root `index.md` carries only `okf_version: "0.1"` in its frontmatter, then groups every page under Markdown headings with list entries like `- [Title](relative/path.md) - one-line description`. Use file-relative standard Markdown links throughout the bundle. Never emit `[[wikilinks]]` or `/`-prefixed bundle links. A nested `index.md` and any `log.md` have no frontmatter; `log.md` uses newest-first `## YYYY-MM-DD` groups.

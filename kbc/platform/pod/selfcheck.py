@@ -7,10 +7,10 @@ verify it": every raw text source must be either cited by a candidate page's
 `authoring/EXCLUSIONS.json`. Anything else is *unaccounted* — the exact
 silent-miss failure mode observed in the 2026-07-03 one-shot compile study.
 
-Engine-neutral by construction: pure filesystem analysis, stdlib only, no
-Agent-SDK imports. Any compile driver (Claude SDK today, other engines later)
-calls `run_layer1()` at its own turn boundary and pushes the returned repair
-prompt through its own message seam.
+Engine-neutral by construction: pure filesystem analysis plus safe YAML
+parsing, with no Agent-SDK imports. Any compile driver (Claude SDK today, other
+engines later) calls `run_layer1()` at its own turn boundary and pushes the
+returned repair prompt through its own message seam.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+import yaml
 
 # Text sources vs binary media. BOTH are ledger-accountable (2026-07-06): the
 # batch-vs-oneshot A/B showed silent media drops are the single worst coverage
@@ -48,8 +50,8 @@ SELFCHECK_PATH = "authoring/SELFCHECK.json"
 # Defaults to zh: the PK/calibration pipeline is not yet locale-threaded and its
 # calibration corpora are Chinese. Mirrors the real siclaw consumer (siclaw
 # src/core/prompt.ts "Domain Knowledge — LLM Wiki"): Read only, no search, start
-# at index.md, whole pages, follow [[links]]. Max fidelity: do NOT tell it it's
-# being tested.
+# at index.md, read whole pages, follow standard Markdown links while tolerating
+# legacy [[links]]. Max fidelity: do NOT tell it it's being tested.
 def _pack_test_role(locale: str = "zh") -> str:
     fp = Path(__file__).resolve().parent / "prompts" / locale / "test_role.md"
     return fp.read_text(encoding="utf-8").rstrip("\n")
@@ -255,8 +257,139 @@ _FILENAME_RE = re.compile(
     r"[^\s,;、；()（）'\"`]+\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS)) + r")\b",
     re.IGNORECASE,
 )
-# OKF reserved routing pages: never provenance-required, never orphans.
-_RESERVED_PAGES = {"index.md", "log.md"}
+# OKF reserved routing pages: never provenance-required, never orphans. The
+# names are reserved at EVERY level of the bundle hierarchy, not just its root.
+_RESERVED_PAGE_NAMES = {"index.md", "log.md"}
+
+
+def _is_reserved_page(rel: str) -> bool:
+    return Path(rel).name in _RESERVED_PAGE_NAMES
+
+
+def parse_okf_frontmatter(md_text: str) -> tuple[dict | None, str, str | None]:
+    """Parse an OKF YAML frontmatter block with a real YAML parser.
+
+    Returns (mapping-or-None, body, error-or-None). A missing block is distinct
+    from an invalid block so the repair prompt can tell the compiler exactly
+    what to fix. `yaml.safe_load` is deliberate: candidate metadata is tenant
+    authored input and must never construct arbitrary Python objects.
+    """
+    lines = md_text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, md_text, "missing YAML frontmatter at the start of the file"
+    end = next((i for i, line in enumerate(lines[1:], start=1)
+                if line.strip() in ("---", "...")), None)
+    if end is None:
+        return None, md_text, "YAML frontmatter has no closing delimiter"
+    raw = "\n".join(lines[1:end])
+    body = "\n".join(lines[end + 1:])
+    try:
+        value = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        problem = getattr(e, "problem", None) or str(e).splitlines()[0]
+        return None, body, f"invalid YAML frontmatter: {problem}"
+    if not isinstance(value, dict):
+        return None, body, "YAML frontmatter must be a mapping"
+    return value, body, None
+
+
+def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[dict]:
+    """Validate the reserved OKF index shape plus Siclaw's v0.1 profile.
+
+    OKF permits frontmatter only on the bundle-root index. Siclaw requires that
+    root block to pin okf_version=0.1 so every published bundle is self-
+    describing. Index entries use portable, file-relative Markdown links; the
+    consumer may keep reading legacy wikilinks, but the compiler no longer emits
+    them.
+    """
+    violations: list[dict] = []
+    fm, body, error = parse_okf_frontmatter(text)
+    if rel == "index.md":
+        if error:
+            violations.append({"page": rel, "kind": "okf_index_frontmatter",
+                               "detail": f"根 index.md 必须只有 okf_version: \"0.1\" 的 YAML frontmatter: {error}"})
+            body = text
+        elif (set(fm or {}) != {"okf_version"}
+              or not isinstance((fm or {}).get("okf_version"), str)
+              or (fm or {}).get("okf_version") != "0.1"):
+            violations.append({"page": rel, "kind": "okf_index_frontmatter",
+                               "detail": "根 index.md frontmatter 必须且只能包含 okf_version: \"0.1\""})
+    else:
+        # A nested index has no frontmatter. A malformed block is still a block,
+        # so detect the delimiter directly instead of treating its parse error as
+        # equivalent to correctly absent frontmatter.
+        if text.splitlines() and text.splitlines()[0].strip() == "---":
+            violations.append({"page": rel, "kind": "okf_index_frontmatter",
+                               "detail": "子目录 index.md 按 OKF 不能包含 frontmatter"})
+        body = text
+
+    if not re.search(r"(?m)^#{1,6}\s+\S", body):
+        violations.append({"page": rel, "kind": "okf_index_structure",
+                           "detail": "index.md 至少需要一个 Markdown 分组标题"})
+    entries = re.findall(r"(?m)^\s*[-*]\s+\[[^\]]+\]\(([^)]+)\)(?:\s+-\s+.+)?\s*$", body)
+    if concept_pages and not entries:
+        violations.append({"page": rel, "kind": "okf_index_structure",
+                           "detail": "index.md 必须用列表形式的标准 Markdown 链接枚举知识页"})
+    return violations
+
+
+def _okf_log_violations(rel: str, text: str) -> list[dict]:
+    violations: list[dict] = []
+    if text.splitlines() and text.splitlines()[0].strip() == "---":
+        violations.append({"page": rel, "kind": "okf_log_frontmatter",
+                           "detail": "log.md 按 OKF 不能包含 frontmatter"})
+    dates = re.findall(r"(?m)^##\s+(\d{4}-\d{2}-\d{2})\s*$", text)
+    valid_dates: list[str] = []
+    for date in dates:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+            valid_dates.append(date)
+        except ValueError:
+            pass
+    if not re.search(r"(?m)^#\s+\S", text) or not dates or len(valid_dates) != len(dates):
+        violations.append({"page": rel, "kind": "okf_log_structure",
+                           "detail": "log.md 需要标题和合法的 ## YYYY-MM-DD 日期分组"})
+    elif valid_dates != sorted(valid_dates, reverse=True):
+        violations.append({"page": rel, "kind": "okf_log_structure",
+                           "detail": "log.md 日期分组必须按从新到旧排列"})
+    if dates and not re.search(r"(?m)^\s*[-*]\s+.+$", text):
+        violations.append({"page": rel, "kind": "okf_log_structure",
+                           "detail": "log.md 日期分组下必须包含列表形式的更新记录"})
+    return violations
+
+
+def okf_v01_violations(pages: dict[str, dict]) -> list[dict]:
+    """Mandatory OKF v0.1 checks plus Siclaw's portable-output profile."""
+    violations: list[dict] = []
+    concept_pages = {rel for rel in pages if not _is_reserved_page(rel)}
+    for rel, page in pages.items():
+        if "error" in page:
+            continue  # the existing unreadable violation is more specific
+        text = page.get("text", "")
+        if _WIKI_LINK_RE.search(text):
+            violations.append({"page": rel, "kind": "okf_wikilink",
+                               "detail": "使用文件相对的标准 Markdown 链接，不要使用 [[wikilink]]"})
+        if any(target.startswith("/") for target in _MD_LINK_RE.findall(text)):
+            violations.append({"page": rel, "kind": "okf_nonportable_link",
+                               "detail": "使用文件相对 Markdown 链接；/ 开头的 bundle 绝对链接在 GitHub 等浏览器会失效"})
+        name = Path(rel).name
+        if name == "index.md":
+            violations.extend(_okf_index_violations(rel, text, concept_pages))
+            continue
+        if name == "log.md":
+            violations.extend(_okf_log_violations(rel, text))
+            continue
+        fm, _, error = parse_okf_frontmatter(text)
+        if error:
+            violations.append({"page": rel, "kind": "okf_frontmatter",
+                               "detail": error})
+            continue
+        type_value = (fm or {}).get("type")
+        if not isinstance(type_value, str) or not type_value.strip():
+            violations.append({"page": rel, "kind": "okf_type",
+                               "detail": "OKF concept frontmatter requires a non-empty string type"})
+
+    return violations
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -322,7 +455,7 @@ def _orphan_pages(pages: dict[str, dict]) -> list[str]:
             if target not in reachable:
                 reachable.add(target)
                 frontier.append(target)
-    return sorted(names - reachable - _RESERVED_PAGES)
+    return sorted(rel for rel in names - reachable if not _is_reserved_page(rel))
 
 
 def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
@@ -343,7 +476,7 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
         if "error" in page:
             violations.append({"page": rel, "kind": "unreadable", "detail": page["error"]})
             continue
-        if rel not in _RESERVED_PAGES and not page["has_compiled_from"] and not page["derived"]:
+        if not _is_reserved_page(rel) and not page["has_compiled_from"] and not page["derived"]:
             violations.append({"page": rel, "kind": "no_provenance",
                                "detail": "frontmatter 缺 compiled_from(纯综合页请标 derived: true)"})
         text = page.get("text", "")
@@ -410,6 +543,7 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
                            "detail": "从 index.md 无链可达——把它挂进 index 或相应父页;确属废页则删除"})
     for err in exclusion_errors:
         violations.append({"page": EXCLUSIONS_PATH, "kind": "exclusions_invalid", "detail": err})
+    violations.extend(okf_v01_violations(pages))
     return {"ok": not violations, "violations": violations}
 
 
@@ -433,7 +567,7 @@ def dup_candidates(pages: dict[str, dict], cap: int = 20) -> list[dict]:
     (near-dups can be legitimate, so the model/owner gets the last word)."""
     infos = []
     for rel, page in sorted(pages.items()):
-        if rel in _RESERVED_PAGES or "error" in page:
+        if _is_reserved_page(rel) or "error" in page:
             continue
         infos.append((rel, _norm_title(page.get("text", "")), set(page["sources"])))
     out: list[dict] = []

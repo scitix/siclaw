@@ -1097,9 +1097,9 @@ async def test_incremental_route():
         wd = Path(td)
         (wd / "candidate").mkdir(parents=True)
         (wd / "authoring").mkdir(parents=True)
-        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
         (wd / "candidate" / "a.md").write_text(
-            "---\ntitle: t\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+            "---\ntype: Topic\ntitle: t\ncompiled_from:\n  - snap/one.md\n---\n正文。")
         run = compile_box.CompileRun("incr1", str(wd), 1)
         # no RAW_CHANGES yet → NOT incremental (falls through to normal/full route)
         assert not compile_box._should_route_to_incremental(run, "请增量重编")
@@ -1142,9 +1142,9 @@ async def test_incremental_integrity_guard():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
-        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md) [c](c.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
-        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
         run = compile_box.CompileRun("incrg", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -1153,8 +1153,8 @@ async def test_incremental_integrity_guard():
               "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
         run._incr_pending = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
         # model edits a.md (authorized) AND drifts into c.md (unauthorized)
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
-        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         # coverage ledger is clean (both sources still cited) yet integrity forces a repair naming c.md
         assert repair is not None and "Incremental scope violation" in repair and "c.md" in repair, repair
@@ -1163,7 +1163,7 @@ async def test_incremental_integrity_guard():
         # consumed here, leaving the repair turn unguarded.
         assert run._incr_pending is not None and run._incr_pending["changeset"] is cs
         # the repair restores c.md → the re-armed guard clears cleanly
-        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
         run._selfcheck_key = None
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is None, repair2
@@ -1187,8 +1187,8 @@ async def test_incremental_guard_rearms_on_ledger_repair():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "orphaned-src.md").write_text("never cited")  # → unaccounted
-        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("incrl", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -1197,7 +1197,7 @@ async def test_incremental_guard_rearms_on_ledger_repair():
         armed = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
         run._incr_pending = armed
         # the turn edits ONLY the authorized page (no byte violations)…
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
         repair = await compile_box._post_turn_selfcheck(run)
         # …but the ledger is unclean (orphaned-src.md unaccounted) → repairing
         assert repair is not None and "orphaned-src.md" in repair, repair
@@ -1223,9 +1223,9 @@ async def test_incremental_violation_auto_restored():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
-        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md) [c](c.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
-        c_original = "---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        c_original = "---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。"
         (wd / "candidate" / "c.md").write_text(c_original)
         run = compile_box.CompileRun("incrr", str(wd), 1)
         run._selfcheck_key = None
@@ -1235,8 +1235,8 @@ async def test_incremental_violation_auto_restored():
         run._incr_pending = {"before": incremental.page_hashes(str(wd)),
                              "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
         # model edits a.md (authorized) AND drifts into c.md (unauthorized)
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
-        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         assert repair is None, repair  # violation auto-restored, ledger clean → no repair turn
         assert (wd / "candidate" / "c.md").read_text() == c_original  # byte-exact restore
@@ -1260,8 +1260,8 @@ async def test_unconverged_files_residual_ticket():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # → unaccounted forever
-        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("uncv", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 99  # budget long spent → unconverged, not repairing
@@ -1274,7 +1274,7 @@ async def test_unconverged_files_residual_ticket():
         assert "never-compiled.md" in tickets[0]["sources"][0]["quote"]
         # a second settle with the same residuals does not duplicate the ticket
         run._selfcheck_key = None
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 又动了。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 又动了。")
         await compile_box._post_turn_selfcheck(run)
         tickets2 = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
         assert len(tickets2) == 1, tickets2
@@ -1296,10 +1296,10 @@ async def test_repair_turn_may_edit_ledger_target_pages():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
-        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md) [c](c.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
         # c.md cites a source that no longer exists → dangling (out of this round's scope)
-        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/ghost.md\n---\n正文c。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/ghost.md\n---\n正文c。")
         run = compile_box.CompileRun("interlock", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -1309,13 +1309,13 @@ async def test_repair_turn_may_edit_ledger_target_pages():
                              "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
         # turn 1: model edits ONLY the authorized page — in scope, but the ledger
         # is unclean (dangling citation on c.md) → repairing, guard re-armed
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
         repair = await compile_box._post_turn_selfcheck(run)
         assert repair is not None and "ghost.md" in repair, repair
         assert run._incr_pending is not None
         assert run._incr_pending.get("repair_pages") == ["c.md"], run._incr_pending.get("repair_pages")
         # repair turn: model fixes the dangling citation on the OUT-OF-SCOPE page
-        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
         run._selfcheck_key = None
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is None, repair2
@@ -1342,9 +1342,9 @@ async def test_incremental_index_deletion_cannot_escape_guard():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
-        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md) [c](c.md)")
-        c_original = "---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。"
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        c_original = "---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
         (wd / "candidate" / "c.md").write_text(c_original)
         run = compile_box.CompileRun("incrx", str(wd), 1)
         run._selfcheck_key = None
@@ -1354,9 +1354,9 @@ async def test_incremental_index_deletion_cannot_escape_guard():
         run._incr_pending = {"before": incremental.page_hashes(str(wd)),
                              "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
         # model edits a.md (authorized), DELETES index.md and drifts into c.md
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
         (wd / "candidate" / "index.md").unlink()
-        (wd / "candidate" / "c.md").write_text("---\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n擅自改。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         # the guard ran: c.md restored byte-exact; index.md (always-editable, no
         # snapshot restore) leaves the tree index-less → orphan lint → repair
@@ -1384,9 +1384,9 @@ async def test_incremental_arm_cleared_when_dispatch_fails():
         wd = Path(td)
         (wd / "candidate").mkdir(parents=True)
         (wd / "authoring").mkdir(parents=True)
-        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
         (wd / "candidate" / "a.md").write_text(
-            "---\ntitle: t\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+            "---\ntype: Topic\ntitle: t\ncompiled_from:\n  - snap/one.md\n---\n正文。")
         # stale per-round declaration from an earlier round must not survive
         (wd / "authoring" / "ADDED_TARGETS.json").write_text('["stale-page.md"]')
         (wd / "authoring" / "RAW_CHANGES.json").write_text(_json.dumps({
@@ -1418,8 +1418,8 @@ async def test_noop_repair_turn_reaches_the_gate():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # unaccounted forever
-        (wd / "candidate" / "index.md").write_text("---\ntype: index\n---\n[a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("noop", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -1452,7 +1452,7 @@ async def test_batch_final_ledger_check_requires_index():
         (wd / "candidate").mkdir()
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
-        (wd / "candidate" / "a.md").write_text("---\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("bfx", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
