@@ -51,6 +51,7 @@ _Avoid_: content locale
     "generation": 12,
     "parameters": {
       "brief": {
+        "intent": "troubleshoot",
         "audience": "internal-eng",
         "depth": "full",
         "redaction": "none",
@@ -109,6 +110,12 @@ parameters. Unknown versions and unknown actions fail closed.
 | `compile.submit_decisions` | `decisions[]` | Apply owner decisions and propose the resulting plan |
 | `compile.apply_rulings` | `dispatch_nonce`, `rulings[]` | Apply contradiction rulings and emit per-ticket receipts |
 | `compile.repair_test` | `question`, `reference_answer`, `verdict` | Repair the minimum draft scope for a failed test |
+
+The optional brief uses stable identifiers. In particular,
+`intent=understand|execute|troubleshoot` selects whether the compiled structure
+prioritizes concepts/relationships, procedures/checks, or symptoms/evidence/
+remediation. It changes content organization only; it never changes protocol
+routing or lifecycle state.
 
 ## Layer responsibilities
 

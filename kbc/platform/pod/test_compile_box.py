@@ -2136,6 +2136,7 @@ async def test_typed_authoring_commands():
                     "operation_id": f"op-{locale}",
                     "generation": 1,
                     "parameters": {"brief": {
+                        "intent": "troubleshoot",
                         "audience": "internal-eng",
                         "depth": "full",
                         "redaction": "none",
@@ -2153,6 +2154,7 @@ async def test_typed_authoring_commands():
             assert brief == {
                 "schema_version": 1,
                 "source": "authoring_command",
+                "intent": "troubleshoot",
                 "audience": "internal-eng",
                 "depth": "full",
                 "redaction": "none",
@@ -2163,6 +2165,12 @@ async def test_typed_authoring_commands():
             r = await client.post(f"/command/{run_id}", json=body)
             assert r.status == 200 and (await r.json())["duplicate"] is True
             assert len(run.client.queries) == 1
+            invalid_intent = json.loads(json.dumps(body))
+            invalid_intent["command_id"] = f"bad-intent-{locale}"
+            invalid_intent["command"]["parameters"]["brief"]["intent"] = "请帮我排障"
+            run._turn_active = False
+            r = await client.post(f"/command/{run_id}", json=invalid_intent)
+            assert r.status == 400 and len(run.client.queries) == 1, await r.text()
             # An idempotency key binds one normalized payload; it cannot be
             # reinterpreted as a different action or generation.
             changed = json.loads(json.dumps(body))
@@ -2172,6 +2180,7 @@ async def test_typed_authoring_commands():
             assert len(run.client.queries) == 1
             # A distinct command cannot be acknowledged and silently dropped
             # while another turn is active.
+            run._turn_active = True
             busy = json.loads(json.dumps(body))
             busy["command_id"] = f"busy-{locale}"
             r = await client.post(f"/command/{run_id}", json=busy)
