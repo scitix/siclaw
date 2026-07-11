@@ -1,17 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gzipSync } from "node:zlib";
 import {
   createClusterHandler,
   createHostHandler,
   createToolsHandler,
-  getLastKnowledgeSyncStatus,
   knowledgeHandler,
   mcpHandler,
   skillsHandler,
 } from "./sync-handlers.js";
+import { knowledgeRepoDirName } from "../shared/knowledge-package.js";
 import type { GatewaySyncClientLike } from "../shared/gateway-sync.js";
 import { CredentialBroker } from "./credential-broker.js";
 import type {
@@ -973,22 +973,24 @@ describe("knowledgeHandler empty-bundle guard", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// knowledgeHandler — multi-repo directory-name collision guard
-//
-// sanitizeKnowledgeRepoDir is more aggressive than the DB's (org,name)
-// uniqueness constraint, so two distinct repos can sanitize to the same
-// directory (e.g. "GPU Cluster" and "GPU/Cluster" -> "gpu-cluster"). Since the
-// extractor does not pre-clean its target, the later repo would silently
-// overwrite the earlier one. The handler must relocate the collider to its
-// globally-unique repo-id directory instead.
-// ---------------------------------------------------------------------------
-
-describe("knowledgeHandler multi-repo dir collision", () => {
+describe("knowledgeHandler multi-repo identity", () => {
   let knowledgeTmpDir: string;
 
+  function packageBase64(title: string): string {
+    const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-package-test-"));
+    const archive = path.join(os.tmpdir(), `knowledge-package-${process.pid}-${Date.now()}-${Math.random()}.tar.gz`);
+    try {
+      fs.writeFileSync(path.join(sourceDir, "index.md"), `# ${title}\n`);
+      execFileSync("tar", ["-czf", archive, "-C", sourceDir, "index.md"]);
+      return fs.readFileSync(archive).toString("base64");
+    } finally {
+      fs.rmSync(sourceDir, { recursive: true, force: true });
+      fs.rmSync(archive, { force: true });
+    }
+  }
+
   beforeEach(() => {
-    knowledgeTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-collision-test-"));
+    knowledgeTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-handler-multi-test-"));
     _mockKnowledgeDir = knowledgeTmpDir;
   });
 
@@ -996,115 +998,22 @@ describe("knowledgeHandler multi-repo dir collision", () => {
     fs.rmSync(knowledgeTmpDir, { recursive: true, force: true });
   });
 
-  it("relocates a colliding repo to its id directory instead of overwriting", async () => {
-    const idA = "aaaaaaaa-0000-0000-0000-000000000001";
-    const idB = "bbbbbbbb-0000-0000-0000-000000000002";
-    const bundleA = makeKnowledgeBundleBase64("# Repo A\n\nAlpha body.\n");
-    const bundleB = makeKnowledgeBundleBase64("# Repo B\n\nBeta body.\n");
+  it("uses stable repo identity so two CJK-only names never collide and index links match", async () => {
+    const repos = [
+      { id: "repo-cn-platform", name: "平台知识", version: 3, sizeBytes: 10, dataBase64: packageBase64("platform") },
+      { id: "repo-cn-business", name: "业务知识", version: 7, sizeBytes: 10, dataBase64: packageBase64("business") },
+    ];
 
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const count = await knowledgeHandler.materialize({
-      version: "v1",
-      repos: [
-        // Both names collapse to "gpu-cluster" under sanitizeKnowledgeRepoDir.
-        { id: idA, name: "GPU Cluster", version: 1, sizeBytes: bundleA.length, dataBase64: bundleA },
-        { id: idB, name: "GPU/Cluster", version: 1, sizeBytes: bundleB.length, dataBase64: bundleB },
-      ],
-    });
+    await expect(knowledgeHandler.materialize({ version: "v1", repos })).resolves.toBe(2);
 
-    expect(count).toBe(2);
+    const platformDir = knowledgeRepoDirName(repos[0].name, repos[0].id);
+    const businessDir = knowledgeRepoDirName(repos[1].name, repos[1].id);
+    expect(platformDir).not.toBe(businessDir);
+    expect(fs.readFileSync(path.join(knowledgeTmpDir, "repos", platformDir, "index.md"), "utf8")).toContain("platform");
+    expect(fs.readFileSync(path.join(knowledgeTmpDir, "repos", businessDir, "index.md"), "utf8")).toContain("business");
 
-    const reposDir = path.join(knowledgeTmpDir, "repos");
-    const firstDir = path.join(reposDir, "gpu-cluster");
-    // The second repo is relocated to its (sanitized) id directory.
-    const secondDir = path.join(reposDir, idB);
-
-    // Both directories exist and neither overwrote the other.
-    expect(fs.existsSync(firstDir)).toBe(true);
-    expect(fs.existsSync(secondDir)).toBe(true);
-    expect(fs.readFileSync(path.join(firstDir, "index.md"), "utf8")).toBe("# Repo A\n\nAlpha body.\n");
-    expect(fs.readFileSync(path.join(secondDir, "index.md"), "utf8")).toBe("# Repo B\n\nBeta body.\n");
-
-    // The top-level index links to the actual on-disk directories.
-    const topIndex = fs.readFileSync(path.join(knowledgeTmpDir, "index.md"), "utf8");
-    expect(topIndex).toContain("[[repos/gpu-cluster/index]]");
-    expect(topIndex).toContain(`[[repos/${idB}/index]]`);
-
-    // The collision fact is recorded in the sync status structure.
-    const status = getLastKnowledgeSyncStatus();
-    expect(status?.dirNameConflicts).toEqual([
-      {
-        repoId: idB,
-        repoName: "GPU/Cluster",
-        sanitizedDir: "gpu-cluster",
-        conflictsWith: "GPU Cluster",
-        fallbackDir: idB,
-      },
-    ]);
-
-    // And it is surfaced loudly, not swallowed.
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("collision"));
-    warnSpy.mockRestore();
-  });
-
-  it("keeps sanitized directories and no conflicts when repo names are distinct", async () => {
-    const bundleA = makeKnowledgeBundleBase64("# Alpha\n");
-    const bundleB = makeKnowledgeBundleBase64("# Beta\n");
-
-    const count = await knowledgeHandler.materialize({
-      version: "v1",
-      repos: [
-        { id: "id-alpha", name: "Alpha KB", version: 1, sizeBytes: bundleA.length, dataBase64: bundleA },
-        { id: "id-beta", name: "Beta KB", version: 1, sizeBytes: bundleB.length, dataBase64: bundleB },
-      ],
-    });
-
-    expect(count).toBe(2);
-    expect(fs.existsSync(path.join(knowledgeTmpDir, "repos", "alpha-kb", "index.md"))).toBe(true);
-    expect(fs.existsSync(path.join(knowledgeTmpDir, "repos", "beta-kb", "index.md"))).toBe(true);
-    expect(getLastKnowledgeSyncStatus()?.dirNameConflicts).toBeUndefined();
+    const index = fs.readFileSync(path.join(knowledgeTmpDir, "index.md"), "utf8");
+    expect(index).toContain(`[[repos/${platformDir}/index]] - 平台知识 v3`);
+    expect(index).toContain(`[[repos/${businessDir}/index]] - 业务知识 v7`);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Minimal knowledge-package (tar.gz) builder for the collision tests. The
-// package must contain a root index.md and be extractable by the system `tar`
-// binary, mirroring what extractKnowledgePackageToDir expects.
-// ---------------------------------------------------------------------------
-
-function makeKnowledgeBundleBase64(indexContent: string): string {
-  const tarGz = makeTarGz([{ name: "index.md", content: indexContent }]);
-  return tarGz.toString("base64");
-}
-
-function makeTarGz(files: Array<{ name: string; content: Buffer | string; type?: string }>): Buffer {
-  const blocks: Buffer[] = [];
-  for (const file of files) {
-    const content = Buffer.isBuffer(file.content) ? file.content : Buffer.from(file.content, "utf8");
-    blocks.push(makeTarHeader(file.name, content.length, file.type ?? "0"));
-    blocks.push(content);
-    const padding = (512 - (content.length % 512)) % 512;
-    if (padding) blocks.push(Buffer.alloc(padding));
-  }
-  blocks.push(Buffer.alloc(1024));
-  return gzipSync(Buffer.concat(blocks));
-}
-
-function makeTarHeader(name: string, size: number, type: string): Buffer {
-  const header = Buffer.alloc(512);
-  header.write(name, 0, 100, "utf8");
-  header.write("0000644\0", 100, 8, "ascii");
-  header.write("0000000\0", 108, 8, "ascii");
-  header.write("0000000\0", 116, 8, "ascii");
-  header.write(size.toString(8).padStart(11, "0") + "\0", 124, 12, "ascii");
-  header.write("00000000000\0", 136, 12, "ascii");
-  header.fill(" ", 148, 156);
-  header.write(type, 156, 1, "ascii");
-  header.write("ustar\0", 257, 6, "ascii");
-  header.write("00", 263, 2, "ascii");
-
-  let checksum = 0;
-  for (const byte of header) checksum += byte;
-  header.write(checksum.toString(8).padStart(6, "0") + "\0 ", 148, 8, "ascii");
-  return header;
-}

@@ -14,8 +14,8 @@ import path from "node:path";
 import { loadConfig, reloadConfig, writeConfig } from "../core/config.js";
 import {
   extractKnowledgePackageToDir,
+  knowledgeRepoDirName,
   replaceDirectoryContentsFromStaging,
-  sanitizeKnowledgeRepoDir,
 } from "../shared/knowledge-package.js";
 import type {
   GatewaySyncType,
@@ -258,12 +258,6 @@ interface KnowledgeSyncStatus {
     id: string; name: string; version: number; sha256: string;
     expectedSha256?: string | null; fileCount?: number | null; sizeBytes: number;
   }>;
-  // Populated when two distinct repos sanitize to the same directory name and
-  // one was relocated to its repo-id directory to avoid a silent overwrite.
-  dirNameConflicts?: Array<{
-    repoId: string; repoName: string; sanitizedDir: string;
-    conflictsWith: string; fallbackDir: string;
-  }>;
 }
 
 let lastKnowledgeSyncStatus: KnowledgeSyncStatus | null = null;
@@ -322,7 +316,6 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
     const stagingDir = path.join(knowledgeDir, `.sync-staging-${Date.now()}-${process.pid}`);
     fs.mkdirSync(stagingDir, { recursive: true });
     const syncedRepos: KnowledgeSyncStatus["repos"] = [];
-    const dirNameConflicts: NonNullable<KnowledgeSyncStatus["dirNameConflicts"]> = [];
 
     try {
       if (repos.length === 1) {
@@ -337,28 +330,18 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
         const repoRoot = path.join(stagingDir, "repos");
         fs.mkdirSync(repoRoot, { recursive: true });
         const indexLines = ["# Knowledge Index", "", "This index was generated from active knowledge repositories.", ""];
-        // sanitizeKnowledgeRepoDir is more aggressive than the (org,name) uniqueness
-        // constraint, so two distinct repos can collapse to the same directory
-        // (e.g. "GPU Cluster" and "GPU/Cluster" both -> "gpu-cluster"). Because
-        // extractKnowledgePackageToDir does not pre-clean its target, the later
-        // repo would silently overlay the earlier one. Detect the collision and
-        // relocate the later repo to its globally-unique id directory.
-        const claimedDirs = new Map<string, string>(); // dirName -> first repo name that claimed it
+        const seenRepoIds = new Set<string>();
+        const seenDirNames = new Set<string>();
         for (const repo of repos) {
-          let dirName = sanitizeKnowledgeRepoDir(repo.name);
-          const priorOwner = claimedDirs.get(dirName);
-          if (priorOwner !== undefined) {
-            const fallbackDir = sanitizeKnowledgeRepoDir(repo.id);
-            console.warn(
-              `[sync-handlers.knowledge] Knowledge repo directory collision: "${repo.name}" and ` +
-              `"${priorOwner}" both sanitize to "${dirName}"; using repo-id directory "${fallbackDir}" ` +
-              `for "${repo.name}" to avoid silently overwriting "${priorOwner}".`,
-            );
-            dirNameConflicts.push({ repoId: repo.id, repoName: repo.name, sanitizedDir: dirName,
-              conflictsWith: priorOwner, fallbackDir });
-            dirName = fallbackDir;
+          if (seenRepoIds.has(repo.id)) {
+            throw new Error(`Duplicate knowledge repository id in bundle: ${repo.id}`);
           }
-          claimedDirs.set(dirName, repo.name);
+          seenRepoIds.add(repo.id);
+          const dirName = knowledgeRepoDirName(repo.name, repo.id);
+          if (seenDirNames.has(dirName)) {
+            throw new Error(`Knowledge repository directory collision: ${dirName}`);
+          }
+          seenDirNames.add(dirName);
           const target = path.join(repoRoot, dirName);
           const buf = Buffer.from(repo.dataBase64, "base64");
           const info = await extractKnowledgePackageToDir(buf, target);
@@ -375,8 +358,7 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
       fs.writeFileSync(path.join(stagingDir, ".sync-manifest.json"),
         JSON.stringify({ syncedAt, version: payload.version ?? "1", repos: syncedRepos }, null, 2) + "\n");
       await replaceDirectoryContentsFromStaging(knowledgeDir, stagingDir);
-      lastKnowledgeSyncStatus = { syncedAt, targetDir: knowledgeDir, repoCount: syncedRepos.length, repos: syncedRepos,
-        dirNameConflicts: dirNameConflicts.length ? dirNameConflicts : undefined };
+      lastKnowledgeSyncStatus = { syncedAt, targetDir: knowledgeDir, repoCount: syncedRepos.length, repos: syncedRepos };
       return repos.length;
     } catch (err) {
       fs.rmSync(stagingDir, { recursive: true, force: true });

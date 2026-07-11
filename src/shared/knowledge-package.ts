@@ -110,6 +110,18 @@ export function sanitizeKnowledgeRepoDir(name: string): string {
   return sanitized.slice(0, 80) || "repo";
 }
 
+/** Stable multi-repo directory identity. Human-readable names alone are not
+ * unique after ASCII sanitization (all-CJK names used to collapse to `repo`).
+ * A hash of the immutable repo id keeps paths filesystem-safe and deterministic
+ * without exposing the full database id in the model-visible catalog. */
+export function knowledgeRepoDirName(name: string, repoId: string): string {
+  const stableId = repoId.trim();
+  if (!stableId) throw new Error("Knowledge repository id is required for multi-repo materialization");
+  const identity = crypto.createHash("sha256").update(stableId).digest("hex").slice(0, 12);
+  const slug = sanitizeKnowledgeRepoDir(name).slice(0, 66);
+  return `${slug}--${identity}`;
+}
+
 export async function replaceDirectoryContentsFromStaging(targetDir: string, stagingDir: string): Promise<void> {
   await fs.mkdir(targetDir, { recursive: true });
   const stagingBase = path.basename(stagingDir);
