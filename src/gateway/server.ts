@@ -438,12 +438,22 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!pending) {
       pending = (async () => {
         const client = await capabilityBoxClient(runId, profile, orgId);
+        let replayWorkspace = false;
         try {
           // Raw sources + (fresh box only) the durable authoring workspace, both
           // from the consumer's store. Best-effort — see materializeCapabilityInputs.
           // The consumer also declares the run's LOCALE through the same channel;
           // the box selects its prompt pack with it (absent ⇒ English default).
-          const materialized = await materializeCapabilityInputs({ client, backend: frontendClient, runId });
+          const materialized = await materializeCapabilityInputs({
+            client,
+            backend: frontendClient,
+            runId,
+            inputRevision: capabilityRunManager.get(runId)?.inputRevision,
+          });
+          replayWorkspace = materialized.reattached === true;
+          if (materialized.inputRevision) {
+            await capabilityRunManager.setInputRevision(runId, materialized.inputRevision);
+          }
           const allowedTools = getBoxProfile(profile).allowedTools ?? null;
           await client.postJson(`/session/${runId}`, {
             instruction: instruction ?? "",
@@ -469,7 +479,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           );
           throw err;
         }
-        driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager })
+        driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager, replayWorkspace })
           .catch(async (err) => {
             console.error(`[capability] session relay failed run=${runId}:`, err);
             await capabilityRunManager.endRun(runId, "failed").catch(() => {});

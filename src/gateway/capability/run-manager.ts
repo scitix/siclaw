@@ -41,6 +41,8 @@ export interface CapabilityRunRecord {
   correlationId?: string;
   status: CapabilityLifecycleStatus;
   runtimeId?: string;
+  /** Frozen consumer input installed into this run's box. */
+  inputRevision?: string;
   /** Wall-clock ms of the last DATA event; drives the stale-run watchdog. */
   lastActivityMs: number;
   /**
@@ -95,6 +97,8 @@ export interface CapabilityRunManagerOptions {
 // defer forever and pin its box. After this many consecutive failed re-checks we
 // stop deferring and reap the run anyway.
 const MAX_REAP_DEFERRALS = 5;
+const INPUT_REVISION_PERSIST_ATTEMPTS = 4;
+const INPUT_REVISION_RETRY_BASE_MS = 250;
 
 export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
@@ -196,6 +200,7 @@ export class CapabilityRunManager {
         orgId: row.org_id ?? "",
         correlationId: row.correlation_id || undefined,
         runtimeId: row.runtime_id || undefined,
+        inputRevision: inputRevisionFromCheckpoint(row.checkpoint),
         status,
         lastActivityMs: this.now(),
         lastHeartbeatMs: this.now(),
@@ -207,6 +212,38 @@ export class CapabilityRunManager {
     } catch (err) {
       console.warn(`[capability] adopt(${runId}) failed: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
+    }
+  }
+
+  /** Checkpoint the exact input before the box session is allowed to run. */
+  async setInputRevision(runId: string, inputRevision: string): Promise<void> {
+    const rec = this.runs.get(runId);
+    const revision = inputRevision.trim();
+    if (!rec || !revision || rec.inputRevision === revision) return;
+    const previousRevision = rec.inputRevision;
+    rec.inputRevision = revision;
+    try {
+      for (let attempt = 1; attempt <= INPUT_REVISION_PERSIST_ATTEMPTS; attempt += 1) {
+        try {
+          await this.persist(rec, { failFast: true });
+          return;
+        } catch (err) {
+          if (attempt === INPUT_REVISION_PERSIST_ATTEMPTS) throw err;
+          const delayMs = INPUT_REVISION_RETRY_BASE_MS * 2 ** (attempt - 1);
+          console.warn(
+            `[capability] checkpoint input revision for ${runId} failed ` +
+            `(attempt ${attempt}/${INPUT_REVISION_PERSIST_ATTEMPTS}); retrying in ${delayMs}ms: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+    } catch (err) {
+      // Never retain an in-memory checkpoint the consumer did not durably ack.
+      // A later session setup must retry instead of returning early on a value
+      // that exists only in this process.
+      rec.inputRevision = previousRevision;
+      throw err;
     }
   }
 
@@ -303,6 +340,7 @@ export class CapabilityRunManager {
           orgId: r.org_id ?? "",
           correlationId: r.correlation_id || undefined,
           runtimeId: r.runtime_id || undefined,
+          inputRevision: inputRevisionFromCheckpoint(r.checkpoint),
           status: r.status || "running",
           lastActivityMs: this.now(),
           lastHeartbeatMs: this.now(),
@@ -478,6 +516,7 @@ export class CapabilityRunManager {
       correlation_id: rec.correlationId ?? "",
       profile: rec.profile,
       status: rec.status,
+      ...(rec.inputRevision ? { checkpoint: { input_revision: rec.inputRevision } } : {}),
       // Reserved wire field, always "" — the runtime does not track a box session
       // id (see the note above adopt()); a future persistent-session design would
       // re-introduce the mirror + carry-through.
@@ -493,4 +532,18 @@ export class CapabilityRunManager {
       );
     }
   }
+}
+
+function inputRevisionFromCheckpoint(checkpoint: unknown): string | undefined {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const revision = (value as { input_revision?: unknown }).input_revision;
+  return typeof revision === "string" && revision.trim() ? revision.trim() : undefined;
 }

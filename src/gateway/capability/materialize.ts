@@ -32,6 +32,10 @@ export interface MaterializeBackend {
 }
 
 export interface MaterializeResult {
+  /** Immutable input revision actually installed into a fresh box. */
+  inputRevision?: string;
+  /** /sources reported an already-live run; the event relay must request replay. */
+  reattached?: boolean;
   /** Consumer-declared locale for the run's box (fetchInput), if any. */
   locale?: string;
   /** Consumer-managed LLM endpoint for the box (opaque passthrough; never logged). */
@@ -44,13 +48,18 @@ export async function materializeCapabilityInputs(opts: {
   client: MaterializeBoxClient;
   backend: MaterializeBackend;
   runId: string;
+  /** Existing checkpoint recovered for this run; fresh boxes must reinstall it exactly. */
+  inputRevision?: string;
 }): Promise<MaterializeResult> {
-  const { client, backend, runId } = opts;
+  const { client, backend, runId, inputRevision } = opts;
 
   const result: MaterializeResult = {};
   let freshBox = false;
   try {
-    const req: CapabilityFetchInputRequest = { run_id: runId };
+    const req: CapabilityFetchInputRequest = {
+      run_id: runId,
+      ...(inputRevision ? { input_revision: inputRevision } : {}),
+    };
     const src = (await backend.request(CAPABILITY_FETCH_INPUT, req)) as CapabilityFetchInputResponse;
     if (src?.locale) result.locale = src.locale;
     if (src?.llm && typeof src.llm === "object") result.llm = src.llm;
@@ -63,6 +72,7 @@ export async function materializeCapabilityInputs(opts: {
         locale: src.locale,
       });
       freshBox = true;
+      if (src.input_revision) result.inputRevision = src.input_revision;
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -75,6 +85,7 @@ export async function materializeCapabilityInputs(opts: {
       // The box already holds this run (live on-disk state) — reattach without
       // touching its workspace.
       console.log(`[capability] session ${runId}: box already live; skipping materialization`);
+      result.reattached = true;
     } else {
       console.warn(`[capability] session ${runId}: source materialize skipped:`, msg);
     }

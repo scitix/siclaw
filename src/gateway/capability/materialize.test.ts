@@ -3,7 +3,7 @@ import { materializeCapabilityInputs } from "./materialize.js";
 import { CAPABILITY_FETCH_INPUT, CAPABILITY_INPUT_WORKSPACE_REF } from "./contract.js";
 
 function fakes(opts: {
-  raw?: { bundle_base64?: string; bundle_sha256?: string; locale?: string };
+  raw?: { bundle_base64?: string; bundle_sha256?: string; locale?: string; input_revision?: string };
   workspace?: { bundle_base64?: string; bundle_sha256?: string };
   workspaceError?: Error;
   sourcesError?: Error;
@@ -37,7 +37,7 @@ beforeEach(() => {
 describe("materializeCapabilityInputs", () => {
   it("fresh box: posts raw sources, then rehydrates the authoring workspace (locale rides along)", async () => {
     const { client, backend, posts } = fakes({
-      raw: { bundle_base64: "UkFX", bundle_sha256: "aa", locale: "zh" },
+      raw: { bundle_base64: "UkFX", bundle_sha256: "aa", locale: "zh", input_revision: "manifest-1" },
       workspace: { bundle_base64: "V1M=", bundle_sha256: "bb" },
     });
     const result = await materializeCapabilityInputs({ client, backend, runId: "r1" });
@@ -45,6 +45,7 @@ describe("materializeCapabilityInputs", () => {
     // The consumer-declared locale is surfaced to the caller (→ /session body)
     // and forwarded on both installs (they seed the constitution).
     expect(result.locale).toBe("zh");
+    expect(result.inputRevision).toBe("manifest-1");
     expect(posts.map((p) => p.path)).toEqual(["/sources", "/authoring"]);
     expect(posts[0].body).toMatchObject({ locale: "zh" });
     expect(posts[1].body).toEqual({ run_id: "r1", bundle_base64: "V1M=", bundle_sha256: "bb", locale: "zh" });
@@ -53,16 +54,34 @@ describe("materializeCapabilityInputs", () => {
     expect(backend.request).toHaveBeenNthCalledWith(2, CAPABILITY_FETCH_INPUT, { run_id: "r1", ref: CAPABILITY_INPUT_WORKSPACE_REF });
   });
 
+  it("dead-box recovery requests the exact checkpointed input revision", async () => {
+    const { client, backend } = fakes({
+      raw: { bundle_base64: "UkFX", input_revision: "manifest-1" },
+    });
+    const result = await materializeCapabilityInputs({
+      client,
+      backend,
+      runId: "r1",
+      inputRevision: "manifest-1",
+    });
+    expect(backend.request).toHaveBeenNthCalledWith(1, CAPABILITY_FETCH_INPUT, {
+      run_id: "r1",
+      input_revision: "manifest-1",
+    });
+    expect(result.inputRevision).toBe("manifest-1");
+  });
+
   it("live box (409 on /sources): never touches the workspace", async () => {
     const { client, backend, posts } = fakes({
-      raw: { bundle_base64: "UkFX" },
+      raw: { bundle_base64: "UkFX", input_revision: "current-but-not-installed" },
       workspace: { bundle_base64: "V1M=" },
       sourcesError: new Error("AgentBox request failed: 409 run r1 already exists"),
     });
-    await materializeCapabilityInputs({ client, backend, runId: "r1" });
+    const result = await materializeCapabilityInputs({ client, backend, runId: "r1" });
 
     expect(posts).toEqual([]); // no /authoring — live on-disk state wins
     expect(backend.request).toHaveBeenCalledTimes(1); // workspace never fetched
+    expect(result.inputRevision).toBeUndefined(); // keep the run's recovered checkpoint
   });
 
   it("live box detected via structured err.status (message wording independent)", async () => {

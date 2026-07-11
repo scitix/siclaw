@@ -8,9 +8,14 @@ class FakeBackend implements RunStateBackend {
   activeRuns: any[] = [];
   getRunRow: any = null;
   failPersist = false;
+  failPersistCount = 0;
   async request(method: string, params?: unknown): Promise<any> {
     this.calls.push({ method, params });
     if (method === CAPABILITY_PERSIST_RUN_STATE && this.failPersist) throw new Error("ws down");
+    if (method === CAPABILITY_PERSIST_RUN_STATE && this.failPersistCount > 0) {
+      if (this.failPersistCount > 0) this.failPersistCount -= 1;
+      throw new Error("FrontendWsClient disconnected");
+    }
     if (method === CAPABILITY_LIST_ACTIVE_RUNS) return { runs: this.activeRuns };
     if (method === CAPABILITY_GET_RUN) return this.getRunRow;
     return { ok: true };
@@ -67,6 +72,68 @@ describe("CapabilityRunManager", () => {
     // running(start) + idle = 2 persists.
     expect(be.persists()).toHaveLength(2);
     expect(be.persists().at(-1)?.params).toMatchObject({ status: "idle" });
+  });
+
+  it("checkpoints the installed input revision and restores it after restart", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.setInputRevision(runId, "manifest-1");
+    expect(mgr.get(runId)?.inputRevision).toBe("manifest-1");
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      checkpoint: { input_revision: "manifest-1" },
+    });
+
+    const recoveredBackend = new FakeBackend();
+    recoveredBackend.activeRuns = [{
+      id: runId,
+      profile: "kb-compile",
+      org_id: "o1",
+      status: "running",
+      checkpoint: JSON.stringify({ input_revision: "manifest-1" }),
+    }];
+    const recovered = new CapabilityRunManager(recoveredBackend);
+    await recovered.recover();
+    expect(recovered.get(runId)?.inputRevision).toBe("manifest-1");
+  });
+
+  it("fails closed when the installed input revision cannot be checkpointed", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    be.failPersistCount = 10;
+    vi.useFakeTimers();
+    try {
+      const checkpoint = mgr.setInputRevision(runId, "manifest-1");
+      const rejected = expect(checkpoint).rejects.toThrow("FrontendWsClient disconnected");
+      await vi.runAllTimersAsync();
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(mgr.get(runId)?.inputRevision).toBeUndefined();
+    expect(be.persists()).toHaveLength(5); // start + four bounded checkpoint attempts
+  });
+
+  it("retries a transient input checkpoint failure before allowing the box to run", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    be.failPersistCount = 2;
+    vi.useFakeTimers();
+    try {
+      const checkpoint = mgr.setInputRevision(runId, "manifest-1");
+      await vi.runAllTimersAsync();
+      await checkpoint;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(mgr.get(runId)?.inputRevision).toBe("manifest-1");
+    expect(be.persists()).toHaveLength(4); // start + two failures + one ack
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      checkpoint: { input_revision: "manifest-1" },
+    });
   });
 
   it("endRun persists the terminal state then drops the run from the live map", async () => {
