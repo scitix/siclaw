@@ -626,8 +626,10 @@ class _FakeRun:
         self._l1_repairs_used = 0
         self.summaries: list[str] = []
         self.injected: list[str] = []
+        self.events: list[dict] = []
 
     async def emit(self, ev):
+        self.events.append(ev)
         if ev.get("type") == "summary":
             self.summaries.append(ev["text"])
 
@@ -1422,6 +1424,7 @@ async def test_consumer_meta_wiring():
         run = _FakeRun(td)
         os.environ["KBC_PK_MODE"] = "off"
         assert await compile_box._post_turn_selfcheck(run) is None  # ledger passes
+        run._sync_sent = {}
 
         calls: list[str] = []
 
@@ -1438,11 +1441,25 @@ async def test_consumer_meta_wiring():
         try:
             await compile_box._set_converge_phase(run, "settled")
             assert getattr(run, "_meta_task", None) is None  # mode off → never fires
+            selfcheck.set_converge_phase(td, "revising")
+            run.events.clear()
+            run._sync_sent = {
+                art["path"]: hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
+                for art in compile_box._collect_workspace_artifacts(td)
+            }
             os.environ["KBC_CONSUMER_META_MODE"] = "auto"
             await compile_box._set_converge_phase(run, "settled")
-            assert run._meta_task is not None
-            await run._meta_task
             assert calls == [td]
+            syncs = [e for e in run.events if e.get("type") == "syncArtifacts"]
+            meta_sync = next(i for i, e in enumerate(syncs)
+                             if any(a.get("path") == "authoring/CONSUMER_META.json"
+                                    for a in e.get("artifacts", [])))
+            settled_sync = next(i for i, e in enumerate(syncs)
+                                if any(a.get("path") == "authoring/SELFCHECK.json"
+                                       and json.loads(a.get("content", "{}"))
+                                           .get("converge_phase") == "settled"
+                                       for a in e.get("artifacts", [])))
+            assert meta_sync < settled_sync, syncs
             meta = json.loads((base / "authoring/CONSUMER_META.json").read_text())
             assert meta["summary"] == "口径摘要" and meta["version"] == 1, meta
             sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
@@ -1453,21 +1470,17 @@ async def test_consumer_meta_wiring():
 
             # same tree → idempotent (no second generation)
             await compile_box._set_converge_phase(run, "settled")
-            if run._meta_task is not None:
-                await run._meta_task
             assert calls == [td]
 
             # content change → the next settle regenerates
             _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx v2")
             assert await compile_box._post_turn_selfcheck(run) is None
             await compile_box._set_converge_phase(run, "settled")
-            await run._meta_task
             assert calls == [td, td]
 
             # generated file deleted (model damage) → same tree self-heals
             (base / "authoring/CONSUMER_META.json").unlink()
             await compile_box._set_converge_phase(run, "settled")
-            await run._meta_task
             assert calls == [td, td, td]
             assert (base / "authoring/CONSUMER_META.json").is_file()
 
@@ -1479,15 +1492,12 @@ async def test_consumer_meta_wiring():
             _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - s/a.md\n---\nx v3")
             assert await compile_box._post_turn_selfcheck(run) is None
             await compile_box._set_converge_phase(run, "settled")
-            await run._meta_task
             sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
             assert sc["consumer_meta"]["state"] == "failed", sc["consumer_meta"]
             assert "model down" in sc["consumer_meta"]["error"]
             assert sc.get("converge_phase") == "settled"  # settle unharmed (fail-open)
             n = len(calls)
             await compile_box._set_converge_phase(run, "settled")
-            if run._meta_task is not None:
-                await run._meta_task
             assert len(calls) == n  # failed tree is not retried (bounded)
         finally:
             cm_mod.generate_consumer_meta = orig

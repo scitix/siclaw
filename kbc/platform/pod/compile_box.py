@@ -1047,20 +1047,26 @@ async def _set_converge_phase(run, phase: str) -> None:
     wd = getattr(run, "workdir", None)
     if not wd:
         return
-    selfcheck.set_converge_phase(wd, phase)
     sent = getattr(run, "_sync_sent", None)
+    if phase == "settled":
+        # A settled sync is the mutation commit signal. Generate the optional
+        # consumer summary first so it either rides that commit or records a
+        # bounded fail-open result; never mutate a terminal draft afterwards.
+        # Explicitly invalidate any previous tree's settled marker before the
+        # generator's own sync (a live incremental workspace may still carry it).
+        selfcheck.set_converge_phase(wd, "verifying")
+        if sent is not None:
+            try:
+                await _sync_workspace(run, sent)
+            except Exception:
+                pass
+        await _ensure_consumer_meta(run)
+    selfcheck.set_converge_phase(wd, phase)
     if sent is not None:
         try:
             await _sync_workspace(run, sent)
         except Exception:
             pass
-    if phase == "settled":
-        # Consumer-meta generation rides the settle transition — EVERY settle
-        # site (seam / media drain / PK terminal / batch end) funnels through
-        # here, so one hook covers them all. Additive + fail-open background
-        # task; keyed by candidate_tree_hash, so incremental rounds regenerate
-        # exactly when content changed and an unchanged settle is a no-op.
-        _maybe_start_consumer_meta(run)
 
 
 # ── consumer-facing meta wiring (S1, DESIGN-kb-consumer-meta-2026-07-10) ─────
@@ -1106,17 +1112,16 @@ def _consumer_meta_due(run) -> bool:
     return True
 
 
-def _maybe_start_consumer_meta(run) -> None:
-    """Kick the blind meta generation as a background task. Unlike media/PK it
-    does not gate the settle (the phase is already terminal when this fires);
-    it only tops the settled draft up with its routing summary."""
+async def _ensure_consumer_meta(run) -> None:
+    """Finish the blind meta attempt before emitting this tree's settled edge.
+    It is optional content, but its lifecycle is not eventual: success/failure
+    belongs to the same open mutation and no writer runs after settlement."""
     try:
         due = _consumer_meta_due(run)
     except Exception:
         return  # a broken due-check must never break the settle transition
     if due:
-        run._meta_task = asyncio.get_running_loop().create_task(
-            _run_consumer_meta_flow(run))
+        await _run_consumer_meta_flow(run)
 
 
 async def _run_consumer_meta_flow(run) -> None:
@@ -1131,10 +1136,13 @@ async def _run_consumer_meta_flow(run) -> None:
     try:
         tree = selfcheck.candidate_tree_hash(workdir)
         await run.emit({"type": "summary", "text": _loc(run,
-            "Consumer summary: generating the KB's routing summary from the compiled pages (background)…",
-            "消费摘要:正在从已编译页面生成本库的口径摘要(后台)…")})
-        meta = await consumermeta.generate_consumer_meta(
-            ClaudeEngine(), workdir=workdir, locale=getattr(run, "locale", None))
+            "Consumer summary: generating the KB's routing summary from the compiled pages…",
+            "消费摘要:正在从已编译页面生成本库的口径摘要…")})
+        timeout_s = max(1, int(os.environ.get("KBC_CONSUMER_META_TIMEOUT_S", "120")))
+        meta = await asyncio.wait_for(
+            consumermeta.generate_consumer_meta(
+                ClaudeEngine(), workdir=workdir, locale=getattr(run, "locale", None)),
+            timeout=timeout_s)
         selfcheck.write_consumer_meta(workdir, meta)
         selfcheck.update_consumer_meta_section(workdir, {
             "state": "generated", "tree_hash": tree,
