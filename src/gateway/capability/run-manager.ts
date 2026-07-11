@@ -157,6 +157,8 @@ export class CapabilityRunManager {
     correlationId?: string;
     runtimeId?: string;
     runId?: string; // caller may supply one (else minted)
+    /** Consumer-selected immutable input, persisted atomically with run start. */
+    inputRevision?: string;
     /**
      * Initial lifecycle status. "running" ONLY when a kickoff instruction will
      * drive an immediate turn; an instruction-less start (find-or-start for a
@@ -174,6 +176,7 @@ export class CapabilityRunManager {
       orgId: p.orgId,
       correlationId: p.correlationId,
       runtimeId: p.runtimeId,
+      inputRevision: p.inputRevision?.trim() || undefined,
       status: p.initialStatus ?? "running",
       messageIds: [],
       commandReceipts: [],

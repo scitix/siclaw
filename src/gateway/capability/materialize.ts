@@ -95,6 +95,25 @@ export async function materializeCapabilityInputs(opts: {
     throw new CapabilityMaterializationError("source-fetch", err);
   }
 
+  const pinnedRevision = inputRevision?.trim();
+  if (pinnedRevision) {
+    const returnedRevision = typeof src?.input_revision === "string" ? src.input_revision.trim() : "";
+    if (returnedRevision !== pinnedRevision) {
+      throw new CapabilityMaterializationError(
+        "source-fetch",
+        new Error(
+          `input revision mismatch: requested ${pinnedRevision}, received ${returnedRevision || "<missing>"}`,
+        ),
+      );
+    }
+    if (!src.bundle_base64) {
+      throw new CapabilityMaterializationError(
+        "source-fetch",
+        new Error(`pinned input revision ${pinnedRevision} returned no source bundle`),
+      );
+    }
+  }
+
   if (src?.locale) result.locale = src.locale;
   if (src?.llm && typeof src.llm === "object") result.llm = src.llm;
   if (src?.settings && typeof src.settings === "object") result.settings = src.settings;

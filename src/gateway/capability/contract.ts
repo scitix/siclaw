@@ -91,6 +91,12 @@ export interface CapabilityStartRequest {
    * Carried on both sides so neither has to double-write the linkage.
    */
   correlation_id?: string;
+  /**
+   * Immutable consumer input selected for this run. New consumers pin it at
+   * start so Runtime can durably checkpoint it before spawning/materializing a
+   * box. Absent preserves the rolling-compatible fetch-then-checkpoint path.
+   */
+  input_revision?: string;
   /** Capability input — opaque to the transport; the box interprets it (e.g. instruction, repo ref). */
   input?: Record<string, unknown>;
 }
