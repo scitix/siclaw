@@ -195,6 +195,34 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed");
   });
 
+  it("persists a structured model-stall failure without relying on the human error string", async () => {
+    const fe = fakeFrontend();
+    const mgr = fakeManager();
+    await driveCapabilitySession({
+      client: fakeClient([{
+        type: "error",
+        error: "ModelStallError('model request stalled')",
+        code: "model_turn_stalled",
+        stage: "model_turn",
+        attempts: 4,
+        idle_s: 90.2,
+        bound_s: 90,
+        tool_pending: false,
+        last_sdk_message: "query",
+      }]),
+      runId: "r1", frontendClient: fe, manager: mgr,
+    });
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed", {
+      code: "model_turn_stalled",
+      stage: "model_turn",
+      attempts: 4,
+      idle_s: 90.2,
+      bound_s: 90,
+      tool_pending: false,
+      last_sdk_message: "query",
+    });
+  });
+
   it("a persistArtifacts outage retries until acknowledged before later events flow", async () => {
     const fe = fakeFrontend();
     let attempts = 0;

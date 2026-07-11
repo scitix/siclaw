@@ -214,6 +214,37 @@ describe("CapabilityRunManager", () => {
     expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
   });
 
+  it("persists a structured terminal failure in the opaque checkpoint", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.endRun(runId, "failed", {
+      code: "model_turn_stalled",
+      stage: "model_turn",
+      attempts: 4,
+      idle_s: 90.2,
+      bound_s: 90,
+      tool_pending: false,
+      last_sdk_message: "query",
+    });
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      run_id: runId,
+      status: "failed",
+      checkpoint: {
+        failure: {
+          code: "model_turn_stalled",
+          stage: "model_turn",
+          attempts: 4,
+          idle_s: 90.2,
+          bound_s: 90,
+          tool_pending: false,
+          last_sdk_message: "query",
+        },
+      },
+    });
+  });
+
   it("recover rebuilds the in-memory map from the consumer's active runs", async () => {
     const be = new FakeBackend();
     be.activeRuns = [

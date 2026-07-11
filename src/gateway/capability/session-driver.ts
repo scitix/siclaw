@@ -21,6 +21,7 @@ import type {
   CapabilityEventType,
   CapabilityPersistArtifactsRequest,
   CapabilityPersistTurnRequest,
+  CapabilityRunFailure,
 } from "./contract.js";
 import {
   CAPABILITY_EVENT,
@@ -39,6 +40,14 @@ interface BoxEvent {
   artifacts?: Array<{ path: string; content?: string; deleted?: boolean }>;
   /** Explicit full-compile commit. Replayed file presence alone is not a commit. */
   commit_input?: boolean;
+  /** Sanitized machine failure fields. Never contains prompts/tool/provider text. */
+  code?: string;
+  stage?: string;
+  attempts?: number;
+  idle_s?: number;
+  bound_s?: number;
+  tool_pending?: boolean;
+  last_sdk_message?: string;
 }
 
 export interface DriveCapabilitySessionOptions {
@@ -161,7 +170,11 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         break;
       case "error":
         emit("lifecycle", { status: "failed", error: evt.error ?? "" });
-        await manager.endRun(runId, "failed");
+        {
+          const failure = structuredBoxFailure(evt);
+          if (failure) await manager.endRun(runId, "failed", failure);
+          else await manager.endRun(runId, "failed");
+        }
         break;
       case "end": {
         // The box's session coroutine exited (clean stream close: max_turns
@@ -185,4 +198,17 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         break;
     }
   }
+}
+
+function structuredBoxFailure(evt: BoxEvent): CapabilityRunFailure | undefined {
+  if (!evt.code || !evt.stage) return undefined;
+  return {
+    code: evt.code,
+    stage: evt.stage,
+    ...(typeof evt.attempts === "number" ? { attempts: evt.attempts } : {}),
+    ...(typeof evt.idle_s === "number" ? { idle_s: evt.idle_s } : {}),
+    ...(typeof evt.bound_s === "number" ? { bound_s: evt.bound_s } : {}),
+    ...(typeof evt.tool_pending === "boolean" ? { tool_pending: evt.tool_pending } : {}),
+    ...(typeof evt.last_sdk_message === "string" ? { last_sdk_message: evt.last_sdk_message } : {}),
+  };
 }

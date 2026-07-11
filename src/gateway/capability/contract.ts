@@ -79,6 +79,21 @@ export function isTerminalCapabilityStatus(s: CapabilityLifecycleStatus): s is C
   return (CAPABILITY_TERMINAL_STATUSES as readonly string[]).includes(s);
 }
 
+/**
+ * Content-free execution failure diagnostic persisted inside the opaque run
+ * checkpoint. Values are deliberately machine fields only: source text, tool
+ * input/output, provider responses, and credentials must never enter it.
+ */
+export interface CapabilityRunFailure {
+  code: string;
+  stage: string;
+  attempts?: number;
+  idle_s?: number;
+  bound_s?: number;
+  tool_pending?: boolean;
+  last_sdk_message?: string;
+}
+
 // ---- Consumer → siclaw ----
 
 export interface CapabilityStartRequest {
