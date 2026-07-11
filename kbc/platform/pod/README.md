@@ -11,7 +11,7 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
   - `POST /sources`  `{run_id?, workdir?, bundle_base64, bundle_sha256?}` → upload the frozen raw bundle, safely unpack into `workdir/raw/` (`drop/` kept as a compatibility alias); calling it after the run has started returns 409
   - `POST /authoring` `{run_id?, workdir?, bundle_base64, bundle_sha256?}` → upload authoring/candidate/eval/release assets, safely unpack into `workdir/`; also allowed on a live run (workspace re-hydration goes through here)
   - `POST /session/{run_id}` `{workdir?, instruction?, allowed_tools?}` → start this run's persistent conversation session (waits for the first /message); idempotent, on a live run it is a no-op attach
-  - `POST /message/{run_id}` `{message}` → inject one round of user message into the persistent session; prepare, compile, and adjudication-driven fix-up are all **ordinary turns**
+  - `POST /message/{run_id}` `{message, message_id?}` → inject one round of user message into the persistent session; a repeated consumer-minted `message_id` is acknowledged without injecting a second turn; prepare, compile, and adjudication-driven fix-up are all **ordinary turns**
   - `GET  /events/{run_id}` → SSE structured events: `session` / `log` / `summary` / `turn_done` / `syncArtifacts` / `plan_proposed` / `error` / `end`
   - `POST /test-session/{run_id}` → **start a test session**: pin the parent run's current draft (`candidate/`) into an immutable snapshot + start a read-only consumer session (reuses this pod, zero new infra); returns `test_session_id` + `snapshot_hash` + `pages`
   - `POST /test-message/{tid}` / `GET /test-events/{tid}` / `POST /test-session/{tid}/close` → the test session's inject / live-stream / teardown

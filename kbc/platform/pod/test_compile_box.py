@@ -336,6 +336,55 @@ async def test_message_waits_for_connect():
     print("✓ message waits for connect (P2.2 race fix)")
 
 
+async def test_message_idempotency_key():
+    """A lost runtime ack may replay capability.message. The box must inject a
+    stable message_id once, while a dispatch error releases the id for retry."""
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        class _C:
+            def __init__(self):
+                self.queries = []
+
+            async def query(self, text, session_id="default"):
+                self.queries.append(text)
+
+        run = compile_box.CompileRun("idem-live", "/tmp", 1)
+        fake = _C()
+        run.client = fake
+        run.connected.set()
+        compile_box.RUNS[run.run_id] = run
+        first = await client.post(f"/message/{run.run_id}", json={"message_id": "op-1", "message": "compile once"})
+        second = await client.post(f"/message/{run.run_id}", json={"message_id": "op-1", "message": "compile twice"})
+        assert first.status == 200 and second.status == 200, (await first.text(), await second.text())
+        assert (await second.json()).get("duplicate") is True
+        assert fake.queries == ["compile once"], fake.queries
+
+        class _Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            async def query(self, text, session_id="default"):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("dispatch failed")
+
+        retry_run = compile_box.CompileRun("idem-retry", "/tmp", 1)
+        flaky = _Flaky()
+        retry_run.client = flaky
+        retry_run.connected.set()
+        compile_box.RUNS[retry_run.run_id] = retry_run
+        failed = await client.post(f"/message/{retry_run.run_id}", json={"message_id": "op-2", "message": "retry me"})
+        retried = await client.post(f"/message/{retry_run.run_id}", json={"message_id": "op-2", "message": "retry me"})
+        assert failed.status == 500 and retried.status == 200, (failed.status, retried.status)
+        assert flaky.calls == 2, flaky.calls
+    finally:
+        await client.close()
+        compile_box.RUNS.clear()
+    print("✓ /message message_id is once-only and releases on dispatch failure")
+
+
 # ── 起测试会话 (read-only test session) ──
 
 async def test_test_path_escape_guard():
@@ -2036,6 +2085,7 @@ async def main():
     await test_session_driver_conversational()
     await test_conversational_session()
     await test_message_waits_for_connect()
+    await test_message_idempotency_key()
     test_pack_candidates_to_wiki()
     test_pack_candidates_symlink_confinement()
     await test_test_path_escape_guard()

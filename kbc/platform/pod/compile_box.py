@@ -270,6 +270,10 @@ class CompileRun:
         # Keep the last full-compile commit replayable across relay restarts.
         # The consumer dedupes it by immutable input revision.
         self._commit_input_replay = False
+        # Consumer-minted turn ids accepted by this live box. The runtime also
+        # checkpoints them; this local set closes the crash window where the box
+        # accepted a turn but the runtime died before persisting its ack.
+        self._message_ids: set[str] = set()
         # Scoped incremental (真增量): armed at kickoff with {before: page_hashes,
         # changeset}; the post-turn seam runs the byte-integrity guard against it,
         # then clears it. None = this turn is not a scoped incremental.
@@ -2798,6 +2802,13 @@ async def handle_message(request: web.Request):
     text = (body.get("message") or "").strip()
     if not text:
         return web.json_response({"error": "message is required"}, status=400)
+    message_id = (body.get("message_id") or "").strip()
+    if len(message_id) > 128:
+        return web.json_response({"error": "message_id must be at most 128 characters"}, status=400)
+    if message_id and message_id in run._message_ids:
+        return web.json_response({"ok": True, "duplicate": True})
+    if message_id:
+        run._message_ids.add(message_id)
     # v3 brief: if the wizard's 「开始生成知识库」message carries a 定调标签 block,
     # persist it deterministically to authoring/BRIEF.json BEFORE the turn so the
     # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
@@ -2807,7 +2818,12 @@ async def handle_message(request: web.Request):
     # precedence over the batch/full route (which is the "recompile everything"
     # fallback when no changeset is present).
     if _should_route_to_incremental(run, text):
-        await _start_incremental(run, text)
+        try:
+            await _start_incremental(run, text)
+        except BaseException:
+            if message_id:
+                run._message_ids.discard(message_id)
+            raise
         return web.json_response({"ok": True, "incremental": True})
     if _is_compile_trigger(text):
         # A FULL recompile kickoff (compile trigger, no RAW_CHANGES) voids any
@@ -2855,6 +2871,8 @@ async def handle_message(request: web.Request):
     except BaseException:
         if full_compile:
             run._full_compile_pending = False
+        if message_id:
+            run._message_ids.discard(message_id)
         raise
     return web.json_response({"ok": True})
 

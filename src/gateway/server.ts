@@ -574,8 +574,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const req = params as unknown as CapabilityMessageRequest;
     const runId = req.run_id;
     const message = req.message;
+    const messageId = req.message_id?.trim();
     if (!runId) throw new Error("run_id is required");
     if (!message) throw new Error("message is required");
+    if (messageId && messageId.length > 128) throw new Error("message_id must be at most 128 characters");
     // The run record is the authority for the box's profile/org. A run missing
     // from memory is first re-adopted from the consumer's store (heals a boot
     // recovery that raced the consumer); only a run the STORE doesn't know (or
@@ -586,13 +588,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // A terminal record can linger in memory while its final persist retries
     // (flushTerminal) — it is just as unaddressable as an unknown run.
     if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
+    if (messageId && capabilityRunManager.hasMessageId(runId, messageId)) {
+      return { ok: true, run_id: runId, duplicate: true };
+    }
     capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
-    await client.postJson(`/message/${runId}`, { message });
-    // The box is now working a turn: reflect it (turn_done flips back to idle).
-    // Keeps the consumer's view honest AND puts the run in the strict staleMs
-    // tier — a wedged turn must not enjoy the long idle TTL.
+    // Publish running BEFORE the box can emit turn_done. Posting first allowed a
+    // fast turn_done→idle to land and then be overwritten by this handler's late
+    // running write, leaving an already-finished turn permanently busy.
     await capabilityRunManager.setStatus(runId, "running");
+    try {
+      await client.postJson(`/message/${runId}`, { message, ...(messageId ? { message_id: messageId } : {}) });
+    } catch (err) {
+      // The box did not accept the turn. Restore the hosting run to idle; a
+      // terminal state that raced here remains sticky in setStatus().
+      await capabilityRunManager.setStatus(runId, "idle");
+      throw err;
+    }
+    if (messageId) await capabilityRunManager.rememberMessageId(runId, messageId);
     return { ok: true, run_id: runId };
   });
 
