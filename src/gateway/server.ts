@@ -41,6 +41,7 @@ import type {
   CapabilityTestStartResponse,
 } from "./capability/contract.js";
 import { CapabilityMaterializationError, materializeCapabilityInputs } from "./capability/materialize.js";
+import { resolveCapabilitySessionLlm } from "./capability/session-config.js";
 import {
   capabilityActiveRuns,
   capabilityMaterializationFailuresTotal,
@@ -299,9 +300,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         try {
           promptResult = await client.prompt(promptOpts);
         } catch (err) {
-          if (err instanceof CapabilityMaterializationError) {
-            capabilityMaterializationFailuresTotal.inc({ stage: err.stage });
-          }
           // Concurrent send: agentbox returns 409 "Session is already
           // running. Use the steer endpoint to add input to the active
           // prompt." when the user double-taps send before the previous
@@ -390,12 +388,31 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // manually started kbc box (usually http://127.0.0.1:3000) to reuse a local
   // Claude Code/OAuth session while testing the consumer↔runtime protocol.
   const localCapabilityBoxEndpoint = process.env.SICLAW_COMPILE_BOX_ENDPOINT?.trim();
-  const capabilityBoxClient = async (runId: string, profile: string, orgId?: string): Promise<AgentBoxClient> => {
+  const capabilityBoxClient = async (
+    runId: string,
+    profile: string,
+    orgId?: string,
+  ): Promise<{ client: AgentBoxClient; created: boolean }> => {
     if (localCapabilityBoxEndpoint) {
-      return new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
+      return {
+        client: new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions),
+        created: false,
+      };
     }
-    const handle = await agentBoxManager.getOrCreate(runId, { profile, orgId });
-    return new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+    // Compatibility for embedded managers/test doubles built before acquisition
+    // disposition existed. The concrete manager always reports it; an older
+    // implementation is conservatively treated as the creator so failed setup
+    // retains the historical cleanup behavior.
+    const manager = agentBoxManager as AgentBoxManager & {
+      getOrCreateWithDisposition?: AgentBoxManager["getOrCreateWithDisposition"];
+    };
+    const acquired = typeof manager.getOrCreateWithDisposition === "function"
+      ? await manager.getOrCreateWithDisposition(runId, { profile, orgId })
+      : { handle: await manager.getOrCreate(runId, { profile, orgId }), created: true };
+    return {
+      client: new AgentBoxClient(acquired.handle.endpoint, 30000, agentBoxTlsOptions),
+      created: acquired.created,
+    };
   };
 
   // ── Capability protocol (option B): siclaw owns the run lifecycle ──────────
@@ -447,7 +464,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     let pending = capabilitySessions.get(runId);
     if (!pending) {
       pending = (async () => {
-        const client = await capabilityBoxClient(runId, profile, orgId);
+        const { client, created } = await capabilityBoxClient(runId, profile, orgId);
         let replayWorkspace = false;
         try {
           // Raw sources + (fresh box only) the durable authoring workspace, both
@@ -469,24 +486,32 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             instruction: instruction ?? "",
             allowed_tools: allowedTools,
             locale: materialized.locale,
-            // Consumer-managed LLM endpoint + KBC_* knobs (DESIGN-kb-llm-binding-v2):
-            // opaque passthrough — the box applies them in-process before its SDK
-            // connects. Never logged here; token stays out of the pod spec.
-            llm: materialized.llm,
+            // Whole-block authority: consumer LLM config wins as-is; only an
+            // absent block uses Runtime's Helm env. The box applies it before
+            // its SDK connects. Never logged here; token stays out of PodSpec.
+            llm: resolveCapabilitySessionLlm(materialized.llm),
             settings: materialized.settings,
           });
         } catch (err) {
-          // Setup failed AFTER the pod was spawned (review): the relay's
-          // finally below — the normal stop owner — never attaches on this
-          // path, so without this stop a spawn-succeeded-but-setup-failed run
-          // leaks its pod + cert Secret until the orphan sweep. stop() is
-          // 404-tolerant (local escape-hatch boxes aren't spawner-managed).
-          void agentBoxManager.stop(runId).catch((stopErr) =>
-            console.error(
-              `[capability] stop box after setup failure run=${runId}:`,
-              stopErr instanceof Error ? stopErr.message : String(stopErr),
-            ),
-          );
+          if (err instanceof CapabilityMaterializationError) {
+            capabilityMaterializationFailuresTotal.inc({ stage: err.stage });
+          }
+          // Only a box created by THIS setup attempt is disposable. A Runtime
+          // replacement can be reattaching to an adopted live box; deleting it
+          // because the consumer had a transient fetch failure would destroy the
+          // in-flight turn that shutdown()/adopt are specifically preserving.
+          if (created) {
+            void agentBoxManager.stop(runId).catch((stopErr) =>
+              console.error(
+                `[capability] stop new box after setup failure run=${runId}:`,
+                stopErr instanceof Error ? stopErr.message : String(stopErr),
+              ),
+            );
+          } else {
+            console.warn(
+              `[capability] setup failed while reattaching existing box run=${runId}; preserving it for retry`,
+            );
+          }
           throw err;
         }
         driveCapabilitySession({ client, runId, frontendClient, manager: capabilityRunManager, replayWorkspace })

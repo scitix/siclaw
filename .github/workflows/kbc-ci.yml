@@ -33,3 +33,5 @@ jobs:
         working-directory: kbc/platform/pod
       - run: python test_redblue.py
         working-directory: kbc/platform/pod
+      - run: python test_mtls_auth.py
+        working-directory: kbc/platform/pod

@@ -33,6 +33,12 @@ interface ManagedBox {
   createdAt: Date;
 }
 
+export interface AgentBoxAcquisition {
+  handle: AgentBoxHandle;
+  /** True only when this call created/recreated the underlying box. */
+  created: boolean;
+}
+
 export class AgentBoxManager {
   private spawner: BoxSpawner;
   private config: Required<AgentBoxManagerConfig>;
@@ -156,6 +162,20 @@ export class AgentBoxManager {
    * (after restart/idle-release), not immediately on a warm pod.
    */
   async getOrCreate(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+    return (await this.getOrCreateWithDisposition(agentId, config)).handle;
+  }
+
+  /**
+   * Get or create a box and report ownership of the resulting resource.
+   *
+   * Callers that perform multi-step setup need this distinction: a failed setup
+   * may clean up a box it just created, but must never delete a live box reused
+   * during Runtime adoption or a warm request.
+   */
+  async getOrCreateWithDisposition(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+  ): Promise<AgentBoxAcquisition> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
     if (this.isK8s) {
       return this.getOrCreateK8s(agentId, config);
@@ -163,7 +183,10 @@ export class AgentBoxManager {
     return this.getOrCreateLocal(agentId, config);
   }
 
-  private async getOrCreateK8s(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+  private async getOrCreateK8s(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+  ): Promise<AgentBoxAcquisition> {
     const name = this.podName(agentId);
     const wantProfile = config?.profile ?? "agent";
 
@@ -174,7 +197,7 @@ export class AgentBoxManager {
         // Warm reuse: return the running pod without spawning. Per-agent config
         // (env/persistence) is NOT re-resolved here — the pod's volume mount is
         // already fixed, so a changed mode applies on the next cold spawn.
-        return { boxId: name, endpoint: info.endpoint, agentId };
+        return { handle: { boxId: name, endpoint: info.endpoint, agentId }, created: false };
       }
       // Profile changed under the same identity — reusing the old-shaped pod would
       // silently run the wrong image/tools/volumes (the historic stale-box gap).
@@ -199,10 +222,13 @@ export class AgentBoxManager {
     });
 
     handle.agentId = agentId;
-    return handle;
+    return { handle, created: true };
   }
 
-  private async getOrCreateLocal(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+  private async getOrCreateLocal(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+  ): Promise<AgentBoxAcquisition> {
     const existing = this.boxes.get(agentId);
     if (existing) {
       existing.lastActiveAt = new Date();
@@ -210,7 +236,7 @@ export class AgentBoxManager {
       if (info && info.status === "running") {
         // Warm reuse: cached running box returned without spawning. Per-agent
         // config (env/persistence) is NOT re-resolved — applies on next cold spawn.
-        return existing.handle;
+        return { handle: existing.handle, created: false };
       }
       this.boxes.delete(agentId);
     }
@@ -226,7 +252,7 @@ export class AgentBoxManager {
     });
 
     this.boxes.set(agentId, { handle, lastActiveAt: new Date(), createdAt: new Date() });
-    return handle;
+    return { handle, created: true };
   }
 
   /**

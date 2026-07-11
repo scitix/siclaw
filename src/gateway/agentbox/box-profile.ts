@@ -28,8 +28,9 @@ export interface BoxProfile {
    */
   image?: string;
   /**
-   * Extra runtime-process env names forwarded into the box, ON TOP of the base
-   * agentbox allowlist. The box does NOT inherit runtime env; only these pass.
+   * Profile-declared Runtime env names. The box never inherits arbitrary
+   * Runtime env: normal AgentBoxes also have a small built-in allowlist, while
+   * lean profiles receive only the names declared here.
    */
   envForward?: string[];
   /** HOME override (e.g. "/work" when rootfs is read-only and the image HOME isn't writable). */
@@ -78,10 +79,10 @@ function kbCompileProfile(): BoxProfile {
   return {
     name: "kb-compile",
     image: process.env.SICLAW_COMPILE_BOX_IMAGE || "kbc-compile-box:latest",
-    // LLM credentials arrive in the consumer-managed /session payload after
-    // fail-closed input materialization. Never duplicate a Runtime secret into
-    // the pod spec; only the non-secret endpoint and ops KBC_* kill switches
-    // are inherited as rolling-upgrade fallbacks.
+    // LLM credentials arrive in /session after fail-closed input materialization:
+    // consumer block first, Runtime Helm fallback only when that block is absent.
+    // Never duplicate a Runtime secret into the pod spec; only the non-secret
+    // endpoint and ops KBC_* kill switches remain as rolling-version fallbacks.
     envForward: ["ANTHROPIC_BASE_URL", "KBC_*"],
     home: "/work",
     volumes: [{ name: "work", mountPath: "/work", sizeLimit: "4Gi" }], // installer allows 2GB unpacked raw + candidate output — 1Gi evicted large-corpus pods

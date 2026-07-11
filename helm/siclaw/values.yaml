@@ -82,14 +82,15 @@ runtime:
   subagentConcurrency: 5
   # LLM endpoint for LEAN CAPABILITY BOXES (kb-compile / kb-test) ONLY. The chat
   # path does not read these — agent models come from the Portal/Upstream model
-  # descriptors. They exist so the runtime can forward ANTHROPIC_* into spawned
-  # kb boxes (BoxProfile envForward). Token rotation: update the Secret, then
-  # rollout-restart the runtime (env Secrets resolve at pod start); live kb
-  # boxes keep their spawn-time token until respawned — either keep the old
-  # token valid through a grace window, or delete agentbox pods after rotating.
+  # descriptors. On a fresh KB session Runtime sends these through the mTLS
+  # /session payload only when the consumer did not provide its own LLM block;
+  # credentials are never copied into the KB PodSpec. Token rotation: update the
+  # Secret, rollout-restart Runtime (env Secrets resolve at pod start), then keep
+  # the old token valid through a grace window or delete KB agentbox pods. A live
+  # box's already-connected SDK client keeps its session-start token until respawn.
   llm:
     baseUrl: ""            # e.g. https://api.scitix.ai/model-api (massapi proxy)
-    model: ""              # optional ANTHROPIC_MODEL default for the box CLI
+    model: ""              # optional model default (below KBC_COMPILE_MODEL)
     tokenSecret:
       name: ""             # existing Secret holding the massapi token
       key: "ANTHROPIC_AUTH_TOKEN"
