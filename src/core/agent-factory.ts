@@ -81,8 +81,8 @@ export interface CreateSiclawSessionOpts {
   /**
    * Absolute path to a directory that a local Portal snapshot has materialized
    * knowledge pages into. CLI mode only: when set, replaces
-   * `config.paths.knowledgeDir` so the agent's Read tool + `[[page]]`
-   * wiki-link convention resolves to Portal-managed content.
+   * `config.paths.knowledgeDir` so the agent's Read tool resolves standard
+   * markdown links and legacy `[[page]]` links to Portal-managed content.
    */
   portalKnowledgeDir?: string;
   /**

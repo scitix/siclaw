@@ -38,6 +38,66 @@ def _safe(name):
     return name if name.endswith(".md") else name + ".md"
 
 
+def _mask_span(text):
+    return "".join("\n" if ch == "\n" else " " for ch in text)
+
+
+def _markdown_prose(text):
+    """Mask fenced and inline code before enforcing the output link profile."""
+    lines = []
+    fence_char = None
+    fence_len = 0
+    for line in text.splitlines(keepends=True):
+        raw = line.rstrip("\r\n")
+        if fence_char is not None:
+            close = re.match(r"^[ ]{0,3}([`~]+)[ \t]*$", raw)
+            lines.append(_mask_span(line))
+            if close and close.group(1)[0] == fence_char and len(close.group(1)) >= fence_len:
+                fence_char = None
+                fence_len = 0
+            continue
+        opened = re.match(r"^[ ]{0,3}(`{3,}|~{3,})(?:[^\r\n]*)$", raw)
+        if opened:
+            fence_char = opened.group(1)[0]
+            fence_len = len(opened.group(1))
+            lines.append(_mask_span(line))
+        else:
+            lines.append(line)
+
+    source = "".join(lines)
+    chars = list(source)
+    pos = 0
+    while True:
+        start = source.find("`", pos)
+        if start < 0:
+            break
+        opener_end = start
+        while opener_end < len(source) and source[opener_end] == "`":
+            opener_end += 1
+        ticks = opener_end - start
+        cursor = opener_end
+        found = -1
+        while True:
+            close = source.find("`", cursor)
+            if close < 0:
+                break
+            close_end = close
+            while close_end < len(source) and source[close_end] == "`":
+                close_end += 1
+            if close_end - close == ticks:
+                found = close_end
+                break
+            cursor = close_end
+        if found < 0:
+            pos = opener_end
+            continue
+        for i in range(start, found):
+            if chars[i] != "\n":
+                chars[i] = " "
+        pos = found
+    return "".join(chars)
+
+
 def emit(ledger, out_dir):
     claims = "\n".join(f"- {c['text']}(源:{c.get('src')})" for c in ledger["claims"]) or "(无)"
     findings = "\n".join(
@@ -63,9 +123,10 @@ def emit(ledger, out_dir):
             metadata, allow_unicode=True, sort_keys=False,
         ).rstrip() + "\n---\n\n"
         body = str(pg.get("body") or "").strip()
-        if re.search(r"\[\[[^\]]+\]\]", body):
+        prose = _markdown_prose(body)
+        if re.search(r"\[\[[^\]]+\]\]", prose):
             raise ValueError(f"OKF page {fn} uses a non-standard wikilink")
-        if re.search(r"\]\(/[^)]+\.md(?:#[^)]*)?\)", body):
+        if re.search(r"\]\(/[^)]+\.md(?:#[^)]*)?\)", prose):
             raise ValueError(f"OKF page {fn} uses a non-portable bundle-absolute link")
         (out_dir / fn).write_text(fm + body + "\n", encoding="utf-8")
         links.append(f"- [{metadata['title']}]({fn}) - {metadata['description']}")

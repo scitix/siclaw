@@ -7,9 +7,12 @@ Pure-function tests need only stdlib; the wiring test imports compile_box
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import os
+import sys
 import tempfile
+import types
 from pathlib import Path
 
 import selfcheck
@@ -73,7 +76,21 @@ def test_okf_v01_conformance():
         "topic.md": {"text": valid},
         "log.md": {"text": "# Update log\n## 2026-07-11\n- **Creation**: Added [Topic](topic.md)."},
     }
-    assert selfcheck.okf_v01_violations(pages) == []
+    assert selfcheck.format_policy_violations(pages) == []
+
+    code_examples = {
+        "index.md": pages["index.md"],
+        "topic.md": {"text": valid + "\n\n```bash\nif [[ -f /etc/foo ]]; then\n  echo yes\nfi\n```"
+                              "\nRun `if [[ -f /etc/foo ]]; then echo yes; fi`."
+                              "\nExample: `[root](/tables/example.md)`."},
+    }
+    assert selfcheck.format_policy_violations(code_examples) == []
+
+    no_version = {**pages, "index.md": {"text": "# Contents\n- [Topic](topic.md) - summary"}}
+    assert selfcheck.okf_v01_violations(no_version) == []
+    assert {v["kind"] for v in selfcheck.siclaw_portable_output_violations(no_version)} == {
+        "siclaw_profile_version_declaration"
+    }
 
     broken = {
         "index.md": {"text": "---\nokf_version: \"0.1\"\n---\n# Index\n- [[bad]]"},
@@ -83,12 +100,80 @@ def test_okf_v01_conformance():
         "sub/index.md": {"text": "---\nokf_version: '0.1'\n---\n# Nested"},
         "log.md": {"text": "---\ntype: log\n---\n# Log\n## 2026-99-99\nentry"},
     }
-    kinds = {v["kind"] for v in selfcheck.okf_v01_violations(broken)}
+    kinds = {v["kind"] for v in selfcheck.format_policy_violations(broken)}
     assert {
         "okf_index_frontmatter", "okf_index_structure", "okf_frontmatter", "okf_type",
-        "okf_wikilink", "okf_nonportable_link", "okf_log_frontmatter", "okf_log_structure",
+        "siclaw_profile_wikilink", "siclaw_profile_bundle_link",
+        "okf_log_frontmatter", "okf_log_structure",
     } <= kinds, kinds
-    print("OK  OKF v0.1 conformance (YAML/type/reserved files/portable links)")
+
+    empty_latest = {
+        "index.md": pages["index.md"],
+        "log.md": {"text": "# Log\n\n## 2026-07-11\n\n## 2026-07-10\n\n- older entry"},
+    }
+    log_violations = selfcheck.okf_v01_violations(empty_latest)
+    assert any(v["kind"] == "okf_log_structure" and "2026-07-11" in v["detail"]
+               for v in log_violations), log_violations
+    print("OK  OKF v0.1 core conformance + Siclaw portable-output profile")
+
+
+def test_markdown_code_is_not_a_link():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "candidate/index.md",
+            "---\nokf_version: \"0.1\"\n---\n# Index\n- [A](a.md)")
+        _mk(base, "candidate/a.md",
+            "---\ntype: Guide\ncompiled_from:\n  - s/a.md\n---\n"
+            "# Bash\n```bash\nif [[ -f /etc/foo ]]; then\n  echo yes\nfi\n```\n"
+            "Inline: `[[ not-a-link ]]` and `[root](/example.md)`.\n")
+        report = selfcheck.run_layer1(td)
+        assert report["coverage"]["closed"], report
+        assert report["lint"]["ok"], report["lint"]
+
+        # A real prose wikilink still bites; code masking must not weaken the
+        # Siclaw new-output profile.
+        _mk(base, "candidate/a.md",
+            "---\ntype: Guide\ncompiled_from:\n  - s/a.md\n---\nSee [[missing]].\n")
+        report = selfcheck.run_layer1(td)
+        kinds = {v["kind"] for v in report["lint"]["violations"]}
+        assert {"broken_wikilink", "siclaw_profile_wikilink"} <= kinds, kinds
+    print("OK  markdown code masked while real prose links still fail")
+
+
+def test_emit_ignores_links_in_code():
+    """The legacy ledger emitter enforces the same prose-only link profile."""
+    fake_llm = types.ModuleType("llm")
+    fake_llm.call_json = lambda _: None
+    old_llm = sys.modules.get("llm")
+    sys.modules["llm"] = fake_llm
+    try:
+        emit_path = Path(__file__).parents[2] / "tools" / "emit.py"
+        spec = importlib.util.spec_from_file_location("kbc_test_emit", emit_path)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        ledger = {"claims": [{"text": "x", "src": "a.md"}], "findings": {}}
+        page = {"filename": "guide.md", "type": "Guide", "title": "Guide", "description": "d",
+                "body": "```bash\nif [[ -f /etc/foo ]]; then echo yes; fi\n```\n`[root](/x.md)`"}
+        module.call_json = lambda _: {"pages": [page]}
+        with tempfile.TemporaryDirectory() as td:
+            assert module.emit(ledger, td) == ["guide.md"]
+
+        module.call_json = lambda _: {"pages": [{**page, "body": "See [[legacy]]."}]}
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                module.emit(ledger, td)
+                raise AssertionError("real wikilink must fail")
+            except ValueError as exc:
+                assert "wikilink" in str(exc)
+    finally:
+        if old_llm is None:
+            sys.modules.pop("llm", None)
+        else:
+            sys.modules["llm"] = old_llm
+    print("OK  emit link profile ignores fenced/inline code and rejects prose wikilinks")
 
 
 def test_inventory_and_exclusions():
@@ -140,7 +225,7 @@ def test_coverage_and_lint():
         kinds = sorted(v["kind"] for v in report["lint"]["violations"])
         # bare.md lacks provenance AND is unreachable from index; p1 has a
         # broken wikilink; index is exempt
-        assert kinds == ["broken_wikilink", "no_provenance", "okf_wikilink", "orphan"], kinds
+        assert kinds == ["broken_wikilink", "no_provenance", "orphan", "siclaw_profile_wikilink"], kinds
 
         # repair prompt names the concrete gaps — locale-threaded, platform default = en
         report["state"] = "repairing"
@@ -1220,6 +1305,8 @@ def main():
     os.environ.setdefault("KBC_PK_MODE", "off")  # PK never fires in unrelated wiring tests
     test_parse_compiled_from()
     test_okf_v01_conformance()
+    test_markdown_code_is_not_a_link()
+    test_emit_ignores_links_in_code()
     test_parse_compiled_from_inline()
     test_inventory_and_exclusions()
     test_matches_segment_aware()

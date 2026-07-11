@@ -1749,6 +1749,7 @@ async def _post_turn_selfcheck(run) -> str | None:
     # (a snapshot miss) is left for a repair turn.
     incr_violations: list[str] = []
     restored_pages: list[str] = []
+    editable: set[str] = set()
     if incr:
         after = incremental.page_hashes(workdir)
         # repair_pages (set on re-arm): a ledger/lint repair turn legitimately
@@ -1765,8 +1766,25 @@ async def _post_turn_selfcheck(run) -> str | None:
                 after = incremental.page_hashes(workdir)
                 incr_violations = incremental.integrity_violations(incr["before"], after, editable)
     report = selfcheck.run_layer1(workdir)
+    grandfathered_format: list[dict] = []
     if incr:
-        report["incremental"] = {"out_of_scope_pages": incr_violations, "restored_pages": restored_pages}
+        blocking, grandfathered_format = selfcheck.filter_incremental_format_violations(
+            report["lint"]["violations"],
+            incr.get("baseline_format_violations") or [],
+            editable,
+        )
+        report["lint"] = {"ok": not blocking, "violations": blocking}
+    if incr:
+        # Keep inherited debt visible without allowing it to widen repair_pages
+        # and silently turn a scoped edit into a whole-library migration. The
+        # full set can be recomputed from the unchanged baseline; cap the report
+        # payload so a legacy corpus cannot exceed the workspace sync budget.
+        report["incremental"] = {
+            "out_of_scope_pages": incr_violations,
+            "restored_pages": restored_pages,
+            "grandfathered_format_violation_count": len(grandfathered_format),
+            "grandfathered_format_violations": grandfathered_format[:40],
+        }
     ledger_clean = report["coverage"]["closed"] and report["lint"]["ok"]
     if ledger_clean and not incr_violations:
         run._l1_repairs_used = 0
@@ -2070,6 +2088,11 @@ async def _start_incremental(run: "CompileRun", text: str, *, strict: bool = Fal
         # cannot rebuild a byte-exact page from a hash, so asking it to burned
         # the whole repair budget and always landed unconverged (3/3 live 07-09).
         "before_bytes": incremental.page_bytes(run.workdir),
+        # Existing format debt on untouched pages is migration work, not a
+        # license for an ordinary incremental repair turn to edit the whole KB.
+        # New/editable pages remain strictly enforced at the closing gate.
+        "baseline_format_violations": selfcheck.format_violation_keys(
+            selfcheck.candidate_pages(run.workdir)),
         "changeset": cs,
     }
     await run.emit({"type": "summary",

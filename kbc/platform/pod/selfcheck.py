@@ -293,27 +293,106 @@ def parse_okf_frontmatter(md_text: str) -> tuple[dict | None, str, str | None]:
     return value, body, None
 
 
-def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[dict]:
-    """Validate the reserved OKF index shape plus Siclaw's v0.1 profile.
+def _mask_span(text: str) -> str:
+    """Blank markdown code while preserving newlines and character offsets."""
+    return "".join("\n" if ch == "\n" else " " for ch in text)
 
-    OKF permits frontmatter only on the bundle-root index. Siclaw requires that
-    root block to pin okf_version=0.1 so every published bundle is self-
-    describing. Index entries use portable, file-relative Markdown links; the
-    consumer may keep reading legacy wikilinks, but the compiler no longer emits
-    them.
+
+def _markdown_prose(md_text: str) -> str:
+    """Markdown text with YAML frontmatter, fenced code, and code spans masked.
+
+    Link lint operates on rendered prose, not raw source. A raw ``[[`` scan
+    rejects ordinary Bash conditionals and example links inside fenced/inline
+    code, both of which OKF explicitly permits. This deliberately implements
+    the code constructs the compiler emits without adding another production
+    markdown dependency.
+    """
+    _, body, error = parse_okf_frontmatter(md_text)
+    if error and not md_text.startswith("---"):
+        body = md_text
+
+    # Fenced blocks: CommonMark allows up to three leading spaces and either a
+    # backtick or tilde fence. A closing fence uses the same character and is at
+    # least as long as the opener.
+    masked_lines: list[str] = []
+    fence_char: str | None = None
+    fence_len = 0
+    for line in body.splitlines(keepends=True):
+        raw = line.rstrip("\r\n")
+        if fence_char is not None:
+            close = re.match(r"^[ ]{0,3}([`~]+)[ \t]*$", raw)
+            masked_lines.append(_mask_span(line))
+            if close and close.group(1)[0] == fence_char and len(close.group(1)) >= fence_len:
+                fence_char = None
+                fence_len = 0
+            continue
+        opened = re.match(r"^[ ]{0,3}(`{3,}|~{3,})(?:[^\r\n]*)$", raw)
+        if opened:
+            fence_char = opened.group(1)[0]
+            fence_len = len(opened.group(1))
+            masked_lines.append(_mask_span(line))
+        else:
+            masked_lines.append(line)
+
+    # Inline code spans can use any backtick-run length and may cross lines.
+    # Pair only equal-length runs; an unmatched run remains literal markdown.
+    text = "".join(masked_lines)
+    chars = list(text)
+    pos = 0
+    while True:
+        start = text.find("`", pos)
+        if start < 0:
+            break
+        end_run = start
+        while end_run < len(text) and text[end_run] == "`":
+            end_run += 1
+        ticks = end_run - start
+        close = end_run
+        found = -1
+        while True:
+            close = text.find("`", close)
+            if close < 0:
+                break
+            close_end = close
+            while close_end < len(text) and text[close_end] == "`":
+                close_end += 1
+            if close_end - close == ticks:
+                found = close_end
+                break
+            close = close_end
+        if found < 0:
+            pos = end_run
+            continue
+        for i in range(start, found):
+            if chars[i] != "\n":
+                chars[i] = " "
+        pos = found
+    return "".join(chars)
+
+
+def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[dict]:
+    """Validate the reserved OKF index shape for a v0.1 bundle.
+
+    OKF permits an optional version declaration only on the bundle-root index;
+    when present here it must target v0.1. Siclaw's producer profile separately
+    requires the declaration and file-relative links on newly authored output.
     """
     violations: list[dict] = []
     fm, body, error = parse_okf_frontmatter(text)
     if rel == "index.md":
-        if error:
+        if error and text.splitlines() and text.splitlines()[0].strip() == "---":
             violations.append({"page": rel, "kind": "okf_index_frontmatter",
-                               "detail": f"根 index.md 必须只有 okf_version: \"0.1\" 的 YAML frontmatter: {error}"})
+                               "detail": f"根 index.md 的 YAML frontmatter 无效: {error}"})
             body = text
-        elif (set(fm or {}) != {"okf_version"}
+        elif not error and (set(fm or {}) != {"okf_version"}
               or not isinstance((fm or {}).get("okf_version"), str)
               or (fm or {}).get("okf_version") != "0.1"):
             violations.append({"page": rel, "kind": "okf_index_frontmatter",
                                "detail": "根 index.md frontmatter 必须且只能包含 okf_version: \"0.1\""})
+        elif error:
+            # OKF makes index.md optional and its root version declaration MAY;
+            # Siclaw's producer profile below requires that declaration.
+            body = text
     else:
         # A nested index has no frontmatter. A malformed block is still a block,
         # so detect the delimiter directly instead of treating its parse error as
@@ -338,7 +417,9 @@ def _okf_log_violations(rel: str, text: str) -> list[dict]:
     if text.splitlines() and text.splitlines()[0].strip() == "---":
         violations.append({"page": rel, "kind": "okf_log_frontmatter",
                            "detail": "log.md 按 OKF 不能包含 frontmatter"})
-    dates = re.findall(r"(?m)^##\s+(\d{4}-\d{2}-\d{2})\s*$", text)
+    prose = _markdown_prose(text)
+    date_matches = list(re.finditer(r"(?m)^##\s+(\d{4}-\d{2}-\d{2})\s*$", prose))
+    dates = [m.group(1) for m in date_matches]
     valid_dates: list[str] = []
     for date in dates:
         try:
@@ -346,32 +427,31 @@ def _okf_log_violations(rel: str, text: str) -> list[dict]:
             valid_dates.append(date)
         except ValueError:
             pass
-    if not re.search(r"(?m)^#\s+\S", text) or not dates or len(valid_dates) != len(dates):
+    if not re.search(r"(?m)^#\s+\S", prose) or not dates or len(valid_dates) != len(dates):
         violations.append({"page": rel, "kind": "okf_log_structure",
                            "detail": "log.md 需要标题和合法的 ## YYYY-MM-DD 日期分组"})
     elif valid_dates != sorted(valid_dates, reverse=True):
         violations.append({"page": rel, "kind": "okf_log_structure",
                            "detail": "log.md 日期分组必须按从新到旧排列"})
-    if dates and not re.search(r"(?m)^\s*[-*]\s+.+$", text):
+    empty_groups = []
+    for i, match in enumerate(date_matches):
+        end = date_matches[i + 1].start() if i + 1 < len(date_matches) else len(prose)
+        if not re.search(r"(?m)^\s*[-*]\s+\S.*$", prose[match.end():end]):
+            empty_groups.append(match.group(1))
+    if empty_groups:
         violations.append({"page": rel, "kind": "okf_log_structure",
-                           "detail": "log.md 日期分组下必须包含列表形式的更新记录"})
+                           "detail": f"log.md 每个日期分组都必须包含列表形式的更新记录: {', '.join(empty_groups)}"})
     return violations
 
 
 def okf_v01_violations(pages: dict[str, dict]) -> list[dict]:
-    """Mandatory OKF v0.1 checks plus Siclaw's portable-output profile."""
+    """Mandatory OKF v0.1 conformance checks only."""
     violations: list[dict] = []
     concept_pages = {rel for rel in pages if not _is_reserved_page(rel)}
     for rel, page in pages.items():
         if "error" in page:
             continue  # the existing unreadable violation is more specific
         text = page.get("text", "")
-        if _WIKI_LINK_RE.search(text):
-            violations.append({"page": rel, "kind": "okf_wikilink",
-                               "detail": "使用文件相对的标准 Markdown 链接，不要使用 [[wikilink]]"})
-        if any(target.startswith("/") for target in _MD_LINK_RE.findall(text)):
-            violations.append({"page": rel, "kind": "okf_nonportable_link",
-                               "detail": "使用文件相对 Markdown 链接；/ 开头的 bundle 绝对链接在 GitHub 等浏览器会失效"})
         name = Path(rel).name
         if name == "index.md":
             violations.extend(_okf_index_violations(rel, text, concept_pages))
@@ -390,6 +470,60 @@ def okf_v01_violations(pages: dict[str, dict]) -> list[dict]:
                                "detail": "OKF concept frontmatter requires a non-empty string type"})
 
     return violations
+
+
+def siclaw_portable_output_violations(pages: dict[str, dict]) -> list[dict]:
+    """Siclaw producer preferences beyond OKF's mandatory conformance rules."""
+    violations: list[dict] = []
+    for rel, page in pages.items():
+        if "error" in page:
+            continue
+        text = page.get("text", "")
+        prose = _markdown_prose(text)
+        if _WIKI_LINK_RE.search(prose):
+            violations.append({"page": rel, "kind": "siclaw_profile_wikilink",
+                               "detail": "Siclaw 新产出使用文件相对的标准 Markdown 链接，不要使用 [[wikilink]]"})
+        if any(target.startswith("/") for target in _MD_LINK_RE.findall(prose)):
+            violations.append({"page": rel, "kind": "siclaw_profile_bundle_link",
+                               "detail": "OKF 允许 / 开头的 bundle 链接，但 Siclaw 新产出使用文件相对链接以便跨浏览器查看"})
+        if (rel == "index.md"
+                and (not text.splitlines() or text.splitlines()[0].strip() != "---")):
+            violations.append({"page": rel, "kind": "siclaw_profile_version_declaration",
+                               "detail": "Siclaw 根 index.md 必须声明 okf_version: \"0.1\""})
+    return violations
+
+
+def format_policy_violations(pages: dict[str, dict]) -> list[dict]:
+    """All OKF-core and Siclaw-profile violations for authoring enforcement."""
+    return okf_v01_violations(pages) + siclaw_portable_output_violations(pages)
+
+
+def format_violation_keys(pages: dict[str, dict]) -> list[list[str]]:
+    """JSON-safe baseline keys used to grandfather untouched legacy pages."""
+    return [list(key) for key in sorted({(v["page"], v["kind"])
+                                         for v in format_policy_violations(pages)})]
+
+
+def filter_incremental_format_violations(
+    violations: list[dict], baseline_keys: list[list[str]], editable_pages: set[str],
+) -> tuple[list[dict], list[dict]]:
+    """Separate blocking violations from inherited legacy format debt.
+
+    Only a violation that already existed at incremental kickoff AND belongs to
+    a page outside the round's editable set is grandfathered. New violations,
+    new pages, and pages the round may edit remain hard failures.
+    """
+    baseline = {(str(item[0]), str(item[1])) for item in baseline_keys
+                if isinstance(item, (list, tuple)) and len(item) == 2}
+    blocking: list[dict] = []
+    inherited: list[dict] = []
+    for violation in violations:
+        key = (str(violation.get("page", "")), str(violation.get("kind", "")))
+        if key in baseline and key[0] not in editable_pages:
+            inherited.append(violation)
+        else:
+            blocking.append(violation)
+    return blocking, inherited
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -423,7 +557,8 @@ def _out_links(rel: str, text: str, names: set[str]) -> set[str]:
     """Resolved intra-wiki edges out of one page (md links + wikilinks)."""
     base = Path(rel).parent
     out: set[str] = set()
-    for target in _MD_LINK_RE.findall(text):
+    prose = _markdown_prose(text)
+    for target in _MD_LINK_RE.findall(prose):
         if target.startswith(("http://", "https://", "/")):
             continue
         resolved = posixpath.normpath((base / target).as_posix())
@@ -431,7 +566,7 @@ def _out_links(rel: str, text: str, names: set[str]) -> set[str]:
             out.add(resolved)
         elif target in names:
             out.add(target)
-    for target in _WIKI_LINK_RE.findall(text):
+    for target in _WIKI_LINK_RE.findall(prose):
         t = target.strip()
         if f"{t}.md" in names:
             out.add(f"{t}.md")
@@ -492,13 +627,14 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
                                           f"({sync_cap // 1024}KB)——超限页不会被持久化/发布(静默丢失);"
                                           "按主题拆成多页并挂回 index")})
         base = Path(rel).parent
-        for target in _MD_LINK_RE.findall(text):
+        prose = _markdown_prose(text)
+        for target in _MD_LINK_RE.findall(prose):
             if target.startswith(("http://", "https://", "/")):
                 continue
             resolved = posixpath.normpath((base / target).as_posix())
             if resolved not in names and target not in names:
                 violations.append({"page": rel, "kind": "broken_link", "detail": target})
-        for target in _WIKI_LINK_RE.findall(text):
+        for target in _WIKI_LINK_RE.findall(prose):
             t = target.strip()
             if t and f"{t}.md" not in names and t not in names:
                 violations.append({"page": rel, "kind": "broken_wikilink", "detail": t})
@@ -543,7 +679,7 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
                            "detail": "从 index.md 无链可达——把它挂进 index 或相应父页;确属废页则删除"})
     for err in exclusion_errors:
         violations.append({"page": EXCLUSIONS_PATH, "kind": "exclusions_invalid", "detail": err})
-    violations.extend(okf_v01_violations(pages))
+    violations.extend(format_policy_violations(pages))
     return {"ok": not violations, "violations": violations}
 
 

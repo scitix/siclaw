@@ -1242,7 +1242,9 @@ async def test_incremental_violation_auto_restored():
         assert (wd / "candidate" / "c.md").read_text() == c_original  # byte-exact restore
         sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc["state"] == "passed", sc
-        assert sc["incremental"] == {"out_of_scope_pages": [], "restored_pages": ["c.md"]}, sc
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+        assert sc["incremental"]["restored_pages"] == ["c.md"], sc
+        assert sc["incremental"]["grandfathered_format_violation_count"] == 0, sc
         assert run._incr_pending is None  # consumed: nothing left to guard
     print("OK  incremental violation auto-restored by code (no repair turn, byte-exact, reported)")
 
@@ -1279,6 +1281,66 @@ async def test_unconverged_files_residual_ticket():
         tickets2 = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
         assert len(tickets2) == 1, tickets2
     print("OK  unconverged files a residual ticket (once, code-written, question queue)")
+
+
+async def test_incremental_grandfathers_untouched_format_debt():
+    """An ordinary scoped edit must not turn a legacy page into a migration
+    target. The same rule still blocks a new profile violation on an editable
+    page, so grandfathering cannot become a blanket lint bypass."""
+    import incremental
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        (wd / "raw" / "snap" / "two.md").write_text("two")
+        (wd / "candidate" / "index.md").write_text(
+            "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [b](b.md)")
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\nA")
+        legacy = "---\ntype: Topic\ncompiled_from:\n  - snap/two.md\n---\nSee [[a]]."
+        (wd / "candidate" / "b.md").write_text(legacy)
+        cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
+              "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
+
+        def arm(run):
+            run._incr_pending = {
+                "before": incremental.page_hashes(str(wd)),
+                "before_bytes": incremental.page_bytes(str(wd)),
+                "baseline_format_violations": selfcheck.format_violation_keys(
+                    selfcheck.candidate_pages(str(wd))),
+                "changeset": cs,
+            }
+
+        run = compile_box.CompileRun("legacy-format", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        arm(run)
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\nA updated")
+        repair = await compile_box._post_turn_selfcheck(run)
+        assert repair is None, repair
+        assert (wd / "candidate" / "b.md").read_text() == legacy
+        sc = json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "passed" and sc["lint"]["ok"], sc
+        inherited = sc["incremental"]
+        assert inherited["grandfathered_format_violation_count"] == 1, inherited
+        assert inherited["grandfathered_format_violations"][0]["page"] == "b.md", inherited
+
+        # A fresh wikilink on the authorized page is not inherited and blocks.
+        run._selfcheck_key = None
+        arm(run)
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\nSee [[b]].")
+        repair2 = await compile_box._post_turn_selfcheck(run)
+        assert repair2 is not None and "siclaw_profile_wikilink" in repair2, repair2
+        sc2 = json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert any(v["page"] == "a.md" and v["kind"] == "siclaw_profile_wikilink"
+                   for v in sc2["lint"]["violations"]), sc2
+    print("OK  incremental format baseline (untouched legacy debt grandfathered; editable violations block)")
 
 
 async def test_repair_turn_may_edit_ledger_target_pages():
@@ -1322,7 +1384,8 @@ async def test_repair_turn_may_edit_ledger_target_pages():
         sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc["state"] == "passed", sc
         # the guard did NOT restore the repair's edit
-        assert sc["incremental"] == {"out_of_scope_pages": [], "restored_pages": []}, sc
+        assert sc["incremental"]["out_of_scope_pages"] == [], sc
+        assert sc["incremental"]["restored_pages"] == [], sc
         assert "snap/two.md" in (wd / "candidate" / "c.md").read_text()
     print("OK  repair turn may edit ledger-target pages (guard widened, repair survives)")
 
@@ -2324,6 +2387,7 @@ async def main():
     await test_incremental_guard_rearms_on_ledger_repair()
     await test_incremental_violation_auto_restored()
     await test_unconverged_files_residual_ticket()
+    await test_incremental_grandfathers_untouched_format_debt()
     await test_repair_turn_may_edit_ledger_target_pages()
     await test_incremental_index_deletion_cannot_escape_guard()
     await test_incremental_arm_cleared_when_dispatch_fails()

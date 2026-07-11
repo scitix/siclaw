@@ -1,0 +1,6 @@
+claude-agent-sdk==0.2.110
+aiohttp
+PyYAML==6.0.3
+python-pptx
+openpyxl
+python-docx

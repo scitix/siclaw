@@ -87,10 +87,11 @@ const KNOWLEDGE_WIKI_BUDGET = 4000;
 /**
  * Inject the knowledge wiki's page catalog into the system prompt.
  *
- * The wiki is a flat markdown directory at `knowledgeDir` whose `index.md` lists
- * every page with a one-line description (and `[[links]]`). We surface that index
- * directly so the agent sees the catalog in context — no eager Read of index.md,
- * no search tool — and then Reads only the specific page(s) it needs on demand.
+ * The wiki is a markdown tree at `knowledgeDir` whose `index.md` lists pages with
+ * one-line descriptions and standard markdown links (legacy `[[links]]` remain
+ * readable). We surface that index directly so the agent sees the catalog in
+ * context — no eager Read of index.md, no search tool — and then Reads only the
+ * specific page(s) it needs on demand.
  *
  * Returns "" when there is no wiki (no index.md). Budgeted: an oversized index is
  * truncated with a pointer to read the full file.
@@ -121,8 +122,10 @@ export function buildKnowledgeWikiCatalog(knowledgeDir?: string): string {
     "",
     "Internal infrastructure knowledge lives as markdown pages under `.siclaw/knowledge/`. " +
     "The page catalog is below — there is no search tool. Read only the page(s) relevant to the task " +
-    "with the Read tool (`.siclaw/knowledge/<name>.md`), read whole pages (each is self-contained), and " +
-    "follow any `[[other-page]]` link the same way. Don't read unrelated pages. Pages are semantic — they " +
+    "with the Read tool, read whole pages (each is self-contained), and follow standard markdown links " +
+    "such as `[name](relative/path.md)` by resolving the target relative to the current page's directory. " +
+    "Also tolerate legacy `[[other-page]]` links, resolved from `.siclaw/knowledge/`. Don't read unrelated " +
+    "pages. Pages are semantic — they " +
     "describe what components are and how they fail, not the commands to run; translate what you learn into " +
     "concrete checks using skills (preferred) and bash.",
     "",
