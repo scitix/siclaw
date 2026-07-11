@@ -9,10 +9,9 @@
  *   - siclaw owns EXECUTION: box + tools + lifecycle + a small execution-state store.
  *   - the consumer owns the DOMAIN: knowledge content + governance + frontend.
  *
- * Contradiction handling is a NORMAL turn (a capability.message), not an async
- * protocol — the model never blocks on a human, so there is no awaiting_input /
- * parked frame. "Async" only means the user rules at their leisure; applying a
- * ruling is just another message injected when the session is idle.
+ * Contradiction handling is not a parked/awaiting-input protocol: the model
+ * never blocks on a human. The user rules at their leisure, then the product
+ * submits a typed compile.apply_rulings command when the session is idle.
  *
  * ── WIRE RULE ─────────────────────────────────────────────────────────────────
  * Every interface below IS the wire shape: field names are snake_case, exactly
@@ -28,6 +27,7 @@
 /** Consumer → siclaw: start / drive / cancel a capability run. */
 export const CAPABILITY_START = "capability.start" as const;
 export const CAPABILITY_MESSAGE = "capability.message" as const;
+export const CAPABILITY_COMMAND = "capability.command" as const;
 export const CAPABILITY_CANCEL = "capability.cancel" as const;
 
 /**
@@ -103,11 +103,33 @@ export interface CapabilityStartResponse {
 export interface CapabilityMessageRequest {
   run_id: string;
   /**
-   * A conversational turn injected into the live session — a compile instruction,
-   * a plain chat turn, or "apply these rulings: ..." (contradiction writeback).
+   * A genuine conversational turn injected into the live session. Product
+   * controls use CapabilityCommandRequest; old fixed-prefix controls are only
+   * a temporary box compatibility adapter.
    * The run's profile/org come from the run record minted at start, not the frame.
    */
   message: string;
+}
+
+/**
+ * Versioned machine-control envelope. The runtime validates only this common
+ * shape and transports `command` opaquely to the selected BoxProfile. Action
+ * names and parameters belong to the box implementation; human-language text
+ * must never be used as the discriminator.
+ */
+export interface CapabilityCommandRequest {
+  run_id: string;
+  /** Consumer-owned idempotency key. */
+  command_id: string;
+  command: {
+    version: number;
+    action: string;
+    /** Consumer-domain mutation receipt; opaque to the runtime. */
+    operation_id: string;
+    /** Consumer-domain write-fencing epoch; opaque to the runtime. */
+    generation: number;
+    parameters?: Record<string, unknown>;
+  };
 }
 
 export interface CapabilityCancelRequest {

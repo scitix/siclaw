@@ -17,6 +17,7 @@ Surface (driven by the runtime):
   POST /authoring          {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install authoring/candidate/eval/release assets → workdir/
   POST /session/{run_id}   {workdir?, instruction?, allowed_tools?, locale?, llm?, settings?} start the run's persistent conversational session (waits for the first /message); idempotent
   POST /message/{run_id}   {message} inject one user turn into the persistent session (prepare/compile/patch are all ordinary turns)
+  POST /command/{run_id}   {command_id, command} execute one typed authoring action; idempotent per live run
   GET  /events/{run_id}    structured SSE stream (session/log/summary/turn_done/syncArtifacts/plan_proposed/error/end)
   POST /test-session/{run_id}  start a test session: pin the current draft as an immutable snapshot + a read-only consumer session (reuses this pod)
   POST /test-message/{tid} · GET /test-events/{tid} · POST /test-session/{tid}/close
@@ -125,6 +126,23 @@ def _tool_strings(locale: str | None) -> dict:
         if fp.exists():
             return json.loads(fp.read_text(encoding="utf-8"))
     raise FileNotFoundError(f"prompt pack missing: tools.json (locale={locale!r})")
+
+
+def _command_strings(locale: str | None) -> dict:
+    """Model-facing typed-command render strings from the locale pack.
+
+    Action selection has already happened before this is called. A translation
+    can change only the directive prose, never the execution branch.
+    """
+    tried = []
+    for cand in ((locale or "").strip().lower(), DEFAULT_LOCALE):
+        if not cand or cand in tried:
+            continue
+        tried.append(cand)
+        fp = _PROMPTS_DIR / cand / "commands.json"
+        if fp.exists():
+            return json.loads(fp.read_text(encoding="utf-8"))
+    raise FileNotFoundError(f"prompt pack missing: commands.json (locale={locale!r})")
 
 
 def _playbook_text(locale: str | None) -> str:
@@ -296,6 +314,12 @@ class CompileRun:
         self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
         self._stall_fatal = False           # stall retries exhausted → fail this turn
         self._rate_retries = 0              # rate-limit (429/503/529) retries on the in-flight turn
+        # Typed machine-control receipts. A command id is accepted at most once
+        # for this live run, and the first command pins the run to the consumer's
+        # operation/generation context. This is intentionally NOT another status
+        # machine; Sicore's operation and the runtime run remain authoritative.
+        self._accepted_command_ids: set[str] = set()
+        self._command_context: tuple[str, int] | None = None
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
@@ -781,6 +805,197 @@ def _capture_brief(run: "CompileRun", text: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# ── Typed authoring commands (v1) ───────────────────────────────────────────
+
+_COMMAND_ACTIONS = {
+    "compile.scout",
+    "compile.generate",
+    "compile.regenerate",
+    "compile.approve_plan",
+    "compile.incremental",
+    "compile.resume",
+    "compile.submit_decisions",
+    "compile.apply_rulings",
+    "compile.repair_test",
+}
+_FULL_COMPILE_ACTIONS = {
+    "compile.generate", "compile.regenerate", "compile.approve_plan", "compile.resume",
+}
+_BRIEF_AUDIENCES = {"", "internal-eng", "frontline", "external", "newcomer"}
+_CONTENT_LOCALE_RE = re.compile(r"^(?:auto|[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*)$")
+
+
+class CommandRejected(ValueError):
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+def _bounded_string(value, field: str, *, required: bool = False, limit: int = 4000) -> str:
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise CommandRejected(f"{field} must be a string")
+    value = value.strip()
+    if required and not value:
+        raise CommandRejected(f"{field} is required")
+    if len(value) > limit:
+        raise CommandRejected(f"{field} exceeds {limit} characters")
+    return value
+
+
+def _normalize_command(body: dict) -> tuple[str, dict]:
+    if not isinstance(body, dict):
+        raise CommandRejected("request body must be an object")
+    command_id = _bounded_string(body.get("command_id"), "command_id", required=True, limit=128)
+    command = body.get("command")
+    if not isinstance(command, dict):
+        raise CommandRejected("command must be an object")
+    if command.get("version") != 1:
+        raise CommandRejected("unsupported command version")
+    action = _bounded_string(command.get("action"), "command.action", required=True, limit=80)
+    if action not in _COMMAND_ACTIONS:
+        raise CommandRejected(f"unsupported command action: {action}")
+    operation_id = _bounded_string(command.get("operation_id"), "command.operation_id", required=True, limit=128)
+    generation = command.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise CommandRejected("command.generation must be a positive integer")
+    parameters = command.get("parameters") or {}
+    if not isinstance(parameters, dict):
+        raise CommandRejected("command.parameters must be an object")
+
+    brief = parameters.get("brief")
+    if brief is not None:
+        if not isinstance(brief, dict):
+            raise CommandRejected("command.parameters.brief must be an object")
+        normalized_brief = {
+            "schema_version": 1,
+            "source": "authoring_command",
+            "audience": _bounded_string(brief.get("audience"), "brief.audience", limit=64),
+            "depth": _bounded_string(brief.get("depth"), "brief.depth", limit=32),
+            "redaction": _bounded_string(brief.get("redaction"), "brief.redaction", limit=32) or "none",
+            "content_locale": _bounded_string(brief.get("content_locale"), "brief.content_locale", limit=64) or "auto",
+            "note": _bounded_string(brief.get("note"), "brief.note", limit=2000),
+        }
+        if normalized_brief["depth"] not in {"", "full", "concise"}:
+            raise CommandRejected("brief.depth must be full or concise")
+        if normalized_brief["audience"] not in _BRIEF_AUDIENCES:
+            raise CommandRejected("brief.audience is unsupported")
+        if normalized_brief["redaction"] not in {"none", "external"}:
+            raise CommandRejected("brief.redaction must be none or external")
+        if not _CONTENT_LOCALE_RE.fullmatch(normalized_brief["content_locale"]):
+            raise CommandRejected("brief.content_locale must be auto or a BCP-47-like locale")
+        parameters = {**parameters, "brief": normalized_brief}
+
+    if action == "compile.approve_plan":
+        plan_id = _bounded_string(parameters.get("plan_id"), "parameters.plan_id", required=True, limit=64).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", plan_id):
+            raise CommandRejected("parameters.plan_id must be a sha256")
+        parameters = {**parameters, "plan_id": plan_id}
+    elif action == "compile.submit_decisions":
+        decisions = parameters.get("decisions")
+        if not isinstance(decisions, list) or not decisions:
+            raise CommandRejected("parameters.decisions must be a non-empty array")
+        clean = []
+        for i, item in enumerate(decisions):
+            if not isinstance(item, dict):
+                raise CommandRejected(f"parameters.decisions[{i}] must be an object")
+            clean.append({
+                "question_id": _bounded_string(item.get("question_id"), f"decisions[{i}].question_id", required=True, limit=128),
+                "value": _bounded_string(item.get("value"), f"decisions[{i}].value", required=True, limit=2000),
+            })
+        parameters = {**parameters, "decisions": clean}
+    elif action == "compile.apply_rulings":
+        nonce = _bounded_string(parameters.get("dispatch_nonce"), "parameters.dispatch_nonce", required=True, limit=128)
+        rulings = parameters.get("rulings")
+        if not isinstance(rulings, list) or not rulings:
+            raise CommandRejected("parameters.rulings must be a non-empty array")
+        clean = []
+        for i, item in enumerate(rulings):
+            if not isinstance(item, dict):
+                raise CommandRejected(f"parameters.rulings[{i}] must be an object")
+            kind = _bounded_string(item.get("kind"), f"rulings[{i}].kind", required=True, limit=32)
+            if kind not in {"value", "accept_suspect"}:
+                raise CommandRejected(f"rulings[{i}].kind must be value or accept_suspect")
+            pages = item.get("affected_pages") or []
+            if not isinstance(pages, list) or not all(isinstance(p, str) and p.strip() for p in pages):
+                raise CommandRejected(f"rulings[{i}].affected_pages must be a string array")
+            clean.append({
+                "ticket_id": _bounded_string(item.get("ticket_id"), f"rulings[{i}].ticket_id", required=True, limit=128),
+                "affected_pages": [p.strip() for p in pages],
+                "kind": kind,
+                "value": _bounded_string(item.get("value"), f"rulings[{i}].value", required=kind == "value", limit=4000),
+            })
+        parameters = {**parameters, "dispatch_nonce": nonce, "rulings": clean}
+    elif action == "compile.repair_test":
+        parameters = {**parameters,
+            "question": _bounded_string(parameters.get("question"), "parameters.question", required=True, limit=4000),
+            "reference_answer": _bounded_string(parameters.get("reference_answer"), "parameters.reference_answer", limit=8000),
+            "verdict": _bounded_string(parameters.get("verdict"), "parameters.verdict", required=True, limit=128),
+            "judge_note": _bounded_string(parameters.get("judge_note"), "parameters.judge_note", limit=4000),
+        }
+
+    return command_id, {
+        "version": 1,
+        "action": action,
+        "operation_id": operation_id,
+        "generation": generation,
+        "parameters": parameters,
+    }
+
+
+def _render_command(run: "CompileRun", command: dict) -> str:
+    action = command["action"]
+    params = command["parameters"]
+    strings = _command_strings(run.locale)
+    if action == "compile.submit_decisions":
+        lines = [strings["compile.submit_decisions_header"]]
+        lines.extend(strings["compile.submit_decisions_line"].format(**item) for item in params["decisions"])
+        return "\n".join(lines)
+    if action == "compile.apply_rulings":
+        lines = [strings["compile.apply_rulings_header"]]
+        for item in params["rulings"]:
+            template = strings["compile.apply_rulings_suspect"] if item["kind"] == "accept_suspect" else strings["compile.apply_rulings_value"]
+            lines.append(template.format(
+                ticket_id=item["ticket_id"],
+                pages=", ".join(item["affected_pages"]) or "?",
+                value=item["value"],
+                nonce=params["dispatch_nonce"],
+            ))
+        return "\n".join(lines)
+    if action == "compile.repair_test":
+        return strings[action].format(
+            question=params["question"],
+            reference_answer=params["reference_answer"] or "(not set)",
+            verdict=params["verdict"],
+            judge_note=params["judge_note"] or "(none)",
+        )
+    return strings[action]
+
+
+def _prepare_command(run: "CompileRun", command: dict) -> None:
+    """Validate workspace-bound references and materialize structured intent."""
+    action = command["action"]
+    params = command["parameters"]
+    if action == "compile.approve_plan":
+        plan_path = Path(run.workdir) / "authoring" / "PROPOSED_PLAN.json"
+        if not plan_path.is_file():
+            raise CommandRejected("the proposed plan no longer exists", 409)
+        if hashlib.sha256(plan_path.read_bytes()).hexdigest() != params["plan_id"]:
+            raise CommandRejected("the proposed plan changed; refresh before approving", 409)
+    if action == "compile.incremental" and not incremental.has_changes(incremental.load_raw_changes(run.workdir)):
+        raise CommandRejected("no structured source changes are available for incremental compile", 409)
+    if action == "compile.resume":
+        plan = _load_batch_plan(run)
+        if plan is None or not batching.pending_batches(plan):
+            raise CommandRejected("no interrupted batch plan is available to resume", 409)
+    brief = params.get("brief")
+    if brief is not None:
+        # Structured command data replaces the old localized-text parser. The
+        # file remains model-facing intent, not a control-plane fact.
+        _write_brief(run.workdir, brief)
 
 
 # The exact whitespace set to strip, enumerated so it is byte-identical with the
@@ -1768,6 +1983,7 @@ _INCREMENTAL_TRIGGER_PREFIXES = ("原料已更新,请增量重编", "请增量�
 
 
 def _is_compile_trigger(text: str) -> bool:
+    """Rolling-upgrade adapter for legacy message-based controls only."""
     return text.startswith(_BATCH_TRIGGER_PREFIXES + _INCREMENTAL_TRIGGER_PREFIXES)
 
 
@@ -1775,19 +1991,24 @@ def _batch_mode_enabled() -> bool:
     return os.environ.get("KBC_BATCH_MODE", "on") != "off"
 
 
-def _should_route_to_incremental(run: "CompileRun", text: str) -> bool:
+def _should_route_to_incremental(run: "CompileRun", text: str, action: str | None = None) -> bool:
     """A compile trigger + a machine-computed changeset from the consumer
     (authoring/RAW_CHANGES.json with real changes) → the SCOPED incremental path,
     which re-touches only the affected pages instead of re-planning the whole
     corpus. No changeset (or empty) → fall through to the normal full compile /
     batch route (backward compatible: the consumer not yet wired = old behavior)."""
-    if run._batch_active or not _is_compile_trigger(text):
+    if run._batch_active:
+        return False
+    if action is not None and action != "compile.incremental":
+        return False
+    if action is None and not _is_compile_trigger(text):
         return False
     return incremental.has_changes(incremental.load_raw_changes(run.workdir))
 
 
-def _should_route_to_batch(run: "CompileRun", text: str) -> bool:
-    if not _batch_mode_enabled() or run._batch_active or not _is_compile_trigger(text):
+def _should_route_to_batch(run: "CompileRun", text: str, action: str | None = None) -> bool:
+    full_compile = action in _FULL_COMPILE_ACTIONS if action is not None else _is_compile_trigger(text)
+    if not _batch_mode_enabled() or run._batch_active or not full_compile:
         return False
     raw_dir = Path(run.workdir) / "raw"
     inventory = batching.scan_sources(raw_dir)
@@ -1798,7 +2019,7 @@ def _should_route_to_batch(run: "CompileRun", text: str) -> bool:
     return plan is not None and len(batching.pending_batches(plan)) > 0
 
 
-async def _start_incremental(run: "CompileRun", text: str) -> None:
+async def _start_incremental(run: "CompileRun", text: str, *, strict: bool = False) -> None:
     """Scoped incremental kickoff: materialize the model-facing CHANGESET from
     the consumer's RAW_CHANGES, snapshot page hashes for the post-turn integrity guard,
     then inject the scoped directive. It is ONE ordinary model turn (not the batch
@@ -1806,6 +2027,8 @@ async def _start_incremental(run: "CompileRun", text: str) -> None:
     once wired, the byte-integrity guard) apply unchanged."""
     cs = incremental.materialize_changeset(run.workdir)
     if cs is None:
+        if strict:
+            raise CommandRejected("structured source changes disappeared before dispatch; retry", 409)
         # Race / empty after the route check → fall back to a normal turn.
         # This fallback bypasses the full-kickoff unlink in the message handler,
         # so clear any stale CHANGESET here too (review): the turn is NOT
@@ -2818,31 +3041,32 @@ async def _await_session_live(run: CompileRun):
     return None
 
 
-async def handle_message(request: web.Request):
-    """Inject a user turn into the run's live persistent session (prepare or a
-    mid-session revision). The reply streams back over GET /events."""
-    run = RUNS.get(request.match_info["run_id"])
-    if not run:
-        return web.json_response({"error": "unknown run"}, status=404)
-    err = await _await_session_live(run)
-    if err is not None:
-        return err
-    body = await request.json()
-    text = (body.get("message") or "").strip()
-    if not text:
-        return web.json_response({"error": "message is required"}, status=400)
+async def _dispatch_authoring_turn(run: CompileRun, text: str, action: str | None = None) -> dict:
+    """One execution seam for legacy chat turns and typed commands.
+
+    `action` is authoritative when present. Text inspection exists only for the
+    rolling-upgrade message adapter and must never be consulted for a typed
+    command.
+    """
     # v3 brief: if the wizard's 「开始生成知识库」message carries a 定调标签 block,
     # persist it deterministically to authoring/BRIEF.json BEFORE the turn so the
     # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
-    _capture_brief(run, text)
+    if action is None:
+        _capture_brief(run, text)
     # Scoped incremental (真增量): a compile trigger + a machine-computed changeset
     # from the consumer → re-touch only affected pages, NOT a whole-corpus re-plan. Takes
     # precedence over the batch/full route (which is the "recompile everything"
     # fallback when no changeset is present).
-    if _should_route_to_incremental(run, text):
-        await _start_incremental(run, text)
-        return web.json_response({"ok": True, "incremental": True})
-    if _is_compile_trigger(text):
+    if _should_route_to_incremental(run, text, action):
+        await _start_incremental(run, text, strict=action == "compile.incremental")
+        return {"ok": True, "incremental": True}
+    if action == "compile.incremental":
+        # Unlike the legacy string adapter, an explicit incremental command must
+        # never silently degrade into a whole-corpus compile.
+        raise CommandRejected("no structured source changes are available for incremental compile", 409)
+    full_compile = action in _FULL_COMPILE_ACTIONS if action is not None else _is_compile_trigger(text)
+    compile_control = full_compile or action == "compile.incremental" or (action is None and _is_compile_trigger(text))
+    if full_compile:
         # A FULL recompile kickoff (compile trigger, no RAW_CHANGES) voids any
         # stale scoped changeset: only the incremental route READS it, but the
         # model reads authoring/ proactively and the prompt's "no CHANGESET =
@@ -2855,7 +3079,7 @@ async def handle_message(request: web.Request):
             pass
     # Batch mode (大库): a compile trigger over an above-threshold corpus (or a
     # plan with pending batches) runs the orchestrator instead of one giant turn.
-    if _should_route_to_batch(run, text):
+    if _should_route_to_batch(run, text, action):
         # Claim batch mode SYNCHRONOUSLY, before spawning the orchestrator task:
         # _run_batch_compile only sets the flag once it starts running, so a
         # second /message racing in before the task is scheduled would pass
@@ -2864,9 +3088,9 @@ async def handle_message(request: web.Request):
         # own idempotent set, and the task's finally clears it).
         run._batch_active = True
         asyncio.create_task(_run_batch_compile(run, text))
-        return web.json_response({"ok": True, "batch": True})
+        return {"ok": True, "batch": True}
     if run._batch_active:
-        if _is_compile_trigger(text):
+        if compile_control:
             # A second trigger mid-batch changes nothing the plan doesn't know.
             await run.emit({"type": "summary", "text": _loc(run,
                 "Batch compile in progress; start another one after this run finishes.",
@@ -2878,8 +3102,7 @@ async def handle_message(request: web.Request):
             await run.emit({"type": "summary", "text": _loc(run,
                 "Noted — it will be passed along to the remaining batches.",
                 "已收到,会带给后续批次一并考虑。")})
-        return web.json_response({"ok": True, "queued": True})
-    full_compile = _is_compile_trigger(text)
+        return {"ok": True, "queued": True}
     if full_compile:
         run._full_compile_pending = True
     run._begin_turn(text)  # arm the stall watchdog — every model turn, incl. the owner's
@@ -2889,7 +3112,76 @@ async def handle_message(request: web.Request):
         if full_compile:
             run._full_compile_pending = False
         raise
-    return web.json_response({"ok": True})
+    return {"ok": True}
+
+
+async def handle_message(request: web.Request):
+    """Inject a genuine conversational turn into the persistent session.
+
+    Legacy control strings remain temporarily recognized by
+    `_dispatch_authoring_turn` for rolling upgrades; migrated product buttons
+    use `/command` instead.
+    """
+    run = RUNS.get(request.match_info["run_id"])
+    if not run:
+        return web.json_response({"error": "unknown run"}, status=404)
+    err = await _await_session_live(run)
+    if err is not None:
+        return err
+    body = await request.json()
+    text = (body.get("message") or "").strip()
+    if not text:
+        return web.json_response({"error": "message is required"}, status=400)
+    try:
+        result = await _dispatch_authoring_turn(run, text)
+    except CommandRejected as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+    return web.json_response(result)
+
+
+async def handle_command(request: web.Request):
+    """Validate and execute one typed authoring command.
+
+    The command id is claimed synchronously before the first await so concurrent
+    duplicate POSTs cannot launch two turns. A dispatch that fails before the
+    SDK accepts it releases the id for retry.
+    """
+    run = RUNS.get(request.match_info["run_id"])
+    if not run:
+        return web.json_response({"error": "unknown run"}, status=404)
+    err = await _await_session_live(run)
+    if err is not None:
+        return err
+    try:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            raise CommandRejected("request body must be valid JSON", 400)
+        command_id, command = _normalize_command(body)
+        context = (command["operation_id"], command["generation"])
+        if command_id in run._accepted_command_ids:
+            return web.json_response({"ok": True, "duplicate": True, "command_id": command_id})
+        # Product controls are never an in-memory "note for later". Accepting a
+        # second command while a turn/batch is active would acknowledge an
+        # action that has not actually been scheduled. Exact replays are handled
+        # above; every distinct concurrent command fails closed and can be
+        # retried as a new product action after the run returns idle.
+        if run._turn_active or run._batch_active:
+            raise CommandRejected("another authoring command is already running", 409)
+        if run._command_context is not None and run._command_context != context:
+            raise CommandRejected("run is pinned to another operation generation", 409)
+        _prepare_command(run, command)
+        text = _render_command(run, command)
+        run._command_context = context
+        run._accepted_command_ids.add(command_id)
+        try:
+            result = await _dispatch_authoring_turn(run, text, command["action"])
+        except BaseException:
+            run._accepted_command_ids.discard(command_id)
+            raise
+        return web.json_response({**result, "command_id": command_id, "action": command["action"]})
+    except CommandRejected as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
 
 
 async def handle_events(request: web.Request):
@@ -3122,6 +3414,7 @@ def build_app() -> web.Application:
         web.post("/authoring", handle_authoring),
         web.post("/session/{run_id}", handle_session),
         web.post("/message/{run_id}", handle_message),
+        web.post("/command/{run_id}", handle_command),
         web.get("/events/{run_id}", handle_events),
         # Test session: read-only consumer session over a pinned draft snapshot.
         web.post("/test-session/{run_id}", handle_open_test),

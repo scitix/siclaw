@@ -1,0 +1,14 @@
+{
+  "compile.scout": "侦察原料清单与代表性片段，更新持久化的来源概览和候选页面计划；只通过结构化定调问题提出负责人必须裁决的高代价选择，然后停下。现在不要写 candidate 页面。",
+  "compile.generate": "立即开始首次全量编译。负责人已授权直接执行，不要再次停下来等待计划确认。先读结构化编译 brief，完整覆盖全部原料并保留溯源；不确定处按 best-guess 落页并建工单，一次完成到 candidate/index.md。",
+  "compile.regenerate": "在当前 staging 工作区完整重新生成知识库草稿。负责人已授权直接执行，不要再次停下来等待计划确认。先读结构化编译 brief，完整覆盖全部原料并保留溯源；不确定处按 best-guess 落页并建工单，一次完成到 candidate/index.md。",
+  "compile.approve_plan": "负责人已批准当前这份精确计划。现在执行该计划，沿用结构化编译 brief；不确定处按 best-guess 落页并建工单，一次完成到 candidate/index.md。",
+  "compile.incremental": "按结构化来源 changeset 执行范围受控的增量编译。",
+  "compile.resume": "从持久化工作区状态继续被中断的编译器分批计划。不要重跑已完成批次，也不要再次等待批准。",
+  "compile.submit_decisions_header": "把以下负责人定调写入持久化 brief 与 intent，然后提出据此形成的编译计划并停下等待批准：",
+  "compile.submit_decisions_line": "- {question_id}：{value}",
+  "compile.apply_rulings_header": "应用以下结构化裁决。只修改点名的 candidate 页面，去掉已解决处的存疑标记；每条裁决都用原样 dispatch nonce 调一次 resolve_ticket。回修后继续此前未完成的任务：",
+  "compile.apply_rulings_value": "- ticket {ticket_id}（影响页：{pages}）：改为「{value}」；nonce：{nonce}",
+  "compile.apply_rulings_suspect": "- ticket {ticket_id}（影响页：{pages}）：接受存疑并保留双源，不改值，只调用 resolve_ticket 登记；nonce：{nonce}",
+  "compile.repair_test": "测试回归失败。请只依据原料修复相关 candidate 页面。问题：{question}\n人工核准参考答案：{reference_answer}\n判分：{verdict}\n判语：{judge_note}\n若原料没有支撑，不得编造，直接报告来源缺口。修复后继续此前未完成的任务。"
+}

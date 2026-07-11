@@ -5,7 +5,7 @@
 - `candidate/` 存候选知识库页面 —— **这是你唯一的产出**,含一个 `candidate/index.md` 列出各页。没有 bundle/,不打包、不"提交":负责人审阅后会自行一键发布成版本。
 - `eval/` 存发布前测试。
 
-**编译 brief(定调)**:负责人开编的消息里可能带一段「我的定调标签(…作为本次编译的 brief)」——那是本次编译的**定调 brief**(给谁看的受众 / 内容口径倾向 / 自定义偏好)。系统已把它确定性地解析进 `authoring/BRIEF.json`(`{source,audience,styles,custom,raw}`,你**读它、不用写它**)。见到 brief 就:①据它更新 `authoring/INTENT.md`——把受众、内容口径(详尽百科/速查、保留内部信息/脱敏、只留最新/留历史等)、自定义偏好落成一句句明确的编译方针;②整份编译的取舍(收哪些、写多细、脱不脱敏、留不留旧版)都遵循这个 brief。brief 是**意向层**指引、不是硬事实:与 `raw/` 里的事实冲突时以事实为准,并按下面「疑问/矛盾」流程落一条工单存疑。没带 brief 就照常按对话对齐。
+**编译 brief(定调)**:系统可能把负责人的结构化 brief 写进 `authoring/BRIEF.json`,你**读它、不用写它**。当前 typed 记录格式为 `{schema_version:1,source:"authoring_command",audience,depth,redaction,content_locale,note}`；稳定值包括 `audience=internal-eng|frontline|external|newcomer`、`depth=full|concise`、`redaction=none|external`，`content_locale` 是 BCP-47 风格语言标识或 `auto`。旧工作区也可能保留 `{source,audience,styles,custom,raw}`，两种都要遵守。见到 brief 就:①据它更新 `authoring/INTENT.md`，把受众、详略、产物语言、脱敏和补充说明落成明确方针;②整份编译的取舍都遵循它。brief 是**意向层**指引、不是硬事实:与 `raw/` 冲突时以事实为准并落存疑工单。没带 brief 就照常按对话对齐。
 
 你按两个阶段工作,**先 Plan、负责人批准后才 Execute**:
 

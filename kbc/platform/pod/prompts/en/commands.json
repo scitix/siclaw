@@ -1,0 +1,14 @@
+{
+  "compile.scout": "Inspect the source inventory and representative source excerpts. Update the durable source snapshot and proposed page plan, ask only high-cost owner decisions through the structured decision-question artifact, then stop. Do not write candidate pages yet.",
+  "compile.generate": "Start the initial full compilation now. The owner has authorized execution without another plan-confirmation stop. Read the structured compile brief, cover the complete source set with provenance, handle uncertainty through best-guess plus tickets, and finish through candidate/index.md.",
+  "compile.regenerate": "Regenerate the complete knowledge-base draft in this staging workspace. The owner has authorized execution without another plan-confirmation stop. Read the structured compile brief, cover the complete source set with provenance, handle uncertainty through best-guess plus tickets, and finish through candidate/index.md.",
+  "compile.approve_plan": "The owner approved the exact current proposed plan. Execute it now, preserve the structured compile brief, handle uncertainty through best-guess plus tickets, and finish through candidate/index.md.",
+  "compile.incremental": "Apply the structured source changeset as a scoped incremental compilation.",
+  "compile.resume": "Resume the interrupted compiler-owned batch plan from its durable workspace state. Do not restart completed batches or ask for another approval.",
+  "compile.submit_decisions_header": "Apply the following owner decisions to the durable brief and intent, then propose the resulting compile plan and stop for approval:",
+  "compile.submit_decisions_line": "- {question_id}: {value}",
+  "compile.apply_rulings_header": "Apply the following structured rulings. Edit only the named candidate pages, remove the resolved uncertainty marker, and call resolve_ticket once per ruling with the exact dispatch nonce. After the repairs, resume any interrupted task:",
+  "compile.apply_rulings_value": "- ticket {ticket_id} (pages: {pages}): use \"{value}\"; nonce: {nonce}",
+  "compile.apply_rulings_suspect": "- ticket {ticket_id} (pages: {pages}): keep both sources as accepted uncertainty; call resolve_ticket without changing the value; nonce: {nonce}",
+  "compile.repair_test": "A regression test failed. Repair only the relevant candidate pages from source evidence. Question: {question}\nHuman-approved reference answer: {reference_answer}\nVerdict: {verdict}\nJudge note: {judge_note}\nDo not invent support that is absent from the sources; report the source gap instead. After the repair, resume any interrupted task."
+}
