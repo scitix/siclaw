@@ -314,6 +314,8 @@ class CompileRun:
         self._tool_pending = False          # last assistant msg asked for a tool
         self._last_model_activity = 0.0     # monotonic ts of the last inbound SDK msg / query
         self._last_directive = ""           # the in-flight turn's text, for retry
+        self._last_sdk_message_type = "query"  # controlled class name only; never message content
+        self._last_stall_diagnostic: dict | None = None
         self._model_retries = 0             # stall retries used on the in-flight turn
         self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
         self._stall_fatal = False           # stall retries exhausted → fail this turn
@@ -339,6 +341,8 @@ class CompileRun:
         self._stall_fatal = False
         self._rate_retries = 0
         self._last_model_activity = time.monotonic()
+        self._last_sdk_message_type = "query"
+        self._last_stall_diagnostic = None
 
     async def inject_user_message(self, text: str):
         """Engine seam: push a user turn into the live session. The Claude SDK
@@ -2542,6 +2546,7 @@ def _note_model_activity(run: CompileRun, msg) -> None:
     """
     run._last_model_activity = time.monotonic()
     message_type = type(msg).__name__
+    run._last_sdk_message_type = message_type
     if message_type == "AssistantMessage":
         blocks = getattr(msg, "content", None) or []
         run._tool_pending = any(type(b).__name__ == "ToolUseBlock" for b in blocks)
@@ -2568,6 +2573,7 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
                         f"model request stalled; exhausted {run._model_retries} attempt(s)"
                     )
                 run._last_model_activity = time.monotonic()
+                run._last_sdk_message_type = "query"
                 await client.query(run._last_directive)   # retry on a fresh request
                 continue
             # C2: a rate-limited / overloaded model call ends the turn with
@@ -2588,6 +2594,7 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
                     run._last_model_activity = time.monotonic()  # backoff isn't a stall
                     await asyncio.sleep(delay)
                     run._last_model_activity = time.monotonic()
+                    run._last_sdk_message_type = "query"
                     await client.query(run._last_directive)
                     continue
                 await run.emit({
@@ -2656,12 +2663,20 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
         run._stall_retrying = True
         run._stall_interrupted_at = time.monotonic()
         run._last_model_activity = time.monotonic()   # bridge the interrupt→result gap
-        await run.emit({
-            "type": "turn_stalled",
-            "attempt": run._model_retries,
+        diagnostic = {
+            "code": "model_turn_stalled",
+            "stage": "model_turn",
+            "attempts": run._model_retries,
             "fatal": run._stall_fatal,
             "idle_s": round(idle, 1),
-        })
+            "bound_s": round(bound, 1),
+            "tool_pending": run._tool_pending,
+            # Controlled SDK class/query marker only. Never include message or
+            # tool content in diagnostic events or the persisted checkpoint.
+            "last_sdk_message": run._last_sdk_message_type,
+        }
+        run._last_stall_diagnostic = diagnostic
+        await run.emit({"type": "turn_stalled", "attempt": run._model_retries, **diagnostic})
         try:
             await client.interrupt()
         except Exception as e:
@@ -2732,7 +2747,17 @@ async def _run_wrapper(run: CompileRun):
         await _COMPILE_IMPL(run)
         clean = True
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
-        await run.emit({"type": "error", "error": repr(e)})
+        error_event = {"type": "error", "error": repr(e)}
+        if isinstance(e, ModelStallError) and run._last_stall_diagnostic:
+            # Structured, content-free diagnostics survive the Runtime→consumer
+            # opaque checkpoint.  Keep the human error for rolling consumers,
+            # but make automation independent of parsing it.
+            error_event.update({
+                key: value
+                for key, value in run._last_stall_diagnostic.items()
+                if key != "fatal"
+            })
+        await run.emit(error_event)
         if getattr(run, "_turn_active", False):
             # never-block symmetry (review fix): a consumer gating on turn_done
             # must not hang because the driver died mid-turn (stall-fatal etc.).

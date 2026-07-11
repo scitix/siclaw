@@ -19,6 +19,7 @@ import type {
   CapabilityLifecycleStatus,
   CapabilityListActiveRunsResponse,
   CapabilityRunRow,
+  CapabilityRunFailure,
   CapabilityRunState,
   CapabilityTerminalStatus,
 } from "./contract.js";
@@ -47,6 +48,8 @@ export interface CapabilityRunRecord {
   messageIds: string[];
   /** Recent typed commands durably accepted by this run (id + payload digest). */
   commandReceipts: CapabilityCommandReceipt[];
+  /** Sanitized machine-readable terminal failure; never user/tool content. */
+  failure?: CapabilityRunFailure;
   /** Wall-clock ms of the last DATA event; drives the stale-run watchdog. */
   lastActivityMs: number;
   /**
@@ -228,6 +231,7 @@ export class CapabilityRunManager {
         inputRevision: inputRevisionFromCheckpoint(row.checkpoint),
         messageIds: messageIdsFromCheckpoint(row.checkpoint),
         commandReceipts: commandReceiptsFromCheckpoint(row.checkpoint),
+        failure: failureFromCheckpoint(row.checkpoint),
         status,
         lastActivityMs: this.now(),
         lastHeartbeatMs: this.now(),
@@ -373,7 +377,11 @@ export class CapabilityRunManager {
    * loop retries the same terminal write (flushTerminal) until it lands, so the
    * store converges to the true outcome instead of a later blanket "failed".
    */
-  async endRun(runId: string, status: CapabilityTerminalStatus): Promise<void> {
+  async endRun(
+    runId: string,
+    status: CapabilityTerminalStatus,
+    failure?: CapabilityRunFailure,
+  ): Promise<void> {
     const rec = this.runs.get(runId);
     if (!rec) return;
     // Terminal is sticky: the FIRST outcome wins. Without this, a done whose
@@ -381,6 +389,7 @@ export class CapabilityRunManager {
     // the relay's error catch when the box stream closes right after `done`.
     if (isTerminalCapabilityStatus(rec.status)) return;
     rec.status = status;
+    if (status === "failed" && failure) rec.failure = normalizeFailure(failure);
     rec.lastActivityMs = this.now();
     try {
       await this.persist(rec, { failFast: true });
@@ -418,6 +427,7 @@ export class CapabilityRunManager {
           inputRevision: inputRevisionFromCheckpoint(r.checkpoint),
           messageIds: messageIdsFromCheckpoint(r.checkpoint),
           commandReceipts: commandReceiptsFromCheckpoint(r.checkpoint),
+          failure: failureFromCheckpoint(r.checkpoint),
           status: r.status || "running",
           lastActivityMs: this.now(),
           lastHeartbeatMs: this.now(),
@@ -591,6 +601,7 @@ export class CapabilityRunManager {
       ...(rec.inputRevision ? { input_revision: rec.inputRevision } : {}),
       ...(rec.messageIds.length > 0 ? { message_ids: rec.messageIds } : {}),
       ...(rec.commandReceipts.length > 0 ? { command_receipts: rec.commandReceipts } : {}),
+      ...(rec.failure ? { failure: rec.failure } : {}),
     };
     const state: CapabilityRunState = {
       run_id: rec.runId,
@@ -674,4 +685,48 @@ function commandReceiptsFromCheckpoint(checkpoint: unknown): CapabilityCommandRe
     normalized.push({ id: cleanID, digest: cleanDigest });
   }
   return normalized.slice(-MAX_COMMAND_RECEIPTS);
+}
+
+function failureFromCheckpoint(checkpoint: unknown): CapabilityRunFailure | undefined {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const failure = (value as { failure?: unknown }).failure;
+  return normalizeFailure(failure);
+}
+
+function normalizeFailure(value: unknown): CapabilityRunFailure | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const token = (field: unknown): string | undefined => {
+    if (typeof field !== "string") return undefined;
+    const normalized = field.trim();
+    return normalized && normalized.length <= 64 && /^[a-zA-Z0-9_.-]+$/.test(normalized)
+      ? normalized
+      : undefined;
+  };
+  const code = token(raw.code);
+  const stage = token(raw.stage);
+  if (!code || !stage) return undefined;
+  const finiteNonNegative = (field: unknown): number | undefined =>
+    typeof field === "number" && Number.isFinite(field) && field >= 0 ? field : undefined;
+  const attempts = finiteNonNegative(raw.attempts);
+  const idle = finiteNonNegative(raw.idle_s);
+  const bound = finiteNonNegative(raw.bound_s);
+  const lastMessage = token(raw.last_sdk_message);
+  return {
+    code,
+    stage,
+    ...(attempts !== undefined ? { attempts: Math.floor(attempts) } : {}),
+    ...(idle !== undefined ? { idle_s: idle } : {}),
+    ...(bound !== undefined ? { bound_s: bound } : {}),
+    ...(typeof raw.tool_pending === "boolean" ? { tool_pending: raw.tool_pending } : {}),
+    ...(lastMessage ? { last_sdk_message: lastMessage } : {}),
+  };
 }

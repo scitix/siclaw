@@ -166,6 +166,36 @@ async def test_run_wrapper_terminal_signals():
             types = _drain_event_types(run)
             assert "error" in types and "done" not in types and types[-1] == "end", types
 
+            async def stalled(run):
+                run._last_stall_diagnostic = {
+                    "code": "model_turn_stalled",
+                    "stage": "model_turn",
+                    "attempts": 4,
+                    "idle_s": 90.2,
+                    "bound_s": 90.0,
+                    "tool_pending": False,
+                    "last_sdk_message": "query",
+                }
+                raise compile_box.ModelStallError("model request stalled; exhausted 4 attempt(s)")
+            compile_box._COMPILE_IMPL = stalled
+            run = compile_box.CompileRun("wrap-stalled", td, 1)
+            await compile_box._run_wrapper(run)
+            events = []
+            while not run.events.empty():
+                events.append(run.events.get_nowait())
+            error = next(e for e in events if e["type"] == "error")
+            assert error == {
+                "type": "error",
+                "error": "ModelStallError('model request stalled; exhausted 4 attempt(s)')",
+                "code": "model_turn_stalled",
+                "stage": "model_turn",
+                "attempts": 4,
+                "idle_s": 90.2,
+                "bound_s": 90.0,
+                "tool_pending": False,
+                "last_sdk_message": "query",
+            }, error
+
             async def cancelled(run):
                 raise asyncio.CancelledError()
             compile_box._COMPILE_IMPL = cancelled
@@ -1960,7 +1990,13 @@ async def test_model_stall_exhausts_to_error():
     assert isinstance(raised, compile_box.ModelStallError), raised
     assert fake.interrupts == 3, fake.interrupts          # 2 retries + the fatal attempt
     assert types.count("turn_stalled") == 3, types
-    assert any(e["type"] == "turn_stalled" and e.get("fatal") for e in evs), evs
+    fatal = next(e for e in evs if e["type"] == "turn_stalled" and e.get("fatal"))
+    assert fatal["code"] == "model_turn_stalled", fatal
+    assert fatal["stage"] == "model_turn", fatal
+    assert fatal["attempts"] == 3, fatal
+    assert fatal["bound_s"] == 0.1, fatal
+    assert fatal["tool_pending"] is False, fatal
+    assert fatal["last_sdk_message"] == "query", fatal
     print("✓ model stall: retries exhausted → ModelStallError (fails fast, no hang)")
 
 
