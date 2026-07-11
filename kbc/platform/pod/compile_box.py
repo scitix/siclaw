@@ -2532,12 +2532,20 @@ def _note_model_activity(run: CompileRun, msg) -> None:
     """Every inbound SDK message (StreamEvent delta, assistant/user turn, result)
     proves the model link is alive → reset the idle clock. An assistant message
     that asks for a tool flips tool_pending so the watchdog uses the longer bound
-    while the CLI runs Read/Bash (that gap is not a model stall)."""
+    while the CLI runs Read/Bash (that gap is not a model stall).
+
+    Partial StreamEvents are transport liveness only.  The Agent SDK emits
+    assistant-tail events (content_block_stop/message_delta/message_stop) after
+    a ToolUseBlock and before the UserMessage containing the tool result; those
+    events must not clear tool_pending or a legitimate long-running tool is
+    measured against the much shorter model-idle bound.
+    """
     run._last_model_activity = time.monotonic()
-    if type(msg).__name__ == "AssistantMessage":
+    message_type = type(msg).__name__
+    if message_type == "AssistantMessage":
         blocks = getattr(msg, "content", None) or []
         run._tool_pending = any(type(b).__name__ == "ToolUseBlock" for b in blocks)
-    else:
+    elif message_type in ("UserMessage", "ResultMessage"):
         run._tool_pending = False
 
 
