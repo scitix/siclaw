@@ -1847,6 +1847,13 @@ class _ToolGapFake:
         am = AssistantMessage("calling read")
         am.content = [TextBlock("calling read"), ToolUseBlock()]
         yield am                                # tool_pending = True
+        # The real Agent SDK emits assistant-tail StreamEvents
+        # (content_block_stop/message_delta/message_stop) before the CLI
+        # returns the UserMessage carrying the tool result.  Those events prove
+        # transport liveness, but they do not mean the tool has finished.
+        yield StreamEvent()
+        yield StreamEvent()
+        yield StreamEvent()
         await asyncio.sleep(self._gap)          # model-silent while the CLI runs the tool
         yield UserMessage()                     # tool_result → tool_pending = False
         yield AssistantMessage("read done")
