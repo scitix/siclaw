@@ -29,6 +29,7 @@ import {
   CAPABILITY_LIST_ACTIVE_RUNS,
   isTerminalCapabilityStatus,
 } from "./contract.js";
+import { ErrorCodes, RpcResponseError } from "../../lib/error-envelope.js";
 
 /** Just the RPC surface the manager needs (so tests can pass a fake). */
 export interface RunStateBackend {
@@ -315,7 +316,14 @@ export class CapabilityRunManager {
     if (!rec || !id || !normalizedDigest) return;
     const existing = rec.commandReceipts.find((receipt) => receipt.id === id);
     if (existing) {
-      if (existing.digest !== normalizedDigest) throw new Error("command_id was already used with a different payload");
+      if (existing.digest !== normalizedDigest) {
+        throw new RpcResponseError({
+          code: ErrorCodes.CONFLICT,
+          message: "command_id was already used with a different payload",
+          retriable: false,
+          status: 409,
+        });
+      }
       return;
     }
     const previous = rec.commandReceipts;

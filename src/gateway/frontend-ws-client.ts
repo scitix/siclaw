@@ -11,6 +11,7 @@
 
 import crypto from "node:crypto";
 import WebSocket from "ws";
+import { wrapRpcError } from "../lib/error-envelope.js";
 
 // ── Public types ─────────────────────────────────────────────
 
@@ -286,7 +287,7 @@ export class FrontendWsClient {
 
   private async handleInboundCommand(id: string, method: string, params: any): Promise<void> {
     if (!this.commandHandler) {
-      this.sendFrame({ type: "res", id, ok: false, error: `No command handler registered` });
+      this.sendFrame({ type: "res", id, ok: false, error: wrapRpcError(new Error("No command handler registered")) });
       return;
     }
 
@@ -294,8 +295,7 @@ export class FrontendWsClient {
       const payload = await this.commandHandler(method, params);
       this.sendFrame({ type: "res", id, ok: true, payload });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.sendFrame({ type: "res", id, ok: false, error: message });
+      this.sendFrame({ type: "res", id, ok: false, error: wrapRpcError(err) });
     }
   }
 

@@ -14,13 +14,17 @@ import crypto from "node:crypto";
 import http from "node:http";
 import type WebSocket from "ws";
 import { WebSocketServer } from "ws";
+import { isErrorDetail, type ErrorDetail } from "../lib/error-envelope.js";
 
 // ── Public types ─────────────────────────────────────────────
 
 export interface RpcResult {
   ok: boolean;
   payload?: unknown;
+  /** Backward-compatible human message for existing Portal callers. */
   error?: string;
+  /** Structured Runtime error when the peer supports the ErrorDetail wire. */
+  errorDetail?: ErrorDetail;
 }
 
 interface PendingRpc {
@@ -97,10 +101,12 @@ export function createConnectionMap(): RuntimeConnectionMap {
       if (entry) {
         clearTimeout(entry.timer);
         pending.delete(msg.id);
+        const errorDetail = isErrorDetail(msg.error) ? msg.error : undefined;
         entry.resolve({
           ok: !!msg.ok,
           payload: msg.payload,
-          error: msg.error,
+          error: typeof msg.error === "string" ? msg.error : errorDetail?.message,
+          ...(errorDetail ? { errorDetail } : {}),
         });
       }
       return;

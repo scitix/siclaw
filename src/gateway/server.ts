@@ -54,7 +54,7 @@ import {
   type RpcHandler,
   type RpcContext,
 } from "./ws-protocol.js";
-import { ErrorCodes, wrapError } from "../lib/error-envelope.js";
+import { ErrorCodes, RpcResponseError, wrapError } from "../lib/error-envelope.js";
 import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
 import { type CredentialService } from "./credential-service.js";
 import { CertificateManager, type CertificateIdentity } from "./security/cert-manager.js";
@@ -700,7 +700,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
     const durableReceipt = capabilityRunManager.commandReceipt(runId, commandId);
     if (durableReceipt) {
-      if (durableReceipt.digest !== digest) throw new Error("command_id was already used with a different payload");
+      if (durableReceipt.digest !== digest) {
+        throw new RpcResponseError({
+          code: ErrorCodes.CONFLICT,
+          message: "command_id was already used with a different payload",
+          retriable: false,
+          status: 409,
+        });
+      }
       return { ok: true, run_id: runId, command_id: commandId, duplicate: true };
     }
     capabilityRunManager.touch(runId);

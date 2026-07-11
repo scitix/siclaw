@@ -333,6 +333,42 @@ describe("AgentBoxClient — error paths", () => {
       await srv.close();
     }
   });
+
+  it("preserves HTTP conflict metadata from a string error body", async () => {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "command_id was already used with a different payload" }));
+    });
+    try {
+      const client = new AgentBoxClient(`http://127.0.0.1:${srv.port}`);
+      const err = await client.postJson("/command/r1", {}).catch((caught) => caught);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).toMatchObject({
+        status: 409,
+        code: "CONFLICT",
+        retriable: false,
+      });
+    } finally { await srv.close(); }
+  });
+
+  it("preserves an AgentBox-provided code/retriable on non-conflict statuses", async () => {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: { code: "BOX_STARTING", message: "session is still starting", retriable: true },
+      }));
+    });
+    try {
+      const client = new AgentBoxClient(`http://127.0.0.1:${srv.port}`);
+      const err = await client.postJson("/command/r1", {}).catch((caught) => caught);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).toMatchObject({
+        status: 503,
+        code: "BOX_STARTING",
+        retriable: true,
+      });
+    } finally { await srv.close(); }
+  });
 });
 
 describe("AgentBoxClient — streamEvents (SSE)", () => {

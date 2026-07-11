@@ -153,7 +153,12 @@ describe("CapabilityRunManager", () => {
     const recovered = new CapabilityRunManager(recoveredBackend);
     await recovered.recover();
     expect(recovered.commandReceipt(runId, "cmd-1")).toEqual({ id: "cmd-1", digest });
-    await expect(recovered.rememberCommandReceipt(runId, "cmd-1", "b".repeat(64))).rejects.toThrow(/different payload/);
+    await expect(recovered.rememberCommandReceipt(runId, "cmd-1", "b".repeat(64))).rejects.toMatchObject({
+      code: "CONFLICT",
+      status: 409,
+      retriable: false,
+      message: expect.stringMatching(/different payload/),
+    });
   });
 
   it("rolls back a command receipt whose durable checkpoint failed", async () => {

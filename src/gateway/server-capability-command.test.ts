@@ -7,6 +7,7 @@ const streamState = vi.hoisted(() => ({
   idlePersisted: null as Promise<void> | null,
   resolveIdlePersisted: null as (() => void) | null,
   targetRunId: "",
+  commandError: null as (Error & { code?: string; status?: number; retriable?: boolean }) | null,
 }));
 
 vi.mock("./chat-repo.js", () => ({
@@ -24,6 +25,7 @@ vi.mock("./agentbox/client.js", () => ({
     constructor(endpoint: string) { this.endpoint = endpoint; }
     async postJson(path: string, body: unknown) {
       posts.push({ path, body });
+      if (path.startsWith("/command/") && streamState.commandError) throw streamState.commandError;
       if (path === `/command/${streamState.targetRunId}` && streamState.fastTurnDone) {
         streamState.releaseTurnDone = true;
         await streamState.idlePersisted;
@@ -81,6 +83,7 @@ afterEach(async () => {
   streamState.idlePersisted = null;
   streamState.resolveIdlePersisted = null;
   streamState.targetRunId = "";
+  streamState.commandError = null;
   vi.clearAllMocks();
 });
 
@@ -113,8 +116,37 @@ describe("capability.command", () => {
     await expect(command({
       ...payload,
       command: { ...payload.command, generation: 8 },
-    })).rejects.toThrow(/different payload/);
+    })).rejects.toMatchObject({
+      code: "CONFLICT",
+      status: 409,
+      retriable: false,
+      message: expect.stringMatching(/different payload/),
+    });
     expect(posts).toHaveLength(postsAfterAcceptance);
+  });
+
+  it("does not coerce a non-conflict AgentBox rejection into CONFLICT", async () => {
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+    });
+    const start = server.rpcMethods.get("capability.start")!;
+    const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
+    streamState.commandError = Object.assign(new Error("session is still starting"), {
+      code: "SERVICE_UNAVAILABLE",
+      status: 503,
+      retriable: true,
+    });
+    const command = server.rpcMethods.get("capability.command")!;
+    await expect(command({
+      run_id: started.run_id,
+      command_id: "cmd-starting",
+      command: { version: 1, action: "compile.generate", operation_id: "op-1", generation: 1, parameters: {} },
+    })).rejects.toMatchObject({
+      code: "SERVICE_UNAVAILABLE",
+      status: 503,
+      retriable: true,
+    });
   });
 
   it("rejects malformed common fields before touching the box", async () => {

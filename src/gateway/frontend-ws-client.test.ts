@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import type { FrontendWsClientOptions } from "./frontend-ws-client.js";
+import { RpcResponseError } from "../lib/error-envelope.js";
 
 // ── Mock WebSocket ──────────────────────────────────────────
 
@@ -220,7 +221,53 @@ describe("FrontendWsClient", () => {
     const cmdResponse = responses.find((r) => r.type === "res" && r.id === "cmd-err");
     expect(cmdResponse).toBeDefined();
     expect(cmdResponse.ok).toBe(false);
-    expect(cmdResponse.error).toContain("handler boom");
+    expect(cmdResponse.error).toEqual({
+      code: "INTERNAL_ERROR",
+      message: "handler boom",
+      retriable: true,
+    });
+
+    client.close();
+  });
+
+  it("onCommand() preserves structured status/code/retriable in negative responses", async () => {
+    const client = await createClient();
+
+    client.onCommand(async () => {
+      throw new RpcResponseError({
+        code: "SERVICE_UNAVAILABLE",
+        message: "box is starting",
+        retriable: true,
+        status: 503,
+      });
+    });
+
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    ws.emit("message", JSON.stringify({
+      type: "req",
+      id: "cmd-structured-error",
+      method: "capability.command",
+      params: {},
+    }));
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    const responses = ws._sent.map((s) => JSON.parse(s));
+    const cmdResponse = responses.find((r) => r.type === "res" && r.id === "cmd-structured-error");
+    expect(cmdResponse).toEqual({
+      type: "res",
+      id: "cmd-structured-error",
+      ok: false,
+      error: {
+        code: "SERVICE_UNAVAILABLE",
+        message: "box is starting",
+        retriable: true,
+        status: 503,
+      },
+    });
 
     client.close();
   });
