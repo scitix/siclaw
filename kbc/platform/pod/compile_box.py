@@ -322,7 +322,7 @@ class CompileRun:
         # for this live run, and the first command pins the run to the consumer's
         # operation/generation context. This is intentionally NOT another status
         # machine; Sicore's operation and the runtime run remain authoritative.
-        self._accepted_command_ids: set[str] = set()
+        self._accepted_commands: dict[str, str] = {}
         self._command_context: tuple[str, int] | None = None
 
     async def emit(self, ev: dict):
@@ -948,6 +948,11 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
         "generation": generation,
         "parameters": parameters,
     }
+
+
+def _command_digest(command: dict) -> str:
+    encoded = json.dumps(command, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _render_command(run: "CompileRun", command: dict) -> str:
@@ -3175,8 +3180,12 @@ async def handle_command(request: web.Request):
         except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
             raise CommandRejected("request body must be valid JSON", 400)
         command_id, command = _normalize_command(body)
+        digest = _command_digest(command)
         context = (command["operation_id"], command["generation"])
-        if command_id in run._accepted_command_ids:
+        accepted_digest = run._accepted_commands.get(command_id)
+        if accepted_digest is not None:
+            if accepted_digest != digest:
+                raise CommandRejected("command_id was already used with a different payload", 409)
             return web.json_response({"ok": True, "duplicate": True, "command_id": command_id})
         # Product controls are never an in-memory "note for later". Accepting a
         # second command while a turn/batch is active would acknowledge an
@@ -3190,11 +3199,11 @@ async def handle_command(request: web.Request):
         _prepare_command(run, command)
         text = _render_command(run, command)
         run._command_context = context
-        run._accepted_command_ids.add(command_id)
+        run._accepted_commands[command_id] = digest
         try:
             result = await _dispatch_authoring_turn(run, text, command["action"])
         except BaseException:
-            run._accepted_command_ids.discard(command_id)
+            run._accepted_commands.pop(command_id, None)
             raise
         return web.json_response({**result, "command_id": command_id, "action": command["action"]})
     except CommandRejected as exc:

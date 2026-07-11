@@ -45,6 +45,8 @@ export interface CapabilityRunRecord {
   inputRevision?: string;
   /** Recent consumer turn ids durably accepted by this run (retry dedupe). */
   messageIds: string[];
+  /** Recent typed commands durably accepted by this run (id + payload digest). */
+  commandReceipts: CapabilityCommandReceipt[];
   /** Wall-clock ms of the last DATA event; drives the stale-run watchdog. */
   lastActivityMs: number;
   /**
@@ -102,6 +104,12 @@ const MAX_REAP_DEFERRALS = 5;
 const INPUT_REVISION_PERSIST_ATTEMPTS = 4;
 const INPUT_REVISION_RETRY_BASE_MS = 250;
 const MAX_MESSAGE_IDS = 128;
+const MAX_COMMAND_RECEIPTS = 128;
+
+export interface CapabilityCommandReceipt {
+  id: string;
+  digest: string;
+}
 
 export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
@@ -168,6 +176,7 @@ export class CapabilityRunManager {
       runtimeId: p.runtimeId,
       status: p.initialStatus ?? "running",
       messageIds: [],
+      commandReceipts: [],
       lastActivityMs: this.now(),
       lastHeartbeatMs: this.now(),
     };
@@ -215,6 +224,7 @@ export class CapabilityRunManager {
         runtimeId: row.runtime_id || undefined,
         inputRevision: inputRevisionFromCheckpoint(row.checkpoint),
         messageIds: messageIdsFromCheckpoint(row.checkpoint),
+        commandReceipts: commandReceiptsFromCheckpoint(row.checkpoint),
         status,
         lastActivityMs: this.now(),
         lastHeartbeatMs: this.now(),
@@ -281,6 +291,32 @@ export class CapabilityRunManager {
       await this.persist(rec, { failFast: true });
     } catch (err) {
       rec.messageIds = previous;
+      throw err;
+    }
+  }
+
+  commandReceipt(runId: string, commandId: string): CapabilityCommandReceipt | undefined {
+    const id = commandId.trim();
+    return id ? this.runs.get(runId)?.commandReceipts.find((receipt) => receipt.id === id) : undefined;
+  }
+
+  /** Persist a typed-command receipt only after the box accepted the command. */
+  async rememberCommandReceipt(runId: string, commandId: string, digest: string): Promise<void> {
+    const rec = this.runs.get(runId);
+    const id = commandId.trim();
+    const normalizedDigest = digest.trim().toLowerCase();
+    if (!rec || !id || !normalizedDigest) return;
+    const existing = rec.commandReceipts.find((receipt) => receipt.id === id);
+    if (existing) {
+      if (existing.digest !== normalizedDigest) throw new Error("command_id was already used with a different payload");
+      return;
+    }
+    const previous = rec.commandReceipts;
+    rec.commandReceipts = [...previous, { id, digest: normalizedDigest }].slice(-MAX_COMMAND_RECEIPTS);
+    try {
+      await this.persist(rec, { failFast: true });
+    } catch (err) {
+      rec.commandReceipts = previous;
       throw err;
     }
   }
@@ -378,6 +414,7 @@ export class CapabilityRunManager {
           runtimeId: r.runtime_id || undefined,
           inputRevision: inputRevisionFromCheckpoint(r.checkpoint),
           messageIds: messageIdsFromCheckpoint(r.checkpoint),
+          commandReceipts: commandReceiptsFromCheckpoint(r.checkpoint),
           status: r.status || "running",
           lastActivityMs: this.now(),
           lastHeartbeatMs: this.now(),
@@ -550,6 +587,7 @@ export class CapabilityRunManager {
     const checkpoint = {
       ...(rec.inputRevision ? { input_revision: rec.inputRevision } : {}),
       ...(rec.messageIds.length > 0 ? { message_ids: rec.messageIds } : {}),
+      ...(rec.commandReceipts.length > 0 ? { command_receipts: rec.commandReceipts } : {}),
     };
     const state: CapabilityRunState = {
       run_id: rec.runId,
@@ -605,4 +643,32 @@ function messageIdsFromCheckpoint(checkpoint: unknown): string[] {
     .filter((id): id is string => typeof id === "string" && id.trim() !== "" && id.trim().length <= 128)
     .map((id) => id.trim())
     .slice(-MAX_MESSAGE_IDS);
+}
+
+function commandReceiptsFromCheckpoint(checkpoint: unknown): CapabilityCommandReceipt[] {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!value || typeof value !== "object") return [];
+  const receipts = (value as { command_receipts?: unknown }).command_receipts;
+  if (!Array.isArray(receipts)) return [];
+  const seen = new Set<string>();
+  const normalized: CapabilityCommandReceipt[] = [];
+  for (const receipt of receipts) {
+    if (!receipt || typeof receipt !== "object") continue;
+    const id = (receipt as { id?: unknown }).id;
+    const digest = (receipt as { digest?: unknown }).digest;
+    if (typeof id !== "string" || typeof digest !== "string") continue;
+    const cleanID = id.trim();
+    const cleanDigest = digest.trim().toLowerCase();
+    if (!cleanID || cleanID.length > 128 || !/^[0-9a-f]{64}$/.test(cleanDigest) || seen.has(cleanID)) continue;
+    seen.add(cleanID);
+    normalized.push({ id: cleanID, digest: cleanDigest });
+  }
+  return normalized.slice(-MAX_COMMAND_RECEIPTS);
 }

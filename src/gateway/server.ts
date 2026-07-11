@@ -87,6 +87,21 @@ import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
 
+function stablePayloadDigest(value: unknown): string {
+  const canonicalize = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(canonicalize);
+    if (input && typeof input === "object") {
+      return Object.fromEntries(
+        Object.entries(input as Record<string, unknown>)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, child]) => [key, canonicalize(child)]),
+      );
+    }
+    return input;
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
+}
+
 export interface RuntimeServer {
   httpServer: http.Server;
   httpsServer: https.Server | null;
@@ -659,6 +674,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const commandId = req.command_id?.trim();
     if (!runId) throw new Error("run_id is required");
     if (!commandId) throw new Error("command_id is required");
+    if (commandId.length > 128) throw new Error("command_id must be at most 128 characters");
     if (!req.command || typeof req.command !== "object") throw new Error("command is required");
     if (!Number.isInteger(req.command.version) || req.command.version < 1) throw new Error("command.version is required");
     if (!req.command.action?.trim()) throw new Error("command.action is required");
@@ -670,18 +686,36 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       throw new Error("command.parameters must be an object");
     }
 
+    const digest = stablePayloadDigest(req.command);
+
     const rec = capabilityRunManager.get(runId) ?? (await capabilityRunManager.adopt(runId));
     if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
+    const durableReceipt = capabilityRunManager.commandReceipt(runId, commandId);
+    if (durableReceipt) {
+      if (durableReceipt.digest !== digest) throw new Error("command_id was already used with a different payload");
+      return { ok: true, run_id: runId, command_id: commandId, duplicate: true };
+    }
     capabilityRunManager.touch(runId);
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
-    const accepted = await client.postJson<{ duplicate?: boolean }>(`/command/${runId}`, {
-      command_id: commandId,
-      command: req.command,
-    });
-    // A duplicate may arrive after the original turn already returned the run
-    // to idle. Marking that replay running would create a phantom in-flight turn
-    // with no future turn_done to clear it.
-    if (!accepted.duplicate) await capabilityRunManager.setStatus(runId, "running");
+    const previousStatus = rec.status;
+    // Publish running BEFORE the box can emit turn_done. A fast command can
+    // complete during postJson; no lifecycle write is allowed after a newly
+    // accepted POST or it could overwrite that turn_done→idle transition.
+    await capabilityRunManager.setStatus(runId, "running");
+    let accepted: { duplicate?: boolean };
+    try {
+      accepted = await client.postJson<{ duplicate?: boolean }>(`/command/${runId}`, {
+        command_id: commandId,
+        command: req.command,
+      });
+    } catch (err) {
+      await capabilityRunManager.setStatus(runId, previousStatus);
+      throw err;
+    }
+    // A box-level duplicate after runtime recovery has no future turn_done. Put
+    // the hosting run back exactly where it was before this replay.
+    if (accepted.duplicate) await capabilityRunManager.setStatus(runId, previousStatus);
+    await capabilityRunManager.rememberCommandReceipt(runId, commandId, digest);
     return { ok: true, run_id: runId, command_id: commandId, duplicate: accepted.duplicate === true };
   });
 

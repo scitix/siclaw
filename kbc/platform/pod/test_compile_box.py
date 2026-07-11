@@ -2163,6 +2163,13 @@ async def test_typed_authoring_commands():
             r = await client.post(f"/command/{run_id}", json=body)
             assert r.status == 200 and (await r.json())["duplicate"] is True
             assert len(run.client.queries) == 1
+            # An idempotency key binds one normalized payload; it cannot be
+            # reinterpreted as a different action or generation.
+            changed = json.loads(json.dumps(body))
+            changed["command"]["generation"] = 2
+            r = await client.post(f"/command/{run_id}", json=changed)
+            assert r.status == 409 and "different payload" in (await r.json())["error"]
+            assert len(run.client.queries) == 1
             # A distinct command cannot be acknowledged and silently dropped
             # while another turn is active.
             busy = json.loads(json.dumps(body))

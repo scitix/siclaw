@@ -78,8 +78,11 @@ parameters. Unknown versions and unknown actions fail closed.
 3. The consumer supplies `operation_id` and `generation`; the box never invents
    domain lifecycle identity. Artifact persistence remains fenced by the
    consumer's attempt and generation.
-4. `command_id` is idempotent within a live run. Repeating an accepted command
-   returns the prior acceptance and does not start a second turn.
+4. `command_id` binds one canonical command payload. Runtime checkpoints recent
+   `{id, digest}` receipts in the consumer-backed run record, and the live box
+   keeps the same protection across Runtime acknowledgement gaps. Repeating the
+   same payload returns the prior acceptance; reusing the id for another payload
+   fails closed.
 5. One run is pinned to one `(operation_id, generation)` command context. A
    command for another context is rejected.
 6. `content_locale`, prompt locale, display message, and free-form notes cannot
@@ -123,8 +126,11 @@ parameters. Unknown versions and unknown actions fail closed.
 
 - validates the common command envelope;
 - finds/adopts the addressed run;
-- forwards the command unchanged to `/command/{run_id}`;
-- updates run activity/status exactly as for an accepted model turn;
+- checks the durable command receipt before touching the box;
+- publishes `running` before POST so a fast `turn_done -> idle` cannot be
+  overwritten by a late handler write;
+- forwards the command unchanged to `/command/{run_id}` and checkpoints the
+  accepted `{command_id, payload digest}` afterward;
 - does not render prompts or understand KB action parameters.
 
 ### KB compile-box
@@ -136,6 +142,17 @@ parameters. Unknown versions and unknown actions fail closed.
 - renders the action into a model directive using the run's prompt locale;
 - selects full, batch, incremental, resume, or repair execution from the action,
   never from rendered text.
+
+## Delivery guarantee
+
+The command path is at-least-once delivery with idempotent acceptance, not a
+distributed exactly-once transaction. A process may die after the box accepts a
+turn but before Runtime or Sicore persists its receipt. Retrying the same id is
+therefore required: the surviving layer acknowledges the duplicate and the
+missing durable receipt is repaired. If both Runtime and the ephemeral box die
+inside that window, Sicore's operation/generation and artifact-write fences
+remain the safety boundary; the same command may be redelivered to a rehydrated
+box, but stale generations cannot commit.
 
 ## Rolling migration
 

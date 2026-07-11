@@ -133,6 +133,39 @@ describe("CapabilityRunManager", () => {
     expect(mgr.hasMessageId(runId, "op-1")).toBe(false);
   });
 
+  it("checkpoints typed command ids with payload digests and restores them", async () => {
+    const digest = "a".repeat(64);
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.rememberCommandReceipt(runId, "cmd-1", digest);
+    expect(mgr.commandReceipt(runId, "cmd-1")).toEqual({ id: "cmd-1", digest });
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      checkpoint: { command_receipts: [{ id: "cmd-1", digest }] },
+    });
+
+    const recoveredBackend = new FakeBackend();
+    recoveredBackend.activeRuns = [{
+      id: runId, profile: "kb-compile", org_id: "o1", status: "idle",
+      checkpoint: JSON.stringify({ command_receipts: [{ id: "cmd-1", digest }] }),
+    }];
+    const recovered = new CapabilityRunManager(recoveredBackend);
+    await recovered.recover();
+    expect(recovered.commandReceipt(runId, "cmd-1")).toEqual({ id: "cmd-1", digest });
+    await expect(recovered.rememberCommandReceipt(runId, "cmd-1", "b".repeat(64))).rejects.toThrow(/different payload/);
+  });
+
+  it("rolls back a command receipt whose durable checkpoint failed", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    be.failPersist = true;
+
+    await expect(mgr.rememberCommandReceipt(runId, "cmd-1", "a".repeat(64))).rejects.toThrow("ws down");
+    expect(mgr.commandReceipt(runId, "cmd-1")).toBeUndefined();
+  });
+
   it("fails closed when the installed input revision cannot be checkpointed", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
