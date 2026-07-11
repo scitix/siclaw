@@ -96,6 +96,11 @@ parameters. Unknown versions and unknown actions fail closed.
 9. A command is an intent/receipt, not another lifecycle state machine. Run
    status remains the execution truth and Sicore's authoring operation remains
    the domain mutation truth.
+10. A consumer that has already selected an immutable source revision supplies
+    `input_revision` on `capability.start`. Runtime persists that revision in the
+    run's initial checkpoint before any box spawn or materialization, then asks
+    every fresh/recovered box for that exact revision. Consumers that omit the
+    field retain the rolling-compatible fetch-then-checkpoint flow.
 
 ## Authoring actions v1
 
@@ -125,6 +130,8 @@ routing or lifecycle state.
 - validates the product action payload;
 - creates the correct authoring operation/attempt;
 - fills `operation_id`, `generation`, and `command_id`;
+- supplies the immutable `input_revision` selected for a new mutation when the
+  consumer supports start-time pinning;
 - persists an optional display message separately;
 - materializes source drift and other consumer-owned inputs;
 - rejects stale artifact writes through the existing generation fence.
@@ -134,6 +141,8 @@ routing or lifecycle state.
 - validates the common command envelope;
 - finds/adopts the addressed run;
 - checks the durable command receipt before touching the box;
+- atomically checkpoints a start-time `input_revision` before touching the box,
+  and reuses it for materialization after restart/adoption;
 - publishes `running` before POST so a fast `turn_done -> idle` cannot be
   overwritten by a late handler write;
 - forwards the command unchanged to `/command/{run_id}` and checkpoints the

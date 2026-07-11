@@ -603,6 +603,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     getBoxProfile(profile);
     const orgId = req.org_id;
     const instruction = req.input?.instruction as string | undefined;
+    let inputRevision: string | undefined;
+    if (req.input_revision !== undefined) {
+      if (typeof req.input_revision !== "string" || !req.input_revision.trim()) {
+        throw new Error("input_revision must be a non-empty string");
+      }
+      inputRevision = req.input_revision.trim();
+    }
     // siclaw mints the runId (the run is siclaw-owned). Initial status follows
     // the instruction: a kickoff instruction drives an immediate turn (running);
     // an instruction-less start (chat arrives via capability.message right
@@ -613,6 +620,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         profile,
         orgId: orgId ?? "",
         correlationId: req.correlation_id,
+        inputRevision,
         initialStatus: instruction && instruction.trim() ? "running" : "idle",
       });
       startedRunId = rec.runId;
