@@ -103,6 +103,11 @@ export interface CapabilityStartResponse {
 export interface CapabilityMessageRequest {
   run_id: string;
   /**
+   * Consumer-minted idempotency key for this conversational turn. Optional for
+   * rolling compatibility; retries carrying the same id must be accepted once.
+   */
+  message_id?: string;
+  /**
    * A genuine conversational turn injected into the live session. Product
    * controls use CapabilityCommandRequest; old fixed-prefix controls are only
    * a temporary box compatibility adapter.
@@ -215,7 +220,7 @@ export interface CapabilityRunState {
   correlation_id: string;
   profile: string;
   status: CapabilityLifecycleStatus;
-  /** Opaque resume blob; KB runs currently checkpoint their installed input revision here. */
+  /** Opaque resume blob; KB runs checkpoint input revision and accepted message ids here. */
   checkpoint?: unknown;
   /**
    * Box session id, reserved for a future where the box persists its session and

@@ -43,6 +43,8 @@ export interface CapabilityRunRecord {
   runtimeId?: string;
   /** Frozen consumer input installed into this run's box. */
   inputRevision?: string;
+  /** Recent consumer turn ids durably accepted by this run (retry dedupe). */
+  messageIds: string[];
   /** Wall-clock ms of the last DATA event; drives the stale-run watchdog. */
   lastActivityMs: number;
   /**
@@ -99,6 +101,7 @@ export interface CapabilityRunManagerOptions {
 const MAX_REAP_DEFERRALS = 5;
 const INPUT_REVISION_PERSIST_ATTEMPTS = 4;
 const INPUT_REVISION_RETRY_BASE_MS = 250;
+const MAX_MESSAGE_IDS = 128;
 
 export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
@@ -164,6 +167,7 @@ export class CapabilityRunManager {
       correlationId: p.correlationId,
       runtimeId: p.runtimeId,
       status: p.initialStatus ?? "running",
+      messageIds: [],
       lastActivityMs: this.now(),
       lastHeartbeatMs: this.now(),
     };
@@ -210,6 +214,7 @@ export class CapabilityRunManager {
         correlationId: row.correlation_id || undefined,
         runtimeId: row.runtime_id || undefined,
         inputRevision: inputRevisionFromCheckpoint(row.checkpoint),
+        messageIds: messageIdsFromCheckpoint(row.checkpoint),
         status,
         lastActivityMs: this.now(),
         lastHeartbeatMs: this.now(),
@@ -256,6 +261,30 @@ export class CapabilityRunManager {
     }
   }
 
+  hasMessageId(runId: string, messageId: string): boolean {
+    const id = messageId.trim();
+    return id !== "" && (this.runs.get(runId)?.messageIds.includes(id) ?? false);
+  }
+
+  /**
+   * Persist a turn id only AFTER the box accepted it. If this checkpoint write
+   * fails, roll the in-memory mark back: the caller returns an error and retries
+   * the same id; the box-level dedupe then turns that retry into a harmless ack.
+   */
+  async rememberMessageId(runId: string, messageId: string): Promise<void> {
+    const rec = this.runs.get(runId);
+    const id = messageId.trim();
+    if (!rec || !id || rec.messageIds.includes(id)) return;
+    const previous = rec.messageIds;
+    rec.messageIds = [...previous, id].slice(-MAX_MESSAGE_IDS);
+    try {
+      await this.persist(rec, { failFast: true });
+    } catch (err) {
+      rec.messageIds = previous;
+      throw err;
+    }
+  }
+
   /** Bump last-DATA activity so the watchdog doesn't reap an actively-used run. */
   touch(runId: string): void {
     const rec = this.runs.get(runId);
@@ -289,11 +318,9 @@ export class CapabilityRunManager {
     const rec = this.runs.get(runId);
     if (!rec) return;
     // Terminal is sticky — mirror endRun. A record can sit here in a TERMINAL
-    // state while its final persist retries (flushTerminal). capability.message
-    // calls setStatus("running") after two awaits (ensure session + POST
-    // /message), so a done/error/cancel landing in that window must not be
-    // flipped back to non-terminal — that would hide the record from
-    // flushTerminal and degrade the true outcome to a watchdog "failed".
+    // state while its final persist retries (flushTerminal). A concurrent
+    // done/error/cancel must never be flipped back to non-terminal — that would
+    // hide the record from flushTerminal and degrade the true outcome.
     if (isTerminalCapabilityStatus(rec.status)) return;
     rec.status = status;
     rec.lastActivityMs = this.now();
@@ -350,6 +377,7 @@ export class CapabilityRunManager {
           correlationId: r.correlation_id || undefined,
           runtimeId: r.runtime_id || undefined,
           inputRevision: inputRevisionFromCheckpoint(r.checkpoint),
+          messageIds: messageIdsFromCheckpoint(r.checkpoint),
           status: r.status || "running",
           lastActivityMs: this.now(),
           lastHeartbeatMs: this.now(),
@@ -519,13 +547,17 @@ export class CapabilityRunManager {
    */
   private async persist(rec: CapabilityRunRecord, opts?: { failFast?: boolean }): Promise<void> {
     // The contract type IS the wire shape (snake_case) — see contract.ts WIRE RULE.
+    const checkpoint = {
+      ...(rec.inputRevision ? { input_revision: rec.inputRevision } : {}),
+      ...(rec.messageIds.length > 0 ? { message_ids: rec.messageIds } : {}),
+    };
     const state: CapabilityRunState = {
       run_id: rec.runId,
       org_id: rec.orgId ?? "",
       correlation_id: rec.correlationId ?? "",
       profile: rec.profile,
       status: rec.status,
-      ...(rec.inputRevision ? { checkpoint: { input_revision: rec.inputRevision } } : {}),
+      ...(Object.keys(checkpoint).length > 0 ? { checkpoint } : {}),
       // Reserved wire field, always "" — the runtime does not track a box session
       // id (see the note above adopt()); a future persistent-session design would
       // re-introduce the mirror + carry-through.
@@ -555,4 +587,22 @@ function inputRevisionFromCheckpoint(checkpoint: unknown): string | undefined {
   if (!value || typeof value !== "object") return undefined;
   const revision = (value as { input_revision?: unknown }).input_revision;
   return typeof revision === "string" && revision.trim() ? revision.trim() : undefined;
+}
+
+function messageIdsFromCheckpoint(checkpoint: unknown): string[] {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!value || typeof value !== "object") return [];
+  const ids = (value as { message_ids?: unknown }).message_ids;
+  if (!Array.isArray(ids)) return [];
+  return ids
+    .filter((id): id is string => typeof id === "string" && id.trim() !== "" && id.trim().length <= 128)
+    .map((id) => id.trim())
+    .slice(-MAX_MESSAGE_IDS);
 }
