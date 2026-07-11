@@ -204,6 +204,113 @@ export function resetFeedbackEchoForTest(): void {
   feedbackEchoSessions.clear();
 }
 
+// ── Group context-mode switch card ───────────────────────────────
+
+export type GroupContextMode = "shared" | "per_user";
+
+export const MODE_ACTION_KIND = "siclaw_ctx_mode";
+
+/** Self-contained payload on each mode button (comes back verbatim in the
+ *  callback, mirroring the feedback buttons — no server-side card mapping). */
+export interface ModeActionValue {
+  kind: typeof MODE_ACTION_KIND;
+  channel_id: string;
+  route_key: string;
+  mode: GroupContextMode;
+  locale: LarkLocale;
+}
+
+const MODE_CARD_COPY: Record<LarkLocale, {
+  title: (m: GroupContextMode) => string;
+  hint: string;
+  shared: string;
+  perUser: string;
+}> = {
+  "zh-CN": {
+    title: (m) => `**本群上下文模式:当前为「${m === "shared" ? "团队模式" : "个人模式"}」**`,
+    hint: "团队模式:全群共用一个对话,机器人跟进全群讨论(故障/支持群)。\n个人模式:每个人各自独立对话,互不影响(大群/混合群)。\n切换后是一段新对话。",
+    shared: "团队模式",
+    perUser: "个人模式",
+  },
+  "en-US": {
+    title: (m) => `**Group context mode: currently ${m === "shared" ? "Team (shared)" : "Personal (per-user)"}**`,
+    hint: "Team: everyone shares one conversation; the bot follows the whole group (incident / support rooms).\nPersonal: each person talks to the bot privately (large / mixed groups).\nSwitching starts a fresh conversation.",
+    shared: "Team (shared)",
+    perUser: "Personal (per-user)",
+  },
+};
+
+/** Schema-2.0 card: current mode + two callback buttons (current one primary). */
+export function buildModeCard(
+  currentMode: GroupContextMode,
+  channelId: string,
+  routeKey: string,
+  locale: LarkLocale,
+): Record<string, unknown> {
+  const copy = MODE_CARD_COPY[locale];
+  const button = (mode: GroupContextMode, label: string) => {
+    const value: ModeActionValue = { kind: MODE_ACTION_KIND, channel_id: channelId, route_key: routeKey, mode, locale };
+    const isCurrent = mode === currentMode;
+    return {
+      tag: "button",
+      element_id: `mode_${mode}`,
+      text: { tag: "plain_text", content: isCurrent ? `✓ ${label}` : label },
+      type: isCurrent ? "primary" : "default",
+      behaviors: [{ type: "callback", value }],
+    };
+  };
+  return {
+    schema: "2.0",
+    body: {
+      elements: [
+        { tag: "markdown", content: copy.title(currentMode) },
+        { tag: "markdown", content: copy.hint },
+        {
+          tag: "column_set",
+          columns: [
+            { tag: "column", width: "auto", elements: [button("shared", copy.shared)] },
+            { tag: "column", width: "auto", elements: [button("per_user", copy.perUser)] },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+/** Post the mode-switch card as a reply. Returns false on any failure so the
+ *  caller can fall back to a plain-text mode notice. */
+export async function sendModeCard(
+  larkClient: any,
+  messageId: string,
+  currentMode: GroupContextMode,
+  channelId: string,
+  routeKey: string,
+  locale: LarkLocale,
+): Promise<boolean> {
+  try {
+    const createRes = await larkClient.cardkit.v1.card.create({
+      data: { type: "card_json", data: JSON.stringify(buildModeCard(currentMode, channelId, routeKey, locale)) },
+    });
+    const cardId: string | undefined = createRes?.data?.card_id;
+    if (!cardId) {
+      console.warn("[lark-card] mode card create returned no card_id");
+      return false;
+    }
+    const replyRes = await larkClient.im.message.reply({
+      path: { message_id: messageId },
+      data: { msg_type: "interactive", content: JSON.stringify({ type: "card", data: { card_id: cardId } }) },
+    });
+    if (replyRes && typeof replyRes.code === "number" && replyRes.code !== 0) {
+      console.error(`[lark-card] posting mode card failed: code=${replyRes.code} msg=${replyRes.msg}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("[lark-card] sendModeCard failed:", err);
+    return false;
+  }
+}
+
 /** The Lark SDK does NOT throw on a non-zero API code — check explicitly. */
 function cardApiFailed(res: unknown): boolean {
   const code = (res as { code?: unknown } | undefined)?.code;

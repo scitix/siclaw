@@ -39,6 +39,19 @@ export interface ResolvedChannelBinding {
   routeType: "group" | "user";
   /** Cached chat title from the platform; null/absent until backfilled. */
   displayName?: string | null;
+  /**
+   * Group context sharing mode, chosen server-side from the binding row.
+   * `"shared"` → the whole group shares one session and non-@ chatter is
+   * buffered into it. `"per_user"` → each sender gets an isolated session and
+   * non-@ chatter is dropped. A NEW group defaults to `"shared"` (written at
+   * pair/auto-bind time), but the server resolves NULL/legacy rows to
+   * `"per_user"` (grandfathering — never merges an existing group's contexts),
+   * so an ABSENT field here is treated as `"per_user"` by the runtime: never
+   * buffer chatter for a group we can't confirm is shared. The runtime treats
+   * `sessionKey` as opaque; this field is the explicit signal for the non-@
+   * ingestion gate — never infer the mode from the key shape.
+   */
+  contextMode?: "shared" | "per_user";
 }
 
 /**
@@ -81,6 +94,26 @@ export async function resolveBinding(
     ...(senderOpenId ? { sender_open_id: senderOpenId } : {}),
   });
   return data.binding ?? null;
+}
+
+/**
+ * Set a group binding's context mode (shared|per_user) via the generic
+ * `channel.setContextMode` RPC. Backs the in-group /mode switch card; the
+ * console selector calls the same RPC. Best-effort — returns the portal's
+ * `{success}` shape, or a failure object if there is no frontend client.
+ */
+export async function setChannelContextMode(
+  channelId: string,
+  routeKey: string,
+  mode: "shared" | "per_user",
+  frontendClient?: FrontendWsClient,
+): Promise<{ success: boolean; mode?: string; error?: string }> {
+  if (!frontendClient) return { success: false, error: "No frontend client for setContextMode" };
+  return frontendClient.request("channel.setContextMode", {
+    channel_id: channelId,
+    route_key: routeKey,
+    mode,
+  });
 }
 
 /** Handle a PAIR code — validates and creates binding via RPC. */

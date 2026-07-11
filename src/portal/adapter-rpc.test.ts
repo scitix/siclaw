@@ -1531,20 +1531,20 @@ describe("channel.list", () => {
 });
 
 describe("channel.resolveBinding", () => {
-  it("returns binding when found", async () => {
-    mockQuery([{ id: "b1", agent_id: "a1", session_id: "s1", route_type: "group", created_by: "u1" }]);
+  it("per_user binding with no session_key returns the legacy binding session", async () => {
+    mockQuery([{ id: "b1", agent_id: "a1", session_id: "s1", route_type: "group", context_mode: "per_user", created_by: "u1" }]);
 
     const result = await getHandler("channel.resolveBinding")(
       { channel_id: "ch1", route_key: "group-123" }, "a1",
     );
-    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s1", createdBy: "u1", routeType: "group", displayName: null });
+    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s1", createdBy: "u1", routeType: "group", displayName: null, contextMode: "per_user" });
   });
 
-  it("lazily creates a session for legacy bindings", async () => {
+  it("lazily creates a session for legacy per_user bindings", async () => {
     const query = mockQuery(
-      [{ id: "b1", agent_id: "a1", session_id: null, route_type: "group", created_by: "u1" }],
+      [{ id: "b1", agent_id: "a1", session_id: null, route_type: "group", context_mode: "per_user", created_by: "u1" }],
       [],
-      [{ id: "b1", agent_id: "a1", session_id: "s-new", route_type: "group", created_by: "u1" }],
+      [{ id: "b1", agent_id: "a1", session_id: "s-new", route_type: "group", context_mode: "per_user", created_by: "u1" }],
     );
 
     const result = await getHandler("channel.resolveBinding")(
@@ -1552,12 +1552,12 @@ describe("channel.resolveBinding", () => {
     );
 
     expect(query.mock.calls[1][0]).toContain("UPDATE channel_bindings SET session_id");
-    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s-new", createdBy: "u1", routeType: "group", displayName: null });
+    expect(result.binding).toEqual({ agentId: "a1", bindingId: "b1", sessionId: "s-new", createdBy: "u1", routeType: "group", displayName: null, contextMode: "per_user" });
   });
 
-  it("lazily creates a participant session when session_key is provided", async () => {
+  it("per_user: creates a participant session keyed by the passed per-sender key", async () => {
     const query = mockQuery(
-      [{ id: "b1", agent_id: "a1", session_id: "shared-session", route_type: "group", created_by: "u1" }],
+      [{ id: "b1", agent_id: "a1", session_id: "shared-session", route_type: "group", context_mode: "per_user", created_by: "u1" }],
       [],
       [],
       [{ session_id: "sender-session" }],
@@ -1583,6 +1583,69 @@ describe("channel.resolveBinding", () => {
       createdBy: "u1",
       routeType: "group",
       displayName: null,
+      contextMode: "per_user",
+    });
+  });
+
+  it("explicit shared overrides the passed key with a per-chat session", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "legacy-ignored", route_type: "group", context_mode: "shared", created_by: "u1" }],
+      [],                            // participant lookup for chat:group-123 → none
+      [],                            // insert participant session
+      [{ session_id: "chat-session" }], // reload
+    );
+
+    // Runtime still passes its per-sender guess; shared mode must ignore it.
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123", session_key: "open_id:ou_1" }, "a1",
+    );
+
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "chat:group-123",
+      expect.any(String),
+    ]);
+    expect(result.binding).toEqual({
+      agentId: "a1",
+      bindingId: "b1",
+      sessionId: "chat-session",
+      sessionKey: "chat:group-123",
+      createdBy: "u1",
+      routeType: "group",
+      displayName: null,
+      contextMode: "shared",
+    });
+  });
+
+  it("NULL context_mode grandfathers to per_user (uses the passed per-sender key, not chat:)", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", created_by: "u1" }], // context_mode absent → NULL
+      [],
+      [],
+      [{ session_id: "sender-session" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      { channel_id: "ch1", route_key: "group-123", session_key: "open_id:ou_1" }, "a1",
+    );
+
+    // Grandfathered: the passed per-sender key is used, NOT chat:group-123.
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "open_id:ou_1",
+      expect.any(String),
+    ]);
+    expect(result.binding).toEqual({
+      agentId: "a1",
+      bindingId: "b1",
+      sessionId: "sender-session",
+      sessionKey: "open_id:ou_1",
+      createdBy: "u1",
+      routeType: "group",
+      displayName: null,
+      contextMode: "per_user",
     });
   });
 
@@ -1629,6 +1692,7 @@ describe("channel.resolveBinding", () => {
       sessionKey: "chat:group-123",
       createdBy: "owner-1",
       routeType: "group",
+      contextMode: "shared",
     });
   });
 
@@ -1672,6 +1736,7 @@ describe("channel.pair", () => {
       "group",
       null,
       "u1",
+      "shared",
     ]);
     expect(query.mock.calls[4][0]).toContain("DELETE FROM channel_binding_sessions");
   });
@@ -1772,6 +1837,39 @@ describe("channel.updateBindingMeta", () => {
     );
     expect(result.success).toBe(false);
     expect(query).not.toHaveBeenCalled();
+  });
+});
+
+describe("channel.setContextMode", () => {
+  it("updates the binding's context_mode", async () => {
+    const query = mockQuery({ affectedRows: 1 } as any);
+
+    const result = await getHandler("channel.setContextMode")(
+      { channel_id: "ch1", route_key: "group-1", mode: "per_user" }, "a1",
+    );
+    expect(result).toEqual({ success: true, mode: "per_user" });
+    expect(query.mock.calls[0][0]).toContain("UPDATE channel_bindings SET context_mode");
+    expect(query.mock.calls[0][1]).toEqual(["per_user", "ch1", "group-1"]);
+  });
+
+  it("rejects an unknown mode without touching the DB", async () => {
+    const query = mockQuery();
+
+    const result = await getHandler("channel.setContextMode")(
+      { channel_id: "ch1", route_key: "group-1", mode: "bogus" }, "a1",
+    );
+    expect(result.success).toBe(false);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("returns an error when the binding is missing", async () => {
+    mockQuery({ affectedRows: 0 } as any);
+
+    const result = await getHandler("channel.setContextMode")(
+      { channel_id: "ch1", route_key: "group-404", mode: "shared" }, "a1",
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("not found");
   });
 
   it("truncates at 255 code points without splitting surrogate pairs", async () => {
@@ -2011,9 +2109,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 52 handlers", () => {
+  it("registers exactly 53 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(52);
+    expect(handlers.size).toBe(53);
   });
 
   it("all expected handler names are registered", () => {
@@ -2029,7 +2127,7 @@ describe("buildAdapterRpcHandlers", () => {
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",
       "channel.list", "channel.resolveBinding", "channel.pair", "channel.resetSession",
-      "channel.updateBindingMeta", "channel.updateName",
+      "channel.updateBindingMeta", "channel.updateName", "channel.setContextMode",
       "channel.resolvePersonalBinding", "channel.pairPersonal", "channel.resetPersonalSession",
       "agent.listForSkill", "agent.listForMcp", "agent.listForCluster", "agent.listForHost",
       "metrics.summary", "metrics.audit", "metrics.auditDetail",

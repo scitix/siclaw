@@ -39,8 +39,22 @@ interface ChannelBindingRow {
   session_id?: string | null;
   route_type?: "group" | "user" | string | null;
   display_name?: string | null;
+  context_mode?: string | null;
   created_by?: string | null;
   channel_created_by?: string | null;
+}
+
+type ContextMode = "shared" | "per_user";
+
+/**
+ * Only an explicit "shared" is shared; NULL / anything unrecognised
+ * grandfathers to "per_user". Existing group bindings pre-date this column and
+ * behaved per-sender, so a NULL must NOT silently merge their contexts on
+ * upgrade. New bindings are written "shared" at pair time (the product default
+ * for a fresh group), so the NULL branch only ever hits legacy rows.
+ */
+function normalizeContextMode(value: unknown): ContextMode {
+  return value === "shared" ? "shared" : "per_user";
 }
 
 interface ResolvedChannelBinding {
@@ -52,6 +66,9 @@ interface ResolvedChannelBinding {
   routeType: "group" | "user";
   /** Cached chat title (group name); null until the gateway backfills it. */
   displayName?: string | null;
+  /** Group context sharing mode (shared default). Set for group bindings; absent
+   *  for 1:1/personal bindings where the mode is meaningless. */
+  contextMode?: ContextMode;
 }
 
 function normalizeRouteType(value: unknown): "group" | "user" {
@@ -64,7 +81,7 @@ async function selectChannelBinding(
   routeKey: string,
 ): Promise<ChannelBindingRow | null> {
   const [rows] = await db.query(
-    `SELECT cb.id, cb.agent_id, cb.session_id, cb.route_type, cb.display_name, cb.created_by,
+    `SELECT cb.id, cb.agent_id, cb.session_id, cb.route_type, cb.display_name, cb.context_mode, cb.created_by,
             c.created_by AS channel_created_by
      FROM channel_bindings cb
      LEFT JOIN channels c ON cb.channel_id = c.id
@@ -87,9 +104,23 @@ async function resolveChannelBinding(
     return resolveOpenGroupBinding(db, channelId, routeKey);
   }
 
-  const session = sessionKey
-    ? await resolveChannelBindingParticipantSession(db, row.id, sessionKey)
-    : await resolveLegacyChannelBindingSession(db, row, channelId, routeKey);
+  const routeType = normalizeRouteType(row.route_type);
+  const contextMode = normalizeContextMode(row.context_mode);
+
+  // Group context mode selects the session-key formula (the runtime uses the
+  // returned key verbatim for both session identity and its serialization
+  // queue, so this one choice drives shared-vs-isolated end to end):
+  //   shared   → chat:{route_key}  — the whole group shares one session,
+  //              overriding whatever per-sender key the runtime guessed.
+  //   per_user → the per-sender key the runtime passed (open_id:{sender}).
+  // Non-group (1:1 user) routes ignore the mode — they are single-user by
+  // nature — and keep the legacy passed-key-or-binding-session behavior.
+  const session =
+    routeType === "group" && contextMode === "shared"
+      ? await resolveChannelBindingParticipantSession(db, row.id, `chat:${routeKey}`)
+      : sessionKey
+        ? await resolveChannelBindingParticipantSession(db, row.id, sessionKey)
+        : await resolveLegacyChannelBindingSession(db, row, channelId, routeKey);
 
   return {
     agentId: row.agent_id,
@@ -97,8 +128,9 @@ async function resolveChannelBinding(
     sessionId: session.sessionId,
     ...(session.sessionKey ? { sessionKey: session.sessionKey } : {}),
     createdBy: row.created_by ?? row.channel_created_by ?? null,
-    routeType: normalizeRouteType(row.route_type),
+    routeType,
     displayName: row.display_name ?? null,
+    contextMode,
   };
 }
 
@@ -199,11 +231,13 @@ async function pairChannelBinding(
     const upsert = buildUpsert(
       db,
       "channel_bindings",
-      ["id", "channel_id", "agent_id", "session_id", "route_key", "route_type", "display_name", "created_by"],
-      [bindingId, params.channel_id, pairingCode.agent_id, sessionId, params.route_key, params.route_type, displayName, pairingCode.created_by],
+      ["id", "channel_id", "agent_id", "session_id", "route_key", "route_type", "display_name", "created_by", "context_mode"],
+      [bindingId, params.channel_id, pairingCode.agent_id, sessionId, params.route_key, params.route_type, displayName, pairingCode.created_by, "shared"],
       ["channel_id", "route_key"],
       // Keep an existing name when a re-pair couldn't fetch one (null) — the
-      // gateway's lazy backfill owns refreshes, PAIR only seeds.
+      // gateway's lazy backfill owns refreshes, PAIR only seeds. context_mode is
+      // seeded on INSERT ("shared" = new-group default) but NOT overwritten on a
+      // re-pair, so a group that was switched to per_user keeps its choice.
       displayName
         ? ["agent_id", "session_id", "route_type", "display_name", "created_by"]
         : ["agent_id", "session_id", "route_type", "created_by"],
@@ -356,6 +390,29 @@ async function updateChannelName(
   return { success: !!result };
 }
 
+/**
+ * Set a group's context sharing mode. The generic switch endpoint behind both
+ * the console selector and the in-group /mode card. Rejects anything but the
+ * two known modes so a bad client can't write a value that NULL-defaults to
+ * shared silently.
+ */
+async function updateChannelBindingContextMode(
+  db: Db,
+  channelId: string,
+  routeKey: string,
+  mode: unknown,
+): Promise<{ success: boolean; mode?: ContextMode; error?: string }> {
+  if (mode !== "shared" && mode !== "per_user") {
+    return { success: false, error: "mode must be 'shared' or 'per_user'" };
+  }
+  const [result] = await db.query(
+    "UPDATE channel_bindings SET context_mode = ? WHERE channel_id = ? AND route_key = ?",
+    [mode, channelId, routeKey],
+  ) as any;
+  if (!result?.affectedRows) return { success: false, error: "Binding not found" };
+  return { success: true, mode };
+}
+
 interface PersonalChannelConfig {
   personal_bot?: {
     agent_id?: string;
@@ -414,7 +471,7 @@ async function resolvePersonalChannelBinding(
  * this, an open bot's groups only ever get a channel_binding_sessions row and
  * are invisible in the Portal. Idempotent on the (channel_id, route_key) unique
  * key; a concurrent first-message loses the INSERT race and re-selects the
- * winner's row. Returns the binding row id. Mirrors sicore's ensureAutoGroupBinding.
+ * winner's row. Returns the binding row id.
  */
 async function ensureOpenGroupBindingRow(
   db: Db,
@@ -424,8 +481,12 @@ async function ensureOpenGroupBindingRow(
   createdBy: string | null,
 ): Promise<string> {
   const id = crypto.randomUUID();
+  // context_mode = 'shared': an open bot's group is a fresh group → the product
+  // default (team mode), matching open bots' historical shared behavior. Written
+  // on INSERT so subsequent messages (which resolve via selectChannelBinding, not
+  // this path) see 'shared' rather than the NULL→per_user grandfather default.
   await db.query(
-    `${insertIgnorePrefix(db)} INTO channel_bindings (id, channel_id, agent_id, route_key, route_type, created_by) VALUES (?, ?, ?, ?, 'group', ?)`,
+    `${insertIgnorePrefix(db)} INTO channel_bindings (id, channel_id, agent_id, route_key, route_type, created_by, context_mode) VALUES (?, ?, ?, ?, 'group', ?, 'shared')`,
     [id, channelId, agentId, routeKey, createdBy],
   );
   const row = await selectChannelBinding(db, channelId, routeKey);
@@ -465,6 +526,10 @@ async function resolveOpenGroupBinding(
     sessionKey: session.sessionKey,
     createdBy,
     routeType: "group",
+    // The materialized row carries context_mode='shared' (see
+    // ensureOpenGroupBindingRow); report it here too so the first message —
+    // before any subsequent selectChannelBinding lookup — is already shared.
+    contextMode: "shared",
   };
 }
 
@@ -1694,6 +1759,17 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     sendJson(res, 200, await updateChannelBindingMeta(db, body.channel_id, body.route_key, body.display_name));
   });
 
+  // POST /api/internal/siclaw/channel/set-context-mode
+  router.post("/api/internal/siclaw/channel/set-context-mode", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ channel_id: string; route_key: string; mode: string }>(req);
+    const db = getDb();
+    sendJson(res, 200, await updateChannelBindingContextMode(db, body.channel_id, body.route_key, body.mode));
+  });
+
   // POST /api/internal/siclaw/channel/reset-session
   router.post("/api/internal/siclaw/channel/reset-session", async (req, res) => {
     if (!requireInternalAuth(req, internalSecret)) {
@@ -2919,6 +2995,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("channel.updateName", async (params) => {
     const db = getDb();
     return updateChannelName(db, params.channel_id, params.name);
+  });
+
+  handlers.set("channel.setContextMode", async (params) => {
+    const db = getDb();
+    return updateChannelBindingContextMode(db, params.channel_id, params.route_key, params.mode);
   });
 
   handlers.set("channel.resolvePersonalBinding", async (params) => {
