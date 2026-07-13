@@ -14,8 +14,8 @@ import path from "node:path";
 import { loadConfig, reloadConfig, writeConfig } from "../core/config.js";
 import {
   extractKnowledgePackageToDir,
+  knowledgeRepoDirName,
   replaceDirectoryContentsFromStaging,
-  sanitizeKnowledgeRepoDir,
 } from "../shared/knowledge-package.js";
 import type {
   GatewaySyncType,
@@ -330,8 +330,18 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
         const repoRoot = path.join(stagingDir, "repos");
         fs.mkdirSync(repoRoot, { recursive: true });
         const indexLines = ["# Knowledge Index", "", "This index was generated from active knowledge repositories.", ""];
+        const seenRepoIds = new Set<string>();
+        const seenDirNames = new Set<string>();
         for (const repo of repos) {
-          const dirName = sanitizeKnowledgeRepoDir(repo.name);
+          if (seenRepoIds.has(repo.id)) {
+            throw new Error(`Duplicate knowledge repository id in bundle: ${repo.id}`);
+          }
+          seenRepoIds.add(repo.id);
+          const dirName = knowledgeRepoDirName(repo.name, repo.id);
+          if (seenDirNames.has(dirName)) {
+            throw new Error(`Knowledge repository directory collision: ${dirName}`);
+          }
+          seenDirNames.add(dirName);
           const target = path.join(repoRoot, dirName);
           const buf = Buffer.from(repo.dataBase64, "base64");
           const info = await extractKnowledgePackageToDir(buf, target);

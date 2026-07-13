@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,7 @@ import {
   mcpHandler,
   skillsHandler,
 } from "./sync-handlers.js";
+import { knowledgeRepoDirName } from "../shared/knowledge-package.js";
 import type { GatewaySyncClientLike } from "../shared/gateway-sync.js";
 import { CredentialBroker } from "./credential-broker.js";
 import type {
@@ -968,5 +970,50 @@ describe("knowledgeHandler empty-bundle guard", () => {
     const count = await knowledgeHandler.materialize({ version: "v1", repos: [] });
     // No meaningful content → falls through to wipe path → reports 0.
     expect(count).toBe(0);
+  });
+});
+
+describe("knowledgeHandler multi-repo identity", () => {
+  let knowledgeTmpDir: string;
+
+  function packageBase64(title: string): string {
+    const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-package-test-"));
+    const archive = path.join(os.tmpdir(), `knowledge-package-${process.pid}-${Date.now()}-${Math.random()}.tar.gz`);
+    try {
+      fs.writeFileSync(path.join(sourceDir, "index.md"), `# ${title}\n`);
+      execFileSync("tar", ["-czf", archive, "-C", sourceDir, "index.md"]);
+      return fs.readFileSync(archive).toString("base64");
+    } finally {
+      fs.rmSync(sourceDir, { recursive: true, force: true });
+      fs.rmSync(archive, { force: true });
+    }
+  }
+
+  beforeEach(() => {
+    knowledgeTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-handler-multi-test-"));
+    _mockKnowledgeDir = knowledgeTmpDir;
+  });
+
+  afterEach(() => {
+    fs.rmSync(knowledgeTmpDir, { recursive: true, force: true });
+  });
+
+  it("uses stable repo identity so two CJK-only names never collide and index links match", async () => {
+    const repos = [
+      { id: "repo-cn-platform", name: "平台知识", version: 3, sizeBytes: 10, dataBase64: packageBase64("platform") },
+      { id: "repo-cn-business", name: "业务知识", version: 7, sizeBytes: 10, dataBase64: packageBase64("business") },
+    ];
+
+    await expect(knowledgeHandler.materialize({ version: "v1", repos })).resolves.toBe(2);
+
+    const platformDir = knowledgeRepoDirName(repos[0].name, repos[0].id);
+    const businessDir = knowledgeRepoDirName(repos[1].name, repos[1].id);
+    expect(platformDir).not.toBe(businessDir);
+    expect(fs.readFileSync(path.join(knowledgeTmpDir, "repos", platformDir, "index.md"), "utf8")).toContain("platform");
+    expect(fs.readFileSync(path.join(knowledgeTmpDir, "repos", businessDir, "index.md"), "utf8")).toContain("business");
+
+    const index = fs.readFileSync(path.join(knowledgeTmpDir, "index.md"), "utf8");
+    expect(index).toContain(`[[repos/${platformDir}/index]] - 平台知识 v3`);
+    expect(index).toContain(`[[repos/${businessDir}/index]] - 业务知识 v7`);
   });
 });
