@@ -33,11 +33,18 @@ interface ManagedBox {
   createdAt: Date;
 }
 
+export interface AgentBoxAcquisition {
+  handle: AgentBoxHandle;
+  /** True only when this call created/recreated the underlying box. */
+  created: boolean;
+}
+
 export class AgentBoxManager {
   private spawner: BoxSpawner;
   private config: Required<AgentBoxManagerConfig>;
   private boxes = new Map<string, ManagedBox>();
   private healthCheckTimer?: ReturnType<typeof setInterval>;
+  private orphanSweepInitialTimer?: ReturnType<typeof setTimeout>;
   private orphanSweepTimer?: ReturnType<typeof setInterval>;
   private readonly isK8s: boolean;
   private spawnEnvResolver?: (agentId: string) => Promise<Record<string, string> | undefined>;
@@ -72,7 +79,8 @@ export class AgentBoxManager {
         console.warn("[agentbox-manager] orphan sweep failed:", err?.message ?? err));
     // unref'd + stored (review finding): the sweep must never pin the event
     // loop or outlive cleanup() — same discipline as the run watchdog.
-    (setTimeout(tick, 60_000) as any).unref?.();
+    this.orphanSweepInitialTimer = setTimeout(tick, 60_000);
+    (this.orphanSweepInitialTimer as any).unref?.();
     this.orphanSweepTimer = setInterval(tick, intervalMs);
     (this.orphanSweepTimer as any).unref?.();
   }
@@ -154,6 +162,20 @@ export class AgentBoxManager {
    * (after restart/idle-release), not immediately on a warm pod.
    */
   async getOrCreate(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+    return (await this.getOrCreateWithDisposition(agentId, config)).handle;
+  }
+
+  /**
+   * Get or create a box and report ownership of the resulting resource.
+   *
+   * Callers that perform multi-step setup need this distinction: a failed setup
+   * may clean up a box it just created, but must never delete a live box reused
+   * during Runtime adoption or a warm request.
+   */
+  async getOrCreateWithDisposition(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+  ): Promise<AgentBoxAcquisition> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
     if (this.isK8s) {
       return this.getOrCreateK8s(agentId, config);
@@ -161,7 +183,10 @@ export class AgentBoxManager {
     return this.getOrCreateLocal(agentId, config);
   }
 
-  private async getOrCreateK8s(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+  private async getOrCreateK8s(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+  ): Promise<AgentBoxAcquisition> {
     const name = this.podName(agentId);
     const wantProfile = config?.profile ?? "agent";
 
@@ -172,7 +197,7 @@ export class AgentBoxManager {
         // Warm reuse: return the running pod without spawning. Per-agent config
         // (env/persistence) is NOT re-resolved here — the pod's volume mount is
         // already fixed, so a changed mode applies on the next cold spawn.
-        return { boxId: name, endpoint: info.endpoint, agentId };
+        return { handle: { boxId: name, endpoint: info.endpoint, agentId }, created: false };
       }
       // Profile changed under the same identity — reusing the old-shaped pod would
       // silently run the wrong image/tools/volumes (the historic stale-box gap).
@@ -197,10 +222,13 @@ export class AgentBoxManager {
     });
 
     handle.agentId = agentId;
-    return handle;
+    return { handle, created: true };
   }
 
-  private async getOrCreateLocal(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+  private async getOrCreateLocal(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+  ): Promise<AgentBoxAcquisition> {
     const existing = this.boxes.get(agentId);
     if (existing) {
       existing.lastActiveAt = new Date();
@@ -208,7 +236,7 @@ export class AgentBoxManager {
       if (info && info.status === "running") {
         // Warm reuse: cached running box returned without spawning. Per-agent
         // config (env/persistence) is NOT re-resolved — applies on next cold spawn.
-        return existing.handle;
+        return { handle: existing.handle, created: false };
       }
       this.boxes.delete(agentId);
     }
@@ -224,7 +252,7 @@ export class AgentBoxManager {
     });
 
     this.boxes.set(agentId, { handle, lastActiveAt: new Date(), createdAt: new Date() });
-    return handle;
+    return { handle, created: true };
   }
 
   /**
@@ -321,18 +349,41 @@ export class AgentBoxManager {
   }
 
   async cleanup(): Promise<void> {
-    this.stopHealthCheck();
-    // The orphan-sweep interval dies with the manager (review: the clear had
-    // landed in setSpawnEnvResolver, which both left it running post-cleanup
-    // and silently disabled GC if a resolver was ever re-set after boot).
-    if (this.orphanSweepTimer) {
-      clearInterval(this.orphanSweepTimer);
-      this.orphanSweepTimer = undefined;
-    }
+    this.stopBackgroundLoops();
     for (const [, managed] of this.boxes) {
       await this.spawner.stop(managed.handle.boxId);
     }
     this.boxes.clear();
     await this.spawner.cleanup();
+  }
+
+  /**
+   * Process shutdown is not cluster teardown. In K8s mode boxes and their
+   * durable run rows outlive a Runtime pod and are adopted by the replacement;
+   * deleting every labelled pod here destroys that hand-off window. Local and
+   * child-process spawners still own their children, so they use full cleanup.
+   */
+  async shutdown(): Promise<void> {
+    if (!this.isK8s) {
+      await this.cleanup();
+      return;
+    }
+    this.stopBackgroundLoops();
+    this.boxes.clear();
+  }
+
+  private stopBackgroundLoops(): void {
+    this.stopHealthCheck();
+    // The orphan-sweep interval dies with the manager (review: the clear had
+    // landed in setSpawnEnvResolver, which both left it running post-cleanup
+    // and silently disabled GC if a resolver was ever re-set after boot).
+    if (this.orphanSweepInitialTimer) {
+      clearTimeout(this.orphanSweepInitialTimer);
+      this.orphanSweepInitialTimer = undefined;
+    }
+    if (this.orphanSweepTimer) {
+      clearInterval(this.orphanSweepTimer);
+      this.orphanSweepTimer = undefined;
+    }
   }
 }

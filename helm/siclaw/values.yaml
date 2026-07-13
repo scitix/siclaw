@@ -82,14 +82,15 @@ runtime:
   subagentConcurrency: 5
   # LLM endpoint for LEAN CAPABILITY BOXES (kb-compile / kb-test) ONLY. The chat
   # path does not read these — agent models come from the Portal/Upstream model
-  # descriptors. They exist so the runtime can forward ANTHROPIC_* into spawned
-  # kb boxes (BoxProfile envForward). Token rotation: update the Secret, then
-  # rollout-restart the runtime (env Secrets resolve at pod start); live kb
-  # boxes keep their spawn-time token until respawned — either keep the old
-  # token valid through a grace window, or delete agentbox pods after rotating.
+  # descriptors. On a fresh KB session Runtime sends these through the mTLS
+  # /session payload only when the consumer did not provide its own LLM block;
+  # credentials are never copied into the KB PodSpec. Token rotation: update the
+  # Secret, rollout-restart Runtime (env Secrets resolve at pod start), then keep
+  # the old token valid through a grace window or delete KB agentbox pods. A live
+  # box's already-connected SDK client keeps its session-start token until respawn.
   llm:
     baseUrl: ""            # e.g. https://api.scitix.ai/model-api (massapi proxy)
-    model: ""              # optional ANTHROPIC_MODEL default for the box CLI
+    model: ""              # optional model default (below KBC_COMPILE_MODEL)
     tokenSecret:
       name: ""             # existing Secret holding the massapi token
       key: "ANTHROPIC_AUTH_TOKEN"
@@ -202,6 +203,15 @@ agentbox:
   # nodes carrying all of these labels (e.g. { disktype: ssd, pool: agents }).
   # Empty ⇒ no constraint; the scheduler picks any eligible node.
   nodeSelector: {}
+  # Ingress isolation for dynamically spawned KB compile/test boxes. The
+  # Runtime is the only built-in caller; mTLS remains the identity boundary.
+  # KB pods use exec health probes, so kubelet/node CIDRs do not need a broad
+  # NetworkPolicy exception (behavior differs across CNIs for HTTP probes).
+  networkPolicy:
+    enabled: true
+    # Extra trusted callers, e.g. a separately deployed Gateway in the same or
+    # another namespace. Entries are appended to the Runtime podSelector.
+    ingressFrom: []
   persistence:
     # PVC persistence has two independent concepts:
     #   1. PVC availability (infrastructure) — is a shared RWX PVC present that
