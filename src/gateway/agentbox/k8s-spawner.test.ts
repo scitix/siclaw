@@ -339,6 +339,8 @@ describe("K8sSpawner — spawn branches", () => {
     expect(container.livenessProbe.httpGet).toBeUndefined();
     expect(container.readinessProbe.exec.command.join(" ")).toContain("/health");
     expect(container.livenessProbe.exec.command).toEqual(container.readinessProbe.exec.command);
+    expect(container.readinessProbe.timeoutSeconds).toBe(3);
+    expect(container.livenessProbe.timeoutSeconds).toBe(3);
   });
 
   it("refuses to forward secret-shaped names through the prefix glob (ops knobs only)", async () => {

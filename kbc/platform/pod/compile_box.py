@@ -1701,6 +1701,13 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
 ]
 
 
+def _compile_model() -> str:
+    """Resolve the model shared by every compiler-owned SDK session."""
+    return (os.environ.get("KBC_COMPILE_MODEL")
+            or os.environ.get("ANTHROPIC_MODEL")
+            or "claude-opus-4-6")
+
+
 def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, session_id: str) -> "ClaudeAgentOptions":
     """One options builder for the persistent session AND every batch session —
     identical role/tools/model so a batch page is written under exactly the same
@@ -1717,9 +1724,7 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         # Pin the compile model explicitly: the box talks to massapi (Bedrock),
         # which serves specific ids — the SDK default may not be one, and the KB
         # compile default is opus by product decision. Overridable per-deploy.
-        model=(os.environ.get("KBC_COMPILE_MODEL")
-               or os.environ.get("ANTHROPIC_MODEL")
-               or "claude-opus-4-6"),
+        model=_compile_model(),
         max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=session_id,
@@ -2042,7 +2047,7 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             permission_mode="bypassPermissions",
             hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(Path(wd), run.locale)])]},
             setting_sources=[],
-            model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
+            model=_compile_model(),
             max_turns=8,
             max_buffer_size=SDK_MAX_BUFFER_BYTES,
             session_id=str(uuid.uuid4()),

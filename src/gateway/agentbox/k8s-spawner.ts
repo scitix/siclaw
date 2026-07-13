@@ -516,6 +516,7 @@ export class K8sSpawner implements BoxSpawner {
                   ] },
                   initialDelaySeconds: 2,
                   periodSeconds: 2,
+                  timeoutSeconds: 3,
                 }
               : {
                   httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
@@ -530,6 +531,7 @@ export class K8sSpawner implements BoxSpawner {
                   ] },
                   initialDelaySeconds: 10,
                   periodSeconds: 10,
+                  timeoutSeconds: 3,
                 }
               : {
                   httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
