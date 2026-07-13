@@ -286,6 +286,63 @@ describe("K8sSpawner — spawn branches", () => {
     }
   });
 
+  it("keeps agent-only embedding credentials out of lean KB PodSpecs", async () => {
+    process.env.SICLAW_EMBEDDING_BASE_URL = "https://embedding.example/v1";
+    process.env.SICLAW_EMBEDDING_API_KEY = "embedding-secret";
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads % 2 === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.24", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    try {
+      await s.spawn({ agentId: "normal-agent" });
+      await s.spawn({ agentId: "kb-compile-run", profile: "kb-compile" });
+      await s.spawn({ agentId: "kb-test-run", profile: "kb-test" });
+      const agentEnv = calls.createNamespacedPod[0].body.spec.containers[0].env;
+      const capabilityEnvs = calls.createNamespacedPod
+        .slice(1)
+        .map((call: any) => call.body.spec.containers[0].env);
+
+      expect(agentEnv).toContainEqual({ name: "SICLAW_EMBEDDING_BASE_URL", value: "https://embedding.example/v1" });
+      expect(agentEnv).toContainEqual({ name: "SICLAW_EMBEDDING_API_KEY", value: "embedding-secret" });
+      for (const env of capabilityEnvs) {
+        expect(env.some((entry: any) => entry.name.startsWith("SICLAW_EMBEDDING_"))).toBe(false);
+      }
+    } finally {
+      delete process.env.SICLAW_EMBEDDING_BASE_URL;
+      delete process.env.SICLAW_EMBEDDING_API_KEY;
+    }
+  });
+
+  it("uses in-container exec probes for KB boxes so NetworkPolicy need not admit kubelet traffic", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.23", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "kb-probe", profile: "kb-compile" });
+    const container = calls.createNamespacedPod[0].body.spec.containers[0];
+    expect(container.readinessProbe.httpGet).toBeUndefined();
+    expect(container.livenessProbe.httpGet).toBeUndefined();
+    expect(container.readinessProbe.exec.command.join(" ")).toContain("/health");
+    expect(container.livenessProbe.exec.command).toEqual(container.readinessProbe.exec.command);
+    expect(container.readinessProbe.timeoutSeconds).toBe(3);
+    expect(container.livenessProbe.timeoutSeconds).toBe(3);
+  });
+
   it("refuses to forward secret-shaped names through the prefix glob (ops knobs only)", async () => {
     process.env.KBC_PK_MODE = "off";                       // knob → forwarded
     process.env.KBC_MASSAPI_TOKEN = "sk-parked";           // secret-shaped → refused

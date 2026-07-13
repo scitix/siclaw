@@ -15,7 +15,7 @@ structured signals:
 Surface (driven by the runtime):
   POST /sources            {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install the frozen raw bundle → workdir/raw
   POST /authoring          {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install authoring/candidate/eval/release assets → workdir/
-  POST /session/{run_id}   {workdir?, instruction?, allowed_tools?, locale?} start the run's persistent conversational session (waits for the first /message); idempotent
+  POST /session/{run_id}   {workdir?, instruction?, allowed_tools?, locale?, llm?, settings?} start the run's persistent conversational session (waits for the first /message); idempotent
   POST /message/{run_id}   {message} inject one user turn into the persistent session (prepare/compile/patch are all ordinary turns)
   GET  /events/{run_id}    structured SSE stream (session/log/summary/turn_done/syncArtifacts/plan_proposed/error/end)
   POST /test-session/{run_id}  start a test session: pin the current draft as an immutable snapshot + a read-only consumer session (reuses this pod)
@@ -23,7 +23,8 @@ Surface (driven by the runtime):
   GET  /health
 
 LLM auth: local runs reuse the subscription (the SDK ships the claude binary);
-production pods set ANTHROPIC_BASE_URL → massapi (keys injected outside the container).
+production config arrives as one authoritative /session llm block (consumer, or
+Runtime Helm fallback when absent), keeping credentials out of the KB PodSpec.
 mTLS: with SICLAW_CERT_PATH certs present the box serves HTTPS and requires a
 client cert (runtime/gateway); otherwise plain HTTP (local).
 """
@@ -56,6 +57,10 @@ import batching
 import incremental
 import mediaverify
 import office_ingest
+from mtls_auth import (
+    client_certificate_error as _client_certificate_error,
+    server_ssl_context,
+)
 import redblue
 import selfcheck
 from engine import ClaudeEngine
@@ -1696,6 +1701,13 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
 ]
 
 
+def _compile_model() -> str:
+    """Resolve the model shared by every compiler-owned SDK session."""
+    return (os.environ.get("KBC_COMPILE_MODEL")
+            or os.environ.get("ANTHROPIC_MODEL")
+            or "claude-opus-4-6")
+
+
 def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, session_id: str) -> "ClaudeAgentOptions":
     """One options builder for the persistent session AND every batch session —
     identical role/tools/model so a batch page is written under exactly the same
@@ -1712,7 +1724,7 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         # Pin the compile model explicitly: the box talks to massapi (Bedrock),
         # which serves specific ids — the SDK default may not be one, and the KB
         # compile default is opus by product decision. Overridable per-deploy.
-        model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
+        model=_compile_model(),
         max_turns=int(os.environ.get("KBC_MAX_TURNS", "150")),
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=session_id,
@@ -2035,7 +2047,7 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
             permission_mode="bypassPermissions",
             hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(Path(wd), run.locale)])]},
             setting_sources=[],
-            model=os.environ.get("KBC_COMPILE_MODEL", "claude-opus-4-6"),
+            model=_compile_model(),
             max_turns=8,
             max_buffer_size=SDK_MAX_BUFFER_BYTES,
             session_id=str(uuid.uuid4()),
@@ -2668,9 +2680,10 @@ async def _teardown_test_session(run: "TestRun"):
 # The consumer owns the credential store and the KB capability policy; both arrive on
 # the /session body and apply IN-PROCESS (the box spawns before fetchInput runs,
 # so pod env is too early — and this keeps the token out of the pod spec).
-# Precedence: consumer config > runtime-env forward (helm fallback) > image
-# defaults. ONE exception: KBC_PK_MODE=off set at the runtime level is the ops
-# KILL SWITCH and must win over consumer config.
+# LLM authority is whole-block: consumer object, else Runtime's Helm fallback;
+# omitted fields in a present object never inherit another authority's token.
+# ONE settings exception: KBC_PK_MODE=off set at the runtime level is the ops
+# KILL SWITCH and must win over consumer settings.
 _PK_KILL_AT_BOOT = os.environ.get("KBC_PK_MODE") == "off"
 
 
@@ -2684,12 +2697,29 @@ def _apply_session_config(body: dict) -> None:
     per-run (SDK client env) instead of mutating the process environment."""
     llm = body.get("llm")
     if isinstance(llm, dict):
-        if llm.get("base_url"):
-            os.environ["ANTHROPIC_BASE_URL"] = str(llm["base_url"])
-        if llm.get("auth_token"):
-            os.environ["ANTHROPIC_AUTH_TOKEN"] = str(llm["auth_token"])
-            # The SDK accepts either; clear a stale forwarded API key so the
-            # consumer credential unambiguously wins.
+        # The LLM object is one authority block, not field-level overrides. If
+        # the consumer supplied it, omitted fields must not inherit a Runtime or
+        # image credential that belongs to another endpoint.
+        for field, env_name in (
+            ("base_url", "ANTHROPIC_BASE_URL"),
+            ("model", "ANTHROPIC_MODEL"),
+        ):
+            value = llm.get(field)
+            if value:
+                os.environ[env_name] = str(value)
+            else:
+                os.environ.pop(env_name, None)
+
+        auth_token = llm.get("auth_token")
+        api_key = llm.get("api_key")
+        if auth_token:
+            os.environ["ANTHROPIC_AUTH_TOKEN"] = str(auth_token)
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        elif api_key:
+            os.environ["ANTHROPIC_API_KEY"] = str(api_key)
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+        else:
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
             os.environ.pop("ANTHROPIC_API_KEY", None)
     settings = body.get("settings")
     if isinstance(settings, dict):
@@ -2706,7 +2736,10 @@ async def handle_session(request: web.Request):
     """Start (or no-op attach to) the run's persistent CONVERSATIONAL session —
     it connects and waits for the first /message (prepare chat; a compile is just
     a later turn). Idempotent: a second call for a live run is a no-op, so the
-    runtime can safely ensure-then-message."""
+    runtime can safely ensure-then-message. A live attach deliberately does not
+    hot-apply a new LLM block: its already-connected SDK child captured the
+    original environment. Rotate with the documented grace window + box respawn
+    until an idle-boundary client reconnect protocol exists."""
     run_id = request.match_info["run_id"]
     if run_id in RUNS:
         return web.json_response({"ok": True, "run_id": run_id, "already_live": True})
@@ -3070,8 +3103,19 @@ async def _flush_on_shutdown(_app) -> None:
             pass
 
 
+@web.middleware
+async def _client_certificate_middleware(request: web.Request, handler):
+    error = _client_certificate_error(request)
+    if error is not None:
+        return web.json_response({"error": error}, status=403)
+    return await handler(request)
+
+
 def build_app() -> web.Application:
-    app = web.Application(client_max_size=_http_max_request_bytes())
+    app = web.Application(
+        client_max_size=_http_max_request_bytes(),
+        middlewares=[_client_certificate_middleware],
+    )
     app.on_shutdown.append(_flush_on_shutdown)
     app.add_routes([
         web.post("/sources", handle_sources),
@@ -3090,25 +3134,9 @@ def build_app() -> web.Application:
 
 
 def _ssl_context():
-    """Production mTLS: with certs, HTTPS + required client cert (only the
-    runtime/gateway can drive the box). No certs locally → plain HTTP."""
+    """Production mTLS, or intentional plain HTTP when no certs exist locally."""
     cert_dir = Path(os.environ.get("SICLAW_CERT_PATH", "/etc/siclaw/certs"))
-    crt, key, ca = cert_dir / "tls.crt", cert_dir / "tls.key", cert_dir / "ca.crt"
-    if not (crt.exists() and key.exists()):
-        return None
-    import ssl
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(str(crt), str(key))
-    if ca.exists():
-        ctx.load_verify_locations(str(ca))
-        # CERT_OPTIONAL, not CERT_REQUIRED: the k8s readiness/liveness probes hit
-        # /health over HTTPS WITHOUT a client cert; requiring one fails the TLS
-        # handshake so the probes never pass and kubelet kills the box. The box is
-        # only addressed by the runtime in-cluster, so requesting-but-not-requiring
-        # the client cert is acceptable for v1. (Production: exempt /health + check
-        # the cert per-route, like agentbox does.)
-        ctx.verify_mode = ssl.CERT_OPTIONAL
-    return ctx
+    return server_ssl_context(cert_dir)
 
 
 def main():

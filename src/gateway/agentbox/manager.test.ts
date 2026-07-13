@@ -68,6 +68,20 @@ describe("AgentBoxManager — Local mode", () => {
     expect(mgr.stats()).toEqual({ total: 1, agentIds: ["agent-a"] });
   });
 
+  it("reports whether local setup created or reused the box", async () => {
+    const spawner = new FakeSpawner("local");
+    const mgr = new AgentBoxManager(spawner);
+    const first = await mgr.getOrCreateWithDisposition("agent-a");
+    expect(first.created).toBe(true);
+
+    spawner.getReturns.set("box-agent-a", {
+      boxId: "box-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "x", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    const second = await mgr.getOrCreateWithDisposition("agent-a");
+    expect(second).toMatchObject({ created: false, handle: { boxId: "box-agent-a" } });
+  });
+
   it("reuses the cached box on second call for the same agent", async () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
@@ -156,6 +170,24 @@ describe("AgentBoxManager — K8s mode", () => {
     expect(handle.boxId).toBe("agentbox-agent-a");
     expect(handle.endpoint).toBe("https://10.0.0.1:3000");
     expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
+  it("reports whether K8s setup created or adopted the pod", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    const created = await mgr.getOrCreateWithDisposition("new-run", { profile: "kb-compile" });
+    expect(created.created).toBe(true);
+
+    spawner.getReturns.set("agentbox-live-run", {
+      boxId: "agentbox-live-run", agentId: "live-run", status: "running",
+      endpoint: "https://10.0.0.9:3000", createdAt: new Date(), lastActiveAt: new Date(),
+      profile: "kb-compile",
+    });
+    const adopted = await mgr.getOrCreateWithDisposition("live-run", { profile: "kb-compile" });
+    expect(adopted).toMatchObject({
+      created: false,
+      handle: { boxId: "agentbox-live-run", endpoint: "https://10.0.0.9:3000" },
+    });
   });
 
   it("creates a new pod when none exists", async () => {
@@ -429,6 +461,23 @@ describe("AgentBoxManager — cleanup", () => {
     expect(spawner.stopCalls.sort()).toEqual(["box-agent-a", "box-agent-b"]);
     expect(spawner.cleanupCalls).toBe(1);
     expect(mgr.stats().total).toBe(0);
+  });
+
+  it("shutdown preserves K8s boxes for another Runtime replica to adopt", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.shutdown();
+    expect(spawner.stopCalls).toEqual([]);
+    expect(spawner.cleanupCalls).toBe(0);
+  });
+
+  it("shutdown still cleans up process-local boxes", async () => {
+    const spawner = new FakeSpawner("local");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.getOrCreate("agent-a");
+    await mgr.shutdown();
+    expect(spawner.stopCalls).toEqual(["box-agent-a"]);
+    expect(spawner.cleanupCalls).toBe(1);
   });
 });
 

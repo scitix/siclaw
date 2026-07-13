@@ -298,6 +298,21 @@ export interface CapabilityFetchInputRequest {
   input_revision?: string;
 }
 
+/**
+ * LLM connection settings installed into one capability box at session setup.
+ *
+ * The object is an authority boundary, not a bag of field-level overrides:
+ * when the consumer supplies it, Runtime must forward that object as-is and
+ * must not fill missing fields with Runtime credentials. Only an entirely
+ * absent consumer object may fall back to Runtime's Helm-provided environment.
+ */
+export interface CapabilityLlmConfig {
+  base_url?: string;
+  auth_token?: string;
+  api_key?: string;
+  model?: string;
+}
+
 export interface CapabilityFetchInputResponse {
   bundle_base64?: string;
   bundle_sha256?: string;
@@ -312,12 +327,13 @@ export interface CapabilityFetchInputResponse {
   locale?: string;
   /**
    * Consumer-managed LLM endpoint for the run's box (DESIGN-kb-llm-binding-v2).
-   * The consumer owns the credential store; the runtime passes
-   * this through OPAQUELY into the box /session body and MUST NOT log it.
-   * Absent ⇒ the box falls back to the runtime-env-forwarded ANTHROPIC_* vars
-   * (the helm Secret path).
+   * The consumer owns the credential store; Runtime passes this whole object
+   * OPAQUELY into the box /session body and MUST NOT log it or merge a Runtime
+   * credential into missing fields. Only an absent object uses Runtime's
+   * Helm-provided ANTHROPIC_* values, also delivered through /session so
+   * credentials never enter the KB PodSpec.
    */
-  llm?: { base_url?: string; auth_token?: string };
+  llm?: CapabilityLlmConfig;
   /**
    * Consumer-managed box behavior knobs, keyed by the box's OWN env vocabulary
    * (KBC_* — model tiers, PK/media-verify switches, budgets). Same wire shape

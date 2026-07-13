@@ -8,9 +8,10 @@
  * The workspace step ONLY runs when /sources succeeded, because that is the
  * fresh-box signal: a box that already holds this run 409s /sources ("run
  * already exists"), and pushing the store's workspace onto a LIVE box could
- * roll back up to a sync interval of newer on-disk work. Everything here is
- * best-effort — an empty KB or a store hiccup must not block the conversation;
- * the box then simply starts from whatever did materialize.
+ * roll back up to a sync interval of newer on-disk work. A successful fetch
+ * with no bundle is the consumer's typed absence (an empty KB / brand-new
+ * workspace). Transport and install failures fail setup closed: continuing
+ * from a partial or unknown input could overwrite a durable draft.
  *
  * Known bounded gap: a box CONTAINER restart clears its in-process run table
  * but keeps /work (emptyDir survives container restarts), so /sources then
@@ -21,7 +22,11 @@
  */
 
 import { CAPABILITY_FETCH_INPUT, CAPABILITY_INPUT_WORKSPACE_REF } from "./contract.js";
-import type { CapabilityFetchInputRequest, CapabilityFetchInputResponse } from "./contract.js";
+import type {
+  CapabilityFetchInputRequest,
+  CapabilityFetchInputResponse,
+  CapabilityLlmConfig,
+} from "./contract.js";
 
 /** Just the surfaces this needs (so tests can pass fakes). */
 export interface MaterializeBoxClient {
@@ -38,10 +43,35 @@ export interface MaterializeResult {
   reattached?: boolean;
   /** Consumer-declared locale for the run's box (fetchInput), if any. */
   locale?: string;
-  /** Consumer-managed LLM endpoint for the box (opaque passthrough; never logged). */
-  llm?: { base_url?: string; auth_token?: string };
+  /** Consumer-managed LLM block for the box (opaque whole-block passthrough; never logged). */
+  llm?: CapabilityLlmConfig;
   /** Consumer-managed KBC_* behavior knobs for the box (opaque passthrough). */
   settings?: Record<string, string>;
+}
+
+export type CapabilityMaterializationStage =
+  | "source-fetch"
+  | "source-install"
+  | "workspace-fetch"
+  | "workspace-install";
+
+/** Setup error with a stable stage for lifecycle reporting and metrics. */
+export class CapabilityMaterializationError extends Error {
+  readonly stage: CapabilityMaterializationStage;
+
+  constructor(stage: CapabilityMaterializationStage, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`capability input materialization failed at ${stage}: ${detail}`, { cause });
+    this.name = "CapabilityMaterializationError";
+    this.stage = stage;
+  }
+}
+
+function isBoxAlreadyLive(err: unknown): boolean {
+  const status = (err as { status?: unknown } | null)?.status;
+  if (status === 409) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return typeof status !== "number" && message.includes("failed: 409");
 }
 
 export async function materializeCapabilityInputs(opts: {
@@ -54,63 +84,67 @@ export async function materializeCapabilityInputs(opts: {
   const { client, backend, runId, inputRevision } = opts;
 
   const result: MaterializeResult = {};
-  let freshBox = false;
+  const req: CapabilityFetchInputRequest = {
+    run_id: runId,
+    ...(inputRevision ? { input_revision: inputRevision } : {}),
+  };
+  let src: CapabilityFetchInputResponse;
   try {
-    const req: CapabilityFetchInputRequest = {
-      run_id: runId,
-      ...(inputRevision ? { input_revision: inputRevision } : {}),
-    };
-    const src = (await backend.request(CAPABILITY_FETCH_INPUT, req)) as CapabilityFetchInputResponse;
-    if (src?.locale) result.locale = src.locale;
-    if (src?.llm && typeof src.llm === "object") result.llm = src.llm;
-    if (src?.settings && typeof src.settings === "object") result.settings = src.settings;
-    if (src?.bundle_base64) {
-      await client.postJson("/sources", {
-        run_id: runId,
-        bundle_base64: src.bundle_base64,
-        bundle_sha256: src.bundle_sha256,
-        locale: src.locale,
-      });
-      freshBox = true;
-      if (src.input_revision) result.inputRevision = src.input_revision;
-    }
+    src = (await backend.request(CAPABILITY_FETCH_INPUT, req)) as CapabilityFetchInputResponse;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    // Prefer the structured HTTP status (client attaches err.status); fall back to
-    // the message only when it's absent (finding E — a client message reword must
-    // not silently turn a 409 into a hard error).
-    const status = (err as { status?: unknown } | null)?.status;
-    const boxAlreadyLive = status === 409 || (typeof status !== "number" && msg.includes("failed: 409"));
-    if (boxAlreadyLive) {
+    throw new CapabilityMaterializationError("source-fetch", err);
+  }
+
+  if (src?.locale) result.locale = src.locale;
+  if (src?.llm && typeof src.llm === "object") result.llm = src.llm;
+  if (src?.settings && typeof src.settings === "object") result.settings = src.settings;
+
+  // RPC success + no bundle is the explicit empty-source result. It is not a
+  // fresh-box signal, so never guess and push workspace state onto a live box.
+  if (!src?.bundle_base64) return result;
+
+  try {
+    await client.postJson("/sources", {
+      run_id: runId,
+      bundle_base64: src.bundle_base64,
+      bundle_sha256: src.bundle_sha256,
+      locale: src.locale,
+    });
+  } catch (err) {
+    // Prefer the structured HTTP status; message parsing is only a rolling-
+    // upgrade fallback for older clients that did not attach err.status.
+    if (isBoxAlreadyLive(err)) {
       // The box already holds this run (live on-disk state) — reattach without
       // touching its workspace.
       console.log(`[capability] session ${runId}: box already live; skipping materialization`);
       result.reattached = true;
-    } else {
-      console.warn(`[capability] session ${runId}: source materialize skipped:`, msg);
+      return result;
     }
-    return result;
+    throw new CapabilityMaterializationError("source-install", err);
   }
-  if (!freshBox) return result; // empty KB — nothing told us the box is fresh, don't guess
+  if (src.input_revision) result.inputRevision = src.input_revision;
+
+  let ws: CapabilityFetchInputResponse;
+  try {
+    const workspaceReq: CapabilityFetchInputRequest = { run_id: runId, ref: CAPABILITY_INPUT_WORKSPACE_REF };
+    ws = (await backend.request(CAPABILITY_FETCH_INPUT, workspaceReq)) as CapabilityFetchInputResponse;
+  } catch (err) {
+    throw new CapabilityMaterializationError("workspace-fetch", err);
+  }
+
+  // Successful absence is a brand-new attempt with no durable workspace yet.
+  if (!ws?.bundle_base64) return result;
 
   try {
-    const req: CapabilityFetchInputRequest = { run_id: runId, ref: CAPABILITY_INPUT_WORKSPACE_REF };
-    const ws = (await backend.request(CAPABILITY_FETCH_INPUT, req)) as CapabilityFetchInputResponse;
-    if (ws?.bundle_base64) {
-      await client.postJson("/authoring", {
-        run_id: runId,
-        bundle_base64: ws.bundle_base64,
-        bundle_sha256: ws.bundle_sha256,
-        locale: result.locale,
-      });
-      console.log(`[capability] session ${runId}: rehydrated authoring workspace into fresh box`);
-    }
+    await client.postJson("/authoring", {
+      run_id: runId,
+      bundle_base64: ws.bundle_base64,
+      bundle_sha256: ws.bundle_sha256,
+      locale: result.locale,
+    });
   } catch (err) {
-    // The box still has raw/ — the agent can work; it just lost draft continuity.
-    console.warn(
-      `[capability] session ${runId}: workspace rehydrate skipped:`,
-      err instanceof Error ? err.message : String(err),
-    );
+    throw new CapabilityMaterializationError("workspace-install", err);
   }
+  console.log(`[capability] session ${runId}: rehydrated authoring workspace into fresh box`);
   return result;
 }
