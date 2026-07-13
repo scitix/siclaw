@@ -382,11 +382,15 @@ async def test_test_path_escape_guard():
 
 async def test_batch_planner_uses_compile_path_guard():
     """The model planner can Write under bypassPermissions, so it must carry the
-    same workspace confinement hook as every other compiler session."""
+    same workspace confinement hook and model policy as every other compiler session."""
     orig = compile_box.ClaudeSDKClient
     previous_mode = os.environ.get("KBC_BATCH_PLANNER")
+    previous_compile_model = os.environ.get("KBC_COMPILE_MODEL")
+    previous_anthropic_model = os.environ.get("ANTHROPIC_MODEL")
     compile_box.ClaudeSDKClient = _FakeSDKClient
     os.environ["KBC_BATCH_PLANNER"] = "model"
+    os.environ.pop("KBC_COMPILE_MODEL", None)
+    os.environ["ANTHROPIC_MODEL"] = "consumer-selected-model"
     try:
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("planner-guard", td, 1)
@@ -395,13 +399,22 @@ async def test_batch_planner_uses_compile_path_guard():
             opts = _FakeSDKClient.last.options
             assert opts.allowed_tools == ["Read", "Write", "Glob"], opts.allowed_tools
             assert opts.hooks and opts.hooks.get("PreToolUse"), opts.hooks
+            assert opts.model == "consumer-selected-model", opts.model
     finally:
         compile_box.ClaudeSDKClient = orig
         if previous_mode is None:
             os.environ.pop("KBC_BATCH_PLANNER", None)
         else:
             os.environ["KBC_BATCH_PLANNER"] = previous_mode
-    print("✓ batch planner uses compile workspace path guard")
+        if previous_compile_model is None:
+            os.environ.pop("KBC_COMPILE_MODEL", None)
+        else:
+            os.environ["KBC_COMPILE_MODEL"] = previous_compile_model
+        if previous_anthropic_model is None:
+            os.environ.pop("ANTHROPIC_MODEL", None)
+        else:
+            os.environ["ANTHROPIC_MODEL"] = previous_anthropic_model
+    print("✓ batch planner uses compile workspace path guard and model policy")
 
 
 
