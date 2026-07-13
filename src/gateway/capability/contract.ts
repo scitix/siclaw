@@ -200,6 +200,19 @@ export interface CapabilityTestCloseRequest {
   test_session_id: string;
 }
 
+export interface CapabilityTestCloseResponse {
+  ok: true;
+  run_id: string;
+  test_session_id: string;
+  /**
+   * Authoritative fence: true only after the box acknowledged teardown or the
+   * Runtime verified that the hosting box no longer exists. Consumers must not
+   * unlock Raw writes from a legacy `ok` / `already_closed` response alone.
+   */
+  close_confirmed: true;
+  already_closed?: true;
+}
+
 /**
  * Explicit, owner-triggered red-team authoring of the first regression test.
  * This is deliberately separate from compilation: the one-shot session can
