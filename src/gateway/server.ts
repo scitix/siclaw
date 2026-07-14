@@ -660,20 +660,28 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
     capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
+    const previousStatus = rec.status;
     // Publish running BEFORE the box can emit turn_done. Posting first allowed a
     // fast turn_done→idle to land and then be overwritten by this handler's late
     // running write, leaving an already-finished turn permanently busy.
     await capabilityRunManager.setStatus(runId, "running");
+    let accepted: { duplicate?: boolean };
     try {
-      await client.postJson(`/message/${runId}`, { message, ...(messageId ? { message_id: messageId } : {}) });
+      accepted = await client.postJson<{ duplicate?: boolean }>(`/message/${runId}`, {
+        message,
+        ...(messageId ? { message_id: messageId } : {}),
+      });
     } catch (err) {
-      // The box did not accept the turn. Restore the hosting run to idle; a
+      // The box did not accept the turn. Restore the hosting run exactly; a
       // terminal state that raced here remains sticky in setStatus().
-      await capabilityRunManager.setStatus(runId, "idle");
+      await capabilityRunManager.setStatus(runId, previousStatus);
       throw err;
     }
+    // A box-level duplicate after runtime recovery has no future turn_done. Put
+    // the hosting run back exactly where it was before this replay.
+    if (accepted.duplicate) await capabilityRunManager.setStatus(runId, previousStatus);
     if (messageId) await capabilityRunManager.rememberMessageId(runId, messageId);
-    return { ok: true, run_id: runId };
+    return { ok: true, run_id: runId, duplicate: accepted.duplicate === true };
   });
 
   rpcMethods.set("capability.command", async (params) => {

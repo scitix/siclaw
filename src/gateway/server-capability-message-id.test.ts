@@ -86,4 +86,60 @@ describe("capability.message idempotency", () => {
     expect(messagePostIndex).toBeGreaterThanOrEqual(0);
     expect(frontend.request.mock.invocationCallOrder[runningPersistIndex]).toBeLessThan(box.posts.mock.invocationCallOrder[messagePostIndex]!);
   });
+
+  it("restores an idle run when the box acknowledges a replay as duplicate", async () => {
+    const frontend = fakeFrontendClient();
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: fakeAgentBoxManager(),
+      frontendClient: frontend,
+      credentialService: {} as any,
+    });
+    const start = server.rpcMethods.get("capability.start")!;
+    const message = server.rpcMethods.get("capability.message")!;
+    const started = await start({ profile: "kb-compile" }) as { run_id: string };
+    box.posts.mockResolvedValueOnce({ ok: true, duplicate: true });
+
+    await expect(message({
+      run_id: started.run_id,
+      message_id: "op-replayed-by-box",
+      message: "compile once",
+    })).resolves.toMatchObject({
+      ok: true,
+      run_id: started.run_id,
+      duplicate: true,
+    });
+
+    const persisted = frontend.request.mock.calls.filter((call: any[]) => call[0] === "capability.persistRunState");
+    expect(persisted.at(-1)?.[1]).toMatchObject({
+      status: "idle",
+      checkpoint: { message_ids: ["op-replayed-by-box"] },
+    });
+  });
+
+  it("restores the previous running status when the box rejects a message", async () => {
+    const frontend = fakeFrontendClient();
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: fakeAgentBoxManager(),
+      frontendClient: frontend,
+      credentialService: {} as any,
+    });
+    const start = server.rpcMethods.get("capability.start")!;
+    const message = server.rpcMethods.get("capability.message")!;
+    const started = await start({
+      profile: "kb-compile",
+      input: { instruction: "compile once" },
+    }) as { run_id: string };
+    box.posts.mockRejectedValueOnce(new Error("box rejected message"));
+
+    await expect(message({
+      run_id: started.run_id,
+      message_id: "op-rejected",
+      message: "follow up",
+    })).rejects.toThrow("box rejected message");
+
+    const persisted = frontend.request.mock.calls.filter((call: any[]) => call[0] === "capability.persistRunState");
+    expect(persisted.at(-1)?.[1]).toMatchObject({ status: "running" });
+  });
 });
