@@ -132,6 +132,11 @@ describe("Phone-home WS integration", () => {
     const result = await connectionMap.sendCommand("test-agent", "bad.method", {});
     expect(result.ok).toBe(false);
     expect(result.error).toContain("handler crashed");
+    expect(result.errorDetail).toEqual({
+      code: "INTERNAL_ERROR",
+      message: "handler crashed",
+      retriable: true,
+    });
   });
 
   it("auth rejection: wrong secret", async () => {

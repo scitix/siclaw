@@ -79,6 +79,21 @@ export function isTerminalCapabilityStatus(s: CapabilityLifecycleStatus): s is C
   return (CAPABILITY_TERMINAL_STATUSES as readonly string[]).includes(s);
 }
 
+/**
+ * Content-free execution failure diagnostic persisted inside the opaque run
+ * checkpoint. Values are deliberately machine fields only: source text, tool
+ * input/output, provider responses, and credentials must never enter it.
+ */
+export interface CapabilityRunFailure {
+  code: string;
+  stage: string;
+  attempts?: number;
+  idle_s?: number;
+  bound_s?: number;
+  tool_pending?: boolean;
+  last_sdk_message?: string;
+}
+
 // ---- Consumer → siclaw ----
 
 export interface CapabilityStartRequest {
@@ -91,6 +106,12 @@ export interface CapabilityStartRequest {
    * Carried on both sides so neither has to double-write the linkage.
    */
   correlation_id?: string;
+  /**
+   * Immutable consumer input selected for this run. New consumers pin it at
+   * start so Runtime can durably checkpoint it before spawning/materializing a
+   * box. Absent preserves the rolling-compatible fetch-then-checkpoint path.
+   */
+  input_revision?: string;
   /** Capability input — opaque to the transport; the box interprets it (e.g. instruction, repo ref). */
   input?: Record<string, unknown>;
 }
@@ -102,6 +123,11 @@ export interface CapabilityStartResponse {
 
 export interface CapabilityMessageRequest {
   run_id: string;
+  /**
+   * Consumer-minted idempotency key for this conversational turn. Optional for
+   * rolling compatibility; retries carrying the same id must be accepted once.
+   */
+  message_id?: string;
   /**
    * A genuine conversational turn injected into the live session. Product
    * controls use CapabilityCommandRequest; old fixed-prefix controls are only
@@ -215,7 +241,7 @@ export interface CapabilityRunState {
   correlation_id: string;
   profile: string;
   status: CapabilityLifecycleStatus;
-  /** Opaque resume blob; KB runs currently checkpoint their installed input revision here. */
+  /** Opaque resume blob; KB runs checkpoint input revision and accepted message ids here. */
   checkpoint?: unknown;
   /**
    * Box session id, reserved for a future where the box persists its session and

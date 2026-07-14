@@ -9,6 +9,7 @@ import https from "node:https";
 import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
 import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core/model-routing.js";
 import { enrichImagesFromText, redactImageUrlsInText } from "./image-url-ingest.js";
+import { RpcResponseError, wrapRpcError } from "../../lib/error-envelope.js";
 
 export interface AgentBoxTlsOptions {
   cert: string;
@@ -102,6 +103,24 @@ export interface ContextUsageResponse {
   cacheReadTokens: number;
   cacheWriteTokens: number;
   cost: number;
+}
+
+function agentBoxResponseError(status: number, body: string): RpcResponseError {
+  const metadata: Record<string, unknown> = { status };
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const nested = parsed?.error && typeof parsed.error === "object"
+      ? parsed.error as Record<string, unknown>
+      : parsed;
+    if (typeof nested.code === "string") metadata.code = nested.code;
+    if (typeof nested.retriable === "boolean") metadata.retriable = nested.retriable;
+    if (typeof nested.retryAfterMs === "number") metadata.retryAfterMs = nested.retryAfterMs;
+    if (nested.details !== undefined) metadata.details = nested.details;
+  } catch {
+    // Non-JSON error bodies still retain their HTTP-derived classification.
+  }
+  const message = `AgentBox request failed: ${status}${body ? ` ${body}` : ""}`;
+  return new RpcResponseError(wrapRpcError(Object.assign(new Error(message), metadata)));
 }
 
 export class AgentBoxClient {
@@ -504,11 +523,7 @@ export class AgentBoxClient {
       if (!resp.ok) {
         const text = await resp.text().catch(() => "");
         console.error(`[agentbox-client] HTTP error: ${method} ${path} → ${resp.status} ${text.slice(0, 200)}`);
-        // Carry the HTTP status structurally so callers can branch on it (e.g.
-        // materialize's 409 = box-already-live) without parsing the message.
-        const e = new Error(`AgentBox request failed: ${resp.status} ${text}`) as Error & { status: number };
-        e.status = resp.status;
-        throw e;
+        throw agentBoxResponseError(resp.status, text);
       }
 
       return resp;
@@ -548,9 +563,7 @@ export class AgentBoxClient {
               resolve(new Response(body, { status, statusText: res.statusMessage }));
             } else {
               console.error(`[agentbox-client] HTTPS error: ${method} ${path} → ${status} ${body.slice(0, 200)}`);
-              const e = new Error(`AgentBox request failed: ${status} ${body}`) as Error & { status: number };
-              e.status = status;
-              reject(e);
+              reject(agentBoxResponseError(status, body));
             }
           });
         },

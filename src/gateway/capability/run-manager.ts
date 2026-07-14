@@ -19,6 +19,7 @@ import type {
   CapabilityLifecycleStatus,
   CapabilityListActiveRunsResponse,
   CapabilityRunRow,
+  CapabilityRunFailure,
   CapabilityRunState,
   CapabilityTerminalStatus,
 } from "./contract.js";
@@ -28,6 +29,7 @@ import {
   CAPABILITY_LIST_ACTIVE_RUNS,
   isTerminalCapabilityStatus,
 } from "./contract.js";
+import { ErrorCodes, RpcResponseError } from "../../lib/error-envelope.js";
 
 /** Just the RPC surface the manager needs (so tests can pass a fake). */
 export interface RunStateBackend {
@@ -43,6 +45,12 @@ export interface CapabilityRunRecord {
   runtimeId?: string;
   /** Frozen consumer input installed into this run's box. */
   inputRevision?: string;
+  /** Recent consumer turn ids durably accepted by this run (retry dedupe). */
+  messageIds: string[];
+  /** Recent typed commands durably accepted by this run (id + payload digest). */
+  commandReceipts: CapabilityCommandReceipt[];
+  /** Sanitized machine-readable terminal failure; never user/tool content. */
+  failure?: CapabilityRunFailure;
   /** Wall-clock ms of the last DATA event; drives the stale-run watchdog. */
   lastActivityMs: number;
   /**
@@ -99,11 +107,23 @@ export interface CapabilityRunManagerOptions {
 const MAX_REAP_DEFERRALS = 5;
 const INPUT_REVISION_PERSIST_ATTEMPTS = 4;
 const INPUT_REVISION_RETRY_BASE_MS = 250;
+const MAX_MESSAGE_IDS = 128;
+const MAX_COMMAND_RECEIPTS = 128;
+
+export interface CapabilityCommandReceipt {
+  id: string;
+  digest: string;
+}
 
 export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
   // runId → consecutive failed reap re-checks; cleared on a successful re-check.
   private reapDeferrals = new Map<string, number>();
+  // Full-state store writes for one run must land in mutation order. The
+  // consumer handles RPCs concurrently and replaces the whole row, so allowing
+  // two persists for the same run in flight can let an older status/checkpoint
+  // finish last and overwrite a newer one. Different runs remain independent.
+  private persistTails = new Map<string, Promise<void>>();
   private readonly now: () => number;
   private readonly staleMs: number;
   private readonly dataStaleMs: number;
@@ -146,6 +166,8 @@ export class CapabilityRunManager {
     correlationId?: string;
     runtimeId?: string;
     runId?: string; // caller may supply one (else minted)
+    /** Consumer-selected immutable input, persisted atomically with run start. */
+    inputRevision?: string;
     /**
      * Initial lifecycle status. "running" ONLY when a kickoff instruction will
      * drive an immediate turn; an instruction-less start (find-or-start for a
@@ -163,7 +185,10 @@ export class CapabilityRunManager {
       orgId: p.orgId,
       correlationId: p.correlationId,
       runtimeId: p.runtimeId,
+      inputRevision: p.inputRevision?.trim() || undefined,
       status: p.initialStatus ?? "running",
+      messageIds: [],
+      commandReceipts: [],
       lastActivityMs: this.now(),
       lastHeartbeatMs: this.now(),
     };
@@ -210,6 +235,9 @@ export class CapabilityRunManager {
         correlationId: row.correlation_id || undefined,
         runtimeId: row.runtime_id || undefined,
         inputRevision: inputRevisionFromCheckpoint(row.checkpoint),
+        messageIds: messageIdsFromCheckpoint(row.checkpoint),
+        commandReceipts: commandReceiptsFromCheckpoint(row.checkpoint),
+        failure: failureFromCheckpoint(row.checkpoint),
         status,
         lastActivityMs: this.now(),
         lastHeartbeatMs: this.now(),
@@ -256,6 +284,63 @@ export class CapabilityRunManager {
     }
   }
 
+  hasMessageId(runId: string, messageId: string): boolean {
+    const id = messageId.trim();
+    return id !== "" && (this.runs.get(runId)?.messageIds.includes(id) ?? false);
+  }
+
+  /**
+   * Persist a turn id only AFTER the box accepted it. If this checkpoint write
+   * fails, roll the in-memory mark back: the caller returns an error and retries
+   * the same id; the box-level dedupe then turns that retry into a harmless ack.
+   */
+  async rememberMessageId(runId: string, messageId: string): Promise<void> {
+    const rec = this.runs.get(runId);
+    const id = messageId.trim();
+    if (!rec || !id || rec.messageIds.includes(id)) return;
+    const previous = rec.messageIds;
+    rec.messageIds = [...previous, id].slice(-MAX_MESSAGE_IDS);
+    try {
+      await this.persist(rec, { failFast: true });
+    } catch (err) {
+      rec.messageIds = previous;
+      throw err;
+    }
+  }
+
+  commandReceipt(runId: string, commandId: string): CapabilityCommandReceipt | undefined {
+    const id = commandId.trim();
+    return id ? this.runs.get(runId)?.commandReceipts.find((receipt) => receipt.id === id) : undefined;
+  }
+
+  /** Persist a typed-command receipt only after the box accepted the command. */
+  async rememberCommandReceipt(runId: string, commandId: string, digest: string): Promise<void> {
+    const rec = this.runs.get(runId);
+    const id = commandId.trim();
+    const normalizedDigest = digest.trim().toLowerCase();
+    if (!rec || !id || !normalizedDigest) return;
+    const existing = rec.commandReceipts.find((receipt) => receipt.id === id);
+    if (existing) {
+      if (existing.digest !== normalizedDigest) {
+        throw new RpcResponseError({
+          code: ErrorCodes.CONFLICT,
+          message: "command_id was already used with a different payload",
+          retriable: false,
+          status: 409,
+        });
+      }
+      return;
+    }
+    const previous = rec.commandReceipts;
+    rec.commandReceipts = [...previous, { id, digest: normalizedDigest }].slice(-MAX_COMMAND_RECEIPTS);
+    try {
+      await this.persist(rec, { failFast: true });
+    } catch (err) {
+      rec.commandReceipts = previous;
+      throw err;
+    }
+  }
+
   /** Bump last-DATA activity so the watchdog doesn't reap an actively-used run. */
   touch(runId: string): void {
     const rec = this.runs.get(runId);
@@ -289,11 +374,9 @@ export class CapabilityRunManager {
     const rec = this.runs.get(runId);
     if (!rec) return;
     // Terminal is sticky — mirror endRun. A record can sit here in a TERMINAL
-    // state while its final persist retries (flushTerminal). capability.message
-    // calls setStatus("running") after two awaits (ensure session + POST
-    // /message), so a done/error/cancel landing in that window must not be
-    // flipped back to non-terminal — that would hide the record from
-    // flushTerminal and degrade the true outcome to a watchdog "failed".
+    // state while its final persist retries (flushTerminal). A concurrent
+    // done/error/cancel must never be flipped back to non-terminal — that would
+    // hide the record from flushTerminal and degrade the true outcome.
     if (isTerminalCapabilityStatus(rec.status)) return;
     rec.status = status;
     rec.lastActivityMs = this.now();
@@ -307,7 +390,11 @@ export class CapabilityRunManager {
    * loop retries the same terminal write (flushTerminal) until it lands, so the
    * store converges to the true outcome instead of a later blanket "failed".
    */
-  async endRun(runId: string, status: CapabilityTerminalStatus): Promise<void> {
+  async endRun(
+    runId: string,
+    status: CapabilityTerminalStatus,
+    failure?: CapabilityRunFailure,
+  ): Promise<void> {
     const rec = this.runs.get(runId);
     if (!rec) return;
     // Terminal is sticky: the FIRST outcome wins. Without this, a done whose
@@ -315,6 +402,7 @@ export class CapabilityRunManager {
     // the relay's error catch when the box stream closes right after `done`.
     if (isTerminalCapabilityStatus(rec.status)) return;
     rec.status = status;
+    if (status === "failed" && failure) rec.failure = normalizeFailure(failure);
     rec.lastActivityMs = this.now();
     try {
       await this.persist(rec, { failFast: true });
@@ -350,6 +438,9 @@ export class CapabilityRunManager {
           correlationId: r.correlation_id || undefined,
           runtimeId: r.runtime_id || undefined,
           inputRevision: inputRevisionFromCheckpoint(r.checkpoint),
+          messageIds: messageIdsFromCheckpoint(r.checkpoint),
+          commandReceipts: commandReceiptsFromCheckpoint(r.checkpoint),
+          failure: failureFromCheckpoint(r.checkpoint),
           status: r.status || "running",
           lastActivityMs: this.now(),
           lastHeartbeatMs: this.now(),
@@ -519,26 +610,42 @@ export class CapabilityRunManager {
    */
   private async persist(rec: CapabilityRunRecord, opts?: { failFast?: boolean }): Promise<void> {
     // The contract type IS the wire shape (snake_case) — see contract.ts WIRE RULE.
+    const checkpoint = {
+      ...(rec.inputRevision ? { input_revision: rec.inputRevision } : {}),
+      ...(rec.messageIds.length > 0 ? { message_ids: rec.messageIds } : {}),
+      ...(rec.commandReceipts.length > 0 ? { command_receipts: rec.commandReceipts } : {}),
+      ...(rec.failure ? { failure: rec.failure } : {}),
+    };
     const state: CapabilityRunState = {
       run_id: rec.runId,
       org_id: rec.orgId ?? "",
       correlation_id: rec.correlationId ?? "",
       profile: rec.profile,
       status: rec.status,
-      ...(rec.inputRevision ? { checkpoint: { input_revision: rec.inputRevision } } : {}),
+      ...(Object.keys(checkpoint).length > 0 ? { checkpoint } : {}),
       // Reserved wire field, always "" — the runtime does not track a box session
       // id (see the note above adopt()); a future persistent-session design would
       // re-introduce the mirror + carry-through.
       session_ref: "",
       runtime_id: rec.runtimeId ?? "",
     };
+    const previous = this.persistTails.get(rec.runId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(async () => {
+      try {
+        await this.backend.request(CAPABILITY_PERSIST_RUN_STATE, state);
+      } catch (err) {
+        if (opts?.failFast) throw err;
+        console.warn(
+          `[capability] persistRunState(${rec.runId} → ${state.status}) failed (kept in memory; reconcile heals the store): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
+    this.persistTails.set(rec.runId, current);
     try {
-      await this.backend.request(CAPABILITY_PERSIST_RUN_STATE, state);
-    } catch (err) {
-      if (opts?.failFast) throw err;
-      console.warn(
-        `[capability] persistRunState(${rec.runId} → ${rec.status}) failed (kept in memory; reconcile heals the store): ${err instanceof Error ? err.message : String(err)}`,
-      );
+      await current;
+    } finally {
+      // A later write may already have replaced this tail while we awaited.
+      if (this.persistTails.get(rec.runId) === current) this.persistTails.delete(rec.runId);
     }
   }
 }
@@ -555,4 +662,94 @@ function inputRevisionFromCheckpoint(checkpoint: unknown): string | undefined {
   if (!value || typeof value !== "object") return undefined;
   const revision = (value as { input_revision?: unknown }).input_revision;
   return typeof revision === "string" && revision.trim() ? revision.trim() : undefined;
+}
+
+function messageIdsFromCheckpoint(checkpoint: unknown): string[] {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!value || typeof value !== "object") return [];
+  const ids = (value as { message_ids?: unknown }).message_ids;
+  if (!Array.isArray(ids)) return [];
+  return ids
+    .filter((id): id is string => typeof id === "string" && id.trim() !== "" && id.trim().length <= 128)
+    .map((id) => id.trim())
+    .slice(-MAX_MESSAGE_IDS);
+}
+
+function commandReceiptsFromCheckpoint(checkpoint: unknown): CapabilityCommandReceipt[] {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!value || typeof value !== "object") return [];
+  const receipts = (value as { command_receipts?: unknown }).command_receipts;
+  if (!Array.isArray(receipts)) return [];
+  const seen = new Set<string>();
+  const normalized: CapabilityCommandReceipt[] = [];
+  for (const receipt of receipts) {
+    if (!receipt || typeof receipt !== "object") continue;
+    const id = (receipt as { id?: unknown }).id;
+    const digest = (receipt as { digest?: unknown }).digest;
+    if (typeof id !== "string" || typeof digest !== "string") continue;
+    const cleanID = id.trim();
+    const cleanDigest = digest.trim().toLowerCase();
+    if (!cleanID || cleanID.length > 128 || !/^[0-9a-f]{64}$/.test(cleanDigest) || seen.has(cleanID)) continue;
+    seen.add(cleanID);
+    normalized.push({ id: cleanID, digest: cleanDigest });
+  }
+  return normalized.slice(-MAX_COMMAND_RECEIPTS);
+}
+
+function failureFromCheckpoint(checkpoint: unknown): CapabilityRunFailure | undefined {
+  let value = checkpoint;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const failure = (value as { failure?: unknown }).failure;
+  return normalizeFailure(failure);
+}
+
+function normalizeFailure(value: unknown): CapabilityRunFailure | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const token = (field: unknown): string | undefined => {
+    if (typeof field !== "string") return undefined;
+    const normalized = field.trim();
+    return normalized && normalized.length <= 64 && /^[a-zA-Z0-9_.-]+$/.test(normalized)
+      ? normalized
+      : undefined;
+  };
+  const code = token(raw.code);
+  const stage = token(raw.stage);
+  if (!code || !stage) return undefined;
+  const finiteNonNegative = (field: unknown): number | undefined =>
+    typeof field === "number" && Number.isFinite(field) && field >= 0 ? field : undefined;
+  const attempts = finiteNonNegative(raw.attempts);
+  const idle = finiteNonNegative(raw.idle_s);
+  const bound = finiteNonNegative(raw.bound_s);
+  const lastMessage = token(raw.last_sdk_message);
+  return {
+    code,
+    stage,
+    ...(attempts !== undefined ? { attempts: Math.floor(attempts) } : {}),
+    ...(idle !== undefined ? { idle_s: idle } : {}),
+    ...(bound !== undefined ? { bound_s: bound } : {}),
+    ...(typeof raw.tool_pending === "boolean" ? { tool_pending: raw.tool_pending } : {}),
+    ...(lastMessage ? { last_sdk_message: lastMessage } : {}),
+  };
 }

@@ -293,6 +293,10 @@ class CompileRun:
         # Keep the last full-compile commit replayable across relay restarts.
         # The consumer dedupes it by immutable input revision.
         self._commit_input_replay = False
+        # Consumer-minted turn ids accepted by this live box. The runtime also
+        # checkpoints them; this local set closes the crash window where the box
+        # accepted a turn but the runtime died before persisting its ack.
+        self._message_ids: set[str] = set()
         # Scoped incremental (真增量): armed at kickoff with {before: page_hashes,
         # changeset}; the post-turn seam runs the byte-integrity guard against it,
         # then clears it. None = this turn is not a scoped incremental.
@@ -310,6 +314,8 @@ class CompileRun:
         self._tool_pending = False          # last assistant msg asked for a tool
         self._last_model_activity = 0.0     # monotonic ts of the last inbound SDK msg / query
         self._last_directive = ""           # the in-flight turn's text, for retry
+        self._last_sdk_message_type = "query"  # controlled class name only; never message content
+        self._last_stall_diagnostic: dict | None = None
         self._model_retries = 0             # stall retries used on the in-flight turn
         self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
         self._stall_fatal = False           # stall retries exhausted → fail this turn
@@ -318,7 +324,7 @@ class CompileRun:
         # for this live run, and the first command pins the run to the consumer's
         # operation/generation context. This is intentionally NOT another status
         # machine; Sicore's operation and the runtime run remain authoritative.
-        self._accepted_command_ids: set[str] = set()
+        self._accepted_commands: dict[str, str] = {}
         self._command_context: tuple[str, int] | None = None
 
     async def emit(self, ev: dict):
@@ -335,6 +341,8 @@ class CompileRun:
         self._stall_fatal = False
         self._rate_retries = 0
         self._last_model_activity = time.monotonic()
+        self._last_sdk_message_type = "query"
+        self._last_stall_diagnostic = None
 
     async def inject_user_message(self, text: str):
         """Engine seam: push a user turn into the live session. The Claude SDK
@@ -824,6 +832,7 @@ _FULL_COMPILE_ACTIONS = {
     "compile.generate", "compile.regenerate", "compile.approve_plan", "compile.resume",
 }
 _BRIEF_AUDIENCES = {"", "internal-eng", "frontline", "external", "newcomer"}
+_BRIEF_INTENTS = {"", "understand", "execute", "troubleshoot"}
 _CONTENT_LOCALE_RE = re.compile(r"^(?:auto|[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*)$")
 
 
@@ -873,6 +882,7 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
         normalized_brief = {
             "schema_version": 1,
             "source": "authoring_command",
+            "intent": _bounded_string(brief.get("intent"), "brief.intent", limit=32),
             "audience": _bounded_string(brief.get("audience"), "brief.audience", limit=64),
             "depth": _bounded_string(brief.get("depth"), "brief.depth", limit=32),
             "redaction": _bounded_string(brief.get("redaction"), "brief.redaction", limit=32) or "none",
@@ -881,6 +891,8 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
         }
         if normalized_brief["depth"] not in {"", "full", "concise"}:
             raise CommandRejected("brief.depth must be full or concise")
+        if normalized_brief["intent"] not in _BRIEF_INTENTS:
+            raise CommandRejected("brief.intent is unsupported")
         if normalized_brief["audience"] not in _BRIEF_AUDIENCES:
             raise CommandRejected("brief.audience is unsupported")
         if normalized_brief["redaction"] not in {"none", "external"}:
@@ -944,6 +956,11 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
         "generation": generation,
         "parameters": parameters,
     }
+
+
+def _command_digest(command: dict) -> str:
+    encoded = json.dumps(command, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _render_command(run: "CompileRun", command: dict) -> str:
@@ -2519,12 +2536,21 @@ def _note_model_activity(run: CompileRun, msg) -> None:
     """Every inbound SDK message (StreamEvent delta, assistant/user turn, result)
     proves the model link is alive → reset the idle clock. An assistant message
     that asks for a tool flips tool_pending so the watchdog uses the longer bound
-    while the CLI runs Read/Bash (that gap is not a model stall)."""
+    while the CLI runs Read/Bash (that gap is not a model stall).
+
+    Partial StreamEvents are transport liveness only.  The Agent SDK emits
+    assistant-tail events (content_block_stop/message_delta/message_stop) after
+    a ToolUseBlock and before the UserMessage containing the tool result; those
+    events must not clear tool_pending or a legitimate long-running tool is
+    measured against the much shorter model-idle bound.
+    """
     run._last_model_activity = time.monotonic()
-    if type(msg).__name__ == "AssistantMessage":
+    message_type = type(msg).__name__
+    run._last_sdk_message_type = message_type
+    if message_type == "AssistantMessage":
         blocks = getattr(msg, "content", None) or []
         run._tool_pending = any(type(b).__name__ == "ToolUseBlock" for b in blocks)
-    else:
+    elif message_type in ("UserMessage", "ResultMessage"):
         run._tool_pending = False
 
 
@@ -2547,6 +2573,7 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
                         f"model request stalled; exhausted {run._model_retries} attempt(s)"
                     )
                 run._last_model_activity = time.monotonic()
+                run._last_sdk_message_type = "query"
                 await client.query(run._last_directive)   # retry on a fresh request
                 continue
             # C2: a rate-limited / overloaded model call ends the turn with
@@ -2567,6 +2594,7 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
                     run._last_model_activity = time.monotonic()  # backoff isn't a stall
                     await asyncio.sleep(delay)
                     run._last_model_activity = time.monotonic()
+                    run._last_sdk_message_type = "query"
                     await client.query(run._last_directive)
                     continue
                 await run.emit({
@@ -2635,12 +2663,20 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
         run._stall_retrying = True
         run._stall_interrupted_at = time.monotonic()
         run._last_model_activity = time.monotonic()   # bridge the interrupt→result gap
-        await run.emit({
-            "type": "turn_stalled",
-            "attempt": run._model_retries,
+        diagnostic = {
+            "code": "model_turn_stalled",
+            "stage": "model_turn",
+            "attempts": run._model_retries,
             "fatal": run._stall_fatal,
             "idle_s": round(idle, 1),
-        })
+            "bound_s": round(bound, 1),
+            "tool_pending": run._tool_pending,
+            # Controlled SDK class/query marker only. Never include message or
+            # tool content in diagnostic events or the persisted checkpoint.
+            "last_sdk_message": run._last_sdk_message_type,
+        }
+        run._last_stall_diagnostic = diagnostic
+        await run.emit({"type": "turn_stalled", "attempt": run._model_retries, **diagnostic})
         try:
             await client.interrupt()
         except Exception as e:
@@ -2711,7 +2747,17 @@ async def _run_wrapper(run: CompileRun):
         await _COMPILE_IMPL(run)
         clean = True
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
-        await run.emit({"type": "error", "error": repr(e)})
+        error_event = {"type": "error", "error": repr(e)}
+        if isinstance(e, ModelStallError) and run._last_stall_diagnostic:
+            # Structured, content-free diagnostics survive the Runtime→consumer
+            # opaque checkpoint.  Keep the human error for rolling consumers,
+            # but make automation independent of parsing it.
+            error_event.update({
+                key: value
+                for key, value in run._last_stall_diagnostic.items()
+                if key != "fatal"
+            })
+        await run.emit(error_event)
         if getattr(run, "_turn_active", False):
             # never-block symmetry (review fix): a consumer gating on turn_done
             # must not hang because the driver died mid-turn (stall-fatal etc.).
@@ -3132,10 +3178,23 @@ async def handle_message(request: web.Request):
     text = (body.get("message") or "").strip()
     if not text:
         return web.json_response({"error": "message is required"}, status=400)
+    message_id = (body.get("message_id") or "").strip()
+    if len(message_id) > 128:
+        return web.json_response({"error": "message_id must be at most 128 characters"}, status=400)
+    if message_id and message_id in run._message_ids:
+        return web.json_response({"ok": True, "duplicate": True})
+    if message_id:
+        run._message_ids.add(message_id)
     try:
         result = await _dispatch_authoring_turn(run, text)
     except CommandRejected as exc:
+        if message_id:
+            run._message_ids.discard(message_id)
         return web.json_response({"error": str(exc)}, status=exc.status)
+    except BaseException:
+        if message_id:
+            run._message_ids.discard(message_id)
+        raise
     return web.json_response(result)
 
 
@@ -3158,8 +3217,12 @@ async def handle_command(request: web.Request):
         except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
             raise CommandRejected("request body must be valid JSON", 400)
         command_id, command = _normalize_command(body)
+        digest = _command_digest(command)
         context = (command["operation_id"], command["generation"])
-        if command_id in run._accepted_command_ids:
+        accepted_digest = run._accepted_commands.get(command_id)
+        if accepted_digest is not None:
+            if accepted_digest != digest:
+                raise CommandRejected("command_id was already used with a different payload", 409)
             return web.json_response({"ok": True, "duplicate": True, "command_id": command_id})
         # Product controls are never an in-memory "note for later". Accepting a
         # second command while a turn/batch is active would acknowledge an
@@ -3173,11 +3236,11 @@ async def handle_command(request: web.Request):
         _prepare_command(run, command)
         text = _render_command(run, command)
         run._command_context = context
-        run._accepted_command_ids.add(command_id)
+        run._accepted_commands[command_id] = digest
         try:
             result = await _dispatch_authoring_turn(run, text, command["action"])
         except BaseException:
-            run._accepted_command_ids.discard(command_id)
+            run._accepted_commands.pop(command_id, None)
             raise
         return web.json_response({**result, "command_id": command_id, "action": command["action"]})
     except CommandRejected as exc:

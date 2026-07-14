@@ -166,6 +166,36 @@ async def test_run_wrapper_terminal_signals():
             types = _drain_event_types(run)
             assert "error" in types and "done" not in types and types[-1] == "end", types
 
+            async def stalled(run):
+                run._last_stall_diagnostic = {
+                    "code": "model_turn_stalled",
+                    "stage": "model_turn",
+                    "attempts": 4,
+                    "idle_s": 90.2,
+                    "bound_s": 90.0,
+                    "tool_pending": False,
+                    "last_sdk_message": "query",
+                }
+                raise compile_box.ModelStallError("model request stalled; exhausted 4 attempt(s)")
+            compile_box._COMPILE_IMPL = stalled
+            run = compile_box.CompileRun("wrap-stalled", td, 1)
+            await compile_box._run_wrapper(run)
+            events = []
+            while not run.events.empty():
+                events.append(run.events.get_nowait())
+            error = next(e for e in events if e["type"] == "error")
+            assert error == {
+                "type": "error",
+                "error": "ModelStallError('model request stalled; exhausted 4 attempt(s)')",
+                "code": "model_turn_stalled",
+                "stage": "model_turn",
+                "attempts": 4,
+                "idle_s": 90.2,
+                "bound_s": 90.0,
+                "tool_pending": False,
+                "last_sdk_message": "query",
+            }, error
+
             async def cancelled(run):
                 raise asyncio.CancelledError()
             compile_box._COMPILE_IMPL = cancelled
@@ -334,6 +364,55 @@ async def test_message_waits_for_connect():
         compile_box.RUNS.clear()
         os.environ.pop("KBC_CONNECT_TIMEOUT_SECS", None)
     print("✓ message waits for connect (P2.2 race fix)")
+
+
+async def test_message_idempotency_key():
+    """A lost runtime ack may replay capability.message. The box must inject a
+    stable message_id once, while a dispatch error releases the id for retry."""
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        class _C:
+            def __init__(self):
+                self.queries = []
+
+            async def query(self, text, session_id="default"):
+                self.queries.append(text)
+
+        run = compile_box.CompileRun("idem-live", "/tmp", 1)
+        fake = _C()
+        run.client = fake
+        run.connected.set()
+        compile_box.RUNS[run.run_id] = run
+        first = await client.post(f"/message/{run.run_id}", json={"message_id": "op-1", "message": "compile once"})
+        second = await client.post(f"/message/{run.run_id}", json={"message_id": "op-1", "message": "compile twice"})
+        assert first.status == 200 and second.status == 200, (await first.text(), await second.text())
+        assert (await second.json()).get("duplicate") is True
+        assert fake.queries == ["compile once"], fake.queries
+
+        class _Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            async def query(self, text, session_id="default"):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("dispatch failed")
+
+        retry_run = compile_box.CompileRun("idem-retry", "/tmp", 1)
+        flaky = _Flaky()
+        retry_run.client = flaky
+        retry_run.connected.set()
+        compile_box.RUNS[retry_run.run_id] = retry_run
+        failed = await client.post(f"/message/{retry_run.run_id}", json={"message_id": "op-2", "message": "retry me"})
+        retried = await client.post(f"/message/{retry_run.run_id}", json={"message_id": "op-2", "message": "retry me"})
+        assert failed.status == 500 and retried.status == 200, (failed.status, retried.status)
+        assert flaky.calls == 2, flaky.calls
+    finally:
+        await client.close()
+        compile_box.RUNS.clear()
+    print("✓ /message message_id is once-only and releases on dispatch failure")
 
 
 # ── 起测试会话 (read-only test session) ──
@@ -1798,6 +1877,13 @@ class _ToolGapFake:
         am = AssistantMessage("calling read")
         am.content = [TextBlock("calling read"), ToolUseBlock()]
         yield am                                # tool_pending = True
+        # The real Agent SDK emits assistant-tail StreamEvents
+        # (content_block_stop/message_delta/message_stop) before the CLI
+        # returns the UserMessage carrying the tool result.  Those events prove
+        # transport liveness, but they do not mean the tool has finished.
+        yield StreamEvent()
+        yield StreamEvent()
+        yield StreamEvent()
         await asyncio.sleep(self._gap)          # model-silent while the CLI runs the tool
         yield UserMessage()                     # tool_result → tool_pending = False
         yield AssistantMessage("read done")
@@ -1904,7 +1990,13 @@ async def test_model_stall_exhausts_to_error():
     assert isinstance(raised, compile_box.ModelStallError), raised
     assert fake.interrupts == 3, fake.interrupts          # 2 retries + the fatal attempt
     assert types.count("turn_stalled") == 3, types
-    assert any(e["type"] == "turn_stalled" and e.get("fatal") for e in evs), evs
+    fatal = next(e for e in evs if e["type"] == "turn_stalled" and e.get("fatal"))
+    assert fatal["code"] == "model_turn_stalled", fatal
+    assert fatal["stage"] == "model_turn", fatal
+    assert fatal["attempts"] == 3, fatal
+    assert fatal["bound_s"] == 0.1, fatal
+    assert fatal["tool_pending"] is False, fatal
+    assert fatal["last_sdk_message"] == "query", fatal
     print("✓ model stall: retries exhausted → ModelStallError (fails fast, no hang)")
 
 
@@ -2087,6 +2179,7 @@ async def test_typed_authoring_commands():
                     "operation_id": f"op-{locale}",
                     "generation": 1,
                     "parameters": {"brief": {
+                        "intent": "troubleshoot",
                         "audience": "internal-eng",
                         "depth": "full",
                         "redaction": "none",
@@ -2104,6 +2197,7 @@ async def test_typed_authoring_commands():
             assert brief == {
                 "schema_version": 1,
                 "source": "authoring_command",
+                "intent": "troubleshoot",
                 "audience": "internal-eng",
                 "depth": "full",
                 "redaction": "none",
@@ -2114,8 +2208,22 @@ async def test_typed_authoring_commands():
             r = await client.post(f"/command/{run_id}", json=body)
             assert r.status == 200 and (await r.json())["duplicate"] is True
             assert len(run.client.queries) == 1
+            invalid_intent = json.loads(json.dumps(body))
+            invalid_intent["command_id"] = f"bad-intent-{locale}"
+            invalid_intent["command"]["parameters"]["brief"]["intent"] = "请帮我排障"
+            run._turn_active = False
+            r = await client.post(f"/command/{run_id}", json=invalid_intent)
+            assert r.status == 400 and len(run.client.queries) == 1, await r.text()
+            # An idempotency key binds one normalized payload; it cannot be
+            # reinterpreted as a different action or generation.
+            changed = json.loads(json.dumps(body))
+            changed["command"]["generation"] = 2
+            r = await client.post(f"/command/{run_id}", json=changed)
+            assert r.status == 409 and "different payload" in (await r.json())["error"]
+            assert len(run.client.queries) == 1
             # A distinct command cannot be acknowledged and silently dropped
             # while another turn is active.
+            run._turn_active = True
             busy = json.loads(json.dumps(body))
             busy["command_id"] = f"busy-{locale}"
             r = await client.post(f"/command/{run_id}", json=busy)
@@ -2196,6 +2304,7 @@ async def main():
     await test_session_driver_conversational()
     await test_conversational_session()
     await test_message_waits_for_connect()
+    await test_message_idempotency_key()
     test_pack_candidates_to_wiki()
     test_pack_candidates_symlink_confinement()
     await test_test_path_escape_guard()

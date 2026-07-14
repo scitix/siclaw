@@ -51,6 +51,7 @@ _Avoid_: content locale
     "generation": 12,
     "parameters": {
       "brief": {
+        "intent": "troubleshoot",
         "audience": "internal-eng",
         "depth": "full",
         "redaction": "none",
@@ -78,8 +79,11 @@ parameters. Unknown versions and unknown actions fail closed.
 3. The consumer supplies `operation_id` and `generation`; the box never invents
    domain lifecycle identity. Artifact persistence remains fenced by the
    consumer's attempt and generation.
-4. `command_id` is idempotent within a live run. Repeating an accepted command
-   returns the prior acceptance and does not start a second turn.
+4. `command_id` binds one canonical command payload. Runtime checkpoints recent
+   `{id, digest}` receipts in the consumer-backed run record, and the live box
+   keeps the same protection across Runtime acknowledgement gaps. Repeating the
+   same payload returns the prior acceptance; reusing the id for another payload
+   fails closed.
 5. One run is pinned to one `(operation_id, generation)` command context. A
    command for another context is rejected.
 6. `content_locale`, prompt locale, display message, and free-form notes cannot
@@ -92,6 +96,11 @@ parameters. Unknown versions and unknown actions fail closed.
 9. A command is an intent/receipt, not another lifecycle state machine. Run
    status remains the execution truth and Sicore's authoring operation remains
    the domain mutation truth.
+10. A consumer that has already selected an immutable source revision supplies
+    `input_revision` on `capability.start`. Runtime persists that revision in the
+    run's initial checkpoint before any box spawn or materialization, then asks
+    every fresh/recovered box for that exact revision. Consumers that omit the
+    field retain the rolling-compatible fetch-then-checkpoint flow.
 
 ## Authoring actions v1
 
@@ -107,6 +116,12 @@ parameters. Unknown versions and unknown actions fail closed.
 | `compile.apply_rulings` | `dispatch_nonce`, `rulings[]` | Apply contradiction rulings and emit per-ticket receipts |
 | `compile.repair_test` | `question`, `reference_answer`, `verdict` | Repair the minimum draft scope for a failed test |
 
+The optional brief uses stable identifiers. In particular,
+`intent=understand|execute|troubleshoot` selects whether the compiled structure
+prioritizes concepts/relationships, procedures/checks, or symptoms/evidence/
+remediation. It changes content organization only; it never changes protocol
+routing or lifecycle state.
+
 ## Layer responsibilities
 
 ### Sicore
@@ -115,6 +130,8 @@ parameters. Unknown versions and unknown actions fail closed.
 - validates the product action payload;
 - creates the correct authoring operation/attempt;
 - fills `operation_id`, `generation`, and `command_id`;
+- supplies the immutable `input_revision` selected for a new mutation when the
+  consumer supports start-time pinning;
 - persists an optional display message separately;
 - materializes source drift and other consumer-owned inputs;
 - rejects stale artifact writes through the existing generation fence.
@@ -123,8 +140,13 @@ parameters. Unknown versions and unknown actions fail closed.
 
 - validates the common command envelope;
 - finds/adopts the addressed run;
-- forwards the command unchanged to `/command/{run_id}`;
-- updates run activity/status exactly as for an accepted model turn;
+- checks the durable command receipt before touching the box;
+- atomically checkpoints a start-time `input_revision` before touching the box,
+  and reuses it for materialization after restart/adoption;
+- publishes `running` before POST so a fast `turn_done -> idle` cannot be
+  overwritten by a late handler write;
+- forwards the command unchanged to `/command/{run_id}` and checkpoints the
+  accepted `{command_id, payload digest}` afterward;
 - does not render prompts or understand KB action parameters.
 
 ### KB compile-box
@@ -136,6 +158,17 @@ parameters. Unknown versions and unknown actions fail closed.
 - renders the action into a model directive using the run's prompt locale;
 - selects full, batch, incremental, resume, or repair execution from the action,
   never from rendered text.
+
+## Delivery guarantee
+
+The command path is at-least-once delivery with idempotent acceptance, not a
+distributed exactly-once transaction. A process may die after the box accepts a
+turn but before Runtime or Sicore persists its receipt. Retrying the same id is
+therefore required: the surviving layer acknowledges the duplicate and the
+missing durable receipt is repaired. If both Runtime and the ephemeral box die
+inside that window, Sicore's operation/generation and artifact-write fences
+remain the safety boundary; the same command may be redelivered to a rehydrated
+box, but stale generations cannot commit.
 
 ## Rolling migration
 

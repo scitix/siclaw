@@ -98,6 +98,119 @@ describe("CapabilityRunManager", () => {
     expect(recovered.get(runId)?.inputRevision).toBe("manifest-1");
   });
 
+  it("checkpoints accepted message ids and restores dedupe after restart", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.setInputRevision(runId, "manifest-1");
+    await mgr.rememberMessageId(runId, "op-1");
+    expect(mgr.hasMessageId(runId, "op-1")).toBe(true);
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      checkpoint: { input_revision: "manifest-1", message_ids: ["op-1"] },
+    });
+
+    const recoveredBackend = new FakeBackend();
+    recoveredBackend.activeRuns = [{
+      id: runId,
+      profile: "kb-compile",
+      org_id: "o1",
+      status: "running",
+      checkpoint: JSON.stringify({ input_revision: "manifest-1", message_ids: ["op-1"] }),
+    }];
+    const recovered = new CapabilityRunManager(recoveredBackend);
+    await recovered.recover();
+    expect(recovered.hasMessageId(runId, "op-1")).toBe(true);
+  });
+
+  it("rolls back an unacknowledged message id so the caller can retry", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    be.failPersist = true;
+
+    await expect(mgr.rememberMessageId(runId, "op-1")).rejects.toThrow("ws down");
+    expect(mgr.hasMessageId(runId, "op-1")).toBe(false);
+  });
+
+  it("checkpoints typed command ids with payload digests and restores them", async () => {
+    const digest = "a".repeat(64);
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.rememberCommandReceipt(runId, "cmd-1", digest);
+    expect(mgr.commandReceipt(runId, "cmd-1")).toEqual({ id: "cmd-1", digest });
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      checkpoint: { command_receipts: [{ id: "cmd-1", digest }] },
+    });
+
+    const recoveredBackend = new FakeBackend();
+    recoveredBackend.activeRuns = [{
+      id: runId, profile: "kb-compile", org_id: "o1", status: "idle",
+      checkpoint: JSON.stringify({ command_receipts: [{ id: "cmd-1", digest }] }),
+    }];
+    const recovered = new CapabilityRunManager(recoveredBackend);
+    await recovered.recover();
+    expect(recovered.commandReceipt(runId, "cmd-1")).toEqual({ id: "cmd-1", digest });
+    await expect(recovered.rememberCommandReceipt(runId, "cmd-1", "b".repeat(64))).rejects.toMatchObject({
+      code: "CONFLICT",
+      status: 409,
+      retriable: false,
+      message: expect.stringMatching(/different payload/),
+    });
+  });
+
+  it("keeps receipt and lifecycle persists ordered for the same run", async () => {
+    let storedState: any;
+    let holdNextPersist = false;
+    let releaseHeldPersist!: () => void;
+    let markHeldPersistStarted!: () => void;
+    const heldPersistReleased = new Promise<void>((resolve) => { releaseHeldPersist = resolve; });
+    const heldPersistStarted = new Promise<void>((resolve) => { markHeldPersistStarted = resolve; });
+    const be: RunStateBackend = {
+      request: vi.fn(async (method: string, params?: unknown) => {
+        if (method !== CAPABILITY_PERSIST_RUN_STATE) return { ok: true };
+        if (holdNextPersist) {
+          holdNextPersist = false;
+          markHeldPersistStarted();
+          await heldPersistReleased;
+        }
+        storedState = params;
+        return { ok: true };
+      }),
+    };
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    // Model the fast-turn race from capability.command: the accepted-command
+    // checkpoint snapshots `running`, then turn_done snapshots `idle`. If the
+    // consumer is allowed to complete those full-row writes out of order, the
+    // delayed receipt write can restore the durable row to stale `running`.
+    holdNextPersist = true;
+    const rememberReceipt = mgr.rememberCommandReceipt(runId, "cmd-fast", "a".repeat(64));
+    const markIdle = mgr.setStatus(runId, "idle");
+    await heldPersistStarted;
+    releaseHeldPersist();
+    await Promise.all([rememberReceipt, markIdle]);
+
+    expect(storedState).toMatchObject({
+      run_id: runId,
+      status: "idle",
+      checkpoint: { command_receipts: [{ id: "cmd-fast", digest: "a".repeat(64) }] },
+    });
+  });
+
+  it("rolls back a command receipt whose durable checkpoint failed", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+    be.failPersist = true;
+
+    await expect(mgr.rememberCommandReceipt(runId, "cmd-1", "a".repeat(64))).rejects.toThrow("ws down");
+    expect(mgr.commandReceipt(runId, "cmd-1")).toBeUndefined();
+  });
+
   it("fails closed when the installed input revision cannot be checkpointed", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
@@ -144,6 +257,37 @@ describe("CapabilityRunManager", () => {
     await mgr.endRun(runId, "done");
     expect(mgr.get(runId)).toBeUndefined();
     expect(be.persists().at(-1)?.params).toMatchObject({ run_id: runId, status: "done" });
+  });
+
+  it("persists a structured terminal failure in the opaque checkpoint", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.endRun(runId, "failed", {
+      code: "model_turn_stalled",
+      stage: "model_turn",
+      attempts: 4,
+      idle_s: 90.2,
+      bound_s: 90,
+      tool_pending: false,
+      last_sdk_message: "query",
+    });
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      run_id: runId,
+      status: "failed",
+      checkpoint: {
+        failure: {
+          code: "model_turn_stalled",
+          stage: "model_turn",
+          attempts: 4,
+          idle_s: 90.2,
+          bound_s: 90,
+          tool_pending: false,
+          last_sdk_message: "query",
+        },
+      },
+    });
   });
 
   it("recover rebuilds the in-memory map from the consumer's active runs", async () => {

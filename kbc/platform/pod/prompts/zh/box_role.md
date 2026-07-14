@@ -5,7 +5,7 @@
 - `candidate/` 存候选知识库页面 —— **这是你唯一的产出**,含一个 `candidate/index.md` 列出各页。没有 bundle/,不打包、不"提交":负责人审阅后会自行一键发布成版本。
 - `eval/` 存发布前测试。
 
-**编译 brief(定调)**:系统可能把负责人的结构化 brief 写进 `authoring/BRIEF.json`,你**读它、不用写它**。当前 typed 记录格式为 `{schema_version:1,source:"authoring_command",audience,depth,redaction,content_locale,note}`；稳定值包括 `audience=internal-eng|frontline|external|newcomer`、`depth=full|concise`、`redaction=none|external`，`content_locale` 是 BCP-47 风格语言标识或 `auto`。旧工作区也可能保留 `{source,audience,styles,custom,raw}`，两种都要遵守。见到 brief 就:①据它更新 `authoring/INTENT.md`，把受众、详略、产物语言、脱敏和补充说明落成明确方针;②整份编译的取舍都遵循它。brief 是**意向层**指引、不是硬事实:与 `raw/` 冲突时以事实为准并落存疑工单。没带 brief 就照常按对话对齐。
+**编译 brief(定调)**:系统可能把负责人的结构化 brief 写进 `authoring/BRIEF.json`,你**读它、不用写它**。当前 typed 记录格式为 `{schema_version:1,source:"authoring_command",intent,audience,depth,redaction,content_locale,note}`。稳定 `intent` 取值为 `understand`（优先组织概念、原理与关系）、`execute`（优先组织步骤、条件与检查项）、`troubleshoot`（优先组织症状、证据、诊断与处理）；其他稳定值包括 `audience=internal-eng|frontline|external|newcomer`、`depth=full|concise`、`redaction=none|external`，`content_locale` 是 BCP-47 风格语言标识或 `auto`。旧工作区也可能保留 `{source,audience,styles,custom,raw}`，两种都要遵守。见到 brief 就:①据它更新 `authoring/INTENT.md`，把目标、受众、详略、产物语言、脱敏和补充说明落成明确方针;②整份编译的取舍都遵循它。brief 是**意向层**指引、不是硬事实:与 `raw/` 冲突时以事实为准并落存疑工单。没带 brief 就照常按对话对齐。
 
 你按两个阶段工作,**先 Plan、负责人批准后才 Execute**:
 

@@ -75,6 +75,42 @@ describe("materializeCapabilityInputs", () => {
     expect(result.inputRevision).toBe("manifest-1");
   });
 
+  it("rejects a consumer response for a different pinned revision before installing sources", async () => {
+    const { client, backend, posts } = fakes({
+      raw: { bundle_base64: "UkFX", input_revision: "manifest-2" },
+    });
+
+    await expect(materializeCapabilityInputs({
+      client,
+      backend,
+      runId: "r1",
+      inputRevision: "manifest-1",
+    })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-fetch",
+      message: expect.stringContaining("input revision mismatch"),
+    });
+    expect(posts).toEqual([]);
+  });
+
+  it("rejects a pinned revision with no source bundle instead of starting empty", async () => {
+    const { client, backend, posts } = fakes({
+      raw: { input_revision: "manifest-1" },
+    });
+
+    await expect(materializeCapabilityInputs({
+      client,
+      backend,
+      runId: "r1",
+      inputRevision: "manifest-1",
+    })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-fetch",
+      message: expect.stringContaining("returned no source bundle"),
+    });
+    expect(posts).toEqual([]);
+  });
+
   it("live box (409 on /sources): never touches the workspace", async () => {
     const { client, backend, posts } = fakes({
       raw: { bundle_base64: "UkFX", input_revision: "current-but-not-installed" },

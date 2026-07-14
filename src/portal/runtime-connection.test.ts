@@ -88,6 +88,28 @@ describe("RuntimeConnectionMap", () => {
     expect(result).toEqual({ ok: true, payload: "pong", error: undefined });
   });
 
+  it("sendCommand retains structured Runtime errors alongside the legacy message", async () => {
+    map = freshMap();
+    const ws = fakeWs();
+    map.register("agent-structured", ws);
+
+    const promise = map.sendCommand("agent-structured", "capability.command", {});
+    const frame = JSON.parse(ws._sent[0]);
+    ws.emit("message", JSON.stringify({
+      type: "res",
+      id: frame.id,
+      ok: false,
+      error: { code: "CONFLICT", message: "command conflict", retriable: false, status: 409 },
+    }));
+
+    await expect(promise).resolves.toEqual({
+      ok: false,
+      payload: undefined,
+      error: "command conflict",
+      errorDetail: { code: "CONFLICT", message: "command conflict", retriable: false, status: 409 },
+    });
+  });
+
   it("sendCommand returns error when agent not connected", async () => {
     map = freshMap();
     const result = await map.sendCommand("no-such-agent", "ping", {});

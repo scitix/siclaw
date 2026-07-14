@@ -54,7 +54,7 @@ import {
   type RpcHandler,
   type RpcContext,
 } from "./ws-protocol.js";
-import { ErrorCodes, wrapError } from "../lib/error-envelope.js";
+import { ErrorCodes, RpcResponseError, wrapError } from "../lib/error-envelope.js";
 import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
 import { type CredentialService } from "./credential-service.js";
 import { CertificateManager, type CertificateIdentity } from "./security/cert-manager.js";
@@ -86,6 +86,21 @@ import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
+
+function stablePayloadDigest(value: unknown): string {
+  const canonicalize = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(canonicalize);
+    if (input && typeof input === "object") {
+      return Object.fromEntries(
+        Object.entries(input as Record<string, unknown>)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, child]) => [key, canonicalize(child)]),
+      );
+    }
+    return input;
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
+}
 
 export interface RuntimeServer {
   httpServer: http.Server;
@@ -588,6 +603,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     getBoxProfile(profile);
     const orgId = req.org_id;
     const instruction = req.input?.instruction as string | undefined;
+    let inputRevision: string | undefined;
+    if (req.input_revision !== undefined) {
+      if (typeof req.input_revision !== "string" || !req.input_revision.trim()) {
+        throw new Error("input_revision must be a non-empty string");
+      }
+      inputRevision = req.input_revision.trim();
+    }
     // siclaw mints the runId (the run is siclaw-owned). Initial status follows
     // the instruction: a kickoff instruction drives an immediate turn (running);
     // an instruction-less start (chat arrives via capability.message right
@@ -598,6 +620,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         profile,
         orgId: orgId ?? "",
         correlationId: req.correlation_id,
+        inputRevision,
         initialStatus: instruction && instruction.trim() ? "running" : "idle",
       });
       startedRunId = rec.runId;
@@ -618,8 +641,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const req = params as unknown as CapabilityMessageRequest;
     const runId = req.run_id;
     const message = req.message;
+    const messageId = req.message_id?.trim();
     if (!runId) throw new Error("run_id is required");
     if (!message) throw new Error("message is required");
+    if (messageId && messageId.length > 128) throw new Error("message_id must be at most 128 characters");
     // The run record is the authority for the box's profile/org. A run missing
     // from memory is first re-adopted from the consumer's store (heals a boot
     // recovery that raced the consumer); only a run the STORE doesn't know (or
@@ -630,14 +655,33 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // A terminal record can linger in memory while its final persist retries
     // (flushTerminal) — it is just as unaddressable as an unknown run.
     if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
+    if (messageId && capabilityRunManager.hasMessageId(runId, messageId)) {
+      return { ok: true, run_id: runId, duplicate: true };
+    }
     capabilityRunManager.touch(runId); // keep the watchdog off an actively-used run
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
-    await client.postJson(`/message/${runId}`, { message });
-    // The box is now working a turn: reflect it (turn_done flips back to idle).
-    // Keeps the consumer's view honest AND puts the run in the strict staleMs
-    // tier — a wedged turn must not enjoy the long idle TTL.
+    const previousStatus = rec.status;
+    // Publish running BEFORE the box can emit turn_done. Posting first allowed a
+    // fast turn_done→idle to land and then be overwritten by this handler's late
+    // running write, leaving an already-finished turn permanently busy.
     await capabilityRunManager.setStatus(runId, "running");
-    return { ok: true, run_id: runId };
+    let accepted: { duplicate?: boolean };
+    try {
+      accepted = await client.postJson<{ duplicate?: boolean }>(`/message/${runId}`, {
+        message,
+        ...(messageId ? { message_id: messageId } : {}),
+      });
+    } catch (err) {
+      // The box did not accept the turn. Restore the hosting run exactly; a
+      // terminal state that raced here remains sticky in setStatus().
+      await capabilityRunManager.setStatus(runId, previousStatus);
+      throw err;
+    }
+    // A box-level duplicate after runtime recovery has no future turn_done. Put
+    // the hosting run back exactly where it was before this replay.
+    if (accepted.duplicate) await capabilityRunManager.setStatus(runId, previousStatus);
+    if (messageId) await capabilityRunManager.rememberMessageId(runId, messageId);
+    return { ok: true, run_id: runId, duplicate: accepted.duplicate === true };
   });
 
   rpcMethods.set("capability.command", async (params) => {
@@ -646,6 +690,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const commandId = req.command_id?.trim();
     if (!runId) throw new Error("run_id is required");
     if (!commandId) throw new Error("command_id is required");
+    if (commandId.length > 128) throw new Error("command_id must be at most 128 characters");
     if (!req.command || typeof req.command !== "object") throw new Error("command is required");
     if (!Number.isInteger(req.command.version) || req.command.version < 1) throw new Error("command.version is required");
     if (!req.command.action?.trim()) throw new Error("command.action is required");
@@ -657,18 +702,43 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       throw new Error("command.parameters must be an object");
     }
 
+    const digest = stablePayloadDigest(req.command);
+
     const rec = capabilityRunManager.get(runId) ?? (await capabilityRunManager.adopt(runId));
     if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
+    const durableReceipt = capabilityRunManager.commandReceipt(runId, commandId);
+    if (durableReceipt) {
+      if (durableReceipt.digest !== digest) {
+        throw new RpcResponseError({
+          code: ErrorCodes.CONFLICT,
+          message: "command_id was already used with a different payload",
+          retriable: false,
+          status: 409,
+        });
+      }
+      return { ok: true, run_id: runId, command_id: commandId, duplicate: true };
+    }
     capabilityRunManager.touch(runId);
     const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
-    const accepted = await client.postJson<{ duplicate?: boolean }>(`/command/${runId}`, {
-      command_id: commandId,
-      command: req.command,
-    });
-    // A duplicate may arrive after the original turn already returned the run
-    // to idle. Marking that replay running would create a phantom in-flight turn
-    // with no future turn_done to clear it.
-    if (!accepted.duplicate) await capabilityRunManager.setStatus(runId, "running");
+    const previousStatus = rec.status;
+    // Publish running BEFORE the box can emit turn_done. A fast command can
+    // complete during postJson; no lifecycle write is allowed after a newly
+    // accepted POST or it could overwrite that turn_done→idle transition.
+    await capabilityRunManager.setStatus(runId, "running");
+    let accepted: { duplicate?: boolean };
+    try {
+      accepted = await client.postJson<{ duplicate?: boolean }>(`/command/${runId}`, {
+        command_id: commandId,
+        command: req.command,
+      });
+    } catch (err) {
+      await capabilityRunManager.setStatus(runId, previousStatus);
+      throw err;
+    }
+    // A box-level duplicate after runtime recovery has no future turn_done. Put
+    // the hosting run back exactly where it was before this replay.
+    if (accepted.duplicate) await capabilityRunManager.setStatus(runId, previousStatus);
+    await capabilityRunManager.rememberCommandReceipt(runId, commandId, digest);
     return { ok: true, run_id: runId, command_id: commandId, duplicate: accepted.duplicate === true };
   });
 

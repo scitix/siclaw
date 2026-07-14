@@ -1,11 +1,13 @@
 import { describe, it, expect } from "vitest";
 import {
   ErrorCodes,
+  RpcResponseError,
   errorBody,
   isErrorDetail,
   isErrorEnvelope,
   sseErrorFrame,
   wrapError,
+  wrapRpcError,
 } from "./error-envelope.js";
 
 describe("error-envelope", () => {
@@ -21,6 +23,33 @@ describe("error-envelope", () => {
       expect(isErrorDetail({ code: "X", retriable: true })).toBe(false);
       expect(isErrorDetail(null)).toBe(false);
       expect(isErrorDetail("string")).toBe(false);
+    });
+  });
+
+  describe("wrapRpcError", () => {
+    it("maps an HTTP 409 to a non-retriable conflict while retaining status", () => {
+      const err = Object.assign(new Error("command id conflict"), { status: 409 });
+      expect(wrapRpcError(err)).toEqual({
+        code: "CONFLICT",
+        message: "command id conflict",
+        retriable: false,
+        status: 409,
+      });
+    });
+
+    it("keeps a non-conflict status distinct and honors explicit metadata", () => {
+      const err = new RpcResponseError({
+        code: "BOX_STARTING",
+        message: "session is still starting",
+        retriable: true,
+        status: 503,
+      });
+      expect(wrapRpcError(err)).toEqual({
+        code: "BOX_STARTING",
+        message: "session is still starting",
+        retriable: true,
+        status: 503,
+      });
     });
   });
 
