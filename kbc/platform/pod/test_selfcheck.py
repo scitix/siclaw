@@ -290,10 +290,12 @@ def test_body_source_annotations():
         base = Path(td)
         first = "docs/MCP 工具与结果设计指南-70f5bd35.md"
         second = "docs/Skill Knowledge 指南.md"
+        report_pdf = "docs/性能报告.pdf"
         punctuated = "docs/上线方案（终版）、GPU 调度，修订；v2.md"
         ascii_punctuated = "docs/Release (final), GPU scheduling; v2.md"
         _mk(base, f"raw/{first}")
         _mk(base, f"raw/{second}")
+        _mk(base, f"raw/{report_pdf}")
         _mk(base, f"raw/{punctuated}")
         _mk(base, f"raw/{ascii_punctuated}")
         _mk(base, "candidate/index.md",
@@ -302,7 +304,7 @@ def test_body_source_annotations():
         def write_page(body: str) -> None:
             _mk(base, "candidate/guide.md",
                 "---\ntype: Guide\ntitle: Guide\ncompiled_from:\n"
-                f"  - {first}\n  - {second}\n  - {punctuated}\n"
+                f"  - {first}\n  - {second}\n  - {report_pdf}\n  - {punctuated}\n"
                 f"  - {ascii_punctuated}\n---\n{body}")
 
         combined = ("(source: MCP 工具与结果设计指南-70f5bd35.md, "
@@ -332,6 +334,19 @@ def test_body_source_annotations():
         report = selfcheck.run_layer1(td)
         assert report["lint"]["ok"], report["lint"]
 
+        # A locator may follow a complete filename directly after whitespace.
+        # This is the natural form emitted by agents and documented by the
+        # provenance contract; it must not require an artificial comma.
+        write_page(
+            f"正文。(source: {Path(first).name} §3)\n"
+            f"More. (source: {Path(report_pdf).name} p.12)\n"
+            f"更多。（来源: {Path(punctuated).name} 第3节）\n"
+            f"Combined. (source: {Path(first).name} §3, "
+            f"{Path(report_pdf).name} lines 10-12)"
+        )
+        report = selfcheck.run_layer1(td)
+        assert report["coverage"]["closed"] and report["lint"]["ok"], report
+
         write_page("正文。"
                    "(source: MCP 工具与结果设计指南-70f5bd35.md, "
                    "Skill Knowledge 指南.md, §3)")
@@ -345,12 +360,25 @@ def test_body_source_annotations():
         assert len(body_violations) == 1, report["lint"]
         assert "Missing Imported Guide.md" in body_violations[0]["detail"], body_violations
 
+        # A locator does not make an unknown file valid: recognize the complete
+        # filename, then let the existing provenance gate report it as uncited.
+        write_page("正文。(source: Missing Imported Guide.md lines 10-12)")
+        report = selfcheck.run_layer1(td)
+        kinds = [v["kind"] for v in report["lint"]["violations"]]
+        assert kinds.count("body_source_uncited") == 1, report["lint"]
+        assert "body_source_malformed" not in kinds, report["lint"]
+
         write_page("正文。(source: MCP 工具与结果设计指南-70f5bd35)")
         report = selfcheck.run_layer1(td)
         body_violations = [v for v in report["lint"]["violations"]
                            if v["kind"] == "body_source_malformed"]
         assert len(body_violations) == 1, report["lint"]
         assert "完整文件名和扩展名" in body_violations[0]["detail"], body_violations
+
+        write_page(f"正文。(source: {Path(first).name} arbitrary prose)")
+        report = selfcheck.run_layer1(td)
+        assert any(v["kind"] == "body_source_malformed"
+                   for v in report["lint"]["violations"]), report["lint"]
     print("OK  body source annotations (spaces / combined / locator / unknown / missing extension)")
 
 
