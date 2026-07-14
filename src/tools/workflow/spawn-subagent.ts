@@ -62,7 +62,7 @@ function itemToText(item: string | Record<string, string>): string {
   return typeof item === "string" ? item : JSON.stringify(item);
 }
 
-function buildDescription(groupEnabled: boolean): string {
+function buildDescription(groupEnabled: boolean, backgroundAllowed: boolean): string {
   const lines = listSubagentTypes().map((t) => `- ${t.agentType}: ${t.whenToUse}`);
   // Rollback (SICLAW_SUBAGENT_GROUP_ENABLED=false): the tool is single-task only, so DON'T teach the
   // batch pattern the tool would then reject — describe the single spawn and point at N separate calls.
@@ -107,17 +107,19 @@ function buildDescription(groupEnabled: boolean): string {
     "{{item}}; omit task_template only when each string item is already a complete prompt. Items must be " +
     "homogeneous — all strings or all objects. Never delegate understanding — give concrete targets, paths, " +
     "and what to check, not 'based on your findings, decide X'.\n\n" +
-    "Foreground vs background: a SINGLE item runs FOREGROUND by default (blocks and returns the result " +
-    "inline so you can keep reasoning); a MULTI-item batch runs in the BACKGROUND by default (it can take " +
-    "10+ minutes, so it launches detached and a completion notification carrying the result arrives on its " +
-    "own)." +
-    (RUN_IN_BACKGROUND_ENABLED
-      ? " Override with run_in_background: set true to detach a single task, or false to block on a small " +
+    (backgroundAllowed
+      ? "Foreground vs background: a SINGLE item runs FOREGROUND by default (blocks and returns the result " +
+        "inline so you can keep reasoning); a MULTI-item batch runs in the BACKGROUND by default (it can take " +
+        "10+ minutes, so it launches detached and a completion notification carrying the result arrives on its " +
+        "own). Override with run_in_background: set true to detach a single task, or false to block on a small " +
         "batch whose result you need inline right now. After a BACKGROUND launch, just END YOUR TURN (or do " +
         "other independent work) — never poll it, never spawn another sub-agent to 'wait for' it, and never " +
         "fabricate its result; report to the user only when the notification arrives. Returns a job_id you " +
         "can pass to job_stop to cancel."
-      : "") +
+      : "Every launch runs FOREGROUND: the call BLOCKS until all items (and the reduce, if any) finish, then " +
+        "returns the results inline. This surface has no detached delivery, so you MUST fold the findings into " +
+        "your reply THIS turn — never tell the user you'll 'report back later'. A large batch can take minutes; " +
+        "that is expected — keep the turn open until it returns.") +
     "\n\nAvailable subagent_type values (shared by every map + reduce child):\n" +
     lines.join("\n")
   );
@@ -127,12 +129,16 @@ export function createSpawnSubagentTool(
   refs: ToolRefs,
   executor = refs.spawnSubagentExecutor,
 ): ToolDefinition {
+  // Background (detached) delegation is allowed only when the global switch is on AND this entry
+  // point can receive an async conclusion. On channel/a2a/api/cron (foregroundSubagentOnly) every
+  // launch runs foreground so the turn carries the real answer. run_in_background exec is separate.
+  const backgroundAllowed = RUN_IN_BACKGROUND_ENABLED && !refs.foregroundSubagentOnly;
   return {
     name: "spawn_subagent",
     label: "Spawn Sub-agent",
     renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("spawn_subagent")), 0, 0),
     renderResult: renderTextResult,
-    description: buildDescription(isSubagentGroupEnabled()),
+    description: buildDescription(isSubagentGroupEnabled(), backgroundAllowed),
     parameters: Type.Object({
       description: Type.String({ description: "Short (3-5 word) label for the task or batch." }),
       task_template: Type.Optional(
@@ -169,7 +175,7 @@ export function createSpawnSubagentTool(
       // (see the runInBackground resolution below), so every launch runs FOREGROUND — this overrides
       // the conditional default rather than preserving it. Foreground batches still work; only
       // detached/background launches are unavailable until the notification chain lands.
-      ...(RUN_IN_BACKGROUND_ENABLED
+      ...(backgroundAllowed
         ? {
             run_in_background: Type.Optional(
               Type.Boolean({
@@ -225,7 +231,7 @@ export function createSpawnSubagentTool(
       // Conditional default (design §"Tool layer (single entry)"): a single item runs foreground (grab the result and
       // keep reasoning), a multi-item batch runs background (asymmetric harm — each side fits its own
       // failure mode). An explicit run_in_background always wins; the flag is force-false while gated.
-      const runInBackground = RUN_IN_BACKGROUND_ENABLED
+      const runInBackground = backgroundAllowed
         ? (p.run_in_background ?? plan.tasks.length > 1)
         : false;
 

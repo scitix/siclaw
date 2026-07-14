@@ -1336,6 +1336,37 @@ describe("handleLarkMessage — streaming card flow", () => {
     clearBackgroundChannelDelivery(sessionId);
   });
 
+  it("surfaces foreground sub-agent progress (tool_execution_update) as a live card step", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-fg-progress" });
+    streamEventsMock.mockImplementation(async function* () {
+      // Group progress carries structured details.items; the card localizes it (tool text is
+      // hard-coded English, so we render N/M from items in the channel locale).
+      yield {
+        type: "tool_execution_update",
+        toolCallId: "t1",
+        partialResult: {
+          content: [{ type: "text", text: "Running sub-agents… 2/3 done" }],
+          details: { phase: "map", items: [{ status: "done" }, { status: "done" }, { status: "running" }] },
+        },
+      };
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "统一结论：GPFS 抖动。" }] },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(makeTextEvent("排查"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls.map((c: any) => c[0].data.content as string);
+    // Localized (zh-CN default) progress step, computed from items (2 done / 3 total).
+    expect(contentCalls.some((c) => c.includes("子任务执行中") && c.includes("2/3") && c.includes("⏳"))).toBe(true);
+    // Not the raw English activity text.
+    expect(contentCalls.some((c) => c.includes("Running sub-agents"))).toBe(false);
+    expect(contentCalls.at(-1)).toContain("统一结论");
+  });
+
   it("shows only the latest step on the card and replaces it with the conclusion on finalize", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-explicit-channel" });
@@ -1929,9 +1960,9 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(JSON.parse(replyArg.data.content).text).toBe("答复");
   });
 
-  it("shows an error message in the card when the agent throws", async () => {
+  it("shows a sanitized error notice (never the raw error) when the agent throws", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
-    promptMock.mockRejectedValue(new Error("AgentBox unreachable"));
+    promptMock.mockRejectedValue(new Error("AgentBox unreachable https://agentbox-internal:8443"));
     const lark = makeCardAwareLarkClient();
 
     await handleLarkMessage(
@@ -1945,8 +1976,80 @@ describe("handleLarkMessage — streaming card flow", () => {
 
     expect(lark.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(1);
     const contentText = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
-    expect(contentText).toContain("\u274C");
-    expect(contentText).toContain("AgentBox unreachable");
+    expect(contentText).toContain("\u5904\u7406\u65F6\u51FA\u9519\u4E86");
+    // Raw error / internal endpoint must NOT leak to the chat.
+    expect(contentText).not.toContain("AgentBox unreachable");
+    expect(contentText).not.toContain("agentbox-internal");
+  });
+
+  it("retries a 409 then succeeds \u2014 never surfaces the raw 409", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    const busy = Object.assign(new Error('AgentBox request failed: 409 {"error":"Session is already running."}'), { status: 409 });
+    promptMock.mockRejectedValueOnce(busy).mockResolvedValueOnce({ sessionId: "s-retry" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "\u7ED3\u8BBA\u597D\u4E86" }] } };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(makeTextEvent("\u7ED3\u8BBA\u662F\u5565"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    expect(promptMock).toHaveBeenCalledTimes(2); // one 409, one success
+    const last = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)?.[0].data.content ?? "";
+    expect(last).toContain("\u7ED3\u8BBA\u597D\u4E86");
+    expect(last).not.toContain("409");
+  });
+
+  it("shows a friendly busy notice when 409 persists past the retry window", async () => {
+    vi.useFakeTimers();
+    try {
+      resolveBindingMock.mockResolvedValue(makeBinding());
+      const busy = Object.assign(new Error('AgentBox request failed: 409 {"error":"Session is already running."}'), { status: 409 });
+      promptMock.mockRejectedValue(busy); // always busy \u2192 retry window elapses
+      const lark = makeCardAwareLarkClient();
+
+      const p = handleLarkMessage(makeTextEvent("\u7ED3\u8BBA\u662F\u5565"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+      await vi.runAllTimersAsync(); // fast-forward the backoff until the retry cap is hit
+      await p;
+
+      const contentText = lark.cardkit.v1.cardElement.content.mock.calls.at(-1)?.[0].data.content ?? "";
+      expect(contentText).toContain("\u8FD8\u5728\u5904\u7406\u4E0A\u4E00\u6761");
+      expect(contentText).not.toContain("409");
+      expect(contentText).not.toContain("already running");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still sends the busy notice via text reply when CardKit creation fails + 409 persists", async () => {
+    vi.useFakeTimers();
+    try {
+      resolveBindingMock.mockResolvedValue(makeBinding());
+      const busy = Object.assign(new Error('AgentBox request failed: 409 {"error":"Session is already running."}'), { status: 409 });
+      promptMock.mockRejectedValue(busy);
+      // CardKit create returns no card_id \u2192 openTypingCard yields null cardSession \u2192 the reply
+      // must fall through to a plain-text busy notice (regression: sessionBusy was missing from
+      // the fallback condition, so nothing was sent).
+      const lark = {
+        im: { image: { create: vi.fn() }, message: { reply: vi.fn().mockResolvedValue({}) } },
+        cardkit: {
+          v1: {
+            card: { create: vi.fn().mockResolvedValue({ data: {} }), settings: vi.fn().mockResolvedValue({ code: 0 }) },
+            cardElement: { content: vi.fn().mockResolvedValue({ code: 0 }) },
+          },
+        },
+      };
+
+      const p = handleLarkMessage(makeTextEvent("\u7ED3\u8BBA\u662F\u5565"), lark as any, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+      await vi.runAllTimersAsync();
+      await p;
+
+      expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+      const replyText = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text as string;
+      expect(replyText).toContain("\u8FD8\u5728\u5904\u7406\u4E0A\u4E00\u6761");
+      expect(replyText).not.toContain("409");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders English placeholder when the channel domain is 'lark' (global)", async () => {
