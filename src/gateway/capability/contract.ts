@@ -42,6 +42,7 @@ export const CAPABILITY_CANCEL = "capability.cancel" as const;
 export const CAPABILITY_TEST_START = "capability.testStart" as const;
 export const CAPABILITY_TEST_MESSAGE = "capability.testMessage" as const;
 export const CAPABILITY_TEST_CLOSE = "capability.testClose" as const;
+export const CAPABILITY_TEST_RECOMMEND = "capability.testRecommend" as const;
 
 /** siclaw → consumer: live stream + content sink + input fetch. */
 export const CAPABILITY_EVENT = "capability.event" as const;
@@ -197,6 +198,23 @@ export interface CapabilityTestMessageRequest {
 export interface CapabilityTestCloseRequest {
   run_id: string;
   test_session_id: string;
+}
+
+/**
+ * Explicit, owner-triggered red-team authoring of one regression test.
+ * This is deliberately separate from compilation: the one-shot session can
+ * read raw/ and candidate/ but cannot mutate either tree. The reference answer
+ * is returned to the control plane and is never sent to the blind test consumer.
+ */
+export interface CapabilityTestRecommendRequest {
+  run_id: string;
+}
+
+export interface CapabilityTestRecommendResponse {
+  run_id: string;
+  question: string;
+  reference_answer: string;
+  evidence_paths: string[];
 }
 
 // ---- siclaw → consumer ----

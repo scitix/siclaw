@@ -37,6 +37,8 @@ import type {
   CapabilityStartRequest,
   CapabilityStartResponse,
   CapabilityTestCloseRequest,
+  CapabilityTestRecommendRequest,
+  CapabilityTestRecommendResponse,
   CapabilityTestMessageRequest,
   CapabilityTestStartRequest,
   CapabilityTestStartResponse,
@@ -824,6 +826,27 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // session (test sessions are disposable; there is nothing to resume).
     await client.postJson(`/test-message/${req.test_session_id}`, { message: req.message });
     return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id };
+  });
+
+  rpcMethods.set("capability.testRecommend", async (params) => {
+    const req = params as unknown as CapabilityTestRecommendRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    const rec = capabilityRunManager.get(req.run_id) ?? (await capabilityRunManager.adopt(req.run_id));
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${req.run_id}`);
+    capabilityRunManager.touch(req.run_id);
+    const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
+    const recommended = await client.postJson<{
+      question: string;
+      reference_answer: string;
+      evidence_paths: string[];
+    }>(`/test-recommendation/${req.run_id}`, {}, 210_000);
+    const response: CapabilityTestRecommendResponse = {
+      run_id: req.run_id,
+      question: recommended.question,
+      reference_answer: recommended.reference_answer,
+      evidence_paths: recommended.evidence_paths,
+    };
+    return response;
   });
 
   rpcMethods.set("capability.testClose", async (params) => {
