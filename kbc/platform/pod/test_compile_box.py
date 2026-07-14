@@ -2056,6 +2056,136 @@ def test_pr382_review_fixes():
     print("✓ pr382 review fixes (brief guard/cap/first-wins, atomic write, id parity vector)")
 
 
+async def test_typed_authoring_commands():
+    """Machine action is stable across locales; text is renderer output only."""
+    class QueryClient:
+        def __init__(self):
+            self.queries = []
+
+        async def query(self, text):
+            self.queries.append(text)
+
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        for run_id, locale, expected in [
+            ("cmd-en", "en", "Start the initial full compilation now"),
+            ("cmd-zh", "zh", "立即开始首次全量编译"),
+        ]:
+            td = tempfile.TemporaryDirectory()
+            run = compile_box.CompileRun(run_id, td.name, 1)
+            run.locale = locale
+            run.client = QueryClient()
+            run.connected.set()
+            compile_box.RUNS[run_id] = run
+            body = {
+                "command_id": f"op-{locale}",
+                "command": {
+                    "version": 1,
+                    "action": "compile.generate",
+                    "operation_id": f"op-{locale}",
+                    "generation": 1,
+                    "parameters": {"brief": {
+                        "audience": "internal-eng",
+                        "depth": "full",
+                        "redaction": "none",
+                        "content_locale": "auto",
+                        "note": "keep examples",
+                    }},
+                },
+            }
+            r = await client.post(f"/command/{run_id}", json=body)
+            assert r.status == 200, await r.text()
+            payload = await r.json()
+            assert payload["action"] == "compile.generate" and len(run.client.queries) == 1, payload
+            assert expected in run.client.queries[0], run.client.queries[0]
+            brief = json.loads((Path(td.name) / "authoring" / "BRIEF.json").read_text())
+            assert brief == {
+                "schema_version": 1,
+                "source": "authoring_command",
+                "audience": "internal-eng",
+                "depth": "full",
+                "redaction": "none",
+                "content_locale": "auto",
+                "note": "keep examples",
+            }, brief
+            # Idempotent retry never launches another turn.
+            r = await client.post(f"/command/{run_id}", json=body)
+            assert r.status == 200 and (await r.json())["duplicate"] is True
+            assert len(run.client.queries) == 1
+            # A distinct command cannot be acknowledged and silently dropped
+            # while another turn is active.
+            busy = json.loads(json.dumps(body))
+            busy["command_id"] = f"busy-{locale}"
+            r = await client.post(f"/command/{run_id}", json=busy)
+            assert r.status == 409 and len(run.client.queries) == 1, await r.text()
+            # A live run is pinned to one operation/generation context.
+            run._turn_active = False
+            other = json.loads(json.dumps(body))
+            other["command_id"] = "other-command"
+            other["command"]["operation_id"] = "other-operation"
+            r = await client.post(f"/command/{run_id}", json=other)
+            assert r.status == 409, await r.text()
+            td.cleanup()
+
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("cmd-bad-json", td, 1)
+            run.client = QueryClient()
+            run.connected.set()
+            compile_box.RUNS[run.run_id] = run
+            r = await client.post(
+                f"/command/{run.run_id}",
+                data="{oops",
+                headers={"Content-Type": "application/json"},
+            )
+            assert r.status == 400, await r.text()
+            assert (await r.json())["error"] == "request body must be valid JSON"
+
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("cmd-guards", td, 1)
+            run.client = QueryClient()
+            run.connected.set()
+            compile_box.RUNS[run.run_id] = run
+            base = {
+                "command_id": "guard-op",
+                "command": {
+                    "version": 1,
+                    "operation_id": "guard-op",
+                    "generation": 3,
+                    "parameters": {},
+                },
+            }
+            # Explicit incremental never degrades into a full compile.
+            incremental_body = json.loads(json.dumps(base))
+            incremental_body["command"]["action"] = "compile.incremental"
+            r = await client.post("/command/cmd-guards", json=incremental_body)
+            assert r.status == 409 and run.client.queries == [], await r.text()
+
+            # Approval binds to the exact proposed-plan bytes.
+            plan = Path(td) / "authoring" / "PROPOSED_PLAN.json"
+            plan.parent.mkdir(parents=True, exist_ok=True)
+            plan.write_text('{"text":"plan A"}\n')
+            approval = json.loads(json.dumps(base))
+            approval["command_id"] = "approve-op"
+            approval["command"]["action"] = "compile.approve_plan"
+            approval["command"]["parameters"] = {"plan_id": "0" * 64}
+            r = await client.post("/command/cmd-guards", json=approval)
+            assert r.status == 409 and run.client.queries == [], await r.text()
+
+        bad = {"command_id": "x", "command": {"version": 1, "action": "编译一下", "operation_id": "x", "generation": 1}}
+        run = compile_box.CompileRun("cmd-bad", tempfile.mkdtemp(), 1)
+        run.client = QueryClient()
+        run.connected.set()
+        compile_box.RUNS[run.run_id] = run
+        r = await client.post("/command/cmd-bad", json=bad)
+        assert r.status == 400 and run.client.queries == [], await r.text()
+        print("✓ typed authoring commands (locale-independent action, brief, idempotency, fencing, stale-plan/incremental guards)")
+    finally:
+        compile_box.RUNS.clear()
+        await client.close()
+
+
 async def main():
     # PK never fires in these wiring tests — a qualifying fixture must not spawn
     # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
@@ -2103,6 +2233,7 @@ async def main():
     await test_model_rate_limit_exhausts_gracefully()
     await test_shutdown_flush_syncs_active_runs()
     test_pr382_review_fixes()
+    await test_typed_authoring_commands()
 
     compile_box._COMPILE_IMPL = fake_driver
     compile_box.RUNS.clear()
