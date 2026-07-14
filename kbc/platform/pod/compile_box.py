@@ -275,6 +275,12 @@ class CompileRun:
         # loop; reset to 0 whenever the check passes).
         self._selfcheck_key: str | None = None
         self._l1_repairs_used = 0
+        # Candidate/exclusion state captured immediately before each model
+        # turn. A conversational turn that leaves this state byte-identical is
+        # not a migration trigger for an inherited legacy draft. Compile,
+        # incremental, and repair turns still force the post-turn gate below.
+        self._turn_selfcheck_key: str | None = None
+        self._l1_repair_pending = False
         # Batch mode (DESIGN-kb-batch-compile-2026-07-05): when the orchestrator
         # drives per-batch sessions, ResultMessage must NOT emit turn_done (the
         # whole batch run is ONE turn to the consumer); the flushed reply is parked
@@ -337,6 +343,7 @@ class CompileRun:
     def _begin_turn(self, directive: str):
         """Arm the stall watchdog for a new model turn. Called for every turn —
         the owner's /message AND internal self-check/verify/batch injections."""
+        self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
         self._last_directive = directive
         self._turn_active = True
         self._tool_pending = False
@@ -1603,12 +1610,27 @@ async def _post_turn_selfcheck(run) -> str | None:
     workdir = getattr(run, "workdir", None)
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
+    turn_start_key = getattr(run, "_turn_selfcheck_key", None)
+    run._turn_selfcheck_key = None
+    l1_repair_turn = getattr(run, "_l1_repair_pending", False)
+    run._l1_repair_pending = False
     # Consume the scoped-incremental guard state once, whatever this turn's outcome
     # (a tree that didn't change → no violations possible → nothing to guard).
     # getattr: test doubles / non-incremental runs may not carry the attribute.
     incr = getattr(run, "_incr_pending", None)
     run._incr_pending = None
     key = selfcheck.state_key(workdir)
+    last_state = (selfcheck.read_selfcheck(workdir) or {}).get("state")
+    unchanged_this_turn = key is not None and turn_start_key is not None and key == turn_start_key
+    if (unchanged_this_turn and incr is None and not l1_repair_turn
+            and not getattr(run, "_full_compile_pending", False)
+            and not getattr(run, "_ledger_forced", False)
+            and last_state != "repairing"):
+        # A normal owner conversation may update intent/plan text, but if it
+        # did not touch candidate/ or EXCLUSIONS it must not conscript an old
+        # draft into the current OKF migration. A changed tree, explicit
+        # compile/incremental round, or unfinished repair still runs the gate.
+        return None
     unchanged = key is not None and key == run._selfcheck_key
     if unchanged:
         # A NO-OP repair turn must still reach the gate: the dedup early-return
@@ -1623,7 +1645,6 @@ async def _post_turn_selfcheck(run) -> str | None:
         # return here would leave whatever state the file last carried (or no
         # state at all) with the gate never re-run — recomputing heals the file
         # and spends the budget honestly (review).
-        last_state = (selfcheck.read_selfcheck(workdir) or {}).get("state")
         if last_state is not None and last_state != "repairing":
             return None
     elif incr is None:
@@ -1726,6 +1747,7 @@ async def _post_turn_selfcheck(run) -> str | None:
             pass  # ticket filing must never break the turn seam (fail-open, §4.5)
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
+        run._l1_repair_pending = True
         if incr:
             # Re-arm the byte-integrity guard for the repair turn itself —
             # for ANY incremental turn entering repair, not only one that
@@ -1828,6 +1850,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 # snapshot and restore over the owner's edits (review finding).
                 run._incr_pending = None
                 run._full_compile_pending = False
+                run._l1_repair_pending = False
                 msg = (f"Self-check repair injection failed: {e!r}"
                        if selfcheck._is_en(getattr(run, "locale", None))
                        else f"自检回修注入失败: {e!r}")

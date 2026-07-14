@@ -1533,6 +1533,7 @@ async def test_noop_repair_turn_reaches_the_gate():
         sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc["state"] == "repairing", sc
         # the repair turn does NOTHING ledger-relevant (tree unchanged, key matches)
+        run._begin_turn(repair)
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is None, repair2
         sc2 = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
@@ -1541,6 +1542,51 @@ async def test_noop_repair_turn_reaches_the_gate():
         assert any(str(tk.get("id", "")).startswith("selfcheck-residual-") for tk in tickets), tickets
         del os.environ["KBC_L1_REPAIR_ROUNDS"]
     print("OK  no-op repair turn reaches the gate (unconverged + residual ticket, not silent)")
+
+
+async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
+    """An ordinary conversation over an inherited draft must not become an
+    implicit whole-library OKF migration merely because this is a fresh box.
+    Candidate changes and explicit full compiles still run the strict gate."""
+
+    def make_legacy_workspace(root: Path) -> None:
+        (root / "raw" / "snap").mkdir(parents=True)
+        (root / "candidate").mkdir()
+        (root / "authoring").mkdir()
+        (root / "raw" / "snap" / "one.md").write_text("source")
+        (root / "candidate" / "index.md").write_text("# Index\n- [Legacy](legacy.md)")
+        (root / "candidate" / "legacy.md").write_text(
+            "---\ntitle: Legacy\ncompiled_from:\n  - snap/one.md\n---\n# Legacy\nInherited body.\n"
+        )
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+
+        chat = base / "chat"
+        make_legacy_workspace(chat)
+        chat_run = compile_box.CompileRun("legacy-chat", str(chat), 1)
+        chat_run._begin_turn("Explain the current scope without editing the draft.")
+        assert await compile_box._post_turn_selfcheck(chat_run) is None
+        assert not (chat / "authoring" / "SELFCHECK.json").exists()
+
+        changed = base / "changed"
+        make_legacy_workspace(changed)
+        changed_run = compile_box.CompileRun("legacy-changed", str(changed), 1)
+        changed_run._begin_turn("Update the draft.")
+        page = changed / "candidate" / "legacy.md"
+        page.write_text(page.read_text() + "Changed this turn.\n")
+        changed_repair = await compile_box._post_turn_selfcheck(changed_run)
+        assert changed_repair is not None and "okf_type" in changed_repair, changed_repair
+
+        compile_wd = base / "compile"
+        make_legacy_workspace(compile_wd)
+        compile_run = compile_box.CompileRun("legacy-compile", str(compile_wd), 1)
+        compile_run._full_compile_pending = True
+        compile_run._begin_turn("Run an explicit full compile.")
+        compile_repair = await compile_box._post_turn_selfcheck(compile_run)
+        assert compile_repair is not None and "okf_type" in compile_repair, compile_repair
+
+    print("OK  unchanged owner chat skips legacy migration; changed/full turns stay strict")
 
 
 async def test_batch_final_ledger_check_requires_index():
@@ -2423,6 +2469,7 @@ async def main():
     await test_incremental_index_deletion_cannot_escape_guard()
     await test_incremental_arm_cleared_when_dispatch_fails()
     await test_noop_repair_turn_reaches_the_gate()
+    await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
     await test_batch_orchestrator_review_fixes()
