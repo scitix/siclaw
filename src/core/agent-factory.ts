@@ -403,6 +403,12 @@ export async function createSiclawSession(
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
+      // Channel (Feishu/DingTalk) is the one entry that BOTH exposes spawn_subagent (see its
+      // registration `modes`) AND has no persistent client to receive a detached conclusion —
+      // so a detached batch would strand its result. Force sub-agents foreground there. web/cli
+      // also have spawn_subagent but are persistent (keep background); a2a/api/task don't expose
+      // spawn_subagent at all, so they're unaffected either way. run_in_background exec untouched.
+      foregroundSubagentOnly: mode === "channel",
       jobStopExecutor: opts?.jobStopExecutor,
       backgroundExecExecutor: opts?.backgroundExecExecutor,
       taskOutputReader: opts?.taskOutputReader,
