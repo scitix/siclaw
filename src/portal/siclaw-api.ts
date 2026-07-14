@@ -2714,6 +2714,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       data: {
         id: row.id,
         agent_id: params.id,
+        name: row.name ?? null,
         domain: row.config.domain === "lark" ? "lark" : "feishu",
         app_id: row.config.app_id ?? "",
         access_mode: "open",

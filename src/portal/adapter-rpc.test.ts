@@ -1597,10 +1597,12 @@ describe("channel.resolveBinding", () => {
     expect(result).toEqual({ binding: null });
   });
 
-  it("open personal-bot auto-binds a group with a shared per-chat session", async () => {
-    mockQuery(
+  it("open personal-bot materializes a binding row + shared per-chat session on first service", async () => {
+    const query = mockQuery(
       [],                                                                  // selectChannelBinding → none
       [{ id: "ch1", created_by: "owner-1", config: JSON.stringify({ personal_bot: { agent_id: "a1", access_mode: "open" } }) }], // selectPersonalChannel
+      {},                                                                  // INSERT IGNORE channel_bindings (row materialized)
+      [{ id: "b-open", agent_id: "a1", route_type: "group", created_by: "owner-1" }], // reselect → the new row
       [],                                                                  // participant session lookup → none
       [],                                                                  // insert participant session
       [{ session_id: "chat-session" }],                                    // participant session reload
@@ -1609,9 +1611,20 @@ describe("channel.resolveBinding", () => {
     const result = await getHandler("channel.resolveBinding")(
       { channel_id: "ch1", route_key: "group-123", session_key: "open_id:ou_1", sender_open_id: "ou_1" }, "a1",
     );
+
+    // A channel_bindings row is inserted so the group is Portal-visible.
+    expect(query.mock.calls[2][0]).toContain("INTO channel_bindings");
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String), "ch1", "a1", "group-123", "owner-1",
+    ]);
+    // The session is keyed under the materialized row id, and that id is the
+    // binding id returned (not the channel id).
+    expect(query.mock.calls[5][1]).toEqual([
+      expect.any(String), "b-open", "chat:group-123", expect.any(String),
+    ]);
     expect(result.binding).toEqual({
       agentId: "a1",
-      bindingId: "ch1",
+      bindingId: "b-open",
       sessionId: "chat-session",
       sessionKey: "chat:group-123",
       createdBy: "owner-1",
@@ -1773,6 +1786,27 @@ describe("channel.updateBindingMeta", () => {
     // i.e. 510 UTF-16 units — and the last char is a whole emoji.
     expect([...stored]).toHaveLength(255);
     expect(stored.endsWith("😀")).toBe(true);
+  });
+});
+
+describe("channel.updateName", () => {
+  it("updates the channel name only when it differs", async () => {
+    const query = mockQuery({ affectedRows: 1 } as any);
+    const result = await getHandler("channel.updateName")(
+      { channel_id: "ch1", name: "寒彻的飞书 CLI" }, "a1",
+    );
+    expect(result).toEqual({ success: true });
+    expect(query.mock.calls[0][0]).toContain("UPDATE channels SET name");
+    // Guarded by `name != ?` so a restart with an unchanged name is a no-op write.
+    expect(query.mock.calls[0][0]).toContain("name != ?");
+    expect(query.mock.calls[0][1]).toEqual(["寒彻的飞书 CLI", "ch1", "寒彻的飞书 CLI"]);
+  });
+
+  it("rejects an empty name without touching the DB", async () => {
+    const query = mockQuery();
+    const result = await getHandler("channel.updateName")({ channel_id: "ch1", name: "   " }, "a1");
+    expect(result.success).toBe(false);
+    expect(query).not.toHaveBeenCalled();
   });
 });
 
@@ -1977,9 +2011,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 51 handlers", () => {
+  it("registers exactly 52 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(51);
+    expect(handlers.size).toBe(52);
   });
 
   it("all expected handler names are registered", () => {
@@ -1995,7 +2029,7 @@ describe("buildAdapterRpcHandlers", () => {
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",
       "channel.list", "channel.resolveBinding", "channel.pair", "channel.resetSession",
-      "channel.updateBindingMeta",
+      "channel.updateBindingMeta", "channel.updateName",
       "channel.resolvePersonalBinding", "channel.pairPersonal", "channel.resetPersonalSession",
       "agent.listForSkill", "agent.listForMcp", "agent.listForCluster", "agent.listForHost",
       "metrics.summary", "metrics.audit", "metrics.auditDetail",
