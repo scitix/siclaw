@@ -253,16 +253,22 @@ _WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)")
 _BODY_SOURCE_START_RE = re.compile(
     r"(?P<open>[（(])\s*(?:source|src|源|来源)\s*[:：]\s*", re.IGNORECASE,
 )
+_SOURCE_LOCATOR_PATTERN = (
+    r"(?:§\s*[\w.-]+|p(?:age)?\.?\s*\d+(?:\s*[-–]\s*\d+)?|"
+    r"lines?\s*\d+(?:\s*[-–]\s*\d+)?|第?\s*\d+\s*(?:页|行|节))"
+)
 _SOURCE_FILE_END_RE = re.compile(
     r"\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS))
-    + r")(?:`)?(?=\s*(?:[,，;；、]|$))",
+    + r")(?:`)?(?=(?:\s*(?:[,，;；、]|$)|\s+"
+    + _SOURCE_LOCATOR_PATTERN + r"\s*(?:[,，;；、]|$)))",
     re.IGNORECASE,
 )
-_SOURCE_LOCATOR_RE = re.compile(
-    r"(?:§\s*[\w.-]+|p(?:age)?\.?\s*\d+(?:\s*[-–]\s*\d+)?|"
-    r"lines?\s*\d+(?:\s*[-–]\s*\d+)?|第?\s*\d+\s*(?:页|行|节))",
+_SOURCE_LOCATOR_RE = re.compile(_SOURCE_LOCATOR_PATTERN, re.IGNORECASE)
+_SOURCE_LOCATOR_PREFIX_RE = re.compile(
+    r"\s+" + _SOURCE_LOCATOR_PATTERN + r"(?=\s*(?:[,，;；、]|$))",
     re.IGNORECASE,
 )
+_SOURCE_SEPARATOR_RE = re.compile(r"\s*[,，;；、]\s*")
 # OKF reserved routing pages: never provenance-required, never orphans. The
 # names are reserved at EVERY level of the bundle hierarchy, not just its root.
 _RESERVED_PAGE_NAMES = {"index.md", "log.md"}
@@ -603,13 +609,24 @@ def _body_source_references(text: str) -> tuple[list[str], list[str]]:
         capture_has_file = False
         capture_has_malformed = False
         cursor = 0
-        for match in _SOURCE_FILE_END_RE.finditer(captured):
+        while match := _SOURCE_FILE_END_RE.search(captured, cursor):
             item = captured[cursor:match.end()].strip(" \t\r\n,，;；、`")
             entry = _norm_source_entry(item)
             if entry and entry not in found:
                 found.append(entry)
             capture_has_file = capture_has_file or bool(entry)
             cursor = match.end()
+
+            # A locator belongs to the filename immediately before it, not to
+            # the next comma-separated filename. Consume it before advancing
+            # the item cursor so ``a.md §3, b.pdf p.5`` yields exactly two
+            # source paths while keeping punctuation inside filenames intact.
+            locator = _SOURCE_LOCATOR_PREFIX_RE.match(captured, cursor)
+            if locator:
+                cursor = locator.end()
+            separator = _SOURCE_SEPARATOR_RE.match(captured, cursor)
+            if separator:
+                cursor = separator.end()
         remainder = captured[cursor:].strip(" \t\r\n,，;；、")
         if remainder and not _SOURCE_LOCATOR_RE.fullmatch(remainder):
             if remainder not in malformed:

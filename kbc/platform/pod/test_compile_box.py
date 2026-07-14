@@ -1302,7 +1302,12 @@ async def test_incremental_grandfathers_untouched_format_debt():
         (wd / "candidate" / "index.md").write_text(legacy_index)
         (wd / "candidate" / "a.md").write_text(
             "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\nA")
-        legacy = "---\ntype: Topic\ncompiled_from:\n  - snap/two.md\n---\nSee [[a]]."
+        # This untouched page carries both legacy format debt and a valid
+        # filename-plus-locator citation. Neither may wedge an unrelated scoped
+        # edit, while the same citation would still be checked if its filename
+        # were absent from compiled_from.
+        legacy = ("---\ntype: Topic\ncompiled_from:\n  - snap/two.md\n---\n"
+                  "See [[a]]. (source: snap/two.md §3)")
         (wd / "candidate" / "b.md").write_text(legacy)
         cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
               "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
