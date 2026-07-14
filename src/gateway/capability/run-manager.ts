@@ -119,6 +119,11 @@ export class CapabilityRunManager {
   private runs = new Map<string, CapabilityRunRecord>();
   // runId → consecutive failed reap re-checks; cleared on a successful re-check.
   private reapDeferrals = new Map<string, number>();
+  // Full-state store writes for one run must land in mutation order. The
+  // consumer handles RPCs concurrently and replaces the whole row, so allowing
+  // two persists for the same run in flight can let an older status/checkpoint
+  // finish last and overwrite a newer one. Different runs remain independent.
+  private persistTails = new Map<string, Promise<void>>();
   private readonly now: () => number;
   private readonly staleMs: number;
   private readonly dataStaleMs: number;
@@ -624,13 +629,23 @@ export class CapabilityRunManager {
       session_ref: "",
       runtime_id: rec.runtimeId ?? "",
     };
+    const previous = this.persistTails.get(rec.runId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(async () => {
+      try {
+        await this.backend.request(CAPABILITY_PERSIST_RUN_STATE, state);
+      } catch (err) {
+        if (opts?.failFast) throw err;
+        console.warn(
+          `[capability] persistRunState(${rec.runId} → ${state.status}) failed (kept in memory; reconcile heals the store): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
+    this.persistTails.set(rec.runId, current);
     try {
-      await this.backend.request(CAPABILITY_PERSIST_RUN_STATE, state);
-    } catch (err) {
-      if (opts?.failFast) throw err;
-      console.warn(
-        `[capability] persistRunState(${rec.runId} → ${rec.status}) failed (kept in memory; reconcile heals the store): ${err instanceof Error ? err.message : String(err)}`,
-      );
+      await current;
+    } finally {
+      // A later write may already have replaced this tail while we awaited.
+      if (this.persistTails.get(rec.runId) === current) this.persistTails.delete(rec.runId);
     }
   }
 }

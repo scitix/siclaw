@@ -161,6 +161,46 @@ describe("CapabilityRunManager", () => {
     });
   });
 
+  it("keeps receipt and lifecycle persists ordered for the same run", async () => {
+    let storedState: any;
+    let holdNextPersist = false;
+    let releaseHeldPersist!: () => void;
+    let markHeldPersistStarted!: () => void;
+    const heldPersistReleased = new Promise<void>((resolve) => { releaseHeldPersist = resolve; });
+    const heldPersistStarted = new Promise<void>((resolve) => { markHeldPersistStarted = resolve; });
+    const be: RunStateBackend = {
+      request: vi.fn(async (method: string, params?: unknown) => {
+        if (method !== CAPABILITY_PERSIST_RUN_STATE) return { ok: true };
+        if (holdNextPersist) {
+          holdNextPersist = false;
+          markHeldPersistStarted();
+          await heldPersistReleased;
+        }
+        storedState = params;
+        return { ok: true };
+      }),
+    };
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    // Model the fast-turn race from capability.command: the accepted-command
+    // checkpoint snapshots `running`, then turn_done snapshots `idle`. If the
+    // consumer is allowed to complete those full-row writes out of order, the
+    // delayed receipt write can restore the durable row to stale `running`.
+    holdNextPersist = true;
+    const rememberReceipt = mgr.rememberCommandReceipt(runId, "cmd-fast", "a".repeat(64));
+    const markIdle = mgr.setStatus(runId, "idle");
+    await heldPersistStarted;
+    releaseHeldPersist();
+    await Promise.all([rememberReceipt, markIdle]);
+
+    expect(storedState).toMatchObject({
+      run_id: runId,
+      status: "idle",
+      checkpoint: { command_receipts: [{ id: "cmd-fast", digest: "a".repeat(64) }] },
+    });
+  });
+
   it("rolls back a command receipt whose durable checkpoint failed", async () => {
     const be = new FakeBackend();
     const mgr = new CapabilityRunManager(be);
