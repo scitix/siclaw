@@ -32,6 +32,7 @@ import { driveTestSession } from "./capability/test-relay.js";
 import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
+  CapabilityCommandRequest,
   CapabilityMessageRequest,
   CapabilityStartRequest,
   CapabilityStartResponse,
@@ -637,6 +638,38 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // tier — a wedged turn must not enjoy the long idle TTL.
     await capabilityRunManager.setStatus(runId, "running");
     return { ok: true, run_id: runId };
+  });
+
+  rpcMethods.set("capability.command", async (params) => {
+    const req = params as unknown as CapabilityCommandRequest;
+    const runId = req.run_id?.trim();
+    const commandId = req.command_id?.trim();
+    if (!runId) throw new Error("run_id is required");
+    if (!commandId) throw new Error("command_id is required");
+    if (!req.command || typeof req.command !== "object") throw new Error("command is required");
+    if (!Number.isInteger(req.command.version) || req.command.version < 1) throw new Error("command.version is required");
+    if (!req.command.action?.trim()) throw new Error("command.action is required");
+    if (!req.command.operation_id?.trim()) throw new Error("command.operation_id is required");
+    if (!Number.isInteger(req.command.generation) || req.command.generation < 1) {
+      throw new Error("command.generation must be a positive integer");
+    }
+    if (req.command.parameters !== undefined && (typeof req.command.parameters !== "object" || req.command.parameters === null || Array.isArray(req.command.parameters))) {
+      throw new Error("command.parameters must be an object");
+    }
+
+    const rec = capabilityRunManager.get(runId) ?? (await capabilityRunManager.adopt(runId));
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${runId}`);
+    capabilityRunManager.touch(runId);
+    const { client } = await ensureCapabilitySession(runId, rec.profile, rec.orgId || undefined, undefined);
+    const accepted = await client.postJson<{ duplicate?: boolean }>(`/command/${runId}`, {
+      command_id: commandId,
+      command: req.command,
+    });
+    // A duplicate may arrive after the original turn already returned the run
+    // to idle. Marking that replay running would create a phantom in-flight turn
+    // with no future turn_done to clear it.
+    if (!accepted.duplicate) await capabilityRunManager.setStatus(runId, "running");
+    return { ok: true, run_id: runId, command_id: commandId, duplicate: accepted.duplicate === true };
   });
 
   rpcMethods.set("capability.cancel", async (params) => {
