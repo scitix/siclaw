@@ -1285,8 +1285,9 @@ async def test_unconverged_files_residual_ticket():
 
 async def test_incremental_grandfathers_untouched_format_debt():
     """An ordinary scoped edit must not turn a legacy page into a migration
-    target. The same rule still blocks a new profile violation on an editable
-    page, so grandfathering cannot become a blanket lint bypass."""
+    target merely because it was authorized. The same rule still blocks a new
+    profile violation on a page actually changed this round, so grandfathering
+    cannot become a blanket lint bypass."""
     import incremental
     import selfcheck
 
@@ -1297,8 +1298,8 @@ async def test_incremental_grandfathers_untouched_format_debt():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
-        (wd / "candidate" / "index.md").write_text(
-            "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [b](b.md)")
+        legacy_index = "# Index\n- [a](a.md)\n- [b](b.md)"
+        (wd / "candidate" / "index.md").write_text(legacy_index)
         (wd / "candidate" / "a.md").write_text(
             "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\nA")
         legacy = "---\ntype: Topic\ncompiled_from:\n  - snap/two.md\n---\nSee [[a]]."
@@ -1323,14 +1324,18 @@ async def test_incremental_grandfathers_untouched_format_debt():
             "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\nA updated")
         repair = await compile_box._post_turn_selfcheck(run)
         assert repair is None, repair
+        assert (wd / "candidate" / "index.md").read_text() == legacy_index
         assert (wd / "candidate" / "b.md").read_text() == legacy
         sc = json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc["state"] == "passed" and sc["lint"]["ok"], sc
         inherited = sc["incremental"]
-        assert inherited["grandfathered_format_violation_count"] == 1, inherited
-        assert inherited["grandfathered_format_violations"][0]["page"] == "b.md", inherited
+        assert inherited["grandfathered_format_violation_count"] == 2, inherited
+        assert {v["page"] for v in inherited["grandfathered_format_violations"]} == {
+            "index.md", "b.md",
+        }, inherited
 
-        # A fresh wikilink on the authorized page is not inherited and blocks.
+        # A fresh wikilink on a page actually changed this round is not inherited
+        # and blocks, even though the untouched legacy index remains grandfathered.
         run._selfcheck_key = None
         arm(run)
         (wd / "candidate" / "a.md").write_text(
@@ -1340,7 +1345,7 @@ async def test_incremental_grandfathers_untouched_format_debt():
         sc2 = json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert any(v["page"] == "a.md" and v["kind"] == "siclaw_profile_wikilink"
                    for v in sc2["lint"]["violations"]), sc2
-    print("OK  incremental format baseline (untouched legacy debt grandfathered; editable violations block)")
+    print("OK  incremental format baseline (unchanged legacy debt grandfathered; changed violations block)")
 
 
 async def test_repair_turn_may_edit_ledger_target_pages():

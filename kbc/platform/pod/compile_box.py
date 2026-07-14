@@ -1768,10 +1768,11 @@ async def _post_turn_selfcheck(run) -> str | None:
     report = selfcheck.run_layer1(workdir)
     grandfathered_format: list[dict] = []
     if incr:
+        format_changed_pages = set(incremental.changed_pages(incr["before"], after))
         blocking, grandfathered_format = selfcheck.filter_incremental_format_violations(
             report["lint"]["violations"],
             incr.get("baseline_format_violations") or [],
-            editable,
+            format_changed_pages,
         )
         report["lint"] = {"ok": not blocking, "violations": blocking}
     if incr:

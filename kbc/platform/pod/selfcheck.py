@@ -511,13 +511,14 @@ def format_violation_keys(pages: dict[str, dict]) -> list[list[str]]:
 
 
 def filter_incremental_format_violations(
-    violations: list[dict], baseline_keys: list[list[str]], editable_pages: set[str],
+    violations: list[dict], baseline_keys: list[list[str]], changed_pages: set[str],
 ) -> tuple[list[dict], list[dict]]:
     """Separate blocking violations from inherited legacy format debt.
 
     Only a violation that already existed at incremental kickoff AND belongs to
-    a page outside the round's editable set is grandfathered. New violations,
-    new pages, and pages the round may edit remain hard failures.
+    a page unchanged this round is grandfathered. New violations and violations
+    on pages that actually changed remain hard failures; merely authorizing a
+    page must not turn an unrelated incremental edit into a format migration.
     """
     baseline = {(str(item[0]), str(item[1])) for item in baseline_keys
                 if isinstance(item, (list, tuple)) and len(item) == 2}
@@ -525,7 +526,7 @@ def filter_incremental_format_violations(
     inherited: list[dict] = []
     for violation in violations:
         key = (str(violation.get("page", "")), str(violation.get("kind", "")))
-        if key in baseline and key[0] not in editable_pages:
+        if key in baseline and key[0] not in changed_pages:
             inherited.append(violation)
         else:
             blocking.append(violation)
