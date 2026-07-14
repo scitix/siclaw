@@ -289,14 +289,16 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(buildKnowledgeWikiCatalog(knowledgeDir)).toBe("");
   });
 
-  it("injects the index catalog verbatim under a Knowledge Wiki heading", () => {
-    const index = "- [[roce-modes]] — RoCE modes and failures\n- [[gpu-xid]] — XID error codes";
+  it("injects the index catalog and documents both current and legacy link contracts", () => {
+    const index = "- [RoCE modes](network/roce-modes.md) — RoCE modes and failures\n- [[gpu-xid]] — XID error codes";
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
     const out = buildKnowledgeWikiCatalog(knowledgeDir);
     expect(out).toContain("# Knowledge Wiki");
     expect(out).toContain("there is no search tool");
-    expect(out).toContain("[[roce-modes]]");
+    expect(out).toContain("[RoCE modes](network/roce-modes.md)");
     expect(out).toContain("[[gpu-xid]]");
+    expect(out).toContain("relative to the current page's directory");
+    expect(out).toContain("tolerate legacy `[[other-page]]`");
     expect(out).not.toContain("truncated");
   });
 
