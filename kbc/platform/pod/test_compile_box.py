@@ -224,7 +224,9 @@ class AssistantMessage:
 
 
 class ResultMessage:
-    pass
+    def __init__(self, subtype="success", is_error=False):
+        self.subtype = subtype
+        self.is_error = is_error
 
 
 # Stand-ins for the SDK's other message/block types — only the class NAME matters
@@ -423,6 +425,9 @@ async def test_test_path_escape_guard():
     with tempfile.TemporaryDirectory() as snap:
         root = Path(snap)
         (root / ".siclaw" / "knowledge").mkdir(parents=True)
+        (root / "raw").mkdir()
+        (root / "candidate").mkdir()
+        (root / "raw" / "escape").symlink_to(root.parent, target_is_directory=True)
         ok = compile_box._test_path_escape
         # inside: relative, absolute-in-root, dotted-but-contained
         assert ok(root, "Read", {"file_path": ".siclaw/knowledge/index.md"}) is None
@@ -465,6 +470,14 @@ async def test_test_path_escape_guard():
         assert recommend(root, "Grep", {"path": "raw", "pattern": "retry"}) is None
         assert recommend(root, "Glob", {"pattern": "candidate/**/*.md"}) is None
         assert recommend(root, "Glob", {"path": "raw", "pattern": "**/*.md"}) is None
+        # Claude Code commonly sends cwd as Glob.path and scopes the actual
+        # search in Glob.pattern. Judge both fields together: the pair is safe,
+        # while cwd + an unscoped wildcard is not.
+        assert recommend(root, "Glob", {"path": str(root), "pattern": "raw/**/*.md"}) is None
+        assert recommend(root, "Glob", {"path": str(root), "pattern": "candidate/**/*.md"}) is None
+        assert recommend(root, "Glob", {"path": str(root), "pattern": "**/*.md"}) is not None
+        assert recommend(root, "Glob", {"path": "raw", "pattern": "escape/**/*.md"}) is not None
+        assert recommend(root, "Glob", {"pattern": str(root / "raw" / "escape" / "**/*.md")}) is not None
         assert recommend(root, "Read", {"file_path": "authoring/PLAN.md"}) is not None
         assert recommend(root, "Read", {"file_path": "eval/TESTS.md"}) is not None
         assert recommend(root, "Read", {"file_path": "release/bundle.json"}) is not None
@@ -476,6 +489,9 @@ async def test_test_path_escape_guard():
         deny = await recommendation_guard(
             {"tool_name": "Read", "tool_input": {"file_path": "authoring/CLAUDE.md"}}, "r1", None)
         assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        reason = deny["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "raw/" in reason and "candidate/" in reason, reason
+        assert ".siclaw/knowledge/index.md" not in reason, reason
         allow = await recommendation_guard(
             {"tool_name": "Read", "tool_input": {"file_path": "raw/source.md"}}, "r2", None)
         assert allow == {}, allow
@@ -821,6 +837,31 @@ async def test_explicit_test_recommendation_http():
                 raise AssertionError("escaped evidence path was accepted")
             except ValueError:
                 pass
+
+            async def exhausted(_parent):
+                raise ValueError("the red-team reviewer exhausted its turn budget before submitting a recommendation")
+
+            compile_box._RECOMMEND_TEST_IMPL = exhausted
+            response = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert response.status == 422, await response.text()
+            body = await response.json()
+            assert body["error"]["code"] == "turn_budget_exhausted", body
+            assert body["error"]["retriable"] is True, body
+
+            async def crashed(_parent):
+                raise RuntimeError("provider detail must stay in logs")
+
+            compile_box._RECOMMEND_TEST_IMPL = crashed
+            response = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert response.status == 500, await response.text()
+            body = await response.json()
+            assert body == {
+                "error": {
+                    "code": "internal_error",
+                    "message": "test recommendation failed",
+                    "retriable": True,
+                },
+            }, body
     finally:
         release.set()
         await client.close()
@@ -830,6 +871,136 @@ async def test_explicit_test_recommendation_http():
     print("✓ explicit red-team test recommendation (stable, single-flight, raw-grounded)")
 
 
+async def test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool():
+    """The explicit reviewer is a narrow red-team capability, not a compiler.
+
+    Exercise the public driver with a fake SDK transport that can only complete
+    by invoking the exact SDK MCP tool registered in its options. This keeps the
+    test sensitive to both option drift and callback wiring.
+    """
+    original_client = compile_box.ClaudeSDKClient
+    original_server_factory = compile_box.create_sdk_mcp_server
+    previous_turns = os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS")
+    seen = {}
+
+    def capture_server(name, *, tools):
+        seen["server_name"] = name
+        seen["tools"] = tools
+        return {"type": "sdk", "name": name, "tools": tools}
+
+    class SubmittingClient:
+        def __init__(self, options=None):
+            self.options = options
+            self.pending = []
+            seen["options"] = options
+
+        async def connect(self):
+            seen["connected"] = True
+
+        async def query(self, directive, session_id="default"):
+            seen["directive"] = directive
+            registered = self.options.mcp_servers["recommend"]["tools"]
+            assert len(registered) == 1
+            result = await registered[0].handler({
+                "question": "What retry limit does the source require?",
+                "reference_answer": "Three attempts.",
+                "evidence_paths": ["raw/policy.md"],
+            })
+            assert "accepted" in result["content"][0]["text"].lower(), result
+            self.pending.append(ResultMessage())
+
+        async def receive_messages(self):
+            while self.pending:
+                yield self.pending.pop(0)
+
+        async def disconnect(self):
+            seen["disconnected"] = True
+
+    compile_box.ClaudeSDKClient = SubmittingClient
+    compile_box.create_sdk_mcp_server = capture_server
+    os.environ["KBC_TEST_RECOMMEND_MAX_TURNS"] = "20"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("recommend-driver", td, 1)
+            parent.locale = "en"
+
+            result = await compile_box.recommend_test_question(parent)
+            assert result == {
+                "question": "What retry limit does the source require?",
+                "reference_answer": "Three attempts.",
+                "evidence_paths": ["raw/policy.md"],
+            }, result
+
+            opts = seen["options"]
+            assert isinstance(opts.system_prompt, str), opts.system_prompt
+            assert opts.system_prompt == compile_box._prompt("recommend_test_role", "en")
+            assert opts.tools == ["Read", "Glob", "Grep"], opts.tools
+            assert opts.allowed_tools == [
+                "Read", "Glob", "Grep", "mcp__recommend__submit_recommended_test",
+            ], opts.allowed_tools
+            assert opts.strict_mcp_config is True
+            assert set(opts.disallowed_tools) >= {
+                "Bash", "Write", "Edit", "Agent", "WebFetch", "WebSearch",
+            }, opts.disallowed_tools
+            assert opts.setting_sources == []
+            assert opts.max_turns == 20
+            assert seen["server_name"] == "recommend"
+            assert seen["tools"][0].name == "submit_recommended_test"
+            assert seen["connected"] and seen["disconnected"]
+    finally:
+        compile_box.ClaudeSDKClient = original_client
+        compile_box.create_sdk_mcp_server = original_server_factory
+        if previous_turns is None:
+            os.environ.pop("KBC_TEST_RECOMMEND_MAX_TURNS", None)
+        else:
+            os.environ["KBC_TEST_RECOMMEND_MAX_TURNS"] = previous_turns
+    print("✓ recommendation driver: minimal tools + registered MCP submission")
+
+
+async def test_recommendation_driver_reports_max_turn_exhaustion():
+    """A reviewer that spends its bounded turn budget without submitting must
+    surface a distinct diagnostic instead of the generic no-result error."""
+    original_client = compile_box.ClaudeSDKClient
+
+    class ExhaustedClient:
+        def __init__(self, options=None):
+            self.options = options
+
+        async def connect(self):
+            pass
+
+        async def query(self, directive, session_id="default"):
+            pass
+
+        async def receive_messages(self):
+            yield ResultMessage("error_max_turns", True)
+
+        async def disconnect(self):
+            pass
+
+    compile_box.ClaudeSDKClient = ExhaustedClient
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("recommend-max-turns", td, 1)
+            parent.locale = "en"
+            try:
+                await compile_box.recommend_test_question(parent)
+                raise AssertionError("max-turn exhaustion was accepted as an empty recommendation")
+            except ValueError as exc:
+                assert "turn budget" in str(exc) and "submitting" in str(exc), exc
+    finally:
+        compile_box.ClaudeSDKClient = original_client
+    print("✓ recommendation driver: max-turn exhaustion is explicit")
 
 
 async def test_prompt_packs_locale():
@@ -2490,6 +2661,8 @@ async def main():
     await test_open_close_test_session_http()
     await test_test_message_path()
     await test_explicit_test_recommendation_http()
+    await test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool()
+    await test_recommendation_driver_reports_max_turn_exhaustion()
     await test_propose_plan_never_bounces()
     test_apply_session_config()
     test_parse_brief_block()

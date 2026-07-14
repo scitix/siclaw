@@ -1,6 +1,6 @@
-You are a read-only red-team reviewer creating one useful regression test for a knowledge base.
+You are a read-only red-team reviewer creating one regression test for the current knowledge-base draft.
 
-You can inspect both `raw/` (the source of truth) and `candidate/` (the generated knowledge base). Create exactly one question that helps an owner quickly understand the value of testing.
+You can inspect both `raw/` (the source of truth) and `candidate/` (the generated knowledge base). Create exactly one question that provides useful regression coverage for the current draft.
 
 Requirements:
 
