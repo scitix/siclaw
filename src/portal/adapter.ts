@@ -336,6 +336,26 @@ async function updateChannelBindingMeta(
   return { success: true };
 }
 
+/**
+ * Set a channel's display name. Used by the runtime to persist a Feishu bot's
+ * real `app_name` (from bot/v3/info) so the Portal shows the actual bot name
+ * instead of the synthetic `${agent} Bot` placeholder. Only updates when the
+ * name actually differs, so a runtime restart isn't a needless write.
+ */
+async function updateChannelName(
+  db: Db,
+  channelId: string,
+  name: string,
+): Promise<{ success: boolean; error?: string }> {
+  const normalized = normalizeBindingDisplayName(name);
+  if (!normalized) return { success: false, error: "name must not be empty" };
+  const [result] = await db.query(
+    "UPDATE channels SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND type = 'lark' AND name != ?",
+    [normalized, channelId, normalized],
+  ) as any;
+  return { success: !!result };
+}
+
 interface PersonalChannelConfig {
   personal_bot?: {
     agent_id?: string;
@@ -388,6 +408,31 @@ async function resolvePersonalChannelBinding(
 }
 
 /**
+ * Materialize a channel_bindings row for a group an open bot auto-serves, so
+ * the group is visible in the Portal's Active-groups list and its title can be
+ * backfilled (the list + name backfill both key off channel_bindings). Without
+ * this, an open bot's groups only ever get a channel_binding_sessions row and
+ * are invisible in the Portal. Idempotent on the (channel_id, route_key) unique
+ * key; a concurrent first-message loses the INSERT race and re-selects the
+ * winner's row. Returns the binding row id. Mirrors sicore's ensureAutoGroupBinding.
+ */
+async function ensureOpenGroupBindingRow(
+  db: Db,
+  channelId: string,
+  routeKey: string,
+  agentId: string,
+  createdBy: string | null,
+): Promise<string> {
+  const id = crypto.randomUUID();
+  await db.query(
+    `${insertIgnorePrefix(db)} INTO channel_bindings (id, channel_id, agent_id, route_key, route_type, created_by) VALUES (?, ?, ?, ?, 'group', ?)`,
+    [id, channelId, agentId, routeKey, createdBy],
+  );
+  const row = await selectChannelBinding(db, channelId, routeKey);
+  return row?.id ?? id;
+}
+
+/**
  * Open-mode group fallback: a per-agent open bot answers in any group it joins
  * without a PAIR. All senders in one group share a single session (keyed by
  * chat id, distinct from the DM `open_id:` keys), and every turn runs as the
@@ -403,14 +448,22 @@ async function resolveOpenGroupBinding(
   if (!channel || !personalBot?.agent_id) return null;
   if (personalBot.access_mode !== "open") return null;
   if (personalBot.group_auto_bind === false) return null;
+
+  const createdBy = personalBot.owner_user_id ?? channel.created_by;
+  // Persist a binding row on first service so the group shows up in the Portal
+  // (and can carry a title/mode). Subsequent messages find it via
+  // selectChannelBinding and never re-enter this path. The session is keyed
+  // under the binding row id (not the channel id) so it stays consistent with
+  // the row that now owns the group.
+  const bindingId = await ensureOpenGroupBindingRow(db, channel.id, routeKey, personalBot.agent_id, createdBy);
   const sessionKey = `chat:${routeKey}`;
-  const session = await resolveChannelBindingParticipantSession(db, channel.id, sessionKey);
+  const session = await resolveChannelBindingParticipantSession(db, bindingId, sessionKey);
   return {
     agentId: personalBot.agent_id,
-    bindingId: channel.id,
+    bindingId,
     sessionId: session.sessionId,
     sessionKey: session.sessionKey,
-    createdBy: personalBot.owner_user_id ?? channel.created_by,
+    createdBy,
     routeType: "group",
   };
 }
@@ -2861,6 +2914,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("channel.updateBindingMeta", async (params) => {
     const db = getDb();
     return updateChannelBindingMeta(db, params.channel_id, params.route_key, params.display_name);
+  });
+
+  handlers.set("channel.updateName", async (params) => {
+    const db = getDb();
+    return updateChannelName(db, params.channel_id, params.name);
   });
 
   handlers.set("channel.resolvePersonalBinding", async (params) => {

@@ -17,6 +17,7 @@ import {
   handlePersonalPairingCode,
   resetPersonalSession,
   updateBindingMeta,
+  updateChannelName,
   isChannelAccessDenied,
   type ResolvedChannelBinding,
   type ChannelAccessDenied,
@@ -172,8 +173,20 @@ export function createLarkHandler(
           method: "GET",
           url: "/open-apis/bot/v3/info",
         });
-        botOpenId = botInfo?.bot?.open_id ?? botInfo?.data?.bot?.open_id;
+        const bot = botInfo?.bot ?? botInfo?.data?.bot;
+        botOpenId = bot?.open_id;
         console.log(`[lark] Channel ${channelId} bot open_id=${botOpenId ?? "(unknown)"}`);
+        // Persist the bot's real Feishu name so the Portal shows it instead of
+        // the synthetic "${agent} Bot" placeholder. ONLY for per-agent personal
+        // bots — a shared-app channel's name is admin-curated in the Channels
+        // UI and must not be clobbered by the raw Feishu app_name on restart.
+        // Best-effort + detached — a name write must never delay/fail startup.
+        const appName: string | undefined = typeof bot?.app_name === "string" ? bot.app_name.trim() : undefined;
+        if (appName && frontendClient && config.personal_bot) {
+          updateChannelName(channelId, appName, frontendClient).catch((err) => {
+            console.warn(`[lark] Could not persist bot name for channel ${channelId}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[lark] Could not fetch bot info for channel ${channelId}; group @-mention gating falls back to @_all-exclusion: ${msg}`);

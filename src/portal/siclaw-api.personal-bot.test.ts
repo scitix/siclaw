@@ -121,6 +121,7 @@ describe("agent personal-bot routes", () => {
       expect(body.data).toEqual({
         id: "ch-bot-1",
         agent_id: "agent-1",
+        name: "cks Bot",
         domain: "feishu",
         app_id: "cli_xxx",
         access_mode: "open",
