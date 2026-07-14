@@ -290,15 +290,20 @@ def test_body_source_annotations():
         base = Path(td)
         first = "docs/MCP 工具与结果设计指南-70f5bd35.md"
         second = "docs/Skill Knowledge 指南.md"
+        punctuated = "docs/上线方案（终版）、GPU 调度，修订；v2.md"
+        ascii_punctuated = "docs/Release (final), GPU scheduling; v2.md"
         _mk(base, f"raw/{first}")
         _mk(base, f"raw/{second}")
+        _mk(base, f"raw/{punctuated}")
+        _mk(base, f"raw/{ascii_punctuated}")
         _mk(base, "candidate/index.md",
             "---\nokf_version: \"0.1\"\n---\n# Index\n- [Guide](guide.md)")
 
         def write_page(body: str) -> None:
             _mk(base, "candidate/guide.md",
                 "---\ntype: Guide\ntitle: Guide\ncompiled_from:\n"
-                f"  - {first}\n  - {second}\n---\n{body}")
+                f"  - {first}\n  - {second}\n  - {punctuated}\n"
+                f"  - {ascii_punctuated}\n---\n{body}")
 
         combined = ("(source: MCP 工具与结果设计指南-70f5bd35.md, "
                     "Skill Knowledge 指南.md, §3) (source: legacy.md, p.12)")
@@ -307,6 +312,25 @@ def test_body_source_annotations():
             "Skill Knowledge 指南.md",
             "legacy.md",
         ]
+
+        punctuated_body = (
+            f"正文。（source: {Path(punctuated).name}）\n"
+            f"More. (source: {Path(ascii_punctuated).name})"
+        )
+        assert selfcheck._body_source_files(punctuated_body) == [
+            Path(punctuated).name,
+            Path(ascii_punctuated).name,
+        ]
+        write_page(punctuated_body)
+        report = selfcheck.run_layer1(td)
+        assert report["coverage"]["closed"] and report["lint"]["ok"], report
+
+        write_page(
+            f"正文。(source: {Path(first).name})\n\n"
+            "```markdown\n(source: Missing Imported Guide.md)\n```"
+        )
+        report = selfcheck.run_layer1(td)
+        assert report["lint"]["ok"], report["lint"]
 
         write_page("正文。"
                    "(source: MCP 工具与结果设计指南-70f5bd35.md, "
@@ -328,6 +352,26 @@ def test_body_source_annotations():
         assert len(body_violations) == 1, report["lint"]
         assert "完整文件名和扩展名" in body_violations[0]["detail"], body_violations
     print("OK  body source annotations (spaces / combined / locator / unknown / missing extension)")
+
+
+def test_spaced_markdown_links():
+    """Spaced page paths resolve in both CommonMark and URL-encoded forms."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/source.md")
+        _mk(base, "candidate/space page.md",
+            "---\ntype: Topic\ncompiled_from:\n  - source.md\n---\n# Space page")
+
+        def write_index(target: str) -> None:
+            _mk(base, "candidate/index.md",
+                "---\nokf_version: \"0.1\"\n---\n# Index\n"
+                f"- [Space page]({target}) - summary")
+
+        for target in ("<space page.md>", "space%20page.md", "space page.md"):
+            write_index(target)
+            report = selfcheck.run_layer1(td)
+            assert report["lint"]["ok"], (target, report["lint"])
+    print("OK  spaced markdown links (angle / percent-encoded / tolerant raw)")
 
 
 def test_charset_corruption_detection():
@@ -1360,6 +1404,7 @@ def main():
     test_coverage_and_lint()
     test_media_ledger_and_new_lint()
     test_body_source_annotations()
+    test_spaced_markdown_links()
     test_media_verify_helpers()
     test_cap_media_pending()
     test_dangling_alone_blocks_closed()

@@ -24,6 +24,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 import yaml
 
@@ -247,16 +248,14 @@ def _matches(path: str, pattern: str) -> bool:
     return _seg_glob(pattern.split("/"), path.split("/"))
 
 
-_MD_LINK_RE = re.compile(r"\]\(([^)#\s]+\.md)(?:#[^)]*)?\)")
+_MD_LINK_RE = re.compile(r"\]\(\s*(<[^>\n]+>|[^)\n]+)\)")
 _WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)")
-# Body-level provenance mentions: (source: X) / (源:X) / (来源:X). The capture
-# is then split on explicit separators before parsing each complete filename.
-# Whitespace is valid inside imported filenames, so it must never be a token
-# boundary here.
-_BODY_SOURCE_RE = re.compile(r"[（(]\s*(?:source|src|源|来源)\s*[:：]\s*([^）)]{1,300})[）)]", re.IGNORECASE)
-_BODY_SOURCE_PART_RE = re.compile(r"[^,，;；、]+")
-_FILENAME_RE = re.compile(
-    r"^\s*(.+\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS)) + r"))\b",
+_BODY_SOURCE_START_RE = re.compile(
+    r"(?P<open>[（(])\s*(?:source|src|源|来源)\s*[:：]\s*", re.IGNORECASE,
+)
+_SOURCE_FILE_END_RE = re.compile(
+    r"\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS))
+    + r")(?:`)?(?=\s*(?:[,，;；、]|$))",
     re.IGNORECASE,
 )
 _SOURCE_LOCATOR_RE = re.compile(
@@ -490,7 +489,7 @@ def siclaw_portable_output_violations(pages: dict[str, dict]) -> list[dict]:
         if _WIKI_LINK_RE.search(prose):
             violations.append({"page": rel, "kind": "siclaw_profile_wikilink",
                                "detail": "Siclaw 新产出使用文件相对的标准 Markdown 链接，不要使用 [[wikilink]]"})
-        if any(target.startswith("/") for target in _MD_LINK_RE.findall(prose)):
+        if any(target.startswith("/") for target in _markdown_link_targets(prose)):
             violations.append({"page": rel, "kind": "siclaw_profile_bundle_link",
                                "detail": "OKF 允许 / 开头的 bundle 链接，但 Siclaw 新产出使用文件相对链接以便跨浏览器查看"})
         if (rel == "index.md"
@@ -543,34 +542,77 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
+def _markdown_link_targets(text: str) -> list[str]:
+    """Markdown ``.md`` destinations normalized for filesystem comparison.
+
+    CommonMark angle destinations, URL-encoded spaces, and the tolerant raw
+    form emitted by existing agents all refer to the same candidate path.
+    """
+    targets: list[str] = []
+    for captured in _MD_LINK_RE.findall(text):
+        destination = captured.strip()
+        if destination.startswith("<") and destination.endswith(">"):
+            destination = destination[1:-1].strip()
+        else:
+            # Keep compatibility with the optional Markdown link-title form.
+            titled = re.fullmatch(
+                r"(.+?\.md(?:#[^\s\"']*)?)\s+(?:\"[^\"]*\"|'[^']*')",
+                destination,
+                re.IGNORECASE,
+            )
+            if titled:
+                destination = titled.group(1)
+        destination = unquote(destination).split("#", 1)[0].strip()
+        if destination.lower().endswith(".md"):
+            targets.append(destination)
+    return targets
+
+
+def _body_source_payloads(text: str) -> list[str]:
+    """Extract source-marker payloads while preserving nested filename pairs."""
+    payloads: list[str] = []
+    prose = _markdown_prose(text)
+    for match in _BODY_SOURCE_START_RE.finditer(prose):
+        stack = [")" if match.group("open") == "(" else "）"]
+        for pos, char in enumerate(prose[match.end():match.end() + 301], start=match.end()):
+            if char == "(":
+                stack.append(")")
+            elif char == "（":
+                stack.append("）")
+            elif char == stack[-1]:
+                stack.pop()
+                if not stack:
+                    payloads.append(prose[match.end():pos])
+                    break
+    return payloads
+
+
 def _body_source_references(text: str) -> tuple[list[str], list[str]]:
     """Return (source files, malformed source items) from body annotations.
 
-    Commas and semicolons separate files; spaces do not. A source marker must
-    name a file with a known extension. This fail-closed rule prevents removing
-    ``.md`` from turning a real provenance mismatch into a silent green lint.
-    Locator-only items such as ``§3`` and ``p.12`` are accepted after a file.
+    A known extension terminates each filename; punctuation before that
+    extension belongs to the imported filename. This fail-closed rule prevents
+    removing ``.md`` from turning a real provenance mismatch into a silent
+    green lint. Locator-only items such as ``§3`` and ``p.12`` are accepted
+    after a file.
     """
     found: list[str] = []
     malformed: list[str] = []
-    for captured in _BODY_SOURCE_RE.findall(_strip_frontmatter(text)):
+    for captured in _body_source_payloads(text):
         capture_has_file = False
         capture_has_malformed = False
-        for part in _BODY_SOURCE_PART_RE.findall(captured):
-            item = part.strip()
-            if not item:
-                continue
-            match = _FILENAME_RE.match(item)
-            if match:
-                entry = _norm_source_entry(match.group(1).strip().strip("`"))
-                if entry and entry not in found:
-                    found.append(entry)
-                capture_has_file = capture_has_file or bool(entry)
-                continue
-            if _SOURCE_LOCATOR_RE.fullmatch(item):
-                continue
-            if item not in malformed:
-                malformed.append(item)
+        cursor = 0
+        for match in _SOURCE_FILE_END_RE.finditer(captured):
+            item = captured[cursor:match.end()].strip(" \t\r\n,，;；、`")
+            entry = _norm_source_entry(item)
+            if entry and entry not in found:
+                found.append(entry)
+            capture_has_file = capture_has_file or bool(entry)
+            cursor = match.end()
+        remainder = captured[cursor:].strip(" \t\r\n,，;；、")
+        if remainder and not _SOURCE_LOCATOR_RE.fullmatch(remainder):
+            if remainder not in malformed:
+                malformed.append(remainder)
             capture_has_malformed = True
         if not capture_has_file and not capture_has_malformed:
             item = captured.strip()
@@ -589,7 +631,7 @@ def _out_links(rel: str, text: str, names: set[str]) -> set[str]:
     base = Path(rel).parent
     out: set[str] = set()
     prose = _markdown_prose(text)
-    for target in _MD_LINK_RE.findall(prose):
+    for target in _markdown_link_targets(prose):
         if target.startswith(("http://", "https://", "/")):
             continue
         resolved = posixpath.normpath((base / target).as_posix())
@@ -659,7 +701,7 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
                                           "按主题拆成多页并挂回 index")})
         base = Path(rel).parent
         prose = _markdown_prose(text)
-        for target in _MD_LINK_RE.findall(prose):
+        for target in _markdown_link_targets(prose):
             if target.startswith(("http://", "https://", "/")):
                 continue
             resolved = posixpath.normpath((base / target).as_posix())
