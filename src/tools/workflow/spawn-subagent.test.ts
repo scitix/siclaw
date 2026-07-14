@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { createSpawnSubagentTool, registration } from "./spawn-subagent.js";
 import { RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
+import { ToolRegistry } from "../../core/tool-registry.js";
 import type {
   ToolRefs,
   SpawnSubagentGroupRequest,
@@ -99,6 +100,61 @@ describe("spawn_subagent tool — single-task collapse path", () => {
     } else {
       expect(captured?.runInBackground).toBe(false);
     }
+  });
+});
+
+describe("spawn_subagent tool — availability by session mode (real ToolRegistry.resolve)", () => {
+  // The tool's registration limits it to modes ["web","channel","cli"]. Resolve the REAL tool
+  // list per entry path (not a hand-built tool) so we assert what each session actually gets:
+  // only `channel` (of the modes that have the tool) needs the foreground gate; a2a/api/task
+  // don't expose spawn_subagent at all, so foregrounding them would be a no-op.
+  const reg = new ToolRegistry();
+  reg.register(registration);
+  const names = (mode: string): string[] =>
+    reg.resolve({ mode: mode as any, refs: makeRefs(vi.fn() as any) }).map((t) => t.name);
+
+  it("exposes spawn_subagent in web/channel/cli, and NOT in task/api/a2a", () => {
+    expect(names("channel")).toContain("spawn_subagent");
+    expect(names("web")).toContain("spawn_subagent");
+    expect(names("cli")).toContain("spawn_subagent");
+    expect(names("task")).not.toContain("spawn_subagent");
+    expect(names("api")).not.toContain("spawn_subagent");
+    expect(names("a2a")).not.toContain("spawn_subagent");
+  });
+});
+
+describe("spawn_subagent tool — foregroundSubagentOnly (channel)", () => {
+  it("hides run_in_background and forces a multi-item batch to foreground", async () => {
+    let captured: SpawnSubagentGroupRequest | undefined;
+    const executor = vi.fn(async (req: SpawnSubagentGroupRequest): Promise<SpawnSubagentResult> => {
+      captured = req;
+      return { status: "done", summary: "all checked", childSessionId: "c", toolCalls: 1, durationMs: 5 };
+    });
+    const tool = createSpawnSubagentTool({ ...makeRefs(executor), foregroundSubagentOnly: true });
+
+    expect((tool.parameters as any).properties.run_in_background).toBeUndefined();
+
+    await tool.execute("call-fg", {
+      description: "triage 3 nodes",
+      items: ["check node-a", "check node-b", "check node-c"],
+    });
+    expect(captured?.runInBackground).toBe(false);
+  });
+
+  it("leaves the multi-item background default intact when NOT foregroundSubagentOnly (web/cli)", async () => {
+    let captured: SpawnSubagentGroupRequest | undefined;
+    const executor = vi.fn(async (req: SpawnSubagentGroupRequest): Promise<SpawnSubagentResult> => {
+      captured = req;
+      return req.runInBackground
+        ? { status: "launched", childSessionId: "c", jobId: "j" }
+        : { status: "done", summary: "x", childSessionId: "c", toolCalls: 1, durationMs: 5 };
+    });
+    const tool = createSpawnSubagentTool(makeRefs(executor)); // foregroundSubagentOnly unset
+    await tool.execute("call-web", {
+      description: "triage 3 nodes",
+      items: ["check node-a", "check node-b", "check node-c"],
+    });
+    expect(captured?.runInBackground).toBe(RUN_IN_BACKGROUND_ENABLED);
   });
 });
 
