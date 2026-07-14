@@ -627,6 +627,10 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_sessions", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "target_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "channel_bindings", "session_id", "CHAR(36) DEFAULT NULL");
+  // Binding owner (the user who PAIRed this chat). Present in the CREATE TABLE above, but older
+  // installs predate it — adapter.ts / siclaw-api.ts SELECT cb.created_by, so existing DBs need
+  // this backfill ALTER or every channel message errors ("Unknown column 'cb.created_by'").
+  await safeAlterTable(db, "channel_bindings", "created_by", "CHAR(36) DEFAULT NULL");
   // Human-readable name of the bound chat (group title / user name), fetched
   // from the channel platform at PAIR time and lazily refreshed by the gateway.
   // Display-only cache — identity is always route_key, never this name.
