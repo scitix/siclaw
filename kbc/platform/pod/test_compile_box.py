@@ -10,7 +10,6 @@ import hashlib
 import io
 import json
 import os
-import re
 import shutil
 import tarfile
 import tempfile
@@ -782,6 +781,37 @@ async def test_prompt_packs_locale():
     print("✓ prompt packs: en/zh parity, en fallback, localized guard/constitution/tools, env override")
 
 
+def test_compile_surface_excludes_auto_question_proposals():
+    """The owner-managed question set is independent from compilation. Once
+    the downstream UI stopped consuming AI proposals, the compile prompt and
+    tool surface must not keep spending an agent turn producing hidden files."""
+    for locale in ("en", "zh"):
+        role = compile_box._prompt("box_role", locale)
+        assert "propose_questions" not in role, locale
+        assert "QUESTIONS_PROPOSED" not in role, locale
+        assert "propose_questions" not in compile_box._tool_strings(locale), locale
+
+    captured = []
+    original = compile_box.create_sdk_mcp_server
+
+    class FakeRun:
+        locale = "en"
+
+    def capture(_name, tools):
+        captured.extend(tool.name for tool in tools)
+        return object()
+
+    compile_box.create_sdk_mcp_server = capture
+    try:
+        compile_box._make_compile_tools(FakeRun())
+    finally:
+        compile_box.create_sdk_mcp_server = original
+
+    assert "propose_questions" not in captured, captured
+    assert "mcp__compile__propose_questions" not in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+    print("✓ compile surface excludes unused AI question proposals")
+
+
 async def test_propose_plan_never_bounces():
     """propose_plan is the deterministic approve signal: the handler itself writes
     authoring/PROPOSED_PLAN.json (code, not model formatting) and always emits —
@@ -944,104 +974,6 @@ def test_parse_brief_block():
     assert compile_box.parse_brief_block("把 raw/ 编成候选页") is None
     assert compile_box.parse_brief_block("") is None
     print("✓ parse_brief_block (tags split, raw from marker, None when absent)")
-
-
-def test_merge_proposed_questions():
-    """Append-merge is dedup-by-question, drops malformed entries, and never wipes
-    the carried-over list."""
-    existing = [{"question": "A?", "reference": "a", "source": "s"}]
-    merged, added, skipped = compile_box.merge_proposed_questions(existing, [
-        {"question": "A?", "reference": "dup", "source": "x"},  # dup of existing #1
-        {"question": "B?", "reference": "b", "source": "s2"},   # new
-        {"question": "   ", "reference": "", "source": ""},      # blank → skip
-        "not-a-dict",                                            # junk → skip
-    ])
-    assert [q["question"] for q in merged] == ["A?", "B?"], merged
-    assert added == 1 and skipped == 3, (added, skipped)
-    # malformed existing entries are dropped from the carry-over; identical incoming skipped
-    merged2, added2, _ = compile_box.merge_proposed_questions(
-        ["junk", {"noquestion": 1}, {"question": "C?"}], [{"question": "C?"}])
-    assert [q["question"] for q in merged2] == ["C?"] and added2 == 0, merged2
-
-    # every merged entry carries a 'q-'+8hex id derived from the normalized question;
-    # formula is FNV-1a — locked against the canonical vector for "a".
-    for q in merged:
-        assert re.fullmatch(r"q-[0-9a-f]{8}", q["id"]), q
-    assert compile_box._question_id(compile_box._normalize_question("A?")) == "q-e40c292c"
-    assert merged[0]["id"] == "q-e40c292c", merged[0]
-
-    # re-propose the same question (different case/whitespace) → dedup, id unchanged
-    id_A = merged[0]["id"]
-    again, added3, skipped3 = compile_box.merge_proposed_questions(merged, [{"question": "  a  "}])
-    assert added3 == 0 and skipped3 == 1, (added3, skipped3)
-    assert next(q for q in again if q["question"] == "A?")["id"] == id_A, again
-
-    # an explicit prior id is preserved; a legacy id-less entry is backfilled
-    kept, _, _ = compile_box.merge_proposed_questions(
-        [{"id": "q-legacy1", "question": "D?"}, {"question": "E?"}], [])
-    by_q = {q["question"]: q for q in kept}
-    assert by_q["D?"]["id"] == "q-legacy1", kept
-    assert re.fullmatch(r"q-[0-9a-f]{8}", by_q["E?"]["id"]), kept
-    print("✓ merge_proposed_questions (append, dedup, drop malformed, stable id)")
-
-
-async def test_propose_questions_appends_dedup():
-    """propose_questions writes authoring/QUESTIONS_PROPOSED.json append-only: a
-    second round adds new questions and skips duplicates (never overwrites), and
-    each round emits a summary line."""
-    with tempfile.TemporaryDirectory() as td:
-        wd = Path(td)
-        (wd / "authoring").mkdir(parents=True)
-        events = []
-
-        class FakeRun:
-            workdir = str(wd)
-            locale = "zh"  # model-facing tool strings come from the locale pack
-
-            async def emit(self, ev):
-                events.append(ev)
-
-        captured = {}
-        orig = compile_box.create_sdk_mcp_server
-
-        def capture(name, tools):
-            captured.update({t.name: t for t in tools})
-            return orig(name, tools=tools)
-
-        compile_box.create_sdk_mcp_server = capture
-        try:
-            compile_box._make_compile_tools(FakeRun())
-        finally:
-            compile_box.create_sdk_mcp_server = orig
-        pq = captured["propose_questions"].handler
-        path = wd / "authoring" / "QUESTIONS_PROPOSED.json"
-
-        r1 = await pq({"questions": [
-            {"question": "默认 quota 是多少?", "reference": "300", "source": "policy.md: cap 300"},
-            {"question": "draco 还在用吗?", "reference": "已废弃", "source": "manual.md"},
-        ]})
-        data = json.loads(path.read_text())
-        assert [q["question"] for q in data] == ["默认 quota 是多少?", "draco 还在用吗?"], data
-        assert data[0]["source"] == "policy.md: cap 300"
-        # every persisted entry carries an id (frontend adopt POSTs it as proposal_id)
-        assert all(re.fullmatch(r"q-[0-9a-f]{8}", q["id"]) for q in data), data
-        assert "新增 2" in r1["content"][0]["text"], r1
-
-        # round 2: one dup (only trailing punctuation differs) + one new → append, skip dup
-        r2 = await pq({"questions": [
-            {"question": "默认 quota 是多少", "reference": "x", "source": "y"},  # dup of #1
-            {"question": "支持哪些区域?", "reference": "cn-*", "source": "regions.md"},
-        ]})
-        data = json.loads(path.read_text())
-        assert len(data) == 3 and data[2]["question"] == "支持哪些区域?", data
-        assert "新增 1" in r2["content"][0]["text"] and "跳过 1" in r2["content"][0]["text"], r2
-        assert sum(1 for e in events if e["type"] == "summary") == 2, events
-
-        # bad arg → guarded, file untouched
-        bad = await pq({"questions": "nope"})
-        assert "数组" in bad["content"][0]["text"], bad
-        assert len(json.loads(path.read_text())) == 3
-    print("✓ propose_questions appends + dedups (never overwrites prior picks)")
 
 
 async def test_message_captures_brief():
@@ -2176,8 +2108,7 @@ async def test_shutdown_flush_syncs_active_runs():
 
 
 def test_pr382_review_fixes():
-    """Review fixes: brief guard + capped/last-marker raw (A/C), atomic writer (B),
-    question-id parity vector + intentional dedup (D/E)."""
+    """Review fixes: brief guard + capped/last-marker raw (A/C) and atomic writer (B)."""
     good = ("开始生成知识库\n\n我的定调标签(请作为本次编译的 brief):\n"
             "- 给谁看:内部工程师\n- 内容倾向:详尽百科\n请执行。")
     b = compile_box.parse_brief_block(good)
@@ -2209,16 +2140,7 @@ def test_pr382_review_fixes():
         compile_box._write_text_atomic(p, '{"a":2}\n')
         assert p.read_text() == '{"a":2}\n' and not list(Path(td).rglob("*.tmp"))
 
-    # D/E: question-id parity vector — MUST equal the frontend's proposal-id.test vector
-    def qid(q):
-        return compile_box._question_id(compile_box._normalize_question(q))
-    assert qid("GPU 有几张?") == "q-4d6d3b41"
-    assert qid("gpu有几张。") == "q-4d6d3b41"            # E: case + trailing-punct + space collapse
-    assert qid("Hello World") == "q-3b9f5c61"
-    assert qid("\ufeffHello World") == "q-3b9f5c61"      # D: BOM stripped identically to the frontend
-    assert qid("H100\tvs　A100") == "q-a5a7d897"
-    assert qid("AbC?") == "q-1a47e90b"
-    print("✓ pr382 review fixes (brief guard/cap/first-wins, atomic write, id parity vector)")
+    print("✓ pr382 review fixes (brief guard/cap/first-wins, atomic write)")
 
 
 async def test_typed_authoring_commands():
@@ -2383,14 +2305,13 @@ async def main():
     await test_test_path_escape_guard()
     await test_batch_planner_uses_compile_path_guard()
     await test_prompt_packs_locale()
+    test_compile_surface_excludes_auto_question_proposals()
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
     await test_test_message_path()
     await test_propose_plan_never_bounces()
     test_apply_session_config()
     test_parse_brief_block()
-    test_merge_proposed_questions()
-    await test_propose_questions_appends_dedup()
     await test_message_captures_brief()
     await test_incremental_route()
     await test_incremental_integrity_guard()

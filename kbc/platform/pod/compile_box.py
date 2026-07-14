@@ -717,21 +717,20 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
     }
 
 
-# ── Protocol v3 helpers: quickstart brief + proposed-question merge ──
+# ── Protocol v3 helper: quickstart brief ──
 # Both are deterministic (code, not model formatting) so a durable record can't
 # be lost to how the agent paraphrases — the same principle behind PROPOSED_PLAN.json.
 
 _BRIEF_MARKER = "我的定调标签"
 _BRIEF_PATH = "authoring/BRIEF.json"
-QUESTIONS_PROPOSED_PATH = "authoring/QUESTIONS_PROPOSED.json"
 _BRIEF_RAW_MAX = 4000  # cap the durable brief's raw slice — the agent is told to follow it
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
     """Write `text` atomically: a temp file in the same dir + os.replace. A torn
     write (SIGTERM / OOM / full disk mid-write) must never leave a half-file that
-    the next read falls back to empty on — that would silently drop prior rounds
-    (e.g. every earlier proposed question). os.replace is atomic within one
+    the next read falls back to empty on — that would silently drop prior
+    structured state. os.replace is atomic within one
     filesystem on POSIX."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -1015,84 +1014,6 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         _write_brief(run.workdir, brief)
 
 
-# The exact whitespace set to strip, enumerated so it is byte-identical with the
-# frontend's mirror (ECMAScript `\s`). Python `re` `\s` and JS `\s` are DIFFERENT
-# fixed sets (Python `\s` strips U+0085 / U+001C–U+001F, JS `\s` strips U+FEFF),
-# so relying on `\s` on either side makes the derived id diverge for a question
-# containing one of those chars — and the frontend re-derives this id for legacy
-# id-less rows, so a divergence resurfaces the adopt/dismiss failure. This
-# explicit class removes the ambiguity; keep it in lockstep with the frontend.
-_WS_RE = re.compile("[\t\n\x0b\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
-_QUESTION_PUNCT = "?？。.!！,，、"
-
-
-def _normalize_question(q: str) -> str:
-    """Dedup key + stable-id basis for a proposed question: strip the fixed
-    whitespace set (`_WS_RE`, enumerated to match the frontend — NOT `\\s`), strip
-    a fixed leading/trailing punctuation set, then lowercase. Trailing punctuation
-    and case are collapsed BY DESIGN — `删除?` and `删除。` map to one key (a
-    question differing only by trailing punctuation is treated as the same); an
-    all-punctuation question normalizes to `""` and the caller drops it."""
-    return _WS_RE.sub("", str(q or "")).strip(_QUESTION_PUNCT).lower()
-
-
-def _fnv1a32(s: str) -> int:
-    """32-bit FNV-1a over the UTF-8 bytes of s. Shared, fixed formula with the
-    frontend so both sides derive the SAME proposal id from a question."""
-    h = 2166136261
-    for b in s.encode("utf-8"):
-        h ^= b
-        h = (h * 16777619) & 0xFFFFFFFF
-    return h
-
-
-def _question_id(normalized: str) -> str:
-    """Stable proposal id agreed with the frontend: 'q-' + fnv1a32(normalized
-    question) as zero-padded 8-hex-digit lowercase. The frontend POSTs this as
-    proposal_id on adopt/dismiss — a missing id → empty proposal_id → the consumer 500s."""
-    return "q-" + format(_fnv1a32(normalized), "08x")
-
-
-def merge_proposed_questions(existing: list, incoming: list) -> tuple[list, int, int]:
-    """Append-merge newly proposed questions onto the existing list, skipping
-    duplicates by normalized question text. Every merged entry carries a stable
-    `id` (see _question_id) — the frontend needs it as proposal_id on adopt/dismiss.
-    A prior explicit id is preserved; legacy/id-less entries are backfilled from
-    the same formula (identical for the same question). Returns (merged, added,
-    skipped). Append-only across rounds so a re-proposal never wipes prior picks."""
-    merged: list = []
-    seen: set = set()
-    for q in existing:
-        if not isinstance(q, dict):
-            continue
-        text = str(q.get("question", "")).strip()
-        if not text:
-            continue
-        key = _normalize_question(text)
-        seen.add(key)
-        qid = str(q.get("id", "")).strip() or _question_id(key)
-        merged.append({**q, "id": qid, "question": text})
-    added = skipped = 0
-    for item in incoming:
-        if not isinstance(item, dict):
-            skipped += 1
-            continue
-        text = str(item.get("question", "")).strip()
-        key = _normalize_question(text)
-        if not key or key in seen:
-            skipped += 1
-            continue
-        seen.add(key)
-        merged.append({
-            "id": _question_id(key),
-            "question": text,
-            "reference": str(item.get("reference", "")).strip(),
-            "source": str(item.get("source", "")).strip(),
-        })
-        added += 1
-    return merged, added, skipped
-
-
 def _make_compile_tools(run: CompileRun):
     """Build the box's custom tools (closures over run) — the structured-signal
     moat. All model-facing text (descriptions + result strings) comes from the
@@ -1174,28 +1095,7 @@ def _make_compile_tools(run: CompileRun):
             return {"content": [{"type": "text", "text": rt["write_failed"].format(e=e)}]}
         return {"content": [{"type": "text", "text": rt["registered"].format(tid=tid)}]}
 
-    @tool("propose_questions", ts["propose_questions"]["desc"], {"questions": list})
-    async def propose_questions(args):
-        pq = ts["propose_questions"]
-        incoming = args.get("questions")
-        if not isinstance(incoming, list):
-            return {"content": [{"type": "text", "text": pq["need_list"]}]}
-        path = Path(run.workdir) / QUESTIONS_PROPOSED_PATH
-        try:
-            existing = json.loads(path.read_text("utf-8")) if path.exists() else []
-            if not isinstance(existing, list):
-                existing = []
-        except Exception:
-            existing = []  # a corrupt/half-written prior file must not lose this round
-        merged, added, skipped = merge_proposed_questions(existing, incoming)
-        try:
-            _write_text_atomic(path, json.dumps(merged, ensure_ascii=False, indent=2) + "\n")
-        except Exception as e:
-            return {"content": [{"type": "text", "text": pq["write_failed"].format(e=e)}]}
-        await run.emit({"type": "summary", "summary": pq["summary"].format(added=added, skipped=skipped, total=len(merged))})
-        return {"content": [{"type": "text", "text": pq["registered"].format(added=added, skipped=skipped, total=len(merged))}]}
-
-    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket, propose_questions])
+    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket])
 
 
 def _seed_workdir(workdir: str):
@@ -1948,7 +1848,6 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
     "mcp__compile__resolve_ticket",
-    "mcp__compile__propose_questions",
 ]
 
 
