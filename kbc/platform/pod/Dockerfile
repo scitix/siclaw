@@ -17,9 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 # Pin the SDK: an unpinned install drifts on every rebuild, and the bundled
 # Claude Code CLI drifts with it (API request-shape changes can break the
 # massapi/Bedrock path). 0.2.110 is production-proven on the KB compile path.
-# python-pptx/openpyxl/python-docx let office_ingest pre-render .pptx/.xlsx/.docx
-# sources to markdown (pdf/text/images are read natively by the agent's Read tool).
-RUN pip install --no-cache-dir claude-agent-sdk==0.2.110 aiohttp python-pptx openpyxl python-docx
+# PyYAML backs deterministic OKF frontmatter validation. python-pptx/openpyxl/
+# python-docx let office_ingest pre-render .pptx/.xlsx/.docx sources to markdown
+# (pdf/text/images are read natively by the agent's Read tool).
+COPY platform/pod/requirements.txt /tmp/kbc-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/kbc-requirements.txt
 
 WORKDIR /app
 # CLAUDE.md is only for the legacy CLI (compile_agent.py walks parents for it).

@@ -17,12 +17,12 @@ def _mk(base: Path, rel: str, text: str = "x"):
 
 def _page(sources: list[str]) -> str:
     cf = "\n".join(f"  - {s}" for s in sources)
-    return f"---\ntitle: t\ncompiled_from:\n{cf}\n---\n正文。"
+    return f"---\ntype: Topic\ntitle: t\ncompiled_from:\n{cf}\n---\n正文。"
 
 
 def _kb(base: Path):
     # 4 pages citing distinct raw sources; index routes them.
-    _mk(base, "candidate/index.md", "---\ntype: index\n---\n[a](a.md) [b](b.md) [c](c.md)")
+    _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [b](b.md)\n- [c](c.md)")
     _mk(base, "candidate/a.md", _page(["snap/one.md", "snap/two.md"]))
     _mk(base, "candidate/b.md", _page(["snap/three.md"]))
     _mk(base, "candidate/c.md", _page(["snap/four.md"]))
@@ -49,7 +49,7 @@ def test_resolve_affected_pages():
 def test_no_basename_cross_match():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[s](snap-cfg.md) [v](vendor-cfg.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [s](snap-cfg.md)\n- [v](vendor-cfg.md)")
         _mk(base, "candidate/snap-cfg.md", _page(["snap/config.md"]))
         _mk(base, "candidate/vendor-cfg.md", _page(["vendor/config.md"]))
         # same basename, different directory: changing snap/config.md must NOT
@@ -72,7 +72,7 @@ def test_no_basename_cross_match():
 def test_raw_prefix_normalization():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[p](p.md) [q](q.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)\n- [q](q.md)")
         _mk(base, "candidate/p.md", _page(["raw/snap/one.md"]))   # prefixed compiled_from
         _mk(base, "candidate/q.md", _page(["snap/two.md"]))       # unprefixed compiled_from
         # original motivation intact: raw/-prefixed compiled_from ↔ unprefixed changeset
@@ -118,7 +118,7 @@ def test_integrity_guard():
         before = incremental.page_hashes(td)
         # model legitimately edits a.md (affected) + index; leaves b/c untouched → no violation
         _mk(base, "candidate/a.md", _page(["snap/one.md", "snap/two.md"]) + "\n新事实。")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\n[a](a.md) [b](b.md) [c](c.md) edited")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [b](b.md)\n- [c](c.md) edited")
         after = incremental.page_hashes(td)
         assert incremental.changed_pages(before, after) == {"a.md": "modified", "index.md": "modified"}
         assert incremental.integrity_violations(before, after, {"a.md"}) == []       # index auto-allowed

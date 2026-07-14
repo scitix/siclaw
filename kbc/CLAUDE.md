@@ -69,10 +69,13 @@ Each page:
 ---
 type: <one or two words, you decide by content, e.g. entity/list/topic>
 title: <title>
+description: <one sentence that helps an index or agent route to this page>
 ---
 <Body. Tag each statement with (source: filename). Adjudicated contradictions are written as conclusions with the involved sources retained; unadjudicated ones are tagged "⚠️ 存疑 (doubtful): …">
 ```
-`index.md` carries only `okf_version: "0.1"` and lists links to the pages (it's an OKF reserved name and doesn't count as an orphan).
+Every concept frontmatter must be parseable YAML and `type` must be a non-empty string. Producer-defined provenance fields remain alongside the OKF fields.
+
+The root `index.md` carries only `okf_version: "0.1"` in frontmatter, then groups every page under headings with entries like `- [Title](relative/path.md) - one-line description`. Emit only file-relative standard Markdown links — never `[[wikilinks]]` or `/`-prefixed bundle links. Nested `index.md` and all `log.md` files carry no frontmatter; logs use newest-first `## YYYY-MM-DD` groups.
 
 ## Repo layout
 

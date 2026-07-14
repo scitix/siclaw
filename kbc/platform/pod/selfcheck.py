@@ -7,10 +7,10 @@ verify it": every raw text source must be either cited by a candidate page's
 `authoring/EXCLUSIONS.json`. Anything else is *unaccounted* — the exact
 silent-miss failure mode observed in the 2026-07-03 one-shot compile study.
 
-Engine-neutral by construction: pure filesystem analysis, stdlib only, no
-Agent-SDK imports. Any compile driver (Claude SDK today, other engines later)
-calls `run_layer1()` at its own turn boundary and pushes the returned repair
-prompt through its own message seam.
+Engine-neutral by construction: pure filesystem analysis plus safe YAML
+parsing, with no Agent-SDK imports. Any compile driver (Claude SDK today, other
+engines later) calls `run_layer1()` at its own turn boundary and pushes the
+returned repair prompt through its own message seam.
 """
 
 from __future__ import annotations
@@ -24,6 +24,9 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
+
+import yaml
 
 # Text sources vs binary media. BOTH are ledger-accountable (2026-07-06): the
 # batch-vs-oneshot A/B showed silent media drops are the single worst coverage
@@ -48,8 +51,8 @@ SELFCHECK_PATH = "authoring/SELFCHECK.json"
 # Defaults to zh: the PK/calibration pipeline is not yet locale-threaded and its
 # calibration corpora are Chinese. Mirrors the real siclaw consumer (siclaw
 # src/core/prompt.ts "Domain Knowledge — LLM Wiki"): Read only, no search, start
-# at index.md, whole pages, follow [[links]]. Max fidelity: do NOT tell it it's
-# being tested.
+# at index.md, read whole pages, follow standard Markdown links while tolerating
+# legacy [[links]]. Max fidelity: do NOT tell it it's being tested.
 def _pack_test_role(locale: str = "zh") -> str:
     fp = Path(__file__).resolve().parent / "prompts" / locale / "test_role.md"
     return fp.read_text(encoding="utf-8").rstrip("\n")
@@ -245,18 +248,295 @@ def _matches(path: str, pattern: str) -> bool:
     return _seg_glob(pattern.split("/"), path.split("/"))
 
 
-_MD_LINK_RE = re.compile(r"\]\(([^)#\s]+\.md)(?:#[^)]*)?\)")
+_MD_LINK_RE = re.compile(r"\]\(\s*(<[^>\n]+>|[^)\n]+)\)")
 _WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)")
-# Body-level provenance mentions: (source: X) / (源:X) / (来源:X). The capture
-# is then mined for filename-looking tokens so locators ("§3", "p.12") and
-# prose sources ("内部访谈") never false-positive.
-_BODY_SOURCE_RE = re.compile(r"[（(]\s*(?:source|src|源|来源)\s*[:：]\s*([^）)]{1,300})[）)]", re.IGNORECASE)
-_FILENAME_RE = re.compile(
-    r"[^\s,;、；()（）'\"`]+\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS)) + r")\b",
+_BODY_SOURCE_START_RE = re.compile(
+    r"(?P<open>[（(])\s*(?:source|src|源|来源)\s*[:：]\s*", re.IGNORECASE,
+)
+_SOURCE_LOCATOR_PATTERN = (
+    r"(?:§\s*[\w.-]+|p(?:age)?\.?\s*\d+(?:\s*[-–]\s*\d+)?|"
+    r"lines?\s*\d+(?:\s*[-–]\s*\d+)?|第?\s*\d+\s*(?:页|行|节))"
+)
+_SOURCE_FILE_END_RE = re.compile(
+    r"\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS))
+    + r")(?:`)?(?=(?:\s*(?:[,，;；、]|$)|\s+"
+    + _SOURCE_LOCATOR_PATTERN + r"\s*(?:[,，;；、]|$)))",
     re.IGNORECASE,
 )
-# OKF reserved routing pages: never provenance-required, never orphans.
-_RESERVED_PAGES = {"index.md", "log.md"}
+_SOURCE_LOCATOR_RE = re.compile(_SOURCE_LOCATOR_PATTERN, re.IGNORECASE)
+_SOURCE_LOCATOR_PREFIX_RE = re.compile(
+    r"\s+" + _SOURCE_LOCATOR_PATTERN + r"(?=\s*(?:[,，;；、]|$))",
+    re.IGNORECASE,
+)
+_SOURCE_SEPARATOR_RE = re.compile(r"\s*[,，;；、]\s*")
+# OKF reserved routing pages: never provenance-required, never orphans. The
+# names are reserved at EVERY level of the bundle hierarchy, not just its root.
+_RESERVED_PAGE_NAMES = {"index.md", "log.md"}
+
+
+def _is_reserved_page(rel: str) -> bool:
+    return Path(rel).name in _RESERVED_PAGE_NAMES
+
+
+def parse_okf_frontmatter(md_text: str) -> tuple[dict | None, str, str | None]:
+    """Parse an OKF YAML frontmatter block with a real YAML parser.
+
+    Returns (mapping-or-None, body, error-or-None). A missing block is distinct
+    from an invalid block so the repair prompt can tell the compiler exactly
+    what to fix. `yaml.safe_load` is deliberate: candidate metadata is tenant
+    authored input and must never construct arbitrary Python objects.
+    """
+    lines = md_text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, md_text, "missing YAML frontmatter at the start of the file"
+    end = next((i for i, line in enumerate(lines[1:], start=1)
+                if line.strip() in ("---", "...")), None)
+    if end is None:
+        return None, md_text, "YAML frontmatter has no closing delimiter"
+    raw = "\n".join(lines[1:end])
+    body = "\n".join(lines[end + 1:])
+    try:
+        value = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        problem = getattr(e, "problem", None) or str(e).splitlines()[0]
+        return None, body, f"invalid YAML frontmatter: {problem}"
+    if not isinstance(value, dict):
+        return None, body, "YAML frontmatter must be a mapping"
+    return value, body, None
+
+
+def _mask_span(text: str) -> str:
+    """Blank markdown code while preserving newlines and character offsets."""
+    return "".join("\n" if ch == "\n" else " " for ch in text)
+
+
+def _markdown_prose(md_text: str) -> str:
+    """Markdown text with YAML frontmatter, fenced code, and code spans masked.
+
+    Link lint operates on rendered prose, not raw source. A raw ``[[`` scan
+    rejects ordinary Bash conditionals and example links inside fenced/inline
+    code, both of which OKF explicitly permits. This deliberately implements
+    the code constructs the compiler emits without adding another production
+    markdown dependency.
+    """
+    _, body, error = parse_okf_frontmatter(md_text)
+    if error and not md_text.startswith("---"):
+        body = md_text
+
+    # Fenced blocks: CommonMark allows up to three leading spaces and either a
+    # backtick or tilde fence. A closing fence uses the same character and is at
+    # least as long as the opener.
+    masked_lines: list[str] = []
+    fence_char: str | None = None
+    fence_len = 0
+    for line in body.splitlines(keepends=True):
+        raw = line.rstrip("\r\n")
+        if fence_char is not None:
+            close = re.match(r"^[ ]{0,3}([`~]+)[ \t]*$", raw)
+            masked_lines.append(_mask_span(line))
+            if close and close.group(1)[0] == fence_char and len(close.group(1)) >= fence_len:
+                fence_char = None
+                fence_len = 0
+            continue
+        opened = re.match(r"^[ ]{0,3}(`{3,}|~{3,})(?:[^\r\n]*)$", raw)
+        if opened:
+            fence_char = opened.group(1)[0]
+            fence_len = len(opened.group(1))
+            masked_lines.append(_mask_span(line))
+        else:
+            masked_lines.append(line)
+
+    # Inline code spans can use any backtick-run length and may cross lines.
+    # Pair only equal-length runs; an unmatched run remains literal markdown.
+    text = "".join(masked_lines)
+    chars = list(text)
+    pos = 0
+    while True:
+        start = text.find("`", pos)
+        if start < 0:
+            break
+        end_run = start
+        while end_run < len(text) and text[end_run] == "`":
+            end_run += 1
+        ticks = end_run - start
+        close = end_run
+        found = -1
+        while True:
+            close = text.find("`", close)
+            if close < 0:
+                break
+            close_end = close
+            while close_end < len(text) and text[close_end] == "`":
+                close_end += 1
+            if close_end - close == ticks:
+                found = close_end
+                break
+            close = close_end
+        if found < 0:
+            pos = end_run
+            continue
+        for i in range(start, found):
+            if chars[i] != "\n":
+                chars[i] = " "
+        pos = found
+    return "".join(chars)
+
+
+def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[dict]:
+    """Validate the reserved OKF index shape for a v0.1 bundle.
+
+    OKF permits an optional version declaration only on the bundle-root index;
+    when present here it must target v0.1. Siclaw's producer profile separately
+    requires the declaration and file-relative links on newly authored output.
+    """
+    violations: list[dict] = []
+    fm, body, error = parse_okf_frontmatter(text)
+    if rel == "index.md":
+        if error and text.splitlines() and text.splitlines()[0].strip() == "---":
+            violations.append({"page": rel, "kind": "okf_index_frontmatter",
+                               "detail": f"根 index.md 的 YAML frontmatter 无效: {error}"})
+            body = text
+        elif not error and (set(fm or {}) != {"okf_version"}
+              or not isinstance((fm or {}).get("okf_version"), str)
+              or (fm or {}).get("okf_version") != "0.1"):
+            violations.append({"page": rel, "kind": "okf_index_frontmatter",
+                               "detail": "根 index.md frontmatter 必须且只能包含 okf_version: \"0.1\""})
+        elif error:
+            # OKF makes index.md optional and its root version declaration MAY;
+            # Siclaw's producer profile below requires that declaration.
+            body = text
+    else:
+        # A nested index has no frontmatter. A malformed block is still a block,
+        # so detect the delimiter directly instead of treating its parse error as
+        # equivalent to correctly absent frontmatter.
+        if text.splitlines() and text.splitlines()[0].strip() == "---":
+            violations.append({"page": rel, "kind": "okf_index_frontmatter",
+                               "detail": "子目录 index.md 按 OKF 不能包含 frontmatter"})
+        body = text
+
+    if not re.search(r"(?m)^#{1,6}\s+\S", body):
+        violations.append({"page": rel, "kind": "okf_index_structure",
+                           "detail": "index.md 至少需要一个 Markdown 分组标题"})
+    entries = re.findall(r"(?m)^\s*[-*]\s+\[[^\]]+\]\(([^)]+)\)(?:\s+-\s+.+)?\s*$", body)
+    if concept_pages and not entries:
+        violations.append({"page": rel, "kind": "okf_index_structure",
+                           "detail": "index.md 必须用列表形式的标准 Markdown 链接枚举知识页"})
+    return violations
+
+
+def _okf_log_violations(rel: str, text: str) -> list[dict]:
+    violations: list[dict] = []
+    if text.splitlines() and text.splitlines()[0].strip() == "---":
+        violations.append({"page": rel, "kind": "okf_log_frontmatter",
+                           "detail": "log.md 按 OKF 不能包含 frontmatter"})
+    prose = _markdown_prose(text)
+    date_matches = list(re.finditer(r"(?m)^##\s+(\d{4}-\d{2}-\d{2})\s*$", prose))
+    dates = [m.group(1) for m in date_matches]
+    valid_dates: list[str] = []
+    for date in dates:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+            valid_dates.append(date)
+        except ValueError:
+            pass
+    if not re.search(r"(?m)^#\s+\S", prose) or not dates or len(valid_dates) != len(dates):
+        violations.append({"page": rel, "kind": "okf_log_structure",
+                           "detail": "log.md 需要标题和合法的 ## YYYY-MM-DD 日期分组"})
+    elif valid_dates != sorted(valid_dates, reverse=True):
+        violations.append({"page": rel, "kind": "okf_log_structure",
+                           "detail": "log.md 日期分组必须按从新到旧排列"})
+    empty_groups = []
+    for i, match in enumerate(date_matches):
+        end = date_matches[i + 1].start() if i + 1 < len(date_matches) else len(prose)
+        if not re.search(r"(?m)^\s*[-*]\s+\S.*$", prose[match.end():end]):
+            empty_groups.append(match.group(1))
+    if empty_groups:
+        violations.append({"page": rel, "kind": "okf_log_structure",
+                           "detail": f"log.md 每个日期分组都必须包含列表形式的更新记录: {', '.join(empty_groups)}"})
+    return violations
+
+
+def okf_v01_violations(pages: dict[str, dict]) -> list[dict]:
+    """Mandatory OKF v0.1 conformance checks only."""
+    violations: list[dict] = []
+    concept_pages = {rel for rel in pages if not _is_reserved_page(rel)}
+    for rel, page in pages.items():
+        if "error" in page:
+            continue  # the existing unreadable violation is more specific
+        text = page.get("text", "")
+        name = Path(rel).name
+        if name == "index.md":
+            violations.extend(_okf_index_violations(rel, text, concept_pages))
+            continue
+        if name == "log.md":
+            violations.extend(_okf_log_violations(rel, text))
+            continue
+        fm, _, error = parse_okf_frontmatter(text)
+        if error:
+            violations.append({"page": rel, "kind": "okf_frontmatter",
+                               "detail": error})
+            continue
+        type_value = (fm or {}).get("type")
+        if not isinstance(type_value, str) or not type_value.strip():
+            violations.append({"page": rel, "kind": "okf_type",
+                               "detail": "OKF concept frontmatter requires a non-empty string type"})
+
+    return violations
+
+
+def siclaw_portable_output_violations(pages: dict[str, dict]) -> list[dict]:
+    """Siclaw producer preferences beyond OKF's mandatory conformance rules."""
+    violations: list[dict] = []
+    for rel, page in pages.items():
+        if "error" in page:
+            continue
+        text = page.get("text", "")
+        prose = _markdown_prose(text)
+        if _WIKI_LINK_RE.search(prose):
+            violations.append({"page": rel, "kind": "siclaw_profile_wikilink",
+                               "detail": "Siclaw 新产出使用文件相对的标准 Markdown 链接，不要使用 [[wikilink]]"})
+        if any(target.startswith("/") for target in _markdown_link_targets(prose)):
+            violations.append({"page": rel, "kind": "siclaw_profile_bundle_link",
+                               "detail": "OKF 允许 / 开头的 bundle 链接，但 Siclaw 新产出使用文件相对链接以便跨浏览器查看"})
+        if (rel == "index.md"
+                and (not text.splitlines() or text.splitlines()[0].strip() != "---")):
+            violations.append({"page": rel, "kind": "siclaw_profile_version_declaration",
+                               "detail": "Siclaw 根 index.md 必须声明 okf_version: \"0.1\""})
+    return violations
+
+
+def format_policy_violations(pages: dict[str, dict]) -> list[dict]:
+    """All OKF-core and Siclaw-profile violations for authoring enforcement."""
+    return okf_v01_violations(pages) + siclaw_portable_output_violations(pages)
+
+
+def format_violation_keys(pages: dict[str, dict]) -> list[list[str]]:
+    """JSON-safe baseline keys used to grandfather untouched legacy pages."""
+    return [list(key) for key in sorted({(v["page"], v["kind"])
+                                         for v in format_policy_violations(pages)})]
+
+
+def filter_incremental_format_violations(
+    violations: list[dict], baseline_keys: list[list[str]], changed_pages: set[str],
+) -> tuple[list[dict], list[dict]]:
+    """Separate blocking violations from inherited legacy format debt.
+
+    Only a violation that already existed at incremental kickoff AND belongs to
+    a page unchanged this round is grandfathered. New violations and violations
+    on pages that actually changed remain hard failures; merely authorizing a
+    page must not turn an unrelated incremental edit into a format migration.
+    """
+    baseline = {(str(item[0]), str(item[1])) for item in baseline_keys
+                if isinstance(item, (list, tuple)) and len(item) == 2}
+    blocking: list[dict] = []
+    inherited: list[dict] = []
+    for violation in violations:
+        key = (str(violation.get("page", "")), str(violation.get("kind", "")))
+        if key in baseline and key[0] not in changed_pages:
+            inherited.append(violation)
+        else:
+            blocking.append(violation)
+    return blocking, inherited
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -269,28 +549,107 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
-def _body_source_files(text: str) -> list[str]:
-    """Filenames cited in the body via (source:/源:/来源: …), raw//drop/ prefix
-    and `<hash8> · ` decoration stripped."""
+def _markdown_link_targets(text: str) -> list[str]:
+    """Markdown ``.md`` destinations normalized for filesystem comparison.
+
+    CommonMark angle destinations, URL-encoded spaces, and the tolerant raw
+    form emitted by existing agents all refer to the same candidate path.
+    """
+    targets: list[str] = []
+    for captured in _MD_LINK_RE.findall(text):
+        destination = captured.strip()
+        if destination.startswith("<") and destination.endswith(">"):
+            destination = destination[1:-1].strip()
+        else:
+            # Keep compatibility with the optional Markdown link-title form.
+            titled = re.fullmatch(
+                r"(.+?\.md(?:#[^\s\"']*)?)\s+(?:\"[^\"]*\"|'[^']*')",
+                destination,
+                re.IGNORECASE,
+            )
+            if titled:
+                destination = titled.group(1)
+        destination = unquote(destination).split("#", 1)[0].strip()
+        if destination.lower().endswith(".md"):
+            targets.append(destination)
+    return targets
+
+
+def _body_source_payloads(text: str) -> list[str]:
+    """Extract source-marker payloads while preserving nested filename pairs."""
+    payloads: list[str] = []
+    prose = _markdown_prose(text)
+    for match in _BODY_SOURCE_START_RE.finditer(prose):
+        stack = [")" if match.group("open") == "(" else "）"]
+        for pos, char in enumerate(prose[match.end():match.end() + 301], start=match.end()):
+            if char == "(":
+                stack.append(")")
+            elif char == "（":
+                stack.append("）")
+            elif char == stack[-1]:
+                stack.pop()
+                if not stack:
+                    payloads.append(prose[match.end():pos])
+                    break
+    return payloads
+
+
+def _body_source_references(text: str) -> tuple[list[str], list[str]]:
+    """Return (source files, malformed source items) from body annotations.
+
+    A known extension terminates each filename; punctuation before that
+    extension belongs to the imported filename. This fail-closed rule prevents
+    removing ``.md`` from turning a real provenance mismatch into a silent
+    green lint. Locator-only items such as ``§3`` and ``p.12`` are accepted
+    after a file.
+    """
     found: list[str] = []
-    for captured in _BODY_SOURCE_RE.findall(_strip_frontmatter(text)):
-        for token in _FILENAME_RE.findall(captured):
-            entry = token.strip()
-            if "·" in entry:
-                entry = entry.rsplit("·", 1)[1].strip()
-            for prefix in ("raw/", "drop/"):
-                if entry.startswith(prefix):
-                    entry = entry[len(prefix):]
+    malformed: list[str] = []
+    for captured in _body_source_payloads(text):
+        capture_has_file = False
+        capture_has_malformed = False
+        cursor = 0
+        while match := _SOURCE_FILE_END_RE.search(captured, cursor):
+            item = captured[cursor:match.end()].strip(" \t\r\n,，;；、`")
+            entry = _norm_source_entry(item)
             if entry and entry not in found:
                 found.append(entry)
-    return found
+            capture_has_file = capture_has_file or bool(entry)
+            cursor = match.end()
+
+            # A locator belongs to the filename immediately before it, not to
+            # the next comma-separated filename. Consume it before advancing
+            # the item cursor so ``a.md §3, b.pdf p.5`` yields exactly two
+            # source paths while keeping punctuation inside filenames intact.
+            locator = _SOURCE_LOCATOR_PREFIX_RE.match(captured, cursor)
+            if locator:
+                cursor = locator.end()
+            separator = _SOURCE_SEPARATOR_RE.match(captured, cursor)
+            if separator:
+                cursor = separator.end()
+        remainder = captured[cursor:].strip(" \t\r\n,，;；、")
+        if remainder and not _SOURCE_LOCATOR_RE.fullmatch(remainder):
+            if remainder not in malformed:
+                malformed.append(remainder)
+            capture_has_malformed = True
+        if not capture_has_file and not capture_has_malformed:
+            item = captured.strip()
+            if item and item not in malformed:
+                malformed.append(item)
+    return found, malformed
+
+
+def _body_source_files(text: str) -> list[str]:
+    """Normalized filenames cited via body ``(source: ...)`` annotations."""
+    return _body_source_references(text)[0]
 
 
 def _out_links(rel: str, text: str, names: set[str]) -> set[str]:
     """Resolved intra-wiki edges out of one page (md links + wikilinks)."""
     base = Path(rel).parent
     out: set[str] = set()
-    for target in _MD_LINK_RE.findall(text):
+    prose = _markdown_prose(text)
+    for target in _markdown_link_targets(prose):
         if target.startswith(("http://", "https://", "/")):
             continue
         resolved = posixpath.normpath((base / target).as_posix())
@@ -298,7 +657,7 @@ def _out_links(rel: str, text: str, names: set[str]) -> set[str]:
             out.add(resolved)
         elif target in names:
             out.add(target)
-    for target in _WIKI_LINK_RE.findall(text):
+    for target in _WIKI_LINK_RE.findall(prose):
         t = target.strip()
         if f"{t}.md" in names:
             out.add(f"{t}.md")
@@ -322,7 +681,7 @@ def _orphan_pages(pages: dict[str, dict]) -> list[str]:
             if target not in reachable:
                 reachable.add(target)
                 frontier.append(target)
-    return sorted(names - reachable - _RESERVED_PAGES)
+    return sorted(rel for rel in names - reachable if not _is_reserved_page(rel))
 
 
 def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
@@ -343,7 +702,7 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
         if "error" in page:
             violations.append({"page": rel, "kind": "unreadable", "detail": page["error"]})
             continue
-        if rel not in _RESERVED_PAGES and not page["has_compiled_from"] and not page["derived"]:
+        if not _is_reserved_page(rel) and not page["has_compiled_from"] and not page["derived"]:
             violations.append({"page": rel, "kind": "no_provenance",
                                "detail": "frontmatter 缺 compiled_from(纯综合页请标 derived: true)"})
         text = page.get("text", "")
@@ -359,13 +718,14 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
                                           f"({sync_cap // 1024}KB)——超限页不会被持久化/发布(静默丢失);"
                                           "按主题拆成多页并挂回 index")})
         base = Path(rel).parent
-        for target in _MD_LINK_RE.findall(text):
+        prose = _markdown_prose(text)
+        for target in _markdown_link_targets(prose):
             if target.startswith(("http://", "https://", "/")):
                 continue
             resolved = posixpath.normpath((base / target).as_posix())
             if resolved not in names and target not in names:
                 violations.append({"page": rel, "kind": "broken_link", "detail": target})
-        for target in _WIKI_LINK_RE.findall(text):
+        for target in _WIKI_LINK_RE.findall(prose):
             t = target.strip()
             if t and f"{t}.md" not in names and t not in names:
                 violations.append({"page": rel, "kind": "broken_wikilink", "detail": t})
@@ -374,11 +734,16 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
         # basename, compiled_from carries the raw-relative path).
         cf_full = set(page["sources"])
         cf_names = {posixpath.basename(s) for s in cf_full}
-        for f in _body_source_files(text):
+        body_sources, malformed_sources = _body_source_references(text)
+        for f in body_sources:
             if f in cf_full or posixpath.basename(f) in cf_names:
                 continue
             violations.append({"page": rel, "kind": "body_source_uncited",
                                "detail": f"正文引用 (source: {f}) 但该文件不在本页 compiled_from——补登记或修正引用"})
+        for item in malformed_sources:
+            violations.append({"page": rel, "kind": "body_source_malformed",
+                               "detail": (f"正文来源标注无法解析为带扩展名的源文件: (source: {item})"
+                                          "——保留与 compiled_from 一致的完整文件名和扩展名")})
         # Charset integrity: U+FFFD (replacement char) is never legitimate KB
         # content — it is the fingerprint of a LOSSY UTF-8 decode (a multibyte
         # char split at a stream chunk boundary upstream, e.g. the model-output
@@ -410,6 +775,7 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
                            "detail": "从 index.md 无链可达——把它挂进 index 或相应父页;确属废页则删除"})
     for err in exclusion_errors:
         violations.append({"page": EXCLUSIONS_PATH, "kind": "exclusions_invalid", "detail": err})
+    violations.extend(format_policy_violations(pages))
     return {"ok": not violations, "violations": violations}
 
 
@@ -433,7 +799,7 @@ def dup_candidates(pages: dict[str, dict], cap: int = 20) -> list[dict]:
     (near-dups can be legitimate, so the model/owner gets the last word)."""
     infos = []
     for rel, page in sorted(pages.items()):
-        if rel in _RESERVED_PAGES or "error" in page:
+        if _is_reserved_page(rel) or "error" in page:
             continue
         infos.append((rel, _norm_title(page.get("text", "")), set(page["sources"])))
     out: list[dict] = []

@@ -449,8 +449,8 @@ def test_pk_section_survives_layer1():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "raw/a.md")
-        _mk(base, "candidate/index.md", "---\ntype: index\n---\ni")
-        _mk(base, "candidate/p.md", "---\ncompiled_from:\n  - a.md\n---\nx")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [P](p.md)")
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - a.md\n---\nx")
         selfcheck.write_selfcheck(td, selfcheck.run_layer1(td))
         selfcheck.update_pk_section(td, {"state": "passed", "questions": 7})
         report = selfcheck.run_layer1(td)  # an L1 re-check must carry pk forward
