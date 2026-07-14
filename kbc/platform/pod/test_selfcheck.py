@@ -284,6 +284,52 @@ def test_media_ledger_and_new_lint():
     print("OK  media ledger + body_source_uncited + orphan-free close + dup_candidates")
 
 
+def test_body_source_annotations():
+    """Body provenance keeps complete imported filenames and fails closed."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        first = "docs/MCP 工具与结果设计指南-70f5bd35.md"
+        second = "docs/Skill Knowledge 指南.md"
+        _mk(base, f"raw/{first}")
+        _mk(base, f"raw/{second}")
+        _mk(base, "candidate/index.md",
+            "---\nokf_version: \"0.1\"\n---\n# Index\n- [Guide](guide.md)")
+
+        def write_page(body: str) -> None:
+            _mk(base, "candidate/guide.md",
+                "---\ntype: Guide\ntitle: Guide\ncompiled_from:\n"
+                f"  - {first}\n  - {second}\n---\n{body}")
+
+        combined = ("(source: MCP 工具与结果设计指南-70f5bd35.md, "
+                    "Skill Knowledge 指南.md, §3) (source: legacy.md, p.12)")
+        assert selfcheck._body_source_files(combined) == [
+            "MCP 工具与结果设计指南-70f5bd35.md",
+            "Skill Knowledge 指南.md",
+            "legacy.md",
+        ]
+
+        write_page("正文。"
+                   "(source: MCP 工具与结果设计指南-70f5bd35.md, "
+                   "Skill Knowledge 指南.md, §3)")
+        report = selfcheck.run_layer1(td)
+        assert report["coverage"]["closed"] and report["lint"]["ok"], report
+
+        write_page("正文。(source: Missing Imported Guide.md)")
+        report = selfcheck.run_layer1(td)
+        body_violations = [v for v in report["lint"]["violations"]
+                           if v["kind"] == "body_source_uncited"]
+        assert len(body_violations) == 1, report["lint"]
+        assert "Missing Imported Guide.md" in body_violations[0]["detail"], body_violations
+
+        write_page("正文。(source: MCP 工具与结果设计指南-70f5bd35)")
+        report = selfcheck.run_layer1(td)
+        body_violations = [v for v in report["lint"]["violations"]
+                           if v["kind"] == "body_source_malformed"]
+        assert len(body_violations) == 1, report["lint"]
+        assert "完整文件名和扩展名" in body_violations[0]["detail"], body_violations
+    print("OK  body source annotations (spaces / combined / locator / unknown / missing extension)")
+
+
 def test_charset_corruption_detection():
     """U+FFFD (the lossy-UTF-8-decode marker) anywhere in a page — path OR body
     prose — must block state=passed. Body-prose corruption is INVISIBLE to the
@@ -1313,6 +1359,7 @@ def main():
     test_noop_exclusion_warning()
     test_coverage_and_lint()
     test_media_ledger_and_new_lint()
+    test_body_source_annotations()
     test_media_verify_helpers()
     test_cap_media_pending()
     test_dangling_alone_blocks_closed()

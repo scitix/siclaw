@@ -250,11 +250,18 @@ def _matches(path: str, pattern: str) -> bool:
 _MD_LINK_RE = re.compile(r"\]\(([^)#\s]+\.md)(?:#[^)]*)?\)")
 _WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)")
 # Body-level provenance mentions: (source: X) / (源:X) / (来源:X). The capture
-# is then mined for filename-looking tokens so locators ("§3", "p.12") and
-# prose sources ("内部访谈") never false-positive.
+# is then split on explicit separators before parsing each complete filename.
+# Whitespace is valid inside imported filenames, so it must never be a token
+# boundary here.
 _BODY_SOURCE_RE = re.compile(r"[（(]\s*(?:source|src|源|来源)\s*[:：]\s*([^）)]{1,300})[）)]", re.IGNORECASE)
+_BODY_SOURCE_PART_RE = re.compile(r"[^,，;；、]+")
 _FILENAME_RE = re.compile(
-    r"[^\s,;、；()（）'\"`]+\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS)) + r")\b",
+    r"^\s*(.+\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS)) + r"))\b",
+    re.IGNORECASE,
+)
+_SOURCE_LOCATOR_RE = re.compile(
+    r"(?:§\s*[\w.-]+|p(?:age)?\.?\s*\d+(?:\s*[-–]\s*\d+)?|"
+    r"lines?\s*\d+(?:\s*[-–]\s*\d+)?|第?\s*\d+\s*(?:页|行|节))",
     re.IGNORECASE,
 )
 # OKF reserved routing pages: never provenance-required, never orphans. The
@@ -536,21 +543,45 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
-def _body_source_files(text: str) -> list[str]:
-    """Filenames cited in the body via (source:/源:/来源: …), raw//drop/ prefix
-    and `<hash8> · ` decoration stripped."""
+def _body_source_references(text: str) -> tuple[list[str], list[str]]:
+    """Return (source files, malformed source items) from body annotations.
+
+    Commas and semicolons separate files; spaces do not. A source marker must
+    name a file with a known extension. This fail-closed rule prevents removing
+    ``.md`` from turning a real provenance mismatch into a silent green lint.
+    Locator-only items such as ``§3`` and ``p.12`` are accepted after a file.
+    """
     found: list[str] = []
+    malformed: list[str] = []
     for captured in _BODY_SOURCE_RE.findall(_strip_frontmatter(text)):
-        for token in _FILENAME_RE.findall(captured):
-            entry = token.strip()
-            if "·" in entry:
-                entry = entry.rsplit("·", 1)[1].strip()
-            for prefix in ("raw/", "drop/"):
-                if entry.startswith(prefix):
-                    entry = entry[len(prefix):]
-            if entry and entry not in found:
-                found.append(entry)
-    return found
+        capture_has_file = False
+        capture_has_malformed = False
+        for part in _BODY_SOURCE_PART_RE.findall(captured):
+            item = part.strip()
+            if not item:
+                continue
+            match = _FILENAME_RE.match(item)
+            if match:
+                entry = _norm_source_entry(match.group(1).strip().strip("`"))
+                if entry and entry not in found:
+                    found.append(entry)
+                capture_has_file = capture_has_file or bool(entry)
+                continue
+            if _SOURCE_LOCATOR_RE.fullmatch(item):
+                continue
+            if item not in malformed:
+                malformed.append(item)
+            capture_has_malformed = True
+        if not capture_has_file and not capture_has_malformed:
+            item = captured.strip()
+            if item and item not in malformed:
+                malformed.append(item)
+    return found, malformed
+
+
+def _body_source_files(text: str) -> list[str]:
+    """Normalized filenames cited via body ``(source: ...)`` annotations."""
+    return _body_source_references(text)[0]
 
 
 def _out_links(rel: str, text: str, names: set[str]) -> set[str]:
@@ -643,11 +674,16 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
         # basename, compiled_from carries the raw-relative path).
         cf_full = set(page["sources"])
         cf_names = {posixpath.basename(s) for s in cf_full}
-        for f in _body_source_files(text):
+        body_sources, malformed_sources = _body_source_references(text)
+        for f in body_sources:
             if f in cf_full or posixpath.basename(f) in cf_names:
                 continue
             violations.append({"page": rel, "kind": "body_source_uncited",
                                "detail": f"正文引用 (source: {f}) 但该文件不在本页 compiled_from——补登记或修正引用"})
+        for item in malformed_sources:
+            violations.append({"page": rel, "kind": "body_source_malformed",
+                               "detail": (f"正文来源标注无法解析为带扩展名的源文件: (source: {item})"
+                                          "——保留与 compiled_from 一致的完整文件名和扩展名")})
         # Charset integrity: U+FFFD (replacement char) is never legitimate KB
         # content — it is the fingerprint of a LOSSY UTF-8 decode (a multibyte
         # char split at a stream chunk boundary upstream, e.g. the model-output
