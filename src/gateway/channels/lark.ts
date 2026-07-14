@@ -54,6 +54,19 @@ const QUEUE_FULL_NOTICE_BY_LOCALE = {
   "zh-CN": "⏳ 当前会话还有较多消息排队处理中，请稍后再发。",
   "en-US": "⏳ This channel session already has several messages queued. Please try again later.",
 } as const;
+// Session is single-threaded in AgentBox: after waiting out the busy window (queue-until-idle)
+// the session is still occupied (e.g. a long run_in_background exec job). Ask the user to retry
+// rather than clobbering the in-flight work or dumping the raw 409.
+const SESSION_BUSY_NOTICE_BY_LOCALE = {
+  "zh-CN": "⏳ 还在处理上一条，请稍候再发。",
+  "en-US": "⏳ Still working on the previous message — please try again shortly.",
+} as const;
+// Generic failure notice. The raw error can leak internal endpoints / infra to everyone in the
+// chat, so we log the real error and show this instead.
+const AGENT_ERROR_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 处理时出错了，请稍后重试。",
+  "en-US": "❌ Something went wrong while processing this. Please try again later.",
+} as const;
 const NEW_SESSION_NOTICE_BY_LOCALE = {
   "zh-CN": "✅ 已开启新会话，此入口中的历史上下文已清空。",
   "en-US": "✅ Started a new session. Previous context for this channel entry has been cleared.",
@@ -928,11 +941,14 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
   let agentError: Error | null = null;
+  let sessionBusy = false;
   try {
-    const promptResult = await client.prompt(promptOpts);
+    // queue-until-idle: wait out a busy session instead of dumping a raw 409.
+    const promptResult = await promptWithBusyRetry(client, promptOpts);
     const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", {
       includeImages: true,
       onMilestone: addMilestone,
+      locale,
       // Audit: persist assistant + tool rows so the channel transcript matches
       // web/api/a2a (origin="channel" set on the session above). Tool output on
       // this stream is already sanitized at the agentbox boundary.
@@ -941,16 +957,24 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     resultText = collected.text;
     replyImages = collected.images;
   } catch (err) {
-    agentError = err instanceof Error ? err : new Error(String(err));
-    console.error(`[lark] Agent execution failed for session=${sessionId}:`, agentError);
+    if (isSessionBusyError(err)) {
+      // Still busy after the retry window — surface a friendly notice, don't clobber.
+      sessionBusy = true;
+      console.warn(`[lark] Session still busy after retry for session=${sessionId}`);
+    } else {
+      agentError = err instanceof Error ? err : new Error(String(err));
+      console.error(`[lark] Agent execution failed for session=${sessionId}:`, agentError);
+    }
   }
 
-  // Materialize the final reply body. Preserve the agent-like-API-key UX:
-  // a single message to the user — no intermediate tool-call spam.
-  const finalBody = agentError
-    ? `\u274C ${agentError.message.slice(0, 500)}`
-    : (resultText || EMPTY_RESULT_NOTICE_BY_LOCALE[locale]);
-  if (agentError) replyImages = [];
+  // Session-busy and other errors both get a sanitized notice \u2014 the raw error (internal
+  // endpoints, 409 JSON) must never reach the chat; it was logged above.
+  const finalBody = sessionBusy
+    ? SESSION_BUSY_NOTICE_BY_LOCALE[locale]
+    : agentError
+      ? AGENT_ERROR_NOTICE_BY_LOCALE[locale]
+      : (resultText || EMPTY_RESULT_NOTICE_BY_LOCALE[locale]);
+  if (agentError || sessionBusy) replyImages = [];
   const displayBody = stripVisualBlocks(finalBody, { stripSourceBlocks: replyImages.length > 0 })
     || VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
   // The final card is JUST the conclusion — the live step indicator is replaced
@@ -977,9 +1001,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       // duplicate messages in the group.
       console.warn(`[lark] Card finalize incomplete for cardId=${cardSession.cardId}; user may see stuck placeholder`);
     }
-  } else if (resultText || agentError) {
-    // Card could not be opened; fall back to a plain text reply with
-    // whatever we have (final answer or error) + any accumulated milestones.
+  } else if (resultText || agentError || sessionBusy) {
+    // Card could not be opened; fall back to a plain text reply with whatever we have —
+    // a real answer, an error notice, OR the session-busy notice (sessionBusy carries no
+    // resultText/agentError, so it must be listed explicitly or the busy notice is dropped).
     await replyToLark(larkClient, messageId, finalCardBody);
     deliveredTextChars = finalCardBody.length;
   }
@@ -1121,6 +1146,43 @@ function shouldDeliverBackgroundReply(text: string, previousChars: number): bool
   return !(previousChars > 80 && chars < 120 && chars < previousChars * 0.75);
 }
 
+/**
+ * True when an AgentBox prompt failed with HTTP 409 ("Session is already running") — the session
+ * is single-threaded and something (previous turn / lingering background exec / synthetic delivery)
+ * still holds the brain. The client wraps non-2xx as `AgentBox request failed: <status> <body>`
+ * with a `.status` field.
+ */
+function isSessionBusyError(err: unknown): boolean {
+  if (err && typeof err === "object" && (err as { status?: number }).status === 409) return true;
+  const m = err instanceof Error ? err.message : String(err);
+  return /request failed: 409\b/i.test(m) || /already running/i.test(m);
+}
+
+/**
+ * queue-until-idle: the per-binding queue already serialises a sender's messages, but a turn can
+ * end while a run_in_background exec job (or the synthetic delivery turn) still holds the session —
+ * so the next dequeued message can still hit 409. Retry with backoff until the session frees; give
+ * up after maxWaitMs so a genuinely stuck/long job doesn't pin the handler forever (caller then
+ * shows the friendly busy notice). Never surfaces the raw 409.
+ */
+async function promptWithBusyRetry(
+  client: AgentBoxClient,
+  opts: PromptOptions,
+  maxWaitMs = 45_000,
+): Promise<Awaited<ReturnType<AgentBoxClient["prompt"]>>> {
+  const started = Date.now();
+  let delay = 500;
+  for (;;) {
+    try {
+      return await client.prompt(opts);
+    } catch (err) {
+      if (!isSessionBusyError(err) || Date.now() - started >= maxWaitMs) throw err;
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 3000);
+    }
+  }
+}
+
 async function deliverVisibleChannelText(
   larkClient: any,
   messageId: string,
@@ -1181,7 +1243,7 @@ export async function collectChannelResponse(
   client: AgentBoxClient,
   sessionId: string,
   logPrefix = "lark",
-  options: { includeImages?: boolean; onMilestone?: (text: string) => void; persist?: ChannelPersistContext } = {},
+  options: { includeImages?: boolean; onMilestone?: (text: string) => void; persist?: ChannelPersistContext; locale?: LarkLocale } = {},
 ): Promise<CollectedChannelResponse> {
   const parts: string[] = [];
   const images: RenderedReplyImage[] = [];
@@ -1215,6 +1277,36 @@ export async function collectChannelResponse(
   try {
     for await (const event of client.streamEvents(sessionId)) {
       const ev = event as Record<string, any>;
+
+      // Live tool progress → milestone. A FOREGROUND sub-agent batch blocks the parent inside one
+      // tool call, so no intermediate assistant turn fires while it runs — without this the card
+      // sits frozen at the last line for the whole (multi-minute) batch. spawn_subagent streams
+      // group progress via tool_execution_update; surface it as the current ⏳ step. (Background
+      // groups instead report via group_progress, not this SSE.)
+      if (ev.type === "tool_execution_update" && options.onMilestone) {
+        const items = Array.isArray(ev.partialResult?.details?.items) ? ev.partialResult.details.items : null;
+        let milestone = "";
+        if (items) {
+          // Structured group progress → render in the channel locale (the tool's own activity
+          // text is hard-coded English; localize here where we know the locale).
+          const total = items.length;
+          const done = items.filter((i: any) => i?.status !== "queued" && i?.status !== "running").length;
+          milestone = (options.locale === "en-US")
+            ? `Running sub-agents… ${done}/${total} done`
+            : `子任务执行中… ${done}/${total} 完成`;
+        } else {
+          // Non-group progress (single-agent step activity): fall back to the raw activity text.
+          const blocks = Array.isArray(ev.partialResult?.content) ? ev.partialResult.content : [];
+          const activity = blocks
+            .filter((b: any) => b?.type === "text")
+            .map((b: any) => (b.text ?? "") as string)
+            .join(" ")
+            .trim();
+          milestone = activity ? (condenseMilestone(activity) || activity) : "";
+        }
+        if (milestone) options.onMilestone(milestone);
+      }
+
       if (ev.type === "content_block_delta" && ev.delta?.text) parts.push(ev.delta.text);
       if (ev.type === "text" && typeof ev.text === "string") parts.push(ev.text);
 

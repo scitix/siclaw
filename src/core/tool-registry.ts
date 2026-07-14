@@ -365,6 +365,16 @@ export interface ToolRefs {
    * never sees a non-working tool (children get no executor → no recursion).
    */
   spawnSubagentExecutor?: SpawnSubagentExecutor;
+  /**
+   * Force spawn_subagent to run FOREGROUND (block, return results inline) — hides the
+   * `run_in_background` param and flips a multi-item batch's default from background to
+   * foreground. Set only for the `channel` session mode: it exposes spawn_subagent (see the
+   * tool's registration `modes`) yet has no persistent client to receive a detached conclusion,
+   * so a background batch would strand its result. web/cli also expose spawn_subagent but are
+   * persistent (leave this false → keep background); a2a/api/task don't expose spawn_subagent at
+   * all. Does NOT affect `run_in_background` exec (node/pod/bash), a within-turn primitive.
+   */
+  foregroundSubagentOnly?: boolean;
   /** Cancels a running background job (sub-agent or bash). Enables the job_stop tool. */
   jobStopExecutor?: JobStopExecutor;
   /**
