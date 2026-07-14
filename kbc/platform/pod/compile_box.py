@@ -91,6 +91,10 @@ RUNS: dict[str, "CompileRun"] = {}
 # Read-only "test session" runs — ephemeral consumer sessions over a pinned draft
 # snapshot (test sessions). Parallel to RUNS, torn down on close/idle. See TestRun.
 TEST_SESSIONS: dict[str, "TestRun"] = {}
+# One explicit red-team recommendation may inspect a run at a time. The Sicore
+# side also owns a durable repo lease; this local guard closes direct/RPC replay
+# races before they spend a second model call.
+RECOMMENDATIONS_ACTIVE: set[str] = set()
 DEFAULT_HTTP_MAX_REQUEST_BYTES = 768 * 1024 * 1024
 
 # ── Prompt packs — locale-parameterized model-facing text ────────────────────
@@ -2800,6 +2804,95 @@ def _make_compile_path_guard(root: Path, locale: str | None = None):
     return _make_path_guard(root, locale, deny_bash=True)
 
 
+def _recommendation_path_escape(root: Path, tool_name: str, tool_input: dict) -> str | None:
+    """Confine the red-team recommender to raw/ and candidate/ only.
+
+    The generic compiler guard protects the pod boundary but intentionally
+    allows authoring/, eval/, and release/. Those contain internal workflow and
+    prior evaluation material that must not influence a blind test proposal.
+    """
+    root = root.resolve()
+    allowed = ((root / "raw").resolve(), (root / "candidate").resolve())
+
+    def within(target: Path, base: Path) -> bool:
+        try:
+            target.relative_to(base)
+            return True
+        except ValueError:
+            return False
+
+    def outside(value: str) -> bool:
+        path = Path(value)
+        target = path if path.is_absolute() else root / path
+        resolved = target.resolve()
+        return not any(within(resolved, base) for base in allowed)
+
+    if tool_name == "Read":
+        value = tool_input.get("file_path")
+        if not isinstance(value, str) or not value.strip() or outside(value):
+            return f"file_path={value}"
+        return None
+
+    if tool_name == "Grep":
+        value = tool_input.get("path")
+        # Grep without path defaults to cwd and would scan every workspace dir.
+        if not isinstance(value, str) or not value.strip() or outside(value):
+            return f"path={value}"
+        return None
+
+    if tool_name == "Glob":
+        pattern = tool_input.get("pattern")
+        if not isinstance(pattern, str) or not pattern.strip() or ".." in PurePosixPath(pattern).parts:
+            return f"pattern={pattern}"
+        path = tool_input.get("path")
+        if isinstance(path, str) and path.strip():
+            if outside(path):
+                return f"path={path}"
+            if pattern.startswith("/"):
+                wildcard_positions = [pattern.find(ch) for ch in ("*", "?", "[") if ch in pattern]
+                base = pattern[:min(wildcard_positions)] if wildcard_positions else pattern
+                if outside(base):
+                    return f"pattern={pattern}"
+            return None
+        if pattern.startswith("/"):
+            wildcard_positions = [pattern.find(ch) for ch in ("*", "?", "[") if ch in pattern]
+            base = pattern[:min(wildcard_positions)] if wildcard_positions else pattern
+            if outside(base):
+                return f"pattern={pattern}"
+            return None
+        first = PurePosixPath(pattern).parts[0] if PurePosixPath(pattern).parts else ""
+        if first not in {"raw", "candidate"}:
+            return f"pattern={pattern}"
+        return None
+
+    if tool_name == "mcp__recommend__submit_recommended_test":
+        return None
+    return f"tool={tool_name}"
+
+
+def _make_recommendation_path_guard(root: Path, locale: str | None = None):
+    """PreToolUse hook for the isolated red-team recommendation session."""
+    deny_template = _prompt("guard_deny", locale).strip()
+
+    async def guard(input_data, tool_use_id, context):
+        offender = _recommendation_path_escape(
+            root,
+            str(input_data.get("tool_name", "")),
+            input_data.get("tool_input") or {},
+        )
+        if offender:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": deny_template.format(root=root, offender=offender),
+                }
+            }
+        return {}
+
+    return guard
+
+
 async def test_session_driver(run: "TestRun"):
     """Read-only consumer driver: host a ClaudeSDKClient over the pinned snapshot
     dir, tools limited to the kb-test profile's whitelist (default Read/Glob/Grep),
@@ -2837,6 +2930,114 @@ async def test_session_driver(run: "TestRun"):
         run.connected.set()  # unblock any /test-message waiters even if connect failed
         run.client = None
         await client.disconnect()
+
+
+def _validate_test_recommendation(root: Path, args: dict) -> dict:
+    """Validate the model's structured recommendation against the live workspace.
+
+    Evidence must name at least one real file below raw/. This makes the
+    reference answer auditable and prevents a model from laundering candidate
+    prose or an escaped host path into ground truth.
+    """
+    question = str(args.get("question", "")).strip()
+    reference = str(args.get("reference_answer", "")).strip()
+    evidence = args.get("evidence_paths")
+    if not question or len(question) > 1024:
+        raise ValueError("recommended question must contain 1-1024 characters")
+    if not reference or len(reference) > 8000:
+        raise ValueError("recommended reference_answer must contain 1-8000 characters")
+    if not isinstance(evidence, list) or not evidence:
+        raise ValueError("recommended test must cite at least one raw evidence path")
+    root = root.resolve()
+    raw_root = (root / "raw").resolve()
+    normalized: list[str] = []
+    for value in evidence[:12]:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("evidence_paths must contain non-empty strings")
+        rel = Path(value.strip())
+        if rel.is_absolute():
+            raise ValueError("evidence_paths must be workspace-relative raw paths")
+        target = (root / rel).resolve()
+        try:
+            target.relative_to(raw_root)
+        except ValueError as exc:
+            raise ValueError(f"evidence path is outside raw/: {value}") from exc
+        if not target.is_file():
+            raise ValueError(f"evidence path does not exist: {value}")
+        normalized.append(target.relative_to(root).as_posix())
+    return {
+        "question": question,
+        "reference_answer": reference,
+        "evidence_paths": list(dict.fromkeys(normalized)),
+    }
+
+
+async def recommend_test_question(parent: "CompileRun") -> dict:
+    """Run one fresh, read-only red-team session over raw/ + candidate/.
+
+    This is intentionally not the compile session and exposes no write tools.
+    It returns one structured question to the control plane; it never writes a
+    proposal artifact and never sends the reference answer to the test consumer.
+    """
+    root = Path(parent.workdir).resolve()
+    if not (root / "candidate" / "index.md").is_file():
+        raise ValueError("no stable candidate draft is available")
+    if not (root / "raw").is_dir() or not any(p.is_file() for p in (root / "raw").rglob("*")):
+        raise ValueError("no raw source is available for a grounded recommendation")
+
+    captured: dict = {}
+    tool_description = _loc(
+        parent,
+        "Submit exactly one simple, valuable regression question with its raw-grounded reference answer and evidence paths.",
+        "提交且仅提交 1 个简单但有价值的回归问题、基于原料的明确参考答案及证据路径。",
+    )
+
+    @tool("submit_recommended_test", tool_description, {
+        "question": str,
+        "reference_answer": str,
+        "evidence_paths": list,
+    })
+    async def submit_recommended_test(args):
+        if captured:
+            return {"content": [{"type": "text", "text": "A recommendation was already submitted."}]}
+        captured.update(_validate_test_recommendation(root, args))
+        return {"content": [{"type": "text", "text": "Recommendation accepted. Stop now."}]}
+
+    opts = ClaudeAgentOptions(
+        cwd=str(root),
+        system_prompt={
+            "type": "preset",
+            "preset": "claude_code",
+            "append": _prompt("recommend_test_role", parent.locale),
+        },
+        allowed_tools=["Read", "Glob", "Grep", "mcp__recommend__submit_recommended_test"],
+        mcp_servers={"recommend": create_sdk_mcp_server("recommend", tools=[submit_recommended_test])},
+        permission_mode="bypassPermissions",
+        setting_sources=[],
+        model=_compile_model(),
+        max_turns=12,
+        max_buffer_size=SDK_MAX_BUFFER_BYTES,
+        session_id=str(uuid.uuid4()),
+        session_store=InMemorySessionStore(),
+        hooks={"PreToolUse": [HookMatcher(hooks=[_make_recommendation_path_guard(root, parent.locale)])]},
+    )
+    client = ClaudeSDKClient(options=opts)
+    try:
+        await client.connect()
+        directive = _loc(
+            parent,
+            "Inspect raw/ and candidate/, then call submit_recommended_test exactly once. Do not merely print JSON.",
+            "检查 raw/ 与 candidate/，然后仅调用一次 submit_recommended_test；不要只输出 JSON。",
+        )
+        await client.query(directive)
+        async for msg in client.receive_messages():
+            if type(msg).__name__ == "ResultMessage":
+                break
+    finally:
+        await client.disconnect()
+    if not captured:
+        raise ValueError("the red-team reviewer returned no structured recommendation")
+    return captured
 
 
 async def _test_session_wrapper(run: "TestRun"):
@@ -3301,6 +3502,29 @@ async def handle_open_test(request: web.Request):
     return web.json_response({"ok": True, "test_session_id": tid, "snapshot_hash": snapshot_hash, "pages": pages})
 
 
+async def handle_test_recommendation(request: web.Request):
+    """Explicitly author one raw-grounded test question for a stable draft."""
+    run_id = request.match_info["run_id"]
+    parent = RUNS.get(run_id)
+    if not parent:
+        return web.json_response({"error": "unknown run"}, status=404)
+    if parent._turn_active or parent._batch_active:
+        return web.json_response({"error": "knowledge authoring is still running"}, status=409)
+    if run_id in RECOMMENDATIONS_ACTIVE:
+        return web.json_response({"error": "a test recommendation is already running"}, status=409)
+    RECOMMENDATIONS_ACTIVE.add(run_id)
+    try:
+        timeout = float(os.environ.get("KBC_TEST_RECOMMEND_TIMEOUT_SECS", "180"))
+        result = await asyncio.wait_for(_RECOMMEND_TEST_IMPL(parent), timeout=timeout)
+        return web.json_response({"ok": True, **result})
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "test recommendation timed out"}, status=504)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    finally:
+        RECOMMENDATIONS_ACTIVE.discard(run_id)
+
+
 async def handle_test_message(request: web.Request):
     """Inject a user turn into a live read-only test session. Reply streams over
     GET /test-events/{tid}."""
@@ -3404,6 +3628,7 @@ def build_app() -> web.Application:
         web.get("/events/{run_id}", handle_events),
         # Test session: read-only consumer session over a pinned draft snapshot.
         web.post("/test-session/{run_id}", handle_open_test),
+        web.post("/test-recommendation/{run_id}", handle_test_recommendation),
         web.post("/test-message/{tid}", handle_test_message),
         web.get("/test-events/{tid}", handle_test_events),
         web.post("/test-session/{tid}/close", handle_close_test),
@@ -3427,6 +3652,7 @@ def main():
 # KBC_SMOKE=1 → free in-cluster wiring e2e (no LLM); default = persistent session.
 _COMPILE_IMPL = _smoke_compile if os.environ.get("KBC_SMOKE") == "1" else run_session
 _TEST_SESSION_IMPL = test_session_driver
+_RECOMMEND_TEST_IMPL = recommend_test_question
 
 if __name__ == "__main__":
     main()

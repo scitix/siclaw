@@ -455,6 +455,30 @@ async def test_test_path_escape_guard():
         assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
         allow = await compile_guard({"tool_name": "Write", "tool_input": {"file_path": "candidate/a.md"}}, "c3", None)
         assert allow == {}, allow
+
+        # The recommendation session is narrower than a compiler: only raw/
+        # and candidate/ may inform the proposed test. Internal workflow,
+        # evaluation and release artifacts remain invisible to the red team.
+        recommend = compile_box._recommendation_path_escape
+        assert recommend(root, "Read", {"file_path": "raw/source.md"}) is None
+        assert recommend(root, "Read", {"file_path": "candidate/index.md"}) is None
+        assert recommend(root, "Grep", {"path": "raw", "pattern": "retry"}) is None
+        assert recommend(root, "Glob", {"pattern": "candidate/**/*.md"}) is None
+        assert recommend(root, "Glob", {"path": "raw", "pattern": "**/*.md"}) is None
+        assert recommend(root, "Read", {"file_path": "authoring/PLAN.md"}) is not None
+        assert recommend(root, "Read", {"file_path": "eval/TESTS.md"}) is not None
+        assert recommend(root, "Read", {"file_path": "release/bundle.json"}) is not None
+        assert recommend(root, "Grep", {"pattern": "reference"}) == "path=None"
+        assert recommend(root, "Glob", {"pattern": "**/*.md"}) == "pattern=**/*.md"
+        assert recommend(root, "Glob", {"pattern": "raw*/**/*.md"}) == "pattern=raw*/**/*.md"
+
+        recommendation_guard = compile_box._make_recommendation_path_guard(root)
+        deny = await recommendation_guard(
+            {"tool_name": "Read", "tool_input": {"file_path": "authoring/CLAUDE.md"}}, "r1", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await recommendation_guard(
+            {"tool_name": "Read", "tool_input": {"file_path": "raw/source.md"}}, "r2", None)
+        assert allow == {}, allow
     print("✓ test-session path guard (C4): snapshot-confined, live /work denied")
 
 
@@ -729,6 +753,65 @@ async def test_test_message_path():
         await client.close()
         compile_box.TEST_SESSIONS.clear()
     print("✓ test-message injects a turn into a live test session")
+
+
+async def test_explicit_test_recommendation_http():
+    """The explicit red-team endpoint is stable-draft-only, single-flight, and
+    returns one validated raw-grounded recommendation without mutating files."""
+    original = compile_box._RECOMMEND_TEST_IMPL
+    compile_box.RUNS.clear()
+    compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    calls = []
+
+    async def fake_recommend(parent):
+        calls.append(parent.run_id)
+        return {
+            "question": "What is the supported retry limit?",
+            "reference_answer": "Three attempts.",
+            "evidence_paths": ["raw/policy.md"],
+        }
+
+    compile_box._RECOMMEND_TEST_IMPL = fake_recommend
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        assert (await client.post("/test-recommendation/missing")).status == 404
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("recommend-1", td, 1)
+            compile_box.RUNS[parent.run_id] = parent
+
+            parent._turn_active = True
+            assert (await client.post(f"/test-recommendation/{parent.run_id}")).status == 409
+            parent._turn_active = False
+
+            response = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert response.status == 200, await response.text()
+            body = await response.json()
+            assert body["question"] == "What is the supported retry limit?", body
+            assert body["evidence_paths"] == ["raw/policy.md"], body
+            assert calls == [parent.run_id]
+            assert not compile_box.RECOMMENDATIONS_ACTIVE
+
+            valid = compile_box._validate_test_recommendation(root, body)
+            assert valid["reference_answer"] == "Three attempts."
+            try:
+                compile_box._validate_test_recommendation(root, {
+                    "question": "leak?", "reference_answer": "secret", "evidence_paths": ["../secret.md"],
+                })
+                raise AssertionError("escaped evidence path was accepted")
+            except ValueError:
+                pass
+    finally:
+        await client.close()
+        compile_box._RECOMMEND_TEST_IMPL = original
+        compile_box.RUNS.clear()
+        compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    print("✓ explicit red-team test recommendation (stable, single-flight, raw-grounded)")
 
 
 
@@ -2309,6 +2392,7 @@ async def main():
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
     await test_test_message_path()
+    await test_explicit_test_recommendation_http()
     await test_propose_plan_never_bounces()
     test_apply_session_config()
     test_parse_brief_block()
