@@ -772,6 +772,7 @@ function ResourcesTab({ allClusters, allHosts, selectedClusterIds, setSelectedCl
 interface PersonalBotInfo {
   id: string
   agent_id: string
+  name?: string | null
   domain: "feishu" | "lark"
   app_id: string
   access_mode: string
@@ -896,7 +897,7 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
           <div className="flex min-w-0 items-center gap-2">
             <ChevronRight className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${botExpanded ? "rotate-90" : ""}`} />
             <div className="min-w-0">
-              <h4 className="text-[13px] font-medium text-foreground">This agent's Feishu bot</h4>
+              <h4 className="text-[13px] font-medium text-foreground">{bot?.name || "This agent's Feishu bot"}</h4>
               {botExpanded || !bot ? (
                 <p className="mt-0.5 text-[11px] text-muted-foreground/70">A dedicated Feishu app — serves direct messages and every group it joins. Open access; admin-configured.</p>
               ) : (

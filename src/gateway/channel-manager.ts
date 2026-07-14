@@ -118,6 +118,21 @@ export async function updateBindingMeta(
   });
 }
 
+/**
+ * Persist a channel's display name (used to store a Feishu bot's real
+ * `app_name` so the Portal shows the actual bot name, not a placeholder).
+ */
+export async function updateChannelName(
+  channelId: string,
+  name: string,
+  frontendClient: FrontendWsClient,
+): Promise<{ success: boolean; error?: string }> {
+  return frontendClient.request("channel.updateName", {
+    channel_id: channelId,
+    name,
+  });
+}
+
 /** Reset the durable session attached to a channel binding. */
 export async function resetBindingSession(
   channelId: string,
