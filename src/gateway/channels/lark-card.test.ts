@@ -13,6 +13,8 @@ import {
   PLACEHOLDER_BY_LOCALE,
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
+  buildModeCard,
+  MODE_ACTION_KIND,
 } from "./lark-card.js";
 
 // ── sanitizeMarkdownForFeishu ──────────────────────────────────
@@ -447,5 +449,34 @@ describe("buildMilestoneCardMarkdown", () => {
     expect(lines).toHaveLength(11); // overflow line + 10 shown
     expect(md).toContain("step 14"); // newest kept
     expect(md).not.toContain("✅ step 1\n"); // oldest dropped
+  });
+});
+
+describe("buildModeCard", () => {
+  function buttons(card: any): any[] {
+    const cols = card.body.elements.find((e: any) => e.tag === "column_set").columns;
+    return cols.map((c: any) => c.elements[0]);
+  }
+
+  it("renders two self-contained mode buttons and marks the current one primary", () => {
+    const card = buildModeCard("shared", "ch1", "oc_group1", "zh-CN") as any;
+    const [sharedBtn, perUserBtn] = buttons(card);
+
+    expect(sharedBtn.behaviors[0].value).toEqual({
+      kind: MODE_ACTION_KIND, channel_id: "ch1", route_key: "oc_group1", mode: "shared", locale: "zh-CN",
+    });
+    expect(perUserBtn.behaviors[0].value).toEqual({
+      kind: MODE_ACTION_KIND, channel_id: "ch1", route_key: "oc_group1", mode: "per_user", locale: "zh-CN",
+    });
+    // Current mode (shared) is highlighted; the other is default.
+    expect(sharedBtn.type).toBe("primary");
+    expect(perUserBtn.type).toBe("default");
+    expect(sharedBtn.text.content).toContain("✓");
+  });
+
+  it("highlights per_user when that is the current mode", () => {
+    const [sharedBtn, perUserBtn] = buttons(buildModeCard("per_user", "ch1", "g", "en-US") as any);
+    expect(perUserBtn.type).toBe("primary");
+    expect(sharedBtn.type).toBe("default");
   });
 });

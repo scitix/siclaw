@@ -40,6 +40,7 @@ const resolvePersonalBindingMock = vi.fn();
 const handlePersonalPairingCodeMock = vi.fn();
 const resetPersonalSessionMock = vi.fn();
 const updateBindingMetaMock = vi.fn();
+const setChannelContextModeMock = vi.fn();
 
 vi.mock("../channel-manager.js", () => ({
   resolveBinding: (...args: unknown[]) => resolveBindingMock(...args),
@@ -49,6 +50,7 @@ vi.mock("../channel-manager.js", () => ({
   handlePersonalPairingCode: (...args: unknown[]) => handlePersonalPairingCodeMock(...args),
   resetPersonalSession: (...args: unknown[]) => resetPersonalSessionMock(...args),
   updateBindingMeta: (...args: unknown[]) => updateBindingMetaMock(...args),
+  setChannelContextMode: (...args: unknown[]) => setChannelContextModeMock(...args),
   isChannelAccessDenied: (v: unknown) =>
     v !== null && typeof v === "object" && (v as { walled?: unknown }).walled === true,
 }));
@@ -960,6 +962,24 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "sicore_user:u42");
   });
 
+  it("/new in a SHARED group is rejected, not reset (one member can't wipe the group)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "grp", sessionKey: "chat:oc_abc123", contextMode: "shared" }));
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("/new"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(resetBindingSessionMock).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("不支持单人重置");
+  });
+
   it("queues concurrent messages for the same sender instead of starting a second prompt", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "queued-session" }));
     let releaseFirst!: () => void;
@@ -1141,6 +1161,51 @@ describe("handleLarkCardAction — 👍/👎 feedback", () => {
   });
 });
 
+describe("handleLarkCardAction — /mode context switch", () => {
+  function modeClient() {
+    return { im: { message: { create: vi.fn().mockResolvedValue({}) } } };
+  }
+  function modeAction(mode: string, overrides: Record<string, unknown> = {}) {
+    return {
+      operator: { open_id: "ou_switcher" },
+      action: {
+        tag: "button",
+        value: { kind: "siclaw_ctx_mode", channel_id: "ch1", route_key: "oc_group1", mode, locale: "zh-CN" },
+      },
+      ...overrides,
+    };
+  }
+  const flush = () => new Promise((r) => setImmediate(r));
+
+  it("returns a success toast synchronously and persists + announces detached", async () => {
+    setChannelContextModeMock.mockResolvedValue({ success: true, mode: "per_user" });
+    const client = modeClient();
+    const result = handleLarkCardAction(modeAction("per_user"), client, { request: vi.fn() } as any);
+    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("个人模式") } });
+
+    await flush();
+    expect(setChannelContextModeMock).toHaveBeenCalledWith("ch1", "oc_group1", "per_user", expect.anything());
+    expect(client.im.message.create).toHaveBeenCalledWith(expect.objectContaining({
+      params: { receive_id_type: "chat_id" },
+      data: expect.objectContaining({ receive_id: "oc_group1", msg_type: "text" }),
+    }));
+  });
+
+  it("rejects an unknown mode with an error toast and no persist", async () => {
+    setChannelContextModeMock.mockClear();
+    const result = handleLarkCardAction(modeAction("bogus"), modeClient(), { request: vi.fn() } as any);
+    expect(result).toEqual({ toast: { type: "error", content: expect.any(String) } });
+    await flush();
+    expect(setChannelContextModeMock).not.toHaveBeenCalled();
+  });
+
+  it("a slow persist does NOT block the callback toast (200671 discipline)", () => {
+    setChannelContextModeMock.mockImplementation(() => new Promise(() => { /* never settles */ }));
+    const result = handleLarkCardAction(modeAction("shared"), modeClient(), { request: vi.fn() } as any);
+    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("团队模式") } });
+  });
+});
+
 describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => {
   const BOT = "ou_bot_self";
 
@@ -1215,6 +1280,47 @@ describe("buildChannelTurnPrompt", () => {
     expect(prompt).toContain("current user request");
     expect(prompt).toContain("Do not force the previous case");
     expect(prompt).toContain("画一个新集群的报告");
+  });
+
+  it("no shared context: no group-discussion block or asker attribution", () => {
+    const prompt = buildChannelTurnPrompt("hello");
+    expect(prompt).not.toContain("<group-discussion");
+    expect(prompt).not.toContain("is now asking");
+    expect(prompt).not.toContain("SHARED group");
+  });
+
+  it("shared: injects an attributed discussion transcript before the asker's request", () => {
+    const prompt = buildChannelTurnPrompt("what's the root cause?", {
+      discussion: [
+        { sender: "…abc123", text: "node-5 is NotReady" },
+        { sender: "…def456", text: "kubelet keeps crashing" },
+      ],
+      truncated: false,
+      asker: "…ghi789",
+    });
+    expect(prompt).toContain("SHARED group");
+    expect(prompt).toContain("<group-discussion>");
+    expect(prompt).toContain("[…abc123] node-5 is NotReady");
+    expect(prompt).toContain("[…def456] kubelet keeps crashing");
+    expect(prompt).toContain("[…ghi789] is now asking:");
+    // The discussion block precedes the current request.
+    expect(prompt.indexOf("<group-discussion>")).toBeLessThan(prompt.indexOf("is now asking"));
+    expect(prompt.indexOf("kubelet keeps crashing")).toBeLessThan(prompt.indexOf("what's the root cause?"));
+  });
+
+  it("shared with no buffered chatter: attributes the asker, no discussion block", () => {
+    const prompt = buildChannelTurnPrompt("hi", { discussion: [], truncated: false, asker: "…xyz" });
+    expect(prompt).not.toContain("<group-discussion");
+    expect(prompt).toContain("[…xyz] is now asking:");
+  });
+
+  it("shared truncated: notes older messages were dropped", () => {
+    const prompt = buildChannelTurnPrompt("go", {
+      discussion: [{ sender: "…a", text: "m" }],
+      truncated: true,
+      asker: "…b",
+    });
+    expect(prompt).toContain("older messages were dropped");
   });
 });
 

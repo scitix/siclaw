@@ -429,6 +429,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     route_key VARCHAR(255) NOT NULL,
     route_type VARCHAR(20) NOT NULL DEFAULT 'group',
     display_name VARCHAR(255) DEFAULT NULL,
+    context_mode VARCHAR(20) DEFAULT NULL,
     created_by CHAR(36),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (channel_id, route_key)
@@ -620,6 +621,7 @@ export async function runPortalMigrations(): Promise<void> {
   // "by user" axis (actorUserColumn). Nullable; only set for channel sessions.
   await safeAlterTable(db, "chat_sessions", "sender_external_id", "VARCHAR(128) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "channel_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "channel_bindings", "context_mode", "VARCHAR(20) DEFAULT NULL");
   await safeAlterTable(db, "skill_versions", "labels", "TEXT DEFAULT NULL");
   await safeAlterTable(db, "skill_versions", "files", "MEDIUMTEXT DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "parent_session_id", "CHAR(36) DEFAULT NULL");

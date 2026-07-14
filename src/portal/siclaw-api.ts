@@ -2670,6 +2670,36 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     sendJson(res, 200, { ok: true });
   });
 
+  // Set a group binding's context mode (shared|per_user) — admin any, user own.
+  // The runtime picks up the change on its mode cache's TTL (or the next @-turn
+  // resolve); the in-group /mode card is the low-latency path.
+  router.put(`${P}/agents/:id/channel-bindings/:bindingId/context-mode`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const body = await parseBody<{ mode?: string }>(req);
+    if (body.mode !== "shared" && body.mode !== "per_user") {
+      sendJson(res, 400, { error: "mode must be 'shared' or 'per_user'" });
+      return;
+    }
+
+    const db = getDb();
+    const isAdmin = auth.role === "admin";
+    const sql = isAdmin
+      ? "SELECT id FROM channel_bindings WHERE id = ? AND agent_id = ?"
+      : "SELECT id FROM channel_bindings WHERE id = ? AND agent_id = ? AND created_by = ?";
+    const params2 = isAdmin ? [params.bindingId, params.id] : [params.bindingId, params.id, auth.userId];
+
+    const [existing] = await db.query(sql, params2) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Binding not found" });
+      return;
+    }
+
+    await db.query("UPDATE channel_bindings SET context_mode = ? WHERE id = ?", [body.mode, params.bindingId]);
+    sendJson(res, 200, { ok: true, mode: body.mode });
+  });
+
   // ================================================================
   // Personal bot (Agent sub-resource) — the agent's dedicated Feishu app.
   //

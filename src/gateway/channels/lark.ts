@@ -11,6 +11,7 @@ import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
 import {
   resolveBinding,
+  setChannelContextMode,
   handlePairingCode,
   resetBindingSession,
   resolvePersonalBinding,
@@ -34,10 +35,14 @@ import {
   buildMilestoneCardMarkdown,
   applyFeedbackSelection,
   FEEDBACK_ACTION_KIND,
+  sendModeCard,
+  MODE_ACTION_KIND,
   PLACEHOLDER_BY_LOCALE,
   EMPTY_RESULT_NOTICE_BY_LOCALE,
   localeForDomain,
   type FeedbackActionValue,
+  type ModeActionValue,
+  type GroupContextMode,
   type LarkLocale,
 } from "./lark-card.js";
 import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
@@ -220,7 +225,7 @@ export function createLarkHandler(
         // handleLarkCardAction doc comment / the 200671 fix).
         "card.action.trigger": (data: any) => {
           try {
-            return handleLarkCardAction(data, larkClient);
+            return handleLarkCardAction(data, larkClient, frontendClient);
           } catch (err) {
             console.error(`[lark] Error handling card action for channel=${channelId}:`, err);
             return undefined;
@@ -365,6 +370,46 @@ function backfillBindingDisplayName(
   })();
 }
 
+const MODE_LABEL_BY_LOCALE: Record<LarkLocale, Record<GroupContextMode, string>> = {
+  "zh-CN": { shared: "团队模式(全群共享上下文)", per_user: "个人模式(各自独立上下文)" },
+  "en-US": { shared: "Team mode (shared context)", per_user: "Personal mode (per-user context)" },
+};
+
+const MODE_TOAST_BY_LOCALE: Record<LarkLocale, { ok: (m: GroupContextMode) => string; fail: string }> = {
+  "zh-CN": {
+    ok: (m) => `已切换为${m === "shared" ? "团队模式" : "个人模式"}`,
+    fail: "切换失败,请重试。",
+  },
+  "en-US": {
+    ok: (m) => `Switched to ${m === "shared" ? "Team" : "Personal"} mode`,
+    fail: "Couldn't switch mode. Please try again.",
+  },
+};
+
+const MODE_ANNOUNCE_BY_LOCALE: Record<LarkLocale, (m: GroupContextMode) => string> = {
+  "zh-CN": (m) =>
+    m === "shared"
+      ? `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].shared};之后大家的消息按全群共享处理。`
+      : `本群已切换为${MODE_LABEL_BY_LOCALE["zh-CN"].per_user};之后每个人各自独立对话。`,
+  "en-US": (m) =>
+    m === "shared"
+      ? `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].shared}; messages are handled as one shared conversation.`
+      : `This group is now in ${MODE_LABEL_BY_LOCALE["en-US"].per_user}; each person now talks to the bot separately.`,
+};
+
+const MODE_UNBOUND_NOTICE_BY_LOCALE: Record<LarkLocale, string> = {
+  "zh-CN": "❌ 本群还没绑定助手,无法设置上下文模式。请先用 PAIR 绑定。",
+  "en-US": "❌ This group isn't bound to an assistant yet, so there's no context mode to set. Pair it first.",
+};
+
+// Shared groups use one group-level session, so a single member's /new would
+// wipe everyone's context — disallowed. A confirmed "reset the whole room" is a
+// future, confirmation-gated action; for now, point the user at their options.
+const SHARED_NEW_REJECTED_NOTICE_BY_LOCALE: Record<LarkLocale, string> = {
+  "zh-CN": "团队模式(全群共享上下文)不支持单人重置——一个人 /new 会清空整群的上下文。如需独立对话,请用 /mode 切换为个人模式,或另建一个群。",
+  "en-US": "Team mode (shared group context) doesn't support a per-person /new — one reset would wipe the whole group's context. For a private thread, switch to Personal mode with /mode, or start a separate group.",
+};
+
 const FEEDBACK_TOAST_BY_LOCALE: Record<LarkLocale, { ok: string; fail: string }> = {
   "zh-CN": { ok: "已收到你的反馈，谢谢！", fail: "反馈记录失败，请稍后再试。" },
   "en-US": { ok: "Feedback recorded — thanks!", fail: "Could not record feedback. Please try again." },
@@ -390,29 +435,39 @@ const FEEDBACK_TOAST_BY_LOCALE: Record<LarkLocale, { ok: string; fail: string }>
 export function handleLarkCardAction(
   data: any,
   larkClient: any,
+  frontendClient?: FrontendWsClient,
 ): { toast: { type: string; content: string } } | undefined {
   // EventDispatcher flattens `event.*` onto the top level (same as messages).
   // Some Feishu/CardKit versions deliver `action.value` as a JSON string
-  // rather than a parsed object — accept both so feedback doesn't silently
+  // rather than a parsed object — accept both so a click doesn't silently
   // no-op on those clients.
   const rawValue = data?.action?.value;
-  let value: Partial<FeedbackActionValue> | undefined;
+  let value: { kind?: string; [k: string]: unknown } | undefined;
   if (typeof rawValue === "string") {
     try { value = JSON.parse(rawValue); } catch { value = undefined; }
   } else {
-    value = rawValue as Partial<FeedbackActionValue> | undefined;
+    value = rawValue as { kind?: string } | undefined;
   }
-  if (!value || value.kind !== FEEDBACK_ACTION_KIND) return undefined;
+  if (!value) return undefined;
 
-  const locale: LarkLocale = value.locale === "en-US" ? "en-US" : "zh-CN";
+  // Context-mode switch buttons take the same self-contained-value + optimistic
+  // toast + detached side-effect shape as feedback (200671 discipline).
+  if (value.kind === MODE_ACTION_KIND) {
+    return handleModeSwitchAction(value as Partial<ModeActionValue>, data, larkClient, frontendClient);
+  }
+
+  if (value.kind !== FEEDBACK_ACTION_KIND) return undefined;
+  const fb = value as Partial<FeedbackActionValue>;
+
+  const locale: LarkLocale = fb.locale === "en-US" ? "en-US" : "zh-CN";
   const toasts = FEEDBACK_TOAST_BY_LOCALE[locale];
-  const rating = value.rating === "up" || value.rating === "down" ? value.rating : null;
+  const rating = fb.rating === "up" || fb.rating === "down" ? fb.rating : null;
   const operatorOpenId: string | undefined = data?.operator?.open_id;
-  if (!rating || !value.session_id || !value.card_id || !operatorOpenId) {
-    console.warn(`[lark] Dropping malformed feedback action card=${value.card_id ?? "?"} rating=${value.rating ?? "?"} operator=${operatorOpenId ?? "?"}`);
+  if (!rating || !fb.session_id || !fb.card_id || !operatorOpenId) {
+    console.warn(`[lark] Dropping malformed feedback action card=${fb.card_id ?? "?"} rating=${fb.rating ?? "?"} operator=${operatorOpenId ?? "?"}`);
     return { toast: { type: "error", content: toasts.fail } };
   }
-  const { session_id: sessionId, card_id: cardId, channel_id: channelId } = value;
+  const { session_id: sessionId, card_id: cardId, channel_id: channelId } = fb;
 
   // Detached: persist the vote, then echo the button highlight. Neither is on
   // the callback-response critical path (see the 3s-budget note above).
@@ -432,13 +487,68 @@ export function handleLarkCardAction(
       }
       console.log(`[lark] Feedback recorded card=${cardId} session=${sessionId} rating=${rating} sender=${operatorOpenId}`);
       // Cosmetic: highlight the chosen button. Never rejects (best-effort boolean).
-      void applyFeedbackSelection(larkClient, value as FeedbackActionValue, rating);
+      void applyFeedbackSelection(larkClient, fb as FeedbackActionValue, rating);
     } catch (err) {
       console.error(`[lark] Feedback persist failed card=${cardId}:`, err);
     }
   })();
 
   return { toast: { type: "success", content: toasts.ok } };
+}
+
+/**
+ * Handle a context-mode switch button. Responds with an optimistic toast and
+ * runs persistence + the group announcement fully detached (Feishu's ~3s
+ * callback budget — same reasoning as feedback). Any group member may switch;
+ * the visible announcement is the social control (design decision), and it also
+ * tells everyone the conversation just reset.
+ */
+function handleModeSwitchAction(
+  value: Partial<ModeActionValue>,
+  data: any,
+  larkClient: any,
+  frontendClient?: FrontendWsClient,
+): { toast: { type: string; content: string } } {
+  const locale: LarkLocale = value.locale === "en-US" ? "en-US" : "zh-CN";
+  const toasts = MODE_TOAST_BY_LOCALE[locale];
+  const mode: GroupContextMode | null =
+    value.mode === "shared" ? "shared" : value.mode === "per_user" ? "per_user" : null;
+  if (!mode || !value.channel_id || !value.route_key) {
+    console.warn(`[lark] Dropping malformed mode action channel=${value.channel_id ?? "?"} mode=${value.mode ?? "?"}`);
+    return { toast: { type: "error", content: toasts.fail } };
+  }
+  const channelId = value.channel_id;
+  const routeKey = value.route_key;
+
+  // Optimistically flip the runtime's own view now: drop the old buffer + cache
+  // and record the new mode, so THIS runtime stops/starts retaining chatter
+  // immediately (no wait on the persist round-trip).
+  forgetGroupState(channelId, routeKey);
+  rememberGroupMode(channelId, routeKey, mode);
+
+  void (async () => {
+    try {
+      const result = await setChannelContextMode(channelId, routeKey, mode, frontendClient);
+      if (!result?.success) {
+        console.warn(`[lark] Mode switch persist rejected chat=${routeKey}: ${result?.error ?? "unknown"}`);
+        return;
+      }
+      console.log(`[lark] Context mode set chat=${routeKey} mode=${mode}`);
+      // Announce in the group — audit trail + everyone learns the reset.
+      await larkClient.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: {
+          receive_id: routeKey,
+          msg_type: "text",
+          content: JSON.stringify({ text: MODE_ANNOUNCE_BY_LOCALE[locale](mode) }),
+        },
+      });
+    } catch (err) {
+      console.error(`[lark] Mode switch failed chat=${routeKey}:`, err);
+    }
+  })();
+
+  return { toast: { type: "success", content: toasts.ok(mode) } };
 }
 
 /**
@@ -545,18 +655,146 @@ function firstLocalePost(raw: any): any {
   return undefined;
 }
 
-export function buildChannelTurnPrompt(text: string): string {
-  return [
+// ── Group context mode (shared vs per_user) ──────────────────────
+//
+// The server (portal adapter) owns the shared-vs-isolated decision and encodes
+// it in the session key it returns; the runtime only needs the mode to decide
+// whether to RETAIN non-@ chatter. Two pieces of runtime-local state support
+// that, both keyed by `${channelId}:${chatId}` and both intentionally
+// process-memory only (a channel app holds one long connection from one
+// runtime, so there is no cross-process buffer to reconcile; a restart drops
+// un-drained chatter — a bounded, documented loss).
+
+// Cache of each group's mode, populated on every @-turn's resolveBinding so the
+// non-@ ingestion gate costs no RPC. Short TTL; an in-group /mode switch busts
+// the entry immediately.
+const GROUP_MODE_TTL_MS = 60_000;
+const groupModeCache = new Map<string, { mode: GroupContextMode; at: number }>();
+
+// Discussion buffer for shared groups: non-@ chatter accumulated per group and
+// drained into the next @-turn's prompt. Bounded by count AND chars so a busy
+// group can't blow up memory or the prompt; `truncated` records that older
+// lines were dropped so the agent can be told the transcript is partial.
+const DISCUSSION_BUFFER_MAX_MSGS = 100;
+const DISCUSSION_BUFFER_MAX_CHARS = 8000;
+interface DiscussionLine { sender: string; text: string; }
+const discussionBuffers = new Map<string, { lines: DiscussionLine[]; truncated: boolean }>();
+
+// Both maps are keyed by group and bounded per entry (mode = one small record;
+// buffer = the MAX_MSGS/MAX_CHARS caps). This bounds the NUMBER of groups too,
+// so a bot in very many groups can't grow either map without limit — evicting
+// the oldest (insertion-ordered) entry, same shape as the feedback echo cache.
+const GROUP_STATE_MAX = 2000;
+
+function evictOldestIfFull<K, V>(map: Map<K, V>, cap: number, incomingKey: K): void {
+  if (map.has(incomingKey) || map.size < cap) return;
+  const oldest = map.keys().next().value;
+  if (oldest !== undefined) map.delete(oldest);
+}
+
+function groupStateKey(channelId: string, chatId: string): string {
+  return `${channelId}:${chatId}`;
+}
+
+function rememberGroupMode(channelId: string, chatId: string, mode: GroupContextMode): void {
+  const key = groupStateKey(channelId, chatId);
+  evictOldestIfFull(groupModeCache, GROUP_STATE_MAX, key);
+  groupModeCache.set(key, { mode, at: Date.now() });
+}
+
+/** Fresh cached mode, or undefined on miss/expiry. Never guesses — an unknown
+ *  group is treated as "not confirmed shared", so its chatter is NOT retained. */
+function cachedGroupMode(channelId: string, chatId: string): GroupContextMode | undefined {
+  const key = groupStateKey(channelId, chatId);
+  const entry = groupModeCache.get(key);
+  if (!entry) return undefined;
+  if (Date.now() - entry.at > GROUP_MODE_TTL_MS) {
+    groupModeCache.delete(key);
+    return undefined;
+  }
+  return entry.mode;
+}
+
+/** Drop cached mode + any buffered chatter for a group (used on a /mode switch). */
+function forgetGroupState(channelId: string, chatId: string): void {
+  const key = groupStateKey(channelId, chatId);
+  groupModeCache.delete(key);
+  discussionBuffers.delete(key);
+}
+
+function appendDiscussion(channelId: string, chatId: string, sender: string, text: string): void {
+  const key = groupStateKey(channelId, chatId);
+  evictOldestIfFull(discussionBuffers, GROUP_STATE_MAX, key);
+  const buf = discussionBuffers.get(key) ?? { lines: [], truncated: false };
+  buf.lines.push({ sender, text });
+  if (buf.lines.length > DISCUSSION_BUFFER_MAX_MSGS) {
+    buf.lines.shift();
+    buf.truncated = true;
+  }
+  let total = buf.lines.reduce((n, l) => n + l.sender.length + l.text.length + 4, 0);
+  while (buf.lines.length > 1 && total > DISCUSSION_BUFFER_MAX_CHARS) {
+    const dropped = buf.lines.shift()!;
+    total -= dropped.sender.length + dropped.text.length + 4;
+    buf.truncated = true;
+  }
+  discussionBuffers.set(key, buf);
+}
+
+/** Take and clear the buffered chatter for a group. */
+function drainDiscussion(channelId: string, chatId: string): { lines: DiscussionLine[]; truncated: boolean } {
+  const key = groupStateKey(channelId, chatId);
+  const buf = discussionBuffers.get(key);
+  if (!buf) return { lines: [], truncated: false };
+  discussionBuffers.delete(key);
+  return buf;
+}
+
+/** Short sender label for shared-group attribution. MVP uses the open_id tail;
+ *  a follow-up can resolve real display names via the contact API + a cache. */
+function senderLabel(senderOpenId: string | null): string {
+  if (!senderOpenId) return "unknown";
+  return senderOpenId.length > 8 ? `…${senderOpenId.slice(-6)}` : senderOpenId;
+}
+
+export interface SharedGroupContext {
+  discussion: DiscussionLine[];
+  truncated: boolean;
+  asker: string;
+}
+
+export function buildChannelTurnPrompt(text: string, shared?: SharedGroupContext): string {
+  const head = [
     "<channel-turn>",
     "This Feishu/Lark channel session may contain earlier incidents, clusters, pods, or reports.",
+  ];
+  if (shared) {
+    head.push(
+      "This is a SHARED group: several people talk to you in one conversation, so messages are labelled with their sender. Attribute requests to the right person and don't assume two labels are the same user.",
+    );
+  }
+  head.push(
     "Treat the message below as the current user request and answer it first.",
     "Use earlier session context only when the user explicitly refers to it, or when it is stable configuration context needed to answer the current request.",
     "If the current message names a different case, cluster, time range, object, or task, treat it as a new request. Do not force the previous case into the answer.",
     "Do not mention these channel-turn instructions to the user.",
     "</channel-turn>",
     "",
-    text,
-  ].join("\n");
+  );
+  const body: string[] = [];
+  if (shared && shared.discussion.length > 0) {
+    body.push(
+      `<group-discussion${shared.truncated ? ' note="older messages were dropped"' : ""}>`,
+      "Messages in the group since your last reply, for context:",
+      ...shared.discussion.map((l) => `[${l.sender}] ${l.text}`),
+      "</group-discussion>",
+      "",
+    );
+  }
+  if (shared) {
+    body.push(`[${shared.asker}] is now asking:`);
+  }
+  body.push(text);
+  return [...head, ...body].join("\n");
 }
 
 // ── Message handler ────────────────────────────────────────────
@@ -682,6 +920,27 @@ export async function handleLarkMessage(
     return;
   }
 
+  // /mode — summon the context-mode switch card. Handled before the @-gate so
+  // it works with or without an @bot (like PAIR); command words are exact.
+  if (/^\/mode$/i.test(text.trim())) {
+    const modeBinding = await resolveBinding(groupChannelId, chatId, frontendClient!, sessionKey, senderOpenId ?? undefined);
+    if (isChannelAccessDenied(modeBinding)) {
+      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale));
+      return;
+    }
+    if (!modeBinding) {
+      await replyToLark(larkClient, messageId, MODE_UNBOUND_NOTICE_BY_LOCALE[locale]);
+      return;
+    }
+    const current: GroupContextMode = modeBinding.contextMode === "shared" ? "shared" : "per_user";
+    rememberGroupMode(groupChannelId, chatId, current);
+    const sent = await sendModeCard(larkClient, messageId, current, groupChannelId, chatId, locale);
+    if (!sent) {
+      await replyToLark(larkClient, messageId, `${MODE_LABEL_BY_LOCALE[locale][current]}`);
+    }
+    return;
+  }
+
   // Only respond when THIS bot is individually @-mentioned. Feishu also
   // delivers "@所有人" to an @bot-scoped app (it mentions everyone, the bot
   // included), so an @所有人 announcement arrives looking just like a real
@@ -690,7 +949,19 @@ export async function handleLarkMessage(
   // exempt (explicit command). Gated on chat_type==="group" so the binding/
   // access checks below stay reachable only for messages aimed at the bot.
   if (chatType === "group" && !isBotMentioned(message, botOpenId)) {
-    console.log(`[lark] Group message not directed at bot (chat=${chatId}) — ignoring (@所有人 / @others / no @bot)`);
+    // Non-@ group message. In a group KNOWN to be shared, retain it as passive
+    // discussion context for the next @-turn — WITHOUT running the agent or
+    // touching the AgentBox (idle pods must not be woken by group chatter).
+    // In a per_user group, or one whose mode we haven't confirmed shared,
+    // drop it immediately: privacy discipline — only a confirmed-shared group
+    // may retain chatter (the receive-all-messages scope is app-level, so the
+    // bot sees chatter from groups it must not buffer).
+    if (text.length > 0 && cachedGroupMode(groupChannelId, chatId) === "shared") {
+      appendDiscussion(groupChannelId, chatId, senderLabel(senderOpenId), text);
+      console.log(`[lark] Buffered non-@ discussion for shared group chat=${chatId}`);
+    } else {
+      console.log(`[lark] Group message not directed at bot (chat=${chatId}) — ignoring (@所有人 / @others / no @bot)`);
+    }
     return;
   }
 
@@ -720,6 +991,18 @@ export async function handleLarkMessage(
   //   - authorized group → sicore_user:<id> (per-user)
   //   - legacy single binding session → "" (binding-level queue + /new reset)
   // /new then resets the right session, and same-session senders serialize.
+  // Cache the group's mode so the non-@ ingestion gate can decide whether to
+  // retain chatter without an RPC per message. Only an explicit "shared" is
+  // shared; an absent field (e.g. an older portal) is treated as per_user so we
+  // never buffer chatter for a group we can't confirm is shared (privacy-safe).
+  const contextMode: GroupContextMode = binding.contextMode === "shared" ? "shared" : "per_user";
+  // If the mode changed out of band (a console switch, or another actor) since
+  // we last cached it, drop any buffered chatter — it belonged to the previous
+  // mode and must not resurface (e.g. after a per_user detour back to shared).
+  const cachedMode = cachedGroupMode(groupChannelId, chatId);
+  if (cachedMode && cachedMode !== contextMode) forgetGroupState(groupChannelId, chatId);
+  rememberGroupMode(groupChannelId, chatId, contextMode);
+
   const effectiveSessionKey = binding.sessionKey ?? "";
   const queueKey = `${binding.bindingId}:${binding.sessionKey ?? "__binding__"}`;
   const queued = enqueueBindingTask(queueKey, () => processQueuedLarkMessage({
@@ -731,6 +1014,7 @@ export async function handleLarkMessage(
     sessionKey: effectiveSessionKey,
     channelId: groupChannelId,
     route: "group",
+    contextMode,
     larkClient,
     agentBoxManager,
     tlsOptions,
@@ -753,6 +1037,9 @@ interface QueuedLarkMessageContext {
   sessionKey: string;
   channelId: string;
   route: "group" | "personal";
+  /** Group route only: "shared" drains the discussion buffer into the prompt
+   *  and attributes the asker; absent/"per_user" behaves as an isolated chat. */
+  contextMode?: GroupContextMode;
   larkClient: any;
   agentBoxManager: AgentBoxManager;
   tlsOptions?: { cert: string; key: string; ca: string };
@@ -770,6 +1057,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     sessionKey,
     channelId,
     route,
+    contextMode,
     larkClient,
     agentBoxManager,
     tlsOptions,
@@ -778,6 +1066,14 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   } = ctx;
 
   if (/^\/new$/i.test(text)) {
+    // A shared group has ONE group-level session, so a single member's /new
+    // would clear everyone's context — reject it instead of resetting. (A
+    // confirmation-gated "reset the whole room" is deferred.) per_user groups
+    // and personal chats reset the caller's own session as before.
+    if (contextMode === "shared") {
+      await replyToLark(larkClient, messageId, SHARED_NEW_REJECTED_NOTICE_BY_LOCALE[locale]);
+      return;
+    }
     await handleNewCommand(route, channelId, chatId, sessionKey, messageId, larkClient, agentBoxManager, tlsOptions, frontendClient, locale);
     return;
   }
@@ -939,8 +1235,14 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const promptText = !visionCapable && imageRefs.length > 0
     ? `${effectiveText}\n[Note: the user attached ${imageRefs.length} image(s), but the current model cannot read images.]`
     : effectiveText;
+  // Shared group: drain the chatter buffered since the last reply and attribute
+  // the asker, so the agent answers @-turns with the whole group's context.
+  const drained = contextMode === "shared" ? drainDiscussion(channelId, chatId) : undefined;
+  const sharedContext: SharedGroupContext | undefined = drained
+    ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
+    : undefined;
   const promptOpts: PromptOptions = {
-    text: buildChannelTurnPrompt(promptText),
+    text: buildChannelTurnPrompt(promptText, sharedContext),
     agentId,
     mode: "channel",
     sessionId,

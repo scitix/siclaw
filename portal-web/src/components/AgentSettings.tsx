@@ -784,7 +784,7 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
   agentId: string; selectedChannelIds: Set<string>; setSelectedChannelIds: (v: Set<string>) => void
 }) {
   const toast = useToast()
-  const [bindings, setBindings] = useState<{ id: string; channel_id: string; channel_name: string; channel_type: string; route_key: string; route_type: string; display_name?: string | null }[]>([])
+  const [bindings, setBindings] = useState<{ id: string; channel_id: string; channel_name: string; channel_type: string; route_key: string; route_type: string; display_name?: string | null; context_mode?: string | null }[]>([])
   const [allChannels, setAllChannels] = useState<{ id: string; name: string; type: string; is_personal_bot?: boolean }[]>([])
   const [loading, setLoading] = useState(true)
   const [pairingCode, setPairingCode] = useState<string | null>(null)
@@ -875,6 +875,16 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
       await api(`/siclaw/agents/${agentId}/channel-bindings/${bindingId}`, { method: "DELETE" })
       setBindings(prev => prev.filter(b => b.id !== bindingId))
       toast.success("Binding removed")
+    } catch (err: any) { toast.error(err.message) }
+  }
+
+  const handleSetContextMode = async (bindingId: string, mode: "shared" | "per_user") => {
+    try {
+      await api(`/siclaw/agents/${agentId}/channel-bindings/${bindingId}/context-mode`, {
+        method: "PUT", body: { mode },
+      })
+      setBindings(prev => prev.map(b => (b.id === bindingId ? { ...b, context_mode: mode } : b)))
+      toast.success(mode === "shared" ? "Switched to Team (shared) mode" : "Switched to Personal (per-user) mode")
     } catch (err: any) { toast.error(err.message) }
   }
 
@@ -979,9 +989,22 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
                     <p className="truncate text-[10px] text-muted-foreground font-mono">{b.channel_name || b.channel_id} · {b.route_type}: {b.route_key}</p>
                   </div>
                 </div>
-                <button onClick={() => handleUnbind(b.id)} title="Unbind" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {b.route_type === "group" && (
+                    <select
+                      value={b.context_mode === "shared" ? "shared" : "per_user"}
+                      onChange={e => handleSetContextMode(b.id, e.target.value as "shared" | "per_user")}
+                      title="Context mode: Team shares one conversation; Personal gives each member their own"
+                      className="rounded-md border border-border/50 bg-secondary/30 px-1.5 py-1 text-[10px] text-muted-foreground hover:bg-secondary/50 focus:outline-none"
+                    >
+                      <option value="shared">Team (shared)</option>
+                      <option value="per_user">Personal (per-user)</option>
+                    </select>
+                  )}
+                  <button onClick={() => handleUnbind(b.id)} title="Unbind" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               </div>
             ))}
           </div>
