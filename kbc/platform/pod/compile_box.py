@@ -280,6 +280,11 @@ class CompileRun:
         # not a migration trigger for an inherited legacy draft. Compile,
         # incremental, and repair turns still force the post-turn gate below.
         self._turn_selfcheck_key: str | None = None
+        # Ordinary owner edits get the same page-scoped legacy-format treatment
+        # as incremental compiles: inherited debt on untouched pages stays
+        # visible but cannot widen a small edit into a whole-library migration.
+        # Internal repair/verify/batch turns never arm this exemption.
+        self._turn_format_guard: dict | None = None
         self._l1_repair_pending = False
         # Batch mode (DESIGN-kb-batch-compile-2026-07-05): when the orchestrator
         # drives per-batch sessions, ResultMessage must NOT emit turn_done (the
@@ -340,10 +345,17 @@ class CompileRun:
     async def emit(self, ev: dict):
         await self.events.put(ev)
 
-    def _begin_turn(self, directive: str):
+    def _begin_turn(self, directive: str, *, grandfather_legacy_format: bool = False):
         """Arm the stall watchdog for a new model turn. Called for every turn —
         the owner's /message AND internal self-check/verify/batch injections."""
         self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
+        self._turn_format_guard = None
+        if grandfather_legacy_format:
+            self._turn_format_guard = {
+                "before": incremental.page_hashes(self.workdir),
+                "baseline_format_violations": selfcheck.format_violation_keys(
+                    selfcheck.candidate_pages(self.workdir)),
+            }
         self._last_directive = directive
         self._turn_active = True
         self._tool_pending = False
@@ -1612,6 +1624,8 @@ async def _post_turn_selfcheck(run) -> str | None:
         return None
     turn_start_key = getattr(run, "_turn_selfcheck_key", None)
     run._turn_selfcheck_key = None
+    turn_format_guard = getattr(run, "_turn_format_guard", None)
+    run._turn_format_guard = None
     l1_repair_turn = getattr(run, "_l1_repair_pending", False)
     run._l1_repair_pending = False
     # Consume the scoped-incremental guard state once, whatever this turn's outcome
@@ -1700,6 +1714,20 @@ async def _post_turn_selfcheck(run) -> str | None:
             format_changed_pages,
         )
         report["lint"] = {"ok": not blocking, "violations": blocking}
+    elif turn_format_guard:
+        after = incremental.page_hashes(workdir)
+        format_changed_pages = set(incremental.changed_pages(
+            turn_format_guard.get("before") or {}, after))
+        blocking, grandfathered_format = selfcheck.filter_incremental_format_violations(
+            report["lint"]["violations"],
+            turn_format_guard.get("baseline_format_violations") or [],
+            format_changed_pages,
+        )
+        report["lint"] = {"ok": not blocking, "violations": blocking}
+        report["grandfathered_format"] = {
+            "violation_count": len(grandfathered_format),
+            "violations": grandfathered_format[:40],
+        }
     if incr:
         # Keep inherited debt visible without allowing it to widen repair_pages
         # and silently turn a scoped edit into a whole-library migration. The
@@ -3298,7 +3326,13 @@ async def _dispatch_authoring_turn(run: CompileRun, text: str, action: str | Non
         return {"ok": True, "queued": True}
     if full_compile:
         run._full_compile_pending = True
-    run._begin_turn(text)  # arm the stall watchdog — every model turn, incl. the owner's
+    run._begin_turn(
+        text,
+        # A normal owner edit may touch one page without conscripting untouched
+        # legacy pages into a whole-library format migration. Explicit compile,
+        # incremental, repair, verify, and batch turns remain strict.
+        grandfather_legacy_format=not full_compile,
+    )  # arm the stall watchdog — every model turn, incl. the owner's
     try:
         await run.client.query(text)
     except BaseException:
