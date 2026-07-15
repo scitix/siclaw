@@ -91,6 +91,10 @@ RUNS: dict[str, "CompileRun"] = {}
 # Read-only "test session" runs — ephemeral consumer sessions over a pinned draft
 # snapshot (test sessions). Parallel to RUNS, torn down on close/idle. See TestRun.
 TEST_SESSIONS: dict[str, "TestRun"] = {}
+# One explicit red-team recommendation may inspect a run at a time. The Sicore
+# side also owns a durable repo lease; this local guard closes direct/RPC replay
+# races before they spend a second model call.
+RECOMMENDATIONS_ACTIVE: set[str] = set()
 DEFAULT_HTTP_MAX_REQUEST_BYTES = 768 * 1024 * 1024
 
 # ── Prompt packs — locale-parameterized model-facing text ────────────────────
@@ -271,6 +275,17 @@ class CompileRun:
         # loop; reset to 0 whenever the check passes).
         self._selfcheck_key: str | None = None
         self._l1_repairs_used = 0
+        # Candidate/exclusion state captured immediately before each model
+        # turn. A conversational turn that leaves this state byte-identical is
+        # not a migration trigger for an inherited legacy draft. Compile,
+        # incremental, and repair turns still force the post-turn gate below.
+        self._turn_selfcheck_key: str | None = None
+        # Ordinary owner edits get the same page-scoped legacy-format treatment
+        # as incremental compiles: inherited debt on untouched pages stays
+        # visible but cannot widen a small edit into a whole-library migration.
+        # Internal repair/verify/batch turns never arm this exemption.
+        self._turn_format_guard: dict | None = None
+        self._l1_repair_pending = False
         # Batch mode (DESIGN-kb-batch-compile-2026-07-05): when the orchestrator
         # drives per-batch sessions, ResultMessage must NOT emit turn_done (the
         # whole batch run is ONE turn to the consumer); the flushed reply is parked
@@ -330,9 +345,17 @@ class CompileRun:
     async def emit(self, ev: dict):
         await self.events.put(ev)
 
-    def _begin_turn(self, directive: str):
+    def _begin_turn(self, directive: str, *, grandfather_legacy_format: bool = False):
         """Arm the stall watchdog for a new model turn. Called for every turn —
         the owner's /message AND internal self-check/verify/batch injections."""
+        self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
+        self._turn_format_guard = None
+        if grandfather_legacy_format:
+            self._turn_format_guard = {
+                "before": incremental.page_hashes(self.workdir),
+                "baseline_format_violations": selfcheck.format_violation_keys(
+                    selfcheck.candidate_pages(self.workdir)),
+            }
         self._last_directive = directive
         self._turn_active = True
         self._tool_pending = False
@@ -717,21 +740,20 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
     }
 
 
-# ── Protocol v3 helpers: quickstart brief + proposed-question merge ──
+# ── Protocol v3 helper: quickstart brief ──
 # Both are deterministic (code, not model formatting) so a durable record can't
 # be lost to how the agent paraphrases — the same principle behind PROPOSED_PLAN.json.
 
 _BRIEF_MARKER = "我的定调标签"
 _BRIEF_PATH = "authoring/BRIEF.json"
-QUESTIONS_PROPOSED_PATH = "authoring/QUESTIONS_PROPOSED.json"
 _BRIEF_RAW_MAX = 4000  # cap the durable brief's raw slice — the agent is told to follow it
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
     """Write `text` atomically: a temp file in the same dir + os.replace. A torn
     write (SIGTERM / OOM / full disk mid-write) must never leave a half-file that
-    the next read falls back to empty on — that would silently drop prior rounds
-    (e.g. every earlier proposed question). os.replace is atomic within one
+    the next read falls back to empty on — that would silently drop prior
+    structured state. os.replace is atomic within one
     filesystem on POSIX."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -1015,84 +1037,6 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         _write_brief(run.workdir, brief)
 
 
-# The exact whitespace set to strip, enumerated so it is byte-identical with the
-# frontend's mirror (ECMAScript `\s`). Python `re` `\s` and JS `\s` are DIFFERENT
-# fixed sets (Python `\s` strips U+0085 / U+001C–U+001F, JS `\s` strips U+FEFF),
-# so relying on `\s` on either side makes the derived id diverge for a question
-# containing one of those chars — and the frontend re-derives this id for legacy
-# id-less rows, so a divergence resurfaces the adopt/dismiss failure. This
-# explicit class removes the ambiguity; keep it in lockstep with the frontend.
-_WS_RE = re.compile("[\t\n\x0b\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
-_QUESTION_PUNCT = "?？。.!！,，、"
-
-
-def _normalize_question(q: str) -> str:
-    """Dedup key + stable-id basis for a proposed question: strip the fixed
-    whitespace set (`_WS_RE`, enumerated to match the frontend — NOT `\\s`), strip
-    a fixed leading/trailing punctuation set, then lowercase. Trailing punctuation
-    and case are collapsed BY DESIGN — `删除?` and `删除。` map to one key (a
-    question differing only by trailing punctuation is treated as the same); an
-    all-punctuation question normalizes to `""` and the caller drops it."""
-    return _WS_RE.sub("", str(q or "")).strip(_QUESTION_PUNCT).lower()
-
-
-def _fnv1a32(s: str) -> int:
-    """32-bit FNV-1a over the UTF-8 bytes of s. Shared, fixed formula with the
-    frontend so both sides derive the SAME proposal id from a question."""
-    h = 2166136261
-    for b in s.encode("utf-8"):
-        h ^= b
-        h = (h * 16777619) & 0xFFFFFFFF
-    return h
-
-
-def _question_id(normalized: str) -> str:
-    """Stable proposal id agreed with the frontend: 'q-' + fnv1a32(normalized
-    question) as zero-padded 8-hex-digit lowercase. The frontend POSTs this as
-    proposal_id on adopt/dismiss — a missing id → empty proposal_id → the consumer 500s."""
-    return "q-" + format(_fnv1a32(normalized), "08x")
-
-
-def merge_proposed_questions(existing: list, incoming: list) -> tuple[list, int, int]:
-    """Append-merge newly proposed questions onto the existing list, skipping
-    duplicates by normalized question text. Every merged entry carries a stable
-    `id` (see _question_id) — the frontend needs it as proposal_id on adopt/dismiss.
-    A prior explicit id is preserved; legacy/id-less entries are backfilled from
-    the same formula (identical for the same question). Returns (merged, added,
-    skipped). Append-only across rounds so a re-proposal never wipes prior picks."""
-    merged: list = []
-    seen: set = set()
-    for q in existing:
-        if not isinstance(q, dict):
-            continue
-        text = str(q.get("question", "")).strip()
-        if not text:
-            continue
-        key = _normalize_question(text)
-        seen.add(key)
-        qid = str(q.get("id", "")).strip() or _question_id(key)
-        merged.append({**q, "id": qid, "question": text})
-    added = skipped = 0
-    for item in incoming:
-        if not isinstance(item, dict):
-            skipped += 1
-            continue
-        text = str(item.get("question", "")).strip()
-        key = _normalize_question(text)
-        if not key or key in seen:
-            skipped += 1
-            continue
-        seen.add(key)
-        merged.append({
-            "id": _question_id(key),
-            "question": text,
-            "reference": str(item.get("reference", "")).strip(),
-            "source": str(item.get("source", "")).strip(),
-        })
-        added += 1
-    return merged, added, skipped
-
-
 def _make_compile_tools(run: CompileRun):
     """Build the box's custom tools (closures over run) — the structured-signal
     moat. All model-facing text (descriptions + result strings) comes from the
@@ -1174,28 +1118,7 @@ def _make_compile_tools(run: CompileRun):
             return {"content": [{"type": "text", "text": rt["write_failed"].format(e=e)}]}
         return {"content": [{"type": "text", "text": rt["registered"].format(tid=tid)}]}
 
-    @tool("propose_questions", ts["propose_questions"]["desc"], {"questions": list})
-    async def propose_questions(args):
-        pq = ts["propose_questions"]
-        incoming = args.get("questions")
-        if not isinstance(incoming, list):
-            return {"content": [{"type": "text", "text": pq["need_list"]}]}
-        path = Path(run.workdir) / QUESTIONS_PROPOSED_PATH
-        try:
-            existing = json.loads(path.read_text("utf-8")) if path.exists() else []
-            if not isinstance(existing, list):
-                existing = []
-        except Exception:
-            existing = []  # a corrupt/half-written prior file must not lose this round
-        merged, added, skipped = merge_proposed_questions(existing, incoming)
-        try:
-            _write_text_atomic(path, json.dumps(merged, ensure_ascii=False, indent=2) + "\n")
-        except Exception as e:
-            return {"content": [{"type": "text", "text": pq["write_failed"].format(e=e)}]}
-        await run.emit({"type": "summary", "summary": pq["summary"].format(added=added, skipped=skipped, total=len(merged))})
-        return {"content": [{"type": "text", "text": pq["registered"].format(added=added, skipped=skipped, total=len(merged))}]}
-
-    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket, propose_questions])
+    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket])
 
 
 def _seed_workdir(workdir: str):
@@ -1699,12 +1622,29 @@ async def _post_turn_selfcheck(run) -> str | None:
     workdir = getattr(run, "workdir", None)
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
+    turn_start_key = getattr(run, "_turn_selfcheck_key", None)
+    run._turn_selfcheck_key = None
+    turn_format_guard = getattr(run, "_turn_format_guard", None)
+    run._turn_format_guard = None
+    l1_repair_turn = getattr(run, "_l1_repair_pending", False)
+    run._l1_repair_pending = False
     # Consume the scoped-incremental guard state once, whatever this turn's outcome
     # (a tree that didn't change → no violations possible → nothing to guard).
     # getattr: test doubles / non-incremental runs may not carry the attribute.
     incr = getattr(run, "_incr_pending", None)
     run._incr_pending = None
     key = selfcheck.state_key(workdir)
+    last_state = (selfcheck.read_selfcheck(workdir) or {}).get("state")
+    unchanged_this_turn = key is not None and turn_start_key is not None and key == turn_start_key
+    if (unchanged_this_turn and incr is None and not l1_repair_turn
+            and not getattr(run, "_full_compile_pending", False)
+            and not getattr(run, "_ledger_forced", False)
+            and last_state != "repairing"):
+        # A normal owner conversation may update intent/plan text, but if it
+        # did not touch candidate/ or EXCLUSIONS it must not conscript an old
+        # draft into the current OKF migration. A changed tree, explicit
+        # compile/incremental round, or unfinished repair still runs the gate.
+        return None
     unchanged = key is not None and key == run._selfcheck_key
     if unchanged:
         # A NO-OP repair turn must still reach the gate: the dedup early-return
@@ -1719,7 +1659,6 @@ async def _post_turn_selfcheck(run) -> str | None:
         # return here would leave whatever state the file last carried (or no
         # state at all) with the gate never re-run — recomputing heals the file
         # and spends the budget honestly (review).
-        last_state = (selfcheck.read_selfcheck(workdir) or {}).get("state")
         if last_state is not None and last_state != "repairing":
             return None
     elif incr is None:
@@ -1775,6 +1714,20 @@ async def _post_turn_selfcheck(run) -> str | None:
             format_changed_pages,
         )
         report["lint"] = {"ok": not blocking, "violations": blocking}
+    elif turn_format_guard:
+        after = incremental.page_hashes(workdir)
+        format_changed_pages = set(incremental.changed_pages(
+            turn_format_guard.get("before") or {}, after))
+        blocking, grandfathered_format = selfcheck.filter_incremental_format_violations(
+            report["lint"]["violations"],
+            turn_format_guard.get("baseline_format_violations") or [],
+            format_changed_pages,
+        )
+        report["lint"] = {"ok": not blocking, "violations": blocking}
+        report["grandfathered_format"] = {
+            "violation_count": len(grandfathered_format),
+            "violations": grandfathered_format[:40],
+        }
     if incr:
         # Keep inherited debt visible without allowing it to widen repair_pages
         # and silently turn a scoped edit into a whole-library migration. The
@@ -1822,6 +1775,7 @@ async def _post_turn_selfcheck(run) -> str | None:
             pass  # ticket filing must never break the turn seam (fail-open, §4.5)
     if report["state"] == "repairing":
         run._l1_repairs_used += 1
+        run._l1_repair_pending = True
         if incr:
             # Re-arm the byte-integrity guard for the repair turn itself —
             # for ANY incremental turn entering repair, not only one that
@@ -1924,6 +1878,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 # snapshot and restore over the owner's edits (review finding).
                 run._incr_pending = None
                 run._full_compile_pending = False
+                run._l1_repair_pending = False
                 msg = (f"Self-check repair injection failed: {e!r}"
                        if selfcheck._is_en(getattr(run, "locale", None))
                        else f"自检回修注入失败: {e!r}")
@@ -1948,7 +1903,6 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
     "mcp__compile__resolve_ticket",
-    "mcp__compile__propose_questions",
 ]
 
 
@@ -2901,6 +2855,115 @@ def _make_compile_path_guard(root: Path, locale: str | None = None):
     return _make_path_guard(root, locale, deny_bash=True)
 
 
+def _recommendation_path_escape(root: Path, tool_name: str, tool_input: dict) -> str | None:
+    """Confine the red-team recommender to raw/ and candidate/ only.
+
+    The generic compiler guard protects the pod boundary but intentionally
+    allows authoring/, eval/, and release/. Those contain internal workflow and
+    prior evaluation material that must not influence a blind test proposal.
+    """
+    root = root.resolve()
+    allowed = ((root / "raw").resolve(), (root / "candidate").resolve())
+
+    def within(target: Path, base: Path) -> bool:
+        try:
+            target.relative_to(base)
+            return True
+        except ValueError:
+            return False
+
+    def outside(value: str) -> bool:
+        path = Path(value)
+        target = path if path.is_absolute() else root / path
+        resolved = target.resolve()
+        return not any(within(resolved, base) for base in allowed)
+
+    if tool_name == "Read":
+        value = tool_input.get("file_path")
+        if not isinstance(value, str) or not value.strip() or outside(value):
+            return f"file_path={value}"
+        return None
+
+    if tool_name == "Grep":
+        value = tool_input.get("path")
+        # Grep without path defaults to cwd and would scan every workspace dir.
+        if not isinstance(value, str) or not value.strip() or outside(value):
+            return f"path={value}"
+        return None
+
+    if tool_name == "Glob":
+        pattern = tool_input.get("pattern")
+        if not isinstance(pattern, str) or not pattern.strip() or ".." in PurePosixPath(pattern).parts:
+            return f"pattern={pattern}"
+        pattern = pattern.strip()
+        path = tool_input.get("path")
+
+        def static_base(glob_pattern: str) -> str:
+            wildcard_positions = [glob_pattern.find(ch) for ch in ("*", "?", "[") if ch in glob_pattern]
+            return glob_pattern[:min(wildcard_positions)] if wildcard_positions else glob_pattern
+
+        # Glob's path and pattern form one search scope. Claude Code commonly
+        # sends the workspace cwd as path plus `raw/**/*.md` as the pattern;
+        # rejecting path in isolation sends the reviewer into a denial loop even
+        # though the effective glob cannot leave raw/. Conversely, cwd + `**/*`
+        # is broad and must remain denied.
+        if pattern.startswith("/"):
+            # The allowed directory itself must be an exact lexical prefix
+            # before any wildcard (`raw*/**` is not equivalent to `raw/**`).
+            if not any(pattern == base.as_posix() or pattern.startswith(base.as_posix() + "/")
+                       for base in allowed):
+                return f"pattern={pattern}"
+            if not any(within(Path(static_base(pattern)).resolve(), base) for base in allowed):
+                return f"pattern={pattern}"
+            return None
+
+        path_value = path.strip() if isinstance(path, str) and path.strip() else ""
+        base_path = Path(path_value) if path_value and Path(path_value).is_absolute() else root / path_value
+        base_path = base_path.resolve()
+        static_target = (base_path / static_base(pattern)).resolve()
+        if any(within(base_path, base) for base in allowed):
+            return None if any(within(static_target, base) for base in allowed) else f"pattern={pattern}"
+        if base_path != root:
+            return f"path={path}"
+        parts = PurePosixPath(pattern).parts
+        first = parts[0] if parts else ""
+        if first not in {"raw", "candidate"}:
+            return f"pattern={pattern}"
+        return None if any(within(static_target, base) for base in allowed) else f"pattern={pattern}"
+
+    if tool_name == "mcp__recommend__submit_recommended_test":
+        return None
+    return f"tool={tool_name}"
+
+
+def _make_recommendation_path_guard(root: Path, locale: str | None = None):
+    """PreToolUse hook for the isolated red-team recommendation session."""
+    deny_template = _prompt("recommend_guard_deny", locale).strip()
+    root = root.resolve()
+
+    async def guard(input_data, tool_use_id, context):
+        offender = _recommendation_path_escape(
+            root,
+            str(input_data.get("tool_name", "")),
+            input_data.get("tool_input") or {},
+        )
+        if offender:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": deny_template.format(
+                        raw_root=root / "raw",
+                        candidate_root=root / "candidate",
+                        offender=offender,
+                    ),
+                }
+            }
+        return {}
+
+    return guard
+
+
 async def test_session_driver(run: "TestRun"):
     """Read-only consumer driver: host a ClaudeSDKClient over the pinned snapshot
     dir, tools limited to the kb-test profile's whitelist (default Read/Glob/Grep),
@@ -2938,6 +3001,147 @@ async def test_session_driver(run: "TestRun"):
         run.connected.set()  # unblock any /test-message waiters even if connect failed
         run.client = None
         await client.disconnect()
+
+
+def _validate_test_recommendation(root: Path, args: dict) -> dict:
+    """Validate the model's structured recommendation against the live workspace.
+
+    Evidence must name at least one real file below raw/. This makes the
+    reference answer auditable and prevents a model from laundering candidate
+    prose or an escaped host path into ground truth.
+    """
+    question = str(args.get("question", "")).strip()
+    reference = str(args.get("reference_answer", "")).strip()
+    evidence = args.get("evidence_paths")
+    if not question or len(question) > 1024:
+        raise ValueError("recommended question must contain 1-1024 characters")
+    if not reference or len(reference) > 8000:
+        raise ValueError("recommended reference_answer must contain 1-8000 characters")
+    if not isinstance(evidence, list) or not evidence:
+        raise ValueError("recommended test must cite at least one raw evidence path")
+    root = root.resolve()
+    raw_root = (root / "raw").resolve()
+    normalized: list[str] = []
+    for value in evidence[:12]:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("evidence_paths must contain non-empty strings")
+        rel = Path(value.strip())
+        if rel.is_absolute():
+            raise ValueError("evidence_paths must be workspace-relative raw paths")
+        target = (root / rel).resolve()
+        try:
+            target.relative_to(raw_root)
+        except ValueError as exc:
+            raise ValueError(f"evidence path is outside raw/: {value}") from exc
+        if not target.is_file():
+            raise ValueError(f"evidence path does not exist: {value}")
+        normalized.append(target.relative_to(root).as_posix())
+    return {
+        "question": question,
+        "reference_answer": reference,
+        "evidence_paths": list(dict.fromkeys(normalized)),
+    }
+
+
+RECOMMENDATION_BUILTIN_TOOLS = ["Read", "Glob", "Grep"]
+RECOMMENDATION_SUBMIT_TOOL = "mcp__recommend__submit_recommended_test"
+RECOMMENDATION_DISALLOWED_TOOLS = [
+    "Bash", "Write", "Edit", "NotebookEdit", "Agent", "Task", "WebFetch", "WebSearch",
+]
+
+
+def _make_recommendation_submit_tool(root: Path, parent: "CompileRun", captured: dict):
+    """Build the single structured output tool for one recommendation call."""
+    tool_description = _loc(
+        parent,
+        "Submit exactly one simple, valuable regression question with its raw-grounded reference answer and evidence paths.",
+        "提交且仅提交 1 个简单但有价值的回归问题、基于原料的明确参考答案及证据路径。",
+    )
+
+    @tool("submit_recommended_test", tool_description, {
+        "question": str,
+        "reference_answer": str,
+        "evidence_paths": list,
+    })
+    async def submit_recommended_test(args):
+        if captured:
+            return {"content": [{"type": "text", "text": "A recommendation was already submitted."}]}
+        captured.update(_validate_test_recommendation(root, args))
+        return {"content": [{"type": "text", "text": "Recommendation accepted. Stop now."}]}
+
+    return submit_recommended_test
+
+
+def _recommendation_session_opts(
+    parent: "CompileRun", root: Path, submit_recommended_test
+) -> "ClaudeAgentOptions":
+    """Create an isolated SDK profile for explicit test recommendation.
+
+    `allowed_tools` only bypasses permission prompts; it does not hide Claude
+    Code's default tool catalogue. Supplying `tools` and a plain system prompt
+    is what makes this a minimal reviewer instead of a compiler-shaped session.
+    """
+    return ClaudeAgentOptions(
+        cwd=str(root),
+        system_prompt=_prompt("recommend_test_role", parent.locale),
+        tools=list(RECOMMENDATION_BUILTIN_TOOLS),
+        allowed_tools=[*RECOMMENDATION_BUILTIN_TOOLS, RECOMMENDATION_SUBMIT_TOOL],
+        disallowed_tools=list(RECOMMENDATION_DISALLOWED_TOOLS),
+        mcp_servers={
+            "recommend": create_sdk_mcp_server("recommend", tools=[submit_recommended_test]),
+        },
+        strict_mcp_config=True,
+        permission_mode="bypassPermissions",
+        setting_sources=[],
+        skills=[],
+        model=_compile_model(),
+        max_turns=int(os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS", "20")),
+        max_buffer_size=SDK_MAX_BUFFER_BYTES,
+        session_id=str(uuid.uuid4()),
+        session_store=InMemorySessionStore(),
+        hooks={"PreToolUse": [HookMatcher(hooks=[_make_recommendation_path_guard(root, parent.locale)])]},
+    )
+
+
+async def recommend_test_question(parent: "CompileRun") -> dict:
+    """Run one fresh, read-only red-team session over raw/ + candidate/.
+
+    This is intentionally not the compile session and exposes no write tools.
+    It returns one structured question to the control plane; it never writes a
+    proposal artifact and never sends the reference answer to the test consumer.
+    """
+    root = Path(parent.workdir).resolve()
+    if not (root / "candidate" / "index.md").is_file():
+        raise ValueError("no stable candidate draft is available")
+    if not (root / "raw").is_dir() or not any(p.is_file() for p in (root / "raw").rglob("*")):
+        raise ValueError("no raw source is available for a grounded recommendation")
+
+    captured: dict = {}
+    submit_recommended_test = _make_recommendation_submit_tool(root, parent, captured)
+    opts = _recommendation_session_opts(parent, root, submit_recommended_test)
+    client = ClaudeSDKClient(options=opts)
+    terminal_result = None
+    try:
+        await client.connect()
+        directive = _loc(
+            parent,
+            "Inspect raw/ and candidate/, then call submit_recommended_test exactly once. Do not merely print JSON.",
+            "检查 raw/ 与 candidate/，然后仅调用一次 submit_recommended_test；不要只输出 JSON。",
+        )
+        await client.query(directive)
+        async for msg in client.receive_messages():
+            if type(msg).__name__ == "ResultMessage":
+                terminal_result = msg
+                break
+    finally:
+        await client.disconnect()
+    if not captured:
+        if getattr(terminal_result, "subtype", "") == "error_max_turns":
+            raise ValueError(
+                "the red-team reviewer exhausted its turn budget before submitting a recommendation"
+            )
+        raise ValueError("the red-team reviewer returned no structured recommendation")
+    return captured
 
 
 async def _test_session_wrapper(run: "TestRun"):
@@ -3175,7 +3379,13 @@ async def _dispatch_authoring_turn(run: CompileRun, text: str, action: str | Non
         return {"ok": True, "queued": True}
     if full_compile:
         run._full_compile_pending = True
-    run._begin_turn(text)  # arm the stall watchdog — every model turn, incl. the owner's
+    run._begin_turn(
+        text,
+        # A normal owner edit may touch one page without conscripting untouched
+        # legacy pages into a whole-library format migration. Explicit compile,
+        # incremental, repair, verify, and batch turns remain strict.
+        grandfather_legacy_format=not full_compile,
+    )  # arm the stall watchdog — every model turn, incl. the owner's
     try:
         await run.client.query(text)
     except BaseException:
@@ -3402,6 +3612,39 @@ async def handle_open_test(request: web.Request):
     return web.json_response({"ok": True, "test_session_id": tid, "snapshot_hash": snapshot_hash, "pages": pages})
 
 
+async def handle_test_recommendation(request: web.Request):
+    """Explicitly author one raw-grounded test question for a stable draft."""
+    def failure(status: int, code: str, message: str, retriable: bool):
+        return web.json_response({
+            "error": {"code": code, "message": message, "retriable": retriable},
+        }, status=status)
+
+    run_id = request.match_info["run_id"]
+    parent = RUNS.get(run_id)
+    if not parent:
+        return failure(404, "runtime_unavailable", "recommendation run is unavailable", True)
+    if parent._turn_active or parent._batch_active:
+        return failure(409, "test_session_failed", "knowledge authoring is still running", True)
+    if run_id in RECOMMENDATIONS_ACTIVE:
+        return failure(409, "test_session_failed", "a test recommendation is already running", True)
+    RECOMMENDATIONS_ACTIVE.add(run_id)
+    try:
+        timeout = float(os.environ.get("KBC_TEST_RECOMMEND_TIMEOUT_SECS", "180"))
+        result = await asyncio.wait_for(_RECOMMEND_TEST_IMPL(parent), timeout=timeout)
+        return web.json_response({"ok": True, **result})
+    except asyncio.TimeoutError:
+        return failure(504, "runtime_unavailable", "test recommendation timed out", True)
+    except ValueError as exc:
+        message = str(exc)
+        code = "turn_budget_exhausted" if "turn budget" in message else "recommendation_invalid"
+        return failure(422, code, message, code == "turn_budget_exhausted")
+    except Exception as exc:
+        print(f"[compile_box] recommendation {run_id} failed: {exc!r}", flush=True)
+        return failure(500, "internal_error", "test recommendation failed", True)
+    finally:
+        RECOMMENDATIONS_ACTIVE.discard(run_id)
+
+
 async def handle_test_message(request: web.Request):
     """Inject a user turn into a live read-only test session. Reply streams over
     GET /test-events/{tid}."""
@@ -3505,6 +3748,7 @@ def build_app() -> web.Application:
         web.get("/events/{run_id}", handle_events),
         # Test session: read-only consumer session over a pinned draft snapshot.
         web.post("/test-session/{run_id}", handle_open_test),
+        web.post("/test-recommendation/{run_id}", handle_test_recommendation),
         web.post("/test-message/{tid}", handle_test_message),
         web.get("/test-events/{tid}", handle_test_events),
         web.post("/test-session/{tid}/close", handle_close_test),
@@ -3528,6 +3772,7 @@ def main():
 # KBC_SMOKE=1 → free in-cluster wiring e2e (no LLM); default = persistent session.
 _COMPILE_IMPL = _smoke_compile if os.environ.get("KBC_SMOKE") == "1" else run_session
 _TEST_SESSION_IMPL = test_session_driver
+_RECOMMEND_TEST_IMPL = recommend_test_question
 
 if __name__ == "__main__":
     main()

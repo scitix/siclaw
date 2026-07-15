@@ -236,12 +236,12 @@ export class AgentBoxClient {
    * POST a JSON body to an arbitrary path, returning parsed JSON.
    * Used by the capability session driver (POST /sources, /session, /message).
    */
-  async postJson<T = unknown>(path: string, body: unknown): Promise<T> {
+  async postJson<T = unknown>(path: string, body: unknown, timeoutMs?: number): Promise<T> {
     const resp = await this.fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
+    }, timeoutMs);
     return resp.json();
   }
 
@@ -502,17 +502,17 @@ export class AgentBoxClient {
   /**
    * Base fetch wrapper (supports both HTTP and HTTPS with mTLS)
    */
-  private async fetch(path: string, init?: RequestInit): Promise<Response> {
+  private async fetch(path: string, init?: RequestInit, timeoutMs = this.timeoutMs): Promise<Response> {
     const url = `${this.endpoint}${path}`;
     const method = init?.method ?? "GET";
 
     // Use https.request for HTTPS with mTLS
     if (this.httpsAgent && this.endpoint.startsWith("https://")) {
-      return this.httpsRequest(path, init);
+      return this.httpsRequest(path, init, timeoutMs);
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const resp = await fetch(url, {
@@ -529,7 +529,7 @@ export class AgentBoxClient {
       return resp;
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        console.error(`[agentbox-client] HTTP timeout: ${method} ${path} (${this.timeoutMs}ms)`);
+        console.error(`[agentbox-client] HTTP timeout: ${method} ${path} (${timeoutMs}ms)`);
       }
       throw err;
     } finally {
@@ -540,7 +540,7 @@ export class AgentBoxClient {
   /**
    * HTTPS request with mTLS (returns a Response-compatible object)
    */
-  private httpsRequest(path: string, init?: RequestInit): Promise<Response> {
+  private httpsRequest(path: string, init?: RequestInit, timeoutMs = this.timeoutMs): Promise<Response> {
     const method = init?.method ?? "GET";
     const urlObj = new URL(path, this.endpoint);
 
@@ -570,9 +570,9 @@ export class AgentBoxClient {
       );
 
       req.on("error", reject);
-      req.setTimeout(this.timeoutMs, () => {
+      req.setTimeout(timeoutMs, () => {
         req.destroy();
-        reject(new Error(`AgentBox HTTPS request timeout: ${method} ${path} (${this.timeoutMs}ms)`));
+        reject(new Error(`AgentBox HTTPS request timeout: ${method} ${path} (${timeoutMs}ms)`));
       });
 
       if (init?.body) {

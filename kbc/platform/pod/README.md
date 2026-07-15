@@ -20,18 +20,16 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
 
   The moat relies on custom tools that let the agent **signal explicitly** (rather than guessing from output):
   `report_summary`→`summary`, `propose_plan`→`plan_proposed`,
-  `resolve_ticket`→writes the `agent_report` in `authoring/CONTRADICTIONS.json` (contradiction-ticket fix-up registration),
-  `propose_questions`→appends (deduped) to `authoring/QUESTIONS_PROPOSED.json` (post-compile test questions, consumed by the frontend "proposed questions / AI-suggested" flow).
+  `resolve_ticket`→writes the `agent_report` in `authoring/CONTRADICTIONS.json` (contradiction-ticket fix-up registration).
   **Contradictions never block**: the agent lands a best-guess page + marks it uncertain + files a ticket, and the owner adjudicates asynchronously afterward (contradiction-as-turn model).
+  Compilation does not generate suggested test questions as a hidden completion side effect; question recommendation belongs to an explicit test workflow over a pinned draft.
 
-## Protocol v3: three linear-wizard enhancements (BOX_ROLE contract, never-block invariant unchanged)
+## Protocol v3: linear-wizard enhancements (BOX_ROLE contract, never-block invariant unchanged)
 
-The linear-wizard mode adds three pure-contract enhancements to the box (design: improve_siclaw/DESIGN-kb-linear-mode-2026-07-03 §3; none introduce a wait-for-user pause):
+The linear-wizard mode adds two pure-contract enhancements to the box (design: improve_siclaw/DESIGN-kb-linear-mode-2026-07-03 §3; neither introduces a wait-for-user pause):
 
 - **Compile brief**: typed commands carry stable audience/depth/redaction/content-locale parameters and deterministically write `authoring/BRIEF.json`; no localized text parsing is needed. The old opening-message parser remains for pre-command clients. BOX_ROLE reads either schema, updates INTENT.md, and treats the brief as intent rather than source fact.
 - **Unified question queue**: "tone-type follow-ups" that surface mid-compile (conventions / redaction / whether to compile process data / whether to keep old versions) are handled **the same** as source contradictions — best-guess into the page + mark `⚠️ 存疑` + append to the **same** `authoring/CONTRADICTIONS.json` (schema unchanged); no new file, no new protocol. On the owner's side it is the same "questions" queue.
-- **Question timing moved earlier**: after compiling (index written, audited) the agent proactively calls `propose_questions` to prepare 3–5 test questions (a single-fact question + reference ≤150 chars + a mandatory raw source, derived from raw not from candidate); append-style dedup, so repeated calls / re-compiles top up rather than overwrite the previous round. Each written entry carries a stable `id` (`"q-" + fnv1a32(normalized question)`, 8 hex chars, same formula as the frontend) — the frontend uses it as the `proposal_id` for accept/reject, so a missing id would make the consumer 500.
-
 - **`compile_agent.py` (one-shot, local debugging)** — a one-off `query()`: reads `workdir/drop/`+`constitution.md`→compiles→writes
   `workdir/bundle/`, no HTTP. Used to quickly verify "the brain can compile inside the container".
 
