@@ -632,6 +632,15 @@ async def test_test_session_driver_readonly():
             opts = _FakeSDKClient.last.options
             assert opts.allowed_tools == ["Read", "Glob", "Grep"], opts.allowed_tools
             assert "Write" not in opts.allowed_tools and "Bash" not in opts.allowed_tools
+            # Read-only contract enforced at the tool-availability layer, not just the
+            # path hook: Bash/Write/WebFetch removed from context so a wandering
+            # consumer cannot shell out of the snapshot or break the closed-book test.
+            assert opts.tools == ["Read", "Glob", "Grep"], opts.tools
+            assert opts.strict_mcp_config is True
+            assert opts.skills == [], opts.skills
+            assert set(opts.disallowed_tools) >= {
+                "Bash", "Write", "Edit", "WebFetch", "WebSearch",
+            }, opts.disallowed_tools
             assert opts.cwd == snap, opts.cwd
             assert opts.mcp_servers == {}, opts.mcp_servers
             # persona comes from the locale pack (TestRun without locale → en default)
