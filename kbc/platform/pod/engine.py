@@ -150,8 +150,14 @@ class ClaudeEngine:
         opts = ClaudeAgentOptions(
             cwd=cwd,
             system_prompt={"type": "preset", "preset": "claude_code", "append": system_prompt},
+            tools=["Read", "Glob", "Grep"],       # read-only base set; removes Bash/Write/Web from context
             allowed_tools=["Read", "Glob", "Grep"],
+            disallowed_tools=[                     # belt-and-suspenders under bypass; keeps the PK closed-book
+                "Bash", "Write", "Edit", "NotebookEdit", "Agent", "Task", "WebFetch", "WebSearch",
+            ],
             mcp_servers={},
+            strict_mcp_config=True,                # ignore project/user/plugin MCP configs
+            skills=[],                             # no skills for a read-only reviewer
             permission_mode="bypassPermissions",  # pod 本身即 sandbox;守卫走 hook
             hooks={"PreToolUse": [HookMatcher(hooks=[_make_multiroot_guard(roots)])]},
             setting_sources=[],                   # 多租户隔离

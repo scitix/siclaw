@@ -2781,6 +2781,15 @@ async def _run_wrapper(run: CompileRun):
 # Default tool whitelist for a read-only kb-test session, used when the runtime
 # profile declares none. Read-only by construction: cannot mutate the snapshot.
 DEFAULT_TEST_ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
+# Tools removed from a read-only consumer session's context entirely (not merely
+# left un-approved). Under bypassPermissions the allowed_tools split is moot, so
+# the read-only contract must be enforced by pinning `tools` to the read set and
+# denying the rest — the path hook only confines path-bearing tools, so Bash (a
+# shell that reads outside the snapshot) and WebFetch/WebSearch (breaking the
+# closed-book property the test score depends on) would otherwise slip through.
+READONLY_CONSUMER_DISALLOWED_TOOLS = [
+    "Bash", "Write", "Edit", "NotebookEdit", "Agent", "Task", "WebFetch", "WebSearch",
+]
 
 # Tool-input keys that name a filesystem path (Read.file_path, Glob/Grep.path).
 _TEST_PATH_KEYS = ("file_path", "path", "notebook_path")
@@ -2975,8 +2984,12 @@ async def test_session_driver(run: "TestRun"):
     opts = ClaudeAgentOptions(
         cwd=run.cwd,
         system_prompt={"type": "preset", "preset": "claude_code", "append": _prompt("test_role", run.locale)},
+        tools=list(DEFAULT_TEST_ALLOWED_TOOLS),    # read-only base set; removes Bash/Write/Web from context
         allowed_tools=run.allowed_tools or DEFAULT_TEST_ALLOWED_TOOLS,
+        disallowed_tools=list(READONLY_CONSUMER_DISALLOWED_TOOLS),  # belt-and-suspenders under bypass
         mcp_servers={},                            # no compile signal tools
+        strict_mcp_config=True,                    # ignore project/user/plugin MCP configs
+        skills=[],                                 # no skills for a read-only consumer
         permission_mode="bypassPermissions",       # the pod itself is the sandbox
         # C4: path confinement — absolute/../ reads must not escape the snapshot
         # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
