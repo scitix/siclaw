@@ -688,6 +688,7 @@ _CREDENTIAL_PATTERNS = (
     ("private key", re.compile(
         r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?"
         r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")),
+    ("Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
     ("OpenAI-compatible API key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
     ("GitHub token", re.compile(r"\b(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]{30,}\b")),
     ("GitHub fine-grained token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),

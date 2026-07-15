@@ -256,6 +256,7 @@ def test_candidate_credential_lint():
         _mk(base, "raw/s/a.md")
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
         secrets = [
+            "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0K1m2N3p4",
             "sk-" + "A1b2C3d4E5f6G7h8I9j0K1",
             "sk-" + "A1b2testC3d4E5f6G7h8I9j0K1",
             "ghp_" + "a" * 36,
