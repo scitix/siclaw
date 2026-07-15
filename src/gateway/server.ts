@@ -85,7 +85,7 @@ import {
 } from "./internal-api.js";
 import { handleDelegate, handleDelegates } from "./delegate-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
-import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
+import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
@@ -316,7 +316,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // could land. consumeAgentSse writes assistant/tool rows with FK
         // referencing chat_sessions, so the row has to exist first.
         await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
-        await appendMessage({ sessionId, role: "user", content: text });
+        const promptMessageId = await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
 
         // Persistence is resolved by agentId in the manager's persistenceResolver
@@ -338,11 +338,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // prompt will fire its own when it actually finishes, and an
           // extra one would close the frontend stream prematurely.
           if (err instanceof Error && err.message.includes("Session is already running")) {
-            await client.steerSession(sessionId, text, { images, files });
+            const steerResult = await client.steerSession(sessionId, text, { images, files });
+            await bindMessageTraceId(promptMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
+              console.warn(`[runtime] failed to bind steer trace session=${sessionId} message=${promptMessageId}:`, bindErr);
+            });
             return;
           }
           throw err;
         }
+
+        await bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
+          console.warn(`[runtime] failed to bind prompt trace session=${promptResult.sessionId} message=${promptMessageId}:`, bindErr);
+        });
 
         const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
         const abortCtrl = new AbortController();
@@ -1004,12 +1011,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // = "steer" lets the frontend render it as a steer bubble, not a plain user
     // message. No ensureChatSession: a steer always targets an already-running
     // session, so the row exists and we must not clobber its title/preview.
-    await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
+    const steerMessageId = await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
     await incrementMessageCount(sessionId);
 
     const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
-    await client.steerSession(sessionId, text, { images, files });
+    const steerResult = await client.steerSession(sessionId, text, { images, files });
+    await bindMessageTraceId(steerMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
+      console.warn(`[runtime] failed to bind explicit steer trace session=${sessionId} message=${steerMessageId}:`, bindErr);
+    });
     return { ok: true };
   });
 

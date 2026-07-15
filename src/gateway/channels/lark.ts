@@ -25,7 +25,7 @@ import {
 } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
-import { appendMessage, ensureChatSession, recordChannelFeedback } from "../chat-repo.js";
+import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback } from "../chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
 import { resolveAgentModelBinding } from "../agent-model-binding.js";
 import {
@@ -1111,9 +1111,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // URL — see promptText below — so resolution is unaffected). Keeps DB rows /
   // session title free of plaintext Signature/AccessKeyId.
   const persistedText = redactImageUrlsInText(effectiveText);
+  let promptMessageId: string;
   try {
     await ensureChatSession(sessionId, agentId, binding.createdBy, persistedText, persistedText, "channel", undefined, { senderExternalId, channelId });
-    await appendMessage({
+    promptMessageId = await appendMessage({
       sessionId,
       role: "user",
       content: persistedText,
@@ -1260,6 +1261,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   try {
     // queue-until-idle: wait out a busy session instead of dumping a raw 409.
     const promptResult = await promptWithBusyRetry(client, promptOpts);
+    await bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
+      console.warn(`[lark] failed to bind prompt trace session=${promptResult.sessionId} message=${promptMessageId}:`, bindErr);
+    });
     const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", {
       includeImages: true,
       onMilestone: addMilestone,
@@ -1267,7 +1271,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       // Audit: persist assistant + tool rows so the channel transcript matches
       // web/api/a2a (origin="channel" set on the session above). Tool output on
       // this stream is already sanitized at the agentbox boundary.
-      persist: { agentId, modelConfig: modelBinding?.modelConfig },
+      persist: { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId },
     });
     resultText = collected.text;
     replyImages = collected.images;
@@ -1552,6 +1556,7 @@ export async function collectResponse(
 export interface ChannelPersistContext {
   agentId: string;
   modelConfig?: { apiKey?: string; baseUrl?: string };
+  traceId?: string;
 }
 
 export async function collectChannelResponse(
@@ -1585,7 +1590,7 @@ export async function collectChannelResponse(
   const pushQ = <T,>(m: Map<string, T[]>, k: string, v: T): void => { const a = m.get(k) ?? []; a.push(v); m.set(k, a); };
   const shiftQ = <T,>(m: Map<string, T[]>, k: string): T | undefined => m.get(k)?.shift();
   const persistRow = async (msg: Parameters<typeof appendMessage>[0]): Promise<void> => {
-    try { await appendMessage(msg); }
+    try { await appendMessage({ ...msg, traceId: persist?.traceId ?? msg.traceId }); }
     catch (err) { console.warn(`[${logPrefix}] audit persist failed session=${sessionId}:`, err); }
   };
 

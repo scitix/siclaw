@@ -7,6 +7,7 @@ const box = vi.hoisted(() => ({
 vi.mock("./chat-repo.js", () => ({
   ensureChatSession: vi.fn(async () => {}),
   appendMessage: vi.fn(async () => "msg-id"),
+  bindMessageTraceId: vi.fn(async () => {}),
   incrementMessageCount: vi.fn(async () => {}),
 }));
 

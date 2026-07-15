@@ -293,7 +293,7 @@ export class TaskCoordinator {
       // activity from interactive chat — without it every cron-triggered
       // session collapses into the default Interactive world.
       await ensureChatSession(sessionId, agentId, userId, job.name, prompt, "task");
-      await appendMessage({ sessionId, role: "user", content: prompt });
+      await appendMessage({ sessionId, role: "user", content: prompt, traceId: promptResult.traceId });
       await incrementMessageCount(sessionId);
 
       const redactionConfig = buildRedactionConfigForModelConfig(binding.modelConfig);

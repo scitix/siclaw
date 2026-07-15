@@ -38,9 +38,11 @@ vi.mock("../channel-manager.js", () => ({
 // collectResponse) assistant/tool rows for audit. Mock it to assert the writes.
 const ensureChatSessionMock = vi.fn();
 const appendMessageMock = vi.fn();
+const bindMessageTraceIdMock = vi.fn();
 vi.mock("../chat-repo.js", () => ({
   ensureChatSession: (...args: unknown[]) => ensureChatSessionMock(...args),
   appendMessage: (...args: unknown[]) => appendMessageMock(...args),
+  bindMessageTraceId: (...args: unknown[]) => bindMessageTraceIdMock(...args),
   incrementMessageCount: () => Promise.resolve(),
 }));
 
@@ -85,6 +87,7 @@ beforeEach(() => {
   ensureChatSessionMock.mockResolvedValue(undefined);
   appendMessageMock.mockReset();
   appendMessageMock.mockResolvedValue("msg-db-1");
+  bindMessageTraceIdMock.mockReset();
   resetConversationSessionsForTest();
   fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
   vi.stubGlobal("fetch", fetchMock);
@@ -302,7 +305,7 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
 
   it("audits the session: persists origin=channel + user/assistant/tool rows when the binding has an owner", async () => {
     resolveBindingMock.mockResolvedValue({ agentId: "agent-7", bindingId: "b1", createdBy: "owner-1" });
-    promptMock.mockResolvedValue({ sessionId: "remote-7" });
+    promptMock.mockResolvedValue({ sessionId: "remote-7", traceId: "0123456789abcdef0123456789abcdef" });
     streamEventsMock.mockImplementation(async function* () {
       yield { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get pods" } };
       yield { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "pods ok" }], details: {} } };
@@ -327,6 +330,14 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
     expect(rows.filter((m) => m.role === "tool")).toHaveLength(1);
     expect(rows.find((m) => m.role === "tool")).toMatchObject({ toolName: "bash", outcome: "success" });
     expect(rows.find((m) => m.role === "assistant")?.content).toBe("done.");
+    expect(bindMessageTraceIdMock).toHaveBeenCalledWith(
+      "msg-db-1",
+      "remote-7",
+      "0123456789abcdef0123456789abcdef",
+    );
+    expect(rows.filter((message) => message.role !== "user").every(
+      (message) => message.traceId === "0123456789abcdef0123456789abcdef",
+    )).toBe(true);
   });
 
   it("does NOT persist when the binding has no owner (no false user_id)", async () => {

@@ -10,6 +10,7 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 vi.mock("./chat-repo.js", () => ({
   ensureChatSession: vi.fn(async () => {}),
   appendMessage: vi.fn(async () => "msg-id"),
+  bindMessageTraceId: vi.fn(async () => {}),
   incrementMessageCount: vi.fn(async () => {}),
 }));
 

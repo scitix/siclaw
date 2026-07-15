@@ -12,9 +12,12 @@
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
 
+const bindMessageTraceIdMock = vi.hoisted(() => vi.fn(async () => {}));
+
 vi.mock("./chat-repo.js", () => ({
   ensureChatSession: vi.fn(async () => {}),
   appendMessage: vi.fn(async () => "msg-id"),
+  bindMessageTraceId: bindMessageTraceIdMock,
   incrementMessageCount: vi.fn(async () => {}),
 }));
 
@@ -40,6 +43,7 @@ vi.mock("./sse-consumer.js", () => ({
 
 const abortSessionCalls: string[] = [];
 const promptCalls: unknown[] = [];
+let promptError: Error | undefined;
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     endpoint: string;
@@ -48,12 +52,13 @@ vi.mock("./agentbox/client.js", () => ({
     }
     prompt = vi.fn(async (opts: { sessionId: string }) => {
       promptCalls.push(opts);
-      return { sessionId: opts.sessionId };
+      if (promptError) throw promptError;
+      return { sessionId: opts.sessionId, traceId: "0123456789abcdef0123456789abcdef" };
     });
     abortSession = vi.fn(async (sessionId: string) => {
       abortSessionCalls.push(sessionId);
     });
-    steerSession = vi.fn(async () => {});
+    steerSession = vi.fn(async () => ({ ok: true, traceId: "fedcba9876543210fedcba9876543210" }));
     streamEvents = async function* () {};
   },
 }));
@@ -104,6 +109,7 @@ afterEach(async () => {
   capturedSignal = undefined;
   abortSessionCalls.length = 0;
   promptCalls.length = 0;
+  promptError = undefined;
   vi.clearAllMocks();
 });
 
@@ -120,6 +126,11 @@ describe("startRuntime — chat.abort wiring", () => {
     // The IIFE must reach consumeAgentSse (ensureChatSession → prompt → register).
     await waitFor(() => capturedSignal !== undefined);
     expect(capturedSignal!.aborted).toBe(false);
+    expect(bindMessageTraceIdMock).toHaveBeenCalledWith(
+      "msg-id",
+      "S",
+      "0123456789abcdef0123456789abcdef",
+    );
 
     const res = await abort({ agentId: "a", sessionId: "S" });
     expect(res).toMatchObject({ ok: true });
@@ -136,6 +147,34 @@ describe("startRuntime — chat.abort wiring", () => {
     await expect(abort({ agentId: "a", sessionId: "missing" })).resolves.toMatchObject({ ok: true });
     // The agentbox is still asked to stop even with no live gateway consumer.
     expect(abortSessionCalls).toEqual(["missing"]);
+  });
+
+  it("binds an explicit steer message to the active prompt trace", async () => {
+    server = await bootRuntime();
+    const steer = server.rpcMethods.get("chat.steer")!;
+
+    await expect(steer({ agentId: "a", sessionId: "S", text: "also check logs" })).resolves.toMatchObject({ ok: true });
+
+    expect(bindMessageTraceIdMock).toHaveBeenCalledWith(
+      "msg-id",
+      "S",
+      "fedcba9876543210fedcba9876543210",
+    );
+  });
+
+  it("binds a concurrent send to the active trace after the automatic steer", async () => {
+    promptError = new Error("Session is already running");
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({ agentId: "a", userId: "u", text: "one more detail", sessionId: "S" }, { sendEvent: vi.fn() });
+    await waitFor(() => bindMessageTraceIdMock.mock.calls.length > 0);
+
+    expect(bindMessageTraceIdMock).toHaveBeenCalledWith(
+      "msg-id",
+      "S",
+      "fedcba9876543210fedcba9876543210",
+    );
   });
 
   it("clears the registration after the turn settles (no leak / no stale abort)", async () => {

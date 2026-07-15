@@ -1212,13 +1212,17 @@ export function createHttpServer(
       ? body.text
       : defaultPromptTextForMedia(promptMedia);
     console.log(`[agentbox-http] Steering session ${sessionId}: ${steerText.slice(0, 80)}`);
+    // Capture before awaiting brain.steer(): the active prompt may finish and
+    // clear the recorder while the steer call is being accepted. A steer is an
+    // addition to that active prompt, so it inherits this existing trace.
+    const traceId = tracingRecorder.getRootTraceId(sessionId);
     try {
       if (promptMedia) {
         await managed.brain.steer(steerText, promptMedia);
       } else {
         await managed.brain.steer(steerText);
       }
-      sendJson(res, 200, { ok: true });
+      sendJson(res, 200, { ok: true, traceId });
     } catch (err) {
       console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);
       const message = err instanceof Error ? err.message : "Steer failed";

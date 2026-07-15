@@ -39,7 +39,7 @@ import { resolveBinding, handlePairingCode, isChannelAccessDenied } from "../cha
 import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "../agent-model-binding.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
-import { appendMessage, ensureChatSession } from "../chat-repo.js";
+import { appendMessage, bindMessageTraceId, ensureChatSession } from "../chat-repo.js";
 import { collectChannelResponse } from "./lark.js";
 import type { RenderedReplyImage } from "./visual-image.js";
 import { deliverImages } from "./dingtalk-image.js";
@@ -329,10 +329,11 @@ export async function handleDingTalkMessage(
   // id is the "same person" key for channel audit; it is stamped on the SESSION
   // (chat_sessions), never falls back to the binding owner. NULL when absent.
   const senderExternalId = message.senderStaffId ?? null;
+  let promptMessageId: string | null = null;
   if (auditable) {
     try {
       await ensureChatSession(sessionId, agentId, binding.createdBy!, text, text, "channel", undefined, { senderExternalId, channelId });
-      await appendMessage({
+      promptMessageId = await appendMessage({
         sessionId,
         role: "user",
         content: text,
@@ -359,11 +360,16 @@ export async function handleDingTalkMessage(
   let agentError: Error | null = null;
   try {
     const promptResult = await client.prompt(promptOpts);
+    if (promptMessageId) {
+      await bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
+        console.warn(`[dingtalk] failed to bind prompt trace session=${promptResult.sessionId} message=${promptMessageId}:`, bindErr);
+      });
+    }
     // Collect the reply with audit persistence (assistant + tool rows, when the
     // session row exists) AND image artifacts for channel delivery.
     const collected = await collectChannelResponse(client, promptResult.sessionId, "dingtalk", {
       includeImages: true,
-      persist: auditable ? { agentId, modelConfig: modelBinding?.modelConfig } : undefined,
+      persist: auditable ? { agentId, modelConfig: modelBinding?.modelConfig, traceId: promptResult.traceId } : undefined,
     });
     resultText = collected.text;
     replyImages = collected.images;

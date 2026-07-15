@@ -173,6 +173,25 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
 }
 
 /**
+ * Attach the AgentBox prompt trace to the exact user message that initiated it.
+ * The Portal RPC enforces user-role, runtime ownership, and NULL-to-value
+ * idempotency. Missing trace ids are tolerated for rolling upgrades where an
+ * older AgentBox does not yet include traceId in its prompt/steer ACK.
+ */
+export async function bindMessageTraceId(
+  messageId: string,
+  sessionId: string,
+  traceId?: string | null,
+): Promise<void> {
+  if (!traceId) return;
+  await getClient().request("chat.bindMessageTraceId", {
+    id: messageId,
+    session_id: sessionId,
+    trace_id: traceId,
+  });
+}
+
+/**
  * Record (or re-vote) end-user feedback on a channel reply. `messageRef` is a
  * channel-level reply reference (Feishu CardKit card_id), not a chat_messages
  * id — see the message_feedback DDL comment. One vote per (reply, person);

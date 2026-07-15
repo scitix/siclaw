@@ -63,12 +63,14 @@ vi.mock("../agent-model-binding.js", () => ({
 
 const ensureChatSessionMock = vi.fn();
 const appendMessageMock = vi.fn();
+const bindMessageTraceIdMock = vi.fn();
 
 const recordChannelFeedbackMock = vi.fn();
 
 vi.mock("../chat-repo.js", () => ({
   ensureChatSession: (...args: unknown[]) => ensureChatSessionMock(...args),
   appendMessage: (...args: unknown[]) => appendMessageMock(...args),
+  bindMessageTraceId: (...args: unknown[]) => bindMessageTraceIdMock(...args),
   recordChannelFeedback: (...args: unknown[]) => recordChannelFeedbackMock(...args),
 }));
 
@@ -200,6 +202,7 @@ beforeEach(() => {
   resolveAgentModelBindingMock.mockReset();
   ensureChatSessionMock.mockReset();
   appendMessageMock.mockReset();
+  bindMessageTraceIdMock.mockReset();
   resolveAgentModelBindingMock.mockResolvedValue(null);
   ensureChatSessionMock.mockResolvedValue(undefined);
   appendMessageMock.mockResolvedValue("msg-db-1");
@@ -793,7 +796,10 @@ describe("handleLarkMessage — routing to AgentBox", () => {
 
   it("persists channel sessions/messages before prompting and wraps the current request", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
-    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    promptMock.mockResolvedValue({
+      sessionId: "session-fixed",
+      traceId: "0123456789abcdef0123456789abcdef",
+    });
     streamEventsMock.mockImplementation(async function* () { /* empty */ });
 
     await handleLarkMessage(
@@ -839,6 +845,11 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     });
     expect(promptMock.mock.calls[0][0].text).toContain("<channel-turn>");
     expect(promptMock.mock.calls[0][0].text).toContain("检查当前集群");
+    expect(bindMessageTraceIdMock).toHaveBeenCalledWith(
+      "msg-db-1",
+      "session-fixed",
+      "0123456789abcdef0123456789abcdef",
+    );
   });
 
   it("records the raw open_id as the channel sender even for a sicore_user session key", async () => {
@@ -2414,12 +2425,15 @@ describe("collectChannelResponse — audit persistence", () => {
       { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "node ok" }], details: {} } },
       { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "All healthy." }] } },
     ];
-    const collected = await collectChannelResponse(fakeClient(events), "s-audit", "lark", { persist: { agentId: "a1" } });
+    const collected = await collectChannelResponse(fakeClient(events), "s-audit", "lark", {
+      persist: { agentId: "a1", traceId: "0123456789abcdef0123456789abcdef" },
+    });
     // Reply text is still the final assistant turn.
     expect(collected.text).toBe("All healthy.");
 
     const calls = appendMessageMock.mock.calls.map((c) => c[0] as any);
     expect(calls.filter((m) => m.role === "assistant").map((m) => m.content)).toEqual(["Checking nodes", "All healthy."]);
+    expect(calls.every((message) => message.traceId === "0123456789abcdef0123456789abcdef")).toBe(true);
     const toolRows = calls.filter((m) => m.role === "tool");
     expect(toolRows).toHaveLength(1);
     expect(toolRows[0]).toMatchObject({ sessionId: "s-audit", toolName: "bash", outcome: "success" });
