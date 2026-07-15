@@ -37,6 +37,9 @@ import type {
   CapabilityStartRequest,
   CapabilityStartResponse,
   CapabilityTestCloseRequest,
+  CapabilityTestCloseResponse,
+  CapabilityTestRecommendRequest,
+  CapabilityTestRecommendResponse,
   CapabilityTestMessageRequest,
   CapabilityTestStartRequest,
   CapabilityTestStartResponse,
@@ -826,21 +829,61 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id };
   });
 
+  rpcMethods.set("capability.testRecommend", async (params) => {
+    const req = params as unknown as CapabilityTestRecommendRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    const rec = capabilityRunManager.get(req.run_id) ?? (await capabilityRunManager.adopt(req.run_id));
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${req.run_id}`);
+    capabilityRunManager.touch(req.run_id);
+    const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
+    const recommended = await client.postJson<{
+      question: string;
+      reference_answer: string;
+      evidence_paths: string[];
+    }>(`/test-recommendation/${req.run_id}`, {}, 210_000);
+    const response: CapabilityTestRecommendResponse = {
+      run_id: req.run_id,
+      question: recommended.question,
+      reference_answer: recommended.reference_answer,
+      evidence_paths: recommended.evidence_paths,
+    };
+    return response;
+  });
+
   rpcMethods.set("capability.testClose", async (params) => {
     const req = params as unknown as CapabilityTestCloseRequest;
     if (!req.run_id) throw new Error("run_id is required");
     if (!req.test_session_id) throw new Error("test_session_id is required");
-    const rec = capabilityRunManager.get(req.run_id);
-    if (!rec) return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id, already_closed: true };
-    // Don't resurrect a box just to close a test session that died with it —
-    // the box's teardown already reclaimed everything when the pod went away.
-    if (!localCapabilityBoxEndpoint) {
+    // Closing a test session is a fencing operation, not ordinary best-effort
+    // cleanup.  The in-memory capability run may have been lost across a
+    // Runtime restart while its box pod is still alive, so absence from the run
+    // manager is NOT proof that the session is gone.  Inspect the box directly
+    // and never spawn/rehydrate one merely to close it.
+    let client: AgentBoxClient;
+    if (localCapabilityBoxEndpoint) {
+      client = new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
+    } else {
       const alive = await agentBoxManager.getAsync(req.run_id);
-      if (!alive) return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id, already_closed: true };
+      if (!alive) {
+        const response: CapabilityTestCloseResponse = {
+          ok: true,
+          run_id: req.run_id,
+          test_session_id: req.test_session_id,
+          already_closed: true,
+          close_confirmed: true,
+        };
+        return response;
+      }
+      client = new AgentBoxClient(alive.endpoint, 30000, agentBoxTlsOptions);
     }
-    const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
     await client.postJson(`/test-session/${req.test_session_id}/close`, {});
-    return { ok: true, run_id: req.run_id, test_session_id: req.test_session_id };
+    const response: CapabilityTestCloseResponse = {
+      ok: true,
+      run_id: req.run_id,
+      test_session_id: req.test_session_id,
+      close_confirmed: true,
+    };
+    return response;
   });
 
   rpcMethods.set("chat.abort", async (params) => {

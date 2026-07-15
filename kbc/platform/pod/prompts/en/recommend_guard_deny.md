@@ -1,0 +1,1 @@
+This is a read-only recommendation review. It may inspect only raw/ ({raw_root}) and candidate/ ({candidate_root}); {offender} is outside those inputs. Use Read, Glob, or Grep with paths scoped below raw/ or candidate/, then submit exactly one recommendation.

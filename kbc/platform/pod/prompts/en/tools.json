@@ -14,12 +14,5 @@
     "not_found": "ticket {tid} not found; existing ids: {ids}",
     "write_failed": "failed to write CONTRADICTIONS.json: {e}",
     "registered": "ticket {tid} registered as patched (agent_report written)"
-  },
-  "propose_questions": {
-    "desc": "Call after compiling finishes (candidate/index.md written, self-audit done): submit 3-5 test questions for the owner to probe the knowledge base. questions is an array; each item {question: a single-fact question, reference: reference answer (≤150 chars), source: raw provenance}. Append-only: repeated calls dedup-merge by question text into authoring/QUESTIONS_PROPOSED.json and never overwrite the owner's prior picks.",
-    "need_list": "propose_questions requires a questions array",
-    "write_failed": "failed to write QUESTIONS_PROPOSED.json: {e}",
-    "summary": "Prepared {added} test question(s) (skipped {skipped} duplicate(s)); {total} total awaiting the owner's selection.",
-    "registered": "Questions registered: {added} added, {skipped} deduplicated, {total} total now (authoring/QUESTIONS_PROPOSED.json)."
   }
 }

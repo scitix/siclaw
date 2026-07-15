@@ -10,7 +10,6 @@ import hashlib
 import io
 import json
 import os
-import re
 import shutil
 import tarfile
 import tempfile
@@ -225,7 +224,9 @@ class AssistantMessage:
 
 
 class ResultMessage:
-    pass
+    def __init__(self, subtype="success", is_error=False):
+        self.subtype = subtype
+        self.is_error = is_error
 
 
 # Stand-ins for the SDK's other message/block types — only the class NAME matters
@@ -424,6 +425,9 @@ async def test_test_path_escape_guard():
     with tempfile.TemporaryDirectory() as snap:
         root = Path(snap)
         (root / ".siclaw" / "knowledge").mkdir(parents=True)
+        (root / "raw").mkdir()
+        (root / "candidate").mkdir()
+        (root / "raw" / "escape").symlink_to(root.parent, target_is_directory=True)
         ok = compile_box._test_path_escape
         # inside: relative, absolute-in-root, dotted-but-contained
         assert ok(root, "Read", {"file_path": ".siclaw/knowledge/index.md"}) is None
@@ -455,6 +459,41 @@ async def test_test_path_escape_guard():
         deny = await compile_guard({"tool_name": "Glob", "tool_input": {"pattern": "../outside/*"}}, "c2b", None)
         assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
         allow = await compile_guard({"tool_name": "Write", "tool_input": {"file_path": "candidate/a.md"}}, "c3", None)
+        assert allow == {}, allow
+
+        # The recommendation session is narrower than a compiler: only raw/
+        # and candidate/ may inform the proposed test. Internal workflow,
+        # evaluation and release artifacts remain invisible to the red team.
+        recommend = compile_box._recommendation_path_escape
+        assert recommend(root, "Read", {"file_path": "raw/source.md"}) is None
+        assert recommend(root, "Read", {"file_path": "candidate/index.md"}) is None
+        assert recommend(root, "Grep", {"path": "raw", "pattern": "retry"}) is None
+        assert recommend(root, "Glob", {"pattern": "candidate/**/*.md"}) is None
+        assert recommend(root, "Glob", {"path": "raw", "pattern": "**/*.md"}) is None
+        # Claude Code commonly sends cwd as Glob.path and scopes the actual
+        # search in Glob.pattern. Judge both fields together: the pair is safe,
+        # while cwd + an unscoped wildcard is not.
+        assert recommend(root, "Glob", {"path": str(root), "pattern": "raw/**/*.md"}) is None
+        assert recommend(root, "Glob", {"path": str(root), "pattern": "candidate/**/*.md"}) is None
+        assert recommend(root, "Glob", {"path": str(root), "pattern": "**/*.md"}) is not None
+        assert recommend(root, "Glob", {"path": "raw", "pattern": "escape/**/*.md"}) is not None
+        assert recommend(root, "Glob", {"pattern": str(root / "raw" / "escape" / "**/*.md")}) is not None
+        assert recommend(root, "Read", {"file_path": "authoring/PLAN.md"}) is not None
+        assert recommend(root, "Read", {"file_path": "eval/TESTS.md"}) is not None
+        assert recommend(root, "Read", {"file_path": "release/bundle.json"}) is not None
+        assert recommend(root, "Grep", {"pattern": "reference"}) == "path=None"
+        assert recommend(root, "Glob", {"pattern": "**/*.md"}) == "pattern=**/*.md"
+        assert recommend(root, "Glob", {"pattern": "raw*/**/*.md"}) == "pattern=raw*/**/*.md"
+
+        recommendation_guard = compile_box._make_recommendation_path_guard(root)
+        deny = await recommendation_guard(
+            {"tool_name": "Read", "tool_input": {"file_path": "authoring/CLAUDE.md"}}, "r1", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        reason = deny["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "raw/" in reason and "candidate/" in reason, reason
+        assert ".siclaw/knowledge/index.md" not in reason, reason
+        allow = await recommendation_guard(
+            {"tool_name": "Read", "tool_input": {"file_path": "raw/source.md"}}, "r2", None)
         assert allow == {}, allow
     print("✓ test-session path guard (C4): snapshot-confined, live /work denied")
 
@@ -732,6 +771,236 @@ async def test_test_message_path():
     print("✓ test-message injects a turn into a live test session")
 
 
+async def test_explicit_test_recommendation_http():
+    """The explicit red-team endpoint is stable-draft-only, single-flight, and
+    returns one validated raw-grounded recommendation without mutating files."""
+    original = compile_box._RECOMMEND_TEST_IMPL
+    compile_box.RUNS.clear()
+    compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_recommend(parent):
+        calls.append(parent.run_id)
+        started.set()
+        await release.wait()
+        return {
+            "question": "What is the supported retry limit?",
+            "reference_answer": "Three attempts.",
+            "evidence_paths": ["raw/policy.md"],
+        }
+
+    compile_box._RECOMMEND_TEST_IMPL = fake_recommend
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        assert (await client.post("/test-recommendation/missing")).status == 404
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("recommend-1", td, 1)
+            compile_box.RUNS[parent.run_id] = parent
+
+            parent._turn_active = True
+            assert (await client.post(f"/test-recommendation/{parent.run_id}")).status == 409
+            parent._turn_active = False
+
+            first = asyncio.create_task(client.post(f"/test-recommendation/{parent.run_id}"))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            concurrent = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert concurrent.status == 409, await concurrent.text()
+            release.set()
+            response = await first
+            assert response.status == 200, await response.text()
+            body = await response.json()
+            assert body["question"] == "What is the supported retry limit?", body
+            assert body["evidence_paths"] == ["raw/policy.md"], body
+            assert calls == [parent.run_id]
+            assert not compile_box.RECOMMENDATIONS_ACTIVE
+
+            # The feature is repeatable by explicit owner action; single-flight
+            # prevents overlap, not future recommendations after completion.
+            response = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert response.status == 200, await response.text()
+            assert calls == [parent.run_id, parent.run_id]
+
+            valid = compile_box._validate_test_recommendation(root, body)
+            assert valid["reference_answer"] == "Three attempts."
+            try:
+                compile_box._validate_test_recommendation(root, {
+                    "question": "leak?", "reference_answer": "secret", "evidence_paths": ["../secret.md"],
+                })
+                raise AssertionError("escaped evidence path was accepted")
+            except ValueError:
+                pass
+
+            async def exhausted(_parent):
+                raise ValueError("the red-team reviewer exhausted its turn budget before submitting a recommendation")
+
+            compile_box._RECOMMEND_TEST_IMPL = exhausted
+            response = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert response.status == 422, await response.text()
+            body = await response.json()
+            assert body["error"]["code"] == "turn_budget_exhausted", body
+            assert body["error"]["retriable"] is True, body
+
+            async def crashed(_parent):
+                raise RuntimeError("provider detail must stay in logs")
+
+            compile_box._RECOMMEND_TEST_IMPL = crashed
+            response = await client.post(f"/test-recommendation/{parent.run_id}")
+            assert response.status == 500, await response.text()
+            body = await response.json()
+            assert body == {
+                "error": {
+                    "code": "internal_error",
+                    "message": "test recommendation failed",
+                    "retriable": True,
+                },
+            }, body
+    finally:
+        release.set()
+        await client.close()
+        compile_box._RECOMMEND_TEST_IMPL = original
+        compile_box.RUNS.clear()
+        compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    print("✓ explicit red-team test recommendation (stable, single-flight, raw-grounded)")
+
+
+async def test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool():
+    """The explicit reviewer is a narrow red-team capability, not a compiler.
+
+    Exercise the public driver with a fake SDK transport that can only complete
+    by invoking the exact SDK MCP tool registered in its options. This keeps the
+    test sensitive to both option drift and callback wiring.
+    """
+    original_client = compile_box.ClaudeSDKClient
+    original_server_factory = compile_box.create_sdk_mcp_server
+    previous_turns = os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS")
+    seen = {}
+
+    def capture_server(name, *, tools):
+        seen["server_name"] = name
+        seen["tools"] = tools
+        return {"type": "sdk", "name": name, "tools": tools}
+
+    class SubmittingClient:
+        def __init__(self, options=None):
+            self.options = options
+            self.pending = []
+            seen["options"] = options
+
+        async def connect(self):
+            seen["connected"] = True
+
+        async def query(self, directive, session_id="default"):
+            seen["directive"] = directive
+            registered = self.options.mcp_servers["recommend"]["tools"]
+            assert len(registered) == 1
+            result = await registered[0].handler({
+                "question": "What retry limit does the source require?",
+                "reference_answer": "Three attempts.",
+                "evidence_paths": ["raw/policy.md"],
+            })
+            assert "accepted" in result["content"][0]["text"].lower(), result
+            self.pending.append(ResultMessage())
+
+        async def receive_messages(self):
+            while self.pending:
+                yield self.pending.pop(0)
+
+        async def disconnect(self):
+            seen["disconnected"] = True
+
+    compile_box.ClaudeSDKClient = SubmittingClient
+    compile_box.create_sdk_mcp_server = capture_server
+    os.environ["KBC_TEST_RECOMMEND_MAX_TURNS"] = "20"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("recommend-driver", td, 1)
+            parent.locale = "en"
+
+            result = await compile_box.recommend_test_question(parent)
+            assert result == {
+                "question": "What retry limit does the source require?",
+                "reference_answer": "Three attempts.",
+                "evidence_paths": ["raw/policy.md"],
+            }, result
+
+            opts = seen["options"]
+            assert isinstance(opts.system_prompt, str), opts.system_prompt
+            assert opts.system_prompt == compile_box._prompt("recommend_test_role", "en")
+            assert opts.tools == ["Read", "Glob", "Grep"], opts.tools
+            assert opts.allowed_tools == [
+                "Read", "Glob", "Grep", "mcp__recommend__submit_recommended_test",
+            ], opts.allowed_tools
+            assert opts.strict_mcp_config is True
+            assert set(opts.disallowed_tools) >= {
+                "Bash", "Write", "Edit", "Agent", "WebFetch", "WebSearch",
+            }, opts.disallowed_tools
+            assert opts.setting_sources == []
+            assert opts.max_turns == 20
+            assert seen["server_name"] == "recommend"
+            assert seen["tools"][0].name == "submit_recommended_test"
+            assert seen["connected"] and seen["disconnected"]
+    finally:
+        compile_box.ClaudeSDKClient = original_client
+        compile_box.create_sdk_mcp_server = original_server_factory
+        if previous_turns is None:
+            os.environ.pop("KBC_TEST_RECOMMEND_MAX_TURNS", None)
+        else:
+            os.environ["KBC_TEST_RECOMMEND_MAX_TURNS"] = previous_turns
+    print("✓ recommendation driver: minimal tools + registered MCP submission")
+
+
+async def test_recommendation_driver_reports_max_turn_exhaustion():
+    """A reviewer that spends its bounded turn budget without submitting must
+    surface a distinct diagnostic instead of the generic no-result error."""
+    original_client = compile_box.ClaudeSDKClient
+
+    class ExhaustedClient:
+        def __init__(self, options=None):
+            self.options = options
+
+        async def connect(self):
+            pass
+
+        async def query(self, directive, session_id="default"):
+            pass
+
+        async def receive_messages(self):
+            yield ResultMessage("error_max_turns", True)
+
+        async def disconnect(self):
+            pass
+
+    compile_box.ClaudeSDKClient = ExhaustedClient
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("recommend-max-turns", td, 1)
+            parent.locale = "en"
+            try:
+                await compile_box.recommend_test_question(parent)
+                raise AssertionError("max-turn exhaustion was accepted as an empty recommendation")
+            except ValueError as exc:
+                assert "turn budget" in str(exc) and "submitting" in str(exc), exc
+    finally:
+        compile_box.ClaudeSDKClient = original_client
+    print("✓ recommendation driver: max-turn exhaustion is explicit")
 
 
 async def test_prompt_packs_locale():
@@ -780,6 +1049,37 @@ async def test_prompt_packs_locale():
     assert compile_box._tool_strings("no-such") == en_ts
     assert "{tid}" in en_ts["resolve_ticket"]["not_found"]  # format slots survive
     print("✓ prompt packs: en/zh parity, en fallback, localized guard/constitution/tools, env override")
+
+
+def test_compile_surface_excludes_auto_question_proposals():
+    """The owner-managed question set is independent from compilation. Once
+    the downstream UI stopped consuming AI proposals, the compile prompt and
+    tool surface must not keep spending an agent turn producing hidden files."""
+    for locale in ("en", "zh"):
+        role = compile_box._prompt("box_role", locale)
+        assert "propose_questions" not in role, locale
+        assert "QUESTIONS_PROPOSED" not in role, locale
+        assert "propose_questions" not in compile_box._tool_strings(locale), locale
+
+    captured = []
+    original = compile_box.create_sdk_mcp_server
+
+    class FakeRun:
+        locale = "en"
+
+    def capture(_name, tools):
+        captured.extend(tool.name for tool in tools)
+        return object()
+
+    compile_box.create_sdk_mcp_server = capture
+    try:
+        compile_box._make_compile_tools(FakeRun())
+    finally:
+        compile_box.create_sdk_mcp_server = original
+
+    assert "propose_questions" not in captured, captured
+    assert "mcp__compile__propose_questions" not in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+    print("✓ compile surface excludes unused AI question proposals")
 
 
 async def test_propose_plan_never_bounces():
@@ -944,104 +1244,6 @@ def test_parse_brief_block():
     assert compile_box.parse_brief_block("把 raw/ 编成候选页") is None
     assert compile_box.parse_brief_block("") is None
     print("✓ parse_brief_block (tags split, raw from marker, None when absent)")
-
-
-def test_merge_proposed_questions():
-    """Append-merge is dedup-by-question, drops malformed entries, and never wipes
-    the carried-over list."""
-    existing = [{"question": "A?", "reference": "a", "source": "s"}]
-    merged, added, skipped = compile_box.merge_proposed_questions(existing, [
-        {"question": "A?", "reference": "dup", "source": "x"},  # dup of existing #1
-        {"question": "B?", "reference": "b", "source": "s2"},   # new
-        {"question": "   ", "reference": "", "source": ""},      # blank → skip
-        "not-a-dict",                                            # junk → skip
-    ])
-    assert [q["question"] for q in merged] == ["A?", "B?"], merged
-    assert added == 1 and skipped == 3, (added, skipped)
-    # malformed existing entries are dropped from the carry-over; identical incoming skipped
-    merged2, added2, _ = compile_box.merge_proposed_questions(
-        ["junk", {"noquestion": 1}, {"question": "C?"}], [{"question": "C?"}])
-    assert [q["question"] for q in merged2] == ["C?"] and added2 == 0, merged2
-
-    # every merged entry carries a 'q-'+8hex id derived from the normalized question;
-    # formula is FNV-1a — locked against the canonical vector for "a".
-    for q in merged:
-        assert re.fullmatch(r"q-[0-9a-f]{8}", q["id"]), q
-    assert compile_box._question_id(compile_box._normalize_question("A?")) == "q-e40c292c"
-    assert merged[0]["id"] == "q-e40c292c", merged[0]
-
-    # re-propose the same question (different case/whitespace) → dedup, id unchanged
-    id_A = merged[0]["id"]
-    again, added3, skipped3 = compile_box.merge_proposed_questions(merged, [{"question": "  a  "}])
-    assert added3 == 0 and skipped3 == 1, (added3, skipped3)
-    assert next(q for q in again if q["question"] == "A?")["id"] == id_A, again
-
-    # an explicit prior id is preserved; a legacy id-less entry is backfilled
-    kept, _, _ = compile_box.merge_proposed_questions(
-        [{"id": "q-legacy1", "question": "D?"}, {"question": "E?"}], [])
-    by_q = {q["question"]: q for q in kept}
-    assert by_q["D?"]["id"] == "q-legacy1", kept
-    assert re.fullmatch(r"q-[0-9a-f]{8}", by_q["E?"]["id"]), kept
-    print("✓ merge_proposed_questions (append, dedup, drop malformed, stable id)")
-
-
-async def test_propose_questions_appends_dedup():
-    """propose_questions writes authoring/QUESTIONS_PROPOSED.json append-only: a
-    second round adds new questions and skips duplicates (never overwrites), and
-    each round emits a summary line."""
-    with tempfile.TemporaryDirectory() as td:
-        wd = Path(td)
-        (wd / "authoring").mkdir(parents=True)
-        events = []
-
-        class FakeRun:
-            workdir = str(wd)
-            locale = "zh"  # model-facing tool strings come from the locale pack
-
-            async def emit(self, ev):
-                events.append(ev)
-
-        captured = {}
-        orig = compile_box.create_sdk_mcp_server
-
-        def capture(name, tools):
-            captured.update({t.name: t for t in tools})
-            return orig(name, tools=tools)
-
-        compile_box.create_sdk_mcp_server = capture
-        try:
-            compile_box._make_compile_tools(FakeRun())
-        finally:
-            compile_box.create_sdk_mcp_server = orig
-        pq = captured["propose_questions"].handler
-        path = wd / "authoring" / "QUESTIONS_PROPOSED.json"
-
-        r1 = await pq({"questions": [
-            {"question": "默认 quota 是多少?", "reference": "300", "source": "policy.md: cap 300"},
-            {"question": "draco 还在用吗?", "reference": "已废弃", "source": "manual.md"},
-        ]})
-        data = json.loads(path.read_text())
-        assert [q["question"] for q in data] == ["默认 quota 是多少?", "draco 还在用吗?"], data
-        assert data[0]["source"] == "policy.md: cap 300"
-        # every persisted entry carries an id (frontend adopt POSTs it as proposal_id)
-        assert all(re.fullmatch(r"q-[0-9a-f]{8}", q["id"]) for q in data), data
-        assert "新增 2" in r1["content"][0]["text"], r1
-
-        # round 2: one dup (only trailing punctuation differs) + one new → append, skip dup
-        r2 = await pq({"questions": [
-            {"question": "默认 quota 是多少", "reference": "x", "source": "y"},  # dup of #1
-            {"question": "支持哪些区域?", "reference": "cn-*", "source": "regions.md"},
-        ]})
-        data = json.loads(path.read_text())
-        assert len(data) == 3 and data[2]["question"] == "支持哪些区域?", data
-        assert "新增 1" in r2["content"][0]["text"] and "跳过 1" in r2["content"][0]["text"], r2
-        assert sum(1 for e in events if e["type"] == "summary") == 2, events
-
-        # bad arg → guarded, file untouched
-        bad = await pq({"questions": "nope"})
-        assert "数组" in bad["content"][0]["text"], bad
-        assert len(json.loads(path.read_text())) == 3
-    print("✓ propose_questions appends + dedups (never overwrites prior picks)")
 
 
 async def test_message_captures_brief():
@@ -1502,6 +1704,7 @@ async def test_noop_repair_turn_reaches_the_gate():
         sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
         assert sc["state"] == "repairing", sc
         # the repair turn does NOTHING ledger-relevant (tree unchanged, key matches)
+        run._begin_turn(repair)
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is None, repair2
         sc2 = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
@@ -1510,6 +1713,86 @@ async def test_noop_repair_turn_reaches_the_gate():
         assert any(str(tk.get("id", "")).startswith("selfcheck-residual-") for tk in tickets), tickets
         del os.environ["KBC_L1_REPAIR_ROUNDS"]
     print("OK  no-op repair turn reaches the gate (unconverged + residual ticket, not silent)")
+
+
+async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
+    """An ordinary conversation over an inherited draft must not become an
+    implicit whole-library OKF migration merely because this is a fresh box.
+    A changed page stays strict, but inherited format debt on untouched pages
+    is grandfathered. Non-format findings and full compiles remain blocking."""
+
+    def make_legacy_workspace(root: Path) -> None:
+        (root / "raw" / "snap").mkdir(parents=True)
+        (root / "candidate").mkdir()
+        (root / "authoring").mkdir()
+        (root / "raw" / "snap" / "one.md").write_text("source")
+        (root / "candidate" / "index.md").write_text(
+            "# Index\n- [Legacy](legacy.md)\n- [Clean](clean.md)"
+        )
+        (root / "candidate" / "legacy.md").write_text(
+            "---\ntitle: Legacy\ncompiled_from:\n  - snap/one.md\n---\n# Legacy\nInherited body.\n"
+        )
+        (root / "candidate" / "clean.md").write_text(
+            "---\ntype: Topic\ntitle: Clean\ncompiled_from:\n  - snap/one.md\n---\n# Clean\nStable body.\n"
+        )
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+
+        chat = base / "chat"
+        make_legacy_workspace(chat)
+        chat_run = compile_box.CompileRun("legacy-chat", str(chat), 1)
+        chat_run._begin_turn(
+            "Explain the current scope without editing the draft.",
+            grandfather_legacy_format=True,
+        )
+        assert await compile_box._post_turn_selfcheck(chat_run) is None
+        assert not (chat / "authoring" / "SELFCHECK.json").exists()
+
+        changed = base / "changed"
+        make_legacy_workspace(changed)
+        changed_run = compile_box.CompileRun("legacy-changed", str(changed), 1)
+        changed_run._begin_turn("Update the draft.", grandfather_legacy_format=True)
+        page = changed / "candidate" / "legacy.md"
+        page.write_text(page.read_text() + "Changed this turn.\n")
+        changed_repair = await compile_box._post_turn_selfcheck(changed_run)
+        assert changed_repair is not None and "okf_type" in changed_repair, changed_repair
+
+        clean_edit = base / "clean-edit"
+        make_legacy_workspace(clean_edit)
+        clean_run = compile_box.CompileRun("legacy-clean-edit", str(clean_edit), 1)
+        clean_run._begin_turn("Fix one clean page.", grandfather_legacy_format=True)
+        clean_page = clean_edit / "candidate" / "clean.md"
+        clean_page.write_text(clean_page.read_text() + "Small wording fix.\n")
+        assert await compile_box._post_turn_selfcheck(clean_run) is None
+        clean_sc = json.loads((clean_edit / "authoring" / "SELFCHECK.json").read_text())
+        assert clean_sc["state"] == "passed" and clean_sc["lint"]["ok"], clean_sc
+        inherited = clean_sc["grandfathered_format"]
+        assert inherited["violation_count"] == 2, inherited
+        assert {v["page"] for v in inherited["violations"]} == {
+            "index.md", "legacy.md",
+        }, inherited
+
+        broken = base / "broken-link"
+        make_legacy_workspace(broken)
+        broken_legacy = broken / "candidate" / "legacy.md"
+        broken_legacy.write_text(broken_legacy.read_text() + "[Missing](missing.md)\n")
+        broken_run = compile_box.CompileRun("legacy-broken-link", str(broken), 1)
+        broken_run._begin_turn("Fix one clean page.", grandfather_legacy_format=True)
+        broken_page = broken / "candidate" / "clean.md"
+        broken_page.write_text(broken_page.read_text() + "Small wording fix.\n")
+        broken_repair = await compile_box._post_turn_selfcheck(broken_run)
+        assert broken_repair is not None and "broken_link" in broken_repair, broken_repair
+
+        compile_wd = base / "compile"
+        make_legacy_workspace(compile_wd)
+        compile_run = compile_box.CompileRun("legacy-compile", str(compile_wd), 1)
+        compile_run._full_compile_pending = True
+        compile_run._begin_turn("Run an explicit full compile.")
+        compile_repair = await compile_box._post_turn_selfcheck(compile_run)
+        assert compile_repair is not None and "okf_type" in compile_repair, compile_repair
+
+    print("OK  owner chat grandfathers only untouched legacy format debt; changed/non-format/full stay strict")
 
 
 async def test_batch_final_ledger_check_requires_index():
@@ -2176,8 +2459,7 @@ async def test_shutdown_flush_syncs_active_runs():
 
 
 def test_pr382_review_fixes():
-    """Review fixes: brief guard + capped/last-marker raw (A/C), atomic writer (B),
-    question-id parity vector + intentional dedup (D/E)."""
+    """Review fixes: brief guard + capped/last-marker raw (A/C) and atomic writer (B)."""
     good = ("开始生成知识库\n\n我的定调标签(请作为本次编译的 brief):\n"
             "- 给谁看:内部工程师\n- 内容倾向:详尽百科\n请执行。")
     b = compile_box.parse_brief_block(good)
@@ -2209,16 +2491,7 @@ def test_pr382_review_fixes():
         compile_box._write_text_atomic(p, '{"a":2}\n')
         assert p.read_text() == '{"a":2}\n' and not list(Path(td).rglob("*.tmp"))
 
-    # D/E: question-id parity vector — MUST equal the frontend's proposal-id.test vector
-    def qid(q):
-        return compile_box._question_id(compile_box._normalize_question(q))
-    assert qid("GPU 有几张?") == "q-4d6d3b41"
-    assert qid("gpu有几张。") == "q-4d6d3b41"            # E: case + trailing-punct + space collapse
-    assert qid("Hello World") == "q-3b9f5c61"
-    assert qid("\ufeffHello World") == "q-3b9f5c61"      # D: BOM stripped identically to the frontend
-    assert qid("H100\tvs　A100") == "q-a5a7d897"
-    assert qid("AbC?") == "q-1a47e90b"
-    print("✓ pr382 review fixes (brief guard/cap/first-wins, atomic write, id parity vector)")
+    print("✓ pr382 review fixes (brief guard/cap/first-wins, atomic write)")
 
 
 async def test_typed_authoring_commands():
@@ -2383,14 +2656,16 @@ async def main():
     await test_test_path_escape_guard()
     await test_batch_planner_uses_compile_path_guard()
     await test_prompt_packs_locale()
+    test_compile_surface_excludes_auto_question_proposals()
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
     await test_test_message_path()
+    await test_explicit_test_recommendation_http()
+    await test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool()
+    await test_recommendation_driver_reports_max_turn_exhaustion()
     await test_propose_plan_never_bounces()
     test_apply_session_config()
     test_parse_brief_block()
-    test_merge_proposed_questions()
-    await test_propose_questions_appends_dedup()
     await test_message_captures_brief()
     await test_incremental_route()
     await test_incremental_integrity_guard()
@@ -2402,6 +2677,7 @@ async def main():
     await test_incremental_index_deletion_cannot_escape_guard()
     await test_incremental_arm_cleared_when_dispatch_fails()
     await test_noop_repair_turn_reaches_the_gate()
+    await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
     await test_batch_orchestrator_review_fixes()
