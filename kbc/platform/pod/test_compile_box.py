@@ -1547,16 +1547,22 @@ async def test_noop_repair_turn_reaches_the_gate():
 async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
     """An ordinary conversation over an inherited draft must not become an
     implicit whole-library OKF migration merely because this is a fresh box.
-    Candidate changes and explicit full compiles still run the strict gate."""
+    A changed page stays strict, but inherited format debt on untouched pages
+    is grandfathered. Non-format findings and full compiles remain blocking."""
 
     def make_legacy_workspace(root: Path) -> None:
         (root / "raw" / "snap").mkdir(parents=True)
         (root / "candidate").mkdir()
         (root / "authoring").mkdir()
         (root / "raw" / "snap" / "one.md").write_text("source")
-        (root / "candidate" / "index.md").write_text("# Index\n- [Legacy](legacy.md)")
+        (root / "candidate" / "index.md").write_text(
+            "# Index\n- [Legacy](legacy.md)\n- [Clean](clean.md)"
+        )
         (root / "candidate" / "legacy.md").write_text(
             "---\ntitle: Legacy\ncompiled_from:\n  - snap/one.md\n---\n# Legacy\nInherited body.\n"
+        )
+        (root / "candidate" / "clean.md").write_text(
+            "---\ntype: Topic\ntitle: Clean\ncompiled_from:\n  - snap/one.md\n---\n# Clean\nStable body.\n"
         )
 
     with tempfile.TemporaryDirectory() as td:
@@ -1565,18 +1571,47 @@ async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
         chat = base / "chat"
         make_legacy_workspace(chat)
         chat_run = compile_box.CompileRun("legacy-chat", str(chat), 1)
-        chat_run._begin_turn("Explain the current scope without editing the draft.")
+        chat_run._begin_turn(
+            "Explain the current scope without editing the draft.",
+            grandfather_legacy_format=True,
+        )
         assert await compile_box._post_turn_selfcheck(chat_run) is None
         assert not (chat / "authoring" / "SELFCHECK.json").exists()
 
         changed = base / "changed"
         make_legacy_workspace(changed)
         changed_run = compile_box.CompileRun("legacy-changed", str(changed), 1)
-        changed_run._begin_turn("Update the draft.")
+        changed_run._begin_turn("Update the draft.", grandfather_legacy_format=True)
         page = changed / "candidate" / "legacy.md"
         page.write_text(page.read_text() + "Changed this turn.\n")
         changed_repair = await compile_box._post_turn_selfcheck(changed_run)
         assert changed_repair is not None and "okf_type" in changed_repair, changed_repair
+
+        clean_edit = base / "clean-edit"
+        make_legacy_workspace(clean_edit)
+        clean_run = compile_box.CompileRun("legacy-clean-edit", str(clean_edit), 1)
+        clean_run._begin_turn("Fix one clean page.", grandfather_legacy_format=True)
+        clean_page = clean_edit / "candidate" / "clean.md"
+        clean_page.write_text(clean_page.read_text() + "Small wording fix.\n")
+        assert await compile_box._post_turn_selfcheck(clean_run) is None
+        clean_sc = json.loads((clean_edit / "authoring" / "SELFCHECK.json").read_text())
+        assert clean_sc["state"] == "passed" and clean_sc["lint"]["ok"], clean_sc
+        inherited = clean_sc["grandfathered_format"]
+        assert inherited["violation_count"] == 2, inherited
+        assert {v["page"] for v in inherited["violations"]} == {
+            "index.md", "legacy.md",
+        }, inherited
+
+        broken = base / "broken-link"
+        make_legacy_workspace(broken)
+        broken_legacy = broken / "candidate" / "legacy.md"
+        broken_legacy.write_text(broken_legacy.read_text() + "[Missing](missing.md)\n")
+        broken_run = compile_box.CompileRun("legacy-broken-link", str(broken), 1)
+        broken_run._begin_turn("Fix one clean page.", grandfather_legacy_format=True)
+        broken_page = broken / "candidate" / "clean.md"
+        broken_page.write_text(broken_page.read_text() + "Small wording fix.\n")
+        broken_repair = await compile_box._post_turn_selfcheck(broken_run)
+        assert broken_repair is not None and "broken_link" in broken_repair, broken_repair
 
         compile_wd = base / "compile"
         make_legacy_workspace(compile_wd)
@@ -1586,7 +1621,7 @@ async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
         compile_repair = await compile_box._post_turn_selfcheck(compile_run)
         assert compile_repair is not None and "okf_type" in compile_repair, compile_repair
 
-    print("OK  unchanged owner chat skips legacy migration; changed/full turns stay strict")
+    print("OK  owner chat grandfathers only untouched legacy format debt; changed/non-format/full stay strict")
 
 
 async def test_batch_final_ledger_check_requires_index():
