@@ -32,6 +32,7 @@ import { driveTestSession } from "./capability/test-relay.js";
 import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
+  CapabilityCancelResponse,
   CapabilityCommandRequest,
   CapabilityMessageRequest,
   CapabilityStartRequest,
@@ -746,18 +747,36 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   });
 
   rpcMethods.set("capability.cancel", async (params) => {
-    const runId = (params as unknown as CapabilityCancelRequest).run_id;
+    const requestedRunId = (params as unknown as CapabilityCancelRequest).run_id;
+    const runId = typeof requestedRunId === "string" ? requestedRunId.trim() : "";
     if (!runId) throw new Error("run_id is required");
-    // Best-effort by design (the cancel must terminalize the run regardless),
-    // but a swallowed stop is how box pods leak — log it loudly.
-    await agentBoxManager.stop(runId).catch((err) =>
+
+    // Fence Runtime traffic before asking the box to stop. The consumer owns
+    // domain rollback and must fence its writers before calling cancel; this
+    // terminal mark additionally prevents a concurrent message/command from
+    // entering while K8s processes the pod deletion.
+    const rec = capabilityRunManager.get(runId) ??
+      (await capabilityRunManager.adopt(runId, { notifyOnAdopt: false }));
+    if (rec) await capabilityRunManager.endRun(runId, "done");
+
+    // stop() is idempotent and treats an already-absent K8s pod as success. Any
+    // other failure is uncertain cleanup and must reach the consumer; claiming
+    // success here would let callers mistake a live box for a completed stop.
+    try {
+      await agentBoxManager.stop(runId);
+    } catch (err) {
       console.error(
-        `[capability] cancel: stop box run=${runId} failed (pod may leak):`,
+        `[capability] cancel: stop box run=${runId} failed:`,
         err instanceof Error ? err.message : String(err),
-      ),
-    );
-    await capabilityRunManager.endRun(runId, "done");
-    return { ok: true, run_id: runId };
+      );
+      throw err;
+    }
+    const response: CapabilityCancelResponse = {
+      ok: true,
+      run_id: runId,
+      stop_confirmed: true,
+    };
+    return response;
   });
 
   // ── Read-only test sessions (start-a-test-session) — reuse the run's live box ──
