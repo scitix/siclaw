@@ -240,7 +240,9 @@ class UserMessage:  # tool_result carrier
 
 
 class ToolUseBlock:  # a content block that requests a tool
-    pass
+    def __init__(self, name="", input=None):
+        self.name = name
+        self.input = input or {}
 
 
 class _FakeSDKClient:
@@ -780,6 +782,51 @@ async def test_test_message_path():
     print("✓ test-message injects a turn into a live test session")
 
 
+async def test_test_session_step_frames():
+    """Test sessions surface each consumer tool call as a display-ready `step`
+    frame (the collapsible retrieval trace in the test UI); compile runs never
+    do — their live contract stays log/turn_done. Labels route through _loc."""
+    async def drain(run):
+        evs = []
+        while not run.events.empty():
+            evs.append(run.events.get_nowait())
+        return evs
+
+    # zh consumer: localized labels; Read strips the dir prefix and .md
+    zh = compile_box.TestRun("t-step-zh", "/tmp", "p1", "h", locale="zh")
+    am = AssistantMessage("结论文本")
+    am.content = [
+        ToolUseBlock("Read", {"file_path": ".siclaw/knowledge/skill-guide.md"}),
+        ToolUseBlock("Grep", {"pattern": "重置卡"}),
+        TextBlock("结论文本"),
+    ]
+    await compile_box._emit_message(zh, am)
+    evs = await drain(zh)
+    steps = [e["text"] for e in evs if e["type"] == "step"]
+    assert steps == ["读「skill-guide」", "检索「重置卡」"], steps
+    logs = [e for e in evs if e["type"] == "log"]
+    assert len(logs) == 1 and logs[0]["text"] == "结论文本", evs
+
+    # platform default locale (en); unknown tool falls back to the generic label
+    en = compile_box.TestRun("t-step-en", "/tmp", "p1", "h")
+    am2 = AssistantMessage("x")
+    am2.content = [ToolUseBlock("Read", {"file_path": "index.md"}), ToolUseBlock("TodoWrite", {})]
+    await compile_box._emit_message(en, am2)
+    steps = [e["text"] for e in await drain(en) if e["type"] == "step"]
+    assert steps == ['Reading "index"', "Consulting material"], steps
+
+    # the SAME blocks on a compile run emit NO step frames (contract unchanged)
+    with tempfile.TemporaryDirectory() as td:
+        comp = compile_box.CompileRun("c-step", td, 1)
+        am3 = AssistantMessage("calling read")
+        am3.content = [ToolUseBlock("Read", {"file_path": "a.md"}), TextBlock("calling read")]
+        await compile_box._emit_message(comp, am3)
+        evs = await drain(comp)
+        assert all(e["type"] != "step" for e in evs), evs
+        assert any(e["type"] == "log" for e in evs), evs
+    print("✓ test-session step frames (retrieval trace); compile runs unaffected")
+
+
 async def test_explicit_test_recommendation_http():
     """The explicit red-team endpoint is stable-draft-only, single-flight, and
     returns one validated raw-grounded recommendation without mutating files."""
@@ -1022,6 +1069,13 @@ async def test_prompt_packs_locale():
     assert compile_box._prompt("box_role", "no-such-locale") == compile_box._prompt("box_role", "en")
     assert "只读的知识消费者" in compile_box._prompt("test_role", "zh")
     assert "read-only knowledge consumer" in compile_box._prompt("test_role", "en")
+    # Answer discipline (clean-answer contract): conclusion-first, no process
+    # narration; the SOURCES trailing-line protocol must survive the edit.
+    zh_role = compile_box._prompt("test_role", "zh")
+    en_role = compile_box._prompt("test_role", "en")
+    assert "回答纪律" in zh_role and "不要叙述你的操作过程" in zh_role, zh_role
+    assert "Answer discipline" in en_role and "Never narrate your process" in en_role, en_role
+    assert "SOURCES:" in zh_role and "SOURCES:" in en_role
 
     with tempfile.TemporaryDirectory() as snap:
         root = Path(snap)
@@ -2669,6 +2723,7 @@ async def main():
     await test_test_session_driver_readonly()
     await test_open_close_test_session_http()
     await test_test_message_path()
+    await test_test_session_step_frames()
     await test_explicit_test_recommendation_http()
     await test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool()
     await test_recommendation_driver_reports_max_turn_exhaustion()

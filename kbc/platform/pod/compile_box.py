@@ -1804,19 +1804,52 @@ async def _post_turn_selfcheck(run) -> str | None:
     return None
 
 
+def _test_step_label(run: "TestRun", tool: str, args: dict) -> str:
+    """Human-readable label for one consumer tool call, in the run's locale.
+    Display-ready by design: the relay and the portal pass `text` through
+    verbatim, so the box is the only place that knows the locale."""
+    if tool == "Read":
+        path = str(args.get("file_path", "") or "")
+        page = path.rsplit("/", 1)[-1]
+        if page.endswith(".md"):
+            page = page[:-3]
+        if page:
+            return _loc(run, f'Reading "{page}"', f"读「{page}」")
+    elif tool in ("Glob", "Grep"):
+        pattern = str(args.get("pattern", "") or "").strip()
+        if len(pattern) > 30:
+            pattern = pattern[:30] + "…"
+        if pattern:
+            return _loc(run, f'Searching "{pattern}"', f"检索「{pattern}」")
+        return _loc(run, "Searching", "检索")
+    return _loc(run, "Consulting material", "查阅资料")
+
+
 async def _emit_message(run: CompileRun, msg) -> None:
     """Relay one Agent SDK message to the SSE stream. Assistant text becomes the
     live chat (`log`) stream AND is accumulated for the turn; a ResultMessage
     marks the turn's end, flushing the accumulated text into `turn_done.text` so
-    the consumer can persist the whole assistant reply (and the UI knows it's idle)."""
+    the consumer can persist the whole assistant reply (and the UI knows it's idle).
+
+    TEST sessions additionally surface each tool call as a `step` frame (the
+    collapsible retrieval trace in the test UI). Compile runs do not: their
+    live narration contract is the `log` stream alone."""
     name = type(msg).__name__
     if name == "AssistantMessage":
         for block in getattr(msg, "content", []) or []:
-            if type(block).__name__ == "TextBlock":
+            btype = type(block).__name__
+            if btype == "TextBlock":
                 t = (getattr(block, "text", "") or "").strip()
                 if t:
                     run._turn_text.append(t)
                     await run.emit({"type": "log", "text": t})
+            elif btype == "ToolUseBlock" and isinstance(run, TestRun):
+                label = _test_step_label(
+                    run,
+                    str(getattr(block, "name", "") or ""),
+                    getattr(block, "input", None) or {},
+                )
+                await run.emit({"type": "step", "text": label})
     elif name == "ResultMessage":
         reply = "\n\n".join(run._turn_text).strip()
         run._turn_text = []
