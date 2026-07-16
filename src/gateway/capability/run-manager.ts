@@ -219,7 +219,10 @@ export class CapabilityRunManager {
    * undefined when the store doesn't know the run or it already ended, so the
    * caller can refuse instead of spawning an unmanaged box.
    */
-  async adopt(runId: string): Promise<CapabilityRunRecord | undefined> {
+  async adopt(
+    runId: string,
+    opts: { notifyOnAdopt?: boolean } = {},
+  ): Promise<CapabilityRunRecord | undefined> {
     const existing = this.runs.get(runId);
     if (existing) return existing;
     try {
@@ -244,7 +247,10 @@ export class CapabilityRunManager {
       };
       this.runs.set(rec.runId, rec);
       console.log(`[capability] adopted run ${runId} from the consumer store (missed by boot recovery)`);
-      this.onAdopt?.(rec);
+      // Destructive control paths may adopt only to terminalize a run. They
+      // must not trigger relay reattachment, which could race cancellation and
+      // recreate execution for a run that is being stopped.
+      if (opts.notifyOnAdopt !== false) this.onAdopt?.(rec);
       return rec;
     } catch (err) {
       console.warn(`[capability] adopt(${runId}) failed: ${err instanceof Error ? err.message : String(err)}`);

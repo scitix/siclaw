@@ -163,6 +163,17 @@ export interface CapabilityCancelRequest {
   run_id: string;
 }
 
+export interface CapabilityCancelResponse {
+  ok: true;
+  run_id: string;
+  /**
+   * True only after the AgentBox termination request was accepted (or the box
+   * was already absent). Runtime lifecycle terminalization is initiated first;
+   * domain consumers must still fence their own writers before cancellation.
+   */
+  stop_confirmed: true;
+}
+
 // ---- Test session (read-only consumer probe over a pinned draft snapshot) ----
 
 export interface CapabilityTestStartRequest {
