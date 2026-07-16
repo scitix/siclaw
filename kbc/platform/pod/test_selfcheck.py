@@ -248,6 +248,50 @@ def test_coverage_and_lint():
     print("OK  coverage + lint + repair prompt (unaccounted / dangling / exempt index / close / locale)")
 
 
+def test_candidate_credential_lint():
+    """Obvious credentials block convergence without echoing their value, while
+    ordinary internal detail and explicit placeholders remain publishable."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/s/a.md")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        secrets = [
+            "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0K1m2N3p4",
+            "sk-" + "A1b2C3d4E5f6G7h8I9j0K1",
+            "sk-" + "A1b2testC3d4E5f6G7h8I9j0K1",
+            "ghp_" + "a" * 36,
+            "github_pat_" + "c" * 25,
+            "xoxb-" + "d" * 25,
+            "AIza" + "E" * 35,
+            "Bearer " + "f" * 32,
+            '"password": "correct-horse-battery-staple"',
+            "API_KEY=long-random-credential-value",
+            "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
+        ]
+        _mk(base, "candidate/p.md",
+            "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\n"
+            + "\n".join(secrets) + "\n")
+
+        report = selfcheck.run_layer1(td)
+        findings = [v for v in report["lint"]["violations"]
+                    if v["kind"] == "credential_exposure"]
+        assert len(findings) == len(secrets), findings
+        assert report["coverage"]["closed"] and not report["lint"]["ok"], report
+        serialized = json.dumps(report)
+        assert all(secret not in serialized for secret in secrets)
+        prompt = selfcheck.build_repair_prompt({**report, "state": "repairing"})
+        assert "credential_exposure" in prompt and "[REDACTED]" in prompt
+        assert all(secret not in prompt for secret in secrets)
+
+        _mk(base, "candidate/p.md",
+            "---\ntype: Topic\ncompiled_from:\n  - s/a.md\n---\n"
+            "Internal host: api.infra.local (10.0.0.42), owner +86 13800000000.\n"
+            "Examples: `sk-<your-key>`, `TOKEN=${TOKEN}`, and [REDACTED].\n")
+        clean = selfcheck.run_layer1(td)
+        assert clean["coverage"]["closed"] and clean["lint"]["ok"], clean
+    print("OK  candidate credential lint (high-confidence, non-echoing, placeholder-safe)")
+
+
 def test_media_ledger_and_new_lint():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -1430,6 +1474,7 @@ def main():
     test_matches_segment_aware()
     test_noop_exclusion_warning()
     test_coverage_and_lint()
+    test_candidate_credential_lint()
     test_media_ledger_and_new_lint()
     test_body_source_annotations()
     test_spaced_markdown_links()

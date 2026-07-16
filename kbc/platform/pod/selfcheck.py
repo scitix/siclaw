@@ -684,6 +684,65 @@ def _orphan_pages(pages: dict[str, dict]) -> list[str]:
     return sorted(rel for rel in names - reachable if not _is_reserved_page(rel))
 
 
+_CREDENTIAL_PATTERNS = (
+    ("private key", re.compile(
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?"
+        r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")),
+    ("Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
+    ("OpenAI-compatible API key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    ("GitHub token", re.compile(r"\b(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]{30,}\b")),
+    ("GitHub fine-grained token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    ("Google API key", re.compile(r"\bAIza[A-Za-z0-9_-]{30,}\b")),
+    ("bearer token", re.compile(r"\bBearer\s+[A-Za-z0-9_.~+/-]{20,}=*\b", re.IGNORECASE)),
+    ("JSON credential value", re.compile(
+        r'"(?:api[_-]?key|apikey|token|secret|password|access_key|secret_key)"\s*:\s*"[^"\n]{16,}"',
+        re.IGNORECASE)),
+    ("environment credential", re.compile(
+        r"\b(?:API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|SECRET_KEY|ACCESS_KEY|"
+        r"AWS_SECRET_ACCESS_KEY|TOKEN|SECRET_TOKEN|PASSWORD)=\S{16,}",
+        re.IGNORECASE)),
+)
+_CREDENTIAL_PLACEHOLDER_RE = re.compile(
+    r"(?:\[REDACTED\]|<[^>]+>|\$\{[^}]+\}|\*{3,}|"
+    r"(?:^|[=:\s\"'])(?:example|placeholder|your[-_ ]|dummy|changeme|"
+    r"replace[-_ ]me|sample|test)[A-Za-z0-9_.:/+@-]*)",
+    re.IGNORECASE,
+)
+
+
+def credential_exposure_violations(rel: str, text: str) -> list[dict]:
+    """High-confidence credential-shaped values in one candidate page.
+
+    This is deliberately narrower than external-content redaction: ordinary
+    names, phone numbers, IPs, internal URLs, and business prose are untouched.
+    Findings report only kind + line, never the matched value, so SELFCHECK and
+    the injected repair message cannot become a second secret-leak channel.
+    """
+    findings: list[tuple[int, int, str]] = []
+    claimed_spans: list[tuple[int, int]] = []
+    for label, pattern in _CREDENTIAL_PATTERNS:
+        for match in pattern.finditer(text):
+            value = match.group(0)
+            if _CREDENTIAL_PLACEHOLDER_RE.search(value):
+                continue
+            span = match.span()
+            if any(span[0] < end and start < span[1] for start, end in claimed_spans):
+                continue
+            claimed_spans.append(span)
+            findings.append((span[0], text.count("\n", 0, span[0]) + 1, label))
+    findings.sort()
+    return [
+        {
+            "page": rel,
+            "kind": "credential_exposure",
+            "detail": (f"possible {label} at line {line}; replace only the secret value "
+                       "with [REDACTED] and keep the non-secret context"),
+        }
+        for _, line, label in findings
+    ]
+
+
 def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
     """Structural lint over the candidate tree: provenance presence, intra-wiki
     link resolution, index reachability (orphans), body-citation hygiene, plus
@@ -706,6 +765,7 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
             violations.append({"page": rel, "kind": "no_provenance",
                                "detail": "frontmatter 缺 compiled_from(纯综合页请标 derived: true)"})
         text = page.get("text", "")
+        violations.extend(credential_exposure_violations(rel, text))
         # Same byte METHOD as the sync gate (stat().st_size), not the decoded
         # text re-encoded: read_text's newline translation under-measures CRLF
         # pages, so a page just over the cap could lint green while the sync
