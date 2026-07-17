@@ -206,6 +206,28 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(lastCreateSiclawSession.calls[1].activeMode).toBe("dp");
   });
 
+  it("refreshes the delegation correlation id on reuse of an IDLE peer session", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-d", undefined, undefined, "normal", { delegationId: "d1", readOnly: false });
+    expect(s1.delegation?.delegationId).toBe("d1");
+    expect(s1._promptDone).toBe(true); // idle after build
+    // Same tier (rw), new delegationId → reused in place with the id refreshed, so
+    // report_findings/request_input on the continuation stamp the CURRENT id.
+    const s2 = await mgr.getOrCreate("sess-d", undefined, undefined, "normal", { delegationId: "d2", readOnly: false });
+    expect(s2).toBe(s1);
+    expect(s1.delegation?.delegationId).toBe("d2");
+  });
+
+  it("does NOT mutate the delegation of a BUSY session (concurrent continuation is rejected elsewhere)", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-d", undefined, undefined, "normal", { delegationId: "d1", readOnly: false });
+    s1._promptDone = false; // a turn is in flight; the HTTP layer will 409 the concurrent continuation
+    const s2 = await mgr.getOrCreate("sess-d", undefined, undefined, "normal", { delegationId: "d2", readOnly: false });
+    expect(s2).toBe(s1); // returned via the !_promptDone reuse branch
+    // The running turn's id must survive — the rejected continuation must not overwrite it.
+    expect(s1.delegation?.delegationId).toBe("d1");
+  });
+
   it("cancels a pending release timer when the session is re-requested", async () => {
     const mgr = new AgentBoxSessionManager();
     const s = await mgr.getOrCreate("sess-1");

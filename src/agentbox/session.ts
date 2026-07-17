@@ -43,7 +43,10 @@ import { spawnBackgroundBash } from "../core/background-bash-runner.js";
 import { DiskTaskOutput, getTaskOutputPath } from "../tools/cmd-exec/disk-output.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
-import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
+import type { KubeconfigRef, SessionMode, DpStateRef, DelegationContext } from "../core/types.js";
+import type { DelegateToAgentExecutor, DelegateStep } from "../core/tool-registry.js";
+import { AGENT_TYPES, normalizeAgentType } from "../core/agent-types.js";
+import type { DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
@@ -134,6 +137,9 @@ export interface ManagedSession {
   mode: SessionMode;
   /** Active operating mode (normal/dp/…) this agent was built for — drives rebuild on change. */
   activeMode: AgentMode;
+  /** Delegation context this agent was built for (undefined = non-delegated). Drives
+   *  rebuild when the delegation tier changes on a reused session id. */
+  delegation?: DelegationContext;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
@@ -239,8 +245,35 @@ let warnedNoPersist = false;
 const LEDGER_AUTOCLEAR_MS = 5_000;
 const DELEGATED_AGENT_MAX_RUNTIME_MS = getSubagentMaxRuntimeMs();
 const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
+
+/**
+ * System-prompt addendum for a read-only DELEGATED worker turn (a peer agent
+ * dispatched by a coordinator over the mesh). Mirrors the general-purpose
+ * sub-agent persona (core/subagent-registry.ts) but tailored: read-only tier +
+ * the structured `report_findings` hand-off contract. The coordinator relays the
+ * worker's stream to the user as one assistant identity, so the worker writes a
+ * concise human-readable narrative AND calls report_findings once at the end.
+ */
+const DELEGATED_READONLY_PERSONA =
+  "You are handling ONE bounded diagnostic task delegated to you by a coordinator agent. " +
+  "This is a READ-ONLY investigation: inspect and gather evidence only. You have read-only " +
+  "tools — kubectl read commands (get/describe/logs/top/events) and shell text tools via bash, " +
+  "cluster/host lookups, and memory search — but NO write or remediation tools; do not attempt " +
+  "to change any infrastructure. Do exactly the task described, then END by calling the " +
+  "`report_findings` tool once with a compact structured result (findings / actions_taken / " +
+  "residual_state). Keep your visible narrative concise — the user sees it directly. Do not ask " +
+  "for confirmation; if blocked, report what you found and what's missing in report_findings.";
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Rebuild key for the delegation tier: "none" (non-delegated) | "ro" | "rw".
+ *  Only the tier (not the ids) affects the resolved toolset, so a re-delegation
+ *  of the same session at the same tier reuses the built agent. */
+function delegationSignature(d: DelegationContext | undefined): "none" | "ro" | "rw" {
+  if (!d) return "none";
+  return d.readOnly ? "ro" : "rw";
 }
 
 async function abortBrainBestEffort(
@@ -306,6 +339,10 @@ export class AgentBoxSessionManager {
    * per-box handler that writes here — never via loadConfig/writeConfig/process.env.
    */
   allowedToolsState: string[] | null = null;
+
+  /** Agent type (sre/coordinator/custom), fetched alongside allowedTools. Drives
+   *  the locked persona injected at session build. Default custom = no persona. */
+  agentTypeState: string = "custom";
 
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
@@ -2273,6 +2310,7 @@ export class AgentBoxSessionManager {
     mode?: SessionMode,
     systemPromptTemplate?: string,
     activeMode: AgentMode = "normal",
+    delegation?: DelegationContext,
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
 
@@ -2285,14 +2323,35 @@ export class AgentBoxSessionManager {
         existing._releaseTimer = null;
         console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
       }
-      // Reuse unless the operating mode changed mid-session (e.g. user toggled Deep
-      // Investigation): rebuild so tools scoped by `availableModes` are re-resolved.
-      // Don't rebuild mid-first-prompt (_promptDone false).
-      if (existing.activeMode === activeMode || !existing._promptDone) {
+      // Reuse unless the operating mode OR the delegation tier changed mid-session
+      // (e.g. user toggled Deep Investigation, or a reused session id flips between a
+      // delegated and a direct turn): rebuild so tools scoped by `availableModes` /
+      // the read-only delegation filter are re-resolved. Don't rebuild mid-first-prompt.
+      const sameDelegation = delegationSignature(existing.delegation) === delegationSignature(delegation);
+      // Refresh the delegation CORRELATION on reuse. The tier is unchanged here (a tier
+      // change falls through to a rebuild below), but every delegation turn gets a NEW
+      // delegationId (and possibly parent ids). The tools read `refs.delegation` LIVE and
+      // it is the SAME object we store here (agent-factory passes it by reference), so an
+      // in-place update makes report_findings / request_input stamp the CURRENT call's id
+      // instead of the previous one — no rebuild needed, conversation preserved.
+      //
+      // ONLY when the session is idle: a concurrent continuation targeting the SAME busy
+      // peer session is rejected with 409 by the HTTP layer AFTER this getOrCreate returns
+      // — mutating the shared context first would stamp the running turn's later
+      // report_findings/request_input with the REJECTED request's id. The gate MUST match
+      // the 409 condition exactly (`!_promptDone || _promptInflight`): `_promptInflight`
+      // can be set while `_promptDone` is momentarily true during synthetic-parent-prompt
+      // setup (background-job completion turn), so check both.
+      if (sameDelegation && existing._promptDone && !existing._promptInflight && existing.delegation && delegation) {
+        existing.delegation.delegationId = delegation.delegationId;
+        existing.delegation.parentSessionId = delegation.parentSessionId;
+        existing.delegation.parentAgentId = delegation.parentAgentId;
+      }
+      if ((existing.activeMode === activeMode && sameDelegation) || !existing._promptDone) {
         return existing;
       }
       console.log(
-        `[agentbox-session] Rebuilding session ${id} for mode change ${existing.activeMode} -> ${activeMode}`,
+        `[agentbox-session] Rebuilding session ${id} for mode change ${existing.activeMode}/${delegationSignature(existing.delegation)} -> ${activeMode}/${delegationSignature(delegation)}`,
       );
       await this.release(id);
     }
@@ -2374,6 +2433,85 @@ export class AgentBoxSessionManager {
     // full pod/process restart from the PV snapshot. taskListId == session id.
     this.rehydrateLedger(id);
 
+    // Delegation roster (coordinator side): the peer agents this agent may
+    // delegate to, delivered from the gateway (K8s boxes have no DB). Skipped on
+    // a delegated turn (a peer can't re-delegate — one-level). Best-effort: a
+    // fetch failure just means the delegate_to_agent tool stays hidden.
+    let delegationRoster: DelegateRosterMember[] | undefined;
+    const gc = this.gatewayClient;
+    if (gc && !delegation) {
+      // Retry once on a transient failure: a single fetch miss would otherwise hide
+      // the whole delegate_to_agent tool for this session's lifetime. (The reverse
+      // coordinator-invalidation path refreshes on member changes, but that can't help
+      // a coordinator whose FIRST fetch failed — hence the immediate retry here.)
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const r = await gc.fetchDelegates();
+          delegationRoster = r.members?.length ? r.members : undefined;
+          break;
+        } catch (err) {
+          console.warn(`[agentbox-session] fetchDelegates failed for ${id} (attempt ${attempt + 1}):`, err);
+        }
+      }
+    }
+    const delegateToAgentExecutor: DelegateToAgentExecutor | undefined = (gc && delegationRoster)
+      ? async (req, onProgress, signal) => {
+          // Translate the peer's live event stream into coordinator-card steps
+          // (same shape spawn_subagent uses), pushing progress as they arrive.
+          const steps: DelegateStep[] = [];
+          let toolCalls = 0;
+          // Match the main window: the command + args arrive on tool_execution_start
+          // (kept by call id), the result on tool_execution_end; assistant reasoning
+          // on message_end. Build the same {assistant|tool} step shape the card renders.
+          const pending = new Map<string, { toolName?: string; args?: unknown }>();
+          let childSessionId: string | undefined;
+          return gc.delegateStream(
+            { peerAgentId: req.peerAgentId, text: req.text, parentSessionId: id, peerSessionId: req.peerSessionId },
+            (evt) => {
+              const e = evt as any;
+              const t = String(e?.type ?? "");
+              if (t === "delegate_session") {
+                // Peer session id known at start → surface it live so the card can
+                // offer "open full session" immediately.
+                childSessionId = e.peerSessionId ? String(e.peerSessionId) : undefined;
+                onProgress?.({ toolCalls, steps: [...steps], childSessionId });
+                return;
+              }
+              if (t === "tool_execution_start") {
+                if (e.toolCallId) pending.set(String(e.toolCallId), { toolName: e.toolName, args: e.args });
+                return;
+              }
+              if (t === "tool_execution_end") {
+                const meta = e.toolCallId ? pending.get(String(e.toolCallId)) : undefined;
+                const toolName = meta?.toolName ?? e.toolName;
+                const args = meta?.args;
+                const resultText = (e.result?.content ?? [])
+                  .filter((c: { type?: string }) => c.type === "text")
+                  .map((c: { text?: string }) => c.text ?? "").join("").slice(0, 2000);
+                toolCalls++;
+                steps.push({
+                  kind: "tool",
+                  toolName,
+                  toolInput: args !== undefined ? (typeof args === "string" ? args : JSON.stringify(args)) : undefined,
+                  content: resultText,
+                  outcome: e.isError ? "error" : "success",
+                  durationMs: typeof e.durationMs === "number" ? e.durationMs : null,
+                });
+                onProgress?.({ toolCalls, steps: [...steps], activity: toolName ? `Ran ${toolName}` : undefined, childSessionId });
+                return;
+              }
+              if (t === "message_end" && e.message?.role === "assistant") {
+                const content: Array<{ type?: string; text?: string; thinking?: string }> = e.message.content ?? [];
+                const text = content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("").trim()
+                  || content.filter((c) => c.type === "thinking").map((c) => c.thinking ?? "").join("").trim();
+                if (text) { steps.push({ kind: "assistant", text }); onProgress?.({ toolCalls, steps: [...steps], activity: text.slice(0, 80), childSessionId }); }
+              }
+            },
+            signal,
+          );
+        }
+      : undefined;
+
     const result = await createSiclawSession({
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
@@ -2387,6 +2525,19 @@ export class AgentBoxSessionManager {
       // agent that never set tool_capabilities).
       allowedTools: this.allowedToolsState,
       systemPromptTemplate,
+      // Delegated read-only turn: gate the toolset (agent-factory filters to
+      // readOnlyDelegable + read file tools) and prepend the worker persona so
+      // the model knows to end with report_findings.
+      delegation,
+      // Worker (delegated read-only) persona takes precedence; otherwise the
+      // agent TYPE's locked persona (sre/coordinator). Custom = no append (uses
+      // the agent's own system_prompt).
+      systemPromptAppend: delegation?.readOnly
+        ? DELEGATED_READONLY_PERSONA
+        : (AGENT_TYPES[normalizeAgentType(this.agentTypeState)].persona ?? undefined),
+      // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
+      delegationRoster,
+      delegateToAgentExecutor,
       // Stable per-session ledger key so the plan survives release/rebuild
       // (a fresh random id would orphan the prior in-memory ledger every turn).
       taskListId: id,
@@ -2430,6 +2581,7 @@ export class AgentBoxSessionManager {
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,
       activeMode,
+      delegation,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,

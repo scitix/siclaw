@@ -78,7 +78,7 @@ Parameters:
 - skill: Skill name (e.g. "node-logs"). If omitted, looks in user scripts
 - script: Script filename (e.g. "get-node-logs.sh")
 - args: Optional arguments to pass to the script
-- netns: Advanced — a pre-resolved netns (from resolve_pod_netns) + node, to reuse one resolution across many runs
+- netns: Advanced — a pre-resolved netns + node, to reuse one resolution across many runs
 - cluster: Cluster name (from cluster_list); omit to use the default cluster when only one is available
 - image: Debug container image (default: SICLAW_DEBUG_IMAGE)
 - timeout_seconds: Timeout (default: 180, max: 300)
@@ -100,7 +100,7 @@ Examples:
       ),
       pod: Type.Optional(
         Type.String({
-          description: "Target pod name. When set, the script runs inside THIS POD's network namespace using host tools (one step — no resolve_pod_netns needed); the node is resolved automatically.",
+          description: "Target pod name. When set, the script runs inside THIS POD's network namespace using host tools (one step — the node + netns are resolved automatically).",
         }),
       ),
       namespace: Type.Optional(
@@ -111,7 +111,7 @@ Examples:
       ),
       netns: Type.Optional(
         Type.String({
-          description: 'Advanced: a pre-resolved network namespace name (from resolve_pod_netns) + `node`. Prefer `pod` for one step; use `netns` to reuse one resolution across many commands.',
+          description: 'Advanced: a pre-resolved network namespace name + `node`. Prefer `pod` for one step; use `netns` to reuse one resolution across many commands.',
         }),
       ),
       cluster: Type.Optional(

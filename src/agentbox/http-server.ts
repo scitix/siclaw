@@ -10,7 +10,7 @@ import http from "node:http";
 import https from "node:https";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
-import type { SessionMode } from "../core/types.js";
+import type { SessionMode, OriginKind, DelegationContext } from "../core/types.js";
 import type { AgentMode } from "../core/tool-registry.js";
 import { loadConfig, resolveTracingEnvironment } from "../core/config.js";
 import type { SiclawConfig } from "../core/config.js";
@@ -63,6 +63,10 @@ interface PromptRequestBody {
   userId?: string;
   text?: string;
   mode?: SessionMode;
+  /** Entry-form of this prompt (audit + delegation read-only hardening). */
+  origin?: OriginKind;
+  /** Present when a coordinator agent delegated this turn over the mesh. */
+  delegation?: DelegationContext;
   modelProvider?: string;
   modelId?: string;
   systemPromptTemplate?: string;
@@ -339,6 +343,27 @@ function resolveActiveMode(
   if (!sessionId) return "normal";
   if (sessionManager.get(sessionId)?.dpStateRef?.active === true) return "dp";
   return sessionManager.getPersistedDpState(sessionId)?.active === true ? "dp" : "normal";
+}
+
+/**
+ * Normalize the incoming delegation marker. Returns undefined for a
+ * non-delegated turn (no behavioural change).
+ *
+ * A delegated agent runs under ITS OWN configuration — the coordinator and the
+ * worker manage their own permissions independently, so delegation does NOT
+ * downgrade the worker's toolset or persona. `readOnly` is therefore EXPLICIT
+ * opt-in only (default false); it is honored when a caller sets it true (a
+ * future read-only delegation tier), but never forced on by origin or by
+ * omission. The marker's real jobs are the result-artifact contract,
+ * one-level anti-recursion, and audit — not permission degradation.
+ */
+export function resolveDelegation(
+  delegation: DelegationContext | undefined,
+  _origin: OriginKind | undefined,
+): DelegationContext | undefined {
+  if (!delegation || !delegation.delegationId) return undefined;
+  const readOnly = delegation.readOnly === true;
+  return { ...delegation, readOnly };
 }
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
@@ -623,7 +648,10 @@ export function createHttpServer(
     }
 
     const activeMode = resolveActiveMode(body.text ?? "", body.sessionId, sessionManager);
-    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, activeMode);
+    // A delegated agent runs under its own configuration; delegation does not
+    // downgrade it. readOnly is honored only when explicitly set true.
+    const delegation = resolveDelegation(body.delegation, body.origin);
+    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, activeMode, delegation);
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
       // be holding the brain even when _promptDone has already flipped

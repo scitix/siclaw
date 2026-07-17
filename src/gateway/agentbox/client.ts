@@ -8,6 +8,7 @@
 import https from "node:https";
 import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
 import { modelOptionsSupportImageInput, type ModelRoutePolicy } from "../../core/model-routing.js";
+import type { OriginKind, DelegationContext } from "../../core/types.js";
 import { enrichImagesFromText, redactImageUrlsInText } from "./image-url-ingest.js";
 import { RpcResponseError, wrapRpcError } from "../../lib/error-envelope.js";
 
@@ -28,6 +29,10 @@ export interface PromptOptions {
   kubeconfigPath?: string | null;
   /** Session mode — "web" | "channel" */
   mode?: string;
+  /** Entry-form of this prompt (audit + delegation read-only hardening). */
+  origin?: OriginKind;
+  /** Present when a coordinator agent delegated this turn over the mesh. */
+  delegation?: DelegationContext;
   /** Model provider to use for this prompt */
   modelProvider?: string;
   /** Model ID to use for this prompt */

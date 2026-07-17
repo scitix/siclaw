@@ -114,7 +114,7 @@ Examples:
 To run in a POD's network namespace (host tools + the pod's network view — e.g. RDMA on a pod that lacks the tools), pass pod= directly (one step; the node is resolved for you):
 - pod: "rdma-a", namespace: "rdma-test", command: "show_gids"
 - pod: "rdma-a", namespace: "rdma-test", command: "ib_write_bw -d mlx5_1 -x 3 -D 20 -F", run_in_background: true
-(Advanced: to reuse one resolution across many commands, call resolve_pod_netns once and pass node= + netns=.)`,
+(Advanced: to reuse one resolution across many commands, pass node= + a pre-resolved netns=.)`,
     parameters: Type.Object({
       node: Type.Optional(Type.String({
         description: "Kubernetes node name to debug. Optional when `pod` is given (the node is resolved from the pod).",
@@ -125,7 +125,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       }),
       pod: Type.Optional(
         Type.String({
-          description: "Target pod name. When set, the command runs inside THIS POD's network namespace using host tools (one step — no resolve_pod_netns needed); the node is resolved automatically. Use for RDMA/RoCE checks on a pod that lacks the tools (show_gids, ib_write_bw…).",
+          description: "Target pod name. When set, the command runs inside THIS POD's network namespace using host tools (one step — the node + netns are resolved automatically). Use for RDMA/RoCE checks on a pod that lacks the tools (show_gids, ib_write_bw…).",
         }),
       ),
       namespace: Type.Optional(
@@ -136,7 +136,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       ),
       netns: Type.Optional(
         Type.String({
-          description: 'Advanced: a pre-resolved network namespace name (from resolve_pod_netns) + `node`. Prefer `pod` for one step; use `netns` to reuse one resolution across many commands.',
+          description: 'Advanced: a pre-resolved network namespace name + `node`. Prefer `pod` for one step; use `netns` to reuse one resolution across many commands.',
         }),
       ),
       cluster: Type.Optional(

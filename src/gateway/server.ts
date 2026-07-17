@@ -81,6 +81,7 @@ import {
   handleDelegationEvents,
   handleMetricsFlush,
 } from "./internal-api.js";
+import { handleDelegate, handleDelegates } from "./delegate-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
@@ -249,6 +250,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // channels stamp "channel" via their own ensureChatSession. Only consumed
     // when THIS handler creates the session row.
     const origin = params.origin as string | undefined;
+    // Delegation marker: present when a coordinator agent (e.g. the incident
+    // concierge) delegated this turn over the mesh. Forwarded to the agentbox so
+    // the worker gates its toolset read-only and stamps the result artifact.
+    const delegation = params.delegation as PromptOptions["delegation"];
     // Portal stamps turnStartMs at POST receipt — closer to user click than
     // the runtime's loop start. Use it as the canonical turn anchor when
     // present; fall back gracefully so direct callers (tests, /run path)
@@ -278,6 +283,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       modelId: params.modelId as string | undefined,
       systemPromptTemplate: params.systemPrompt as string | undefined,
       mode: params.mode as string | undefined,
+      origin: origin as PromptOptions["origin"],
+      delegation,
       modelConfig,
       modelRouting,
       images,
@@ -1320,6 +1327,21 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/knowledge/bundle" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleKnowledgeBundle(req, res, identity, frontendClient);
+            return;
+          }
+
+          // Delegation roster — peer agents this coordinator may delegate to (via RPC)
+          if (url === "/api/internal/delegates" && method === "GET") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            void handleDelegates(req, res, identity, frontendClient);
+            return;
+          }
+
+          // Agent-to-agent delegation — coordinator delegates a bounded read-only
+          // task to a peer agent; gateway prompts the peer + returns its artifact.
+          if (url === "/api/internal/delegate" && method === "POST") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            void handleDelegate(req, res, identity, { agentBoxManager, agentBoxTlsOptions, frontendClient });
             return;
           }
 

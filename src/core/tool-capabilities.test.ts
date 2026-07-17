@@ -61,8 +61,9 @@ describe("resolveCapabilities", () => {
     expect(result).toEqual(["manage_schedule"]);
   });
 
-  it("CAPABILITY_GROUPS contains the 10 designed groups", () => {
+  it("CAPABILITY_GROUPS contains the 11 designed groups", () => {
     expect(Object.keys(CAPABILITY_GROUPS).sort()).toEqual([
+      "delegate_agents",
       "inspect_infra",
       "plan_tasks",
       "read_files",

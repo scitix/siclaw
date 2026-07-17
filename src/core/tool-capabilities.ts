@@ -28,14 +28,15 @@
 export const CAPABILITY_GROUPS: Record<string, string[]> = {
   read_files:      ["read", "grep", "find", "ls"],
   write_sandbox:   ["write", "edit", "skill_preview"],   // includes skill authoring
-  inspect_infra:   ["cluster_list", "host_list", "resolve_pod_netns"],
+  inspect_infra:   ["cluster_list", "host_list"],   // read-only fleet discovery (registry)
   run_commands:    ["bash", "node_exec", "pod_exec", "host_exec"],
   run_scripts:     ["node_script", "pod_script", "local_script", "host_script"],
   search_memory:   ["memory_search", "memory_get"],
   plan_tasks:      ["task_create", "task_update", "task_list", "task_get"],     // split ①
   spawn_subagents: ["spawn_subagent", "task_output", "job_stop"], // split ① (permission amplification)
+  delegate_agents: ["delegate_to_agent", "list_delegates"],   // delegate a bounded task to a peer agent (roster-gated) + inspect delegate coverage; distinct from spawn
   scheduling:      ["manage_schedule"],
-  session_output:  ["task_report", "save_feedback", "channel_update"],   // includes IM-channel-visible updates
+  session_output:  ["task_report", "save_feedback", "channel_update", "report_findings", "request_input"],   // IM-channel-visible updates + delegation result artifact + clarification request
 };
 
 /**
