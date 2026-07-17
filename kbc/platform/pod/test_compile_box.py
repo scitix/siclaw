@@ -660,10 +660,32 @@ async def test_test_session_driver_readonly():
     print("✓ test session driver is read-only (Read/Glob/Grep, no MCP, no kickoff)")
 
 
+async def test_test_session_driver_uses_captured_contract():
+    """The fingerprinted tool/model/turn contract is the one passed to the SDK."""
+    orig = compile_box.ClaudeSDKClient
+    compile_box.ClaudeSDKClient = _FakeSDKClient
+    try:
+        with tempfile.TemporaryDirectory() as snap:
+            run = compile_box.TestRun("t-contract", snap, parent_run_id="p1", snapshot_hash="h")
+            run.allowed_tools = ["Read", "Bash"]
+            run.consumer_model = "captured-model"
+            run.consumer_max_turns = 7
+            await compile_box.test_session_driver(run)
+            opts = _FakeSDKClient.last.options
+            assert opts.tools == ["Read"], opts.tools
+            assert opts.allowed_tools == ["Read"], opts.allowed_tools
+            assert opts.model == "captured-model", opts.model
+            assert opts.max_turns == 7, opts.max_turns
+    finally:
+        compile_box.ClaudeSDKClient = orig
+    print("✓ test session driver uses its captured consumer contract")
+
+
 async def test_open_close_test_session_http():
     """POST /test-session pins the parent draft into a snapshot dir and starts a
-    session (200 + hash + pages); unknown parent → 404; missing index.md → 400;
-    concurrency cap → 429; close tears down (snapshot dir + registry entry gone)."""
+    session (200 + snapshot/consumer hashes + pages); unknown parent → 404;
+    missing index.md → 400; concurrency cap → 429; close tears down
+    (snapshot dir + registry entry gone)."""
     orig = compile_box.ClaudeSDKClient
     compile_box.ClaudeSDKClient = _FakeSDKClient
     compile_box.RUNS.clear()
@@ -689,6 +711,8 @@ async def test_open_close_test_session_http():
         body = await r.json()
         tid = body["test_session_id"]
         assert body["pages"] == 2 and len(body["snapshot_hash"]) == 64, body
+        assert len(body["consumer_fingerprint"]) == 64, body
+        assert body["consumer_fingerprint"] == compile_box.TEST_SESSIONS[tid].consumer_fingerprint
         kidx = Path(snap_root) / tid / ".siclaw" / "knowledge" / "index.md"
         assert kidx.read_text() == "# index\n"
 
@@ -1076,6 +1100,29 @@ async def test_prompt_packs_locale():
     assert "回答纪律" in zh_role and "不要叙述你的操作过程" in zh_role, zh_role
     assert "Answer discipline" in en_role and "Never narrate your process" in en_role, en_role
     assert "SOURCES:" in zh_role and "SOURCES:" in en_role
+    # Retrieval discipline matches the actual read-only tool surface: index-first,
+    # scoped search as a fallback, full-page reads, and no premature "not covered".
+    assert "Glob/Grep" in zh_role and "Glob/Grep" in en_role
+    assert ".siclaw/knowledge/" in zh_role and ".siclaw/knowledge/" in en_role
+    assert "全部合理候选页之后" in zh_role, zh_role
+    assert "only after checking the index and every plausible page" in en_role, en_role
+    assert "没有检索工具" not in zh_role and "there is no search tool" not in en_role
+
+    # A regression round's consumer identity is deterministic and changes only
+    # with answer-affecting contract inputs. Tool order is not semantic.
+    fp_en = compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 60)
+    assert len(fp_en) == 64
+    assert fp_en == compile_box._test_consumer_fingerprint("en", ["Grep", "Read", "Glob"], "model-a", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("zh", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-b", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-b", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read"], "model-a", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 61)
+    assert (
+        compile_box._test_consumer_fingerprint("en", ["Read", "Bash"], "model-a", "sdk-a", 60)
+        == compile_box._test_consumer_fingerprint("en", ["Read"], "model-a", "sdk-a", 60)
+    )
+    assert compile_box._effective_test_allowed_tools([]) == []
 
     with tempfile.TemporaryDirectory() as snap:
         root = Path(snap)
@@ -2721,6 +2768,7 @@ async def main():
     await test_prompt_packs_locale()
     test_compile_surface_excludes_auto_question_proposals()
     await test_test_session_driver_readonly()
+    await test_test_session_driver_uses_captured_contract()
     await test_open_close_test_session_http()
     await test_test_message_path()
     await test_test_session_step_frames()

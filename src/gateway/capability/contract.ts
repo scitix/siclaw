@@ -194,8 +194,10 @@ export interface CapabilityTestStartRequest {
 export interface CapabilityTestStartResponse {
   run_id: string;
   test_session_id: string;
-  /** sha256 over the pinned snapshot — grading binds to (question × snapshot). */
+  /** sha256 over the pinned Wiki content side of the regression-round identity. */
   snapshot_hash: string;
+  /** sha256 over the answer-affecting consumer prompt/model/SDK/tool/turn contract. */
+  consumer_fingerprint: string;
   /** Page count of the pinned snapshot. */
   pages: number;
 }
