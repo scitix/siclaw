@@ -31,6 +31,16 @@ describe("channel_update tool", () => {
     expect(channelTools.map((tool) => tool.name)).toContain("channel_update");
   });
 
+  it("is suppressed on a delegated turn even in channel mode", () => {
+    const delegatedRefs: ToolRefs = { ...makeRefs(vi.fn() as any), delegation: { delegationId: "d1", readOnly: true } };
+    expect(registration.available?.(delegatedRefs)).toBe(false);
+
+    const registry = new ToolRegistry();
+    registry.register(registration);
+    const channelTools = registry.resolve({ mode: "channel", refs: delegatedRefs, allowedTools: null });
+    expect(channelTools.map((t) => t.name)).not.toContain("channel_update");
+  });
+
   it("maps concise params to the injected Gateway-owned executor", async () => {
     let captured: ChannelMessageRequest | undefined;
     const executor = vi.fn(async (req: ChannelMessageRequest) => {

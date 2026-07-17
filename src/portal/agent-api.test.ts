@@ -121,7 +121,7 @@ describe("registerAgentRoutes", () => {
       expect(query.mock.calls[0][1]).toEqual(["%foo%", "%foo%"]);
     });
 
-    it("caps page_size at 100", async () => {
+    it("caps page_size at 500 (Delegates roster fetches the full list in one page)", async () => {
       query
         .mockResolvedValueOnce([[{ total: 0 }], []])
         .mockResolvedValueOnce([[], []]);
@@ -129,9 +129,9 @@ describe("registerAgentRoutes", () => {
         url: "/api/v1/agents?page_size=9999",
         method: "GET",
       }));
-      // list call: [...params, pageSize, offset] — pageSize should be 100
+      // list call: [...params, pageSize, offset] — pageSize should be capped at 500
       const listArgs = query.mock.calls[1][1];
-      expect(listArgs[listArgs.length - 2]).toBe(100);
+      expect(listArgs[listArgs.length - 2]).toBe(500);
     });
   });
 
@@ -274,6 +274,41 @@ describe("registerAgentRoutes", () => {
       }));
       expect(status).toBe(201);
     });
+
+    it("nulls system_prompt for a built-in agent type on create (locked persona)", async () => {
+      // Coordinator has defaultNoSkills → no auto-bind: INSERT then SELECT-back.
+      query
+        .mockResolvedValueOnce([undefined, []])                        // insert agent
+        .mockResolvedValueOnce([[{ id: "a-new", name: "coord" }], []]); // select-back
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents",
+        method: "POST",
+        body: { name: "coord", agent_type: "coordinator", system_prompt: "SHOULD BE DROPPED" },
+      }));
+
+      expect(status).toBe(201);
+      const insertArgs = query.mock.calls[0][1];
+      expect(insertArgs[8]).toBe("coordinator"); // agent_type
+      expect(insertArgs[9]).toBeNull();          // system_prompt dropped for built-in type
+    });
+
+    it("keeps a custom agent's system_prompt on create", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])                        // insert agent
+        .mockResolvedValueOnce([[], []])                              // select builtin (none)
+        .mockResolvedValueOnce([[{ id: "a-new", name: "c" }], []]);   // select-back
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents",
+        method: "POST",
+        body: { name: "c", agent_type: "custom", system_prompt: "keep me" },
+      }));
+
+      expect(status).toBe(201);
+      const insertArgs = query.mock.calls[0][1];
+      expect(insertArgs[9]).toBe("keep me");
+    });
   });
 
   // ── GET /api/v1/agents/:id ───────────────────────────────
@@ -318,6 +353,26 @@ describe("registerAgentRoutes", () => {
         body: {},
       }));
       expect(status).toBe(400);
+    });
+
+    it("nulls the stale Custom system_prompt when switching to a built-in type", async () => {
+      // agent_type in body → effective type resolved without a pre-read: UPDATE then SELECT-back.
+      query
+        .mockResolvedValueOnce([undefined, []])                    // UPDATE
+        .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]); // SELECT-back
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { agent_type: "coordinator", system_prompt: "stale custom prompt" },
+      }));
+
+      expect(status).toBe(200);
+      const updateSql = query.mock.calls[0][0] as string;
+      const updateArgs = query.mock.calls[0][1] as unknown[];
+      expect(updateSql).toContain("system_prompt = ?");
+      expect(updateArgs).toContain("coordinator");        // agent_type set
+      expect(updateArgs).not.toContain("stale custom prompt"); // stale prompt dropped, not persisted
     });
 
     it("notifies agent.reload when is_production changes", async () => {
@@ -577,6 +632,7 @@ describe("registerAgentRoutes", () => {
     it("terminates runtime then deletes", async () => {
       query
         .mockResolvedValueOnce([[{ id: "a1" }], []])  // existence
+        .mockResolvedValueOnce([[], []])              // collect dependent coordinators (none)
         .mockResolvedValueOnce([undefined, []]);       // delete
       connMap.sendCommand = vi.fn().mockResolvedValue({ ok: true });
 
@@ -593,6 +649,7 @@ describe("registerAgentRoutes", () => {
     it("still deletes from DB when runtime terminate fails", async () => {
       query
         .mockResolvedValueOnce([[{ id: "a1" }], []])
+        .mockResolvedValueOnce([[], []])              // collect dependent coordinators
         .mockResolvedValueOnce([undefined, []]);
       connMap.sendCommand = vi.fn().mockResolvedValue({ ok: false, error: "no runtime" });
 
@@ -603,6 +660,24 @@ describe("registerAgentRoutes", () => {
 
       expect(status).toBe(200);
       expect(body.terminate.ok).toBe(false);
+    });
+
+    it("captures dependent coordinators BEFORE the delete and notifies them AFTER", async () => {
+      query
+        .mockResolvedValueOnce([[{ id: "a1" }], []])                          // existence
+        .mockResolvedValueOnce([[{ coordinator_agent_id: "coordA" }], []])    // collect coordinators (before delete)
+        .mockResolvedValueOnce([undefined, []]);                              // delete
+      connMap.sendCommand = vi.fn().mockResolvedValue({ ok: true });
+
+      const { status } = await runRoute(router, fakeReq({ url: "/api/v1/agents/a1", method: "DELETE" }));
+      expect(status).toBe(200);
+
+      // Ordering: the coordinator lookup (call 1) must precede DELETE FROM agents (call 2),
+      // so the reverse rows are read before the FK cascade removes them.
+      expect(String(query.mock.calls[1][0])).toMatch(/coordinator_agent_id/);
+      expect(String(query.mock.calls[2][0])).toMatch(/DELETE FROM agents/);
+      // And the captured coordinator is notified to reload its roster (a `tools` reload).
+      expect(connMap.notify).toHaveBeenCalledWith("coordA", "agent.reload", { agentId: "coordA", resources: ["tools"] });
     });
   });
 
@@ -686,7 +761,8 @@ describe("registerAgentRoutes", () => {
         .mockResolvedValueOnce([[{ id: "s1", name: "skill" }], []])
         .mockResolvedValueOnce([[], []])
         .mockResolvedValueOnce([[{ id: "ch1", name: "lark" }], []])
-        .mockResolvedValueOnce([[], []]);
+        .mockResolvedValueOnce([[], []])
+        .mockResolvedValueOnce([[{ id: "d1", name: "peer-agent" }], []]);
 
       const { status, body } = await runRoute(router, fakeReq({
         url: "/api/v1/agents/a1/resources",
@@ -698,6 +774,7 @@ describe("registerAgentRoutes", () => {
       expect(body.hosts).toHaveLength(0);
       expect(body.skills).toHaveLength(1);
       expect(body.channels).toHaveLength(1);
+      expect(body.delegates).toHaveLength(1);
     });
   });
 

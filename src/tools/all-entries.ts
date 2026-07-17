@@ -21,7 +21,8 @@ import { registration as hostScript } from "./script-exec/host-script.js";
 import { registration as clusterList } from "./query/cluster-list.js";
 import { registration as hostList } from "./query/host-list.js";
 // knowledge_search removed — replaced by LLM Wiki (Read tool + .siclaw/knowledge/)
-import { registration as resolvePodNetns } from "./query/resolve-pod-netns.js";
+// resolve_pod_netns removed — node_exec/pod_exec/*_script auto-resolve pod→netns
+// internally via pod= (shared pod-netns-resolve.ts); the standalone tool was redundant.
 import { registration as memorySearch } from "./query/memory-search.js";
 import { registration as memoryGet } from "./query/memory-get.js";
 // workflow — investigation_feedback / deep_search / propose_hypotheses /
@@ -33,6 +34,10 @@ import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
 import { registration as skillPreview } from "./workflow/skill-preview.js";
 import { registration as channelUpdate } from "./workflow/channel-update.js";
+import { registration as reportFindings } from "./workflow/report-findings.js";
+import { registration as requestInput } from "./workflow/request-input.js";
+import { registration as delegateToAgent } from "./workflow/delegate-to-agent.js";
+import { registration as listDelegates } from "./workflow/list-delegates.js";
 import {
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
 } from "./workflow/task-tools.js";
@@ -47,10 +52,11 @@ export const allToolEntries: ToolEntry[] = [
   nodeScript, podScript, localScript, hostScript,
   // ── query ──
   clusterList, hostList,
-  resolvePodNetns, memorySearch, memoryGet,
+  memorySearch, memoryGet,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
-  channelUpdate,
+  channelUpdate, reportFindings, requestInput,
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
   spawnSubagent, jobStop, taskOutput,
+  delegateToAgent, listDelegates,
 ];

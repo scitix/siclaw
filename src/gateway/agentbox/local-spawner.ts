@@ -19,6 +19,7 @@ import type { CertificateManager } from "../security/cert-manager.js";
 import { getDb } from "../db.js";
 import { safeParseJson } from "../dialect-helpers.js";
 import { resolveCapabilities } from "../../core/tool-capabilities.js";
+import { normalizeAgentType, effectiveCapabilityKeys } from "../../core/agent-types.js";
 
 interface LocalBox {
   agentId: string;
@@ -89,24 +90,31 @@ export class LocalSpawner implements BoxSpawner {
       agentId,
     );
 
-    // Inject the resolved tool whitelist at spawn time. The tools sync type is
-    // initialSync:false, so the framework's syncAllResources never pulls it
-    // (and isn't even run in Local mode). LocalSpawner lives inside the Gateway
-    // process with direct DB access, so it resolves capabilities here — before
-    // createHttpServer + the first session — so a restricted agent is restricted
-    // from its very first turn (not unrestricted-until-next-reload). This also
-    // avoids a GET round-trip and the Local-mode cert last-spawn-wins hazard.
-    // null/empty selection → null = unrestricted (today's behaviour).
+    // Inject the resolved tool whitelist AND the locked agent-type policy at spawn
+    // time. The tools sync type is initialSync:false, so the framework's
+    // syncAllResources never pulls it (and isn't even run in Local mode).
+    // LocalSpawner lives inside the Gateway process with direct DB access, so it
+    // resolves both here — before createHttpServer + the first session — so a
+    // restricted agent is restricted from its very first turn (not
+    // unrestricted-until-next-reload). This mirrors the K8s path
+    // (internal-api.ts handleToolCapabilities): a built-in type (sre/coordinator)
+    // LOCKS its capability set via effectiveCapabilityKeys and drives the locked
+    // persona via agentTypeState — without this, a Coordinator with an empty raw
+    // tool_capabilities would resolve to null (unrestricted) and keep the default
+    // custom persona in Local mode. custom with null/empty selection → null =
+    // unrestricted (today's behaviour).
     try {
       const db = getDb();
       const [rows] = await db.query(
-        "SELECT tool_capabilities FROM agents WHERE id = ?",
+        "SELECT tool_capabilities, agent_type FROM agents WHERE id = ?",
         [agentId],
-      ) as [Array<{ tool_capabilities?: unknown }>, unknown];
+      ) as [Array<{ tool_capabilities?: unknown; agent_type?: unknown }>, unknown];
       const groupKeys = rows.length > 0
         ? safeParseJson<string[] | null>(rows[0].tool_capabilities, null)
         : null;
-      sessionManager.allowedToolsState = resolveCapabilities(groupKeys);
+      const agentType = normalizeAgentType(rows.length > 0 ? rows[0].agent_type : undefined);
+      sessionManager.allowedToolsState = resolveCapabilities(effectiveCapabilityKeys(agentType, groupKeys));
+      sessionManager.agentTypeState = agentType;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Fail safe-open: an agent that can't resolve its whitelist starts

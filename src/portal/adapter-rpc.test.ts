@@ -49,6 +49,8 @@ describe("config.getAgent", () => {
       icon: "bot", color: "#fff", idle_timeout_sec: 300,
       // No tool_capabilities column on this row → unrestricted (null).
       tool_capabilities: null,
+      // No agent_type column on this row → custom (default).
+      agent_type: "custom",
     });
   });
 
@@ -1037,7 +1039,7 @@ describe("chat.resolveSession", () => {
     const result = await getHandler("chat.resolveSession")(
       { session_id: "sess1" }, "a1",
     );
-    expect(result).toEqual({ found: true, user_id: "u1", agent_id: "a1" });
+    expect(result).toEqual({ found: true, user_id: "u1", agent_id: "a1", parent_session_id: null, target_agent_id: null });
   });
 
   it("returns found:false when sessionId is unknown", async () => {
@@ -1057,11 +1059,34 @@ describe("chat.resolveSession", () => {
     const result = await getHandler("chat.resolveSession")(
       { session_id: "sess-soft-deleted" }, "a1",
     );
-    expect(result).toEqual({ found: true, user_id: "u-deleted", agent_id: "a-deleted" });
+    expect(result).toEqual({ found: true, user_id: "u-deleted", agent_id: "a-deleted", parent_session_id: null, target_agent_id: null });
     // Defense in depth: the SQL must not mention deleted_at. If anyone
     // re-adds that predicate in a future "cleanup" PR this regresses.
     const sql = (query.mock.calls[0][0] as string).toLowerCase();
     expect(sql).not.toContain("deleted_at");
+  });
+});
+
+describe("chat.recentDelegationSessions", () => {
+  it("returns recent delegation session ids scoped to parent + target, newest-first", async () => {
+    const query = mockQuery([{ id: "s3" }, { id: "s2" }, { id: "s1" }]);
+    const result = await getHandler("chat.recentDelegationSessions")(
+      { parent_session_id: "coord-1", target_agent_id: "peer-1", limit: 8 }, "a1",
+    );
+    expect(result).toEqual({ ids: ["s3", "s2", "s1"] });
+    // Scoped to this coordinator conversation → this peer, delegation-origin only.
+    const sql = (query.mock.calls[0][0] as string).toLowerCase();
+    expect(sql).toContain("parent_session_id = ?");
+    expect(sql).toContain("target_agent_id = ?");
+    expect(sql).toContain("origin = 'delegation'");
+    expect(sql).toContain("order by last_active_at desc");
+    expect(query.mock.calls[0][1]).toEqual(["coord-1", "peer-1", 8]);
+  });
+
+  it("clamps the limit to a sane range", async () => {
+    const query = mockQuery([]);
+    await getHandler("chat.recentDelegationSessions")({ parent_session_id: "c", target_agent_id: "p", limit: 9999 }, "a1");
+    expect((query.mock.calls[0][1] as unknown[])[2]).toBe(50);
   });
 });
 
@@ -2109,9 +2134,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 53 handlers", () => {
+  it("registers exactly 55 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(53);
+    expect(handlers.size).toBe(55);
   });
 
   it("all expected handler names are registered", () => {
@@ -2120,6 +2145,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getAgent", "config.getResources", "config.getSettings",
       "config.getModelBinding", "config.getMcpServers", "config.getSkillBundle", "config.getKnowledgeBundle",
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel", "config.getTracingConfig",
+      "config.getDelegates",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
       "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.recordFeedback", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",

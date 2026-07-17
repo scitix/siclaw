@@ -2089,6 +2089,9 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       // (legacy MySQL JSON, new MySQL TEXT, SQLite TEXT). The Gateway resolves
       // these group keys → concrete allowedTools at its boundary.
       tool_capabilities: safeParseJson<string[] | null>(agent.tool_capabilities, null),
+      // Agent type (sre/coordinator/custom). Built-in types lock the capability
+      // set + persona at the box; custom uses tool_capabilities + system_prompt.
+      agent_type: agent.agent_type ?? "custom",
     };
   });
 
@@ -2132,6 +2135,42 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       knowledge_repo_ids: (knowledgeRepos as any[]).map((r: any) => r.repo_id),
       is_production: isProduction,
     };
+  });
+
+  // Delegation roster for a coordinator agent: the peer agents it may delegate
+  // to, each with a derived manifest (description + bound cluster/host names) so
+  // the coordinator's LLM can pick a target. Serves BOTH the gateway's
+  // authorization check (peer ∈ members) and the coordinator's prompt manifest.
+  handlers.set("config.getDelegates", async (params) => {
+    const db = getDb();
+    const coordinatorId = params.agentId;
+    const [members] = await db.query(
+      `SELECT a.id, a.name, a.description FROM agent_delegates ad
+       JOIN agents a ON ad.member_agent_id = a.id
+       WHERE ad.coordinator_agent_id = ? AND a.status = 'active'
+       ORDER BY a.name`,
+      [coordinatorId],
+    ) as any;
+    const roster = await Promise.all((members as any[]).map(async (m) => {
+      const [[clusters], [hosts]] = await Promise.all([
+        db.query(
+          `SELECT c.name FROM agent_clusters ac JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
+          [m.id],
+        ),
+        db.query(
+          `SELECT h.name FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
+          [m.id],
+        ),
+      ]) as any;
+      return {
+        id: m.id,
+        name: m.name,
+        description: m.description ?? "",
+        clusters: (clusters as any[]).map((r) => r.name),
+        hosts: (hosts as any[]).map((r) => r.name),
+      };
+    }));
+    return { members: roster };
   });
 
   handlers.set("config.getSettings", async (params) => {
@@ -2626,11 +2665,32 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     // outcomes). The row's user_id is immutable history, regardless of
     // visibility in the UI.
     const [rows] = await db.query(
-      `SELECT user_id, agent_id FROM chat_sessions WHERE id = ? LIMIT 1`,
+      `SELECT user_id, agent_id, parent_session_id, target_agent_id FROM chat_sessions WHERE id = ? LIMIT 1`,
       [params.session_id],
     ) as any;
     if (!rows || rows.length === 0) return { found: false };
-    return { found: true, user_id: rows[0].user_id, agent_id: rows[0].agent_id };
+    return {
+      found: true,
+      user_id: rows[0].user_id,
+      agent_id: rows[0].agent_id,
+      parent_session_id: rows[0].parent_session_id ?? null,
+      target_agent_id: rows[0].target_agent_id ?? null,
+    };
+  });
+
+  // Recent delegation sessions for a coordinator conversation → a given peer,
+  // newest-first. Used by delegate-api to bound session reuse to the coordinator's
+  // most-recent delegations (a long-running conversation can't resume a stale one).
+  handlers.set("chat.recentDelegationSessions", async (params) => {
+    const db = getDb();
+    const limit = Math.min(Math.max(1, Number(params.limit) || 8), 50);
+    const [rows] = await db.query(
+      `SELECT id FROM chat_sessions
+         WHERE parent_session_id = ? AND target_agent_id = ? AND origin = 'delegation' AND deleted_at IS NULL
+         ORDER BY last_active_at DESC LIMIT ?`,
+      [params.parent_session_id, params.target_agent_id, limit],
+    ) as any;
+    return { ids: (rows as any[]).map((r) => r.id as string) };
   });
 
   handlers.set("chat.ensureSession", async (params) => {

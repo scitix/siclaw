@@ -75,11 +75,11 @@ Concrete tool invocations with realistic parameters.
 | `host_script` | A host via SSH | Host-level tools on a node reachable via SSH. **Preferred over `node_script`** — runs over SSH with no debug pod (lighter, leaves the node untouched) |
 | `node_script` | K8s node (host) | Host tools, /proc, /sys, devices, nsenter. The **fallback** when the node is not an SSH host, or whenever a pod's `netns` is needed |
 | `pod_script` | Inside a pod | Diagnostics inside a running container |
-| `node_script` + `netns` | Node + pod's network ns | Host tools + pod's network view (call `resolve_pod_netns` first) |
+| `node_script` + `pod` | Node + pod's network ns | Host tools + pod's network view (pass `pod=` — node + netns resolved automatically) |
 
 **Host vs node for host-level skills.** `host_script` and `node_script` take the **same** `skill`/`script`/`args` — only the target differs (`host="<id>"` vs `node="<name>"`). For a host-level skill, write the `## Tool` line as `host_script` (preferred) / `node_script` (fallback) and keep the Examples in one form — the agent picks the right tool at runtime based on `host_list`. Do **not** duplicate every example across both tools.
 
-**Exception — pod's netns cannot degrade to host.** A skill that enters a pod's network namespace uses `node_script` + `netns` (a privileged debug pod with `nsenter`). `host_script` has no `netns` path, so these skills **must** stay on `node_script` — never offer a `host_script` form for them.
+**Exception — pod's netns cannot degrade to host.** A skill that enters a pod's network namespace uses `node_script` with `pod=` (a privileged debug pod with `nsenter`). `host_script` has no netns path, so these skills **must** stay on `node_script` — never offer a `host_script` form for them.
 
 ## Best Practices
 

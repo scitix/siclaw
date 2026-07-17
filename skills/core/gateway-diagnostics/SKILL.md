@@ -40,19 +40,15 @@ node_script: node="<node>", skill="gateway-diagnostics", script="show-gateway.sh
 
 ### Pod target
 
-Runs in the pod's network namespace using host tools. Two steps:
+Runs in the pod's network namespace using host tools — one step: pass `pod`
+(+ `namespace`) and `node_script` resolves the node and enters the pod's netns
+for you:
+```
+node_script: pod="<pod>", namespace="<ns>", skill="gateway-diagnostics", script="ping-gateway.sh", args="<args>"
+```
 
-1. Resolve the pod's network namespace:
-   ```
-   resolve_pod_netns: pod="<pod>", namespace="<ns>"
-   ```
-2. Run the script with the returned node and netns:
-   ```
-   node_script: node="<node>", netns="<netns>", skill="gateway-diagnostics", script="ping-gateway.sh", args="<args>"
-   ```
-
-> The script does not enter the namespace itself — `node_script` does that via
-> the `netns=` param. The same script file serves both node and pod targets.
+> `node_script` resolves the pod → node + netns internally and runs the script in
+> the pod's network namespace. The same script file serves both node and pod targets.
 
 ## Parameters
 
@@ -91,13 +87,10 @@ Ping a node's gateway, sourcing from the interface IP:
 node_script: node="nodepool-061", skill="gateway-diagnostics", script="ping-gateway.sh", args="--interface bond0 --source-ip"
 ```
 
-Show / ping a pod's gateway (resolve netns first):
+Show / ping a pod's gateway (one step — `pod` resolves node + netns):
 ```
-resolve_pod_netns: pod="rdma-pod", namespace="rdma-test"
-→ node="worker-1", netns="abc123"
-
-node_script: node="worker-1", netns="abc123", skill="gateway-diagnostics", script="show-gateway.sh", args="--interface net1 --json"
-node_script: node="worker-1", netns="abc123", skill="gateway-diagnostics", script="ping-gateway.sh", args="--interface net1 --source-dev"
+node_script: pod="rdma-pod", namespace="rdma-test", skill="gateway-diagnostics", script="show-gateway.sh", args="--interface net1 --json"
+node_script: pod="rdma-pod", namespace="rdma-test", skill="gateway-diagnostics", script="ping-gateway.sh", args="--interface net1 --source-dev"
 ```
 
 ## Interface types & switchdev
