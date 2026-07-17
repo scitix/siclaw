@@ -883,7 +883,20 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${req.run_id}`);
     capabilityRunManager.touch(req.run_id);
     const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
-    const assisted = await client.postJson<Omit<CapabilityTestReferenceAssistResponse, "run_id">>(
+    const assisted = await client.postJson<
+      | {
+          ok: true;
+          mode: "suggest";
+          candidates: Extract<CapabilityTestReferenceAssistResponse, { mode: "suggest" }>["candidates"];
+        }
+      | {
+          ok: true;
+          mode: "polish";
+          polished_answer: string;
+          evidence_paths: string[];
+          warnings: string[];
+        }
+    >(
       `/test-reference-assist/${req.run_id}`,
       {
         mode: req.mode,
@@ -893,7 +906,25 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       },
       75_000,
     );
-    return { run_id: req.run_id, ...assisted } as CapabilityTestReferenceAssistResponse;
+    if (assisted.mode === "suggest") {
+      const response: CapabilityTestReferenceAssistResponse = {
+        run_id: req.run_id,
+        mode: "suggest",
+        candidates: assisted.candidates,
+      };
+      return response;
+    }
+    if (assisted.mode === "polish") {
+      const response: CapabilityTestReferenceAssistResponse = {
+        run_id: req.run_id,
+        mode: "polish",
+        polished_answer: assisted.polished_answer,
+        evidence_paths: assisted.evidence_paths,
+        warnings: assisted.warnings,
+      };
+      return response;
+    }
+    throw new Error("reference assistant returned an unexpected mode");
   });
 
   rpcMethods.set("capability.testClose", async (params) => {

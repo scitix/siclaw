@@ -17,13 +17,24 @@ vi.mock("./agentbox/client.js", () => ({
       posts.push({ path, body, timeoutMs });
       if (path.startsWith("/test-recommendation/")) {
         return {
+          ok: true,
           question: "What is the retry limit?",
           reference_answer: "Three attempts.",
           evidence_paths: ["raw/policy.md"],
         };
       }
       if (path.startsWith("/test-reference-assist/")) {
+        if ((body as { mode?: string }).mode === "polish") {
+          return {
+            ok: true,
+            mode: "polish",
+            polished_answer: "Retry no more than three times.",
+            evidence_paths: ["raw/policy.md"],
+            warnings: ["The draft overstated the retry limit."],
+          };
+        }
         return {
+          ok: true,
           mode: "suggest",
           candidates: [
             { style: "concise", answer: "Three attempts.", evidence_paths: ["raw/policy.md"] },
@@ -116,6 +127,38 @@ describe("capability.testReferenceAssist", () => {
     expect(posts).toContainEqual({
       path: `/test-reference-assist/${started.run_id}`,
       body: { mode: "suggest", question: "What is the retry limit?" },
+      timeoutMs: 75_000,
+    });
+  });
+
+  it("strips the box envelope from a polished answer response", async () => {
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+    });
+    const start = server.rpcMethods.get("capability.start")!;
+    const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
+    const assist = server.rpcMethods.get("capability.testReferenceAssist")!;
+
+    await expect(assist({
+      run_id: started.run_id,
+      mode: "polish",
+      question: "What is the retry limit?",
+      draft_answer: "Retry five times.",
+    })).resolves.toEqual({
+      run_id: started.run_id,
+      mode: "polish",
+      polished_answer: "Retry no more than three times.",
+      evidence_paths: ["raw/policy.md"],
+      warnings: ["The draft overstated the retry limit."],
+    });
+    expect(posts).toContainEqual({
+      path: `/test-reference-assist/${started.run_id}`,
+      body: {
+        mode: "polish",
+        question: "What is the retry limit?",
+        draft_answer: "Retry five times.",
+      },
       timeoutMs: 75_000,
     });
   });
