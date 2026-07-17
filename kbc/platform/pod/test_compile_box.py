@@ -660,6 +660,27 @@ async def test_test_session_driver_readonly():
     print("✓ test session driver is read-only (Read/Glob/Grep, no MCP, no kickoff)")
 
 
+async def test_test_session_driver_uses_captured_contract():
+    """The fingerprinted tool/model/turn contract is the one passed to the SDK."""
+    orig = compile_box.ClaudeSDKClient
+    compile_box.ClaudeSDKClient = _FakeSDKClient
+    try:
+        with tempfile.TemporaryDirectory() as snap:
+            run = compile_box.TestRun("t-contract", snap, parent_run_id="p1", snapshot_hash="h")
+            run.allowed_tools = ["Read"]
+            run.consumer_model = "captured-model"
+            run.consumer_max_turns = 7
+            await compile_box.test_session_driver(run)
+            opts = _FakeSDKClient.last.options
+            assert opts.tools == ["Read"], opts.tools
+            assert opts.allowed_tools == ["Read"], opts.allowed_tools
+            assert opts.model == "captured-model", opts.model
+            assert opts.max_turns == 7, opts.max_turns
+    finally:
+        compile_box.ClaudeSDKClient = orig
+    print("✓ test session driver uses its captured consumer contract")
+
+
 async def test_open_close_test_session_http():
     """POST /test-session pins the parent draft into a snapshot dir and starts a
     session (200 + snapshot/consumer hashes + pages); unknown parent → 404;
@@ -1089,13 +1110,14 @@ async def test_prompt_packs_locale():
 
     # A regression round's consumer identity is deterministic and changes only
     # with answer-affecting contract inputs. Tool order is not semantic.
-    fp_en = compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-a")
+    fp_en = compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 60)
     assert len(fp_en) == 64
-    assert fp_en == compile_box._test_consumer_fingerprint("en", ["Grep", "Read", "Glob"], "model-a", "sdk-a")
-    assert fp_en != compile_box._test_consumer_fingerprint("zh", ["Read", "Glob", "Grep"], "model-a", "sdk-a")
-    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-b", "sdk-a")
-    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-b")
-    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read"], "model-a", "sdk-a")
+    assert fp_en == compile_box._test_consumer_fingerprint("en", ["Grep", "Read", "Glob"], "model-a", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("zh", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-b", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-b", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read"], "model-a", "sdk-a", 60)
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 61)
 
     with tempfile.TemporaryDirectory() as snap:
         root = Path(snap)
@@ -2741,6 +2763,7 @@ async def main():
     await test_prompt_packs_locale()
     test_compile_surface_excludes_auto_question_proposals()
     await test_test_session_driver_readonly()
+    await test_test_session_driver_uses_captured_contract()
     await test_open_close_test_session_http()
     await test_test_message_path()
     await test_test_session_step_frames()

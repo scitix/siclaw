@@ -405,6 +405,7 @@ class TestRun:
         # Captured once when the session opens so the advertised consumer
         # fingerprint and the SDK options cannot drift within one session.
         self.consumer_model: str | None = None
+        self.consumer_max_turns: int | None = None
         self.consumer_fingerprint: str = ""
 
     async def emit(self, ev: dict):
@@ -2820,7 +2821,7 @@ async def _run_wrapper(run: CompileRun):
 # profile declares none. Read-only by construction: cannot mutate the snapshot.
 DEFAULT_TEST_ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
 # Bump only when answer-affecting consumer behavior changes outside the prompt,
-# model, or tool set already covered by _test_consumer_fingerprint().
+# model, SDK, tool set, or turn limit already covered by the fingerprint.
 TEST_CONSUMER_CONTRACT_VERSION = 1
 # Tools removed from a read-only consumer session's context entirely (not merely
 # left un-approved). Under bypassPermissions the allowed_tools split is moot, so
@@ -2835,6 +2836,10 @@ READONLY_CONSUMER_DISALLOWED_TOOLS = [
 
 def _test_model() -> str:
     return os.environ.get("KBC_TEST_MODEL", "claude-sonnet-4-6")
+
+
+def _test_max_turns() -> int:
+    return int(os.environ.get("KBC_TEST_MAX_TURNS", "60"))
 
 
 def _test_sdk_version() -> str:
@@ -2853,13 +2858,14 @@ def _test_consumer_fingerprint(
     allowed_tools: list[str] | None,
     model: str | None = None,
     sdk_version: str | None = None,
+    max_turns: int | None = None,
 ) -> str:
     """Stable identity for the answer-affecting read-only consumer contract.
 
     The whole image digest is intentionally excluded: unrelated box changes must
-    not split regression rounds. Prompt bytes, effective model, SDK version and
-    tool surface are automatic; TEST_CONSUMER_CONTRACT_VERSION is the explicit
-    seam for any remaining answer-affecting driver behavior.
+    not split regression rounds. Prompt bytes, effective model, SDK version,
+    tool surface and turn limit are automatic; TEST_CONSUMER_CONTRACT_VERSION
+    is the explicit seam for any remaining answer-affecting driver behavior.
     """
     role = _prompt("test_role", locale)
     contract = {
@@ -2868,6 +2874,7 @@ def _test_consumer_fingerprint(
         "model": model or _test_model(),
         "sdk_version": sdk_version or _test_sdk_version(),
         "tools": sorted(set(_effective_test_allowed_tools(allowed_tools))),
+        "max_turns": max_turns if max_turns is not None else _test_max_turns(),
     }
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -3063,11 +3070,12 @@ async def test_session_driver(run: "TestRun"):
     /test-events. Mirrors run_session minus writes/compile-tools/sync/bundle."""
     sid = run.session_id or str(uuid.uuid4())
     run.session_id = sid
+    effective_tools = _effective_test_allowed_tools(run.allowed_tools)
     opts = ClaudeAgentOptions(
         cwd=run.cwd,
         system_prompt={"type": "preset", "preset": "claude_code", "append": _prompt("test_role", run.locale)},
-        tools=list(DEFAULT_TEST_ALLOWED_TOOLS),    # read-only base set; removes Bash/Write/Web from context
-        allowed_tools=_effective_test_allowed_tools(run.allowed_tools),
+        tools=effective_tools,                    # actual context matches the fingerprinted profile contract
+        allowed_tools=effective_tools,
         disallowed_tools=list(READONLY_CONSUMER_DISALLOWED_TOOLS),  # belt-and-suspenders under bypass
         mcp_servers={},                            # no compile signal tools
         strict_mcp_config=True,                    # ignore project/user/plugin MCP configs
@@ -3080,7 +3088,7 @@ async def test_session_driver(run: "TestRun"):
         # The test session mimics the REAL consumer → the gate/consumer tier
         # (sonnet), not the compile tier. Massapi-served id; overridable per-deploy.
         model=run.consumer_model or _test_model(),
-        max_turns=int(os.environ.get("KBC_TEST_MAX_TURNS", "60")),
+        max_turns=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
         session_id=sid,
         session_store=InMemorySessionStore(),
     )
@@ -3687,6 +3695,9 @@ async def handle_open_test(request: web.Request):
     if active >= _max_test_sessions():
         return web.json_response({"error": "too many concurrent test sessions"}, status=429)
     body = await request.json() if request.body_exists else {}
+    consumer_tools = _effective_test_allowed_tools(body.get("allowed_tools"))
+    consumer_model = _test_model()
+    consumer_max_turns = _test_max_turns()
     tid = str(uuid.uuid4())
     dest = Path(_test_snapshot_root()) / tid
     try:
@@ -3701,10 +3712,12 @@ async def handle_open_test(request: web.Request):
         return web.json_response({"error": str(e)}, status=400)
     run = TestRun(tid, str(dest), parent_run_id=parent.run_id, snapshot_hash=snapshot_hash, locale=parent.locale)
     # Tool whitelist from the runtime BoxProfile (kb-test); None/absent → read-only default.
-    run.allowed_tools = body.get("allowed_tools")
-    run.consumer_model = _test_model()
+    run.allowed_tools = consumer_tools
+    run.consumer_model = consumer_model
+    run.consumer_max_turns = consumer_max_turns
     run.consumer_fingerprint = _test_consumer_fingerprint(
         run.locale, run.allowed_tools, run.consumer_model,
+        max_turns=run.consumer_max_turns,
     )
     TEST_SESSIONS[tid] = run
     run.task = asyncio.create_task(_test_session_wrapper(run))
