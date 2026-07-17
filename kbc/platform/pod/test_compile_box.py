@@ -1076,6 +1076,13 @@ async def test_prompt_packs_locale():
     assert "回答纪律" in zh_role and "不要叙述你的操作过程" in zh_role, zh_role
     assert "Answer discipline" in en_role and "Never narrate your process" in en_role, en_role
     assert "SOURCES:" in zh_role and "SOURCES:" in en_role
+    # Retrieval discipline matches the actual read-only tool surface: index-first,
+    # scoped search as a fallback, full-page reads, and no premature "not covered".
+    assert "Glob/Grep" in zh_role and "Glob/Grep" in en_role
+    assert ".siclaw/knowledge/" in zh_role and ".siclaw/knowledge/" in en_role
+    assert "全部合理候选页之后" in zh_role, zh_role
+    assert "only after checking the index and every plausible page" in en_role, en_role
+    assert "没有检索工具" not in zh_role and "there is no search tool" not in en_role
 
     with tempfile.TemporaryDirectory() as snap:
         root = Path(snap)
