@@ -290,6 +290,25 @@ function shiftPending<T>(map: Map<string, T[]>, key: string): T | undefined {
   return value;
 }
 
+/** Everything captured at tool_execution_start that its tool_execution_end
+ *  (and the abort finalizer) needs to complete the row. */
+interface PendingToolCall {
+  toolName: string;
+  /** Raw JSON of the call args (unredacted — redacted at write time). */
+  input: string;
+  startMs: number;
+  /** DB row id of the eagerly-persisted "running" placeholder (persist mode only). */
+  messageId?: string;
+  preThinkingMs?: number;
+}
+
+/** Pairing key for a tool_execution_start/end pair: the invocation-unique
+ *  toolCallId when the event carries one, else the tool name (FIFO fallback). */
+function toolCallKey(evt: Record<string, unknown>, toolName: string): string {
+  const id = evt.toolCallId;
+  return typeof id === "string" && id ? id : toolName;
+}
+
 export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<SseConsumptionResult> {
   const { client, sessionId, userId, onEvent, signal } = opts;
   const persist = opts.persistMessages === true;
@@ -354,17 +373,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   };
   let lastToolName = "";
 
-  // Queued by toolName. pi-agent events do not always expose a stable call id,
-  // so this preserves multiple same-name starts across refresh persistence in
-  // the order the runtime emits them.
-  const pendingToolInputs = new Map<string, string[]>();
-  const pendingToolStartTimes = new Map<string, number[]>();
-  const pendingToolMessageIds = new Map<string, string[]>();
-  // Per-tool pre-tool-call thinking time captured at tool_execution_start, to
-  // be merged into the row's metadata at tool_execution_end (so the persisted
-  // metadata survives the round-trip without being clobbered by the
-  // extractPersistableDetails extraction from result.details).
-  const pendingPreThinkingMs = new Map<string, number[]>();
+  // In-flight tool calls awaiting their tool_execution_end. Keyed by the
+  // event's toolCallId (stable per invocation): pi-agent runs a same-turn tool
+  // batch in PARALLEL, so ends arrive in completion order, not start order —
+  // name-FIFO pairing writes call A's result into call B's row (and stamps the
+  // wrong dbMessageId on the relayed event, so the live card cross-attaches
+  // too). Events lacking a toolCallId fall back to a per-toolName FIFO queue.
+  const pendingToolCalls = new Map<string, PendingToolCall[]>();
 
   let eventCount = 0;
   const startTime = Date.now();
@@ -536,9 +551,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       if (toolResult?.details?.blocked) outcome = "blocked";
       else if (toolResult?.details?.error) outcome = "error";
 
-      const toolStartTime = shiftPending(pendingToolStartTimes, toolName);
-      const durationMs = toolStartTime != null ? Date.now() - toolStartTime : undefined;
-      const preThinkingMs = shiftPending(pendingPreThinkingMs, toolName);
+      const pendingCall = shiftPending(pendingToolCalls, toolCallKey(evt, toolName));
+      const durationMs = pendingCall ? Date.now() - pendingCall.startMs : undefined;
+      const preThinkingMs = pendingCall?.preThinkingMs;
       // Surface duration + pre-thinking on the live event for frontend.
       if (durationMs != null) {
         (evt as Record<string, unknown>).durationMs = durationMs;
@@ -546,8 +561,8 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       if (preThinkingMs != null) {
         (evt as Record<string, unknown>).preThinkingMs = preThinkingMs;
       }
-      const toolInput = shiftPending(pendingToolInputs, toolName) || "";
-      const existingMessageId = shiftPending(pendingToolMessageIds, toolName);
+      const toolInput = pendingCall?.input || "";
+      const existingMessageId = pendingCall?.messageId;
       const detailsMeta = extractPersistableDetails(toolResult?.details, redactionConfig);
       // Merge pre-thinking back in — extractPersistableDetails only looks at
       // the tool *result*, so we'd otherwise lose what we recorded at
@@ -646,11 +661,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       // nonNegative() drops cross-pod clock-drift artefacts; absence
       // downstream means "unknown", which is the correct semantics.
       const preThinkingMs = nonNegative(nowAtStart - lastBoundaryTime);
-      pushPending(pendingToolInputs, startToolName, rawToolInput);
-      pushPending(pendingToolStartTimes, startToolName, nowAtStart);
-      if (preThinkingMs !== undefined) {
-        pushPending(pendingPreThinkingMs, startToolName, preThinkingMs);
-      }
+      const pendingCall: PendingToolCall = {
+        toolName: startToolName,
+        input: rawToolInput,
+        startMs: nowAtStart,
+      };
+      if (preThinkingMs !== undefined) pendingCall.preThinkingMs = preThinkingMs;
+      pushPending(pendingToolCalls, toolCallKey(evt, startToolName), pendingCall);
       lastToolName = startToolName;
       // Surface on the live event so frontend can render 💭 immediately.
       if (preThinkingMs !== undefined) {
@@ -682,7 +699,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           durationMs: null,
           metadata: startMetadataWithRoute,
         });
-        pushPending(pendingToolMessageIds, startToolName, dbMessageId);
+        pendingCall.messageId = dbMessageId;
         await incrementMessageCount(sessionId);
       }
     }
@@ -894,28 +911,27 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // null, metadata.status="stopped"), and persist any partial assistant text so the words the
   // model already streamed don't vanish on the next refetch.
   if (persist && signal?.aborted) {
-    for (const [toolName, ids] of pendingToolMessageIds) {
-      // startTimes/inputs are pushed in lockstep with the message ids on tool_execution_start
-      // and shifted together on tool_execution_end, so the surviving entries stay index-aligned.
-      const startTimes = pendingToolStartTimes.get(toolName) ?? [];
-      const inputs = pendingToolInputs.get(toolName) ?? [];
-      for (let i = 0; i < ids.length; i++) {
-        const stoppedMeta: Record<string, unknown> = { status: "stopped" };
-        if (startTimes[i] != null) stoppedMeta.started_at = new Date(startTimes[i]).toISOString();
+    for (const queue of pendingToolCalls.values()) {
+      for (const pendingCall of queue) {
+        if (!pendingCall.messageId) continue;
+        const stoppedMeta: Record<string, unknown> = {
+          status: "stopped",
+          started_at: new Date(pendingCall.startMs).toISOString(),
+        };
         try {
           // updateMessage REPLACES columns (it is not a partial patch), so we must re-send
           // toolName + toolInput or they'd be NULLed — leaving the stopped card with no identity.
           await updateMessage({
-            messageId: ids[i],
+            messageId: pendingCall.messageId,
             sessionId,
             content: "",
-            toolName,
-            toolInput: inputs[i] ? redactText(inputs[i], redactionConfig) : null,
+            toolName: pendingCall.toolName,
+            toolInput: pendingCall.input ? redactText(pendingCall.input, redactionConfig) : null,
             outcome: null,
             metadata: stoppedMeta,
           });
         } catch (err) {
-          console.warn(`[sse-consumer] ${userId}: failed to finalize aborted tool row ${ids[i]}:`, err);
+          console.warn(`[sse-consumer] ${userId}: failed to finalize aborted tool row ${pendingCall.messageId}:`, err);
         }
       }
     }

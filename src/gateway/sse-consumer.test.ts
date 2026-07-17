@@ -677,7 +677,7 @@ describe("consumeAgentSse — tool execution", () => {
     expect(result.resultText).toBe("Investigation complete.");
   });
 
-  it("supports parallel tool calls by keying pending state per toolName", async () => {
+  it("supports parallel tool calls via the per-toolName FIFO fallback when events lack a toolCallId", async () => {
     const events = [
       { type: "tool_execution_start", toolName: "a", args: { x: 1 } },
       { type: "tool_execution_start", toolName: "b", args: { y: 2 } },
@@ -692,6 +692,45 @@ describe("consumeAgentSse — tool execution", () => {
     const b = toolRows.find((r) => r.toolName === "b");
     expect(a.toolInput).toContain("\"x\":1");
     expect(b.toolInput).toContain("\"y\":2");
+  });
+
+  it("pairs same-name parallel calls by toolCallId when ends arrive out of start order", async () => {
+    // pi-agent executes a same-turn tool batch in parallel: all starts fire in
+    // call order, each end fires on ITS OWN completion. Name-FIFO pairing wrote
+    // the first-completed result into the first-STARTED row — the audit/live
+    // card then showed one command with another call's output.
+    const events = [
+      { type: "tool_execution_start", toolCallId: "c1", toolName: "navix", args: { cmd: "nodes" } },
+      { type: "tool_execution_start", toolCallId: "c2", toolName: "navix", args: { cmd: "workloads" } },
+      { type: "tool_execution_start", toolCallId: "c3", toolName: "navix", args: { cmd: "diagnoses" } },
+      // Completion order ≠ start order.
+      { type: "tool_execution_end", toolCallId: "c3", toolName: "navix",
+        result: { content: [{ type: "text", text: "diagnoses output" }] } },
+      { type: "tool_execution_end", toolCallId: "c1", toolName: "navix",
+        result: { content: [{ type: "text", text: "nodes output" }] } },
+      { type: "tool_execution_end", toolCallId: "c2", toolName: "navix",
+        result: { content: [{ type: "text", text: "workloads output" }] } },
+    ];
+    const relayedEndRowIds: Array<string | undefined> = [];
+    await consumeAgentSse({
+      client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true,
+      onEvent: (_evt, eventType, extra) => {
+        if (eventType === "tool_execution_end") relayedEndRowIds.push(extra?.dbMessageId);
+      },
+    });
+    // Placeholder rows were appended in start order: msg-1=c1, msg-2=c2, msg-3=c3.
+    // Each result must land in its own row.
+    expect(updateCalls).toHaveLength(3);
+    const byRow = Object.fromEntries(updateCalls.map((u) => [u.messageId, u]));
+    expect(byRow["msg-1"].toolInput).toContain("nodes");
+    expect(byRow["msg-1"].content).toBe("nodes output");
+    expect(byRow["msg-2"].toolInput).toContain("workloads");
+    expect(byRow["msg-2"].content).toBe("workloads output");
+    expect(byRow["msg-3"].toolInput).toContain("diagnoses");
+    expect(byRow["msg-3"].content).toBe("diagnoses output");
+    // The relayed live event must carry the row its result was written to, so the
+    // frontend (which prefers dbMessageId) attaches it to the right card.
+    expect(relayedEndRowIds).toEqual(["msg-3", "msg-1", "msg-2"]);
   });
 });
 
