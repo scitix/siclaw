@@ -1034,6 +1034,7 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
     original_client = compile_box.ClaudeSDKClient
     original_server_factory = compile_box.create_sdk_mcp_server
     previous_turns = os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS")
+    previous_light_model = os.environ.get("KBC_PK_BLUE_MODEL")
     seen = {}
 
     def capture_server(name, *, tools):
@@ -1071,6 +1072,7 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
     compile_box.ClaudeSDKClient = SubmittingClient
     compile_box.create_sdk_mcp_server = capture_server
     os.environ["KBC_REFERENCE_ASSIST_MAX_TURNS"] = "8"
+    os.environ["KBC_PK_BLUE_MODEL"] = "claude-light-admin-config"
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1091,10 +1093,12 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
                 "Read", "Glob", "Grep", "mcp__reference_assist__submit_reference_suggestions",
             ]
             assert opts.max_turns == 8
+            assert opts.model == "claude-light-admin-config"
             assert opts.setting_sources == [] and opts.skills == [] and opts.strict_mcp_config is True
             assert set(opts.disallowed_tools) >= {"Bash", "Write", "Edit", "Agent", "WebSearch"}
             assert seen["server_name"] == "reference_assist"
             assert '"question": "What is the retry limit?"' in seen["directive"]
+            assert "2-3 independently usable candidates" in seen["directive"]
     finally:
         compile_box.ClaudeSDKClient = original_client
         compile_box.create_sdk_mcp_server = original_server_factory
@@ -1102,6 +1106,10 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
             os.environ.pop("KBC_REFERENCE_ASSIST_MAX_TURNS", None)
         else:
             os.environ["KBC_REFERENCE_ASSIST_MAX_TURNS"] = previous_turns
+        if previous_light_model is None:
+            os.environ.pop("KBC_PK_BLUE_MODEL", None)
+        else:
+            os.environ["KBC_PK_BLUE_MODEL"] = previous_light_model
     print("✓ reference-answer assist driver: fast + isolated + structured")
 
 
