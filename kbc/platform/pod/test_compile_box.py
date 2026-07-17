@@ -951,6 +951,160 @@ async def test_explicit_test_recommendation_http():
     print("✓ explicit red-team test recommendation (stable, single-flight, raw-grounded)")
 
 
+async def test_reference_assist_http_and_validation():
+    """Reference assistance is stable-draft-only, shares the red-review lock,
+    and accepts only distinct raw-grounded structured results."""
+    original = compile_box._REFERENCE_ASSIST_IMPL
+    compile_box.RUNS.clear()
+    compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    calls = []
+
+    async def fake_assist(parent, payload):
+        calls.append((parent.run_id, payload))
+        return {
+            "mode": "suggest",
+            "candidates": [
+                {"style": "concise", "answer": "Three attempts.", "evidence_paths": ["raw/policy.md"]},
+                {"style": "complete", "answer": "Retry no more than three times.", "evidence_paths": ["raw/policy.md"]},
+            ],
+        }
+
+    compile_box._REFERENCE_ASSIST_IMPL = fake_assist
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        assert (await client.post("/test-reference-assist/missing", json={
+            "mode": "suggest", "question": "What is the retry limit?",
+        })).status == 404
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("assist-1", td, 1)
+            compile_box.RUNS[parent.run_id] = parent
+
+            invalid = await client.post(f"/test-reference-assist/{parent.run_id}", json={
+                "mode": "polish", "question": "What is the retry limit?",
+            })
+            assert invalid.status == 400, await invalid.text()
+
+            parent._turn_active = True
+            busy = await client.post(f"/test-reference-assist/{parent.run_id}", json={
+                "mode": "suggest", "question": "What is the retry limit?",
+            })
+            assert busy.status == 409, await busy.text()
+            parent._turn_active = False
+
+            response = await client.post(f"/test-reference-assist/{parent.run_id}", json={
+                "mode": "suggest", "question": "What is the retry limit?",
+            })
+            assert response.status == 200, await response.text()
+            body = await response.json()
+            assert body["candidates"][0]["answer"] == "Three attempts.", body
+            assert calls[0][1]["evidence_paths"] == [], calls
+
+            validated = compile_box._validate_reference_suggestions(root, {
+                "candidates": body["candidates"],
+            })
+            assert validated["mode"] == "suggest"
+            polished = compile_box._validate_polished_reference(root, {
+                "polished_answer": "Three attempts.",
+                "evidence_paths": ["raw/policy.md"],
+                "warnings": ["Draft overstated the limit."],
+            })
+            assert polished["warnings"] == ["Draft overstated the limit."]
+            try:
+                compile_box._validate_reference_assist_request(root, {
+                    "mode": "suggest", "question": "leak?", "evidence_paths": ["../secret.md"],
+                })
+                raise AssertionError("escaped evidence hint was accepted")
+            except ValueError:
+                pass
+    finally:
+        await client.close()
+        compile_box._REFERENCE_ASSIST_IMPL = original
+        compile_box.RUNS.clear()
+        compile_box.RECOMMENDATIONS_ACTIVE.clear()
+    print("✓ reference-answer assist HTTP + raw-grounded validation")
+
+
+async def test_reference_assist_driver_is_fast_isolated_and_structured():
+    original_client = compile_box.ClaudeSDKClient
+    original_server_factory = compile_box.create_sdk_mcp_server
+    previous_turns = os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS")
+    seen = {}
+
+    def capture_server(name, *, tools):
+        seen["server_name"] = name
+        seen["tools"] = tools
+        return {"type": "sdk", "name": name, "tools": tools}
+
+    class SubmittingClient:
+        def __init__(self, options=None):
+            self.options = options
+            self.pending = []
+            seen["options"] = options
+
+        async def connect(self):
+            pass
+
+        async def query(self, directive, session_id="default"):
+            seen["directive"] = directive
+            registered = self.options.mcp_servers["reference_assist"]["tools"]
+            await registered[0].handler({
+                "candidates": [
+                    {"style": "concise", "answer": "Three attempts.", "evidence_paths": ["raw/policy.md"]},
+                    {"style": "complete", "answer": "Retry no more than three times.", "evidence_paths": ["raw/policy.md"]},
+                ],
+            })
+            self.pending.append(ResultMessage())
+
+        async def receive_messages(self):
+            while self.pending:
+                yield self.pending.pop(0)
+
+        async def disconnect(self):
+            pass
+
+    compile_box.ClaudeSDKClient = SubmittingClient
+    compile_box.create_sdk_mcp_server = capture_server
+    os.environ["KBC_REFERENCE_ASSIST_MAX_TURNS"] = "8"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "candidate").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            (root / "candidate" / "index.md").write_text("# Policy\n")
+            parent = compile_box.CompileRun("assist-driver", td, 1)
+            parent.locale = "en"
+            result = await compile_box.assist_reference_answer(parent, {
+                "mode": "suggest", "question": "What is the retry limit?",
+            })
+            assert result["mode"] == "suggest", result
+            opts = seen["options"]
+            assert opts.system_prompt == compile_box._prompt("reference_assist_role", "en")
+            assert opts.tools == ["Read", "Glob", "Grep"]
+            assert opts.allowed_tools == [
+                "Read", "Glob", "Grep", "mcp__reference_assist__submit_reference_suggestions",
+            ]
+            assert opts.max_turns == 8
+            assert opts.setting_sources == [] and opts.skills == [] and opts.strict_mcp_config is True
+            assert set(opts.disallowed_tools) >= {"Bash", "Write", "Edit", "Agent", "WebSearch"}
+            assert seen["server_name"] == "reference_assist"
+            assert '"question": "What is the retry limit?"' in seen["directive"]
+    finally:
+        compile_box.ClaudeSDKClient = original_client
+        compile_box.create_sdk_mcp_server = original_server_factory
+        if previous_turns is None:
+            os.environ.pop("KBC_REFERENCE_ASSIST_MAX_TURNS", None)
+        else:
+            os.environ["KBC_REFERENCE_ASSIST_MAX_TURNS"] = previous_turns
+    print("✓ reference-answer assist driver: fast + isolated + structured")
+
+
 async def test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool():
     """The explicit reviewer is a narrow red-team capability, not a compiler.
 
@@ -2773,6 +2927,8 @@ async def main():
     await test_test_message_path()
     await test_test_session_step_frames()
     await test_explicit_test_recommendation_http()
+    await test_reference_assist_http_and_validation()
+    await test_reference_assist_driver_is_fast_isolated_and_structured()
     await test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool()
     await test_recommendation_driver_reports_max_turn_exhaustion()
     await test_propose_plan_never_bounces()
