@@ -22,6 +22,15 @@ vi.mock("./agentbox/client.js", () => ({
           evidence_paths: ["raw/policy.md"],
         };
       }
+      if (path.startsWith("/test-reference-assist/")) {
+        return {
+          mode: "suggest",
+          candidates: [
+            { style: "concise", answer: "Three attempts.", evidence_paths: ["raw/policy.md"] },
+            { style: "complete", answer: "Retry at most three times.", evidence_paths: ["raw/policy.md"] },
+          ],
+        };
+      }
       return { ok: true };
     }
     async getJson() { return {}; }
@@ -78,6 +87,36 @@ describe("capability.testRecommend", () => {
       path: `/test-recommendation/${started.run_id}`,
       body: {},
       timeoutMs: 210_000,
+    });
+  });
+});
+
+describe("capability.testReferenceAssist", () => {
+  it("runs a bounded reference-answer assist call on the authoring box", async () => {
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+    });
+    const start = server.rpcMethods.get("capability.start")!;
+    const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
+    const assist = server.rpcMethods.get("capability.testReferenceAssist")!;
+
+    await expect(assist({
+      run_id: started.run_id,
+      mode: "suggest",
+      question: "What is the retry limit?",
+    })).resolves.toEqual({
+      run_id: started.run_id,
+      mode: "suggest",
+      candidates: [
+        { style: "concise", answer: "Three attempts.", evidence_paths: ["raw/policy.md"] },
+        { style: "complete", answer: "Retry at most three times.", evidence_paths: ["raw/policy.md"] },
+      ],
+    });
+    expect(posts).toContainEqual({
+      path: `/test-reference-assist/${started.run_id}`,
+      body: { mode: "suggest", question: "What is the retry limit?" },
+      timeoutMs: 75_000,
     });
   });
 });
