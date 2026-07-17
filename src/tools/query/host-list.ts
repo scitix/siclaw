@@ -97,4 +97,5 @@ The response includes "total" (full match count) and "next_cursor": if total exc
 export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createHostListTool(refs.kubeconfigRef),
+  readOnlyDelegable: true,
 };

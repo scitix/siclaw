@@ -432,6 +432,8 @@ export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler
  */
 interface ToolsPayload {
   allowedTools: string[] | null;
+  /** Agent type (sre/coordinator/custom) — drives the box's locked persona. */
+  agentType?: string;
 }
 
 /**
@@ -442,6 +444,8 @@ interface ToolsPayload {
  */
 export interface ToolsStateTarget {
   allowedToolsState: string[] | null;
+  /** Agent type resolved from the tool-capabilities payload; drives the persona. */
+  agentTypeState?: string;
 }
 
 /**
@@ -479,6 +483,7 @@ export function createToolsHandler(
       // resolveCapabilities(null) === null and agent-factory's null=all-tools.
       const allowed = Array.isArray(payload?.allowedTools) ? payload.allowedTools : null;
       target.allowedToolsState = allowed;
+      target.agentTypeState = typeof payload?.agentType === "string" ? payload.agentType : "custom";
       return allowed ? allowed.length : 0;
     },
 

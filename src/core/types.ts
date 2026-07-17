@@ -12,6 +12,42 @@ import type { MemoryIndexer } from "../memory/indexer.js";
 
 export type SessionMode = "web" | "channel" | "cli" | "task";
 
+// ── Delegation (agent-to-agent, siclaw-native via the gateway) ──
+
+/**
+ * Entry-form of a prompt, as stamped by the caller (web / api / a2a / channel /
+ * cron). Used for audit categorization and to carry the entry context into a
+ * delegated turn. `undefined` ⇒ web.
+ */
+export type OriginKind = "web" | "api" | "a2a" | "channel" | "task";
+
+/**
+ * Present when this turn was delegated by a coordinator agent to a peer,
+ * siclaw-native via the gateway's internal delegate API. Its presence marks the
+ * turn as delegated; `readOnly` carries the permission tier. Carried end-to-end
+ * from the delegate request to the worker's ToolRefs so the worker can (a) gate
+ * its toolset read-only when asked and (b) stamp the result artifact with
+ * `delegationId`.
+ *
+ * Wire contract: see docs/design/agent-delegation.md.
+ */
+export interface DelegationContext {
+  /** Correlates this delegated turn back to the coordinator's delegation record. */
+  delegationId: string;
+  /** Coordinator's session id (metadata; not load-bearing for the worker). */
+  parentSessionId?: string;
+  /** Coordinator's agent id (metadata; not load-bearing for the worker). */
+  parentAgentId?: string;
+  /**
+   * Permission tier. Default `false`: the peer runs under ITS OWN configuration
+   * (capabilities / persona / model) — coordinator and worker manage their
+   * permissions independently, so delegation does NOT downgrade the peer.
+   * `true` is an explicit opt-in that filters the worker's toolset to
+   * read-only-delegable tools only; it is not imposed by the delegate transport.
+   */
+  readOnly: boolean;
+}
+
 // ── Mutable ref types ──
 
 export interface KubeconfigRef {

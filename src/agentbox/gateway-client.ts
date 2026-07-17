@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
+import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
 
 export interface GatewayClientOptions {
   gatewayUrl: string;
@@ -157,6 +158,99 @@ export class GatewayClient {
   }
 
   /**
+   * Agent-to-agent delegation (caller side), LIVE-streaming: ask the gateway to
+   * run a bounded read-only task on a PEER agent. The gateway streams the peer's
+   * events back as Server-Sent Events; `onPeerEvent` fires per peer chat.event
+   * (so the coordinator can render the peer's steps live), and the promise
+   * resolves with the final result when the `delegate_result` frame arrives.
+   * The gateway re-validates the peer is in this box's coordinator roster.
+   *
+   * Generous timeout (10 min, matching the exec ceiling) — a real read-only
+   * investigation easily exceeds the 5s default.
+   */
+  delegateStream(req: DelegateRequest, onPeerEvent: (evt: Record<string, unknown>) => void, signal?: AbortSignal): Promise<DelegateResponse> {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        resolve({ ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], error: "delegation stopped" });
+        return;
+      }
+      const url = new URL("/api/internal/delegate", this.gatewayUrl);
+      const isHttps = url.protocol === "https:";
+      const requestOptions: https.RequestOptions = {
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path: url.pathname,
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        ...(isHttps && this.tlsOptions ? this.tlsOptions : {}),
+      };
+      const client = isHttps ? https : http;
+      let result: DelegateResponse | undefined;
+      const request = client.request(requestOptions, (res: any) => {
+        // Pre-stream error (non-200): body is a plain JSON error.
+        if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+          let body = "";
+          res.on("data", (c: Buffer) => { body += c.toString(); });
+          res.on("end", () => {
+            let error = `Gateway returned ${res.statusCode}`;
+            try { error = (JSON.parse(body) as { error?: string }).error ?? error; } catch { /* keep */ }
+            resolve({ ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], error });
+          });
+          return;
+        }
+        let buffer = "";
+        res.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).replace(/^ /, "");
+            if (!data) continue;
+            let frame: any;
+            try { frame = JSON.parse(data); } catch { continue; }
+            if (frame?.type === "peer_event" && frame.event) {
+              try { onPeerEvent(frame.event as Record<string, unknown>); } catch { /* best-effort render */ }
+            } else if (frame?.type === "delegate_session" && frame.peerSessionId) {
+              // Early frame: peer session id, known at delegation start. Forward as a
+              // synthetic event so the translator can surface it to the card live.
+              try { onPeerEvent({ type: "delegate_session", peerSessionId: frame.peerSessionId }); } catch { /* best-effort */ }
+            } else if (frame?.type === "delegate_result" && frame.result) {
+              result = frame.result as DelegateResponse;
+            }
+          }
+        });
+        res.on("end", () => {
+          resolve(result ?? { ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], error: "delegation stream ended without a result" });
+        });
+      });
+      request.on("error", (err: Error) => reject(new Error(`Delegate request failed: ${err.message}`)));
+      // A delegated diagnosis is a long-running task — the peer runs its sub-agents
+      // FOREGROUND, so a multi-node investigation legitimately takes many minutes
+      // (observed 7-8 min). The old 10 min ceiling cut those off ("coordinator got
+      // no report"). Allow up to 30 min; on timeout the request is destroyed, which
+      // the gateway detects and uses to abort the peer turn.
+      request.setTimeout(1_800_000, () => { request.destroy(); reject(new Error("Delegate request timed out after 30 min")); });
+      // Stop: tearing down the request closes the connection, which the gateway
+      // detects and uses to cancel the peer's turn. Resolve cleanly (the request's
+      // subsequent 'error' is ignored once the promise has settled).
+      if (signal) {
+        signal.addEventListener("abort", () => {
+          try { request.destroy(); } catch { /* already gone */ }
+          resolve(result ?? { ok: false, peerAgentId: req.peerAgentId, status: "failed", steps: [], error: "delegation stopped" });
+        }, { once: true });
+      }
+      request.write(JSON.stringify(req));
+      request.end();
+    });
+  }
+
+  /** Fetch this coordinator's delegation roster (authorization + manifest). */
+  async fetchDelegates(): Promise<DelegatesResponse> {
+    return this.request("/api/internal/delegates", "GET");
+  }
+
+  /**
    * Return a GatewaySyncClientLike adapter for use with sync handlers.
    * Keeps `request()` private while exposing a minimal interface.
    */
@@ -169,7 +263,7 @@ export class GatewayClient {
   /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
-  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any): Promise<any> {
+  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any, timeoutMs = 5000): Promise<any> {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
@@ -215,7 +309,7 @@ export class GatewayClient {
         reject(new Error(`Gateway request failed: ${err.message}`));
       });
 
-      req.setTimeout(5000, () => {
+      req.setTimeout(timeoutMs, () => {
         req.destroy();
         reject(new Error("Gateway request timeout"));
       });

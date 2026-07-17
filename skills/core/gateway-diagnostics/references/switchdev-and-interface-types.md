@@ -38,7 +38,7 @@ If the target interface is a **PF (physical function) in switchdev mode**
 Test the actual VF data path through a RoCE pod:
 
 1. Run `node-list-roce-pods` on the node to find a RoCE pod.
-2. Use this skill's **pod target** (`resolve_pod_netns` → `node_script` with
-   `netns=`) against that pod's interface (typically `net1`).
+2. Use this skill's **pod target** (`node_script` with `pod=` — one step; node +
+   netns resolved automatically) against that pod's interface (typically `net1`).
 
 See `roce-diag-sriov-switchdev` for full background on SR-IOV switchdev mode.

@@ -143,8 +143,9 @@ one mechanism (`src/tools/infra/pod-netns-resolve.ts` resolves pod → netns):
   - kubectl: `node_exec(pod, namespace, command)` / `node_script(pod, …)` — node is resolved too.
   - ssh: `host_exec(host=<node>, pod, namespace, command)` / `host_script(…)` — `host` is the node;
     its SSH credential must be **root** (crictl + `ip netns exec` need CAP_SYS_ADMIN).
-- **Advanced / reuse** — `resolve_pod_netns(pod, namespace)` → `{node, netns}`, then
-  `node_exec(node, netns, command)`; lets one resolution serve many commands.
+- **Advanced** — pass a pre-resolved `netns` (+ `node`) to `node_exec` / `node_script` to run in
+  a specific network namespace directly. The one-step `pod=` path re-resolves per call; `netns=`
+  is the escape hatch when you already hold a netns name.
 
 The netns/nsenter/`ip netns exec` prefix is always **tool-constructed** (never raw model input):
 the inner command goes through the same whitelist; the netns name (from crictl) is regex-validated.

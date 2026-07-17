@@ -38,6 +38,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     model_id VARCHAR(255),
     model_routing TEXT,
     tool_capabilities TEXT,
+    agent_type VARCHAR(32) NOT NULL DEFAULT 'custom',
     system_prompt TEXT,
     is_production TINYINT(1) NOT NULL DEFAULT 1,
     idle_timeout_sec INT NOT NULL DEFAULT 300,
@@ -94,6 +95,18 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     PRIMARY KEY (agent_id, host_id),
     CONSTRAINT fk_ah_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
     CONSTRAINT fk_ah_host FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
+  )`,
+
+  // Delegation roster: which peer agents a coordinator agent is authorized to
+  // delegate to (agent-to-agent delegation). Membership IS the authorization
+  // (config-time, not derived). Both columns reference agents(id); a delete of
+  // either side cascades the roster row. Mirrors agent_clusters/agent_hosts.
+  `CREATE TABLE IF NOT EXISTS agent_delegates (
+    coordinator_agent_id CHAR(36) NOT NULL,
+    member_agent_id CHAR(36) NOT NULL,
+    PRIMARY KEY (coordinator_agent_id, member_agent_id),
+    CONSTRAINT fk_ad_coordinator FOREIGN KEY (coordinator_agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_ad_member FOREIGN KEY (member_agent_id) REFERENCES agents(id) ON DELETE CASCADE
   )`,
 
   // Skills + MCP servers must be created BEFORE their junction tables below,
@@ -584,6 +597,9 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "knowledge_publish_events", "idx_kpe_repo", "repo_id, created_at");
   // hosts jump chain reverse lookup
   await ensureIndex(db, "hosts", "idx_hosts_jump", "jump_host_id");
+  // agent_delegates reverse lookup (who may delegate to this member) — the PK
+  // already covers the forward (coordinator → members) direction.
+  await ensureIndex(db, "agent_delegates", "idx_agent_delegates_member", "member_agent_id");
 }
 
 export async function runPortalMigrations(): Promise<void> {
@@ -605,6 +621,7 @@ export async function runPortalMigrations(): Promise<void> {
   // JSON column type) for MySQL+SQLite dual-compat. NULL = no selection = all
   // tools (backward-compatible with agents predating this feature).
   await safeAlterTable(db, "agents", "tool_capabilities", "TEXT DEFAULT NULL");
+  await safeAlterTable(db, "agents", "agent_type", "VARCHAR(32) NOT NULL DEFAULT 'custom'");
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
   await safeAlterTable(db, "model_entries", "vision", "TINYINT(1) NOT NULL DEFAULT 0");

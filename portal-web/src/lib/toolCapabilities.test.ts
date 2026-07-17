@@ -8,9 +8,10 @@ import {
 const KNOWN_KEYS = CAPABILITY_GROUPS.map((g) => g.key)
 
 describe("CAPABILITY_GROUPS shape", () => {
-  it("declares exactly the 10 designed groups", () => {
-    expect(CAPABILITY_GROUPS).toHaveLength(10)
+  it("declares exactly the 11 designed groups", () => {
+    expect(CAPABILITY_GROUPS).toHaveLength(11)
     expect([...KNOWN_KEYS].sort()).toEqual([
+      "delegate_agents",
       "inspect_infra",
       "plan_tasks",
       "read_files",

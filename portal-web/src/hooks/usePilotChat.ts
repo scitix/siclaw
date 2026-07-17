@@ -85,6 +85,13 @@ export interface ChatMessage {
 interface UsePilotChatOptions {
   agentId: string
   sessionId: string | null
+  /**
+   * Treat the session as live even when server-side liveness can't confirm it. Used by the
+   * delegated-peer drawer (PeerSessionView): the peer session runs in the PEER's box, so
+   * chatSessionStatus() against the coordinator agent always reports not-running — without this
+   * the drawer would never live-feed the peer's relayed chat.event stream and stay static.
+   */
+  forceLive?: boolean
 }
 
 interface UsePilotChatReturn {
@@ -215,6 +222,11 @@ export function formatToolInput(toolName: string, args?: Record<string, unknown>
       .map((task) => typeof task === "object" && task ? (task as Record<string, unknown>).scope : undefined)
       .find((scope) => typeof scope === "string" && scope.length > 0) as string | undefined
     return firstScope ? `${count} sub-agent tasks · ${firstScope}` : `${count} sub-agent tasks`
+  }
+  if (name === "delegate_to_agent") {
+    const who = (args.agent_name as string) || (args.agent_id as string) || ""
+    const task = (args.task as string) || ""
+    return who && task ? `${who}: ${task}` : who || task
   }
   if (name === "local_script") {
     const skill = (args.skill as string) || ""
@@ -982,7 +994,7 @@ function hasActiveAsyncDelegationSurface(messages: PilotMessage[]): boolean {
   return hasRunningAsyncDelegationMessages(messages) || hasPendingDelegationSynthesis(messages)
 }
 
-export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePilotChatReturn {
+export function usePilotChat({ agentId, sessionId, forceLive }: UsePilotChatOptions): UsePilotChatReturn {
   const [messages, setMessages] = useState<PilotMessage[]>([])
   // The session id that `messages` currently belong to. Kept in lockstep with every
   // wholesale `setMessages` in the session-switch effect below so a stale-messages window
@@ -1131,6 +1143,10 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         // (recoveredLiveRef); the DB poller is the fallback only when liveness is unavailable/false.
         let live = false
         try { live = (await chatSessionStatus(agentId, sessionId!)).running } catch { /* fail-safe: static */ }
+        // A delegated-peer drawer forces live: its box liveness is unobservable from
+        // the coordinator agent, so trust the caller's "still running" signal and
+        // live-feed the relayed chat.event stream.
+        if (forceLive) live = true
         if (cancelled) return
         const recoveredActive = live || hasRunning || hasPendingDelegationSynthesis(pilotMsgs)
         setStreaming(recoveredActive)
@@ -1487,7 +1503,12 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           // a ref also keeps it out of this effect's deps so the EventSource isn't re-subscribed.
           handleChatEventRef.current?.(evt)
           if (evt?.type === "prompt_done" || evt?.type === "done") {
-            recoveredLiveRef.current = false
+            // forceLive (delegated-peer drawer): the peer's foreground sub-agents each
+            // emit their own prompt_done mid-turn — stopping the live feed on the first
+            // one froze "thinking" after the initial flash. Keep the feed alive across
+            // prompt_done for the drawer's lifetime (still reconcile via refetch); the
+            // EventSource is torn down on close. Non-forceLive sessions stop as before.
+            if (!forceLive) recoveredLiveRef.current = false
             scheduleRefetch()
           }
         }
@@ -1495,12 +1516,21 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     })
     // EventSource auto-reconnects on transient errors; nothing to do here.
 
+    // forceLive (delegated-peer drawer): the relayed chat.event live-feed is built
+    // for /send semantics and a stray prompt_done ends it early, so it can't be the
+    // sole freshness source. Poll a lightweight page-1 refetch while open — the
+    // peer's rows grow as its turn streams, so the drawer stays current robustly.
+    const pollTimer = forceLive ? setInterval(() => { if (!closed) void refetchHistory() }, 3000) : null
+
     return () => {
       closed = true
       if (refetchTimer) clearTimeout(refetchTimer)
+      if (pollTimer) clearInterval(pollTimer)
       es.close()
     }
-  }, [agentId, sessionId])
+    // forceLive is read inside (the peer-drawer poll + keep-feed-alive-across-prompt_done
+    // branch); include it so a flip re-arms the effect even without a session-id change.
+  }, [agentId, sessionId, forceLive])
 
   // Process a chat.event from the SSE stream
   const handleChatEvent = useCallback(

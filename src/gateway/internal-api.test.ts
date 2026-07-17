@@ -220,14 +220,14 @@ describe("handleToolCapabilities", () => {
     const res = new FakeRes();
     await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ allowedTools: null });
+    expect(JSON.parse(res.body)).toEqual({ allowedTools: null, agentType: "custom" });
   });
 
   it("treats an empty selection as null (whitelist off)", async () => {
     frontend.responses.set("config.getAgent", { tool_capabilities: [] });
     const res = new FakeRes();
     await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
-    expect(JSON.parse(res.body)).toEqual({ allowedTools: null });
+    expect(JSON.parse(res.body)).toEqual({ allowedTools: null, agentType: "custom" });
   });
 
   it("500 when the agent lookup fails", async () => {

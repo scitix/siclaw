@@ -139,6 +139,43 @@ describe("ToolRegistry", () => {
     expect(names()).toEqual(["task_create", "bash"]); // default = normal
   });
 
+  it("read-only delegation keeps ONLY readOnlyDelegable tools", () => {
+    const reg = new ToolRegistry();
+    reg.register(
+      { category: "query", create: () => stubToolDef("cluster_list"), readOnlyDelegable: true },
+      { category: "cmd-exec", create: () => stubToolDef("node_exec") }, // write — not tagged
+      { category: "workflow", create: () => stubToolDef("report_findings"), readOnlyDelegable: true },
+      { category: "workflow", create: () => stubToolDef("channel_update") }, // not tagged
+    );
+    const refs = stubRefs({
+      delegation: { delegationId: "d1", readOnly: true },
+      sessionEventEmitter: () => {},
+    });
+    const tools = reg.resolve({ mode: "web", refs });
+    expect(tools.map((t) => t.name).sort()).toEqual(["cluster_list", "report_findings"]);
+  });
+
+  it("write-tier delegation (readOnly:false) does NOT apply the read-only filter", () => {
+    const reg = new ToolRegistry();
+    reg.register(
+      { category: "query", create: () => stubToolDef("cluster_list"), readOnlyDelegable: true },
+      { category: "cmd-exec", create: () => stubToolDef("node_exec") },
+    );
+    const refs = stubRefs({ delegation: { delegationId: "d1", readOnly: false } });
+    const tools = reg.resolve({ mode: "web", refs });
+    expect(tools.map((t) => t.name).sort()).toEqual(["cluster_list", "node_exec"]);
+  });
+
+  it("non-delegated turn is unaffected by the read-only filter", () => {
+    const reg = new ToolRegistry();
+    reg.register(
+      { category: "query", create: () => stubToolDef("cluster_list"), readOnlyDelegable: true },
+      { category: "cmd-exec", create: () => stubToolDef("node_exec") },
+    );
+    const tools = reg.resolve({ mode: "web", refs: stubRefs() });
+    expect(tools.map((t) => t.name).sort()).toEqual(["cluster_list", "node_exec"]);
+  });
+
   it("annotates tools that require explicit user approval", () => {
     const reg = new ToolRegistry();
     reg.register(

@@ -19,6 +19,8 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
+import { AGENT_TYPES, normalizeAgentType } from "../core/agent-types.js";
+import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
 
@@ -55,7 +57,10 @@ export function registerAgentRoutes(
 
     const query = parseQuery(req.url ?? "");
     const page = Math.max(1, parseInt(query.page ?? "1", 10));
-    const pageSize = Math.min(100, Math.max(1, parseInt(query.page_size ?? "20", 10)));
+    // Cap 500 (not 100): the Delegates roster picker fetches the full agent list
+    // in one page (page_size=500) to choose delegation targets. A 100 cap silently
+    // hid agents beyond the first 100 from the roster.
+    const pageSize = Math.min(500, Math.max(1, parseInt(query.page_size ?? "20", 10)));
     const search = query.search ?? "";
     const offset = (page - 1) * pageSize;
 
@@ -75,7 +80,7 @@ export function registerAgentRoutes(
 
     const listParams = [...params, pageSize, offset];
     const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id, a.model_routing,
-        a.is_production, a.idle_timeout_sec, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
+        a.agent_type, a.is_production, a.idle_timeout_sec, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
         (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
@@ -112,9 +117,10 @@ export function registerAgentRoutes(
       return;
     }
 
+    const agentType = normalizeAgentType(body.agent_type);
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, system_prompt, is_production, idle_timeout_sec, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, agent_type, system_prompt, is_production, idle_timeout_sec, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -124,7 +130,11 @@ export function registerAgentRoutes(
         body.model_id ?? null,
         modelRouting ?? null,
         toolCapabilities ?? null,
-        body.system_prompt ?? null,
+        agentType,
+        // Built-in types (sre/coordinator) use a LOCKED persona — never store a
+        // Custom system_prompt for them (the runtime would use it as the base
+        // prompt and merely append the type persona). Only custom keeps its own.
+        agentType === "custom" ? (body.system_prompt ?? null) : null,
         body.is_production ?? 1,
         normalizeIdleTimeoutSec(body.idle_timeout_sec),
         body.icon ?? null,
@@ -133,8 +143,9 @@ export function registerAgentRoutes(
       ],
     );
 
-    // Auto-bind builtin skills to new agent
-    try {
+    // Auto-bind builtin skills to new agent — skipped for types that default to
+    // no skills (e.g. a Coordinator, which routes rather than executes).
+    if (!AGENT_TYPES[agentType].defaultNoSkills) try {
       const [builtinSkills] = await db.query(
         "SELECT id FROM skills WHERE is_builtin = 1 AND status = 'installed' AND org_id = ?",
         [auth.orgId],
@@ -200,21 +211,50 @@ export function registerAgentRoutes(
       newIdleTimeoutSec = normalizeIdleTimeoutSec(body.idle_timeout_sec);
     }
 
+    // Built-in agent types (sre/coordinator) use a LOCKED persona and must NOT
+    // carry a Custom system_prompt (the runtime would use it as the base prompt
+    // and merely append the type persona → contradictory hidden instructions).
+    // Determine the EFFECTIVE type post-update (body override, else the stored
+    // value) and force system_prompt to null for non-custom — the UI hides the
+    // field for built-in types but still submits its stale value.
+    let effectiveAgentType: string | null = null;
+    if ("agent_type" in body) {
+      effectiveAgentType = normalizeAgentType(body.agent_type);
+    } else if ("system_prompt" in body) {
+      const [cur] = await db.query("SELECT agent_type FROM agents WHERE id = ?", [params.id]) as any;
+      effectiveAgentType = normalizeAgentType(cur[0]?.agent_type);
+    }
+    const forceNullPrompt = effectiveAgentType !== null && effectiveAgentType !== "custom";
+
     // Build dynamic SET clause
     const fields = [
       "name", "description", "status", "model_provider",
-      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "icon", "color",
+      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "icon", "color", "agent_type",
     ];
     const setClauses: string[] = [];
     const values: unknown[] = [];
 
     for (const field of fields) {
       if (field in body) {
-        setClauses.push(`${field} = ?`);
-        // newIdleTimeoutSec is non-null here: field === "idle_timeout_sec" implies
-        // "idle_timeout_sec" in body, which is exactly when it was computed above.
-        values.push(field === "idle_timeout_sec" ? newIdleTimeoutSec! : body[field]);
+        if (field === "system_prompt" && forceNullPrompt) {
+          setClauses.push("system_prompt = ?");
+          values.push(null);
+        } else if (field === "agent_type") {
+          setClauses.push("agent_type = ?");
+          values.push(normalizeAgentType(body.agent_type));
+        } else {
+          setClauses.push(`${field} = ?`);
+          // newIdleTimeoutSec is non-null here: field === "idle_timeout_sec" implies
+          // "idle_timeout_sec" in body, which is exactly when it was computed above.
+          values.push(field === "idle_timeout_sec" ? newIdleTimeoutSec! : body[field]);
+        }
       }
+    }
+    // Switching to a built-in type without an explicit system_prompt in the body:
+    // still clear any stale Custom prompt left on the row.
+    if (forceNullPrompt && !("system_prompt" in body)) {
+      setClauses.push("system_prompt = ?");
+      values.push(null);
     }
     if ("model_routing" in body) {
       try {
@@ -270,9 +310,10 @@ export function registerAgentRoutes(
       connectionMap.notify(params.id, "agent.reload", { resources: ["skills", "cluster", "host"] });
     }
 
-    // tool_capabilities change → push a tools reload so the active AgentBox
-    // re-fetches its whitelist and invalidates live sessions (mid-turn-safe).
-    if (toolCapabilitiesChanged) {
+    // tool_capabilities OR agent_type change → push a tools reload so the active
+    // AgentBox re-fetches its whitelist + type (caps/persona are type-locked) and
+    // invalidates live sessions (mid-turn-safe).
+    if (toolCapabilitiesChanged || ("agent_type" in body)) {
       connectionMap.notify(params.id, "agent.reload", { agentId: params.id, resources: ["tools"] });
     }
 
@@ -285,6 +326,13 @@ export function registerAgentRoutes(
     // spawn reads the new value, so we don't disrupt a live box for them.
     if ("idle_timeout_sec" in body && oldIdleTimeoutSec === 0 && (newIdleTimeoutSec ?? 0) > 0) {
       connectionMap.notify(params.id, "agent.terminate", { agentId: params.id });
+    }
+
+    // A change to this agent's roster-visible attributes must refresh any coordinator
+    // that delegates to it (its manifest line: name / description / status; and its
+    // coverage via is_production, which filters the visible cluster/host set).
+    if ("name" in body || "description" in body || "status" in body || "is_production" in body) {
+      void notifyCoordinatorsForMembers(connectionMap, [params.id]);
     }
   });
 
@@ -314,8 +362,17 @@ export function registerAgentRoutes(
       console.warn(`[agent-api] delete ${params.id}: runtime terminate failed: ${termResult.error}`);
     }
 
+    // Refresh coordinators that delegate to this agent. Order matters: CAPTURE the
+    // coordinator ids BEFORE the delete (the FK cascade removes the agent_delegates
+    // reverse rows), then DELETE, then NOTIFY. Notifying before the delete would let a
+    // coordinator rebuild + re-fetch the still-present row, re-caching the doomed peer
+    // with no later invalidation.
+    const dependentCoordinators = await collectDependentCoordinators([params.id]);
+
     await db.query("DELETE FROM agents WHERE id = ?", [params.id]);
     sendJson(res, 200, { deleted: true, terminate: termResult });
+
+    notifyCoordinators(connectionMap, dependentCoordinators);
   });
 
   // PUT /api/v1/agents/:id/resources — bind resources (admin only)
@@ -330,6 +387,7 @@ export function registerAgentRoutes(
       mcp_server_ids?: string[];
       channel_ids?: string[];
       knowledge_repo_ids?: string[];
+      delegate_agent_ids?: string[];
     }>(req);
 
     const db = getDb();
@@ -383,6 +441,15 @@ export function registerAgentRoutes(
           await conn.query("INSERT INTO agent_knowledge_repos (agent_id, repo_id) VALUES (?, ?)", [agentId, kid]);
         }
       }
+      if (body.delegate_agent_ids !== undefined) {
+        // Delegation roster: peer agents this coordinator may delegate to.
+        // Drop self-references (an agent can't delegate to itself) + dedupe.
+        await conn.query("DELETE FROM agent_delegates WHERE coordinator_agent_id = ?", [agentId]);
+        for (const mid of [...new Set(body.delegate_agent_ids)]) {
+          if (mid === agentId) continue;
+          await conn.query("INSERT INTO agent_delegates (coordinator_agent_id, member_agent_id) VALUES (?, ?)", [agentId, mid]);
+        }
+      }
 
       await conn.commit();
     } catch (err) {
@@ -396,6 +463,9 @@ export function registerAgentRoutes(
 
     // Notify running AgentBox to reload (fire-and-forget)
     connectionMap.notify(params.id, "agent.reload", { agentId: params.id });
+    // This agent's cluster/host bindings changed → its coverage in any coordinator's
+    // roster is now stale; refresh the coordinators that delegate to it.
+    void notifyCoordinatorsForMembers(connectionMap, [params.id]);
   });
 
   // GET /api/v1/agents/:id/resources — get bindings
@@ -406,7 +476,7 @@ export function registerAgentRoutes(
     const db = getDb();
     const agentId = params.id;
 
-    const [[clusters], [hosts], [skills], [mcpServers], [channels], [knowledgeRepos]] = await Promise.all([
+    const [[clusters], [hosts], [skills], [mcpServers], [channels], [knowledgeRepos], [delegates]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
          JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
@@ -437,6 +507,11 @@ export function registerAgentRoutes(
          JOIN knowledge_repos kr ON akr.repo_id = kr.id WHERE akr.agent_id = ?`,
         [agentId],
       ),
+      db.query(
+        `SELECT a.id, a.name, a.description FROM agent_delegates ad
+         JOIN agents a ON ad.member_agent_id = a.id WHERE ad.coordinator_agent_id = ?`,
+        [agentId],
+      ),
     ]) as any;
 
     sendJson(res, 200, {
@@ -446,6 +521,7 @@ export function registerAgentRoutes(
       mcp_servers: mcpServers,
       channels,
       knowledge_repos: knowledgeRepos,
+      delegates,
     });
   });
 
@@ -475,8 +551,8 @@ export function registerAgentRoutes(
       await conn.beginTransaction();
 
       await conn.query(
-        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, system_prompt, is_production, icon, color, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, agent_type, system_prompt, is_production, icon, color, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           newId,
           newName,
@@ -485,6 +561,7 @@ export function registerAgentRoutes(
           source.model_provider,
           source.model_id,
           source.model_routing,
+          source.agent_type ?? "custom",
           source.system_prompt,
           source.is_production,
           source.icon,
@@ -550,6 +627,18 @@ export function registerAgentRoutes(
         await conn.query(
           "INSERT INTO agent_knowledge_repos (agent_id, repo_id) VALUES (?, ?)",
           [newId, row.repo_id],
+        );
+      }
+
+      // Copy delegation roster (peer agents this coordinator may delegate to)
+      const [delegateRows] = await conn.query(
+        "SELECT member_agent_id FROM agent_delegates WHERE coordinator_agent_id = ?",
+        [sourceId],
+      ) as any;
+      for (const row of delegateRows) {
+        await conn.query(
+          "INSERT INTO agent_delegates (coordinator_agent_id, member_agent_id) VALUES (?, ?)",
+          [newId, row.member_agent_id],
         );
       }
 

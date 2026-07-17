@@ -9,8 +9,9 @@
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
-  SessionMode, KubeconfigRef, MemoryRef, DpStateRef,
+  SessionMode, KubeconfigRef, MemoryRef, DpStateRef, DelegationContext,
 } from "./types.js";
+import type { DelegateResponse, DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { MemoryIndexer } from "../memory/indexer.js";
 
 export type { SessionMode };
@@ -337,6 +338,44 @@ export interface BackgroundExecWiring {
  */
 export type SessionEventEmitter = (event: Record<string, unknown>) => void;
 
+/** A single live step of a delegated peer's turn — same shape the spawn_subagent
+ *  card renders (assistant reasoning line, or a tool call with its result). */
+export interface DelegateStep {
+  kind: "assistant" | "tool";
+  text?: string;
+  toolName?: string;
+  toolInput?: string;
+  content?: string;
+  outcome?: "success" | "error";
+  durationMs?: number | null;
+}
+
+/** Live progress of a delegated turn, emitted as the peer streams. Mirrors the
+ *  spawn_subagent progress shape so the coordinator card updates identically. */
+export interface DelegateProgress {
+  toolCalls: number;
+  steps: DelegateStep[];
+  activity?: string;
+  /** The peer session id, known from delegation start — lets the card show the
+   *  "open full session" affordance live (before the final result arrives). */
+  childSessionId?: string;
+}
+
+/**
+ * Delegates a bounded read-only task to a PEER agent (its own box, reached via
+ * the gateway) and resolves with the peer's final result. `onProgress` fires as
+ * the peer streams (live steps), so the caller can render the peer's work in
+ * real time. Injected per-session from agentbox (which holds the gatewayClient).
+ * Absent → the `delegate_to_agent` tool stays out of the resolved tool list.
+ */
+export type DelegateToAgentExecutor = (
+  req: { peerAgentId: string; text: string; peerSessionId?: string },
+  onProgress?: (p: DelegateProgress) => void,
+  /** Aborts the delegation when the coordinator's turn is stopped: closes the
+   *  relay stream and cancels the peer's turn. */
+  signal?: AbortSignal,
+) => Promise<DelegateResponse>;
+
 /** All dependencies shared by tool factory functions. */
 export interface ToolRefs {
   kubeconfigRef: KubeconfigRef;
@@ -387,6 +426,25 @@ export interface ToolRefs {
   taskOutputReader?: TaskOutputReader;
   /** Sends an agent-selected visible update to the active IM channel; Gateway owns delivery policy. */
   channelMessageExecutor?: ChannelMessageExecutor;
+  /**
+   * Present when this turn was delegated by a coordinator agent to a peer,
+   * siclaw-native via the gateway's internal delegate API. Its presence marks a
+   * delegated turn; `readOnly` drives the read-only
+   * tool filter in `resolve()`. Tools use it to gate visibility (report_findings
+   * appears only when delegated; channel_update is suppressed) and to stamp the
+   * result artifact with `delegationId`. See docs/design/agent-delegation.md.
+   */
+  delegation?: DelegationContext;
+  /**
+   * Delegation roster for a COORDINATOR agent: the peer agents it may delegate
+   * to, with derived manifest (name/description/bindings). Non-empty + an
+   * executor present → the `delegate_to_agent` tool is exposed and its
+   * description lists these peers. Delivered from the gateway (K8s boxes have no
+   * DB). See docs/design/agent-delegation.md §5.
+   */
+  delegationRoster?: DelegateRosterMember[];
+  /** Runs a delegation to a peer agent. See DelegateToAgentExecutor. */
+  delegateToAgentExecutor?: DelegateToAgentExecutor;
 }
 
 /** Declarative registration for a single tool. */
@@ -425,6 +483,16 @@ export interface ToolEntry {
    * Omit = always available.
    */
   available?: (refs: ToolRefs) => boolean;
+
+  /**
+   * True on tools safe to expose in a READ-ONLY DELEGATED turn (queries, reads,
+   * the result-artifact reporter). When `refs.delegation?.readOnly` is set,
+   * `resolve()` keeps ONLY tools with this flag — every exec/script/mutation tool
+   * drops out, so a delegated worker physically cannot write. Omit = not exposed
+   * under read-only delegation. Orthogonal to `allowedTools` (per-agent capability
+   * whitelist) — both filters apply. See docs/design/agent-delegation.md §8.
+   */
+  readOnlyDelegable?: boolean;
 
   /**
    * Operating modes that expose this tool. Omit = available in every mode (the
@@ -470,11 +538,19 @@ export class ToolRegistry {
   }): ResolvedToolDefinition[] {
     const { mode, refs, allowedTools, activeMode = "normal" } = opts;
 
-    // 1. session-mode + operating-mode + available check (create not called yet)
+    // Read-only delegated turn: the worker was delegated a bounded task by a
+    // coordinator over the mesh, at the read-only tier (design §8). Keep ONLY
+    // tools tagged readOnlyDelegable — this drops every exec/script/mutation
+    // tool, so the worker physically cannot write. Non-delegated turns and
+    // write-tier delegation (P1) are unaffected.
+    const delegatedReadOnly = refs.delegation?.readOnly === true;
+
+    // 1. session-mode + operating-mode + delegation + available check (create not called yet)
     const applicable = this.entries.filter(
       (e) =>
         (!e.modes || e.modes.includes(mode)) &&
         (!e.availableModes || e.availableModes.includes(activeMode)) &&
+        (!delegatedReadOnly || e.readOnlyDelegable === true) &&
         (!e.available || e.available(refs)),
     );
 

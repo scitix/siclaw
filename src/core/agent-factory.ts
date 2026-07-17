@@ -45,7 +45,7 @@ import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryE
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
-import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
+import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
   sessionManager?: SessionManager;
@@ -55,6 +55,18 @@ export interface CreateSiclawSessionOpts {
   activeMode?: AgentMode;
   /** True when building a spawned sub-agent (child) — hides the plan/task tools. */
   isSubagent?: boolean;
+  /**
+   * Present when this turn was delegated by a coordinator agent over the mesh.
+   * When `readOnly`, the resolved toolset is filtered to read-only-delegable tools
+   * (registry `readOnlyDelegable` + read file tools), so a delegated worker cannot
+   * write/remediate. See docs/design/agent-delegation.md §8.
+   */
+  delegation?: DelegationContext;
+  /** Coordinator side: peer agents this agent may delegate to (manifest for the
+   *  delegate_to_agent tool). Non-empty + executor → the tool is exposed. */
+  delegationRoster?: import("./tool-registry.js").ToolRefs["delegationRoster"];
+  /** Coordinator side: runs a delegation to a peer agent (gateway-mediated). */
+  delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
   /** Agent tool allow-list: null = all tools, string[] = only these tools */
   allowedTools?: string[] | null;
   /** Extra system prompt content appended for agent customization */
@@ -403,16 +415,27 @@ export async function createSiclawSession(
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
-      // Channel (Feishu/DingTalk) is the one entry that BOTH exposes spawn_subagent (see its
-      // registration `modes`) AND has no persistent client to receive a detached conclusion —
-      // so a detached batch would strand its result. Force sub-agents foreground there. web/cli
-      // also have spawn_subagent but are persistent (keep background); a2a/api/task don't expose
-      // spawn_subagent at all, so they're unaffected either way. run_in_background exec untouched.
-      foregroundSubagentOnly: mode === "channel",
+      // Force sub-agents foreground when a detached batch's conclusion would be
+      // stranded because the caller blocks on the turn's own result and has no
+      // persistent client to receive a later notification:
+      //   • Channel (Feishu/DingTalk): exposes spawn_subagent, no persistent client.
+      //   • Delegated peer (any delegation turn): the gateway prompts it with no
+      //     mode → it runs as "web" (so it has FULL capabilities incl. spawn), but
+      //     the coordinator delegates SYNCHRONOUSLY (drains one turn's stream). A
+      //     backgrounded batch would return an intermediate "started…" and the
+      //     coordinator would poll by re-delegating. Foreground makes the one turn
+      //     carry the complete result.
+      // Direct api/a2a/task calls need no handling here: spawn_subagent's `modes`
+      // are web/channel/cli only, so those entries never expose it. web/cli keep
+      // background (persistent clients). run_in_background exec is untouched.
+      foregroundSubagentOnly: mode === "channel" || opts?.delegation != null,
       jobStopExecutor: opts?.jobStopExecutor,
       backgroundExecExecutor: opts?.backgroundExecExecutor,
       taskOutputReader: opts?.taskOutputReader,
       channelMessageExecutor: opts?.channelMessageExecutor,
+      delegation: opts?.delegation,
+      delegationRoster: opts?.delegationRoster,
+      delegateToAgentExecutor: opts?.delegateToAgentExecutor,
     },
     allowedTools,
     activeMode: opts?.activeMode ?? "normal",
@@ -476,6 +499,12 @@ export async function createSiclawSession(
   const writeAllowedDirs = [userDataDir];
   const blockedMemoryDir = memoryEnabled ? null : memoryDir;
 
+  // Read-only delegated turn: drop the write file tools (Edit/Write) so a
+  // delegated worker cannot mutate even its own scratch dir. Reads (Read/Grep/
+  // Find/Ls) stay. These tools live outside the registry, so the resolve()
+  // readOnlyDelegable filter doesn't reach them — gate them here instead.
+  const delegatedReadOnly = opts?.delegation?.readOnly === true;
+
   const restrictedFileTools = [
     createReadTool(cwd, {
       operations: {
@@ -483,19 +512,21 @@ export async function createSiclawSession(
         access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK); },
       },
     }),
-    createEditTool(cwd, {
-      operations: {
-        readFile: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsReadFile(p); },
-        writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsWriteFile(p, c, "utf-8"); },
-        access: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK | fs.constants.W_OK); },
-      },
-    }),
-    createWriteTool(cwd, {
-      operations: {
-        writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "write", blockedMemoryDir); return fsWriteFile(p, c, "utf-8"); },
-        mkdir: async (d) => { assertToolPathAllowed(d, writeAllowedDirs, "write", blockedMemoryDir); await fsMkdir(d, { recursive: true }); },
-      },
-    }),
+    ...(delegatedReadOnly ? [] : [
+      createEditTool(cwd, {
+        operations: {
+          readFile: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsReadFile(p); },
+          writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsWriteFile(p, c, "utf-8"); },
+          access: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK | fs.constants.W_OK); },
+        },
+      }),
+      createWriteTool(cwd, {
+        operations: {
+          writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "write", blockedMemoryDir); return fsWriteFile(p, c, "utf-8"); },
+          mkdir: async (d) => { assertToolPathAllowed(d, writeAllowedDirs, "write", blockedMemoryDir); await fsMkdir(d, { recursive: true }); },
+        },
+      }),
+    ]),
     createGrepTool(cwd, {
       operations: {
         isDirectory: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedMemoryDir); return fs.statSync(p).isDirectory(); },

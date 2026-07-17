@@ -94,6 +94,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_skills_overlay",
       "idx_skills_org_name",
       "idx_hosts_jump",
+      "idx_agent_delegates_member",
     ];
 
     await runPortalMigrations();

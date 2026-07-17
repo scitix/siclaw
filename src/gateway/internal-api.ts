@@ -26,6 +26,7 @@ import {
 } from "./channels/background-delivery.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import { resolveCapabilities } from "../core/tool-capabilities.js";
+import { normalizeAgentType, effectiveCapabilityKeys } from "../core/agent-types.js";
 import type {
   DelegationAppendMessagePayload,
   DelegationEventPayload,
@@ -286,12 +287,14 @@ export async function handleToolCapabilities(
     const agent = await frontendClient.request("config.getAgent", {
       agentId: identity.agentId,
     });
-    // tool_capabilities is the stored group-key array (null/empty = unrestricted).
-    // resolveCapabilities(null/[]) === null keeps the backward-compatible default.
-    const allowedTools = resolveCapabilities(
-      (agent?.tool_capabilities ?? null) as string[] | null,
-    );
-    sendJson(res, 200, { allowedTools });
+    // Built-in types (sre/coordinator) LOCK the capability set; custom uses the
+    // agent's own tool_capabilities. resolveCapabilities(null/[]) === null keeps
+    // the backward-compatible "unrestricted" default for custom with no selection.
+    const agentType = normalizeAgentType(agent?.agent_type);
+    const capsKeys = effectiveCapabilityKeys(agentType, (agent?.tool_capabilities ?? null) as string[] | null);
+    const allowedTools = resolveCapabilities(capsKeys);
+    // agentType rides along so the box can apply the type's locked persona.
+    sendJson(res, 200, { allowedTools, agentType });
   } catch (err) {
     console.error("[internal-api] tool-capabilities error:", err);
     sendJson(res, 500, { error: "Internal server error" });

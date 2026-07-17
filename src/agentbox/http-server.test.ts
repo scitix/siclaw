@@ -86,7 +86,7 @@ vi.mock("./gateway-client.js", () => ({
 }));
 
 // Import SUT after mocks.
-import { createHttpServer } from "./http-server.js";
+import { createHttpServer, resolveDelegation } from "./http-server.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1327,5 +1327,31 @@ describe("http-server — idle self-destruct", () => {
     const { onIdleShutdown } = arm({ idleTimeoutMs: 1000, disableIdleShutdown: true });
     vi.advanceTimersByTime(60 * 60 * 1000);
     expect(onIdleShutdown).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveDelegation (worker autonomy — readOnly is explicit opt-in)", () => {
+  it("returns undefined for a non-delegated turn", () => {
+    expect(resolveDelegation(undefined, "web")).toBeUndefined();
+    // A malformed marker without a delegationId is treated as non-delegated.
+    expect(resolveDelegation({ delegationId: "", readOnly: false }, "web")).toBeUndefined();
+  });
+
+  it("does NOT downgrade the worker: readOnly=false survives from ANY origin", () => {
+    expect(resolveDelegation({ delegationId: "d1", readOnly: false }, "web")).toEqual({ delegationId: "d1", readOnly: false });
+    // Non-interactive origins no longer force read-only — the worker runs under its own config.
+    for (const origin of ["task", "a2a", "api", "channel"] as const) {
+      expect(resolveDelegation({ delegationId: "d1", readOnly: false }, origin)?.readOnly).toBe(false);
+    }
+  });
+
+  it("defaults to NOT read-only when the flag is omitted (worker autonomous)", () => {
+    expect(resolveDelegation({ delegationId: "d1" } as any, "web")?.readOnly).toBe(false);
+    expect(resolveDelegation({ delegationId: "d1" } as any, "api")?.readOnly).toBe(false);
+  });
+
+  it("honors an EXPLICIT read-only=true opt-in (future read-only tier)", () => {
+    expect(resolveDelegation({ delegationId: "d1", readOnly: true }, "web")?.readOnly).toBe(true);
+    expect(resolveDelegation({ delegationId: "d1", readOnly: true }, "api")?.readOnly).toBe(true);
   });
 });

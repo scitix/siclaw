@@ -487,4 +487,12 @@ export const registration: ToolEntry = {
       executor: refs.backgroundExecExecutor,
       sessionIdRef: refs.sessionIdRef,
     }),
+  // Safe under read-only delegation: kubectl is capped to read-only subcommands
+  // (kubectl exec + config view --raw explicitly blocked), the command-validator
+  // rejects output redirection and command/process substitution, the whitelist
+  // (command-sets.ts COMMANDS) contains only non-mutating binaries, and this tool
+  // runs in the agentbox's own context — it creates NO cluster resources (unlike
+  // node/pod/host_exec, which pin a debug pod). This gives a delegated worker real
+  // kubectl read-only diagnosis. See docs/design/agent-delegation.md §8.
+  readOnlyDelegable: true,
 };
