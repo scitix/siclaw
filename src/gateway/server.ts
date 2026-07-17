@@ -808,6 +808,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     })) as {
       test_session_id: string;
       snapshot_hash: string;
+      consumer_fingerprint: string;
       pages: number;
     };
     driveTestSession({
@@ -827,6 +828,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       run_id: runId,
       test_session_id: opened.test_session_id,
       snapshot_hash: opened.snapshot_hash,
+      consumer_fingerprint: opened.consumer_fingerprint,
       pages: opened.pages,
     };
     return res;

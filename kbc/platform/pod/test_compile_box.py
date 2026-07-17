@@ -662,8 +662,9 @@ async def test_test_session_driver_readonly():
 
 async def test_open_close_test_session_http():
     """POST /test-session pins the parent draft into a snapshot dir and starts a
-    session (200 + hash + pages); unknown parent → 404; missing index.md → 400;
-    concurrency cap → 429; close tears down (snapshot dir + registry entry gone)."""
+    session (200 + snapshot/consumer hashes + pages); unknown parent → 404;
+    missing index.md → 400; concurrency cap → 429; close tears down
+    (snapshot dir + registry entry gone)."""
     orig = compile_box.ClaudeSDKClient
     compile_box.ClaudeSDKClient = _FakeSDKClient
     compile_box.RUNS.clear()
@@ -689,6 +690,8 @@ async def test_open_close_test_session_http():
         body = await r.json()
         tid = body["test_session_id"]
         assert body["pages"] == 2 and len(body["snapshot_hash"]) == 64, body
+        assert len(body["consumer_fingerprint"]) == 64, body
+        assert body["consumer_fingerprint"] == compile_box.TEST_SESSIONS[tid].consumer_fingerprint
         kidx = Path(snap_root) / tid / ".siclaw" / "knowledge" / "index.md"
         assert kidx.read_text() == "# index\n"
 
@@ -1083,6 +1086,16 @@ async def test_prompt_packs_locale():
     assert "全部合理候选页之后" in zh_role, zh_role
     assert "only after checking the index and every plausible page" in en_role, en_role
     assert "没有检索工具" not in zh_role and "there is no search tool" not in en_role
+
+    # A regression round's consumer identity is deterministic and changes only
+    # with answer-affecting contract inputs. Tool order is not semantic.
+    fp_en = compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-a")
+    assert len(fp_en) == 64
+    assert fp_en == compile_box._test_consumer_fingerprint("en", ["Grep", "Read", "Glob"], "model-a", "sdk-a")
+    assert fp_en != compile_box._test_consumer_fingerprint("zh", ["Read", "Glob", "Grep"], "model-a", "sdk-a")
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-b", "sdk-a")
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-b")
+    assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read"], "model-a", "sdk-a")
 
     with tempfile.TemporaryDirectory() as snap:
         root = Path(snap)
