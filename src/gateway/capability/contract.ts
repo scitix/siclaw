@@ -43,6 +43,7 @@ export const CAPABILITY_TEST_START = "capability.testStart" as const;
 export const CAPABILITY_TEST_MESSAGE = "capability.testMessage" as const;
 export const CAPABILITY_TEST_CLOSE = "capability.testClose" as const;
 export const CAPABILITY_TEST_RECOMMEND = "capability.testRecommend" as const;
+export const CAPABILITY_TEST_REFERENCE_ASSIST = "capability.testReferenceAssist" as const;
 
 /** siclaw → consumer: live stream + content sink + input fetch. */
 export const CAPABILITY_EVENT = "capability.event" as const;
@@ -229,6 +230,39 @@ export interface CapabilityTestRecommendResponse {
   reference_answer: string;
   evidence_paths: string[];
 }
+
+/**
+ * Short-lived, knowledge-grounded assistance while an owner authors one
+ * reference answer. The reviewer is isolated from both the compiler session
+ * and the blind test consumer; results are transient until the owner saves.
+ */
+export interface CapabilityTestReferenceAssistRequest {
+  run_id: string;
+  mode: "suggest" | "polish";
+  question: string;
+  draft_answer?: string;
+  evidence_paths?: string[];
+}
+
+export interface CapabilityTestReferenceSuggestion {
+  style: "concise" | "complete" | "boundary";
+  answer: string;
+  evidence_paths: string[];
+}
+
+export type CapabilityTestReferenceAssistResponse =
+  | {
+      run_id: string;
+      mode: "suggest";
+      candidates: CapabilityTestReferenceSuggestion[];
+    }
+  | {
+      run_id: string;
+      mode: "polish";
+      polished_answer: string;
+      evidence_paths: string[];
+      warnings: string[];
+    };
 
 export interface CapabilityTestCloseResponse {
   ok: true;

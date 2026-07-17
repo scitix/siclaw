@@ -41,6 +41,8 @@ import type {
   CapabilityTestCloseResponse,
   CapabilityTestRecommendRequest,
   CapabilityTestRecommendResponse,
+  CapabilityTestReferenceAssistRequest,
+  CapabilityTestReferenceAssistResponse,
   CapabilityTestMessageRequest,
   CapabilityTestStartRequest,
   CapabilityTestStartResponse,
@@ -869,6 +871,60 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       evidence_paths: recommended.evidence_paths,
     };
     return response;
+  });
+
+  rpcMethods.set("capability.testReferenceAssist", async (params) => {
+    const req = params as unknown as CapabilityTestReferenceAssistRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    if (req.mode !== "suggest" && req.mode !== "polish") throw new Error("mode must be suggest or polish");
+    if (!req.question?.trim()) throw new Error("question is required");
+    if (req.mode === "polish" && !req.draft_answer?.trim()) throw new Error("draft_answer is required for polish");
+    const rec = capabilityRunManager.get(req.run_id) ?? (await capabilityRunManager.adopt(req.run_id));
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${req.run_id}`);
+    capabilityRunManager.touch(req.run_id);
+    const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
+    const assisted = await client.postJson<
+      | {
+          ok: true;
+          mode: "suggest";
+          candidates: Extract<CapabilityTestReferenceAssistResponse, { mode: "suggest" }>["candidates"];
+        }
+      | {
+          ok: true;
+          mode: "polish";
+          polished_answer: string;
+          evidence_paths: string[];
+          warnings: string[];
+        }
+    >(
+      `/test-reference-assist/${req.run_id}`,
+      {
+        mode: req.mode,
+        question: req.question,
+        ...(req.draft_answer ? { draft_answer: req.draft_answer } : {}),
+        ...(req.evidence_paths?.length ? { evidence_paths: req.evidence_paths } : {}),
+      },
+      75_000,
+    );
+    if (assisted.mode === "suggest") {
+      const response: CapabilityTestReferenceAssistResponse = {
+        run_id: req.run_id,
+        mode: "suggest",
+        candidates: assisted.candidates,
+      };
+      return response;
+    }
+    if (assisted.mode === "polish") {
+      const response: CapabilityTestReferenceAssistResponse = {
+        run_id: req.run_id,
+        mode: "polish",
+        polished_answer: assisted.polished_answer,
+        evidence_paths: assisted.evidence_paths,
+        warnings: assisted.warnings,
+      };
+      return response;
+    }
+    throw new Error("reference assistant returned an unexpected mode");
   });
 
   rpcMethods.set("capability.testClose", async (params) => {
