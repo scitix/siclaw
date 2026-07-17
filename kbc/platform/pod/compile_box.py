@@ -2850,7 +2850,9 @@ def _test_sdk_version() -> str:
 
 
 def _effective_test_allowed_tools(allowed_tools: list[str] | None) -> list[str]:
-    return list(allowed_tools or DEFAULT_TEST_ALLOWED_TOOLS)
+    requested = DEFAULT_TEST_ALLOWED_TOOLS if allowed_tools is None else allowed_tools
+    disallowed = set(READONLY_CONSUMER_DISALLOWED_TOOLS)
+    return [tool_name for tool_name in requested if tool_name not in disallowed]
 
 
 def _test_consumer_fingerprint(

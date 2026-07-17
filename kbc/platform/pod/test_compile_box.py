@@ -667,7 +667,7 @@ async def test_test_session_driver_uses_captured_contract():
     try:
         with tempfile.TemporaryDirectory() as snap:
             run = compile_box.TestRun("t-contract", snap, parent_run_id="p1", snapshot_hash="h")
-            run.allowed_tools = ["Read"]
+            run.allowed_tools = ["Read", "Bash"]
             run.consumer_model = "captured-model"
             run.consumer_max_turns = 7
             await compile_box.test_session_driver(run)
@@ -1118,6 +1118,11 @@ async def test_prompt_packs_locale():
     assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-b", 60)
     assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read"], "model-a", "sdk-a", 60)
     assert fp_en != compile_box._test_consumer_fingerprint("en", ["Read", "Glob", "Grep"], "model-a", "sdk-a", 61)
+    assert (
+        compile_box._test_consumer_fingerprint("en", ["Read", "Bash"], "model-a", "sdk-a", 60)
+        == compile_box._test_consumer_fingerprint("en", ["Read"], "model-a", "sdk-a", 60)
+    )
+    assert compile_box._effective_test_allowed_tools([]) == []
 
     with tempfile.TemporaryDirectory() as snap:
         root = Path(snap)
