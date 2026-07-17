@@ -10,6 +10,8 @@ import { SchedulePanel } from "./chat/SchedulePanel"
 import { PlanPanel } from "./plan/PlanPanel"
 import { foldPlan } from "./plan/foldPlan"
 import { SubagentTranscript } from "./plan/SubagentTranscript"
+import { PeerSessionView } from "./chat/PeerSessionView"
+import { latestDelegateCardStatus } from "../lib/delegateCard"
 import { JobsBar } from "./plan/JobsBar"
 import type { ChatAttachment, PilotMessage } from "./chat/types"
 
@@ -155,7 +157,7 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
   const [skillPanelMsg, setSkillPanelMsg] = useState<PilotMessage | null>(null)
   const [schedulePanelMsg, setSchedulePanelMsg] = useState<PilotMessage | null>(null)
   const [showPlan, setShowPlan] = useState(true)
-  const [subagentDrill, setSubagentDrill] = useState<{ childSessionId: string; status?: string; label?: string } | null>(null)
+  const [subagentDrill, setSubagentDrill] = useState<{ childSessionId: string; status?: string; label?: string; full?: boolean } | null>(null)
 
   // Auto-title: track whether we already titled this session
   const titledSessionRef = useRef<string | null>(null)
@@ -298,6 +300,21 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
     setSchedulePanelMsg(null)
   }, [activeSessionId])
 
+  // Keep the open peer-session drawer's liveness in sync with the delegate card's
+  // CURRENT status. `subagentDrill.status` is a snapshot captured when the drawer
+  // opened, so without this the drawer's "Live" badge + forced polling would stay on
+  // after the delegate card reaches a terminal state. A CONTINUED delegation reuses
+  // the same child_session_id, so the timeline can hold several cards for one peer
+  // session — search from the END for the LATEST matching card, so a freshly-opened
+  // running continuation isn't overwritten by an earlier card's terminal status.
+  useEffect(() => {
+    if (!subagentDrill?.full) return
+    const current = latestDelegateCardStatus(pilot.messages, subagentDrill.childSessionId)
+    if (current && current !== subagentDrill.status) {
+      setSubagentDrill((prev) => (prev ? { ...prev, status: current } : prev))
+    }
+  }, [pilot.messages, subagentDrill?.full, subagentDrill?.childSessionId, subagentDrill?.status])
+
   const handleNewSession = useCallback(async () => {
     try {
       const session = await api<ChatSession>(`/siclaw/agents/${agentId}/chat/sessions`, { method: "POST" })
@@ -418,7 +435,7 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
       </div>
 
       {/* Chat content */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="relative flex flex-1 overflow-hidden">
         {activeSessionId ? (
           <>
             <div className="relative flex flex-1 min-w-0">
@@ -446,7 +463,7 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
                   setSkillPanelMsg(null)
                   setSchedulePanelMsg(msg)
                 }}
-                onOpenSubagent={(childSessionId, status, label) => setSubagentDrill({ childSessionId, status, label })}
+                onOpenSubagent={(childSessionId, status, label, opts) => setSubagentDrill({ childSessionId, status, label, full: opts?.full })}
               />
               {/* Plan: a floating overlay panel, toggled from the top bar's plan button. */}
               {showPlan && planActive && (
@@ -460,13 +477,24 @@ export function AgentChat({ agentId, selectedSessionId, onSessionChange }: Agent
               <SchedulePanel message={schedulePanelMsg} onClose={() => setSchedulePanelMsg(null)} />
             )}
             {subagentDrill && agentId && (
-              <SubagentTranscript
-                agentId={agentId}
-                childSessionId={subagentDrill.childSessionId}
-                status={subagentDrill.status}
-                label={subagentDrill.label}
-                onClose={() => setSubagentDrill(null)}
-              />
+              subagentDrill.full ? (
+                <PeerSessionView
+                  agentId={agentId}
+                  sessionId={subagentDrill.childSessionId}
+                  status={subagentDrill.status}
+                  label={subagentDrill.label}
+                  onClose={() => setSubagentDrill(null)}
+                  onOpenSubagent={(childSessionId, status, label, opts) => setSubagentDrill({ childSessionId, status, label, full: opts?.full })}
+                />
+              ) : (
+                <SubagentTranscript
+                  agentId={agentId}
+                  childSessionId={subagentDrill.childSessionId}
+                  status={subagentDrill.status}
+                  label={subagentDrill.label}
+                  onClose={() => setSubagentDrill(null)}
+                />
+              )
             )}
           </>
         ) : (

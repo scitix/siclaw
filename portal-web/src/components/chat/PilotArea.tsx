@@ -27,6 +27,7 @@ import {
   Download,
   CircleAlert,
   Layers,
+  ExternalLink,
 } from "lucide-react"
 import { cn } from "./cn"
 import { Markdown } from "./Markdown"
@@ -308,7 +309,7 @@ export interface PilotAreaProps {
   sessionKey?: string | null
   onOpenSkillPanel?: (msg: PilotMessage) => void
   onOpenSchedulePanel?: (msg: PilotMessage) => void
-  onOpenSubagent?: (childSessionId: string, status?: string, label?: string) => void
+  onOpenSubagent?: (childSessionId: string, status?: string, label?: string, opts?: { full?: boolean }) => void
   agentId?: string
   /** Read-only transcript: hides the composer and edit/steer/dig-deeper affordances.
    *  Used by the admin session-snapshot view. Message rendering is unchanged. */
@@ -601,7 +602,7 @@ export function PilotArea({
   const visibleForCopy = useMemo(() => messages.filter(isVisibleChatMessage), [messages])
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-card relative">
+    <div className="flex-1 flex flex-col h-full bg-card relative min-w-0">
       {visibleForCopy.length > 0 && (
         <div className="absolute top-2 left-3 z-10">
           <button
@@ -1195,6 +1196,10 @@ function statusTone(status?: string): { label: string; className: string } {
       return { label: "Timed out", className: "bg-amber-500/10 text-amber-400 border-amber-500/30" }
     case "partial":
       return { label: "Partial", className: "bg-amber-500/10 text-amber-300 border-amber-500/30" }
+    case "stopped":
+      return { label: "Stopped", className: "bg-amber-500/10 text-amber-400 border-amber-500/30" }
+    case "input_required":
+      return { label: "Needs input", className: "bg-blue-500/10 text-blue-300 border-blue-500/30" }
     case "aborted":
     case "cancelled":
       return { label: "Cancelled", className: "bg-amber-500/10 text-amber-400 border-amber-500/30" }
@@ -1419,9 +1424,11 @@ function agentWorkSummary(message: PilotMessage): {
     numberValue(metadata.durationMs)
   return {
     target: rawTarget,
-    targetLabel: isSelfDelegation ? "self sub-agent" : (targetName ? `${targetName} · ${rawTarget}` : rawTarget),
+    // Human-facing target: the agent NAME, never the raw UUID (which bloated the
+    // card subtitle). Fall back to a neutral word when the name is unknown.
+    targetLabel: isSelfDelegation ? "self sub-agent" : (targetName || "specialist"),
     isSelfDelegation,
-    scope: stringValue(args.description) ?? stringValue(args.scope) ?? stringValue(args.prompt) ?? stringValue(metadata.scope) ?? message.toolInput,
+    scope: stringValue(args.task) ?? stringValue(args.description) ?? stringValue(args.scope) ?? stringValue(args.prompt) ?? stringValue(metadata.scope) ?? message.toolInput,
     summary: normalizeAgentWorkSummary(
       // Background spawn: the folded sub-agent report (subBgSummary), not the launch JSON.
       stringValue(metadata.subBgSummary) ??
@@ -1496,8 +1503,9 @@ function MessageItem({
   onChipClick?: (chip: FillActionChip, meta: { isDpCheckpoint: boolean }) => void
   onOpenSkillPanel?: (msg: PilotMessage) => void
   onOpenSchedulePanel?: (msg: PilotMessage) => void
-  /** Drill into a child sub-agent transcript (used by the group card's per-item rows). */
-  onOpenSubagent?: (childSessionId: string, status?: string, label?: string) => void
+  /** Drill into a child sub-agent transcript (used by the group card's per-item rows).
+   *  `opts.full` opens the rich full-session view (delegated peers) vs the compact transcript. */
+  onOpenSubagent?: (childSessionId: string, status?: string, label?: string, opts?: { full?: boolean }) => void
   agentId?: string
   canEditMessage?: boolean
   editingContent?: string | null
@@ -1528,7 +1536,7 @@ function MessageItem({
       return <SubagentGroupCard message={message} onOpenSubagent={onOpenSubagent} />
     }
     if (message.toolName === "delegate_to_agent" || message.toolName === "spawn_subagent" || message.metadata?.kind === "agent_work") {
-      return <AgentWorkCard message={message} />
+      return <AgentWorkCard message={message} onOpenSubagent={onOpenSubagent} />
     }
     if (message.toolName === "skill_preview" && !message.isStreaming) {
       return (
@@ -1936,9 +1944,18 @@ function SubagentSteps({ steps }: { steps: SubagentStepView[] }) {
   )
 }
 
-function AgentWorkCard({ message }: { message: PilotMessage }) {
+function AgentWorkCard({ message, onOpenSubagent }: { message: PilotMessage; onOpenSubagent?: (childSessionId: string, status?: string, label?: string, opts?: { full?: boolean }) => void }) {
   const work = agentWorkSummary(message)
   const steps = (message.toolDetails?.steps as SubagentStepView[] | undefined) ?? []
+  // Drop plan-bookkeeping tool rows (task_create/update/…) — they're noise in a
+  // step summary; the plan is a panel, not a row per update.
+  const TASK_STEP_TOOLS = new Set(["task_create", "task_update", "task_list", "task_get"])
+  const visibleSteps = steps.filter((s) => !(s.kind === "tool" && s.toolName && TASK_STEP_TOOLS.has(s.toolName)))
+  // The autonomous peer's final narrative is BOTH the last assistant step and
+  // work.summary (finalText) → don't render the Findings block when it just
+  // repeats the last step.
+  const lastAssistantText = [...visibleSteps].reverse().find((s) => s.kind === "assistant")?.text?.trim()
+  const showFindings = Boolean(work.summary && work.summary.trim() !== lastAssistantText)
   // Queued = waiting for a concurrency slot. pi paints the whole fan-out batch as
   // "running" at once (one tool_execution_start each), so without this the queued
   // children would falsely show a spinner; the backend flips status to "queued".
@@ -1950,19 +1967,30 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
   const bgSubDone = Boolean(message.metadata?.subBgStatus)
   const isRunning = !isQueued && (message.toolStatus === "running" || message.isStreaming || (isBgSubagent && !bgSubDone))
   const isSpawn = message.toolName === "spawn_subagent"
-  // Collapsed by default — the user expands the card when they want to see the
-  // execution. (Legacy delegate cards keep auto-opening while streaming.)
+  // Collapsed by default (including while streaming) — the header shows the
+  // status; the user expands to watch the delegated agent's live transcript.
   const [expanded, setExpanded] = useState(false)
-  const isOpen = isSpawn ? expanded : message.isStreaming || expanded
+  const isOpen = expanded
+  // Bounded, auto-following transcript: cap the step list's height and follow the
+  // newest step while the delegated/sub agent is still running, so a long run
+  // scrolls inside the card instead of growing the card without bound.
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (isOpen && isRunning && scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+  }, [steps.length, isOpen, isRunning])
   const tone = statusTone(work.status)
-  const title = isSpawn ? "Sub-agent" : work.isSelfDelegation ? "Delegated investigation" : "Expert collaboration"
+  const title = isSpawn ? "Sub-agent" : work.isSelfDelegation ? "Delegated investigation" : `Delegated to ${work.targetLabel}`
 
   return (
     <div className="pl-12 min-w-0">
-      <div className="bg-card border border-border rounded-xl shadow-sm shadow-black/10 overflow-hidden max-w-3xl">
+      <div className="bg-card border border-border rounded-xl shadow-sm shadow-black/10 overflow-hidden">
+        <div className="flex items-center bg-secondary/70">
         <button
           type="button"
-          className="flex items-center gap-3 w-full px-4 py-3 bg-secondary/70 hover:bg-secondary transition-colors text-left min-w-0"
+          className="flex items-center gap-3 flex-1 px-4 py-3 hover:bg-secondary transition-colors text-left min-w-0"
+          // Expanding shows the FULL delegated prompt (delegates) / the inline step
+          // view (spawn). The peer's live transcript lives in the drawer, opened by
+          // the icon button on the right — not by expanding.
           onClick={() => setExpanded(!expanded)}
         >
           <ChevronRight
@@ -1994,21 +2022,41 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
                 {tone.label}
               </span>
             </div>
-            {!isSpawn && (
-              <div className="text-xs text-muted-foreground truncate">
-                {`${work.targetLabel}${work.scope ? ` · ${work.scope}` : ""}`}
-              </div>
+            {!isSpawn && work.scope && (
+              <div className="text-xs text-muted-foreground truncate">{work.scope}</div>
             )}
           </div>
+        </button>
+        <div className="flex items-center gap-2 shrink-0 pl-1 pr-3">
+          {!isSpawn && work.childSessionId && onOpenSubagent && (
+            <button
+              type="button"
+              title="Open full session"
+              aria-label="Open full session"
+              onClick={() => onOpenSubagent(work.childSessionId!, work.status, work.targetLabel, { full: true })}
+              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-purple-400"
+            >
+              <ExternalLink className="w-4 h-4" />
+            </button>
+          )}
           {isQueued ? (
             <Clock className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
           ) : isRunning ? (
             <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
           ) : null}
-        </button>
+        </div>
+        </div>
 
-        {isOpen && (
-          <div className="p-4 space-y-3 bg-secondary/20 border-t border-border">
+        {isOpen && !isSpawn && (
+          // Delegate: expanding shows the FULL prompt that was delegated (the peer's
+          // live work is in the drawer, opened via the header icon button).
+          <div className="p-4 bg-secondary/20 border-t border-border max-h-[460px] overflow-y-auto">
+            <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1.5">Delegated task</div>
+            <div className="text-sm text-foreground whitespace-pre-wrap break-words">{work.scope || "(no prompt)"}</div>
+          </div>
+        )}
+        {isSpawn && isOpen && (
+          <div ref={scrollRef} className="p-4 space-y-3 bg-secondary/20 border-t border-border max-h-[460px] overflow-y-auto">
             {isSpawn ? (
               // The card is just the sub-agent's execution process; the conclusion is
               // surfaced by the parent in the main conversation, so no report here.
@@ -2038,33 +2086,22 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
               </div>
             ) : (
               <>
-                <div className="grid gap-2">
-                  <div className="rounded-lg border border-border bg-card/70 p-3">
-                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">
-                      {work.isSelfDelegation ? "Target" : "Target agent"}
-                    </div>
-                    <div className="text-sm text-foreground truncate">{work.targetLabel}</div>
+                {/* Live transcript of the delegated agent — same rendering as the
+                    main window (assistant reasoning + tool calls), streamed in.
+                    The whole card body scrolls (bounded above). */}
+                {visibleSteps.length > 0 ? (
+                  <SubagentSteps steps={visibleSteps} />
+                ) : isRunning ? (
+                  <div className="text-xs text-muted-foreground flex items-center gap-2">
+                    <Loader2 className="w-3 h-3 animate-spin" /> Delegated agent working…
                   </div>
-                </div>
-                {work.scope && (
+                ) : null}
+                {showFindings && (
                   <div>
-                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Scope</div>
-                    <p className="text-sm text-foreground whitespace-pre-wrap">{work.scope}</p>
+                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Findings</div>
+                    <div className="text-sm text-foreground"><Markdown>{work.summary ?? ""}</Markdown></div>
                   </div>
                 )}
-                {work.summary && (
-                  <div>
-                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Capsule sent to parent</div>
-                    <div className="text-sm text-foreground"><Markdown>{work.summary}</Markdown></div>
-                  </div>
-                )}
-                {work.fullSummary && work.fullSummary !== work.summary && (
-                  <div>
-                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Full sub-agent report</div>
-                    <div className="text-sm text-foreground max-h-96 overflow-y-auto pr-2"><Markdown>{work.fullSummary}</Markdown></div>
-                  </div>
-                )}
-                <AgentToolTraceList trace={work.toolTrace} defaultOpen={isRunning} />
               </>
             )}
             <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">

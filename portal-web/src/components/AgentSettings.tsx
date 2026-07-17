@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react"
-import { ArrowDown, ArrowUp, ChevronRight, Loader2, Plus, Save, Trash2, Users } from "lucide-react"
+import { ArrowDown, ArrowUp, Check, ChevronRight, Cpu, Loader2, Plus, Save, Trash2, Users } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
 import { AgentTasks } from "./AgentTasks"
 import { AgentApiKeys } from "./AgentApiKeys"
 import { CapabilityGroupSelector } from "./CapabilityGroupSelector"
 import { toCapabilitySet } from "../lib/toolCapabilities"
+import { AGENT_TYPES, agentTypeOption, type AgentTypeKey } from "../lib/agentTypes"
 
 interface Agent {
   id: string; name: string; description: string; status: string
@@ -13,6 +14,7 @@ interface Agent {
   is_production: boolean; icon: string; color: string; created_at: string
   model_routing?: unknown
   idle_timeout_sec?: number
+  agent_type?: string
   // Wire form: the raw `agents` TEXT column — a JSON string ('["read_files"]')
   // or null, not a decoded array (mirrors model_routing). toCapabilitySet
   // coerces both forms.
@@ -26,6 +28,7 @@ interface AgentResources {
   mcp_servers: { id: string; name: string; transport?: string }[]
   channels: { id: string; name: string; type: string }[]
   knowledge_repos: { id: string; name: string; description?: string }[]
+  delegates?: { id: string; name: string; description?: string }[]
 }
 
 interface AvailableCluster { id: string; name: string; api_server: string; is_production: boolean }
@@ -52,6 +55,7 @@ const TABS = [
   { key: "mcp", label: "MCP" },
   { key: "knowledge", label: "Knowledge" },
   { key: "resources", label: "Resources" },
+  { key: "delegates", label: "Delegates" },
   { key: "channels", label: "Channels" },
   { key: "tasks", label: "Tasks" },
   { key: "api-keys", label: "API Keys" },
@@ -173,6 +177,8 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [isProduction, setIsProduction] = useState(agent.is_production)
   const [idleTimeoutSec, setIdleTimeoutSec] = useState<number>(agent.idle_timeout_sec ?? 300)
   const [selectedCapabilities, setSelectedCapabilities] = useState<Set<string>>(toCapabilitySet(agent.tool_capabilities))
+  const [agentType, setAgentType] = useState<AgentTypeKey>(agentTypeOption(agent.agent_type).key)
+  const typeDef = agentTypeOption(agentType)
 
   // ── Data ──
   const [providers, setProviders] = useState<Provider[]>([])
@@ -192,12 +198,15 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [selectedMcpIds, setSelectedMcpIds] = useState<Set<string>>(new Set())
   const [selectedKnowledgeRepoIds, setSelectedKnowledgeRepoIds] = useState<Set<string>>(new Set())
   const [selectedChannelIds, setSelectedChannelIds] = useState<Set<string>>(new Set())
+  const [selectedDelegateIds, setSelectedDelegateIds] = useState<Set<string>>(new Set())
+  const [allAgents, setAllAgents] = useState<DelegatableAgent[]>([])
   const [skillLabelFilter, setSkillLabelFilter] = useState("")
   const [saving, setSaving] = useState(false)
 
   // Sync form state when agent prop changes
   useEffect(() => {
     setName(agent.name); setDescription(agent.description || "")
+    setAgentType(agentTypeOption(agent.agent_type).key)
     setModelProvider(agent.model_provider || ""); setModelId(agent.model_id || "")
     const modelRouting = parseModelRouting(agent.model_routing)
     setRoutingEnabled(modelRouting?.enabled === true)
@@ -215,6 +224,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     api<{ data: typeof allSkills }>("/siclaw/skills?page_size=500").then(r => setAllSkills(Array.isArray(r.data) ? r.data : [])).catch(() => setAllSkills([])).finally(() => setLoadingSkills(false))
     api<{ data: typeof allMcpServers }>("/siclaw/mcp").then(r => setAllMcpServers(Array.isArray(r.data) ? r.data : [])).catch(() => setAllMcpServers([])).finally(() => setLoadingMcp(false))
     api<{ data: typeof allKnowledgeRepos }>("/siclaw/admin/knowledge/repos").then(r => setAllKnowledgeRepos(Array.isArray(r.data) ? r.data : [])).catch(() => setAllKnowledgeRepos([])).finally(() => setLoadingKnowledge(false))
+    api<{ data: typeof allAgents }>("/agents?page_size=500").then(r => setAllAgents(Array.isArray(r.data) ? r.data : [])).catch(() => setAllAgents([]))
   }, [])
 
   useEffect(() => {
@@ -235,6 +245,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
       setSelectedMcpIds(new Set(resources.mcp_servers?.map(m => m.id) || []))
       setSelectedChannelIds(new Set(resources.channels?.map(c => c.id) || []))
       setSelectedKnowledgeRepoIds(new Set(resources.knowledge_repos?.map((k: any) => k.id) || []))
+      setSelectedDelegateIds(new Set(resources.delegates?.map(d => d.id) || []))
     }
   }, [resources])
 
@@ -260,11 +271,11 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     try {
       const updated = await api<Agent>(`/agents/${agent.id}`, {
         method: "PUT",
-        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, tool_capabilities: Array.from(selectedCapabilities) },
+        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, tool_capabilities: Array.from(selectedCapabilities), agent_type: agentType },
       })
       await api(`/agents/${agent.id}/resources`, {
         method: "PUT",
-        body: { cluster_ids: Array.from(selectedClusterIds), host_ids: Array.from(selectedHostIds), skill_ids: Array.from(selectedSkillIds), mcp_server_ids: Array.from(selectedMcpIds), channel_ids: Array.from(selectedChannelIds), knowledge_repo_ids: Array.from(selectedKnowledgeRepoIds) },
+        body: { cluster_ids: Array.from(selectedClusterIds), host_ids: Array.from(selectedHostIds), skill_ids: Array.from(selectedSkillIds), mcp_server_ids: Array.from(selectedMcpIds), channel_ids: Array.from(selectedChannelIds), knowledge_repo_ids: Array.from(selectedKnowledgeRepoIds), delegate_agent_ids: Array.from(selectedDelegateIds) },
       })
       onUpdate(updated)
       toast.success("Saved — agent will reload automatically")
@@ -274,7 +285,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   }
 
   // Tabs that need the Save button
-  const saveTabs: TabKey[] = ["basic", "model", "tools", "skills", "mcp", "knowledge", "resources", "channels"]
+  const saveTabs: TabKey[] = ["basic", "model", "tools", "skills", "mcp", "knowledge", "resources", "delegates", "channels"]
   const showSave = saveTabs.includes(activeTab)
 
   return (
@@ -310,21 +321,53 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
       {/* Tab content */}
       <div className="flex-1 overflow-auto">
-        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} />}
+        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} promptLocked={typeDef.lockedPrompt} typeLabel={typeDef.label} />}
         {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} routingEnabled={routingEnabled} setRoutingEnabled={setRoutingEnabled} fallbackCandidates={fallbackCandidates} setFallbackCandidates={setFallbackCandidates} />}
         {activeTab === "tools" && (
           <div className="px-6 py-6 space-y-4 max-w-2xl">
+            {/* Agent type — governs the capability set (and, for built-in types, the persona). */}
+            <div>
+              <h3 className="text-[13px] font-medium text-foreground">Agent type</h3>
+              <p className="text-[12px] text-muted-foreground mt-0.5">The type sets this agent's role. SRE / Coordinator lock the capabilities and the system prompt; Custom lets you choose both.</p>
+              <div className="mt-2 space-y-1.5">
+                {AGENT_TYPES.map(t => (
+                  <label key={t.key} className="flex items-start gap-2 p-2 rounded-md border border-border hover:bg-secondary/30 cursor-pointer">
+                    <input type="radio" name="agent-type" className="mt-0.5" checked={agentType === t.key} onChange={() => setAgentType(t.key)} />
+                    <span className="flex-1 min-w-0">
+                      <span className="text-[12px] font-medium text-foreground">{t.label}</span>
+                      <span className="block text-[11px] text-muted-foreground">{t.description}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
             <div>
               <h3 className="text-[13px] font-medium text-foreground">Tool capabilities</h3>
-              <p className="text-[12px] text-muted-foreground mt-0.5">Restrict which built-in tools this agent can use. Changes apply live — the running agent reloads on save.</p>
+              <p className="text-[12px] text-muted-foreground mt-0.5">
+                {typeDef.capabilities
+                  ? "Locked by the agent type — these capabilities are granted automatically."
+                  : "Restrict which built-in tools this agent can use. Changes apply live — the running agent reloads on save."}
+              </p>
             </div>
-            <CapabilityGroupSelector selected={selectedCapabilities} onChange={setSelectedCapabilities} />
+            {typeDef.capabilities ? (
+              <div className="flex flex-wrap gap-1.5">
+                {typeDef.capabilities.map(c => (
+                  <span key={c} className="px-2 py-1 rounded-md text-[11px] font-mono bg-secondary text-muted-foreground border border-border">{c}</span>
+                ))}
+                {typeDef.defaultNoSkills && (
+                  <p className="w-full text-[11px] text-muted-foreground/70 mt-1">No skills bound by default; attach only the routing helpers this coordinator needs (Skills tab).</p>
+                )}
+              </div>
+            ) : (
+              <CapabilityGroupSelector selected={selectedCapabilities} onChange={setSelectedCapabilities} />
+            )}
           </div>
         )}
         {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} isProduction={isProduction} loading={loadingSkills || loadingResources} />}
         {activeTab === "mcp" && <McpTab allMcpServers={allMcpServers} selectedMcpIds={selectedMcpIds} setSelectedMcpIds={setSelectedMcpIds} loading={loadingMcp || loadingResources} />}
         {activeTab === "knowledge" && <KnowledgeTab allRepos={allKnowledgeRepos} selectedIds={selectedKnowledgeRepoIds} setSelectedIds={setSelectedKnowledgeRepoIds} loading={loadingKnowledge || loadingResources} />}
         {activeTab === "resources" && <ResourcesTab allClusters={allClusters} allHosts={allHosts} selectedClusterIds={selectedClusterIds} setSelectedClusterIds={setSelectedClusterIds} selectedHostIds={selectedHostIds} setSelectedHostIds={setSelectedHostIds} loading={loadingResources} isProduction={isProduction} />}
+        {activeTab === "delegates" && <DelegatesTab agentId={agent.id} allAgents={allAgents} selectedDelegateIds={selectedDelegateIds} setSelectedDelegateIds={setSelectedDelegateIds} loading={loadingResources} />}
         {activeTab === "channels" && <ChannelsTab agentId={agent.id} selectedChannelIds={selectedChannelIds} setSelectedChannelIds={setSelectedChannelIds} />}
         {activeTab === "tasks" && <AgentTasks agentId={agent.id} />}
         {activeTab === "api-keys" && <AgentApiKeys agentId={agent.id} />}
@@ -334,6 +377,119 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 }
 
 // ── Tab Components ──────────────────────────────────────
+
+interface DelegatableAgent {
+  id: string; name: string; description?: string
+  agent_type?: string; model_id?: string; model_provider?: string
+  status?: string; is_production?: boolean
+}
+
+const TYPE_BADGE: Record<string, { label: string; className: string }> = {
+  sre: { label: "SRE", className: "bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/30" },
+  coordinator: { label: "Coordinator", className: "bg-purple-500/10 text-purple-600 dark:text-purple-400 border-purple-500/30" },
+  custom: { label: "Custom", className: "bg-muted text-muted-foreground border-border" },
+}
+
+function DelegatesTab({ agentId, allAgents, selectedDelegateIds, setSelectedDelegateIds, loading }: {
+  agentId: string
+  allAgents: DelegatableAgent[]
+  selectedDelegateIds: Set<string>
+  setSelectedDelegateIds: (s: Set<string>) => void
+  loading: boolean
+}) {
+  const [query, setQuery] = useState("")
+  const others = allAgents.filter(a => a.id !== agentId)
+  const q = query.trim().toLowerCase()
+  const filtered = q
+    ? others.filter(a => a.name.toLowerCase().includes(q) || (a.description ?? "").toLowerCase().includes(q))
+    : others
+  // Selected first, then by name — the roster reads as "who's on the team" at a glance.
+  const sorted = [...filtered].sort((a, b) => {
+    const sa = selectedDelegateIds.has(a.id) ? 0 : 1, sb = selectedDelegateIds.has(b.id) ? 0 : 1
+    return sa !== sb ? sa - sb : a.name.localeCompare(b.name)
+  })
+  const toggle = (id: string) => {
+    const next = new Set(selectedDelegateIds)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    setSelectedDelegateIds(next)
+  }
+  return (
+    <div className="px-6 py-6 space-y-4 max-w-3xl">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="text-sm font-semibold text-foreground">Delegate roster</h3>
+          <p className="text-[12px] text-muted-foreground mt-1 leading-relaxed max-w-xl">
+            The specialist agents this one may hand a task to. Each delegate runs in its own environment under
+            its own capabilities and reports back — this agent keeps oversight. Membership here is the
+            authorization: only listed agents can be delegated to.
+          </p>
+        </div>
+        <span className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-primary/10 text-primary border border-primary/20 text-[12px] font-medium">
+          {selectedDelegateIds.size} selected
+        </span>
+      </div>
+
+      {others.length > 6 && (
+        <input
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          placeholder="Search agents…"
+          className="w-full h-9 px-3 rounded-lg border border-border bg-background text-[13px] focus:outline-none focus:ring-2 focus:ring-primary/30"
+        />
+      )}
+
+      {loading ? (
+        <p className="text-[12px] text-muted-foreground/60">Loading…</p>
+      ) : others.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border py-10 text-center">
+          <p className="text-[13px] text-muted-foreground">No other agents available to delegate to.</p>
+          <p className="text-[12px] text-muted-foreground/60 mt-1">Create another agent, then add it here.</p>
+        </div>
+      ) : (
+        <div className="grid gap-2">
+          {sorted.map(a => {
+            const checked = selectedDelegateIds.has(a.id)
+            const type = TYPE_BADGE[a.agent_type ?? "custom"] ?? TYPE_BADGE.custom
+            const model = a.model_id || "No model"
+            return (
+              <button
+                type="button"
+                key={a.id}
+                onClick={() => toggle(a.id)}
+                className={`group flex items-center gap-3 w-full text-left rounded-xl border px-4 py-3 transition-all ${
+                  checked
+                    ? "border-primary/50 bg-primary/[0.06] shadow-sm"
+                    : "border-border bg-card hover:border-border hover:bg-secondary/40"
+                }`}
+              >
+                <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
+                  checked ? "bg-primary border-primary text-primary-foreground" : "border-border bg-background group-hover:border-primary/40"
+                }`}>
+                  {checked && <Check className="h-3.5 w-3.5" />}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-[13px] font-semibold text-foreground truncate">{a.name}</span>
+                    <span className={`shrink-0 px-1.5 py-0.5 rounded-full border text-[10px] font-medium ${type.className}`}>{type.label}</span>
+                    <span className={`shrink-0 px-1.5 py-0.5 rounded-full border text-[10px] font-medium ${a.is_production ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30" : "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30"}`}>
+                      {a.is_production ? "PROD" : "DEV"}
+                    </span>
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-muted-foreground truncate">
+                    {a.description || <span className="italic text-muted-foreground/50">No description</span>}
+                  </div>
+                  <div className="mt-1 flex items-center gap-1.5 text-[10.5px] text-muted-foreground/70">
+                    <Cpu className="h-3 w-3" /> {model}
+                  </div>
+                </div>
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
 
 // Quick-pick windows for the idle self-destruct timer. Resident = 0 (the pod
 // never auto-destroys). Values are seconds; the backend floors any positive
@@ -382,10 +538,11 @@ function IdleTimeoutField({ value, onChange }: { value: number; onChange: (v: nu
   )
 }
 
-function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec }: {
+function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec, promptLocked, typeLabel }: {
   name: string; setName: (v: string) => void; description: string; setDescription: (v: string) => void
   systemPrompt: string; setSystemPrompt: (v: string) => void; isProduction: boolean; setIsProduction: (v: boolean) => void
   idleTimeoutSec: number; setIdleTimeoutSec: (v: number) => void
+  promptLocked: boolean; typeLabel: string
 }) {
   return (
     <div className="px-6 py-6 space-y-5 max-w-2xl">
@@ -399,7 +556,13 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
       </div>
       <div className="space-y-1.5">
         <label className="text-[12px] text-muted-foreground">System Prompt</label>
-        <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional system prompt..." />
+        {promptLocked ? (
+          <p className="text-[12px] text-muted-foreground/70 rounded-md border border-border bg-secondary/30 px-3 py-2">
+            Defined by the <span className="font-medium text-foreground">{typeLabel}</span> type — this agent's system prompt is built in and not editable. Switch to a Custom agent to write your own.
+          </p>
+        ) : (
+          <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional system prompt..." />
+        )}
       </div>
       <IdleTimeoutField value={idleTimeoutSec} onChange={setIdleTimeoutSec} />
       <div className="space-y-2 pt-2">

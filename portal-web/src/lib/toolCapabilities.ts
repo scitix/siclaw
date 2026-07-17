@@ -20,14 +20,15 @@ export interface CapabilityGroup {
 export const CAPABILITY_GROUPS: CapabilityGroup[] = [
   { key: "read_files", name: "Read files", description: "Read & search files and knowledge pages", tools: ["read", "grep", "find", "ls"] },
   { key: "write_sandbox", name: "Write & author skills", description: "Write/edit scratch files and author skills (sandboxed to user-data)", tools: ["write", "edit", "skill_preview"] },
-  { key: "inspect_infra", name: "Inspect infrastructure", description: "Read-only probes of clusters and hosts", tools: ["cluster_list", "host_list", "resolve_pod_netns"] },
+  { key: "inspect_infra", name: "Inspect infrastructure", description: "Read-only discovery of bound clusters and hosts", tools: ["cluster_list", "host_list"] },
   { key: "run_commands", name: "Run commands", description: "Execute whitelisted shell commands (kubectl read-only)", tools: ["bash", "node_exec", "pod_exec", "host_exec"] },
   { key: "run_scripts", name: "Run scripts", description: "Execute scripts on node / pod / host", tools: ["node_script", "pod_script", "local_script", "host_script"] },
   { key: "search_memory", name: "Search memory", description: "Semantic search over long-term memory", tools: ["memory_search", "memory_get"] },
   { key: "plan_tasks", name: "Plan tasks", description: "Create and track a task ledger", tools: ["task_create", "task_update", "task_list", "task_get"] },
-  { key: "spawn_subagents", name: "Spawn sub-agents", description: "Fan out work to sub-agents (privilege amplification)", tools: ["spawn_subagent", "task_output", "job_stop"] },
+  { key: "spawn_subagents", name: "Spawn sub-agents", description: "Fan out work to in-box sub-agents (privilege amplification)", tools: ["spawn_subagent", "task_output", "job_stop"] },
+  { key: "delegate_agents", name: "Delegate to agents", description: "Delegate a bounded task to a peer agent (roster-gated) + inspect delegate coverage", tools: ["delegate_to_agent", "list_delegates"] },
   { key: "scheduling", name: "Scheduling", description: "Manage scheduled / recurring runs", tools: ["manage_schedule"] },
-  { key: "session_output", name: "Session output", description: "Report findings, post channel updates & submit feedback", tools: ["task_report", "save_feedback", "channel_update"] },
+  { key: "session_output", name: "Session output", description: "Report findings, post channel updates & submit feedback", tools: ["task_report", "save_feedback", "channel_update", "report_findings", "request_input"] },
 ]
 
 /** Total distinct tools across the selected group keys (for the UI summary). */

@@ -7,6 +7,7 @@ import { Tooltip } from "../components/tooltip"
 import { useConfirm } from "../components/confirm-dialog"
 import { buildChatPath, chatSessionForAgent } from "../lib/chatSelection"
 import { CapabilityGroupSelector } from "../components/CapabilityGroupSelector"
+import { AGENT_TYPES } from "../lib/agentTypes"
 
 interface Agent {
   id: string; name: string; description: string; status: string
@@ -27,7 +28,7 @@ export function Agents() {
   const [providers, setProviders] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
   const [showCreate, setShowCreate] = useState(false)
-  const [form, setForm] = useState({ name: "", description: "", model_provider: "", model_id: "", is_production: true, tool_capabilities: [] as string[] })
+  const [form, setForm] = useState({ name: "", description: "", model_provider: "", model_id: "", is_production: true, tool_capabilities: [] as string[], agent_type: "custom" as string })
   const [restrictTools, setRestrictTools] = useState(false)
   const [creating, setCreating] = useState(false)
   const navigate = useNavigate()
@@ -52,7 +53,7 @@ export function Agents() {
       setAgents((prev) => [...prev, a])
       setShowCreate(false)
       setRestrictTools(false)
-      setForm({ name: "", description: "", model_provider: "", model_id: "", is_production: true, tool_capabilities: [] })
+      setForm({ name: "", description: "", model_provider: "", model_id: "", is_production: true, tool_capabilities: [], agent_type: "custom" })
     } catch (err: any) { toast.error(err.message) } finally { setCreating(false) }
   }
 
@@ -115,6 +116,20 @@ export function Agents() {
             <label className="block text-sm font-medium mb-1">Description</label>
             <input placeholder="Optional description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
           </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Type</label>
+            <div className="space-y-1.5">
+              {AGENT_TYPES.map((t) => (
+                <label key={t.key} className="flex items-start gap-2 p-2 rounded-md border border-border hover:bg-secondary/30 cursor-pointer">
+                  <input type="radio" name="new-agent-type" className="mt-0.5" checked={form.agent_type === t.key} onChange={() => setForm({ ...form, agent_type: t.key })} />
+                  <span className="flex-1 min-w-0">
+                    <span className="text-sm font-medium">{t.label}</span>
+                    <span className="block text-xs text-muted-foreground">{t.description}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium mb-1">Provider</label>
@@ -156,6 +171,7 @@ export function Agents() {
               <p className="text-xs text-muted-foreground">Production agents only receive approved skills and can only access production clusters/hosts. Dev agents see draft skills and dev resources.</p>
             </div>
           </div>
+          {form.agent_type === "custom" ? (
           <div>
             <div className="flex items-start gap-3">
               <button
@@ -182,6 +198,9 @@ export function Agents() {
               </div>
             )}
           </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">Capabilities and the system prompt are defined by the <span className="font-medium text-foreground">{form.agent_type}</span> type — nothing to configure here.</p>
+          )}
           </div>
           <div className="flex gap-2 p-4 border-t border-border shrink-0">
             <button onClick={handleCreate} disabled={creating || !form.name} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "..." : "Create"}</button>
