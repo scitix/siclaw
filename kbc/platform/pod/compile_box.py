@@ -3412,7 +3412,11 @@ def _reference_assist_session_opts(parent: "CompileRun", root: Path, submit_tool
         setting_sources=[],
         skills=[],
         model=_reference_assist_model(),
-        max_turns=int(os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS", "8")),
+        # The LIGHT reviewer often needs several narrow reads before it can
+        # ground 2-3 candidates. Eight turns proved too small in real KBs and
+        # could end before the mandatory submit call. The wall-clock timeout
+        # remains the hard boundary.
+        max_turns=int(os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS", "20")),
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=str(uuid.uuid4()),
         session_store=InMemorySessionStore(),
@@ -3454,6 +3458,11 @@ async def assist_reference_answer(parent: "CompileRun", payload: dict) -> dict:
                 "\n\nSuggestion mode: return 2-3 independently usable candidates. Each candidate must contain only the answer itself, not research narration or multiple nested versions. Keep simple definition or relationship questions to 1-3 sentences unless the sources show that important boundaries are required.",
                 "\n\n建议模式：返回 2-3 个可独立使用的候选。每个候选只写答案本身，不要写检索过程，也不要在单个候选内再嵌套多个版本。简单定义或关系题默认用 1-3 句回答；仅在原料表明确有重要边界时再展开。",
             )
+        directive += _loc(
+            parent,
+            "\n\nTimebox retrieval. Once the necessary evidence is found, stop reading and call the submit tool; always reserve a turn for submission.",
+            "\n\n请限制检索范围。找到足以回答的证据后立即停止读取并调用提交工具，务必为提交保留一轮。",
+        )
         await client.query(directive)
         async for msg in client.receive_messages():
             if type(msg).__name__ == "ResultMessage":
@@ -4005,7 +4014,7 @@ async def handle_test_reference_assist(request: web.Request):
         return failure(409, "test_session_failed", "a read-only knowledge review is already running", True)
     RECOMMENDATIONS_ACTIVE.add(run_id)
     try:
-        timeout = float(os.environ.get("KBC_REFERENCE_ASSIST_TIMEOUT_SECS", "180"))
+        timeout = float(os.environ.get("KBC_REFERENCE_ASSIST_TIMEOUT_SECS", "600"))
         result = await asyncio.wait_for(_REFERENCE_ASSIST_IMPL(parent, payload), timeout=timeout)
         return web.json_response({"ok": True, **result})
     except asyncio.TimeoutError:

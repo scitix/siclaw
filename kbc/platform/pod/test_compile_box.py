@@ -1071,7 +1071,7 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
 
     compile_box.ClaudeSDKClient = SubmittingClient
     compile_box.create_sdk_mcp_server = capture_server
-    os.environ["KBC_REFERENCE_ASSIST_MAX_TURNS"] = "8"
+    os.environ.pop("KBC_REFERENCE_ASSIST_MAX_TURNS", None)
     os.environ["KBC_PK_BLUE_MODEL"] = "claude-light-admin-config"
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -1092,7 +1092,7 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
             assert opts.allowed_tools == [
                 "Read", "Glob", "Grep", "mcp__reference_assist__submit_reference_suggestions",
             ]
-            assert opts.max_turns == 8
+            assert opts.max_turns == 20
             assert opts.model == "claude-light-admin-config"
             assert opts.setting_sources == [] and opts.skills == [] and opts.strict_mcp_config is True
             assert set(opts.disallowed_tools) >= {"Bash", "Write", "Edit", "Agent", "WebSearch"}

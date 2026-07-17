@@ -904,7 +904,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         ...(req.draft_answer ? { draft_answer: req.draft_answer } : {}),
         ...(req.evidence_paths?.length ? { evidence_paths: req.evidence_paths } : {}),
       },
-      195_000,
+      615_000,
     );
     if (assisted.mode === "suggest") {
       const response: CapabilityTestReferenceAssistResponse = {

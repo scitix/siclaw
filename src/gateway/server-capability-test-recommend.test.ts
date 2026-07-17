@@ -127,7 +127,7 @@ describe("capability.testReferenceAssist", () => {
     expect(posts).toContainEqual({
       path: `/test-reference-assist/${started.run_id}`,
       body: { mode: "suggest", question: "What is the retry limit?" },
-      timeoutMs: 195_000,
+      timeoutMs: 615_000,
     });
   });
 
@@ -159,7 +159,7 @@ describe("capability.testReferenceAssist", () => {
         question: "What is the retry limit?",
         draft_answer: "Retry five times.",
       },
-      timeoutMs: 195_000,
+      timeoutMs: 615_000,
     });
   });
 });
