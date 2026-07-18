@@ -8,6 +8,8 @@ export const TERMINAL_A2A_STATES = new Set([
   "TASK_STATE_REJECTED",
 ]);
 
+const READ_RETRY_DELAYS_MS = [100, 300] as const;
+
 const SIMPLE_STATE: Record<string, SiclawTaskState> = {
   TASK_STATE_SUBMITTED: "submitted",
   TASK_STATE_WORKING: "working",
@@ -42,7 +44,7 @@ export interface SiclawTaskList {
   tasks: SiclawTask[];
   total_size: number;
   page_size: number;
-  next_page_token: string | null;
+  next_page_token: number | null;
 }
 
 export interface ListTaskOptions {
@@ -147,8 +149,26 @@ function errorFromResponse(status: number, payload: unknown): A2aClientError {
   return new A2aClientError(message, {
     httpStatus: status,
     reason,
-    retriable: status === 429 || status === 502 || status === 503 || status === 504,
+    retriable: isRetriableHttpStatus(status),
   });
+}
+
+function isRetriableHttpStatus(status: number): boolean {
+  return status === 408 || status === 429 || status === 500
+    || status === 502 || status === 503 || status === 504;
+}
+
+function normalizeNextPageToken(value: unknown): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  const token = typeof value === "number"
+    ? value
+    : typeof value === "string" ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(token) || token < 0) {
+    throw new A2aClientError("Sicore returned an invalid A2A page token", {
+      reason: "INVALID_A2A_RESPONSE",
+    });
+  }
+  return token;
 }
 
 export class SicoreA2aClient implements SiclawA2aApi {
@@ -161,9 +181,14 @@ export class SicoreA2aClient implements SiclawA2aApi {
     this.agentBaseUrl = `${config.baseUrl}/api/v1/a2a/agents/${encodeURIComponent(config.agentId)}`;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    timeoutMs = this.config.requestTimeoutMs,
+  ): Promise<T> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+    const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
     timer.unref();
     try {
       let response: Response;
@@ -191,7 +216,19 @@ export class SicoreA2aClient implements SiclawA2aApi {
         );
       }
 
-      const raw = await response.text();
+      let raw: string;
+      try {
+        raw = await response.text();
+      } catch (error) {
+        throw new A2aClientError(
+          `Could not read Sicore A2A response: ${error instanceof Error ? error.message : String(error)}`,
+          {
+            httpStatus: response.status,
+            reason: "A2A_RESPONSE_READ_FAILED",
+            retriable: method === "GET",
+          },
+        );
+      }
       let payload: unknown = null;
       if (raw) {
         try {
@@ -200,7 +237,7 @@ export class SicoreA2aClient implements SiclawA2aApi {
           throw new A2aClientError("Sicore returned a non-JSON A2A response", {
             httpStatus: response.status,
             reason: "INVALID_A2A_RESPONSE",
-            retriable: response.status >= 500,
+            retriable: method === "GET" && (response.ok || isRetriableHttpStatus(response.status)),
           });
         }
       }
@@ -209,6 +246,50 @@ export class SicoreA2aClient implements SiclawA2aApi {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  private async readWithRetry<T>(
+    operation: (timeoutMs: number) => Promise<T>,
+    overallDeadline?: number,
+  ): Promise<T> {
+    const operationDeadline = Math.min(
+      overallDeadline ?? Number.POSITIVE_INFINITY,
+      Date.now() + this.config.requestTimeoutMs,
+    );
+    let lastError: A2aClientError | null = null;
+
+    for (let attempt = 0; attempt <= READ_RETRY_DELAYS_MS.length; attempt += 1) {
+      const remaining = operationDeadline - Date.now();
+      if (remaining <= 0) {
+        throw lastError ?? new A2aClientError("Sicore A2A request timed out", {
+          reason: "A2A_TIMEOUT",
+          retriable: true,
+        });
+      }
+      try {
+        return await operation(remaining);
+      } catch (error) {
+        if (!(error instanceof A2aClientError) || !error.retriable) throw error;
+        lastError = error;
+        const retryDelayMs = READ_RETRY_DELAYS_MS[attempt];
+        if (retryDelayMs === undefined || Date.now() + retryDelayMs >= operationDeadline) throw error;
+        await delay(retryDelayMs);
+      }
+    }
+
+    throw lastError ?? new A2aClientError("Sicore A2A read failed");
+  }
+
+  private async loadTask(taskId: string, overallDeadline?: number): Promise<SiclawTask> {
+    return this.readWithRetry(async (timeoutMs) => {
+      const payload = await this.request<{ task?: unknown }>(
+        "GET",
+        `/tasks/${encodeURIComponent(taskId)}`,
+        undefined,
+        timeoutMs,
+      );
+      return normalizeTask(payload.task);
+    }, overallDeadline);
   }
 
   async sendMessage(question: string, contextId?: string): Promise<SiclawTask> {
@@ -223,8 +304,7 @@ export class SicoreA2aClient implements SiclawA2aApi {
   }
 
   async getTask(taskId: string): Promise<SiclawTask> {
-    const payload = await this.request<{ task?: unknown }>("GET", `/tasks/${encodeURIComponent(taskId)}`);
-    return normalizeTask(payload.task);
+    return this.loadTask(taskId);
   }
 
   async cancelTask(taskId: string): Promise<SiclawTask> {
@@ -239,30 +319,46 @@ export class SicoreA2aClient implements SiclawA2aApi {
     if (options.pageSize !== undefined) query.set("pageSize", String(options.pageSize));
     if (options.pageToken !== undefined) query.set("pageToken", String(options.pageToken));
     const suffix = query.size > 0 ? `?${query}` : "";
-    const payload = await this.request<{
-      tasks?: unknown[];
-      totalSize?: number;
-      pageSize?: number;
-      nextPageToken?: string;
-    }>("GET", `/tasks${suffix}`);
-    return {
-      tasks: Array.isArray(payload.tasks) ? payload.tasks.map(normalizeTask) : [],
-      total_size: typeof payload.totalSize === "number" ? payload.totalSize : 0,
-      page_size: typeof payload.pageSize === "number" ? payload.pageSize : 0,
-      next_page_token: payload.nextPageToken ? payload.nextPageToken : null,
-    };
+    return this.readWithRetry(async (timeoutMs) => {
+      const payload = await this.request<{
+        tasks?: unknown[];
+        totalSize?: number;
+        pageSize?: number;
+        nextPageToken?: unknown;
+      }>("GET", `/tasks${suffix}`, undefined, timeoutMs);
+      return {
+        tasks: Array.isArray(payload.tasks) ? payload.tasks.map(normalizeTask) : [],
+        total_size: typeof payload.totalSize === "number" ? payload.totalSize : 0,
+        page_size: typeof payload.pageSize === "number" ? payload.pageSize : 0,
+        next_page_token: normalizeNextPageToken(payload.nextPageToken),
+      };
+    });
   }
 
   async waitForTask(taskId: string, waitSeconds: number): Promise<SiclawTask> {
-    let current = await this.getTask(taskId);
-    if (current.is_terminal || waitSeconds <= 0) return current;
+    if (waitSeconds <= 0) return this.getTask(taskId);
     const deadline = Date.now() + waitSeconds * 1_000;
+    let current: SiclawTask | null = null;
+    let lastError: A2aClientError | null = null;
+
     while (Date.now() < deadline) {
+      try {
+        current = await this.loadTask(taskId, deadline);
+        lastError = null;
+      } catch (error) {
+        if (!(error instanceof A2aClientError) || !error.retriable) throw error;
+        lastError = error;
+      }
+      if (current?.is_terminal) return current;
+
       const remaining = deadline - Date.now();
-      await delay(Math.min(this.config.pollIntervalMs, Math.max(remaining, 0)));
-      current = await this.getTask(taskId);
-      if (current.is_terminal) return current;
+      if (remaining <= 0) break;
+      await delay(Math.min(this.config.pollIntervalMs, remaining));
     }
-    return current;
+    if (current) return current;
+    throw lastError ?? new A2aClientError("Sicore A2A wait timed out before receiving a task snapshot", {
+      reason: "A2A_TIMEOUT",
+      retriable: true,
+    });
   }
 }

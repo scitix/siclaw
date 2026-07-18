@@ -40,7 +40,7 @@ Required:
 
 Optional:
 
-- `SICLAW_A2A_TIMEOUT_MS`: per-request timeout, default `30000`.
+- `SICLAW_A2A_TIMEOUT_MS`: network-operation timeout, default `30000`. Bounded GET retries share this same budget.
 - `SICLAW_A2A_POLL_INTERVAL_MS`: task polling interval, default `3000`.
 
 The key must never be passed as a command-line argument or committed to a project MCP config. Prefer a private key file outside the repository:
@@ -110,6 +110,8 @@ previous conversation.
 ## Failure behavior
 
 - A2A `message:send` is never automatically retried, avoiding duplicate investigation tasks.
+- Idempotent task reads retry transient timeouts, connection failures, malformed responses, HTTP 408/429, and HTTP 500/502/503/504 at most twice with short backoff. Retries stay inside the read or watchdog deadline.
+- Task cancellation is never automatically retried.
 - If a bounded wait expires, the tool returns a compact working task; call `siclaw_wait_task` again instead of resubmitting the question.
 - HTTP 401/403/429/503 and A2A error reasons are returned as MCP tool errors without request headers or key material.
 - Adapter restarts do not lose server-side tasks; recover them with `siclaw_list_tasks` using the same key.
