@@ -215,6 +215,14 @@ _MODEL_IDLE_TIMEOUT_S = float(os.environ.get("KBC_MODEL_IDLE_TIMEOUT_S", "90"))
 _MODEL_TOOL_IDLE_TIMEOUT_S = float(os.environ.get("KBC_MODEL_TOOL_IDLE_TIMEOUT_S", "660"))
 _MODEL_MAX_RETRIES = int(os.environ.get("KBC_MODEL_MAX_RETRIES", "3"))
 _MODEL_WATCHDOG_POLL_S = float(os.environ.get("KBC_MODEL_WATCHDOG_POLL_S", "10"))
+# Hierarchical batches deliberately carry a much larger bounded context than
+# ordinary turns and flat batches. A valid long-form Write tool call can spend
+# more than 90s producing its JSON argument without an SDK delta; the ordinary
+# watchdog then interrupts useful work four times and leaves the batch pending.
+# Relax only this new, >8MB-corpus path. Small/single-session and medium/flat
+# compiles retain the established 90s failure-detection bound.
+_HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = float(os.environ.get(
+    "KBC_HIERARCHICAL_MODEL_IDLE_TIMEOUT_S", "240"))
 
 # ── Rate-limit resilience (C2) ───────────────────────────────────────────────
 # massapi under concurrency (5-10 boxes × the red-blue PK) can return 429/503/529.
@@ -342,6 +350,9 @@ class CompileRun:
         self._model_retries = 0             # stall retries used on the in-flight turn
         self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
         self._stall_fatal = False           # stall retries exhausted → fail this turn
+        # Temporary orchestrator-scoped override. Only hierarchical batch mode
+        # sets this; every other turn continues to use _MODEL_IDLE_TIMEOUT_S.
+        self._model_idle_timeout_s: float | None = None
         self._rate_retries = 0              # rate-limit (429/503/529) retries on the in-flight turn
         # Typed machine-control receipts. A command id is accepted at most once
         # for this live run, and the first command pins the run to the consumer's
@@ -2538,6 +2549,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     section-reduce, and final phases: BATCH_PLAN.json carries phase plus per-unit
     done stamps, and a later compile trigger resumes the unfinished phase."""
     run._batch_active = True
+    previous_model_idle_timeout = run._model_idle_timeout_s
     replies: list[str] = []
     try:
         raw_dir = Path(run.workdir) / "raw"
@@ -2571,6 +2583,8 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         n = len(plan["batches"])
         pending = batching.pending_batches(plan)
         if plan.get("mode") == "hierarchical":
+            run._model_idle_timeout_s = max(
+                _MODEL_IDLE_TIMEOUT_S, _HIERARCHICAL_MODEL_IDLE_TIMEOUT_S)
             plan_summary_en = (
                 f"Hierarchical batch plan: {n} map batch(es), "
                 f"{plan.get('budget', 0) // 1024}KB effective / "
@@ -2774,6 +2788,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         except Exception:
             pass
     finally:
+        run._model_idle_timeout_s = previous_model_idle_timeout
         run._batch_active = False
     # Red-blue PK examines the train's FINAL state, in the background, after the
     # single logical turn has closed (never inside it — turn_done latency is
@@ -2906,7 +2921,12 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
         client = run.client
         if client is None:
             continue
-        bound = _MODEL_TOOL_IDLE_TIMEOUT_S if run._tool_pending else _MODEL_IDLE_TIMEOUT_S
+        model_idle_timeout = (
+            run._model_idle_timeout_s
+            if run._model_idle_timeout_s is not None
+            else _MODEL_IDLE_TIMEOUT_S
+        )
+        bound = _MODEL_TOOL_IDLE_TIMEOUT_S if run._tool_pending else model_idle_timeout
         idle = time.monotonic() - run._last_model_activity
         if idle <= bound:
             continue
