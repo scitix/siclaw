@@ -1,0 +1,275 @@
+"""Unit tests for the Codex SDK adapter (no external model calls)."""
+
+import asyncio
+import os
+import sys
+import tempfile
+import types
+from pathlib import Path
+
+import compile_box
+from codex_engine import (
+    CodexSDKClient,
+    EngineTool,
+    _safe_error_message,
+    isolated_readonly_workspace,
+)
+from engine import CodexEngine
+
+
+def test_isolated_readonly_workspace():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        raw = base / "source-raw"
+        candidate = base / "source-candidate"
+        forbidden = base / "private.txt"
+        raw.mkdir()
+        candidate.mkdir()
+        (raw / "a.md").write_text("raw", encoding="utf-8")
+        (candidate / "index.md").write_text("candidate", encoding="utf-8")
+        forbidden.write_text("secret", encoding="utf-8")
+        (raw / "escape").symlink_to(forbidden)
+        os.environ["KBC_CODEX_STATE_ROOT"] = td
+        staged_path = None
+        with isolated_readonly_workspace({"raw": raw, "candidate": candidate}) as staged:
+            staged_path = staged
+            assert (staged / "raw" / "a.md").read_text(encoding="utf-8") == "raw"
+            assert (staged / "candidate" / "index.md").is_file()
+            assert not (staged / "raw" / "escape").exists()
+            assert sorted(path.name for path in staged.iterdir()) == ["candidate", "raw"]
+            (staged / "raw" / "a.md").write_text("staged-only", encoding="utf-8")
+            assert (raw / "a.md").read_text(encoding="utf-8") == "raw"
+        assert staged_path is not None and not staged_path.exists()
+    print("OK  Codex isolated workspace exposes only declared regular trees")
+
+
+async def test_codex_config_is_tenant_isolated():
+    captured = {}
+
+    class FakeConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            captured["config"] = kwargs
+
+    class FakeThread:
+        id = "thread-mass"
+
+    class FakeCodex:
+        def __init__(self, *, config):
+            captured["codex_config"] = config
+
+        async def thread_start(self, **kwargs):
+            captured["thread"] = kwargs
+            return FakeThread()
+
+        async def close(self):
+            captured["closed"] = True
+
+    fake_module = types.SimpleNamespace(
+        ApprovalMode=types.SimpleNamespace(deny_all="deny_all"),
+        AsyncCodex=FakeCodex,
+        CodexConfig=FakeConfig,
+        Sandbox=types.SimpleNamespace(
+            read_only="read-only",
+            workspace_write="workspace-write",
+            full_access="full-access",
+        ),
+    )
+    previous = sys.modules.get("openai_codex")
+    sys.modules["openai_codex"] = fake_module
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            os.environ.update({
+                "KBC_CODEX_STATE_ROOT": td,
+                "OPENAI_BASE_URL": "https://mass.invalid/model-api",
+                "OPENAI_API_KEY": "test-key-not-secret",
+            })
+
+            async def submit(args):
+                return str(args)
+
+            client = CodexSDKClient(
+                cwd=td,
+                system_prompt="KBC contract",
+                model="gpt-5.6-luna",
+                session_id="pending",
+                read_only=True,
+                tools=[EngineTool("submit", "Submit", {"type": "object"}, submit)],
+            )
+            async def fake_callback_listener():
+                return "http://127.0.0.1:1/tool-call"
+
+            client._start_callback_listener = fake_callback_listener
+            home = Path(client._codex_home)
+            await client.connect()
+            overrides = set(captured["config"]["config_overrides"])
+            assert 'model_providers.kbc_mass.wire_api="responses"' in overrides
+            assert "model_providers.kbc_mass.requires_openai_auth=false" in overrides
+            assert "project_doc_max_bytes=0" in overrides
+            for feature in ("apps", "goals", "hooks", "memories", "multi_agent", "remote_plugin"):
+                assert f"features.{feature}=false" in overrides
+            assert "features.code_mode.enabled=false" in overrides
+            assert "features.shell_tool=true" in overrides
+            assert 'mcp_servers.kbc.tools.submit.approval_mode="approve"' in overrides
+            assert captured["config"]["env"] == {
+                "CODEX_HOME": str(home),
+                "OPENAI_API_KEY": "test-key-not-secret",
+            }
+            assert captured["thread"]["model_provider"] == "kbc_mass"
+            assert captured["thread"]["approval_mode"] == "deny_all"
+            assert captured["thread"]["sandbox"] == "full-access"
+            assert client.session_id == "thread-mass"
+            await client.disconnect()
+            assert captured["closed"] is True and not home.exists()
+    finally:
+        if previous is None:
+            sys.modules.pop("openai_codex", None)
+        else:
+            sys.modules["openai_codex"] = previous
+    print("OK  Codex config uses Mass Responses and disables tenant-unsafe ambient features")
+
+
+async def test_codex_engine_stages_and_rewrites_roots():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        wiki = base / "wiki"
+        raw = base / "raw"
+        live = base / "live-draft"
+        wiki.mkdir()
+        raw.mkdir()
+        live.mkdir()
+        (wiki / "index.md").write_text("wiki", encoding="utf-8")
+        (raw / "a.md").write_text("raw", encoding="utf-8")
+        (live / "secret.md").write_text("forbidden", encoding="utf-8")
+        os.environ["KBC_CODEX_STATE_ROOT"] = td
+        engine = CodexEngine()
+        staged, replacements = await engine._stage_allowed_roots([str(wiki), str(raw)])
+        assert sorted(path.name for path in staged.iterdir()) == ["root-0-wiki", "root-1-raw"]
+        assert not any(path.name == "live-draft" for path in staged.rglob("*"))
+        prompt = f"wiki={wiki.resolve()}; raw={raw.resolve()}; do not read {live}"
+        rewritten = engine._rewrite_paths(prompt, replacements)
+        assert str(wiki.resolve()) not in rewritten and str(raw.resolve()) not in rewritten
+        assert str(live) in rewritten  # undeclared roots are never mapped into the sandbox view
+        staged_again, _ = await engine._stage_allowed_roots([str(wiki), str(raw)])
+        assert staged_again == staged
+        engine._stage_finalizer()
+        assert not engine._stage_root.exists()
+    print("OK  Codex reviewer caches an isolated multi-root snapshot and rewrites prompt paths")
+
+
+def test_error_redaction():
+    assert "sk-live" not in _safe_error_message("401 for sk-liveTOKEN123456789")
+    assert "[REDACTED]" in _safe_error_message("401 for sk-liveTOKEN123456789")
+    print("OK  Codex error messages redact API-key-shaped values")
+
+
+async def test_codex_recommendation_uses_isolated_view_and_neutral_tool():
+    captured = {}
+
+    class ResultMessage:
+        subtype = "success"
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def connect(self):
+            cwd = Path(captured["cwd"])
+            assert (cwd / "raw" / "policy.md").is_file()
+            assert (cwd / "candidate" / "index.md").is_file()
+            assert not (cwd / "authoring").exists()
+
+        async def query(self, _directive):
+            await captured["tools"][0].handler({
+                "question": "How many retries?",
+                "reference_answer": "Three.",
+                "evidence_paths": ["raw/policy.md"],
+            })
+
+        async def receive_messages(self):
+            yield ResultMessage()
+
+        async def disconnect(self):
+            pass
+
+    original_client = compile_box.CodexSDKClient
+    original_engine = os.environ.get("KBC_ENGINE")
+    try:
+        compile_box.CodexSDKClient = FakeClient
+        os.environ["KBC_ENGINE"] = "codex_sdk"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "run"
+            (root / "raw").mkdir(parents=True)
+            (root / "candidate").mkdir()
+            (root / "authoring").mkdir()
+            (root / "raw" / "policy.md").write_text("retries = 3", encoding="utf-8")
+            (root / "candidate" / "index.md").write_text("# Policy", encoding="utf-8")
+            (root / "authoring" / "private.json").write_text("internal", encoding="utf-8")
+            os.environ["KBC_CODEX_STATE_ROOT"] = td
+            parent = compile_box.CompileRun("codex-recommend", str(root), 1)
+            result = await compile_box.recommend_test_question(parent)
+            assert result["reference_answer"] == "Three."
+            staged = Path(captured["cwd"])
+            assert not staged.exists()
+    finally:
+        compile_box.CodexSDKClient = original_client
+        if original_engine is None:
+            os.environ.pop("KBC_ENGINE", None)
+        else:
+            os.environ["KBC_ENGINE"] = original_engine
+    print("OK  Codex recommendation branch reuses neutral KBC tools inside an isolated view")
+
+
+async def test_codex_tool_budget_interrupts_and_preserves_contract():
+    class FakeTurn:
+        def __init__(self):
+            self.interrupts = 0
+
+        async def interrupt(self):
+            self.interrupts += 1
+
+    def notification(payload):
+        return types.SimpleNamespace(payload=payload)
+
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["KBC_CODEX_STATE_ROOT"] = td
+        client = CodexSDKClient(
+            cwd=td,
+            system_prompt="test",
+            model="gpt-5.6-luna",
+            session_id="budget",
+            max_tool_calls=1,
+        )
+        turn = FakeTurn()
+        client._turn = turn
+        command = type("CommandExecutionThreadItem", (), {})()
+        started = type("ItemStartedNotification", (), {"item": command})()
+        await client._relay_notification(notification(started))
+        await client._relay_notification(notification(started))
+        assert turn.interrupts == 1 and client._budget_exhausted
+        completed_turn = types.SimpleNamespace(
+            status=types.SimpleNamespace(value="completed"), error=None,
+        )
+        completed = type("TurnCompletedNotification", (), {"turn": completed_turn})()
+        await client._relay_notification(notification(completed))
+        messages = []
+        while not client._events.empty():
+            messages.append(client._events.get_nowait())
+        results = [item for item in messages if type(item).__name__ == "ResultMessage"]
+        assert len(results) == 1
+        assert results[0].is_error and results[0].subtype == "error_max_turns"
+        await client.disconnect()
+    print("OK  Codex tool-call budget interrupts active loops as error_max_turns")
+
+
+async def main():
+    test_isolated_readonly_workspace()
+    await test_codex_config_is_tenant_isolated()
+    await test_codex_engine_stages_and_rewrites_roots()
+    test_error_redaction()
+    await test_codex_recommendation_uses_isolated_view_and_neutral_tool()
+    await test_codex_tool_budget_interrupts_and_preserves_contract()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
