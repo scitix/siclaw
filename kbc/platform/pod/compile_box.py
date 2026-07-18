@@ -251,6 +251,19 @@ class ModelStallError(Exception):
     reason instead of the box sitting silently."""
 
 
+class ModelResultError(Exception):
+    """An internal compile session ended with an SDK error result.
+
+    Ordinary conversational turns keep their existing never-block behavior,
+    but a batch session must fail closed: otherwise an authentication or model
+    execution failure can be mistaken for a successful no-op and stamped done.
+    """
+
+
+class BatchOutputError(Exception):
+    """A successful internal session did not account for its assigned sources."""
+
+
 class CompileRun:
     def __init__(self, run_id: str, workdir: str, round_: int, instruction: str = ""):
         self.run_id = run_id
@@ -2225,6 +2238,16 @@ def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
     p.write_text(batching.dump_json(value))
 
 
+def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[str]:
+    """Assigned sources still absent from both Candidate provenance and exclusions."""
+    pages = selfcheck.candidate_pages(run.workdir)
+    exclusions, _ = selfcheck.load_exclusions(run.workdir)
+    return sorted(
+        set(sources)
+        & set(selfcheck.coverage(run.workdir, pages, exclusions)["unaccounted"])
+    )
+
+
 async def _drive_batch_session(run: "CompileRun", directive: str, label: str) -> str:
     """One bounded internal session: fresh session_id, same role/tools/workspace.
     Streams its output through _emit_message with turn_done suppressed; returns
@@ -2242,7 +2265,8 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str) ->
         await run.emit({"type": "log", "text": _loc(run, f"—— {label} started ——", f"—— {label} 开始 ——")})
         run._begin_turn(directive)
         await client.query(directive)
-        await _consume_turn_stream(run, client, stop_on_result=True)
+        await _consume_turn_stream(
+            run, client, stop_on_result=True, fail_on_error_result=True)
         return run._last_turn_reply
     finally:
         run._suppress_turn_done = False
@@ -2595,6 +2619,15 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             reply = await _drive_batch_session(run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"))
             if reply:
                 replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
+            still_unaccounted = _unaccounted_batch_sources(
+                run, batch.get("sources") or [])
+            if still_unaccounted:
+                shown = ", ".join(still_unaccounted[:5])
+                suffix = "…" if len(still_unaccounted) > 5 else ""
+                raise BatchOutputError(
+                    f"batch {batch['id']} left {len(still_unaccounted)} assigned "
+                    f"source(s) unaccounted: {shown}{suffix}"
+                )
             batching.stamp_done(plan, batch["id"])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
             # Push the done-stamp (and the batch's pages) to the durable store
@@ -2804,7 +2837,13 @@ def _note_model_activity(run: CompileRun, msg) -> None:
         run._tool_pending = False
 
 
-async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool) -> None:
+async def _consume_turn_stream(
+    run: CompileRun,
+    client,
+    *,
+    stop_on_result: bool,
+    fail_on_error_result: bool = False,
+) -> None:
     """Relay a session's message stream through _emit_message, owning the
     stall-retry seam. A ResultMessage that the watchdog provoked (via interrupt())
     is NOT a real turn end: discard it and re-issue the directive (bounded), or
@@ -2830,7 +2869,8 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
             # is_error + api_error_status. Back off and re-issue rather than
             # surfacing it as a finished turn.
             status = getattr(msg, "api_error_status", None)
-            if getattr(msg, "is_error", False) and status in _MODEL_RATE_STATUSES:
+            is_error = bool(getattr(msg, "is_error", False))
+            if is_error and status in _MODEL_RATE_STATUSES:
                 if run._rate_retries < _MODEL_RATE_MAX_RETRIES:
                     run._rate_retries += 1
                     delay = _rate_backoff_delay(run._rate_retries)
@@ -2854,6 +2894,18 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
                                  f"模型限流(HTTP {status}),退避重试 {run._rate_retries} 次仍未通过,本轮先停,请稍后再开编。"),
                 })
                 # fall through: end the turn (run goes idle), do not crash
+            if is_error and fail_on_error_result:
+                # Never let an internal map/reduce/final session stamp its unit
+                # done when the SDK itself says the turn failed. Keep the
+                # diagnostic deliberately bounded: subtype/status are enough to
+                # route the failure without echoing provider payloads or tokens.
+                run._turn_active = False
+                run._turn_text = []
+                run._last_turn_reply = ""
+                subtype = str(getattr(msg, "subtype", "unknown") or "unknown")[:80]
+                raise ModelResultError(
+                    f"model result failed (subtype={subtype}, api_status={status})"
+                )
             run._turn_active = False
             await _emit_message(run, msg)
             if stop_on_result:
