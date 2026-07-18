@@ -6,6 +6,7 @@ each test gets a fresh tmp dir from the main() harness.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -87,14 +88,14 @@ def test_hierarchical_pack_keeps_document_assets_together(tmp_path):
         },
     )
     inv = bt.scan_sources(raw)
-    batches = bt.pack_hierarchical_batches(inv, budget=100_000)
+    batches = bt.pack_hierarchical_batches(inv, budget=200_000)
     gpu = next(b for b in batches if "gpu/guide.md" in b["sources"])
     assert set(gpu["sources"]) >= {
         "gpu/guide.md", "gpu/guide.assets/a.png", "gpu/guide.assets/b.png"}
     assert bt.validate_plan(
-        bt.build_plan(inv, batches, planner="hierarchical-code", budget=100_000),
+        bt.build_plan(inv, batches, planner="hierarchical-code", budget=200_000),
         inv,
-        budget=100_000,
+        budget=200_000,
     ) == []
 
 
@@ -109,8 +110,9 @@ def test_hierarchical_pack_splits_oversized_family_with_anchor_context(tmp_path)
         },
     )
     inv = bt.scan_sources(raw)
-    # Images each cost 30KB, so a 40KB hierarchical budget forces one/chunk.
-    budget = 40 * 1024
+    # Hierarchical images cost 64KB, so a 70KB budget forces one/chunk while
+    # still leaving room to repeat the tiny Markdown anchor as context.
+    budget = 70 * 1024
     batches = bt.pack_hierarchical_batches(inv, budget=budget)
     assert len(batches) == 3, batches
     assert batches[0]["sources"][0] == "gpu/guide.md"
@@ -148,6 +150,30 @@ def test_hierarchical_text_cap_preserves_session_context_safety(tmp_path):
         text_budget=400 * 1024)
     assert bt.validate_plan(
         plan, inv, budget=1024 * 1024, text_budget=400 * 1024) == []
+
+
+def test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries(tmp_path):
+    previous = os.environ.get("KBC_HIERARCHICAL_IMAGE_COST_BYTES")
+    os.environ["KBC_HIERARCHICAL_IMAGE_COST_BYTES"] = str(64 * 1024)
+    try:
+        files = {"guide.md": 100 * 1024}
+        files.update({f"guide.assets/page-{i:03d}.jpg": 1_000 for i in range(30)})
+        raw = _mk(tmp_path, files)
+        inv = bt.scan_sources(raw)
+        # The medium/flat route keeps its established 30KB estimate.
+        image = next(i for i in inv if i["path"].endswith("page-000.jpg"))
+        assert image["effective"] == 30 * 1024
+        batches = bt.pack_hierarchical_batches(inv, budget=1024 * 1024)
+        image_counts = [sum(p.endswith(".jpg") for p in b["sources"]) for b in batches]
+        assert max(image_counts) <= 14, image_counts
+        plan = bt.build_plan(
+            inv, batches, planner="hierarchical-code", budget=1024 * 1024)
+        assert bt.validate_plan(plan, inv, budget=1024 * 1024) == []
+    finally:
+        if previous is None:
+            os.environ.pop("KBC_HIERARCHICAL_IMAGE_COST_BYTES", None)
+        else:
+            os.environ["KBC_HIERARCHICAL_IMAGE_COST_BYTES"] = previous
 
 
 def test_validate_plan_accepts_code_baseline(tmp_path):
@@ -319,6 +345,7 @@ def main():
         test_hierarchical_pack_splits_oversized_family_with_anchor_context,
         test_validate_hierarchical_context_is_known_and_budgeted,
         test_hierarchical_text_cap_preserves_session_context_safety,
+        test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries,
         test_validate_plan_accepts_code_baseline,
         test_validate_plan_rejects_missing_duplicate_unknown_overflow,
         test_validate_plan_rejects_duplicate_and_empty_batch_ids,
