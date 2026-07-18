@@ -2194,11 +2194,13 @@ async def test_hierarchical_batch_plan_and_section_reduce():
     real_drive = compile_box._drive_batch_session
     real_repairs = compile_box._run_ledger_repairs
     real_media_enabled = compile_box._media_verify_enabled
+    real_hierarchical_idle_timeout = compile_box._HIERARCHICAL_MODEL_IDLE_TIMEOUT_S
     try:
         os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
         os.environ["KBC_HIERARCHICAL_THRESHOLD_BYTES"] = "100"
         os.environ["KBC_HIERARCHICAL_BATCH_BUDGET_BYTES"] = "400"
         os.environ["KBC_BATCH_PLANNER"] = "model"
+        compile_box._HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = 123
 
         # Hierarchical mode is deterministic and must bypass the model planner.
         inventory = [
@@ -2218,9 +2220,11 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             (wd / "raw" / "gpu" / "b.md").write_bytes(b"b" * 300)
             run = compile_box.CompileRun("hier-run", str(wd), 1)
             driven: list[str] = []
+            observed_idle_timeouts: list[float | None] = []
 
             async def fake_drive(run_, directive, label):
                 driven.append(label + "|" + directive.splitlines()[0])
+                observed_idle_timeouts.append(run_._model_idle_timeout_s)
                 if label.startswith("batch ") or label.startswith("批 "):
                     candidate = wd / "candidate"
                     candidate.mkdir(exist_ok=True)
@@ -2243,6 +2247,10 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             assert sum(item.startswith("batch ") for item in driven) == 2, driven
             assert sum(item.startswith("section reduce ") for item in driven) == 1, driven
             assert driven[-1].startswith("final review"), driven
+            assert set(observed_idle_timeouts) == {
+                max(compile_box._MODEL_IDLE_TIMEOUT_S, 123)
+            }, observed_idle_timeouts
+            assert run._model_idle_timeout_s is None, run._model_idle_timeout_s
             saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
             assert saved["phase"] == "complete", saved
             assert all(r["status"] == "done" for r in saved["reductions"]), saved
@@ -2261,6 +2269,7 @@ async def test_hierarchical_batch_plan_and_section_reduce():
         compile_box._drive_batch_session = real_drive
         compile_box._run_ledger_repairs = real_repairs
         compile_box._media_verify_enabled = real_media_enabled
+        compile_box._HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = real_hierarchical_idle_timeout
         for name, value in previous.items():
             if value is None:
                 os.environ.pop(name, None)
