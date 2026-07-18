@@ -23,6 +23,7 @@ import posixpath
 import re
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -254,7 +255,8 @@ _BODY_SOURCE_START_RE = re.compile(
     r"(?P<open>[（(])\s*(?:source|src|源|来源)\s*[:：]\s*", re.IGNORECASE,
 )
 _SOURCE_LOCATOR_PATTERN = (
-    r"(?:§\s*[\w.-]+|p(?:age)?\.?\s*\d+(?:\s*[-–]\s*\d+)?|"
+    r"(?:§\s*[\w.-]+|(?:p(?:ages?)?|pp?)\.?\s*\d+"
+    r"(?:(?:\s*[-–]\s*|\s*,\s*)\d+)*|"
     r"lines?\s*\d+(?:\s*[-–]\s*\d+)?|第?\s*\d+\s*(?:页|行|节))"
 )
 _SOURCE_FILE_END_RE = re.compile(
@@ -992,6 +994,12 @@ def run_layer1(workdir: str) -> dict:
     cov = coverage(workdir, pages, exclusions)
     lint = lint_candidate(pages, exclusion_errors)
     previous = read_selfcheck(workdir) or {}
+    media_verify = previous.get("media_verify")
+    citing_media = media_citing_pages(workdir)
+    if media_verify is not None or citing_media:
+        media_verify = dict(media_verify or {})
+        media_verify["summary"] = media_verification_summary(
+            workdir, media_verify=media_verify, citing=citing_media)
     return {
         "version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1000,7 +1008,7 @@ def run_layer1(workdir: str) -> dict:
         "lint": {"ok": lint["ok"], "violations": lint["violations"]},
         "dup_candidates": dup_candidates(pages),
         "pk": previous.get("pk"),  # Layer-2 results survive L1 re-checks
-        "media_verify": previous.get("media_verify"),
+        "media_verify": media_verify,
         # The converge signal survives too: _post_turn_selfcheck overwrites the
         # whole file with this report, and dropping the phase left a per-turn
         # window with no converge_phase before the seam re-set it (review).
@@ -1355,11 +1363,102 @@ def media_citing_pages(workdir: str) -> dict[str, list[str]]:
 
 
 def pending_media_verification(workdir: str) -> dict[str, list[str]]:
-    """Image-citing pages minus the ones SELFCHECK.json records as verified."""
+    """Image-citing pages whose current page+image fingerprint is not verified.
+
+    Page paths alone are not identities: a repair can edit the same page, and an
+    incremental source refresh can replace an image at the same raw path. The
+    previous path-only ledger silently skipped both cases. Reports without the
+    v2 fingerprint map intentionally re-enter once so they acquire a stable
+    content-bound identity on their next verification.
+    """
     citing = media_citing_pages(workdir)
     sc = read_selfcheck(workdir) or {}
-    done = set((sc.get("media_verify") or {}).get("verified_pages") or [])
-    return {p: imgs for p, imgs in citing.items() if p not in done}
+    fingerprints = (sc.get("media_verify") or {}).get("verified_fingerprints") or {}
+    current = media_page_fingerprints(workdir, citing)
+    return {p: imgs for p, imgs in citing.items()
+            if fingerprints.get(p) != current.get(p)}
+
+
+def media_page_fingerprints(
+    workdir: str, citing: dict[str, list[str]] | None = None,
+) -> dict[str, str]:
+    """Stable identity for every image-citing candidate page.
+
+    The digest covers the final page bytes, every cited raw-relative image path,
+    and each image's bytes. Hash each shared image once per scan so a page edit or
+    same-path image replacement deterministically re-arms verification without
+    turning a large shared asset into repeated I/O.
+    """
+    citing = citing if citing is not None else media_citing_pages(workdir)
+    root = Path(workdir)
+    image_hashes: dict[str, bytes] = {}
+    out: dict[str, str] = {}
+    for page, images in sorted(citing.items()):
+        page_path = root / "candidate" / page
+        try:
+            page_bytes = page_path.read_bytes()
+        except OSError:
+            continue
+        digest = hashlib.sha256()
+        digest.update(page_bytes)
+        for image in sorted(images):
+            digest.update(b"\0")
+            digest.update(image.encode("utf-8"))
+            if image not in image_hashes:
+                image_path = root / "raw" / image
+                try:
+                    stat = image_path.stat()
+                    image_hashes[image] = _cached_file_digest(
+                        str(image_path), stat.st_size, stat.st_mtime_ns,
+                        stat.st_ctime_ns, stat.st_ino)
+                except OSError:
+                    image_hashes[image] = b"missing"
+            digest.update(b"\0")
+            digest.update(image_hashes[image])
+        out[page] = digest.hexdigest()
+    return out
+
+
+@lru_cache(maxsize=8192)
+def _cached_file_digest(
+    path: str, _size: int, _mtime_ns: int, _ctime_ns: int, _inode: int,
+) -> bytes:
+    """Stream a file digest and reuse it while the filesystem identity is stable."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def media_verification_summary(
+    workdir: str,
+    media_verify: dict | None = None,
+    citing: dict[str, list[str]] | None = None,
+    current: dict[str, str] | None = None,
+) -> dict[str, int]:
+    """Machine-readable coverage that cannot confuse exhausted with passed."""
+    citing = citing if citing is not None else media_citing_pages(workdir)
+    media_verify = media_verify if media_verify is not None else (
+        (read_selfcheck(workdir) or {}).get("media_verify") or {})
+    current = current if current is not None else media_page_fingerprints(workdir, citing)
+    verified = media_verify.get("verified_fingerprints") or {}
+    exhausted_names = set(media_verify.get("exhausted") or [])
+    settled = {p for p, fingerprint in current.items()
+               if verified.get(p) == fingerprint}
+    exhausted = settled & exhausted_names
+    passed = settled - exhausted
+    pending = set(citing) - settled
+    all_images = {image for images in citing.values() for image in images}
+    pending_images = {image for page in pending for image in citing.get(page, [])}
+    return {
+        "total_pages": len(citing),
+        "passed_pages": len(passed),
+        "exhausted_pages": len(exhausted),
+        "pending_pages": len(pending),
+        "total_images": len(all_images),
+        "pending_images": len(pending_images),
+    }
 
 
 def mark_media_verified(workdir: str, pages: list[str], exhausted: bool = False) -> None:
@@ -1370,17 +1469,29 @@ def mark_media_verified(workdir: str, pages: list[str], exhausted: bool = False)
     must never read as a clean pass)."""
     report = read_selfcheck(workdir) or {"version": 1, "coverage": None, "lint": None, "state": None}
     mv = report.get("media_verify") or {}
+    mv["version"] = 2
+    citing = media_citing_pages(workdir)
+    current = media_page_fingerprints(workdir, citing)
     mv["verified_pages"] = sorted(set(mv.get("verified_pages") or []) | set(pages))
+    fingerprints = mv.get("verified_fingerprints") or {}
+    for page in pages:
+        if page in current:
+            fingerprints[page] = current[page]
+    mv["verified_fingerprints"] = fingerprints
     if exhausted:
         mv["exhausted"] = sorted(set(mv.get("exhausted") or []) | set(pages))
-    elif mv.get("attempts"):
+    else:
+        mv["exhausted"] = sorted(set(mv.get("exhausted") or []) - set(pages))
         # A COMPLETED verification clears the page's retry count: a stale
         # residue would otherwise push a later re-entry (page re-cited after a
         # recompile) to "exhausted" after fewer real failures than the budget
         # implies — and the map stays bounded. Exhausted pages keep their count
         # as forensics (they are marked verified and never re-enter pending).
         for p in pages:
-            mv["attempts"].pop(p, None)
+            (mv.get("attempts") or {}).pop(p, None)
+            (mv.get("attempt_fingerprints") or {}).pop(p, None)
+    mv["summary"] = media_verification_summary(
+        workdir, media_verify=mv, citing=citing, current=current)
     mv["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     report["media_verify"] = mv
     write_selfcheck(workdir, report)
@@ -1394,10 +1505,21 @@ def bump_media_attempts(workdir: str, pages: list[str]) -> dict[str, int]:
     (silent permanent false-pass) or unbounded re-runs."""
     report = read_selfcheck(workdir) or {"version": 1, "coverage": None, "lint": None, "state": None}
     mv = report.get("media_verify") or {}
+    mv["version"] = 2
     attempts = mv.get("attempts") or {}
+    attempt_fingerprints = mv.get("attempt_fingerprints") or {}
+    citing = media_citing_pages(workdir)
+    current = media_page_fingerprints(workdir, citing)
     for p in pages:
+        if attempt_fingerprints.get(p) != current.get(p):
+            attempts[p] = 0
         attempts[p] = int(attempts.get(p, 0)) + 1
+        if p in current:
+            attempt_fingerprints[p] = current[p]
     mv["attempts"] = attempts
+    mv["attempt_fingerprints"] = attempt_fingerprints
+    mv["summary"] = media_verification_summary(
+        workdir, media_verify=mv, citing=citing, current=current)
     report["media_verify"] = mv
     write_selfcheck(workdir, report)
     return {p: attempts[p] for p in pages}
