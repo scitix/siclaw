@@ -1092,6 +1092,50 @@ def _make_compile_tools(run: CompileRun):
         return {"content": [{"type": "text", "text": ts["propose_plan"]["ack"] + reminder}]}
 
     @tool(
+        "delete_candidate_page",
+        ts["delete_candidate_page"]["desc"],
+        {"path": str},
+    )
+    async def delete_candidate_page(args):
+        """Delete one dead Markdown page without granting shell/file-tree power.
+
+        The model already receives deterministic orphan/duplicate findings and
+        must occasionally remove the losing page after a merge. Edit/Write
+        cannot express deletion, while Bash would be far too broad. This tool is
+        therefore confined to a single regular ``candidate/**/*.md`` file and
+        protects routing pages at every level.
+        """
+        strings = ts["delete_candidate_page"]
+        raw_path = str(args.get("path", "")).strip()
+        try:
+            rel = _safe_tar_path(raw_path)
+        except ValueError:
+            return {"content": [{"type": "text", "text": strings["invalid"].format(path=raw_path)}]}
+        if rel.suffix.lower() != ".md":
+            return {"content": [{"type": "text", "text": strings["markdown_only"].format(path=raw_path)}]}
+        if rel.name.lower() in {"index.md", "log.md"}:
+            return {"content": [{"type": "text", "text": strings["reserved"].format(path=raw_path)}]}
+
+        root = (Path(run.workdir) / "candidate").resolve()
+        target = root.joinpath(*rel.parts)
+        try:
+            target.resolve(strict=False).relative_to(root)
+        except (ValueError, OSError):
+            return {"content": [{"type": "text", "text": strings["invalid"].format(path=raw_path)}]}
+        if target.is_symlink():
+            return {"content": [{"type": "text", "text": strings["invalid"].format(path=raw_path)}]}
+        if not target.exists():
+            return {"content": [{"type": "text", "text": strings["not_found"].format(path=raw_path)}]}
+        if not target.is_file():
+            return {"content": [{"type": "text", "text": strings["not_file"].format(path=raw_path)}]}
+        try:
+            target.unlink()
+        except OSError as e:
+            return {"content": [{"type": "text", "text": strings["failed"].format(path=raw_path, e=e)}]}
+        await run.emit({"type": "summary", "summary": strings["deleted"].format(path=rel.as_posix())})
+        return {"content": [{"type": "text", "text": strings["deleted"].format(path=rel.as_posix())}]}
+
+    @tool(
         "resolve_ticket",
         ts["resolve_ticket"]["desc"],
         # dispatch_nonce IS part of the schema: the prompt orders the echo and
@@ -1136,7 +1180,10 @@ def _make_compile_tools(run: CompileRun):
             return {"content": [{"type": "text", "text": rt["write_failed"].format(e=e)}]}
         return {"content": [{"type": "text", "text": rt["registered"].format(tid=tid)}]}
 
-    return create_sdk_mcp_server("compile", tools=[report_summary, propose_plan, resolve_ticket])
+    return create_sdk_mcp_server(
+        "compile",
+        tools=[report_summary, propose_plan, delete_candidate_page, resolve_ticket],
+    )
 
 
 def _seed_workdir(workdir: str):
@@ -1210,6 +1257,16 @@ def _settle_media_outcome(run, chunk: dict, result: dict | None) -> list[str]:
     means the whole flow failed → every page in the chunk is a failed attempt.
     Returns the pages exhausted this round."""
     completed = list((result or {}).get("completed_pages") or [])
+    # A successful comparison with a finding is not a verified final page: the
+    # repair turn is about to edit it, and even a no-op repair must not convert a
+    # known mismatch into a green ledger. Keep finding pages pending; the
+    # content-bound fingerprint then verifies the repaired bytes on the next
+    # drain/round.
+    finding_pages = {
+        str(item.get("page")) for item in ((result or {}).get("findings") or [])
+        if isinstance(item, dict) and item.get("page")
+    }
+    completed = [page for page in completed if page not in finding_pages]
     failed = list((result or {}).get("failed_pages") or [])
     if result is None:
         failed = list(chunk)
@@ -1309,6 +1366,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
     injected_repair = False
     settled = False        # the primary settle ran — the except must never settle AGAIN
     failed_pages: list[str] = []
+    finding_pages: list[str] = []
     exhausted: list[str] = []
     try:
         n_imgs = sum(len(v) for v in chunk.values())
@@ -1333,6 +1391,10 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             except Exception:
                 pass
         findings, errors = result["findings"], result["errors"]
+        finding_pages = sorted({
+            str(item.get("page")) for item in findings
+            if isinstance(item, dict) and item.get("page")
+        })
         tail = _loc(run, f"; {len(errors)} transcription/comparison failure(s)",
                     f";{len(errors)} 项转写/比对失败") if errors else ""
         if findings:
@@ -1367,8 +1429,14 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
         # ones are marked verified and leave pending on their own): the chain
         # below then moves on to the not-yet-attempted chunks instead of
         # hot-looping the failed pages through the attempt budget.
+        # A finding page stays pending until the repair changes and re-verifies
+        # it. If injecting that repair failed, defer it for this drain so the
+        # same mismatch cannot hot-loop; a fresh turn retries it.
+        deferred_pages = set(failed_pages)
+        if finding_pages and not injected_repair:
+            deferred_pages.update(finding_pages)
         run._media_deferred = getattr(run, "_media_deferred", set()) | (
-            set(failed_pages) - set(exhausted))
+            deferred_pages - set(exhausted))
         run._media_inflight = getattr(run, "_media_inflight", set()) - set(chunk)
         # We ARE run._media_task and are completing: release the single-flight
         # reference first, or _media_verify_due's not-done() guard blocks the
@@ -1953,6 +2021,7 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "Read", "Write", "Edit", "Glob", "Grep",
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
+    "mcp__compile__delete_candidate_page",
     "mcp__compile__resolve_ticket",
 ]
 

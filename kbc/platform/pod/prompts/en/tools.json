@@ -7,6 +7,16 @@
     "ack": "Plan submitted to the owner (the UI now shows the plan and the approve control); awaiting approval. Do not write candidate/ pages until the approval message arrives.",
     "reminder": " (Reminder: while you are at it, maintain the candidate-page list as `- [ ] page — one line` in the ## Next Pages section of authoring/PLAN.md as your working state, to make progress easy to track; this does not affect the plan you just submitted.)"
   },
+  "delete_candidate_page": {
+    "desc": "Delete exactly one genuinely dead Markdown page below candidate/ after merging duplicate or orphan content. Pass a path relative to candidate/ (for example `guide/old.md`). This tool cannot delete index.md/log.md, directories, non-Markdown files, symlinks, or anything outside candidate/. Fix incoming links before deleting the page.",
+    "invalid": "refused unsafe candidate path: {path}",
+    "markdown_only": "only candidate Markdown pages may be deleted: {path}",
+    "reserved": "reserved routing pages cannot be deleted: {path}",
+    "not_found": "candidate page does not exist: {path}",
+    "not_file": "candidate path is not a regular file: {path}",
+    "failed": "failed to delete candidate page {path}: {e}",
+    "deleted": "deleted candidate page: {path}"
+  },
   "resolve_ticket": {
     "desc": "Call once per contradiction ticket you have patched (one call per ticket, no batching): register which ticket (ticket_id), the value you applied (applied_value), the candidate files you actually edited (pages_edited — must cover the ticket's affected_pages), and a one-line note. This marks the ticket as patched and writes an auditable agent_report — the basis for the contradiction view showing 'AI patched' for the owner to verify. Echo dispatch_nonce verbatim from the apply directive's `nonce:` line (empty string when the directive carries none) — it matches this receipt to the exact dispatch round.",
     "need_id": "resolve_ticket requires ticket_id",
