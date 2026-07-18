@@ -31,7 +31,7 @@ import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
 import { getDb, type Db } from "../gateway/db.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
-import { buildProviderModelDescriptor } from "../core/model-compat.js";
+import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
 import { resolveCapabilities } from "../core/tool-capabilities.js";
 import type {
   CliSnapshotKnowledgeRepo,
@@ -404,13 +404,14 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
 
     for (const p of providers) {
       const entries = modelsByProviderId.get(p.id) ?? [];
+      const providerApi = normalizeProviderApi(p.api_type);
       providersOut[p.name] = {
         baseUrl: p.base_url,
         apiKey: p.api_key ?? "",
-        api: p.api_type,
+        api: providerApi,
         authHeader: true,
         models: entries.map((m) =>
-          buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+          buildProviderModelDescriptor(m, { api: providerApi, baseUrl: p.base_url }),
         ),
       };
       // First model flagged is_default wins. If none, first provider's first model is a fallback.

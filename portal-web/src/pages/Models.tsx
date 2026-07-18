@@ -25,6 +25,19 @@ export interface Provider {
   models?: ModelEntry[]
 }
 
+// Legacy api_type values stored before the options became pi's canonical api
+// ids ("anthropic" is a pi provider slug, not an api). Mirrors the server-side
+// normalizeProviderApi (src/core/model-compat.ts), which keeps old rows working
+// at read time; this map only affects what the edit form shows and re-saves.
+const LEGACY_API_TYPES: Record<string, string> = {
+  anthropic: "anthropic-messages",
+  openai: "openai-completions",
+}
+
+export function normalizeApiType(apiType: string): string {
+  return LEGACY_API_TYPES[apiType] ?? apiType
+}
+
 export function Models() {
   const [providers, setProviders] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
@@ -82,7 +95,10 @@ export function Models() {
       name: provider.name,
       base_url: provider.base_url,
       api_key: provider.api_key || "",
-      api_type: provider.api_type,
+      // Rows created before the api_type options became pi's canonical api ids
+      // carry legacy values; map them so the select shows (and re-saves) the
+      // canonical id instead of silently snapping to the first option.
+      api_type: normalizeApiType(provider.api_type),
     })
     setExpandedId(provider.id)
   }
@@ -188,7 +204,7 @@ export function Models() {
               <label className="block text-sm font-medium mb-1">API Type</label>
               <select value={providerForm.api_type} onChange={(e) => setProviderForm({ ...providerForm, api_type: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background">
                 <option value="openai-completions">OpenAI Compatible</option>
-                <option value="anthropic">Anthropic</option>
+                <option value="anthropic-messages">Anthropic</option>
               </select>
             </div>
           </div>
@@ -247,7 +263,7 @@ export function Models() {
                           <input placeholder="Name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
                           <select value={editForm.api_type} onChange={(e) => setEditForm({ ...editForm, api_type: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background">
                             <option value="openai-completions">OpenAI Compatible</option>
-                            <option value="anthropic">Anthropic</option>
+                            <option value="anthropic-messages">Anthropic</option>
                           </select>
                         </div>
                         <input placeholder="Base URL" value={editForm.base_url} onChange={(e) => setEditForm({ ...editForm, base_url: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" />

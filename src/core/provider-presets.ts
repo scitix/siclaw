@@ -48,7 +48,9 @@ export const PRESETS: ProviderPreset[] = [
     label: "Anthropic (Claude Sonnet 4, Claude Opus 4)",
     name: "anthropic",
     baseUrl: "https://api.anthropic.com/v1",
-    api: "anthropic",
+    // pi-ai API-provider registry id — "anthropic" alone is a provider slug
+    // there, not an api, and fails model resolution (see normalizeProviderApi).
+    api: "anthropic-messages",
     models: [
       {
         id: "claude-sonnet-4-20250514",
@@ -58,7 +60,7 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 16000,
-        compat: defaultProviderModelCompat({ api: "anthropic", baseUrl: "https://api.anthropic.com/v1" }),
+        compat: defaultProviderModelCompat({ api: "anthropic-messages", baseUrl: "https://api.anthropic.com/v1" }),
       },
       {
         id: "claude-opus-4-20250514",
@@ -68,7 +70,7 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 16000,
-        compat: defaultProviderModelCompat({ api: "anthropic", baseUrl: "https://api.anthropic.com/v1" }),
+        compat: defaultProviderModelCompat({ api: "anthropic-messages", baseUrl: "https://api.anthropic.com/v1" }),
       },
     ],
   },
