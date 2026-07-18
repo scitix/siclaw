@@ -89,6 +89,37 @@ describe("SicoreA2aClient", () => {
     expect(error.message).not.toContain("super-secret-key");
   });
 
+  it("retries transient GET failures within one read timeout", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ error: { message: "temporary" } }, 500))
+      .mockResolvedValueOnce(new Response("not-json", { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({ task: task("TASK_STATE_COMPLETED", "recovered") }));
+    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+
+    await expect(client.getTask("task-1")).resolves.toMatchObject({ state: "completed", result: "recovered" });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("bounds transient GET retries", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ error: { message: "temporary" } }, 503));
+    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+
+    await expect(client.getTask("task-1")).rejects.toBeInstanceOf(A2aClientError);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("never retries task submission or cancellation", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ error: { message: "temporary" } }, 503));
+    const client = new SicoreA2aClient(config(), fetchImpl as typeof fetch);
+
+    await expect(client.sendMessage("check node")).rejects.toBeInstanceOf(A2aClientError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    await expect(client.cancelTask("task-1")).rejects.toBeInstanceOf(A2aClientError);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("polls until a task becomes terminal", async () => {
     const fetchImpl = vi
       .fn()
@@ -101,6 +132,27 @@ describe("SicoreA2aClient", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps read retries inside the wait deadline and returns the last snapshot", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ task: task() }))
+      .mockImplementationOnce(async (_url: string | URL | Request, init?: RequestInit) => (
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        })
+      ));
+    const client = new SicoreA2aClient(
+      config({ requestTimeoutMs: 5_000, pollIntervalMs: 10 }),
+      fetchImpl as typeof fetch,
+    );
+
+    const startedAt = Date.now();
+    await expect(client.waitForTask("task-1", 0.05)).resolves.toMatchObject({ state: "working" });
+
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("maps list and cancel routes", async () => {
     const fetchImpl = vi
       .fn()
@@ -110,7 +162,7 @@ describe("SicoreA2aClient", () => {
 
     const list = await client.listTasks({ contextId: "context-1", status: "TASK_STATE_WORKING", pageSize: 10, pageToken: 0 });
     expect(list.total_size).toBe(1);
-    expect(list.next_page_token).toBe("10");
+    expect(list.next_page_token).toBe(10);
     expect(String(fetchImpl.mock.calls[0][0])).toContain("contextId=context-1");
     expect(String(fetchImpl.mock.calls[0][0])).toContain("status=TASK_STATE_WORKING");
 
