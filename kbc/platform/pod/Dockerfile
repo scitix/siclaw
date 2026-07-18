@@ -1,6 +1,7 @@
-# Compile-pod image = Python + Claude Agent SDK + the kbc compile brain.
+# Compile-pod image = Python + both agent SDK adapters + the kbc compile brain.
 #
-# The Agent SDK ships the Claude Code binary — no separate CLI install.
+# Each pinned SDK ships its matching runtime binary; /session selects exactly
+# one engine for a run (claude_agent_sdk or codex_sdk).
 #
 # build:  docker build -f platform/pod/Dockerfile -t kbc-compile-pod .   (run from kbc/ = build ctx)
 # run (production; LLM via the company massapi):

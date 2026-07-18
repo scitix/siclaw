@@ -1440,7 +1440,9 @@ def test_apply_session_config():
     llm applies + clears a stale forwarded API key; settings whitelisted to
     KBC_*; the boot-time KBC_PK_MODE=off kill switch outranks consumer config."""
     keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
-            "KBC_COMPILE_MODEL", "KBC_PK_MODE")
+            "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY", "OPENAI_AUTH_TOKEN",
+            "KBC_ENGINE", "KBC_COMPILE_MODEL", "KBC_TEST_MODEL", "KBC_PK_BLUE_MODEL",
+            "KBC_PK_MODE")
     backup = {k: os.environ.get(k) for k in keys}
     kill_backup = compile_box._PK_KILL_AT_BOOT
     try:
@@ -1477,6 +1479,43 @@ def test_apply_session_config():
         assert "ANTHROPIC_MODEL" not in os.environ
         assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
         assert os.environ["ANTHROPIC_API_KEY"] == "api-key-2"
+
+        # Codex is an ordinary API-key Responses provider, never the
+        # subscription-only codex_responses path. Switching engines clears the
+        # previous SDK's complete authority block.
+        compile_box._apply_session_config({
+            "llm": {
+                "engine": "codex_sdk",
+                "protocol": "openai_responses",
+                "base_url": "https://massapi.example/model-api",
+                "api_key": "mass-key",
+                "model": "gpt-5.6-luna",
+            },
+            "settings": {"KBC_ENGINE": "claude_agent_sdk"},
+        })
+        assert os.environ["KBC_ENGINE"] == "codex_sdk"
+        assert os.environ["OPENAI_BASE_URL"] == "https://massapi.example/model-api"
+        assert os.environ["OPENAI_API_KEY"] == "mass-key"
+        assert os.environ["OPENAI_MODEL"] == "gpt-5.6-luna"
+        assert not any(key in os.environ for key in (
+            "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+        ))
+
+        # kb-test is the production-consumer/blue tier. The selected blue role
+        # must therefore drive the interactive test session as well, while an
+        # explicit test-only override still wins.
+        os.environ["KBC_PK_BLUE_MODEL"] = "gpt-5.6-luna"
+        assert compile_box._test_model() == "gpt-5.6-luna"
+        os.environ["KBC_TEST_MODEL"] = "gpt-5.6-luna-test"
+        assert compile_box._test_model() == "gpt-5.6-luna-test"
+        os.environ.pop("KBC_TEST_MODEL")
+        try:
+            compile_box._apply_session_config({"llm": {
+                "engine": "codex_sdk", "protocol": "anthropic",
+            }})
+            raise AssertionError("mismatched engine/protocol must fail closed")
+        except ValueError as exc:
+            assert "requires protocol" in str(exc), exc
 
         # ops kill switch: runtime-level off beats consumer "auto"
         os.environ["KBC_PK_MODE"] = "off"
