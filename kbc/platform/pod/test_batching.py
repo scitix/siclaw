@@ -164,6 +164,41 @@ def test_hierarchical_large_anchor_is_not_replayed_into_every_image_chunk(tmp_pa
     assert all(b["context_sources"] == [] for b in manual_batches[1:])
 
 
+def test_hierarchical_oversized_text_anchor_is_sliced_before_image_chunks(tmp_path):
+    raw = _mk(
+        tmp_path,
+        {f"gpu/manual.assets/page-{i:03d}.jpg": 1_000 for i in range(13)},
+    )
+    manual = raw / "gpu/manual.md"
+    manual.parent.mkdir(parents=True, exist_ok=True)
+    manual.write_text("".join(f"line {i:05d}\n" for i in range(18_000)))
+    inv = bt.scan_sources(raw)
+    batches = bt.pack_hierarchical_batches(inv)
+    slice_batches = [b for b in batches if b.get("source_ranges")]
+    assert len(slice_batches) >= 3
+    assert all(b["sources"] == ["gpu/manual.md"] for b in slice_batches)
+    assert all(b["text_bytes"] <= 64 * 1024 for b in slice_batches)
+    assert all(b["defer_accounting"] for b in slice_batches[:-1])
+    assert slice_batches[-1]["defer_accounting"] is False
+    assert all("gpu/manual.md" not in b["context_sources"] for b in batches)
+    assert max(sum(p.endswith(".jpg") for p in b["sources"]) for b in batches) <= 8
+    plan = bt.build_plan(inv, batches, planner="hierarchical-code")
+    assert plan["version"] == 3
+    assert bt.validate_plan(
+        plan, inv, budget=1024 * 1024, text_budget=128 * 1024) == []
+
+    broken = bt.build_plan(
+        inv, [dict(batch) for batch in batches], planner="hierarchical-code")
+    first_range = next(b for b in broken["batches"] if b.get("source_ranges"))
+    first_range["source_ranges"] = {
+        "gpu/manual.md": dict(first_range["source_ranges"]["gpu/manual.md"])
+    }
+    first_range["source_ranges"]["gpu/manual.md"]["end_line"] -= 1
+    errors = bt.validate_plan(
+        broken, inv, budget=1024 * 1024, text_budget=128 * 1024)
+    assert any("not contiguous" in error for error in errors), errors
+
+
 def test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries(tmp_path):
     previous = os.environ.get("KBC_HIERARCHICAL_IMAGE_COST_BYTES")
     os.environ["KBC_HIERARCHICAL_IMAGE_COST_BYTES"] = str(128 * 1024)
@@ -358,6 +393,7 @@ def main():
         test_validate_hierarchical_context_is_known_and_budgeted,
         test_hierarchical_text_cap_preserves_session_context_safety,
         test_hierarchical_large_anchor_is_not_replayed_into_every_image_chunk,
+        test_hierarchical_oversized_text_anchor_is_sliced_before_image_chunks,
         test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries,
         test_validate_plan_accepts_code_baseline,
         test_validate_plan_rejects_missing_duplicate_unknown_overflow,
