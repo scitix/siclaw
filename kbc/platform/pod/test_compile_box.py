@@ -2476,6 +2476,114 @@ def test_hierarchical_media_verify_round_limit():
     print("\u2713 hierarchical media verify: scales by pending pages, flat unchanged, hard cap")
 
 
+async def test_hierarchical_media_rechecks_after_ledger_repair():
+    """A media repair followed by a ledger-format repair must be verified at
+    the ledger-clean fingerprint. The old tail verified the media edit first,
+    then changed the page in a final ledger pass and still marked the plan
+    complete with that final revision pending image verification."""
+    import batching
+    import selfcheck
+
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media_enabled = compile_box._media_verify_enabled
+    real_blind_verify = compile_box.mediaverify.run_blind_verify
+    real_engine = compile_box.ClaudeEngine
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw").mkdir()
+            (wd / "raw" / "chart.png").write_bytes(b"image")
+            (wd / "candidate").mkdir()
+            (wd / "candidate" / "index.md").write_text(
+                "---\nokf_version: \"0.1\"\n---\n# Index\n- [Page](page.md)\n")
+            page = wd / "candidate" / "page.md"
+            page.write_text(
+                "---\ntype: Topic\ntitle: Page\ncompiled_from:\n"
+                "  - chart.png\n---\ninitial (source: chart.png)\n")
+            (wd / "authoring").mkdir()
+            plan = {
+                "version": 2,
+                "planner": "hierarchical-code",
+                "mode": "hierarchical",
+                "phase": "final",
+                "batches": [{
+                    "id": "h001",
+                    "sources": ["chart.png"],
+                    "context_sources": [],
+                    "bytes": 5,
+                    "status": "done",
+                }],
+                "reductions": [],
+            }
+            (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+            run = compile_box.CompileRun("media-ledger-fingerprint", str(wd), 1)
+            order: list[str] = []
+            media_calls = 0
+
+            async def fake_drive(run_, directive, label):
+                order.append(f"drive:{label}")
+                if label == "final review":
+                    assert "do not read raw/" in directive, directive
+                if label in {"image verification", "图像复核"}:
+                    page.write_text(page.read_text() + "media-repair\n")
+                return f"done {label}"
+
+            async def fake_repairs(run_, replies):
+                order.append("ledger")
+                if "media-repair" in page.read_text() and "ledger-repair" not in page.read_text():
+                    page.write_text(page.read_text() + "ledger-repair\n")
+
+            async def fake_blind_verify(engine, workdir, pending, progress=None, locale=None):
+                nonlocal media_calls
+                media_calls += 1
+                order.append(f"verify:{media_calls}:{'ledger-repair' in page.read_text()}")
+                if media_calls == 1:
+                    return {
+                        "findings": [{
+                            "page": "page.md",
+                            "image": "chart.png",
+                            "kind": "不一致",
+                            "claim": "initial",
+                            "expected": "corrected",
+                            "fix": "repair",
+                        }],
+                        "errors": [],
+                        "images": 1,
+                        "completed_pages": ["page.md"],
+                        "failed_pages": [],
+                    }
+                return {
+                    "findings": [],
+                    "errors": [],
+                    "images": 1,
+                    "completed_pages": ["page.md"],
+                    "failed_pages": [],
+                }
+
+            compile_box._drive_batch_session = fake_drive
+            compile_box._run_ledger_repairs = fake_repairs
+            compile_box._media_verify_enabled = lambda: True
+            compile_box.mediaverify.run_blind_verify = fake_blind_verify
+            compile_box.ClaudeEngine = lambda: object()
+            await compile_box._run_batch_compile(run, "直接开始编译")
+
+            assert media_calls == 2, order
+            assert order.index("ledger", order.index("verify:1:False")) < order.index("verify:2:True"), order
+            assert selfcheck.pending_media_verification(td) == {}, order
+            report = selfcheck.read_selfcheck(td)
+            assert report["media_verify"]["summary"]["pending_pages"] == 0, report
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert saved["phase"] == "complete", saved
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._run_ledger_repairs = real_repairs
+        compile_box._media_verify_enabled = real_media_enabled
+        compile_box.mediaverify.run_blind_verify = real_blind_verify
+        compile_box.ClaudeEngine = real_engine
+    print("\u2713 hierarchical media verify: ledger-clean revision is rechecked")
+
+
 async def test_batch_orchestrator_review_fixes():
     """Review fixes: (a) resume prunes sources deleted from raw/ (no directive
     points at a missing file; an emptied batch is skipped); (b) an orchestrator
@@ -3328,6 +3436,7 @@ async def main():
     test_hierarchical_text_slice_materialization_and_directive()
     await test_hierarchical_batch_plan_and_section_reduce()
     test_hierarchical_media_verify_round_limit()
+    await test_hierarchical_media_rechecks_after_ledger_repair()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()
     await test_model_stall_live_stream_not_reaped()

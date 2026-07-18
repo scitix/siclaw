@@ -2573,7 +2573,8 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
         step += 1
         lines.append(f"{step}) Check authoring/EXCLUSIONS.json: sources you decided not to compile (including "
                      "images/PDF and other media) must be explicitly accounted for.")
-        lines.append("Close out only — do not recompile pages that are already fine. When done, report "
+        lines.append("Close out only — do not read raw/ or recompile pages that are already fine. "
+                     "Use Candidate and the authoring ledgers for this cross-batch review. When done, report "
                      "briefly: total pages, which pages this close-out touched, which pairs were "
                      "merged/exempted and why, and anything worth the owner's attention.")
         return "\n".join(lines) + notes
@@ -2594,7 +2595,8 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
                  "(如时间序取最新并保留沿革),定不了的才 best-guess+⚠️存疑+落工单;顺带检查既有 ⚠️ 里有没有其实能收敛的;")
     step += 1
     lines.append(f"{step}) 核对 authoring/EXCLUSIONS.json:决定不编的源(含图片/PDF 等媒体)必须显式入账。")
-    lines.append("只做收口,不重编已经完好的页。完成后简短汇报:总页数、本次收口动了哪些页、合并/豁免了哪几对及理由、还有什么值得负责人注意。")
+    lines.append("只做收口,不要读 raw/,也不重编已经完好的页;跨批核对只使用 Candidate 和 authoring 账本。"
+                 "完成后简短汇报:总页数、本次收口动了哪些页、合并/豁免了哪几对及理由、还有什么值得负责人注意。")
     return "\n".join(lines) + notes
 
 
@@ -2899,7 +2901,6 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # add image-digesting pages), then one more ledger refresh so
         # SELFCHECK.json reflects the verified final state.
         if _media_verify_enabled():
-            repaired_any = False
             rounds = 0
             initial_pending = selfcheck.pending_media_verification(run.workdir)
             round_limit = _batch_media_verify_round_limit(plan, initial_pending)
@@ -2951,12 +2952,16 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         _loc(run, "image verification", "图像复核"))
                     if verify_reply:
                         replies.append(_loc(run, f"[Image verification] {verify_reply}", f"【图像复核】{verify_reply}"))
-                    repaired_any = True
+                    # A media repair can introduce a malformed or dangling
+                    # source annotation. Repair the ledger BEFORE the next
+                    # blind comparison so the verified fingerprint belongs to
+                    # the final lint-clean bytes, not the pre-ledger revision.
+                    # The while loop then naturally re-verifies any page that
+                    # this bounded ledger pass changed.
+                    await _run_ledger_repairs(run, replies)
                 else:
                     await run.emit({"type": "summary",
                                     "text": f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓"})
-            if repaired_any:
-                await _run_ledger_repairs(run, replies)
         # Owner notes that arrived during the tail phases (ledger repair / image
         # verify) were acked as "will be considered" but have no later batch to
         # ride — honor the contract with a bounded digest session before the
