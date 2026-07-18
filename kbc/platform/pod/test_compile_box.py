@@ -2254,11 +2254,14 @@ async def test_batch_orchestrator_routing_and_resume():
             return f"done {label}"
 
         real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
         compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
         try:
             await compile_box._run_batch_compile(run, "直接开始编译")
         finally:
             compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
 
         events = []
         while not run.events.empty():
@@ -2281,10 +2284,12 @@ async def test_batch_orchestrator_routing_and_resume():
         assert compile_box._should_route_to_batch(run, "直接开始编译")
         driven.clear()
         compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
         try:
             await compile_box._run_batch_compile(run, "直接开始编译")
         finally:
             compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
         assert len(driven) == 2 and driven[0].startswith("batch 2/2"), driven
 
         # mid-batch owner chat queues and is relayed into the next directive
@@ -2404,7 +2409,9 @@ async def test_batch_orchestrator_review_fixes():
     points at a missing file; an emptied batch is skipped); (b) an orchestrator
     error still CLOSES the logical turn (error + turn_done, never-block); (c)
     owner notes arriving during the tail phases get a bounded digest session
-    instead of being silently abandoned at turn_done."""
+    instead of being silently abandoned at turn_done; (e) an SDK error result
+    leaves the current batch pending instead of falsely stamping it done; (f)
+    even a successful no-op result cannot stamp unaccounted sources done."""
     import batching
 
     def _events(run):
@@ -2417,6 +2424,8 @@ async def test_batch_orchestrator_review_fixes():
     os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
     os.environ["KBC_BATCH_PLANNER"] = "code"
     real_drive = compile_box._drive_batch_session
+    real_accounted = compile_box._unaccounted_batch_sources
+    compile_box._unaccounted_batch_sources = lambda run_, sources: []
     try:
         # (a) resume after a source vanished: plan pins deleted.md in a pending
         # batch (and a fully-vanished batch) — directives must not mention them.
@@ -2505,8 +2514,73 @@ async def test_batch_orchestrator_review_fixes():
             assert any(d.startswith("批 1/1|【分批编译 · 批 1/1") for d in driven), driven
             turn = next(e for e in _events(run) if e["type"] == "turn_done")
             assert "【批 1/1】" in turn["text"] and "【终审】" in turn["text"], turn
+
+        # (e) The real GPU corpus exposed this path: Claude Code returned an
+        # authentication error ResultMessage with no assistant output. Treating
+        # it like a successful empty result stamped every map batch done. The
+        # batch must remain pending so the next valid run can resume honestly.
+        compile_box._drive_batch_session = real_drive
+        compile_box._unaccounted_batch_sources = real_accounted
+
+        class _ErrorResultClient:
+            def __init__(self, options=None):
+                self.options = options
+
+            async def connect(self, prompt=None):
+                pass
+
+            async def query(self, prompt, session_id="default"):
+                pass
+
+            async def receive_messages(self):
+                yield ResultMessage("error_during_execution", is_error=True)
+
+            async def disconnect(self):
+                pass
+
+        real_client = compile_box.ClaudeSDKClient
+        compile_box.ClaudeSDKClient = _ErrorResultClient
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                (wd / "raw" / "a").mkdir(parents=True)
+                (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+                run = compile_box.CompileRun("rf5", str(wd), 1)
+                await compile_box._run_batch_compile(run, "直接开始编译")
+                saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+                assert saved["batches"][0]["status"] == "pending", saved
+                evs = _events(run)
+                assert any(e["type"] == "error" and "ModelResultError" in e.get("error", "")
+                           for e in evs), evs
+                assert sum(e["type"] == "turn_done" for e in evs) == 1, evs
+        finally:
+            compile_box.ClaudeSDKClient = real_client
+
+        # (f) is_error=False is necessary but not sufficient: a provider/SDK
+        # regression may return an empty successful result. Every assigned
+        # source must now be cited or explicitly excluded before the done stamp.
+        class _NoopResultClient(_ErrorResultClient):
+            async def receive_messages(self):
+                yield ResultMessage()
+
+        compile_box.ClaudeSDKClient = _NoopResultClient
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                (wd / "raw" / "a").mkdir(parents=True)
+                (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+                run = compile_box.CompileRun("rf6", str(wd), 1)
+                await compile_box._run_batch_compile(run, "直接开始编译")
+                saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+                assert saved["batches"][0]["status"] == "pending", saved
+                evs = _events(run)
+                assert any(e["type"] == "error" and "BatchOutputError" in e.get("error", "")
+                           for e in evs), evs
+        finally:
+            compile_box.ClaudeSDKClient = real_client
     finally:
         compile_box._drive_batch_session = real_drive
+        compile_box._unaccounted_batch_sources = real_accounted
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
         del os.environ["KBC_BATCH_BUDGET_BYTES"]
     print("✓ batch orchestrator review fixes: resume-prune / error turn_done / tail-note digest")
