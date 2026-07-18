@@ -48,6 +48,14 @@ def _image_cost() -> int:
     return int(os.environ.get("KBC_BATCH_IMAGE_COST_BYTES", str(30 * 1024)))
 
 
+def _hierarchical_image_cost() -> int:
+    """High-resolution page renders accumulate vision tokens across a long
+    map session. Keep the established flat-planner estimate for medium corpora,
+    but use a conservative cost in the very-large hierarchical path."""
+    return int(os.environ.get(
+        "KBC_HIERARCHICAL_IMAGE_COST_BYTES", str(64 * 1024)))
+
+
 def _pdf_page_cost() -> int:
     return int(os.environ.get("KBC_BATCH_PDF_PAGE_COST_BYTES", str(8 * 1024)))
 
@@ -157,6 +165,12 @@ def corpus_bytes(inventory: list[dict[str, Any]]) -> int:
 
 def _eff(item: dict[str, Any]) -> int:
     return int(item.get("effective", item["bytes"]))
+
+
+def _hierarchical_eff(item: dict[str, Any]) -> int:
+    if Path(str(item["path"])).suffix.lower() in IMAGE_EXTS:
+        return max(_eff(item), _hierarchical_image_cost())
+    return _eff(item)
 
 
 def _text_eff(item: dict[str, Any]) -> int:
@@ -298,7 +312,7 @@ def pack_hierarchical_batches(
             "id": f"h{len(result) + 1:03d}",
             "sources": [str(i["path"]) for i in sources],
             "context_sources": [str(i["path"]) for i in context],
-            "bytes": sum(_eff(i) for i in sources + context),
+            "bytes": sum(_hierarchical_eff(i) for i in sources + context),
             "text_bytes": sum(_text_eff(i) for i in sources + context),
             "status": "pending",
         })
@@ -312,7 +326,7 @@ def pack_hierarchical_batches(
             current_text_bytes = 0
 
     for family in source_families(inventory):
-        family_bytes = sum(_eff(i) for i in family)
+        family_bytes = sum(_hierarchical_eff(i) for i in family)
         family_text_bytes = sum(_text_eff(i) for i in family)
         section = _top_dir(str(family[0]["path"]))
         if family_bytes <= limit and family_text_bytes <= text_limit:
@@ -334,30 +348,30 @@ def pack_hierarchical_batches(
         if anchor is not None:
             # The anchor itself is accounted once, in the first chunk.
             first = [remaining.pop(0)]
-            first_bytes = _eff(first[0])
+            first_bytes = _hierarchical_eff(first[0])
             first_text_bytes = _text_eff(first[0])
             while (
                 remaining
-                and first_bytes + _eff(remaining[0]) <= limit
+                and first_bytes + _hierarchical_eff(remaining[0]) <= limit
                 and first_text_bytes + _text_eff(remaining[0]) <= text_limit
             ):
                 item = remaining.pop(0)
                 first.append(item)
-                first_bytes += _eff(item)
+                first_bytes += _hierarchical_eff(item)
                 first_text_bytes += _text_eff(item)
             append_batch(first)
 
         # Re-reading an oversized anchor on every chunk would itself overflow
         # the context. In that rare case the chunks remain independent.
         context = [anchor] if (
-            anchor is not None and _eff(anchor) < limit and _text_eff(anchor) < text_limit
+            anchor is not None and _hierarchical_eff(anchor) < limit and _text_eff(anchor) < text_limit
         ) else []
-        context_bytes = sum(_eff(i) for i in context)
+        context_bytes = sum(_hierarchical_eff(i) for i in context)
         context_text_bytes = sum(_text_eff(i) for i in context)
         while remaining:
             batch_context = context
             if context and (
-                context_bytes + _eff(remaining[0]) > limit
+                context_bytes + _hierarchical_eff(remaining[0]) > limit
                 or context_text_bytes + _text_eff(remaining[0]) > text_limit
             ):
                 # A single oversized asset/file is allowed as a solo batch; do
@@ -365,18 +379,18 @@ def pack_hierarchical_batches(
                 # the anchor beside it.
                 batch_context = []
             chunk: list[dict[str, Any]] = []
-            chunk_bytes = sum(_eff(i) for i in batch_context)
+            chunk_bytes = sum(_hierarchical_eff(i) for i in batch_context)
             chunk_text_bytes = sum(_text_eff(i) for i in batch_context)
             while remaining and (
                 (
-                    chunk_bytes + _eff(remaining[0]) <= limit
+                    chunk_bytes + _hierarchical_eff(remaining[0]) <= limit
                     and chunk_text_bytes + _text_eff(remaining[0]) <= text_limit
                 )
                 or not chunk
             ):
                 item = remaining.pop(0)
                 chunk.append(item)
-                chunk_bytes += _eff(item)
+                chunk_bytes += _hierarchical_eff(item)
                 chunk_text_bytes += _text_eff(item)
             append_batch(chunk, batch_context)
     flush()
@@ -425,7 +439,8 @@ def validate_plan(
     toward the per-session budget."""
     b = budget if budget is not None else batch_budget_bytes()
     errors: list[str] = []
-    sizes = {i["path"]: _eff(i) for i in inventory}
+    effective = _hierarchical_eff if plan.get("mode") == "hierarchical" else _eff
+    sizes = {i["path"]: effective(i) for i in inventory}
     text_sizes = {i["path"]: _text_eff(i) for i in inventory}
     seen: dict[str, str] = {}
     seen_ids: set[str] = set()
