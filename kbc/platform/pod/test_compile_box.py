@@ -1436,6 +1436,54 @@ async def test_propose_plan_never_bounces():
     print("✓ propose_plan always signals; PROPOSED_PLAN.json written by code")
 
 
+async def test_delete_candidate_page_is_scoped():
+    """The compiler can remove a merged-away page without gaining Bash."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "candidate/guide").mkdir(parents=True)
+        (wd / "raw").mkdir()
+        (wd / "candidate/index.md").write_text("# Index", encoding="utf-8")
+        (wd / "candidate/guide/index.md").write_text("# Guide", encoding="utf-8")
+        dead = wd / "candidate/guide/dead.md"
+        dead.write_text("old", encoding="utf-8")
+        outside = wd / "raw/source.md"
+        outside.write_text("raw", encoding="utf-8")
+        events = []
+
+        class FakeRun:
+            workdir = str(wd)
+            locale = "en"
+
+            async def emit(self, ev):
+                events.append(ev)
+
+        captured = {}
+        original = compile_box.create_sdk_mcp_server
+
+        def capture(name, tools):
+            captured.update({t.name: t for t in tools})
+            return original(name, tools=tools)
+
+        compile_box.create_sdk_mcp_server = capture
+        try:
+            compile_box._make_compile_tools(FakeRun())
+        finally:
+            compile_box.create_sdk_mcp_server = original
+        delete = captured["delete_candidate_page"].handler
+
+        assert "mcp__compile__delete_candidate_page" in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+        result = await delete({"path": "guide/dead.md"})
+        assert not dead.exists(), result
+        assert events and events[-1]["type"] == "summary", events
+
+        for refused in ("../raw/source.md", "/tmp/out.md", "index.md",
+                        "guide/index.md", "guide/data.json"):
+            result = await delete({"path": refused})
+            assert "deleted candidate page" not in result["content"][0]["text"], (refused, result)
+        assert outside.read_text(encoding="utf-8") == "raw"
+    print("✓ delete_candidate_page is confined to non-routing candidate Markdown files")
+
+
 def test_install_wiki_snapshot_size_guard():
     """Fix A: the published-snapshot installer rejects an oversized compressed
     bundle AND a decompression bomb (accumulated-unpacked cap), like its sibling
@@ -3114,6 +3162,7 @@ async def main():
     await test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool()
     await test_recommendation_driver_reports_max_turn_exhaustion()
     await test_propose_plan_never_bounces()
+    await test_delete_candidate_page_is_scoped()
     test_apply_session_config()
     test_parse_brief_block()
     await test_message_captures_brief()

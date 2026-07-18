@@ -386,7 +386,10 @@ def test_body_source_annotations():
             f"More. (source: {Path(report_pdf).name} p.12)\n"
             f"更多。（来源: {Path(punctuated).name} 第3节）\n"
             f"Combined. (source: {Path(first).name} §3, "
-            f"{Path(report_pdf).name} lines 10-12)"
+            f"{Path(report_pdf).name} lines 10-12)\n"
+            f"Plural. (source: {Path(report_pdf).name} Pages 3-5)\n"
+            f"List. (source: {Path(report_pdf).name} Pages 2, 4)\n"
+            f"Short plural. (source: {Path(report_pdf).name} pp. 8-9)"
         )
         report = selfcheck.run_layer1(td)
         assert report["coverage"]["closed"] and report["lint"]["ok"], report
@@ -506,9 +509,56 @@ def test_media_verify_helpers():
         # run_layer1 must carry media_verify forward (not wipe it)
         report = selfcheck.run_layer1(td)
         assert report["media_verify"]["verified_pages"] == ["p1.md"], report["media_verify"]
+        assert report["media_verify"]["summary"] == {
+            "total_pages": 1, "passed_pages": 1, "exhausted_pages": 0,
+            "pending_pages": 0, "total_images": 2, "pending_images": 0,
+        }, report["media_verify"]
         selfcheck.write_selfcheck(td, report)
         assert selfcheck.pending_media_verification(td) == {}
     print("OK  media_citing_pages + pending/mark idempotency + carry-forward")
+
+
+def test_media_verify_content_identity_and_attempt_reset():
+    """A verified path is not a verified future revision of that page/image."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/chart.png", "image-v1")
+        _mk(base, "candidate/index.md",
+            "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        page = base / "candidate/p.md"
+        _mk(base, "candidate/p.md",
+            "---\ntype: Topic\ncompiled_from:\n  - chart.png\n---\nvalue 1")
+
+        selfcheck.mark_media_verified(td, ["p.md"])
+        assert selfcheck.pending_media_verification(td) == {}
+
+        # Same path, edited claim: must re-enter and get a fresh retry budget.
+        page.write_text(page.read_text() + "\nvalue 2", encoding="utf-8")
+        assert list(selfcheck.pending_media_verification(td)) == ["p.md"]
+        assert selfcheck.bump_media_attempts(td, ["p.md"])["p.md"] == 1
+        assert selfcheck.bump_media_attempts(td, ["p.md"])["p.md"] == 2
+
+        # Same page, same image path, replaced bytes: identity changes and the
+        # previous revision's two failed attempts must not exhaust this one.
+        (base / "raw/chart.png").write_text("image-v2", encoding="utf-8")
+        assert list(selfcheck.pending_media_verification(td)) == ["p.md"]
+        assert selfcheck.bump_media_attempts(td, ["p.md"])["p.md"] == 1
+
+        selfcheck.mark_media_verified(td, ["p.md"], exhausted=True)
+        report = selfcheck.read_selfcheck(td)
+        assert report["media_verify"]["summary"]["exhausted_pages"] == 1, report
+        assert report["media_verify"]["summary"]["passed_pages"] == 0, report
+
+        # A later repair re-arms an exhausted page; a clean verify clears the
+        # stale exhausted flag and records the repaired fingerprint as passed.
+        page.write_text(page.read_text() + "\nrepaired", encoding="utf-8")
+        assert list(selfcheck.pending_media_verification(td)) == ["p.md"]
+        selfcheck.mark_media_verified(td, ["p.md"])
+        report = selfcheck.read_selfcheck(td)
+        assert report["media_verify"]["summary"]["passed_pages"] == 1, report
+        assert report["media_verify"]["summary"]["exhausted_pages"] == 0, report
+        assert report["media_verify"]["exhausted"] == [], report
+    print("OK  media verification identity = page bytes + cited image bytes; retries reset per revision")
 
 
 def test_cap_media_pending():
@@ -1000,11 +1050,26 @@ async def test_media_verify_wiring():
             await run._media_task
             assert calls[0] == {"p.md": ["s/i1.png"]}, calls
             assert run.injected and "[System self-check · image verification]" in run.injected[-1] and "94% 是 MEM 条" in run.injected[-1]
-            assert compile_box._pk_due(run) is None         # q.md still pending → PK waits
-            assert _maybe_start_media_verify(run)           # remainder rolls: chunk 2 (q.md)
+            assert compile_box._pk_due(run) is None         # finding page + q.md pending → PK waits
+
+            # Simulate the injected repair editing the finding page. The path is
+            # unchanged, but its content fingerprint must re-arm verification.
+            p = base / "candidate/p.md"
+            p.write_text(p.read_text() + "\nfixed", encoding="utf-8")
+            assert _maybe_start_media_verify(run)           # repaired p.md verifies again
             await run._media_task
-            assert calls[1] == {"q.md": ["s/i2.png"]}, calls
-            assert len(run.injected) == 1                   # clean chunk → no injection
+            assert calls[1] == {"p.md": ["s/i1.png"]}, calls
+            # Clean p.md self-drains the remaining q.md chunk before settling.
+            for _ in range(4):
+                if len(calls) >= 3:
+                    break
+                task = run._media_task
+                if task is not None:
+                    await task
+                else:
+                    await asyncio.sleep(0)
+            assert calls[2] == {"q.md": ["s/i2.png"]}, calls
+            assert len(run.injected) == 1                   # clean recheck/chunk → no new injection
             assert not _maybe_start_media_verify(run)       # all verified → done
         finally:
             mv.run_blind_verify = orig
@@ -1052,9 +1117,10 @@ async def test_media_inject_failure_does_not_double_settle():
             await run._media_task
             sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
             mvsec = sc["media_verify"]
-            assert "p.md" in mvsec["verified_pages"], mvsec       # the completed verification stands
+            assert "p.md" not in (mvsec.get("verified_pages") or []), mvsec  # known finding is not a pass
             assert "p.md" not in (mvsec.get("exhausted") or []), mvsec   # no spurious exhausted
             assert not (mvsec.get("attempts") or {}), mvsec       # no phantom failed-attempt bump
+            assert list(selfcheck.pending_media_verification(td)) == ["p.md"], mvsec
             assert sc.get("converge_phase") == "settled", sc      # inject failure falls through to the seam
         finally:
             mv.run_blind_verify = orig
@@ -1479,6 +1545,7 @@ def main():
     test_body_source_annotations()
     test_spaced_markdown_links()
     test_media_verify_helpers()
+    test_media_verify_content_identity_and_attempt_reset()
     test_cap_media_pending()
     test_dangling_alone_blocks_closed()
     test_file_residual_ticket()
