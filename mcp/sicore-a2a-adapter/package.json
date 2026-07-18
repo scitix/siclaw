@@ -1,0 +1,33 @@
+{
+  "name": "@scitix/sicore-a2a-mcp-adapter",
+  "version": "0.1.0",
+  "description": "Local stdio MCP adapter for one Sicore-hosted Siclaw A2A agent",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "sicore-a2a-mcp": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "npm run build && vitest run --config vitest.config.ts",
+    "test:watch": "vitest --config vitest.config.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.8",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  },
+  "license": "Apache-2.0"
+}
