@@ -14,6 +14,10 @@ structured signals:
 
 Surface (driven by the runtime):
   POST /sources            {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install the frozen raw bundle → workdir/raw
+  POST /sources/begin      {run_id, input_revision, snapshot} begin/resume a Source Snapshot v2 install
+  POST /sources/state      {run_id, input_revision} report missing Source Snapshot v2 parts
+  POST /sources/part       {run_id, input_revision, part_id, bundle_base64} verify and persist one part
+  POST /sources/commit     {run_id, input_revision} atomically install a complete v2 snapshot → workdir/raw
   POST /authoring          {run_id?, workdir?, bundle_base64, bundle_sha256?, locale?} install authoring/candidate/eval/release assets → workdir/
   POST /session/{run_id}   {workdir?, instruction?, allowed_tools?, locale?, llm?, settings?} start the run's persistent conversational session (waits for the first /message); idempotent
   POST /message/{run_id}   {message} inject one user turn into the persistent session (prepare/compile/patch are all ordinary turns)
@@ -68,6 +72,7 @@ import redblue
 import selfcheck
 from engine import selected_readonly_engine
 from codex_engine import CodexSDKClient, EngineTool, isolated_readonly_workspace
+import source_snapshot
 
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches
 # (HTTP 400 "context_management: Extra inputs are not permitted").
@@ -3849,6 +3854,90 @@ async def handle_sources(request: web.Request):
     return web.json_response({"ok": True, **result})
 
 
+def _snapshot_request_identity(body: dict) -> tuple[str, str, str]:
+    return body.get("workdir", "/work"), body.get("run_id"), body.get("input_revision")
+
+
+def _snapshot_live_conflict(run_id: str | None):
+    if run_id and run_id in RUNS:
+        return web.json_response({"error": "run already exists; upload sources before /session", "run_id": run_id}, status=409)
+    return None
+
+
+async def handle_sources_begin(request: web.Request):
+    body = await request.json()
+    workdir, run_id, input_revision = _snapshot_request_identity(body)
+    conflict = _snapshot_live_conflict(run_id)
+    if conflict is not None:
+        return conflict
+    try:
+        result = source_snapshot.begin_snapshot(workdir, run_id, input_revision, body.get("snapshot"))
+    except source_snapshot.SnapshotConflict as error:
+        return web.json_response({"error": str(error)}, status=409)
+    except (ValueError, TypeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+    return web.json_response({"ok": True, **result})
+
+
+async def handle_sources_state(request: web.Request):
+    body = await request.json()
+    workdir, run_id, input_revision = _snapshot_request_identity(body)
+    try:
+        result = source_snapshot.snapshot_state(workdir, run_id, input_revision)
+    except source_snapshot.SnapshotConflict as error:
+        return web.json_response({"error": str(error)}, status=409)
+    except (ValueError, TypeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+    return web.json_response({"ok": True, **result})
+
+
+async def handle_sources_part(request: web.Request):
+    body = await request.json()
+    workdir, run_id, input_revision = _snapshot_request_identity(body)
+    conflict = _snapshot_live_conflict(run_id)
+    if conflict is not None:
+        return conflict
+    encoded = body.get("bundle_base64") or body.get("bundle_b64")
+    if not encoded:
+        return web.json_response({"error": "bundle_base64 is required"}, status=400)
+    try:
+        bundle = base64.b64decode(encoded, validate=True)
+        result = source_snapshot.install_part(
+            workdir,
+            run_id,
+            input_revision,
+            body.get("part_id"),
+            bundle,
+            body.get("bundle_sha256"),
+        )
+    except source_snapshot.SnapshotConflict as error:
+        return web.json_response({"error": str(error)}, status=409)
+    except (ValueError, TypeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+    return web.json_response({"ok": True, **result})
+
+
+async def handle_sources_commit(request: web.Request):
+    body = await request.json()
+    workdir, run_id, input_revision = _snapshot_request_identity(body)
+    conflict = _snapshot_live_conflict(run_id)
+    if conflict is not None:
+        return conflict
+    try:
+        result = source_snapshot.commit_snapshot(
+            workdir,
+            run_id,
+            input_revision,
+            convert_office=office_ingest.convert_tree,
+        )
+        _ensure_workdir_constitution(workdir, body.get("locale"))
+    except source_snapshot.SnapshotConflict as error:
+        return web.json_response({"error": str(error)}, status=409)
+    except (ValueError, TypeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+    return web.json_response({"ok": True, **result})
+
+
 async def handle_authoring(request: web.Request):
     # NOTE: authoring assets are just installed into the workspace (/work/authoring
     # etc.), independent of run state — so this is allowed on a LIVE session run
@@ -4365,6 +4454,10 @@ def build_app() -> web.Application:
     app.on_shutdown.append(_flush_on_shutdown)
     app.add_routes([
         web.post("/sources", handle_sources),
+        web.post("/sources/begin", handle_sources_begin),
+        web.post("/sources/state", handle_sources_state),
+        web.post("/sources/part", handle_sources_part),
+        web.post("/sources/commit", handle_sources_commit),
         web.post("/authoring", handle_authoring),
         web.post("/session/{run_id}", handle_session),
         web.post("/message/{run_id}", handle_message),

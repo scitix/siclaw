@@ -410,6 +410,40 @@ export interface CapabilityContentRef {
  * raw-source bundle. Go mirror: capability.InputRefWorkspace.
  */
 export const CAPABILITY_INPUT_WORKSPACE_REF = "workspace" as const;
+/** Fetch one immutable Source Snapshot v2 part by `part_id`. */
+export const CAPABILITY_INPUT_SOURCE_PART_REF = "source-part" as const;
+
+export interface CapabilitySourceSnapshotFile {
+  /** Relative POSIX path under raw/. */
+  path: string;
+  size_bytes: number;
+  sha256: string;
+}
+
+export interface CapabilitySourceSnapshotPart {
+  part_id: string;
+  /** SHA-256 of this part's compressed tar.gz bytes. */
+  sha256: string;
+  bundle_size_bytes: number;
+  unpacked_size_bytes: number;
+  file_count: number;
+  files: CapabilitySourceSnapshotFile[];
+}
+
+/**
+ * Immutable, resumable raw-source delivery descriptor.
+ *
+ * `manifest_sha256` is the SHA-256 of the canonical flattened file manifest
+ * (path/size/sha256 sorted by path). The box independently recomputes it before
+ * accepting an install, while each compressed part is verified separately.
+ */
+export interface CapabilitySourceSnapshot {
+  version: 2;
+  manifest_sha256: string;
+  total_bytes: number;
+  file_count: number;
+  parts: CapabilitySourceSnapshotPart[];
+}
 
 /**
  * Input fetch. GENERALIZES compile.sourceBundle. siclaw asks the consumer for
@@ -418,10 +452,12 @@ export const CAPABILITY_INPUT_WORKSPACE_REF = "workspace" as const;
  */
 export interface CapabilityFetchInputRequest {
   run_id: string;
-  /** Input kind: "" = frozen raw sources; CAPABILITY_INPUT_WORKSPACE_REF = durable workspace. */
+  /** Input kind: raw sources, durable workspace, or one Source Snapshot v2 part. */
   ref?: string;
   /** Recovery pin: return this exact immutable source manifest instead of freezing current raw. */
   input_revision?: string;
+  /** Required when ref=CAPABILITY_INPUT_SOURCE_PART_REF. */
+  part_id?: string;
 }
 
 /**
@@ -446,6 +482,8 @@ export interface CapabilityLlmConfig {
 export interface CapabilityFetchInputResponse {
   bundle_base64?: string;
   bundle_sha256?: string;
+  /** Present instead of bundle_base64 for resumable Source Snapshot v2 delivery. */
+  source_snapshot?: CapabilitySourceSnapshot;
   /** Immutable consumer input revision represented by the source bundle. */
   input_revision?: string;
   /**

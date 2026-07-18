@@ -9,6 +9,7 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
 
 - **`compile_box.py` (served, production form)** — an aiohttp service, driven by the runtime over the **box's own HTTP+SSE contract**:
   - `POST /sources`  `{run_id?, workdir?, bundle_base64, bundle_sha256?}` → upload the frozen raw bundle, safely unpack into `workdir/raw/` (`drop/` kept as a compatibility alias); calling it after the run has started returns 409
+  - Source Snapshot v2 (large/resumable raw input): `POST /sources/begin` with the immutable descriptor → upload only returned `missing_parts` through `POST /sources/part` → `POST /sources/commit`; `POST /sources/state` can recover progress after a container restart. Every compressed part and declared file is SHA-256 verified, and `raw/` changes only after a complete atomic commit. The v1 `/sources` route remains supported for rolling upgrades and small bundles.
   - `POST /authoring` `{run_id?, workdir?, bundle_base64, bundle_sha256?}` → upload authoring/candidate/eval/release assets, safely unpack into `workdir/`; also allowed on a live run (workspace re-hydration goes through here)
   - `POST /session/{run_id}` `{workdir?, instruction?, allowed_tools?, llm?, settings?}` → start this run's persistent conversation session (waits for the first /message); idempotent, on a live run it is a no-op attach and does not hot-rotate the connected SDK client
   - `POST /message/{run_id}` `{message, message_id?}` → inject one genuine conversational turn; a repeated consumer-minted `message_id` is acknowledged without injecting a second turn; legacy control-prefix recognition remains only for rolling upgrades
@@ -54,6 +55,10 @@ docker run --rm -p 3000:3000 \
   kbc-compile-box
 # then:
 #   POST :3000/sources {"run_id":"r1","bundle_base64":"...","bundle_sha256":"..."}
+# or for Source Snapshot v2:
+#   POST :3000/sources/begin  {"run_id":"r1","input_revision":"...","snapshot":{...}}
+#   POST :3000/sources/part   {"run_id":"r1","input_revision":"...","part_id":"part-000001","bundle_base64":"..."}
+#   POST :3000/sources/commit {"run_id":"r1","input_revision":"..."}
 #   POST :3000/authoring {"run_id":"r1","bundle_base64":"...","bundle_sha256":"..."}
 #   POST :3000/session/r1 {"instruction":"..."}
 #   POST :3000/message/r1 {"message":"compile raw/ into candidate pages"} → GET :3000/events/r1 (SSE)
