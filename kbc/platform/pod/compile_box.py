@@ -2056,9 +2056,13 @@ def _should_route_to_batch(run: "CompileRun", text: str, action: str | None = No
     inventory = batching.scan_sources(raw_dir)
     if batching.should_batch(inventory):
         return True
-    # An interrupted batch run must finish as a batch run even if raw shrank.
+    # An interrupted batch/reduce/final run must finish in the orchestrator even
+    # if raw shrank below the threshold after the plan was pinned.
     plan = _load_batch_plan(run)
-    return plan is not None and len(batching.pending_batches(plan)) > 0
+    return plan is not None and (
+        len(batching.pending_batches(plan)) > 0
+        or plan.get("phase") in {"map", "reduce", "final"}
+    )
 
 
 async def _start_incremental(run: "CompileRun", text: str, *, strict: bool = False) -> None:
@@ -2182,6 +2186,17 @@ def _drain_batch_notes(run: "CompileRun") -> str:
 def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
                              locale: str | None = None) -> str:
     listing = "\n".join(f"- raw/{p}" for p in batch["sources"])
+    context_sources = batch.get("context_sources", [])
+    context_listing = "\n".join(f"- raw/{p}" for p in context_sources)
+    context_en = (
+        "\n\nRead-only family context (you MAY re-read these anchors to interpret the listed assets, "
+        "but they are already accounted by another batch; do not compile them again):\n" + context_listing
+        if context_listing else ""
+    )
+    context_zh = (
+        "\n\n只读的同族上下文(可重读这些锚点来理解本批附件,但它们已由其他批次入账,不要重复编译):\n" + context_listing
+        if context_listing else ""
+    )
     if selfcheck._is_en(locale):
         return (
             f"[Batch compile · batch {k}/{n} · {batch['id']}] Compile ONLY the sources below "
@@ -2191,15 +2206,40 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
             "compiled_from must list the sources it was actually compiled from); update the matching "
             "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
-            "never stop. Do not read ANY raw source outside this batch. When done, report briefly which pages "
-            "this batch produced." + notes
+            "never stop. Do not read any raw source outside this compile list and any explicitly listed "
+            "read-only family context. When done, report briefly which pages "
+            "this batch produced." + context_en + notes
         )
     return (
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
         "先读 authoring/BRIEF.json、authoring/INTENT.md 和 candidate/index.md 保持口径与结构一致;"
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
         "compiled_from 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
-        "本批之外的 raw 源一个都不要读。完成后简短汇报本批编了哪些页。" + notes
+        "除上面清单及明确列出的只读同族上下文外,其他 raw 源一个都不要读。完成后简短汇报本批编了哪些页。"
+        + context_zh + notes
+    )
+
+
+def _compose_reduction_directive(
+    reduction: dict, k: int, n: int, notes: str, locale: str | None = None
+) -> str:
+    pages = "\n".join(f"- candidate/{p}" for p in reduction["pages"])
+    section = reduction.get("section") or "root"
+    if selfcheck._is_en(locale):
+        return (
+            f"[Hierarchical compile · section reduce {k}/{n} · {reduction['id']}] "
+            f"Consolidate the candidate pages for source section {section!r}:\n{pages}\n"
+            "Read ONLY the listed candidate pages plus candidate/index.md. Merge genuinely duplicate pages, "
+            "preserve all compiled_from entries and source-backed details, converge terminology and structure, "
+            "and repair index links for pages you merge or rename. Do not read raw/ in this reduce pass and do "
+            "not touch candidate pages outside this list. This is consolidation, not a new compilation. Report "
+            "the pages merged or edited." + notes
+        )
+    return (
+        f"【层级编译 · 分区归并 {k}/{n} · {reduction['id']}】归并来源分区 {section!r} 的下列候选页:\n{pages}\n"
+        "只读上列 candidate 页和 candidate/index.md。合并确实重复的页面,完整保留 compiled_from 与有来源支撑的细节,"
+        "统一术语和结构,并修复被合并或改名页面的 index 链接。本归并轮不要读 raw/,也不要改清单外的 candidate 页。"
+        "这是归并,不是重新编译。完成后汇报合并或修改了哪些页。" + notes
     )
 
 
@@ -2304,6 +2344,22 @@ def _planner_role(locale: str | None) -> str:
 async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
     """Code baseline always exists; the model may regroup topically but ONLY a
     plan that passes deterministic validation replaces the baseline."""
+    if batching.should_hierarchical(inventory):
+        budget = batching.hierarchical_batch_budget_bytes()
+        text_budget = batching.hierarchical_text_budget_bytes()
+        batches = batching.pack_hierarchical_batches(
+            inventory, budget=budget, text_budget=text_budget)
+        plan = batching.build_plan(
+            inventory, batches, planner="hierarchical-code", budget=budget,
+            text_budget=text_budget)
+        errors = batching.validate_plan(
+            plan, inventory, budget=budget, text_budget=text_budget)
+        if errors:
+            raise RuntimeError(
+                "hierarchical batch planner produced an invalid plan: "
+                + "; ".join(errors[:3]))
+        return plan
+
     budget = batching.batch_budget_bytes()
     baseline = batching.build_plan(inventory, batching.pack_batches(inventory), planner="code")
     if os.environ.get("KBC_BATCH_PLANNER", "model") == "code":
@@ -2392,9 +2448,9 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
 
 async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     """The batch orchestrator: ONE logical turn to the consumer (single turn_done at
-    the end), many bounded sessions inside. Crash-resumable at batch granularity:
-    BATCH_PLAN.json carries per-batch done stamps, and any later compile trigger
-    re-enters here and continues from the first pending batch."""
+    the end), many bounded sessions inside. Crash-resumable across map, optional
+    section-reduce, and final phases: BATCH_PLAN.json carries phase plus per-unit
+    done stamps, and a later compile trigger resumes the unfinished phase."""
     run._batch_active = True
     replies: list[str] = []
     try:
@@ -2402,7 +2458,10 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         inventory = batching.scan_sources(raw_dir)
         total_kb = batching.corpus_bytes(inventory) // 1024
         plan = _load_batch_plan(run)
-        resuming = plan is not None and len(batching.pending_batches(plan)) > 0
+        resuming = plan is not None and (
+            len(batching.pending_batches(plan)) > 0
+            or plan.get("phase") in {"map", "reduce", "final"}
+        )
         if not resuming:
             _write_batch_file(run, batching.SOURCES_INVENTORY_PATH, inventory)
             await run.emit({"type": "summary", "text": _loc(run,
@@ -2425,13 +2484,27 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                                         + ("…" if len(dropped) > 5 else "")})
         n = len(plan["batches"])
         pending = batching.pending_batches(plan)
+        if plan.get("mode") == "hierarchical":
+            plan_summary_en = (
+                f"Hierarchical batch plan: {n} map batch(es), "
+                f"{plan.get('budget', 0) // 1024}KB effective / "
+                f"{plan.get('text_budget', 0) // 1024}KB text per batch.")
+            plan_summary_zh = (
+                f"层级分批计划:共 {n} 个映射批次,每批有效预算 "
+                f"{plan.get('budget', 0) // 1024}KB、文本上限 "
+                f"{plan.get('text_budget', 0) // 1024}KB。")
+        else:
+            plan_summary_en = (
+                f"Batch plan ({plan.get('planner')}): {n} batch(es), "
+                f"budget {plan.get('budget', 0) // 1024}KB/batch.")
+            plan_summary_zh = (
+                f"分批计划({plan.get('planner')}):共 {n} 批,预算 "
+                f"{plan.get('budget', 0) // 1024}KB/批。")
         await run.emit({
             "type": "summary",
             "text": (_loc(run, f"Resuming batch compile: {len(pending)}/{n} batch(es) remaining.",
                           f"继续分批编译:剩余 {len(pending)}/{n} 批。") if resuming
-                     else _loc(run,
-                               f"Batch plan ({plan.get('planner')}): {n} batch(es), budget {plan.get('budget', 0) // 1024}KB/batch.",
-                               f"分批计划({plan.get('planner')}):共 {n} 批,预算 {plan.get('budget', 0) // 1024}KB/批。")),
+                     else _loc(run, plan_summary_en, plan_summary_zh)),
         })
         for batch in list(pending):
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
@@ -2452,6 +2525,60 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     pass  # periodic sync will retry; the local stamp is already on disk
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
+        if plan.get("mode") == "hierarchical":
+            if "reductions" not in plan:
+                plan["reductions"] = batching.pack_section_reductions(
+                    selfcheck.candidate_pages(run.workdir))
+            plan["phase"] = "reduce"
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            reductions = plan.get("reductions", [])
+            reduction_count = len(reductions)
+            pending_reductions = batching.pending_reductions(plan)
+            if reduction_count:
+                await run.emit({
+                    "type": "summary",
+                    "text": _loc(
+                        run,
+                        f"Hierarchical reduce: {len(pending_reductions)}/{reduction_count} section group(s) remaining.",
+                        f"层级归并:剩余 {len(pending_reductions)}/{reduction_count} 个分区组。",
+                    ),
+                })
+            for reduction in list(pending_reductions):
+                # A previous reduction may have merged a page that a persisted
+                # later group mentioned. Remove missing pages rather than ask a
+                # resumed session to read paths that no longer exist.
+                current_pages = selfcheck.candidate_pages(run.workdir)
+                reduction["pages"] = [
+                    p for p in reduction.get("pages", []) if p in current_pages]
+                if len(reduction["pages"]) < 2:
+                    batching.stamp_reduction_done(plan, reduction["id"])
+                    _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                    continue
+                k = next(
+                    i + 1 for i, item in enumerate(reductions)
+                    if item["id"] == reduction["id"])
+                directive = _compose_reduction_directive(
+                    reduction, k, reduction_count, _drain_batch_notes(run),
+                    locale=getattr(run, "locale", None))
+                reply = await _drive_batch_session(
+                    run, directive,
+                    _loc(run, f"section reduce {k}/{reduction_count}",
+                         f"分区归并 {k}/{reduction_count}"))
+                if reply:
+                    replies.append(_loc(
+                        run,
+                        f"[Section reduce {k}/{reduction_count}] {reply}",
+                        f"【分区归并 {k}/{reduction_count}】{reply}"))
+                batching.stamp_reduction_done(plan, reduction["id"])
+                _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                sent = getattr(run, "_sync_sent", None)
+                if sent is not None:
+                    try:
+                        await _sync_workspace(run, sent)
+                    except Exception:
+                        pass
+        plan["phase"] = "final"
+        _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         final_reply = await _drive_batch_session(
             run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
             _loc(run, "final review", "终审"))
@@ -2532,10 +2659,19 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 replies.append(_loc(run, f"[Note digest] {notes_reply}", f"【留言消化】{notes_reply}"))
             await _run_ledger_repairs(run, replies)  # the digest may have touched pages
         sent = getattr(run, "_sync_sent", None)
+        plan["phase"] = "complete"
+        _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         if sent is not None:
             # Successful batch completion is one full-compile provenance commit.
             # Content and input revision must land atomically before turn_done.
-            await _sync_workspace(run, sent, commit_input=True)
+            try:
+                await _sync_workspace(run, sent, commit_input=True)
+            except Exception:
+                # The durable commit did not happen. Keep the plan resumable at
+                # final close-out rather than falsely claiming completion.
+                plan["phase"] = "final"
+                _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                raise
         await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
                         or _loc(run, "Batch compile complete.", "分批编译完成。")})
     except Exception as e:

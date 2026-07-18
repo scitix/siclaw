@@ -2177,6 +2177,98 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+async def test_hierarchical_batch_plan_and_section_reduce():
+    """Only the second, very-large-corpus gate selects hierarchical planning.
+    The map keeps anchor context explicit, section reduce runs after all maps,
+    and the persisted phase closes as complete. No model planner is spent on a
+    huge inventory."""
+    import batching
+
+    env_names = [
+        "KBC_BATCH_THRESHOLD_BYTES",
+        "KBC_HIERARCHICAL_THRESHOLD_BYTES",
+        "KBC_HIERARCHICAL_BATCH_BUDGET_BYTES",
+        "KBC_BATCH_PLANNER",
+    ]
+    previous = {name: os.environ.get(name) for name in env_names}
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media_enabled = compile_box._media_verify_enabled
+    try:
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_HIERARCHICAL_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_HIERARCHICAL_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "model"
+
+        # Hierarchical mode is deterministic and must bypass the model planner.
+        inventory = [
+            {"path": "gpu/a.md", "bytes": 300, "effective": 300},
+            {"path": "gpu/b.md", "bytes": 300, "effective": 300},
+        ]
+        with tempfile.TemporaryDirectory() as plan_td:
+            plan = await compile_box._plan_batches(
+                compile_box.CompileRun("hier-plan", plan_td, 1), inventory)
+        assert plan["planner"] == "hierarchical-code" and plan["mode"] == "hierarchical", plan
+        assert len(plan["batches"]) == 2, plan
+
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "gpu").mkdir(parents=True)
+            (wd / "raw" / "gpu" / "a.md").write_bytes(b"a" * 300)
+            (wd / "raw" / "gpu" / "b.md").write_bytes(b"b" * 300)
+            run = compile_box.CompileRun("hier-run", str(wd), 1)
+            driven: list[str] = []
+
+            async def fake_drive(run_, directive, label):
+                driven.append(label + "|" + directive.splitlines()[0])
+                if label.startswith("batch ") or label.startswith("批 "):
+                    candidate = wd / "candidate"
+                    candidate.mkdir(exist_ok=True)
+                    source = "gpu/a.md" if not (candidate / "a.md").exists() else "gpu/b.md"
+                    page = Path(source).name
+                    (candidate / page).write_text(
+                        "---\n"
+                        f"type: Topic\ntitle: {page}\ncompiled_from:\n  - {source}\n"
+                        "---\n# Body\nsource-backed detail\n")
+                return f"done {label}"
+
+            async def no_repairs(run_, replies):
+                return None
+
+            compile_box._drive_batch_session = fake_drive
+            compile_box._run_ledger_repairs = no_repairs
+            compile_box._media_verify_enabled = lambda: False
+            await compile_box._run_batch_compile(run, "直接开始编译")
+
+            assert sum(item.startswith("batch ") for item in driven) == 2, driven
+            assert sum(item.startswith("section reduce ") for item in driven) == 1, driven
+            assert driven[-1].startswith("final review"), driven
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert saved["phase"] == "complete", saved
+            assert all(r["status"] == "done" for r in saved["reductions"]), saved
+
+            # A crash during final close-out resumes final only — it must never
+            # replay the expensive map or reduce train, even if raw has since
+            # shrunk below the ordinary batch threshold.
+            saved["phase"] = "final"
+            (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(saved))
+            os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
+            assert compile_box._should_route_to_batch(run, "直接开始编译")
+            driven.clear()
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            assert len(driven) == 1 and driven[0].startswith("final review"), driven
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._run_ledger_repairs = real_repairs
+        compile_box._media_verify_enabled = real_media_enabled
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("\u2713 hierarchical batch: deterministic map / section reduce / complete phase")
+
+
 async def test_batch_orchestrator_review_fixes():
     """Review fixes: (a) resume prunes sources deleted from raw/ (no directive
     points at a missing file; an emptied batch is skipped); (b) an orchestrator
@@ -2956,6 +3048,7 @@ async def main():
     await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
+    await test_hierarchical_batch_plan_and_section_reduce()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()
     await test_model_stall_live_stream_not_reaped()
