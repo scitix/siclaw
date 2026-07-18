@@ -34,6 +34,16 @@ def test_threshold_gate_small_kb_never_batches(tmp_path):
     assert bt.should_batch(inv, threshold=250 * 1024) is True
 
 
+def test_tiered_gate_keeps_small_and_medium_routes_stable(tmp_path):
+    raw = _mk(tmp_path, {"a.md": 500 * 1024})
+    inv = bt.scan_sources(raw)
+    assert bt.should_batch(inv, threshold=400 * 1024) is True
+    assert bt.should_hierarchical(inv, threshold=8 * 1024 * 1024) is False
+    huge = _mk(tmp_path / "huge", {"a.md": 9 * 1024 * 1024})
+    huge_inv = bt.scan_sources(huge)
+    assert bt.should_hierarchical(huge_inv, threshold=8 * 1024 * 1024) is True
+
+
 def test_pack_groups_by_top_dir_and_budget(tmp_path):
     raw = _mk(
         tmp_path,
@@ -63,6 +73,81 @@ def test_pack_oversized_single_file_gets_own_batch(tmp_path):
     batches = bt.pack_batches(inv, budget=200)
     assert batches[0]["sources"] == ["big/x.md"]
     assert batches[1]["sources"] == ["big/y.md"]
+
+
+def test_hierarchical_pack_keeps_document_assets_together(tmp_path):
+    raw = _mk(
+        tmp_path,
+        {
+            "gpu/guide.md": 100,
+            "gpu/guide.assets/a.png": 1_000,
+            "gpu/guide.assets/b.png": 1_000,
+            "gpu/other.md": 50,
+            "ops/runbook.md": 50,
+        },
+    )
+    inv = bt.scan_sources(raw)
+    batches = bt.pack_hierarchical_batches(inv, budget=100_000)
+    gpu = next(b for b in batches if "gpu/guide.md" in b["sources"])
+    assert set(gpu["sources"]) >= {
+        "gpu/guide.md", "gpu/guide.assets/a.png", "gpu/guide.assets/b.png"}
+    assert bt.validate_plan(
+        bt.build_plan(inv, batches, planner="hierarchical-code", budget=100_000),
+        inv,
+        budget=100_000,
+    ) == []
+
+
+def test_hierarchical_pack_splits_oversized_family_with_anchor_context(tmp_path):
+    raw = _mk(
+        tmp_path,
+        {
+            "gpu/guide.md": 10,
+            "gpu/guide.assets/a.png": 1_000,
+            "gpu/guide.assets/b.png": 1_000,
+            "gpu/guide.assets/c.png": 1_000,
+        },
+    )
+    inv = bt.scan_sources(raw)
+    # Images each cost 30KB, so a 40KB hierarchical budget forces one/chunk.
+    budget = 40 * 1024
+    batches = bt.pack_hierarchical_batches(inv, budget=budget)
+    assert len(batches) == 3, batches
+    assert batches[0]["sources"][0] == "gpu/guide.md"
+    assert all(b["context_sources"] == ["gpu/guide.md"] for b in batches[1:])
+    flat_sources = [p for b in batches for p in b["sources"]]
+    assert sorted(flat_sources) == sorted(i["path"] for i in inv)
+    plan = bt.build_plan(inv, batches, planner="hierarchical-code", budget=budget)
+    assert plan["mode"] == "hierarchical" and plan["phase"] == "map"
+    assert bt.validate_plan(plan, inv, budget=budget) == []
+
+
+def test_validate_hierarchical_context_is_known_and_budgeted(tmp_path):
+    raw = _mk(tmp_path, {"guide.md": 100, "guide.assets/a.png": 1_000})
+    inv = bt.scan_sources(raw)
+    unknown = {"batches": [{
+        "id": "h001", "sources": ["guide.md", "guide.assets/a.png"],
+        "context_sources": ["ghost.md"],
+    }]}
+    assert any("unknown context source" in e for e in bt.validate_plan(unknown, inv, budget=100_000))
+    duplicate = {"batches": [{
+        "id": "h001", "sources": ["guide.md", "guide.assets/a.png"],
+        "context_sources": ["guide.md"],
+    }]}
+    assert any("also repeated as context" in e for e in bt.validate_plan(duplicate, inv, budget=100_000))
+
+
+def test_hierarchical_text_cap_preserves_session_context_safety(tmp_path):
+    raw = _mk(tmp_path, {"docs/a.md": 300 * 1024, "docs/b.md": 300 * 1024})
+    inv = bt.scan_sources(raw)
+    batches = bt.pack_hierarchical_batches(
+        inv, budget=1024 * 1024, text_budget=400 * 1024)
+    assert len(batches) == 2, batches
+    plan = bt.build_plan(
+        inv, batches, planner="hierarchical-code", budget=1024 * 1024,
+        text_budget=400 * 1024)
+    assert bt.validate_plan(
+        plan, inv, budget=1024 * 1024, text_budget=400 * 1024) == []
 
 
 def test_validate_plan_accepts_code_baseline(tmp_path):
@@ -103,6 +188,25 @@ def test_normalize_model_plan_and_progress(tmp_path):
     assert [b["id"] for b in bt.pending_batches(plan)] == ["late"]
     assert bt.normalize_model_plan({"batches": "nope"}) is None
     assert bt.normalize_model_plan([1, 2]) is None
+
+
+def test_section_reductions_group_only_unambiguous_multi_page_sections(tmp_path):
+    pages = {
+        "gpu/a.md": {"sources": ["gpu/a.md"], "bytes": 100},
+        "gpu/b.md": {"sources": ["gpu/b.md"], "bytes": 100},
+        "ops/a.md": {"sources": ["ops/a.md"], "bytes": 100},
+        "mixed.md": {"sources": ["gpu/c.md", "ops/c.md"], "bytes": 100},
+        "derived.md": {"sources": [], "bytes": 100},
+        "index.md": {"sources": [], "bytes": 100},
+    }
+    reductions = bt.pack_section_reductions(pages, budget=500)
+    assert len(reductions) == 1, reductions
+    assert reductions[0]["section"] == "gpu"
+    assert reductions[0]["pages"] == ["gpu/a.md", "gpu/b.md"]
+    plan = {"reductions": reductions}
+    assert len(bt.pending_reductions(plan)) == 1
+    bt.stamp_reduction_done(plan, reductions[0]["id"])
+    assert bt.pending_reductions(plan) == []
 
 
 def test_effective_weights_images_pdf_binary(tmp_path: Path):
@@ -208,14 +312,20 @@ def main():
     tests = [
         test_scan_skips_hidden_and_empty,
         test_threshold_gate_small_kb_never_batches,
+        test_tiered_gate_keeps_small_and_medium_routes_stable,
         test_pack_groups_by_top_dir_and_budget,
         test_pack_oversized_single_file_gets_own_batch,
+        test_hierarchical_pack_keeps_document_assets_together,
+        test_hierarchical_pack_splits_oversized_family_with_anchor_context,
+        test_validate_hierarchical_context_is_known_and_budgeted,
+        test_hierarchical_text_cap_preserves_session_context_safety,
         test_validate_plan_accepts_code_baseline,
         test_validate_plan_rejects_missing_duplicate_unknown_overflow,
         test_validate_plan_rejects_duplicate_and_empty_batch_ids,
         test_scan_confines_symlinks,
         test_prune_missing_sources,
         test_normalize_model_plan_and_progress,
+        test_section_reductions_group_only_unambiguous_multi_page_sections,
         test_effective_weights_images_pdf_binary,
         test_pack_uses_effective_not_raw_bytes,
         test_pdf_fallback_when_no_markers,

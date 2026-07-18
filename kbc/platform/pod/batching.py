@@ -7,8 +7,11 @@ baseline stands. Budgets are enforced by THIS code; the model never gets to
 overfill a session.
 
 Design invariants:
-- Small/medium KBs never enter batch mode (threshold gate) — their compile path
-  is byte-identical to today.
+- Small KBs never enter batch mode (threshold gate) — their compile path is
+  byte-identical to today. Medium KBs retain the original flat batch planner.
+- Only very large corpora enter hierarchical mode. Sibling ``*.assets`` files
+  stay with their Markdown anchor, and an oversized family repeats only that
+  anchor as read-only context while accounting each source exactly once.
 - Every raw source lands in exactly one batch (coverage is validated, and the
   final full-corpus SELFCHECK proves no batch dropped anything).
 - A single file larger than the budget still gets its own batch (we never split
@@ -25,6 +28,10 @@ from typing import Any
 
 DEFAULT_BATCH_THRESHOLD_BYTES = 400 * 1024
 DEFAULT_BATCH_BUDGET_BYTES = 200 * 1024
+DEFAULT_HIERARCHICAL_THRESHOLD_BYTES = 8 * 1024 * 1024
+DEFAULT_HIERARCHICAL_BATCH_BUDGET_BYTES = 1024 * 1024
+DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 400 * 1024
+DEFAULT_REDUCTION_BUDGET_BYTES = 512 * 1024
 
 # ── effective-size weighting ─────────────────────────────────────────────────
 # Raw bytes are a terrible proxy for context cost on non-text sources: a 168KB
@@ -91,6 +98,28 @@ def batch_budget_bytes() -> int:
     return int(os.environ.get("KBC_BATCH_BUDGET_BYTES", str(DEFAULT_BATCH_BUDGET_BYTES)))
 
 
+def hierarchical_threshold_bytes() -> int:
+    return int(os.environ.get(
+        "KBC_HIERARCHICAL_THRESHOLD_BYTES", str(DEFAULT_HIERARCHICAL_THRESHOLD_BYTES)))
+
+
+def hierarchical_batch_budget_bytes() -> int:
+    return int(os.environ.get(
+        "KBC_HIERARCHICAL_BATCH_BUDGET_BYTES",
+        str(DEFAULT_HIERARCHICAL_BATCH_BUDGET_BYTES)))
+
+
+def hierarchical_text_budget_bytes() -> int:
+    return int(os.environ.get(
+        "KBC_HIERARCHICAL_TEXT_BUDGET_BYTES",
+        str(DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES)))
+
+
+def reduction_budget_bytes() -> int:
+    return int(os.environ.get(
+        "KBC_REDUCTION_BUDGET_BYTES", str(DEFAULT_REDUCTION_BUDGET_BYTES)))
+
+
 def scan_sources(raw_dir: Path) -> list[dict[str, Any]]:
     """Inventory of raw sources: repo-relative path + size, sorted for stable
     plans. Hidden files and empty files are skipped (they carry no compile
@@ -130,12 +159,26 @@ def _eff(item: dict[str, Any]) -> int:
     return int(item.get("effective", item["bytes"]))
 
 
+def _text_eff(item: dict[str, Any]) -> int:
+    return int(item["bytes"]) if Path(str(item["path"])).suffix.lower() in TEXT_EXTS else 0
+
+
 def corpus_effective_bytes(inventory: list[dict[str, Any]]) -> int:
     return sum(_eff(i) for i in inventory)
 
 
 def should_batch(inventory: list[dict[str, Any]], threshold: int | None = None) -> bool:
     return corpus_effective_bytes(inventory) > (threshold if threshold is not None else batch_threshold_bytes())
+
+
+def should_hierarchical(
+    inventory: list[dict[str, Any]], threshold: int | None = None
+) -> bool:
+    """The second routing gate. Keeping it separate from ``should_batch`` is
+    intentional: changing the large-corpus strategy must not move the existing
+    small/single-session or medium/flat-batch boundaries."""
+    limit = threshold if threshold is not None else hierarchical_threshold_bytes()
+    return corpus_effective_bytes(inventory) > limit
 
 
 def _top_dir(path: str) -> str:
@@ -186,18 +229,185 @@ def pack_batches(inventory: list[dict[str, Any]], budget: int | None = None) -> 
     return batches
 
 
+def _asset_anchor(path: str, known: set[str]) -> str | None:
+    """Return the Markdown source owning a file below ``<name>.assets/``.
+
+    Feishu/Docx exports use this layout consistently. The anchor is recognized
+    only when the corresponding ``<name>.md`` is actually in the inventory, so
+    an unrelated directory whose name happens to end in ``.assets`` is never
+    invented as context.
+    """
+    parts = path.split("/")
+    for idx, part in enumerate(parts[:-1]):
+        if not part.endswith(".assets"):
+            continue
+        anchor = "/".join(parts[:idx] + [part[:-len(".assets")] + ".md"])
+        if anchor in known:
+            return anchor
+    return None
+
+
+def source_families(inventory: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group every source into one deterministic document family.
+
+    A family is an anchor Markdown file plus all media below its sibling
+    ``*.assets`` directory. Everything else is a one-source family. Returning
+    inventory records (rather than just paths) keeps this function pure and
+    lets the packer enforce effective-byte budgets without rescanning disk.
+    """
+    by_path = {str(i["path"]): i for i in inventory}
+    known = set(by_path)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in inventory:
+        path = str(item["path"])
+        key = _asset_anchor(path, known) or path
+        grouped.setdefault(key, []).append(item)
+    families: list[list[dict[str, Any]]] = []
+    for key in sorted(grouped):
+        items = grouped[key]
+        # Put the anchor first, then stable path order for its assets.
+        items.sort(key=lambda i: (str(i["path"]) != key, str(i["path"])))
+        families.append(items)
+    return families
+
+
+def pack_hierarchical_batches(
+    inventory: list[dict[str, Any]], budget: int | None = None,
+    text_budget: int | None = None,
+) -> list[dict[str, Any]]:
+    """Pack very large corpora without separating a document from its media.
+
+    Small families are greedily combined inside the same top-level section.
+    Oversized families are split across batches; later chunks may re-read the
+    Markdown anchor through ``context_sources``. Context is charged to every
+    chunk's budget but is not counted again by the coverage ledger.
+    """
+    limit = budget if budget is not None else hierarchical_batch_budget_bytes()
+    text_limit = text_budget if text_budget is not None else hierarchical_text_budget_bytes()
+    result: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    current_bytes = 0
+    current_text_bytes = 0
+    current_dir: str | None = None
+
+    def append_batch(
+        sources: list[dict[str, Any]], context: list[dict[str, Any]] | None = None
+    ) -> None:
+        context = context or []
+        result.append({
+            "id": f"h{len(result) + 1:03d}",
+            "sources": [str(i["path"]) for i in sources],
+            "context_sources": [str(i["path"]) for i in context],
+            "bytes": sum(_eff(i) for i in sources + context),
+            "text_bytes": sum(_text_eff(i) for i in sources + context),
+            "status": "pending",
+        })
+
+    def flush() -> None:
+        nonlocal current, current_bytes, current_text_bytes
+        if current:
+            append_batch(current)
+            current = []
+            current_bytes = 0
+            current_text_bytes = 0
+
+    for family in source_families(inventory):
+        family_bytes = sum(_eff(i) for i in family)
+        family_text_bytes = sum(_text_eff(i) for i in family)
+        section = _top_dir(str(family[0]["path"]))
+        if family_bytes <= limit and family_text_bytes <= text_limit:
+            if current and (
+                current_dir != section
+                or current_bytes + family_bytes > limit
+                or current_text_bytes + family_text_bytes > text_limit
+            ):
+                flush()
+            current_dir = section
+            current.extend(family)
+            current_bytes += family_bytes
+            current_text_bytes += family_text_bytes
+            continue
+
+        flush()
+        anchor = family[0] if str(family[0]["path"]).lower().endswith(".md") else None
+        remaining = family[:]
+        if anchor is not None:
+            # The anchor itself is accounted once, in the first chunk.
+            first = [remaining.pop(0)]
+            first_bytes = _eff(first[0])
+            first_text_bytes = _text_eff(first[0])
+            while (
+                remaining
+                and first_bytes + _eff(remaining[0]) <= limit
+                and first_text_bytes + _text_eff(remaining[0]) <= text_limit
+            ):
+                item = remaining.pop(0)
+                first.append(item)
+                first_bytes += _eff(item)
+                first_text_bytes += _text_eff(item)
+            append_batch(first)
+
+        # Re-reading an oversized anchor on every chunk would itself overflow
+        # the context. In that rare case the chunks remain independent.
+        context = [anchor] if (
+            anchor is not None and _eff(anchor) < limit and _text_eff(anchor) < text_limit
+        ) else []
+        context_bytes = sum(_eff(i) for i in context)
+        context_text_bytes = sum(_text_eff(i) for i in context)
+        while remaining:
+            batch_context = context
+            if context and (
+                context_bytes + _eff(remaining[0]) > limit
+                or context_text_bytes + _text_eff(remaining[0]) > text_limit
+            ):
+                # A single oversized asset/file is allowed as a solo batch; do
+                # not turn it into an invalid multi-source batch by repeating
+                # the anchor beside it.
+                batch_context = []
+            chunk: list[dict[str, Any]] = []
+            chunk_bytes = sum(_eff(i) for i in batch_context)
+            chunk_text_bytes = sum(_text_eff(i) for i in batch_context)
+            while remaining and (
+                (
+                    chunk_bytes + _eff(remaining[0]) <= limit
+                    and chunk_text_bytes + _text_eff(remaining[0]) <= text_limit
+                )
+                or not chunk
+            ):
+                item = remaining.pop(0)
+                chunk.append(item)
+                chunk_bytes += _eff(item)
+                chunk_text_bytes += _text_eff(item)
+            append_batch(chunk, batch_context)
+    flush()
+    return result
+
+
 def build_plan(
     inventory: list[dict[str, Any]],
     batches: list[dict[str, Any]],
     planner: str,
     threshold: int | None = None,
     budget: int | None = None,
+    text_budget: int | None = None,
 ) -> dict[str, Any]:
+    mode = "hierarchical" if planner == "hierarchical-code" else "flat"
     return {
-        "version": 1,
+        "version": 2 if mode == "hierarchical" else 1,
         "planner": planner,
-        "threshold": threshold if threshold is not None else batch_threshold_bytes(),
+        "mode": mode,
+        "phase": "map",
+        "threshold": (
+            threshold if threshold is not None
+            else hierarchical_threshold_bytes() if mode == "hierarchical"
+            else batch_threshold_bytes()
+        ),
         "budget": budget if budget is not None else batch_budget_bytes(),
+        "text_budget": (
+            text_budget if text_budget is not None
+            else hierarchical_text_budget_bytes() if mode == "hierarchical"
+            else None
+        ),
         "total_bytes": corpus_bytes(inventory),
         "total_effective_bytes": corpus_effective_bytes(inventory),
         "batches": batches,
@@ -205,14 +415,18 @@ def build_plan(
 
 
 def validate_plan(
-    plan: dict[str, Any], inventory: list[dict[str, Any]], budget: int | None = None
+    plan: dict[str, Any], inventory: list[dict[str, Any]], budget: int | None = None,
+    text_budget: int | None = None,
 ) -> list[str]:
     """Errors for a (possibly model-proposed) plan. Empty list = valid.
     Rules: every inventory source in exactly one batch, no unknown sources,
-    every batch within budget unless it is a single oversized file."""
+    every batch within budget unless it is a single oversized file. Optional
+    context sources may repeat across batches but are read-only and still count
+    toward the per-session budget."""
     b = budget if budget is not None else batch_budget_bytes()
     errors: list[str] = []
     sizes = {i["path"]: _eff(i) for i in inventory}
+    text_sizes = {i["path"]: _text_eff(i) for i in inventory}
     seen: dict[str, str] = {}
     seen_ids: set[str] = set()
     batches = plan.get("batches")
@@ -232,7 +446,12 @@ def validate_plan(
         if not isinstance(sources, list) or not sources:
             errors.append(f"batch {bid}: empty or missing sources")
             continue
+        context = batch.get("context_sources", [])
+        if not isinstance(context, list):
+            errors.append(f"batch {bid}: context_sources must be a list")
+            context = []
         total = 0
+        text_total = 0
         for path in sources:
             if path not in sizes:
                 errors.append(f"batch {bid}: unknown source {path}")
@@ -241,8 +460,25 @@ def validate_plan(
                 errors.append(f"source {path} appears in {seen[path]} and {bid}")
             seen[path] = bid
             total += sizes[path]
-        if total > b and len(sources) > 1:
+            text_total += text_sizes[path]
+        for path in context:
+            if path not in sizes:
+                errors.append(f"batch {bid}: unknown context source {path}")
+                continue
+            if path in sources:
+                errors.append(f"batch {bid}: source {path} is also repeated as context")
+                continue
+            total += sizes[path]
+            text_total += text_sizes[path]
+        if total > b and len(sources) + len(context) > 1:
             errors.append(f"batch {bid}: {total} bytes exceeds budget {b}")
+        if (
+            text_budget is not None
+            and text_total > text_budget
+            and len(sources) + len(context) > 1
+        ):
+            errors.append(
+                f"batch {bid}: {text_total} text bytes exceeds text budget {text_budget}")
     missing = [p for p in sizes if p not in seen]
     if missing:
         errors.append(f"sources not covered: {', '.join(sorted(missing)[:5])}" + ("…" if len(missing) > 5 else ""))
@@ -273,6 +509,67 @@ def pending_batches(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return [b for b in plan.get("batches", []) if b.get("status") != "done"]
 
 
+def pack_section_reductions(
+    pages: dict[str, dict[str, Any]], budget: int | None = None
+) -> list[dict[str, Any]]:
+    """Build bounded candidate-page reduce groups after hierarchical mapping.
+
+    Pages are assigned to a source top-level section only when their provenance
+    points unambiguously to one section. Cross-section and derived pages stay
+    for the global final review. Single-page groups need no reduce session.
+    """
+    limit = budget if budget is not None else reduction_budget_bytes()
+    groups: dict[str, list[tuple[str, int]]] = {}
+    for path, page in pages.items():
+        if Path(path).name in {"index.md", "log.md"}:
+            continue
+        sections = {_top_dir(str(s)) for s in page.get("sources", [])}
+        if len(sections) != 1:
+            continue
+        section = next(iter(sections))
+        groups.setdefault(section, []).append((path, int(page.get("bytes", 0))))
+
+    reductions: list[dict[str, Any]] = []
+    for section in sorted(groups):
+        entries = sorted(groups[section])
+        if len(entries) < 2:
+            continue
+        current: list[tuple[str, int]] = []
+        current_bytes = 0
+
+        def flush() -> None:
+            nonlocal current, current_bytes
+            if len(current) >= 2:
+                reductions.append({
+                    "id": f"r{len(reductions) + 1:03d}",
+                    "section": section,
+                    "pages": [p for p, _ in current],
+                    "bytes": current_bytes,
+                    "status": "pending",
+                })
+            current = []
+            current_bytes = 0
+
+        for entry in entries:
+            if current and current_bytes + entry[1] > limit:
+                flush()
+            current.append(entry)
+            current_bytes += entry[1]
+        flush()
+    return reductions
+
+
+def pending_reductions(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    return [r for r in plan.get("reductions", []) if r.get("status") != "done"]
+
+
+def stamp_reduction_done(plan: dict[str, Any], reduction_id: str) -> dict[str, Any]:
+    for reduction in plan.get("reductions", []):
+        if reduction.get("id") == reduction_id:
+            reduction["status"] = "done"
+    return plan
+
+
 def stamp_done(plan: dict[str, Any], batch_id: str) -> dict[str, Any]:
     for b in plan.get("batches", []):
         if b.get("id") == batch_id:
@@ -298,6 +595,11 @@ def prune_missing_sources(plan: dict[str, Any], known: set[str]) -> list[str]:
             b["sources"] = sources
             if not sources:
                 b["status"] = "done"
+        context = [s for s in b.get("context_sources", []) if s in known]
+        context_gone = [s for s in b.get("context_sources", []) if s not in known]
+        if context_gone:
+            dropped.extend(context_gone)
+            b["context_sources"] = context
     return dropped
 
 
