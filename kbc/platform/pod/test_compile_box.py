@@ -18,6 +18,7 @@ from pathlib import Path
 from aiohttp.test_utils import TestClient, TestServer
 
 import compile_box
+import source_snapshot
 
 
 async def fake_driver(run):
@@ -66,6 +67,39 @@ def deterministic_bytes(size):
         out.extend(hashlib.sha256(str(i).encode()).digest())
         i += 1
     return bytes(out[:size])
+
+
+def make_source_snapshot(groups):
+    parts = []
+    bundles = []
+    all_files = []
+    for index, files in enumerate(groups, start=1):
+        bundle = make_source_bundle(files)
+        descriptors = []
+        for path, data in files.items():
+            payload = data if isinstance(data, bytes) else data.encode()
+            descriptors.append({
+                "path": path,
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+        all_files.extend(descriptors)
+        parts.append({
+            "part_id": f"part-{index:06d}",
+            "sha256": hashlib.sha256(bundle).hexdigest(),
+            "bundle_size_bytes": len(bundle),
+            "unpacked_size_bytes": sum(item["size_bytes"] for item in descriptors),
+            "file_count": len(descriptors),
+            "files": descriptors,
+        })
+        bundles.append(bundle)
+    return {
+        "version": 2,
+        "manifest_sha256": hashlib.sha256(source_snapshot.canonical_file_manifest(all_files)).hexdigest(),
+        "total_bytes": sum(item["size_bytes"] for item in all_files),
+        "file_count": len(all_files),
+        "parts": parts,
+    }, bundles
 
 
 async def test_workspace_sync():
@@ -3016,6 +3050,51 @@ async def main():
     await client.start_server()
     try:
         assert (await (await client.get("/health")).json())["status"] == "ok"
+
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td)
+            (workdir / "raw").mkdir()
+            (workdir / "raw" / "old.md").write_text("old raw\n")
+            snapshot, part_bundles = make_source_snapshot([
+                {"docs/a.md": "alpha\n"},
+                {"docs/b.md": "beta\n"},
+            ])
+            identity = {"run_id": "snapshot-run", "input_revision": "manifest-v2", "workdir": td}
+            r = await client.post("/sources/begin", json={**identity, "snapshot": snapshot})
+            begin = await r.json()
+            assert r.status == 200 and begin["missing_parts"] == ["part-000001", "part-000002"], begin
+
+            r = await client.post("/sources/part", json={
+                **identity,
+                "part_id": "part-000001",
+                "bundle_base64": base64.b64encode(part_bundles[0]).decode(),
+                "bundle_sha256": snapshot["parts"][0]["sha256"],
+            })
+            assert r.status == 200, await r.text()
+            r = await client.post("/sources/state", json=identity)
+            state = await r.json()
+            assert state["missing_parts"] == ["part-000002"], state
+            r = await client.post("/sources/commit", json=identity)
+            assert r.status == 409, await r.text()
+            assert (workdir / "raw" / "old.md").read_text() == "old raw\n"
+
+            r = await client.post("/sources/part", json={
+                **identity,
+                "part_id": "part-000002",
+                "bundle_base64": base64.b64encode(part_bundles[1]).decode(),
+                "bundle_sha256": snapshot["parts"][1]["sha256"],
+            })
+            assert r.status == 200, await r.text()
+            r = await client.post("/sources/commit", json={**identity, "locale": "zh"})
+            committed = await r.json()
+            assert r.status == 200 and committed["committed"], committed
+            assert (workdir / "raw" / "docs" / "a.md").read_text() == "alpha\n"
+            assert (workdir / "drop" / "docs" / "b.md").read_text() == "beta\n"
+            r = await client.post("/sources/begin", json={**identity, "snapshot": snapshot})
+            replay = await r.json()
+            assert r.status == 200 and replay["committed"] and replay["missing_parts"] == [], replay
+
+            print("✓ Source Snapshot v2 HTTP resume + atomic commit + idempotent replay")
 
         with tempfile.TemporaryDirectory() as td:
             large_bundle = make_source_bundle({"large.bin": deterministic_bytes(2 * 1024 * 1024)})
