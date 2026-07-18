@@ -53,7 +53,15 @@ def _hierarchical_image_cost() -> int:
     map session. Keep the established flat-planner estimate for medium corpora,
     but use a conservative cost in the very-large hierarchical path."""
     return int(os.environ.get(
-        "KBC_HIERARCHICAL_IMAGE_COST_BYTES", str(64 * 1024)))
+        "KBC_HIERARCHICAL_IMAGE_COST_BYTES", str(128 * 1024)))
+
+
+def _hierarchical_context_anchor_max_bytes() -> int:
+    """A large rendered document is useful in the first family chunk, but
+    replaying it beside every later image chunk burns the same context over and
+    over. Later chunks can use the Candidate produced by the first chunk."""
+    return int(os.environ.get(
+        "KBC_HIERARCHICAL_CONTEXT_ANCHOR_MAX_BYTES", str(96 * 1024)))
 
 
 def _pdf_page_cost() -> int:
@@ -365,6 +373,7 @@ def pack_hierarchical_batches(
         # the context. In that rare case the chunks remain independent.
         context = [anchor] if (
             anchor is not None and _hierarchical_eff(anchor) < limit and _text_eff(anchor) < text_limit
+            and _text_eff(anchor) <= _hierarchical_context_anchor_max_bytes()
         ) else []
         context_bytes = sum(_hierarchical_eff(i) for i in context)
         context_text_bytes = sum(_text_eff(i) for i in context)

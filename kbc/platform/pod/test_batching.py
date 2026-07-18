@@ -88,14 +88,14 @@ def test_hierarchical_pack_keeps_document_assets_together(tmp_path):
         },
     )
     inv = bt.scan_sources(raw)
-    batches = bt.pack_hierarchical_batches(inv, budget=200_000)
+    batches = bt.pack_hierarchical_batches(inv, budget=300_000)
     gpu = next(b for b in batches if "gpu/guide.md" in b["sources"])
     assert set(gpu["sources"]) >= {
         "gpu/guide.md", "gpu/guide.assets/a.png", "gpu/guide.assets/b.png"}
     assert bt.validate_plan(
-        bt.build_plan(inv, batches, planner="hierarchical-code", budget=200_000),
+        bt.build_plan(inv, batches, planner="hierarchical-code", budget=300_000),
         inv,
-        budget=200_000,
+        budget=300_000,
     ) == []
 
 
@@ -110,9 +110,9 @@ def test_hierarchical_pack_splits_oversized_family_with_anchor_context(tmp_path)
         },
     )
     inv = bt.scan_sources(raw)
-    # Hierarchical images cost 64KB, so a 70KB budget forces one/chunk while
+    # Hierarchical images cost 128KB, so a 140KB budget forces one/chunk while
     # still leaving room to repeat the tiny Markdown anchor as context.
-    budget = 70 * 1024
+    budget = 140 * 1024
     batches = bt.pack_hierarchical_batches(inv, budget=budget)
     assert len(batches) == 3, batches
     assert batches[0]["sources"][0] == "gpu/guide.md"
@@ -152,9 +152,21 @@ def test_hierarchical_text_cap_preserves_session_context_safety(tmp_path):
         plan, inv, budget=1024 * 1024, text_budget=400 * 1024) == []
 
 
+def test_hierarchical_large_anchor_is_not_replayed_into_every_image_chunk(tmp_path):
+    files = {"gpu/manual.md": 120 * 1024}
+    files.update({f"gpu/manual.assets/page-{i:03d}.jpg": 1_000 for i in range(20)})
+    raw = _mk(tmp_path, files)
+    inv = bt.scan_sources(raw)
+    batches = bt.pack_hierarchical_batches(inv, budget=1024 * 1024)
+    manual_batches = [b for b in batches if any("manual" in p for p in b["sources"])]
+    assert "gpu/manual.md" in manual_batches[0]["sources"]
+    assert len(manual_batches) > 1
+    assert all(b["context_sources"] == [] for b in manual_batches[1:])
+
+
 def test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries(tmp_path):
     previous = os.environ.get("KBC_HIERARCHICAL_IMAGE_COST_BYTES")
-    os.environ["KBC_HIERARCHICAL_IMAGE_COST_BYTES"] = str(64 * 1024)
+    os.environ["KBC_HIERARCHICAL_IMAGE_COST_BYTES"] = str(128 * 1024)
     try:
         files = {"guide.md": 100 * 1024}
         files.update({f"guide.assets/page-{i:03d}.jpg": 1_000 for i in range(30)})
@@ -165,7 +177,7 @@ def test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries(
         assert image["effective"] == 30 * 1024
         batches = bt.pack_hierarchical_batches(inv, budget=1024 * 1024)
         image_counts = [sum(p.endswith(".jpg") for p in b["sources"]) for b in batches]
-        assert max(image_counts) <= 14, image_counts
+        assert max(image_counts) <= 8, image_counts
         plan = bt.build_plan(
             inv, batches, planner="hierarchical-code", budget=1024 * 1024)
         assert bt.validate_plan(plan, inv, budget=1024 * 1024) == []
@@ -345,6 +357,7 @@ def main():
         test_hierarchical_pack_splits_oversized_family_with_anchor_context,
         test_validate_hierarchical_context_is_known_and_budgeted,
         test_hierarchical_text_cap_preserves_session_context_safety,
+        test_hierarchical_large_anchor_is_not_replayed_into_every_image_chunk,
         test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries,
         test_validate_plan_accepts_code_baseline,
         test_validate_plan_rejects_missing_duplicate_unknown_overflow,
