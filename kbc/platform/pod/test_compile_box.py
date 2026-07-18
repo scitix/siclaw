@@ -3140,6 +3140,26 @@ async def main():
             assert (Path(td) / "authoring" / "CLAUDE.md").read_text() == "follow the workspace\n"
             assert (Path(td) / "eval" / "TESTS.md").read_text() == "# Tests\n"
 
+            # Standard tar tools emit explicit root directory entries before files.
+            # Those safe roots must be accepted without permitting root-level files.
+            directory_bundle_buffer = io.BytesIO()
+            with tarfile.open(fileobj=directory_bundle_buffer, mode="w:gz") as tf:
+                root = tarfile.TarInfo("candidate/")
+                root.type = tarfile.DIRTYPE
+                root.mode = 0o755
+                tf.addfile(root)
+                payload = b"# Restored candidate\n"
+                page = tarfile.TarInfo("candidate/index.md")
+                page.size = len(payload)
+                tf.addfile(page, io.BytesIO(payload))
+            r = await client.post("/authoring", json={
+                "run_id": "r1",
+                "workdir": td,
+                "bundle_base64": base64.b64encode(directory_bundle_buffer.getvalue()).decode(),
+            })
+            assert r.status == 200, await r.text()
+            assert (Path(td) / "candidate" / "index.md").read_text() == "# Restored candidate\n"
+
             bad_authoring_bundle = make_source_bundle({"raw/nope.md": "nope"})
             r = await client.post("/authoring", json={
                 "workdir": td,

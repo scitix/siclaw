@@ -670,11 +670,14 @@ def _install_source_bundle(bundle: bytes, workdir: str, expected_sha256: str | N
     }
 
 
-def _safe_authoring_path(name: str) -> Path:
+def _safe_authoring_path(name: str, *, is_dir: bool = False) -> Path:
     rel = _safe_tar_path(name)
+    allowed_roots = {"authoring", "candidate", "eval", "release"}
+    if len(rel.parts) == 1 and is_dir and rel.parts[0] in allowed_roots:
+        return rel
     if len(rel.parts) < 2:
         raise ValueError(f"unsafe authoring path {name!r}: must include a file path under a workspace directory")
-    if rel.parts[0] not in {"authoring", "candidate", "eval", "release"}:
+    if rel.parts[0] not in allowed_roots:
         raise ValueError(f"unsafe authoring path {name!r}: must be under authoring/, candidate/, eval/, or release/")
     return rel
 
@@ -703,7 +706,7 @@ def _install_authoring_bundle(bundle: bytes, workdir: str, expected_sha256: str 
             raise ValueError(f"invalid authoring bundle: {e}") from e
         with tf:
             for member in tf.getmembers():
-                rel = _safe_authoring_path(member.name)
+                rel = _safe_authoring_path(member.name, is_dir=member.isdir())
                 target = staging / Path(*rel.parts)
                 resolved = target.resolve(strict=False)
                 try:
