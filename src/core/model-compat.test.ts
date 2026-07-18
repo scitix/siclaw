@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildProviderModelDescriptor, defaultProviderModelCompat } from "./model-compat.js";
+import { buildProviderModelDescriptor, defaultProviderModelCompat, normalizeProviderApi } from "./model-compat.js";
 
 describe("defaultProviderModelCompat", () => {
   it("keeps developer-role messages for the official OpenAI API", () => {
@@ -57,5 +57,34 @@ describe("buildProviderModelDescriptor", () => {
       provider,
     );
     expect(d.input).toEqual(["text"]);
+  });
+});
+
+describe("normalizeProviderApi", () => {
+  it("maps the legacy 'anthropic' api_type to pi's registered api id", () => {
+    // "anthropic" is a pi provider slug, not an api — feeding it to a model
+    // config fails the turn with "No API provider registered for api: anthropic".
+    expect(normalizeProviderApi("anthropic")).toBe("anthropic-messages");
+  });
+
+  it("maps the legacy 'openai' api_type to openai-completions", () => {
+    expect(normalizeProviderApi("openai")).toBe("openai-completions");
+  });
+
+  it("passes canonical and unknown api ids through unchanged", () => {
+    expect(normalizeProviderApi("anthropic-messages")).toBe("anthropic-messages");
+    expect(normalizeProviderApi("openai-completions")).toBe("openai-completions");
+    expect(normalizeProviderApi("openai-responses")).toBe("openai-responses");
+    expect(normalizeProviderApi("some-custom-api")).toBe("some-custom-api");
+  });
+
+  it("is case/whitespace tolerant on legacy values", () => {
+    expect(normalizeProviderApi(" Anthropic ")).toBe("anthropic-messages");
+  });
+
+  it("falls back to openai-completions for empty/null", () => {
+    expect(normalizeProviderApi("")).toBe("openai-completions");
+    expect(normalizeProviderApi(null)).toBe("openai-completions");
+    expect(normalizeProviderApi(undefined)).toBe("openai-completions");
   });
 });

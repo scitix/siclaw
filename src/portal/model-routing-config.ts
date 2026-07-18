@@ -1,6 +1,6 @@
 import { getDb } from "../gateway/db.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
-import { buildProviderModelDescriptor } from "../core/model-compat.js";
+import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
 import {
   normalizeCandidates,
   normalizeModelRoutePolicy,
@@ -100,14 +100,15 @@ async function loadProviderConfigs(providerNames: string[]): Promise<Map<string,
       "SELECT model_id, name, reasoning, vision, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
       [provider.id],
     );
+    const providerApi = normalizeProviderApi(provider.api_type);
     out.set(provider.name, {
       name: provider.name,
       baseUrl: provider.base_url,
       apiKey: provider.api_key ?? "",
-      api: provider.api_type,
+      api: providerApi,
       authHeader: true,
       models: modelRows.map((model) =>
-        buildProviderModelDescriptor(model, { api: provider.api_type, baseUrl: provider.base_url }),
+        buildProviderModelDescriptor(model, { api: providerApi, baseUrl: provider.base_url }),
       ),
     });
   }

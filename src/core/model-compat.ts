@@ -15,6 +15,26 @@ export interface ProviderModelRow {
   max_tokens: number;
 }
 
+/**
+ * Map legacy provider api names to the pi-ai API-provider registry's canonical
+ * ids. pi looks a model's `api` up in its registry verbatim ("anthropic" is a
+ * provider slug there, not an api — only "anthropic-messages" is registered),
+ * so any legacy value reaching a model config fails the whole turn with
+ * "No API provider registered for api: …". Portal DB rows and settings.json
+ * written before this mapping existed carry the legacy names; normalizing at
+ * read time keeps them working without a data migration.
+ */
+const LEGACY_API_ALIASES: Record<string, string> = {
+  anthropic: "anthropic-messages",
+  openai: "openai-completions",
+};
+
+export function normalizeProviderApi(api: string | null | undefined): string {
+  const raw = (api ?? "").trim();
+  if (!raw) return "openai-completions";
+  return LEGACY_API_ALIASES[raw.toLowerCase()] ?? raw;
+}
+
 function isOfficialOpenAIBaseUrl(baseUrl?: string | null): boolean {
   if (!baseUrl) return false;
   try {
