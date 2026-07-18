@@ -1,9 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { CapabilityMaterializationError, materializeCapabilityInputs } from "./materialize.js";
-import { CAPABILITY_FETCH_INPUT, CAPABILITY_INPUT_WORKSPACE_REF } from "./contract.js";
+import {
+  CAPABILITY_FETCH_INPUT,
+  CAPABILITY_INPUT_SOURCE_PART_REF,
+  CAPABILITY_INPUT_WORKSPACE_REF,
+} from "./contract.js";
+import type { CapabilityFetchInputResponse } from "./contract.js";
 
 function fakes(opts: {
-  raw?: { bundle_base64?: string; bundle_sha256?: string; locale?: string; input_revision?: string };
+  raw?: CapabilityFetchInputResponse;
+  parts?: Record<string, CapabilityFetchInputResponse>;
+  missingParts?: string[];
   workspace?: { bundle_base64?: string; bundle_sha256?: string };
   rawError?: Error;
   workspaceError?: Error;
@@ -14,8 +21,15 @@ function fakes(opts: {
   const client = {
     postJson: vi.fn(async (path: string, body: any) => {
       if (path === "/sources" && opts.sourcesError) throw opts.sourcesError;
+      if (path.startsWith("/sources/") && opts.sourcesError) throw opts.sourcesError;
       if (path === "/authoring" && opts.authoringError) throw opts.authoringError;
       posts.push({ path, body });
+      if (path === "/sources/begin") {
+        return {
+          ok: true,
+          missing_parts: opts.missingParts ?? body.snapshot.parts.map((part: { part_id: string }) => part.part_id),
+        };
+      }
       return { ok: true };
     }),
   };
@@ -25,6 +39,9 @@ function fakes(opts: {
       if (params?.ref === CAPABILITY_INPUT_WORKSPACE_REF) {
         if (opts.workspaceError) throw opts.workspaceError;
         return opts.workspace ?? {};
+      }
+      if (params?.ref === CAPABILITY_INPUT_SOURCE_PART_REF) {
+        return opts.parts?.[params.part_id] ?? {};
       }
       if (opts.rawError) throw opts.rawError;
       return opts.raw ?? {};
@@ -73,6 +90,110 @@ describe("materializeCapabilityInputs", () => {
       input_revision: "manifest-1",
     });
     expect(result.inputRevision).toBe("manifest-1");
+  });
+
+  it("Source Snapshot v2 uploads only box-reported missing parts and commits before workspace", async () => {
+    const snapshot = {
+      version: 2 as const,
+      manifest_sha256: "f".repeat(64),
+      total_bytes: 7,
+      file_count: 2,
+      parts: [
+        {
+          part_id: "part-000001",
+          sha256: "a".repeat(64),
+          bundle_size_bytes: 10,
+          unpacked_size_bytes: 3,
+          file_count: 1,
+          files: [{ path: "a.md", size_bytes: 3, sha256: "1".repeat(64) }],
+        },
+        {
+          part_id: "part-000002",
+          sha256: "b".repeat(64),
+          bundle_size_bytes: 11,
+          unpacked_size_bytes: 4,
+          file_count: 1,
+          files: [{ path: "b.md", size_bytes: 4, sha256: "2".repeat(64) }],
+        },
+      ],
+    };
+    const { client, backend, posts } = fakes({
+      raw: { source_snapshot: snapshot, input_revision: "manifest-2", locale: "zh" },
+      parts: {
+        "part-000002": {
+          bundle_base64: "UDI=",
+          bundle_sha256: "b".repeat(64),
+          input_revision: "manifest-2",
+        },
+      },
+      missingParts: ["part-000002"],
+      workspace: { bundle_base64: "V1M=" },
+    });
+
+    const result = await materializeCapabilityInputs({ client, backend, runId: "r2" });
+
+    expect(result).toMatchObject({ inputRevision: "manifest-2", locale: "zh" });
+    expect(posts.map((post) => post.path)).toEqual([
+      "/sources/begin",
+      "/sources/part",
+      "/sources/commit",
+      "/authoring",
+    ]);
+    expect(backend.request).toHaveBeenNthCalledWith(2, CAPABILITY_FETCH_INPUT, {
+      run_id: "r2",
+      input_revision: "manifest-2",
+      ref: CAPABILITY_INPUT_SOURCE_PART_REF,
+      part_id: "part-000002",
+    });
+  });
+
+  it("Source Snapshot v2 rejects a part from another revision before upload", async () => {
+    const snapshot = {
+      version: 2 as const,
+      manifest_sha256: "f".repeat(64),
+      total_bytes: 3,
+      file_count: 1,
+      parts: [{
+        part_id: "part-000001",
+        sha256: "a".repeat(64),
+        bundle_size_bytes: 10,
+        unpacked_size_bytes: 3,
+        file_count: 1,
+        files: [{ path: "a.md", size_bytes: 3, sha256: "1".repeat(64) }],
+      }],
+    };
+    const { client, backend, posts } = fakes({
+      raw: { source_snapshot: snapshot, input_revision: "manifest-2" },
+      parts: { "part-000001": { bundle_base64: "UDE=", input_revision: "manifest-other" } },
+    });
+
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r2" })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-install",
+      message: expect.stringContaining("revision mismatch"),
+    });
+    expect(posts.map((post) => post.path)).toEqual(["/sources/begin"]);
+  });
+
+  it("Source Snapshot v2 requires an immutable input revision", async () => {
+    const { client, backend, posts } = fakes({
+      raw: {
+        source_snapshot: {
+          version: 2,
+          manifest_sha256: "f".repeat(64),
+          total_bytes: 0,
+          file_count: 0,
+          parts: [],
+        },
+      },
+    });
+
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r2" })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-install",
+      message: expect.stringContaining("requires input_revision"),
+    });
+    expect(posts).toEqual([]);
   });
 
   it("rejects a consumer response for a different pinned revision before installing sources", async () => {
