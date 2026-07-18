@@ -1307,6 +1307,21 @@ def _media_verify_rounds() -> int:
     return max(1, int(os.environ.get("KBC_MEDIA_VERIFY_ROUNDS", "3")))
 
 
+def _batch_media_verify_round_limit(plan: dict, pending: dict[str, list[str]]) -> int:
+    """Keep the established tail bound for flat/smaller compiles, but give a
+    hierarchical train enough bounded rounds to visit every initially pending
+    image page (including its failed-attempt budget). A hard operator cap still
+    fences pathological repair loops; hierarchical completion fails closed if
+    pending work remains after that cap."""
+    ordinary = _media_verify_rounds()
+    if plan.get("mode") != "hierarchical":
+        return ordinary
+    cap = max(ordinary, int(os.environ.get(
+        "KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS", "256")))
+    needed = len(pending) * _media_verify_attempts() + ordinary
+    return min(cap, max(ordinary, needed))
+
+
 def _settle_media_outcome(run, chunk: dict, result: dict | None) -> list[str]:
     """Post-verify bookkeeping (review fix: pages used to be marked verified
     BEFORE verification ran, so a total transcription failure shipped image
@@ -2797,17 +2812,28 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         if _media_verify_enabled():
             repaired_any = False
             rounds = 0
+            initial_pending = selfcheck.pending_media_verification(run.workdir)
+            round_limit = _batch_media_verify_round_limit(plan, initial_pending)
             while True:
                 pending = selfcheck.pending_media_verification(run.workdir)
                 if not pending:
                     break
                 rounds += 1
-                if rounds > _media_verify_rounds():
+                if rounds > round_limit:
                     # Repair turns can add new image citations that re-enter
-                    # pending — cap the loop; the remainder rides a later turn.
+                    # pending. Flat mode keeps its established fail-open tail;
+                    # a hierarchical train must not claim complete while a
+                    # large image backlog is still unverified. Its persisted
+                    # `final` phase makes the next trigger resume the tail
+                    # without replaying the map batches.
                     await run.emit({"type": "summary", "text": _loc(run,
-                        f"Self-check (images): verify/repair round cap ({_media_verify_rounds()}) reached — remaining pages will be picked up on the next trigger.",
-                        f"自检(图像):验修轮达到上限({_media_verify_rounds()} 轮)——剩余页将在下一轮触发时继续复核。")})
+                        f"Self-check (images): verify/repair round cap ({round_limit}) reached — remaining pages will be picked up on the next trigger.",
+                        f"自检(图像):验修轮达到上限({round_limit} 轮)——剩余页将在下一轮触发时继续复核。")})
+                    if plan.get("mode") == "hierarchical":
+                        raise BatchOutputError(
+                            f"hierarchical image verification left {len(pending)} "
+                            f"page(s) pending after {round_limit} round(s)"
+                        )
                     break
                 # Blind transcribe+compare per ≤max-images chunk (v2): engine
                 # sessions read one image each — no in-session image pileup.

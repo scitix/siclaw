@@ -2404,6 +2404,36 @@ async def test_hierarchical_batch_plan_and_section_reduce():
     print("\u2713 hierarchical batch: deterministic map / section reduce / complete phase")
 
 
+def test_hierarchical_media_verify_round_limit():
+    """Large trains scale the image-tail budget; ordinary/flat compiles retain
+    the established three-round latency bound, and an operator cap stays hard."""
+    names = (
+        "KBC_MEDIA_VERIFY_ROUNDS",
+        "KBC_MEDIA_VERIFY_ATTEMPTS",
+        "KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS",
+    )
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        os.environ["KBC_MEDIA_VERIFY_ROUNDS"] = "3"
+        os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "2"
+        os.environ["KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS"] = "256"
+        pending = {f"page-{i}.md": [f"image-{i}.png"] for i in range(4)}
+        assert compile_box._batch_media_verify_round_limit(
+            {"mode": "flat"}, pending) == 3
+        assert compile_box._batch_media_verify_round_limit(
+            {"mode": "hierarchical"}, pending) == 11
+        os.environ["KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS"] = "5"
+        assert compile_box._batch_media_verify_round_limit(
+            {"mode": "hierarchical"}, pending) == 5
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("\u2713 hierarchical media verify: scales by pending pages, flat unchanged, hard cap")
+
+
 async def test_batch_orchestrator_review_fixes():
     """Review fixes: (a) resume prunes sources deleted from raw/ (no directive
     points at a missing file; an emptied batch is skipped); (b) an orchestrator
@@ -3254,6 +3284,7 @@ async def main():
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
     await test_hierarchical_batch_plan_and_section_reduce()
+    test_hierarchical_media_verify_round_limit()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()
     await test_model_stall_live_stream_not_reaped()
