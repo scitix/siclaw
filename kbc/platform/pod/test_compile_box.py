@@ -2303,6 +2303,48 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+def test_hierarchical_text_slice_materialization_and_directive():
+    """Oversized-text helpers are bounded, ephemeral views of Raw. The model
+    reads the helper, but durable Candidate provenance still names the original
+    Raw source rather than an internal slice path."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        source = wd / "raw" / "gpu" / "manual.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("".join(f"line-{line}\n" for line in range(1, 7)))
+        batch = {
+            "id": "h001",
+            "sources": ["gpu/manual.md"],
+            "context_sources": [],
+            "source_ranges": {
+                "gpu/manual.md": {
+                    "start_line": 2,
+                    "end_line": 4,
+                    "part": 1,
+                    "parts": 2,
+                    "bytes": 21,
+                    "slice_file": ".kbc-batch-slices/manual-p001.md",
+                }
+            },
+            "defer_accounting": True,
+        }
+        run = compile_box.CompileRun("slice-materialize", str(wd), 1)
+        compile_box._materialize_batch_slices(run, {"batches": [batch]})
+
+        helper = wd / ".kbc-batch-slices" / "manual-p001.md"
+        excerpt = helper.read_text()
+        assert "raw/gpu/manual.md, lines 2-4" in excerpt, excerpt
+        assert "line-2\nline-3\nline-4\n" in excerpt, excerpt
+        assert "line-1" not in excerpt and "line-5" not in excerpt, excerpt
+
+        directive = compile_box._compose_batch_directive(batch, 1, 2, "", "zh-CN")
+        assert ".kbc-batch-slices/manual-p001.md" in directive, directive
+        assert "本批绝不要直接打开原 Raw 全文" in directive, directive
+        assert "compiled_from 必须引用原 Raw 路径(raw/gpu/manual.md)" in directive, directive
+        assert "compiled_from 必须引用原 Raw 路径(.kbc-batch-slices" not in directive
+    print("\u2713 hierarchical text slices: bounded helper with original-Raw provenance")
+
+
 async def test_hierarchical_batch_plan_and_section_reduce():
     """Only the second, very-large-corpus gate selects hierarchical planning.
     The map keeps anchor context explicit, section reduce runs after all maps,
@@ -3283,6 +3325,7 @@ async def main():
     await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
+    test_hierarchical_text_slice_materialization_and_directive()
     await test_hierarchical_batch_plan_and_section_reduce()
     test_hierarchical_media_verify_round_limit()
     await test_batch_orchestrator_review_fixes()

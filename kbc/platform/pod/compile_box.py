@@ -2330,6 +2330,61 @@ def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
     p.write_text(batching.dump_json(value))
 
 
+def _materialize_batch_slices(run: "CompileRun", plan: dict) -> None:
+    """Build ephemeral, read-bounded excerpts for oversized Markdown sources.
+
+    The fragment is never a provenance identity and never enters durable
+    authoring state. It is recreated from Raw on every resume so a model turn
+    cannot read the entire oversized source behind the planner's back.
+    """
+    workdir = Path(run.workdir).resolve()
+    raw_root = (workdir / "raw").resolve()
+    slice_root = (workdir / ".kbc-batch-slices").resolve()
+    shutil.rmtree(slice_root, ignore_errors=True)
+    for batch in plan.get("batches", []):
+        ranges = batch.get("source_ranges")
+        if not isinstance(ranges, dict):
+            continue
+        for source, source_range in ranges.items():
+            if not isinstance(source_range, dict):
+                raise BatchOutputError(f"invalid source range for {source}")
+            source_path = (raw_root / source).resolve()
+            try:
+                source_path.relative_to(raw_root)
+            except ValueError as error:
+                raise BatchOutputError(f"text slice source escapes Raw: {source}") from error
+            if not source_path.is_file():
+                raise BatchOutputError(f"text slice source is missing: {source}")
+            rel_slice = PurePosixPath(str(source_range.get("slice_file") or ""))
+            if (
+                not rel_slice.parts
+                or rel_slice.parts[0] != ".kbc-batch-slices"
+                or ".." in rel_slice.parts
+            ):
+                raise BatchOutputError(f"unsafe text slice path for {source}")
+            target = (workdir / Path(*rel_slice.parts)).resolve()
+            try:
+                target.relative_to(slice_root)
+            except ValueError as error:
+                raise BatchOutputError(f"text slice path escapes workspace: {rel_slice}") from error
+            try:
+                start = int(source_range["start_line"])
+                end = int(source_range["end_line"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise BatchOutputError(f"malformed text slice for {source}") from error
+            lines = source_path.read_bytes().splitlines(keepends=True)
+            if start < 1 or end < start or end > len(lines):
+                raise BatchOutputError(
+                    f"text slice range {start}-{end} is invalid for {source} ({len(lines)} lines)"
+                )
+            header = (
+                f"<!-- KBC read-only excerpt: raw/{source}, lines {start}-{end}. "
+                f"Candidate compiled_from must cite raw/{source}, never this helper path. -->\n"
+            ).encode("utf-8")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(header + b"".join(lines[start - 1:end]))
+
+
 def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[str]:
     """Assigned sources still absent from both Candidate provenance and exclusions."""
     pages = selfcheck.candidate_pages(run.workdir)
@@ -2381,7 +2436,24 @@ def _drain_batch_notes(run: "CompileRun") -> str:
 
 def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
                              locale: str | None = None) -> str:
-    listing = "\n".join(f"- raw/{p}" for p in batch["sources"])
+    source_ranges = batch.get("source_ranges", {})
+    listing_lines: list[str] = []
+    sliced_sources: list[str] = []
+    for path in batch["sources"]:
+        source_range = source_ranges.get(path) if isinstance(source_ranges, dict) else None
+        if isinstance(source_range, dict):
+            start = source_range["start_line"]
+            end = source_range["end_line"]
+            part = source_range["part"]
+            parts = source_range["parts"]
+            slice_file = source_range["slice_file"]
+            listing_lines.append(
+                f"- {slice_file} (read-only excerpt of raw/{path}, lines {start}-{end}, part {part}/{parts})"
+            )
+            sliced_sources.append(path)
+        else:
+            listing_lines.append(f"- raw/{path}")
+    listing = "\n".join(listing_lines)
     context_sources = batch.get("context_sources", [])
     context_listing = "\n".join(f"- raw/{p}" for p in context_sources)
     context_en = (
@@ -2392,6 +2464,20 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
     context_zh = (
         "\n\n只读的同族上下文(可重读这些锚点来理解本批附件,但它们已由其他批次入账,不要重复编译):\n" + context_listing
         if context_listing else ""
+    )
+    slice_en = (
+        "\n\nThis batch uses a bounded excerpt of an oversized Raw source. Read ONLY the listed "
+        "`.kbc-batch-slices/` helper, never open the original Raw file directly in this batch. "
+        "Compile only facts present in this excerpt; compiled_from must cite the original Raw path "
+        f"({', '.join('raw/' + path for path in sliced_sources)}), never the helper path."
+        if sliced_sources else ""
+    )
+    slice_zh = (
+        "\n\n本批使用超大 Raw 的有界片段。只读清单中的 `.kbc-batch-slices/` 辅助文件,本批绝不要直接打开原 Raw 全文。"
+        "只编译片段中实际出现的事实;compiled_from 必须引用原 Raw 路径("
+        + ", ".join("raw/" + path for path in sliced_sources)
+        + "),绝不能引用辅助文件。"
+        if sliced_sources else ""
     )
     if selfcheck._is_en(locale):
         return (
@@ -2404,7 +2490,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
             "never stop. Do not read any raw source outside this compile list and any explicitly listed "
             "read-only family context. When done, report briefly which pages "
-            "this batch produced." + context_en + notes
+            "this batch produced." + context_en + slice_en + notes
         )
     return (
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
@@ -2412,7 +2498,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
         "compiled_from 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
         "除上面清单及明确列出的只读同族上下文外,其他 raw 源一个都不要读。完成后简短汇报本批编了哪些页。"
-        + context_zh + notes
+        + context_zh + slice_zh + notes
     )
 
 
@@ -2690,6 +2776,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                                              f"断点续批:{len(dropped)} 个源已不在 raw/ 中,已从待编批次剔除:")
                                         + ", ".join(sorted(dropped)[:5])
                                         + ("…" if len(dropped) > 5 else "")})
+        _materialize_batch_slices(run, plan)
         n = len(plan["batches"])
         pending = batching.pending_batches(plan)
         if plan.get("mode") == "hierarchical":
@@ -2722,8 +2809,10 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             reply = await _drive_batch_session(run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"))
             if reply:
                 replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
-            still_unaccounted = _unaccounted_batch_sources(
-                run, batch.get("sources") or [])
+            still_unaccounted = (
+                [] if batch.get("defer_accounting")
+                else _unaccounted_batch_sources(run, batch.get("sources") or [])
+            )
             if still_unaccounted:
                 shown = ", ".join(still_unaccounted[:5])
                 suffix = "…" if len(still_unaccounted) > 5 else ""
@@ -2918,6 +3007,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         except Exception:
             pass
     finally:
+        shutil.rmtree(Path(run.workdir) / ".kbc-batch-slices", ignore_errors=True)
         run._model_idle_timeout_s = previous_model_idle_timeout
         run._batch_active = False
     # Red-blue PK examines the train's FINAL state, in the background, after the

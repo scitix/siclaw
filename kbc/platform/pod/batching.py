@@ -20,6 +20,7 @@ Design invariants:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,8 @@ DEFAULT_BATCH_THRESHOLD_BYTES = 400 * 1024
 DEFAULT_BATCH_BUDGET_BYTES = 200 * 1024
 DEFAULT_HIERARCHICAL_THRESHOLD_BYTES = 8 * 1024 * 1024
 DEFAULT_HIERARCHICAL_BATCH_BUDGET_BYTES = 1024 * 1024
-DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 400 * 1024
+DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 128 * 1024
+DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES = 64 * 1024
 DEFAULT_REDUCTION_BUDGET_BYTES = 512 * 1024
 
 # ── effective-size weighting ─────────────────────────────────────────────────
@@ -62,6 +64,39 @@ def _hierarchical_context_anchor_max_bytes() -> int:
     over. Later chunks can use the Candidate produced by the first chunk."""
     return int(os.environ.get(
         "KBC_HIERARCHICAL_CONTEXT_ANCHOR_MAX_BYTES", str(96 * 1024)))
+
+
+def _hierarchical_text_slice_bytes() -> int:
+    return max(1, int(os.environ.get(
+        "KBC_HIERARCHICAL_TEXT_SLICE_BYTES",
+        str(DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES))))
+
+
+def _text_slices(path: Path, size: int) -> tuple[int, list[dict[str, int]]] | None:
+    """Line-bounded chunks for a Markdown source that cannot safely fit one
+    hierarchical model turn. The Raw file remains the provenance identity;
+    these ranges only bound what each internal map session may read."""
+    if path.suffix.lower() != ".md" or size <= hierarchical_text_budget_bytes():
+        return None
+    lines = path.read_bytes().splitlines(keepends=True)
+    if not lines:
+        return None
+    target = min(_hierarchical_text_slice_bytes(), hierarchical_text_budget_bytes())
+    slices: list[dict[str, int]] = []
+    start = 0
+    while start < len(lines):
+        end = start
+        total = 0
+        while end < len(lines) and (total + len(lines[end]) <= target or end == start):
+            total += len(lines[end])
+            end += 1
+        slices.append({
+            "start_line": start + 1,
+            "end_line": end,
+            "bytes": total,
+        })
+        start = end
+    return len(lines), slices
 
 
 def _pdf_page_cost() -> int:
@@ -159,11 +194,15 @@ def scan_sources(raw_dir: Path) -> list[dict[str, Any]]:
         size = p.stat().st_size
         if size == 0:
             continue
-        items.append({
+        item = {
             "path": str(p.relative_to(raw_dir)),
             "bytes": size,
             "effective": effective_bytes(p, size),
-        })
+        }
+        sliced = _text_slices(p, size)
+        if sliced is not None:
+            item["line_count"], item["text_slices"] = sliced
+        items.append(item)
     return items
 
 
@@ -325,6 +364,30 @@ def pack_hierarchical_batches(
             "status": "pending",
         })
 
+    def append_text_slices(item: dict[str, Any]) -> None:
+        slices = item.get("text_slices") or []
+        source = str(item["path"])
+        source_key = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
+        count = len(slices)
+        for index, text_slice in enumerate(slices, start=1):
+            result.append({
+                "id": f"h{len(result) + 1:03d}",
+                "sources": [source],
+                "context_sources": [],
+                "source_ranges": {
+                    source: {
+                        **text_slice,
+                        "part": index,
+                        "parts": count,
+                        "slice_file": f".kbc-batch-slices/{source_key}-p{index:03d}.md",
+                    },
+                },
+                "defer_accounting": index < count,
+                "bytes": int(text_slice["bytes"]),
+                "text_bytes": int(text_slice["bytes"]),
+                "status": "pending",
+            })
+
     def flush() -> None:
         nonlocal current, current_bytes, current_text_bytes
         if current:
@@ -353,7 +416,11 @@ def pack_hierarchical_batches(
         flush()
         anchor = family[0] if str(family[0]["path"]).lower().endswith(".md") else None
         remaining = family[:]
-        if anchor is not None:
+        sliced_anchor = anchor if anchor is not None and anchor.get("text_slices") else None
+        if sliced_anchor is not None:
+            remaining.pop(0)
+            append_text_slices(sliced_anchor)
+        elif anchor is not None:
             # The anchor itself is accounted once, in the first chunk.
             first = [remaining.pop(0)]
             first_bytes = _hierarchical_eff(first[0])
@@ -372,7 +439,8 @@ def pack_hierarchical_batches(
         # Re-reading an oversized anchor on every chunk would itself overflow
         # the context. In that rare case the chunks remain independent.
         context = [anchor] if (
-            anchor is not None and _hierarchical_eff(anchor) < limit and _text_eff(anchor) < text_limit
+            sliced_anchor is None and anchor is not None
+            and _hierarchical_eff(anchor) < limit and _text_eff(anchor) < text_limit
             and _text_eff(anchor) <= _hierarchical_context_anchor_max_bytes()
         ) else []
         context_bytes = sum(_hierarchical_eff(i) for i in context)
@@ -415,8 +483,13 @@ def build_plan(
     text_budget: int | None = None,
 ) -> dict[str, Any]:
     mode = "hierarchical" if planner == "hierarchical-code" else "flat"
+    has_text_slices = any(batch.get("source_ranges") for batch in batches)
     return {
-        "version": 2 if mode == "hierarchical" else 1,
+        "version": (
+            3 if mode == "hierarchical" and has_text_slices
+            else 2 if mode == "hierarchical"
+            else 1
+        ),
         "planner": planner,
         "mode": mode,
         "phase": "map",
@@ -449,9 +522,11 @@ def validate_plan(
     b = budget if budget is not None else batch_budget_bytes()
     errors: list[str] = []
     effective = _hierarchical_eff if plan.get("mode") == "hierarchical" else _eff
-    sizes = {i["path"]: effective(i) for i in inventory}
-    text_sizes = {i["path"]: _text_eff(i) for i in inventory}
+    records = {i["path"]: i for i in inventory}
+    sizes = {path: effective(item) for path, item in records.items()}
+    text_sizes = {path: _text_eff(item) for path, item in records.items()}
     seen: dict[str, str] = {}
+    slice_appearances: dict[str, list[dict[str, Any]]] = {}
     seen_ids: set[str] = set()
     batches = plan.get("batches")
     if not isinstance(batches, list) or not batches:
@@ -474,17 +549,61 @@ def validate_plan(
         if not isinstance(context, list):
             errors.append(f"batch {bid}: context_sources must be a list")
             context = []
+        source_ranges = batch.get("source_ranges", {})
+        if not isinstance(source_ranges, dict):
+            errors.append(f"batch {bid}: source_ranges must be an object")
+            source_ranges = {}
+        unknown_range_sources = set(source_ranges) - set(sources)
+        if unknown_range_sources:
+            errors.append(
+                f"batch {bid}: source_ranges names unassigned source(s): "
+                + ", ".join(sorted(unknown_range_sources)[:3]))
+        if source_ranges and (len(sources) != 1 or context):
+            errors.append(f"batch {bid}: a text-slice batch must contain one source and no context")
         total = 0
         text_total = 0
         for path in sources:
             if path not in sizes:
                 errors.append(f"batch {bid}: unknown source {path}")
                 continue
+            source_range = source_ranges.get(path)
             if path in seen:
-                errors.append(f"source {path} appears in {seen[path]} and {bid}")
-            seen[path] = bid
-            total += sizes[path]
-            text_total += text_sizes[path]
+                if source_range is None or path not in slice_appearances:
+                    errors.append(f"source {path} appears in {seen[path]} and {bid}")
+            else:
+                seen[path] = bid
+            if source_range is None:
+                if path in slice_appearances:
+                    errors.append(f"source {path} mixes sliced and unsliced assignments")
+                total += sizes[path]
+                text_total += text_sizes[path]
+                continue
+            if not isinstance(source_range, dict):
+                errors.append(f"batch {bid}: invalid source range for {path}")
+                continue
+            try:
+                parsed_range = {
+                    "bid": bid,
+                    "start_line": int(source_range["start_line"]),
+                    "end_line": int(source_range["end_line"]),
+                    "bytes": int(source_range["bytes"]),
+                    "part": int(source_range["part"]),
+                    "parts": int(source_range["parts"]),
+                    "slice_file": str(source_range["slice_file"]),
+                    "defer_accounting": bool(batch.get("defer_accounting", False)),
+                }
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"batch {bid}: malformed source range for {path}")
+                continue
+            if parsed_range["start_line"] < 1 or parsed_range["end_line"] < parsed_range["start_line"]:
+                errors.append(f"batch {bid}: invalid line range for {path}")
+            if parsed_range["bytes"] < 1:
+                errors.append(f"batch {bid}: empty text slice for {path}")
+            if not parsed_range["slice_file"].startswith(".kbc-batch-slices/"):
+                errors.append(f"batch {bid}: unsafe slice file for {path}")
+            slice_appearances.setdefault(path, []).append(parsed_range)
+            total += max(0, parsed_range["bytes"])
+            text_total += max(0, parsed_range["bytes"])
         for path in context:
             if path not in sizes:
                 errors.append(f"batch {bid}: unknown context source {path}")
@@ -503,6 +622,26 @@ def validate_plan(
         ):
             errors.append(
                 f"batch {bid}: {text_total} text bytes exceeds text budget {text_budget}")
+    for path, appearances in slice_appearances.items():
+        line_count = int(records.get(path, {}).get("line_count", 0))
+        ordered = sorted(appearances, key=lambda item: item["part"])
+        declared_parts = {item["parts"] for item in ordered}
+        if line_count < 1 or len(declared_parts) != 1 or next(iter(declared_parts), 0) != len(ordered):
+            errors.append(f"source {path} has incomplete text-slice metadata")
+            continue
+        if [item["part"] for item in ordered] != list(range(1, len(ordered) + 1)):
+            errors.append(f"source {path} has non-sequential text slices")
+        expected_start = 1
+        for index, item in enumerate(ordered):
+            if item["start_line"] != expected_start:
+                errors.append(f"source {path} text slices are not contiguous")
+                break
+            expected_start = item["end_line"] + 1
+            should_defer = index < len(ordered) - 1
+            if item["defer_accounting"] != should_defer:
+                errors.append(f"source {path} has invalid deferred-accounting boundary")
+        if expected_start != line_count + 1:
+            errors.append(f"source {path} text slices do not cover all {line_count} lines")
     missing = [p for p in sizes if p not in seen]
     if missing:
         errors.append(f"sources not covered: {', '.join(sorted(missing)[:5])}" + ("…" if len(missing) > 5 else ""))
@@ -617,6 +756,10 @@ def prune_missing_sources(plan: dict[str, Any], known: set[str]) -> list[str]:
         if gone:
             dropped.extend(gone)
             b["sources"] = sources
+            ranges = b.get("source_ranges")
+            if isinstance(ranges, dict):
+                for source in gone:
+                    ranges.pop(source, None)
             if not sources:
                 b["status"] = "done"
         context = [s for s in b.get("context_sources", []) if s in known]
@@ -624,7 +767,7 @@ def prune_missing_sources(plan: dict[str, Any], known: set[str]) -> list[str]:
         if context_gone:
             dropped.extend(context_gone)
             b["context_sources"] = context
-    return dropped
+    return sorted(set(dropped))
 
 
 def dump_json(value: Any) -> str:
