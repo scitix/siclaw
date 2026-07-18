@@ -52,10 +52,10 @@ describe("stdio process", () => {
     httpServers.push(mock);
     const port = await listen(mock);
 
-    const adapterEntrypoint = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+    const adapterEntrypoint = fileURLToPath(new URL("./index.ts", import.meta.url));
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: [adapterEntrypoint],
+      args: ["--import", "tsx", adapterEntrypoint],
       env: {
         SICORE_URL: `http://127.0.0.1:${port}`,
         SICLAW_AGENT_ID: "agent-e2e",
