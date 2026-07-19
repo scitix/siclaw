@@ -250,7 +250,9 @@ def reduction_budget_bytes() -> int:
         "KBC_REDUCTION_BUDGET_BYTES", str(DEFAULT_REDUCTION_BUDGET_BYTES)))
 
 
-def scan_sources(raw_dir: Path) -> list[dict[str, Any]]:
+def scan_sources(
+    raw_dir: Path, *, include_pdf_execution_metadata: bool = True,
+) -> list[dict[str, Any]]:
     """Inventory of raw sources: repo-relative path + size, sorted for stable
     plans. Hidden files and empty files are skipped (they carry no compile
     content; the installer never writes them, but a defensive skip is cheap).
@@ -273,7 +275,14 @@ def scan_sources(raw_dir: Path) -> list[dict[str, Any]]:
         size = p.stat().st_size
         if size == 0:
             continue
-        page_count = pdf_page_count(p) if p.suffix.lower() == ".pdf" else None
+        # Routing small/ordinary KBs must remain the established cheap scan.
+        # Authoritative Poppler metadata is only needed after batch mode has
+        # already been selected and the hierarchical planner may split a PDF.
+        page_count = (
+            pdf_page_count(p)
+            if include_pdf_execution_metadata and p.suffix.lower() == ".pdf"
+            else None
+        )
         item = {
             "path": str(p.relative_to(raw_dir)),
             "bytes": size,

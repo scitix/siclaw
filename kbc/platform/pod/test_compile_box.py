@@ -2346,6 +2346,28 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+def test_small_kb_batch_gate_skips_poppler_metadata():
+    """Ordinary compile routing keeps the pre-PDF-slicing cheap scan. Poppler
+    metadata is execution detail for a selected batch plan, never a new cost on
+    every small-KB compile trigger."""
+    import batching
+
+    real_pdfinfo = batching._pdfinfo_page_count
+    try:
+        batching._pdfinfo_page_count = lambda path: (_ for _ in ()).throw(
+            AssertionError("pdfinfo must not run in the small-KB route gate"))
+        with tempfile.TemporaryDirectory() as td:
+            raw = Path(td) / "raw"
+            raw.mkdir()
+            (raw / "small.pdf").write_bytes(b"%PDF-1.7 /Type /Page")
+            run = compile_box.CompileRun("small-pdf-route", td, 1)
+            assert not compile_box._should_route_to_batch(
+                run, "", action="compile.generate")
+    finally:
+        batching._pdfinfo_page_count = real_pdfinfo
+    print("\u2713 small KB route: no Poppler metadata subprocess")
+
+
 def test_hierarchical_text_slice_materialization_and_directive():
     """Oversized-text helpers are bounded, ephemeral views of Raw. The model
     reads the helper, but durable Candidate provenance still names the original
@@ -2455,11 +2477,12 @@ def test_hierarchical_pdf_page_directive():
     }
     directive = compile_box._compose_batch_directive(batch, 42, 50, "", "en")
     assert "raw/gpu/manual.pdf (PDF pages 41-53, part 3/3)" in directive, directive
-    assert '`pages: "21-40"`' in directive, directive
+    assert '`pages: "41-53"`' in directive, directive
     assert "EXACT listed range" in directive, directive
     assert "compiled_from must cite the original Raw PDF path (raw/gpu/manual.pdf)" in directive
 
     directive_zh = compile_box._compose_batch_directive(batch, 42, 50, "", "zh-CN")
+    assert '`pages: "41-53"`' in directive_zh, directive_zh
     assert "Read 工具的 `pages` 参数必须严格等于清单页段" in directive_zh, directive_zh
     assert "compiled_from 必须引用原 Raw PDF 路径(raw/gpu/manual.pdf)" in directive_zh
     print("\u2713 hierarchical PDF slices: exact Read.pages directive and Raw provenance")
@@ -3553,6 +3576,7 @@ async def main():
     await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
+    test_small_kb_batch_gate_skips_poppler_metadata()
     test_hierarchical_text_slice_materialization_and_directive()
     test_hierarchical_resume_state_contract()
     test_hierarchical_pdf_page_directive()

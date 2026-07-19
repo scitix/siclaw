@@ -2244,7 +2244,10 @@ def _should_route_to_batch(run: "CompileRun", text: str, action: str | None = No
     if not _batch_mode_enabled() or run._batch_active or not full_compile:
         return False
     raw_dir = Path(run.workdir) / "raw"
-    inventory = batching.scan_sources(raw_dir)
+    # This gate runs for every normal compile trigger. Keep it metadata-light:
+    # Poppler page counting belongs to the batch planner, not the small-KB path.
+    inventory = batching.scan_sources(
+        raw_dir, include_pdf_execution_metadata=False)
     if batching.should_batch(inventory):
         return True
     # An interrupted batch/reduce/final run must finish in the orchestrator even
@@ -2516,10 +2519,14 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         + "),绝不能引用辅助文件。"
         if sliced_sources else ""
     )
+    page_example = (
+        f'{paged_sources[0][1]}-{paged_sources[0][2]}'
+        if paged_sources else ""
+    )
     page_en = (
         "\n\nThis batch is one bounded page range of an oversized PDF. Read each listed PDF "
-        "with the Read tool's `pages` argument set to the EXACT listed range (for example, "
-        "`pages: \"21-40\"`). Do not read pages outside that range in this batch. Compile only "
+        "with the Read tool's `pages` argument set to the EXACT listed range (for this batch, "
+        f"`pages: \"{page_example}\"`). Do not read pages outside that range in this batch. Compile only "
         "facts visible in those pages; compiled_from must cite the original Raw PDF path ("
         + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
         + ")."
@@ -2527,7 +2534,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
     )
     page_zh = (
         "\n\n本批只处理超大 PDF 的一个有界页段。读取清单中的 PDF 时,Read 工具的 `pages` 参数必须严格等于"
-        "清单页段(例如 `pages: \"21-40\"`),本批不得读取范围外页面。只编译该页段可见的事实;"
+        f"清单页段(本批为 `pages: \"{page_example}\"`),本批不得读取范围外页面。只编译该页段可见的事实;"
         "compiled_from 必须引用原 Raw PDF 路径("
         + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
         + ")."
