@@ -86,6 +86,19 @@ class SourceSnapshotTest(unittest.TestCase):
             "03893ac5d1c473dd02f41eb12245120037acfa71357ac1fbf20b9ac82bc388b0",
         )
 
+    def test_canonical_manifest_matches_sicore_json_escaping(self):
+        files = [{
+            "path": "R&D<plan>\u2028.md",
+            "sha256": "a" * 64,
+            "size_bytes": 1,
+        }]
+        self.assertEqual(
+            source_snapshot.canonical_file_manifest(files).decode(),
+            '[{"path":"R\\u0026D\\u003cplan\\u003e\\u2028.md","sha256":"'
+            + "a" * 64
+            + '","size_bytes":1}]',
+        )
+
     def test_resumes_missing_parts_and_commits_atomically(self):
         snapshot, bundles = make_snapshot([
             {"docs/a.md": b"alpha\n"},

@@ -69,7 +69,21 @@ def canonical_file_manifest(files: list[dict]) -> bytes:
         ({"path": item["path"], "sha256": item["sha256"], "size_bytes": item["size_bytes"]} for item in files),
         key=lambda item: item["path"],
     )
-    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    # Sicore computes this digest with Go's encoding/json.  Its otherwise
+    # compact UTF-8 output escapes the HTML-sensitive code points and the two
+    # JavaScript line separators even inside filenames.  Mirror that wire
+    # contract explicitly; Python's json encoder leaves these characters raw
+    # when ensure_ascii=False, which would make a valid path such as R&D.md
+    # reject the whole snapshot with a manifest hash mismatch.
+    payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    payload = (
+        payload.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    return payload.encode("utf-8")
 
 
 def validate_snapshot(snapshot: object) -> dict:
