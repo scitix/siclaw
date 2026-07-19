@@ -11,7 +11,7 @@
 #     kbc-compile-pod
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin the SDK: an unpinned install drifts on every rebuild, and the bundled
@@ -19,7 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 # massapi/Bedrock path). 0.2.110 is production-proven on the KB compile path.
 # PyYAML backs deterministic OKF frontmatter validation. python-pptx/openpyxl/
 # python-docx let office_ingest pre-render .pptx/.xlsx/.docx sources to markdown
-# (pdf/text/images are read natively by the agent's Read tool).
+# (PDFs are rendered by the agent's Read tool through poppler-utils; text and
+# images are read directly).
 COPY platform/pod/requirements.txt /tmp/kbc-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/kbc-requirements.txt
 

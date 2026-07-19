@@ -2073,7 +2073,8 @@ def _reference_assist_model() -> str:
             or _compile_model())
 
 
-def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, session_id: str) -> "ClaudeAgentOptions":
+def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, session_id: str,
+                          pdf_page_ranges: dict | None = None) -> "ClaudeAgentOptions":
     """One options builder for the persistent session AND every batch session —
     identical role/tools/model so a batch page is written under exactly the same
     conventions as a single-session page."""
@@ -2094,7 +2095,9 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=session_id,
         session_store=InMemorySessionStore(),
-        hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(Path(wd), run.locale)])]},
+        hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(
+            Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges
+        )])]},
         # Stream partial deltas so the stall watchdog sees fine-grained model
         # liveness: a live-but-slow generation keeps emitting StreamEvents (idle
         # clock stays fresh), while a black-holed request emits nothing at all.
@@ -2318,13 +2321,17 @@ def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[st
     )
 
 
-async def _drive_batch_session(run: "CompileRun", directive: str, label: str) -> str:
+async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
+                               pdf_page_ranges: dict | None = None) -> str:
     """One bounded internal session: fresh session_id, same role/tools/workspace.
     Streams its output through _emit_message with turn_done suppressed; returns
     the session's final reply text. run.client points at the live session so the
     park/ruling MCP tools and the inject seam keep working."""
     wd = str(Path(run.workdir).resolve())
-    opts = _compile_session_opts(run, wd, _compile_system_prompt(run), str(uuid.uuid4()))
+    opts = _compile_session_opts(
+        run, wd, _compile_system_prompt(run), str(uuid.uuid4()),
+        pdf_page_ranges=pdf_page_ranges,
+    )
     client = ClaudeSDKClient(options=opts)
     prev_client = run.client
     run._suppress_turn_done = True
@@ -2360,10 +2367,16 @@ def _drain_batch_notes(run: "CompileRun") -> str:
 def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
                              locale: str | None = None) -> str:
     source_ranges = batch.get("source_ranges", {})
+    source_page_ranges = batch.get("source_page_ranges", {})
     listing_lines: list[str] = []
     sliced_sources: list[str] = []
+    paged_sources: list[tuple[str, int, int]] = []
     for path in batch["sources"]:
         source_range = source_ranges.get(path) if isinstance(source_ranges, dict) else None
+        page_range = (
+            source_page_ranges.get(path)
+            if isinstance(source_page_ranges, dict) else None
+        )
         if isinstance(source_range, dict):
             start = source_range["start_line"]
             end = source_range["end_line"]
@@ -2374,6 +2387,15 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
                 f"- {slice_file} (read-only excerpt of raw/{path}, lines {start}-{end}, part {part}/{parts})"
             )
             sliced_sources.append(path)
+        elif isinstance(page_range, dict):
+            start = page_range["start_page"]
+            end = page_range["end_page"]
+            part = page_range["part"]
+            parts = page_range["parts"]
+            listing_lines.append(
+                f"- raw/{path} (PDF pages {start}-{end}, part {part}/{parts})"
+            )
+            paged_sources.append((path, start, end))
         else:
             listing_lines.append(f"- raw/{path}")
     listing = "\n".join(listing_lines)
@@ -2402,6 +2424,23 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         + "),绝不能引用辅助文件。"
         if sliced_sources else ""
     )
+    page_en = (
+        "\n\nThis batch is one bounded page range of an oversized PDF. Read each listed PDF "
+        "with the Read tool's `pages` argument set to the EXACT listed range (for example, "
+        "`pages: \"21-40\"`). Do not read pages outside that range in this batch. Compile only "
+        "facts visible in those pages; compiled_from must cite the original Raw PDF path ("
+        + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
+        + ")."
+        if paged_sources else ""
+    )
+    page_zh = (
+        "\n\n本批只处理超大 PDF 的一个有界页段。读取清单中的 PDF 时,Read 工具的 `pages` 参数必须严格等于"
+        "清单页段(例如 `pages: \"21-40\"`),本批不得读取范围外页面。只编译该页段可见的事实;"
+        "compiled_from 必须引用原 Raw PDF 路径("
+        + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
+        + ")."
+        if paged_sources else ""
+    )
     if selfcheck._is_en(locale):
         return (
             f"[Batch compile · batch {k}/{n} · {batch['id']}] Compile ONLY the sources below "
@@ -2413,7 +2452,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
             "never stop. Do not read any raw source outside this compile list and any explicitly listed "
             "read-only family context. When done, report briefly which pages "
-            "this batch produced." + context_en + slice_en + notes
+            "this batch produced." + context_en + slice_en + page_en + notes
         )
     return (
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
@@ -2421,7 +2460,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
         "compiled_from 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
         "除上面清单及明确列出的只读同族上下文外,其他 raw 源一个都不要读。完成后简短汇报本批编了哪些页。"
-        + context_zh + slice_zh + notes
+        + context_zh + slice_zh + page_zh + notes
     )
 
 
@@ -2720,7 +2759,10 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         for batch in list(pending):
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
             directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run), locale=getattr(run, "locale", None))
-            reply = await _drive_batch_session(run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"))
+            reply = await _drive_batch_session(
+                run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"),
+                pdf_page_ranges=batch.get("source_page_ranges"),
+            )
             if reply:
                 replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
             still_unaccounted = (
@@ -3332,7 +3374,37 @@ def _test_path_escape(root: Path, tool_name: str, tool_input: dict) -> str | Non
     return None
 
 
-def _make_path_guard(root: Path, locale: str | None = None, *, deny_bash: bool = False):
+def _pdf_page_range_violation(root: Path, page_ranges: dict | None,
+                              tool_name: str, tool_input: dict) -> str | None:
+    """Require a sliced-PDF map batch to read exactly its assigned pages.
+
+    The directive tells the model which range to read; this hook makes that
+    boundary deterministic under ``bypassPermissions``. Other Raw and workspace
+    paths remain governed by the normal compile guard.
+    """
+    if tool_name != "Read" or not isinstance(page_ranges, dict) or not page_ranges:
+        return None
+    value = tool_input.get("file_path")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value)
+    target = (path if path.is_absolute() else root / path).resolve()
+    for source, page_range in page_ranges.items():
+        if not isinstance(source, str) or not isinstance(page_range, dict):
+            continue
+        expected_target = (root / "raw" / source).resolve()
+        if target != expected_target:
+            continue
+        expected = f"{page_range.get('start_page')}-{page_range.get('end_page')}"
+        actual_value = tool_input.get("pages")
+        actual = str(actual_value).strip() if actual_value is not None else ""
+        if actual != expected:
+            return f"pages={actual or '<missing>'} expected={expected} for raw/{source}"
+    return None
+
+
+def _make_path_guard(root: Path, locale: str | None = None, *, deny_bash: bool = False,
+                     pdf_page_ranges: dict | None = None):
     """PreToolUse hook confining one SDK session to its workspace. Hooks fire
     under bypassPermissions; compiler sessions also deny Bash as defense in
     depth if a future profile accidentally adds it back."""
@@ -3340,9 +3412,14 @@ def _make_path_guard(root: Path, locale: str | None = None, *, deny_bash: bool =
 
     async def guard(input_data, tool_use_id, context):
         tool_name = str(input_data.get("tool_name", ""))
+        tool_input = input_data.get("tool_input") or {}
         offender = "tool=Bash" if deny_bash and tool_name == "Bash" else _test_path_escape(
-            root, tool_name, input_data.get("tool_input") or {}
+            root, tool_name, tool_input
         )
+        if not offender:
+            offender = _pdf_page_range_violation(
+                root, pdf_page_ranges, tool_name, tool_input
+            )
         if offender:
             return {
                 "hookSpecificOutput": {
@@ -3361,9 +3438,12 @@ def _make_test_path_guard(root: Path, locale: str | None = None):
     return _make_path_guard(root, locale)
 
 
-def _make_compile_path_guard(root: Path, locale: str | None = None):
+def _make_compile_path_guard(root: Path, locale: str | None = None,
+                             pdf_page_ranges: dict | None = None):
     """Constrain compiler and planner sessions to their /work workspace."""
-    return _make_path_guard(root, locale, deny_bash=True)
+    return _make_path_guard(
+        root, locale, deny_bash=True, pdf_page_ranges=pdf_page_ranges
+    )
 
 
 def _recommendation_path_escape(root: Path, tool_name: str, tool_input: dict) -> str | None:
