@@ -525,6 +525,46 @@ async def test_test_path_escape_guard():
         }, "p3", None)
         assert allow == {}, allow
 
+        # Batch sessions are mechanically confined to the validated Raw list.
+        # A text-slice batch omits the original Markdown and may read only its
+        # helper; a regular/PDF source remains directly readable. Directory or
+        # cwd-wide Grep cannot bypass the per-file Read boundary.
+        (root / "raw" / "other.md").touch()
+        scoped_guard = compile_box._make_compile_path_guard(
+            root, raw_read_allowlist=["manual.pdf"])
+        allow = await scoped_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "raw/manual.pdf"},
+        }, "s1", None)
+        assert allow == {}, allow
+        allow = await scoped_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "candidate/index.md"},
+        }, "s2", None)
+        assert allow == {}, allow
+        for tool_name, tool_input in (
+            ("Read", {"file_path": "raw/other.md"}),
+            ("Grep", {"pattern": "secret"}),
+            ("Grep", {"path": ".", "pattern": "secret"}),
+            ("Grep", {"path": "raw", "pattern": "secret"}),
+            ("Grep", {"path": "raw/other.md", "pattern": "secret"}),
+        ):
+            deny = await scoped_guard({
+                "tool_name": tool_name, "tool_input": tool_input,
+            }, "s3", None)
+            assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await scoped_guard({
+            "tool_name": "Grep",
+            "tool_input": {"path": "raw/manual.pdf", "pattern": "needle"},
+        }, "s4", None)
+        assert allow == {}, allow
+        deny_all_raw = compile_box._make_compile_path_guard(
+            root, raw_read_allowlist=[])
+        deny = await deny_all_raw({
+            "tool_name": "Read", "tool_input": {"file_path": "raw/manual.pdf"},
+        }, "s5", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+
         # The recommendation session is narrower than a compiler: only raw/
         # and candidate/ may inform the proposed test. Internal workflow,
         # evaluation and release artifacts remain invisible to the red team.
@@ -2292,7 +2332,8 @@ async def test_batch_orchestrator_routing_and_resume():
         # stub the session driver: record directives, pretend each session works
         driven: list[str] = []
 
-        async def fake_drive(run_, directive, label, pdf_page_ranges=None):
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_read_allowlist=None):
             driven.append(label + "|" + directive.split("\n")[0])
             return f"done {label}"
 
@@ -2407,7 +2448,6 @@ def test_hierarchical_text_slice_materialization_and_directive():
         assert "本批绝不要直接打开原 Raw 全文" in directive, directive
         assert "compiled_from 必须引用原 Raw 路径(raw/gpu/manual.md)" in directive, directive
         assert "compiled_from 必须引用原 Raw 路径(.kbc-batch-slices" not in directive
-
         # A completed map batch is durable history, not a future model turn.
         # If its Raw source disappears before reduce/final resumes, rebuilding
         # its ephemeral slice would make the train fail forever even though the
@@ -2416,6 +2456,25 @@ def test_hierarchical_text_slice_materialization_and_directive():
         source.unlink()
         compile_box._materialize_batch_slices(run, {"batches": [batch]})
         assert not helper.exists()
+
+        assert compile_box._batch_raw_read_allowlist(batch) == []
+
+        regular = {
+            "sources": ["gpu/spec.md", "gpu/manual.pdf"],
+            "context_sources": ["gpu/anchor.md"],
+            "source_ranges": {
+                "gpu/spec.md": {
+                    "start_line": 1,
+                    "end_line": 2,
+                    "part": 1,
+                    "parts": 2,
+                    "slice_file": ".kbc-batch-slices/spec-p001.md",
+                }
+            },
+        }
+        assert compile_box._batch_raw_read_allowlist(regular) == [
+            "gpu/anchor.md", "gpu/manual.pdf",
+        ]
     print("\u2713 hierarchical text slices: bounded helper with original-Raw provenance")
 
 
@@ -2532,10 +2591,13 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             run = compile_box.CompileRun("hier-run", str(wd), 1)
             driven: list[str] = []
             observed_idle_timeouts: list[float | None] = []
+            observed_raw_allowlists: list[tuple[str, list[str] | None]] = []
 
-            async def fake_drive(run_, directive, label, pdf_page_ranges=None):
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                                 raw_read_allowlist=None):
                 driven.append(label + "|" + directive.splitlines()[0])
                 observed_idle_timeouts.append(run_._model_idle_timeout_s)
+                observed_raw_allowlists.append((label, raw_read_allowlist))
                 if label.startswith("batch ") or label.startswith("批 "):
                     candidate = wd / "candidate"
                     candidate.mkdir(exist_ok=True)
@@ -2558,6 +2620,12 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             assert sum(item.startswith("batch ") for item in driven) == 2, driven
             assert sum(item.startswith("section reduce ") for item in driven) == 1, driven
             assert driven[-1].startswith("final review"), driven
+            assert observed_raw_allowlists[:2] == [
+                ("batch 1/2", ["gpu/a.md"]),
+                ("batch 2/2", ["gpu/b.md"]),
+            ], observed_raw_allowlists
+            assert all(allowed == [] for label, allowed in observed_raw_allowlists[2:]
+                       if label.startswith(("section reduce ", "final review"))), observed_raw_allowlists
             assert set(observed_idle_timeouts) == {
                 max(compile_box._MODEL_IDLE_TIMEOUT_S, 123)
             }, observed_idle_timeouts
@@ -2664,7 +2732,8 @@ async def test_hierarchical_media_rechecks_after_ledger_repair():
             order: list[str] = []
             media_calls = 0
 
-            async def fake_drive(run_, directive, label, pdf_page_ranges=None):
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                                 raw_read_allowlist=None):
                 order.append(f"drive:{label}")
                 if label == "final review":
                     assert "do not read raw/" in directive, directive
@@ -2767,7 +2836,8 @@ async def test_batch_orchestrator_review_fixes():
             run = compile_box.CompileRun("rf1", str(wd), 1)
             driven: list[str] = []
 
-            async def fake_drive(run_, directive, label, pdf_page_ranges=None):
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                                 raw_read_allowlist=None):
                 driven.append(f"{label}|{directive}")
                 return f"done {label}"
 
@@ -2788,7 +2858,8 @@ async def test_batch_orchestrator_review_fixes():
             (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
             run = compile_box.CompileRun("rf2", str(wd), 1)
 
-            async def boom(run_, directive, label, pdf_page_ranges=None):
+            async def boom(run_, directive, label, pdf_page_ranges=None,
+                           raw_read_allowlist=None):
                 raise RuntimeError("session exploded")
 
             compile_box._drive_batch_session = boom
@@ -2805,7 +2876,8 @@ async def test_batch_orchestrator_review_fixes():
             run = compile_box.CompileRun("rf3", str(wd), 1)
             driven = []
 
-            async def drive_and_note(run_, directive, label, pdf_page_ranges=None):
+            async def drive_and_note(run_, directive, label, pdf_page_ranges=None,
+                                     raw_read_allowlist=None):
                 driven.append(f"{label}|{directive}")
                 if label == "final review":  # owner speaks while the tail is running
                     run_._batch_notes.append("附录不要发布")
@@ -2827,7 +2899,8 @@ async def test_batch_orchestrator_review_fixes():
             run.locale = "zh"
             driven = []
 
-            async def fake_zh(run_, directive, label, pdf_page_ranges=None):
+            async def fake_zh(run_, directive, label, pdf_page_ranges=None,
+                              raw_read_allowlist=None):
                 driven.append(f"{label}|{directive}")
                 return f"done {label}"
 

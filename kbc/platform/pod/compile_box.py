@@ -2133,7 +2133,8 @@ def _reference_assist_model() -> str:
 
 
 def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, session_id: str,
-                          pdf_page_ranges: dict | None = None) -> "ClaudeAgentOptions":
+                          pdf_page_ranges: dict | None = None,
+                          raw_read_allowlist: list[str] | None = None) -> "ClaudeAgentOptions":
     """One options builder for the persistent session AND every batch session —
     identical role/tools/model so a batch page is written under exactly the same
     conventions as a single-session page."""
@@ -2155,7 +2156,8 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         session_id=session_id,
         session_store=InMemorySessionStore(),
         hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(
-            Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges
+            Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges,
+            raw_read_allowlist=raw_read_allowlist,
         )])]},
         # Stream partial deltas so the stall watchdog sees fine-grained model
         # liveness: a live-but-slow generation keeps emitting StreamEvents (idle
@@ -2167,7 +2169,8 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
 
 
 def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, session_id: str,
-                            pdf_page_ranges: dict | None = None):
+                            pdf_page_ranges: dict | None = None,
+                            raw_read_allowlist: list[str] | None = None):
     """Create the selected persistent compiler adapter.
 
     The mature turn/sync/watchdog orchestration consumes the same client shape
@@ -2183,7 +2186,9 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
             max_tool_calls=int(os.environ.get("KBC_MAX_TURNS", "150")),
         )
     return ClaudeSDKClient(options=_compile_session_opts(
-        run, wd, system_prompt, session_id, pdf_page_ranges=pdf_page_ranges
+        run, wd, system_prompt, session_id,
+        pdf_page_ranges=pdf_page_ranges,
+        raw_read_allowlist=raw_read_allowlist,
     ))
 
 
@@ -2417,7 +2422,8 @@ def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[st
 
 
 async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
-                               pdf_page_ranges: dict | None = None) -> str:
+                               pdf_page_ranges: dict | None = None,
+                               raw_read_allowlist: list[str] | None = None) -> str:
     """One bounded internal session: fresh session_id, same role/tools/workspace.
     Streams its output through _emit_message with turn_done suppressed; returns
     the session's final reply text. run.client points at the live session so the
@@ -2427,6 +2433,7 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
     client = _compile_session_client(
         run, wd, _compile_system_prompt(run), session_id,
         pdf_page_ranges=pdf_page_ranges,
+        raw_read_allowlist=raw_read_allowlist,
     )
     prev_client = run.client
     run._suppress_turn_done = True
@@ -2457,6 +2464,29 @@ def _drain_batch_notes(run: "CompileRun") -> str:
     return _loc(run,
                 f"\n\nThe owner added during the compile (take it into account; it affects the remaining batches):\n{notes}",
                 f"\n\n负责人在编译过程中补充说(一并考虑,影响后续各批):\n{notes}")
+
+
+def _batch_raw_read_allowlist(batch: dict) -> list[str]:
+    """Raw files one map session may inspect directly.
+
+    Text-sliced sources are intentionally absent: the session must read their
+    bounded ``.kbc-batch-slices`` helper instead. PDF slices remain present
+    because the Read tool needs the original PDF plus the exact page-range
+    guard. Family anchors are explicit read-only context for the batch.
+    """
+    source_ranges = batch.get("source_ranges")
+    sliced = set(source_ranges) if isinstance(source_ranges, dict) else set()
+    allowed = {
+        source
+        for source in batch.get("sources", [])
+        if isinstance(source, str) and source not in sliced
+    }
+    allowed.update(
+        source
+        for source in batch.get("context_sources", [])
+        if isinstance(source, str)
+    )
+    return sorted(allowed)
 
 
 def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
@@ -2869,6 +2899,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             reply = await _drive_batch_session(
                 run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"),
                 pdf_page_ranges=batch.get("source_page_ranges"),
+                raw_read_allowlist=_batch_raw_read_allowlist(batch),
             )
             if reply:
                 replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
@@ -2934,7 +2965,9 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 reply = await _drive_batch_session(
                     run, directive,
                     _loc(run, f"section reduce {k}/{reduction_count}",
-                         f"分区归并 {k}/{reduction_count}"))
+                         f"分区归并 {k}/{reduction_count}"),
+                    raw_read_allowlist=[],
+                )
                 if reply:
                     replies.append(_loc(
                         run,
@@ -2952,7 +2985,9 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         final_reply = await _drive_batch_session(
             run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
-            _loc(run, "final review", "终审"))
+            _loc(run, "final review", "终审"),
+            raw_read_allowlist=[],
+        )
         if final_reply:
             replies.append(_loc(run, f"[Final review] {final_reply}", f"【终审】{final_reply}"))
         # Full-corpus selfcheck + bounded repair rounds, each a fresh bounded
@@ -3525,8 +3560,55 @@ def _pdf_page_range_violation(root: Path, page_ranges: dict | None,
     return None
 
 
+def _raw_read_scope_violation(root: Path, raw_read_allowlist: list[str] | None,
+                              tool_name: str, tool_input: dict) -> str | None:
+    """Keep one internal batch session inside its validated Raw source list.
+
+    ``None`` means an ordinary compiler session with no batch scope. An empty
+    list means a reduce/final session that may inspect Candidate and authoring
+    state but no Raw content. Text-slice sessions deliberately omit the
+    original source from the allowlist and read only their materialized helper.
+
+    Read exposes one file directly. Grep can expose many files at once, so a
+    scoped session must name either an allowed Raw file or a path that cannot
+    include Raw at all; cwd-wide and raw-directory searches fail closed. Glob
+    only lists paths, while every subsequent content read remains guarded.
+    """
+    if raw_read_allowlist is None or tool_name not in {"Read", "Grep"}:
+        return None
+    root = root.resolve()
+    raw_root = (root / "raw").resolve()
+    allowed: set[Path] = set()
+    for source in raw_read_allowlist:
+        if not isinstance(source, str) or not source.strip():
+            continue
+        target = (raw_root / source).resolve()
+        try:
+            target.relative_to(raw_root)
+        except ValueError:
+            continue
+        allowed.add(target)
+
+    field = "file_path" if tool_name == "Read" else "path"
+    value = tool_input.get(field)
+    if not isinstance(value, str) or not value.strip():
+        return "path=<missing> would search the batch workspace including raw/" if tool_name == "Grep" else None
+    path = Path(value)
+    target = (path if path.is_absolute() else root / path).resolve()
+    if tool_name == "Grep" and (target == root or target in raw_root.parents):
+        return f"path={value} would search outside the batch Raw allowlist"
+    try:
+        target.relative_to(raw_root)
+    except ValueError:
+        return None
+    if target not in allowed:
+        return f"{field}={value} is outside the batch Raw allowlist"
+    return None
+
+
 def _make_path_guard(root: Path, locale: str | None = None, *, deny_bash: bool = False,
-                     pdf_page_ranges: dict | None = None):
+                     pdf_page_ranges: dict | None = None,
+                     raw_read_allowlist: list[str] | None = None):
     """PreToolUse hook confining one SDK session to its workspace. Hooks fire
     under bypassPermissions; compiler sessions also deny Bash as defense in
     depth if a future profile accidentally adds it back."""
@@ -3538,6 +3620,10 @@ def _make_path_guard(root: Path, locale: str | None = None, *, deny_bash: bool =
         offender = "tool=Bash" if deny_bash and tool_name == "Bash" else _test_path_escape(
             root, tool_name, tool_input
         )
+        if not offender:
+            offender = _raw_read_scope_violation(
+                root, raw_read_allowlist, tool_name, tool_input
+            )
         if not offender:
             offender = _pdf_page_range_violation(
                 root, pdf_page_ranges, tool_name, tool_input
@@ -3561,10 +3647,12 @@ def _make_test_path_guard(root: Path, locale: str | None = None):
 
 
 def _make_compile_path_guard(root: Path, locale: str | None = None,
-                             pdf_page_ranges: dict | None = None):
+                             pdf_page_ranges: dict | None = None,
+                             raw_read_allowlist: list[str] | None = None):
     """Constrain compiler and planner sessions to their /work workspace."""
     return _make_path_guard(
-        root, locale, deny_bash=True, pdf_page_ranges=pdf_page_ranges
+        root, locale, deny_bash=True, pdf_page_ranges=pdf_page_ranges,
+        raw_read_allowlist=raw_read_allowlist,
     )
 
 
