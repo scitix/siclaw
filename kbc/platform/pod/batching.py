@@ -14,8 +14,9 @@ Design invariants:
   anchor as read-only context while accounting each source exactly once.
 - Every raw source lands in exactly one batch (coverage is validated, and the
   final full-corpus SELFCHECK proves no batch dropped anything).
-- A single file larger than the budget still gets its own batch (we never split
-  a file; the page that compiles it needs the whole file anyway).
+- Raw provenance remains one source identity. Oversized Markdown and PDF work
+  is segmented into bounded line/page batches; other oversized files keep the
+  historical one-file batch behavior.
 """
 
 from __future__ import annotations
@@ -24,6 +25,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +37,7 @@ DEFAULT_HIERARCHICAL_THRESHOLD_BYTES = 8 * 1024 * 1024
 DEFAULT_HIERARCHICAL_BATCH_BUDGET_BYTES = 1024 * 1024
 DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 128 * 1024
 DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES = 64 * 1024
+DEFAULT_HIERARCHICAL_PDF_SLICE_PAGES = 20
 DEFAULT_REDUCTION_BUDGET_BYTES = 512 * 1024
 
 # ── effective-size weighting ─────────────────────────────────────────────────
@@ -72,6 +77,15 @@ def _hierarchical_text_slice_bytes() -> int:
         str(DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES))))
 
 
+def hierarchical_pdf_slice_pages() -> int:
+    """Claude Code's Read tool accepts at most 20 PDF pages per call. Keep the
+    planner limit explicit and configurable for provider-specific deployments,
+    but never allow a zero-width slice."""
+    return max(1, int(os.environ.get(
+        "KBC_HIERARCHICAL_PDF_SLICE_PAGES",
+        str(DEFAULT_HIERARCHICAL_PDF_SLICE_PAGES))))
+
+
 def _text_slices(path: Path, size: int) -> tuple[int, list[dict[str, int]]] | None:
     """Line-bounded chunks for a Markdown source that cannot safely fit one
     hierarchical model turn. The Raw file remains the provenance identity;
@@ -99,6 +113,25 @@ def _text_slices(path: Path, size: int) -> tuple[int, list[dict[str, int]]] | No
     return len(lines), slices
 
 
+def _pdf_slices(page_count: int) -> list[dict[str, int]] | None:
+    """Contiguous Read-tool page ranges for a PDF that is too large for one
+    bounded model turn. The original PDF remains the sole provenance identity;
+    page ranges are internal execution metadata."""
+    limit = hierarchical_pdf_slice_pages()
+    if page_count <= limit:
+        return None
+    count = (page_count + limit - 1) // limit
+    return [
+        {
+            "start_page": start,
+            "end_page": min(page_count, start + limit - 1),
+            "part": index,
+            "parts": count,
+        }
+        for index, start in enumerate(range(1, page_count + 1, limit), start=1)
+    ]
+
+
 def _pdf_page_cost() -> int:
     return int(os.environ.get("KBC_BATCH_PDF_PAGE_COST_BYTES", str(8 * 1024)))
 
@@ -108,13 +141,59 @@ def _binary_weight() -> float:
 
 
 _PDF_PAGE_RE = re.compile(rb"/Type\s*/Page(?![s/])")
+_PDFINFO_PAGES_RE = re.compile(r"^Pages:\s*([0-9]+)\s*$", re.MULTILINE)
+
+
+def _pdfinfo_page_count(path: Path) -> int | None:
+    """Ask Poppler for the authoritative page count when it is installed.
+
+    ``pdfinfo`` and the Read tool's ``pdftoppm`` renderer ship in the same
+    ``poppler-utils`` package, so a production compile image either has both or
+    falls through to the dependency-free marker estimate below.
+    """
+    executable = shutil.which("pdfinfo")
+    if executable is None:
+        return None
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    try:
+        result = subprocess.run(
+            [executable, str(path)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = _PDFINFO_PAGES_RE.search(result.stdout)
+    if match is None:
+        return None
+    count = int(match.group(1))
+    return count or None
 
 
 def pdf_page_count(path: Path) -> int | None:
-    """Cheap page estimate: count /Type /Page object markers (excluding /Pages
-    tree nodes) in a single pass. Works for most non-encrypted PDFs; None when
-    nothing is found (e.g. fully compressed object streams) so the caller can
-    fall back to a byte heuristic."""
+    """Page count for planning: authoritative Poppler metadata first, then a
+    cheap /Type /Page marker estimate (excluding /Pages tree nodes). None is
+    reserved for unreadable/encrypted inputs where both methods fail, so the
+    caller can keep the historical byte heuristic."""
+    page_count = _pdfinfo_page_count(path)
+    if page_count is not None:
+        return page_count
+    return _pdf_marker_page_count(path)
+
+
+def _pdf_marker_page_count(path: Path) -> int | None:
+    """Historical dependency-free estimator used by effective-size routing.
+
+    Keep this separate from authoritative Poppler metadata so adding stable
+    page slicing cannot move the established small/medium KB thresholds.
+    """
     try:
         data = path.read_bytes()
     except OSError:
@@ -131,7 +210,7 @@ def effective_bytes(path: Path, size: int) -> int:
     if ext in IMAGE_EXTS:
         return _image_cost()
     if ext == ".pdf":
-        pages = pdf_page_count(path)
+        pages = _pdf_marker_page_count(path)
         if pages is not None:
             return pages * _pdf_page_cost()
         return max(30 * 1024, min(int(size * 0.1), 400 * 1024))
@@ -194,11 +273,20 @@ def scan_sources(raw_dir: Path) -> list[dict[str, Any]]:
         size = p.stat().st_size
         if size == 0:
             continue
+        page_count = pdf_page_count(p) if p.suffix.lower() == ".pdf" else None
         item = {
             "path": str(p.relative_to(raw_dir)),
             "bytes": size,
+            # Preserve the established small/medium routing signal. Poppler's
+            # authoritative page_count below is execution metadata for the
+            # hierarchical planner, not a threshold migration.
             "effective": effective_bytes(p, size),
         }
+        if page_count is not None:
+            item["page_count"] = page_count
+            pdf_slices = _pdf_slices(page_count)
+            if pdf_slices is not None:
+                item["pdf_slices"] = pdf_slices
         sliced = _text_slices(p, size)
         if sliced is not None:
             item["line_count"], item["text_slices"] = sliced
@@ -308,26 +396,103 @@ def _asset_anchor(path: str, known: set[str]) -> str | None:
     return None
 
 
+_ATTACHMENT_EXTS = {"pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx"}
+_ATTACHMENT_ANCHOR_RE = re.compile(
+    r"^(?:[0-9]+-)?(.+?) \((pdf|doc|docx|ppt|pptx|xls|xlsx)附件\)\.md$",
+    re.IGNORECASE,
+)
+
+
+def _identity_part(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()
+
+
+def _attachment_identity(path: str) -> tuple[str, str, str] | None:
+    """Stable identity for an original file (or its exact sibling Markdown)
+    below ``_attachments/``. Directory + full stem + real extension must match;
+    no fuzzy title matching is allowed."""
+    parts = path.split("/")
+    if len(parts) < 3 or parts[0] != "_attachments":
+        return None
+    filename = parts[-1]
+    if filename.lower().endswith(".md"):
+        filename = filename[:-3]
+    stem, dot, ext = filename.rpartition(".")
+    if not dot or ext.casefold() not in _ATTACHMENT_EXTS:
+        return None
+    return (
+        _identity_part("/".join(parts[1:-1])),
+        _identity_part(stem),
+        ext.casefold(),
+    )
+
+
+def _attachment_anchor_identity(path: str) -> tuple[str, str, str] | None:
+    parts = path.split("/")
+    if len(parts) < 2 or parts[0] == "_attachments":
+        return None
+    match = _ATTACHMENT_ANCHOR_RE.fullmatch(parts[-1])
+    if match is None:
+        return None
+    return (
+        _identity_part("/".join(parts[:-1])),
+        _identity_part(match.group(1)),
+        match.group(2).casefold(),
+    )
+
+
+def _attachment_anchors(known: set[str]) -> dict[tuple[str, str, str], str]:
+    """Return only unambiguous exporter identities. If two anchors normalize
+    to the same identity, omit the key so both attachments remain independent
+    rather than being silently attached to the wrong document."""
+    matches: dict[tuple[str, str, str], list[str]] = {}
+    for path in known:
+        identity = _attachment_anchor_identity(path)
+        if identity is not None:
+            matches.setdefault(identity, []).append(path)
+    return {
+        identity: paths[0]
+        for identity, paths in matches.items()
+        if len(paths) == 1
+    }
+
+
 def source_families(inventory: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Group every source into one deterministic document family.
 
     A family is an anchor Markdown file plus all media below its sibling
-    ``*.assets`` directory. Everything else is a one-source family. Returning
+    ``*.assets`` directory, plus an exactly matched original/sidecar below
+    ``_attachments/``. Everything else is a one-source family. Returning
     inventory records (rather than just paths) keeps this function pure and
     lets the packer enforce effective-byte budgets without rescanning disk.
     """
     by_path = {str(i["path"]): i for i in inventory}
     known = set(by_path)
+    attachment_anchors = _attachment_anchors(known)
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in inventory:
         path = str(item["path"])
-        key = _asset_anchor(path, known) or path
+        attachment_identity = _attachment_identity(path)
+        key = (
+            _asset_anchor(path, known)
+            or (attachment_anchors.get(attachment_identity) if attachment_identity else None)
+            or path
+        )
         grouped.setdefault(key, []).append(item)
     families: list[list[dict[str, Any]]] = []
     for key in sorted(grouped):
         items = grouped[key]
-        # Put the anchor first, then stable path order for its assets.
-        items.sort(key=lambda i: (str(i["path"]) != key, str(i["path"])))
+        # Put the anchor first, then the exact original/sidecar attachment, then
+        # derived page images. Lexical order alone is wrong when the section
+        # name sorts before ``_attachments`` (the real GPU export does): it
+        # would spend vision batches on rendered pages before reading the
+        # source PDF that gives those pages stable semantics.
+        items.sort(key=lambda i: (
+            0 if str(i["path"]) == key
+            else 1 if _attachment_identity(str(i["path"])) is not None
+            else 2,
+            str(i["path"]),
+        ))
         families.append(items)
     return families
 
@@ -388,6 +553,23 @@ def pack_hierarchical_batches(
                 "status": "pending",
             })
 
+    def append_pdf_slices(item: dict[str, Any]) -> None:
+        slices = item.get("pdf_slices") or []
+        source = str(item["path"])
+        count = len(slices)
+        for index, page_slice in enumerate(slices, start=1):
+            pages = int(page_slice["end_page"]) - int(page_slice["start_page"]) + 1
+            result.append({
+                "id": f"h{len(result) + 1:03d}",
+                "sources": [source],
+                "context_sources": [],
+                "source_page_ranges": {source: dict(page_slice)},
+                "defer_accounting": index < count,
+                "bytes": pages * _pdf_page_cost(),
+                "text_bytes": 0,
+                "status": "pending",
+            })
+
     def flush() -> None:
         nonlocal current, current_bytes, current_text_bytes
         if current:
@@ -400,7 +582,8 @@ def pack_hierarchical_batches(
         family_bytes = sum(_hierarchical_eff(i) for i in family)
         family_text_bytes = sum(_text_eff(i) for i in family)
         section = _top_dir(str(family[0]["path"]))
-        if family_bytes <= limit and family_text_bytes <= text_limit:
+        has_slices = any(i.get("text_slices") or i.get("pdf_slices") for i in family)
+        if not has_slices and family_bytes <= limit and family_text_bytes <= text_limit:
             if current and (
                 current_dir != section
                 or current_bytes + family_bytes > limit
@@ -427,6 +610,8 @@ def pack_hierarchical_batches(
             first_text_bytes = _text_eff(first[0])
             while (
                 remaining
+                and not remaining[0].get("text_slices")
+                and not remaining[0].get("pdf_slices")
                 and first_bytes + _hierarchical_eff(remaining[0]) <= limit
                 and first_text_bytes + _text_eff(remaining[0]) <= text_limit
             ):
@@ -446,6 +631,12 @@ def pack_hierarchical_batches(
         context_bytes = sum(_hierarchical_eff(i) for i in context)
         context_text_bytes = sum(_text_eff(i) for i in context)
         while remaining:
+            if remaining[0].get("text_slices"):
+                append_text_slices(remaining.pop(0))
+                continue
+            if remaining[0].get("pdf_slices"):
+                append_pdf_slices(remaining.pop(0))
+                continue
             batch_context = context
             if context and (
                 context_bytes + _hierarchical_eff(remaining[0]) > limit
@@ -460,7 +651,9 @@ def pack_hierarchical_batches(
             chunk_text_bytes = sum(_text_eff(i) for i in batch_context)
             while remaining and (
                 (
-                    chunk_bytes + _hierarchical_eff(remaining[0]) <= limit
+                    not remaining[0].get("text_slices")
+                    and not remaining[0].get("pdf_slices")
+                    and chunk_bytes + _hierarchical_eff(remaining[0]) <= limit
                     and chunk_text_bytes + _text_eff(remaining[0]) <= text_limit
                 )
                 or not chunk
@@ -484,9 +677,11 @@ def build_plan(
 ) -> dict[str, Any]:
     mode = "hierarchical" if planner == "hierarchical-code" else "flat"
     has_text_slices = any(batch.get("source_ranges") for batch in batches)
+    has_pdf_slices = any(batch.get("source_page_ranges") for batch in batches)
     return {
         "version": (
-            3 if mode == "hierarchical" and has_text_slices
+            4 if mode == "hierarchical" and has_pdf_slices
+            else 3 if mode == "hierarchical" and has_text_slices
             else 2 if mode == "hierarchical"
             else 1
         ),
@@ -512,7 +707,7 @@ def build_plan(
 
 def validate_plan(
     plan: dict[str, Any], inventory: list[dict[str, Any]], budget: int | None = None,
-    text_budget: int | None = None,
+    text_budget: int | None = None, pdf_slice_pages: int | None = None,
 ) -> list[str]:
     """Errors for a (possibly model-proposed) plan. Empty list = valid.
     Rules: every inventory source in exactly one batch, no unknown sources,
@@ -527,7 +722,12 @@ def validate_plan(
     text_sizes = {path: _text_eff(item) for path, item in records.items()}
     seen: dict[str, str] = {}
     slice_appearances: dict[str, list[dict[str, Any]]] = {}
+    page_slice_appearances: dict[str, list[dict[str, Any]]] = {}
     seen_ids: set[str] = set()
+    pdf_page_limit = (
+        pdf_slice_pages if pdf_slice_pages is not None
+        else hierarchical_pdf_slice_pages()
+    )
     batches = plan.get("batches")
     if not isinstance(batches, list) or not batches:
         return ["plan has no batches"]
@@ -560,6 +760,19 @@ def validate_plan(
                 + ", ".join(sorted(unknown_range_sources)[:3]))
         if source_ranges and (len(sources) != 1 or context):
             errors.append(f"batch {bid}: a text-slice batch must contain one source and no context")
+        source_page_ranges = batch.get("source_page_ranges", {})
+        if not isinstance(source_page_ranges, dict):
+            errors.append(f"batch {bid}: source_page_ranges must be an object")
+            source_page_ranges = {}
+        unknown_page_range_sources = set(source_page_ranges) - set(sources)
+        if unknown_page_range_sources:
+            errors.append(
+                f"batch {bid}: source_page_ranges names unassigned source(s): "
+                + ", ".join(sorted(unknown_page_range_sources)[:3]))
+        if source_page_ranges and (len(sources) != 1 or context):
+            errors.append(f"batch {bid}: a PDF page-slice batch must contain one source and no context")
+        if source_ranges and source_page_ranges:
+            errors.append(f"batch {bid}: cannot mix text and PDF source ranges")
         total = 0
         text_total = 0
         for path in sources:
@@ -567,43 +780,79 @@ def validate_plan(
                 errors.append(f"batch {bid}: unknown source {path}")
                 continue
             source_range = source_ranges.get(path)
+            source_page_range = source_page_ranges.get(path)
             if path in seen:
-                if source_range is None or path not in slice_appearances:
+                if (
+                    source_range is None
+                    and source_page_range is None
+                ) or (
+                    source_range is not None and path not in slice_appearances
+                ) or (
+                    source_page_range is not None and path not in page_slice_appearances
+                ):
                     errors.append(f"source {path} appears in {seen[path]} and {bid}")
             else:
                 seen[path] = bid
-            if source_range is None:
-                if path in slice_appearances:
+            if source_range is None and source_page_range is None:
+                if path in slice_appearances or path in page_slice_appearances:
                     errors.append(f"source {path} mixes sliced and unsliced assignments")
                 total += sizes[path]
                 text_total += text_sizes[path]
                 continue
-            if not isinstance(source_range, dict):
+            if source_range is not None and source_page_range is not None:
+                errors.append(f"batch {bid}: source {path} mixes text and PDF ranges")
+                continue
+            if source_range is not None and not isinstance(source_range, dict):
                 errors.append(f"batch {bid}: invalid source range for {path}")
                 continue
+            if source_range is not None:
+                try:
+                    parsed_range = {
+                        "bid": bid,
+                        "start_line": int(source_range["start_line"]),
+                        "end_line": int(source_range["end_line"]),
+                        "bytes": int(source_range["bytes"]),
+                        "part": int(source_range["part"]),
+                        "parts": int(source_range["parts"]),
+                        "slice_file": str(source_range["slice_file"]),
+                        "defer_accounting": bool(batch.get("defer_accounting", False)),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    errors.append(f"batch {bid}: malformed source range for {path}")
+                    continue
+                if parsed_range["start_line"] < 1 or parsed_range["end_line"] < parsed_range["start_line"]:
+                    errors.append(f"batch {bid}: invalid line range for {path}")
+                if parsed_range["bytes"] < 1:
+                    errors.append(f"batch {bid}: empty text slice for {path}")
+                if not parsed_range["slice_file"].startswith(".kbc-batch-slices/"):
+                    errors.append(f"batch {bid}: unsafe slice file for {path}")
+                slice_appearances.setdefault(path, []).append(parsed_range)
+                total += max(0, parsed_range["bytes"])
+                text_total += max(0, parsed_range["bytes"])
+                continue
+            if not isinstance(source_page_range, dict):
+                errors.append(f"batch {bid}: invalid PDF page range for {path}")
+                continue
             try:
-                parsed_range = {
+                parsed_page_range = {
                     "bid": bid,
-                    "start_line": int(source_range["start_line"]),
-                    "end_line": int(source_range["end_line"]),
-                    "bytes": int(source_range["bytes"]),
-                    "part": int(source_range["part"]),
-                    "parts": int(source_range["parts"]),
-                    "slice_file": str(source_range["slice_file"]),
+                    "start_page": int(source_page_range["start_page"]),
+                    "end_page": int(source_page_range["end_page"]),
+                    "part": int(source_page_range["part"]),
+                    "parts": int(source_page_range["parts"]),
                     "defer_accounting": bool(batch.get("defer_accounting", False)),
                 }
             except (KeyError, TypeError, ValueError):
-                errors.append(f"batch {bid}: malformed source range for {path}")
+                errors.append(f"batch {bid}: malformed PDF page range for {path}")
                 continue
-            if parsed_range["start_line"] < 1 or parsed_range["end_line"] < parsed_range["start_line"]:
-                errors.append(f"batch {bid}: invalid line range for {path}")
-            if parsed_range["bytes"] < 1:
-                errors.append(f"batch {bid}: empty text slice for {path}")
-            if not parsed_range["slice_file"].startswith(".kbc-batch-slices/"):
-                errors.append(f"batch {bid}: unsafe slice file for {path}")
-            slice_appearances.setdefault(path, []).append(parsed_range)
-            total += max(0, parsed_range["bytes"])
-            text_total += max(0, parsed_range["bytes"])
+            page_span = parsed_page_range["end_page"] - parsed_page_range["start_page"] + 1
+            if parsed_page_range["start_page"] < 1 or page_span < 1:
+                errors.append(f"batch {bid}: invalid PDF page range for {path}")
+            if page_span > pdf_page_limit:
+                errors.append(
+                    f"batch {bid}: PDF page range for {path} exceeds {pdf_page_limit} pages")
+            page_slice_appearances.setdefault(path, []).append(parsed_page_range)
+            total += max(0, page_span) * _pdf_page_cost()
         for path in context:
             if path not in sizes:
                 errors.append(f"batch {bid}: unknown context source {path}")
@@ -642,6 +891,26 @@ def validate_plan(
                 errors.append(f"source {path} has invalid deferred-accounting boundary")
         if expected_start != line_count + 1:
             errors.append(f"source {path} text slices do not cover all {line_count} lines")
+    for path, appearances in page_slice_appearances.items():
+        page_count = int(records.get(path, {}).get("page_count", 0))
+        ordered = sorted(appearances, key=lambda item: item["part"])
+        declared_parts = {item["parts"] for item in ordered}
+        if page_count < 1 or len(declared_parts) != 1 or next(iter(declared_parts), 0) != len(ordered):
+            errors.append(f"source {path} has incomplete PDF page-slice metadata")
+            continue
+        if [item["part"] for item in ordered] != list(range(1, len(ordered) + 1)):
+            errors.append(f"source {path} has non-sequential PDF page slices")
+        expected_start = 1
+        for index, item in enumerate(ordered):
+            if item["start_page"] != expected_start:
+                errors.append(f"source {path} PDF page slices are not contiguous")
+                break
+            expected_start = item["end_page"] + 1
+            should_defer = index < len(ordered) - 1
+            if item["defer_accounting"] != should_defer:
+                errors.append(f"source {path} has invalid PDF deferred-accounting boundary")
+        if expected_start != page_count + 1:
+            errors.append(f"source {path} PDF slices do not cover all {page_count} pages")
     missing = [p for p in sizes if p not in seen]
     if missing:
         errors.append(f"sources not covered: {', '.join(sorted(missing)[:5])}" + ("…" if len(missing) > 5 else ""))
@@ -760,6 +1029,10 @@ def prune_missing_sources(plan: dict[str, Any], known: set[str]) -> list[str]:
             if isinstance(ranges, dict):
                 for source in gone:
                     ranges.pop(source, None)
+            page_ranges = b.get("source_page_ranges")
+            if isinstance(page_ranges, dict):
+                for source in gone:
+                    page_ranges.pop(source, None)
             if not sources:
                 b["status"] = "done"
         context = [s for s in b.get("context_sources", []) if s in known]
