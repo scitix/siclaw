@@ -433,6 +433,10 @@ export interface CapabilityFetchInputRequest {
  * absent consumer object may fall back to Runtime's Helm-provided environment.
  */
 export interface CapabilityLlmConfig {
+  /** Agent harness selected by the consumer; absent preserves Claude compatibility. */
+  engine?: "claude_agent_sdk" | "codex_sdk";
+  /** Wire protocol expected by the selected engine/model provider. */
+  protocol?: "anthropic" | "openai_responses";
   base_url?: string;
   auth_token?: string;
   api_key?: string;
