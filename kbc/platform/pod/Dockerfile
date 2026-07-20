@@ -12,7 +12,7 @@
 #     kbc-compile-pod
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin the SDK: an unpinned install drifts on every rebuild, and the bundled

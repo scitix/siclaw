@@ -210,7 +210,7 @@ async def test_real_codex_writer_sandbox_confines_commands():
                     {"command": ["/bin/sh", "-c", "printf ok > writer.txt"], "cwd": client.cwd},
                     response_model=CommandExecResponse,
                 )
-                assert write.exit_code == 0
+                assert write.exit_code == 0, write.stderr
                 assert (workspace / "writer.txt").read_text(encoding="utf-8") == "ok"
 
                 outside = await rpc.request(
