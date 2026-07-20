@@ -1437,15 +1437,17 @@ async def test_propose_plan_never_bounces():
 
 
 async def test_delete_candidate_page_is_scoped():
-    """The compiler can remove a merged-away page without gaining Bash."""
+    """Both compiler engines can remove a merged-away page without Bash."""
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
         (wd / "candidate/guide").mkdir(parents=True)
         (wd / "raw").mkdir()
         (wd / "candidate/index.md").write_text("# Index", encoding="utf-8")
         (wd / "candidate/guide/index.md").write_text("# Guide", encoding="utf-8")
-        dead = wd / "candidate/guide/dead.md"
-        dead.write_text("old", encoding="utf-8")
+        engine_dead = wd / "candidate/guide/engine-dead.md"
+        engine_dead.write_text("old", encoding="utf-8")
+        claude_dead = wd / "candidate/guide/claude-dead.md"
+        claude_dead.write_text("old", encoding="utf-8")
         outside = wd / "raw/source.md"
         outside.write_text("raw", encoding="utf-8")
         events = []
@@ -1456,6 +1458,19 @@ async def test_delete_candidate_page_is_scoped():
 
             async def emit(self, ev):
                 events.append(ev)
+
+        engine_tools = {
+            item.name: item for item in compile_box._compile_engine_tools(FakeRun())
+        }
+        engine_delete = engine_tools["delete_candidate_page"]
+        assert engine_delete.input_schema == {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        engine_result = await engine_delete.handler({"path": "guide/engine-dead.md"})
+        assert not engine_dead.exists(), engine_result
+        assert "deleted candidate page" in engine_result
 
         captured = {}
         original = compile_box.create_sdk_mcp_server
@@ -1472,16 +1487,16 @@ async def test_delete_candidate_page_is_scoped():
         delete = captured["delete_candidate_page"].handler
 
         assert "mcp__compile__delete_candidate_page" in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
-        result = await delete({"path": "guide/dead.md"})
-        assert not dead.exists(), result
-        assert events and events[-1]["type"] == "summary", events
+        result = await delete({"path": "guide/claude-dead.md"})
+        assert not claude_dead.exists(), result
+        assert len(events) == 2 and events[-1]["type"] == "summary", events
 
         for refused in ("../raw/source.md", "/tmp/out.md", "index.md",
                         "guide/index.md", "guide/data.json"):
             result = await delete({"path": refused})
             assert "deleted candidate page" not in result["content"][0]["text"], (refused, result)
         assert outside.read_text(encoding="utf-8") == "raw"
-    print("✓ delete_candidate_page is confined to non-routing candidate Markdown files")
+    print("✓ delete_candidate_page is engine-neutral and confined to non-routing candidate Markdown files")
 
 
 def test_install_wiki_snapshot_size_guard():
@@ -2488,7 +2503,7 @@ async def test_hierarchical_media_rechecks_after_ledger_repair():
     real_repairs = compile_box._run_ledger_repairs
     real_media_enabled = compile_box._media_verify_enabled
     real_blind_verify = compile_box.mediaverify.run_blind_verify
-    real_engine = compile_box.ClaudeEngine
+    real_engine_selector = compile_box.selected_readonly_engine
     try:
         with tempfile.TemporaryDirectory() as td:
             wd = Path(td)
@@ -2565,7 +2580,7 @@ async def test_hierarchical_media_rechecks_after_ledger_repair():
             compile_box._run_ledger_repairs = fake_repairs
             compile_box._media_verify_enabled = lambda: True
             compile_box.mediaverify.run_blind_verify = fake_blind_verify
-            compile_box.ClaudeEngine = lambda: object()
+            compile_box.selected_readonly_engine = lambda: object()
             await compile_box._run_batch_compile(run, "直接开始编译")
 
             assert media_calls == 2, order
@@ -2580,7 +2595,7 @@ async def test_hierarchical_media_rechecks_after_ledger_repair():
         compile_box._run_ledger_repairs = real_repairs
         compile_box._media_verify_enabled = real_media_enabled
         compile_box.mediaverify.run_blind_verify = real_blind_verify
-        compile_box.ClaudeEngine = real_engine
+        compile_box.selected_readonly_engine = real_engine_selector
     print("\u2713 hierarchical media verify: ledger-clean revision is rechecked")
 
 
