@@ -85,7 +85,7 @@ An asymmetric "one writer, many examiners" design: the **judge** (strong tier, r
 ## Boundaries / next steps
 
 - **resume**: the session does not survive a box restart (`InMemorySessionStore`); the runtime side falls back on "re-hydrate a cold box" (re-materialize raw + durable workspace), with SDK `resume` + a file-backed `session_store` as a later increment.
-- **Codex writer isolation**: native shell/file tools run under the `kbc_writer` permission profile, which exposes only platform-minimal system files plus the current workspace and its isolated shell home; network access and unified exec are disabled.
+- **Codex writer isolation**: native shell/file tools run under the `kbc_writer` permission profile, which exposes only platform-minimal system files, the pinned Codex runtime, the current workspace, and its isolated shell home; network access and unified exec are disabled.
 - **Codex Linux host prerequisite**: the host/container policy must allow the installed `bubblewrap` to create user, PID, and network namespaces. If it cannot, writer commands fail closed; the engine never falls back to `full_access`.
 - **test session isolation**: the immutable snapshot is also the mechanical read boundary. Claude receives the exact effective `Read/Glob/Grep` subset plus a path guard; Codex disables native shell/file tools and exposes the same effective subset through root-confined KBC MCP tools. The effective contract is included in the consumer fingerprint.
 - Test-session cap `KBC_MAX_TEST_SESSIONS` (default 3), snapshots land in `KBC_TEST_SNAPSHOT_ROOT` (default `/tmp/kbc-tests`), destroyed on close.

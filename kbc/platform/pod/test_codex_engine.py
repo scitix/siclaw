@@ -150,11 +150,13 @@ async def test_codex_config_is_tenant_isolated():
             assert "features.shell_tool=true" in writer_overrides
             assert "features.unified_exec=false" in writer_overrides
             assert 'default_permissions="kbc_writer"' in writer_overrides
+            from codex_cli_bin import bundled_package_dir
             writer_profile = next(
                 value for value in writer_overrides if value.startswith("permissions.kbc_writer=")
             )
             assert (
                 f'permissions.kbc_writer={{ filesystem = {{ ":minimal" = "read", '
+                f'"{bundled_package_dir().resolve()}" = "read", '
                 f'"{resolved_root}" = "write", '
                 f'"{writer_shell_home.resolve()}" = "write" }}, '
                 'network = { enabled = false } }'

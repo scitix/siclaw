@@ -474,6 +474,7 @@ class CodexSDKClient:
     async def connect(self) -> None:
         # Lazy import keeps the Claude image/test environment importable even if
         # only the original SDK dependency is installed.
+        from codex_cli_bin import bundled_package_dir
         from openai_codex import ApprovalMode, AsyncCodex, CodexConfig
 
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
@@ -540,6 +541,10 @@ class CodexSDKClient:
                 # system config only; it deliberately excludes user data and
                 # process metadata such as /proc.
                 ":minimal": "read",
+                # The pinned runtime may live outside the platform roots (for
+                # example setup-python installs it under /opt on CI). Codex
+                # re-execs this binary inside bubblewrap for each command.
+                str(bundled_package_dir().resolve()): "read",
                 self.cwd: "write",
                 str(Path(self._shell_home).resolve()): "write",
             }
