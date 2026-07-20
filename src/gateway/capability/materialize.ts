@@ -21,11 +21,16 @@
  * workspace probe would be needed to close it.
  */
 
-import { CAPABILITY_FETCH_INPUT, CAPABILITY_INPUT_WORKSPACE_REF } from "./contract.js";
+import {
+  CAPABILITY_FETCH_INPUT,
+  CAPABILITY_INPUT_SOURCE_PART_REF,
+  CAPABILITY_INPUT_WORKSPACE_REF,
+} from "./contract.js";
 import type {
   CapabilityFetchInputRequest,
   CapabilityFetchInputResponse,
   CapabilityLlmConfig,
+  CapabilitySourceSnapshot,
 } from "./contract.js";
 
 /** Just the surfaces this needs (so tests can pass fakes). */
@@ -67,11 +72,84 @@ export class CapabilityMaterializationError extends Error {
   }
 }
 
+const BOX_RUN_ALREADY_LIVE = "KBC_RUN_ALREADY_LIVE";
+const LEGACY_BOX_RUN_ALREADY_LIVE = "run already exists; upload sources before /session";
+
 function isBoxAlreadyLive(err: unknown): boolean {
-  const status = (err as { status?: unknown } | null)?.status;
-  if (status === 409) return true;
+  const metadata = err as { status?: unknown; code?: unknown } | null;
+  const status = metadata?.status;
+  if (status === 409 && metadata?.code === BOX_RUN_ALREADY_LIVE) return true;
   const message = err instanceof Error ? err.message : String(err);
-  return typeof status !== "number" && message.includes("failed: 409");
+  // Rolling-upgrade compatibility for boxes that predate the stable conflict
+  // code. Match the exact legacy live-run text as well as the 409; Source
+  // Snapshot v2 deliberately uses 409 for persisted-state conflicts too.
+  return message.includes(LEGACY_BOX_RUN_ALREADY_LIVE)
+    && (status === 409 || (typeof status !== "number" && message.includes("failed: 409")));
+}
+
+function hasSourceInput(src: CapabilityFetchInputResponse | null | undefined): boolean {
+  return Boolean(src?.bundle_base64 || src?.source_snapshot);
+}
+
+function requireV2Revision(src: CapabilityFetchInputResponse): string {
+  const revision = typeof src.input_revision === "string" ? src.input_revision.trim() : "";
+  if (!revision) throw new Error("Source Snapshot v2 requires input_revision");
+  return revision;
+}
+
+async function installSourceSnapshot(opts: {
+  client: MaterializeBoxClient;
+  backend: MaterializeBackend;
+  runId: string;
+  src: CapabilityFetchInputResponse;
+  snapshot: CapabilitySourceSnapshot;
+}): Promise<void> {
+  const { client, backend, runId, src, snapshot } = opts;
+  const revision = requireV2Revision(src);
+  const begin = await client.postJson<{ missing_parts?: string[] }>("/sources/begin", {
+    run_id: runId,
+    input_revision: revision,
+    snapshot,
+    locale: src.locale,
+  });
+  const missing = Array.isArray(begin?.missing_parts) ? begin.missing_parts : [];
+  const expected = new Map(snapshot.parts.map((part) => [part.part_id, part]));
+
+  for (const partId of missing) {
+    const descriptor = expected.get(partId);
+    if (!descriptor) throw new Error(`box requested unknown source part ${partId}`);
+
+    const req: CapabilityFetchInputRequest = {
+      run_id: runId,
+      input_revision: revision,
+      ref: CAPABILITY_INPUT_SOURCE_PART_REF,
+      part_id: partId,
+    };
+    const fetched = (await backend.request(CAPABILITY_FETCH_INPUT, req)) as CapabilityFetchInputResponse;
+    const returnedRevision = typeof fetched?.input_revision === "string" ? fetched.input_revision.trim() : "";
+    if (returnedRevision !== revision) {
+      throw new Error(
+        `source part ${partId} revision mismatch: requested ${revision}, received ${returnedRevision || "<missing>"}`,
+      );
+    }
+    if (!fetched.bundle_base64) throw new Error(`source part ${partId} returned no bundle`);
+    if (fetched.bundle_sha256 && fetched.bundle_sha256.toLowerCase() !== descriptor.sha256.toLowerCase()) {
+      throw new Error(`source part ${partId} descriptor hash mismatch`);
+    }
+    await client.postJson("/sources/part", {
+      run_id: runId,
+      input_revision: revision,
+      part_id: partId,
+      bundle_base64: fetched.bundle_base64,
+      bundle_sha256: descriptor.sha256,
+    });
+  }
+
+  await client.postJson("/sources/commit", {
+    run_id: runId,
+    input_revision: revision,
+    locale: src.locale,
+  });
 }
 
 export async function materializeCapabilityInputs(opts: {
@@ -106,7 +184,7 @@ export async function materializeCapabilityInputs(opts: {
         ),
       );
     }
-    if (!src.bundle_base64) {
+    if (!hasSourceInput(src)) {
       throw new CapabilityMaterializationError(
         "source-fetch",
         new Error(`pinned input revision ${pinnedRevision} returned no source bundle`),
@@ -120,15 +198,20 @@ export async function materializeCapabilityInputs(opts: {
 
   // RPC success + no bundle is the explicit empty-source result. It is not a
   // fresh-box signal, so never guess and push workspace state onto a live box.
-  if (!src?.bundle_base64) return result;
+  if (!hasSourceInput(src)) return result;
 
   try {
-    await client.postJson("/sources", {
-      run_id: runId,
-      bundle_base64: src.bundle_base64,
-      bundle_sha256: src.bundle_sha256,
-      locale: src.locale,
-    });
+    if (src.source_snapshot) {
+      if (src.bundle_base64) throw new Error("source response cannot contain both bundle_base64 and source_snapshot");
+      await installSourceSnapshot({ client, backend, runId, src, snapshot: src.source_snapshot });
+    } else {
+      await client.postJson("/sources", {
+        run_id: runId,
+        bundle_base64: src.bundle_base64,
+        bundle_sha256: src.bundle_sha256,
+        locale: src.locale,
+      });
+    }
   } catch (err) {
     // Prefer the structured HTTP status; message parsing is only a rolling-
     // upgrade fallback for older clients that did not attach err.status.
