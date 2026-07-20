@@ -27,6 +27,8 @@ jobs:
       - run: pip install -r kbc/platform/pod/requirements.txt
       - run: python test_compile_box.py
         working-directory: kbc/platform/pod
+      - run: python test_codex_engine.py
+        working-directory: kbc/platform/pod
       - run: python test_office_ingest.py
         working-directory: kbc/platform/pod
       - run: python test_selfcheck.py

@@ -105,6 +105,11 @@ _GLOB_MAX_RESULTS = 500
 _GREP_MAX_RESULTS = 200
 _GREP_MAX_FILES = 5_000
 _GREP_MAX_FILE_BYTES = 2 * 1024 * 1024
+_READ_TOOL_NAME_MAP = {
+    "Read": "kbc_read_file",
+    "Glob": "kbc_glob_files",
+    "Grep": "kbc_grep_files",
+}
 
 
 class _ReadOnlyFileAccess:
@@ -178,6 +183,19 @@ class _ReadOnlyFileAccess:
                 self.grep_files,
             ),
         ]
+
+    def selected_tools(self, allowed_tools: Iterable[str] | None) -> list[EngineTool]:
+        tools = self.tools()
+        if allowed_tools is None:
+            return tools
+        requested = list(dict.fromkeys(allowed_tools))
+        unknown = sorted(set(requested).difference(_READ_TOOL_NAME_MAP))
+        if unknown:
+            raise ValueError(
+                "unsupported read-only Codex tools: " + ", ".join(unknown)
+            )
+        selected = {_READ_TOOL_NAME_MAP[name] for name in requested}
+        return [item for item in tools if item.name in selected]
 
     def _resolve(self, value: object, *, default: Path | None = None) -> Path:
         if value is None and default is not None:
@@ -398,6 +416,7 @@ class CodexSDKClient:
         session_id: str,
         read_only: bool = False,
         allowed_read_roots: list[str] | None = None,
+        allowed_read_tools: list[str] | None = None,
         tools: list[EngineTool] | None = None,
         reasoning_effort: str | None = None,
         max_tool_calls: int | None = None,
@@ -410,8 +429,8 @@ class CodexSDKClient:
         declared_tools = list(tools or [])
         if read_only:
             file_access = _ReadOnlyFileAccess(cwd, allowed_read_roots or [cwd])
-            read_tools = file_access.tools()
-            reserved = {item.name for item in read_tools}
+            read_tools = file_access.selected_tools(allowed_read_tools)
+            reserved = set(_READ_TOOL_NAME_MAP.values())
             duplicates = sorted(reserved.intersection(item.name for item in declared_tools))
             if duplicates:
                 raise ValueError(f"read-only tool names are reserved: {', '.join(duplicates)}")
@@ -420,6 +439,8 @@ class CodexSDKClient:
         else:
             if allowed_read_roots:
                 raise ValueError("allowed_read_roots is only valid for read-only Codex sessions")
+            if allowed_read_tools is not None:
+                raise ValueError("allowed_read_tools is only valid for read-only Codex sessions")
             self.allowed_read_roots = ()
             self.tools = declared_tools
         # Mass GPT-5.6 high/medium can spend longer than KBC's 90s model-idle
@@ -453,7 +474,7 @@ class CodexSDKClient:
     async def connect(self) -> None:
         # Lazy import keeps the Claude image/test environment importable even if
         # only the original SDK dependency is installed.
-        from openai_codex import ApprovalMode, AsyncCodex, CodexConfig, Sandbox
+        from openai_codex import ApprovalMode, AsyncCodex, CodexConfig
 
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -482,6 +503,10 @@ class CodexSDKClient:
             "features.multi_agent=false",
             "features.remote_plugin=false",
             "features.shell_snapshot=false",
+            # Keep one mechanically sandboxed command path. The Python SDK host
+            # does not implement unified exec and enabling a second executor
+            # would create a parallel permission surface.
+            "features.unified_exec=false",
             # The Python SDK does not provide Codex's host-side JavaScript
             # executor. Force native shell/file tools instead of code-mode
             # calls such as `exec -> tools.exec_command(...)` that cannot be
@@ -505,13 +530,29 @@ class CodexSDKClient:
                 # tools. No model-proposed subprocess is available, avoiding
                 # both host reads and restricted-host nested-sandbox failures.
                 "features.shell_tool=false",
-                "features.unified_exec=false",
                 "default_permissions=" + _toml("kbc_readonly"),
                 "permissions.kbc_readonly={ filesystem = { " + readable_roots
                 + " }, network = { enabled = false } }",
             ])
         else:
-            overrides.append("features.shell_tool=true")
+            writable_roots = {
+                # Codex expands :minimal to platform binaries, libraries and
+                # system config only; it deliberately excludes user data and
+                # process metadata such as /proc.
+                ":minimal": "read",
+                self.cwd: "write",
+                str(Path(self._shell_home).resolve()): "write",
+            }
+            filesystem = ", ".join(
+                f"{_toml(root)} = {_toml(access)}"
+                for root, access in writable_roots.items()
+            )
+            overrides.extend([
+                "features.shell_tool=true",
+                "default_permissions=" + _toml("kbc_writer"),
+                "permissions.kbc_writer={ filesystem = { " + filesystem
+                + " }, network = { enabled = false } }",
+            ])
         if self.tools:
             callback_url = await self._start_callback_listener()
             server_path = Path(__file__).resolve().with_name("mcp_tool_server.py")
@@ -550,10 +591,23 @@ class CodexSDKClient:
         self._codex = AsyncCodex(config=config)
         read_contract = ""
         if self.read_only:
+            available_read_tools = [
+                item.name for item in self.tools if item.name in _READ_TOOL_NAME_MAP.values()
+            ]
+            tool_contract = (
+                "Use only these KBC filesystem tools: " + ", ".join(available_read_tools) + ". "
+                if available_read_tools
+                else "No filesystem inspection tools are available for this consumer profile. "
+            )
             read_contract = (
                 "\n\nClosed-book filesystem contract: native shell and file mutation are unavailable. "
-                "Use the kbc_read_file, kbc_glob_files and kbc_grep_files tools for text inspection. "
-                "Read only these declared snapshot roots: " + ", ".join(self.allowed_read_roots)
+                + tool_contract
+                + "Read only these declared snapshot roots: " + ", ".join(self.allowed_read_roots)
+            )
+        else:
+            read_contract = (
+                "\n\nWriter filesystem contract: shell and file tools are sandboxed to the current "
+                "KBC workspace, with process metadata and network access denied."
             )
         self._thread = await self._codex.thread_start(
             # KBC is an unattended compiler. auto_review still routes workspace
@@ -567,10 +621,10 @@ class CodexSDKClient:
             ephemeral=True,
             model=self.model,
             model_provider="kbc_mass",
-            # Writer sessions retain the existing Pod-level boundary. Read-only
-            # sessions select the kbc_readonly permission profile above instead
-            # of the legacy whole-filesystem read-only preset.
-            sandbox=None if self.read_only else Sandbox.full_access,
+            # Named permission profiles above are the mechanical boundary for
+            # both writer and closed-book sessions. Passing a legacy sandbox
+            # mode here would override the selected profile.
+            sandbox=None,
         )
         # Public session identity must be the resumable Codex thread id, not the
         # provisional box UUID passed to the constructor.

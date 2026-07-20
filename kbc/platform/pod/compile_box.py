@@ -3191,6 +3191,7 @@ async def test_session_driver(run: "TestRun"):
             session_id=sid,
             read_only=True,
             allowed_read_roots=[run.cwd],
+            allowed_read_tools=effective_tools,
             max_tool_calls=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
         )
     else:

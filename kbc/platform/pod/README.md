@@ -1,4 +1,4 @@
-# platform/pod — compile box (Claude Agent SDK + kbc brain)
+# platform/pod — compile box (Claude Agent SDK / Codex SDK + kbc brain)
 
 The siclaw platform's **compile box**: runs the kbc compile brain as a **Claude Agent SDK** persistent session = a "headless
 Claude Code with a wrapped entry point". The engine / tools / compact are not rewritten by a single line; it only adds structured-signal tools for the kbc moat.
@@ -85,6 +85,7 @@ An asymmetric "one writer, many examiners" design: the **judge** (strong tier, r
 ## Boundaries / next steps
 
 - **resume**: the session does not survive a box restart (`InMemorySessionStore`); the runtime side falls back on "re-hydrate a cold box" (re-materialize raw + durable workspace), with SDK `resume` + a file-backed `session_store` as a later increment.
-- **test session isolation**: read-only relies on the allowed_tools allowlist (default `Read/Glob/Grep`), but under bypassPermissions an absolute-path Read can still escape the snapshot directory (review C4) — a path fence is a to-do for the test-session slice.
+- **Codex writer isolation**: native shell/file tools run under the `kbc_writer` permission profile, which exposes only platform-minimal system files plus the current workspace and its isolated shell home; network access and unified exec are disabled.
+- **test session isolation**: the immutable snapshot is also the mechanical read boundary. Claude receives the exact effective `Read/Glob/Grep` subset plus a path guard; Codex disables native shell/file tools and exposes the same effective subset through root-confined KBC MCP tools. The effective contract is included in the consumer fingerprint.
 - Test-session cap `KBC_MAX_TEST_SESSIONS` (default 3), snapshots land in `KBC_TEST_SNAPSHOT_ROOT` (default `/tmp/kbc-tests`), destroyed on close.
 - `KBC_SMOKE=1` → fake driver (does not call the LLM), verifies the box↔runtime↔consumer wiring (events + artifact sync) for free in the cluster.

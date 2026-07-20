@@ -148,8 +148,19 @@ async def test_codex_config_is_tenant_isolated():
             await writer.connect()
             writer_overrides = set(captured["config"]["config_overrides"])
             assert "features.shell_tool=true" in writer_overrides
-            assert 'default_permissions="kbc_readonly"' not in writer_overrides
-            assert captured["thread"]["sandbox"] == "full-access"
+            assert "features.unified_exec=false" in writer_overrides
+            assert 'default_permissions="kbc_writer"' in writer_overrides
+            writer_profile = next(
+                value for value in writer_overrides if value.startswith("permissions.kbc_writer=")
+            )
+            assert (
+                f'permissions.kbc_writer={{ filesystem = {{ ":minimal" = "read", '
+                f'"{resolved_root}" = "write", '
+                f'"{writer_shell_home.resolve()}" = "write" }}, '
+                'network = { enabled = false } }'
+            ) == writer_profile, writer_profile
+            assert captured["thread"]["sandbox"] is None
+            assert "process metadata and network access denied" in captured["thread"]["developer_instructions"]
             await writer.disconnect()
             assert not writer_home.exists() and not writer_shell_home.exists()
     finally:
@@ -158,6 +169,80 @@ async def test_codex_config_is_tenant_isolated():
         else:
             sys.modules["openai_codex"] = previous
     print("OK  Codex config uses Mass Responses and disables tenant-unsafe ambient features")
+
+
+async def test_real_codex_writer_sandbox_confines_commands():
+    if os.name != "posix":
+        print("SKIP Codex writer sandbox command probe requires a POSIX host")
+        return
+
+    from openai_codex.generated.v2_all import CommandExecResponse
+
+    previous = {
+        name: os.environ.get(name)
+        for name in ("KBC_CODEX_STATE_ROOT", "OPENAI_BASE_URL", "OPENAI_API_KEY")
+    }
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            secret = root / "provider-secret.txt"
+            secret_value = "writer-sandbox-secret-sentinel"
+            secret.write_text(secret_value, encoding="utf-8")
+            os.environ.update({
+                "KBC_CODEX_STATE_ROOT": str(root),
+                "OPENAI_BASE_URL": "https://mass.invalid/model-api",
+                "OPENAI_API_KEY": secret_value,
+            })
+            client = CodexSDKClient(
+                cwd=str(workspace),
+                system_prompt="writer sandbox startup probe",
+                model="gpt-5.6-luna",
+                session_id="writer-sandbox-probe",
+            )
+            try:
+                await client.connect()
+                rpc = client._codex._client
+
+                write = await rpc.request(
+                    "command/exec",
+                    {"command": ["/bin/sh", "-c", "printf ok > writer.txt"], "cwd": client.cwd},
+                    response_model=CommandExecResponse,
+                )
+                assert write.exit_code == 0
+                assert (workspace / "writer.txt").read_text(encoding="utf-8") == "ok"
+
+                outside = await rpc.request(
+                    "command/exec",
+                    {"command": ["/bin/cat", str(secret)], "cwd": client.cwd},
+                    response_model=CommandExecResponse,
+                )
+                assert outside.exit_code != 0
+                assert secret_value not in outside.stdout + outside.stderr
+
+                process_metadata = await rpc.request(
+                    "command/exec",
+                    {
+                        "command": [
+                            "/bin/sh",
+                            "-c",
+                            "cat /proc/*/environ 2>/dev/null || true",
+                        ],
+                        "cwd": client.cwd,
+                    },
+                    response_model=CommandExecResponse,
+                )
+                assert secret_value not in process_metadata.stdout + process_metadata.stderr
+            finally:
+                await client.disconnect()
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("OK  real Codex writer shell writes only in-workspace and cannot read provider credentials")
 
 
 async def test_codex_engine_stages_and_rewrites_roots():
@@ -239,6 +324,95 @@ async def test_readonly_file_tools_confine_paths_and_bound_output():
         await expect_denied("kbc_glob_files", {"pattern": "../*.txt"})
         await client.disconnect()
     print("OK  Codex read-only tools mechanically confine traversal, absolute paths and symlinks")
+
+
+def test_readonly_file_tools_honor_exact_consumer_contract():
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["KBC_CODEX_STATE_ROOT"] = td
+        read_only = CodexSDKClient(
+            cwd=td,
+            system_prompt="closed book",
+            model="gpt-5.6-luna",
+            session_id="readonly-subset",
+            read_only=True,
+            allowed_read_roots=[td],
+            allowed_read_tools=["Read"],
+        )
+        assert list(read_only._tool_by_name) == ["kbc_read_file"]
+
+        no_tools = CodexSDKClient(
+            cwd=td,
+            system_prompt="closed book",
+            model="gpt-5.6-luna",
+            session_id="readonly-empty",
+            read_only=True,
+            allowed_read_roots=[td],
+            allowed_read_tools=[],
+        )
+        assert not no_tools._tool_by_name
+
+        try:
+            CodexSDKClient(
+                cwd=td,
+                system_prompt="closed book",
+                model="gpt-5.6-luna",
+                session_id="readonly-unsupported",
+                read_only=True,
+                allowed_read_roots=[td],
+                allowed_read_tools=["Read", "UnknownTool"],
+            )
+        except ValueError as exc:
+            assert "unsupported read-only Codex tools: UnknownTool" in str(exc)
+        else:
+            raise AssertionError("unsupported consumer tool was silently accepted")
+    print("OK  Codex read-only tools match the exact fingerprinted consumer contract")
+
+
+async def test_codex_test_driver_passes_fingerprinted_tool_contract():
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.session_id = "codex-consumer-thread"
+
+        async def connect(self):
+            pass
+
+        async def receive_messages(self):
+            if False:
+                yield None
+
+        async def disconnect(self):
+            pass
+
+    original_client = compile_box.CodexSDKClient
+    original_engine = os.environ.get("KBC_ENGINE")
+    try:
+        compile_box.CodexSDKClient = FakeClient
+        os.environ["KBC_ENGINE"] = "codex_sdk"
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.TestRun(
+                "codex-consumer-contract",
+                td,
+                parent_run_id="parent",
+                snapshot_hash="snapshot",
+            )
+            run.allowed_tools = ["Read", "Bash"]
+            run.consumer_model = "consumer-model"
+            run.consumer_max_turns = 7
+            await compile_box.test_session_driver(run)
+            assert captured["allowed_read_tools"] == ["Read"]
+            assert captured["allowed_read_roots"] == [td]
+            assert captured["model"] == "consumer-model"
+            assert captured["max_tool_calls"] == 7
+    finally:
+        compile_box.CodexSDKClient = original_client
+        if original_engine is None:
+            os.environ.pop("KBC_ENGINE", None)
+        else:
+            os.environ["KBC_ENGINE"] = original_engine
+    print("OK  Codex test driver passes the exact fingerprinted consumer tool contract")
 
 
 async def test_codex_recommendation_uses_isolated_view_and_neutral_tool():
@@ -345,9 +519,12 @@ async def test_codex_tool_budget_interrupts_and_preserves_contract():
 async def main():
     test_isolated_readonly_workspace()
     await test_codex_config_is_tenant_isolated()
+    await test_real_codex_writer_sandbox_confines_commands()
     await test_codex_engine_stages_and_rewrites_roots()
     test_error_redaction()
     await test_readonly_file_tools_confine_paths_and_bound_output()
+    test_readonly_file_tools_honor_exact_consumer_contract()
+    await test_codex_test_driver_passes_fingerprinted_tool_contract()
     await test_codex_recommendation_uses_isolated_view_and_neutral_tool()
     await test_codex_tool_budget_interrupts_and_preserves_contract()
 
