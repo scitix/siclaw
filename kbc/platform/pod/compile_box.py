@@ -215,6 +215,14 @@ _MODEL_IDLE_TIMEOUT_S = float(os.environ.get("KBC_MODEL_IDLE_TIMEOUT_S", "90"))
 _MODEL_TOOL_IDLE_TIMEOUT_S = float(os.environ.get("KBC_MODEL_TOOL_IDLE_TIMEOUT_S", "660"))
 _MODEL_MAX_RETRIES = int(os.environ.get("KBC_MODEL_MAX_RETRIES", "3"))
 _MODEL_WATCHDOG_POLL_S = float(os.environ.get("KBC_MODEL_WATCHDOG_POLL_S", "10"))
+# Hierarchical batches deliberately carry a much larger bounded context than
+# ordinary turns and flat batches. A valid long-form Write tool call can spend
+# more than 90s producing its JSON argument without an SDK delta; the ordinary
+# watchdog then interrupts useful work four times and leaves the batch pending.
+# Relax only this new, >8MB-corpus path. Small/single-session and medium/flat
+# compiles retain the established 90s failure-detection bound.
+_HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = float(os.environ.get(
+    "KBC_HIERARCHICAL_MODEL_IDLE_TIMEOUT_S", "240"))
 
 # ── Rate-limit resilience (C2) ───────────────────────────────────────────────
 # massapi under concurrency (5-10 boxes × the red-blue PK) can return 429/503/529.
@@ -247,6 +255,19 @@ class ModelStallError(Exception):
     """A turn's model request stalled past the idle bound and exhausted retries.
     Raised out of the consume loop so _run_wrapper fails the run with a clear
     reason instead of the box sitting silently."""
+
+
+class ModelResultError(Exception):
+    """An internal compile session ended with an SDK error result.
+
+    Ordinary conversational turns keep their existing never-block behavior,
+    but a batch session must fail closed: otherwise an authentication or model
+    execution failure can be mistaken for a successful no-op and stamped done.
+    """
+
+
+class BatchOutputError(Exception):
+    """A successful internal session did not account for its assigned sources."""
 
 
 class CompileRun:
@@ -342,6 +363,9 @@ class CompileRun:
         self._model_retries = 0             # stall retries used on the in-flight turn
         self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
         self._stall_fatal = False           # stall retries exhausted → fail this turn
+        # Temporary orchestrator-scoped override. Only hierarchical batch mode
+        # sets this; every other turn continues to use _MODEL_IDLE_TIMEOUT_S.
+        self._model_idle_timeout_s: float | None = None
         self._rate_retries = 0              # rate-limit (429/503/529) retries on the in-flight turn
         # Typed machine-control receipts. A command id is accepted at most once
         # for this live run, and the first command pins the run to the consumer's
@@ -1044,7 +1068,7 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         raise CommandRejected("no structured source changes are available for incremental compile", 409)
     if action == "compile.resume":
         plan = _load_batch_plan(run)
-        if plan is None or not batching.pending_batches(plan):
+        if not _batch_plan_resumable(plan):
             raise CommandRejected("no interrupted batch plan is available to resume", 409)
     brief = params.get("brief")
     if brief is not None:
@@ -1086,6 +1110,45 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
         if "- [ ]" not in section and "- [x]" not in section:
             reminder = ts["propose_plan"]["reminder"]
         return ts["propose_plan"]["ack"] + reminder
+
+    async def delete_candidate_page(args):
+        """Delete one dead Markdown page without granting shell/file-tree power.
+
+        The model already receives deterministic orphan/duplicate findings and
+        must occasionally remove the losing page after a merge. Edit/Write
+        cannot express deletion, while Bash would be far too broad. This tool is
+        therefore confined to a single regular ``candidate/**/*.md`` file and
+        protects routing pages at every level.
+        """
+        strings = ts["delete_candidate_page"]
+        raw_path = str(args.get("path", "")).strip()
+        try:
+            rel = _safe_tar_path(raw_path)
+        except ValueError:
+            return strings["invalid"].format(path=raw_path)
+        if rel.suffix.lower() != ".md":
+            return strings["markdown_only"].format(path=raw_path)
+        if rel.name.lower() in {"index.md", "log.md"}:
+            return strings["reserved"].format(path=raw_path)
+
+        root = (Path(run.workdir) / "candidate").resolve()
+        target = root.joinpath(*rel.parts)
+        try:
+            target.resolve(strict=False).relative_to(root)
+        except (ValueError, OSError):
+            return strings["invalid"].format(path=raw_path)
+        if target.is_symlink():
+            return strings["invalid"].format(path=raw_path)
+        if not target.exists():
+            return strings["not_found"].format(path=raw_path)
+        if not target.is_file():
+            return strings["not_file"].format(path=raw_path)
+        try:
+            target.unlink()
+        except OSError as e:
+            return strings["failed"].format(path=raw_path, e=e)
+        await run.emit({"type": "summary", "summary": strings["deleted"].format(path=rel.as_posix())})
+        return strings["deleted"].format(path=rel.as_posix())
 
     async def resolve_ticket(args):
         rt = ts["resolve_ticket"]
@@ -1134,6 +1197,16 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
             ts["propose_plan"]["desc"],
             {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]},
             propose_plan,
+        ),
+        EngineTool(
+            "delete_candidate_page",
+            ts["delete_candidate_page"]["desc"],
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            delete_candidate_page,
         ),
         EngineTool(
             "resolve_ticket",
@@ -1234,6 +1307,21 @@ def _media_verify_rounds() -> int:
     return max(1, int(os.environ.get("KBC_MEDIA_VERIFY_ROUNDS", "3")))
 
 
+def _batch_media_verify_round_limit(plan: dict, pending: dict[str, list[str]]) -> int:
+    """Keep the established tail bound for flat/smaller compiles, but give a
+    hierarchical train enough bounded rounds to visit every initially pending
+    image page (including its failed-attempt budget). A hard operator cap still
+    fences pathological repair loops; hierarchical completion fails closed if
+    pending work remains after that cap."""
+    ordinary = _media_verify_rounds()
+    if plan.get("mode") != "hierarchical":
+        return ordinary
+    cap = max(ordinary, int(os.environ.get(
+        "KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS", "256")))
+    needed = len(pending) * _media_verify_attempts() + ordinary
+    return min(cap, max(ordinary, needed))
+
+
 def _settle_media_outcome(run, chunk: dict, result: dict | None) -> list[str]:
     """Post-verify bookkeeping (review fix: pages used to be marked verified
     BEFORE verification ran, so a total transcription failure shipped image
@@ -1243,6 +1331,16 @@ def _settle_media_outcome(run, chunk: dict, result: dict | None) -> list[str]:
     means the whole flow failed → every page in the chunk is a failed attempt.
     Returns the pages exhausted this round."""
     completed = list((result or {}).get("completed_pages") or [])
+    # A successful comparison with a finding is not a verified final page: the
+    # repair turn is about to edit it, and even a no-op repair must not convert a
+    # known mismatch into a green ledger. Keep finding pages pending; the
+    # content-bound fingerprint then verifies the repaired bytes on the next
+    # drain/round.
+    finding_pages = {
+        str(item.get("page")) for item in ((result or {}).get("findings") or [])
+        if isinstance(item, dict) and item.get("page")
+    }
+    completed = [page for page in completed if page not in finding_pages]
     failed = list((result or {}).get("failed_pages") or [])
     if result is None:
         failed = list(chunk)
@@ -1342,6 +1440,7 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
     injected_repair = False
     settled = False        # the primary settle ran — the except must never settle AGAIN
     failed_pages: list[str] = []
+    finding_pages: list[str] = []
     exhausted: list[str] = []
     try:
         n_imgs = sum(len(v) for v in chunk.values())
@@ -1366,6 +1465,10 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
             except Exception:
                 pass
         findings, errors = result["findings"], result["errors"]
+        finding_pages = sorted({
+            str(item.get("page")) for item in findings
+            if isinstance(item, dict) and item.get("page")
+        })
         tail = _loc(run, f"; {len(errors)} transcription/comparison failure(s)",
                     f";{len(errors)} 项转写/比对失败") if errors else ""
         if findings:
@@ -1400,8 +1503,14 @@ async def _run_media_verify_flow(run, chunk: dict[str, list[str]]) -> None:
         # ones are marked verified and leave pending on their own): the chain
         # below then moves on to the not-yet-attempted chunks instead of
         # hot-looping the failed pages through the attempt budget.
+        # A finding page stays pending until the repair changes and re-verifies
+        # it. If injecting that repair failed, defer it for this drain so the
+        # same mismatch cannot hot-loop; a fresh turn retries it.
+        deferred_pages = set(failed_pages)
+        if finding_pages and not injected_repair:
+            deferred_pages.update(finding_pages)
         run._media_deferred = getattr(run, "_media_deferred", set()) | (
-            set(failed_pages) - set(exhausted))
+            deferred_pages - set(exhausted))
         run._media_inflight = getattr(run, "_media_inflight", set()) - set(chunk)
         # We ARE run._media_task and are completing: release the single-flight
         # reference first, or _media_verify_due's not-done() guard blocks the
@@ -1986,6 +2095,7 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "Read", "Write", "Edit", "Glob", "Grep",
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
+    "mcp__compile__delete_candidate_page",
     "mcp__compile__resolve_ticket",
 ]
 
@@ -2131,9 +2241,9 @@ def _should_route_to_batch(run: "CompileRun", text: str, action: str | None = No
     inventory = batching.scan_sources(raw_dir)
     if batching.should_batch(inventory):
         return True
-    # An interrupted batch run must finish as a batch run even if raw shrank.
-    plan = _load_batch_plan(run)
-    return plan is not None and len(batching.pending_batches(plan)) > 0
+    # An interrupted batch/reduce/final run must finish in the orchestrator even
+    # if raw shrank below the threshold after the plan was pinned.
+    return _batch_plan_resumable(_load_batch_plan(run))
 
 
 async def _start_incremental(run: "CompileRun", text: str, *, strict: bool = False) -> None:
@@ -2210,10 +2320,91 @@ def _load_batch_plan(run: "CompileRun") -> dict | None:
         return None
 
 
+def _batch_plan_resumable(plan: dict | None) -> bool:
+    """Whether an interrupted batch train still owns executable work.
+
+    Hierarchical trains can fail after every map batch is stamped done, while
+    section reduction or final review is still pending. Keep the command gate,
+    routing gate, and orchestrator resume decision on this one definition so a
+    typed ``compile.resume`` cannot reject work the orchestrator can recover.
+    """
+    return plan is not None and (
+        len(batching.pending_batches(plan)) > 0
+        or plan.get("phase") in {"map", "reduce", "final"}
+    )
+
+
 def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
     p = Path(run.workdir) / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(batching.dump_json(value))
+
+
+def _materialize_batch_slices(run: "CompileRun", plan: dict) -> None:
+    """Build ephemeral, read-bounded excerpts for oversized Markdown sources.
+
+    The fragment is never a provenance identity and never enters durable
+    authoring state. It is recreated from Raw on every resume so a model turn
+    cannot read the entire oversized source behind the planner's back.
+    """
+    workdir = Path(run.workdir).resolve()
+    raw_root = (workdir / "raw").resolve()
+    slice_root = (workdir / ".kbc-batch-slices").resolve()
+    shutil.rmtree(slice_root, ignore_errors=True)
+    for batch in plan.get("batches", []):
+        if batch.get("status") == "done":
+            continue
+        ranges = batch.get("source_ranges")
+        if not isinstance(ranges, dict):
+            continue
+        for source, source_range in ranges.items():
+            if not isinstance(source_range, dict):
+                raise BatchOutputError(f"invalid source range for {source}")
+            source_path = (raw_root / source).resolve()
+            try:
+                source_path.relative_to(raw_root)
+            except ValueError as error:
+                raise BatchOutputError(f"text slice source escapes Raw: {source}") from error
+            if not source_path.is_file():
+                raise BatchOutputError(f"text slice source is missing: {source}")
+            rel_slice = PurePosixPath(str(source_range.get("slice_file") or ""))
+            if (
+                not rel_slice.parts
+                or rel_slice.parts[0] != ".kbc-batch-slices"
+                or ".." in rel_slice.parts
+            ):
+                raise BatchOutputError(f"unsafe text slice path for {source}")
+            target = (workdir / Path(*rel_slice.parts)).resolve()
+            try:
+                target.relative_to(slice_root)
+            except ValueError as error:
+                raise BatchOutputError(f"text slice path escapes workspace: {rel_slice}") from error
+            try:
+                start = int(source_range["start_line"])
+                end = int(source_range["end_line"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise BatchOutputError(f"malformed text slice for {source}") from error
+            lines = source_path.read_bytes().splitlines(keepends=True)
+            if start < 1 or end < start or end > len(lines):
+                raise BatchOutputError(
+                    f"text slice range {start}-{end} is invalid for {source} ({len(lines)} lines)"
+                )
+            header = (
+                f"<!-- KBC read-only excerpt: raw/{source}, lines {start}-{end}. "
+                f"Candidate compiled_from must cite raw/{source}, never this helper path. -->\n"
+            ).encode("utf-8")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(header + b"".join(lines[start - 1:end]))
+
+
+def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[str]:
+    """Assigned sources still absent from both Candidate provenance and exclusions."""
+    pages = selfcheck.candidate_pages(run.workdir)
+    exclusions, _ = selfcheck.load_exclusions(run.workdir)
+    return sorted(
+        set(sources)
+        & set(selfcheck.coverage(run.workdir, pages, exclusions)["unaccounted"])
+    )
 
 
 async def _drive_batch_session(run: "CompileRun", directive: str, label: str) -> str:
@@ -2233,7 +2424,8 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str) ->
         await run.emit({"type": "log", "text": _loc(run, f"—— {label} started ——", f"—— {label} 开始 ——")})
         run._begin_turn(directive)
         await client.query(directive)
-        await _consume_turn_stream(run, client, stop_on_result=True)
+        await _consume_turn_stream(
+            run, client, stop_on_result=True, fail_on_error_result=True)
         return run._last_turn_reply
     finally:
         run._suppress_turn_done = False
@@ -2256,7 +2448,49 @@ def _drain_batch_notes(run: "CompileRun") -> str:
 
 def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
                              locale: str | None = None) -> str:
-    listing = "\n".join(f"- raw/{p}" for p in batch["sources"])
+    source_ranges = batch.get("source_ranges", {})
+    listing_lines: list[str] = []
+    sliced_sources: list[str] = []
+    for path in batch["sources"]:
+        source_range = source_ranges.get(path) if isinstance(source_ranges, dict) else None
+        if isinstance(source_range, dict):
+            start = source_range["start_line"]
+            end = source_range["end_line"]
+            part = source_range["part"]
+            parts = source_range["parts"]
+            slice_file = source_range["slice_file"]
+            listing_lines.append(
+                f"- {slice_file} (read-only excerpt of raw/{path}, lines {start}-{end}, part {part}/{parts})"
+            )
+            sliced_sources.append(path)
+        else:
+            listing_lines.append(f"- raw/{path}")
+    listing = "\n".join(listing_lines)
+    context_sources = batch.get("context_sources", [])
+    context_listing = "\n".join(f"- raw/{p}" for p in context_sources)
+    context_en = (
+        "\n\nRead-only family context (you MAY re-read these anchors to interpret the listed assets, "
+        "but they are already accounted by another batch; do not compile them again):\n" + context_listing
+        if context_listing else ""
+    )
+    context_zh = (
+        "\n\n只读的同族上下文(可重读这些锚点来理解本批附件,但它们已由其他批次入账,不要重复编译):\n" + context_listing
+        if context_listing else ""
+    )
+    slice_en = (
+        "\n\nThis batch uses a bounded excerpt of an oversized Raw source. Read ONLY the listed "
+        "`.kbc-batch-slices/` helper, never open the original Raw file directly in this batch. "
+        "Compile only facts present in this excerpt; compiled_from must cite the original Raw path "
+        f"({', '.join('raw/' + path for path in sliced_sources)}), never the helper path."
+        if sliced_sources else ""
+    )
+    slice_zh = (
+        "\n\n本批使用超大 Raw 的有界片段。只读清单中的 `.kbc-batch-slices/` 辅助文件,本批绝不要直接打开原 Raw 全文。"
+        "只编译片段中实际出现的事实;compiled_from 必须引用原 Raw 路径("
+        + ", ".join("raw/" + path for path in sliced_sources)
+        + "),绝不能引用辅助文件。"
+        if sliced_sources else ""
+    )
     if selfcheck._is_en(locale):
         return (
             f"[Batch compile · batch {k}/{n} · {batch['id']}] Compile ONLY the sources below "
@@ -2266,15 +2500,40 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
             "compiled_from must list the sources it was actually compiled from); update the matching "
             "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
-            "never stop. Do not read ANY raw source outside this batch. When done, report briefly which pages "
-            "this batch produced." + notes
+            "never stop. Do not read any raw source outside this compile list and any explicitly listed "
+            "read-only family context. When done, report briefly which pages "
+            "this batch produced." + context_en + slice_en + notes
         )
     return (
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
         "先读 authoring/BRIEF.json、authoring/INTENT.md 和 candidate/index.md 保持口径与结构一致;"
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
         "compiled_from 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
-        "本批之外的 raw 源一个都不要读。完成后简短汇报本批编了哪些页。" + notes
+        "除上面清单及明确列出的只读同族上下文外,其他 raw 源一个都不要读。完成后简短汇报本批编了哪些页。"
+        + context_zh + slice_zh + notes
+    )
+
+
+def _compose_reduction_directive(
+    reduction: dict, k: int, n: int, notes: str, locale: str | None = None
+) -> str:
+    pages = "\n".join(f"- candidate/{p}" for p in reduction["pages"])
+    section = reduction.get("section") or "root"
+    if selfcheck._is_en(locale):
+        return (
+            f"[Hierarchical compile · section reduce {k}/{n} · {reduction['id']}] "
+            f"Consolidate the candidate pages for source section {section!r}:\n{pages}\n"
+            "Read ONLY the listed candidate pages plus candidate/index.md. Merge genuinely duplicate pages, "
+            "preserve all compiled_from entries and source-backed details, converge terminology and structure, "
+            "and repair index links for pages you merge or rename. Do not read raw/ in this reduce pass and do "
+            "not touch candidate pages outside this list. This is consolidation, not a new compilation. Report "
+            "the pages merged or edited." + notes
+        )
+    return (
+        f"【层级编译 · 分区归并 {k}/{n} · {reduction['id']}】归并来源分区 {section!r} 的下列候选页:\n{pages}\n"
+        "只读上列 candidate 页和 candidate/index.md。合并确实重复的页面,完整保留 compiled_from 与有来源支撑的细节,"
+        "统一术语和结构,并修复被合并或改名页面的 index 链接。本归并轮不要读 raw/,也不要改清单外的 candidate 页。"
+        "这是归并,不是重新编译。完成后汇报合并或修改了哪些页。" + notes
     )
 
 
@@ -2326,7 +2585,8 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
         step += 1
         lines.append(f"{step}) Check authoring/EXCLUSIONS.json: sources you decided not to compile (including "
                      "images/PDF and other media) must be explicitly accounted for.")
-        lines.append("Close out only — do not recompile pages that are already fine. When done, report "
+        lines.append("Close out only — do not read raw/ or recompile pages that are already fine. "
+                     "Use Candidate and the authoring ledgers for this cross-batch review. When done, report "
                      "briefly: total pages, which pages this close-out touched, which pairs were "
                      "merged/exempted and why, and anything worth the owner's attention.")
         return "\n".join(lines) + notes
@@ -2347,7 +2607,8 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
                  "(如时间序取最新并保留沿革),定不了的才 best-guess+⚠️存疑+落工单;顺带检查既有 ⚠️ 里有没有其实能收敛的;")
     step += 1
     lines.append(f"{step}) 核对 authoring/EXCLUSIONS.json:决定不编的源(含图片/PDF 等媒体)必须显式入账。")
-    lines.append("只做收口,不重编已经完好的页。完成后简短汇报:总页数、本次收口动了哪些页、合并/豁免了哪几对及理由、还有什么值得负责人注意。")
+    lines.append("只做收口,不要读 raw/,也不重编已经完好的页;跨批核对只使用 Candidate 和 authoring 账本。"
+                 "完成后简短汇报:总页数、本次收口动了哪些页、合并/豁免了哪几对及理由、还有什么值得负责人注意。")
     return "\n".join(lines) + notes
 
 
@@ -2379,6 +2640,22 @@ def _planner_role(locale: str | None) -> str:
 async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
     """Code baseline always exists; the model may regroup topically but ONLY a
     plan that passes deterministic validation replaces the baseline."""
+    if batching.should_hierarchical(inventory):
+        budget = batching.hierarchical_batch_budget_bytes()
+        text_budget = batching.hierarchical_text_budget_bytes()
+        batches = batching.pack_hierarchical_batches(
+            inventory, budget=budget, text_budget=text_budget)
+        plan = batching.build_plan(
+            inventory, batches, planner="hierarchical-code", budget=budget,
+            text_budget=text_budget)
+        errors = batching.validate_plan(
+            plan, inventory, budget=budget, text_budget=text_budget)
+        if errors:
+            raise RuntimeError(
+                "hierarchical batch planner produced an invalid plan: "
+                + "; ".join(errors[:3]))
+        return plan
+
     budget = batching.batch_budget_bytes()
     baseline = batching.build_plan(inventory, batching.pack_batches(inventory), planner="code")
     if os.environ.get("KBC_BATCH_PLANNER", "model") == "code":
@@ -2478,17 +2755,18 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
 
 async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     """The batch orchestrator: ONE logical turn to the consumer (single turn_done at
-    the end), many bounded sessions inside. Crash-resumable at batch granularity:
-    BATCH_PLAN.json carries per-batch done stamps, and any later compile trigger
-    re-enters here and continues from the first pending batch."""
+    the end), many bounded sessions inside. Crash-resumable across map, optional
+    section-reduce, and final phases: BATCH_PLAN.json carries phase plus per-unit
+    done stamps, and a later compile trigger resumes the unfinished phase."""
     run._batch_active = True
+    previous_model_idle_timeout = run._model_idle_timeout_s
     replies: list[str] = []
     try:
         raw_dir = Path(run.workdir) / "raw"
         inventory = batching.scan_sources(raw_dir)
         total_kb = batching.corpus_bytes(inventory) // 1024
         plan = _load_batch_plan(run)
-        resuming = plan is not None and len(batching.pending_batches(plan)) > 0
+        resuming = _batch_plan_resumable(plan)
         if not resuming:
             _write_batch_file(run, batching.SOURCES_INVENTORY_PATH, inventory)
             await run.emit({"type": "summary", "text": _loc(run,
@@ -2509,15 +2787,32 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                                              f"断点续批:{len(dropped)} 个源已不在 raw/ 中,已从待编批次剔除:")
                                         + ", ".join(sorted(dropped)[:5])
                                         + ("…" if len(dropped) > 5 else "")})
+        _materialize_batch_slices(run, plan)
         n = len(plan["batches"])
         pending = batching.pending_batches(plan)
+        if plan.get("mode") == "hierarchical":
+            run._model_idle_timeout_s = max(
+                _MODEL_IDLE_TIMEOUT_S, _HIERARCHICAL_MODEL_IDLE_TIMEOUT_S)
+            plan_summary_en = (
+                f"Hierarchical batch plan: {n} map batch(es), "
+                f"{plan.get('budget', 0) // 1024}KB effective / "
+                f"{plan.get('text_budget', 0) // 1024}KB text per batch.")
+            plan_summary_zh = (
+                f"层级分批计划:共 {n} 个映射批次,每批有效预算 "
+                f"{plan.get('budget', 0) // 1024}KB、文本上限 "
+                f"{plan.get('text_budget', 0) // 1024}KB。")
+        else:
+            plan_summary_en = (
+                f"Batch plan ({plan.get('planner')}): {n} batch(es), "
+                f"budget {plan.get('budget', 0) // 1024}KB/batch.")
+            plan_summary_zh = (
+                f"分批计划({plan.get('planner')}):共 {n} 批,预算 "
+                f"{plan.get('budget', 0) // 1024}KB/批。")
         await run.emit({
             "type": "summary",
             "text": (_loc(run, f"Resuming batch compile: {len(pending)}/{n} batch(es) remaining.",
                           f"继续分批编译:剩余 {len(pending)}/{n} 批。") if resuming
-                     else _loc(run,
-                               f"Batch plan ({plan.get('planner')}): {n} batch(es), budget {plan.get('budget', 0) // 1024}KB/batch.",
-                               f"分批计划({plan.get('planner')}):共 {n} 批,预算 {plan.get('budget', 0) // 1024}KB/批。")),
+                     else _loc(run, plan_summary_en, plan_summary_zh)),
         })
         for batch in list(pending):
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
@@ -2525,6 +2820,17 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             reply = await _drive_batch_session(run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"))
             if reply:
                 replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
+            still_unaccounted = (
+                [] if batch.get("defer_accounting")
+                else _unaccounted_batch_sources(run, batch.get("sources") or [])
+            )
+            if still_unaccounted:
+                shown = ", ".join(still_unaccounted[:5])
+                suffix = "…" if len(still_unaccounted) > 5 else ""
+                raise BatchOutputError(
+                    f"batch {batch['id']} left {len(still_unaccounted)} assigned "
+                    f"source(s) unaccounted: {shown}{suffix}"
+                )
             batching.stamp_done(plan, batch["id"])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
             # Push the done-stamp (and the batch's pages) to the durable store
@@ -2538,6 +2844,60 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     pass  # periodic sync will retry; the local stamp is already on disk
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
+        if plan.get("mode") == "hierarchical":
+            if "reductions" not in plan:
+                plan["reductions"] = batching.pack_section_reductions(
+                    selfcheck.candidate_pages(run.workdir))
+            plan["phase"] = "reduce"
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            reductions = plan.get("reductions", [])
+            reduction_count = len(reductions)
+            pending_reductions = batching.pending_reductions(plan)
+            if reduction_count:
+                await run.emit({
+                    "type": "summary",
+                    "text": _loc(
+                        run,
+                        f"Hierarchical reduce: {len(pending_reductions)}/{reduction_count} section group(s) remaining.",
+                        f"层级归并:剩余 {len(pending_reductions)}/{reduction_count} 个分区组。",
+                    ),
+                })
+            for reduction in list(pending_reductions):
+                # A previous reduction may have merged a page that a persisted
+                # later group mentioned. Remove missing pages rather than ask a
+                # resumed session to read paths that no longer exist.
+                current_pages = selfcheck.candidate_pages(run.workdir)
+                reduction["pages"] = [
+                    p for p in reduction.get("pages", []) if p in current_pages]
+                if len(reduction["pages"]) < 2:
+                    batching.stamp_reduction_done(plan, reduction["id"])
+                    _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                    continue
+                k = next(
+                    i + 1 for i, item in enumerate(reductions)
+                    if item["id"] == reduction["id"])
+                directive = _compose_reduction_directive(
+                    reduction, k, reduction_count, _drain_batch_notes(run),
+                    locale=getattr(run, "locale", None))
+                reply = await _drive_batch_session(
+                    run, directive,
+                    _loc(run, f"section reduce {k}/{reduction_count}",
+                         f"分区归并 {k}/{reduction_count}"))
+                if reply:
+                    replies.append(_loc(
+                        run,
+                        f"[Section reduce {k}/{reduction_count}] {reply}",
+                        f"【分区归并 {k}/{reduction_count}】{reply}"))
+                batching.stamp_reduction_done(plan, reduction["id"])
+                _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                sent = getattr(run, "_sync_sent", None)
+                if sent is not None:
+                    try:
+                        await _sync_workspace(run, sent)
+                    except Exception:
+                        pass
+        plan["phase"] = "final"
+        _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         final_reply = await _drive_batch_session(
             run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
             _loc(run, "final review", "终审"))
@@ -2550,19 +2910,29 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # add image-digesting pages), then one more ledger refresh so
         # SELFCHECK.json reflects the verified final state.
         if _media_verify_enabled():
-            repaired_any = False
             rounds = 0
+            initial_pending = selfcheck.pending_media_verification(run.workdir)
+            round_limit = _batch_media_verify_round_limit(plan, initial_pending)
             while True:
                 pending = selfcheck.pending_media_verification(run.workdir)
                 if not pending:
                     break
                 rounds += 1
-                if rounds > _media_verify_rounds():
+                if rounds > round_limit:
                     # Repair turns can add new image citations that re-enter
-                    # pending — cap the loop; the remainder rides a later turn.
+                    # pending. Flat mode keeps its established fail-open tail;
+                    # a hierarchical train must not claim complete while a
+                    # large image backlog is still unverified. Its persisted
+                    # `final` phase makes the next trigger resume the tail
+                    # without replaying the map batches.
                     await run.emit({"type": "summary", "text": _loc(run,
-                        f"Self-check (images): verify/repair round cap ({_media_verify_rounds()}) reached — remaining pages will be picked up on the next trigger.",
-                        f"自检(图像):验修轮达到上限({_media_verify_rounds()} 轮)——剩余页将在下一轮触发时继续复核。")})
+                        f"Self-check (images): verify/repair round cap ({round_limit}) reached — remaining pages will be picked up on the next trigger.",
+                        f"自检(图像):验修轮达到上限({round_limit} 轮)——剩余页将在下一轮触发时继续复核。")})
+                    if plan.get("mode") == "hierarchical":
+                        raise BatchOutputError(
+                            f"hierarchical image verification left {len(pending)} "
+                            f"page(s) pending after {round_limit} round(s)"
+                        )
                     break
                 # Blind transcribe+compare per ≤max-images chunk (v2): engine
                 # sessions read one image each — no in-session image pileup.
@@ -2591,12 +2961,16 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         _loc(run, "image verification", "图像复核"))
                     if verify_reply:
                         replies.append(_loc(run, f"[Image verification] {verify_reply}", f"【图像复核】{verify_reply}"))
-                    repaired_any = True
+                    # A media repair can introduce a malformed or dangling
+                    # source annotation. Repair the ledger BEFORE the next
+                    # blind comparison so the verified fingerprint belongs to
+                    # the final lint-clean bytes, not the pre-ledger revision.
+                    # The while loop then naturally re-verifies any page that
+                    # this bounded ledger pass changed.
+                    await _run_ledger_repairs(run, replies)
                 else:
                     await run.emit({"type": "summary",
                                     "text": f"自检(图像):{result['images']} 张图已核,断言与图一致 ✓"})
-            if repaired_any:
-                await _run_ledger_repairs(run, replies)
         # Owner notes that arrived during the tail phases (ledger repair / image
         # verify) were acked as "will be considered" but have no later batch to
         # ride — honor the contract with a bounded digest session before the
@@ -2618,10 +2992,19 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 replies.append(_loc(run, f"[Note digest] {notes_reply}", f"【留言消化】{notes_reply}"))
             await _run_ledger_repairs(run, replies)  # the digest may have touched pages
         sent = getattr(run, "_sync_sent", None)
+        plan["phase"] = "complete"
+        _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         if sent is not None:
             # Successful batch completion is one full-compile provenance commit.
             # Content and input revision must land atomically before turn_done.
-            await _sync_workspace(run, sent, commit_input=True)
+            try:
+                await _sync_workspace(run, sent, commit_input=True)
+            except Exception:
+                # The durable commit did not happen. Keep the plan resumable at
+                # final close-out rather than falsely claiming completion.
+                plan["phase"] = "final"
+                _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                raise
         await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
                         or _loc(run, "Batch compile complete.", "分批编译完成。")})
     except Exception as e:
@@ -2638,6 +3021,8 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         except Exception:
             pass
     finally:
+        shutil.rmtree(Path(run.workdir) / ".kbc-batch-slices", ignore_errors=True)
+        run._model_idle_timeout_s = previous_model_idle_timeout
         run._batch_active = False
     # Red-blue PK examines the train's FINAL state, in the background, after the
     # single logical turn has closed (never inside it — turn_done latency is
@@ -2670,7 +3055,13 @@ def _note_model_activity(run: CompileRun, msg) -> None:
         run._tool_pending = False
 
 
-async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool) -> None:
+async def _consume_turn_stream(
+    run: CompileRun,
+    client,
+    *,
+    stop_on_result: bool,
+    fail_on_error_result: bool = False,
+) -> None:
     """Relay a session's message stream through _emit_message, owning the
     stall-retry seam. A ResultMessage that the watchdog provoked (via interrupt())
     is NOT a real turn end: discard it and re-issue the directive (bounded), or
@@ -2696,7 +3087,8 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
             # is_error + api_error_status. Back off and re-issue rather than
             # surfacing it as a finished turn.
             status = getattr(msg, "api_error_status", None)
-            if getattr(msg, "is_error", False) and status in _MODEL_RATE_STATUSES:
+            is_error = bool(getattr(msg, "is_error", False))
+            if is_error and status in _MODEL_RATE_STATUSES:
                 if run._rate_retries < _MODEL_RATE_MAX_RETRIES:
                     run._rate_retries += 1
                     delay = _rate_backoff_delay(run._rate_retries)
@@ -2720,6 +3112,18 @@ async def _consume_turn_stream(run: CompileRun, client, *, stop_on_result: bool)
                                  f"模型限流(HTTP {status}),退避重试 {run._rate_retries} 次仍未通过,本轮先停,请稍后再开编。"),
                 })
                 # fall through: end the turn (run goes idle), do not crash
+            if is_error and fail_on_error_result:
+                # Never let an internal map/reduce/final session stamp its unit
+                # done when the SDK itself says the turn failed. Keep the
+                # diagnostic deliberately bounded: subtype/status are enough to
+                # route the failure without echoing provider payloads or tokens.
+                run._turn_active = False
+                run._turn_text = []
+                run._last_turn_reply = ""
+                subtype = str(getattr(msg, "subtype", "unknown") or "unknown")[:80]
+                raise ModelResultError(
+                    f"model result failed (subtype={subtype}, api_status={status})"
+                )
             run._turn_active = False
             await _emit_message(run, msg)
             if stop_on_result:
@@ -2770,7 +3174,12 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
         client = run.client
         if client is None:
             continue
-        bound = _MODEL_TOOL_IDLE_TIMEOUT_S if run._tool_pending else _MODEL_IDLE_TIMEOUT_S
+        model_idle_timeout = (
+            run._model_idle_timeout_s
+            if run._model_idle_timeout_s is not None
+            else _MODEL_IDLE_TIMEOUT_S
+        )
+        bound = _MODEL_TOOL_IDLE_TIMEOUT_S if run._tool_pending else model_idle_timeout
         idle = time.monotonic() - run._last_model_activity
         if idle <= bound:
             continue

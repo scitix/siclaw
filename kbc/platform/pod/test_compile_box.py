@@ -1436,6 +1436,69 @@ async def test_propose_plan_never_bounces():
     print("✓ propose_plan always signals; PROPOSED_PLAN.json written by code")
 
 
+async def test_delete_candidate_page_is_scoped():
+    """Both compiler engines can remove a merged-away page without Bash."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "candidate/guide").mkdir(parents=True)
+        (wd / "raw").mkdir()
+        (wd / "candidate/index.md").write_text("# Index", encoding="utf-8")
+        (wd / "candidate/guide/index.md").write_text("# Guide", encoding="utf-8")
+        engine_dead = wd / "candidate/guide/engine-dead.md"
+        engine_dead.write_text("old", encoding="utf-8")
+        claude_dead = wd / "candidate/guide/claude-dead.md"
+        claude_dead.write_text("old", encoding="utf-8")
+        outside = wd / "raw/source.md"
+        outside.write_text("raw", encoding="utf-8")
+        events = []
+
+        class FakeRun:
+            workdir = str(wd)
+            locale = "en"
+
+            async def emit(self, ev):
+                events.append(ev)
+
+        engine_tools = {
+            item.name: item for item in compile_box._compile_engine_tools(FakeRun())
+        }
+        engine_delete = engine_tools["delete_candidate_page"]
+        assert engine_delete.input_schema == {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        engine_result = await engine_delete.handler({"path": "guide/engine-dead.md"})
+        assert not engine_dead.exists(), engine_result
+        assert "deleted candidate page" in engine_result
+
+        captured = {}
+        original = compile_box.create_sdk_mcp_server
+
+        def capture(name, tools):
+            captured.update({t.name: t for t in tools})
+            return original(name, tools=tools)
+
+        compile_box.create_sdk_mcp_server = capture
+        try:
+            compile_box._make_compile_tools(FakeRun())
+        finally:
+            compile_box.create_sdk_mcp_server = original
+        delete = captured["delete_candidate_page"].handler
+
+        assert "mcp__compile__delete_candidate_page" in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+        result = await delete({"path": "guide/claude-dead.md"})
+        assert not claude_dead.exists(), result
+        assert len(events) == 2 and events[-1]["type"] == "summary", events
+
+        for refused in ("../raw/source.md", "/tmp/out.md", "index.md",
+                        "guide/index.md", "guide/data.json"):
+            result = await delete({"path": refused})
+            assert "deleted candidate page" not in result["content"][0]["text"], (refused, result)
+        assert outside.read_text(encoding="utf-8") == "raw"
+    print("✓ delete_candidate_page is engine-neutral and confined to non-routing candidate Markdown files")
+
+
 def test_install_wiki_snapshot_size_guard():
     """Fix A: the published-snapshot installer rejects an oversized compressed
     bundle AND a decompression bomb (accumulated-unpacked cap), like its sibling
@@ -2206,11 +2269,14 @@ async def test_batch_orchestrator_routing_and_resume():
             return f"done {label}"
 
         real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
         compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
         try:
             await compile_box._run_batch_compile(run, "直接开始编译")
         finally:
             compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
 
         events = []
         while not run.events.empty():
@@ -2233,10 +2299,12 @@ async def test_batch_orchestrator_routing_and_resume():
         assert compile_box._should_route_to_batch(run, "直接开始编译")
         driven.clear()
         compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
         try:
             await compile_box._run_batch_compile(run, "直接开始编译")
         finally:
             compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
         assert len(driven) == 2 and driven[0].startswith("batch 2/2"), driven
 
         # mid-batch owner chat queues and is relayed into the next directive
@@ -2250,12 +2318,343 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+def test_hierarchical_text_slice_materialization_and_directive():
+    """Oversized-text helpers are bounded, ephemeral views of Raw. The model
+    reads the helper, but durable Candidate provenance still names the original
+    Raw source rather than an internal slice path."""
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        source = wd / "raw" / "gpu" / "manual.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("".join(f"line-{line}\n" for line in range(1, 7)))
+        batch = {
+            "id": "h001",
+            "sources": ["gpu/manual.md"],
+            "context_sources": [],
+            "source_ranges": {
+                "gpu/manual.md": {
+                    "start_line": 2,
+                    "end_line": 4,
+                    "part": 1,
+                    "parts": 2,
+                    "bytes": 21,
+                    "slice_file": ".kbc-batch-slices/manual-p001.md",
+                }
+            },
+            "defer_accounting": True,
+        }
+        run = compile_box.CompileRun("slice-materialize", str(wd), 1)
+        compile_box._materialize_batch_slices(run, {"batches": [batch]})
+
+        helper = wd / ".kbc-batch-slices" / "manual-p001.md"
+        excerpt = helper.read_text()
+        assert "raw/gpu/manual.md, lines 2-4" in excerpt, excerpt
+        assert "line-2\nline-3\nline-4\n" in excerpt, excerpt
+        assert "line-1" not in excerpt and "line-5" not in excerpt, excerpt
+
+        directive = compile_box._compose_batch_directive(batch, 1, 2, "", "zh-CN")
+        assert ".kbc-batch-slices/manual-p001.md" in directive, directive
+        assert "本批绝不要直接打开原 Raw 全文" in directive, directive
+        assert "compiled_from 必须引用原 Raw 路径(raw/gpu/manual.md)" in directive, directive
+        assert "compiled_from 必须引用原 Raw 路径(.kbc-batch-slices" not in directive
+
+        # A completed map batch is durable history, not a future model turn.
+        # If its Raw source disappears before reduce/final resumes, rebuilding
+        # its ephemeral slice would make the train fail forever even though the
+        # batch's Candidate output has already landed.
+        batch["status"] = "done"
+        source.unlink()
+        compile_box._materialize_batch_slices(run, {"batches": [batch]})
+        assert not helper.exists()
+    print("\u2713 hierarchical text slices: bounded helper with original-Raw provenance")
+
+
+def test_hierarchical_resume_state_contract():
+    """Typed resume accepts every unfinished hierarchical phase, including
+    reduce/final after all map batches are done, while complete stays closed."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "authoring").mkdir()
+        run = compile_box.CompileRun("hier-resume-state", str(wd), 1)
+        command = {"action": "compile.resume", "parameters": {}}
+        plan = {
+            "version": 3,
+            "mode": "hierarchical",
+            "batches": [{"id": "h001", "sources": ["done.md"], "status": "done"}],
+            "reductions": [],
+        }
+
+        for phase in ("map", "reduce", "final"):
+            plan["phase"] = phase
+            (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+            assert compile_box._batch_plan_resumable(plan), phase
+            compile_box._prepare_command(run, command)
+            assert compile_box._should_route_to_batch(
+                run, "ignored localized text", "compile.resume"
+            ), phase
+
+        plan["phase"] = "complete"
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        assert not compile_box._batch_plan_resumable(plan)
+        try:
+            compile_box._prepare_command(run, command)
+        except compile_box.CommandRejected as error:
+            assert error.status == 409
+            assert "no interrupted batch plan" in str(error)
+        else:
+            raise AssertionError("complete batch plan must not be resumable")
+    print("\u2713 hierarchical resume: typed command covers map/reduce/final only")
+
+
+async def test_hierarchical_batch_plan_and_section_reduce():
+    """Only the second, very-large-corpus gate selects hierarchical planning.
+    The map keeps anchor context explicit, section reduce runs after all maps,
+    and the persisted phase closes as complete. No model planner is spent on a
+    huge inventory."""
+    import batching
+
+    env_names = [
+        "KBC_BATCH_THRESHOLD_BYTES",
+        "KBC_HIERARCHICAL_THRESHOLD_BYTES",
+        "KBC_HIERARCHICAL_BATCH_BUDGET_BYTES",
+        "KBC_BATCH_PLANNER",
+    ]
+    previous = {name: os.environ.get(name) for name in env_names}
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media_enabled = compile_box._media_verify_enabled
+    real_hierarchical_idle_timeout = compile_box._HIERARCHICAL_MODEL_IDLE_TIMEOUT_S
+    try:
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_HIERARCHICAL_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_HIERARCHICAL_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "model"
+        compile_box._HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = 123
+
+        # Hierarchical mode is deterministic and must bypass the model planner.
+        inventory = [
+            {"path": "gpu/a.md", "bytes": 300, "effective": 300},
+            {"path": "gpu/b.md", "bytes": 300, "effective": 300},
+        ]
+        with tempfile.TemporaryDirectory() as plan_td:
+            plan = await compile_box._plan_batches(
+                compile_box.CompileRun("hier-plan", plan_td, 1), inventory)
+        assert plan["planner"] == "hierarchical-code" and plan["mode"] == "hierarchical", plan
+        assert len(plan["batches"]) == 2, plan
+
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw" / "gpu").mkdir(parents=True)
+            (wd / "raw" / "gpu" / "a.md").write_bytes(b"a" * 300)
+            (wd / "raw" / "gpu" / "b.md").write_bytes(b"b" * 300)
+            run = compile_box.CompileRun("hier-run", str(wd), 1)
+            driven: list[str] = []
+            observed_idle_timeouts: list[float | None] = []
+
+            async def fake_drive(run_, directive, label):
+                driven.append(label + "|" + directive.splitlines()[0])
+                observed_idle_timeouts.append(run_._model_idle_timeout_s)
+                if label.startswith("batch ") or label.startswith("批 "):
+                    candidate = wd / "candidate"
+                    candidate.mkdir(exist_ok=True)
+                    source = "gpu/a.md" if not (candidate / "a.md").exists() else "gpu/b.md"
+                    page = Path(source).name
+                    (candidate / page).write_text(
+                        "---\n"
+                        f"type: Topic\ntitle: {page}\ncompiled_from:\n  - {source}\n"
+                        "---\n# Body\nsource-backed detail\n")
+                return f"done {label}"
+
+            async def no_repairs(run_, replies):
+                return None
+
+            compile_box._drive_batch_session = fake_drive
+            compile_box._run_ledger_repairs = no_repairs
+            compile_box._media_verify_enabled = lambda: False
+            await compile_box._run_batch_compile(run, "直接开始编译")
+
+            assert sum(item.startswith("batch ") for item in driven) == 2, driven
+            assert sum(item.startswith("section reduce ") for item in driven) == 1, driven
+            assert driven[-1].startswith("final review"), driven
+            assert set(observed_idle_timeouts) == {
+                max(compile_box._MODEL_IDLE_TIMEOUT_S, 123)
+            }, observed_idle_timeouts
+            assert run._model_idle_timeout_s is None, run._model_idle_timeout_s
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert saved["phase"] == "complete", saved
+            assert all(r["status"] == "done" for r in saved["reductions"]), saved
+
+            # A crash during final close-out resumes final only — it must never
+            # replay the expensive map or reduce train, even if raw has since
+            # shrunk below the ordinary batch threshold.
+            saved["phase"] = "final"
+            (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(saved))
+            os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
+            assert compile_box._should_route_to_batch(run, "直接开始编译")
+            driven.clear()
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            assert len(driven) == 1 and driven[0].startswith("final review"), driven
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._run_ledger_repairs = real_repairs
+        compile_box._media_verify_enabled = real_media_enabled
+        compile_box._HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = real_hierarchical_idle_timeout
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("\u2713 hierarchical batch: deterministic map / section reduce / complete phase")
+
+
+def test_hierarchical_media_verify_round_limit():
+    """Large trains scale the image-tail budget; ordinary/flat compiles retain
+    the established three-round latency bound, and an operator cap stays hard."""
+    names = (
+        "KBC_MEDIA_VERIFY_ROUNDS",
+        "KBC_MEDIA_VERIFY_ATTEMPTS",
+        "KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS",
+    )
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        os.environ["KBC_MEDIA_VERIFY_ROUNDS"] = "3"
+        os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "2"
+        os.environ["KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS"] = "256"
+        pending = {f"page-{i}.md": [f"image-{i}.png"] for i in range(4)}
+        assert compile_box._batch_media_verify_round_limit(
+            {"mode": "flat"}, pending) == 3
+        assert compile_box._batch_media_verify_round_limit(
+            {"mode": "hierarchical"}, pending) == 11
+        os.environ["KBC_HIERARCHICAL_MEDIA_VERIFY_MAX_ROUNDS"] = "5"
+        assert compile_box._batch_media_verify_round_limit(
+            {"mode": "hierarchical"}, pending) == 5
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("\u2713 hierarchical media verify: scales by pending pages, flat unchanged, hard cap")
+
+
+async def test_hierarchical_media_rechecks_after_ledger_repair():
+    """A media repair followed by a ledger-format repair must be verified at
+    the ledger-clean fingerprint. The old tail verified the media edit first,
+    then changed the page in a final ledger pass and still marked the plan
+    complete with that final revision pending image verification."""
+    import batching
+    import selfcheck
+
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media_enabled = compile_box._media_verify_enabled
+    real_blind_verify = compile_box.mediaverify.run_blind_verify
+    real_engine_selector = compile_box.selected_readonly_engine
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw").mkdir()
+            (wd / "raw" / "chart.png").write_bytes(b"image")
+            (wd / "candidate").mkdir()
+            (wd / "candidate" / "index.md").write_text(
+                "---\nokf_version: \"0.1\"\n---\n# Index\n- [Page](page.md)\n")
+            page = wd / "candidate" / "page.md"
+            page.write_text(
+                "---\ntype: Topic\ntitle: Page\ncompiled_from:\n"
+                "  - chart.png\n---\ninitial (source: chart.png)\n")
+            (wd / "authoring").mkdir()
+            plan = {
+                "version": 2,
+                "planner": "hierarchical-code",
+                "mode": "hierarchical",
+                "phase": "final",
+                "batches": [{
+                    "id": "h001",
+                    "sources": ["chart.png"],
+                    "context_sources": [],
+                    "bytes": 5,
+                    "status": "done",
+                }],
+                "reductions": [],
+            }
+            (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+            run = compile_box.CompileRun("media-ledger-fingerprint", str(wd), 1)
+            order: list[str] = []
+            media_calls = 0
+
+            async def fake_drive(run_, directive, label):
+                order.append(f"drive:{label}")
+                if label == "final review":
+                    assert "do not read raw/" in directive, directive
+                if label in {"image verification", "图像复核"}:
+                    page.write_text(page.read_text() + "media-repair\n")
+                return f"done {label}"
+
+            async def fake_repairs(run_, replies):
+                order.append("ledger")
+                if "media-repair" in page.read_text() and "ledger-repair" not in page.read_text():
+                    page.write_text(page.read_text() + "ledger-repair\n")
+
+            async def fake_blind_verify(engine, workdir, pending, progress=None, locale=None):
+                nonlocal media_calls
+                media_calls += 1
+                order.append(f"verify:{media_calls}:{'ledger-repair' in page.read_text()}")
+                if media_calls == 1:
+                    return {
+                        "findings": [{
+                            "page": "page.md",
+                            "image": "chart.png",
+                            "kind": "不一致",
+                            "claim": "initial",
+                            "expected": "corrected",
+                            "fix": "repair",
+                        }],
+                        "errors": [],
+                        "images": 1,
+                        "completed_pages": ["page.md"],
+                        "failed_pages": [],
+                    }
+                return {
+                    "findings": [],
+                    "errors": [],
+                    "images": 1,
+                    "completed_pages": ["page.md"],
+                    "failed_pages": [],
+                }
+
+            compile_box._drive_batch_session = fake_drive
+            compile_box._run_ledger_repairs = fake_repairs
+            compile_box._media_verify_enabled = lambda: True
+            compile_box.mediaverify.run_blind_verify = fake_blind_verify
+            compile_box.selected_readonly_engine = lambda: object()
+            await compile_box._run_batch_compile(run, "直接开始编译")
+
+            assert media_calls == 2, order
+            assert order.index("ledger", order.index("verify:1:False")) < order.index("verify:2:True"), order
+            assert selfcheck.pending_media_verification(td) == {}, order
+            report = selfcheck.read_selfcheck(td)
+            assert report["media_verify"]["summary"]["pending_pages"] == 0, report
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert saved["phase"] == "complete", saved
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._run_ledger_repairs = real_repairs
+        compile_box._media_verify_enabled = real_media_enabled
+        compile_box.mediaverify.run_blind_verify = real_blind_verify
+        compile_box.selected_readonly_engine = real_engine_selector
+    print("\u2713 hierarchical media verify: ledger-clean revision is rechecked")
+
+
 async def test_batch_orchestrator_review_fixes():
     """Review fixes: (a) resume prunes sources deleted from raw/ (no directive
     points at a missing file; an emptied batch is skipped); (b) an orchestrator
     error still CLOSES the logical turn (error + turn_done, never-block); (c)
     owner notes arriving during the tail phases get a bounded digest session
-    instead of being silently abandoned at turn_done."""
+    instead of being silently abandoned at turn_done; (e) an SDK error result
+    leaves the current batch pending instead of falsely stamping it done; (f)
+    even a successful no-op result cannot stamp unaccounted sources done."""
     import batching
 
     def _events(run):
@@ -2268,6 +2667,8 @@ async def test_batch_orchestrator_review_fixes():
     os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
     os.environ["KBC_BATCH_PLANNER"] = "code"
     real_drive = compile_box._drive_batch_session
+    real_accounted = compile_box._unaccounted_batch_sources
+    compile_box._unaccounted_batch_sources = lambda run_, sources: []
     try:
         # (a) resume after a source vanished: plan pins deleted.md in a pending
         # batch (and a fully-vanished batch) — directives must not mention them.
@@ -2356,8 +2757,73 @@ async def test_batch_orchestrator_review_fixes():
             assert any(d.startswith("批 1/1|【分批编译 · 批 1/1") for d in driven), driven
             turn = next(e for e in _events(run) if e["type"] == "turn_done")
             assert "【批 1/1】" in turn["text"] and "【终审】" in turn["text"], turn
+
+        # (e) The real GPU corpus exposed this path: Claude Code returned an
+        # authentication error ResultMessage with no assistant output. Treating
+        # it like a successful empty result stamped every map batch done. The
+        # batch must remain pending so the next valid run can resume honestly.
+        compile_box._drive_batch_session = real_drive
+        compile_box._unaccounted_batch_sources = real_accounted
+
+        class _ErrorResultClient:
+            def __init__(self, options=None):
+                self.options = options
+
+            async def connect(self, prompt=None):
+                pass
+
+            async def query(self, prompt, session_id="default"):
+                pass
+
+            async def receive_messages(self):
+                yield ResultMessage("error_during_execution", is_error=True)
+
+            async def disconnect(self):
+                pass
+
+        real_client = compile_box.ClaudeSDKClient
+        compile_box.ClaudeSDKClient = _ErrorResultClient
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                (wd / "raw" / "a").mkdir(parents=True)
+                (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+                run = compile_box.CompileRun("rf5", str(wd), 1)
+                await compile_box._run_batch_compile(run, "直接开始编译")
+                saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+                assert saved["batches"][0]["status"] == "pending", saved
+                evs = _events(run)
+                assert any(e["type"] == "error" and "ModelResultError" in e.get("error", "")
+                           for e in evs), evs
+                assert sum(e["type"] == "turn_done" for e in evs) == 1, evs
+        finally:
+            compile_box.ClaudeSDKClient = real_client
+
+        # (f) is_error=False is necessary but not sufficient: a provider/SDK
+        # regression may return an empty successful result. Every assigned
+        # source must now be cited or explicitly excluded before the done stamp.
+        class _NoopResultClient(_ErrorResultClient):
+            async def receive_messages(self):
+                yield ResultMessage()
+
+        compile_box.ClaudeSDKClient = _NoopResultClient
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                (wd / "raw" / "a").mkdir(parents=True)
+                (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+                run = compile_box.CompileRun("rf6", str(wd), 1)
+                await compile_box._run_batch_compile(run, "直接开始编译")
+                saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+                assert saved["batches"][0]["status"] == "pending", saved
+                evs = _events(run)
+                assert any(e["type"] == "error" and "BatchOutputError" in e.get("error", "")
+                           for e in evs), evs
+        finally:
+            compile_box.ClaudeSDKClient = real_client
     finally:
         compile_box._drive_batch_session = real_drive
+        compile_box._unaccounted_batch_sources = real_accounted
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
         del os.environ["KBC_BATCH_BUDGET_BYTES"]
     print("✓ batch orchestrator review fixes: resume-prune / error turn_done / tail-note digest")
@@ -3013,6 +3479,7 @@ async def main():
     await test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool()
     await test_recommendation_driver_reports_max_turn_exhaustion()
     await test_propose_plan_never_bounces()
+    await test_delete_candidate_page_is_scoped()
     test_apply_session_config()
     test_parse_brief_block()
     await test_message_captures_brief()
@@ -3029,6 +3496,11 @@ async def main():
     await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
+    test_hierarchical_text_slice_materialization_and_directive()
+    test_hierarchical_resume_state_contract()
+    await test_hierarchical_batch_plan_and_section_reduce()
+    test_hierarchical_media_verify_round_limit()
+    await test_hierarchical_media_rechecks_after_ledger_repair()
     await test_batch_orchestrator_review_fixes()
     await test_model_stall_retries_then_completes()
     await test_model_stall_live_stream_not_reaped()

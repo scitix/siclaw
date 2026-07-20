@@ -7,6 +7,16 @@
     "ack": "计划已抛给负责人(UI 已显示计划与批准控件),等待批准。在收到批准消息前不要写 candidate/ 页面。",
     "reminder": "(提醒:顺手把候选页清单以 `- [ ] 页名 — 一句话` 维护进 authoring/PLAN.md 的 ## Next Pages 作为你的工作状态,便于追踪进度;这不影响本次计划已抛出。)"
   },
+  "delete_candidate_page": {
+    "desc": "归并重复页或孤儿页后，删除 candidate/ 下确属废弃的一篇 Markdown 页面。path 必须相对 candidate/（例如 `guide/old.md`）。不能删除 index.md/log.md、目录、非 Markdown、符号链接或 candidate/ 之外的内容；删除前先修好所有入链。",
+    "invalid": "拒绝不安全的 candidate 路径: {path}",
+    "markdown_only": "只能删除 candidate Markdown 页面: {path}",
+    "reserved": "不能删除保留的路由页面: {path}",
+    "not_found": "candidate 页面不存在: {path}",
+    "not_file": "candidate 路径不是普通文件: {path}",
+    "failed": "删除 candidate 页面 {path} 失败: {e}",
+    "deleted": "已删除 candidate 页面: {path}"
+  },
   "resolve_ticket": {
     "desc": "回修完一条矛盾工单后逐条调用(一条一次,别批量):登记你把哪条(ticket_id)按什么值(applied_value)回修了、实际改了哪几个 candidate 文件(pages_edited,必须覆盖该工单的 affected_pages)、一句话备注(note)。这会把该工单标为已回修并写下可审计的 agent_report —— 是「矛盾处理」显示「AI 已回修」、并让负责人核对的依据。 dispatch_nonce 原样回传指令里该工单的 nonce:(指令没带就传空字符串)——它把这份回执对到确切的派发轮。",
     "need_id": "resolve_ticket 需要 ticket_id",
