@@ -70,6 +70,58 @@ def deterministic_directory_bundle(root: Path, files: list[dict]) -> bytes:
 
 
 class SourceSnapshotTest(unittest.TestCase):
+    def test_default_part_envelope_accepts_200_mib_source_transport(self):
+        file_size = 200 * 1024 * 1024
+        bundle_size = file_size + 1024 * 1024
+        files = [{
+            "path": "manuals/large.pdf",
+            "size_bytes": file_size,
+            "sha256": "a" * 64,
+        }]
+        snapshot = {
+            "version": 2,
+            "manifest_sha256": hashlib.sha256(source_snapshot.canonical_file_manifest(files)).hexdigest(),
+            "total_bytes": file_size,
+            "file_count": 1,
+            "parts": [{
+                "part_id": "part-000001",
+                "sha256": "b" * 64,
+                "bundle_size_bytes": bundle_size,
+                "unpacked_size_bytes": file_size,
+                "file_count": 1,
+                "files": files,
+            }],
+        }
+
+        normalized = source_snapshot.validate_snapshot(snapshot)
+
+        self.assertEqual(normalized["parts"][0]["bundle_size_bytes"], bundle_size)
+
+    def test_default_part_envelope_remains_bounded(self):
+        file_size = source_snapshot.DEFAULT_MAX_SOURCE_PART_UNPACKED_BYTES + 1
+        files = [{
+            "path": "too-large.bin",
+            "size_bytes": file_size,
+            "sha256": "a" * 64,
+        }]
+        snapshot = {
+            "version": 2,
+            "manifest_sha256": hashlib.sha256(source_snapshot.canonical_file_manifest(files)).hexdigest(),
+            "total_bytes": file_size,
+            "file_count": 1,
+            "parts": [{
+                "part_id": "part-000001",
+                "sha256": "b" * 64,
+                "bundle_size_bytes": 1,
+                "unpacked_size_bytes": file_size,
+                "file_count": 1,
+                "files": files,
+            }],
+        }
+
+        with self.assertRaisesRegex(ValueError, "unpacks too large"):
+            source_snapshot.validate_snapshot(snapshot)
+
     def test_canonical_manifest_matches_sicore_contract(self):
         files = [
             {"path": "b.md", "sha256": "2" * 64, "size_bytes": 4},
