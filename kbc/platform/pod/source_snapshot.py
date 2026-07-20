@@ -23,6 +23,15 @@ from typing import Callable
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PART_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+# Sicore admits individual Feishu/Drive source files up to 200 MiB. A tar+gzip
+# transport object for an incompressible file can be slightly larger than the
+# source itself, so keep a bounded 256 MiB envelope on both the compressed and
+# declared-unpacked sides. The compile-box HTTP request ceiling remains 768 MiB,
+# leaving room for JSON/base64 expansion without turning this into an unbounded
+# upload path.
+DEFAULT_MAX_SOURCE_PART_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_SOURCE_PART_UNPACKED_BYTES = 256 * 1024 * 1024
+
 
 class SnapshotConflict(ValueError):
     """The requested operation conflicts with persisted snapshot state."""
@@ -94,8 +103,11 @@ def validate_snapshot(snapshot: object) -> dict:
         raise ValueError("source snapshot must contain at least one part")
     max_parts = _positive_env("KBC_MAX_SOURCE_PARTS", 10_000)
     max_files = _positive_env("KBC_MAX_SOURCE_FILES", 100_000)
-    max_part_bytes = _positive_env("KBC_MAX_SOURCE_PART_BYTES", 64 * 1024 * 1024)
-    max_part_unpacked = _positive_env("KBC_MAX_SOURCE_PART_UNPACKED_BYTES", 128 * 1024 * 1024)
+    max_part_bytes = _positive_env("KBC_MAX_SOURCE_PART_BYTES", DEFAULT_MAX_SOURCE_PART_BYTES)
+    max_part_unpacked = _positive_env(
+        "KBC_MAX_SOURCE_PART_UNPACKED_BYTES",
+        DEFAULT_MAX_SOURCE_PART_UNPACKED_BYTES,
+    )
     max_total_unpacked = _positive_env("KBC_MAX_SOURCE_UNPACKED_BYTES", 2 * 1024 * 1024 * 1024)
     if len(parts) > max_parts:
         raise ValueError(f"source snapshot has too many parts: {len(parts)} > {max_parts}")
