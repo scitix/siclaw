@@ -24,6 +24,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # Codex's named filesystem profiles use bubblewrap on Linux. Installing
+      # the distro package also supplies the Ubuntu AppArmor allowance for its
+      # executable; the bundled fallback is intentionally not trusted by that
+      # host policy.
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - run: pip install -r kbc/platform/pod/requirements.txt
       - run: python test_compile_box.py
         working-directory: kbc/platform/pod
