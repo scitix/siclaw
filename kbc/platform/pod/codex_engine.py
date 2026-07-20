@@ -26,7 +26,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Iterator, Mapping
+from typing import Awaitable, Callable, Iterable, Iterator, Mapping
 
 from aiohttp import web
 
@@ -90,19 +90,252 @@ def _status_from_error(value: object) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _safe_error_message(value: object) -> str:
+def _safe_error_message(value: object, secret_values: Iterable[str] = ()) -> str:
     text = str(getattr(value, "message", value) or "Codex turn failed")
+    for secret_value in secret_values:
+        if secret_value:
+            text = text.replace(secret_value, "[REDACTED]")
     text = re.sub(r"\bsk-[A-Za-z0-9_+\-/=]{8,}", "[REDACTED]", text)
     return text[:1000]
+
+
+_READ_MAX_LINES = 500
+_READ_MAX_CHARS = 200_000
+_GLOB_MAX_RESULTS = 500
+_GREP_MAX_RESULTS = 200
+_GREP_MAX_FILES = 5_000
+_GREP_MAX_FILE_BYTES = 2 * 1024 * 1024
+
+
+class _ReadOnlyFileAccess:
+    """Root-confined text inspection tools for closed-book Codex sessions."""
+
+    def __init__(self, cwd: str, roots: Iterable[str | Path]):
+        self.cwd = Path(cwd).resolve()
+        self.roots = tuple(dict.fromkeys(Path(value).resolve() for value in roots))
+        if not self.cwd.is_dir():
+            raise ValueError(f"read-only cwd is not a directory: {self.cwd}")
+        if not self.roots:
+            raise ValueError("read-only Codex sessions require at least one allowed root")
+        for root in self.roots:
+            if not root.is_dir():
+                raise ValueError(f"allowed read root is not a directory: {root}")
+
+    def tools(self) -> list[EngineTool]:
+        return [
+            EngineTool(
+                "kbc_read_file",
+                "Read a UTF-8 text file inside the declared KBC snapshot roots. "
+                "Returns numbered lines with bounded output.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Absolute path or path relative to the session cwd."},
+                        "offset": {"type": "integer", "minimum": 1, "description": "First line to return (1-based)."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": _READ_MAX_LINES},
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                self.read_file,
+            ),
+            EngineTool(
+                "kbc_glob_files",
+                "List regular files inside the declared KBC snapshot roots using a relative glob pattern.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Relative glob such as **/*.md."},
+                        "path": {
+                            "type": "string",
+                            "description": "Optional allowed directory; defaults to the session cwd.",
+                        },
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": _GLOB_MAX_RESULTS},
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": False,
+                },
+                self.glob_files,
+            ),
+            EngineTool(
+                "kbc_grep_files",
+                "Search for a literal string in bounded UTF-8 text files inside the declared KBC snapshot roots.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Literal text to find."},
+                        "path": {
+                            "type": "string",
+                            "description": "Optional allowed directory; defaults to the session cwd.",
+                        },
+                        "pattern": {"type": "string", "description": "Relative file glob; defaults to **/*."},
+                        "case_sensitive": {"type": "boolean"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": _GREP_MAX_RESULTS},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                self.grep_files,
+            ),
+        ]
+
+    def _resolve(self, value: object, *, default: Path | None = None) -> Path:
+        if value is None and default is not None:
+            candidate = default
+        elif isinstance(value, str) and value.strip() and "\x00" not in value:
+            raw = Path(value.strip())
+            candidate = raw if raw.is_absolute() else self.cwd / raw
+        else:
+            raise ValueError("path must be a non-empty string")
+        resolved = candidate.resolve()
+        for root in self.roots:
+            try:
+                resolved.relative_to(root)
+                return resolved
+            except ValueError:
+                continue
+        raise ValueError(f"path is outside the allowed KBC snapshot roots: {value!r}")
+
+    @staticmethod
+    def _validated_pattern(value: object, *, default: str | None = None) -> str:
+        pattern = default if value is None else value
+        if not isinstance(pattern, str) or not pattern.strip() or "\x00" in pattern:
+            raise ValueError("pattern must be a non-empty relative glob")
+        pattern = pattern.strip()
+        path = Path(pattern)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("pattern must be relative and cannot contain parent traversal")
+        return pattern
+
+    @staticmethod
+    def _bounded_int(value: object, *, default: int, maximum: int, name: str) -> int:
+        if value is None:
+            return default
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > maximum:
+            raise ValueError(f"{name} must be an integer from 1 to {maximum}")
+        return value
+
+    def _display(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.cwd)) or "."
+        except ValueError:
+            return str(path)
+
+    async def read_file(self, args: dict) -> str:
+        path = self._resolve(args.get("path"))
+        offset = self._bounded_int(args.get("offset"), default=1, maximum=10_000_000, name="offset")
+        limit = self._bounded_int(args.get("limit"), default=200, maximum=_READ_MAX_LINES, name="limit")
+
+        def read() -> str:
+            if not path.is_file():
+                raise ValueError(f"path is not a regular file: {self._display(path)}")
+            lines: list[str] = []
+            chars = 0
+            truncated = False
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if line_number < offset:
+                        continue
+                    if "\x00" in line:
+                        raise ValueError(f"binary files are not supported: {self._display(path)}")
+                    rendered = f"{line_number}: {line.rstrip()}"
+                    if len(lines) >= limit or chars + len(rendered) + 1 > _READ_MAX_CHARS:
+                        truncated = True
+                        break
+                    lines.append(rendered)
+                    chars += len(rendered) + 1
+            if not lines:
+                return f"{self._display(path)}: no text at or after line {offset}"
+            header = f"{self._display(path)} (lines {offset}-{offset + len(lines) - 1})"
+            suffix = "\n[output truncated; request another offset]" if truncated else ""
+            return header + "\n" + "\n".join(lines) + suffix
+
+        return await asyncio.to_thread(read)
+
+    async def glob_files(self, args: dict) -> str:
+        base = self._resolve(args.get("path"), default=self.cwd)
+        pattern = self._validated_pattern(args.get("pattern"))
+        max_results = self._bounded_int(
+            args.get("max_results"), default=200, maximum=_GLOB_MAX_RESULTS, name="max_results"
+        )
+
+        def glob() -> str:
+            if not base.is_dir():
+                raise ValueError(f"glob path is not a directory: {self._display(base)}")
+            matches: list[str] = []
+            for candidate in base.glob(pattern):
+                try:
+                    resolved = self._resolve(str(candidate))
+                except ValueError:
+                    continue
+                if resolved.is_file():
+                    matches.append(self._display(resolved))
+                    if len(matches) >= max_results:
+                        break
+            matches.sort()
+            if not matches:
+                return "no matching files"
+            suffix = "\n[results limited]" if len(matches) >= max_results else ""
+            return "\n".join(matches) + suffix
+
+        return await asyncio.to_thread(glob)
+
+    async def grep_files(self, args: dict) -> str:
+        query = args.get("query")
+        if not isinstance(query, str) or not query or "\x00" in query:
+            raise ValueError("query must be a non-empty literal string")
+        base = self._resolve(args.get("path"), default=self.cwd)
+        pattern = self._validated_pattern(args.get("pattern"), default="**/*")
+        case_sensitive = args.get("case_sensitive", False)
+        if not isinstance(case_sensitive, bool):
+            raise ValueError("case_sensitive must be a boolean")
+        max_results = self._bounded_int(
+            args.get("max_results"), default=100, maximum=_GREP_MAX_RESULTS, name="max_results"
+        )
+
+        def grep() -> str:
+            if not base.is_dir():
+                raise ValueError(f"grep path is not a directory: {self._display(base)}")
+            needle = query if case_sensitive else query.casefold()
+            matches: list[str] = []
+            files_seen = 0
+            for candidate in base.glob(pattern):
+                try:
+                    path = self._resolve(str(candidate))
+                except ValueError:
+                    continue
+                if not path.is_file() or path.stat().st_size > _GREP_MAX_FILE_BYTES:
+                    continue
+                files_seen += 1
+                if files_seen > _GREP_MAX_FILES:
+                    break
+                try:
+                    with path.open("r", encoding="utf-8", errors="replace") as handle:
+                        for line_number, line in enumerate(handle, 1):
+                            if "\x00" in line:
+                                break
+                            haystack = line if case_sensitive else line.casefold()
+                            if needle in haystack:
+                                rendered = f"{self._display(path)}:{line_number}: {line.rstrip()}"
+                                matches.append(rendered[:4_000])
+                                if len(matches) >= max_results:
+                                    return "\n".join(matches) + "\n[results limited]"
+                except OSError:
+                    continue
+            if not matches:
+                return "no matches"
+            suffix = "\n[file scan limited]" if files_seen > _GREP_MAX_FILES else ""
+            return "\n".join(matches) + suffix
+
+        return await asyncio.to_thread(grep)
 
 
 def _copy_readonly_tree(source: Path, destination: Path) -> None:
     """Make an isolated filesystem view without preserving source symlinks.
 
-    Use independent file copies rather than hard links. Restricted Kubernetes
-    hosts require Codex full-access inside the already isolated KBC Pod, so a
-    reviewer that accidentally writes its staged view must not mutate the
-    original raw/candidate inode.
+    Use independent file copies rather than hard links. Writer sessions keep
+    Pod-level full access, while closed-book sessions use root-confined read
+    tools; either way, staging must never share mutable raw/candidate inodes.
     """
 
     def copy_file(src: str, dst: str) -> str:
@@ -164,6 +397,7 @@ class CodexSDKClient:
         model: str,
         session_id: str,
         read_only: bool = False,
+        allowed_read_roots: list[str] | None = None,
         tools: list[EngineTool] | None = None,
         reasoning_effort: str | None = None,
         max_tool_calls: int | None = None,
@@ -173,7 +407,21 @@ class CodexSDKClient:
         self.model = model
         self.session_id = session_id
         self.read_only = read_only
-        self.tools = tools or []
+        declared_tools = list(tools or [])
+        if read_only:
+            file_access = _ReadOnlyFileAccess(cwd, allowed_read_roots or [cwd])
+            read_tools = file_access.tools()
+            reserved = {item.name for item in read_tools}
+            duplicates = sorted(reserved.intersection(item.name for item in declared_tools))
+            if duplicates:
+                raise ValueError(f"read-only tool names are reserved: {', '.join(duplicates)}")
+            self.allowed_read_roots = tuple(str(root) for root in file_access.roots)
+            self.tools = read_tools + declared_tools
+        else:
+            if allowed_read_roots:
+                raise ValueError("allowed_read_roots is only valid for read-only Codex sessions")
+            self.allowed_read_roots = ()
+            self.tools = declared_tools
         # Mass GPT-5.6 high/medium can spend longer than KBC's 90s model-idle
         # safety bound before its first actionable item. Low still retains the
         # model's agentic workflow and is the reliable unattended default; a
@@ -191,11 +439,16 @@ class CodexSDKClient:
         self._callback_runner: web.AppRunner | None = None
         self._callback_token = secrets.token_urlsafe(24)
         self._tool_by_name = {item.name: item for item in self.tools}
+        if len(self._tool_by_name) != len(self.tools):
+            raise ValueError("Codex MCP tool names must be unique")
         self._tool_calls_this_turn = 0
         self._budget_exhausted = False
+        self._result_emitted_this_turn = False
+        self._api_key = ""
         state_root = Path(os.environ.get("KBC_CODEX_STATE_ROOT", "/work"))
         state_root.mkdir(parents=True, exist_ok=True)
         self._codex_home = tempfile.mkdtemp(prefix=".kbc-codex-", dir=str(state_root))
+        self._shell_home = tempfile.mkdtemp(prefix=".kbc-shell-home-", dir=str(state_root))
 
     async def connect(self) -> None:
         # Lazy import keeps the Claude image/test environment importable even if
@@ -208,6 +461,7 @@ class CodexSDKClient:
             raise RuntimeError("codex_sdk requires llm.base_url (OpenAI Responses endpoint)")
         if not api_key:
             raise RuntimeError("codex_sdk requires llm.api_key/auth_token")
+        self._api_key = api_key
 
         overrides = [
             "model_provider=" + _toml("kbc_mass"),
@@ -233,14 +487,31 @@ class CodexSDKClient:
             # calls such as `exec -> tools.exec_command(...)` that cannot be
             # serviced by this compile-box host.
             "features.code_mode.enabled=false",
-            "features.shell_tool=true",
             # Model-proposed shell commands receive no API key/token.  PATH and
-            # HOME are sufficient for the preinstalled deterministic KBC tools.
+            # HOME is a separate empty directory from CODEX_HOME, so even a
+            # writer shell cannot inspect Codex runtime/config state through ~.
+            "allow_login_shell=false",
             "shell_environment_policy.inherit=" + _toml("none"),
             "shell_environment_policy.include_only=" + _toml(["PATH", "HOME"]),
             "shell_environment_policy.set.PATH=" + _toml(os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")),
-            "shell_environment_policy.set.HOME=" + _toml(self._codex_home),
+            "shell_environment_policy.set.HOME=" + _toml(self._shell_home),
         ]
+        if self.read_only:
+            readable_roots = ", ".join(
+                f"{_toml(root)} = \"read\"" for root in self.allowed_read_roots
+            )
+            overrides.extend([
+                # Closed-book consumers use only KBC's root-checking MCP read
+                # tools. No model-proposed subprocess is available, avoiding
+                # both host reads and restricted-host nested-sandbox failures.
+                "features.shell_tool=false",
+                "features.unified_exec=false",
+                "default_permissions=" + _toml("kbc_readonly"),
+                "permissions.kbc_readonly={ filesystem = { " + readable_roots
+                + " }, network = { enabled = false } }",
+            ])
+        else:
+            overrides.append("features.shell_tool=true")
         if self.tools:
             callback_url = await self._start_callback_listener()
             server_path = Path(__file__).resolve().with_name("mcp_tool_server.py")
@@ -277,6 +548,13 @@ class CodexSDKClient:
             client_title="Siclaw KB Compiler",
         )
         self._codex = AsyncCodex(config=config)
+        read_contract = ""
+        if self.read_only:
+            read_contract = (
+                "\n\nClosed-book filesystem contract: native shell and file mutation are unavailable. "
+                "Use the kbc_read_file, kbc_glob_files and kbc_grep_files tools for text inspection. "
+                "Read only these declared snapshot roots: " + ", ".join(self.allowed_read_roots)
+            )
         self._thread = await self._codex.thread_start(
             # KBC is an unattended compiler. auto_review still routes workspace
             # commands through an approval reviewer, which can reject ordinary
@@ -285,17 +563,14 @@ class CodexSDKClient:
             # boundary used by Claude's bypassPermissions mode.
             approval_mode=ApprovalMode.deny_all,
             cwd=self.cwd,
-            developer_instructions=self.system_prompt,
+            developer_instructions=self.system_prompt + read_contract,
             ephemeral=True,
             model=self.model,
             model_provider="kbc_mass",
-            # Restricted Kubernetes container hosts can refuse Codex's nested
-            # bubblewrap split policies. The box itself contains one KB run and
-            # is already the process/filesystem boundary, so both writer and
-            # staged closed-book reviewers use the Claude-parity full-access
-            # preset inside that Pod. Model subprocesses still receive only
-            # PATH/HOME, never the provider key/token.
-            sandbox=Sandbox.full_access,
+            # Writer sessions retain the existing Pod-level boundary. Read-only
+            # sessions select the kbc_readonly permission profile above instead
+            # of the legacy whole-filesystem read-only preset.
+            sandbox=None if self.read_only else Sandbox.full_access,
         )
         # Public session identity must be the resumable Codex thread id, not the
         # provisional box UUID passed to the constructor.
@@ -339,7 +614,9 @@ class CodexSDKClient:
         if self._callback_runner is not None:
             await self._callback_runner.cleanup()
             self._callback_runner = None
+        self._api_key = ""
         shutil.rmtree(self._codex_home, ignore_errors=True)
+        shutil.rmtree(self._shell_home, ignore_errors=True)
         await self._events.put(_CLOSED)
 
     async def _start_callback_listener(self) -> str:
@@ -358,7 +635,8 @@ class CodexSDKClient:
         return f"http://127.0.0.1:{port}/tool-call"
 
     async def _handle_tool_call(self, request: web.Request) -> web.Response:
-        if request.headers.get("x-kbc-token") != self._callback_token:
+        provided_token = request.headers.get("x-kbc-token", "")
+        if not secrets.compare_digest(provided_token, self._callback_token):
             return web.json_response({"error": "forbidden"}, status=403)
         body = await request.json()
         name = str(body.get("name", ""))
@@ -386,6 +664,7 @@ class CodexSDKClient:
             prompt = await self._prompts.get()
             self._tool_calls_this_turn = 0
             self._budget_exhausted = False
+            self._result_emitted_this_turn = False
             try:
                 self._turn = await self._thread.turn(prompt, effort=effort)
                 async for notification in self._turn.stream():
@@ -393,14 +672,15 @@ class CodexSDKClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await self._events.put(AssistantMessage([
-                    TextBlock("Codex turn failed: " + _safe_error_message(exc))
-                ]))
-                await self._events.put(ResultMessage(
-                    is_error=True,
-                    api_error_status=_status_from_error(exc),
-                    subtype="error_max_turns" if self._budget_exhausted else "error_during_execution",
-                ))
+                if not self._result_emitted_this_turn:
+                    await self._events.put(AssistantMessage([
+                        TextBlock("Codex turn failed: " + _safe_error_message(exc, (self._api_key,)))
+                    ]))
+                    await self._emit_result(ResultMessage(
+                        is_error=True,
+                        api_error_status=_status_from_error(exc),
+                        subtype="error_max_turns" if self._budget_exhausted else "error_during_execution",
+                    ))
             finally:
                 self._turn = None
 
@@ -448,15 +728,17 @@ class CodexSDKClient:
                 if text:
                     await self._events.put(AssistantMessage([TextBlock(text)]))
         elif name == "TurnCompletedNotification":
+            if self._result_emitted_this_turn:
+                return
             turn = getattr(payload, "turn", None)
             status = str(getattr(getattr(turn, "status", None), "value", getattr(turn, "status", "")))
             error = getattr(turn, "error", None)
             is_error = self._budget_exhausted or status not in {"completed", ""}
             if is_error and not self._budget_exhausted:
                 await self._events.put(AssistantMessage([
-                    TextBlock("Codex turn failed: " + _safe_error_message(error))
+                    TextBlock("Codex turn failed: " + _safe_error_message(error, (self._api_key,)))
                 ]))
-            await self._events.put(ResultMessage(
+            await self._emit_result(ResultMessage(
                 is_error=is_error,
                 api_error_status=_status_from_error(getattr(error, "message", error)),
                 subtype=(
@@ -465,3 +747,10 @@ class CodexSDKClient:
                     else f"error_{status or 'unknown'}"
                 ),
             ))
+
+    async def _emit_result(self, result: ResultMessage) -> None:
+        """Keep terminal turn signaling one-shot even if an SDK stream repeats it."""
+        if self._result_emitted_this_turn:
+            return
+        self._result_emitted_this_turn = True
+        await self._events.put(result)
