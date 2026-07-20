@@ -418,6 +418,7 @@ class CodexSDKClient:
         allowed_read_roots: list[str] | None = None,
         allowed_read_tools: list[str] | None = None,
         tools: list[EngineTool] | None = None,
+        writer_filesystem_access: Mapping[str, str] | None = None,
         reasoning_effort: str | None = None,
         max_tool_calls: int | None = None,
     ):
@@ -428,6 +429,8 @@ class CodexSDKClient:
         self.read_only = read_only
         declared_tools = list(tools or [])
         if read_only:
+            if writer_filesystem_access:
+                raise ValueError("writer_filesystem_access is only valid for writer Codex sessions")
             file_access = _ReadOnlyFileAccess(cwd, allowed_read_roots or [cwd])
             read_tools = file_access.selected_tools(allowed_read_tools)
             reserved = set(_READ_TOOL_NAME_MAP.values())
@@ -443,6 +446,21 @@ class CodexSDKClient:
                 raise ValueError("allowed_read_tools is only valid for read-only Codex sessions")
             self.allowed_read_roots = ()
             self.tools = declared_tools
+        self.writer_filesystem_access: dict[str, str] = {}
+        workspace_root = Path(self.cwd)
+        for raw_path, access in (writer_filesystem_access or {}).items():
+            if access not in {"read", "write", "deny"}:
+                raise ValueError(f"invalid writer filesystem access {access!r} for {raw_path!r}")
+            target = Path(raw_path).resolve()
+            try:
+                target.relative_to(workspace_root)
+            except ValueError as error:
+                raise ValueError(
+                    f"writer filesystem override is outside the session workspace: {raw_path!r}"
+                ) from error
+            if target == workspace_root:
+                raise ValueError("writer filesystem override cannot replace the workspace root")
+            self.writer_filesystem_access[str(target)] = access
         # Mass GPT-5.6 high/medium can spend longer than KBC's 90s model-idle
         # safety bound before its first actionable item. Low still retains the
         # model's agentic workflow and is the reliable unattended default; a
@@ -536,7 +554,7 @@ class CodexSDKClient:
                 + " }, network = { enabled = false } }",
             ])
         else:
-            writable_roots = {
+            filesystem_roots = {
                 # Codex expands :minimal to platform binaries, libraries and
                 # system config only; it deliberately excludes user data and
                 # process metadata such as /proc.
@@ -548,9 +566,10 @@ class CodexSDKClient:
                 self.cwd: "write",
                 str(Path(self._shell_home).resolve()): "write",
             }
+            filesystem_roots.update(self.writer_filesystem_access)
             filesystem = ", ".join(
                 f"{_toml(root)} = {_toml(access)}"
-                for root, access in writable_roots.items()
+                for root, access in filesystem_roots.items()
             )
             overrides.extend([
                 "features.shell_tool=true",
@@ -610,9 +629,14 @@ class CodexSDKClient:
                 + "Read only these declared snapshot roots: " + ", ".join(self.allowed_read_roots)
             )
         else:
+            scoped = (
+                " Batch sessions may add denied Raw and temporary read-only source-view subtrees "
+                "through this same profile."
+                if self.writer_filesystem_access else ""
+            )
             read_contract = (
                 "\n\nWriter filesystem contract: shell and file tools are sandboxed to the current "
-                "KBC workspace, with process metadata and network access denied."
+                "KBC workspace, with process metadata and network access denied." + scoped
             )
         self._thread = await self._codex.thread_start(
             # KBC is an unattended compiler. auto_review still routes workspace
