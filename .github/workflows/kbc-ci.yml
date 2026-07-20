@@ -29,6 +29,11 @@ jobs:
       # executable; the bundled fallback is intentionally not trusted by that
       # host policy.
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      # GitHub's Ubuntu 24.04 image additionally blocks the network namespace
+      # that the fail-closed Codex profile requires. The production host must
+      # supply an equivalent bubblewrap/userns allowance; relax only this
+      # ephemeral runner so the real sandbox contract can be exercised.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: pip install -r kbc/platform/pod/requirements.txt
       - run: python test_compile_box.py
         working-directory: kbc/platform/pod
