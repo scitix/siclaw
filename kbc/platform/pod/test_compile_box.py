@@ -497,6 +497,74 @@ async def test_test_path_escape_guard():
         allow = await compile_guard({"tool_name": "Write", "tool_input": {"file_path": "candidate/a.md"}}, "c3", None)
         assert allow == {}, allow
 
+        # A PDF-slice map session may read its assigned Raw PDF only with the
+        # exact pages from the validated plan. The same guard leaves unrelated
+        # workspace reads alone.
+        pdf = root / "raw" / "manual.pdf"
+        pdf.touch()
+        pdf_guard = compile_box._make_compile_path_guard(
+            root,
+            pdf_page_ranges={
+                "manual.pdf": {"start_page": 21, "end_page": 40, "part": 2, "parts": 3}
+            },
+        )
+        allow = await pdf_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "raw/manual.pdf", "pages": "21-40"},
+        }, "p1", None)
+        assert allow == {}, allow
+        for tool_input in (
+            {"file_path": "raw/manual.pdf"},
+            {"file_path": str(pdf), "pages": "1-20"},
+        ):
+            deny = await pdf_guard({"tool_name": "Read", "tool_input": tool_input}, "p2", None)
+            assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await pdf_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "candidate/index.md"},
+        }, "p3", None)
+        assert allow == {}, allow
+
+        # Batch sessions are mechanically confined to the validated Raw list.
+        # A text-slice batch omits the original Markdown and may read only its
+        # helper; a regular/PDF source remains directly readable. Directory or
+        # cwd-wide Grep cannot bypass the per-file Read boundary.
+        (root / "raw" / "other.md").touch()
+        scoped_guard = compile_box._make_compile_path_guard(
+            root, raw_read_allowlist=["manual.pdf"])
+        allow = await scoped_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "raw/manual.pdf"},
+        }, "s1", None)
+        assert allow == {}, allow
+        allow = await scoped_guard({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "candidate/index.md"},
+        }, "s2", None)
+        assert allow == {}, allow
+        for tool_name, tool_input in (
+            ("Read", {"file_path": "raw/other.md"}),
+            ("Grep", {"pattern": "secret"}),
+            ("Grep", {"path": ".", "pattern": "secret"}),
+            ("Grep", {"path": "raw", "pattern": "secret"}),
+            ("Grep", {"path": "raw/other.md", "pattern": "secret"}),
+        ):
+            deny = await scoped_guard({
+                "tool_name": tool_name, "tool_input": tool_input,
+            }, "s3", None)
+            assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+        allow = await scoped_guard({
+            "tool_name": "Grep",
+            "tool_input": {"path": "raw/manual.pdf", "pattern": "needle"},
+        }, "s4", None)
+        assert allow == {}, allow
+        deny_all_raw = compile_box._make_compile_path_guard(
+            root, raw_read_allowlist=[])
+        deny = await deny_all_raw({
+            "tool_name": "Read", "tool_input": {"file_path": "raw/manual.pdf"},
+        }, "s5", None)
+        assert deny["hookSpecificOutput"]["permissionDecision"] == "deny", deny
+
         # The recommendation session is narrower than a compiler: only raw/
         # and candidate/ may inform the proposed test. Internal workflow,
         # evaluation and release artifacts remain invisible to the red team.
@@ -2264,7 +2332,8 @@ async def test_batch_orchestrator_routing_and_resume():
         # stub the session driver: record directives, pretend each session works
         driven: list[str] = []
 
-        async def fake_drive(run_, directive, label):
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_read_allowlist=None):
             driven.append(label + "|" + directive.split("\n")[0])
             return f"done {label}"
 
@@ -2318,6 +2387,28 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+def test_small_kb_batch_gate_skips_poppler_metadata():
+    """Ordinary compile routing keeps the pre-PDF-slicing cheap scan. Poppler
+    metadata is execution detail for a selected batch plan, never a new cost on
+    every small-KB compile trigger."""
+    import batching
+
+    real_pdfinfo = batching._pdfinfo_page_count
+    try:
+        batching._pdfinfo_page_count = lambda path: (_ for _ in ()).throw(
+            AssertionError("pdfinfo must not run in the small-KB route gate"))
+        with tempfile.TemporaryDirectory() as td:
+            raw = Path(td) / "raw"
+            raw.mkdir()
+            (raw / "small.pdf").write_bytes(b"%PDF-1.7 /Type /Page")
+            run = compile_box.CompileRun("small-pdf-route", td, 1)
+            assert not compile_box._should_route_to_batch(
+                run, "", action="compile.generate")
+    finally:
+        batching._pdfinfo_page_count = real_pdfinfo
+    print("\u2713 small KB route: no Poppler metadata subprocess")
+
+
 def test_hierarchical_text_slice_materialization_and_directive():
     """Oversized-text helpers are bounded, ephemeral views of Raw. The model
     reads the helper, but durable Candidate provenance still names the original
@@ -2357,7 +2448,6 @@ def test_hierarchical_text_slice_materialization_and_directive():
         assert "本批绝不要直接打开原 Raw 全文" in directive, directive
         assert "compiled_from 必须引用原 Raw 路径(raw/gpu/manual.md)" in directive, directive
         assert "compiled_from 必须引用原 Raw 路径(.kbc-batch-slices" not in directive
-
         # A completed map batch is durable history, not a future model turn.
         # If its Raw source disappears before reduce/final resumes, rebuilding
         # its ephemeral slice would make the train fail forever even though the
@@ -2366,6 +2456,25 @@ def test_hierarchical_text_slice_materialization_and_directive():
         source.unlink()
         compile_box._materialize_batch_slices(run, {"batches": [batch]})
         assert not helper.exists()
+
+        assert compile_box._batch_raw_read_allowlist(batch) == []
+
+        regular = {
+            "sources": ["gpu/spec.md", "gpu/manual.pdf"],
+            "context_sources": ["gpu/anchor.md"],
+            "source_ranges": {
+                "gpu/spec.md": {
+                    "start_line": 1,
+                    "end_line": 2,
+                    "part": 1,
+                    "parts": 2,
+                    "slice_file": ".kbc-batch-slices/spec-p001.md",
+                }
+            },
+        }
+        assert compile_box._batch_raw_read_allowlist(regular) == [
+            "gpu/anchor.md", "gpu/manual.pdf",
+        ]
     print("\u2713 hierarchical text slices: bounded helper with original-Raw provenance")
 
 
@@ -2406,6 +2515,167 @@ def test_hierarchical_resume_state_contract():
         else:
             raise AssertionError("complete batch plan must not be resumable")
     print("\u2713 hierarchical resume: typed command covers map/reduce/final only")
+
+
+def test_hierarchical_pdf_page_directive():
+    """A PDF slice stays on its original Raw identity while the directive
+    requires the exact validated Read.pages range."""
+    batch = {
+        "id": "h042",
+        "sources": ["gpu/manual.pdf"],
+        "context_sources": [],
+        "source_page_ranges": {
+            "gpu/manual.pdf": {
+                "start_page": 41,
+                "end_page": 53,
+                "part": 3,
+                "parts": 3,
+            }
+        },
+        "defer_accounting": False,
+    }
+    previous_engine = os.environ.get("KBC_ENGINE")
+    os.environ["KBC_ENGINE"] = "claude_agent_sdk"
+    try:
+        directive = compile_box._compose_batch_directive(batch, 42, 50, "", "en")
+        assert "raw/gpu/manual.pdf (PDF pages 41-53, part 3/3)" in directive, directive
+        assert '`pages: "41-53"`' in directive, directive
+        assert "EXACT listed range" in directive, directive
+        assert "compiled_from must cite the original Raw PDF path (raw/gpu/manual.pdf)" in directive
+
+        directive_zh = compile_box._compose_batch_directive(batch, 42, 50, "", "zh-CN")
+        assert '`pages: "41-53"`' in directive_zh, directive_zh
+        assert "Read 工具的 `pages` 参数必须严格等于清单页段" in directive_zh, directive_zh
+        assert "compiled_from 必须引用原 Raw PDF 路径(raw/gpu/manual.pdf)" in directive_zh
+    finally:
+        if previous_engine is None:
+            os.environ.pop("KBC_ENGINE", None)
+        else:
+            os.environ["KBC_ENGINE"] = previous_engine
+    print("\u2713 hierarchical PDF slices: exact Read.pages directive and Raw provenance")
+
+
+async def test_codex_batch_scope_and_pdf_page_tool():
+    """Codex gets the same batch Raw boundary through its filesystem profile;
+    a page-sliced PDF is withheld from shell and exposed only through a fixed
+    host-side Poppler tool."""
+    previous_engine = os.environ.get("KBC_ENGINE")
+    original_client = compile_box.CodexSDKClient
+    original_client_factory = compile_box._compile_session_client
+    original_which = compile_box.shutil.which
+    original_run = compile_box.subprocess.run
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class FakeResult:
+        returncode = 0
+        stdout = "page forty-one\npage forty-two\n"
+        stderr = ""
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw" / "gpu").mkdir(parents=True)
+            (root / "raw" / "gpu" / "manual.pdf").write_bytes(b"%PDF-test")
+            (root / "raw" / "gpu" / "anchor.md").write_text("anchor")
+            page_ranges = {
+                "gpu/manual.pdf": {
+                    "start_page": 41,
+                    "end_page": 53,
+                    "part": 3,
+                    "parts": 3,
+                }
+            }
+            allowlist = ["gpu/anchor.md", "gpu/manual.pdf"]
+            source_view = compile_box._materialize_codex_batch_source_view(
+                root, allowlist, page_ranges, "test-session")
+            assert source_view is not None
+            assert (source_view / "gpu" / "anchor.md").read_text() == "anchor"
+            assert not (source_view / "gpu" / "manual.pdf").exists()
+            access = compile_box._codex_batch_filesystem_access(
+                root, allowlist, source_view)
+            assert access == {
+                str((root / "raw").resolve()): "deny",
+                str(source_view.resolve()): "read",
+            }
+            note = compile_box._codex_batch_source_view_note(
+                root, source_view, allowlist, page_ranges, "en")
+            assert "raw/gpu/anchor.md -> .kbc-batch-sources-test-session/gpu/anchor.md" in note
+            assert "compiled_from must still cite the original raw/... path" in note
+
+            os.environ["KBC_ENGINE"] = "codex_sdk"
+            compile_box.CodexSDKClient = FakeClient
+            run = compile_box.CompileRun("codex-pdf-slice", td, 1)
+            client = compile_box._compile_session_client(
+                run, td, "system", "session",
+                pdf_page_ranges=page_ranges,
+                raw_read_allowlist=allowlist,
+                codex_source_view=source_view,
+            )
+            assert isinstance(client, FakeClient)
+            assert captured["writer_filesystem_access"] == access
+            pdf_tools = [
+                item for item in captured["tools"]
+                if item.name == "read_assigned_pdf_pages"
+            ]
+            assert len(pdf_tools) == 1
+
+            observed_commands = []
+            compile_box.shutil.which = lambda name: "/usr/bin/pdftotext" if name == "pdftotext" else None
+
+            def fake_run(command, **kwargs):
+                observed_commands.append(command)
+                return FakeResult()
+
+            compile_box.subprocess.run = fake_run
+            extracted = await pdf_tools[0].handler({})
+            assert "raw/gpu/manual.pdf (PDF pages 41-53)" in extracted
+            assert observed_commands and observed_commands[0][1:5] == ["-f", "41", "-l", "53"]
+
+            batch = {
+                "id": "h042",
+                "sources": ["gpu/manual.pdf"],
+                "context_sources": [],
+                "source_page_ranges": page_ranges,
+                "defer_accounting": False,
+            }
+            directive = compile_box._compose_batch_directive(batch, 42, 50, "", "en")
+            assert "read_assigned_pdf_pages" in directive
+            assert "mechanically hidden from shell/file tools" in directive
+            assert "Read tool's `pages`" not in directive
+
+            cleanup = {}
+
+            def exploding_factory(*args, codex_source_view=None, **kwargs):
+                cleanup["view"] = codex_source_view
+                raise RuntimeError("client construction failed")
+
+            compile_box._compile_session_client = exploding_factory
+            try:
+                await compile_box._drive_batch_session(
+                    run, "compile anchor", "cleanup probe",
+                    raw_read_allowlist=["gpu/anchor.md"],
+                )
+                raise AssertionError("expected client construction failure")
+            except RuntimeError as error:
+                assert str(error) == "client construction failed"
+            finally:
+                compile_box._compile_session_client = original_client_factory
+            assert cleanup["view"] is not None
+            assert not cleanup["view"].exists()
+    finally:
+        compile_box.CodexSDKClient = original_client
+        compile_box._compile_session_client = original_client_factory
+        compile_box.shutil.which = original_which
+        compile_box.subprocess.run = original_run
+        if previous_engine is None:
+            os.environ.pop("KBC_ENGINE", None)
+        else:
+            os.environ["KBC_ENGINE"] = previous_engine
+    print("\u2713 Codex batch scope: Raw deny-by-default + fixed PDF page tool")
 
 
 async def test_hierarchical_batch_plan_and_section_reduce():
@@ -2452,10 +2722,13 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             run = compile_box.CompileRun("hier-run", str(wd), 1)
             driven: list[str] = []
             observed_idle_timeouts: list[float | None] = []
+            observed_raw_allowlists: list[tuple[str, list[str] | None]] = []
 
-            async def fake_drive(run_, directive, label):
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                                 raw_read_allowlist=None):
                 driven.append(label + "|" + directive.splitlines()[0])
                 observed_idle_timeouts.append(run_._model_idle_timeout_s)
+                observed_raw_allowlists.append((label, raw_read_allowlist))
                 if label.startswith("batch ") or label.startswith("批 "):
                     candidate = wd / "candidate"
                     candidate.mkdir(exist_ok=True)
@@ -2478,6 +2751,12 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             assert sum(item.startswith("batch ") for item in driven) == 2, driven
             assert sum(item.startswith("section reduce ") for item in driven) == 1, driven
             assert driven[-1].startswith("final review"), driven
+            assert observed_raw_allowlists[:2] == [
+                ("batch 1/2", ["gpu/a.md"]),
+                ("batch 2/2", ["gpu/b.md"]),
+            ], observed_raw_allowlists
+            assert all(allowed == [] for label, allowed in observed_raw_allowlists[2:]
+                       if label.startswith(("section reduce ", "final review"))), observed_raw_allowlists
             assert set(observed_idle_timeouts) == {
                 max(compile_box._MODEL_IDLE_TIMEOUT_S, 123)
             }, observed_idle_timeouts
@@ -2584,7 +2863,8 @@ async def test_hierarchical_media_rechecks_after_ledger_repair():
             order: list[str] = []
             media_calls = 0
 
-            async def fake_drive(run_, directive, label):
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                                 raw_read_allowlist=None):
                 order.append(f"drive:{label}")
                 if label == "final review":
                     assert "do not read raw/" in directive, directive
@@ -2687,7 +2967,8 @@ async def test_batch_orchestrator_review_fixes():
             run = compile_box.CompileRun("rf1", str(wd), 1)
             driven: list[str] = []
 
-            async def fake_drive(run_, directive, label):
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                                 raw_read_allowlist=None):
                 driven.append(f"{label}|{directive}")
                 return f"done {label}"
 
@@ -2708,7 +2989,8 @@ async def test_batch_orchestrator_review_fixes():
             (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
             run = compile_box.CompileRun("rf2", str(wd), 1)
 
-            async def boom(run_, directive, label):
+            async def boom(run_, directive, label, pdf_page_ranges=None,
+                           raw_read_allowlist=None):
                 raise RuntimeError("session exploded")
 
             compile_box._drive_batch_session = boom
@@ -2725,7 +3007,8 @@ async def test_batch_orchestrator_review_fixes():
             run = compile_box.CompileRun("rf3", str(wd), 1)
             driven = []
 
-            async def drive_and_note(run_, directive, label):
+            async def drive_and_note(run_, directive, label, pdf_page_ranges=None,
+                                     raw_read_allowlist=None):
                 driven.append(f"{label}|{directive}")
                 if label == "final review":  # owner speaks while the tail is running
                     run_._batch_notes.append("附录不要发布")
@@ -2747,7 +3030,8 @@ async def test_batch_orchestrator_review_fixes():
             run.locale = "zh"
             driven = []
 
-            async def fake_zh(run_, directive, label):
+            async def fake_zh(run_, directive, label, pdf_page_ranges=None,
+                              raw_read_allowlist=None):
                 driven.append(f"{label}|{directive}")
                 return f"done {label}"
 
@@ -3496,8 +3780,11 @@ async def main():
     await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
+    test_small_kb_batch_gate_skips_poppler_metadata()
     test_hierarchical_text_slice_materialization_and_directive()
     test_hierarchical_resume_state_contract()
+    test_hierarchical_pdf_page_directive()
+    await test_codex_batch_scope_and_pdf_page_tool()
     await test_hierarchical_batch_plan_and_section_reduce()
     test_hierarchical_media_verify_round_limit()
     await test_hierarchical_media_rechecks_after_ledger_repair()

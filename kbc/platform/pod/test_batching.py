@@ -99,6 +99,50 @@ def test_hierarchical_pack_keeps_document_assets_together(tmp_path):
     ) == []
 
 
+def test_hierarchical_family_links_exact_original_attachment_and_sidecar(tmp_path):
+    raw = _mk(
+        tmp_path,
+        {
+            "gpu/14-manual (pdf附件).md": 100,
+            "gpu/14-manual (pdf附件).assets/page-001.jpg": 1_000,
+            "_attachments/gpu/manual.pdf": 1_000,
+            "_attachments/gpu/manual.pdf.md": 100,
+            "_attachments/other/manual.pdf": 1_000,
+        },
+    )
+    families = bt.source_families(bt.scan_sources(raw))
+    linked = next(
+        family for family in families
+        if family[0]["path"] == "gpu/14-manual (pdf附件).md"
+    )
+    assert [item["path"] for item in linked] == [
+        "gpu/14-manual (pdf附件).md",
+        "_attachments/gpu/manual.pdf",
+        "_attachments/gpu/manual.pdf.md",
+        "gpu/14-manual (pdf附件).assets/page-001.jpg",
+    ]
+    assert any(
+        [item["path"] for item in family] == ["_attachments/other/manual.pdf"]
+        for family in families
+    )
+
+
+def test_hierarchical_family_does_not_guess_ambiguous_attachment_anchor(tmp_path):
+    raw = _mk(
+        tmp_path,
+        {
+            "gpu/14-manual (pdf附件).md": 100,
+            "gpu/manual (pdf附件).md": 100,
+            "_attachments/gpu/manual.pdf": 1_000,
+        },
+    )
+    families = bt.source_families(bt.scan_sources(raw))
+    assert any(
+        [item["path"] for item in family] == ["_attachments/gpu/manual.pdf"]
+        for family in families
+    )
+
+
 def test_hierarchical_pack_splits_oversized_family_with_anchor_context(tmp_path):
     raw = _mk(
         tmp_path,
@@ -197,6 +241,77 @@ def test_hierarchical_oversized_text_anchor_is_sliced_before_image_chunks(tmp_pa
     errors = bt.validate_plan(
         broken, inv, budget=1024 * 1024, text_budget=128 * 1024)
     assert any("not contiguous" in error for error in errors), errors
+
+
+def test_hierarchical_pdf_is_split_into_contiguous_read_page_ranges(tmp_path):
+    raw = _mk(tmp_path, {})
+    pdf = raw / "docs/manual.pdf"
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.7 /Type /Pages " + b"/Type /Page 1 " * 45)
+    inv = bt.scan_sources(raw)
+    item = inv[0]
+    assert item["page_count"] == 45
+    assert len(item["pdf_slices"]) == 3
+    batches = bt.pack_hierarchical_batches(inv)
+    ranges = [batch["source_page_ranges"]["docs/manual.pdf"] for batch in batches]
+    assert [(r["start_page"], r["end_page"]) for r in ranges] == [
+        (1, 20), (21, 40), (41, 45)]
+    assert [batch["defer_accounting"] for batch in batches] == [True, True, False]
+    plan = bt.build_plan(inv, batches, planner="hierarchical-code")
+    assert plan["version"] == 4
+    assert bt.validate_plan(plan, inv) == []
+
+    broken = bt.build_plan(
+        inv, [dict(batch) for batch in batches], planner="hierarchical-code")
+    middle = broken["batches"][1]
+    middle["source_page_ranges"] = {
+        "docs/manual.pdf": dict(middle["source_page_ranges"]["docs/manual.pdf"])
+    }
+    middle["source_page_ranges"]["docs/manual.pdf"]["start_page"] = 22
+    errors = bt.validate_plan(broken, inv)
+    assert any("not contiguous" in error for error in errors), errors
+
+
+def test_hierarchical_pdf_slice_configuration_cannot_exceed_read_limit(tmp_path):
+    previous = os.environ.get("KBC_HIERARCHICAL_PDF_SLICE_PAGES")
+    try:
+        os.environ["KBC_HIERARCHICAL_PDF_SLICE_PAGES"] = "99"
+        assert bt.hierarchical_pdf_slice_pages() == 20
+        assert [(item["start_page"], item["end_page"]) for item in bt._pdf_slices(41)] == [
+            (1, 20), (21, 40), (41, 41),
+        ]
+        os.environ["KBC_HIERARCHICAL_PDF_SLICE_PAGES"] = "7"
+        assert bt.hierarchical_pdf_slice_pages() == 7
+    finally:
+        if previous is None:
+            os.environ.pop("KBC_HIERARCHICAL_PDF_SLICE_PAGES", None)
+        else:
+            os.environ["KBC_HIERARCHICAL_PDF_SLICE_PAGES"] = previous
+
+
+def test_linked_original_pdf_ranges_run_before_derived_page_images(tmp_path):
+    raw = _mk(
+        tmp_path,
+        {
+            "gpu/14-manual (pdf附件).md": 100,
+            "gpu/14-manual (pdf附件).assets/page-001.jpg": 1_000,
+        },
+    )
+    pdf = raw / "_attachments/gpu/manual.pdf"
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.7 /Type /Pages " + b"/Type /Page 1 " * 45)
+    inv = bt.scan_sources(raw)
+    batches = bt.pack_hierarchical_batches(inv)
+    anchor_index = next(
+        i for i, batch in enumerate(batches)
+        if "gpu/14-manual (pdf附件).md" in batch["sources"])
+    pdf_indexes = [i for i, batch in enumerate(batches) if batch.get("source_page_ranges")]
+    image_index = next(
+        i for i, batch in enumerate(batches)
+        if "gpu/14-manual (pdf附件).assets/page-001.jpg" in batch["sources"])
+    assert anchor_index < min(pdf_indexes) < max(pdf_indexes) < image_index
+    plan = bt.build_plan(inv, batches, planner="hierarchical-code")
+    assert bt.validate_plan(plan, inv) == []
 
 
 def test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries(tmp_path):
@@ -321,6 +436,32 @@ def test_pdf_fallback_when_no_markers(tmp_path: Path):
     assert 30 * 1024 <= eff <= 400 * 1024  # clamped byte heuristic
 
 
+def test_pdfinfo_page_count_parser(tmp_path: Path):
+    del tmp_path
+    match = bt._PDFINFO_PAGES_RE.search(
+        "Title:          GPU Manual\nPages:          112\nEncrypted:      no\n"
+    )
+    assert match is not None and int(match.group(1)) == 112
+
+
+def test_pdfinfo_metadata_does_not_move_effective_size_route(tmp_path: Path):
+    raw = _mk(tmp_path, {})
+    raw.mkdir()
+    pdf = raw / "opaque.pdf"
+    pdf.write_bytes(b"%PDF-1.7 compressed-object-streams " + b"q" * 2_000_000)
+    real_pdfinfo = bt._pdfinfo_page_count
+    bt._pdfinfo_page_count = lambda path: 50
+    try:
+        item = bt.scan_sources(raw)[0]
+    finally:
+        bt._pdfinfo_page_count = real_pdfinfo
+    assert item["page_count"] == 50
+    assert len(item["pdf_slices"]) == 3
+    # Baseline byte fallback: max(30KB, min(10% of 2MB, 400KB)). If Poppler
+    # leaked into routing this would instead be 50 * 8KB.
+    assert item["effective"] == int(pdf.stat().st_size * 0.1)
+
+
 def test_plan_fragmentation_guard(tmp_path: Path):
     base = [{"id": f"b{i:02d}", "sources": [f"s{i}"]} for i in range(14)]
     ok_model = [{"id": f"m{i:02d}", "sources": [f"s{i}"]} for i in range(16)]      # 14→16: fine
@@ -389,11 +530,16 @@ def main():
         test_pack_groups_by_top_dir_and_budget,
         test_pack_oversized_single_file_gets_own_batch,
         test_hierarchical_pack_keeps_document_assets_together,
+        test_hierarchical_family_links_exact_original_attachment_and_sidecar,
+        test_hierarchical_family_does_not_guess_ambiguous_attachment_anchor,
         test_hierarchical_pack_splits_oversized_family_with_anchor_context,
         test_validate_hierarchical_context_is_known_and_budgeted,
         test_hierarchical_text_cap_preserves_session_context_safety,
         test_hierarchical_large_anchor_is_not_replayed_into_every_image_chunk,
         test_hierarchical_oversized_text_anchor_is_sliced_before_image_chunks,
+        test_hierarchical_pdf_is_split_into_contiguous_read_page_ranges,
+        test_hierarchical_pdf_slice_configuration_cannot_exceed_read_limit,
+        test_linked_original_pdf_ranges_run_before_derived_page_images,
         test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries,
         test_validate_plan_accepts_code_baseline,
         test_validate_plan_rejects_missing_duplicate_unknown_overflow,
@@ -405,6 +551,8 @@ def main():
         test_effective_weights_images_pdf_binary,
         test_pack_uses_effective_not_raw_bytes,
         test_pdf_fallback_when_no_markers,
+        test_pdfinfo_page_count_parser,
+        test_pdfinfo_metadata_does_not_move_effective_size_route,
         test_plan_fragmentation_guard,
     ]
     for fn in tests:
