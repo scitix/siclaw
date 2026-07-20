@@ -371,6 +371,10 @@ def _remove_path(path: Path) -> None:
 
 
 def _swap_raw(workdir: Path, staging: Path, mark_committed: Callable[[], None]) -> None:
+    # Concurrency contract: commit_snapshot and this rename sequence run
+    # synchronously on the compile-box event loop, and the HTTP handler rejects
+    # commits after a run becomes live. Do not offload or make this path async
+    # without first adding a per-workdir lock around the complete swap/rollback.
     raw = workdir / "raw"
     drop = workdir / "drop"
     backup = workdir / f".raw-backup-{uuid.uuid4().hex}"

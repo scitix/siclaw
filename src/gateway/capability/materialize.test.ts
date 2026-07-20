@@ -236,7 +236,9 @@ describe("materializeCapabilityInputs", () => {
     const { client, backend, posts } = fakes({
       raw: { bundle_base64: "UkFX", input_revision: "current-but-not-installed" },
       workspace: { bundle_base64: "V1M=" },
-      sourcesError: new Error("AgentBox request failed: 409 run r1 already exists"),
+      sourcesError: new Error(
+        'AgentBox request failed: 409 {"error":"run already exists; upload sources before /session","run_id":"r1"}',
+      ),
     });
     const result = await materializeCapabilityInputs({ client, backend, runId: "r1" });
 
@@ -245,10 +247,11 @@ describe("materializeCapabilityInputs", () => {
     expect(result.inputRevision).toBeUndefined(); // keep the run's recovered checkpoint
   });
 
-  it("live box detected via structured err.status (message wording independent)", async () => {
-    // The client attaches err.status; a reworded message with no "failed: 409"
-    // substring must still be recognized as box-already-live (finding E).
-    const err = Object.assign(new Error("conflict: box already holds this run"), { status: 409 });
+  it("live box detected via stable conflict code (message wording independent)", async () => {
+    const err = Object.assign(new Error("conflict: box already holds this run"), {
+      status: 409,
+      code: "KBC_RUN_ALREADY_LIVE",
+    });
     const { client, backend, posts } = fakes({
       raw: { bundle_base64: "UkFX" },
       workspace: { bundle_base64: "V1M=" },
@@ -256,6 +259,39 @@ describe("materializeCapabilityInputs", () => {
     });
     await materializeCapabilityInputs({ client, backend, runId: "r1" });
 
+    expect(posts).toEqual([]);
+    expect(backend.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("Source Snapshot v2 treats an untagged 409 as an install conflict, not a live reattach", async () => {
+    const snapshot = {
+      version: 2 as const,
+      manifest_sha256: "f".repeat(64),
+      total_bytes: 3,
+      file_count: 1,
+      parts: [{
+        part_id: "part-000001",
+        sha256: "a".repeat(64),
+        bundle_size_bytes: 10,
+        unpacked_size_bytes: 3,
+        file_count: 1,
+        files: [{ path: "a.md", size_bytes: 3, sha256: "1".repeat(64) }],
+      }],
+    };
+    const conflict = Object.assign(
+      new Error("AgentBox request failed: 409 source snapshot descriptor changed for the same run and revision"),
+      { status: 409, code: "CONFLICT" },
+    );
+    const { client, backend, posts } = fakes({
+      raw: { source_snapshot: snapshot, input_revision: "manifest-2" },
+      sourcesError: conflict,
+    });
+
+    await expect(materializeCapabilityInputs({ client, backend, runId: "r2" })).rejects.toMatchObject({
+      name: "CapabilityMaterializationError",
+      stage: "source-install",
+      cause: expect.objectContaining({ status: 409, code: "CONFLICT" }),
+    });
     expect(posts).toEqual([]);
     expect(backend.request).toHaveBeenCalledTimes(1);
   });

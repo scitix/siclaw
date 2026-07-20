@@ -72,11 +72,19 @@ export class CapabilityMaterializationError extends Error {
   }
 }
 
+const BOX_RUN_ALREADY_LIVE = "KBC_RUN_ALREADY_LIVE";
+const LEGACY_BOX_RUN_ALREADY_LIVE = "run already exists; upload sources before /session";
+
 function isBoxAlreadyLive(err: unknown): boolean {
-  const status = (err as { status?: unknown } | null)?.status;
-  if (status === 409) return true;
+  const metadata = err as { status?: unknown; code?: unknown } | null;
+  const status = metadata?.status;
+  if (status === 409 && metadata?.code === BOX_RUN_ALREADY_LIVE) return true;
   const message = err instanceof Error ? err.message : String(err);
-  return typeof status !== "number" && message.includes("failed: 409");
+  // Rolling-upgrade compatibility for boxes that predate the stable conflict
+  // code. Match the exact legacy live-run text as well as the 409; Source
+  // Snapshot v2 deliberately uses 409 for persisted-state conflicts too.
+  return message.includes(LEGACY_BOX_RUN_ALREADY_LIVE)
+    && (status === 409 || (typeof status !== "number" && message.includes("failed: 409")));
 }
 
 function hasSourceInput(src: CapabilityFetchInputResponse | null | undefined): boolean {

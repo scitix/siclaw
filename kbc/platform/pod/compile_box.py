@@ -3837,16 +3837,15 @@ async def handle_session(request: web.Request):
 
 
 async def handle_sources(request: web.Request):
-    body = await request.json()
-    run_id = body.get("run_id")
-    if run_id and run_id in RUNS:
-        return web.json_response({"error": "run already exists; upload sources before /session", "run_id": run_id}, status=409)
-
-    encoded = body.get("bundle_base64") or body.get("bundle_b64")
-    if not encoded:
-        return web.json_response({"error": "bundle_base64 is required"}, status=400)
-
     try:
+        body = await _source_request_body(request)
+        run_id = body.get("run_id")
+        conflict = _source_live_conflict(run_id)
+        if conflict is not None:
+            return conflict
+        encoded = body.get("bundle_base64") or body.get("bundle_b64")
+        if not encoded:
+            return web.json_response({"error": "bundle_base64 is required"}, status=400)
         bundle = base64.b64decode(encoded, validate=True)
         result = _install_source_bundle(bundle, body.get("workdir", "/work"), body.get("bundle_sha256"), locale=body.get("locale"))
     except (ValueError, TypeError) as e:
@@ -3861,19 +3860,36 @@ def _snapshot_request_identity(body: dict) -> tuple[str, str, str]:
     return body.get("workdir", "/work"), body.get("run_id"), body.get("input_revision")
 
 
-def _snapshot_live_conflict(run_id: str | None):
+async def _source_request_body(request: web.Request) -> dict:
+    try:
+        body = await request.json() if request.body_exists else {}
+    except (ValueError, UnicodeDecodeError, TypeError) as error:
+        raise ValueError("request body must be valid JSON") from error
+    if not isinstance(body, dict):
+        raise TypeError("request body must be a JSON object")
+    return body
+
+
+def _source_live_conflict(run_id: str | None):
     if run_id and run_id in RUNS:
-        return web.json_response({"error": "run already exists; upload sources before /session", "run_id": run_id}, status=409)
+        return web.json_response({
+            "error": {
+                "code": "KBC_RUN_ALREADY_LIVE",
+                "message": "run already exists; upload sources before /session",
+                "retriable": False,
+                "details": {"run_id": run_id},
+            },
+        }, status=409)
     return None
 
 
 async def handle_sources_begin(request: web.Request):
-    body = await request.json()
-    workdir, run_id, input_revision = _snapshot_request_identity(body)
-    conflict = _snapshot_live_conflict(run_id)
-    if conflict is not None:
-        return conflict
     try:
+        body = await _source_request_body(request)
+        workdir, run_id, input_revision = _snapshot_request_identity(body)
+        conflict = _source_live_conflict(run_id)
+        if conflict is not None:
+            return conflict
         result = source_snapshot.begin_snapshot(workdir, run_id, input_revision, body.get("snapshot"))
     except source_snapshot.SnapshotConflict as error:
         return web.json_response({"error": str(error)}, status=409)
@@ -3883,9 +3899,9 @@ async def handle_sources_begin(request: web.Request):
 
 
 async def handle_sources_state(request: web.Request):
-    body = await request.json()
-    workdir, run_id, input_revision = _snapshot_request_identity(body)
     try:
+        body = await _source_request_body(request)
+        workdir, run_id, input_revision = _snapshot_request_identity(body)
         result = source_snapshot.snapshot_state(workdir, run_id, input_revision)
     except source_snapshot.SnapshotConflict as error:
         return web.json_response({"error": str(error)}, status=409)
@@ -3895,15 +3911,15 @@ async def handle_sources_state(request: web.Request):
 
 
 async def handle_sources_part(request: web.Request):
-    body = await request.json()
-    workdir, run_id, input_revision = _snapshot_request_identity(body)
-    conflict = _snapshot_live_conflict(run_id)
-    if conflict is not None:
-        return conflict
-    encoded = body.get("bundle_base64") or body.get("bundle_b64")
-    if not encoded:
-        return web.json_response({"error": "bundle_base64 is required"}, status=400)
     try:
+        body = await _source_request_body(request)
+        workdir, run_id, input_revision = _snapshot_request_identity(body)
+        conflict = _source_live_conflict(run_id)
+        if conflict is not None:
+            return conflict
+        encoded = body.get("bundle_base64") or body.get("bundle_b64")
+        if not encoded:
+            return web.json_response({"error": "bundle_base64 is required"}, status=400)
         bundle = base64.b64decode(encoded, validate=True)
         result = source_snapshot.install_part(
             workdir,
@@ -3921,12 +3937,12 @@ async def handle_sources_part(request: web.Request):
 
 
 async def handle_sources_commit(request: web.Request):
-    body = await request.json()
-    workdir, run_id, input_revision = _snapshot_request_identity(body)
-    conflict = _snapshot_live_conflict(run_id)
-    if conflict is not None:
-        return conflict
     try:
+        body = await _source_request_body(request)
+        workdir, run_id, input_revision = _snapshot_request_identity(body)
+        conflict = _source_live_conflict(run_id)
+        if conflict is not None:
+            return conflict
         result = source_snapshot.commit_snapshot(
             workdir,
             run_id,
