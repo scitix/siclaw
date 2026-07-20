@@ -2357,7 +2357,55 @@ def test_hierarchical_text_slice_materialization_and_directive():
         assert "本批绝不要直接打开原 Raw 全文" in directive, directive
         assert "compiled_from 必须引用原 Raw 路径(raw/gpu/manual.md)" in directive, directive
         assert "compiled_from 必须引用原 Raw 路径(.kbc-batch-slices" not in directive
+
+        # A completed map batch is durable history, not a future model turn.
+        # If its Raw source disappears before reduce/final resumes, rebuilding
+        # its ephemeral slice would make the train fail forever even though the
+        # batch's Candidate output has already landed.
+        batch["status"] = "done"
+        source.unlink()
+        compile_box._materialize_batch_slices(run, {"batches": [batch]})
+        assert not helper.exists()
     print("\u2713 hierarchical text slices: bounded helper with original-Raw provenance")
+
+
+def test_hierarchical_resume_state_contract():
+    """Typed resume accepts every unfinished hierarchical phase, including
+    reduce/final after all map batches are done, while complete stays closed."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "authoring").mkdir()
+        run = compile_box.CompileRun("hier-resume-state", str(wd), 1)
+        command = {"action": "compile.resume", "parameters": {}}
+        plan = {
+            "version": 3,
+            "mode": "hierarchical",
+            "batches": [{"id": "h001", "sources": ["done.md"], "status": "done"}],
+            "reductions": [],
+        }
+
+        for phase in ("map", "reduce", "final"):
+            plan["phase"] = phase
+            (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+            assert compile_box._batch_plan_resumable(plan), phase
+            compile_box._prepare_command(run, command)
+            assert compile_box._should_route_to_batch(
+                run, "ignored localized text", "compile.resume"
+            ), phase
+
+        plan["phase"] = "complete"
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        assert not compile_box._batch_plan_resumable(plan)
+        try:
+            compile_box._prepare_command(run, command)
+        except compile_box.CommandRejected as error:
+            assert error.status == 409
+            assert "no interrupted batch plan" in str(error)
+        else:
+            raise AssertionError("complete batch plan must not be resumable")
+    print("\u2713 hierarchical resume: typed command covers map/reduce/final only")
 
 
 async def test_hierarchical_batch_plan_and_section_reduce():
@@ -3449,6 +3497,7 @@ async def main():
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
     test_hierarchical_text_slice_materialization_and_directive()
+    test_hierarchical_resume_state_contract()
     await test_hierarchical_batch_plan_and_section_reduce()
     test_hierarchical_media_verify_round_limit()
     await test_hierarchical_media_rechecks_after_ledger_repair()
