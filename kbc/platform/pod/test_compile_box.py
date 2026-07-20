@@ -2534,17 +2534,148 @@ def test_hierarchical_pdf_page_directive():
         },
         "defer_accounting": False,
     }
-    directive = compile_box._compose_batch_directive(batch, 42, 50, "", "en")
-    assert "raw/gpu/manual.pdf (PDF pages 41-53, part 3/3)" in directive, directive
-    assert '`pages: "41-53"`' in directive, directive
-    assert "EXACT listed range" in directive, directive
-    assert "compiled_from must cite the original Raw PDF path (raw/gpu/manual.pdf)" in directive
+    previous_engine = os.environ.get("KBC_ENGINE")
+    os.environ["KBC_ENGINE"] = "claude_agent_sdk"
+    try:
+        directive = compile_box._compose_batch_directive(batch, 42, 50, "", "en")
+        assert "raw/gpu/manual.pdf (PDF pages 41-53, part 3/3)" in directive, directive
+        assert '`pages: "41-53"`' in directive, directive
+        assert "EXACT listed range" in directive, directive
+        assert "compiled_from must cite the original Raw PDF path (raw/gpu/manual.pdf)" in directive
 
-    directive_zh = compile_box._compose_batch_directive(batch, 42, 50, "", "zh-CN")
-    assert '`pages: "41-53"`' in directive_zh, directive_zh
-    assert "Read 工具的 `pages` 参数必须严格等于清单页段" in directive_zh, directive_zh
-    assert "compiled_from 必须引用原 Raw PDF 路径(raw/gpu/manual.pdf)" in directive_zh
+        directive_zh = compile_box._compose_batch_directive(batch, 42, 50, "", "zh-CN")
+        assert '`pages: "41-53"`' in directive_zh, directive_zh
+        assert "Read 工具的 `pages` 参数必须严格等于清单页段" in directive_zh, directive_zh
+        assert "compiled_from 必须引用原 Raw PDF 路径(raw/gpu/manual.pdf)" in directive_zh
+    finally:
+        if previous_engine is None:
+            os.environ.pop("KBC_ENGINE", None)
+        else:
+            os.environ["KBC_ENGINE"] = previous_engine
     print("\u2713 hierarchical PDF slices: exact Read.pages directive and Raw provenance")
+
+
+async def test_codex_batch_scope_and_pdf_page_tool():
+    """Codex gets the same batch Raw boundary through its filesystem profile;
+    a page-sliced PDF is withheld from shell and exposed only through a fixed
+    host-side Poppler tool."""
+    previous_engine = os.environ.get("KBC_ENGINE")
+    original_client = compile_box.CodexSDKClient
+    original_client_factory = compile_box._compile_session_client
+    original_which = compile_box.shutil.which
+    original_run = compile_box.subprocess.run
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class FakeResult:
+        returncode = 0
+        stdout = "page forty-one\npage forty-two\n"
+        stderr = ""
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw" / "gpu").mkdir(parents=True)
+            (root / "raw" / "gpu" / "manual.pdf").write_bytes(b"%PDF-test")
+            (root / "raw" / "gpu" / "anchor.md").write_text("anchor")
+            page_ranges = {
+                "gpu/manual.pdf": {
+                    "start_page": 41,
+                    "end_page": 53,
+                    "part": 3,
+                    "parts": 3,
+                }
+            }
+            allowlist = ["gpu/anchor.md", "gpu/manual.pdf"]
+            source_view = compile_box._materialize_codex_batch_source_view(
+                root, allowlist, page_ranges, "test-session")
+            assert source_view is not None
+            assert (source_view / "gpu" / "anchor.md").read_text() == "anchor"
+            assert not (source_view / "gpu" / "manual.pdf").exists()
+            access = compile_box._codex_batch_filesystem_access(
+                root, allowlist, source_view)
+            assert access == {
+                str((root / "raw").resolve()): "deny",
+                str(source_view.resolve()): "read",
+            }
+            note = compile_box._codex_batch_source_view_note(
+                root, source_view, allowlist, page_ranges, "en")
+            assert "raw/gpu/anchor.md -> .kbc-batch-sources-test-session/gpu/anchor.md" in note
+            assert "compiled_from must still cite the original raw/... path" in note
+
+            os.environ["KBC_ENGINE"] = "codex_sdk"
+            compile_box.CodexSDKClient = FakeClient
+            run = compile_box.CompileRun("codex-pdf-slice", td, 1)
+            client = compile_box._compile_session_client(
+                run, td, "system", "session",
+                pdf_page_ranges=page_ranges,
+                raw_read_allowlist=allowlist,
+                codex_source_view=source_view,
+            )
+            assert isinstance(client, FakeClient)
+            assert captured["writer_filesystem_access"] == access
+            pdf_tools = [
+                item for item in captured["tools"]
+                if item.name == "read_assigned_pdf_pages"
+            ]
+            assert len(pdf_tools) == 1
+
+            observed_commands = []
+            compile_box.shutil.which = lambda name: "/usr/bin/pdftotext" if name == "pdftotext" else None
+
+            def fake_run(command, **kwargs):
+                observed_commands.append(command)
+                return FakeResult()
+
+            compile_box.subprocess.run = fake_run
+            extracted = await pdf_tools[0].handler({})
+            assert "raw/gpu/manual.pdf (PDF pages 41-53)" in extracted
+            assert observed_commands and observed_commands[0][1:5] == ["-f", "41", "-l", "53"]
+
+            batch = {
+                "id": "h042",
+                "sources": ["gpu/manual.pdf"],
+                "context_sources": [],
+                "source_page_ranges": page_ranges,
+                "defer_accounting": False,
+            }
+            directive = compile_box._compose_batch_directive(batch, 42, 50, "", "en")
+            assert "read_assigned_pdf_pages" in directive
+            assert "mechanically hidden from shell/file tools" in directive
+            assert "Read tool's `pages`" not in directive
+
+            cleanup = {}
+
+            def exploding_factory(*args, codex_source_view=None, **kwargs):
+                cleanup["view"] = codex_source_view
+                raise RuntimeError("client construction failed")
+
+            compile_box._compile_session_client = exploding_factory
+            try:
+                await compile_box._drive_batch_session(
+                    run, "compile anchor", "cleanup probe",
+                    raw_read_allowlist=["gpu/anchor.md"],
+                )
+                raise AssertionError("expected client construction failure")
+            except RuntimeError as error:
+                assert str(error) == "client construction failed"
+            finally:
+                compile_box._compile_session_client = original_client_factory
+            assert cleanup["view"] is not None
+            assert not cleanup["view"].exists()
+    finally:
+        compile_box.CodexSDKClient = original_client
+        compile_box._compile_session_client = original_client_factory
+        compile_box.shutil.which = original_which
+        compile_box.subprocess.run = original_run
+        if previous_engine is None:
+            os.environ.pop("KBC_ENGINE", None)
+        else:
+            os.environ["KBC_ENGINE"] = previous_engine
+    print("\u2713 Codex batch scope: Raw deny-by-default + fixed PDF page tool")
 
 
 async def test_hierarchical_batch_plan_and_section_reduce():
@@ -3653,6 +3784,7 @@ async def main():
     test_hierarchical_text_slice_materialization_and_directive()
     test_hierarchical_resume_state_contract()
     test_hierarchical_pdf_page_directive()
+    await test_codex_batch_scope_and_pdf_page_tool()
     await test_hierarchical_batch_plan_and_section_reduce()
     test_hierarchical_media_verify_round_limit()
     await test_hierarchical_media_rechecks_after_ledger_repair()

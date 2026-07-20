@@ -165,6 +165,32 @@ async def test_codex_config_is_tenant_isolated():
             assert "process metadata and network access denied" in captured["thread"]["developer_instructions"]
             await writer.disconnect()
             assert not writer_home.exists() and not writer_shell_home.exists()
+
+            raw = Path(td) / "raw"
+            raw.mkdir()
+            view = Path(td) / ".kbc-batch-sources-test"
+            view.mkdir()
+            allowed = view / "allowed.md"
+            allowed.write_text("allowed", encoding="utf-8")
+            scoped = CodexSDKClient(
+                cwd=td,
+                system_prompt="scoped writer",
+                model="gpt-5.6-luna",
+                session_id="pending-scoped-writer",
+                writer_filesystem_access={
+                    str(raw): "deny",
+                    str(view): "read",
+                },
+            )
+            await scoped.connect()
+            scoped_overrides = set(captured["config"]["config_overrides"])
+            scoped_profile = next(
+                value for value in scoped_overrides if value.startswith("permissions.kbc_writer=")
+            )
+            assert f'"{raw.resolve()}" = "deny"' in scoped_profile, scoped_profile
+            assert f'"{view.resolve()}" = "read"' in scoped_profile, scoped_profile
+            assert "temporary read-only source-view subtrees" in captured["thread"]["developer_instructions"]
+            await scoped.disconnect()
     finally:
         if previous is None:
             sys.modules.pop("openai_codex", None)
@@ -189,6 +215,16 @@ async def test_real_codex_writer_sandbox_confines_commands():
             root = Path(td).resolve()
             workspace = root / "workspace"
             workspace.mkdir()
+            raw = workspace / "raw"
+            raw.mkdir()
+            allowed_raw = raw / "allowed.md"
+            denied_raw = raw / "denied.md"
+            allowed_raw.write_text("allowed-raw-sentinel", encoding="utf-8")
+            denied_raw.write_text("denied-raw-sentinel", encoding="utf-8")
+            source_view = workspace / ".kbc-batch-sources-probe"
+            source_view.mkdir()
+            allowed_view = source_view / "allowed.md"
+            allowed_view.write_text("allowed-raw-sentinel", encoding="utf-8")
             secret = root / "provider-secret.txt"
             secret_value = "writer-sandbox-secret-sentinel"
             secret.write_text(secret_value, encoding="utf-8")
@@ -238,6 +274,46 @@ async def test_real_codex_writer_sandbox_confines_commands():
                 assert secret_value not in process_metadata.stdout + process_metadata.stderr
             finally:
                 await client.disconnect()
+
+            scoped = CodexSDKClient(
+                cwd=str(workspace),
+                system_prompt="writer Raw scope probe",
+                model="gpt-5.6-luna",
+                session_id="writer-raw-scope-probe",
+                writer_filesystem_access={
+                    str(raw): "deny",
+                    str(source_view): "read",
+                },
+            )
+            try:
+                await scoped.connect()
+                rpc = scoped._codex._client
+                allowed_read = await rpc.request(
+                    "command/exec",
+                    {"command": ["/bin/cat", str(allowed_view)], "cwd": scoped.cwd},
+                    response_model=CommandExecResponse,
+                )
+                assert allowed_read.exit_code == 0
+                assert "allowed-raw-sentinel" in allowed_read.stdout
+                allowed_write = await rpc.request(
+                    "command/exec",
+                    {
+                        "command": ["/usr/bin/touch", str(allowed_view)],
+                        "cwd": scoped.cwd,
+                    },
+                    response_model=CommandExecResponse,
+                )
+                assert allowed_write.exit_code != 0
+                assert allowed_view.read_text(encoding="utf-8") == "allowed-raw-sentinel"
+                denied_read = await rpc.request(
+                    "command/exec",
+                    {"command": ["/bin/cat", str(denied_raw)], "cwd": scoped.cwd},
+                    response_model=CommandExecResponse,
+                )
+                assert denied_read.exit_code != 0
+                assert "denied-raw-sentinel" not in denied_read.stdout + denied_read.stderr
+            finally:
+                await scoped.disconnect()
     finally:
         for name, value in previous.items():
             if value is None:

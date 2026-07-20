@@ -272,6 +272,23 @@ def test_hierarchical_pdf_is_split_into_contiguous_read_page_ranges(tmp_path):
     assert any("not contiguous" in error for error in errors), errors
 
 
+def test_hierarchical_pdf_slice_configuration_cannot_exceed_read_limit(tmp_path):
+    previous = os.environ.get("KBC_HIERARCHICAL_PDF_SLICE_PAGES")
+    try:
+        os.environ["KBC_HIERARCHICAL_PDF_SLICE_PAGES"] = "99"
+        assert bt.hierarchical_pdf_slice_pages() == 20
+        assert [(item["start_page"], item["end_page"]) for item in bt._pdf_slices(41)] == [
+            (1, 20), (21, 40), (41, 41),
+        ]
+        os.environ["KBC_HIERARCHICAL_PDF_SLICE_PAGES"] = "7"
+        assert bt.hierarchical_pdf_slice_pages() == 7
+    finally:
+        if previous is None:
+            os.environ.pop("KBC_HIERARCHICAL_PDF_SLICE_PAGES", None)
+        else:
+            os.environ["KBC_HIERARCHICAL_PDF_SLICE_PAGES"] = previous
+
+
 def test_linked_original_pdf_ranges_run_before_derived_page_images(tmp_path):
     raw = _mk(
         tmp_path,
@@ -521,6 +538,7 @@ def main():
         test_hierarchical_large_anchor_is_not_replayed_into_every_image_chunk,
         test_hierarchical_oversized_text_anchor_is_sliced_before_image_chunks,
         test_hierarchical_pdf_is_split_into_contiguous_read_page_ranges,
+        test_hierarchical_pdf_slice_configuration_cannot_exceed_read_limit,
         test_linked_original_pdf_ranges_run_before_derived_page_images,
         test_hierarchical_image_cost_is_conservative_without_moving_flat_boundaries,
         test_validate_plan_accepts_code_baseline,

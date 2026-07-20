@@ -79,11 +79,12 @@ def _hierarchical_text_slice_bytes() -> int:
 
 def hierarchical_pdf_slice_pages() -> int:
     """Claude Code's Read tool accepts at most 20 PDF pages per call. Keep the
-    planner limit explicit and configurable for provider-specific deployments,
-    but never allow a zero-width slice."""
-    return max(1, int(os.environ.get(
+    planner limit configurable downwards for tighter deployments, but never
+    let configuration exceed the provider's hard limit or create a zero-width
+    slice."""
+    return min(DEFAULT_HIERARCHICAL_PDF_SLICE_PAGES, max(1, int(os.environ.get(
         "KBC_HIERARCHICAL_PDF_SLICE_PAGES",
-        str(DEFAULT_HIERARCHICAL_PDF_SLICE_PAGES))))
+        str(DEFAULT_HIERARCHICAL_PDF_SLICE_PAGES)))))
 
 
 def _text_slices(path: Path, size: int) -> tuple[int, list[dict[str, int]]] | None:
