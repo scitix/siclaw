@@ -193,10 +193,9 @@ class ClaudeEngine:
 class CodexEngine:
     """ReadonlyAgentEngine on the official Codex SDK.
 
-    The Codex runtime supplies its own read/search command workflow; KBC stages
-    independent copies of declared roots inside the single-run Pod and strips
-    all credentials from model-proposed subprocess environments. The caller
-    still owns structured output parsing and deterministic evidence validation.
+    KBC stages independent copies of declared roots and exposes only its own
+    root-confined read/search MCP tools. The caller still owns structured output
+    parsing and deterministic evidence validation.
     """
 
     def __init__(self):
@@ -281,6 +280,7 @@ class CodexEngine:
             model=model,
             session_id=str(uuid.uuid4()),
             read_only=True,
+            allowed_read_roots=[str(workspace)],
             reasoning_effort=effort,
             max_tool_calls=int(os.environ.get("KBC_PK_MAX_TURNS", "40")),
         )

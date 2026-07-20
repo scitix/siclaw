@@ -94,6 +94,7 @@ async def test_codex_config_is_tenant_isolated():
                 model="gpt-5.6-luna",
                 session_id="pending",
                 read_only=True,
+                allowed_read_roots=[td],
                 tools=[EngineTool("submit", "Submit", {"type": "object"}, submit)],
             )
             async def fake_callback_listener():
@@ -101,6 +102,7 @@ async def test_codex_config_is_tenant_isolated():
 
             client._start_callback_listener = fake_callback_listener
             home = Path(client._codex_home)
+            shell_home = Path(client._shell_home)
             await client.connect()
             overrides = set(captured["config"]["config_overrides"])
             assert 'model_providers.kbc_mass.wire_api="responses"' in overrides
@@ -109,7 +111,19 @@ async def test_codex_config_is_tenant_isolated():
             for feature in ("apps", "goals", "hooks", "memories", "multi_agent", "remote_plugin"):
                 assert f"features.{feature}=false" in overrides
             assert "features.code_mode.enabled=false" in overrides
-            assert "features.shell_tool=true" in overrides
+            assert "features.shell_tool=false" in overrides
+            assert "features.unified_exec=false" in overrides
+            assert 'default_permissions="kbc_readonly"' in overrides
+            resolved_root = str(Path(td).resolve())
+            assert (
+                f'permissions.kbc_readonly={{ filesystem = {{ "{resolved_root}" = "read" }}, '
+                'network = { enabled = false } }'
+            ) in overrides
+            assert "allow_login_shell=false" in overrides
+            assert f'shell_environment_policy.set.HOME="{shell_home}"' in overrides
+            assert str(shell_home) != str(home)
+            for tool_name in ("kbc_read_file", "kbc_glob_files", "kbc_grep_files", "submit"):
+                assert f'mcp_servers.kbc.tools.{tool_name}.approval_mode="approve"' in overrides
             assert 'mcp_servers.kbc.tools.submit.approval_mode="approve"' in overrides
             assert captured["config"]["env"] == {
                 "CODEX_HOME": str(home),
@@ -117,10 +131,27 @@ async def test_codex_config_is_tenant_isolated():
             }
             assert captured["thread"]["model_provider"] == "kbc_mass"
             assert captured["thread"]["approval_mode"] == "deny_all"
-            assert captured["thread"]["sandbox"] == "full-access"
+            assert captured["thread"]["sandbox"] is None
+            assert "native shell and file mutation are unavailable" in captured["thread"]["developer_instructions"]
             assert client.session_id == "thread-mass"
             await client.disconnect()
-            assert captured["closed"] is True and not home.exists()
+            assert captured["closed"] is True and not home.exists() and not shell_home.exists()
+
+            writer = CodexSDKClient(
+                cwd=td,
+                system_prompt="writer",
+                model="gpt-5.6-luna",
+                session_id="pending-writer",
+            )
+            writer_home = Path(writer._codex_home)
+            writer_shell_home = Path(writer._shell_home)
+            await writer.connect()
+            writer_overrides = set(captured["config"]["config_overrides"])
+            assert "features.shell_tool=true" in writer_overrides
+            assert 'default_permissions="kbc_readonly"' not in writer_overrides
+            assert captured["thread"]["sandbox"] == "full-access"
+            await writer.disconnect()
+            assert not writer_home.exists() and not writer_shell_home.exists()
     finally:
         if previous is None:
             sys.modules.pop("openai_codex", None)
@@ -160,7 +191,54 @@ async def test_codex_engine_stages_and_rewrites_roots():
 def test_error_redaction():
     assert "sk-live" not in _safe_error_message("401 for sk-liveTOKEN123456789")
     assert "[REDACTED]" in _safe_error_message("401 for sk-liveTOKEN123456789")
-    print("OK  Codex error messages redact API-key-shaped values")
+    mass_key = "tenant-token-without-sk-prefix"
+    assert mass_key not in _safe_error_message(f"401 for {mass_key}", (mass_key,))
+    assert "[REDACTED]" in _safe_error_message(f"401 for {mass_key}", (mass_key,))
+    print("OK  Codex error messages redact shaped and exact provider keys")
+
+
+async def test_readonly_file_tools_confine_paths_and_bound_output():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        allowed = base / "snapshot"
+        forbidden = base / "provider-secret.txt"
+        allowed.mkdir()
+        forbidden.write_text("mass-secret", encoding="utf-8")
+        (allowed / "docs").mkdir()
+        (allowed / "docs" / "a.md").write_text("Alpha\nneedle here\nOmega\n", encoding="utf-8")
+        (allowed / "docs" / "b.md").write_text("Needle again\n", encoding="utf-8")
+        (allowed / "escape").symlink_to(forbidden)
+        os.environ["KBC_CODEX_STATE_ROOT"] = td
+        client = CodexSDKClient(
+            cwd=str(allowed),
+            system_prompt="closed book",
+            model="gpt-5.6-luna",
+            session_id="readonly-tools",
+            read_only=True,
+            allowed_read_roots=[str(allowed)],
+        )
+        tools = client._tool_by_name
+        read = await tools["kbc_read_file"].handler({"path": "docs/a.md", "offset": 2, "limit": 1})
+        assert "2: needle here" in read and "3: Omega" not in read
+        globbed = await tools["kbc_glob_files"].handler({"pattern": "**/*.md"})
+        assert "docs/a.md" in globbed and "docs/b.md" in globbed
+        grepped = await tools["kbc_grep_files"].handler({"query": "needle", "pattern": "**/*.md"})
+        assert "docs/a.md:2" in grepped and "docs/b.md:1" in grepped
+
+        async def expect_denied(tool_name, args):
+            try:
+                await tools[tool_name].handler(args)
+            except ValueError as exc:
+                assert "outside" in str(exc) or "parent traversal" in str(exc)
+            else:
+                raise AssertionError(f"{tool_name} unexpectedly allowed {args}")
+
+        await expect_denied("kbc_read_file", {"path": "../provider-secret.txt"})
+        await expect_denied("kbc_read_file", {"path": str(forbidden)})
+        await expect_denied("kbc_read_file", {"path": "escape"})
+        await expect_denied("kbc_glob_files", {"pattern": "../*.txt"})
+        await client.disconnect()
+    print("OK  Codex read-only tools mechanically confine traversal, absolute paths and symlinks")
 
 
 async def test_codex_recommendation_uses_isolated_view_and_neutral_tool():
@@ -175,6 +253,7 @@ async def test_codex_recommendation_uses_isolated_view_and_neutral_tool():
 
         async def connect(self):
             cwd = Path(captured["cwd"])
+            assert captured["allowed_read_roots"] == [str(cwd)]
             assert (cwd / "raw" / "policy.md").is_file()
             assert (cwd / "candidate" / "index.md").is_file()
             assert not (cwd / "authoring").exists()
@@ -252,6 +331,7 @@ async def test_codex_tool_budget_interrupts_and_preserves_contract():
         )
         completed = type("TurnCompletedNotification", (), {"turn": completed_turn})()
         await client._relay_notification(notification(completed))
+        await client._relay_notification(notification(completed))
         messages = []
         while not client._events.empty():
             messages.append(client._events.get_nowait())
@@ -267,6 +347,7 @@ async def main():
     await test_codex_config_is_tenant_isolated()
     await test_codex_engine_stages_and_rewrites_roots()
     test_error_redaction()
+    await test_readonly_file_tools_confine_paths_and_bound_output()
     await test_codex_recommendation_uses_isolated_view_and_neutral_tool()
     await test_codex_tool_budget_interrupts_and_preserves_contract()
 

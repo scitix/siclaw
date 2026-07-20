@@ -3190,6 +3190,7 @@ async def test_session_driver(run: "TestRun"):
             model=run.consumer_model or _test_model(),
             session_id=sid,
             read_only=True,
+            allowed_read_roots=[run.cwd],
             max_tool_calls=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
         )
     else:
@@ -3407,6 +3408,7 @@ async def recommend_test_question(parent: "CompileRun") -> dict:
                 model=_compile_model(),
                 session_id=str(uuid.uuid4()),
                 read_only=True,
+                allowed_read_roots=[str(session_root)],
                 tools=[_recommendation_engine_tool(root, parent, captured)],
                 max_tool_calls=int(os.environ.get("KBC_TEST_RECOMMEND_MAX_TURNS", "20")),
             )
@@ -3670,6 +3672,7 @@ async def assist_reference_answer(parent: "CompileRun", payload: dict) -> dict:
                 model=_reference_assist_model(),
                 session_id=str(uuid.uuid4()),
                 read_only=True,
+                allowed_read_roots=[str(session_root)],
                 tools=[_reference_assist_engine_tool(root, parent, request_payload["mode"], captured)],
                 max_tool_calls=int(os.environ.get("KBC_REFERENCE_ASSIST_MAX_TURNS", "20")),
             )
