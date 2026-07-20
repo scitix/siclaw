@@ -3060,6 +3060,11 @@ async def main():
                 {"docs/b.md": "beta\n"},
             ])
             identity = {"run_id": "snapshot-run", "input_revision": "manifest-v2", "workdir": td}
+            for route in ("/sources", "/sources/begin", "/sources/state", "/sources/part", "/sources/commit"):
+                for payload in (b"", b"{"):
+                    r = await client.post(route, data=payload, headers={"Content-Type": "application/json"})
+                    assert r.status == 400, (route, payload, r.status, await r.text())
+
             r = await client.post("/sources/begin", json={**identity, "snapshot": snapshot})
             begin = await r.json()
             assert r.status == 200 and begin["missing_parts"] == ["part-000001", "part-000002"], begin
@@ -3185,7 +3190,16 @@ async def main():
                 "workdir": td,
                 "bundle_base64": base64.b64encode(bundle).decode(),
             })
-            assert r.status == 409, r.status
+            live_conflict = await r.json()
+            assert r.status == 409 and live_conflict["error"]["code"] == "KBC_RUN_ALREADY_LIVE", live_conflict
+            r = await client.post("/sources/begin", json={
+                "run_id": "r1",
+                "input_revision": "manifest-v2",
+                "workdir": td,
+                "snapshot": snapshot,
+            })
+            live_conflict = await r.json()
+            assert r.status == 409 and live_conflict["error"]["code"] == "KBC_RUN_ALREADY_LIVE", live_conflict
             # /authoring IS allowed on a live run (200): the runtime rehydrates the
             # durable workspace / pushes assets into an existing session through it.
             r = await client.post("/authoring", json={

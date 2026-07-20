@@ -351,6 +351,31 @@ describe("AgentBoxClient — error paths", () => {
     } finally { await srv.close(); }
   });
 
+  it("preserves an AgentBox-provided live-run code on conflict", async () => {
+    const srv = await startServer((_req, res) => {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          code: "KBC_RUN_ALREADY_LIVE",
+          message: "run already exists; upload sources before /session",
+          retriable: false,
+          details: { run_id: "r1" },
+        },
+      }));
+    });
+    try {
+      const client = new AgentBoxClient(`http://127.0.0.1:${srv.port}`);
+      const err = await client.postJson("/sources/begin", {}).catch((caught) => caught);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).toMatchObject({
+        status: 409,
+        code: "KBC_RUN_ALREADY_LIVE",
+        retriable: false,
+        details: { run_id: "r1" },
+      });
+    } finally { await srv.close(); }
+  });
+
   it("preserves an AgentBox-provided code/retriable on non-conflict statuses", async () => {
     const srv = await startServer((_req, res) => {
       res.writeHead(503, { "Content-Type": "application/json" });
