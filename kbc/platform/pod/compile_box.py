@@ -1068,7 +1068,7 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         raise CommandRejected("no structured source changes are available for incremental compile", 409)
     if action == "compile.resume":
         plan = _load_batch_plan(run)
-        if plan is None or not batching.pending_batches(plan):
+        if not _batch_plan_resumable(plan):
             raise CommandRejected("no interrupted batch plan is available to resume", 409)
     brief = params.get("brief")
     if brief is not None:
@@ -2243,11 +2243,7 @@ def _should_route_to_batch(run: "CompileRun", text: str, action: str | None = No
         return True
     # An interrupted batch/reduce/final run must finish in the orchestrator even
     # if raw shrank below the threshold after the plan was pinned.
-    plan = _load_batch_plan(run)
-    return plan is not None and (
-        len(batching.pending_batches(plan)) > 0
-        or plan.get("phase") in {"map", "reduce", "final"}
-    )
+    return _batch_plan_resumable(_load_batch_plan(run))
 
 
 async def _start_incremental(run: "CompileRun", text: str, *, strict: bool = False) -> None:
@@ -2324,6 +2320,20 @@ def _load_batch_plan(run: "CompileRun") -> dict | None:
         return None
 
 
+def _batch_plan_resumable(plan: dict | None) -> bool:
+    """Whether an interrupted batch train still owns executable work.
+
+    Hierarchical trains can fail after every map batch is stamped done, while
+    section reduction or final review is still pending. Keep the command gate,
+    routing gate, and orchestrator resume decision on this one definition so a
+    typed ``compile.resume`` cannot reject work the orchestrator can recover.
+    """
+    return plan is not None and (
+        len(batching.pending_batches(plan)) > 0
+        or plan.get("phase") in {"map", "reduce", "final"}
+    )
+
+
 def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
     p = Path(run.workdir) / rel
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -2342,6 +2352,8 @@ def _materialize_batch_slices(run: "CompileRun", plan: dict) -> None:
     slice_root = (workdir / ".kbc-batch-slices").resolve()
     shutil.rmtree(slice_root, ignore_errors=True)
     for batch in plan.get("batches", []):
+        if batch.get("status") == "done":
+            continue
         ranges = batch.get("source_ranges")
         if not isinstance(ranges, dict):
             continue
@@ -2754,10 +2766,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         inventory = batching.scan_sources(raw_dir)
         total_kb = batching.corpus_bytes(inventory) // 1024
         plan = _load_batch_plan(run)
-        resuming = plan is not None and (
-            len(batching.pending_batches(plan)) > 0
-            or plan.get("phase") in {"map", "reduce", "final"}
-        )
+        resuming = _batch_plan_resumable(plan)
         if not resuming:
             _write_batch_file(run, batching.SOURCES_INVENTORY_PATH, inventory)
             await run.emit({"type": "summary", "text": _loc(run,
