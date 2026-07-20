@@ -1,4 +1,5 @@
 claude-agent-sdk==0.2.110
+openai-codex==0.144.4
 aiohttp
 PyYAML==6.0.3
 python-pptx

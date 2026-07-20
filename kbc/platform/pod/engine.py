@@ -16,7 +16,10 @@ import asyncio
 import json
 import os
 import re
+import shutil
+import tempfile
 import uuid
+import weakref
 from pathlib import Path
 from typing import Protocol
 
@@ -185,3 +188,127 @@ class ClaudeEngine:
         finally:
             await client.disconnect()
         return "\n\n".join(parts)
+
+
+class CodexEngine:
+    """ReadonlyAgentEngine on the official Codex SDK.
+
+    KBC stages independent copies of declared roots and exposes only its own
+    root-confined read/search MCP tools. The caller still owns structured output
+    parsing and deterministic evidence validation.
+    """
+
+    def __init__(self):
+        self._stage_lock = asyncio.Lock()
+        self._staged: dict[tuple[str, ...], tuple[Path, dict[str, str]]] = {}
+        self._stage_root: Path | None = None
+        self._stage_finalizer = None
+
+    async def _stage_allowed_roots(self, roots: list[str]) -> tuple[Path, dict[str, str]]:
+        """Cache one disposable, source-isolated view per root set.
+
+        A red-blue run can make many calls over the same raw/wiki snapshots.
+        Staging once keeps that structural isolation inexpensive while the
+        engine instance lives; the finalizer removes all views after the run.
+        """
+        from codex_engine import _copy_readonly_tree
+
+        key = tuple(str(Path(value).resolve()) for value in roots)
+        async with self._stage_lock:
+            cached = self._staged.get(key)
+            if cached is not None:
+                return cached
+            if self._stage_root is None:
+                state_root = Path(os.environ.get("KBC_CODEX_STATE_ROOT", "/work"))
+                state_root.mkdir(parents=True, exist_ok=True)
+                root = Path(tempfile.mkdtemp(prefix=".kbc-codex-engine-", dir=str(state_root)))
+                self._stage_root = root
+                self._stage_finalizer = weakref.finalize(self, shutil.rmtree, root, True)
+            view = self._stage_root / f"view-{len(self._staged)}"
+
+            def stage() -> tuple[Path, dict[str, str]]:
+                replacements: dict[str, str] = {}
+                if len(key) == 1:
+                    source = Path(key[0])
+                    _copy_readonly_tree(source, view)
+                    replacements[key[0]] = str(view)
+                else:
+                    view.mkdir()
+                    for index, value in enumerate(key):
+                        source = Path(value)
+                        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", source.name) or "root"
+                        destination = view / f"root-{index}-{safe_name}"
+                        _copy_readonly_tree(source, destination)
+                        replacements[value] = str(destination)
+                return view, replacements
+
+            staged = await asyncio.to_thread(stage)
+            self._staged[key] = staged
+            return staged
+
+    @staticmethod
+    def _rewrite_paths(text: str, replacements: dict[str, str]) -> str:
+        for original in sorted(replacements, key=len, reverse=True):
+            text = text.replace(original, replacements[original])
+        return text
+
+    async def run_readonly_agent(
+        self, *, cwd: str, system_prompt: str, user_message: str,
+        model: str, effort: str | None = None,
+        allowed_read_roots: list[str], timeout_secs: float,
+    ) -> str:
+        from codex_engine import CodexSDKClient
+
+        declared_roots = list(allowed_read_roots) or [cwd]
+        roots = [str(Path(value).resolve()) for value in declared_roots]
+        workspace, replacements = await self._stage_allowed_roots(roots)
+        # macOS commonly spells /private/var as /var in tempfile paths. Prompts
+        # carry the caller's spelling, while the staged cache keys are resolved.
+        for declared, resolved in zip(declared_roots, roots):
+            replacements[str(Path(declared))] = replacements[resolved]
+        staged_system_prompt = self._rewrite_paths(system_prompt, replacements)
+        staged_user_message = self._rewrite_paths(user_message, replacements)
+        staged_roots = [replacements[value] for value in roots]
+        root_contract = (
+            "\n\nFilesystem contract: this is a closed-book, read-only review. "
+            "Read only the following roots and never inspect parent/sibling paths: "
+            + ", ".join(staged_roots)
+        )
+        client = CodexSDKClient(
+            cwd=str(workspace),
+            system_prompt=staged_system_prompt + root_contract,
+            model=model,
+            session_id=str(uuid.uuid4()),
+            read_only=True,
+            allowed_read_roots=[str(workspace)],
+            reasoning_effort=effort,
+            max_tool_calls=int(os.environ.get("KBC_PK_MAX_TURNS", "40")),
+        )
+        parts: list[str] = []
+
+        async def _run():
+            await client.connect()
+            await client.query(staged_user_message)
+            async for msg in client.receive_response():
+                if type(msg).__name__ != "AssistantMessage":
+                    continue
+                for block in getattr(msg, "content", []) or []:
+                    if type(block).__name__ == "TextBlock":
+                        text = str(getattr(block, "text", "") or "").strip()
+                        if text:
+                            parts.append(text)
+
+        try:
+            await asyncio.wait_for(_run(), timeout=timeout_secs)
+        finally:
+            await client.disconnect()
+        return "\n\n".join(parts)
+
+
+def selected_readonly_engine() -> ReadonlyAgentEngine:
+    kind = os.environ.get("KBC_ENGINE", "claude_agent_sdk").strip().lower()
+    if kind in {"codex", "codex_sdk"}:
+        return CodexEngine()
+    if kind in {"claude", "claude_agent_sdk"}:
+        return ClaudeEngine()
+    raise ValueError(f"unknown KBC_ENGINE {kind!r}")
