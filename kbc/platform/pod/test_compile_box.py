@@ -3861,6 +3861,29 @@ async def main():
             print("✓ Source Snapshot v2 HTTP resume + atomic commit + idempotent replay")
 
         with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td)
+            (workdir / "raw").mkdir()
+            (workdir / "raw" / "old.md").write_text("old raw\n")
+            office_bundle = make_source_bundle({"manual.docx": b"new office source"})
+            original_convert_tree = compile_box.office_ingest.convert_tree
+            try:
+                def reject_office(_root):
+                    raise compile_box.office_ingest.OfficeIngestLimitExceeded("Office budget exceeded")
+
+                compile_box.office_ingest.convert_tree = reject_office
+                r = await client.post("/sources", json={
+                    "workdir": td,
+                    "bundle_base64": base64.b64encode(office_bundle).decode(),
+                })
+                assert r.status == 400 and "Office budget exceeded" in await r.text()
+                assert (workdir / "raw" / "old.md").read_text() == "old raw\n"
+                assert not (workdir / "raw" / "manual.docx").exists()
+            finally:
+                compile_box.office_ingest.convert_tree = original_convert_tree
+
+            print("✓ legacy source install keeps previous Raw on Office budget failure")
+
+        with tempfile.TemporaryDirectory() as td:
             large_bundle = make_source_bundle({"large.bin": deterministic_bytes(2 * 1024 * 1024)})
             assert len(base64.b64encode(large_bundle)) > 1024 * 1024
             r = await client.post("/sources", json={

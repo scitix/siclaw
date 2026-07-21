@@ -159,6 +159,23 @@ describe("FrontendWsClient", () => {
     client.close();
   });
 
+  it("request() supports a longer per-call timeout without changing the client default", async () => {
+    const client = await createClient({ timeoutMs: 200 });
+
+    const connectPromise = client.connect();
+    openLatestWs();
+    await connectPromise;
+
+    const requestPromise = client.request("source.part", undefined, 500);
+    const rejection = expect(requestPromise).rejects.toThrow("timed out after 500ms");
+    vi.advanceTimersByTime(300);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    vi.advanceTimersByTime(201);
+
+    await rejection;
+    client.close();
+  });
+
   // ── 5. onCommand() dispatches and sends response ──────────
 
   it("onCommand() dispatches inbound command and sends response", async () => {

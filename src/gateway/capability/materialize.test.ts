@@ -17,13 +17,13 @@ function fakes(opts: {
   sourcesError?: Error;
   authoringError?: Error;
 }) {
-  const posts: Array<{ path: string; body: any }> = [];
+  const posts: Array<{ path: string; body: any; timeoutMs?: number }> = [];
   const client = {
-    postJson: vi.fn(async (path: string, body: any) => {
+    postJson: vi.fn(async (path: string, body: any, timeoutMs?: number) => {
       if (path === "/sources" && opts.sourcesError) throw opts.sourcesError;
       if (path.startsWith("/sources/") && opts.sourcesError) throw opts.sourcesError;
       if (path === "/authoring" && opts.authoringError) throw opts.authoringError;
-      posts.push({ path, body });
+      posts.push({ path, body, timeoutMs });
       if (path === "/sources/begin") {
         return {
           ok: true,
@@ -144,7 +144,9 @@ describe("materializeCapabilityInputs", () => {
       input_revision: "manifest-2",
       ref: CAPABILITY_INPUT_SOURCE_PART_REF,
       part_id: "part-000002",
-    });
+    }, 600_000);
+    expect(posts.find((post) => post.path === "/sources/part")?.timeoutMs).toBe(600_000);
+    expect(posts.find((post) => post.path === "/sources/commit")?.timeoutMs).toBe(900_000);
   });
 
   it("Source Snapshot v2 rejects a part from another revision before upload", async () => {

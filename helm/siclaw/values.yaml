@@ -53,10 +53,15 @@ runtime:
   resources:
     requests:
       cpu: "100m"
-      memory: "128Mi"
+      # Source Snapshot v2 transports one part at a time, but a maximum-size
+      # part can transiently retain its RPC JSON and outbound box request.
+      memory: "512Mi"
     limits:
       cpu: "2"
       memory: "2Gi"
+  # Keep room outside V8 for the binary/base64 buffers used by large source
+  # parts. runtime.env.NODE_OPTIONS may override this complete setting.
+  nodeMaxOldSpaceMB: 1024
   memory:
     # Disabled by default for integrated production deployments. Enabling
     # this re-exposes memory_search/memory_get and session memory auto-save.
