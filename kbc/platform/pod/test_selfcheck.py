@@ -429,6 +429,65 @@ def test_body_source_annotations():
     print("OK  body source annotations (spaces / combined / locator / unknown / missing extension)")
 
 
+def test_deterministic_body_source_normalization():
+    """Exact, unique aliases repair mechanically; ambiguity and code stay put."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n")
+        page = base / "candidate" / "guide.md"
+        original = (
+            "---\ntype: Guide\ntitle: Guide\ncompiled_from:\n"
+            "  - docs/专题目录.md\n---\n"
+            "正文。（source: “专题目录” 第3节）\n"
+            "```markdown\n(source: 专题目录)\n```\n"
+        )
+        _mk(base, "candidate/guide.md", original)
+
+        fixes = selfcheck.normalize_body_source_annotations(td)
+        assert fixes == [{
+            "rule": "body_source_exact_alias",
+            "page": "guide.md",
+            "from": "“专题目录” 第3节",
+            "to": "docs/专题目录.md 第3节",
+        }], fixes
+        updated = page.read_text()
+        assert "（source: docs/专题目录.md 第3节）" in updated, updated
+        assert "```markdown\n(source: 专题目录)\n```" in updated, updated
+        assert not any(v["kind"] == "body_source_malformed"
+                       for v in selfcheck.run_layer1(td)["lint"]["violations"])
+
+        # A second pass is byte-identical and emits no duplicate audit record.
+        stable = page.read_bytes()
+        assert selfcheck.normalize_body_source_annotations(td) == []
+        assert page.read_bytes() == stable
+
+        # Duplicate stems are genuinely ambiguous and must remain for semantic
+        # repair rather than silently choosing one source.
+        ambiguous = (
+            "---\ntype: Guide\ntitle: Ambiguous\ncompiled_from:\n"
+            "  - a/专题目录.md\n  - b/专题目录.pdf\n---\n"
+            "正文。(source: 专题目录)\n"
+        )
+        _mk(base, "candidate/ambiguous.md", ambiguous)
+        before = (base / "candidate" / "ambiguous.md").read_bytes()
+        assert selfcheck.normalize_body_source_annotations(
+            td, allowed_pages={"ambiguous.md"}) == []
+        assert (base / "candidate" / "ambiguous.md").read_bytes() == before
+        report = selfcheck.run_layer1(td)
+        assert any(v["page"] == "ambiguous.md" and v["kind"] == "body_source_malformed"
+                   for v in report["lint"]["violations"]), report["lint"]
+
+        scoped = (
+            "---\ntype: Guide\ntitle: Scoped\ncompiled_from:\n"
+            "  - docs/only-this.md\n---\n正文。(source: only-this)\n"
+        )
+        _mk(base, "candidate/scoped.md", scoped)
+        assert selfcheck.normalize_body_source_annotations(
+            td, allowed_pages={"ambiguous.md"}) == []
+        assert (base / "candidate" / "scoped.md").read_text() == scoped
+    print("OK  deterministic source normalization (unique / locator / code / ambiguous / idempotent)")
+
+
 def test_spaced_markdown_links():
     """Spaced page paths resolve in both CommonMark and URL-encoded forms."""
     with tempfile.TemporaryDirectory() as td:
@@ -1543,6 +1602,7 @@ def main():
     test_candidate_credential_lint()
     test_media_ledger_and_new_lint()
     test_body_source_annotations()
+    test_deterministic_body_source_normalization()
     test_spaced_markdown_links()
     test_media_verify_helpers()
     test_media_verify_content_identity_and_attempt_reset()

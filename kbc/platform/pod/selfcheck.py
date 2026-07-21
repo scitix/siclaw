@@ -21,6 +21,7 @@ import json
 import os
 import posixpath
 import re
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -321,9 +322,20 @@ def _markdown_prose(md_text: str) -> str:
     the code constructs the compiler emits without adding another production
     markdown dependency.
     """
-    _, body, error = parse_okf_frontmatter(md_text)
-    if error and not md_text.startswith("---"):
-        body = md_text
+    # Mask valid frontmatter instead of dropping it. Keeping the returned text
+    # byte-for-byte aligned with ``md_text`` lets deterministic repair code use
+    # match offsets safely while preserving the existing rendered-prose lint
+    # semantics. Malformed/absent frontmatter remains prose, as before.
+    body_start = 0
+    lines = md_text.splitlines(keepends=True)
+    if lines and lines[0].strip() == "---":
+        offset = len(lines[0])
+        for line in lines[1:]:
+            offset += len(line)
+            if line.strip() in ("---", "..."):
+                body_start = offset
+                break
+    body = md_text[body_start:]
 
     # Fenced blocks: CommonMark allows up to three leading spaces and either a
     # backtick or tilde fence. A closing fence uses the same character and is at
@@ -381,7 +393,7 @@ def _markdown_prose(md_text: str) -> str:
             if chars[i] != "\n":
                 chars[i] = " "
         pos = found
-    return "".join(chars)
+    return _mask_span(md_text[:body_start]) + "".join(chars)
 
 
 def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[dict]:
@@ -577,9 +589,9 @@ def _markdown_link_targets(text: str) -> list[str]:
     return targets
 
 
-def _body_source_payloads(text: str) -> list[str]:
-    """Extract source-marker payloads while preserving nested filename pairs."""
-    payloads: list[str] = []
+def _body_source_payload_spans(text: str) -> list[tuple[int, int, str]]:
+    """Extract source payloads and exact source-text offsets outside code."""
+    payloads: list[tuple[int, int, str]] = []
     prose = _markdown_prose(text)
     for match in _BODY_SOURCE_START_RE.finditer(prose):
         stack = [")" if match.group("open") == "(" else "）"]
@@ -591,9 +603,113 @@ def _body_source_payloads(text: str) -> list[str]:
             elif char == stack[-1]:
                 stack.pop()
                 if not stack:
-                    payloads.append(prose[match.end():pos])
+                    payloads.append((match.end(), pos, text[match.end():pos]))
                     break
     return payloads
+
+
+def _body_source_payloads(text: str) -> list[str]:
+    """Extract source-marker payloads while preserving nested filename pairs."""
+    return [payload for _, _, payload in _body_source_payload_spans(text)]
+
+
+_SOURCE_ALIAS_QUOTES = {
+    '"': '"', "'": "'", "`": "`", "“": "”", "‘": "’",
+}
+
+
+def _source_alias_key(value: str) -> str:
+    """Conservative comparison key for an incomplete body source label."""
+    value = unicodedata.normalize("NFC", value).strip()
+    while len(value) >= 2 and value[0] in _SOURCE_ALIAS_QUOTES:
+        if value[-1] != _SOURCE_ALIAS_QUOTES[value[0]]:
+            break
+        value = value[1:-1].strip()
+    return value.casefold()
+
+
+def _source_without_known_extension(value: str) -> str | None:
+    lower = value.casefold()
+    for ext in sorted(KNOWN_SOURCE_EXTS, key=len, reverse=True):
+        if lower.endswith(ext.casefold()):
+            return value[:-len(ext)]
+    return None
+
+
+def _source_aliases(source: str) -> set[str]:
+    """Exact aliases accepted for a source; no fuzzy title matching."""
+    aliases = {source, posixpath.basename(source)}
+    for value in tuple(aliases):
+        stem = _source_without_known_extension(value)
+        if stem:
+            aliases.add(stem)
+    return {key for value in aliases if (key := _source_alias_key(value))}
+
+
+def _split_trailing_locator(value: str) -> tuple[str, str]:
+    """Separate a supported trailing locator while retaining its whitespace."""
+    matches = list(_SOURCE_LOCATOR_PREFIX_RE.finditer(value))
+    if matches and matches[-1].end() == len(value):
+        match = matches[-1]
+        return value[:match.start()], value[match.start():]
+    return value, ""
+
+
+def normalize_body_source_annotations(
+    workdir: str,
+    allowed_pages: set[str] | None = None,
+) -> list[dict[str, str]]:
+    """Repair unambiguous missing-extension body citations without a model.
+
+    Only a single malformed payload that exactly matches one unique
+    ``compiled_from`` alias is rewritten. Mixed lists, arbitrary prose, and
+    duplicate stems remain lint failures for semantic repair. Code fences and
+    inline code are masked by ``_body_source_payload_spans``. When supplied,
+    ``allowed_pages`` keeps incremental byte-isolation intact.
+    """
+    candidate = Path(workdir) / "candidate"
+    fixes: list[dict[str, str]] = []
+    if not candidate.is_dir():
+        return fixes
+    for path in sorted(candidate.rglob("*.md")):
+        rel = path.relative_to(candidate).as_posix()
+        if allowed_pages is not None and rel not in allowed_pages:
+            continue
+        try:
+            text = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        sources, _, _ = parse_compiled_from(text)
+        if not sources:
+            continue
+        aliases: dict[str, set[str]] = {}
+        for source in sources:
+            for alias in _source_aliases(source):
+                aliases.setdefault(alias, set()).add(source)
+        replacements: list[tuple[int, int, str, str]] = []
+        for start, end, payload in _body_source_payload_spans(text):
+            found, malformed = _body_source_references(f"(source: {payload})")
+            if found or len(malformed) != 1:
+                continue
+            label, locator = _split_trailing_locator(malformed[0])
+            matches = aliases.get(_source_alias_key(label), set())
+            if len(matches) != 1:
+                continue
+            source = next(iter(matches))
+            replacement = source + locator
+            if replacement == payload:
+                continue
+            replacements.append((start, end, payload, replacement))
+        if not replacements:
+            continue
+        updated = text
+        for start, end, before, after in reversed(replacements):
+            updated = updated[:start] + after + updated[end:]
+            fixes.append({"rule": "body_source_exact_alias", "page": rel,
+                          "from": before, "to": after})
+        _write_text_atomic(path, updated)
+    fixes.sort(key=lambda item: (item["page"], item["from"], item["to"]))
+    return fixes
 
 
 def _body_source_references(text: str) -> tuple[list[str], list[str]]:

@@ -1961,6 +1961,44 @@ async def test_unconverged_files_residual_ticket():
     print("OK  unconverged files a residual ticket (once, code-written, question queue)")
 
 
+async def test_exact_source_alias_is_repaired_before_l1_budget():
+    """Mechanical provenance repair settles without spending a model round."""
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "docs").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "docs" / "专题目录.md").write_text("source")
+        (wd / "candidate" / "index.md").write_text(
+            "---\nokf_version: \"0.1\"\n---\n# Index\n- [Guide](guide.md)\n")
+        (wd / "candidate" / "guide.md").write_text(
+            "---\ntype: Guide\ntitle: Guide\ncompiled_from:\n"
+            "  - docs/专题目录.md\n---\n正文。(source: 专题目录)\n")
+        run = compile_box.CompileRun("mechanical-source", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        run._full_compile_pending = True
+
+        repair = await compile_box._post_turn_selfcheck(run)
+
+        assert repair is None, repair
+        assert run._l1_repairs_used == 0
+        assert "(source: docs/专题目录.md)" in (
+            wd / "candidate" / "guide.md").read_text()
+        sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+        assert sc["state"] == "passed" and sc["lint"]["ok"], sc
+        assert sc["mechanical_fixes"]["count"] == 1, sc
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        summaries = [event.get("text", "") for event in events
+                     if event.get("type") == "summary"]
+        assert any("without using a repair round" in text for text in summaries), summaries
+    print("OK  exact source alias auto-repairs before L1 model budget")
+
+
 async def test_incremental_grandfathers_untouched_format_debt():
     """An ordinary scoped edit must not turn a legacy page into a migration
     target merely because it was authorized. The same rule still blocks a new
@@ -3772,6 +3810,7 @@ async def main():
     await test_incremental_guard_rearms_on_ledger_repair()
     await test_incremental_violation_auto_restored()
     await test_unconverged_files_residual_ticket()
+    await test_exact_source_alias_is_repaired_before_l1_budget()
     await test_incremental_grandfathers_untouched_format_debt()
     await test_repair_turn_may_edit_ledger_target_pages()
     await test_incremental_index_deletion_cannot_escape_guard()
