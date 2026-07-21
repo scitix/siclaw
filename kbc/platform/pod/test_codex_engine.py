@@ -6,15 +6,47 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 import compile_box
 from codex_engine import (
     CodexSDKClient,
     EngineTool,
+    _require_writer_sandbox,
     _safe_error_message,
     isolated_readonly_workspace,
 )
 from engine import CodexEngine
+
+
+def test_writer_sandbox_preflight():
+    completed = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    with patch("codex_engine.sys.platform", "linux"), \
+         patch("codex_engine.shutil.which", return_value="/usr/bin/bwrap"), \
+         patch("codex_engine.subprocess.run", return_value=completed) as run:
+        _require_writer_sandbox()
+        command = run.call_args.args[0]
+        assert "--unshare-user" in command
+        assert "--unshare-pid" in command
+        assert "--unshare-net" in command
+
+    denied = types.SimpleNamespace(
+        returncode=1,
+        stdout="",
+        stderr="bwrap: No permissions to create new namespace\n",
+    )
+    with patch("codex_engine.sys.platform", "linux"), \
+         patch("codex_engine.shutil.which", return_value="/usr/bin/bwrap"), \
+         patch("codex_engine.subprocess.run", return_value=denied):
+        try:
+            _require_writer_sandbox()
+        except RuntimeError as error:
+            message = str(error)
+            assert "No permissions to create new namespace" in message
+            assert "refusing an unsandboxed fallback" in message
+        else:
+            raise AssertionError("denied bubblewrap must fail closed")
+    print("OK  Codex writer preflight diagnoses a blocked nested sandbox")
 
 
 def test_isolated_readonly_workspace():
@@ -145,7 +177,8 @@ async def test_codex_config_is_tenant_isolated():
             )
             writer_home = Path(writer._codex_home)
             writer_shell_home = Path(writer._shell_home)
-            await writer.connect()
+            with patch("codex_engine._require_writer_sandbox"):
+                await writer.connect()
             writer_overrides = set(captured["config"]["config_overrides"])
             assert "features.shell_tool=true" in writer_overrides
             assert "features.unified_exec=false" in writer_overrides
@@ -182,7 +215,8 @@ async def test_codex_config_is_tenant_isolated():
                     str(view): "read",
                 },
             )
-            await scoped.connect()
+            with patch("codex_engine._require_writer_sandbox"):
+                await scoped.connect()
             scoped_overrides = set(captured["config"]["config_overrides"])
             scoped_profile = next(
                 value for value in scoped_overrides if value.startswith("permissions.kbc_writer=")
@@ -595,6 +629,7 @@ async def test_codex_tool_budget_interrupts_and_preserves_contract():
 
 
 async def main():
+    test_writer_sandbox_preflight()
     test_isolated_readonly_workspace()
     await test_codex_config_is_tenant_isolated()
     await test_real_codex_writer_sandbox_confines_commands()

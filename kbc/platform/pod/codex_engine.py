@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -97,6 +98,49 @@ def _safe_error_message(value: object, secret_values: Iterable[str] = ()) -> str
             text = text.replace(secret_value, "[REDACTED]")
     text = re.sub(r"\bsk-[A-Za-z0-9_+\-/=]{8,}", "[REDACTED]", text)
     return text[:1000]
+
+
+def _require_writer_sandbox() -> None:
+    """Fail before the model turn when Linux cannot launch Codex's sandbox."""
+    if not sys.platform.startswith("linux"):
+        return
+    executable = shutil.which("bwrap")
+    if not executable:
+        raise RuntimeError(
+            "Codex writer sandbox unavailable: bubblewrap is not installed; "
+            "refusing an unsandboxed fallback"
+        )
+    try:
+        result = subprocess.run(
+            [
+                executable,
+                "--die-with-parent",
+                "--unshare-user",
+                "--unshare-pid",
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "/bin/true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(
+            "Codex writer sandbox preflight could not execute bubblewrap; "
+            "refusing an unsandboxed fallback"
+        ) from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown bubblewrap error").strip()
+        detail = re.sub(r"\s+", " ", detail)[:500]
+        raise RuntimeError(
+            "Codex writer sandbox unavailable: bubblewrap cannot create isolated "
+            f"user/PID/network namespaces and mounts ({detail}); refusing an "
+            "unsandboxed fallback"
+        )
 
 
 _READ_MAX_LINES = 500
@@ -494,6 +538,9 @@ class CodexSDKClient:
         # only the original SDK dependency is installed.
         from codex_cli_bin import bundled_package_dir
         from openai_codex import ApprovalMode, AsyncCodex, CodexConfig
+
+        if not self.read_only:
+            _require_writer_sandbox()
 
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()

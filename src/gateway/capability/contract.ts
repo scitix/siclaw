@@ -99,7 +99,7 @@ export interface CapabilityRunFailure {
 // ---- Consumer → siclaw ----
 
 export interface CapabilityStartRequest {
-  /** BoxProfile name selecting the box shape + tool/trust envelope (e.g. "kb-compile", "kb-test"). */
+  /** BoxProfile name selecting the box shape + tool/trust envelope (e.g. "kb-compile", "kb-compile-codex", "kb-test"). */
   profile: string;
   /** Consumer org owning the run — scopes the persisted run row (SSE gate / listing). */
   org_id?: string;

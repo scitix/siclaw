@@ -411,6 +411,16 @@ spec:
     emptyDir: {}
 ```
 
+The Codex KB writer is the one profile-scoped exception to the outer
+`RuntimeDefault` seccomp/AppArmor policy. `kb-compile-codex` must let the
+non-root process create the user/PID/network namespaces and private mounts used
+by Bubblewrap; the inner `kbc_writer` profile then exposes only the compile
+workspace and disables network access. The Pod still drops all capabilities,
+uses a read-only root filesystem, and mounts no service-account token. A
+Bubblewrap preflight fails the run before model execution if that narrower
+inner boundary cannot be installed. Ordinary AgentBoxes, Claude `kb-compile`,
+and read-only `kb-test` retain `RuntimeDefault`.
+
 **Why `readOnlyRootFilesystem`**: Prevents filesystem tampering if the agent process is
 compromised. All writable paths are explicit emptyDir mounts. `sudo` with `NOPASSWD`
 does not need timestamp caching, so no additional writable paths are needed for it.
