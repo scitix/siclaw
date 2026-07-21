@@ -99,7 +99,7 @@ export class FrontendWsClient {
    * Send an RPC request and await the response.
    * Throws on timeout, error response, or if not connected.
    */
-  request(method: string, params?: unknown): Promise<any> {
+  request(method: string, params?: unknown, timeoutMs = this.opts.timeoutMs): Promise<any> {
     if (!this._connected || !this.ws) {
       return Promise.reject(new Error("FrontendWsClient is not connected"));
     }
@@ -110,8 +110,8 @@ export class FrontendWsClient {
     return new Promise<any>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`RPC ${method} timed out after ${this.opts.timeoutMs}ms`));
-      }, this.opts.timeoutMs);
+        reject(new Error(`RPC ${method} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
       timer.unref?.();
 
       this.pending.set(id, { resolve, reject, timer });

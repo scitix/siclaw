@@ -230,6 +230,32 @@ class SourceSnapshotTest(unittest.TestCase):
             self.assertFalse((workdir / "raw" / "new.md").exists())
             self.assertEqual((workdir / "drop" / "old.md").read_text(encoding="utf-8"), "old\n")
 
+    def test_office_budget_failure_never_changes_existing_raw(self):
+        snapshot, bundles = make_snapshot([{"manual.docx": b"new office source"}])
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            (workdir / "raw").mkdir()
+            (workdir / "raw" / "old.md").write_text("old\n", encoding="utf-8")
+            source_snapshot.begin_snapshot(directory, "run-1", "revision-1", snapshot)
+            source_snapshot.install_part(directory, "run-1", "revision-1", "part-000001", bundles[0])
+
+            def reject_office(_path: str):
+                raise ValueError("Office derived budget exceeded")
+
+            with self.assertRaisesRegex(ValueError, "Office derived budget exceeded"):
+                source_snapshot.commit_snapshot(
+                    directory,
+                    "run-1",
+                    "revision-1",
+                    convert_office=reject_office,
+                )
+
+            self.assertEqual((workdir / "raw" / "old.md").read_text(encoding="utf-8"), "old\n")
+            self.assertFalse((workdir / "raw" / "manual.docx").exists())
+            self.assertFalse(source_snapshot.snapshot_state(
+                directory, "run-1", "revision-1",
+            )["committed"])
+
     def test_part_cannot_smuggle_an_undeclared_file(self):
         declared = b"declared\n"
         malicious_bundle = make_bundle({"declared.md": declared, "extra.md": b"extra\n"})
