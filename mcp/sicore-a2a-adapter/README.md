@@ -33,13 +33,13 @@ Requires Node.js 22.19 or newer.
 Required:
 
 - `SICORE_URL`: Sicore base URL, for example `https://sicore.example.com`.
-- `SICLAW_AGENT_ID`: the agent UUID bound to the A2A key.
 - exactly one of:
   - `SICLAW_A2A_KEY_FILE`: path to a file containing the key. On Unix it must have mode `0600` or stricter.
   - `SICLAW_A2A_KEY`: direct environment fallback for ephemeral testing.
 
 Optional:
 
+- `SICLAW_AGENT_ID`: the agent UUID bound to the A2A key. Keys are per-agent, so by default the adapter resolves the agent from the key at startup (`GET /api/v1/a2a/self`). Set it explicitly to pin the agent as a cross-check, or when talking to an older Sicore without the `/self` endpoint.
 - `SICLAW_A2A_TIMEOUT_MS`: network-operation timeout, default `30000`. Bounded GET retries share this same budget.
 - `SICLAW_A2A_POLL_INTERVAL_MS`: task polling interval, default `3000`.
 
@@ -58,7 +58,6 @@ chmod 600 ~/.config/siclaw/test-a2a-key
 
 ```bash
 SICORE_URL=https://sicore.example.com \
-SICLAW_AGENT_ID=<agent-uuid> \
 SICLAW_A2A_KEY_FILE=~/.config/siclaw/test-a2a-key \
 node dist/index.js
 ```
@@ -72,7 +71,6 @@ Use absolute paths so the MCP process does not depend on the current project dir
 ```bash
 codex mcp add \
   --env SICORE_URL=https://sicore.example.com \
-  --env SICLAW_AGENT_ID=<agent-uuid> \
   --env SICLAW_A2A_KEY_FILE=/absolute/path/to/test-a2a-key \
   siclaw-test -- node /absolute/path/to/sicore-a2a-adapter/dist/index.js
 ```
@@ -82,12 +80,11 @@ codex mcp add \
 ```bash
 claude mcp add -s user \
   -e SICORE_URL=https://sicore.example.com \
-  -e SICLAW_AGENT_ID=<agent-uuid> \
   -e SICLAW_A2A_KEY_FILE=/absolute/path/to/test-a2a-key \
   siclaw-test -- node /absolute/path/to/sicore-a2a-adapter/dist/index.js
 ```
 
-Create one named MCP server per Siclaw agent/key pair. The model-visible tool schemas intentionally contain no `agent_id` parameter.
+Create one named MCP server per Siclaw agent/key pair. The model-visible tool schemas intentionally contain no `agent_id` parameter, and the adapter derives the agent from the key itself (add `-e SICLAW_AGENT_ID=<agent-uuid>` to pin it explicitly or for an older Sicore).
 
 ## Watchdog behavior
 

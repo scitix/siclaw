@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { A2aClientError, normalizeTask, SicoreA2aClient } from "./a2a-client.js";
-import type { AdapterConfig } from "./config.js";
+import { A2aClientError, normalizeTask, resolveAgentId, SicoreA2aClient } from "./a2a-client.js";
+import type { ResolvedAdapterConfig } from "./config.js";
 
-function config(extra: Partial<AdapterConfig> = {}): AdapterConfig {
+function config(extra: Partial<ResolvedAdapterConfig> = {}): ResolvedAdapterConfig {
   return {
     baseUrl: "https://sicore.example.com",
     agentId: "agent/one",
@@ -50,6 +50,34 @@ describe("normalizeTask", () => {
 
   it("uses the status message as the error for failed tasks", () => {
     expect(normalizeTask(task("TASK_STATE_FAILED")).error).toBe("investigation failed");
+  });
+});
+
+describe("resolveAgentId", () => {
+  it("resolves the bound agent from the key via /self", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ agentId: "agent-9" }));
+    await expect(resolveAgentId(config(), fetchImpl as typeof fetch)).resolves.toBe("agent-9");
+    expect(String(fetchImpl.mock.calls[0][0])).toBe("https://sicore.example.com/api/v1/a2a/self");
+  });
+
+  it("tells the operator to pin SICLAW_AGENT_ID on an older Sicore", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ error: { message: "A2A route not found" } }, 404));
+    await expect(resolveAgentId(config(), fetchImpl as typeof fetch))
+      .rejects.toThrow(/set SICLAW_AGENT_ID/);
+  });
+
+  it("propagates authentication failures without masking them", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      error: {
+        status: "UNAUTHENTICATED",
+        message: "A valid SiCore agent API key is required",
+        details: [{ reason: "AUTHENTICATION_REQUIRED" }],
+      },
+    }, 401));
+    const error = await resolveAgentId(config(), fetchImpl as typeof fetch).catch((value) => value as A2aClientError);
+    expect(error).toBeInstanceOf(A2aClientError);
+    expect(error.httpStatus).toBe(401);
+    expect(error.reason).toBe("AUTHENTICATION_REQUIRED");
   });
 });
 
