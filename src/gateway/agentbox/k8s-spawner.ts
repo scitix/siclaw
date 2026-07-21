@@ -133,6 +133,7 @@ export class K8sSpawner implements BoxSpawner {
     // capability like "kb-compile" declares its own image + writable /work etc.
     // All flavors reuse the same spawn/cert/mTLS/port machinery below.
     const profile = getBoxProfile(boxConfig.profile);
+    const needsBubblewrap = profile.nestedSandbox === "bubblewrap";
     const image = boxConfig.image ?? profile.image ?? this.config.image;
     const agentId = boxConfig.agentId;
     if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
@@ -371,6 +372,17 @@ export class K8sSpawner implements BoxSpawner {
       metadata: {
         name: podName,
         namespace,
+        ...(needsBubblewrap
+          ? {
+              // Kubernetes 1.29 exposes AppArmor through the legacy per-container
+              // annotation. Bubblewrap immediately installs the narrower inner
+              // filesystem/network boundary; without this exception AppArmor
+              // rejects its namespace mounts before that boundary exists.
+              annotations: {
+                "container.apparmor.security.beta.kubernetes.io/agentbox": "unconfined",
+              },
+            }
+          : {}),
         labels: {
           // Keep app=agentbox so existing list()/cleanup() lifecycle management
           // covers capability pods too; the profile name distinguishes them for
@@ -394,9 +406,13 @@ export class K8sSpawner implements BoxSpawner {
         // then drops to agentbox via runuser). Child processes run as
         // sandbox user via sudo. CHOWN/FOWNER are needed for the
         // entrypoint to fix volume permissions; SETUID/SETGID for user
-        // switching. All capabilities drop after runuser.
+        // switching. The non-root Codex compile image needs none of those
+        // capabilities; its container context below drops everything.
         securityContext: {
-          seccompProfile: { type: "RuntimeDefault" },
+          // Only the compile profile may create its declared nested sandbox.
+          // Normal AgentBoxes and closed-book kb-test boxes retain the outer
+          // RuntimeDefault policy.
+          seccompProfile: { type: needsBubblewrap ? "Unconfined" : "RuntimeDefault" },
         },
         volumes: [
           {
@@ -440,10 +456,12 @@ export class K8sSpawner implements BoxSpawner {
             image,
             imagePullPolicy,
             securityContext: {
-              capabilities: {
-                drop: ["ALL"],
-                add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "AUDIT_WRITE"],
-              },
+              capabilities: needsBubblewrap
+                ? { drop: ["ALL"] }
+                : {
+                    drop: ["ALL"],
+                    add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "AUDIT_WRITE"],
+                  },
               readOnlyRootFilesystem: true,
             },
             ports: [
@@ -508,7 +526,7 @@ export class K8sSpawner implements BoxSpawner {
             // Kubelet HTTP probes originate outside that podSelector on several
             // CNIs, so use an in-container HTTPS check for KB profiles. The
             // endpoint is deliberately the sole route that needs no client cert.
-            readinessProbe: profile.name === "kb-compile" || profile.name === "kb-test"
+            readinessProbe: profile.name === "kb-compile" || profile.name === "kb-compile-codex" || profile.name === "kb-test"
               ? {
                   exec: { command: [
                     "python", "-c",
@@ -523,7 +541,7 @@ export class K8sSpawner implements BoxSpawner {
                   initialDelaySeconds: 2,
                   periodSeconds: 2,
                 },
-            livenessProbe: profile.name === "kb-compile" || profile.name === "kb-test"
+            livenessProbe: profile.name === "kb-compile" || profile.name === "kb-compile-codex" || profile.name === "kb-test"
               ? {
                   exec: { command: [
                     "python", "-c",
@@ -669,7 +687,7 @@ export class K8sSpawner implements BoxSpawner {
   }
 
   /**
-   * Periodic orphan GC for CAPABILITY boxes (kb-compile / kb-test) + their cert
+   * Periodic orphan GC for CAPABILITY boxes (kb-compile variants / kb-test) + their cert
    * Secrets. Two orphan shapes (audit finding — both accumulate forever):
    *   - a pod in a terminal phase (Succeeded/Failed): its process exited, a
    *     capability run never reuses a pod;
@@ -684,7 +702,7 @@ export class K8sSpawner implements BoxSpawner {
   async sweepOrphans(isLive: (runRef: string) => boolean | Promise<boolean>): Promise<void> {
     const { namespace, labelPrefix } = this.config;
     const selector = `${labelPrefix}/app=agentbox`;
-    const capabilityTypes = new Set(["kb-compile", "kb-test"]);
+    const capabilityTypes = new Set(["kb-compile", "kb-compile-codex", "kb-test"]);
     const pods = await this.coreApi.listNamespacedPod({ namespace, labelSelector: selector });
     const keptPods = new Set<string>();
     for (const pod of pods.items ?? []) {
