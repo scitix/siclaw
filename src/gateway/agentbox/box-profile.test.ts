@@ -20,6 +20,7 @@ describe("getBoxProfile", () => {
     expect(p.image).toBeUndefined();
     expect(p.volumes).toBeUndefined();
     expect(p.allowedTools).toBeUndefined();
+    expect(p.nestedSandbox).toBeUndefined();
   });
 
   it("kb-compile → dedicated image + LLM env + writable /work + box-owned restricted tools", () => {
@@ -27,11 +28,22 @@ describe("getBoxProfile", () => {
     const p = getBoxProfile("kb-compile");
     expect(p.image).toBe("kbc-compile-box:test-tag");
     expect(p.home).toBe("/work");
+    expect(p.nestedSandbox).toBeUndefined();
     expect(p.volumes).toEqual([{ name: "work", mountPath: "/work", sizeLimit: "4Gi" }]);
     expect(p.envForward).toContain("ANTHROPIC_BASE_URL");
     expect(p.envForward).not.toContain("ANTHROPIC_API_KEY");
     expect(p.envForward).not.toContain("ANTHROPIC_AUTH_TOKEN");
     expect(p.allowedTools).toBeNull();
+  });
+
+  it("kb-compile-codex → compile shape plus the declared Bubblewrap requirement", () => {
+    const compile = getBoxProfile("kb-compile");
+    const codex = getBoxProfile("kb-compile-codex");
+    expect(codex).toMatchObject({
+      ...compile,
+      name: "kb-compile-codex",
+      nestedSandbox: "bubblewrap",
+    });
   });
 
   it("kb-test → same box shape as kb-compile but a read-only tool envelope", () => {
@@ -41,6 +53,7 @@ describe("getBoxProfile", () => {
     expect(test.image).toBe(compile.image);
     expect(test.home).toBe(compile.home);
     expect(test.volumes).toEqual(compile.volumes);
+    expect(test.nestedSandbox).toBeUndefined();
     // ...the trust difference is expressed purely as allowedTools.
     expect(test.allowedTools).toEqual(["Read", "Glob", "Grep"]);
     expect(test.allowedTools).not.toContain("Write");

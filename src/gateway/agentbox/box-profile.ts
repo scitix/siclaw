@@ -37,6 +37,17 @@ export interface BoxProfile {
   home?: string;
   /** Extra writable emptyDir volumes. */
   volumes?: BoxProfileVolume[];
+  /**
+   * Inner Linux sandbox required by this image. `bubblewrap` needs to create
+   * user/PID/network namespaces and private mounts; Kubernetes' runtime-default
+   * seccomp/AppArmor profiles deny those operations before the inner sandbox
+   * can apply its narrower filesystem and network policy.
+   *
+   * This is deliberately profile-scoped. A normal AgentBox must retain the
+   * outer runtime-default policy, and read-only KB test boxes do not launch a
+   * native shell at all.
+   */
+  nestedSandbox?: "bubblewrap";
   /** Tool/trust profile: allowed tool names (null = all). Enforced end-to-end in A.3. */
   allowedTools?: string[] | null;
   /**
@@ -98,6 +109,20 @@ function kbCompileProfile(): BoxProfile {
 }
 
 /**
+ * kb-compile-codex — the same authoring capability and image as kb-compile,
+ * with the outer exception Codex needs to install its *narrower* Bubblewrap
+ * sandbox. Keeping this as a distinct profile means Claude authoring boxes
+ * retain Kubernetes' RuntimeDefault seccomp/AppArmor policy.
+ */
+function kbCompileCodexProfile(): BoxProfile {
+  return {
+    ...kbCompileProfile(),
+    name: "kb-compile-codex",
+    nestedSandbox: "bubblewrap",
+  };
+}
+
+/**
  * kb-test — a read-only, zero-infra KB consumer box (start-a-test-session). Same kbc image +
  * writable /work (Claude Code's ~/.claude) as kb-compile, but a RESTRICTED tool
  * envelope: Read/Glob/Grep only — no Write/Edit/Bash and no compile MCP tools, so
@@ -123,6 +148,7 @@ function kbTestProfile(): BoxProfile {
 const BUILTIN_PROFILES: Record<string, () => BoxProfile> = {
   agent: () => AGENT_PROFILE,
   "kb-compile": kbCompileProfile,
+  "kb-compile-codex": kbCompileCodexProfile,
   "kb-test": kbTestProfile,
 };
 
