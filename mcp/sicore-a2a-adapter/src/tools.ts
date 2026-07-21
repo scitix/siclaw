@@ -110,6 +110,7 @@ type ToolResult = {
 type TaskToolView = Omit<SiclawTask, "result"> & {
   result?: string | null;
   progress_chars: number;
+  wait_error?: string;
 };
 
 function taskView(task: SiclawTask, includeTerminalResult: boolean): TaskToolView {
@@ -154,13 +155,14 @@ function intArg(
   return value as number;
 }
 
-function taskText(task: SiclawTask): string {
+function taskText(task: SiclawTask, waitError?: string): string {
   const lines = [
     `Siclaw task ${task.task_id}: ${task.state}`,
     `context_id: ${task.context_id}`,
   ];
   if (task.updated_at) lines.push(`updated_at: ${task.updated_at}`);
   if (task.status_message) lines.push(`status: ${task.status_message}`);
+  if (waitError) lines.push(`wait_error: ${waitError} (status polling failed, but the task was already created)`);
   if (task.is_terminal && task.result) lines.push("", task.result);
   if (!task.is_terminal) {
     const progressChars = task.result?.length ?? 0;
@@ -170,10 +172,12 @@ function taskText(task: SiclawTask): string {
   return lines.join("\n");
 }
 
-function taskResult(task: SiclawTask): ToolResult {
+function taskResult(task: SiclawTask, waitError?: string): ToolResult {
+  const view = taskView(task, true);
+  if (waitError) view.wait_error = waitError;
   return {
-    content: [{ type: "text", text: taskText(task) }],
-    structuredContent: taskView(task, true) as unknown as Record<string, unknown>,
+    content: [{ type: "text", text: taskText(task, waitError) }],
+    structuredContent: view as unknown as Record<string, unknown>,
   };
 }
 
@@ -195,10 +199,14 @@ export function createToolHandler(api: SiclawA2aApi) {
         const contextId = stringArg(args, "context_id");
         const waitSeconds = intArg(args, "wait_seconds", 20, 0, 50);
         const submitted = await api.sendMessage(question, contextId);
-        const task = waitSeconds > 0 && !submitted.is_terminal
-          ? await api.waitForTask(submitted.task_id, waitSeconds)
-          : submitted;
-        return taskResult(task);
+        if (waitSeconds === 0 || submitted.is_terminal) return taskResult(submitted);
+        try {
+          return taskResult(await api.waitForTask(submitted.task_id, waitSeconds));
+        } catch (error) {
+          // The task exists server-side at this point; a plain error would drop the
+          // task_id and invite the client to resubmit a duplicate investigation.
+          return taskResult(submitted, error instanceof Error ? error.message : String(error));
+        }
       }
       if (name === "siclaw_get_task") {
         return taskResult(await api.getTask(stringArg(args, "task_id", true)!));
