@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createClusterListTool } from "./cluster-list.js";
 import { CredentialBroker } from "../../agentbox/credential-broker.js";
+import type { ProbeResult } from "../../agentbox/credential-broker.js";
 import type {
   CredentialTransport,
   ClusterMeta,
@@ -137,37 +138,42 @@ describe("cluster_list tool — lazy fill", () => {
 });
 
 describe("cluster_list tool — opt-in probe flag", () => {
+  // The fixtures below are typed as ProbeResult (no `as any`), so any future
+  // change to the probe contract fails these mocks at compile time.
   it("without probe: no cluster contact, entries carry no reachability", async () => {
     transport.clusters = [{ name: "c1", is_production: true }];
     let probeCalls = 0;
-    broker.probeClusters = (async (names: string[]) => {
+    broker.probeClusters = async (names: string[]): Promise<ProbeResult[]> => {
       probeCalls += 1;
-      return names.map((name) => ({ name, reachable: true }));
-    }) as any;
+      return names.map((name) => ({ name, probe_status: "success", reachable: true, server_version: "unknown" }));
+    };
     const tool = createClusterListTool(ref);
     const result = await tool.execute("id", {});
     const parsed = JSON.parse((result.content[0] as any).text.split("\n\n")[0]);
     expect(probeCalls).toBe(0);
     expect(parsed.clusters[0]).not.toHaveProperty("reachable");
+    expect(parsed.clusters[0]).not.toHaveProperty("probe_status");
   });
 
-  it("probe:true folds reachable + server_version into each entry", async () => {
+  it("probe:true (success) folds probe_status + reachable + server_version into each entry", async () => {
     transport.clusters = [
       { name: "c1", is_production: true },
       { name: "c2", is_production: false },
     ];
     const probedNames: string[][] = [];
-    broker.probeClusters = (async (names: string[]) => {
+    broker.probeClusters = async (names: string[]): Promise<ProbeResult[]> => {
       probedNames.push([...names]);
-      return names.map((name) => ({ name, reachable: true, server_version: "v1.29.0" }));
-    }) as any;
+      return names.map((name) => ({ name, probe_status: "success", reachable: true, server_version: "v1.29.0" }));
+    };
     const tool = createClusterListTool(ref);
     const result = await tool.execute("id", { probe: true });
     const parsed = JSON.parse((result.content[0] as any).text.split("\n\n")[0]);
     expect(probedNames).toEqual([["c1", "c2"]]);
     for (const c of parsed.clusters) {
+      expect(c.probe_status).toBe("success");
       expect(c.reachable).toBe(true);
       expect(c.server_version).toBe("v1.29.0");
+      expect(c).not.toHaveProperty("probe_reason");
     }
   });
 
@@ -178,24 +184,53 @@ describe("cluster_list tool — opt-in probe flag", () => {
       { name: "dev-c", is_production: false },
     ];
     let probedWith: string[] = [];
-    broker.probeClusters = (async (names: string[]) => {
+    broker.probeClusters = async (names: string[]): Promise<ProbeResult[]> => {
       probedWith = [...names];
-      return names.map((name) => ({ name, reachable: true }));
-    }) as any;
+      return names.map((name) => ({ name, probe_status: "success", reachable: true, server_version: "unknown" }));
+    };
     const tool = createClusterListTool(ref);
     await tool.execute("id", { name: "prod", probe: true });
     expect(probedWith.sort()).toEqual(["prod-a", "prod-b"]);
   });
 
-  it("unreachable probe surfaces reachable:false + probe_error, no server_version", async () => {
+  it("unreachable probe surfaces reachable:false + probe_reason + probe_error, no server_version", async () => {
     transport.clusters = [{ name: "c1", is_production: true }];
-    broker.probeClusters = (async (names: string[]) =>
-      names.map((name) => ({ name, reachable: false, probe_error: "connection timeout" }))) as any;
+    broker.probeClusters = async (names: string[]): Promise<ProbeResult[]> =>
+      names.map((name) => ({ name, probe_status: "unreachable", reachable: false, reason: "timeout", probe_error: "i/o timeout" }));
     const tool = createClusterListTool(ref);
     const result = await tool.execute("id", { probe: true });
     const parsed = JSON.parse((result.content[0] as any).text.split("\n\n")[0]);
+    expect(parsed.clusters[0].probe_status).toBe("unreachable");
+    expect(parsed.clusters[0].probe_reason).toBe("timeout");
     expect(parsed.clusters[0].reachable).toBe(false);
-    expect(parsed.clusters[0].probe_error).toBe("connection timeout");
+    expect(parsed.clusters[0].probe_error).toBe("i/o timeout");
+    expect(parsed.clusters[0]).not.toHaveProperty("server_version");
+  });
+
+  it("probe_failed surfaces probe_reason + error WITHOUT claiming the cluster is unreachable", async () => {
+    transport.clusters = [{ name: "c1", is_production: false }];
+    broker.probeClusters = async (names: string[]): Promise<ProbeResult[]> =>
+      names.map((name) => ({ name, probe_status: "probe_failed", reason: "kubeconfig", probe_error: "no configuration has been provided" }));
+    const tool = createClusterListTool(ref);
+    const result = await tool.execute("id", { probe: true });
+    const parsed = JSON.parse((result.content[0] as any).text.split("\n\n")[0]);
+    expect(parsed.clusters[0].probe_status).toBe("probe_failed");
+    expect(parsed.clusters[0].probe_reason).toBe("kubeconfig");
+    expect(parsed.clusters[0].probe_error).toBe("no configuration has been provided");
+    expect(parsed.clusters[0]).not.toHaveProperty("reachable");
+    expect(parsed.clusters[0]).not.toHaveProperty("server_version");
+  });
+
+  it("probe_failed/auth carries reachable:true (401 proves the API server answered — cluster is up)", async () => {
+    transport.clusters = [{ name: "c1", is_production: true }];
+    broker.probeClusters = async (names: string[]): Promise<ProbeResult[]> =>
+      names.map((name) => ({ name, probe_status: "probe_failed", reason: "auth", reachable: true, probe_error: "Unauthorized" }));
+    const tool = createClusterListTool(ref);
+    const result = await tool.execute("id", { probe: true });
+    const parsed = JSON.parse((result.content[0] as any).text.split("\n\n")[0]);
+    expect(parsed.clusters[0].probe_status).toBe("probe_failed");
+    expect(parsed.clusters[0].probe_reason).toBe("auth");
+    expect(parsed.clusters[0].reachable).toBe(true);
     expect(parsed.clusters[0]).not.toHaveProperty("server_version");
   });
 });

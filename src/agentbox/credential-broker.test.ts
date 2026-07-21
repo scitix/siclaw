@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CredentialBroker } from "./credential-broker.js";
+import { CredentialBroker, classifyKubectlProbeError, withProbeTimeout } from "./credential-broker.js";
+import type { ProbeResult, ClusterLocalInfo } from "./credential-broker.js";
 import type {
   CredentialTransport,
   ClusterMeta,
@@ -524,37 +525,247 @@ describe("CredentialBroker — probeClusters batch", () => {
   // only the batch contract (order, per-item fold pass-through, concurrency
   // bound) rather than kubectl.
   it("preserves input order and folds each per-cluster result (batch never rejects)", async () => {
-    broker.probeCluster = (async (name: string) =>
+    broker.probeCluster = async (name: string): Promise<ProbeResult> =>
       name === "bad"
-        ? { name, reachable: false, probe_error: "boom" }
-        : { name, reachable: true, server_version: "v1.29.0" }) as any;
+        ? { name, probe_status: "unreachable", reachable: false, reason: "connection_refused", probe_error: "boom" }
+        : { name, probe_status: "success", reachable: true, server_version: "v1.29.0" };
 
     const results = await broker.probeClusters(["good1", "bad", "good2"]);
 
     expect(results.map((r) => r.name)).toEqual(["good1", "bad", "good2"]);
-    expect(results[1]).toEqual({ name: "bad", reachable: false, probe_error: "boom" });
-    expect(results[0].reachable).toBe(true);
-    expect(results[2].reachable).toBe(true);
+    expect(results[1]).toEqual({ name: "bad", probe_status: "unreachable", reachable: false, reason: "connection_refused", probe_error: "boom" });
+    expect(results[0].probe_status).toBe("success");
+    expect(results[2].probe_status).toBe("success");
   });
 
   it("bounds in-flight probes to the given concurrency", async () => {
     let active = 0;
     let maxActive = 0;
-    broker.probeCluster = ((name: string) => {
+    broker.probeCluster = (name: string): Promise<ProbeResult> => {
       active += 1;
       maxActive = Math.max(maxActive, active);
-      return new Promise((resolve) => {
+      return new Promise<ProbeResult>((resolve) => {
         setTimeout(() => {
           active -= 1;
-          resolve({ name, reachable: true });
+          resolve({ name, probe_status: "success", reachable: true, server_version: "unknown" });
         }, 5);
       });
-    }) as any;
+    };
 
     const names = ["a", "b", "c", "d", "e"];
     const results = await broker.probeClusters(names, { concurrency: 2 });
 
     expect(maxActive).toBe(2); // never more than the cap in flight at once
     expect(results.map((r) => r.name)).toEqual(names); // order still preserved
+  });
+
+  it("folds an acquire failure into probe_failed/credential (never a rejected batch)", async () => {
+    // FakeTransport.getClusterCredential throws when no payload is registered —
+    // i.e. the kubeconfig can't even be fetched. That is a local/credential
+    // problem, NOT a statement about the cluster.
+    transport.clusters = [{ name: "c1", is_production: true }];
+    await broker.refreshClusters();
+    const [result] = await broker.probeClusters(["c1"]);
+    expect(result.probe_status).toBe("probe_failed");
+    if (result.probe_status === "probe_failed") {
+      expect(result.reason).toBe("credential");
+      expect(result).not.toHaveProperty("reachable");
+    }
+  });
+});
+
+describe("classifyKubectlProbeError — evidence-based classification", () => {
+  // A killed child with a positive network error in stderr is a real network
+  // failure; without such evidence it is a local timeout of unknown reachability.
+  const killed = (message: string): Error =>
+    Object.assign(new Error(message), { killed: true });
+  const withCode = (message: string, code: string): Error =>
+    Object.assign(new Error(message), { code });
+
+  type Expectation = {
+    probe_status: ProbeResult["probe_status"];
+    reason?: string;
+    reachable?: true | false | "absent";
+  };
+
+  const cases: Array<{ desc: string; err: Error; stderr: string; expect: Expectation }> = [
+    {
+      desc: "ENOENT — kubectl binary missing",
+      err: withCode("spawn kubectl ENOENT", "ENOENT"),
+      stderr: "",
+      expect: { probe_status: "probe_failed", reason: "kubectl_missing", reachable: "absent" },
+    },
+    {
+      desc: "EACCES — kubectl not executable",
+      err: withCode("spawn kubectl EACCES", "EACCES"),
+      stderr: "",
+      expect: { probe_status: "probe_failed", reason: "kubectl_missing", reachable: "absent" },
+    },
+    {
+      desc: "localhost:8080 fallback — missing/empty kubeconfig",
+      err: new Error("exit 1"),
+      stderr: "The connection to the server localhost:8080 was refused - did you specify the right host or port?",
+      expect: { probe_status: "probe_failed", reason: "kubeconfig", reachable: "absent" },
+    },
+    {
+      desc: "no configuration provided — invalid kubeconfig",
+      err: new Error("exit 1"),
+      stderr: "error: no configuration has been provided, try setting KUBERNETES_MASTER environment variable",
+      expect: { probe_status: "probe_failed", reason: "kubeconfig", reachable: "absent" },
+    },
+    {
+      desc: "no context is currently set — kubeconfig",
+      err: new Error("exit 1"),
+      stderr: 'error: no context is currently set, use "kubectl config use-context <context>" to select a new one',
+      expect: { probe_status: "probe_failed", reason: "kubeconfig", reachable: "absent" },
+    },
+    {
+      desc: "hung exec credential plugin — kubeconfig (request never left the host)",
+      err: new Error("exit 1"),
+      stderr: "error: getting credentials: exec: executable aws-iam-authenticator not found",
+      expect: { probe_status: "probe_failed", reason: "kubeconfig", reachable: "absent" },
+    },
+    {
+      desc: "401 Unauthorized — auth, server answered so reachable:true",
+      err: new Error("exit 1"),
+      stderr: "error: You must be logged in to the server (Unauthorized)",
+      expect: { probe_status: "probe_failed", reason: "auth", reachable: true },
+    },
+    {
+      desc: "403 Forbidden — authz, server answered so reachable:true",
+      err: new Error("exit 1"),
+      stderr: 'Error from server (Forbidden): pods is forbidden: User "x" cannot list resource "pods"',
+      expect: { probe_status: "probe_failed", reason: "authz", reachable: true },
+    },
+    {
+      desc: "404 NotFound — endpoint answered but NOT proof of a healthy API (no reachable)",
+      err: new Error("exit 1"),
+      stderr: "Error from server (NotFound): the server could not find the requested resource",
+      expect: { probe_status: "probe_failed", reason: "endpoint", reachable: "absent" },
+    },
+    {
+      desc: "x509 — certificate validation failure, TLS not completed (no reachable)",
+      err: new Error("exit 1"),
+      stderr: "Unable to connect to the server: x509: certificate signed by unknown authority",
+      expect: { probe_status: "probe_failed", reason: "tls_cert", reachable: "absent" },
+    },
+    {
+      desc: "DNS — hostname did not resolve",
+      err: new Error("exit 1"),
+      stderr: 'Unable to connect to the server: dial tcp: lookup api.example.com on 10.0.0.1:53: no such host',
+      expect: { probe_status: "unreachable", reason: "dns", reachable: false },
+    },
+    {
+      desc: "connection refused — real API server host:port",
+      err: new Error("exit 1"),
+      stderr: "The connection to the server 10.0.0.5:6443 was refused - did you specify the right host or port?",
+      expect: { probe_status: "unreachable", reason: "connection_refused", reachable: false },
+    },
+    {
+      desc: "connection reset",
+      err: new Error("exit 1"),
+      stderr: "Unable to connect to the server: read tcp 10.0.0.9:443: connection reset by peer",
+      expect: { probe_status: "unreachable", reason: "connection_reset", reachable: false },
+    },
+    {
+      desc: "no route to host",
+      err: new Error("exit 1"),
+      stderr: "Unable to connect to the server: dial tcp 10.0.0.5:6443: connect: no route to host",
+      expect: { probe_status: "unreachable", reason: "network", reachable: false },
+    },
+    {
+      desc: "client-go request timeout — positive network-timeout evidence",
+      err: new Error("exit 1"),
+      stderr: "Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded) i/o timeout",
+      expect: { probe_status: "unreachable", reason: "timeout", reachable: false },
+    },
+    {
+      desc: "child killed with client-go timeout evidence — evidence wins, unreachable",
+      err: killed("Command failed"),
+      stderr: "Unable to connect to the server: context deadline exceeded",
+      expect: { probe_status: "unreachable", reason: "timeout", reachable: false },
+    },
+    {
+      desc: "child killed WITHOUT network evidence — local timeout, reachability unknown",
+      err: killed("Command was killed with SIGTERM"),
+      stderr: "",
+      expect: { probe_status: "probe_failed", reason: "timeout", reachable: "absent" },
+    },
+    {
+      desc: "unrecognised stderr — unknown, no reachability claim",
+      err: new Error("exit 1"),
+      stderr: "error: some brand new kubectl failure we have never seen",
+      expect: { probe_status: "probe_failed", reason: "unknown", reachable: "absent" },
+    },
+  ];
+
+  for (const c of cases) {
+    it(c.desc, () => {
+      const r = classifyKubectlProbeError("c1", c.err, c.stderr);
+      expect(r.name).toBe("c1");
+      expect(r.probe_status).toBe(c.expect.probe_status);
+      if (c.expect.reason !== undefined && r.probe_status !== "success") {
+        expect(r.reason).toBe(c.expect.reason);
+      }
+      if (c.expect.reachable === "absent") {
+        expect(r).not.toHaveProperty("reachable");
+      } else if (c.expect.reachable !== undefined) {
+        expect((r as { reachable?: boolean }).reachable).toBe(c.expect.reachable);
+      }
+      // Every non-success result carries a non-empty probe_error.
+      if (r.probe_status !== "success") {
+        expect(typeof r.probe_error).toBe("string");
+        expect(r.probe_error.length).toBeGreaterThan(0);
+      }
+    });
+  }
+});
+
+describe("withProbeTimeout — aborts timed-out work before it reaches kubectl", () => {
+  it("resolves with probe_failed/timeout and never starts post-timeout work", async () => {
+    let startedWorkAfterTimeout = false;
+    const result = await withProbeTimeout(
+      "c1",
+      async (signal) => {
+        // Simulate a credential fetch that outlives the probe timeout.
+        await new Promise((r) => setTimeout(r, 40));
+        if (signal.aborted) {
+          // Correct: the guard prevents spawning kubectl after the timeout.
+          return { name: "c1", probe_status: "probe_failed", reason: "credential", probe_error: "aborted before kubectl" };
+        }
+        startedWorkAfterTimeout = true;
+        return { name: "c1", probe_status: "success", reachable: true, server_version: "v1" };
+      },
+      10,
+    );
+    expect(result.probe_status).toBe("probe_failed");
+    if (result.probe_status === "probe_failed") expect(result.reason).toBe("timeout");
+    // Let the late operation settle and confirm it took the aborted branch.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(startedWorkAfterTimeout).toBe(false);
+  });
+
+  it("returns the operation result verbatim when it finishes before the timeout", async () => {
+    const result = await withProbeTimeout(
+      "c1",
+      async () => ({ name: "c1", probe_status: "success", reachable: true, server_version: "v1.30.0" }),
+      1000,
+    );
+    expect(result).toEqual({ name: "c1", probe_status: "success", reachable: true, server_version: "v1.30.0" });
+  });
+
+  it("probeCluster does not run kubectl once the probe has timed out fetching credentials", async () => {
+    // ensureCluster resolves a (fake) path AFTER the probe timeout. If the guard
+    // is wired, probeKubeconfig is never called — so the reason stays `timeout`,
+    // NOT `kubectl_missing`/`unknown` (which is what a real kubectl spawn against
+    // a bogus path with no kubectl on PATH would produce).
+    broker.ensureCluster = (name: string): Promise<ClusterLocalInfo> =>
+      new Promise((res) =>
+        setTimeout(() => res({ meta: { name, is_production: false }, path: "/definitely/not/a/real/kubeconfig" }), 40),
+      );
+    const [result] = await broker.probeClusters(["c1"], { timeoutMs: 10 });
+    expect(result.probe_status).toBe("probe_failed");
+    if (result.probe_status === "probe_failed") expect(result.reason).toBe("timeout");
+    await new Promise((r) => setTimeout(r, 60)); // let the late ensureCluster settle
   });
 });
