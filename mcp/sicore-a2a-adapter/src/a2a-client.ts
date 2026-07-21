@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import type { AdapterConfig } from "./config.js";
+import type { AdapterConfig, ResolvedAdapterConfig } from "./config.js";
 
 export const TERMINAL_A2A_STATES = new Set([
   "TASK_STATE_COMPLETED",
@@ -171,11 +171,141 @@ function normalizeNextPageToken(value: unknown): number | null {
   return token;
 }
 
+async function a2aRequest<T>(
+  fetchImpl: typeof fetch,
+  apiKey: string,
+  url: string,
+  method: string,
+  body: unknown,
+  timeoutMs: number,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  timer.unref();
+  try {
+    let response: Response;
+    try {
+      response = await fetchImpl(url, {
+        method,
+        headers: {
+          accept: "application/a2a+json, application/json",
+          authorization: `Bearer ${apiKey}`,
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new A2aClientError("Sicore A2A request timed out", {
+          reason: "A2A_TIMEOUT",
+          retriable: true,
+        });
+      }
+      throw new A2aClientError(
+        `Could not reach Sicore A2A endpoint: ${error instanceof Error ? error.message : String(error)}`,
+        { reason: "A2A_UNREACHABLE", retriable: true },
+      );
+    }
+
+    let raw: string;
+    try {
+      raw = await response.text();
+    } catch (error) {
+      throw new A2aClientError(
+        `Could not read Sicore A2A response: ${error instanceof Error ? error.message : String(error)}`,
+        {
+          httpStatus: response.status,
+          reason: "A2A_RESPONSE_READ_FAILED",
+          retriable: method === "GET",
+        },
+      );
+    }
+    let payload: unknown = null;
+    if (raw) {
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        throw new A2aClientError("Sicore returned a non-JSON A2A response", {
+          httpStatus: response.status,
+          reason: "INVALID_A2A_RESPONSE",
+          retriable: method === "GET" && (response.ok || isRetriableHttpStatus(response.status)),
+        });
+      }
+    }
+    if (!response.ok) throw errorFromResponse(response.status, payload);
+    return payload as T;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function retryIdempotentRead<T>(
+  requestTimeoutMs: number,
+  operation: (timeoutMs: number) => Promise<T>,
+  overallDeadline?: number,
+): Promise<T> {
+  const operationDeadline = Math.min(
+    overallDeadline ?? Number.POSITIVE_INFINITY,
+    Date.now() + requestTimeoutMs,
+  );
+  let lastError: A2aClientError | null = null;
+
+  for (let attempt = 0; attempt <= READ_RETRY_DELAYS_MS.length; attempt += 1) {
+    const remaining = operationDeadline - Date.now();
+    if (remaining <= 0) {
+      throw lastError ?? new A2aClientError("Sicore A2A request timed out", {
+        reason: "A2A_TIMEOUT",
+        retriable: true,
+      });
+    }
+    try {
+      return await operation(remaining);
+    } catch (error) {
+      if (!(error instanceof A2aClientError) || !error.retriable) throw error;
+      lastError = error;
+      const retryDelayMs = READ_RETRY_DELAYS_MS[attempt];
+      if (retryDelayMs === undefined || Date.now() + retryDelayMs >= operationDeadline) throw error;
+      await delay(retryDelayMs);
+    }
+  }
+
+  throw lastError ?? new A2aClientError("Sicore A2A read failed");
+}
+
+// resolveAgentId asks Sicore which agent the configured key is bound to
+// (GET /api/v1/a2a/self). Keys are per-agent, so this spares the operator
+// from copying the agent UUID into client config. Older Sicore deployments
+// without the endpoint require SICLAW_AGENT_ID to be set explicitly.
+export async function resolveAgentId(
+  config: AdapterConfig,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<string> {
+  let payload: { agentId?: unknown } | null;
+  try {
+    payload = await retryIdempotentRead(config.requestTimeoutMs, (timeoutMs) =>
+      a2aRequest(fetchImpl, config.apiKey, `${config.baseUrl}/api/v1/a2a/self`, "GET", undefined, timeoutMs));
+  } catch (error) {
+    if (error instanceof A2aClientError && error.httpStatus === 404) {
+      throw new A2aClientError(
+        "This Sicore does not support key self-resolution (GET /api/v1/a2a/self); set SICLAW_AGENT_ID explicitly",
+        { httpStatus: 404, reason: "SELF_RESOLUTION_UNSUPPORTED" },
+      );
+    }
+    throw error;
+  }
+  const agentId = typeof payload?.agentId === "string" ? payload.agentId.trim() : "";
+  if (!agentId) {
+    throw new A2aClientError("Sicore /self returned no agentId", { reason: "INVALID_A2A_RESPONSE" });
+  }
+  return agentId;
+}
+
 export class SicoreA2aClient implements SiclawA2aApi {
   private readonly agentBaseUrl: string;
 
   constructor(
-    private readonly config: AdapterConfig,
+    private readonly config: ResolvedAdapterConfig,
     private readonly fetchImpl: typeof fetch = globalThis.fetch,
   ) {
     this.agentBaseUrl = `${config.baseUrl}/api/v1/a2a/agents/${encodeURIComponent(config.agentId)}`;
@@ -187,97 +317,14 @@ export class SicoreA2aClient implements SiclawA2aApi {
     body?: unknown,
     timeoutMs = this.config.requestTimeoutMs,
   ): Promise<T> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
-    timer.unref();
-    try {
-      let response: Response;
-      try {
-        response = await this.fetchImpl(`${this.agentBaseUrl}${path}`, {
-          method,
-          headers: {
-            accept: "application/a2a+json, application/json",
-            authorization: `Bearer ${this.config.apiKey}`,
-            ...(body === undefined ? {} : { "content-type": "application/json" }),
-          },
-          body: body === undefined ? undefined : JSON.stringify(body),
-          signal: controller.signal,
-        });
-      } catch (error) {
-        if (controller.signal.aborted) {
-          throw new A2aClientError("Sicore A2A request timed out", {
-            reason: "A2A_TIMEOUT",
-            retriable: true,
-          });
-        }
-        throw new A2aClientError(
-          `Could not reach Sicore A2A endpoint: ${error instanceof Error ? error.message : String(error)}`,
-          { reason: "A2A_UNREACHABLE", retriable: true },
-        );
-      }
-
-      let raw: string;
-      try {
-        raw = await response.text();
-      } catch (error) {
-        throw new A2aClientError(
-          `Could not read Sicore A2A response: ${error instanceof Error ? error.message : String(error)}`,
-          {
-            httpStatus: response.status,
-            reason: "A2A_RESPONSE_READ_FAILED",
-            retriable: method === "GET",
-          },
-        );
-      }
-      let payload: unknown = null;
-      if (raw) {
-        try {
-          payload = JSON.parse(raw);
-        } catch {
-          throw new A2aClientError("Sicore returned a non-JSON A2A response", {
-            httpStatus: response.status,
-            reason: "INVALID_A2A_RESPONSE",
-            retriable: method === "GET" && (response.ok || isRetriableHttpStatus(response.status)),
-          });
-        }
-      }
-      if (!response.ok) throw errorFromResponse(response.status, payload);
-      return payload as T;
-    } finally {
-      clearTimeout(timer);
-    }
+    return a2aRequest(this.fetchImpl, this.config.apiKey, `${this.agentBaseUrl}${path}`, method, body, timeoutMs);
   }
 
   private async readWithRetry<T>(
     operation: (timeoutMs: number) => Promise<T>,
     overallDeadline?: number,
   ): Promise<T> {
-    const operationDeadline = Math.min(
-      overallDeadline ?? Number.POSITIVE_INFINITY,
-      Date.now() + this.config.requestTimeoutMs,
-    );
-    let lastError: A2aClientError | null = null;
-
-    for (let attempt = 0; attempt <= READ_RETRY_DELAYS_MS.length; attempt += 1) {
-      const remaining = operationDeadline - Date.now();
-      if (remaining <= 0) {
-        throw lastError ?? new A2aClientError("Sicore A2A request timed out", {
-          reason: "A2A_TIMEOUT",
-          retriable: true,
-        });
-      }
-      try {
-        return await operation(remaining);
-      } catch (error) {
-        if (!(error instanceof A2aClientError) || !error.retriable) throw error;
-        lastError = error;
-        const retryDelayMs = READ_RETRY_DELAYS_MS[attempt];
-        if (retryDelayMs === undefined || Date.now() + retryDelayMs >= operationDeadline) throw error;
-        await delay(retryDelayMs);
-      }
-    }
-
-    throw lastError ?? new A2aClientError("Sicore A2A read failed");
+    return retryIdempotentRead(this.config.requestTimeoutMs, operation, overallDeadline);
   }
 
   private async loadTask(taskId: string, overallDeadline?: number): Promise<SiclawTask> {

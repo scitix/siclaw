@@ -2,11 +2,14 @@ import { readFileSync, statSync } from "node:fs";
 
 export interface AdapterConfig {
   baseUrl: string;
-  agentId: string;
+  /** Absent when the agent should be resolved from the key via GET /api/v1/a2a/self. */
+  agentId?: string;
   apiKey: string;
   requestTimeoutMs: number;
   pollIntervalMs: number;
 }
+
+export type ResolvedAdapterConfig = AdapterConfig & { agentId: string };
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -93,8 +96,8 @@ function loadApiKey(env: NodeJS.ProcessEnv): string {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdapterConfig {
-  const agentId = required(env, "SICLAW_AGENT_ID");
-  if (Buffer.byteLength(agentId, "utf8") > 255) {
+  const agentId = env.SICLAW_AGENT_ID?.trim() || undefined;
+  if (agentId && Buffer.byteLength(agentId, "utf8") > 255) {
     throw new ConfigError("SICLAW_AGENT_ID must be 255 bytes or less");
   }
   return {

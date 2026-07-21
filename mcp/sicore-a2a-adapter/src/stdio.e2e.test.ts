@@ -83,4 +83,42 @@ describe("stdio process", () => {
       message: { role: "ROLE_USER", parts: [{ text: "check e2e" }] },
     });
   });
+
+  it("self-resolves the agent from the key when SICLAW_AGENT_ID is absent", async () => {
+    const paths: string[] = [];
+    const mock = createServer(async (request, response) => {
+      paths.push(request.url ?? "");
+      for await (const _chunk of request) { /* drain */ }
+      response.writeHead(200, { "content-type": "application/a2a+json" });
+      if (request.url === "/api/v1/a2a/self") {
+        response.end(JSON.stringify({ agentId: "agent-resolved" }));
+        return;
+      }
+      response.end(JSON.stringify({ task: completedTask() }));
+    });
+    httpServers.push(mock);
+    const port = await listen(mock);
+
+    const adapterEntrypoint = fileURLToPath(new URL("./index.ts", import.meta.url));
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["--import", "tsx", adapterEntrypoint],
+      env: {
+        SICORE_URL: `http://127.0.0.1:${port}`,
+        SICLAW_A2A_KEY: "e2e-key",
+      },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "stdio-e2e-self", version: "1.0.0" });
+    clients.push(client);
+    await client.connect(transport);
+
+    const result = await client.callTool({
+      name: "siclaw_investigate",
+      arguments: { question: "check self-resolve", wait_seconds: 0 },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(paths[0]).toBe("/api/v1/a2a/self");
+    expect(paths).toContain("/api/v1/a2a/agents/agent-resolved/message:send");
+  });
 });

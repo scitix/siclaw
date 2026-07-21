@@ -30,6 +30,10 @@ describe("loadConfig", () => {
     });
   });
 
+  it("treats SICLAW_AGENT_ID as optional for key self-resolution", () => {
+    expect(loadConfig(baseEnv({ SICLAW_AGENT_ID: undefined })).agentId).toBeUndefined();
+  });
+
   it("allows HTTP only for loopback testing", () => {
     expect(loadConfig(baseEnv({ SICORE_URL: "http://127.0.0.1:3000" })).baseUrl)
       .toBe("http://127.0.0.1:3000");
