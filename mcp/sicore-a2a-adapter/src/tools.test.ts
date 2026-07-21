@@ -97,6 +97,23 @@ describe("tool contract", () => {
     expect(result.structuredContent).not.toHaveProperty("result");
   });
 
+  it("keeps the submitted task_id when the bounded wait fails after submission", async () => {
+    const api = fakeApi();
+    vi.mocked(api.waitForTask).mockRejectedValue(new Error("Sicore A2A request timed out"));
+    const result = await createToolHandler(api)("siclaw_investigate", { question: "check node" });
+
+    expect(api.sendMessage).toHaveBeenCalledOnce();
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent).toMatchObject({
+      task_id: "task-1",
+      state: "working",
+      wait_error: "Sicore A2A request timed out",
+    });
+    expect(result.content[0].text).toContain("task-1");
+    expect(result.content[0].text).toContain("wait_error: Sicore A2A request timed out");
+    expect(result.content[0].text).toContain("do not submit the same investigation again");
+  });
+
   it("returns MCP tool errors for invalid arguments", async () => {
     const result = await createToolHandler(fakeApi())("siclaw_get_task", {});
     expect(result.isError).toBe(true);
