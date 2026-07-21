@@ -35,10 +35,10 @@ import type {
 
 /** Just the surfaces this needs (so tests can pass fakes). */
 export interface MaterializeBoxClient {
-  postJson<T = unknown>(path: string, body: unknown): Promise<T>;
+  postJson<T = unknown>(path: string, body: unknown, timeoutMs?: number): Promise<T>;
 }
 export interface MaterializeBackend {
-  request(method: string, params?: unknown): Promise<any>;
+  request(method: string, params?: unknown, timeoutMs?: number): Promise<any>;
 }
 
 export interface MaterializeResult {
@@ -74,6 +74,12 @@ export class CapabilityMaterializationError extends Error {
 
 const BOX_RUN_ALREADY_LIVE = "KBC_RUN_ALREADY_LIVE";
 const LEGACY_BOX_RUN_ALREADY_LIVE = "run already exists; upload sources before /session";
+// A source part can carry one admitted 200 MiB file plus archive/base64
+// overhead. Fetching it through the consumer RPC and installing it into the box
+// must not inherit the interactive 30s request timeout. Commit may additionally
+// hash/copy the complete 1.5 GiB snapshot and derive Office sidecars.
+const SOURCE_PART_TRANSFER_TIMEOUT_MS = 10 * 60_000;
+const SOURCE_SNAPSHOT_COMMIT_TIMEOUT_MS = 15 * 60_000;
 
 function isBoxAlreadyLive(err: unknown): boolean {
   const metadata = err as { status?: unknown; code?: unknown } | null;
@@ -125,7 +131,11 @@ async function installSourceSnapshot(opts: {
       ref: CAPABILITY_INPUT_SOURCE_PART_REF,
       part_id: partId,
     };
-    const fetched = (await backend.request(CAPABILITY_FETCH_INPUT, req)) as CapabilityFetchInputResponse;
+    const fetched = (await backend.request(
+      CAPABILITY_FETCH_INPUT,
+      req,
+      SOURCE_PART_TRANSFER_TIMEOUT_MS,
+    )) as CapabilityFetchInputResponse;
     const returnedRevision = typeof fetched?.input_revision === "string" ? fetched.input_revision.trim() : "";
     if (returnedRevision !== revision) {
       throw new Error(
@@ -142,14 +152,14 @@ async function installSourceSnapshot(opts: {
       part_id: partId,
       bundle_base64: fetched.bundle_base64,
       bundle_sha256: descriptor.sha256,
-    });
+    }, SOURCE_PART_TRANSFER_TIMEOUT_MS);
   }
 
   await client.postJson("/sources/commit", {
     run_id: runId,
     input_revision: revision,
     locale: src.locale,
-  });
+  }, SOURCE_SNAPSHOT_COMMIT_TIMEOUT_MS);
 }
 
 export async function materializeCapabilityInputs(opts: {

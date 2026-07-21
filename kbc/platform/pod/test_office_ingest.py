@@ -6,6 +6,7 @@ in. Run: python test_office_ingest.py
 
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import office_ingest
 
@@ -76,9 +77,64 @@ def test_fail_open_on_corrupt():
     print("OK  fail-open (corrupt file recorded in errors, valid files still converted, never raises)")
 
 
+def test_derived_markdown_budget_is_atomic():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        from docx import Document
+        doc = Document(); doc.add_paragraph("content that exceeds a tiny derived budget")
+        doc.save(str(root / "large.docx"))
+
+        with mock.patch.dict("os.environ", {"KBC_MAX_OFFICE_DERIVED_BYTES": "16"}):
+            try:
+                office_ingest.convert_tree(str(root))
+                raise AssertionError("expected OfficeIngestLimitExceeded")
+            except office_ingest.OfficeIngestLimitExceeded as error:
+                assert "derived markdown" in str(error), error
+
+        assert not (root / "large.docx.md").exists()
+        assert not list(root.glob(".large.docx.md.*.tmp"))
+    print("OK  derived markdown budget fails explicitly without a partial sidecar")
+
+
+def test_archive_expansion_budget_is_atomic():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        from docx import Document
+        doc = Document(); doc.add_paragraph("small document")
+        doc.save(str(root / "archive.docx"))
+
+        with mock.patch.dict("os.environ", {"KBC_MAX_OFFICE_ARCHIVE_UNPACKED_BYTES": "1"}):
+            try:
+                office_ingest.convert_tree(str(root))
+                raise AssertionError("expected OfficeIngestLimitExceeded")
+            except office_ingest.OfficeIngestLimitExceeded as error:
+                assert "expands to" in str(error), error
+
+        assert not (root / "archive.docx.md").exists()
+        assert not list(root.glob(".archive.docx.md.*.tmp"))
+    print("OK  archive expansion budget fails explicitly without a partial sidecar")
+
+
+def test_empty_office_file_keeps_readable_sidecar_contract():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        from docx import Document
+        Document().save(str(root / "empty.docx"))
+
+        converted, errors = office_ingest.convert_tree(str(root))
+
+        assert not errors, errors
+        assert converted == [("empty.docx", "empty.docx.md")], converted
+        assert (root / "empty.docx.md").read_bytes() == b"\n"
+    print("OK  empty Office input retains its one-newline readable sidecar")
+
+
 def main():
     test_convert_tree()
     test_fail_open_on_corrupt()
+    test_derived_markdown_budget_is_atomic()
+    test_archive_expansion_budget_is_atomic()
+    test_empty_office_file_keeps_readable_sidecar_contract()
     print("ALL OK  test_office_ingest")
 
 

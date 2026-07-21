@@ -166,6 +166,8 @@ spec:
                   key: {{ .tokenSecret.key | default "ANTHROPIC_AUTH_TOKEN" }}
             {{- end }}
             {{- end }}
+            - name: NODE_OPTIONS
+              value: {{ printf "--max-old-space-size=%v" (.Values.runtime.nodeMaxOldSpaceMB | default 1024) | quote }}
             # User-supplied env entries come last so callers can override any
             # of the values above (e.g. swap in SICLAW_CA_CERT_FILE).
             {{- range $key, $value := .Values.runtime.env }}
