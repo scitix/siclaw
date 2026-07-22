@@ -169,6 +169,11 @@ class ClaudeEngine:
             session_id=str(uuid.uuid4()),
             session_store=InMemorySessionStore(),
         )
+        # Verify agents are non-interactive too — route them through the
+        # de-streaming shim when it is active (lazy import keeps this module
+        # importable without aiohttp).
+        import destream
+        opts.env = {**(opts.env or {}), **destream.session_env("verify")}
         client = ClaudeSDKClient(options=opts)
         parts: list[str] = []
 

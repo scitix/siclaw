@@ -2158,6 +2158,9 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=session_id,
         session_store=InMemorySessionStore(),
+        # Non-interactive session → de-streamed Anthropic route (charset fix);
+        # merged over the inherited env by the SDK, so credentials stay put.
+        env=destream.session_env("authoring"),
         hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(
             Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges,
             raw_read_allowlist=raw_read_allowlist,
@@ -3008,6 +3011,7 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
                 max_buffer_size=SDK_MAX_BUFFER_BYTES,
                 session_id=planner_session_id,
                 session_store=InMemorySessionStore(),
+                env=destream.session_env("authoring"),
             )
             client = ClaudeSDKClient(options=opts)
         prev = run.client
@@ -3511,6 +3515,12 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
             else _MODEL_IDLE_TIMEOUT_S
         )
         bound = _MODEL_TOOL_IDLE_TIMEOUT_S if run._tool_pending else model_idle_timeout
+        # De-streamed turns produce no SDK deltas mid-request: the idle bound
+        # must cover a whole model request or the watchdog false-kills long
+        # generations (see destream.model_idle_floor).
+        floor = destream.model_idle_floor()
+        if floor:
+            bound = max(bound, floor)
         idle = time.monotonic() - run._last_model_activity
         if idle <= bound:
             continue
@@ -4638,9 +4648,6 @@ def _apply_session_config(body: dict) -> None:
             if k == "KBC_PK_MODE" and _PK_KILL_AT_BOOT:
                 continue  # ops kill switch outranks consumer config
             os.environ[k] = str(value)
-    # After the final env state lands: opt the Anthropic route in/out of the
-    # in-pod de-streaming shim (KBC_DESTREAM, charset fix — see destream.py).
-    destream.maybe_activate()
 
 
 async def handle_session(request: web.Request):
