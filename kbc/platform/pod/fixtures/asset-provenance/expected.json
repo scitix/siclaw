@@ -1,0 +1,70 @@
+{
+  "attribution_edges": {
+    "archive.md": [
+      "assets/shared.png"
+    ],
+    "excluded-doc.md": [
+      "assets/inherited.png"
+    ],
+    "guide/deep/detail.md": [
+      "guide/assets/diagram.png"
+    ],
+    "guide/setup.md": [
+      "guide/assets/a b.png",
+      "guide/assets/diagram.png",
+      "guide/assets/screenshot.png"
+    ],
+    "overview.md": [
+      "assets/hero.png",
+      "assets/shared.png",
+      "report.assets/fig.png"
+    ]
+  },
+  "coverage": {
+    "total_sources": 16,
+    "cited": 5,
+    "excluded": 2,
+    "auto_attached": 7,
+    "auto_attached_sample": [
+      {
+        "asset": "assets/hero.png",
+        "via": "overview.md"
+      },
+      {
+        "asset": "assets/inherited.png",
+        "via": "excluded-doc.md"
+      },
+      {
+        "asset": "assets/shared.png",
+        "via": "overview.md"
+      },
+      {
+        "asset": "guide/assets/a b.png",
+        "via": "guide/setup.md"
+      },
+      {
+        "asset": "guide/assets/diagram.png",
+        "via": "guide/deep/detail.md"
+      },
+      {
+        "asset": "guide/assets/diagram.png",
+        "via": "guide/setup.md"
+      },
+      {
+        "asset": "guide/assets/screenshot.png",
+        "via": "guide/setup.md"
+      },
+      {
+        "asset": "report.assets/fig.png",
+        "via": "overview.md"
+      }
+    ],
+    "unaccounted": [
+      "archive.md",
+      "assets/orphan.png"
+    ],
+    "dangling_citations": [],
+    "noop_exclusions": [],
+    "closed": false
+  }
+}
