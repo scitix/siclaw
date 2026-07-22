@@ -71,12 +71,47 @@ export interface LocalInfo<TMeta extends { name: string }> {
 export type ClusterLocalInfo = LocalInfo<ClusterMeta>;
 export type HostLocalInfo = LocalInfo<HostMeta>;
 
-export interface ProbeResult {
-  name: string;
-  reachable: boolean;
-  server_version?: string;
-  probe_error?: string;
-}
+/**
+ * Why `unreachable` was concluded — the API server could not be contacted at the
+ * network layer. Every one of these is a statement ABOUT THE CLUSTER.
+ */
+export type UnreachableReason =
+  | "connection_refused" // TCP RST — nothing listening / firewalled at the API server host:port
+  | "dns"                // the API server hostname did not resolve
+  | "network"            // no route / network unreachable / generic transport failure
+  | "connection_reset"   // peer reset / EOF / broken pipe mid-request
+  | "timeout";           // i/o timeout / context deadline / TLS handshake timeout
+
+/**
+ * Why `probe_failed` was concluded. NONE of these say the cluster is down — they
+ * are LOCAL tooling, kubeconfig, credential, or auth/trust problems (or an
+ * operation timeout that never reached a verdict). Surfacing the specific reason
+ * stops a caller from reading "probe failed" as "cluster is unreachable".
+ */
+export type ProbeFailedReason =
+  | "kubectl_missing" // kubectl binary absent / not executable (local tooling)
+  | "kubeconfig"      // kubeconfig empty/invalid/no server/bad context/authinfo (local config)
+  | "credential"      // the kubeconfig could not even be acquired from the gateway
+  | "auth"            // API server ANSWERED and rejected the identity (401 Unauthorized)
+  | "authz"           // API server ANSWERED but RBAC denied the request (403 Forbidden)
+  | "endpoint"        // an HTTP endpoint answered 404 (NotFound) — proves SOMETHING replied,
+                      // but a wrong server URL or an intermediary can produce this too, so it
+                      // is NOT proof of a healthy Kubernetes API. Reachability stays unknown.
+  | "tls_cert"        // server reached at TCP but its certificate is untrusted/expired/mismatched
+  | "timeout"         // the probe operation itself did not return in time — verdict unknown
+  | "unknown";        // kubectl failed for a reason we cannot confidently attribute
+
+export type ProbeResult =
+  | { name: string; probe_status: "success"; reachable: true; server_version: string }
+  | { name: string; probe_status: "unreachable"; reachable: false; reason: UnreachableReason; probe_error: string }
+  // probe_failed carries reachable:true ONLY for auth (401) and authz (403) — the
+  // API server both ANSWERED and adjudicated the identity/RBAC, which is proof the
+  // cluster IS reachable; the problem is this side's credentials/RBAC, not a down
+  // cluster. Every other reason omits reachable: a local/config/timeout failure
+  // never established reachability; tls_cert reached TCP but not a full HTTP
+  // exchange; and a 404 (`endpoint`) only proves *an* HTTP responder answered,
+  // which a misrouted URL or intermediary can fake — not a healthy K8s API.
+  | { name: string; probe_status: "probe_failed"; reason: ProbeFailedReason; reachable?: true; probe_error: string };
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes (unused; payload carries ttl)
 void DEFAULT_TTL_MS;
@@ -447,42 +482,66 @@ export class CredentialBroker {
    * only on miss/expiry — a reachability check does not need FRESH credentials,
    * and reuse avoids a credential.get round-trip on every probe (also warming
    * the cache for the kubectl/script tools that follow). Any acquire failure
-   * (unbound, credential error) is folded into an unreachable result rather
-   * than thrown, so a batch probe never fails as a whole on one bad cluster.
+   * (unbound, credential error) is folded into probe_failed rather than thrown,
+   * so a batch probe never fails as a whole or misreports a local failure as a
+   * Kubernetes API reachability failure.
    */
-  async probeCluster(clusterName: string): Promise<ProbeResult> {
-    let info: ClusterLocalInfo;
-    try {
-      info = await this.ensureCluster(clusterName, "cluster_probe");
-    } catch (err) {
-      return {
-        name: clusterName,
-        reachable: false,
-        probe_error: err instanceof Error ? err.message : String(err),
-      };
-    }
-    if (!info?.path) {
-      return {
-        name: clusterName,
-        reachable: false,
-        probe_error: "kubeconfig path missing after acquire",
-      };
-    }
-    return probeKubeconfig(clusterName, info.path);
+  async probeCluster(clusterName: string, opts: { timeoutMs?: number } = {}): Promise<ProbeResult> {
+    // A probe is diagnostic work, not a general credential/tool request. Keep
+    // it bounded so a stalled Runtime/Portal RPC cannot make cluster_list look
+    // hung until the normal 30s RPC timeout expires. On timeout the signal is
+    // aborted; we check it before spawning kubectl so a slow credential fetch
+    // that outlives the timeout can NEVER continue into post-timeout kubectl work.
+    return withProbeTimeout(clusterName, async (signal) => {
+      let info: ClusterLocalInfo;
+      try {
+        info = await this.ensureCluster(clusterName, "cluster_probe");
+      } catch (err) {
+        return {
+          name: clusterName,
+          probe_status: "probe_failed",
+          reason: "credential",
+          probe_error: `could not acquire kubeconfig: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      // The credential fetch may have taken longer than the probe timeout. If we
+      // have already timed out, do NOT spawn kubectl — the caller was handed a
+      // timeout result and a late kubectl here would be unbounded work outside the
+      // concurrency limiter's slot.
+      if (signal.aborted) {
+        return {
+          name: clusterName,
+          probe_status: "probe_failed",
+          reason: "timeout",
+          probe_error: "probe timed out during credential acquisition; kubectl was not started",
+        };
+      }
+      if (!info?.path) {
+        return {
+          name: clusterName,
+          probe_status: "probe_failed",
+          reason: "credential",
+          probe_error: "kubeconfig path missing after acquire",
+        };
+      }
+      return probeKubeconfig(clusterName, info.path, signal);
+    }, opts.timeoutMs);
   }
 
   /**
    * Probe several clusters concurrently, bounded so an agent with many bound
    * clusters can't spawn an unbounded fan-out of kubectl processes. Each probe
-   * is independent — a per-cluster failure yields an unreachable ProbeResult in
-   * place, never a rejected batch. Results preserve input order.
+   * is independent — a per-cluster failure yields an unreachable or probe_failed
+   * result in place, never a rejected batch. Results preserve input order.
    */
   async probeClusters(
     clusterNames: string[],
-    opts: { concurrency?: number } = {},
+    opts: { concurrency?: number; timeoutMs?: number } = {},
   ): Promise<ProbeResult[]> {
     const limiter = new ConcurrencyLimiter(opts.concurrency ?? 8);
-    return Promise.all(clusterNames.map((name) => limiter.run(() => this.probeCluster(name))));
+    return Promise.all(
+      clusterNames.map((name) => limiter.run(() => this.probeCluster(name, { timeoutMs: opts.timeoutMs }))),
+    );
   }
 
   getClusterLocalInfo(clusterName: string): ClusterLocalInfo | undefined {
@@ -783,26 +842,233 @@ function reconstructClusterResponse(cached: ClusterLocalInfo): CredentialRespons
   };
 }
 
-function probeKubeconfig(name: string, kubeconfigPath: string): Promise<ProbeResult> {
+function probeErrorText(err: Error, stderr: string | Buffer): string {
+  // kubectl/client-go writes the useful API, TLS, auth, and kubeconfig errors to
+  // stderr. Keep the complete bounded message; selecting only one line loses the
+  // actual Kubernetes failure behind child_process's generic wrapper.
+  const kubeError = String(stderr).trim();
+  if (kubeError) return kubeError.slice(0, 2000);
+  const message = err.message.trim();
+  return (message || "kubectl probe failed").slice(0, 2000);
+}
+
+/**
+ * Map a failed `kubectl version` invocation to a three-state ProbeResult with a
+ * structured `reason`. The ORDER of the checks matters — several classes of
+ * failure share substrings, and getting the precedence wrong is exactly what
+ * makes a caller hallucinate a healthy cluster as "down" (or vice-versa):
+ *
+ *   1. spawn errors (ENOENT/EACCES)  → kubectl_missing   (local tooling)
+ *   2. localhost:8080 refusal        → kubeconfig        (client-go's no-config
+ *      fallback host — the REAL API server was never contacted, so this must be
+ *      caught BEFORE the generic "connection refused" network rule)
+ *   3. other kubeconfig/context errors → kubeconfig      (local config)
+ *   4. 401 Unauthorized              → auth (reachable)  (server adjudicated identity)
+ *   4b. 403 Forbidden                → authz (reachable) (server adjudicated RBAC)
+ *   4c. 404 NotFound                 → endpoint          (an HTTP responder answered,
+ *      but a wrong URL/intermediary can too — no reachability claim)
+ *   5. x509 / cert validation        → tls_cert          (TCP reached, TLS failed)
+ *   6. POSITIVE network-layer evidence → unreachable     (statement about cluster)
+ *   7. child killed, no such evidence  → timeout (probe_failed) — our execFile
+ *      timeout may have killed a hung LOCAL exec credential plugin before any
+ *      request left the machine, so reachability is unknown (NOT unreachable)
+ *   8. anything else                 → unknown           (report, don't guess)
+ */
+export function classifyKubectlProbeError(
+  name: string,
+  err: Error,
+  stderr: string | Buffer = "",
+): ProbeResult {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === "ENOENT") {
+    return { name, probe_status: "probe_failed", reason: "kubectl_missing", probe_error: "kubectl executable not found on PATH — local tooling problem, says nothing about the cluster" };
+  }
+  if (code === "EACCES") {
+    return { name, probe_status: "probe_failed", reason: "kubectl_missing", probe_error: "kubectl exists but is not executable — local tooling problem, says nothing about the cluster" };
+  }
+
+  const probeError = probeErrorText(err, stderr);
+  const text = probeError.toLowerCase();
+
+  // (2)+(3) Local kubeconfig problems. localhost:8080 / 127.0.0.1:8080 is the
+  // client-go default when the kubeconfig has no usable server/context, so a
+  // refusal there is LOCAL — a real cluster shows its own host:port and falls
+  // through to the network rules below. Do NOT key on "did you specify the right
+  // host or port" — kubectl appends that to genuine refusals too.
+  if (
+    /localhost:8080|127\.0\.0\.1:8080/.test(text)
+    // kubeconfig / context / authinfo problems that never leave this machine.
+    // A local exec/authProvider credential plugin ("getting credentials: exec:
+    // <plugin> not found", "no auth provider found") fails BEFORE any request is
+    // sent, so it is a kubeconfig problem here — NOT proof the server answered.
+    || /no configuration has been provided|invalid configuration|error loading config|unable to (read|load).*config|missing or incomplete configuration|context ".*" does not exist|no such context|no context is currently set|current-context|no auth provider found|getting credentials|exec: executable .* (not found|failed)|exec plugin/.test(text)
+  ) {
+    return { name, probe_status: "probe_failed", reason: "kubeconfig", probe_error: probeError };
+  }
+
+  // (4) 401 Unauthorized: the API server ANSWERED and rejected the identity.
+  // The HTTP response is proof the cluster is reachable — reachable:true.
+  if (/unauthorized|must be logged in|asked for the client to provide credentials/.test(text)) {
+    return { name, probe_status: "probe_failed", reason: "auth", reachable: true, probe_error: probeError };
+  }
+
+  // (4b) 403 Forbidden from the server: TCP + TLS + HTTP all succeeded and the
+  // API server adjudicated RBAC. A proof-of-reachability response — reachable:true.
+  // Distinct from `auth` so callers can tell an identity (401) from an RBAC (403)
+  // denial. NotFound is deliberately NOT matched here (see 4c).
+  if (/error from server \(forbidden\)|is forbidden: user/.test(text)) {
+    return { name, probe_status: "probe_failed", reason: "authz", reachable: true, probe_error: probeError };
+  }
+
+  // (4c) 404 NotFound: an HTTP endpoint answered, but that is weaker evidence than
+  // a 401/403. A wrong server URL, a stale/misrouted context, or an intermediary
+  // (proxy/load balancer) can all return 404 without the Kubernetes API server
+  // ever adjudicating the request. Report it as an endpoint/config problem WITHOUT
+  // claiming the cluster is up — reachable is omitted.
+  if (/error from server \(notfound\)|the server could not find the requested resource/.test(text)) {
+    return { name, probe_status: "probe_failed", reason: "endpoint", probe_error: probeError };
+  }
+
+  // (5) TLS certificate validation: server reached at TCP but the TLS exchange
+  // failed (untrusted/expired/mismatched cert). A trust/config problem, not down.
+  // TLS never completed, so we do NOT claim reachable.
+  if (/x509|certificate signed by unknown authority|certificate has expired|certificate is valid for|failed to verify certificate|cannot validate certificate/.test(text)) {
+    return { name, probe_status: "probe_failed", reason: "tls_cert", probe_error: probeError };
+  }
+
+  // (6) Genuine network-layer unreachability — a statement about the cluster.
+  // These require POSITIVE evidence in stderr; a killed child alone is NOT enough
+  // (see (7)). client-go's own request/handshake timeout is such positive
+  // evidence, so it stays here — distinct from our local execFile kill.
+  if (/timed out|i\/o timeout|context deadline exceeded|tls handshake timeout|request timeout|deadline exceeded/.test(text)) {
+    return { name, probe_status: "unreachable", reachable: false, reason: "timeout", probe_error: probeError };
+  }
+  if (/no such host|server misbehaving|lookup .* on |name resolution|temporary failure in name resolution/.test(text)) {
+    return { name, probe_status: "unreachable", reachable: false, reason: "dns", probe_error: probeError };
+  }
+  // kubectl's own phrasing is "The connection to the server <host:port> was
+  // refused - did you specify the right host or port?" (client-go's ECONNREFUSED
+  // wrapper), which does NOT contain the substring "connection refused" — match
+  // it explicitly alongside the lower-level go phrasings. The localhost:8080
+  // variant of this message was already peeled off as `kubeconfig` above.
+  if (/connection refused|actively refused|the connection to the server .* was refused/.test(text)) {
+    return { name, probe_status: "unreachable", reachable: false, reason: "connection_refused", probe_error: probeError };
+  }
+  if (/connection reset|broken pipe|unexpected eof|\beof\b/.test(text)) {
+    return { name, probe_status: "unreachable", reachable: false, reason: "connection_reset", probe_error: probeError };
+  }
+  if (/network is unreachable|no route to host|host is unreachable|unable to connect to the server/.test(text)) {
+    return { name, probe_status: "unreachable", reachable: false, reason: "network", probe_error: probeError };
+  }
+
+  // (7) The child was killed (our execFile timeout fired) with NO network-layer
+  // evidence in stderr. The kill can also hit a hung LOCAL exec credential plugin
+  // that never sent a request, so we cannot say the API server was unreachable.
+  // Classify as a probe_failed/timeout with UNKNOWN reachability (reachable omitted)
+  // — never as `unreachable`, which would let a stuck local plugin masquerade as a
+  // down cluster.
+  const killed = (err as NodeJS.ErrnoException & { killed?: boolean }).killed === true;
+  if (killed) {
+    return {
+      name,
+      probe_status: "probe_failed",
+      reason: "timeout",
+      probe_error: `${probeError} (the local kubectl probe was killed by our timeout with no network-layer error — reachability unknown)`,
+    };
+  }
+
+  // (8) kubectl ran but failed for a reason we cannot confidently attribute to
+  // the cluster. Report stderr verbatim WITHOUT claiming unreachability.
+  return { name, probe_status: "probe_failed", reason: "unknown", probe_error: probeError };
+}
+
+export const PROBE_TOTAL_TIMEOUT_MS = 7_000;
+
+/**
+ * Bound `operation` to `timeoutMs`. On timeout we resolve promptly with a
+ * probe_failed/timeout result AND abort the shared AbortSignal handed to
+ * `operation`, so timed-out work cannot continue into kubectl: `operation`
+ * checks `signal.aborted` before spawning, and a kubectl child launched with
+ * this signal is killed when it fires. The aborted operation settles in the
+ * background and its late result is discarded (the guard below is idempotent).
+ *
+ * Because timed-out work is aborted rather than left running, releasing the
+ * concurrency-limiter slot early (in probeClusters) no longer leaks kubectl
+ * processes — the bounded fan-out holds.
+ *
+ * `timeoutMs` is injectable for tests; production callers use the default.
+ */
+export function withProbeTimeout(
+  name: string,
+  operation: (signal: AbortSignal) => Promise<ProbeResult>,
+  timeoutMs: number = PROBE_TOTAL_TIMEOUT_MS,
+): Promise<ProbeResult> {
   return new Promise((resolve) => {
+    const controller = new AbortController();
+    let settled = false;
+    const finish = (result: ProbeResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      controller.abort();
+      finish({
+        name,
+        probe_status: "probe_failed",
+        reason: "timeout",
+        probe_error: `cluster probe timed out after ${timeoutMs}ms (credential fetch or kubectl probe did not return — cluster reachability unknown)`,
+      });
+    }, timeoutMs);
+    timer.unref?.();
+    operation(controller.signal).then(
+      (result) => finish(result),
+      (err: unknown) => {
+        // A rejection caused by our own abort is expected — the timeout result
+        // has already been delivered, so finish() is a no-op here.
+        finish({
+          name,
+          probe_status: "probe_failed",
+          reason: "unknown",
+          probe_error: err instanceof Error ? err.message : String(err),
+        });
+      },
+    );
+  });
+}
+
+function probeKubeconfig(name: string, kubeconfigPath: string, signal?: AbortSignal): Promise<ProbeResult> {
+  return new Promise((resolve) => {
+    // Guard: the probe may have already timed out while the kubeconfig was being
+    // fetched. Do not spawn kubectl after the abort.
+    if (signal?.aborted) {
+      resolve({
+        name,
+        probe_status: "probe_failed",
+        reason: "timeout",
+        probe_error: "probe timed out before kubectl was spawned; reachability unknown",
+      });
+      return;
+    }
     execFile(
       "kubectl",
       ["version", "--output=json", `--kubeconfig=${kubeconfigPath}`, "--request-timeout=3s"],
-      { timeout: 5000 },
-      (err, stdout) => {
+      // Pass the abort signal so a still-running kubectl is killed the moment the
+      // total-probe timeout fires (Node sends SIGTERM); `timeout` is the local
+      // per-invocation ceiling.
+      { timeout: 5000, signal },
+      (err, stdout, stderr) => {
         if (err) {
-          const msg = err.message?.includes("timed out")
-            ? "connection timeout"
-            : err.message?.split("\n")[0] ?? "unknown error";
-          resolve({ name, reachable: false, probe_error: msg });
+          resolve(classifyKubectlProbeError(name, err, stderr));
           return;
         }
         try {
           const info = JSON.parse(stdout);
           const ver = info.serverVersion?.gitVersion ?? "unknown";
-          resolve({ name, reachable: true, server_version: ver });
+          resolve({ name, probe_status: "success", reachable: true, server_version: ver });
         } catch {
-          resolve({ name, reachable: true, server_version: "unknown" });
+          resolve({ name, probe_status: "success", reachable: true, server_version: "unknown" });
         }
       },
     );
