@@ -7,6 +7,7 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { getDb } from "../gateway/db.js";
+import { isUniqueViolation } from "../gateway/dialect-helpers.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { authenticateApiKey, type ApiKeyAuthResult } from "./api-key-auth.js";
 import { resolveAgentModelBinding } from "./chat-gateway.js";
@@ -80,6 +81,10 @@ type A2aStreamResponse =
 interface ActiveTracker {
   unsubscribe: () => void;
   artifactText: string;
+  currentMessageText: string;
+  messageStartOffset: number;
+  lastFlushAt: number;
+  persistChain: Promise<void>;
 }
 
 const activeTrackers = new Map<string, ActiveTracker>();
@@ -343,23 +348,32 @@ async function createTaskRecord(params: {
   apiKeyId: string;
   contextId: string;
   sessionId: string;
+  activeContextKey: string;
 }): Promise<A2aTaskRecord> {
   const db = getDb();
-  await db.query(
-    `INSERT INTO a2a_tasks
-       (id, agent_id, user_id, api_key_id, context_id, session_id, state, status_message)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      params.id,
-      params.agentId,
-      params.userId,
-      params.apiKeyId,
-      params.contextId,
-      params.sessionId,
-      "TASK_STATE_SUBMITTED",
-      "Task submitted to Siclaw",
-    ],
-  );
+  try {
+    await db.query(
+      `INSERT INTO a2a_tasks
+         (id, agent_id, user_id, api_key_id, context_id, session_id, active_context_key, state, status_message)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        params.id,
+        params.agentId,
+        params.userId,
+        params.apiKeyId,
+        params.contextId,
+        params.sessionId,
+        params.activeContextKey,
+        "TASK_STATE_SUBMITTED",
+        "Task submitted to Siclaw",
+      ],
+    );
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      throw contextBusyError();
+    }
+    throw err;
+  }
   return {
     id: params.id,
     agentId: params.agentId,
@@ -376,6 +390,37 @@ async function createTaskRecord(params: {
     lastEventAt: null,
     completedAt: null,
   };
+}
+
+function activeContextKey(agentId: string, apiKeyId: string, contextId: string): string {
+  return crypto.createHash("sha256")
+    .update(agentId)
+    .update("\0")
+    .update(apiKeyId)
+    .update("\0")
+    .update(contextId)
+    .digest("hex");
+}
+
+function contextBusyError(): A2aHttpError {
+  return new A2aHttpError(
+    409,
+    "CONTEXT_BUSY",
+    "Another A2A task is already active in this context; wait for it to finish or cancel it",
+  );
+}
+
+async function hasActiveTaskForContext(agentId: string, apiKeyId: string, contextId: string): Promise<boolean> {
+  const db = getDb();
+  const [rows] = await db.query(
+    `SELECT id
+       FROM a2a_tasks
+      WHERE agent_id = ? AND api_key_id = ? AND context_id = ?
+        AND state NOT IN (${TERMINAL_STATES_SQL})
+      LIMIT 1`,
+    [agentId, apiKeyId, contextId],
+  ) as any;
+  return rows.length > 0;
 }
 
 async function loadTaskRecord(agentId: string, taskId: string, apiKeyId: string): Promise<A2aTaskRecord | null> {
@@ -475,7 +520,8 @@ async function setTaskState(
   // mislabel the task (user clicked cancel, DB ends up FAILED).
   const sql = terminal
     ? `UPDATE a2a_tasks
-          SET state = ?, status_message = ?, error = ?, updated_at = CURRENT_TIMESTAMP,
+          SET state = ?, status_message = ?, error = ?, active_context_key = NULL,
+              updated_at = CURRENT_TIMESTAMP,
               last_event_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP
         WHERE id = ? AND state NOT IN (${TERMINAL_STATES_SQL})`
     : `UPDATE a2a_tasks
@@ -557,7 +603,12 @@ function buildStatusUpdate(
   };
 }
 
-function buildArtifactUpdate(task: A2aTaskRecord, delta: string, lastChunk = false): A2aStreamResponse {
+function buildArtifactUpdate(
+  task: A2aTaskRecord,
+  text: string,
+  lastChunk = false,
+  append = true,
+): A2aStreamResponse {
   return {
     artifactUpdate: {
       taskId: task.id,
@@ -565,9 +616,9 @@ function buildArtifactUpdate(task: A2aTaskRecord, delta: string, lastChunk = fal
       artifact: {
         artifactId: ASSISTANT_ARTIFACT_ID,
         name: "Siclaw diagnosis",
-        parts: [{ text: delta, mediaType: "text/markdown" }],
+        parts: [{ text, mediaType: "text/markdown" }],
       },
-      append: true,
+      append,
       lastChunk,
     },
   };
@@ -603,6 +654,44 @@ function extractDelta(evt: Record<string, unknown>): string {
   return "";
 }
 
+function extractAssistantMessageText(evt: Record<string, unknown>): string {
+  if (evt.type !== "message_end") return "";
+  const message = (evt as any).message;
+  if (message?.role !== "assistant") return "";
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  return message.content
+    .filter((block: unknown) => block && typeof block === "object" && (block as any).type === "text")
+    .map((block: unknown) => typeof (block as any).text === "string" ? (block as any).text : "")
+    .join("");
+}
+
+function progressFlushMs(): number {
+  const value = Number(process.env.SICLAW_A2A_PROGRESS_FLUSH_MS ?? 3_000);
+  return Number.isFinite(value) && value >= 0 ? value : 3_000;
+}
+
+function queueArtifactCheckpoint(taskId: string, tracker: ActiveTracker): void {
+  const snapshot = tracker.artifactText;
+  tracker.persistChain = tracker.persistChain
+    .then(() => setTaskArtifact(taskId, snapshot))
+    .catch((err) => {
+      // A partial checkpoint is recoverability metadata, not a terminal transition.
+      // Keep streaming and retry with a newer snapshot; the terminal path still performs
+      // an awaited final write before reporting completion.
+      console.error(`[a2a-gateway] partial artifact checkpoint failed for task ${taskId}:`, err);
+    });
+}
+
+function maybeCheckpointArtifact(taskId: string, tracker: ActiveTracker): void {
+  const interval = progressFlushMs();
+  if (interval <= 0) return;
+  const now = Date.now();
+  if (tracker.lastFlushAt !== 0 && now - tracker.lastFlushAt < interval) return;
+  tracker.lastFlushAt = now;
+  queueArtifactCheckpoint(taskId, tracker);
+}
+
 function toolName(evt: Record<string, unknown>): string | undefined {
   const name = (evt as any).toolName ?? (evt as any).name;
   return typeof name === "string" && name ? name : undefined;
@@ -620,6 +709,10 @@ function ensureTaskTracker(task: A2aTaskRecord, connectionMap: RuntimeConnection
 
   const tracker: ActiveTracker = {
     artifactText: task.artifactText,
+    currentMessageText: "",
+    messageStartOffset: task.artifactText.length,
+    lastFlushAt: 0,
+    persistChain: Promise.resolve(),
     unsubscribe: () => {},
   };
 
@@ -643,14 +736,54 @@ async function handleTrackedEvent(
   tracker: ActiveTracker,
   evt: Record<string, unknown>,
 ): Promise<void> {
-  // Text deltas accumulate in the in-memory tracker and are flushed to a2a_tasks.artifact_text
-  // only at terminal events (prompt_done / stream_error). The a2a_tasks row is a protocol
-  // projection, not the durable transcript — chat_messages is the audit source of truth — so a
-  // crash mid-turn loses the partial artifact from the projection but never from chat history.
+  if (evt.type === "message_start") {
+    tracker.currentMessageText = "";
+    tracker.messageStartOffset = tracker.artifactText.length;
+    return;
+  }
+
   const delta = extractDelta(evt);
   if (delta) {
+    if (!tracker.currentMessageText) tracker.messageStartOffset = tracker.artifactText.length;
     tracker.artifactText += delta;
+    tracker.currentMessageText += delta;
     emitTask(task.id, buildArtifactUpdate(task, delta));
+    maybeCheckpointArtifact(task.id, tracker);
+    return;
+  }
+
+  if (evt.type === "message_end") {
+    const completeText = extractAssistantMessageText(evt);
+    if (!completeText) {
+      tracker.currentMessageText = "";
+      return;
+    }
+
+    if (!tracker.currentMessageText) {
+      tracker.artifactText += completeText;
+      emitTask(task.id, buildArtifactUpdate(task, completeText));
+    } else if (completeText.startsWith(tracker.currentMessageText)) {
+      const missingSuffix = completeText.slice(tracker.currentMessageText.length);
+      if (missingSuffix) {
+        tracker.artifactText += missingSuffix;
+        emitTask(task.id, buildArtifactUpdate(task, missingSuffix));
+      }
+    } else {
+      // A full message_end is the authoritative content for this assistant message.
+      // If deltas were dropped or rewritten, replace the current message tail and emit
+      // an append=false snapshot so streaming clients converge with polling clients.
+      tracker.artifactText = tracker.artifactText.slice(0, tracker.messageStartOffset) + completeText;
+      emitTask(task.id, buildArtifactUpdate(task, tracker.artifactText, false, false));
+    }
+    tracker.currentMessageText = "";
+    tracker.messageStartOffset = tracker.artifactText.length;
+    // A completed assistant message can be followed by a long tool call with no text
+    // deltas. Persist it immediately (still serialized behind any earlier checkpoint)
+    // so polling clients do not remain stuck on the first throttled prefix.
+    if (progressFlushMs() > 0) {
+      tracker.lastFlushAt = Date.now();
+      queueArtifactCheckpoint(task.id, tracker);
+    }
     return;
   }
 
@@ -682,6 +815,7 @@ async function handleTrackedEvent(
       return;
     }
     const message = streamErrorMessage(evt);
+    await tracker.persistChain;
     await setTaskArtifact(task.id, tracker.artifactText);
     await setTaskState(task.id, "TASK_STATE_FAILED", message, message);
     emitTask(task.id, buildStatusUpdate(task, "TASK_STATE_FAILED", message));
@@ -695,6 +829,7 @@ async function handleTrackedEvent(
       stopTaskTracker(task.id);
       return;
     }
+    await tracker.persistChain;
     await setTaskArtifact(task.id, tracker.artifactText);
     await setTaskState(task.id, "TASK_STATE_COMPLETED", "Siclaw task completed");
     emitTask(task.id, buildArtifactUpdate(task, "", true));
@@ -708,6 +843,13 @@ function stopTaskTracker(taskId: string): void {
   if (!tracker) return;
   activeTrackers.delete(taskId);
   tracker.unsubscribe();
+}
+
+async function persistTrackedArtifact(taskId: string): Promise<void> {
+  const tracker = activeTrackers.get(taskId);
+  if (!tracker) return;
+  await tracker.persistChain;
+  await setTaskArtifact(taskId, tracker.artifactText);
 }
 
 async function submitA2aTask(params: {
@@ -729,6 +871,9 @@ async function submitA2aTask(params: {
 
   const taskId = crypto.randomUUID();
   const contextId = message.contextId || crypto.randomUUID();
+  if (await hasActiveTaskForContext(agentId, auth.keyId, contextId)) {
+    throw contextBusyError();
+  }
   const sessionId = message.contextId
     ? (await loadSessionIdForContext(agentId, auth.keyId, contextId)) ?? crypto.randomUUID()
     : contextId;
@@ -739,6 +884,7 @@ async function submitA2aTask(params: {
     apiKeyId: auth.keyId,
     contextId,
     sessionId,
+    activeContextKey: activeContextKey(agentId, auth.keyId, contextId),
   });
 
   ensureTaskTracker(task, connectionMap);
@@ -799,6 +945,7 @@ async function reconcileOrphanedTask(task: A2aTaskRecord): Promise<A2aTaskRecord
   if (now - firstSeen < orphanGraceMs()) return null;
   orphanFirstSeenMs.delete(task.id);
   const message = "Siclaw runtime disconnected before the task finished";
+  await persistTrackedArtifact(task.id);
   await setTaskState(task.id, "TASK_STATE_FAILED", message, message);
   emitTask(task.id, buildStatusUpdate(task, "TASK_STATE_FAILED", message));
   stopTaskTracker(task.id);
@@ -1027,18 +1174,26 @@ export function registerA2aRoutes(
   router.post("/api/v1/a2a/agents/:agentId/tasks/:taskId:cancel", async (req, res, params) => {
     try {
       const { auth, task } = await loadAuthorizedTask(req, params.agentId, params.taskId);
+      let cancelAttempted = false;
       if (!isTerminalState(task.state)) {
+        cancelAttempted = true;
         const result = await connectionMap.sendCommand(params.agentId, "chat.abort", {
           agentId: params.agentId,
           userId: auth.createdBy,
           sessionId: task.sessionId,
         });
         if (!result.ok) throw new A2aHttpError(502, "RUNTIME_ERROR", result.error ?? "Runtime cancel failed");
+        await persistTrackedArtifact(task.id);
         await setTaskState(task.id, "TASK_STATE_CANCELED", "Task canceled by A2A client");
-        emitTask(task.id, buildStatusUpdate(task, "TASK_STATE_CANCELED", "Task canceled by A2A client"));
         stopTaskTracker(task.id);
       }
       const latest = await loadTaskRecord(params.agentId, params.taskId, auth.keyId) ?? task;
+      // A runtime terminal event may win the race while chat.abort is in flight. The
+      // terminal-immutable SQL guard preserves that state; only emit CANCELED if this
+      // request actually won, so subscribers never see a contradictory terminal frame.
+      if (cancelAttempted && latest.state === "TASK_STATE_CANCELED") {
+        emitTask(task.id, buildStatusUpdate(task, "TASK_STATE_CANCELED", "Task canceled by A2A client"));
+      }
       sendA2aJson(res, 200, { task: buildTask(latest) });
     } catch (err) {
       respondA2aError(req, res, err);

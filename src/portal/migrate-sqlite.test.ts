@@ -113,6 +113,18 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
     );
     expect(allIdx.map((r) => r.name).sort()).toEqual(expectedIndexes.slice().sort());
+
+    const [activeContextIndexes] = await db.query<Array<{ name: string; sql: string }>>(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_a2a_tasks_active_context'",
+    );
+    expect(activeContextIndexes).toHaveLength(1);
+    expect(activeContextIndexes[0].sql).toContain("CREATE UNIQUE INDEX");
+  });
+
+  it("adds the A2A active-context lease column", async () => {
+    await runPortalMigrations();
+    const [columns] = await getDb().query<Array<{ name: string }>>("PRAGMA table_info(`a2a_tasks`)");
+    expect(columns.map((column) => column.name)).toContain("active_context_key");
   });
 
   it("is resilient to legacy-style pre-populated schema (simulated dump replay)", async () => {
