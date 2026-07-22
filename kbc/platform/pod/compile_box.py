@@ -305,6 +305,11 @@ class CompileRun:
         # loop; reset to 0 whenever the check passes).
         self._selfcheck_key: str | None = None
         self._l1_repairs_used = 0
+        # Per-episode repair-budget high-water mark (review, PR #430): the
+        # limit is derived from the OPEN workload, which shrinks as repairs
+        # succeed — gating on a per-turn recomputation would close the gate
+        # at ~half-repaired. Keep the episode's max; reset with the counter.
+        self._l1_round_limit = 0
         # Candidate/exclusion state captured immediately before each model
         # turn. A conversational turn that leaves this state byte-identical is
         # not a migration trigger for an inherited legacy draft. Compile,
@@ -1289,6 +1294,29 @@ def _l1_repair_rounds() -> int:
     return int(os.environ.get("KBC_L1_REPAIR_ROUNDS", "2"))
 
 
+def _l1_repair_round_limit(report: dict) -> int:
+    """Scale the ledger auto-repair budget with the ACTUAL workload instead of
+    a flat constant. A first full compile / wiki adoption over a large KB can
+    open dozens of mechanical violations at once; with the flat 2-round budget
+    it structurally lands unconverged and dumps the tail into the owner's
+    question queue (live adoption run, 2026-07-22: 55-item residual after two
+    rounds). Mirrors _batch_media_verify_round_limit: the flat value stays the
+    floor for ordinary drift, the open-violation count adds bounded rounds, and
+    a hard operator cap still fences pathological repair loops."""
+    base = _l1_repair_rounds()
+    cov = report.get("coverage") or {}
+    lint = report.get("lint") or {}
+    workload = (len(cov.get("unaccounted") or [])
+                + len(cov.get("dangling_citations") or [])
+                + len(lint.get("violations") or []))
+    if workload <= 0:
+        return base
+    per_round = max(1, int(os.environ.get(
+        "KBC_L1_REPAIR_VIOLATIONS_PER_ROUND", "12")))
+    cap = max(base, int(os.environ.get("KBC_L1_REPAIR_MAX_ROUNDS", "16")))
+    return min(cap, max(base, -(-workload // per_round)))
+
+
 def _media_verify_enabled() -> bool:
     return os.environ.get("KBC_MEDIA_VERIFY", "on") != "off"
 
@@ -1923,10 +1951,17 @@ async def _post_turn_selfcheck(run) -> str | None:
             "grandfathered_format_violations": grandfathered_format[:40],
         }
     ledger_clean = report["coverage"]["closed"] and report["lint"]["ok"]
+    # High-water, not per-turn recomputation: the workload SHRINKS as repairs
+    # succeed, so re-deriving the limit each turn strands the episode at
+    # ~half-repaired (review). max() also lets the budget grow if a repair
+    # legitimately reopens violations mid-episode.
+    run._l1_round_limit = max(getattr(run, "_l1_round_limit", 0),
+                              _l1_repair_round_limit(report))
     if ledger_clean and not incr_violations:
         run._l1_repairs_used = 0
+        run._l1_round_limit = 0
         report["state"] = "passed"
-    elif run._l1_repairs_used < _l1_repair_rounds():
+    elif run._l1_repairs_used < run._l1_round_limit:
         report["state"] = "repairing"
         # The report carries the PREVIOUS converge_phase (possibly "settled");
         # the pre-turn_done sync would ship repairing+settled for one window
@@ -1937,6 +1972,7 @@ async def _post_turn_selfcheck(run) -> str | None:
     else:
         report["state"] = "unconverged"  # budget spent: publish card shows the rest
     report["repair_rounds_used"] = run._l1_repairs_used
+    report["repair_rounds_limit"] = run._l1_round_limit
     selfcheck.write_selfcheck(workdir, report)
     locale = getattr(run, "locale", None)
     if restored_pages:
@@ -3088,6 +3124,7 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
     # for this phase's own findings. Each _run_ledger_repairs call is bounded
     # by its own budget; the batch tail calls it a bounded number of times.
     run._l1_repairs_used = 0
+    run._l1_round_limit = 0
     run._ledger_forced = True  # batch-final: the mid-Execute index exemption is off
     try:
         repair = await _post_turn_selfcheck(run)
