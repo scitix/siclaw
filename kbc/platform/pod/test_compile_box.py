@@ -2191,6 +2191,48 @@ async def test_noop_repair_turn_reaches_the_gate():
     print("OK  no-op repair turn reaches the gate (unconverged + residual ticket, not silent)")
 
 
+def test_media_verify_suppresses_text_backed_beyond_transcript():
+    """A beyond-transcript image doubt whose claim is verbatim-backed by a
+    co-cited TEXT source is corroboration noise, not an owner question (live
+    adoption run 2026-07-22: "FP4 +46%" flagged while the co-cited markdown
+    states the figure verbatim). Inconsistent findings are never suppressed."""
+    import mediaverify
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "raw" / "snap" / "perf.md").write_text(
+            "B300较B200，FP4有46%提升；整体也只 +39.7%，不太符合预期。")
+        page_text = (
+            "---\ntype: Comparison\ntitle: c\ncompiled_from:\n"
+            "  - snap/perf.md\n  - snap/assets/tok1.png\n---\n"
+            "B300 FP4 较 B200 +46%。整体 +39.7%。另一个编造值 +87.5%。")
+        findings = [
+            {"image": "snap/assets/tok1.png", "claim": "B300 FP4 较 B200 +46%",
+             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
+            {"image": "snap/assets/tok1.png", "claim": "整体 +39.7%",
+             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
+            {"image": "snap/assets/tok1.png", "claim": "编造值 +87.5%",
+             "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"},
+            {"image": "snap/assets/tok1.png", "claim": "FP4 较 B200 +46%",
+             "kind": "不一致", "expected": "图中为 40%", "fix": "…"},
+        ]
+        kept, suppressed = mediaverify.suppress_text_backed(
+            str(wd), "c.md", page_text, findings)
+        s_claims = {s["claim"] for s in suppressed}
+        assert s_claims == {"B300 FP4 较 B200 +46%", "整体 +39.7%"}, suppressed
+        k_kinds = [(f["kind"], f["claim"]) for f in kept]
+        assert ("超出转写范围", "编造值 +87.5%") in k_kinds, kept   # not in text → real doubt
+        assert ("不一致", "FP4 较 B200 +46%") in k_kinds, kept      # conflicts never suppressed
+        assert all(s["suppressed_reason"] == "text_source_backed" for s in suppressed)
+        # qualitative claim without distinctive numbers → never suppressed
+        kept2, sup2 = mediaverify.suppress_text_backed(
+            str(wd), "c.md", page_text,
+            [{"image": "snap/assets/tok1.png", "claim": "该型号为 X 系列",
+              "kind": "超出转写范围", "expected": "not in the transcript", "fix": "…"}])
+        assert not sup2 and len(kept2) == 1
+    print("OK  media verify suppresses text-backed beyond-transcript doubts (keeps real ones + conflicts)")
+
+
 async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
     """An ordinary conversation over an inherited draft must not become an
     implicit whole-library OKF migration merely because this is a fresh box.

@@ -36,8 +36,10 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import re
+
 from redblue import _agent_json  # JSON call + one lenient retry, shared shape
-from selfcheck import _is_en  # locale gate: None/en → English, zh → Chinese
+from selfcheck import _is_en, parse_compiled_from  # locale gate + citation parse
 
 TRANSCRIPTS_PATH = "authoring/MEDIA_TRANSCRIPTS.json"
 _TRANSCRIPT_CHAR_CAP = 6000  # per image, persisted
@@ -230,6 +232,80 @@ async def compare_page(engine, tmp_dir: str, page_rel: str, page_text: str,
     return out
 
 
+_TEXT_SOURCE_SUFFIXES = (".md", ".txt", ".log", ".json", ".csv")
+_CLAIM_NUM_RE = re.compile(r"[+\-]?\d[\d.,]*%?")
+_TEXT_SOURCE_READ_CAP = 2 * 1024 * 1024  # per source file
+
+
+def _distinctive_tokens(claim: str) -> list[str]:
+    """Numeric tokens strong enough to identify the claim in a text source.
+    Percentages and decimals first (46%, 39.7 — near-unique in practice);
+    plain integers only when >=3 digits (13440), never bare '8'/'70'."""
+    strong, plain = [], []
+    for tok in _CLAIM_NUM_RE.findall(claim):
+        core = tok.lstrip("+-").rstrip("%").rstrip(".,")
+        if not core:
+            continue
+        if "%" in tok or "." in core:
+            strong.append(tok.lstrip("+-"))
+        elif len(core) >= 3:
+            plain.append(core)
+    return strong or plain
+
+
+def _co_cited_text(workdir: str, page_text: str) -> str:
+    """Concatenated body of the page's co-cited TEXT sources (raw-relative)."""
+    sources, _, _ = parse_compiled_from(page_text)
+    raw = Path(workdir) / "raw"
+    chunks: list[str] = []
+    for src in sources:
+        if not src.lower().endswith(_TEXT_SOURCE_SUFFIXES):
+            continue
+        fp = raw / src
+        try:
+            if fp.is_file():
+                chunks.append(fp.read_text(encoding="utf-8", errors="replace")
+                              [:_TEXT_SOURCE_READ_CAP])
+        except OSError:
+            continue
+    return "\n".join(chunks)
+
+
+def suppress_text_backed(workdir: str, page: str, page_text: str,
+                         findings: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split compare findings into (kept, suppressed).
+
+    A 超出转写范围 finding says "the cited image cannot support this claim".
+    That inference only holds when the image is the claim's SOLE source — but
+    curated pages routinely cite whole asset sets as corroboration while the
+    figure itself comes from a co-cited text export (live adoption run,
+    2026-07-22: "FP4 +46%" flagged although the co-cited markdown states
+    "FP4有46%提升" verbatim). When the claim's distinctive numeric tokens are
+    found in a co-cited text source, the image is corroboration, not the
+    authority — reclassify silently instead of asking the owner.
+
+    不一致 findings are NEVER suppressed: a text-backed claim that contradicts
+    what the image actually shows is a genuine cross-source conflict."""
+    beyond = [f for f in findings if f.get("kind") == "超出转写范围"]
+    if not beyond:
+        return findings, []
+    text = _co_cited_text(workdir, page_text)
+    if not text:
+        return findings, []
+    kept, suppressed = [], []
+    for f in findings:
+        if f.get("kind") != "超出转写范围":
+            kept.append(f)
+            continue
+        tokens = _distinctive_tokens(str(f.get("claim") or ""))
+        if tokens and any(tok in text for tok in tokens):
+            suppressed.append({**f, "page": page,
+                               "suppressed_reason": "text_source_backed"})
+        else:
+            kept.append(f)
+    return kept, suppressed
+
+
 async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
                            progress=None, locale: str | None = None) -> dict:
     """Transcribe every image in `pending` (cache-aware, concurrent), then
@@ -268,6 +344,7 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
     save_transcripts(workdir, cache)
 
     findings: list[dict] = []
+    suppressed_all: list[dict] = []
     completed: list[str] = []
     failed: list[str] = []
     cand = Path(workdir) / "candidate"
@@ -295,7 +372,10 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
             return
         async with sem:
             try:
-                findings.extend(await compare_page(engine, empty, page, text, ts, locale=locale))
+                raw_findings = await compare_page(engine, empty, page, text, ts, locale=locale)
+                kept, suppressed = suppress_text_backed(workdir, page, text, raw_findings)
+                findings.extend(kept)
+                suppressed_all.extend(suppressed)
             except Exception as e:
                 errors.append(f"comparison failed {page}: {e!r}" if en
                               else f"比对失败 {page}: {e!r}")
@@ -307,8 +387,13 @@ async def run_blind_verify(engine, workdir: str, pending: dict[str, list[str]],
         else f"自检(图像·比对):{len(pending)} 页比对中…")
     await asyncio.gather(*(_page(p, imgs) for p, imgs in pending.items()))
     shutil.rmtree(empty, ignore_errors=True)
+    if suppressed_all:
+        say(f"Self-check (image · comparison): {len(suppressed_all)} beyond-transcript doubt(s) "
+            "auto-resolved — claim verbatim-backed by a co-cited text source (image kept as corroboration)" if en
+            else f"自检(图像·比对):{len(suppressed_all)} 条\u201c超出转写范围\u201d疑点因同页文本源逐字背书自动归为佐证,不出卡")
     return {"findings": findings, "errors": errors,
             "images": len(images), "cache_hits": hits,
+            "suppressed_text_backed": suppressed_all,
             "completed_pages": sorted(completed), "failed_pages": sorted(failed)}
 
 
