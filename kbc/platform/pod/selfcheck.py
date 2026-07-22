@@ -109,7 +109,10 @@ def is_media_asset(rel: str) -> bool:
     ext = posixpath.splitext(rel)[1].lower()
     if ext not in MEDIA_ASSET_EXTS:
         return False
-    return any(seg == "assets" or seg.endswith(".assets")
+    # Segment match is case-INSENSITIVE, matching the sicore ledger mirror (an
+    # `Assets/` dir counts too); the platform always writes lowercase `assets/`,
+    # so this only matters for hand-authored trees, but the two repos must agree.
+    return any(seg.lower() == "assets" or seg.lower().endswith(".assets")
                for seg in rel.split("/"))
 
 
@@ -619,13 +622,23 @@ def _markdown_link_targets(text: str) -> list[str]:
     return targets
 
 
+def _strip_fragment_query(target: str) -> str:
+    """Drop a URL ``#fragment`` / ``?query`` from the STILL-ENCODED target, before
+    percent-decoding — so an encoded ``%23``/``%3F`` that is part of a real
+    filename survives while an actual fragment/query delimiter is removed. Order
+    matches the sicore ledger's parser (strip angle → truncate #/? → unescape) so
+    the two repos derive byte-identical edges."""
+    return target.split("#", 1)[0].split("?", 1)[0]
+
+
 def document_link_targets(md_text: str) -> list[str]:
     """Every link/image destination in one document's prose — the building block
     of the doc→asset attribution edge (coverage v2, §4.2). Covers markdown
     ``![](...)`` and ``[](...)`` plus HTML ``<img src=...>`` (single- OR
-    double-quoted). Each target is URL-decoded (``%20`` → space) and has its
-    fragment and optional link title stripped. Code fences/spans are masked so a
-    path inside example code is not mistaken for a real embed."""
+    double-quoted). Angle brackets are unwrapped and an optional link title
+    stripped; then the ``#fragment``/``?query`` is truncated and the result is
+    URL-decoded once (``%20`` → space). Code fences/spans are masked so a path
+    inside example code is not mistaken for a real embed."""
     targets: list[str] = []
     prose = _markdown_prose(md_text)
     for captured in _MD_LINK_RE.findall(prose):
@@ -636,11 +649,11 @@ def document_link_targets(md_text: str) -> list[str]:
             titled = re.fullmatch(r"(.+?)\s+(?:\"[^\"]*\"|'[^']*')", destination)
             if titled:
                 destination = titled.group(1).strip()
-        destination = unquote(destination).split("#", 1)[0].strip()
+        destination = unquote(_strip_fragment_query(destination)).strip()
         if destination:
             targets.append(destination)
     for captured in _HTML_IMG_SRC_RE.findall(prose):
-        destination = unquote(captured[1:-1]).split("#", 1)[0].strip()
+        destination = unquote(_strip_fragment_query(captured[1:-1])).strip()
         if destination:
             targets.append(destination)
     return targets

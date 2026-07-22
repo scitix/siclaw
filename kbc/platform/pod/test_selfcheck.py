@@ -1605,7 +1605,10 @@ def test_is_media_asset():
     """Media-asset predicate (coverage v2 §4.1): an assets/ (or legacy *.assets)
     segment AND an image extension; sheet placeholders and non-images are not."""
     yes = ["assets/a.png", "guide/assets/b.JPG", "report.assets/c.png",
-           "x/assets/y/d.webp", "assets/photo.tiff"]
+           "x/assets/y/d.webp", "assets/photo.tiff",
+           # case-INSENSITIVE segment (locked here, not in the fixture: an
+           # uppercase dir is not portable on a case-insensitive filesystem).
+           "Assets/e.png", "report.ASSETS/f.png", "guide/AsSeTs/g.png"]
     no = ["docs/x.png",              # no assets segment
           "assets/sheets/t.md",      # sheet placeholder = content file
           "assets/data.json",        # json is not an image
@@ -1616,7 +1619,7 @@ def test_is_media_asset():
         assert selfcheck.is_media_asset(p), p
     for p in no:
         assert not selfcheck.is_media_asset(p), p
-    print("OK  is_media_asset (assets/ + *.assets, image ext, case-insensitive; sheet/.json/.pdf excluded)")
+    print("OK  is_media_asset (assets/ + *.assets, case-insensitive seg + image ext; sheet/.json/.pdf excluded)")
 
 
 def test_document_link_targets():
@@ -1633,15 +1636,17 @@ def test_document_link_targets():
         "![f](<assets/g h.png>)\n"
         "![t](assets/t.png \"caption\")\n"
         "![h](assets/i.png#frag)\n"
+        "![q](assets/q.png?v=2)\n"
         "```\n![code](assets/nope.png)\n```\n"
         "[ext](https://example.test/y.png)\n"
     )
     for want in ["assets/a.png", "assets/b.png", "assets/c.png", "assets/d.png",
                  "assets/a b.png", "assets/g h.png", "assets/t.png", "assets/i.png",
-                 "https://example.test/y.png"]:
+                 "assets/q.png", "https://example.test/y.png"]:
         assert want in targets, (want, targets)
-    assert "assets/nope.png" not in targets, targets  # masked inside a code fence
-    print("OK  document_link_targets (md/html/url-encoded/angle/title/fragment; code masked)")
+    assert "assets/nope.png" not in targets, targets       # masked inside a code fence
+    assert "assets/q.png?v=2" not in targets, targets       # ?query truncated
+    print("OK  document_link_targets (md/html/url-encoded/angle/title/fragment/query; code masked)")
 
 
 def test_coverage_v2_auto_attach():

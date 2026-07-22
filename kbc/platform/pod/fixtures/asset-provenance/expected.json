@@ -6,6 +6,9 @@
     "excluded-doc.md": [
       "assets/inherited.png"
     ],
+    "extras.md": [
+      "assets/q.png"
+    ],
     "guide/deep/detail.md": [
       "guide/assets/diagram.png"
     ],
@@ -21,10 +24,10 @@
     ]
   },
   "coverage": {
-    "total_sources": 16,
-    "cited": 5,
+    "total_sources": 18,
+    "cited": 6,
     "excluded": 2,
-    "auto_attached": 7,
+    "auto_attached": 8,
     "auto_attached_sample": [
       {
         "asset": "assets/hero.png",
@@ -33,6 +36,10 @@
       {
         "asset": "assets/inherited.png",
         "via": "excluded-doc.md"
+      },
+      {
+        "asset": "assets/q.png",
+        "via": "extras.md"
       },
       {
         "asset": "assets/shared.png",
