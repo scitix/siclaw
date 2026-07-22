@@ -165,27 +165,39 @@ async def test_non_stream_and_other_routes_pass_through_verbatim():
     print("OK  non-streaming posts and other routes pass through as raw bytes")
 
 
-def test_maybe_activate_env_logic():
-    destream._PORT = 45678
-    shim = "http://127.0.0.1:45678"
+def test_default_on_session_scoped_activation():
+    """v2 semantics: default ON for non-interactive Anthropic sessions with no
+    deployment config; TEST sessions always stream; codex untouched; KBC_DESTREAM
+    stays as the operator opt-out escape hatch."""
     env_backup = {k: os.environ.get(k) for k in
                   ("KBC_DESTREAM", "KBC_ENGINE", "ANTHROPIC_BASE_URL")}
+    destream._PORT = 45678
+    shim = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:45678"}
     try:
         os.environ["ANTHROPIC_BASE_URL"] = "https://api.example/model-api"
-        os.environ["KBC_DESTREAM"] = "1"
+        os.environ.pop("KBC_DESTREAM", None)
         os.environ.pop("KBC_ENGINE", None)
-        destream.maybe_activate()
-        assert os.environ["ANTHROPIC_BASE_URL"] == shim
-        assert destream._UPSTREAM == "https://api.example/model-api"
-        destream.maybe_activate()  # idempotent: shim url is not re-captured
-        assert destream._UPSTREAM == "https://api.example/model-api"
-        os.environ["KBC_DESTREAM"] = "0"
-        destream.maybe_activate()  # opt-out restores the real upstream
+        # default ON, session-scoped
+        assert destream.enabled()
+        assert destream.session_env("authoring") == shim
+        assert destream.session_env("verify") == shim
+        assert destream.session_env("test") == {}          # interactive: never
+        assert destream.model_idle_floor() == 900.0
+        # the box's own environment is NOT rewritten (per-session env only)
         assert os.environ["ANTHROPIC_BASE_URL"] == "https://api.example/model-api"
-        os.environ["KBC_DESTREAM"] = "1"
+        # operator opt-out
+        os.environ["KBC_DESTREAM"] = "off"
+        assert not destream.enabled()
+        assert destream.session_env("authoring") == {}
+        assert destream.model_idle_floor() == 0.0
+        os.environ.pop("KBC_DESTREAM", None)
+        # codex engine out of scope
         os.environ["KBC_ENGINE"] = "codex_sdk"
-        destream.maybe_activate()  # codex engine is out of scope
-        assert os.environ["ANTHROPIC_BASE_URL"] == "https://api.example/model-api"
+        assert not destream.enabled()
+        os.environ.pop("KBC_ENGINE", None)
+        # no shim listener -> off
+        destream._PORT = None
+        assert not destream.enabled()
     finally:
         destream._PORT = None
         destream._UPSTREAM = None
@@ -194,11 +206,11 @@ def test_maybe_activate_env_logic():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    print("OK  maybe_activate: opt-in rewrites, opt-out restores, codex untouched")
+    print("OK  default-on session-scoped activation (test sessions stream, opt-out works)")
 
 
 if __name__ == "__main__":
-    test_maybe_activate_env_logic()
+    test_default_on_session_scoped_activation()
     for fn in (test_destream_synthesizes_valid_sse,
                test_destream_pings_while_upstream_is_slow,
                test_destream_upstream_error_becomes_stream_error_event,
