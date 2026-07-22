@@ -239,6 +239,13 @@ _TEST_MODEL_IDLE_TIMEOUT_S = float(os.environ.get(
 # is recreated. A periodic sweep tears down sessions idle past this TTL.
 _TEST_SESSION_IDLE_TTL_S = float(os.environ.get("KBC_TEST_SESSION_IDLE_TTL_S", "1800"))
 _TEST_SESSION_REAP_POLL_S = float(os.environ.get("KBC_TEST_SESSION_REAP_POLL_S", "60"))
+# Structured error code for the 429 refusal when the pod's concurrent
+# test-session cap is full. Emitted in the box's own {error:{code,message,
+# retriable}} shape (same convention as handle_test_recommendation) so the
+# runtime's agentbox error mapping passes a STABLE code + retriable=false
+# through to the consumer — a bare 429 would otherwise map to the generic
+# TOO_MANY_REQUESTS with retriable=true. Mirrored in gateway contract.ts.
+TEST_SESSION_LIMIT_ERROR_CODE = "test_session_limit"
 
 
 def _now_iso() -> str:
@@ -5376,7 +5383,16 @@ async def handle_open_test(request: web.Request):
         return web.json_response({"error": "unknown run"}, status=404)
     active = sum(1 for t in TEST_SESSIONS.values() if not t.done)
     if active >= _max_test_sessions():
-        return web.json_response({"error": "too many concurrent test sessions"}, status=429)
+        # Structured error (same shape as handle_test_recommendation) so the
+        # runtime maps a STABLE code + retriable=false, not the generic 429.
+        # Not retriable: the caller must close an idle session, not auto-retry.
+        return web.json_response(
+            {"error": {
+                "code": TEST_SESSION_LIMIT_ERROR_CODE,
+                "message": "too many concurrent test sessions",
+                "retriable": False,
+            }},
+            status=429)
     body = await request.json() if request.body_exists else {}
     consumer_tools = _effective_test_allowed_tools(body.get("allowed_tools"))
     consumer_model = _test_model()

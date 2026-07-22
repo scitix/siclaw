@@ -828,7 +828,13 @@ async def test_open_close_test_session_http():
         # concurrency cap → 429 (deterministic: a non-done stub occupies the only slot)
         os.environ["KBC_MAX_TEST_SESSIONS"] = "1"
         compile_box.TEST_SESSIONS["busy"] = compile_box.TestRun("busy", "/tmp/x", "p1", "h")
-        assert (await client.post("/test-session/p1")).status == 429
+        capped = await client.post("/test-session/p1")
+        assert capped.status == 429
+        # structured error so the runtime maps a stable code + retriable=false
+        err = (await capped.json())["error"]
+        assert err["code"] == compile_box.TEST_SESSION_LIMIT_ERROR_CODE, err
+        assert err["retriable"] is False, err
+        assert "too many concurrent test session" in err["message"], err
         compile_box.TEST_SESSIONS.clear()
         os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
 

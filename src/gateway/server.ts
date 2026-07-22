@@ -44,6 +44,9 @@ import type {
   CapabilityTestReferenceAssistRequest,
   CapabilityTestReferenceAssistResponse,
   CapabilityTestMessageRequest,
+  CapabilityTestSessionsRequest,
+  CapabilityTestSessionsResponse,
+  CapabilityTestSessionSummary,
   CapabilityTestStartRequest,
   CapabilityTestStartResponse,
 } from "./capability/contract.js";
@@ -985,6 +988,32 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       run_id: req.run_id,
       test_session_id: req.test_session_id,
       close_confirmed: true,
+    };
+    return response;
+  });
+
+  rpcMethods.set("capability.testSessions", async (params) => {
+    const req = params as unknown as CapabilityTestSessionsRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    // Read-only reconciliation: NEVER spawn/rehydrate a box just to list (mirrors
+    // testClose's box discovery). An absent/dead box has no live sessions → [].
+    // The box's GET /test-sessions rows are passed through verbatim (the `tid`
+    // wire field is load-bearing for the consumer — do not rename).
+    let client: AgentBoxClient;
+    if (localCapabilityBoxEndpoint) {
+      client = new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
+    } else {
+      const alive = await agentBoxManager.getAsync(req.run_id);
+      if (!alive) {
+        const empty: CapabilityTestSessionsResponse = { run_id: req.run_id, sessions: [] };
+        return empty;
+      }
+      client = new AgentBoxClient(alive.endpoint, 30000, agentBoxTlsOptions);
+    }
+    const listed = await client.getJson<{ sessions: CapabilityTestSessionSummary[] }>("/test-sessions");
+    const response: CapabilityTestSessionsResponse = {
+      run_id: req.run_id,
+      sessions: listed.sessions ?? [],
     };
     return response;
   });

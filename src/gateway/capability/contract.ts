@@ -44,6 +44,20 @@ export const CAPABILITY_TEST_MESSAGE = "capability.testMessage" as const;
 export const CAPABILITY_TEST_CLOSE = "capability.testClose" as const;
 export const CAPABILITY_TEST_RECOMMEND = "capability.testRecommend" as const;
 export const CAPABILITY_TEST_REFERENCE_ASSIST = "capability.testReferenceAssist" as const;
+/** Enumerate the box's live test sessions for a run (orphan reconciliation). */
+export const CAPABILITY_TEST_SESSIONS = "capability.testSessions" as const;
+
+/**
+ * ErrorDetail.code the box emits when testStart is refused because the pod's
+ * concurrent test-session cap (KBC_MAX_TEST_SESSIONS) is full — HTTP 429 with a
+ * structured `{error:{code,message,retriable:false}}` body. Sourced in the box
+ * (compile_box handle_open_test) and passed through unchanged by the agentbox
+ * error mapping (agentBoxResponseError → wrapRpcError). NOT retriable: the caller
+ * must close an idle session, not auto-retry. Distinct from the generic
+ * TOO_MANY_REQUESTS a bare 429 would otherwise map to, so a consumer can tell
+ * "test-session limit" apart from a model rate-limit 429.
+ */
+export const TEST_SESSION_LIMIT_ERROR_CODE = "test_session_limit" as const;
 
 /** siclaw → consumer: live stream + content sink + input fetch. */
 export const CAPABILITY_EVENT = "capability.event" as const;
@@ -212,6 +226,34 @@ export interface CapabilityTestMessageRequest {
 export interface CapabilityTestCloseRequest {
   run_id: string;
   test_session_id: string;
+}
+
+/**
+ * Enumerate the box's live test sessions for a run so the consumer can
+ * reconcile orphans (a lost server ack / persistence failure can leave a
+ * box-side session nobody closed) against its own records. Read-only: the
+ * runtime NEVER spawns/rehydrates a box just to list — a dead/absent box has
+ * no sessions and returns an empty list.
+ */
+export interface CapabilityTestSessionsRequest {
+  run_id: string;
+}
+
+export interface CapabilityTestSessionSummary {
+  /** Box-side test session id. Field name is `tid` (NOT test_session_id) — the
+   *  box's GET /test-sessions rows pass through unchanged; do not rename. */
+  tid: string;
+  parent_run_id: string;
+  /** iso8601 UTC (e.g. "2026-07-22T09:30:00Z"). */
+  created_at: string;
+  /** iso8601 UTC; refreshed on open, each turn, and event consumption. */
+  last_activity_at: string;
+  done: boolean;
+}
+
+export interface CapabilityTestSessionsResponse {
+  run_id: string;
+  sessions: CapabilityTestSessionSummary[];
 }
 
 /**
