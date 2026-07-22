@@ -80,21 +80,46 @@ describe("tool contract", () => {
     expect(result.structuredContent).toMatchObject({ state: "completed", result: "root cause" });
   });
 
-  it("keeps a working response compact until the terminal result", async () => {
+  it("keeps a working response compact but surfaces a progress tail", async () => {
     const api = fakeApi();
     vi.mocked(api.getTask).mockResolvedValue({
       ...task(),
-      result: "partial evidence that should not be repeated",
+      result: "partial evidence worth relaying to the caller",
       updated_at: "2026-07-18T00:00:00.000Z",
     });
     const result = await createToolHandler(api)("siclaw_get_task", { task_id: "task-1" });
-    expect(result.content[0].text).not.toContain("partial evidence that should not be repeated");
+    expect(result.content[0].text).toContain("progress_tail (latest excerpt):");
+    expect(result.content[0].text).toContain("partial evidence worth relaying to the caller");
     expect(result.content[0].text).toContain("siclaw_wait_task");
     expect(result.structuredContent).toMatchObject({
       state: "working",
-      progress_chars: 44,
+      progress_chars: 45,
+      progress_tail: "partial evidence worth relaying to the caller",
     });
     expect(result.structuredContent).not.toHaveProperty("result");
+  });
+
+  it("bounds the progress tail to the last 400 runes of a long partial report", async () => {
+    const api = fakeApi();
+    const partial = "x".repeat(700) + "the latest narrative sentence";
+    vi.mocked(api.getTask).mockResolvedValue({
+      ...task(),
+      result: partial,
+      updated_at: "2026-07-18T00:00:00.000Z",
+    });
+    const result = await createToolHandler(api)("siclaw_get_task", { task_id: "task-1" });
+    const tail = (result.structuredContent as { progress_tail: string }).progress_tail;
+    expect(tail.startsWith("…")).toBe(true);
+    expect(tail.endsWith("the latest narrative sentence")).toBe(true);
+    expect(Array.from(tail).length).toBe(401);
+    expect(result.structuredContent).toMatchObject({ progress_chars: 729 });
+    expect(result.content[0].text).not.toContain(partial);
+  });
+
+  it("omits the progress tail from terminal responses", async () => {
+    const result = await createToolHandler(fakeApi())("siclaw_get_task", { task_id: "task-1" });
+    expect(result.structuredContent).not.toHaveProperty("progress_tail");
+    expect(result.structuredContent).toMatchObject({ state: "completed", result: "root cause" });
   });
 
   it("keeps the submitted task_id when the bounded wait fails after submission", async () => {
