@@ -2296,6 +2296,51 @@ def test_l1_repair_budget_scales_with_workload():
     print("OK  L1 repair budget scales with open-violation workload (floor + cap)")
 
 
+async def test_l1_repair_budget_high_water_survives_shrinking_workload():
+    """Loop-level pin for the review finding on PR #430: the limit is derived
+    from the OPEN workload, which shrinks as repairs land. Gating on a per-turn
+    recomputation closes the gate at ~half-repaired; the episode must keep its
+    high-water allowance, and the persisted report must stay coherent
+    (used <= limit) even on the unconverged exit."""
+    import json as _json
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "snap").mkdir(parents=True)
+        (wd / "candidate").mkdir()
+        (wd / "authoring").mkdir()
+        (wd / "raw" / "snap" / "one.md").write_text("one")
+        for i in range(30):  # 30 unaccounted -> limit ceil(30/12)=3 with floor pinned to 1
+            (wd / "raw" / "snap" / f"orphan{i}.md").write_text("x")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        run = compile_box.CompileRun("noop", str(wd), 1)
+        run._selfcheck_key = None
+        os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
+        try:
+            repair = await compile_box._post_turn_selfcheck(run)
+            assert repair is not None  # round 1: repairing, high-water = 3
+            sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+            assert sc["repair_rounds_limit"] == 3, sc["repair_rounds_limit"]
+            # "repair" lands: 28 orphans fixed -> workload shrinks to 2 (limit would be 1)
+            for i in range(28):
+                (wd / "raw" / "snap" / f"orphan{i}.md").unlink()
+            run._begin_turn(repair)
+            repair2 = await compile_box._post_turn_selfcheck(run)
+            assert repair2 is not None, "high-water must keep the gate open (used=1 < 3)"
+            run._begin_turn(repair2)
+            repair3 = await compile_box._post_turn_selfcheck(run)
+            assert repair3 is not None, "used=2 < 3 still repairing"
+            run._begin_turn(repair3)
+            repair4 = await compile_box._post_turn_selfcheck(run)
+            assert repair4 is None  # used=3 == limit -> unconverged
+            sc = _json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
+            assert sc["state"] == "unconverged", sc["state"]
+            assert sc["repair_rounds_used"] == 3 and sc["repair_rounds_limit"] == 3, sc
+        finally:
+            del os.environ["KBC_L1_REPAIR_ROUNDS"]
+    print("OK  L1 repair budget keeps its episode high-water while the workload shrinks")
+
+
 async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
     """An ordinary conversation over an inherited draft must not become an
     implicit whole-library OKF migration merely because this is a fresh box.
