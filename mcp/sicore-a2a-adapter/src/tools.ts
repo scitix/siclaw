@@ -12,7 +12,7 @@ const STATUS_TO_A2A: Record<string, string> = {
 export const TOOL_DEFINITIONS = [
   {
     name: "siclaw_investigate",
-    description: "Ask the configured Siclaw SRE agent to investigate an operational question. This creates an asynchronous Sicore A2A task. Reuse context_id to continue the same investigation. If the returned task is not terminal, do not submit it again: call siclaw_wait_task until it finishes unless the user explicitly requested fire-and-forget. The configured A2A key fixes which Siclaw agent is used.",
+    description: "Ask the configured Siclaw SRE agent to investigate an operational question. This creates an asynchronous Sicore A2A task. Reuse context_id to continue the same investigation; tasks with distinct context_ids run in parallel server-side, so submit independent hypotheses concurrently. If the returned task is not terminal, do not submit it again: call siclaw_wait_task until it finishes unless the user explicitly requested fire-and-forget. The configured A2A key fixes which Siclaw agent is used.",
     inputSchema: {
       type: "object",
       properties: {
@@ -41,7 +41,7 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "siclaw_wait_task",
-    description: "Wait for an existing Siclaw investigation without creating another task. Use this as the same-turn watchdog: call it repeatedly while the task is non-terminal, unless the user asks to stop or the overall investigation deadline is exhausted. Working responses are compact; the full report is returned once the task reaches a terminal state.",
+    description: "Wait for an existing Siclaw investigation without creating another task. Use this as the same-turn watchdog: call it repeatedly while the task is non-terminal, unless the user asks to stop or the overall investigation deadline is exhausted. Working responses are compact — a short progress_tail excerpt of the investigation narrative plus counters; the full report is returned once the task reaches a terminal state.",
     inputSchema: {
       type: "object",
       properties: {
@@ -110,15 +110,32 @@ type ToolResult = {
 type TaskToolView = Omit<SiclawTask, "result"> & {
   result?: string | null;
   progress_chars: number;
+  progress_tail?: string;
   wait_error?: string;
 };
 
-function taskView(task: SiclawTask, includeTerminalResult: boolean): TaskToolView {
+// Working responses withhold the partial report for compactness, but expose a
+// bounded tail so pollers can relay what the investigation is doing right now.
+const PROGRESS_TAIL_MAX_RUNES = 400;
+
+function progressTail(text: string | null | undefined): string | undefined {
+  if (!text) return undefined;
+  const runes = Array.from(text);
+  if (runes.length <= PROGRESS_TAIL_MAX_RUNES) return text;
+  return "…" + runes.slice(-PROGRESS_TAIL_MAX_RUNES).join("");
+}
+
+// includeReport gates all report content — the full result on terminal tasks
+// AND the progress_tail excerpt on working ones. Listings pass false: they
+// exist to recover task IDs and must never carry investigation text.
+function taskView(task: SiclawTask, includeReport: boolean): TaskToolView {
   const { result, ...summary } = task;
+  const tail = includeReport && !task.is_terminal ? progressTail(result) : undefined;
   return {
     ...summary,
-    progress_chars: result?.length ?? 0,
-    ...(includeTerminalResult && task.is_terminal ? { result } : {}),
+    progress_chars: result ? Array.from(result).length : 0,
+    ...(tail !== undefined ? { progress_tail: tail } : {}),
+    ...(includeReport && task.is_terminal ? { result } : {}),
   };
 }
 
@@ -165,8 +182,11 @@ function taskText(task: SiclawTask, waitError?: string): string {
   if (waitError) lines.push(`wait_error: ${waitError} (status polling failed, but the task was already created)`);
   if (task.is_terminal && task.result) lines.push("", task.result);
   if (!task.is_terminal) {
-    const progressChars = task.result?.length ?? 0;
-    if (progressChars > 0) lines.push(`progress_chars: ${progressChars} (partial report withheld until terminal)`);
+    const progressChars = task.result ? Array.from(task.result).length : 0;
+    if (progressChars > 0) {
+      lines.push(`progress_chars: ${progressChars} (full report is withheld until terminal)`);
+      lines.push("progress_tail (latest excerpt):", progressTail(task.result)!);
+    }
     lines.push("", "The investigation is still running. Call siclaw_wait_task with the task_id; do not submit the same investigation again.");
   }
   return lines.join("\n");
