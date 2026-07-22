@@ -226,6 +226,52 @@ _MODEL_WATCHDOG_POLL_S = float(os.environ.get("KBC_MODEL_WATCHDOG_POLL_S", "10")
 _HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = float(os.environ.get(
     "KBC_HIERARCHICAL_MODEL_IDLE_TIMEOUT_S", "240"))
 
+# ── Test-session resilience (read-only consumer turns) ───────────────────────
+# A test session streams faithfully (no de-stream shim), so the compile-path
+# watchdog does not cover it. It gets its OWN turn-stall guard reusing the same
+# idle-latency semantics (SDK event == alive), defaulting to the compile idle
+# bound. Unlike compile, a wedged test turn is reaped WITHOUT retry: the UI is
+# freed with a turn-level error and the session stays live for the next question.
+_TEST_MODEL_IDLE_TIMEOUT_S = float(os.environ.get(
+    "KBC_TEST_MODEL_IDLE_TIMEOUT_S", str(_MODEL_IDLE_TIMEOUT_S)))
+# Orphan reaper: a server timeout / persistence failure can leave a box-side test
+# session that nobody closes, holding one of KBC_MAX_TEST_SESSIONS until the pod
+# is recreated. A periodic sweep tears down sessions idle past this TTL.
+_TEST_SESSION_IDLE_TTL_S = float(os.environ.get("KBC_TEST_SESSION_IDLE_TTL_S", "1800"))
+_TEST_SESSION_REAP_POLL_S = float(os.environ.get("KBC_TEST_SESSION_REAP_POLL_S", "60"))
+
+
+def _now_iso() -> str:
+    """UTC timestamp for the test-session wire contract (created_at/last_activity_at)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _print_test_lifecycle(label: str, run: "TestRun", extra: str = "") -> None:
+    """One stdout line per test-session lifecycle event (test.open / test.close /
+    turn.start / turn.done / turn.stalled / ttl.reap). tid + parent_run_id ONLY —
+    never user content — so pod logs make orphan/stall triage possible without
+    leaking the KB or the consumer's questions. Same [compile_box] prefix style."""
+    tail = f" {extra}" if extra else ""
+    print(f"[compile_box] {label} tid={run.tid} parent={run.parent_run_id}{tail}", flush=True)
+
+
+def _touch_test_activity(run: "TestRun") -> None:
+    """Mark liveness for the idle-TTL reaper (open, each turn, event consumption)."""
+    run._last_activity_monotonic = time.monotonic()
+    run.last_activity_at = _now_iso()
+
+
+def _arm_test_turn(run: "TestRun") -> None:
+    """Arm the turn-stall watchdog for a new test-session turn (the /test-message
+    analogue of CompileRun._begin_turn, minus compile/selfcheck bookkeeping)."""
+    run._turn_active = True
+    run._tool_pending = False
+    run._stall_reaped = False
+    run._last_sdk_message_type = "query"
+    run._last_model_activity = time.monotonic()
+    _touch_test_activity(run)
+
+
 # ── Rate-limit resilience (C2) ───────────────────────────────────────────────
 # massapi under concurrency (5-10 boxes × the red-blue PK) can return 429/503/529.
 # The bundled CLI retries internally a few times; past that the turn ends with
@@ -445,6 +491,24 @@ class TestRun:
         self.consumer_model: str | None = None
         self.consumer_max_turns: int | None = None
         self.consumer_fingerprint: str = ""
+        # Lifecycle timestamps for the idle-TTL reaper and GET /test-sessions.
+        # created_at/last_activity_at are wire (iso8601, agreed with sicore);
+        # _last_activity_monotonic drives the TTL comparison (clock-skew safe).
+        now = time.monotonic()
+        self.created_at: str = _now_iso()
+        self.last_activity_at: str = self.created_at
+        self._last_activity_monotonic: float = now
+        # Turn-stall watchdog state (mirrors CompileRun's, minus retry/compile
+        # bookkeeping). A turn is active from a /test-message query() until its
+        # ResultMessage; the watchdog only judges an active turn, against model
+        # latency, relaxing to the tool bound while a read tool runs.
+        self._turn_active = False
+        self._tool_pending = False
+        self._last_model_activity: float = now
+        self._last_sdk_message_type = "query"  # controlled class name only; never content
+        # Set by the watchdog when it reaps a wedged turn; the receive loop then
+        # discards the interrupted ResultMessage instead of announcing it.
+        self._stall_reaped = False
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
@@ -4096,6 +4160,118 @@ def _make_recommendation_path_guard(root: Path, locale: str | None = None):
     return guard
 
 
+async def _consume_test_turn_stream(run: "TestRun", client) -> None:
+    """Relay a read-only test session's message stream through _emit_message,
+    owning the test-path stall reaper. Every inbound SDK message is liveness
+    (resets the idle clock, updates tool_pending) AND refreshes the TTL. Unlike
+    the compile path there is NO retry: when the watchdog has reaped the turn,
+    its ResultMessage is the torn-down attempt — discard it (the UI already got a
+    turn_done from the watchdog) and stay live for the next /test-message. A real
+    ResultMessage ends the turn normally."""
+    async for msg in client.receive_messages():
+        _note_model_activity(run, msg)   # SDK event == alive; flips tool_pending
+        _touch_test_activity(run)        # any message is also TTL liveness
+        if type(msg).__name__ == "ResultMessage":
+            if run._stall_reaped:
+                # The watchdog interrupted this turn and already emitted the
+                # turn-level error + turn_done. This is the reaped attempt's
+                # empty result; drop its partial text and keep the session live.
+                run._turn_text = []
+                run._stall_reaped = False
+                run._turn_active = False
+                continue
+            was_active = run._turn_active
+            run._turn_active = False
+            if was_active:
+                _print_test_lifecycle("turn.done", run)
+            await _emit_message(run, msg)
+            continue
+        await _emit_message(run, msg)
+
+
+async def _test_stall_watchdog(run: "TestRun") -> None:
+    """Reap a test-session turn wedged on a black-holed model request. The test
+    path streams faithfully (no de-stream shim), so this is its ONLY stall guard.
+    It does not retry: it reaps the turn once (interrupt → the receive loop
+    discards the torn-down result), emits a turn-level error + turn_done so the
+    UI stops "thinking", and leaves the session live for the next question. Only
+    judges an ACTIVE turn; a pending read tool relaxes to the tool bound so a slow
+    Read/Grep over the snapshot is never false-killed (I4)."""
+    while not run.done:
+        await asyncio.sleep(_MODEL_WATCHDOG_POLL_S)
+        if not run._turn_active or run._stall_reaped:
+            continue
+        client = run.client
+        if client is None:
+            continue
+        # destream_floor=0: test sessions do not de-stream, so the model bound
+        # needs no lift; a pending tool still keeps its own (longer) bound.
+        bound = _watchdog_idle_bound(run._tool_pending, _TEST_MODEL_IDLE_TIMEOUT_S, 0.0)
+        idle = time.monotonic() - run._last_model_activity
+        if idle <= bound:
+            continue
+        run._stall_reaped = True
+        run._turn_active = False
+        run._turn_text = []           # the wedged attempt produced nothing usable
+        _print_test_lifecycle(
+            "turn.stalled", run, extra=f"idle={round(idle, 1)}s bound={round(bound, 1)}s")
+        await run.emit({
+            "type": "turn_stalled",
+            "idle_s": round(idle, 1),
+            "bound_s": round(bound, 1),
+            "tool_pending": run._tool_pending,
+            "last_sdk_message": run._last_sdk_message_type,
+        })
+        await run.emit({"type": "error", "error": _loc(run,
+            "The answer timed out — please try again.",
+            "回答超时,请重试。")})
+        # turn_done frees the UI (idle) while the session stays open; the next
+        # /test-message re-arms a fresh turn on the same live client.
+        await run.emit({"type": "turn_done", "text": _loc(run,
+            "The answer timed out — please try again.",
+            "回答超时,请重试。")})
+        try:
+            await client.interrupt()
+        except Exception as e:
+            # A swallowed interrupt cannot un-wedge the receive loop, but the UI
+            # already recovered above; do not disconnect (spec: keep the session
+            # live). Surface the interrupt failure for pod-log triage.
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"Test session: interrupt after stall failed {e!r}",
+                f"测试会话:停滞后中断失败 {e!r}")})
+
+
+async def _reap_idle_test_sessions() -> int:
+    """One idle-TTL sweep: tear down every test session idle past the TTL and emit
+    a close event. Split from the loop so a test can drive a single deterministic
+    pass. Returns the number reaped."""
+    now = time.monotonic()
+    stale = [r for r in list(TEST_SESSIONS.values())
+             if not r.done and (now - r._last_activity_monotonic) > _TEST_SESSION_IDLE_TTL_S]
+    for run in stale:
+        _print_test_lifecycle(
+            "ttl.reap", run, extra=f"idle={round(now - run._last_activity_monotonic)}s")
+        try:
+            await run.emit({"type": "summary", "text": _loc(run,
+                "Test session closed after being idle.",
+                "测试会话空闲超时,已关闭。")})
+        except Exception:
+            pass
+        await _teardown_test_session(run)   # cancels the task → wrapper emits `end`
+    return len(stale)
+
+
+async def _test_session_reaper() -> None:
+    """Periodic idle-TTL sweep for orphaned test sessions. Fail-open: a sweep
+    error must never kill the reaper loop (it protects a shared concurrency slot)."""
+    while True:
+        await asyncio.sleep(_TEST_SESSION_REAP_POLL_S)
+        try:
+            await _reap_idle_test_sessions()
+        except Exception as e:
+            print(f"[compile_box] test-session reaper sweep failed: {e!r}", flush=True)
+
+
 async def test_session_driver(run: "TestRun"):
     """Read-only consumer driver: host a ClaudeSDKClient over the pinned snapshot
     dir, tools limited to the kb-test profile's whitelist (default Read/Glob/Grep),
@@ -4146,8 +4322,10 @@ async def test_session_driver(run: "TestRun"):
         sid = str(getattr(client, "session_id", sid) or sid)
         run.session_id = sid
         await run.emit({"type": "session", "session_id": sid})
-        async for msg in client.receive_messages():
-            await _emit_message(run, msg)
+        # Persistent conversational stream with the turn-stall reaper (started by
+        # _test_session_wrapper). Yields this turn's output then blocks for the
+        # next /test-message, keeping the session alive until close/idle-TTL.
+        await _consume_test_turn_stream(run, client)
     finally:
         run.connected.set()  # unblock any /test-message waiters even if connect failed
         run.client = None
@@ -4621,15 +4799,22 @@ async def assist_reference_answer(parent: "CompileRun", payload: dict) -> dict:
 
 
 async def _test_session_wrapper(run: "TestRun"):
-    """Lifecycle for a read-only test session: run the driver, turn a crash into an
-    `error` event, always close with `end`. No syncer / bundle fallback (read-only,
-    nothing to persist). Cancellation (teardown) skips `error`, still emits `end`."""
+    """Lifecycle for a read-only test session: run the driver under a turn-stall
+    watchdog, turn a crash into an `error` event, always close with `end`. No
+    syncer / bundle fallback (read-only, nothing to persist). Cancellation
+    (teardown) skips `error`, still emits `end`."""
+    watchdog = asyncio.create_task(_test_stall_watchdog(run))
     try:
         await _TEST_SESSION_IMPL(run)
     except Exception as e:  # top-level boundary; CancelledError (teardown) passes through
         await run.emit({"type": "error", "error": repr(e)})
     finally:
         run.done = True
+        watchdog.cancel()
+        try:
+            await watchdog
+        except asyncio.CancelledError:
+            pass
         await run.emit({"type": "end"})
 
 
@@ -4637,6 +4822,7 @@ async def _teardown_test_session(run: "TestRun"):
     """Cancel the session task (→ driver finally disconnects the client), drop the
     snapshot dir, and forget the run. The original RUNS machinery has no GC; test
     sessions are frequent + ephemeral, so they get explicit teardown."""
+    _print_test_lifecycle("test.close", run)
     if run.task and not run.task.done():
         run.task.cancel()
         try:
@@ -5218,6 +5404,7 @@ async def handle_open_test(request: web.Request):
     )
     TEST_SESSIONS[tid] = run
     run.task = asyncio.create_task(_test_session_wrapper(run))
+    _print_test_lifecycle("test.open", run, extra=f"pages={pages}")
     return web.json_response({
         "ok": True,
         "test_session_id": tid,
@@ -5310,6 +5497,8 @@ async def handle_test_message(request: web.Request):
     text = (body.get("message") or "").strip()
     if not text:
         return web.json_response({"error": "message is required"}, status=400)
+    _arm_test_turn(run)   # arm the turn-stall watchdog for this turn
+    _print_test_lifecycle("turn.start", run)
     await run.client.query(text)
     return web.json_response({"ok": True})
 
@@ -5344,6 +5533,45 @@ async def handle_close_test(request: web.Request):
         return web.json_response({"ok": True, "already_closed": True})
     await _teardown_test_session(run)
     return web.json_response({"ok": True})
+
+
+async def handle_list_test_sessions(request: web.Request):
+    """List the box's live test sessions so the consumer can reconcile orphans
+    against its own records and drive the idle-reap view. Wire contract agreed
+    with sicore — the field names (tid/parent_run_id/created_at/last_activity_at/
+    done) are load-bearing, do not rename."""
+    return web.json_response({"sessions": [
+        {
+            "tid": r.tid,
+            "parent_run_id": r.parent_run_id,
+            "created_at": r.created_at,
+            "last_activity_at": r.last_activity_at,
+            "done": r.done,
+        }
+        for r in TEST_SESSIONS.values()
+    ]})
+
+
+_TEST_SESSION_REAPER_TASK: "asyncio.Task | None" = None
+
+
+async def _start_test_session_reaper(_app) -> None:
+    """aiohttp on_startup: launch the idle-TTL orphan reaper (needs a running loop)."""
+    global _TEST_SESSION_REAPER_TASK
+    _TEST_SESSION_REAPER_TASK = asyncio.create_task(_test_session_reaper())
+
+
+async def _stop_test_session_reaper(_app) -> None:
+    """aiohttp on_cleanup: stop the reaper so it does not outlive the app."""
+    global _TEST_SESSION_REAPER_TASK
+    task = _TEST_SESSION_REAPER_TASK
+    _TEST_SESSION_REAPER_TASK = None
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _flush_on_shutdown(_app) -> None:
@@ -5391,7 +5619,9 @@ def build_app() -> web.Application:
         middlewares=[_client_certificate_middleware],
     )
     app.on_startup.append(destream.start)
+    app.on_startup.append(_start_test_session_reaper)
     app.on_shutdown.append(_flush_on_shutdown)
+    app.on_cleanup.append(_stop_test_session_reaper)
     app.add_routes([
         web.post("/sources", handle_sources),
         web.post("/sources/begin", handle_sources_begin),
@@ -5409,6 +5639,7 @@ def build_app() -> web.Application:
         web.post("/test-reference-assist/{run_id}", handle_test_reference_assist),
         web.post("/test-message/{tid}", handle_test_message),
         web.get("/test-events/{tid}", handle_test_events),
+        web.get("/test-sessions", handle_list_test_sessions),
         web.post("/test-session/{tid}/close", handle_close_test),
         web.get("/health", handle_health),
     ])
