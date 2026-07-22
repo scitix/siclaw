@@ -62,6 +62,7 @@ from claude_agent_sdk import (
 )
 
 import batching
+import destream
 import incremental
 import mediaverify
 import office_ingest
@@ -4637,6 +4638,9 @@ def _apply_session_config(body: dict) -> None:
             if k == "KBC_PK_MODE" and _PK_KILL_AT_BOOT:
                 continue  # ops kill switch outranks consumer config
             os.environ[k] = str(value)
+    # After the final env state lands: opt the Anthropic route in/out of the
+    # in-pod de-streaming shim (KBC_DESTREAM, charset fix — see destream.py).
+    destream.maybe_activate()
 
 
 async def handle_session(request: web.Request):
@@ -5300,6 +5304,7 @@ def build_app() -> web.Application:
         client_max_size=_http_max_request_bytes(),
         middlewares=[_client_certificate_middleware],
     )
+    app.on_startup.append(destream.start)
     app.on_shutdown.append(_flush_on_shutdown)
     app.add_routes([
         web.post("/sources", handle_sources),
