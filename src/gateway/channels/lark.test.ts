@@ -203,6 +203,7 @@ beforeEach(() => {
   ensureChatSessionMock.mockReset();
   appendMessageMock.mockReset();
   bindMessageTraceIdMock.mockReset();
+  bindMessageTraceIdMock.mockResolvedValue(undefined);
   resolveAgentModelBindingMock.mockResolvedValue(null);
   ensureChatSessionMock.mockResolvedValue(undefined);
   appendMessageMock.mockResolvedValue("msg-db-1");
