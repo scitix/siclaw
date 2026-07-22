@@ -1,5 +1,23 @@
 import { describe, it, expect } from "vitest";
-import { stdinExecCmd } from "./exec-utils.js";
+import { filterPodNoise, stdinExecCmd } from "./exec-utils.js";
+
+describe("filterPodNoise", () => {
+  it("removes kubectl exec SPDY stream diagnostics but preserves the real error", () => {
+    const noisy = [
+      "I0722 15:03:20.306993   65357 log.go:244] (0x46) Create stream",
+      "I0722 15:03:20.355662   65357 log.go:244] Reply frame received for 1",
+      "error: executable file not found in $PATH",
+    ].join("\n");
+
+    expect(filterPodNoise(noisy)).toBe(
+      "error: executable file not found in $PATH",
+    );
+  });
+
+  it("keeps ordinary command stderr", () => {
+    expect(filterPodNoise("permission denied\ncommand failed")).toBe("permission denied\ncommand failed");
+  });
+});
 
 describe("stdinExecCmd", () => {
   it("generates correct bash stdin command without args", () => {
