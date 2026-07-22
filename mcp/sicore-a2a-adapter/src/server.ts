@@ -6,7 +6,10 @@ import { createToolHandler, TOOL_DEFINITIONS } from "./tools.js";
 
 export const SERVER_INSTRUCTIONS = [
   "Use siclaw_investigate for operational questions that require the configured Siclaw SRE agent.",
-  "When it returns a non-terminal task, keep the current turn open and call siclaw_wait_task with the same task_id until terminal, unless the user requests fire-and-forget, asks to stop, or the overall investigation deadline is exhausted.",
+  "Independent questions or hypotheses can run concurrently: submit each as its own task with a distinct (or omitted) context_id instead of investigating them serially.",
+  "When unsure what the agent can reach, first ask it to list its bound clusters and data sources.",
+  "For diagnostic questions, ask it to cite the data sources it consulted and its confidence in the conclusion.",
+  "When a call returns a non-terminal task, keep the current turn open and call siclaw_wait_task with the same task_id until terminal, unless the user requests fire-and-forget, asks to stop, or the overall investigation deadline is exhausted.",
   "Never resubmit the same question merely because a task is still working.",
   "Use siclaw_list_tasks to recover server-side tasks after a client restart.",
 ].join(" ");

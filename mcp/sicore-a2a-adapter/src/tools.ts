@@ -12,7 +12,7 @@ const STATUS_TO_A2A: Record<string, string> = {
 export const TOOL_DEFINITIONS = [
   {
     name: "siclaw_investigate",
-    description: "Ask the configured Siclaw SRE agent to investigate an operational question. This creates an asynchronous Sicore A2A task. Reuse context_id to continue the same investigation. If the returned task is not terminal, do not submit it again: call siclaw_wait_task until it finishes unless the user explicitly requested fire-and-forget. The configured A2A key fixes which Siclaw agent is used.",
+    description: "Ask the configured Siclaw SRE agent to investigate an operational question. This creates an asynchronous Sicore A2A task. Reuse context_id to continue the same investigation; tasks with distinct context_ids run in parallel server-side, so submit independent hypotheses concurrently. If the returned task is not terminal, do not submit it again: call siclaw_wait_task until it finishes unless the user explicitly requested fire-and-forget. The configured A2A key fixes which Siclaw agent is used.",
     inputSchema: {
       type: "object",
       properties: {
