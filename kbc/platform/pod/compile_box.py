@@ -2219,6 +2219,9 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=session_id,
         session_store=InMemorySessionStore(),
+        # Non-interactive session → de-streamed Anthropic route (charset fix);
+        # merged over the inherited env by the SDK, so credentials stay put.
+        env=destream.session_env("authoring"),
         hooks={"PreToolUse": [HookMatcher(hooks=[_make_compile_path_guard(
             Path(wd), run.locale, pdf_page_ranges=pdf_page_ranges,
             raw_read_allowlist=raw_read_allowlist,
@@ -3069,6 +3072,7 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
                 max_buffer_size=SDK_MAX_BUFFER_BYTES,
                 session_id=planner_session_id,
                 session_store=InMemorySessionStore(),
+                env=destream.session_env("authoring"),
             )
             client = ClaudeSDKClient(options=opts)
         prev = run.client
@@ -3528,6 +3532,18 @@ async def _consume_turn_stream(
 _STALL_INTERRUPT_DEADLINE_S = int(os.environ.get("KBC_STALL_INTERRUPT_DEADLINE_S", "120"))
 
 
+def _watchdog_idle_bound(tool_pending: bool, model_idle_timeout: float, destream_floor: float) -> float:
+    """Idle bound for the stall watchdog.
+
+    A pending tool is LOCAL execution and keeps its own (shorter) bound;
+    de-streaming only affects the model-request phase, so the de-stream floor
+    lifts ONLY the model bound — it must never extend a stuck tool's timeout.
+    """
+    if tool_pending:
+        return _MODEL_TOOL_IDLE_TIMEOUT_S
+    return max(model_idle_timeout, destream_floor) if destream_floor else model_idle_timeout
+
+
 async def _model_stall_watchdog(run: CompileRun) -> None:
     """Reap a turn wedged on a black-holed model request. Interrupt the attempt;
     _consume_turn_stream then re-issues it (or fails). Only judges an ACTIVE turn,
@@ -3572,7 +3588,12 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
             if run._model_idle_timeout_s is not None
             else _MODEL_IDLE_TIMEOUT_S
         )
-        bound = _MODEL_TOOL_IDLE_TIMEOUT_S if run._tool_pending else model_idle_timeout
+        # De-streamed model turns emit no SDK deltas mid-request, so the model
+        # idle bound must cover a whole generation or the watchdog false-kills
+        # long ones. A pending tool is unaffected by de-streaming and keeps its
+        # own (shorter) bound (see _watchdog_idle_bound / destream.model_idle_floor).
+        bound = _watchdog_idle_bound(
+            run._tool_pending, model_idle_timeout, destream.model_idle_floor())
         idle = time.monotonic() - run._last_model_activity
         if idle <= bound:
             continue
@@ -4258,6 +4279,9 @@ def _recommendation_session_opts(
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=str(uuid.uuid4()),
         session_store=InMemorySessionStore(),
+        # Non-interactive red-team reviewer → de-streamed Anthropic route
+        # (charset fix); merged over the inherited env by the SDK.
+        env=destream.session_env("verify"),
         hooks={"PreToolUse": [HookMatcher(hooks=[_make_recommendation_path_guard(root, parent.locale)])]},
     )
 
@@ -4528,6 +4552,9 @@ def _reference_assist_session_opts(parent: "CompileRun", root: Path, submit_tool
         max_buffer_size=SDK_MAX_BUFFER_BYTES,
         session_id=str(uuid.uuid4()),
         session_store=InMemorySessionStore(),
+        # Non-interactive reference-answer assistant → de-streamed Anthropic
+        # route (charset fix); merged over the inherited env by the SDK.
+        env=destream.session_env("verify"),
         hooks={"PreToolUse": [HookMatcher(hooks=[_make_recommendation_path_guard(root, parent.locale)])]},
     )
 
@@ -4700,9 +4727,6 @@ def _apply_session_config(body: dict) -> None:
             if k == "KBC_PK_MODE" and _PK_KILL_AT_BOOT:
                 continue  # ops kill switch outranks consumer config
             os.environ[k] = str(value)
-    # After the final env state lands: opt the Anthropic route in/out of the
-    # in-pod de-streaming shim (KBC_DESTREAM, charset fix — see destream.py).
-    destream.maybe_activate()
 
 
 async def handle_session(request: web.Request):

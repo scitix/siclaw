@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -165,27 +166,39 @@ async def test_non_stream_and_other_routes_pass_through_verbatim():
     print("OK  non-streaming posts and other routes pass through as raw bytes")
 
 
-def test_maybe_activate_env_logic():
-    destream._PORT = 45678
-    shim = "http://127.0.0.1:45678"
+def test_default_on_session_scoped_activation():
+    """v2 semantics: default ON for non-interactive Anthropic sessions with no
+    deployment config; TEST sessions always stream; codex untouched; KBC_DESTREAM
+    stays as the operator opt-out escape hatch."""
     env_backup = {k: os.environ.get(k) for k in
                   ("KBC_DESTREAM", "KBC_ENGINE", "ANTHROPIC_BASE_URL")}
+    destream._PORT = 45678
+    shim = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:45678"}
     try:
         os.environ["ANTHROPIC_BASE_URL"] = "https://api.example/model-api"
-        os.environ["KBC_DESTREAM"] = "1"
+        os.environ.pop("KBC_DESTREAM", None)
         os.environ.pop("KBC_ENGINE", None)
-        destream.maybe_activate()
-        assert os.environ["ANTHROPIC_BASE_URL"] == shim
-        assert destream._UPSTREAM == "https://api.example/model-api"
-        destream.maybe_activate()  # idempotent: shim url is not re-captured
-        assert destream._UPSTREAM == "https://api.example/model-api"
-        os.environ["KBC_DESTREAM"] = "0"
-        destream.maybe_activate()  # opt-out restores the real upstream
+        # default ON, session-scoped
+        assert destream.enabled()
+        assert destream.session_env("authoring") == shim
+        assert destream.session_env("verify") == shim
+        assert destream.session_env("test") == {}          # interactive: never
+        assert destream.model_idle_floor() == 900.0
+        # the box's own environment is NOT rewritten (per-session env only)
         assert os.environ["ANTHROPIC_BASE_URL"] == "https://api.example/model-api"
-        os.environ["KBC_DESTREAM"] = "1"
+        # operator opt-out
+        os.environ["KBC_DESTREAM"] = "off"
+        assert not destream.enabled()
+        assert destream.session_env("authoring") == {}
+        assert destream.model_idle_floor() == 0.0
+        os.environ.pop("KBC_DESTREAM", None)
+        # codex engine out of scope
         os.environ["KBC_ENGINE"] = "codex_sdk"
-        destream.maybe_activate()  # codex engine is out of scope
-        assert os.environ["ANTHROPIC_BASE_URL"] == "https://api.example/model-api"
+        assert not destream.enabled()
+        os.environ.pop("KBC_ENGINE", None)
+        # no shim listener -> off
+        destream._PORT = None
+        assert not destream.enabled()
     finally:
         destream._PORT = None
         destream._UPSTREAM = None
@@ -194,11 +207,83 @@ def test_maybe_activate_env_logic():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    print("OK  maybe_activate: opt-in rewrites, opt-out restores, codex untouched")
+    print("OK  default-on session-scoped activation (test sessions stream, opt-out works)")
+
+
+def test_verify_caller_opts_carry_shim():
+    """Integration guard: the two non-interactive Claude reviewer sessions
+    (test recommendation + reference-answer assist) must thread the de-stream
+    shim into their SDK env, exactly like the authoring/verify entrypoints.
+    Without it they keep hitting the streaming gateway and re-expose the
+    cross-chunk charset corruption this PR fixes. Opt-out must clear it."""
+    import tempfile
+    import types
+
+    import compile_box
+
+    env_backup = {k: os.environ.get(k) for k in
+                  ("KBC_DESTREAM", "KBC_ENGINE", "ANTHROPIC_BASE_URL")}
+    destream._PORT = 45678
+    shim = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:45678"}
+    try:
+        os.environ["ANTHROPIC_BASE_URL"] = "https://api.example/model-api"
+        os.environ.pop("KBC_DESTREAM", None)
+        os.environ.pop("KBC_ENGINE", None)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            parent = types.SimpleNamespace(locale="en")
+
+            rec_submit = compile_box._make_recommendation_submit_tool(root, parent, {})
+            rec_opts = compile_box._recommendation_session_opts(parent, root, rec_submit)
+            assert rec_opts.env == shim, rec_opts.env
+
+            ref_submit, allowed = compile_box._make_reference_assist_submit_tool(
+                root, parent, "polish", {})
+            ref_opts = compile_box._reference_assist_session_opts(
+                parent, root, ref_submit, allowed)
+            assert ref_opts.env == shim, ref_opts.env
+
+            # operator opt-out drops both back to true streaming (empty env)
+            os.environ["KBC_DESTREAM"] = "off"
+            assert compile_box._recommendation_session_opts(
+                parent, root, rec_submit).env == {}
+            assert compile_box._reference_assist_session_opts(
+                parent, root, ref_submit, allowed).env == {}
+    finally:
+        destream._PORT = None
+        destream._UPSTREAM = None
+        for k, v in env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("OK  recommendation + reference-assist opts carry the shim env (opt-out clears it)")
+
+
+def test_watchdog_floor_scoped_to_model_phase():
+    """Integration guard for the stall watchdog: the de-stream idle floor lifts
+    ONLY the model-request bound. A pending tool is local execution and must
+    keep its own (shorter) bound, or a wedged tool would be reaped minutes
+    late."""
+    import compile_box
+
+    tool_bound = compile_box._MODEL_TOOL_IDLE_TIMEOUT_S  # 660s default
+    # tool pending: floor NEVER applies, even a large one
+    assert compile_box._watchdog_idle_bound(True, 90.0, 900.0) == tool_bound
+    assert compile_box._watchdog_idle_bound(True, 90.0, 0.0) == tool_bound
+    # model phase: floor lifts the model bound when the shim is active
+    assert compile_box._watchdog_idle_bound(False, 90.0, 900.0) == 900.0
+    # model phase, shim off: bound is untouched
+    assert compile_box._watchdog_idle_bound(False, 90.0, 0.0) == 90.0
+    # floor never shrinks an already-larger model bound
+    assert compile_box._watchdog_idle_bound(False, 1200.0, 900.0) == 1200.0
+    print("OK  watchdog de-stream floor applies to the model bound only, never a pending tool")
 
 
 if __name__ == "__main__":
-    test_maybe_activate_env_logic()
+    test_default_on_session_scoped_activation()
+    test_verify_caller_opts_carry_shim()
+    test_watchdog_floor_scoped_to_model_phase()
     for fn in (test_destream_synthesizes_valid_sse,
                test_destream_pings_while_upstream_is_slow,
                test_destream_upstream_error_becomes_stream_error_event,

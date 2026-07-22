@@ -14,9 +14,13 @@ non-streaming switch, hence a localhost shim:
 Scope: only POST .../v1/messages bodies with "stream": true are de-streamed.
 Everything else (count_tokens, models, non-streaming posts) passes through
 verbatim as RAW BYTES — the shim must never introduce a decode step of its
-own. Activation is per-profile via the consumer-settings whitelist
-(KBC_DESTREAM=1 on the compile profile); test-session boxes keep true
-streaming for interactive UX.
+own. Activation is DEFAULT-ON and session-scoped in the binary (no deployment
+config): authoring/batch/planner/verify sessions get the shim via per-session
+CLI env, TEST sessions always keep true streaming for interactive UX, the
+codex/OpenAI route is untouched, and KBC_DESTREAM=0/off is the operator
+escape hatch (e.g. once the gateway ships cross-chunk incremental decoding).
+Blast radius is this container image only: the shim binds 127.0.0.1 inside
+the kbc-compile-box pod; runtime/agentbox/sicore LLM callers never see it.
 """
 
 from __future__ import annotations
@@ -48,24 +52,55 @@ def _upstream_timeout() -> float:
     return float(os.environ.get("KBC_DESTREAM_TIMEOUT", "3600"))
 
 
-def maybe_activate() -> None:
-    """Called after session config lands in os.environ (sync seam). When the
-    profile opts in and the engine is the Anthropic one, remember the real
-    upstream and point the CLI at the shim; when it opts out, restore."""
-    global _UPSTREAM
-    if _PORT is None:
-        return
-    shim_url = f"http://127.0.0.1:{_PORT}"
-    base = os.environ.get("ANTHROPIC_BASE_URL", "")
-    wanted = (_truthy(os.environ.get("KBC_DESTREAM"))
-              and os.environ.get("KBC_ENGINE", "claude_agent_sdk") != "codex_sdk")
-    if wanted:
-        if base and base != shim_url:
-            _UPSTREAM = base
-        if _UPSTREAM:
-            os.environ["ANTHROPIC_BASE_URL"] = shim_url
-    elif base == shim_url and _UPSTREAM:
-        os.environ["ANTHROPIC_BASE_URL"] = _UPSTREAM
+def _explicitly_off() -> bool:
+    return (os.environ.get("KBC_DESTREAM") or "").strip().lower() in (
+        "0", "off", "false", "no")
+
+
+def enabled() -> bool:
+    """Default ON for the Anthropic engine — the corruption is a standing
+    gateway bug and the compile box is non-interactive, so byte-correct text
+    is the right default. KBC_DESTREAM=0/off is the operator escape hatch
+    (e.g. after the gateway ships cross-chunk decoding). Codex/OpenAI routes
+    are out of scope."""
+    if _PORT is None or _explicitly_off():
+        return False
+    if os.environ.get("KBC_ENGINE", "claude_agent_sdk") == "codex_sdk":
+        return False
+    return bool(_UPSTREAM or os.environ.get("ANTHROPIC_BASE_URL"))
+
+
+def session_env(kind: str) -> dict:
+    """Per-session CLI env override (merged over the inherited environment by
+    the SDK). Authoring/verify sessions are non-interactive → de-streamed;
+    TEST sessions keep true streaming for interactive UX and always get {}."""
+    if kind not in ("authoring", "verify") or not enabled():
+        return {}
+    return {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{_PORT}"}
+
+
+def model_idle_floor() -> float:
+    """De-streamed turns emit no SDK deltas until the request completes, so
+    the fine-grained stall watchdog would false-kill any generation longer
+    than its idle bound. When the shim is active the idle bound must cover a
+    whole model request; black-hole reaping degrades from seconds to this
+    bound — the honest price of the charset fix, still far under the CLI's
+    own ~60min request timeout."""
+    if not enabled():
+        return 0.0
+    return float(os.environ.get("KBC_DESTREAM_MODEL_IDLE_TIMEOUT_S", "900"))
+
+
+def _upstream_url() -> str | None:
+    """Resolved per request: the box's own environment keeps pointing at the
+    REAL gateway (only CLI child processes get the shim URL), so no global
+    rewrite/restore bookkeeping is needed."""
+    if _UPSTREAM:
+        return _UPSTREAM
+    base = os.environ.get("ANTHROPIC_BASE_URL")
+    if base and _PORT is not None and f"127.0.0.1:{_PORT}" in base:
+        return None  # self-loop guard
+    return base or None
 
 
 def _fwd_headers(request: web.Request) -> dict:
@@ -142,7 +177,7 @@ async def _destream_messages(request: web.Request, body: dict) -> web.StreamResp
 
     ping_task = asyncio.create_task(_pings())
     try:
-        url = (_UPSTREAM or "").rstrip("/") + request.path_qs
+        url = (_upstream_url() or "").rstrip("/") + request.path_qs
         timeout = aiohttp.ClientTimeout(total=_upstream_timeout())
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, json={**body, "stream": False},
@@ -175,7 +210,7 @@ async def _destream_messages(request: web.Request, body: dict) -> web.StreamResp
 
 async def _passthrough(request: web.Request, body_bytes: bytes) -> web.StreamResponse:
     """Verbatim relay, RAW BYTES both ways — never decode here."""
-    url = (_UPSTREAM or "").rstrip("/") + request.path_qs
+    url = (_upstream_url() or "").rstrip("/") + request.path_qs
     timeout = aiohttp.ClientTimeout(total=_upstream_timeout())
     async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
         async with session.request(request.method, url, data=body_bytes,
@@ -190,7 +225,7 @@ async def _passthrough(request: web.Request, body_bytes: bytes) -> web.StreamRes
 
 
 async def _handle(request: web.Request) -> web.StreamResponse:
-    if not _UPSTREAM:
+    if not _upstream_url():
         return web.json_response(
             {"type": "error",
              "error": {"type": "api_error",
