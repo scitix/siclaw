@@ -998,11 +998,16 @@ describe("http-server — steer / abort / clear-queue", () => {
   });
 
   it("POST /api/sessions/:id/steer calls brain.steer", async () => {
+    const s = await sm.getOrCreate("st2");
+    let finishPrompt!: () => void;
+    s.brain.prompt.mockImplementation(() => new Promise<void>((resolve) => { finishPrompt = resolve; }));
     await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "st2" });
-    const s = sm.sessions.get("st2")!;
     const r = await getJson(port, "/api/sessions/st2/steer", "POST", { text: "stop" });
     expect(r.status).toBe(200);
+    expect(r.data.traceId).toMatch(/^[0-9a-f]{32}$/);
     expect(s.brain.steer).toHaveBeenCalledWith("stop");
+    finishPrompt();
+    await flushAsync();
   });
 
   it("POST /api/sessions/:id/steer forwards images to brain.steer", async () => {

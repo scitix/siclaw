@@ -77,6 +77,12 @@ export interface PromptResponse {
   traceId?: string;
 }
 
+export interface SteerResponse {
+  ok: boolean;
+  /** Trace of the active prompt that accepted this additional user input. */
+  traceId?: string;
+}
+
 export interface SessionInfo {
   id: string;
   createdAt: string;
@@ -261,10 +267,10 @@ export class AgentBoxClient {
   /**
    * Send a steer instruction (inserts a user message after interrupting the current tool)
    */
-  async steerSession(sessionId: string, text: string, media?: PromptMediaOptions): Promise<void> {
+  async steerSession(sessionId: string, text: string, media?: PromptMediaOptions): Promise<SteerResponse> {
     const images = media?.images;
     const files = media?.files;
-    await this.fetch(`/api/sessions/${sessionId}/steer`, {
+    const resp = await this.fetch(`/api/sessions/${sessionId}/steer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -273,6 +279,7 @@ export class AgentBoxClient {
         ...(files && files.length > 0 ? { files } : {}),
       }),
     });
+    return resp.json();
   }
 
   /**

@@ -92,7 +92,7 @@ describe("AgentBoxClient — prompt + session CRUD", () => {
         res.end(JSON.stringify({ ok: true }));
       } else if (req.method === "POST" && url === "/api/sessions/s1/steer") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, traceId: "0123456789abcdef0123456789abcdef" }));
       } else if (req.method === "POST" && url === "/api/sessions/s1/abort") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
@@ -166,7 +166,8 @@ describe("AgentBoxClient — prompt + session CRUD", () => {
   });
 
   it("steerSession() posts the text body", async () => {
-    await client.steerSession("s1", "stop the pod");
+    const result = await client.steerSession("s1", "stop the pod");
+    expect(result.traceId).toBe("0123456789abcdef0123456789abcdef");
     const req = srv.captures.find((c) => c.url === "/api/sessions/s1/steer")!;
     expect(req.method).toBe("POST");
     expect(JSON.parse(req.body)).toEqual({ text: "stop the pod" });

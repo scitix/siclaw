@@ -3,6 +3,7 @@ import {
   initChatRepo,
   ensureChatSession,
   appendMessage,
+  bindMessageTraceId,
   appendDelegationEvent,
   updateMessage,
   updateDelegationToolMessage,
@@ -185,6 +186,25 @@ describe("appendMessage", () => {
       delegation_id: "delegation-1",
       target_agent_id: "target-agent",
     });
+  });
+});
+
+describe("bindMessageTraceId", () => {
+  it("sends the exact message/session/trace binding", async () => {
+    await bindMessageTraceId("msg-1", "sid", "0123456789abcdef0123456789abcdef");
+    expect(fake.calls).toEqual([{
+      method: "chat.bindMessageTraceId",
+      params: {
+        id: "msg-1",
+        session_id: "sid",
+        trace_id: "0123456789abcdef0123456789abcdef",
+      },
+    }]);
+  });
+
+  it("is a no-op when a rolling-upgrade ACK has no trace id", async () => {
+    await bindMessageTraceId("msg-1", "sid", undefined);
+    expect(fake.calls).toHaveLength(0);
   });
 });
 

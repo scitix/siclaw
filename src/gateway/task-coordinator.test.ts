@@ -26,9 +26,9 @@ class FakeAgentBoxClient {
   constructor(endpoint: string, _timeoutMs?: number, _tls?: any) {
     this.endpoint = endpoint;
   }
-  async prompt(opts: any): Promise<{ ok: true; sessionId: string }> {
+  async prompt(opts: any): Promise<{ ok: true; sessionId: string; traceId: string }> {
     this.promptCalls.push(opts);
-    return { ok: true, sessionId: opts.sessionId };
+    return { ok: true, sessionId: opts.sessionId, traceId: "0123456789abcdef0123456789abcdef" };
   }
   async *streamEvents(_sid: string): AsyncIterable<unknown> {
     for (const e of this.streamList) yield e;
@@ -323,6 +323,9 @@ describe("TaskCoordinator execution", () => {
     expect(received.taskName).toBe("Good Task");
     expect(received.userId).toBe("u1");
     expect(received.resultText).toBe("done");
+    expect(appendCalls.find((message) => message.role === "user")?.traceId).toBe(
+      "0123456789abcdef0123456789abcdef",
+    );
   });
 
   it("passes modelRouting from resolved binding to AgentBox prompt", async () => {
