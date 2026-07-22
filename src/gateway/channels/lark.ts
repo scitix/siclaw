@@ -1261,7 +1261,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   try {
     // queue-until-idle: wait out a busy session instead of dumping a raw 409.
     const promptResult = await promptWithBusyRetry(client, promptOpts);
-    await bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
+    void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
       console.warn(`[lark] failed to bind prompt trace session=${promptResult.sessionId} message=${promptMessageId}:`, bindErr);
     });
     const collected = await collectChannelResponse(client, promptResult.sessionId, "lark", {

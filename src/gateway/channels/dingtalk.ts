@@ -361,7 +361,7 @@ export async function handleDingTalkMessage(
   try {
     const promptResult = await client.prompt(promptOpts);
     if (promptMessageId) {
-      await bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
+      void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
         console.warn(`[dingtalk] failed to bind prompt trace session=${promptResult.sessionId} message=${promptMessageId}:`, bindErr);
       });
     }

@@ -174,9 +174,11 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
 
 /**
  * Attach the AgentBox prompt trace to the exact user message that initiated it.
- * The Portal RPC enforces user-role, runtime ownership, and NULL-to-value
- * idempotency. Missing trace ids are tolerated for rolling upgrades where an
- * older AgentBox does not yet include traceId in its prompt/steer ACK.
+ * The Portal RPC enforces the exact message/session pair, user role, and
+ * NULL-to-value idempotency. SiCore additionally verifies Runtime ownership;
+ * standalone Portal uses its portal-secret-authenticated Runtime trust domain.
+ * Missing trace ids are tolerated for rolling upgrades where an older AgentBox
+ * does not yet include traceId in its prompt/steer ACK.
  */
 export async function bindMessageTraceId(
   messageId: string,

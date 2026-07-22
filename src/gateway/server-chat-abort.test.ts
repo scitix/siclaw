@@ -116,6 +116,19 @@ afterEach(async () => {
 });
 
 describe("startRuntime — chat.abort wiring", () => {
+  it("starts consuming the reply without waiting for trace binding", async () => {
+    bindMessageTraceIdMock.mockImplementationOnce(() => new Promise<void>(() => {}));
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, { sendEvent: vi.fn() });
+    await waitFor(() => capturedSignal !== undefined);
+
+    expect(bindMessageTraceIdMock).toHaveBeenCalled();
+    await abort({ agentId: "a", sessionId: "S" });
+  });
+
   it("aborts the in-flight chat.send consumer signal AND the agentbox", async () => {
     server = await bootRuntime();
     const send = server.rpcMethods.get("chat.send")!;

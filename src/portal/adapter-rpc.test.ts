@@ -1144,6 +1144,68 @@ describe("chat.appendMessage", () => {
   });
 });
 
+describe("chat.bindMessageTraceId", () => {
+  const traceId = "0123456789abcdef0123456789abcdef";
+
+  it("binds an unassigned user message to the exact session and trace", async () => {
+    const query = vi.fn().mockResolvedValueOnce([{ affectedRows: 1 }, []]);
+    (getDb as any).mockReturnValue({ query, getConnection: vi.fn() });
+
+    const result = await getHandler("chat.bindMessageTraceId")({
+      id: "msg-1",
+      session_id: "sess-1",
+      trace_id: traceId,
+    }, "runtime");
+
+    expect(result).toEqual({ ok: true });
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][0]).toContain("role = 'user'");
+    expect(query.mock.calls[0][0]).toContain("trace_id IS NULL OR trace_id = ?");
+    expect(query.mock.calls[0][1]).toEqual([traceId, "msg-1", "sess-1", traceId]);
+  });
+
+  it("accepts an idempotent same-trace retry when the update reports no changed row", async () => {
+    const query = vi.fn()
+      .mockResolvedValueOnce([{ affectedRows: 0 }, []])
+      .mockResolvedValueOnce([[{ role: "user", trace_id: traceId }], []]);
+    (getDb as any).mockReturnValue({ query, getConnection: vi.fn() });
+
+    await expect(getHandler("chat.bindMessageTraceId")({
+      id: "msg-1",
+      session_id: "sess-1",
+      trace_id: traceId,
+    }, "runtime")).resolves.toEqual({ ok: true });
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects an invalid trace id without touching the database", async () => {
+    const query = mockQuery();
+    await expect(getHandler("chat.bindMessageTraceId")({
+      id: "msg-1",
+      session_id: "sess-1",
+      trace_id: "INVALID",
+    }, "runtime")).rejects.toThrow("32 lowercase hexadecimal characters");
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "a missing message", row: undefined, error: "chat message not found" },
+    { name: "a non-user message", row: { role: "assistant", trace_id: null }, error: "only be bound to a user message" },
+    { name: "a conflicting trace", row: { role: "user", trace_id: "fedcba9876543210fedcba9876543210" }, error: "already bound to a different trace" },
+  ])("rejects $name", async ({ row, error }) => {
+    const query = vi.fn()
+      .mockResolvedValueOnce([{ affectedRows: 0 }, []])
+      .mockResolvedValueOnce([row ? [row] : [], []]);
+    (getDb as any).mockReturnValue({ query, getConnection: vi.fn() });
+
+    await expect(getHandler("chat.bindMessageTraceId")({
+      id: "msg-1",
+      session_id: "sess-1",
+      trace_id: traceId,
+    }, "runtime")).rejects.toThrow(error);
+  });
+});
+
 describe("chat.recordFeedback", () => {
   it("upserts a vote keyed by (message_ref, sender)", async () => {
     const query = mockQuery([]);
@@ -2134,9 +2196,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 55 handlers", () => {
+  it("registers exactly 56 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(55);
+    expect(handlers.size).toBe(56);
   });
 
   it("all expected handler names are registered", () => {
@@ -2148,7 +2210,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getDelegates",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
-      "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.recordFeedback", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
+      "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.bindMessageTraceId", "chat.recordFeedback", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",

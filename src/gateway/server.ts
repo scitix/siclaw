@@ -351,7 +351,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             }).catch((updateErr) => {
               console.warn(`[runtime] failed to mark automatic steer message session=${sessionId} message=${promptMessageId}:`, updateErr);
             });
-            await bindMessageTraceId(promptMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
+            void bindMessageTraceId(promptMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
               console.warn(`[runtime] failed to bind steer trace session=${sessionId} message=${promptMessageId}:`, bindErr);
             });
             return;
@@ -359,7 +359,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           throw err;
         }
 
-        await bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
+        void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
           console.warn(`[runtime] failed to bind prompt trace session=${promptResult.sessionId} message=${promptMessageId}:`, bindErr);
         });
 
@@ -1029,7 +1029,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     const steerResult = await client.steerSession(sessionId, text, { images, files });
-    await bindMessageTraceId(steerMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
+    void bindMessageTraceId(steerMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
       console.warn(`[runtime] failed to bind explicit steer trace session=${sessionId} message=${steerMessageId}:`, bindErr);
     });
     return { ok: true };
