@@ -1710,6 +1710,24 @@ def test_coverage_v2_auto_attach():
     print("OK  coverage v2 auto-attach (embed/orphan/sheet, v1 compat, exclusion inherit, shared-any-cited)")
 
 
+def test_media_citing_pages_via_attribution_edge():
+    """Coverage v2: a page citing only a DOCUMENT still enters the image
+    numeric-verification surface for every image that document embeds — agents no
+    longer cite images one-by-one, so the attribution edge is the carrier."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/doc.md", "# D\n![c](assets/chart.png)\n")
+        _mk(base, "raw/assets/chart.png")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        # cites the DOCUMENT only — no image in compiled_from, no (source: img)
+        _mk(base, "candidate/p.md",
+            "---\ntype: Topic\ncompiled_from:\n  - doc.md\n---\nSummary of the chart.")
+        citing = selfcheck.media_citing_pages(td)
+        assert citing == {"p.md": ["assets/chart.png"]}, citing
+        assert list(selfcheck.pending_media_verification(td)) == ["p.md"]
+    print("OK  media_citing_pages via attribution edge (doc-only citation still verifies embedded images)")
+
+
 def test_asset_provenance_fixture():
     """The shared two-repo fixture: edges + coverage v2 must equal expected.json
     byte-for-byte (sicore's adoption ledger asserts the SAME expected.json)."""
@@ -1742,6 +1760,7 @@ def main():
     test_is_media_asset()
     test_document_link_targets()
     test_coverage_v2_auto_attach()
+    test_media_citing_pages_via_attribution_edge()
     test_asset_provenance_fixture()
     test_body_source_annotations()
     test_deterministic_body_source_normalization()

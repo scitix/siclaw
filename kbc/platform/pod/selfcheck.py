@@ -1592,15 +1592,27 @@ def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) 
 
 
 def media_citing_pages(workdir: str) -> dict[str, list[str]]:
-    """candidate page → sorted raw-relative image paths it digests, gathered
-    from compiled_from entries AND body (source: …) citations. Basename match
-    tolerated for body citations (bodies usually cite the bare filename)."""
+    """candidate page → sorted raw-relative image paths whose numeric fidelity
+    this page is responsible for. Three discovery paths, UNIONED:
+      1. compiled_from image entries — an image cited directly (legacy pages);
+      2. body ``(source: …)`` image citations — basename match tolerated;
+      3. attribution-edge reverse lookup — a page that cites a DOCUMENT ``d`` in
+         its compiled_from inherits the numeric check of every image ``d``
+         embeds in its body.
+    Path 3 is what keeps image re-verification alive under coverage v2: agents
+    now cite DOCUMENTS (images auto-attach, see coverage/asset_attribution_edges)
+    rather than listing images one-by-one, so without it the fresh-eyes numeric
+    check would silently stop covering embedded charts — a silent fail-open on the
+    exact fidelity risk it exists to catch. Only IMAGE_SOURCE_EXTS images go to
+    transcription, so edge assets are intersected with the raw image set (a media
+    asset like .tiff is accounted by coverage but not numerically re-read here)."""
     raw_images = [p for p in source_inventory(workdir)
                   if posixpath.splitext(p)[1].lower() in IMAGE_SOURCE_EXTS]
     by_basename: dict[str, list[str]] = {}
     for p in raw_images:
         by_basename.setdefault(posixpath.basename(p), []).append(p)
     raw_set = set(raw_images)
+    edges = asset_attribution_edges(workdir)
     out: dict[str, list[str]] = {}
     for rel, page in candidate_pages(workdir).items():
         if "error" in page:
@@ -1615,6 +1627,11 @@ def media_citing_pages(workdir: str) -> dict[str, list[str]]:
                 matches = by_basename.get(posixpath.basename(entry), [])
                 if len(matches) == 1:
                     hits.add(matches[0])
+        # Path 3: images embedded by a document this page cites in compiled_from.
+        for entry in page["sources"]:
+            for asset in edges.get(entry, ()):
+                if asset in raw_set:
+                    hits.add(asset)
         if hits:
             out[rel] = sorted(hits)
     return out
