@@ -25,7 +25,7 @@ import {
   isErrorDetail,
   type ErrorDetail,
 } from "../lib/error-envelope.js";
-import { buildProviderModelDescriptor } from "../core/model-compat.js";
+import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
 import { resolveAgentModelRouting } from "./model-routing-config.js";
 import { authenticateApiKey } from "./api-key-auth.js";
 
@@ -297,12 +297,13 @@ export async function resolveAgentModelBinding(agentId: string): Promise<Resolve
     | undefined;
   if (!provider) return null;
 
+  const bindingApi = normalizeProviderApi(provider.api_type);
   const [entryRows] = await db.query(
     "SELECT model_id, name, reasoning, vision, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
     [provider.id],
   ) as any;
   const models = (entryRows as any[]).map((m: any) =>
-    buildProviderModelDescriptor(m, { api: provider.api_type, baseUrl: provider.base_url }),
+    buildProviderModelDescriptor(m, { api: bindingApi, baseUrl: provider.base_url }),
   );
 
   const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
@@ -317,7 +318,7 @@ export async function resolveAgentModelBinding(agentId: string): Promise<Resolve
       name: provider.name,
       baseUrl: provider.base_url,
       apiKey: provider.api_key ?? "",
-      api: provider.api_type,
+      api: bindingApi,
       authHeader: true,
       models,
     },

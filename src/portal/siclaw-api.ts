@@ -2983,7 +2983,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         id, auth.orgId, trim(body.name), trim(body.base_url),
-        trim(body.api_key) || null, trim(body.api_type) || "openai",
+        trim(body.api_key) || null, trim(body.api_type) || "openai-completions",
         body.sort_order ?? 0,
       ],
     );
