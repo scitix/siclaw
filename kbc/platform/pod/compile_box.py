@@ -1839,7 +1839,6 @@ async def _post_turn_selfcheck(run) -> str | None:
     # snapshot covers and the ledger/lint flags the rest. The early-returns
     # used to fire after the guard state was already consumed, letting an
     # index-deleting turn escape the byte freeze entirely (review finding).
-    run._selfcheck_key = key
     # Scoped-incremental byte-integrity guard: on an incremental turn, pages OUTSIDE
     # the authorized set (affected ∪ declared added-targets ∪ index) must be byte-
     # identical to their pre-turn state. Violations are RESTORED BY CODE first —
@@ -1851,6 +1850,7 @@ async def _post_turn_selfcheck(run) -> str | None:
     incr_violations: list[str] = []
     restored_pages: list[str] = []
     editable: set[str] = set()
+    after: dict[str, str] | None = None
     if incr:
         after = incremental.page_hashes(workdir)
         # repair_pages (set on re-arm): a ledger/lint repair turn legitimately
@@ -1866,7 +1866,28 @@ async def _post_turn_selfcheck(run) -> str | None:
             if restored_pages:
                 after = incremental.page_hashes(workdir)
                 incr_violations = incremental.integrity_violations(incr["before"], after, editable)
+    # Mechanical provenance repair belongs before Layer-1 and before the model
+    # repair budget. It is deliberately scoped to pages already editable in an
+    # incremental turn; ordinary guarded owner edits are limited to pages that
+    # actually changed, so this cannot become an implicit whole-library rewrite.
+    mechanical_allowed: set[str] | None = None
+    if incr:
+        mechanical_allowed = editable
+    elif turn_format_guard:
+        current = incremental.page_hashes(workdir)
+        mechanical_allowed = set(incremental.changed_pages(
+            turn_format_guard.get("before") or {}, current))
+    mechanical_fixes = selfcheck.normalize_body_source_annotations(
+        workdir, allowed_pages=mechanical_allowed)
+    if mechanical_fixes:
+        after = incremental.page_hashes(workdir)
+        key = selfcheck.state_key(workdir)
+    run._selfcheck_key = key
     report = selfcheck.run_layer1(workdir)
+    report["mechanical_fixes"] = {
+        "count": len(mechanical_fixes),
+        "items": mechanical_fixes[:40],
+    }
     grandfathered_format: list[dict] = []
     if incr:
         format_changed_pages = set(incremental.changed_pages(incr["before"], after))
@@ -1923,6 +1944,10 @@ async def _post_turn_selfcheck(run) -> str | None:
         await run.emit({"type": "summary", "text": _loc(run,
             f"[Incremental guard] {len(restored_pages)} out-of-scope page(s) auto-restored byte-exact: {shown}",
             f"【增量护栏】{len(restored_pages)} 页越界改动已自动按字节还原:{shown}")})
+    if mechanical_fixes:
+        await run.emit({"type": "summary", "text": _loc(run,
+            f"Self-check normalized {len(mechanical_fixes)} unambiguous source citation(s) without using a repair round.",
+            f"自检已机械规范化 {len(mechanical_fixes)} 处可唯一判定的来源标注,未消耗回修轮次。")})
     await run.emit({"type": "summary", "text": selfcheck.narration(report, locale)})
     if report["state"] == "unconverged":
         # Budget spent with residuals → land a ticket in the owner's question
