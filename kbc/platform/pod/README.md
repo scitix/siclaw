@@ -48,11 +48,11 @@ platform/pod/.venv/bin/python platform/pod/test_compile_box.py
 ## Run (container, production form)
 
 ```bash
-docker build -f platform/pod/Dockerfile -t kbc-compile-box .
+docker build -f platform/pod/Dockerfile -t siclaw-kbc-box .
 docker run --rm -p 3000:3000 \
   -e ANTHROPIC_BASE_URL=https://<massapi>/ \   # model goes through the company massapi (key injected on the proxy side)
   -v /tmp/wd:/work \
-  kbc-compile-box
+  siclaw-kbc-box
 # then:
 #   POST :3000/sources {"run_id":"r1","bundle_base64":"...","bundle_sha256":"..."}
 # or for Source Snapshot v2:
