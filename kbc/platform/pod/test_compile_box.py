@@ -6,6 +6,7 @@
 """
 import asyncio
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -13,6 +14,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -951,6 +953,169 @@ async def test_test_session_step_frames():
         assert all(e["type"] != "step" for e in evs), evs
         assert any(e["type"] == "log" for e in evs), evs
     print("✓ test-session step frames (retrieval trace); compile runs unaffected")
+
+
+class _TestStallFake:
+    """First query black-holes (receive blocks on a gate) so the watchdog must
+    reap it; interrupt() yields the torn-down ResultMessage. A SECOND query
+    produces a real answer then closes → proves the session stayed live after the
+    reap (the whole point of defect 1: recover the UI without killing the session)."""
+
+    def __init__(self):
+        self.queries = []
+        self.interrupts = 0
+        self._gate = asyncio.Event()
+        self._mode = "idle"
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if len(self.queries) == 1:
+            self._mode = "blackhole"          # no gate set → receive blocks (the wedge)
+        else:
+            self._mode = "produce"
+            self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1
+        self._mode = "interrupted"
+        self._gate.set()
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if self._mode == "interrupted":
+                yield ResultMessage()             # the reaped attempt ends
+            elif self._mode == "produce":
+                yield AssistantMessage("RoCE is a transport")
+                yield ResultMessage()
+                self._closed = True
+                return
+
+    async def disconnect(self):
+        self._closed = True
+
+
+async def test_test_session_stall_reaps_turn_keeps_session_live():
+    """Defect 1: a black-holed test turn used to hang the UI on "思考中" forever —
+    the test path had no stall watchdog. Now a wedged turn is reaped (interrupt +
+    turn-level error + turn_done so the UI goes idle), and the session stays live:
+    a fresh question after the stall still gets a real answer. Also asserts the
+    turn.stalled / turn.done stdout lines carry tid+parent and NO user content."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    buf = io.StringIO()
+    fake = _TestStallFake()
+    try:
+        with tempfile.TemporaryDirectory() as snap, contextlib.redirect_stdout(buf):
+            run = compile_box.TestRun("t-stall", snap, parent_run_id="p-stall", snapshot_hash="h")
+            run.client = fake
+            run.connected.set()
+            wdog = asyncio.create_task(compile_box._test_stall_watchdog(run))
+            consume = asyncio.create_task(compile_box._consume_test_turn_stream(run, fake))
+            try:
+                # turn 1 → black-holed; the watchdog must interrupt/reap it
+                compile_box._arm_test_turn(run)
+                await fake.query("what is roce?")
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and fake.interrupts == 0:
+                    await asyncio.sleep(0.02)
+                assert fake.interrupts == 1, fake.interrupts
+                # turn 2 → the SAME live session answers a fresh question
+                compile_box._arm_test_turn(run)
+                await fake.query("again")
+                await asyncio.wait_for(consume, timeout=3)
+            finally:
+                run.done = True
+                wdog.cancel()
+                try:
+                    await wdog
+                except asyncio.CancelledError:
+                    pass
+        evs = _drain(run)
+        types = [e["type"] for e in evs]
+        assert "turn_stalled" in types and "error" in types and "turn_done" in types, types
+        td = next(e for e in evs if e["type"] == "turn_done")
+        assert "timed out" in td["text"], td       # UI-facing timeout wording (en default)
+        # the post-stall question produced a real answer → session stayed usable
+        assert any(e["type"] == "log" and "RoCE" in e.get("text", "") for e in evs), evs
+        assert fake.queries == ["what is roce?", "again"], fake.queries
+        out = buf.getvalue()
+        assert "turn.stalled tid=t-stall parent=p-stall" in out, out
+        assert "turn.done tid=t-stall parent=p-stall" in out, out
+        assert "roce" not in out.lower(), out    # never leak the question text to stdout
+    finally:
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S) = saved
+    print("✓ test-session stall watchdog reaps a wedged turn and keeps the session live")
+
+
+async def test_test_session_idle_ttl_reaper():
+    """Defect 2 (TTL): a test session idle past KBC_TEST_SESSION_IDLE_TTL_S is torn
+    down by the periodic sweep — the snapshot dir + registry slot are freed and a
+    ttl.reap stdout line fires. A recently-active session is left alone."""
+    compile_box.TEST_SESSIONS.clear()
+    saved = compile_box._TEST_SESSION_IDLE_TTL_S
+    compile_box._TEST_SESSION_IDLE_TTL_S = 100.0
+    buf = io.StringIO()
+    stale_dir = tempfile.mkdtemp()
+    fresh_dir = tempfile.mkdtemp()
+    try:
+        stale = compile_box.TestRun("t-stale", stale_dir, parent_run_id="p-ttl", snapshot_hash="h")
+        stale._last_activity_monotonic = time.monotonic() - 500.0   # idle > TTL
+        fresh = compile_box.TestRun("t-fresh", fresh_dir, parent_run_id="p-ttl", snapshot_hash="h")
+        compile_box._touch_test_activity(fresh)                     # just active
+        compile_box.TEST_SESSIONS["t-stale"] = stale
+        compile_box.TEST_SESSIONS["t-fresh"] = fresh
+        with contextlib.redirect_stdout(buf):
+            reaped = await compile_box._reap_idle_test_sessions()
+        assert reaped == 1, reaped
+        assert "t-stale" not in compile_box.TEST_SESSIONS, compile_box.TEST_SESSIONS
+        assert "t-fresh" in compile_box.TEST_SESSIONS
+        assert not Path(stale_dir).exists(), "stale snapshot dir not dropped"
+        # the reaped session got a close (summary) event before teardown emitted end
+        se = [stale.events.get_nowait() for _ in range(stale.events.qsize())]
+        assert any(e["type"] == "summary" for e in se), se
+        out = buf.getvalue()
+        assert "ttl.reap tid=t-stale parent=p-ttl" in out, out
+        assert "test.close tid=t-stale parent=p-ttl" in out, out
+    finally:
+        compile_box._TEST_SESSION_IDLE_TTL_S = saved
+        compile_box.TEST_SESSIONS.clear()
+        shutil.rmtree(stale_dir, ignore_errors=True)
+        shutil.rmtree(fresh_dir, ignore_errors=True)
+    print("✓ test-session idle-TTL reaper drops orphans, spares active sessions")
+
+
+async def test_list_test_sessions_endpoint():
+    """Defect 2 (list): GET /test-sessions returns the agreed sicore wire contract
+    exactly — tid / parent_run_id / created_at / last_activity_at / done — one row
+    per live session."""
+    compile_box.TEST_SESSIONS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        empty = await (await client.get("/test-sessions")).json()
+        assert empty == {"sessions": []}, empty
+
+        run = compile_box.TestRun("tl1", "/tmp", parent_run_id="pl1", snapshot_hash="h")
+        run.done = False
+        compile_box.TEST_SESSIONS["tl1"] = run
+        body = await (await client.get("/test-sessions")).json()
+        assert list(body.keys()) == ["sessions"], body
+        assert len(body["sessions"]) == 1, body
+        row = body["sessions"][0]
+        assert set(row.keys()) == {"tid", "parent_run_id", "created_at", "last_activity_at", "done"}, row
+        assert row["tid"] == "tl1" and row["parent_run_id"] == "pl1" and row["done"] is False, row
+        assert row["created_at"].endswith("Z") and row["last_activity_at"].endswith("Z"), row
+    finally:
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+    print("✓ GET /test-sessions lists live sessions in the agreed wire contract")
 
 
 async def test_explicit_test_recommendation_http():
@@ -3907,6 +4072,9 @@ async def main():
     await test_open_close_test_session_http()
     await test_test_message_path()
     await test_test_session_step_frames()
+    await test_test_session_stall_reaps_turn_keeps_session_live()
+    await test_test_session_idle_ttl_reaper()
+    await test_list_test_sessions_endpoint()
     await test_explicit_test_recommendation_http()
     await test_reference_assist_http_and_validation()
     await test_reference_assist_driver_is_fast_isolated_and_structured()
