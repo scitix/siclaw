@@ -13,6 +13,7 @@ vi.mock("./chat-repo.js", () => ({
   ensureChatSession: vi.fn(async () => {}),
   appendMessage: vi.fn(async () => "msg-id"),
   bindMessageTraceId: vi.fn(async () => {}),
+  updateMessage: vi.fn(async () => {}),
   incrementMessageCount: vi.fn(async () => {}),
 }));
 

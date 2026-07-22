@@ -13,11 +13,13 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 
 const bindMessageTraceIdMock = vi.hoisted(() => vi.fn(async () => {}));
+const updateMessageMock = vi.hoisted(() => vi.fn(async () => {}));
 
 vi.mock("./chat-repo.js", () => ({
   ensureChatSession: vi.fn(async () => {}),
   appendMessage: vi.fn(async () => "msg-id"),
   bindMessageTraceId: bindMessageTraceIdMock,
+  updateMessage: updateMessageMock,
   incrementMessageCount: vi.fn(async () => {}),
 }));
 
@@ -162,7 +164,7 @@ describe("startRuntime — chat.abort wiring", () => {
     );
   });
 
-  it("binds a concurrent send to the active trace after the automatic steer", async () => {
+  it("marks and binds a concurrent send after the automatic steer", async () => {
     promptError = new Error("Session is already running");
     server = await bootRuntime();
     const send = server.rpcMethods.get("chat.send")!;
@@ -170,10 +172,19 @@ describe("startRuntime — chat.abort wiring", () => {
     await send({ agentId: "a", userId: "u", text: "one more detail", sessionId: "S" }, { sendEvent: vi.fn() });
     await waitFor(() => bindMessageTraceIdMock.mock.calls.length > 0);
 
+    expect(updateMessageMock).toHaveBeenCalledWith({
+      messageId: "msg-id",
+      sessionId: "S",
+      content: "one more detail",
+      metadata: { kind: "steer" },
+    });
     expect(bindMessageTraceIdMock).toHaveBeenCalledWith(
       "msg-id",
       "S",
       "fedcba9876543210fedcba9876543210",
+    );
+    expect(updateMessageMock.mock.invocationCallOrder[0]).toBeLessThan(
+      bindMessageTraceIdMock.mock.invocationCallOrder[0],
     );
   });
 

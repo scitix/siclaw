@@ -85,7 +85,7 @@ import {
 } from "./internal-api.js";
 import { handleDelegate, handleDelegates } from "./delegate-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
-import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
+import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
@@ -339,6 +339,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // extra one would close the frontend stream prematurely.
           if (err instanceof Error && err.message.includes("Session is already running")) {
             const steerResult = await client.steerSession(sessionId, text, { images, files });
+            // chat.send persisted this row before it knew the active session would
+            // reject a fresh prompt. Once the fallback steer is accepted, label the
+            // existing row so transcript/trace readers do not mistake it for the
+            // prompt that started the active trace.
+            await updateMessage({
+              messageId: promptMessageId,
+              sessionId,
+              content: text,
+              metadata: { kind: "steer" },
+            }).catch((updateErr) => {
+              console.warn(`[runtime] failed to mark automatic steer message session=${sessionId} message=${promptMessageId}:`, updateErr);
+            });
             await bindMessageTraceId(promptMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
               console.warn(`[runtime] failed to bind steer trace session=${sessionId} message=${promptMessageId}:`, bindErr);
             });
