@@ -2734,6 +2734,42 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return { id };
   });
 
+  handlers.set("chat.bindMessageTraceId", async (params) => {
+    const messageId = typeof params.id === "string" ? params.id : "";
+    const sessionId = typeof params.session_id === "string" ? params.session_id : "";
+    const traceId = typeof params.trace_id === "string" ? params.trace_id : "";
+    if (!messageId) throw new Error("message id is required");
+    if (!sessionId) throw new Error("session_id is required");
+    if (!/^[0-9a-f]{32}$/.test(traceId)) {
+      throw new Error("trace_id must be 32 lowercase hexadecimal characters");
+    }
+
+    // Standalone Portal has one portal-secret-authenticated Runtime trust
+    // domain and no runtime_id relation. Scope ownership to the exact
+    // message/session pair here; SiCore additionally enforces per-Runtime
+    // ownership in its own implementation of this RPC.
+    const db = getDb();
+    const [result] = await db.query(
+      `UPDATE chat_messages SET trace_id = ?
+       WHERE id = ? AND session_id = ? AND role = 'user'
+         AND (trace_id IS NULL OR trace_id = ?)`,
+      [traceId, messageId, sessionId, traceId],
+    ) as any;
+    if (Number(result?.affectedRows ?? 0) > 0) return { ok: true };
+
+    // MySQL may report zero affected rows for a same-value update. Read only
+    // on that path to distinguish an idempotent retry from a conflicting bind.
+    const [rows] = await db.query(
+      `SELECT role, trace_id FROM chat_messages WHERE id = ? AND session_id = ? LIMIT 1`,
+      [messageId, sessionId],
+    ) as any;
+    if (!rows?.length) throw new Error("chat message not found");
+    if (rows[0].role !== "user") throw new Error("trace_id can only be bound to a user message");
+    if (rows[0].trace_id === traceId) return { ok: true };
+    if (rows[0].trace_id != null) throw new Error("chat message is already bound to a different trace");
+    throw new Error("chat message trace binding was not applied");
+  });
+
   handlers.set("chat.recordFeedback", async (params) => {
     const db = getDb();
     return recordMessageFeedback(db, params);
