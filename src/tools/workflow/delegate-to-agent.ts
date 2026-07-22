@@ -61,15 +61,17 @@ export function createDelegateToAgentTool(refs: ToolRefs): ToolDefinition {
       "back — you keep oversight. Use this when a task belongs to a peer's domain/resources rather than your " +
       "own. Pass the target's `agent_id` (the [id: …] value below) and `agent_name`. " +
       "First use list_delegates(query=<target cluster/host/node>) to confirm WHICH agent covers the target " +
-      "(the coverage is not listed here — only counts). To continue an earlier line of work with the SAME " +
-      "specialist, pass the `session_id` that a prior delegation returned (the peer keeps its context); omit " +
-      "it to start a fresh session for an unrelated task.\n\n" +
+      "(the coverage is not listed here — only counts). To continue the SAME investigation, pass the " +
+      "`session_id` it is already running under (the id a prior delegation returned; the peer keeps its " +
+      "context) — this includes answering a clarification, supplying a missing detail, or narrowing to a " +
+      "different layer of the same problem. Do NOT adopt a newly-returned session_id in place of the one you " +
+      "are continuing. Omit `session_id` ONLY for a genuinely unrelated new problem.\n\n" +
       "Agents you may delegate to:\n" + (rosterMd || "(none)"),
     parameters: Type.Object({
       agent_id: Type.String({ description: "The id of the agent to delegate to — the [id: …] value from the list above." }),
       agent_name: Type.Optional(Type.String({ description: "That agent's name (for display; from the list above)." })),
       task: Type.String({ minLength: 1, description: "The bounded task / question for that agent. Be specific about the target resource." }),
-      session_id: Type.Optional(Type.String({ description: "Continue a prior peer session (the session_id a previous delegation to this agent returned) so the peer retains context. Omit to start fresh." })),
+      session_id: Type.Optional(Type.String({ description: "The active session_id of the SAME investigation (returned by a prior delegation) so the peer retains context — reuse it for clarifications, missing details, and narrowing to another layer of the same problem. Omit ONLY for a genuinely unrelated new problem." })),
     }),
     async execute(toolCallId, rawParams, signal) {
       const params = rawParams as DelegateParams;
