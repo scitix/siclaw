@@ -691,6 +691,13 @@ def normalize_body_source_annotations(
             found, malformed = _body_source_references(f"(source: {payload})")
             if found or len(malformed) != 1:
                 continue
+            if malformed[0] != payload.strip(" \t\r\n,，;；、"):
+                # The ASCII-wrapped re-parse closed before the span's true end
+                # (e.g. an unbalanced ")" inside a full-width marker), so the
+                # parsed item covers only a prefix of the span. Rewriting the
+                # whole span would silently drop the tail — leave it malformed
+                # for semantic repair instead.
+                continue
             label, locator = _split_trailing_locator(malformed[0])
             matches = aliases.get(_source_alias_key(label), set())
             if len(matches) != 1:

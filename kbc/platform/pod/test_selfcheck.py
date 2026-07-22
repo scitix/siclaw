@@ -477,6 +477,20 @@ def test_deterministic_body_source_normalization():
         assert any(v["page"] == "ambiguous.md" and v["kind"] == "body_source_malformed"
                    for v in report["lint"]["violations"]), report["lint"]
 
+        # An unbalanced ASCII ")" inside a full-width marker makes the
+        # ASCII-wrapped re-parse close early; rewriting would silently drop
+        # the ")节选" tail. The span must stay put as a lint failure.
+        truncating = (
+            "---\ntype: Guide\ntitle: Truncating\ncompiled_from:\n"
+            "  - docs/报告.md\n---\n正文。（source: 报告)节选）\n"
+        )
+        _mk(base, "candidate/truncating.md", truncating)
+        assert selfcheck.normalize_body_source_annotations(
+            td, allowed_pages={"truncating.md"}) == []
+        assert (base / "candidate" / "truncating.md").read_text() == truncating
+        assert any(v["page"] == "truncating.md" and v["kind"] == "body_source_malformed"
+                   for v in selfcheck.run_layer1(td)["lint"]["violations"])
+
         scoped = (
             "---\ntype: Guide\ntitle: Scoped\ncompiled_from:\n"
             "  - docs/only-this.md\n---\n正文。(source: only-this)\n"
@@ -485,7 +499,7 @@ def test_deterministic_body_source_normalization():
         assert selfcheck.normalize_body_source_annotations(
             td, allowed_pages={"ambiguous.md"}) == []
         assert (base / "candidate" / "scoped.md").read_text() == scoped
-    print("OK  deterministic source normalization (unique / locator / code / ambiguous / idempotent)")
+    print("OK  deterministic source normalization (unique / locator / code / ambiguous / truncation-guard / idempotent)")
 
 
 def test_spaced_markdown_links():
