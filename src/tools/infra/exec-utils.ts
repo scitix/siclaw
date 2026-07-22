@@ -165,13 +165,19 @@ export function stdinExecCmd(interpreter: "bash" | "python3", escapedArgs?: stri
 }
 
 /**
- * Filter out kubectl run informational lines from stderr
- * (e.g. 'pod "node-debug-xxx" deleted').
+ * Filter wrapper noise from kubectl/debug-pod stderr while preserving the actual
+ * command or Kubernetes error. The klog `log.go:244` lines are client-side
+ * SPDY/WebSocket stream diagnostics, not evidence from the target container.
  */
 export function filterPodNoise(stderr: string): string {
   return stderr
     .split("\n")
-    .filter((line) => !line.match(/^pod "node-debug-.*" deleted$/))
+    .filter((line) => {
+      if (line.match(/^pod "node-debug-.*" deleted$/)) return false;
+      return !line.match(
+        /^[IWEF]\d{4}\s+\d{2}:\d{2}:\d+\.\d+\s+\d+\s+log\.go:\d+\].*(?:Create stream|Stream added, broadcasting:|Reply frame received for|Data frame received for|Data frame handling|Data frame sent|Stream removed, broadcasting:|Go away received).*$/,
+      );
+    })
     .join("\n")
     .trim();
 }

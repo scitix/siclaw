@@ -12,7 +12,7 @@ import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
-import { validatePodName, prepareExecEnv } from "../infra/exec-utils.js";
+import { validatePodName, prepareExecEnv, filterPodNoise } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
@@ -236,7 +236,7 @@ Examples:
         );
 
         return {
-          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: stderr.trim() || undefined }) }],
+          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: filterPodNoise(stderr.trim()) || undefined }) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
@@ -246,7 +246,7 @@ Examples:
           return { content: [{ type: "text", text: "Aborted." }], details: { error: true } };
         }
         const stdout = (err.stdout?.trim() ?? "") as string;
-        const stderr = (err.stderr?.trim() ?? err.message) as string;
+        const stderr = filterPodNoise((err.stderr?.trim() ?? err.message) as string);
         const exitCode = err.code ?? "unknown";
         return {
           content: [{ type: "text", text: postExecSecurity(`${stdout || "(no output)"}\n[exit code: ${exitCode}]`, pre.action, { stderr: stderr || undefined }) }],
