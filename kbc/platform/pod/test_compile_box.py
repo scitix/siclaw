@@ -2271,6 +2271,31 @@ def test_media_verify_suppresses_text_backed_beyond_transcript():
     print("OK  media verify suppresses text-backed beyond-transcript doubts (keeps real ones + conflicts)")
 
 
+def test_l1_repair_budget_scales_with_workload():
+    """Flat budget stays the floor for ordinary drift; a first-compile-sized
+    violation pile earns proportionally more bounded rounds; the operator cap
+    fences runaways (2026-07-22 adoption run: 55 residuals vs 2 flat rounds)."""
+    def rep(unacc=0, dangling=0, lint=0):
+        return {"coverage": {"unaccounted": ["x"] * unacc,
+                             "dangling_citations": ["y"] * dangling},
+                "lint": {"violations": [{}] * lint}}
+    assert compile_box._l1_repair_round_limit(rep()) == compile_box._l1_repair_rounds()
+    assert compile_box._l1_repair_round_limit(rep(unacc=3)) == compile_box._l1_repair_rounds()
+    assert compile_box._l1_repair_round_limit(rep(unacc=40, lint=15)) == 5  # ceil(55/12)
+    assert compile_box._l1_repair_round_limit(rep(unacc=500)) == 16  # capped
+    os.environ["KBC_L1_REPAIR_MAX_ROUNDS"] = "6"
+    try:
+        assert compile_box._l1_repair_round_limit(rep(unacc=500)) == 6
+    finally:
+        del os.environ["KBC_L1_REPAIR_MAX_ROUNDS"]
+    os.environ["KBC_L1_REPAIR_VIOLATIONS_PER_ROUND"] = "5"
+    try:
+        assert compile_box._l1_repair_round_limit(rep(unacc=20)) == 4
+    finally:
+        del os.environ["KBC_L1_REPAIR_VIOLATIONS_PER_ROUND"]
+    print("OK  L1 repair budget scales with open-violation workload (floor + cap)")
+
+
 async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
     """An ordinary conversation over an inherited draft must not become an
     implicit whole-library OKF migration merely because this is a fresh box.
