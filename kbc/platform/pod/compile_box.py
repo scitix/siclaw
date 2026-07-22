@@ -1289,6 +1289,29 @@ def _l1_repair_rounds() -> int:
     return int(os.environ.get("KBC_L1_REPAIR_ROUNDS", "2"))
 
 
+def _l1_repair_round_limit(report: dict) -> int:
+    """Scale the ledger auto-repair budget with the ACTUAL workload instead of
+    a flat constant. A first full compile / wiki adoption over a large KB can
+    open dozens of mechanical violations at once; with the flat 2-round budget
+    it structurally lands unconverged and dumps the tail into the owner's
+    question queue (live adoption run, 2026-07-22: 55-item residual after two
+    rounds). Mirrors _batch_media_verify_round_limit: the flat value stays the
+    floor for ordinary drift, the open-violation count adds bounded rounds, and
+    a hard operator cap still fences pathological repair loops."""
+    base = _l1_repair_rounds()
+    cov = report.get("coverage") or {}
+    lint = report.get("lint") or {}
+    workload = (len(cov.get("unaccounted") or [])
+                + len(cov.get("dangling_citations") or [])
+                + len(lint.get("violations") or []))
+    if workload <= 0:
+        return base
+    per_round = max(1, int(os.environ.get(
+        "KBC_L1_REPAIR_VIOLATIONS_PER_ROUND", "12")))
+    cap = max(base, int(os.environ.get("KBC_L1_REPAIR_MAX_ROUNDS", "16")))
+    return min(cap, max(base, -(-workload // per_round)))
+
+
 def _media_verify_enabled() -> bool:
     return os.environ.get("KBC_MEDIA_VERIFY", "on") != "off"
 
@@ -1926,7 +1949,7 @@ async def _post_turn_selfcheck(run) -> str | None:
     if ledger_clean and not incr_violations:
         run._l1_repairs_used = 0
         report["state"] = "passed"
-    elif run._l1_repairs_used < _l1_repair_rounds():
+    elif run._l1_repairs_used < _l1_repair_round_limit(report):
         report["state"] = "repairing"
         # The report carries the PREVIOUS converge_phase (possibly "settled");
         # the pre-turn_done sync would ship repairing+settled for one window
@@ -1937,6 +1960,7 @@ async def _post_turn_selfcheck(run) -> str | None:
     else:
         report["state"] = "unconverged"  # budget spent: publish card shows the rest
     report["repair_rounds_used"] = run._l1_repairs_used
+    report["repair_rounds_limit"] = _l1_repair_round_limit(report)
     selfcheck.write_selfcheck(workdir, report)
     locale = getattr(run, "locale", None)
     if restored_pages:
