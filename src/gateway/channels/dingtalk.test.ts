@@ -88,6 +88,7 @@ beforeEach(() => {
   appendMessageMock.mockReset();
   appendMessageMock.mockResolvedValue("msg-db-1");
   bindMessageTraceIdMock.mockReset();
+  bindMessageTraceIdMock.mockResolvedValue(undefined);
   resetConversationSessionsForTest();
   fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
   vi.stubGlobal("fetch", fetchMock);
