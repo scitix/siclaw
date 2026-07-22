@@ -122,6 +122,21 @@ describe("tool contract", () => {
     expect(result.structuredContent).toMatchObject({ state: "completed", result: "root cause" });
   });
 
+  it("withholds the progress tail from task listings", async () => {
+    const api = fakeApi();
+    vi.mocked(api.listTasks).mockResolvedValue({
+      tasks: [{ ...task(), result: "partial investigation narrative" }],
+      total_size: 1,
+      page_size: 20,
+      next_page_token: null,
+    });
+    const result = await createToolHandler(api)("siclaw_list_tasks", {});
+    const row = (result.structuredContent as { tasks: Record<string, unknown>[] }).tasks[0];
+    expect(row).not.toHaveProperty("progress_tail");
+    expect(row).not.toHaveProperty("result");
+    expect(result.content[0].text).not.toContain("partial investigation narrative");
+  });
+
   it("keeps the submitted task_id when the bounded wait fails after submission", async () => {
     const api = fakeApi();
     vi.mocked(api.waitForTask).mockRejectedValue(new Error("Sicore A2A request timed out"));

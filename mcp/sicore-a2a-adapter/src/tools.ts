@@ -125,14 +125,17 @@ function progressTail(text: string | null | undefined): string | undefined {
   return "…" + runes.slice(-PROGRESS_TAIL_MAX_RUNES).join("");
 }
 
-function taskView(task: SiclawTask, includeTerminalResult: boolean): TaskToolView {
+// includeReport gates all report content — the full result on terminal tasks
+// AND the progress_tail excerpt on working ones. Listings pass false: they
+// exist to recover task IDs and must never carry investigation text.
+function taskView(task: SiclawTask, includeReport: boolean): TaskToolView {
   const { result, ...summary } = task;
-  const tail = task.is_terminal ? undefined : progressTail(result);
+  const tail = includeReport && !task.is_terminal ? progressTail(result) : undefined;
   return {
     ...summary,
     progress_chars: result ? Array.from(result).length : 0,
     ...(tail !== undefined ? { progress_tail: tail } : {}),
-    ...(includeTerminalResult && task.is_terminal ? { result } : {}),
+    ...(includeReport && task.is_terminal ? { result } : {}),
   };
 }
 
