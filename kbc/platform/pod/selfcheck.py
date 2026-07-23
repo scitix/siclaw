@@ -42,6 +42,16 @@ IMAGE_SOURCE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 MEDIA_SOURCE_EXTS = IMAGE_SOURCE_EXTS | {".pdf", ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx"}
 KNOWN_SOURCE_EXTS = TEXT_SOURCE_EXTS | MEDIA_SOURCE_EXTS
 
+# Media ASSETS (coverage v2, DESIGN-kb-asset-provenance-2026-07-22 §4.1): images
+# that live under an `assets/` directory (or the legacy `*.assets/` export form).
+# They are DOCUMENT ATTACHMENTS, not first-class sources — a media asset embedded
+# in the body of an accounted document is auto-accounted against that document
+# (see is_media_asset / asset_attribution_edges / coverage), so cf no longer needs
+# a token per image and the exclusion ledger no longer needs a row per image.
+# Superset of IMAGE_SOURCE_EXTS by .tiff; kept EXACT and byte-for-byte in sync
+# with the sicore ledger mirror via the shared fixture.
+MEDIA_ASSET_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".tiff"}
+
 EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
 SELFCHECK_PATH = "authoring/SELFCHECK.json"
 
@@ -84,6 +94,26 @@ def source_inventory(workdir: str) -> list[str]:
             continue
         out.append(rel.as_posix())
     return sorted(out)
+
+
+def is_media_asset(rel: str) -> bool:
+    """A raw source is a media ASSET — a document attachment, auto-accountable in
+    coverage v2 — when some path SEGMENT is `assets` (or the legacy `*.assets`
+    export form) AND its extension is a known image type (case-insensitive).
+
+    Deliberately NARROW: sheet placeholders at `assets/sheets/*.md` and every
+    other `.md`/`.json` are content files (their extension is not an image type),
+    so they stay first-class sources that must be cited or excluded. Auto-attaching
+    a sheet placeholder would launder 'the table data was never compiled' into
+    'covered' — the exact fail-open §4.1 forbids."""
+    ext = posixpath.splitext(rel)[1].lower()
+    if ext not in MEDIA_ASSET_EXTS:
+        return False
+    # Segment match is case-INSENSITIVE, matching the sicore ledger mirror (an
+    # `Assets/` dir counts too); the platform always writes lowercase `assets/`,
+    # so this only matters for hand-authored trees, but the two repos must agree.
+    return any(seg.lower() == "assets" or seg.lower().endswith(".assets")
+               for seg in rel.split("/"))
 
 
 def _strip_source_prefix(entry: str) -> str:
@@ -252,6 +282,9 @@ def _matches(path: str, pattern: str) -> bool:
 
 _MD_LINK_RE = re.compile(r"\]\(\s*(<[^>\n]+>|[^)\n]+)\)")
 _WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)")
+# HTML <img src="..."> (single OR double quotes) — 07-21 lesson: a feishu doc
+# embedded 120 table images as HTML <img>, invisible to a markdown-only scan.
+_HTML_IMG_SRC_RE = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*(\"[^\"]*\"|'[^']*')", re.IGNORECASE)
 _BODY_SOURCE_START_RE = re.compile(
     r"(?P<open>[（(])\s*(?:source|src|源|来源)\s*[:：]\s*", re.IGNORECASE,
 )
@@ -587,6 +620,79 @@ def _markdown_link_targets(text: str) -> list[str]:
         if destination.lower().endswith(".md"):
             targets.append(destination)
     return targets
+
+
+def _strip_fragment_query(target: str) -> str:
+    """Drop a URL ``#fragment`` / ``?query`` from the STILL-ENCODED target, before
+    percent-decoding — so an encoded ``%23``/``%3F`` that is part of a real
+    filename survives while an actual fragment/query delimiter is removed. Order
+    matches the sicore ledger's parser (strip angle → truncate #/? → unescape) so
+    the two repos derive byte-identical edges."""
+    return target.split("#", 1)[0].split("?", 1)[0]
+
+
+def document_link_targets(md_text: str) -> list[str]:
+    """Every link/image destination in one document's prose — the building block
+    of the doc→asset attribution edge (coverage v2, §4.2). Covers markdown
+    ``![](...)`` and ``[](...)`` plus HTML ``<img src=...>`` (single- OR
+    double-quoted). Angle brackets are unwrapped and an optional link title
+    stripped; then the ``#fragment``/``?query`` is truncated and the result is
+    URL-decoded once (``%20`` → space). Code fences/spans are masked so a path
+    inside example code is not mistaken for a real embed."""
+    targets: list[str] = []
+    prose = _markdown_prose(md_text)
+    for captured in _MD_LINK_RE.findall(prose):
+        destination = captured.strip()
+        if destination.startswith("<") and destination.endswith(">"):
+            destination = destination[1:-1].strip()
+        else:
+            titled = re.fullmatch(r"(.+?)\s+(?:\"[^\"]*\"|'[^']*')", destination)
+            if titled:
+                destination = titled.group(1).strip()
+        destination = unquote(_strip_fragment_query(destination)).strip()
+        if destination:
+            targets.append(destination)
+    for captured in _HTML_IMG_SRC_RE.findall(prose):
+        destination = unquote(_strip_fragment_query(captured[1:-1])).strip()
+        if destination:
+            targets.append(destination)
+    return targets
+
+
+def asset_attribution_edges(
+    workdir: str, sources: list[str] | None = None,
+) -> dict[str, list[str]]:
+    """Map each raw ``.md`` document to the media assets it embeds in its body.
+
+    For every document ``d`` under ``raw/``, resolve each body link/img target
+    relative to ``d``'s directory (``posixpath.normpath``, URL-decoded); an edge
+    ``d→a`` is recorded only when ``a`` is a media asset present in the raw
+    inventory. A target that resolves to nothing — or to a non-media file —
+    yields no edge and never errors: the raw tree is the single source of truth
+    for what embeds what, so the box (local files) and the server (sync-time
+    refs) derive the SAME edges. Values are sorted for determinism."""
+    sources = source_inventory(workdir) if sources is None else sources
+    media = {s for s in sources if is_media_asset(s)}
+    raw = Path(workdir) / "raw"
+    edges: dict[str, list[str]] = {}
+    for doc in sources:
+        if not doc.lower().endswith(".md"):
+            continue
+        try:
+            text = (raw / doc).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        base = posixpath.dirname(doc)
+        hits: set[str] = set()
+        for target in document_link_targets(text):
+            if target.startswith(("http://", "https://", "//", "/")):
+                continue
+            resolved = posixpath.normpath(posixpath.join(base, target))
+            if resolved in media:
+                hits.add(resolved)
+        if hits:
+            edges[doc] = sorted(hits)
+    return edges
 
 
 def _body_source_payload_spans(text: str) -> list[tuple[int, int, str]]:
@@ -1003,7 +1109,21 @@ def dup_candidates(pages: dict[str, dict], cap: int = 20) -> list[dict]:
 
 
 def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> dict:
-    """The ledger: raw inventory − compiled_from union − exclusions = unaccounted."""
+    """The ledger (coverage v2): raw inventory − compiled_from union − exclusions
+    − auto-attached media = unaccounted.
+
+    v2 adds ONE accounting path (monotonic — it can only SHRINK unaccounted, so
+    every v1-green library stays green): a media asset (image under `assets/`,
+    see is_media_asset) embedded in the body of a document that is ITSELF
+    accounted (cited or excluded) is auto-attached to that document and counts as
+    accounted. Media assets are the document's attachments, not first-class
+    sources — so `compiled_from` no longer needs a token per image and the
+    exclusion ledger no longer needs a row per image. Two things deliberately do
+    NOT auto-attach: an ORPHAN asset embedded by no accounted document (upload
+    residue — it stays unaccounted and must be excluded with a reason, so a human
+    still sees it), and `assets/sheets/*.md` placeholders (content files, not
+    media — is_media_asset excludes them, so they remain first-class sources). A
+    directly-cited asset still counts as cited (v1 compatibility)."""
     sources = source_inventory(workdir)
     source_set = set(sources)
     cited: set[str] = set()
@@ -1020,12 +1140,34 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
     # glob) — surfaced as a warning so the owner fixes it, but non-blocking (a
     # stale exclusion for an already-removed file shouldn't wedge the gate).
     noop_exclusions = sorted({e["pattern"] for e in exclusions} - hit)
-    unaccounted = sorted(source_set - cited - excluded)
+    # v2 auto-attach. Edges come from the raw tree (each document's body image
+    # links), so both repos compute the SAME accounting from the SAME frozen
+    # source set. `auto` is the NET-NEW set — media assets accounted ONLY via an
+    # embedding accounted document (not already cited/excluded); the subtraction
+    # below is identical either way, but reporting the net-new set keeps cited /
+    # excluded / auto_attached a disjoint, auditable decomposition of accounted.
+    media_assets = {s for s in source_set if is_media_asset(s)}
+    accounted_docs = cited | excluded
+    edges = asset_attribution_edges(workdir, sources)
+    auto_edges = sorted(
+        (asset, doc)
+        for doc, assets in edges.items() if doc in accounted_docs
+        for asset in assets
+        if asset in media_assets and asset not in cited and asset not in excluded
+    )
+    auto = {asset for asset, _ in auto_edges}
+    unaccounted = sorted(source_set - cited - excluded - auto)
     dangling = sorted(cited - source_set)
     return {
         "total_sources": len(sources),
         "cited": len(cited & source_set),
         "excluded": len(excluded),
+        # Auto-attach must be OBSERVABLE, never a silent fail-open (platform
+        # architecture audit's largest class): report the count and a capped
+        # sample of the accounting edges (asset ← the document that embeds it).
+        "auto_attached": len(auto),
+        "auto_attached_sample": [{"asset": asset, "via": doc}
+                                 for asset, doc in auto_edges[:20]],
         "unaccounted": unaccounted,
         "dangling_citations": dangling,
         "noop_exclusions": noop_exclusions,
@@ -1244,14 +1386,20 @@ def narration(report: dict, locale: str | None = None) -> str:
     cov, lint = report["coverage"], report["lint"]
     en = _is_en(locale)
     noop = cov.get("noop_exclusions") or []
+    auto = cov.get("auto_attached") or 0
     warn = ""
     if noop:
         warn = (f" ⚠ {len(noop)} exclusion(s) match no source — likely a typo" if en
                 else f" ⚠ {len(noop)} 条排除未命中任何源——疑似写错")
+    auto_note = ""
+    if auto:
+        auto_note = (f"; {auto} media auto-attached" if en
+                     else f";{auto} 张媒体自动附属")
     if en:
         if report["state"] == "passed":
             return (f"Self-check (ledger): closed ✓ — {cov['cited']} sources compiled"
-                    f" / {cov['excluded']} explicitly excluded / {cov['total_sources']} total; lint passed") + warn
+                    f" / {cov['excluded']} explicitly excluded / {cov['total_sources']} total"
+                    f"{auto_note}; lint passed") + warn
         parts = []
         if cov["unaccounted"]:
             parts.append(f"{len(cov['unaccounted'])} source file(s) unaccounted")
@@ -1263,7 +1411,7 @@ def narration(report: dict, locale: str | None = None) -> str:
         return "Self-check (ledger): " + ", ".join(parts) + " — " + tail + warn
     if report["state"] == "passed":
         return (f"自检(账本):闭合 ✓ — {cov['cited']} 源已编 / {cov['excluded']} 显式排除"
-                f" / 共 {cov['total_sources']};lint 通过") + warn
+                f" / 共 {cov['total_sources']}{auto_note};lint 通过") + warn
     parts = []
     if cov["unaccounted"]:
         parts.append(f"{len(cov['unaccounted'])} 个源文件未入账")
@@ -1457,15 +1605,27 @@ def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) 
 
 
 def media_citing_pages(workdir: str) -> dict[str, list[str]]:
-    """candidate page → sorted raw-relative image paths it digests, gathered
-    from compiled_from entries AND body (source: …) citations. Basename match
-    tolerated for body citations (bodies usually cite the bare filename)."""
+    """candidate page → sorted raw-relative image paths whose numeric fidelity
+    this page is responsible for. Three discovery paths, UNIONED:
+      1. compiled_from image entries — an image cited directly (legacy pages);
+      2. body ``(source: …)`` image citations — basename match tolerated;
+      3. attribution-edge reverse lookup — a page that cites a DOCUMENT ``d`` in
+         its compiled_from inherits the numeric check of every image ``d``
+         embeds in its body.
+    Path 3 is what keeps image re-verification alive under coverage v2: agents
+    now cite DOCUMENTS (images auto-attach, see coverage/asset_attribution_edges)
+    rather than listing images one-by-one, so without it the fresh-eyes numeric
+    check would silently stop covering embedded charts — a silent fail-open on the
+    exact fidelity risk it exists to catch. Only IMAGE_SOURCE_EXTS images go to
+    transcription, so edge assets are intersected with the raw image set (a media
+    asset like .tiff is accounted by coverage but not numerically re-read here)."""
     raw_images = [p for p in source_inventory(workdir)
                   if posixpath.splitext(p)[1].lower() in IMAGE_SOURCE_EXTS]
     by_basename: dict[str, list[str]] = {}
     for p in raw_images:
         by_basename.setdefault(posixpath.basename(p), []).append(p)
     raw_set = set(raw_images)
+    edges = asset_attribution_edges(workdir)
     out: dict[str, list[str]] = {}
     for rel, page in candidate_pages(workdir).items():
         if "error" in page:
@@ -1480,6 +1640,11 @@ def media_citing_pages(workdir: str) -> dict[str, list[str]]:
                 matches = by_basename.get(posixpath.basename(entry), [])
                 if len(matches) == 1:
                     hits.add(matches[0])
+        # Path 3: images embedded by a document this page cites in compiled_from.
+        for entry in page["sources"]:
+            for asset in edges.get(entry, ()):
+                if asset in raw_set:
+                    hits.add(asset)
         if hits:
             out[rel] = sorted(hits)
     return out
