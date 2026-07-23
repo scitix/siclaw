@@ -1377,6 +1377,49 @@ class _RetryRebuildFake:
         self._q.put_nowait(_STREAM_STOP)
 
 
+class _ImmediateRetryFake:
+    """Immediate-retry-within-window stand-in: instance 0 black-holes query 1;
+    its interrupt() is ACCEPTED but the torn-down ResultMessage never arrives
+    (terminator lost, window pending). Any LATER query on instance 0 answers
+    normally — pre-fix, those frames landed while the window was still pending
+    and were dropped one generation behind, with their ResultMessage mistaken
+    for the lost terminator. Instance 1 (the rebuild) answers normally."""
+
+    instances: list = []
+
+    def __init__(self, options=None):
+        self.options = options
+        self.idx = len(_ImmediateRetryFake.instances)
+        _ImmediateRetryFake.instances.append(self)
+        self.queries = []
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if self.idx == 0 and len(self.queries) == 1:
+            return  # black-hole the first turn only
+        self._q.put_nowait(AssistantMessage("answer: " + text))
+        self._q.put_nowait(ResultMessage())
+
+    async def interrupt(self):
+        pass  # accepted — but no torn-down ResultMessage is ever delivered
+
+    async def receive_messages(self):
+        while not self._closed:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self._closed = True
+        self._q.put_nowait(_STREAM_STOP)
+
+
 async def _await(cond, *, timeout=3.0, poll=0.02):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1494,6 +1537,74 @@ async def test_test_session_terminator_in_window_no_rebuild():
     assert "turn.rebuild_armed" not in out, out
     assert "turn.rebuilt" not in out, out
     print("✓ test-session no rebuild: an in-window stall terminator keeps the same client")
+
+
+async def test_test_session_immediate_retry_within_terminator_window():
+    """Review P1: interrupt() succeeds but the reaped turn's terminator is lost,
+    and the user retries IMMEDIATELY after the stall turn_done — inside the
+    pending-terminator window. Pre-fix, arming that retry on the old client
+    counted its frames one generation behind (all silently dropped), and its own
+    ResultMessage was mistaken for the lost terminator, cancelling the rebuild
+    decision: the user's valid retry was never displayed and timed out again.
+    Now /test-message treats an unresolved window like _needs_rebuild: the retry
+    rebuilds a fresh client, exactly ONE stall timeout is ever surfaced, and the
+    second question is answered normally."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+             compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._TEST_STALL_REBUILD_WINDOW_S,
+             compile_box.ClaudeSDKClient)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0  # wide: the retry always lands inside it
+    _ImmediateRetryFake.instances = []
+    compile_box.ClaudeSDKClient = _ImmediateRetryFake
+    compile_box.TEST_SESSIONS.clear()
+    buf = io.StringIO()
+    snap = tempfile.mkdtemp()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    run = compile_box.TestRun("t-ir", snap, parent_run_id="p-ir", snapshot_hash="h")
+    compile_box.TEST_SESSIONS["t-ir"] = run
+    try:
+        with contextlib.redirect_stdout(buf):
+            run.task = asyncio.create_task(compile_box._test_session_wrapper(run))
+            assert await compile_box._await_session_live(run) is None
+            r1 = await client.post("/test-message/t-ir", json={"message": "first question"})
+            assert r1.status == 200, await r1.text()
+            # the stall reap frees the UI (turn_done) and arms the terminator window
+            assert await _await(lambda: run._pending_terminator_deadline is not None), \
+                "the stall was never reaped / the window never armed"
+            # the UI retries at once, well inside the window
+            r2 = await client.post("/test-message/t-ir", json={"message": "second question"})
+            assert r2.status == 200, await r2.text()
+            assert await _await(lambda: run._turn_active is False and run._results_seen >= 1), \
+                "the immediate retry never completed"
+        evs = _drain(run)
+        stalls = [e for e in evs if e["type"] == "turn_stalled"]
+        assert len(stalls) == 1, stalls  # exactly one timeout ever surfaced
+        logs = [e["text"] for e in evs if e["type"] == "log"]
+        assert any("answer: second question" in t for t in logs), logs
+        assert any(e["type"] == "turn_done" and "answer: second question" in e.get("text", "")
+                   for e in evs), evs
+        assert len(_ImmediateRetryFake.instances) == 2, _ImmediateRetryFake.instances  # rebuilt
+        out = buf.getvalue()
+        assert "turn.rebuilt tid=t-ir" in out, out
+        assert "turn.stale_frame_dropped" not in out, out  # the retry's frames were never eaten
+        assert "question" not in out.lower() and "answer" not in out.lower(), out  # no content leak
+    finally:
+        run.done = True
+        if run.task and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+        shutil.rmtree(snap, ignore_errors=True)
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+         compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._TEST_STALL_REBUILD_WINDOW_S,
+         compile_box.ClaudeSDKClient) = saved
+    print("✓ test-session immediate retry inside the terminator window rebuilds; one timeout, answer shown")
 
 
 async def test_test_session_rebuild_retry_after_failed_reconnect():
@@ -4649,6 +4760,7 @@ async def main():
     await test_test_session_rebuild_after_lost_terminator()
     await test_test_session_terminator_in_window_no_rebuild()
     await test_test_session_rebuild_retry_after_failed_reconnect()
+    await test_test_session_immediate_retry_within_terminator_window()
     await test_test_session_idle_ttl_reaper()
     await test_list_test_sessions_endpoint()
     await test_explicit_test_recommendation_http()

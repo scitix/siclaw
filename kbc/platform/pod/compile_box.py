@@ -5742,6 +5742,10 @@ async def _rebuild_test_client(run: "TestRun") -> web.Response | None:
     a rebuild that overruns surfaces a retryable error instead of hanging. Returns
     an error Response on failure, else None."""
     run._needs_rebuild = False
+    # An unresolved post-interrupt window is moot on a fresh client; clearing it
+    # here (not just in the driver's post-connect reset) stops the watchdog from
+    # re-flagging terminator_lost while the rebuild is in flight.
+    run._pending_terminator_deadline = None
     run._rebuild_error = None
     run._rebuild_ready.clear()
     run._rebuild_requested.set()   # the driver's asyncio.wait wakes, cancels consume, reconnects
@@ -5769,15 +5773,27 @@ async def handle_test_message(request: web.Request):
     text = (body.get("message") or "").strip()
     if not text:
         return web.json_response({"error": "message is required"}, status=400)
-    if run._needs_rebuild:
-        # The previous turn's terminator was lost (reconnect a clean client before
-        # arming, or the generation guard would drop this turn's frames forever) OR
-        # a prior rebuild's reconnect failed. This must run BEFORE the liveness
-        # wait: after a failed reconnect the driver clears `connected` and parks
-        # until the next rebuild request, so gating on `connected` first would turn
-        # every retry into a 25s timeout → 503 and the retry path would never fire.
-        # A successful rebuild sets `connected` before signalling ready, so the
-        # liveness wait below is correct in this order too.
+    if run._needs_rebuild or run._pending_terminator_deadline is not None:
+        # Rebuild before arming whenever the generation stream is broken or in
+        # doubt:
+        # (a) _needs_rebuild — the previous turn's terminator is known lost
+        #     (interrupt failed / window elapsed) or a prior rebuild's reconnect
+        #     failed; the guard would drop this turn's frames forever.
+        # (b) an unresolved post-interrupt terminator window — the reaped turn's
+        #     terminator has NOT landed yet, so arming a new turn now is ambiguous:
+        #     if the terminator never arrives, the new turn's frames are counted
+        #     one generation behind and silently dropped, and its own
+        #     ResultMessage is mistaken for the old turn's terminator, cancelling
+        #     the rebuild decision (review P1: an immediate retry right after the
+        #     stall turn_done lost the user's answer and timed out again). A
+        #     fresh client is deterministic; the stalled SDK history is already
+        #     the accepted loss.
+        # This must also run BEFORE the liveness wait: after a failed reconnect
+        # the driver clears `connected` and parks until the next rebuild request,
+        # so gating on `connected` first would turn every retry into a 25s
+        # timeout → 503 and the retry path would never fire. A successful rebuild
+        # sets `connected` before signalling ready, so the liveness wait below is
+        # correct in this order too.
         err = await _rebuild_test_client(run)
         if err is not None:
             return err
