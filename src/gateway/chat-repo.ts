@@ -202,6 +202,8 @@ export async function bindMessageTraceId(
 export async function recordChannelFeedback(params: {
   sessionId: string;
   messageRef: string;
+  /** Exact assistant chat_messages id. Missing only for legacy cards. */
+  messageId?: string;
   rating: "up" | "down";
   senderExternalId: string;
   channelId?: string | null;
@@ -210,6 +212,7 @@ export async function recordChannelFeedback(params: {
   return getClient().request("chat.recordFeedback", {
     session_id: params.sessionId,
     message_ref: params.messageRef,
+    ...(params.messageId ? { message_id: params.messageId } : {}),
     rating: params.rating,
     sender_external_id: params.senderExternalId,
     channel_id: params.channelId ?? null,
