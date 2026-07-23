@@ -913,7 +913,7 @@ class _AliveFakeClient:
 
 
 async def test_open_test_session_idempotency():
-    """A retried testStart (same idempotency_key) returns the SAME live session —
+    """A retried testStart (same client_request_id) returns the SAME live session —
     same tid/snapshot_hash/pages, flagged idempotent_replay, no new session, no new
     concurrency slot. A different key opens a new session. Teardown drops the key
     so a later same-key open starts fresh (never replays a dead tid)."""
@@ -939,13 +939,13 @@ async def test_open_test_session_idempotency():
         compile_box.RUNS["p1"] = compile_box.CompileRun("p1", wd, 1)
 
         # first open with a key → a fresh session (idempotent_replay False)
-        b1 = await (await client.post("/test-session/p1", json={"idempotency_key": "k-1"})).json()
+        b1 = await (await client.post("/test-session/p1", json={"client_request_id": "k-1"})).json()
         tid1 = b1["test_session_id"]
         assert b1["idempotent_replay"] is False, b1
         n1 = await active()
 
         # retry SAME key → same tid + snapshot_hash + pages, replay flagged, count unchanged
-        b2 = await (await client.post("/test-session/p1", json={"idempotency_key": "k-1"})).json()
+        b2 = await (await client.post("/test-session/p1", json={"client_request_id": "k-1"})).json()
         assert b2["test_session_id"] == tid1, (b1, b2)
         assert b2["snapshot_hash"] == b1["snapshot_hash"] and b2["pages"] == b1["pages"], (b1, b2)
         assert b2["idempotent_replay"] is True, b2
@@ -953,13 +953,13 @@ async def test_open_test_session_idempotency():
         assert len(compile_box.TEST_SESSIONS) == 1, compile_box.TEST_SESSIONS
 
         # a DIFFERENT key opens a new session
-        b3 = await (await client.post("/test-session/p1", json={"idempotency_key": "k-2"})).json()
+        b3 = await (await client.post("/test-session/p1", json={"client_request_id": "k-2"})).json()
         assert b3["test_session_id"] != tid1 and len(compile_box.TEST_SESSIONS) == 2
 
         # teardown drops the key → the same key opens FRESH afterwards (no dead replay)
         assert (await client.post(f"/test-session/{tid1}/close")).status == 200
         assert "k-1" not in compile_box.TEST_SESSION_IDEMPOTENCY, compile_box.TEST_SESSION_IDEMPOTENCY
-        b4 = await (await client.post("/test-session/p1", json={"idempotency_key": "k-1"})).json()
+        b4 = await (await client.post("/test-session/p1", json={"client_request_id": "k-1"})).json()
         assert b4["test_session_id"] != tid1 and b4["idempotent_replay"] is False, b4
 
         # no-key opens are never deduped (old-consumer behavior unchanged)
