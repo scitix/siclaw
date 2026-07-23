@@ -121,4 +121,72 @@ describe("stdio process", () => {
     expect(paths[0]).toBe("/api/v1/a2a/self");
     expect(paths).toContain("/api/v1/a2a/agents/agent-resolved/message:send");
   });
+
+  it("resolves several named keys, injects aliases into tool descriptions, and routes by alias", async () => {
+    const requests: Array<{ path: string; auth: string }> = [];
+    const mock = createServer(async (request, response) => {
+      const auth = request.headers.authorization ?? "";
+      const path = request.url ?? "";
+      requests.push({ path, auth });
+      for await (const _chunk of request) { /* drain */ }
+      response.writeHead(200, { "content-type": "application/a2a+json" });
+      if (path === "/api/v1/a2a/self") {
+        const agentId = auth === "Bearer secret-key-sre"
+          ? "agent-sre-id"
+          : auth === "Bearer secret-key-kb" ? "agent-kb-id" : "agent-unknown";
+        response.end(JSON.stringify({ agentId }));
+        return;
+      }
+      response.end(JSON.stringify({ task: completedTask() }));
+    });
+    httpServers.push(mock);
+    const port = await listen(mock);
+
+    const adapterEntrypoint = fileURLToPath(new URL("./index.ts", import.meta.url));
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["--import", "tsx", adapterEntrypoint],
+      env: {
+        SICORE_URL: `http://127.0.0.1:${port}`,
+        SICLAW_A2A_KEYS: JSON.stringify({ sre: "secret-key-sre", kb: "secret-key-kb" }),
+      },
+      stderr: "pipe",
+    });
+    let stderr = "";
+    transport.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+    const client = new Client({ name: "stdio-e2e-multi", version: "1.0.0" });
+    clients.push(client);
+    await client.connect(transport);
+
+    // Both keys are self-resolved once at startup.
+    const selfCalls = requests.filter((entry) => entry.path === "/api/v1/a2a/self");
+    expect(selfCalls.map((entry) => entry.auth).sort()).toEqual([
+      "Bearer secret-key-kb",
+      "Bearer secret-key-sre",
+    ]);
+
+    const listed = await client.listTools();
+    const investigate = listed.tools.find((tool) => tool.name === "siclaw_investigate")!;
+    expect(investigate.description).toContain("sre = agent-sre-id");
+    expect(investigate.description).toContain("kb = agent-kb-id");
+    // The description advertises aliases, never the keys.
+    expect(investigate.description).not.toContain("secret-key");
+    expect(investigate.inputSchema.properties).toHaveProperty("agent");
+    expect(investigate.inputSchema.properties).not.toHaveProperty("key");
+
+    const result = await client.callTool({
+      name: "siclaw_investigate",
+      arguments: { question: "check kb", agent: "kb", wait_seconds: 0 },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ task_id: "task-e2e", agent: "kb" });
+    const sendCall = requests.find((entry) => entry.path.endsWith("/message:send"));
+    expect(sendCall?.path).toBe("/api/v1/a2a/agents/agent-kb-id/message:send");
+    expect(sendCall?.auth).toBe("Bearer secret-key-kb");
+
+    // The diagnostic ready line reports agent ids, never key material.
+    expect(stderr).toContain("agents=[");
+    expect(stderr).toContain("agent-kb-id");
+    expect(stderr).not.toContain("secret-key");
+  });
 });

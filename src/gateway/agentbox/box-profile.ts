@@ -23,6 +23,14 @@ export interface BoxProfile {
   /** Profile name; also the box reuse-key discriminator (A.5) and a pod label. */
   name: string;
   /**
+   * Pod-name prefix for boxes of this profile (default "agentbox"). The compile
+   * profiles override it to "kbc-box" so an operator scanning `kubectl get pods`
+   * during a production incident can tell a KB compile box from a chat agentbox
+   * by name alone, not just by label/image filtering. All resources derived from
+   * the pod name (cert Secret, hostname) follow this prefix automatically.
+   */
+  podNamePrefix?: string;
+  /**
    * Container image. undefined → the spawner's default agentbox image
    * (this.config.image / $SICLAW_AGENTBOX_IMAGE).
    */
@@ -71,7 +79,7 @@ export const AGENT_PROFILE: BoxProfile = {
  * explicit compile-box image (helm `agentbox.compileBoxEnabled` ⇒ the
  * SICLAW_COMPILE_BOX_IMAGE env). This is the single source of truth the Runtime
  * advertises to its consumer on connect so the consumer can route compile runs
- * here WITHOUT any consumer-side config. The bare `kbc-compile-box:latest`
+ * here WITHOUT any consumer-side config. The bare `siclaw-kbc-box:latest`
  * fallback in the profiles above is deliberately NOT treated as capable: an
  * unset env means KB stays dark (fail-closed), so we must not claim capability.
  */
@@ -89,7 +97,8 @@ export function isCompileCapable(): boolean {
 function kbCompileProfile(): BoxProfile {
   return {
     name: "kb-compile",
-    image: process.env.SICLAW_COMPILE_BOX_IMAGE || "kbc-compile-box:latest",
+    podNamePrefix: "kbc-box",
+    image: process.env.SICLAW_COMPILE_BOX_IMAGE || "siclaw-kbc-box:latest",
     // LLM credentials arrive in /session after fail-closed input materialization:
     // consumer block first, Runtime Helm fallback only when that block is absent.
     // Never duplicate a Runtime secret into the pod spec; only the non-secret
@@ -133,7 +142,7 @@ function kbCompileCodexProfile(): BoxProfile {
 function kbTestProfile(): BoxProfile {
   return {
     name: "kb-test",
-    image: process.env.SICLAW_COMPILE_BOX_IMAGE || "kbc-compile-box:latest",
+    image: process.env.SICLAW_COMPILE_BOX_IMAGE || "siclaw-kbc-box:latest",
     envForward: ["ANTHROPIC_BASE_URL", "KBC_*"],
     home: "/work",
     // Same cap as kb-compile — the profiles' documented invariant is "identical

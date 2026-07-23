@@ -28,9 +28,18 @@ vi.mock("./capability/materialize.js", () => ({
 
 const { startRuntime } = await import("./server.js");
 
-function fakeFrontendClient() {
+// When `runProfile` is given, the fake answers capability.getRun with a live run
+// row carrying that profile — this is how a memory-cold testClose (no in-memory
+// run after a Runtime restart) recovers the profile it needs to target the right
+// pod-name prefix. Omit it to keep the store empty (adopt returns undefined).
+function fakeFrontendClient(runProfile?: string) {
   return {
-    request: vi.fn(async () => ({})),
+    request: vi.fn(async (method: string, params: any) => {
+      if (runProfile && method === "capability.getRun") {
+        return { id: params?.run_id, status: "running", profile: runProfile };
+      }
+      return {};
+    }),
     onCommand: vi.fn(),
     emitEvent: vi.fn(),
     close: vi.fn(),
@@ -65,14 +74,15 @@ afterEach(async () => {
 describe("capability.testClose", () => {
   it("closes an existing box session even when the Runtime has no in-memory run", async () => {
     const manager = fakeAgentBoxManager({
-      boxId: "agentbox-run-lost",
+      boxId: "kbc-box-run-lost",
       endpoint: "https://10.0.0.9:3000",
       agentId: "run-lost",
     });
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
-      frontendClient: fakeFrontendClient(),
+      // Memory-cold: the run only exists in the store, with a compile profile.
+      frontendClient: fakeFrontendClient("kb-compile"),
       credentialService: {} as any,
     });
 
@@ -83,7 +93,9 @@ describe("capability.testClose", () => {
       run_id: "run-lost",
       test_session_id: "test-1",
     });
-    expect(manager.getAsync).toHaveBeenCalledWith("run-lost");
+    // The profile is recovered from the store so getAsync targets kbc-box-run-lost,
+    // not agentbox-run-lost — otherwise a live compile box reads as already-closed.
+    expect(manager.getAsync).toHaveBeenCalledWith("run-lost", "kb-compile");
     expect(postJsonMock).toHaveBeenCalledWith("/test-session/test-1/close", {});
     expect(manager.getOrCreate).not.toHaveBeenCalled();
   });

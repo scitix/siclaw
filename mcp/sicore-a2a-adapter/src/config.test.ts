@@ -20,18 +20,97 @@ function baseEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 }
 
 describe("loadConfig", () => {
-  it("loads and normalizes environment configuration", () => {
+  it("loads and normalizes the single-key form as the default alias", () => {
     expect(loadConfig(baseEnv())).toEqual({
       baseUrl: "https://sicore.example.com",
-      agentId: "agent-1",
-      apiKey: "test-key",
+      keys: [{ alias: "default", apiKey: "test-key", agentId: "agent-1" }],
       requestTimeoutMs: 30_000,
       pollIntervalMs: 3_000,
     });
   });
 
   it("treats SICLAW_AGENT_ID as optional for key self-resolution", () => {
-    expect(loadConfig(baseEnv({ SICLAW_AGENT_ID: undefined })).agentId).toBeUndefined();
+    expect(loadConfig(baseEnv({ SICLAW_AGENT_ID: undefined })).keys).toEqual([
+      { alias: "default", apiKey: "test-key", agentId: undefined },
+    ]);
+  });
+
+  it("parses SICLAW_A2A_KEYS into named keys in declaration order", () => {
+    const env = baseEnv({
+      SICLAW_A2A_KEY: undefined,
+      SICLAW_AGENT_ID: undefined,
+      SICLAW_A2A_KEYS: '{"sre":"sk-a","kb":"sk-b"}',
+    });
+    expect(loadConfig(env).keys).toEqual([
+      { alias: "sre", apiKey: "sk-a" },
+      { alias: "kb", apiKey: "sk-b" },
+    ]);
+  });
+
+  it("merges the single key as default alongside named keys", () => {
+    const env = baseEnv({
+      SICLAW_AGENT_ID: undefined,
+      SICLAW_A2A_KEYS: '{"kb":"sk-b"}',
+    });
+    expect(loadConfig(env).keys).toEqual([
+      { alias: "default", apiKey: "test-key", agentId: undefined },
+      { alias: "kb", apiKey: "sk-b" },
+    ]);
+  });
+
+  it("rejects a named alias colliding with the single-key default", () => {
+    const env = baseEnv({
+      SICLAW_AGENT_ID: undefined,
+      SICLAW_A2A_KEYS: '{"default":"sk-b"}',
+    });
+    expect(() => loadConfig(env)).toThrow(/collides with the single-key/);
+  });
+
+  it("rejects invalid alias names", () => {
+    const env = baseEnv({
+      SICLAW_A2A_KEY: undefined,
+      SICLAW_AGENT_ID: undefined,
+      SICLAW_A2A_KEYS: '{"SRE":"sk-a"}',
+    });
+    expect(() => loadConfig(env)).toThrow(/is invalid/);
+  });
+
+  it("rejects SICLAW_AGENT_ID combined with SICLAW_A2A_KEYS", () => {
+    const env = baseEnv({
+      SICLAW_A2A_KEY: undefined,
+      SICLAW_A2A_KEYS: '{"sre":"sk-a"}',
+    });
+    expect(() => loadConfig(env)).toThrow(/cannot be combined with SICLAW_A2A_KEYS/);
+  });
+
+  it("rejects malformed SICLAW_A2A_KEYS JSON without echoing values", () => {
+    const env = baseEnv({
+      SICLAW_A2A_KEY: undefined,
+      SICLAW_AGENT_ID: undefined,
+      SICLAW_A2A_KEYS: "not-json",
+    });
+    expect(() => loadConfig(env)).toThrow(/must be a JSON object/);
+  });
+
+  it("rejects a non-string key value without echoing it", () => {
+    const env = baseEnv({
+      SICLAW_A2A_KEY: undefined,
+      SICLAW_AGENT_ID: undefined,
+      SICLAW_A2A_KEYS: '{"sre":123}',
+    });
+    try {
+      loadConfig(env);
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      expect((error as Error).message).toContain("sre");
+      expect((error as Error).message).not.toContain("123");
+    }
+  });
+
+  it("requires at least one key", () => {
+    const env = baseEnv({ SICLAW_A2A_KEY: undefined, SICLAW_AGENT_ID: undefined });
+    expect(() => loadConfig(env)).toThrow(/at least one key/);
   });
 
   it("allows HTTP only for loopback testing", () => {
@@ -47,8 +126,8 @@ describe("loadConfig", () => {
     const keyFile = join(dir, "key");
     writeFileSync(keyFile, "file-key\n", { mode: 0o600 });
     chmodSync(keyFile, 0o600);
-    const env = baseEnv({ SICLAW_A2A_KEY: undefined, SICLAW_A2A_KEY_FILE: keyFile });
-    expect(loadConfig(env).apiKey).toBe("file-key");
+    const env = baseEnv({ SICLAW_A2A_KEY: undefined, SICLAW_AGENT_ID: undefined, SICLAW_A2A_KEY_FILE: keyFile });
+    expect(loadConfig(env).keys).toEqual([{ alias: "default", apiKey: "file-key", agentId: undefined }]);
   });
 
   it.runIf(process.platform !== "win32")("rejects a group-readable key file", () => {

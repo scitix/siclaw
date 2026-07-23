@@ -35,4 +35,4 @@ turning the run checkpoint into an unbounded transcript.
 The field is additive and optional, so Sicore, the runtime, and the compile-box
 image may roll independently. Full protection is active after all three pieces
 are deployed; changing `compile_box.py` requires rebuilding the
-`kbc-compile-box` image.
+`siclaw-kbc-box` image.

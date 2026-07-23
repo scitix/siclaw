@@ -129,7 +129,7 @@ describe("capability.cancel", () => {
       run_id: started.run_id,
       stop_confirmed: true,
     });
-    expect(stop).toHaveBeenCalledWith(started.run_id);
+    expect(stop).toHaveBeenCalledWith(started.run_id, "kb-compile");
   });
 
   it("surfaces uncertain cleanup and lets an idempotent retry confirm the stop", async () => {
@@ -181,7 +181,9 @@ describe("capability.cancel", () => {
     expect(frontend.rows.get("run-after-restart")).toMatchObject({ status: "done" });
     expect(manager.getAsync).not.toHaveBeenCalled();
     expect(manager.getOrCreate).not.toHaveBeenCalled();
-    expect(manager.stop).toHaveBeenCalledWith("run-after-restart");
+    // Store-only run: cancel adopts it (notifyOnAdopt:false) to recover the
+    // profile, so stop targets the compile pod prefix (kbc-box-), not agentbox-.
+    expect(manager.stop).toHaveBeenCalledWith("run-after-restart", "kb-compile");
   });
 
   it("rejects a blank run id before touching the run store or box", async () => {
