@@ -1601,6 +1601,153 @@ def test_content_hash_shared_formula():
     print("OK  content_hash: pack == tree == canonical (single shared formula)")
 
 
+def test_is_media_asset():
+    """Media-asset predicate (coverage v2 §4.1): an assets/ (or legacy *.assets)
+    segment AND an image extension; sheet placeholders and non-images are not."""
+    yes = ["assets/a.png", "guide/assets/b.JPG", "report.assets/c.png",
+           "x/assets/y/d.webp", "assets/photo.tiff",
+           # case-INSENSITIVE segment (locked here, not in the fixture: an
+           # uppercase dir is not portable on a case-insensitive filesystem).
+           "Assets/e.png", "report.ASSETS/f.png", "guide/AsSeTs/g.png"]
+    no = ["docs/x.png",              # no assets segment
+          "assets/sheets/t.md",      # sheet placeholder = content file
+          "assets/data.json",        # json is not an image
+          "assets/notes.pdf",        # pdf is not a media asset
+          "assetsx/y.png",           # segment is not exactly `assets`
+          "my.assets.bak/y.png"]     # segment ends with .bak, not .assets
+    for p in yes:
+        assert selfcheck.is_media_asset(p), p
+    for p in no:
+        assert not selfcheck.is_media_asset(p), p
+    print("OK  is_media_asset (assets/ + *.assets, case-insensitive seg + image ext; sheet/.json/.pdf excluded)")
+
+
+def test_document_link_targets():
+    """Link/img extraction (coverage v2 §4.2): md image + md link + HTML <img>
+    (both quote styles), URL-decoded, angle-bracket, title/fragment stripped,
+    code fences masked; external targets pass through (filtered at edge time)."""
+    targets = selfcheck.document_link_targets(
+        "# T\n"
+        "![a](assets/a.png)\n"
+        "[b](assets/b.png)\n"
+        "<img src=\"assets/c.png\">\n"
+        "<img alt='x' src='assets/d.png' />\n"
+        "![e](assets/a%20b.png)\n"
+        "![f](<assets/g h.png>)\n"
+        "![t](assets/t.png \"caption\")\n"
+        "![h](assets/i.png#frag)\n"
+        "![q](assets/q.png?v=2)\n"
+        "```\n![code](assets/nope.png)\n```\n"
+        "[ext](https://example.test/y.png)\n"
+    )
+    for want in ["assets/a.png", "assets/b.png", "assets/c.png", "assets/d.png",
+                 "assets/a b.png", "assets/g h.png", "assets/t.png", "assets/i.png",
+                 "assets/q.png", "https://example.test/y.png"]:
+        assert want in targets, (want, targets)
+    assert "assets/nope.png" not in targets, targets       # masked inside a code fence
+    assert "assets/q.png?v=2" not in targets, targets       # ?query truncated
+    print("OK  document_link_targets (md/html/url-encoded/angle/title/fragment/query; code masked)")
+
+
+def test_coverage_v2_auto_attach():
+    """Coverage v2 auto-attach semantics, each in isolation."""
+    okf_index = "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)\n"
+
+    # A. image embedded by a cited doc → auto; orphan image → unaccounted; a
+    # sheet placeholder is a content file, not media (cited, not auto).
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/d.md", "# D\n![x](assets/a.png)\n")
+        _mk(base, "raw/assets/a.png"); _mk(base, "raw/assets/orphan.png")
+        _mk(base, "raw/assets/sheets/t.md", "| c |\n| - |\n| 1 |\n")
+        _mk(base, "candidate/index.md", okf_index)
+        _mk(base, "candidate/p.md",
+            "---\ntype: Topic\ncompiled_from:\n  - d.md\n  - assets/sheets/t.md\n---\nok")
+        cov = selfcheck.run_layer1(td)["coverage"]
+        assert cov["unaccounted"] == ["assets/orphan.png"], cov
+        assert cov["auto_attached"] == 1, cov
+        assert cov["auto_attached_sample"] == [{"asset": "assets/a.png", "via": "d.md"}], cov
+        assert not selfcheck.is_media_asset("assets/sheets/t.md")
+        assert not cov["closed"]
+
+    # B. v1 compatibility + no double count: a directly-cited asset stays cited,
+    # an explicitly-excluded asset stays excluded, and neither shows up as auto.
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/d.md", "# D\n![a](assets/a.png)\n![b](assets/b.png)\n")
+        _mk(base, "raw/assets/a.png"); _mk(base, "raw/assets/b.png")
+        _mk(base, "candidate/index.md", okf_index)
+        _mk(base, "candidate/p.md",
+            "---\ntype: Topic\ncompiled_from:\n  - d.md\n  - assets/a.png\n---\nok")
+        _mk(base, "authoring/EXCLUSIONS.json",
+            json.dumps([{"pattern": "assets/b.png", "reason": "not needed"}]))
+        cov = selfcheck.run_layer1(td)["coverage"]
+        assert cov["closed"], cov
+        assert cov["auto_attached"] == 0, cov
+        assert cov["cited"] == 2 and cov["excluded"] == 1, cov
+
+    # C. an image inherits its document's exclusion (auto via an excluded doc).
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/x.md", "# X\n![c](assets/c.png)\n")
+        _mk(base, "raw/assets/c.png")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n")
+        _mk(base, "authoring/EXCLUSIONS.json",
+            json.dumps([{"pattern": "x.md", "reason": "draft"}]))
+        cov = selfcheck.run_layer1(td)["coverage"]
+        assert cov["closed"], cov
+        assert cov["auto_attached"] == 1, cov
+        assert cov["auto_attached_sample"] == [{"asset": "assets/c.png", "via": "x.md"}], cov
+
+    # D. an image shared by a cited AND an unaccounted doc: auto via the cited
+    # one; the unaccounted document itself stays unaccounted (no fail-open).
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/cited.md", "# C\n![s](assets/s.png)\n")
+        _mk(base, "raw/loose.md", "# L\n![s](assets/s.png)\n")
+        _mk(base, "raw/assets/s.png")
+        _mk(base, "candidate/index.md", okf_index)
+        _mk(base, "candidate/p.md", "---\ntype: Topic\ncompiled_from:\n  - cited.md\n---\nok")
+        cov = selfcheck.run_layer1(td)["coverage"]
+        assert cov["unaccounted"] == ["loose.md"], cov
+        assert cov["auto_attached"] == 1, cov
+        assert cov["auto_attached_sample"] == [{"asset": "assets/s.png", "via": "cited.md"}], cov
+    print("OK  coverage v2 auto-attach (embed/orphan/sheet, v1 compat, exclusion inherit, shared-any-cited)")
+
+
+def test_media_citing_pages_via_attribution_edge():
+    """Coverage v2: a page citing only a DOCUMENT still enters the image
+    numeric-verification surface for every image that document embeds — agents no
+    longer cite images one-by-one, so the attribution edge is the carrier."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/doc.md", "# D\n![c](assets/chart.png)\n")
+        _mk(base, "raw/assets/chart.png")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)")
+        # cites the DOCUMENT only — no image in compiled_from, no (source: img)
+        _mk(base, "candidate/p.md",
+            "---\ntype: Topic\ncompiled_from:\n  - doc.md\n---\nSummary of the chart.")
+        citing = selfcheck.media_citing_pages(td)
+        assert citing == {"p.md": ["assets/chart.png"]}, citing
+        assert list(selfcheck.pending_media_verification(td)) == ["p.md"]
+    print("OK  media_citing_pages via attribution edge (doc-only citation still verifies embedded images)")
+
+
+def test_asset_provenance_fixture():
+    """The shared two-repo fixture: edges + coverage v2 must equal expected.json
+    byte-for-byte (sicore's adoption ledger asserts the SAME expected.json)."""
+    fx = Path(__file__).resolve().parent / "fixtures" / "asset-provenance"
+    expected = json.loads((fx / "expected.json").read_text(encoding="utf-8"))
+    edges = selfcheck.asset_attribution_edges(str(fx))
+    assert edges == expected["attribution_edges"], edges
+    pages = selfcheck.candidate_pages(str(fx))
+    exclusions, errors = selfcheck.load_exclusions(str(fx))
+    assert errors == [], errors
+    cov = selfcheck.coverage(str(fx), pages, exclusions)
+    assert cov == expected["coverage"], cov
+    print("OK  asset-provenance fixture (edges + coverage v2 == expected.json)")
+
+
 def main():
     os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
     os.environ.setdefault("KBC_PK_MODE", "off")  # PK never fires in unrelated wiring tests
@@ -1615,6 +1762,11 @@ def main():
     test_coverage_and_lint()
     test_candidate_credential_lint()
     test_media_ledger_and_new_lint()
+    test_is_media_asset()
+    test_document_link_targets()
+    test_coverage_v2_auto_attach()
+    test_media_citing_pages_via_attribution_edge()
+    test_asset_provenance_fixture()
     test_body_source_annotations()
     test_deterministic_body_source_normalization()
     test_spaced_markdown_links()

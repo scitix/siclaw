@@ -36,6 +36,7 @@ client cert (runtime/gateway); otherwise plain HTTP (local).
 """
 import asyncio
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -101,6 +102,14 @@ RUNS: dict[str, "CompileRun"] = {}
 # Read-only "test session" runs — ephemeral consumer sessions over a pinned draft
 # snapshot (test sessions). Parallel to RUNS, torn down on close/idle. See TestRun.
 TEST_SESSIONS: dict[str, "TestRun"] = {}
+# (parent_run_id, consumer-minted client_request_id) → tid, for open-test-session
+# retries. A retried testStart (same run + key) must return the SAME live session,
+# never a second session or concurrency slot. The key is RUN-SCOPED: a box hosts
+# multiple runs, and two runs that happen to mint the same client_request_id must
+# NOT hand each other's tid/snapshot/fingerprint back. Process-local; entries are
+# cleared on teardown with their session (a torn-down key opens fresh, so a stale
+# mapping is never replayed).
+TEST_SESSION_IDEMPOTENCY: dict[tuple[str, str], str] = {}
 # One explicit red-team read-only review may inspect a run at a time. Test
 # recommendation and reference-answer assistance share this guard so two owner
 # actions cannot spend overlapping model calls against the same workspace.
@@ -225,6 +234,72 @@ _MODEL_WATCHDOG_POLL_S = float(os.environ.get("KBC_MODEL_WATCHDOG_POLL_S", "10")
 # compiles retain the established 90s failure-detection bound.
 _HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = float(os.environ.get(
     "KBC_HIERARCHICAL_MODEL_IDLE_TIMEOUT_S", "240"))
+
+# ── Test-session resilience (read-only consumer turns) ───────────────────────
+# A test session streams faithfully (no de-stream shim), so the compile-path
+# watchdog does not cover it. It gets its OWN turn-stall guard reusing the same
+# idle-latency semantics (SDK event == alive), defaulting to the compile idle
+# bound. Unlike compile, a wedged test turn is reaped WITHOUT retry: the UI is
+# freed with a turn-level error and the session stays live for the next question.
+_TEST_MODEL_IDLE_TIMEOUT_S = float(os.environ.get(
+    "KBC_TEST_MODEL_IDLE_TIMEOUT_S", str(_MODEL_IDLE_TIMEOUT_S)))
+# Orphan reaper: a server timeout / persistence failure can leave a box-side test
+# session that nobody closes, holding one of KBC_MAX_TEST_SESSIONS until the pod
+# is recreated. A periodic sweep tears down sessions idle past this TTL.
+_TEST_SESSION_IDLE_TTL_S = float(os.environ.get("KBC_TEST_SESSION_IDLE_TTL_S", "1800"))
+_TEST_SESSION_REAP_POLL_S = float(os.environ.get("KBC_TEST_SESSION_REAP_POLL_S", "60"))
+# After the stall reaper interrupt()s a wedged test turn, the torn-down
+# ResultMessage should still arrive and advance the generation stream. But a true
+# black-hole can swallow interrupt() too, so that terminator may NEVER come — the
+# per-turn generation guard then miscounts every later turn (armed generation
+# outruns _results_seen forever). When interrupt() succeeds we give the terminator
+# this bounded window to land; if it does not, we flag the session for a client
+# rebuild instead of letting the generation stream drift permanently.
+_TEST_STALL_REBUILD_WINDOW_S = float(os.environ.get("KBC_TEST_STALL_REBUILD_WINDOW_S", "10"))
+# Bound on a /test-message-triggered client rebuild (disconnect + reconnect on the
+# same snapshot). A rebuild that overruns this surfaces a retryable error instead
+# of hanging the request.
+_TEST_REBUILD_DEADLINE_S = float(os.environ.get("KBC_TEST_REBUILD_DEADLINE_S", "30"))
+# Structured error code for the 429 refusal when the pod's concurrent
+# test-session cap is full. Emitted in the box's own {error:{code,message,
+# retriable}} shape (same convention as handle_test_recommendation) so the
+# runtime's agentbox error mapping passes a STABLE code + retriable=false
+# through to the consumer — a bare 429 would otherwise map to the generic
+# TOO_MANY_REQUESTS with retriable=true. Mirrored in gateway contract.ts.
+TEST_SESSION_LIMIT_ERROR_CODE = "test_session_limit"
+
+
+def _now_iso() -> str:
+    """UTC timestamp for the test-session wire contract (created_at/last_activity_at)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _print_test_lifecycle(label: str, run: "TestRun", extra: str = "") -> None:
+    """One stdout line per test-session lifecycle event (test.open / test.close /
+    turn.start / turn.done / turn.stalled / ttl.reap). tid + parent_run_id ONLY —
+    never user content — so pod logs make orphan/stall triage possible without
+    leaking the KB or the consumer's questions. Same [compile_box] prefix style."""
+    tail = f" {extra}" if extra else ""
+    print(f"[compile_box] {label} tid={run.tid} parent={run.parent_run_id}{tail}", flush=True)
+
+
+def _touch_test_activity(run: "TestRun") -> None:
+    """Mark liveness for the idle-TTL reaper (open, each turn, event consumption)."""
+    run._last_activity_monotonic = time.monotonic()
+    run.last_activity_at = _now_iso()
+
+
+def _arm_test_turn(run: "TestRun") -> None:
+    """Arm the turn-stall watchdog for a new test-session turn (the /test-message
+    analogue of CompileRun._begin_turn, minus compile/selfcheck bookkeeping)."""
+    run._turn_active = True
+    run._tool_pending = False
+    run._stall_reaped = False
+    run._turn_generation += 1   # supersede any reaped turn's late stragglers
+    run._last_sdk_message_type = "query"
+    run._last_model_activity = time.monotonic()
+    _touch_test_activity(run)
+
 
 # ── Rate-limit resilience (C2) ───────────────────────────────────────────────
 # massapi under concurrency (5-10 boxes × the red-blue PK) can return 429/503/529.
@@ -445,6 +520,55 @@ class TestRun:
         self.consumer_model: str | None = None
         self.consumer_max_turns: int | None = None
         self.consumer_fingerprint: str = ""
+        # Lifecycle timestamps for the idle-TTL reaper and GET /test-sessions.
+        # created_at/last_activity_at are wire (iso8601, agreed with sicore);
+        # _last_activity_monotonic drives the TTL comparison (clock-skew safe).
+        now = time.monotonic()
+        self.created_at: str = _now_iso()
+        self.last_activity_at: str = self.created_at
+        self._last_activity_monotonic: float = now
+        # Turn-stall watchdog state (mirrors CompileRun's, minus retry/compile
+        # bookkeeping). A turn is active from a /test-message query() until its
+        # ResultMessage; the watchdog only judges an active turn, against model
+        # latency, relaxing to the tool bound while a read tool runs.
+        self._turn_active = False
+        self._tool_pending = False
+        self._last_model_activity: float = now
+        self._last_sdk_message_type = "query"  # controlled class name only; never content
+        # Set by the watchdog when it reaps a wedged turn; the receive loop then
+        # discards the interrupted ResultMessage instead of announcing it.
+        self._stall_reaped = False
+        # Per-turn generation, bumped every _arm_test_turn. After a stall reap the
+        # watchdog frees the UI immediately, so a new /test-message can arm the next
+        # turn BEFORE the reaped turn's straggler frames (partial text + its
+        # torn-down ResultMessage) drain from the stream. The receive loop tags each
+        # frame with the generation it belongs to (results stream in strict turn
+        # order) and drops any whose generation is below the armed one — so a late
+        # frame can never terminate or contaminate the current turn. _results_seen
+        # counts consumed ResultMessages; frame generation = _results_seen + 1.
+        self._turn_generation = 0
+        self._results_seen = 0
+        # Client-rebuild coordination (review P1). The generation guard above
+        # silently assumes a reaped turn's terminator eventually arrives. When it
+        # cannot (interrupt() itself was swallowed, or its result black-holed), the
+        # generation stream can never realign and every later turn would be dropped.
+        # The watchdog then flags _needs_rebuild; the next /test-message disconnects
+        # and reconnects a fresh SDK client on the same pinned snapshot (state reset
+        # to a clean generation) before arming the turn. _pending_terminator_* time
+        # the post-interrupt grace window inside the watchdog loop (event-loop timed,
+        # never blocking the handler). _rebuild_requested/_rebuild_ready/_rebuild_error
+        # hand the rebuild off to the driver task and report the outcome back.
+        self._needs_rebuild = False
+        self._pending_terminator_deadline: float | None = None
+        self._pending_terminator_gen = 0
+        self._rebuild_requested: asyncio.Event = asyncio.Event()
+        self._rebuild_ready: asyncio.Event = asyncio.Event()
+        self._rebuild_error: str | None = None
+        # Snapshot page count (returned by open, replayed on an idempotent open).
+        self.pages: int = 0
+        # Consumer-minted client_request_id that opened this session (if any), so
+        # teardown can drop its TEST_SESSION_IDEMPOTENCY entry.
+        self.client_request_id: str | None = None
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
@@ -4096,17 +4220,190 @@ def _make_recommendation_path_guard(root: Path, locale: str | None = None):
     return guard
 
 
-async def test_session_driver(run: "TestRun"):
-    """Read-only consumer driver: host a ClaudeSDKClient over the pinned snapshot
-    dir, tools limited to the kb-test profile's whitelist (default Read/Glob/Grep),
-    persona = test_role pack, no MCP, no kickoff. A conversational session — connects and
-    waits for the first /test-message; each turn streams log + turn_done over GET
-    /test-events. Mirrors run_session minus writes/compile-tools/sync/bundle."""
-    sid = run.session_id or str(uuid.uuid4())
-    run.session_id = sid
+async def _consume_test_turn_stream(run: "TestRun", client) -> None:
+    """Relay a read-only test session's message stream through _emit_message,
+    owning the test-path stall reaper. Every inbound SDK message is liveness
+    (resets the idle clock, updates tool_pending) AND refreshes the TTL. Unlike
+    the compile path there is NO retry: when the watchdog has reaped the turn,
+    its ResultMessage is the torn-down attempt — discard it (the UI already got a
+    turn_done from the watchdog) and stay live for the next /test-message. A real
+    ResultMessage ends the turn normally.
+
+    Frames stream in strict turn order (a query's frames — including its lone
+    ResultMessage — all precede the next query's), so a frame's generation is
+    `_results_seen + 1`. After a stall reap the watchdog frees the UI at once and
+    the next /test-message can arm a newer turn before the reaped turn's stragglers
+    drain; those below the armed generation are dropped so a late ResultMessage can
+    never terminate — nor a late partial contaminate — the current turn."""
+    async for msg in client.receive_messages():
+        is_result = type(msg).__name__ == "ResultMessage"
+        frame_gen = run._results_seen + 1
+        if frame_gen < run._turn_generation:
+            # A superseded (reaped) turn's straggler. Drop it without touching the
+            # live turn's liveness/tool_pending — updating those from a stale frame
+            # would skew the watchdog's read of the current turn. A ResultMessage
+            # still advances _results_seen so the stream stays turn-aligned.
+            if is_result:
+                run._results_seen += 1
+            _print_test_lifecycle(
+                "turn.stale_frame_dropped", run,
+                extra=f"frame_gen={frame_gen} armed_gen={run._turn_generation} kind={type(msg).__name__}")
+            continue
+        _note_model_activity(run, msg)   # SDK event == alive; flips tool_pending
+        _touch_test_activity(run)        # any message is also TTL liveness
+        if is_result:
+            run._results_seen += 1
+            if run._stall_reaped:
+                # The watchdog interrupted this turn and already emitted the
+                # turn-level error + turn_done. This is the reaped attempt's
+                # empty result; drop its partial text and keep the session live.
+                run._turn_text = []
+                run._stall_reaped = False
+                run._turn_active = False
+                continue
+            was_active = run._turn_active
+            run._turn_active = False
+            if was_active:
+                _print_test_lifecycle("turn.done", run)
+            await _emit_message(run, msg)
+            continue
+        await _emit_message(run, msg)
+
+
+async def _test_stall_watchdog(run: "TestRun") -> None:
+    """Reap a test-session turn wedged on a black-holed model request. The test
+    path streams faithfully (no de-stream shim), so this is its ONLY stall guard.
+    It does not retry: it reaps the turn once (interrupt → the receive loop
+    discards the torn-down result), emits a turn-level error + turn_done so the
+    UI stops "thinking", and leaves the session live for the next question. Only
+    judges an ACTIVE turn; a pending read tool relaxes to the tool bound so a slow
+    Read/Grep over the snapshot is never false-killed (I4)."""
+    while not run.done:
+        await asyncio.sleep(_MODEL_WATCHDOG_POLL_S)
+        # Resolve a pending post-interrupt terminator window (armed at the reap
+        # below). The reaped turn's terminator is the ResultMessage that advances
+        # _results_seen to that turn's recorded GENERATION — only that specific
+        # evidence clears the window (review: a bare "_results_seen advanced"
+        # check let any later turn's ResultMessage impersonate the lost
+        # terminator and cancel the rebuild decision). If the window elapses
+        # first, the terminator is lost and the generation guard can never
+        # realign: flag a rebuild so the next /test-message starts the SDK client
+        # fresh. Runs above the active-turn guard because a reaped turn is no
+        # longer active.
+        if run._pending_terminator_deadline is not None:
+            if run._results_seen >= run._pending_terminator_gen:
+                run._pending_terminator_deadline = None
+            elif time.monotonic() >= run._pending_terminator_deadline:
+                run._pending_terminator_deadline = None
+                run._needs_rebuild = True
+                _print_test_lifecycle("turn.rebuild_armed", run, extra="reason=terminator_lost")
+        if not run._turn_active or run._stall_reaped:
+            continue
+        client = run.client
+        if client is None:
+            continue
+        # destream_floor=0: test sessions do not de-stream, so the model bound
+        # needs no lift; a pending tool still keeps its own (longer) bound.
+        bound = _watchdog_idle_bound(run._tool_pending, _TEST_MODEL_IDLE_TIMEOUT_S, 0.0)
+        idle = time.monotonic() - run._last_model_activity
+        if idle <= bound:
+            continue
+        run._stall_reaped = True
+        run._turn_active = False
+        run._turn_text = []           # the wedged attempt produced nothing usable
+        # Arm the pending-terminator guard NOW, before any await: the turn_done
+        # below frees the UI, and a retry can land while interrupt() is still in
+        # flight — /test-message must already see the unresolved window and
+        # rebuild (review: arming only after interrupt() returned left a gap in
+        # which a retry armed a misaligned turn on the wedged client, and its
+        # ResultMessage then impersonated the reaped turn's terminator). The
+        # guard records the reaped turn's GENERATION: its terminator is the
+        # ResultMessage that advances _results_seen to that generation, so the
+        # resolver at the top of this loop compares against the generation
+        # rather than trusting any bare counter advance.
+        run._pending_terminator_gen = run._turn_generation
+        run._pending_terminator_deadline = time.monotonic() + _TEST_STALL_REBUILD_WINDOW_S
+        _print_test_lifecycle(
+            "turn.stalled", run, extra=f"idle={round(idle, 1)}s bound={round(bound, 1)}s")
+        await run.emit({
+            "type": "turn_stalled",
+            "idle_s": round(idle, 1),
+            "bound_s": round(bound, 1),
+            "tool_pending": run._tool_pending,
+            "last_sdk_message": run._last_sdk_message_type,
+        })
+        await run.emit({"type": "error", "error": _loc(run,
+            "The answer timed out — please try again.",
+            "回答超时,请重试。")})
+        # turn_done frees the UI (idle) while the session stays open; the next
+        # /test-message re-arms a fresh turn on the same live client.
+        await run.emit({"type": "turn_done", "text": _loc(run,
+            "The answer timed out — please try again.",
+            "回答超时,请重试。")})
+        try:
+            await client.interrupt()
+        except Exception as e:
+            # A swallowed interrupt cannot un-wedge the receive loop and its
+            # torn-down result will never arrive, so the generation stream can
+            # never realign. Escalate the armed window to an immediate rebuild
+            # flag: the next /test-message reconnects a fresh client. The UI
+            # already recovered above; do not disconnect here (spec: keep the
+            # session live). Surface the interrupt failure for pod-log triage.
+            # Guard on the client still being current — a retry may have already
+            # rebuilt underneath this await (disconnecting `client` is exactly
+            # what makes interrupt() raise then), and re-flagging would force a
+            # second, spurious rebuild of the fresh client.
+            if run.client is client:
+                run._pending_terminator_deadline = None
+                run._needs_rebuild = True
+                _print_test_lifecycle("turn.rebuild_armed", run, extra="reason=interrupt_failed")
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Test session: interrupt after stall failed {e!r}",
+                    f"测试会话:停滞后中断失败 {e!r}")})
+        # On success the window armed above stands: the torn-down ResultMessage
+        # should arrive and advance _results_seen to the reaped generation; the
+        # resolver clears the window then, or flags a rebuild when it elapses.
+
+
+async def _reap_idle_test_sessions() -> int:
+    """One idle-TTL sweep: tear down every test session idle past the TTL and emit
+    a close event. Split from the loop so a test can drive a single deterministic
+    pass. Returns the number reaped."""
+    now = time.monotonic()
+    stale = [r for r in list(TEST_SESSIONS.values())
+             if not r.done and (now - r._last_activity_monotonic) > _TEST_SESSION_IDLE_TTL_S]
+    for run in stale:
+        _print_test_lifecycle(
+            "ttl.reap", run, extra=f"idle={round(now - run._last_activity_monotonic)}s")
+        try:
+            await run.emit({"type": "summary", "text": _loc(run,
+                "Test session closed after being idle.",
+                "测试会话空闲超时,已关闭。")})
+        except Exception:
+            pass
+        await _teardown_test_session(run)   # cancels the task → wrapper emits `end`
+    return len(stale)
+
+
+async def _test_session_reaper() -> None:
+    """Periodic idle-TTL sweep for orphaned test sessions. Fail-open: a sweep
+    error must never kill the reaper loop (it protects a shared concurrency slot)."""
+    while True:
+        await asyncio.sleep(_TEST_SESSION_REAP_POLL_S)
+        try:
+            await _reap_idle_test_sessions()
+        except Exception as e:
+            print(f"[compile_box] test-session reaper sweep failed: {e!r}", flush=True)
+
+
+def _build_test_client(run: "TestRun", sid: str):
+    """Construct (but do not connect) a read-only test-session SDK client over the
+    pinned snapshot dir, tools limited to the kb-test profile's whitelist. Split
+    out so both the first connect and a post-stall rebuild build an identical
+    client (same snapshot, same profile) — only the SDK session id differs."""
     effective_tools = _effective_test_allowed_tools(run.allowed_tools)
     if _engine_kind() == "codex_sdk":
-        client = CodexSDKClient(
+        return CodexSDKClient(
             cwd=run.cwd,
             system_prompt=_prompt("test_role", run.locale),
             model=run.consumer_model or _test_model(),
@@ -4116,42 +4413,136 @@ async def test_session_driver(run: "TestRun"):
             allowed_read_tools=effective_tools,
             max_tool_calls=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
         )
-    else:
-        opts = ClaudeAgentOptions(
-            cwd=run.cwd,
-            system_prompt={"type": "preset", "preset": "claude_code", "append": _prompt("test_role", run.locale)},
-            tools=effective_tools,                    # actual context matches the fingerprinted profile contract
-            allowed_tools=effective_tools,
-            disallowed_tools=list(READONLY_CONSUMER_DISALLOWED_TOOLS),  # belt-and-suspenders under bypass
-            mcp_servers={},                            # no compile signal tools
-            strict_mcp_config=True,                    # ignore project/user/plugin MCP configs
-            skills=[],                                 # no skills for a read-only consumer
-            permission_mode="bypassPermissions",       # the pod itself is the sandbox
-            # C4: path confinement — absolute/../ reads must not escape the snapshot
-            # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
-            hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd), run.locale)])]},
-            setting_sources=[],                        # tenant isolation
-            # The test session mimics the REAL consumer → the gate/consumer tier
-            # (sonnet), not the compile tier. Massapi-served id; overridable per-deploy.
-            model=run.consumer_model or _test_model(),
-            max_turns=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
-            session_id=sid,
-            session_store=InMemorySessionStore(),
-        )
-        client = ClaudeSDKClient(options=opts)
-    try:
-        await client.connect()  # conversational: wait for the first /test-message
+    opts = ClaudeAgentOptions(
+        cwd=run.cwd,
+        system_prompt={"type": "preset", "preset": "claude_code", "append": _prompt("test_role", run.locale)},
+        tools=effective_tools,                    # actual context matches the fingerprinted profile contract
+        allowed_tools=effective_tools,
+        disallowed_tools=list(READONLY_CONSUMER_DISALLOWED_TOOLS),  # belt-and-suspenders under bypass
+        mcp_servers={},                            # no compile signal tools
+        strict_mcp_config=True,                    # ignore project/user/plugin MCP configs
+        skills=[],                                 # no skills for a read-only consumer
+        permission_mode="bypassPermissions",       # the pod itself is the sandbox
+        # C4: path confinement — absolute/../ reads must not escape the snapshot
+        # to the live /work draft. Hook, not can_use_tool: hooks fire under bypass.
+        hooks={"PreToolUse": [HookMatcher(hooks=[_make_test_path_guard(Path(run.cwd), run.locale)])]},
+        setting_sources=[],                        # tenant isolation
+        # The test session mimics the REAL consumer → the gate/consumer tier
+        # (sonnet), not the compile tier. Massapi-served id; overridable per-deploy.
+        model=run.consumer_model or _test_model(),
+        max_turns=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
+        session_id=sid,
+        session_store=InMemorySessionStore(),
+    )
+    return ClaudeSDKClient(options=opts)
+
+
+def _reset_test_turn_state(run: "TestRun") -> None:
+    """Zero the per-turn generation bookkeeping for a freshly (re)connected client.
+    A rebuild starts a brand-new SDK conversation, so the generation counters,
+    reap latch, and pending-terminator window must all return to their initial
+    values — otherwise the guard in _consume_test_turn_stream would keep dropping
+    the new client's frames against a stale armed generation."""
+    run._turn_active = False
+    run._tool_pending = False
+    run._stall_reaped = False
+    run._turn_generation = 0
+    run._results_seen = 0
+    run._turn_text = []
+    run._needs_rebuild = False
+    run._pending_terminator_deadline = None
+    run._pending_terminator_gen = 0
+
+
+async def test_session_driver(run: "TestRun"):
+    """Read-only consumer driver: host a ClaudeSDKClient over the pinned snapshot
+    dir, tools limited to the kb-test profile's whitelist (default Read/Glob/Grep),
+    persona = test_role pack, no MCP, no kickoff. A conversational session — connects and
+    waits for the first /test-message; each turn streams log + turn_done over GET
+    /test-events. Mirrors run_session minus writes/compile-tools/sync/bundle.
+
+    Epoch loop: normally one connect drives the session for its whole life. But a
+    reaped turn whose terminator is lost flags _needs_rebuild; the next
+    /test-message sets _rebuild_requested, and this loop then disconnects the dead
+    client and reconnects a fresh one on the SAME snapshot (a new SDK conversation —
+    the stalled SDK-side history is deliberately discarded; the UI transcript is
+    server-persisted, and a stalled session's history is already unreliable). The
+    tid / snapshot / UI session row are unchanged across the rebuild."""
+    sid = run.session_id or str(uuid.uuid4())
+    run.session_id = sid
+    rebuilding = False
+    while True:
+        client = _build_test_client(run, run.session_id)
+        try:
+            await client.connect()  # conversational: wait for the first /test-message
+        except Exception as e:
+            if not rebuilding:
+                run.connected.set()  # unblock /test-message waiters → they see 409
+                raise                # first connect failed: hard session failure
+            # A rebuild's reconnect failed. Keep the session row alive and report a
+            # retryable error to the waiting handler rather than tearing the session
+            # down; a later /test-message retries the rebuild.
+            run._rebuild_error = repr(e)
+            run._needs_rebuild = True
+            run.connected.clear()
+            run.client = None
+            run._rebuild_ready.set()
+            await run._rebuild_requested.wait()
+            run._rebuild_requested.clear()
+            run._rebuild_ready.clear()
+            continue
         run.client = client
         run.connected.set()
-        sid = str(getattr(client, "session_id", sid) or sid)
+        sid = str(getattr(client, "session_id", run.session_id) or run.session_id)
         run.session_id = sid
         await run.emit({"type": "session", "session_id": sid})
-        async for msg in client.receive_messages():
-            await _emit_message(run, msg)
-    finally:
-        run.connected.set()  # unblock any /test-message waiters even if connect failed
-        run.client = None
+        if rebuilding:
+            # The reconnect succeeded; the state was zeroed before this epoch.
+            run._rebuild_error = None
+            run._rebuild_ready.set()
+        # Persistent conversational stream with the turn-stall reaper (started by
+        # _test_session_wrapper). Runs until the stream ends (close/teardown) OR a
+        # /test-message asks for a rebuild; whichever fires first wins.
+        consume = asyncio.create_task(_consume_test_turn_stream(run, client))
+        rebuild_req = asyncio.create_task(run._rebuild_requested.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {consume, rebuild_req}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            # Teardown cancels the wrapper task while we await here; never leak the
+            # child tasks. Cancel both, drain, then let the cancellation propagate
+            # (the finally still disconnects the client via the outer flow).
+            for t in (consume, rebuild_req):
+                t.cancel()
+            await asyncio.gather(consume, rebuild_req, return_exceptions=True)
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+            raise
+        finally:
+            run.connected.clear()
+            run.client = None
+        if rebuild_req in done:
+            # Rebuild wins even if consume also just finished — a fresh client is
+            # always safe. Cancel the consume loop, drop the dead client, reset the
+            # generation state, and reconnect with a new SDK session id.
+            if not consume.done():
+                consume.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consume
+            await client.disconnect()
+            run._rebuild_requested.clear()
+            _reset_test_turn_state(run)
+            run.session_id = str(uuid.uuid4())
+            rebuilding = True
+            continue
+        # Stream ended on its own (close / teardown / driver stop): surface any
+        # consume exception to the wrapper and end the session.
+        rebuild_req.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await rebuild_req
         await client.disconnect()
+        consume.result()
+        return
 
 
 def _validate_test_recommendation(root: Path, args: dict) -> dict:
@@ -4621,15 +5012,22 @@ async def assist_reference_answer(parent: "CompileRun", payload: dict) -> dict:
 
 
 async def _test_session_wrapper(run: "TestRun"):
-    """Lifecycle for a read-only test session: run the driver, turn a crash into an
-    `error` event, always close with `end`. No syncer / bundle fallback (read-only,
-    nothing to persist). Cancellation (teardown) skips `error`, still emits `end`."""
+    """Lifecycle for a read-only test session: run the driver under a turn-stall
+    watchdog, turn a crash into an `error` event, always close with `end`. No
+    syncer / bundle fallback (read-only, nothing to persist). Cancellation
+    (teardown) skips `error`, still emits `end`."""
+    watchdog = asyncio.create_task(_test_stall_watchdog(run))
     try:
         await _TEST_SESSION_IMPL(run)
     except Exception as e:  # top-level boundary; CancelledError (teardown) passes through
         await run.emit({"type": "error", "error": repr(e)})
     finally:
         run.done = True
+        watchdog.cancel()
+        try:
+            await watchdog
+        except asyncio.CancelledError:
+            pass
         await run.emit({"type": "end"})
 
 
@@ -4637,6 +5035,15 @@ async def _teardown_test_session(run: "TestRun"):
     """Cancel the session task (→ driver finally disconnects the client), drop the
     snapshot dir, and forget the run. The original RUNS machinery has no GC; test
     sessions are frequent + ephemeral, so they get explicit teardown."""
+    _print_test_lifecycle("test.close", run)
+    # Drop the idempotency mapping WITH the session: a torn-down key must open a
+    # fresh session, never replay a dead tid (guard on tid so a re-minted key for
+    # a newer session is not clobbered). The key is run-scoped, so rebuild the
+    # (parent_run_id, client_request_id) tuple that stored it.
+    if run.client_request_id:
+        key = (run.parent_run_id, run.client_request_id)
+        if TEST_SESSION_IDEMPOTENCY.get(key) == run.tid:
+            TEST_SESSION_IDEMPOTENCY.pop(key, None)
     if run.task and not run.task.done():
         run.task.cancel()
         try:
@@ -5188,10 +5595,49 @@ async def handle_open_test(request: web.Request):
     parent = RUNS.get(request.match_info["run_id"])
     if not parent:
         return web.json_response({"error": "unknown run"}, status=404)
+    body = await request.json() if request.body_exists else {}
+    # Idempotent open: a retried testStart (same consumer-minted client_request_id)
+    # returns the SAME live session. The dedup key is RUN-SCOPED — (parent_run_id,
+    # client_request_id) — so on a shared box two runs colliding on a request id
+    # each open their own session instead of aliasing one another's snapshot. Before
+    # replaying we re-verify the mapped session still belongs to THIS parent run; a
+    # mismatch (or a stale/closed mapping) falls through to a fresh open. Checked
+    # BEFORE the cap (a replay must not be spuriously 429'd) and BEFORE packing (a
+    # replay does no snapshot work). `idempotent_replay` tells the runtime NOT to
+    # start a second event relay on the already-relayed session (the box's
+    # /test-events is single-consumer). Absent key (empty/omitted) → unchanged
+    # old-consumer behavior.
+    req_id = (body.get("client_request_id") or "").strip()
+    if len(req_id) > 128:
+        return web.json_response({"error": "client_request_id must be at most 128 characters"}, status=400)
+    idem_key = (parent.run_id, req_id) if req_id else None
+    if idem_key is not None:
+        existing = TEST_SESSIONS.get(TEST_SESSION_IDEMPOTENCY.get(idem_key, ""))
+        if existing is not None and not existing.done and existing.parent_run_id == parent.run_id:
+            _print_test_lifecycle("test.open.idempotent", existing)
+            return web.json_response({
+                "ok": True,
+                "test_session_id": existing.tid,
+                "snapshot_hash": existing.snapshot_hash,
+                "consumer_fingerprint": existing.consumer_fingerprint,
+                "pages": existing.pages,
+                "idempotent_replay": True,
+            })
+        # Stale/mismatched mapping (session closed/reaped, or a cross-run entry that
+        # slipped in): drop it and open fresh below.
+        TEST_SESSION_IDEMPOTENCY.pop(idem_key, None)
     active = sum(1 for t in TEST_SESSIONS.values() if not t.done)
     if active >= _max_test_sessions():
-        return web.json_response({"error": "too many concurrent test sessions"}, status=429)
-    body = await request.json() if request.body_exists else {}
+        # Structured error (same shape as handle_test_recommendation) so the
+        # runtime maps a STABLE code + retriable=false, not the generic 429.
+        # Not retriable: the caller must close an idle session, not auto-retry.
+        return web.json_response(
+            {"error": {
+                "code": TEST_SESSION_LIMIT_ERROR_CODE,
+                "message": "too many concurrent test sessions",
+                "retriable": False,
+            }},
+            status=429)
     consumer_tools = _effective_test_allowed_tools(body.get("allowed_tools"))
     consumer_model = _test_model()
     consumer_max_turns = _test_max_turns()
@@ -5216,14 +5662,20 @@ async def handle_open_test(request: web.Request):
         run.locale, run.allowed_tools, run.consumer_model,
         max_turns=run.consumer_max_turns,
     )
+    run.pages = pages
+    if idem_key is not None:
+        run.client_request_id = req_id
+        TEST_SESSION_IDEMPOTENCY[idem_key] = tid
     TEST_SESSIONS[tid] = run
     run.task = asyncio.create_task(_test_session_wrapper(run))
+    _print_test_lifecycle("test.open", run, extra=f"pages={pages}")
     return web.json_response({
         "ok": True,
         "test_session_id": tid,
         "snapshot_hash": snapshot_hash,
         "consumer_fingerprint": run.consumer_fingerprint,
         "pages": pages,
+        "idempotent_replay": False,
     })
 
 
@@ -5297,19 +5749,77 @@ async def handle_test_reference_assist(request: web.Request):
         RECOMMENDATIONS_ACTIVE.discard(run_id)
 
 
+async def _rebuild_test_client(run: "TestRun") -> web.Response | None:
+    """Reconnect a fresh SDK client for a session whose prior turn's terminator was
+    lost (interrupt() failed or its post-interrupt window elapsed). The generation
+    stream can never realign on the old client, so hand the rebuild to the driver
+    task: it disconnects the dead client and reconnects on the SAME pinned snapshot
+    with reset generation state. The tid / snapshot / UI session row are preserved;
+    the SDK-side conversation history is intentionally dropped (a stalled session's
+    history is already unreliable and the UI transcript lives server-side). Bounded —
+    a rebuild that overruns surfaces a retryable error instead of hanging. Returns
+    an error Response on failure, else None."""
+    run._needs_rebuild = False
+    # An unresolved post-interrupt window is moot on a fresh client; clearing it
+    # here (not just in the driver's post-connect reset) stops the watchdog from
+    # re-flagging terminator_lost while the rebuild is in flight.
+    run._pending_terminator_deadline = None
+    run._rebuild_error = None
+    run._rebuild_ready.clear()
+    run._rebuild_requested.set()   # the driver's asyncio.wait wakes, cancels consume, reconnects
+    try:
+        await asyncio.wait_for(run._rebuild_ready.wait(), timeout=_TEST_REBUILD_DEADLINE_S)
+    except asyncio.TimeoutError:
+        run._rebuild_error = "test session rebuild timed out"
+    if run._rebuild_error is not None:
+        _print_test_lifecycle("turn.rebuild_failed", run, extra=f"err={run._rebuild_error!r}")
+        await run.emit({"type": "error", "error": _loc(run,
+            "The session could not be restarted — please try again.",
+            "会话无法重启,请重试。")})
+        return web.json_response({"error": "test session rebuild failed"}, status=503)
+    _print_test_lifecycle("turn.rebuilt", run)
+    return None
+
+
 async def handle_test_message(request: web.Request):
     """Inject a user turn into a live read-only test session. Reply streams over
     GET /test-events/{tid}."""
     run = TEST_SESSIONS.get(request.match_info["tid"])
     if not run:
         return web.json_response({"error": "unknown test session"}, status=404)
-    err = await _await_session_live(run)  # duck-typed on .connected/.client
-    if err is not None:
-        return err
     body = await request.json()
     text = (body.get("message") or "").strip()
     if not text:
         return web.json_response({"error": "message is required"}, status=400)
+    if run._needs_rebuild or run._pending_terminator_deadline is not None:
+        # Rebuild before arming whenever the generation stream is broken or in
+        # doubt:
+        # (a) _needs_rebuild — the previous turn's terminator is known lost
+        #     (interrupt failed / window elapsed) or a prior rebuild's reconnect
+        #     failed; the guard would drop this turn's frames forever.
+        # (b) an unresolved post-interrupt terminator window — the reaped turn's
+        #     terminator has NOT landed yet, so arming a new turn now is ambiguous:
+        #     if the terminator never arrives, the new turn's frames are counted
+        #     one generation behind and silently dropped, and its own
+        #     ResultMessage is mistaken for the old turn's terminator, cancelling
+        #     the rebuild decision (review P1: an immediate retry right after the
+        #     stall turn_done lost the user's answer and timed out again). A
+        #     fresh client is deterministic; the stalled SDK history is already
+        #     the accepted loss.
+        # This must also run BEFORE the liveness wait: after a failed reconnect
+        # the driver clears `connected` and parks until the next rebuild request,
+        # so gating on `connected` first would turn every retry into a 25s
+        # timeout → 503 and the retry path would never fire. A successful rebuild
+        # sets `connected` before signalling ready, so the liveness wait below is
+        # correct in this order too.
+        err = await _rebuild_test_client(run)
+        if err is not None:
+            return err
+    err = await _await_session_live(run)  # duck-typed on .connected/.client
+    if err is not None:
+        return err
+    _arm_test_turn(run)   # arm the turn-stall watchdog for this turn
+    _print_test_lifecycle("turn.start", run)
     await run.client.query(text)
     return web.json_response({"ok": True})
 
@@ -5344,6 +5854,45 @@ async def handle_close_test(request: web.Request):
         return web.json_response({"ok": True, "already_closed": True})
     await _teardown_test_session(run)
     return web.json_response({"ok": True})
+
+
+async def handle_list_test_sessions(request: web.Request):
+    """List the box's live test sessions so the consumer can reconcile orphans
+    against its own records and drive the idle-reap view. Wire contract agreed
+    with sicore — the field names (tid/parent_run_id/created_at/last_activity_at/
+    done) are load-bearing, do not rename."""
+    return web.json_response({"sessions": [
+        {
+            "tid": r.tid,
+            "parent_run_id": r.parent_run_id,
+            "created_at": r.created_at,
+            "last_activity_at": r.last_activity_at,
+            "done": r.done,
+        }
+        for r in TEST_SESSIONS.values()
+    ]})
+
+
+_TEST_SESSION_REAPER_TASK: "asyncio.Task | None" = None
+
+
+async def _start_test_session_reaper(_app) -> None:
+    """aiohttp on_startup: launch the idle-TTL orphan reaper (needs a running loop)."""
+    global _TEST_SESSION_REAPER_TASK
+    _TEST_SESSION_REAPER_TASK = asyncio.create_task(_test_session_reaper())
+
+
+async def _stop_test_session_reaper(_app) -> None:
+    """aiohttp on_cleanup: stop the reaper so it does not outlive the app."""
+    global _TEST_SESSION_REAPER_TASK
+    task = _TEST_SESSION_REAPER_TASK
+    _TEST_SESSION_REAPER_TASK = None
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _flush_on_shutdown(_app) -> None:
@@ -5391,7 +5940,9 @@ def build_app() -> web.Application:
         middlewares=[_client_certificate_middleware],
     )
     app.on_startup.append(destream.start)
+    app.on_startup.append(_start_test_session_reaper)
     app.on_shutdown.append(_flush_on_shutdown)
+    app.on_cleanup.append(_stop_test_session_reaper)
     app.add_routes([
         web.post("/sources", handle_sources),
         web.post("/sources/begin", handle_sources_begin),
@@ -5409,6 +5960,7 @@ def build_app() -> web.Application:
         web.post("/test-reference-assist/{run_id}", handle_test_reference_assist),
         web.post("/test-message/{tid}", handle_test_message),
         web.get("/test-events/{tid}", handle_test_events),
+        web.get("/test-sessions", handle_list_test_sessions),
         web.post("/test-session/{tid}/close", handle_close_test),
         web.get("/health", handle_health),
     ])

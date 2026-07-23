@@ -28,7 +28,7 @@ import { getBoxProfile } from "./agentbox/box-profile.js";
 import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
-import { driveTestSession } from "./capability/test-relay.js";
+import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
 import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
@@ -44,6 +44,9 @@ import type {
   CapabilityTestReferenceAssistRequest,
   CapabilityTestReferenceAssistResponse,
   CapabilityTestMessageRequest,
+  CapabilityTestSessionsRequest,
+  CapabilityTestSessionsResponse,
+  CapabilityTestSessionSummary,
   CapabilityTestStartRequest,
   CapabilityTestStartResponse,
 } from "./capability/contract.js";
@@ -92,7 +95,7 @@ import { MetricsAggregator } from "./metrics-aggregator.js";
 import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
-import { resolveAgentModelBinding } from "./agent-model-binding.js";
+import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "./agent-model-binding.js";
 
 function stablePayloadDigest(value: unknown): string {
   const canonicalize = (input: unknown): unknown => {
@@ -319,6 +322,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         const promptMessageId = await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
 
+        // System-prompt precedence for the box session. An explicit
+        // params.systemPrompt (the portal-standalone path stamps it from the
+        // agent's model binding) wins as-is. When the caller does NOT forward one
+        // — e.g. sicore's web-chat proxy, which never sends systemPrompt — fall
+        // back to the agent's own custom template (agents.system_prompt via
+        // config.getAgent). Without this fallback a custom-prompt agent silently
+        // got AgentBox's built-in default SRE persona on the web path, even though
+        // the channel paths (dingtalk/lark) already resolved it and worked.
+        //
+        // Best-effort: resolveAgentSystemPrompt swallows RPC errors and returns
+        // undefined (no custom prompt / lookup failed) → built-in default, so a
+        // lookup failure never turns into a chat failure. AgentBox applies the
+        // template only at session creation, so this affects NEW sessions; a warm
+        // multi-turn session keeps the prompt it was created with (unchanged).
+        if (promptOpts.systemPromptTemplate === undefined) {
+          promptOpts.systemPromptTemplate = await resolveAgentSystemPrompt(agentId, frontendClient);
+        }
+
         // Persistence is resolved by agentId in the manager's persistenceResolver
         // (registered in startRuntime), not from per-request params — so every
         // entry point lands the same mode for the same agent.
@@ -474,7 +495,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // terminal mark, so the store and the cluster agree. Local escape-hatch boxes
     // aren't managed by the spawner — stop() is a no-op/404 there, hence catch.
     onReap: async (rec) => {
-      await agentBoxManager.stop(rec.runId).catch((err) => {
+      // Pass the run's profile so the manager targets the right pod name — a
+      // compile box is "kbc-box-<id>", not "agentbox-<id>"; a mismatched name
+      // would 404 and leak the pod instead of reaping it.
+      await agentBoxManager.stop(rec.runId, rec.profile).catch((err) => {
         console.warn(`[capability] reap: stopping box ${rec.runId} failed:`, err instanceof Error ? err.message : String(err));
       });
     },
@@ -487,7 +511,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     onAdopt: (rec) => {
       void (async () => {
         try {
-          const alive = await agentBoxManager.getAsync(rec.runId);
+          const alive = await agentBoxManager.getAsync(rec.runId, rec.profile);
           if (!alive) return;
           await ensureCapabilitySession(rec.runId, rec.profile, rec.orgId || undefined, undefined);
           console.log(`[capability] re-attached relay to live box for recovered run ${rec.runId}`);
@@ -549,7 +573,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // because the consumer had a transient fetch failure would destroy the
           // in-flight turn that shutdown()/adopt are specifically preserving.
           if (created) {
-            void agentBoxManager.stop(runId).catch((stopErr) =>
+            void agentBoxManager.stop(runId, profile).catch((stopErr) =>
               console.error(
                 `[capability] stop new box after setup failure run=${runId}:`,
                 stopErr instanceof Error ? stopErr.message : String(stopErr),
@@ -577,7 +601,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             // running pod + cert Secret forever (audit finding; the crash
             // path was covered piecemeal before, this owns both). stop() is
             // 404-tolerant, so the idle-reap double-stop stays quiet.
-            void agentBoxManager.stop(runId).catch((stopErr) =>
+            void agentBoxManager.stop(runId, profile).catch((stopErr) =>
               console.error(
                 `[capability] stop box after relay close run=${runId}:`,
                 stopErr instanceof Error ? stopErr.message : String(stopErr),
@@ -604,7 +628,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // Fallback only (label-less debris hands us a pod name): strip the pod
     // prefix. That inversion is exact only for minted lowercase-UUID run ids —
     // which is why the label, not this strip, is the primary channel (review).
-    const runId = runRef.startsWith("agentbox-") ? runRef.slice("agentbox-".length) : runRef;
+    // A compile box carries the "kbc-box-" prefix, others "agentbox-".
+    const runId = runRef.startsWith("kbc-box-")
+      ? runRef.slice("kbc-box-".length)
+      : runRef.startsWith("agentbox-")
+        ? runRef.slice("agentbox-".length)
+        : runRef;
     const rec = capabilityRunManager.get(runId);
     if (rec) return !isTerminalCapabilityStatus(rec.status);
     // Memory miss ≠ dead. Boot recovery can race the consumer (the exact
@@ -791,7 +820,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // other failure is uncertain cleanup and must reach the consumer; claiming
     // success here would let callers mistake a live box for a completed stop.
     try {
-      await agentBoxManager.stop(runId);
+      // Target the run's own pod-name prefix — a compile box is "kbc-box-<id>",
+      // not "agentbox-<id>". rec was just resolved above (get ?? adopt); an
+      // absent profile falls back to the default prefix.
+      await agentBoxManager.stop(runId, rec?.profile);
     } catch (err) {
       console.error(
         `[capability] cancel: stop box run=${runId} failed:`,
@@ -833,25 +865,33 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // Optional consumer-provided snapshot (e.g. a published version bundle);
       // absent → the box pins the run's candidate/ draft.
       ...(req.bundle_base64 ? { bundle_base64: req.bundle_base64, bundle_sha256: req.bundle_sha256 } : {}),
+      // Idempotency: a retried testStart (same client_request_id) returns the
+      // SAME live session instead of opening a second one — passed to the box.
+      ...(req.client_request_id ? { client_request_id: req.client_request_id } : {}),
     })) as {
       test_session_id: string;
       snapshot_hash: string;
       consumer_fingerprint: string;
       pages: number;
+      idempotent_replay?: boolean;
     };
-    driveTestSession({
-      client,
-      runId,
-      testSessionId: opened.test_session_id,
-      frontendClient,
-      touch: () => capabilityRunManager.touch(runId),
-    }).catch((err) => {
-      // A dead test relay is disposable — log, never fail the authoring run.
-      console.warn(
-        `[capability] test relay ended run=${runId} tid=${opened.test_session_id}:`,
-        err instanceof Error ? err.message : String(err),
-      );
-    });
+    // Only drive a freshly-opened session — an idempotent replay is already
+    // relayed, and the box's /test-events is single-consumer (see predicate).
+    if (shouldRelayTestSession(opened)) {
+      driveTestSession({
+        client,
+        runId,
+        testSessionId: opened.test_session_id,
+        frontendClient,
+        touch: () => capabilityRunManager.touch(runId),
+      }).catch((err) => {
+        // A dead test relay is disposable — log, never fail the authoring run.
+        console.warn(
+          `[capability] test relay ended run=${runId} tid=${opened.test_session_id}:`,
+          err instanceof Error ? err.message : String(err),
+        );
+      });
+    }
     const res: CapabilityTestStartResponse = {
       run_id: runId,
       test_session_id: opened.test_session_id,
@@ -966,7 +1006,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (localCapabilityBoxEndpoint) {
       client = new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
     } else {
-      const alive = await agentBoxManager.getAsync(req.run_id);
+      // getAsync computes the pod name from the run's PROFILE prefix (a compile
+      // box is "kbc-box-<id>", a chat box "agentbox-<id>"), so it must be told
+      // the profile or it looks up the wrong pod and reports a live session as
+      // already-closed. The in-memory run may be gone after a Runtime restart —
+      // recover its profile from the consumer store WITHOUT reattaching a relay
+      // (notifyOnAdopt:false) or spawning a box. Unknown profile ⇒ default prefix.
+      const rec =
+        capabilityRunManager.get(req.run_id) ??
+        (await capabilityRunManager.adopt(req.run_id, { notifyOnAdopt: false }));
+      const alive = await agentBoxManager.getAsync(req.run_id, rec?.profile);
       if (!alive) {
         const response: CapabilityTestCloseResponse = {
           ok: true,
@@ -985,6 +1034,42 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       run_id: req.run_id,
       test_session_id: req.test_session_id,
       close_confirmed: true,
+    };
+    return response;
+  });
+
+  rpcMethods.set("capability.testSessions", async (params) => {
+    const req = params as unknown as CapabilityTestSessionsRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    // Read-only reconciliation: NEVER spawn/rehydrate a box just to list (mirrors
+    // testClose's box discovery). An absent/dead box has no live sessions → [].
+    // The box's GET /test-sessions rows are passed through verbatim (the `tid`
+    // wire field is load-bearing for the consumer — do not rename).
+    let client: AgentBoxClient;
+    if (localCapabilityBoxEndpoint) {
+      client = new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
+    } else {
+      // Same profile-aware discovery as testClose: getAsync needs the run's
+      // profile to build the right pod-name prefix (kbc-box-<id> for a compile
+      // box). Recover it from the store when memory-cold — never spawning a box
+      // or reattaching a relay (notifyOnAdopt:false). Unknown profile ⇒ default.
+      const rec =
+        capabilityRunManager.get(req.run_id) ??
+        (await capabilityRunManager.adopt(req.run_id, { notifyOnAdopt: false }));
+      const alive = await agentBoxManager.getAsync(req.run_id, rec?.profile);
+      if (!alive) {
+        const empty: CapabilityTestSessionsResponse = { run_id: req.run_id, sessions: [] };
+        return empty;
+      }
+      client = new AgentBoxClient(alive.endpoint, 30000, agentBoxTlsOptions);
+    }
+    const listed = await client.getJson<{ sessions: CapabilityTestSessionSummary[] }>("/test-sessions");
+    // Scope to THIS run: a SHARED box (SICLAW_COMPILE_BOX_ENDPOINT) hosts test
+    // sessions for multiple parent runs, and one run must never see (or reap)
+    // another's. Double protection with the consumer's own ParentRunID check.
+    const response: CapabilityTestSessionsResponse = {
+      run_id: req.run_id,
+      sessions: (listed.sessions ?? []).filter((s) => s.parent_run_id === req.run_id),
     };
     return response;
   });

@@ -1,0 +1,10 @@
+[
+  {
+    "pattern": "excluded-doc.md",
+    "reason": "superseded draft, not compiled"
+  },
+  {
+    "pattern": "assets/orphan-excluded.png",
+    "reason": "upload residue, embedded by no document"
+  }
+]
