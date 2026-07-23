@@ -573,7 +573,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // because the consumer had a transient fetch failure would destroy the
           // in-flight turn that shutdown()/adopt are specifically preserving.
           if (created) {
-            void agentBoxManager.stop(runId).catch((stopErr) =>
+            void agentBoxManager.stop(runId, profile).catch((stopErr) =>
               console.error(
                 `[capability] stop new box after setup failure run=${runId}:`,
                 stopErr instanceof Error ? stopErr.message : String(stopErr),
@@ -601,7 +601,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             // running pod + cert Secret forever (audit finding; the crash
             // path was covered piecemeal before, this owns both). stop() is
             // 404-tolerant, so the idle-reap double-stop stays quiet.
-            void agentBoxManager.stop(runId).catch((stopErr) =>
+            void agentBoxManager.stop(runId, profile).catch((stopErr) =>
               console.error(
                 `[capability] stop box after relay close run=${runId}:`,
                 stopErr instanceof Error ? stopErr.message : String(stopErr),
@@ -820,7 +820,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // other failure is uncertain cleanup and must reach the consumer; claiming
     // success here would let callers mistake a live box for a completed stop.
     try {
-      await agentBoxManager.stop(runId);
+      // Target the run's own pod-name prefix — a compile box is "kbc-box-<id>",
+      // not "agentbox-<id>". rec was just resolved above (get ?? adopt); an
+      // absent profile falls back to the default prefix.
+      await agentBoxManager.stop(runId, rec?.profile);
     } catch (err) {
       console.error(
         `[capability] cancel: stop box run=${runId} failed:`,
@@ -1003,7 +1006,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (localCapabilityBoxEndpoint) {
       client = new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
     } else {
-      const alive = await agentBoxManager.getAsync(req.run_id);
+      // getAsync computes the pod name from the run's PROFILE prefix (a compile
+      // box is "kbc-box-<id>", a chat box "agentbox-<id>"), so it must be told
+      // the profile or it looks up the wrong pod and reports a live session as
+      // already-closed. The in-memory run may be gone after a Runtime restart —
+      // recover its profile from the consumer store WITHOUT reattaching a relay
+      // (notifyOnAdopt:false) or spawning a box. Unknown profile ⇒ default prefix.
+      const rec =
+        capabilityRunManager.get(req.run_id) ??
+        (await capabilityRunManager.adopt(req.run_id, { notifyOnAdopt: false }));
+      const alive = await agentBoxManager.getAsync(req.run_id, rec?.profile);
       if (!alive) {
         const response: CapabilityTestCloseResponse = {
           ok: true,
@@ -1037,7 +1049,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (localCapabilityBoxEndpoint) {
       client = new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
     } else {
-      const alive = await agentBoxManager.getAsync(req.run_id);
+      // Same profile-aware discovery as testClose: getAsync needs the run's
+      // profile to build the right pod-name prefix (kbc-box-<id> for a compile
+      // box). Recover it from the store when memory-cold — never spawning a box
+      // or reattaching a relay (notifyOnAdopt:false). Unknown profile ⇒ default.
+      const rec =
+        capabilityRunManager.get(req.run_id) ??
+        (await capabilityRunManager.adopt(req.run_id, { notifyOnAdopt: false }));
+      const alive = await agentBoxManager.getAsync(req.run_id, rec?.profile);
       if (!alive) {
         const empty: CapabilityTestSessionsResponse = { run_id: req.run_id, sessions: [] };
         return empty;
