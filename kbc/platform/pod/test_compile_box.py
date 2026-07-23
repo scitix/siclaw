@@ -6,6 +6,7 @@
 """
 import asyncio
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -13,6 +14,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -826,7 +828,13 @@ async def test_open_close_test_session_http():
         # concurrency cap → 429 (deterministic: a non-done stub occupies the only slot)
         os.environ["KBC_MAX_TEST_SESSIONS"] = "1"
         compile_box.TEST_SESSIONS["busy"] = compile_box.TestRun("busy", "/tmp/x", "p1", "h")
-        assert (await client.post("/test-session/p1")).status == 429
+        capped = await client.post("/test-session/p1")
+        assert capped.status == 429
+        # structured error so the runtime maps a stable code + retriable=false
+        err = (await capped.json())["error"]
+        assert err["code"] == compile_box.TEST_SESSION_LIMIT_ERROR_CODE, err
+        assert err["retriable"] is False, err
+        assert "too many concurrent test session" in err["message"], err
         compile_box.TEST_SESSIONS.clear()
         os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
 
@@ -876,6 +884,101 @@ async def test_open_close_test_session_http():
         os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
         shutil.rmtree(snap_root, ignore_errors=True)
     print("✓ open/close test session over HTTP (snapshot pinned, cap, teardown)")
+
+
+class _AliveFakeClient:
+    """A test-session SDK stand-in that connects and then BLOCKS in receive
+    (emits nothing, session stays live / not-done) until disconnect. The default
+    _FakeSDKClient self-completes almost immediately, which would race the
+    idempotency replay against the session going done — this keeps it live so the
+    replay deterministically hits an active session."""
+
+    def __init__(self, options=None):
+        self.options = options
+        self._closed = asyncio.Event()
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        pass
+
+    async def receive_messages(self):
+        await self._closed.wait()
+        return
+        yield  # unreachable; makes this an async generator
+
+    async def disconnect(self):
+        self._closed.set()
+
+
+async def test_open_test_session_idempotency():
+    """A retried testStart (same client_request_id) returns the SAME live session —
+    same tid/snapshot_hash/pages, flagged idempotent_replay, no new session, no new
+    concurrency slot. A different key opens a new session. Teardown drops the key
+    so a later same-key open starts fresh (never replays a dead tid)."""
+    orig = compile_box.ClaudeSDKClient
+    compile_box.ClaudeSDKClient = _AliveFakeClient
+    compile_box.RUNS.clear()
+    compile_box.TEST_SESSIONS.clear()
+    compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+    snap_root = tempfile.mkdtemp()
+    os.environ["KBC_TEST_SNAPSHOT_ROOT"] = snap_root
+    os.environ["KBC_MAX_TEST_SESSIONS"] = "10"  # exercise idempotency, not the cap
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+
+    async def active():
+        return sum(1 for t in compile_box.TEST_SESSIONS.values() if not t.done)
+
+    try:
+        wd = tempfile.mkdtemp()
+        cand = Path(wd) / "candidate"
+        cand.mkdir()
+        (cand / "index.md").write_text("# index\n")
+        compile_box.RUNS["p1"] = compile_box.CompileRun("p1", wd, 1)
+
+        # first open with a key → a fresh session (idempotent_replay False)
+        b1 = await (await client.post("/test-session/p1", json={"client_request_id": "k-1"})).json()
+        tid1 = b1["test_session_id"]
+        assert b1["idempotent_replay"] is False, b1
+        n1 = await active()
+
+        # retry SAME key → same tid + snapshot_hash + pages, replay flagged, count unchanged
+        b2 = await (await client.post("/test-session/p1", json={"client_request_id": "k-1"})).json()
+        assert b2["test_session_id"] == tid1, (b1, b2)
+        assert b2["snapshot_hash"] == b1["snapshot_hash"] and b2["pages"] == b1["pages"], (b1, b2)
+        assert b2["idempotent_replay"] is True, b2
+        assert await active() == n1, "replay must not consume a new slot"
+        assert len(compile_box.TEST_SESSIONS) == 1, compile_box.TEST_SESSIONS
+
+        # a DIFFERENT key opens a new session
+        b3 = await (await client.post("/test-session/p1", json={"client_request_id": "k-2"})).json()
+        assert b3["test_session_id"] != tid1 and len(compile_box.TEST_SESSIONS) == 2
+
+        # teardown drops the key → the same key opens FRESH afterwards (no dead replay)
+        assert (await client.post(f"/test-session/{tid1}/close")).status == 200
+        assert "k-1" not in compile_box.TEST_SESSION_IDEMPOTENCY, compile_box.TEST_SESSION_IDEMPOTENCY
+        b4 = await (await client.post("/test-session/p1", json={"client_request_id": "k-1"})).json()
+        assert b4["test_session_id"] != tid1 and b4["idempotent_replay"] is False, b4
+
+        # no-key opens are never deduped (old-consumer behavior unchanged)
+        b5 = await (await client.post("/test-session/p1")).json()
+        b6 = await (await client.post("/test-session/p1")).json()
+        assert b5["test_session_id"] != b6["test_session_id"], (b5, b6)
+
+        for t in list(compile_box.TEST_SESSIONS.keys()):
+            await client.post(f"/test-session/{t}/close")
+    finally:
+        await client.close()
+        compile_box.ClaudeSDKClient = orig
+        compile_box.RUNS.clear()
+        compile_box.TEST_SESSIONS.clear()
+        compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+        os.environ.pop("KBC_TEST_SNAPSHOT_ROOT", None)
+        os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
+        shutil.rmtree(snap_root, ignore_errors=True)
+    print("✓ test-session open is idempotent per key (same tid, no new slot, replay flagged)")
 
 
 async def test_test_message_path():
@@ -951,6 +1054,169 @@ async def test_test_session_step_frames():
         assert all(e["type"] != "step" for e in evs), evs
         assert any(e["type"] == "log" for e in evs), evs
     print("✓ test-session step frames (retrieval trace); compile runs unaffected")
+
+
+class _TestStallFake:
+    """First query black-holes (receive blocks on a gate) so the watchdog must
+    reap it; interrupt() yields the torn-down ResultMessage. A SECOND query
+    produces a real answer then closes → proves the session stayed live after the
+    reap (the whole point of defect 1: recover the UI without killing the session)."""
+
+    def __init__(self):
+        self.queries = []
+        self.interrupts = 0
+        self._gate = asyncio.Event()
+        self._mode = "idle"
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if len(self.queries) == 1:
+            self._mode = "blackhole"          # no gate set → receive blocks (the wedge)
+        else:
+            self._mode = "produce"
+            self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1
+        self._mode = "interrupted"
+        self._gate.set()
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if self._mode == "interrupted":
+                yield ResultMessage()             # the reaped attempt ends
+            elif self._mode == "produce":
+                yield AssistantMessage("RoCE is a transport")
+                yield ResultMessage()
+                self._closed = True
+                return
+
+    async def disconnect(self):
+        self._closed = True
+
+
+async def test_test_session_stall_reaps_turn_keeps_session_live():
+    """Defect 1: a black-holed test turn used to hang the UI on "思考中" forever —
+    the test path had no stall watchdog. Now a wedged turn is reaped (interrupt +
+    turn-level error + turn_done so the UI goes idle), and the session stays live:
+    a fresh question after the stall still gets a real answer. Also asserts the
+    turn.stalled / turn.done stdout lines carry tid+parent and NO user content."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    buf = io.StringIO()
+    fake = _TestStallFake()
+    try:
+        with tempfile.TemporaryDirectory() as snap, contextlib.redirect_stdout(buf):
+            run = compile_box.TestRun("t-stall", snap, parent_run_id="p-stall", snapshot_hash="h")
+            run.client = fake
+            run.connected.set()
+            wdog = asyncio.create_task(compile_box._test_stall_watchdog(run))
+            consume = asyncio.create_task(compile_box._consume_test_turn_stream(run, fake))
+            try:
+                # turn 1 → black-holed; the watchdog must interrupt/reap it
+                compile_box._arm_test_turn(run)
+                await fake.query("what is roce?")
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and fake.interrupts == 0:
+                    await asyncio.sleep(0.02)
+                assert fake.interrupts == 1, fake.interrupts
+                # turn 2 → the SAME live session answers a fresh question
+                compile_box._arm_test_turn(run)
+                await fake.query("again")
+                await asyncio.wait_for(consume, timeout=3)
+            finally:
+                run.done = True
+                wdog.cancel()
+                try:
+                    await wdog
+                except asyncio.CancelledError:
+                    pass
+        evs = _drain(run)
+        types = [e["type"] for e in evs]
+        assert "turn_stalled" in types and "error" in types and "turn_done" in types, types
+        td = next(e for e in evs if e["type"] == "turn_done")
+        assert "timed out" in td["text"], td       # UI-facing timeout wording (en default)
+        # the post-stall question produced a real answer → session stayed usable
+        assert any(e["type"] == "log" and "RoCE" in e.get("text", "") for e in evs), evs
+        assert fake.queries == ["what is roce?", "again"], fake.queries
+        out = buf.getvalue()
+        assert "turn.stalled tid=t-stall parent=p-stall" in out, out
+        assert "turn.done tid=t-stall parent=p-stall" in out, out
+        assert "roce" not in out.lower(), out    # never leak the question text to stdout
+    finally:
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S) = saved
+    print("✓ test-session stall watchdog reaps a wedged turn and keeps the session live")
+
+
+async def test_test_session_idle_ttl_reaper():
+    """Defect 2 (TTL): a test session idle past KBC_TEST_SESSION_IDLE_TTL_S is torn
+    down by the periodic sweep — the snapshot dir + registry slot are freed and a
+    ttl.reap stdout line fires. A recently-active session is left alone."""
+    compile_box.TEST_SESSIONS.clear()
+    saved = compile_box._TEST_SESSION_IDLE_TTL_S
+    compile_box._TEST_SESSION_IDLE_TTL_S = 100.0
+    buf = io.StringIO()
+    stale_dir = tempfile.mkdtemp()
+    fresh_dir = tempfile.mkdtemp()
+    try:
+        stale = compile_box.TestRun("t-stale", stale_dir, parent_run_id="p-ttl", snapshot_hash="h")
+        stale._last_activity_monotonic = time.monotonic() - 500.0   # idle > TTL
+        fresh = compile_box.TestRun("t-fresh", fresh_dir, parent_run_id="p-ttl", snapshot_hash="h")
+        compile_box._touch_test_activity(fresh)                     # just active
+        compile_box.TEST_SESSIONS["t-stale"] = stale
+        compile_box.TEST_SESSIONS["t-fresh"] = fresh
+        with contextlib.redirect_stdout(buf):
+            reaped = await compile_box._reap_idle_test_sessions()
+        assert reaped == 1, reaped
+        assert "t-stale" not in compile_box.TEST_SESSIONS, compile_box.TEST_SESSIONS
+        assert "t-fresh" in compile_box.TEST_SESSIONS
+        assert not Path(stale_dir).exists(), "stale snapshot dir not dropped"
+        # the reaped session got a close (summary) event before teardown emitted end
+        se = [stale.events.get_nowait() for _ in range(stale.events.qsize())]
+        assert any(e["type"] == "summary" for e in se), se
+        out = buf.getvalue()
+        assert "ttl.reap tid=t-stale parent=p-ttl" in out, out
+        assert "test.close tid=t-stale parent=p-ttl" in out, out
+    finally:
+        compile_box._TEST_SESSION_IDLE_TTL_S = saved
+        compile_box.TEST_SESSIONS.clear()
+        shutil.rmtree(stale_dir, ignore_errors=True)
+        shutil.rmtree(fresh_dir, ignore_errors=True)
+    print("✓ test-session idle-TTL reaper drops orphans, spares active sessions")
+
+
+async def test_list_test_sessions_endpoint():
+    """Defect 2 (list): GET /test-sessions returns the agreed sicore wire contract
+    exactly — tid / parent_run_id / created_at / last_activity_at / done — one row
+    per live session."""
+    compile_box.TEST_SESSIONS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        empty = await (await client.get("/test-sessions")).json()
+        assert empty == {"sessions": []}, empty
+
+        run = compile_box.TestRun("tl1", "/tmp", parent_run_id="pl1", snapshot_hash="h")
+        run.done = False
+        compile_box.TEST_SESSIONS["tl1"] = run
+        body = await (await client.get("/test-sessions")).json()
+        assert list(body.keys()) == ["sessions"], body
+        assert len(body["sessions"]) == 1, body
+        row = body["sessions"][0]
+        assert set(row.keys()) == {"tid", "parent_run_id", "created_at", "last_activity_at", "done"}, row
+        assert row["tid"] == "tl1" and row["parent_run_id"] == "pl1" and row["done"] is False, row
+        assert row["created_at"].endswith("Z") and row["last_activity_at"].endswith("Z"), row
+    finally:
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+    print("✓ GET /test-sessions lists live sessions in the agreed wire contract")
 
 
 async def test_explicit_test_recommendation_http():
@@ -3905,8 +4171,12 @@ async def main():
     await test_test_session_driver_readonly()
     await test_test_session_driver_uses_captured_contract()
     await test_open_close_test_session_http()
+    await test_open_test_session_idempotency()
     await test_test_message_path()
     await test_test_session_step_frames()
+    await test_test_session_stall_reaps_turn_keeps_session_live()
+    await test_test_session_idle_ttl_reaper()
+    await test_list_test_sessions_endpoint()
     await test_explicit_test_recommendation_http()
     await test_reference_assist_http_and_validation()
     await test_reference_assist_driver_is_fast_isolated_and_structured()

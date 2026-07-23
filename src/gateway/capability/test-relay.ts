@@ -40,6 +40,19 @@ export interface DriveTestSessionOptions {
 }
 
 /**
+ * Whether the runtime should start a test-event relay for a just-returned
+ * testStart. An idempotent replay reuses an ALREADY-relayed session — the box's
+ * /test-events is single-consumer, so a second relay would split the frame
+ * stream — so a replay must NOT be relayed again. A fresh open (or an older box
+ * that omits the flag) IS relayed. Extracted as a pure predicate so this
+ * rare-and-subtle replay branch stays regression-proof if the testStart handler
+ * is later refactored (a dropped inline guard would silently split streams).
+ */
+export function shouldRelayTestSession(opened: { idempotent_replay?: boolean }): boolean {
+  return !opened.idempotent_replay;
+}
+
+/**
  * Relay the test-session event stream until the box closes it (`end`, emitted
  * on teardown/close). Errors propagate to the caller — which only logs: a dead
  * test relay is disposable, never a run failure.

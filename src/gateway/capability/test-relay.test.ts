@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { driveTestSession } from "./test-relay.js";
+import { driveTestSession, shouldRelayTestSession } from "./test-relay.js";
 import type { AgentBoxClient } from "../agentbox/client.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import type { CapabilityEventFrame } from "./contract.js";
@@ -85,5 +85,19 @@ describe("driveTestSession", () => {
     // persistArtifact / persistRunState) must never be touched by a test relay.
     expect(requests).toEqual([]);
     expect(emitted).toHaveLength(2);
+  });
+});
+
+describe("shouldRelayTestSession", () => {
+  it("does NOT relay an idempotent replay (already-relayed, single-consumer stream)", () => {
+    expect(shouldRelayTestSession({ idempotent_replay: true })).toBe(false);
+  });
+
+  it("relays a freshly-opened session", () => {
+    expect(shouldRelayTestSession({ idempotent_replay: false })).toBe(true);
+  });
+
+  it("relays when the flag is absent (older box that omits it)", () => {
+    expect(shouldRelayTestSession({})).toBe(true);
   });
 });
