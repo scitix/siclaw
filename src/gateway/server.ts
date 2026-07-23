@@ -474,7 +474,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // terminal mark, so the store and the cluster agree. Local escape-hatch boxes
     // aren't managed by the spawner — stop() is a no-op/404 there, hence catch.
     onReap: async (rec) => {
-      await agentBoxManager.stop(rec.runId).catch((err) => {
+      // Pass the run's profile so the manager targets the right pod name — a
+      // compile box is "kbc-box-<id>", not "agentbox-<id>"; a mismatched name
+      // would 404 and leak the pod instead of reaping it.
+      await agentBoxManager.stop(rec.runId, rec.profile).catch((err) => {
         console.warn(`[capability] reap: stopping box ${rec.runId} failed:`, err instanceof Error ? err.message : String(err));
       });
     },
@@ -487,7 +490,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     onAdopt: (rec) => {
       void (async () => {
         try {
-          const alive = await agentBoxManager.getAsync(rec.runId);
+          const alive = await agentBoxManager.getAsync(rec.runId, rec.profile);
           if (!alive) return;
           await ensureCapabilitySession(rec.runId, rec.profile, rec.orgId || undefined, undefined);
           console.log(`[capability] re-attached relay to live box for recovered run ${rec.runId}`);
@@ -604,7 +607,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // Fallback only (label-less debris hands us a pod name): strip the pod
     // prefix. That inversion is exact only for minted lowercase-UUID run ids —
     // which is why the label, not this strip, is the primary channel (review).
-    const runId = runRef.startsWith("agentbox-") ? runRef.slice("agentbox-".length) : runRef;
+    // A compile box carries the "kbc-box-" prefix, others "agentbox-".
+    const runId = runRef.startsWith("kbc-box-")
+      ? runRef.slice("kbc-box-".length)
+      : runRef.startsWith("agentbox-")
+        ? runRef.slice("agentbox-".length)
+        : runRef;
     const rec = capabilityRunManager.get(runId);
     if (rec) return !isTerminalCapabilityStatus(rec.status);
     // Memory miss ≠ dead. Boot recovery can race the consumer (the exact

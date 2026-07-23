@@ -196,13 +196,13 @@ agentbox:
   debugImage: ""
   # KB compile capability (kb-compile / kb-test boxes; built from this repo's
   # kbc/, ships with every release via `make docker`). The RELEASE-COUPLED
-  # switch: true ⇒ the runtime spawns {image.registry}/kbc-compile-box:{image.tag}
+  # switch: true ⇒ the runtime spawns {image.registry}/siclaw-kbc-box:{image.tag}
   # — same registry/tag convention as every other component. false + no
   # override ⇒ KB stays dark (fail-closed; compile attempts error, chat
   # unaffected).
   compileBoxEnabled: false
   # Full-image override (implies enabled): hot-fix the compile brain
-  # independently of a release, e.g. "registry/.../kbc-compile-box:main-<sha>".
+  # independently of a release, e.g. "registry/.../siclaw-kbc-box:main-<sha>".
   compileBoxImage: ""
   # Node selector applied to every spawned AgentBox pod. Constrains pods to
   # nodes carrying all of these labels (e.g. { disktype: ssd, pool: agents }).

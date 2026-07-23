@@ -20,7 +20,7 @@ CLI env, TEST sessions always keep true streaming for interactive UX, the
 codex/OpenAI route is untouched, and KBC_DESTREAM=0/off is the operator
 escape hatch (e.g. once the gateway ships cross-chunk incremental decoding).
 Blast radius is this container image only: the shim binds 127.0.0.1 inside
-the kbc-compile-box pod; runtime/agentbox/sicore LLM callers never see it.
+the siclaw-kbc-box pod; runtime/agentbox/sicore LLM callers never see it.
 """
 
 from __future__ import annotations

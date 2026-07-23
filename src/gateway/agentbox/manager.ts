@@ -11,6 +11,7 @@
 
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
+import { getBoxProfile } from "./box-profile.js";
 
 export interface AgentBoxManagerConfig {
   /** Health check interval (ms) — local dev only */
@@ -130,10 +131,20 @@ export class AgentBoxManager {
   /**
    * Pod / box name. One pod per agent — we trim agentId to keep under the 63-char
    * K8s name limit and only sanitize forbidden characters.
+   *
+   * The prefix is profile-derived and MUST match K8sSpawner.podName (compile
+   * boxes are "kbc-box-", everything else "agentbox-"): the manager looks a pod
+   * up by this computed name for warm reuse, liveness and stop, so a mismatch
+   * would miss the real pod (a leaked box on stop, a missed re-attach on adopt).
    */
-  private podName(agentId: string): string {
+  private podName(agentId: string, prefix = "agentbox"): string {
     const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
-    return `agentbox-${sanitized}`;
+    return `${prefix}-${sanitized}`;
+  }
+
+  /** Pod-name prefix a profile spawns under (see K8sSpawner / BoxProfile.podNamePrefix). */
+  private prefixForProfile(profile: string | undefined): string {
+    return getBoxProfile(profile).podNamePrefix ?? "agentbox";
   }
 
   private async runHealthCheck(): Promise<void> {
@@ -187,8 +198,8 @@ export class AgentBoxManager {
     agentId: string,
     config?: Partial<AgentBoxConfig>,
   ): Promise<AgentBoxAcquisition> {
-    const name = this.podName(agentId);
     const wantProfile = config?.profile ?? "agent";
+    const name = this.podName(agentId, this.prefixForProfile(wantProfile));
 
     const info = await this.spawner.get(name);
     if (info && info.status === "running" && info.endpoint && this.isCertFresh(info)) {
@@ -303,9 +314,9 @@ export class AgentBoxManager {
     return undefined;
   }
 
-  async getAsync(agentId: string): Promise<AgentBoxHandle | undefined> {
+  async getAsync(agentId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
     if (this.isK8s) {
-      const name = this.podName(agentId);
+      const name = this.podName(agentId, this.prefixForProfile(profile));
       const info = await this.spawner.get(name);
       if (info && info.status === "running" && info.endpoint) {
         return { boxId: name, endpoint: info.endpoint, agentId };
@@ -315,9 +326,9 @@ export class AgentBoxManager {
     return this.get(agentId);
   }
 
-  async stop(agentId: string): Promise<void> {
+  async stop(agentId: string, profile?: string): Promise<void> {
     if (this.isK8s) {
-      const name = this.podName(agentId);
+      const name = this.podName(agentId, this.prefixForProfile(profile));
       console.log(`[agentbox-manager] Stopping AgentBox ${name}`);
       await this.spawner.stop(name);
       return;

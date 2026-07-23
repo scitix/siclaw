@@ -104,10 +104,40 @@ export class K8sSpawner implements BoxSpawner {
    * Generate Pod name — keyed on agentId only (one pod per agent, shared
    * across callers). Sanitized to the K8s name charset and capped so the
    * full name stays under 63 chars.
+   *
+   * The prefix comes from the BoxProfile (default "agentbox"; compile boxes use
+   * "kbc-box"). Both prefixes are ≤ 8 chars, so the 50-char agentId cap keeps the
+   * full name well under 63.
    */
-  private podName(agentId: string): string {
+  private podName(agentId: string, prefix = "agentbox"): string {
     const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
-    return `agentbox-${sanitized}`;
+    return `${prefix}-${sanitized}`;
+  }
+
+  /**
+   * Upgrade migration: reap a pod left under the OLD "agentbox-" name for a
+   * profile that now spawns under a different prefix (e.g. "kbc-box-"). Deletes
+   * the pod and its cert Secret, then waits for it to disappear so the agent
+   * never has two live boxes across the rename.
+   *
+   * Guard: only a compile box (boxType label "kb-compile*") is reaped. A chat
+   * box (boxType "agent") keeps the "agentbox-" name and owns its own lifecycle;
+   * it must never be touched even if it happens to share this agentId. A missing
+   * legacy pod (404) is the normal post-migration steady state → no-op.
+   */
+  private async reapRenamedLegacyPod(legacyName: string, namespace: string, labelPrefix: string): Promise<void> {
+    let existing: k8s.V1Pod;
+    try {
+      existing = await this.coreApi.readNamespacedPod({ name: legacyName, namespace });
+    } catch (err: any) {
+      if (err.code === 404 || err.statusCode === 404) return;
+      throw err;
+    }
+    const boxType = existing.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent";
+    if (!boxType.startsWith("kb-compile")) return;
+    console.log(`[k8s-spawner] Reaping legacy-named pod ${legacyName} (boxType=${boxType}) superseded by renamed prefix`);
+    await this.stop(legacyName); // deletes pod + cert Secret, 404-tolerant
+    await this.waitForPodDeleted(legacyName, namespace);
   }
 
   private gatewayUrl(namespace: string): string {
@@ -137,10 +167,21 @@ export class K8sSpawner implements BoxSpawner {
     const image = boxConfig.image ?? profile.image ?? this.config.image;
     const agentId = boxConfig.agentId;
     if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
-    const podName = this.podName(agentId);
+    const podPrefix = profile.podNamePrefix ?? "agentbox";
+    const podName = this.podName(agentId, podPrefix);
     const orgId = boxConfig.orgId || "";
 
     console.log(`[k8s-spawner] Creating pod: ${podName} for agent: ${agentId}`);
+
+    // Upgrade compatibility: a profile that carries a non-default pod prefix used
+    // to spawn under the "agentbox-" name. After the rename, the spawner looks up
+    // (and reuses) the NEW name only, so a pre-upgrade pod under the old name would
+    // leak — two boxes for one agent, the old one never reaped. Reap the stale
+    // old-named pod (+ its cert Secret) first, but only when it is a compile box
+    // (boxType "kb-compile*") — never a chat box that merely shares the agentId.
+    if (podPrefix !== "agentbox") {
+      await this.reapRenamedLegacyPod(this.podName(agentId, "agentbox"), namespace, labelPrefix);
+    }
 
     // Stamp the pod + its cert Secret with the CA fingerprint. The runtime uses
     // it to detect pods whose mTLS cert was signed by a rotated CA (those can no
