@@ -886,6 +886,101 @@ async def test_open_close_test_session_http():
     print("✓ open/close test session over HTTP (snapshot pinned, cap, teardown)")
 
 
+class _AliveFakeClient:
+    """A test-session SDK stand-in that connects and then BLOCKS in receive
+    (emits nothing, session stays live / not-done) until disconnect. The default
+    _FakeSDKClient self-completes almost immediately, which would race the
+    idempotency replay against the session going done — this keeps it live so the
+    replay deterministically hits an active session."""
+
+    def __init__(self, options=None):
+        self.options = options
+        self._closed = asyncio.Event()
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        pass
+
+    async def receive_messages(self):
+        await self._closed.wait()
+        return
+        yield  # unreachable; makes this an async generator
+
+    async def disconnect(self):
+        self._closed.set()
+
+
+async def test_open_test_session_idempotency():
+    """A retried testStart (same idempotency_key) returns the SAME live session —
+    same tid/snapshot_hash/pages, flagged idempotent_replay, no new session, no new
+    concurrency slot. A different key opens a new session. Teardown drops the key
+    so a later same-key open starts fresh (never replays a dead tid)."""
+    orig = compile_box.ClaudeSDKClient
+    compile_box.ClaudeSDKClient = _AliveFakeClient
+    compile_box.RUNS.clear()
+    compile_box.TEST_SESSIONS.clear()
+    compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+    snap_root = tempfile.mkdtemp()
+    os.environ["KBC_TEST_SNAPSHOT_ROOT"] = snap_root
+    os.environ["KBC_MAX_TEST_SESSIONS"] = "10"  # exercise idempotency, not the cap
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+
+    async def active():
+        return sum(1 for t in compile_box.TEST_SESSIONS.values() if not t.done)
+
+    try:
+        wd = tempfile.mkdtemp()
+        cand = Path(wd) / "candidate"
+        cand.mkdir()
+        (cand / "index.md").write_text("# index\n")
+        compile_box.RUNS["p1"] = compile_box.CompileRun("p1", wd, 1)
+
+        # first open with a key → a fresh session (idempotent_replay False)
+        b1 = await (await client.post("/test-session/p1", json={"idempotency_key": "k-1"})).json()
+        tid1 = b1["test_session_id"]
+        assert b1["idempotent_replay"] is False, b1
+        n1 = await active()
+
+        # retry SAME key → same tid + snapshot_hash + pages, replay flagged, count unchanged
+        b2 = await (await client.post("/test-session/p1", json={"idempotency_key": "k-1"})).json()
+        assert b2["test_session_id"] == tid1, (b1, b2)
+        assert b2["snapshot_hash"] == b1["snapshot_hash"] and b2["pages"] == b1["pages"], (b1, b2)
+        assert b2["idempotent_replay"] is True, b2
+        assert await active() == n1, "replay must not consume a new slot"
+        assert len(compile_box.TEST_SESSIONS) == 1, compile_box.TEST_SESSIONS
+
+        # a DIFFERENT key opens a new session
+        b3 = await (await client.post("/test-session/p1", json={"idempotency_key": "k-2"})).json()
+        assert b3["test_session_id"] != tid1 and len(compile_box.TEST_SESSIONS) == 2
+
+        # teardown drops the key → the same key opens FRESH afterwards (no dead replay)
+        assert (await client.post(f"/test-session/{tid1}/close")).status == 200
+        assert "k-1" not in compile_box.TEST_SESSION_IDEMPOTENCY, compile_box.TEST_SESSION_IDEMPOTENCY
+        b4 = await (await client.post("/test-session/p1", json={"idempotency_key": "k-1"})).json()
+        assert b4["test_session_id"] != tid1 and b4["idempotent_replay"] is False, b4
+
+        # no-key opens are never deduped (old-consumer behavior unchanged)
+        b5 = await (await client.post("/test-session/p1")).json()
+        b6 = await (await client.post("/test-session/p1")).json()
+        assert b5["test_session_id"] != b6["test_session_id"], (b5, b6)
+
+        for t in list(compile_box.TEST_SESSIONS.keys()):
+            await client.post(f"/test-session/{t}/close")
+    finally:
+        await client.close()
+        compile_box.ClaudeSDKClient = orig
+        compile_box.RUNS.clear()
+        compile_box.TEST_SESSIONS.clear()
+        compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+        os.environ.pop("KBC_TEST_SNAPSHOT_ROOT", None)
+        os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
+        shutil.rmtree(snap_root, ignore_errors=True)
+    print("✓ test-session open is idempotent per key (same tid, no new slot, replay flagged)")
+
+
 async def test_test_message_path():
     """/test-message injects a user turn into a LIVE test session (200 + query
     forwarded); an unknown test session → 404."""
@@ -4076,6 +4171,7 @@ async def main():
     await test_test_session_driver_readonly()
     await test_test_session_driver_uses_captured_contract()
     await test_open_close_test_session_http()
+    await test_open_test_session_idempotency()
     await test_test_message_path()
     await test_test_session_step_frames()
     await test_test_session_stall_reaps_turn_keeps_session_live()
