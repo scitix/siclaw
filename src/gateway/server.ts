@@ -28,7 +28,7 @@ import { getBoxProfile } from "./agentbox/box-profile.js";
 import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
-import { driveTestSession } from "./capability/test-relay.js";
+import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
 import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
@@ -44,6 +44,9 @@ import type {
   CapabilityTestReferenceAssistRequest,
   CapabilityTestReferenceAssistResponse,
   CapabilityTestMessageRequest,
+  CapabilityTestSessionsRequest,
+  CapabilityTestSessionsResponse,
+  CapabilityTestSessionSummary,
   CapabilityTestStartRequest,
   CapabilityTestStartResponse,
 } from "./capability/contract.js";
@@ -859,25 +862,33 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // Optional consumer-provided snapshot (e.g. a published version bundle);
       // absent → the box pins the run's candidate/ draft.
       ...(req.bundle_base64 ? { bundle_base64: req.bundle_base64, bundle_sha256: req.bundle_sha256 } : {}),
+      // Idempotency: a retried testStart (same client_request_id) returns the
+      // SAME live session instead of opening a second one — passed to the box.
+      ...(req.client_request_id ? { client_request_id: req.client_request_id } : {}),
     })) as {
       test_session_id: string;
       snapshot_hash: string;
       consumer_fingerprint: string;
       pages: number;
+      idempotent_replay?: boolean;
     };
-    driveTestSession({
-      client,
-      runId,
-      testSessionId: opened.test_session_id,
-      frontendClient,
-      touch: () => capabilityRunManager.touch(runId),
-    }).catch((err) => {
-      // A dead test relay is disposable — log, never fail the authoring run.
-      console.warn(
-        `[capability] test relay ended run=${runId} tid=${opened.test_session_id}:`,
-        err instanceof Error ? err.message : String(err),
-      );
-    });
+    // Only drive a freshly-opened session — an idempotent replay is already
+    // relayed, and the box's /test-events is single-consumer (see predicate).
+    if (shouldRelayTestSession(opened)) {
+      driveTestSession({
+        client,
+        runId,
+        testSessionId: opened.test_session_id,
+        frontendClient,
+        touch: () => capabilityRunManager.touch(runId),
+      }).catch((err) => {
+        // A dead test relay is disposable — log, never fail the authoring run.
+        console.warn(
+          `[capability] test relay ended run=${runId} tid=${opened.test_session_id}:`,
+          err instanceof Error ? err.message : String(err),
+        );
+      });
+    }
     const res: CapabilityTestStartResponse = {
       run_id: runId,
       test_session_id: opened.test_session_id,
@@ -1011,6 +1022,35 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       run_id: req.run_id,
       test_session_id: req.test_session_id,
       close_confirmed: true,
+    };
+    return response;
+  });
+
+  rpcMethods.set("capability.testSessions", async (params) => {
+    const req = params as unknown as CapabilityTestSessionsRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    // Read-only reconciliation: NEVER spawn/rehydrate a box just to list (mirrors
+    // testClose's box discovery). An absent/dead box has no live sessions → [].
+    // The box's GET /test-sessions rows are passed through verbatim (the `tid`
+    // wire field is load-bearing for the consumer — do not rename).
+    let client: AgentBoxClient;
+    if (localCapabilityBoxEndpoint) {
+      client = new AgentBoxClient(localCapabilityBoxEndpoint, 30000, agentBoxTlsOptions);
+    } else {
+      const alive = await agentBoxManager.getAsync(req.run_id);
+      if (!alive) {
+        const empty: CapabilityTestSessionsResponse = { run_id: req.run_id, sessions: [] };
+        return empty;
+      }
+      client = new AgentBoxClient(alive.endpoint, 30000, agentBoxTlsOptions);
+    }
+    const listed = await client.getJson<{ sessions: CapabilityTestSessionSummary[] }>("/test-sessions");
+    // Scope to THIS run: a SHARED box (SICLAW_COMPILE_BOX_ENDPOINT) hosts test
+    // sessions for multiple parent runs, and one run must never see (or reap)
+    // another's. Double protection with the consumer's own ParentRunID check.
+    const response: CapabilityTestSessionsResponse = {
+      run_id: req.run_id,
+      sessions: (listed.sessions ?? []).filter((s) => s.parent_run_id === req.run_id),
     };
     return response;
   });
