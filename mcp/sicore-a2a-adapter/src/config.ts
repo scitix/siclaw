@@ -1,15 +1,31 @@
 import { readFileSync, statSync } from "node:fs";
 
+/** One named A2A key. `agentId` is set only when pinned via SICLAW_AGENT_ID on the single-key path. */
+export interface NamedKey {
+  alias: string;
+  apiKey: string;
+  agentId?: string;
+}
+
 export interface AdapterConfig {
   baseUrl: string;
-  /** Absent when the agent should be resolved from the key via GET /api/v1/a2a/self. */
-  agentId?: string;
+  keys: NamedKey[];
+  requestTimeoutMs: number;
+  pollIntervalMs: number;
+}
+
+/** Per-key config handed to one SicoreA2aClient after its agent is resolved. */
+export interface ResolvedAdapterConfig {
+  baseUrl: string;
+  agentId: string;
   apiKey: string;
   requestTimeoutMs: number;
   pollIntervalMs: number;
 }
 
-export type ResolvedAdapterConfig = AdapterConfig & { agentId: string };
+export const ALIAS_PATTERN = "^[a-z0-9][a-z0-9_-]{0,31}$";
+const ALIAS_RE = new RegExp(ALIAS_PATTERN);
+const DEFAULT_ALIAS = "default";
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -84,7 +100,10 @@ function loadKeyFromFile(path: string): string {
   return key;
 }
 
-function loadApiKey(env: NodeJS.ProcessEnv): string {
+// The single-key form (SICLAW_A2A_KEY / SICLAW_A2A_KEY_FILE) is the original,
+// backward-compatible way to configure exactly one agent. It maps to the
+// reserved "default" alias so old configs keep working untouched.
+function loadSingleKey(env: NodeJS.ProcessEnv): string | undefined {
   const direct = env.SICLAW_A2A_KEY?.trim();
   const keyFile = env.SICLAW_A2A_KEY_FILE?.trim();
   if (direct && keyFile) {
@@ -92,18 +111,82 @@ function loadApiKey(env: NodeJS.ProcessEnv): string {
   }
   if (keyFile) return loadKeyFromFile(keyFile);
   if (direct) return direct;
-  throw new ConfigError("SICLAW_A2A_KEY or SICLAW_A2A_KEY_FILE is required");
+  return undefined;
+}
+
+function parseKeysJson(raw: string): Array<[string, string]> {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(raw);
+  } catch {
+    throw new ConfigError('SICLAW_A2A_KEYS must be a JSON object mapping alias to key, e.g. {"sre":"sk-..."}');
+  }
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+    throw new ConfigError('SICLAW_A2A_KEYS must be a JSON object mapping alias to key, e.g. {"sre":"sk-..."}');
+  }
+  const entries: Array<[string, string]> = [];
+  for (const [alias, value] of Object.entries(obj)) {
+    if (typeof value !== "string" || !value.trim()) {
+      // Do not echo the value; a malformed key must never surface in an error.
+      throw new ConfigError(`SICLAW_A2A_KEYS["${alias}"] must be a non-empty string key`);
+    }
+    entries.push([alias, value.trim()]);
+  }
+  if (entries.length === 0) {
+    throw new ConfigError("SICLAW_A2A_KEYS must contain at least one alias");
+  }
+  return entries;
+}
+
+function loadKeys(env: NodeJS.ProcessEnv): NamedKey[] {
+  const single = loadSingleKey(env);
+  const multiRaw = env.SICLAW_A2A_KEYS?.trim();
+  const pinnedAgentId = env.SICLAW_AGENT_ID?.trim() || undefined;
+  if (pinnedAgentId && Buffer.byteLength(pinnedAgentId, "utf8") > 255) {
+    throw new ConfigError("SICLAW_AGENT_ID must be 255 bytes or less");
+  }
+
+  const byAlias = new Map<string, NamedKey>();
+
+  if (single !== undefined) {
+    // SICLAW_AGENT_ID only pins the default single key. Every SICLAW_A2A_KEYS
+    // entry resolves its own agent at startup, so pinning one id there is
+    // ambiguous and rejected below.
+    byAlias.set(DEFAULT_ALIAS, { alias: DEFAULT_ALIAS, apiKey: single, agentId: pinnedAgentId });
+  }
+
+  if (multiRaw) {
+    if (pinnedAgentId) {
+      throw new ConfigError(
+        "SICLAW_AGENT_ID cannot be combined with SICLAW_A2A_KEYS; each named key resolves its own agent",
+      );
+    }
+    for (const [alias, key] of parseKeysJson(multiRaw)) {
+      if (!ALIAS_RE.test(alias)) {
+        throw new ConfigError(`SICLAW_A2A_KEYS alias "${alias}" is invalid; must match ${ALIAS_PATTERN}`);
+      }
+      if (byAlias.has(alias)) {
+        // The only possible collision is with the "default" single key.
+        throw new ConfigError(
+          `SICLAW_A2A_KEYS alias "${alias}" collides with the single-key SICLAW_A2A_KEY/SICLAW_A2A_KEY_FILE (reserved as "default"); remove one`,
+        );
+      }
+      byAlias.set(alias, { alias, apiKey: key });
+    }
+  }
+
+  if (byAlias.size === 0) {
+    throw new ConfigError(
+      "Configure at least one key via SICLAW_A2A_KEYS, SICLAW_A2A_KEY, or SICLAW_A2A_KEY_FILE",
+    );
+  }
+  return [...byAlias.values()];
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdapterConfig {
-  const agentId = env.SICLAW_AGENT_ID?.trim() || undefined;
-  if (agentId && Buffer.byteLength(agentId, "utf8") > 255) {
-    throw new ConfigError("SICLAW_AGENT_ID must be 255 bytes or less");
-  }
   return {
     baseUrl: normalizeBaseUrl(required(env, "SICORE_URL")),
-    agentId,
-    apiKey: loadApiKey(env),
+    keys: loadKeys(env),
     requestTimeoutMs: parseBoundedInteger(env, "SICLAW_A2A_TIMEOUT_MS", 30_000, 1_000, 120_000),
     pollIntervalMs: parseBoundedInteger(env, "SICLAW_A2A_POLL_INTERVAL_MS", 3_000, 500, 5_000),
   };
