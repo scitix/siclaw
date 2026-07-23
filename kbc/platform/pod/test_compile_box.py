@@ -1155,6 +1155,184 @@ async def test_test_session_stall_reaps_turn_keeps_session_live():
     print("✓ test-session stall watchdog reaps a wedged turn and keeps the session live")
 
 
+_STREAM_STOP = object()
+
+
+class _QueuedFrameFake:
+    """A test-session SDK stand-in whose receive stream is fed one frame at a time
+    by the test via an asyncio.Queue. Unlike _TestStallFake's single _mode, this
+    lets a test enqueue a reaped turn's LATE frames (a partial + its torn-down
+    ResultMessage) AFTER the next turn is armed, reproducing the exact stall→reap→
+    immediate-new-query→late-frame race. connect/query record only; interrupt is
+    counted but injects no frame (the test controls when the reaped result lands)."""
+
+    def __init__(self):
+        self.queries = []
+        self.interrupts = 0
+        self._q: asyncio.Queue = asyncio.Queue()
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    def push(self, msg):
+        self._q.put_nowait(msg)
+
+    def close_stream(self):
+        self._q.put_nowait(_STREAM_STOP)
+
+    async def receive_messages(self):
+        while True:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self.close_stream()
+
+
+async def test_test_session_late_reaped_frames_never_terminate_new_turn():
+    """Race guard (per-turn generation): the stall watchdog frees the UI the instant
+    it reaps a wedged turn, so a new /test-message can arm the NEXT turn before the
+    reaped turn's straggler frames (a partial + its interrupted ResultMessage) drain
+    from the stream. Those stale frames must be dropped (logged), never fold into or
+    terminate the freshly-armed turn — the new answer must complete on its OWN result.
+    Drives the real watchdog for the reap, then injects the late frames deterministically."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    buf = io.StringIO()
+    fake = _QueuedFrameFake()
+    try:
+        with tempfile.TemporaryDirectory() as snap, contextlib.redirect_stdout(buf):
+            run = compile_box.TestRun("t-race", snap, parent_run_id="p-race", snapshot_hash="h")
+            run.client = fake
+            run.connected.set()
+            wdog = asyncio.create_task(compile_box._test_stall_watchdog(run))
+            consume = asyncio.create_task(compile_box._consume_test_turn_stream(run, fake))
+            try:
+                # turn 1 (gen 1) black-holes (no frames pushed) → the watchdog reaps
+                # it: turn_done frees the UI, _stall_reaped set, interrupt() fired.
+                compile_box._arm_test_turn(run)
+                await fake.query("first question (black-holed)")
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and fake.interrupts == 0:
+                    await asyncio.sleep(0.02)
+                assert fake.interrupts == 1, fake.interrupts
+                assert run._turn_generation == 1 and run._stall_reaped, run._turn_generation
+                # the reap is done; stop the watchdog so turn 2's controlled
+                # injection can't be spuriously reaped by idle timing.
+                wdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wdog
+
+                # UI immediately asks the NEXT question → turn 2 (gen 2). This clears
+                # _stall_reaped, so ONLY the generation guard can protect turn 2.
+                compile_box._arm_test_turn(run)
+                await fake.query("second question (the real one)")
+                assert run._turn_generation == 2 and not run._stall_reaped
+
+                # NOW turn 1's stragglers arrive late — a partial then its torn-down
+                # ResultMessage. Both belong to gen 1 < armed gen 2 → dropped.
+                fake.push(AssistantMessage("stale text from the reaped turn"))
+                fake.push(ResultMessage())
+                drain_deadline = time.monotonic() + 3
+                while time.monotonic() < drain_deadline and run._results_seen < 1:
+                    await asyncio.sleep(0.01)
+                assert run._results_seen == 1, run._results_seen
+                # the late reaped result must NOT have terminated the live turn 2
+                assert run._turn_active is True, "a stale reaped frame terminated the new turn"
+
+                # turn 2's real answer completes the turn on its own result frame
+                fake.push(AssistantMessage("real answer for the second question"))
+                fake.push(ResultMessage())
+                fake.close_stream()
+                await asyncio.wait_for(consume, timeout=3)
+            finally:
+                run.done = True
+                wdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wdog
+        evs = _drain(run)
+        logs = [e["text"] for e in evs if e["type"] == "log"]
+        # the surviving turn answered with turn 2's text, never the reaped turn's
+        assert any("real answer for the second question" in t for t in logs), logs
+        assert not any("stale text from the reaped turn" in t for t in logs), logs
+        # exactly one clean turn_done carried turn 2's real answer (the reap emitted
+        # its own timeout turn_done earlier; turn 2 must not double- or mis-terminate)
+        clean_dones = [e for e in evs if e["type"] == "turn_done"
+                       and "real answer for the second question" in e.get("text", "")]
+        assert len(clean_dones) == 1, [e for e in evs if e["type"] == "turn_done"]
+        assert run._turn_active is False, run._turn_active
+        out = buf.getvalue()
+        # both reaped stragglers were dropped as stale and logged with tid+parent
+        assert out.count("turn.stale_frame_dropped tid=t-race parent=p-race") == 2, out
+        assert "answer" not in out.lower() and "question" not in out.lower(), out  # no content leak
+    finally:
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S) = saved
+    print("✓ test-session late reaped frames are dropped, never terminate the freshly-armed turn")
+
+
+async def test_open_test_session_idempotency_is_run_scoped():
+    """P1: the open-test dedup key is (parent_run_id, client_request_id). On a shared
+    box two runs that mint the SAME client_request_id must each open their OWN session
+    (no cross-run aliasing of tid/snapshot/fingerprint); the same key on the SAME run
+    still replays. Teardown drops only the run-scoped key."""
+    orig = compile_box.ClaudeSDKClient
+    compile_box.ClaudeSDKClient = _AliveFakeClient
+    compile_box.RUNS.clear()
+    compile_box.TEST_SESSIONS.clear()
+    compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+    snap_root = tempfile.mkdtemp()
+    os.environ["KBC_TEST_SNAPSHOT_ROOT"] = snap_root
+    os.environ["KBC_MAX_TEST_SESSIONS"] = "10"  # exercise idempotency, not the cap
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        for rid in ("p1", "p2"):
+            wd = tempfile.mkdtemp()
+            cand = Path(wd) / "candidate"
+            cand.mkdir()
+            (cand / "index.md").write_text(f"# index {rid}\n")
+            compile_box.RUNS[rid] = compile_box.CompileRun(rid, wd, 1)
+
+        # SAME client_request_id on TWO different runs → two DISTINCT fresh sessions
+        a = await (await client.post("/test-session/p1", json={"client_request_id": "shared"})).json()
+        b = await (await client.post("/test-session/p2", json={"client_request_id": "shared"})).json()
+        assert a["test_session_id"] != b["test_session_id"], (a, b)
+        assert a["idempotent_replay"] is False and b["idempotent_replay"] is False, (a, b)
+        assert len(compile_box.TEST_SESSIONS) == 2, compile_box.TEST_SESSIONS
+        # the two run-scoped keys coexist, each pointing at its own run's session
+        assert compile_box.TEST_SESSION_IDEMPOTENCY[("p1", "shared")] == a["test_session_id"]
+        assert compile_box.TEST_SESSION_IDEMPOTENCY[("p2", "shared")] == b["test_session_id"]
+
+        # same key + SAME run → replay of THAT run's session (never the other run's)
+        a2 = await (await client.post("/test-session/p1", json={"client_request_id": "shared"})).json()
+        assert a2["test_session_id"] == a["test_session_id"] and a2["idempotent_replay"] is True, (a, a2)
+        assert len(compile_box.TEST_SESSIONS) == 2, "replay must not open a new session"
+
+        for t in list(compile_box.TEST_SESSIONS.keys()):
+            await client.post(f"/test-session/{t}/close")
+        # teardown removed both run-scoped keys
+        assert compile_box.TEST_SESSION_IDEMPOTENCY == {}, compile_box.TEST_SESSION_IDEMPOTENCY
+    finally:
+        await client.close()
+        compile_box.ClaudeSDKClient = orig
+        compile_box.RUNS.clear()
+        compile_box.TEST_SESSIONS.clear()
+        compile_box.TEST_SESSION_IDEMPOTENCY.clear()
+        os.environ.pop("KBC_TEST_SNAPSHOT_ROOT", None)
+        os.environ.pop("KBC_MAX_TEST_SESSIONS", None)
+        shutil.rmtree(snap_root, ignore_errors=True)
+    print("✓ test-session idempotency is run-scoped (same key, different runs → distinct sessions)")
+
+
 async def test_test_session_idle_ttl_reaper():
     """Defect 2 (TTL): a test session idle past KBC_TEST_SESSION_IDLE_TTL_S is torn
     down by the periodic sweep — the snapshot dir + registry slot are freed and a
@@ -4172,9 +4350,11 @@ async def main():
     await test_test_session_driver_uses_captured_contract()
     await test_open_close_test_session_http()
     await test_open_test_session_idempotency()
+    await test_open_test_session_idempotency_is_run_scoped()
     await test_test_message_path()
     await test_test_session_step_frames()
     await test_test_session_stall_reaps_turn_keeps_session_live()
+    await test_test_session_late_reaped_frames_never_terminate_new_turn()
     await test_test_session_idle_ttl_reaper()
     await test_list_test_sessions_endpoint()
     await test_explicit_test_recommendation_http()

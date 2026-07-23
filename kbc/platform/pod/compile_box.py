@@ -101,11 +101,14 @@ RUNS: dict[str, "CompileRun"] = {}
 # Read-only "test session" runs — ephemeral consumer sessions over a pinned draft
 # snapshot (test sessions). Parallel to RUNS, torn down on close/idle. See TestRun.
 TEST_SESSIONS: dict[str, "TestRun"] = {}
-# Consumer-minted client_request_id → tid, for open-test-session retries. A
-# retried testStart (same key) must return the SAME live session, never a second
-# session or concurrency slot. Process-local; entries are cleared on teardown with
-# their session (a torn-down key opens fresh, so a stale mapping is never replayed).
-TEST_SESSION_IDEMPOTENCY: dict[str, str] = {}
+# (parent_run_id, consumer-minted client_request_id) → tid, for open-test-session
+# retries. A retried testStart (same run + key) must return the SAME live session,
+# never a second session or concurrency slot. The key is RUN-SCOPED: a box hosts
+# multiple runs, and two runs that happen to mint the same client_request_id must
+# NOT hand each other's tid/snapshot/fingerprint back. Process-local; entries are
+# cleared on teardown with their session (a torn-down key opens fresh, so a stale
+# mapping is never replayed).
+TEST_SESSION_IDEMPOTENCY: dict[tuple[str, str], str] = {}
 # One explicit red-team read-only review may inspect a run at a time. Test
 # recommendation and reference-answer assistance share this guard so two owner
 # actions cannot spend overlapping model calls against the same workspace.
@@ -279,6 +282,7 @@ def _arm_test_turn(run: "TestRun") -> None:
     run._turn_active = True
     run._tool_pending = False
     run._stall_reaped = False
+    run._turn_generation += 1   # supersede any reaped turn's late stragglers
     run._last_sdk_message_type = "query"
     run._last_model_activity = time.monotonic()
     _touch_test_activity(run)
@@ -521,6 +525,16 @@ class TestRun:
         # Set by the watchdog when it reaps a wedged turn; the receive loop then
         # discards the interrupted ResultMessage instead of announcing it.
         self._stall_reaped = False
+        # Per-turn generation, bumped every _arm_test_turn. After a stall reap the
+        # watchdog frees the UI immediately, so a new /test-message can arm the next
+        # turn BEFORE the reaped turn's straggler frames (partial text + its
+        # torn-down ResultMessage) drain from the stream. The receive loop tags each
+        # frame with the generation it belongs to (results stream in strict turn
+        # order) and drops any whose generation is below the armed one — so a late
+        # frame can never terminate or contaminate the current turn. _results_seen
+        # counts consumed ResultMessages; frame generation = _results_seen + 1.
+        self._turn_generation = 0
+        self._results_seen = 0
         # Snapshot page count (returned by open, replayed on an idempotent open).
         self.pages: int = 0
         # Consumer-minted client_request_id that opened this session (if any), so
@@ -4184,11 +4198,32 @@ async def _consume_test_turn_stream(run: "TestRun", client) -> None:
     the compile path there is NO retry: when the watchdog has reaped the turn,
     its ResultMessage is the torn-down attempt — discard it (the UI already got a
     turn_done from the watchdog) and stay live for the next /test-message. A real
-    ResultMessage ends the turn normally."""
+    ResultMessage ends the turn normally.
+
+    Frames stream in strict turn order (a query's frames — including its lone
+    ResultMessage — all precede the next query's), so a frame's generation is
+    `_results_seen + 1`. After a stall reap the watchdog frees the UI at once and
+    the next /test-message can arm a newer turn before the reaped turn's stragglers
+    drain; those below the armed generation are dropped so a late ResultMessage can
+    never terminate — nor a late partial contaminate — the current turn."""
     async for msg in client.receive_messages():
+        is_result = type(msg).__name__ == "ResultMessage"
+        frame_gen = run._results_seen + 1
+        if frame_gen < run._turn_generation:
+            # A superseded (reaped) turn's straggler. Drop it without touching the
+            # live turn's liveness/tool_pending — updating those from a stale frame
+            # would skew the watchdog's read of the current turn. A ResultMessage
+            # still advances _results_seen so the stream stays turn-aligned.
+            if is_result:
+                run._results_seen += 1
+            _print_test_lifecycle(
+                "turn.stale_frame_dropped", run,
+                extra=f"frame_gen={frame_gen} armed_gen={run._turn_generation} kind={type(msg).__name__}")
+            continue
         _note_model_activity(run, msg)   # SDK event == alive; flips tool_pending
         _touch_test_activity(run)        # any message is also TTL liveness
-        if type(msg).__name__ == "ResultMessage":
+        if is_result:
+            run._results_seen += 1
             if run._stall_reaped:
                 # The watchdog interrupted this turn and already emitted the
                 # turn-level error + turn_done. This is the reaped attempt's
@@ -4842,10 +4877,12 @@ async def _teardown_test_session(run: "TestRun"):
     _print_test_lifecycle("test.close", run)
     # Drop the idempotency mapping WITH the session: a torn-down key must open a
     # fresh session, never replay a dead tid (guard on tid so a re-minted key for
-    # a newer session is not clobbered).
-    key = run.client_request_id
-    if key and TEST_SESSION_IDEMPOTENCY.get(key) == run.tid:
-        TEST_SESSION_IDEMPOTENCY.pop(key, None)
+    # a newer session is not clobbered). The key is run-scoped, so rebuild the
+    # (parent_run_id, client_request_id) tuple that stored it.
+    if run.client_request_id:
+        key = (run.parent_run_id, run.client_request_id)
+        if TEST_SESSION_IDEMPOTENCY.get(key) == run.tid:
+            TEST_SESSION_IDEMPOTENCY.pop(key, None)
     if run.task and not run.task.done():
         run.task.cancel()
         try:
@@ -5399,17 +5436,23 @@ async def handle_open_test(request: web.Request):
         return web.json_response({"error": "unknown run"}, status=404)
     body = await request.json() if request.body_exists else {}
     # Idempotent open: a retried testStart (same consumer-minted client_request_id)
-    # returns the SAME live session. Checked BEFORE the cap (a replay must not be
-    # spuriously 429'd) and BEFORE packing (a replay does no snapshot work).
-    # `idempotent_replay` tells the runtime NOT to start a second event relay on the
-    # already-relayed session (the box's /test-events is single-consumer). Absent
-    # key (empty/omitted) → unchanged old-consumer behavior.
-    idem_key = (body.get("client_request_id") or "").strip()
-    if len(idem_key) > 128:
+    # returns the SAME live session. The dedup key is RUN-SCOPED — (parent_run_id,
+    # client_request_id) — so on a shared box two runs colliding on a request id
+    # each open their own session instead of aliasing one another's snapshot. Before
+    # replaying we re-verify the mapped session still belongs to THIS parent run; a
+    # mismatch (or a stale/closed mapping) falls through to a fresh open. Checked
+    # BEFORE the cap (a replay must not be spuriously 429'd) and BEFORE packing (a
+    # replay does no snapshot work). `idempotent_replay` tells the runtime NOT to
+    # start a second event relay on the already-relayed session (the box's
+    # /test-events is single-consumer). Absent key (empty/omitted) → unchanged
+    # old-consumer behavior.
+    req_id = (body.get("client_request_id") or "").strip()
+    if len(req_id) > 128:
         return web.json_response({"error": "client_request_id must be at most 128 characters"}, status=400)
-    if idem_key:
+    idem_key = (parent.run_id, req_id) if req_id else None
+    if idem_key is not None:
         existing = TEST_SESSIONS.get(TEST_SESSION_IDEMPOTENCY.get(idem_key, ""))
-        if existing is not None and not existing.done:
+        if existing is not None and not existing.done and existing.parent_run_id == parent.run_id:
             _print_test_lifecycle("test.open.idempotent", existing)
             return web.json_response({
                 "ok": True,
@@ -5419,7 +5462,8 @@ async def handle_open_test(request: web.Request):
                 "pages": existing.pages,
                 "idempotent_replay": True,
             })
-        # Stale mapping (session closed/reaped): drop it and open fresh below.
+        # Stale/mismatched mapping (session closed/reaped, or a cross-run entry that
+        # slipped in): drop it and open fresh below.
         TEST_SESSION_IDEMPOTENCY.pop(idem_key, None)
     active = sum(1 for t in TEST_SESSIONS.values() if not t.done)
     if active >= _max_test_sessions():
@@ -5458,8 +5502,8 @@ async def handle_open_test(request: web.Request):
         max_turns=run.consumer_max_turns,
     )
     run.pages = pages
-    if idem_key:
-        run.client_request_id = idem_key
+    if idem_key is not None:
+        run.client_request_id = req_id
         TEST_SESSION_IDEMPOTENCY[idem_key] = tid
     TEST_SESSIONS[tid] = run
     run.task = asyncio.create_task(_test_session_wrapper(run))
