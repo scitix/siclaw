@@ -101,10 +101,10 @@ RUNS: dict[str, "CompileRun"] = {}
 # Read-only "test session" runs — ephemeral consumer sessions over a pinned draft
 # snapshot (test sessions). Parallel to RUNS, torn down on close/idle. See TestRun.
 TEST_SESSIONS: dict[str, "TestRun"] = {}
-# Consumer-minted idempotency key → tid, for open-test-session retries. A retried
-# testStart (same key) must return the SAME live session, never a second session
-# or concurrency slot. Process-local; entries are cleared on teardown with their
-# session (a torn-down key opens fresh, so a stale mapping can never be replayed).
+# Consumer-minted client_request_id → tid, for open-test-session retries. A
+# retried testStart (same key) must return the SAME live session, never a second
+# session or concurrency slot. Process-local; entries are cleared on teardown with
+# their session (a torn-down key opens fresh, so a stale mapping is never replayed).
 TEST_SESSION_IDEMPOTENCY: dict[str, str] = {}
 # One explicit red-team read-only review may inspect a run at a time. Test
 # recommendation and reference-answer assistance share this guard so two owner
@@ -523,9 +523,9 @@ class TestRun:
         self._stall_reaped = False
         # Snapshot page count (returned by open, replayed on an idempotent open).
         self.pages: int = 0
-        # Consumer-minted idempotency key that opened this session (if any), so
+        # Consumer-minted client_request_id that opened this session (if any), so
         # teardown can drop its TEST_SESSION_IDEMPOTENCY entry.
-        self.idempotency_key: str | None = None
+        self.client_request_id: str | None = None
 
     async def emit(self, ev: dict):
         await self.events.put(ev)
@@ -4843,7 +4843,7 @@ async def _teardown_test_session(run: "TestRun"):
     # Drop the idempotency mapping WITH the session: a torn-down key must open a
     # fresh session, never replay a dead tid (guard on tid so a re-minted key for
     # a newer session is not clobbered).
-    key = run.idempotency_key
+    key = run.client_request_id
     if key and TEST_SESSION_IDEMPOTENCY.get(key) == run.tid:
         TEST_SESSION_IDEMPOTENCY.pop(key, None)
     if run.task and not run.task.done():
@@ -5398,14 +5398,15 @@ async def handle_open_test(request: web.Request):
     if not parent:
         return web.json_response({"error": "unknown run"}, status=404)
     body = await request.json() if request.body_exists else {}
-    # Idempotent open: a retried testStart (same consumer-minted key) returns the
-    # SAME live session. Checked BEFORE the cap (a replay must not be spuriously
-    # 429'd) and BEFORE packing (a replay does no snapshot work). `idempotent_replay`
-    # tells the runtime NOT to start a second event relay on the already-relayed
-    # session (the box's /test-events is single-consumer). Absent key → unchanged.
-    idem_key = (body.get("idempotency_key") or "").strip()
+    # Idempotent open: a retried testStart (same consumer-minted client_request_id)
+    # returns the SAME live session. Checked BEFORE the cap (a replay must not be
+    # spuriously 429'd) and BEFORE packing (a replay does no snapshot work).
+    # `idempotent_replay` tells the runtime NOT to start a second event relay on the
+    # already-relayed session (the box's /test-events is single-consumer). Absent
+    # key (empty/omitted) → unchanged old-consumer behavior.
+    idem_key = (body.get("client_request_id") or "").strip()
     if len(idem_key) > 128:
-        return web.json_response({"error": "idempotency_key must be at most 128 characters"}, status=400)
+        return web.json_response({"error": "client_request_id must be at most 128 characters"}, status=400)
     if idem_key:
         existing = TEST_SESSIONS.get(TEST_SESSION_IDEMPOTENCY.get(idem_key, ""))
         if existing is not None and not existing.done:
@@ -5458,7 +5459,7 @@ async def handle_open_test(request: web.Request):
     )
     run.pages = pages
     if idem_key:
-        run.idempotency_key = idem_key
+        run.client_request_id = idem_key
         TEST_SESSION_IDEMPOTENCY[idem_key] = tid
     TEST_SESSIONS[tid] = run
     run.task = asyncio.create_task(_test_session_wrapper(run))

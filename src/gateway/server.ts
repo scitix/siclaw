@@ -836,9 +836,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // Optional consumer-provided snapshot (e.g. a published version bundle);
       // absent → the box pins the run's candidate/ draft.
       ...(req.bundle_base64 ? { bundle_base64: req.bundle_base64, bundle_sha256: req.bundle_sha256 } : {}),
-      // Idempotency: a retried testStart (same key) returns the SAME live
-      // session instead of opening a second one — passed through to the box.
-      ...(req.idempotency_key ? { idempotency_key: req.idempotency_key } : {}),
+      // Idempotency: a retried testStart (same client_request_id) returns the
+      // SAME live session instead of opening a second one — passed to the box.
+      ...(req.client_request_id ? { client_request_id: req.client_request_id } : {}),
     })) as {
       test_session_id: string;
       snapshot_hash: string;
