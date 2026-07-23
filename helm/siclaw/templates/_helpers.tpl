@@ -82,7 +82,7 @@ Build agentbox image string — same registry/tag as gateway, different componen
 {{/*
 KB compile-box image (spawned per compile run by the runtime; NOT a helm-managed
 pod). Release-coupled by default: agentbox.compileBoxEnabled=true derives
-{registry}/kbc-compile-box:{image.tag} — the image ships with every release
+{registry}/siclaw-kbc-box:{image.tag} — the image ships with every release
 (`make docker` builds it). agentbox.compileBoxImage overrides the full string
 (hot-fix the compile brain independently of a release) and implies enabled.
 Empty result ⇒ KB stays dark (fail-closed).
@@ -93,9 +93,9 @@ Empty result ⇒ KB stays dark (fail-closed).
 {{- $ab.compileBoxImage -}}
 {{- else if $ab.compileBoxEnabled -}}
 {{- if .Values.image.registry -}}
-{{- printf "%s/kbc-compile-box:%s" .Values.image.registry .Values.image.tag -}}
+{{- printf "%s/siclaw-kbc-box:%s" .Values.image.registry .Values.image.tag -}}
 {{- else -}}
-{{- printf "kbc-compile-box:%s" .Values.image.tag -}}
+{{- printf "siclaw-kbc-box:%s" .Values.image.tag -}}
 {{- end -}}
 {{- end -}}
 {{- end }}

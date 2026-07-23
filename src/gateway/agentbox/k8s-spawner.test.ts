@@ -266,7 +266,8 @@ describe("K8sSpawner — spawn branches", () => {
     let reads = 0;
     readPodImpl.fn = async () => {
       reads++;
-      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      // reads 1 (legacy agentbox-name probe) + 2 (new kbc-box name) both absent → create.
+      if (reads <= 2) throw Object.assign(new Error("nf"), { code: 404 });
       return { status: { phase: "Running", podIP: "10.0.0.21", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
 
@@ -362,7 +363,8 @@ describe("K8sSpawner — spawn branches", () => {
     let reads = 0;
     readPodImpl.fn = async () => {
       reads++;
-      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      // reads 1 (legacy agentbox-name probe) + 2 (new kbc-box name) both absent → create.
+      if (reads <= 2) throw Object.assign(new Error("nf"), { code: 404 });
       return { status: { phase: "Running", podIP: "10.0.0.23", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
 
@@ -389,7 +391,8 @@ describe("K8sSpawner — spawn branches", () => {
     let reads = 0;
     readPodImpl.fn = async () => {
       reads++;
-      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      // reads 1 (legacy agentbox-name probe) + 2 (new kbc-box name) both absent → create.
+      if (reads <= 2) throw Object.assign(new Error("nf"), { code: 404 });
       return { status: { phase: "Running", podIP: "10.0.0.22", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
 
@@ -666,6 +669,93 @@ describe("K8sSpawner — spawn branches", () => {
       return { status: { phase: "Failed" }, metadata: { labels: {} } };
     };
     await expect(s.spawn({ agentId: "default" })).rejects.toThrow(/failed to start: Failed/);
+  });
+});
+
+describe("K8sSpawner — pod-name prefix (compile boxes vs chat) + upgrade migration", () => {
+  // First read of any given pod name → 404 (absent), subsequent reads → Running.
+  // Keyed per-name so a legacy lookup and a fresh spawn can interleave.
+  function perNameFirst404ThenRunning(podIP = "10.0.0.30") {
+    const seen = new Map<string, number>();
+    return async (args: any) => {
+      const n = (seen.get(args.name) ?? 0) + 1;
+      seen.set(args.name, n);
+      if (n === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP, conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+  }
+
+  it("names compile pods with the kbc-box prefix while chat pods keep agentbox", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+    readPodImpl.fn = perNameFirst404ThenRunning();
+
+    await s.spawn({ agentId: "chatty" });
+    await s.spawn({ agentId: "kbrun", profile: "kb-compile" });
+
+    const bodies = calls.createNamespacedPod.map((c: any) => c.body);
+    const names = bodies.map((b: any) => b.metadata.name);
+    expect(names).toContain("agentbox-chatty");
+    expect(names).toContain("kbc-box-kbrun");
+    // Resources derived from the pod name follow the prefix.
+    const compilePod = bodies.find((b: any) => b.metadata.name === "kbc-box-kbrun");
+    expect(compilePod.spec.hostname).toBe("kbc-box-kbrun");
+    const secretNames = calls.createNamespacedSecret.map((c: any) => c.body.metadata.name);
+    expect(secretNames).toContain("kbc-box-kbrun-cert");
+  });
+
+  it("reaps the legacy agentbox-named compile pod (+ its cert Secret) when spawning under kbc-box", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+
+    let legacyDeleted = false;
+    deletePodImpl.fn = async (args: any) => {
+      if (args.name === "agentbox-migrated") legacyDeleted = true;
+      return {};
+    };
+    const newName = perNameFirst404ThenRunning();
+    readPodImpl.fn = async (args: any) => {
+      if (args.name === "agentbox-migrated") {
+        if (legacyDeleted) throw Object.assign(new Error("nf"), { code: 404 }); // waitForPodDeleted sees it gone
+        return {
+          status: { phase: "Running", podIP: "10.0.0.31", conditions: [{ type: "Ready", status: "True" }] },
+          metadata: { labels: { "siclaw.io/boxType": "kb-compile" } },
+        };
+      }
+      return newName(args);
+    };
+
+    await s.spawn({ agentId: "migrated", profile: "kb-compile" });
+
+    expect(calls.deleteNamespacedPod.some((c: any) => c.name === "agentbox-migrated")).toBe(true);
+    expect(calls.deleteNamespacedSecret.some((c: any) => c.name === "agentbox-migrated-cert")).toBe(true);
+    // The new box is created under the renamed prefix, not the old one.
+    expect(calls.createNamespacedPod.map((c: any) => c.body.metadata.name)).toEqual(["kbc-box-migrated"]);
+  });
+
+  it("never reaps a legacy agentbox-named CHAT pod that happens to share the agentId", async () => {
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner();
+    s.setCertManager(cm as any);
+
+    const newName = perNameFirst404ThenRunning();
+    readPodImpl.fn = async (args: any) => {
+      if (args.name === "agentbox-shared") {
+        // A chat box under this name owns its own idle-destruct lifecycle.
+        return {
+          status: { phase: "Running", podIP: "10.0.0.32", conditions: [{ type: "Ready", status: "True" }] },
+          metadata: { labels: { "siclaw.io/boxType": "agent" } },
+        };
+      }
+      return newName(args);
+    };
+
+    await s.spawn({ agentId: "shared", profile: "kb-compile" });
+
+    expect(calls.deleteNamespacedPod.some((c: any) => c.name === "agentbox-shared")).toBe(false);
+    expect(calls.createNamespacedPod.map((c: any) => c.body.metadata.name)).toEqual(["kbc-box-shared"]);
   });
 });
 
@@ -1058,10 +1148,11 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
     let reads = 0;
     g.__k8sImpls.readNamespacedPod = async () => {
       reads++;
-      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      // reads 1 (legacy agentbox-name probe) + 2 (new kbc-box name) both absent → create.
+      if (reads <= 2) throw Object.assign(new Error("nf"), { code: 404 });
       return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
-    process.env.SICLAW_COMPILE_BOX_IMAGE = "kbc-compile-box:test";
+    process.env.SICLAW_COMPILE_BOX_IMAGE = "siclaw-kbc-box:test";
     try {
       await s.spawn({ agentId: "res-test", profile: "kb-compile" });
     } finally {

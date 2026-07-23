@@ -178,15 +178,16 @@ describe("AgentBoxManager — K8s mode", () => {
     const created = await mgr.getOrCreateWithDisposition("new-run", { profile: "kb-compile" });
     expect(created.created).toBe(true);
 
-    spawner.getReturns.set("agentbox-live-run", {
-      boxId: "agentbox-live-run", agentId: "live-run", status: "running",
+    // A kb-compile box spawns under the "kbc-box-" prefix, not "agentbox-".
+    spawner.getReturns.set("kbc-box-live-run", {
+      boxId: "kbc-box-live-run", agentId: "live-run", status: "running",
       endpoint: "https://10.0.0.9:3000", createdAt: new Date(), lastActiveAt: new Date(),
       profile: "kb-compile",
     });
     const adopted = await mgr.getOrCreateWithDisposition("live-run", { profile: "kb-compile" });
     expect(adopted).toMatchObject({
       created: false,
-      handle: { boxId: "agentbox-live-run", endpoint: "https://10.0.0.9:3000" },
+      handle: { boxId: "kbc-box-live-run", endpoint: "https://10.0.0.9:3000" },
     });
   });
 
@@ -201,8 +202,8 @@ describe("AgentBoxManager — K8s mode", () => {
   it("reuses a running pod when the requested profile matches", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
-    spawner.getReturns.set("agentbox-run-1", {
-      boxId: "agentbox-run-1", agentId: "run-1", status: "running",
+    spawner.getReturns.set("kbc-box-run-1", {
+      boxId: "kbc-box-run-1", agentId: "run-1", status: "running",
       endpoint: "https://10.0.0.9:3000", createdAt: new Date(), lastActiveAt: new Date(),
       profile: "kb-compile",
     });
@@ -215,17 +216,18 @@ describe("AgentBoxManager — K8s mode", () => {
   it("stops and respawns when the running pod's profile no longer matches", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
-    // A pod is running as kb-compile, but the same id is now requested as kb-test.
-    spawner.getReturns.set("agentbox-run-1", {
-      boxId: "agentbox-run-1", agentId: "run-1", status: "running",
+    // A pod is running as kb-compile, but the same id is now requested as
+    // kb-compile-codex — a realistic same-prefix ("kbc-box-") profile switch.
+    spawner.getReturns.set("kbc-box-run-1", {
+      boxId: "kbc-box-run-1", agentId: "run-1", status: "running",
       endpoint: "https://10.0.0.9:3000", createdAt: new Date(), lastActiveAt: new Date(),
       profile: "kb-compile",
     });
-    const handle = await mgr.getOrCreate("run-1", { profile: "kb-test" });
+    const handle = await mgr.getOrCreate("run-1", { profile: "kb-compile-codex" });
     // Old-shaped pod stopped; a fresh box spawned with the requested profile.
-    expect(spawner.stopCalls).toEqual(["agentbox-run-1"]);
+    expect(spawner.stopCalls).toEqual(["kbc-box-run-1"]);
     expect(spawner.spawnCalls).toHaveLength(1);
-    expect(spawner.spawnCalls[0].profile).toBe("kb-test");
+    expect(spawner.spawnCalls[0].profile).toBe("kb-compile-codex");
     expect(handle.boxId).toBe("box-run-1");
   });
 
@@ -275,6 +277,27 @@ describe("AgentBoxManager — K8s mode", () => {
     const mgr = new AgentBoxManager(spawner);
     await mgr.stop("agent-a");
     expect(spawner.stopCalls).toEqual(["agentbox-agent-a"]);
+  });
+
+  it("stop(runId, 'kb-compile') targets the kbc-box-prefixed pod (reap must not leak it)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.stop("run-1", "kb-compile");
+    expect(spawner.stopCalls).toEqual(["kbc-box-run-1"]);
+  });
+
+  it("getAsync(runId, 'kb-compile') finds the kbc-box-prefixed live box (adopt re-attach)", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    spawner.getReturns.set("kbc-box-run-1", {
+      boxId: "kbc-box-run-1", agentId: "run-1", status: "running",
+      endpoint: "https://10.0.0.9:3000", createdAt: new Date(), lastActiveAt: new Date(),
+      profile: "kb-compile",
+    });
+    const handle = await mgr.getAsync("run-1", "kb-compile");
+    expect(handle?.boxId).toBe("kbc-box-run-1");
+    // Without the profile it would look under "agentbox-run-1" and miss.
+    expect(await mgr.getAsync("run-1")).toBeUndefined();
   });
 });
 

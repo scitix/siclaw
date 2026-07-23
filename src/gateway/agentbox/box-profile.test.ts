@@ -24,9 +24,9 @@ describe("getBoxProfile", () => {
   });
 
   it("kb-compile → dedicated image + LLM env + writable /work + box-owned restricted tools", () => {
-    process.env.SICLAW_COMPILE_BOX_IMAGE = "kbc-compile-box:test-tag";
+    process.env.SICLAW_COMPILE_BOX_IMAGE = "siclaw-kbc-box:test-tag";
     const p = getBoxProfile("kb-compile");
-    expect(p.image).toBe("kbc-compile-box:test-tag");
+    expect(p.image).toBe("siclaw-kbc-box:test-tag");
     expect(p.home).toBe("/work");
     expect(p.nestedSandbox).toBeUndefined();
     expect(p.volumes).toEqual([{ name: "work", mountPath: "/work", sizeLimit: "4Gi" }]);
@@ -58,6 +58,17 @@ describe("getBoxProfile", () => {
     expect(test.allowedTools).toEqual(["Read", "Glob", "Grep"]);
     expect(test.allowedTools).not.toContain("Write");
     expect(test.allowedTools).not.toContain("Bash");
+  });
+
+  it("compile profiles declare the kbc-box pod prefix; agent/test keep the default", () => {
+    // Operational distinguishability: a compile box's pod name must read as a KB
+    // box, not a chat agentbox, when an operator scans `kubectl get pods`.
+    expect(getBoxProfile("kb-compile").podNamePrefix).toBe("kbc-box");
+    expect(getBoxProfile("kb-compile-codex").podNamePrefix).toBe("kbc-box");
+    // The default agent and the read-only kb-test box keep the agentbox prefix
+    // (kb-test is short-lived and out of scope for this rename).
+    expect(getBoxProfile("agent").podNamePrefix).toBeUndefined();
+    expect(getBoxProfile("kb-test").podNamePrefix).toBeUndefined();
   });
 
   it("fail-closed: an unknown profile throws (no silent downgrade to the all-tools agent)", () => {
