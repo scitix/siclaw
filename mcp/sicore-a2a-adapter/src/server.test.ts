@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SiclawA2aApi, SiclawTask } from "./a2a-client.js";
+import { AgentRouter } from "./router.js";
 import { createMcpServer } from "./server.js";
 
 const closeAfter: Array<{ close(): Promise<void> }> = [];
@@ -34,10 +35,14 @@ function fakeApi(): SiclawA2aApi {
   };
 }
 
+function singleRouter(api: SiclawA2aApi): AgentRouter {
+  return new AgentRouter([{ alias: "default", agentId: "agent-default", api }]);
+}
+
 describe("MCP server", () => {
   it("completes MCP initialization, lists tools, and calls Siclaw through the adapter", async () => {
     const api = fakeApi();
-    const server = createMcpServer(api);
+    const server = createMcpServer(singleRouter(api));
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     closeAfter.push(client, server);

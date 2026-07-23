@@ -1,5 +1,8 @@
 import { setTimeout as delay } from "node:timers/promises";
-import type { AdapterConfig, ResolvedAdapterConfig } from "./config.js";
+import type { ResolvedAdapterConfig } from "./config.js";
+
+/** The subset of config resolveAgentId needs; each named key supplies its own. */
+export type AgentResolveInput = Pick<ResolvedAdapterConfig, "baseUrl" | "apiKey" | "requestTimeoutMs">;
 
 export const TERMINAL_A2A_STATES = new Set([
   "TASK_STATE_COMPLETED",
@@ -278,7 +281,7 @@ async function retryIdempotentRead<T>(
 // from copying the agent UUID into client config. Older Sicore deployments
 // without the endpoint require SICLAW_AGENT_ID to be set explicitly.
 export async function resolveAgentId(
-  config: AdapterConfig,
+  config: AgentResolveInput,
   fetchImpl: typeof fetch = globalThis.fetch,
 ): Promise<string> {
   let payload: { agentId?: unknown } | null;
