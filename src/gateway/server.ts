@@ -92,7 +92,7 @@ import { MetricsAggregator } from "./metrics-aggregator.js";
 import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
-import { resolveAgentModelBinding } from "./agent-model-binding.js";
+import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "./agent-model-binding.js";
 
 function stablePayloadDigest(value: unknown): string {
   const canonicalize = (input: unknown): unknown => {
@@ -318,6 +318,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
         const promptMessageId = await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
+
+        // System-prompt precedence for the box session. An explicit
+        // params.systemPrompt (the portal-standalone path stamps it from the
+        // agent's model binding) wins as-is. When the caller does NOT forward one
+        // — e.g. sicore's web-chat proxy, which never sends systemPrompt — fall
+        // back to the agent's own custom template (agents.system_prompt via
+        // config.getAgent). Without this fallback a custom-prompt agent silently
+        // got AgentBox's built-in default SRE persona on the web path, even though
+        // the channel paths (dingtalk/lark) already resolved it and worked.
+        //
+        // Best-effort: resolveAgentSystemPrompt swallows RPC errors and returns
+        // undefined (no custom prompt / lookup failed) → built-in default, so a
+        // lookup failure never turns into a chat failure. AgentBox applies the
+        // template only at session creation, so this affects NEW sessions; a warm
+        // multi-turn session keeps the prompt it was created with (unchanged).
+        if (promptOpts.systemPromptTemplate === undefined) {
+          promptOpts.systemPromptTemplate = await resolveAgentSystemPrompt(agentId, frontendClient);
+        }
 
         // Persistence is resolved by agentId in the manager's persistenceResolver
         // (registered in startRuntime), not from per-request params — so every
