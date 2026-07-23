@@ -28,7 +28,7 @@ import { getBoxProfile } from "./agentbox/box-profile.js";
 import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
-import { driveTestSession } from "./capability/test-relay.js";
+import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
 import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
   CapabilityCancelRequest,
@@ -846,10 +846,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       pages: number;
       idempotent_replay?: boolean;
     };
-    // On an idempotent replay the box returned an ALREADY-relayed session; its
-    // /test-events stream is single-consumer, so a second relay would split the
-    // frames. Only drive a freshly-opened session.
-    if (!opened.idempotent_replay) {
+    // Only drive a freshly-opened session — an idempotent replay is already
+    // relayed, and the box's /test-events is single-consumer (see predicate).
+    if (shouldRelayTestSession(opened)) {
       driveTestSession({
         client,
         runId,
