@@ -28,9 +28,18 @@ vi.mock("./capability/materialize.js", () => ({
 
 const { startRuntime } = await import("./server.js");
 
-function fakeFrontendClient() {
+// With `runProfile`, the fake answers capability.getRun with a live run row so a
+// memory-cold testSessions (no in-memory run after a Runtime restart) can recover
+// the profile that getAsync needs to build the right pod-name prefix. Omit it to
+// keep the store empty (adopt returns undefined → default prefix).
+function fakeFrontendClient(runProfile?: string) {
   return {
-    request: vi.fn(async () => ({})),
+    request: vi.fn(async (method: string, params: any) => {
+      if (runProfile && method === "capability.getRun") {
+        return { id: params?.run_id, status: "running", profile: runProfile };
+      }
+      return {};
+    }),
     onCommand: vi.fn(),
     emitEvent: vi.fn(),
     close: vi.fn(),
@@ -75,14 +84,15 @@ describe("capability.testSessions", () => {
     ];
     getJsonMock.mockResolvedValue({ sessions: rows });
     const manager = fakeAgentBoxManager({
-      boxId: "agentbox-run-live",
+      boxId: "kbc-box-run-live",
       endpoint: "https://10.0.0.10:3000",
       agentId: "run-live",
     });
     server = await startRuntime({
       config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
       agentBoxManager: manager,
-      frontendClient: fakeFrontendClient(),
+      // Memory-cold: the run only lives in the store, with a compile profile.
+      frontendClient: fakeFrontendClient("kb-compile"),
       credentialService: {} as any,
     });
 
@@ -91,7 +101,9 @@ describe("capability.testSessions", () => {
       run_id: "run-live",
       sessions: rows, // passed through byte-for-byte: `tid`, not renamed
     });
-    expect(manager.getAsync).toHaveBeenCalledWith("run-live");
+    // Profile recovered from the store so getAsync targets kbc-box-run-live — a
+    // profile-less lookup would miss the compile pod and report no sessions.
+    expect(manager.getAsync).toHaveBeenCalledWith("run-live", "kb-compile");
     expect(getJsonMock).toHaveBeenCalledWith("/test-sessions");
     expect(manager.getOrCreate).not.toHaveBeenCalled(); // never spawn to list
   });
