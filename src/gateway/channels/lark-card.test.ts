@@ -308,7 +308,7 @@ describe("feedback buttons", () => {
     const session = { cardId: "CARD-FB-1", elementId: "md_main", sequence: 0 };
 
     const ok = await finalizeCard(client as any, session, "done", {
-      ctx: { sessionId: "sess-1", channelId: "ch-1" },
+      ctx: { sessionId: "sess-1", channelId: "ch-1", messageId: "msg-assistant-1" },
       locale: "zh-CN",
     });
     expect(ok).toBe(true);
@@ -328,7 +328,7 @@ describe("feedback buttons", () => {
     expect(row.element_id).toBe("fb_row");
     const buttons = row.columns.map((c: any) => c.elements[0]);
     expect(buttons.map((b: any) => b.element_id)).toEqual(["fb_up", "fb_down"]);
-    // The value payload is self-contained — persistence needs no message-id map.
+    // The value payload is self-contained — persistence needs no card-to-message map.
     expect(buttons[0].behaviors[0]).toEqual({
       type: "callback",
       value: {
@@ -337,6 +337,7 @@ describe("feedback buttons", () => {
         session_id: "sess-1",
         card_id: "CARD-FB-1",
         channel_id: "ch-1",
+        message_id: "msg-assistant-1",
         locale: "zh-CN",
       },
     });
