@@ -5765,19 +5765,25 @@ async def handle_test_message(request: web.Request):
     run = TEST_SESSIONS.get(request.match_info["tid"])
     if not run:
         return web.json_response({"error": "unknown test session"}, status=404)
-    err = await _await_session_live(run)  # duck-typed on .connected/.client
-    if err is not None:
-        return err
     body = await request.json()
     text = (body.get("message") or "").strip()
     if not text:
         return web.json_response({"error": "message is required"}, status=400)
     if run._needs_rebuild:
-        # The previous turn's terminator was lost; reconnect a clean client before
-        # arming, or the generation guard would drop this turn's frames forever.
+        # The previous turn's terminator was lost (reconnect a clean client before
+        # arming, or the generation guard would drop this turn's frames forever) OR
+        # a prior rebuild's reconnect failed. This must run BEFORE the liveness
+        # wait: after a failed reconnect the driver clears `connected` and parks
+        # until the next rebuild request, so gating on `connected` first would turn
+        # every retry into a 25s timeout → 503 and the retry path would never fire.
+        # A successful rebuild sets `connected` before signalling ready, so the
+        # liveness wait below is correct in this order too.
         err = await _rebuild_test_client(run)
         if err is not None:
             return err
+    err = await _await_session_live(run)  # duck-typed on .connected/.client
+    if err is not None:
+        return err
     _arm_test_turn(run)   # arm the turn-stall watchdog for this turn
     _print_test_lifecycle("turn.start", run)
     await run.client.query(text)

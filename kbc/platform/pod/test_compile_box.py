@@ -1335,6 +1335,48 @@ class _RebuildFake:
         self._q.put_nowait(_STREAM_STOP)
 
 
+class _RetryRebuildFake:
+    """Rebuild-retry stand-in: instance 0 connects fine but black-holes turn 1 and
+    its interrupt() raises (forcing a rebuild); instance 1 — the rebuild's
+    reconnect — FAILS to connect (a transient error); instance 2 connects and
+    answers normally. Exercises the failed-rebuild retry path end to end."""
+
+    instances: list = []
+
+    def __init__(self, options=None):
+        self.options = options
+        self.idx = len(_RetryRebuildFake.instances)
+        _RetryRebuildFake.instances.append(self)
+        self.queries = []
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        if self.idx == 1:
+            raise RuntimeError("transient reconnect failure")
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if self.idx == 0:
+            return  # black-hole every turn on the doomed first client
+        self._q.put_nowait(AssistantMessage("answer: " + text))
+        self._q.put_nowait(ResultMessage())
+
+    async def interrupt(self):
+        raise RuntimeError("interrupt swallowed by the black hole")
+
+    async def receive_messages(self):
+        while not self._closed:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self._closed = True
+        self._q.put_nowait(_STREAM_STOP)
+
+
 async def _await(cond, *, timeout=3.0, poll=0.02):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1452,6 +1494,79 @@ async def test_test_session_terminator_in_window_no_rebuild():
     assert "turn.rebuild_armed" not in out, out
     assert "turn.rebuilt" not in out, out
     print("✓ test-session no rebuild: an in-window stall terminator keeps the same client")
+
+
+async def test_test_session_rebuild_retry_after_failed_reconnect():
+    """Review P1: a rebuild whose reconnect FAILS must stay retryable over HTTP.
+    After a failed reconnect the driver clears `connected` and parks until the next
+    rebuild request, so /test-message must consult _needs_rebuild BEFORE the
+    liveness gate — gating on `connected` first turns every retry into a connect
+    timeout → 503 "session is still starting" and the retry logic never runs (the
+    session is then stuck until the idle TTL). First retry → 503 rebuild failed
+    (flag re-armed); second retry → fresh client, 200, turn answered on it."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+             compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._TEST_STALL_REBUILD_WINDOW_S,
+             compile_box.ClaudeSDKClient)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
+    _RetryRebuildFake.instances = []
+    compile_box.ClaudeSDKClient = _RetryRebuildFake
+    # keep the pre-fix failure mode fast: the old ordering would eat this timeout
+    # on every retry instead of ever reaching the rebuild
+    os.environ["KBC_CONNECT_TIMEOUT_SECS"] = "1"
+    compile_box.TEST_SESSIONS.clear()
+    buf = io.StringIO()
+    snap = tempfile.mkdtemp()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    run = compile_box.TestRun("t-rr", snap, parent_run_id="p-rr", snapshot_hash="h")
+    compile_box.TEST_SESSIONS["t-rr"] = run
+    try:
+        with contextlib.redirect_stdout(buf):
+            run.task = asyncio.create_task(compile_box._test_session_wrapper(run))
+            assert await compile_box._await_session_live(run) is None
+            # turn 1 black-holes; the watchdog reaps it and interrupt() raises → rebuild flagged
+            r1 = await client.post("/test-message/t-rr", json={"message": "first question"})
+            assert r1.status == 200, await r1.text()
+            assert await _await(lambda: run._needs_rebuild), "rebuild was never flagged"
+
+            # retry 1: the rebuild's reconnect fails (instance 1) → an immediate
+            # retryable 503, NOT a liveness-gate timeout
+            r2 = await client.post("/test-message/t-rr", json={"message": "second question"})
+            assert r2.status == 503, await r2.text()
+            assert "rebuild failed" in (await r2.json())["error"], await r2.text()
+            assert run._needs_rebuild is True, "a failed rebuild must re-arm the flag for the next retry"
+
+            # retry 2: the rebuild succeeds (instance 2) and the turn is answered on it
+            r3 = await client.post("/test-message/t-rr", json={"message": "third question"})
+            assert r3.status == 200, await r3.text()
+            assert await _await(lambda: run._turn_active is False and run._results_seen >= 1), \
+                "the retried turn never completed"
+        evs = _drain(run)
+        logs = [e["text"] for e in evs if e["type"] == "log"]
+        assert any("answer: third question" in t for t in logs), logs
+        assert len(_RetryRebuildFake.instances) == 3, _RetryRebuildFake.instances
+        out = buf.getvalue()
+        assert "turn.rebuild_failed tid=t-rr" in out, out
+        assert "turn.rebuilt tid=t-rr" in out, out
+        assert "question" not in out.lower() and "answer" not in out.lower(), out  # no content leak
+    finally:
+        run.done = True
+        if run.task and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+        os.environ.pop("KBC_CONNECT_TIMEOUT_SECS", None)
+        shutil.rmtree(snap, ignore_errors=True)
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+         compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._TEST_STALL_REBUILD_WINDOW_S,
+         compile_box.ClaudeSDKClient) = saved
+    print("✓ test-session rebuild retry: a failed reconnect 503s fast and the next retry rebuilds")
 
 
 async def test_open_test_session_idempotency_is_run_scoped():
@@ -4533,6 +4648,7 @@ async def main():
     await test_test_session_rebuild_after_failed_interrupt()
     await test_test_session_rebuild_after_lost_terminator()
     await test_test_session_terminator_in_window_no_rebuild()
+    await test_test_session_rebuild_retry_after_failed_reconnect()
     await test_test_session_idle_ttl_reaper()
     await test_list_test_sessions_endpoint()
     await test_explicit_test_recommendation_http()
