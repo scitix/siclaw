@@ -605,21 +605,39 @@ def _markdown_link_targets(text: str) -> list[str]:
     targets: list[str] = []
     for captured in _MD_LINK_RE.findall(text):
         destination = captured.strip()
-        if destination.startswith("<") and destination.endswith(">"):
-            destination = destination[1:-1].strip()
-        else:
-            # Keep compatibility with the optional Markdown link-title form.
-            titled = re.fullmatch(
-                r"(.+?\.md(?:#[^\s\"']*)?)\s+(?:\"[^\"]*\"|'[^']*')",
-                destination,
-                re.IGNORECASE,
-            )
-            if titled:
-                destination = titled.group(1)
+        # Keep compatibility with the optional Markdown link-title form.
+        titled = re.fullmatch(
+            r"(.+?\.md(?:#[^\s\"']*)?)\s+(?:\"[^\"]*\"|'[^']*')",
+            destination,
+            re.IGNORECASE,
+        )
+        if titled:
+            destination = titled.group(1)
+        # After the title strip so a quoted title is never mistaken for the
+        # angle destination's trailing fragment (same ordering + rationale as
+        # document_link_targets — an anchored `<...>#sec` link must not keep
+        # its brackets and get misreported as an orphaned page).
+        destination = _unwrap_angle_destination(destination)
         destination = unquote(destination).split("#", 1)[0].strip()
         if destination.lower().endswith(".md"):
             targets.append(destination)
     return targets
+
+
+def _unwrap_angle_destination(destination: str) -> str:
+    """Unwrap a CommonMark angle-bracketed destination, tolerating a trailing
+    ``#fragment``/``?query`` OUTSIDE the closing bracket (``<a b.png>#fig1``):
+    the remainder is re-appended so the ordinary #/? truncation removes it.
+    Previously the wrapper was only stripped when the destination *ended* in
+    ``>``, so an anchored angle link kept its brackets and lost its edge — a
+    good compile was wrongly failed (review finding). Runs AFTER the title
+    strip (a quoted title is not a fragment) and BEFORE #/? truncation. Mirrors
+    the sicore ledger's unwrapAngleDestination; change only in lockstep."""
+    if destination.startswith("<"):
+        close = destination.find(">")
+        if close != -1:
+            return destination[1:close].strip() + destination[close + 1:].strip()
+    return destination
 
 
 def _strip_fragment_query(target: str) -> str:
@@ -643,12 +661,10 @@ def document_link_targets(md_text: str) -> list[str]:
     prose = _markdown_prose(md_text)
     for captured in _MD_LINK_RE.findall(prose):
         destination = captured.strip()
-        if destination.startswith("<") and destination.endswith(">"):
-            destination = destination[1:-1].strip()
-        else:
-            titled = re.fullmatch(r"(.+?)\s+(?:\"[^\"]*\"|'[^']*')", destination)
-            if titled:
-                destination = titled.group(1).strip()
+        titled = re.fullmatch(r"(.+?)\s+(?:\"[^\"]*\"|'[^']*')", destination)
+        if titled:
+            destination = titled.group(1).strip()
+        destination = _unwrap_angle_destination(destination)
         destination = unquote(_strip_fragment_query(destination)).strip()
         if destination:
             targets.append(destination)
