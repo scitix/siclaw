@@ -204,6 +204,14 @@ export interface CapabilityTestStartRequest {
   bundle_base64?: string;
   /** sha256 of the bundle bytes; the box verifies it at install time. */
   bundle_sha256?: string;
+  /**
+   * Optional consumer-minted idempotency key. A retried testStart with the same
+   * key returns the SAME live test session (same tid + snapshot_hash) instead of
+   * opening a second one / consuming a second concurrency slot — so a lost ack
+   * or a client retry cannot leave a ghost session. Absent → always open fresh
+   * (old-consumer behavior unchanged).
+   */
+  idempotency_key?: string;
 }
 
 export interface CapabilityTestStartResponse {

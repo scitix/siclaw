@@ -96,6 +96,36 @@ describe("capability.testSessions", () => {
     expect(manager.getOrCreate).not.toHaveBeenCalled(); // never spawn to list
   });
 
+  it("scopes the list to the requested run — a shared box's other runs stay invisible", async () => {
+    // A shared box (SICLAW_COMPILE_BOX_ENDPOINT) hosts sessions for many runs;
+    // the box returns them all, and the runtime must filter to the caller's run
+    // so one run can never see (or reap) another's session.
+    process.env.SICLAW_COMPILE_BOX_ENDPOINT = "https://10.0.0.20:3000";
+    const iso = "2026-07-22T09:30:00Z";
+    getJsonMock.mockResolvedValue({
+      sessions: [
+        { tid: "a-1", parent_run_id: "run-A", created_at: iso, last_activity_at: iso, done: false },
+        { tid: "b-1", parent_run_id: "run-B", created_at: iso, last_activity_at: iso, done: false },
+        { tid: "a-2", parent_run_id: "run-A", created_at: iso, last_activity_at: iso, done: true },
+      ],
+    });
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: fakeAgentBoxManager(null),
+      frontendClient: fakeFrontendClient(),
+      credentialService: {} as any,
+    });
+    try {
+      const list = server.rpcMethods.get("capability.testSessions")!;
+      const a = (await list({ run_id: "run-A" })) as any;
+      expect(a.sessions.map((s: any) => s.tid)).toEqual(["a-1", "a-2"]); // only run-A's
+      const b = (await list({ run_id: "run-B" })) as any;
+      expect(b.sessions.map((s: any) => s.tid)).toEqual(["b-1"]); // run-A's stay invisible
+    } finally {
+      delete process.env.SICLAW_COMPILE_BOX_ENDPOINT;
+    }
+  });
+
   it("returns an empty list when the box is absent — never spawns/rehydrates", async () => {
     const manager = fakeAgentBoxManager(null);
     server = await startRuntime({
