@@ -1279,6 +1279,181 @@ async def test_test_session_late_reaped_frames_never_terminate_new_turn():
     print("✓ test-session late reaped frames are dropped, never terminate the freshly-armed turn")
 
 
+class _RebuildFake:
+    """Multi-epoch test-session SDK stand-in for the client-rebuild P1. The FIRST
+    connected instance black-holes its first query (forcing a stall reap); its
+    interrupt() behaviour is scenario-driven:
+      - "interrupt_fails":      interrupt() RAISES → the torn-down result can never
+                                come, so the watchdog flags a rebuild at once.
+      - "terminator_never":     interrupt() is accepted but no ResultMessage is ever
+                                delivered → the post-interrupt window elapses → rebuild.
+      - "terminator_in_window": interrupt() delivers the torn-down ResultMessage →
+                                the generation stream realigns → NO rebuild.
+    A SECOND instance (built by the driver's rebuild) answers the next turn normally.
+    Instances are tracked class-side so a test asserts how many connects happened
+    (2 = a rebuild occurred; 1 = the existing drop path handled it)."""
+
+    instances: list = []
+    scenario = "interrupt_fails"
+
+    def __init__(self, options=None):
+        self.options = options
+        self.idx = len(_RebuildFake.instances)
+        _RebuildFake.instances.append(self)
+        self.queries = []
+        self.interrupts = 0
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if self.idx == 0 and len(self.queries) == 1:
+            return  # first turn on the first client black-holes (push nothing)
+        self._q.put_nowait(AssistantMessage("answer: " + text))
+        self._q.put_nowait(ResultMessage())
+
+    async def interrupt(self):
+        self.interrupts += 1
+        if _RebuildFake.scenario == "interrupt_fails":
+            raise RuntimeError("interrupt swallowed by the black hole")
+        if _RebuildFake.scenario == "terminator_in_window":
+            self._q.put_nowait(ResultMessage())  # the torn-down terminator lands
+        # "terminator_never": accepted, but nothing is ever delivered
+
+    async def receive_messages(self):
+        while not self._closed:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self._closed = True
+        self._q.put_nowait(_STREAM_STOP)
+
+
+async def _await(cond, *, timeout=3.0, poll=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        await asyncio.sleep(poll)
+    return False
+
+
+async def _drive_rebuild_scenario(scenario):
+    """Boot a real test session (driver + watchdog via _test_session_wrapper) over
+    a _RebuildFake, black-hole turn 1, let the watchdog reap it, then reproduce the
+    NEXT /test-message exactly as handle_test_message does (rebuild-if-flagged →
+    arm → query). Returns (run, buf, rebuilt) where rebuilt says a reconnect
+    happened. Caller drains + asserts, then this restores globals."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+             compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._TEST_STALL_REBUILD_WINDOW_S,
+             compile_box.ClaudeSDKClient)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
+    _RebuildFake.instances = []
+    _RebuildFake.scenario = scenario
+    compile_box.ClaudeSDKClient = _RebuildFake
+    buf = io.StringIO()
+    snap = tempfile.mkdtemp()
+    run = compile_box.TestRun("t-rb", snap, parent_run_id="p-rb", snapshot_hash="h")
+    try:
+        with contextlib.redirect_stdout(buf):
+            run.task = asyncio.create_task(compile_box._test_session_wrapper(run))
+            assert await compile_box._await_session_live(run) is None
+            # turn 1 → black-holed; the watchdog must reap it
+            compile_box._arm_test_turn(run)
+            await run.client.query("first question")
+            assert await _await(lambda: _RebuildFake.instances[0].interrupts == 1), "turn 1 was never reaped"
+            # the rebuild decision settles asynchronously (immediately for a failed
+            # interrupt, after the window for a lost terminator, never in-window)
+            if scenario == "terminator_in_window":
+                assert await _await(lambda: run._results_seen >= 1), "the in-window terminator was not consumed"
+                await asyncio.sleep(compile_box._TEST_STALL_REBUILD_WINDOW_S + 0.1)  # let the window pass
+                assert run._needs_rebuild is False, "an in-window terminator must NOT force a rebuild"
+            else:
+                assert await _await(lambda: run._needs_rebuild), f"{scenario}: rebuild was never flagged"
+
+            # the NEXT /test-message: mirror handle_test_message's decision path
+            rebuilt = run._needs_rebuild
+            if run._needs_rebuild:
+                assert await compile_box._rebuild_test_client(run) is None, "rebuild reported an error"
+            compile_box._arm_test_turn(run)
+            await run.client.query("second question")
+            assert await _await(lambda: run._turn_active is False and run._results_seen >= 1), "turn 2 never completed"
+        evs = _drain(run)
+        return run, buf, rebuilt, evs
+    finally:
+        run.done = True
+        if run.task and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+        shutil.rmtree(snap, ignore_errors=True)
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+         compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._TEST_STALL_REBUILD_WINDOW_S,
+         compile_box.ClaudeSDKClient) = saved
+
+
+async def test_test_session_rebuild_after_failed_interrupt():
+    """Review P1 (a): the stall reaper's interrupt() can FAIL, so the wedged turn's
+    torn-down ResultMessage never arrives — _results_seen can never catch up to the
+    armed generation, and every later turn would be dropped forever. The watchdog
+    now flags _needs_rebuild the instant interrupt() raises; the next /test-message
+    reconnects a fresh SDK client (2nd connect) with a clean generation, and the new
+    turn answers normally on it."""
+    run, buf, rebuilt, evs = await _drive_rebuild_scenario("interrupt_fails")
+    assert rebuilt is True, "a failed interrupt must trigger a client rebuild"
+    assert len(_RebuildFake.instances) == 2, _RebuildFake.instances  # reconnected
+    logs = [e["text"] for e in evs if e["type"] == "log"]
+    assert any("answer: second question" in t for t in logs), logs
+    assert any(e["type"] == "turn_done" and "answer: second question" in e.get("text", "") for e in evs), evs
+    out = buf.getvalue()
+    assert "turn.rebuild_armed tid=t-rb parent=p-rb reason=interrupt_failed" in out, out
+    assert "turn.rebuilt tid=t-rb parent=p-rb" in out, out
+    assert "question" not in out.lower() and "answer" not in out.lower(), out  # no content leak
+    print("✓ test-session rebuild: a failed stall interrupt reconnects a clean client")
+
+
+async def test_test_session_rebuild_after_lost_terminator():
+    """Review P1 (b): interrupt() is ACCEPTED but its torn-down ResultMessage never
+    lands (a true black-hole swallows it too). The post-interrupt window elapses
+    with _results_seen unchanged → the watchdog flags a rebuild → the next
+    /test-message reconnects a fresh client and the new turn answers normally."""
+    run, buf, rebuilt, evs = await _drive_rebuild_scenario("terminator_never")
+    assert rebuilt is True, "a lost terminator must trigger a client rebuild"
+    assert len(_RebuildFake.instances) == 2, _RebuildFake.instances  # reconnected
+    logs = [e["text"] for e in evs if e["type"] == "log"]
+    assert any("answer: second question" in t for t in logs), logs
+    out = buf.getvalue()
+    assert "turn.rebuild_armed tid=t-rb parent=p-rb reason=terminator_lost" in out, out
+    assert "turn.rebuilt tid=t-rb parent=p-rb" in out, out
+    print("✓ test-session rebuild: a lost stall terminator reconnects after the window")
+
+
+async def test_test_session_terminator_in_window_no_rebuild():
+    """Review P1 (c) — regression guard: when interrupt() DOES deliver the torn-down
+    ResultMessage within the window, _results_seen realigns, no rebuild is flagged,
+    and the next turn is served on the SAME client via the existing generation-drop
+    path (only ONE connect ever happens)."""
+    run, buf, rebuilt, evs = await _drive_rebuild_scenario("terminator_in_window")
+    assert rebuilt is False, "an in-window terminator must NOT rebuild"
+    assert len(_RebuildFake.instances) == 1, _RebuildFake.instances  # no reconnect
+    logs = [e["text"] for e in evs if e["type"] == "log"]
+    assert any("answer: second question" in t for t in logs), logs
+    out = buf.getvalue()
+    assert "turn.rebuild_armed" not in out, out
+    assert "turn.rebuilt" not in out, out
+    print("✓ test-session no rebuild: an in-window stall terminator keeps the same client")
+
+
 async def test_open_test_session_idempotency_is_run_scoped():
     """P1: the open-test dedup key is (parent_run_id, client_request_id). On a shared
     box two runs that mint the SAME client_request_id must each open their OWN session
@@ -4355,6 +4530,9 @@ async def main():
     await test_test_session_step_frames()
     await test_test_session_stall_reaps_turn_keeps_session_live()
     await test_test_session_late_reaped_frames_never_terminate_new_turn()
+    await test_test_session_rebuild_after_failed_interrupt()
+    await test_test_session_rebuild_after_lost_terminator()
+    await test_test_session_terminator_in_window_no_rebuild()
     await test_test_session_idle_ttl_reaper()
     await test_list_test_sessions_endpoint()
     await test_explicit_test_recommendation_http()
