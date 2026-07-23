@@ -7,7 +7,9 @@ their edge extraction + coverage math over this same `raw/` + `candidate/` +
 
 Cases exercised: relative link, `../` cross-directory link, HTML `<img>`,
 URL-encoded path (`%20`), a `?query`-suffixed target (truncated before
-decoding), a body reference to a nonexistent asset (no edge, no error), a
+decoding), an angle-bracketed destination with a trailing `#fragment`
+(`<assets/c d.png>#fig1` — unwrapped even though the destination does not
+*end* in `>`), a body reference to a nonexistent asset (no edge, no error), a
 0-byte download-failed placeholder, `assets/sheets/*.md` (a content file, not
 media), one image shared by a cited and an unaccounted document (auto via the
 accounted one), an orphan image (unaccounted unless excluded), an image

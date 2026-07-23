@@ -14,6 +14,7 @@
     ],
     "guide/setup.md": [
       "guide/assets/a b.png",
+      "guide/assets/c d.png",
       "guide/assets/diagram.png",
       "guide/assets/screenshot.png"
     ],
@@ -24,10 +25,10 @@
     ]
   },
   "coverage": {
-    "total_sources": 18,
+    "total_sources": 19,
     "cited": 6,
     "excluded": 2,
-    "auto_attached": 8,
+    "auto_attached": 9,
     "auto_attached_sample": [
       {
         "asset": "assets/hero.png",
@@ -47,6 +48,10 @@
       },
       {
         "asset": "guide/assets/a b.png",
+        "via": "guide/setup.md"
+      },
+      {
+        "asset": "guide/assets/c d.png",
         "via": "guide/setup.md"
       },
       {
