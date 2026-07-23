@@ -1420,6 +1420,54 @@ class _ImmediateRetryFake:
         self._q.put_nowait(_STREAM_STOP)
 
 
+class _BlockedInterruptFake:
+    """Reap-to-arm race stand-in: instance 0 black-holes query 1 and its
+    interrupt() BLOCKS until the test releases it (a slow SDK round-trip) —
+    modelling the gap in which the UI has already received the stall turn_done
+    but the terminator window used to be armed only after interrupt() returned.
+    A retry landing in that gap must still be gated. Later queries on instance 0
+    answer normally (pre-fix, they were the frames dropped one generation
+    behind). Instance 1 (the rebuild) answers normally."""
+
+    instances: list = []
+    interrupt_entered: asyncio.Event
+    interrupt_release: asyncio.Event
+
+    def __init__(self, options=None):
+        self.options = options
+        self.idx = len(_BlockedInterruptFake.instances)
+        _BlockedInterruptFake.instances.append(self)
+        self.queries = []
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, text, session_id="default"):
+        self.queries.append(text)
+        if self.idx == 0 and len(self.queries) == 1:
+            return  # black-hole the first turn only
+        self._q.put_nowait(AssistantMessage("answer: " + text))
+        self._q.put_nowait(ResultMessage())
+
+    async def interrupt(self):
+        _BlockedInterruptFake.interrupt_entered.set()
+        await _BlockedInterruptFake.interrupt_release.wait()
+        # released: accepted, but the torn-down ResultMessage never arrives
+
+    async def receive_messages(self):
+        while not self._closed:
+            msg = await self._q.get()
+            if msg is _STREAM_STOP:
+                return
+            yield msg
+
+    async def disconnect(self):
+        self._closed = True
+        self._q.put_nowait(_STREAM_STOP)
+
+
 async def _await(cond, *, timeout=3.0, poll=0.02):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1605,6 +1653,78 @@ async def test_test_session_immediate_retry_within_terminator_window():
          compile_box._TEST_STALL_REBUILD_WINDOW_S,
          compile_box.ClaudeSDKClient) = saved
     print("✓ test-session immediate retry inside the terminator window rebuilds; one timeout, answer shown")
+
+
+async def test_test_session_retry_during_interrupt_in_flight():
+    """Review (Medium): the stall reaper frees the UI (turn_done) BEFORE awaiting
+    interrupt(), so a retry can land while interrupt() is still in flight. The
+    window used to be armed only after interrupt() returned — a retry in that gap
+    saw neither _needs_rebuild nor a pending window, armed a misaligned turn on
+    the wedged client, and (with the terminator lost) every later frame was
+    silently dropped until the idle TTL, while the retry's own ResultMessage
+    impersonated the lost terminator and cancelled the rebuild decision. The
+    window is now armed at the reap itself (before any await) and the resolver
+    compares against the reaped turn's generation, so the in-flight-interrupt
+    retry rebuilds a fresh client: exactly one stall, the retry's answer is
+    displayed."""
+    saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+             compile_box._MODEL_WATCHDOG_POLL_S,
+             compile_box._TEST_STALL_REBUILD_WINDOW_S,
+             compile_box.ClaudeSDKClient)
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._MODEL_WATCHDOG_POLL_S = 0.03
+    compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0
+    _BlockedInterruptFake.instances = []
+    _BlockedInterruptFake.interrupt_entered = asyncio.Event()
+    _BlockedInterruptFake.interrupt_release = asyncio.Event()
+    compile_box.ClaudeSDKClient = _BlockedInterruptFake
+    compile_box.TEST_SESSIONS.clear()
+    buf = io.StringIO()
+    snap = tempfile.mkdtemp()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    run = compile_box.TestRun("t-race2", snap, parent_run_id="p-race2", snapshot_hash="h")
+    compile_box.TEST_SESSIONS["t-race2"] = run
+    try:
+        with contextlib.redirect_stdout(buf):
+            run.task = asyncio.create_task(compile_box._test_session_wrapper(run))
+            assert await compile_box._await_session_live(run) is None
+            r1 = await client.post("/test-message/t-race2", json={"message": "first question"})
+            assert r1.status == 200, await r1.text()
+            # the reap has emitted turn_done and is now parked INSIDE interrupt()
+            await asyncio.wait_for(_BlockedInterruptFake.interrupt_entered.wait(), timeout=3)
+            # the user retries in exactly that gap
+            r2 = await client.post("/test-message/t-race2", json={"message": "second question"})
+            assert r2.status == 200, await r2.text()
+            assert await _await(lambda: run._turn_active is False and run._results_seen >= 1), \
+                "the in-gap retry never completed"
+            _BlockedInterruptFake.interrupt_release.set()   # let the reaper's interrupt return
+            await asyncio.sleep(0.1)                        # give the watchdog a settle beat
+        evs = _drain(run)
+        stalls = [e for e in evs if e["type"] == "turn_stalled"]
+        assert len(stalls) == 1, stalls
+        logs = [e["text"] for e in evs if e["type"] == "log"]
+        assert any("answer: second question" in t for t in logs), logs
+        assert len(_BlockedInterruptFake.instances) == 2, _BlockedInterruptFake.instances  # rebuilt
+        out = buf.getvalue()
+        assert "turn.rebuilt tid=t-race2" in out, out
+        assert "turn.stale_frame_dropped" not in out, out
+        assert "question" not in out.lower() and "answer" not in out.lower(), out  # no content leak
+    finally:
+        _BlockedInterruptFake.interrupt_release.set()
+        run.done = True
+        if run.task and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+        await client.close()
+        compile_box.TEST_SESSIONS.clear()
+        shutil.rmtree(snap, ignore_errors=True)
+        (compile_box._TEST_MODEL_IDLE_TIMEOUT_S,
+         compile_box._MODEL_WATCHDOG_POLL_S,
+         compile_box._TEST_STALL_REBUILD_WINDOW_S,
+         compile_box.ClaudeSDKClient) = saved
+    print("✓ test-session retry during an in-flight interrupt rebuilds; one stall, answer shown")
 
 
 async def test_test_session_rebuild_retry_after_failed_reconnect():
@@ -4761,6 +4881,7 @@ async def main():
     await test_test_session_terminator_in_window_no_rebuild()
     await test_test_session_rebuild_retry_after_failed_reconnect()
     await test_test_session_immediate_retry_within_terminator_window()
+    await test_test_session_retry_during_interrupt_in_flight()
     await test_test_session_idle_ttl_reaper()
     await test_list_test_sessions_endpoint()
     await test_explicit_test_recommendation_http()

@@ -560,7 +560,7 @@ class TestRun:
         # hand the rebuild off to the driver task and report the outcome back.
         self._needs_rebuild = False
         self._pending_terminator_deadline: float | None = None
-        self._pending_terminator_seen = 0
+        self._pending_terminator_gen = 0
         self._rebuild_requested: asyncio.Event = asyncio.Event()
         self._rebuild_ready: asyncio.Event = asyncio.Event()
         self._rebuild_error: str | None = None
@@ -4280,15 +4280,18 @@ async def _test_stall_watchdog(run: "TestRun") -> None:
     Read/Grep over the snapshot is never false-killed (I4)."""
     while not run.done:
         await asyncio.sleep(_MODEL_WATCHDOG_POLL_S)
-        # Resolve a pending post-interrupt terminator window (armed below after a
-        # successful interrupt). If the reaped turn's ResultMessage arrived, the
-        # consume loop advanced _results_seen and the generation stream is intact —
-        # clear the window. If the window elapsed with nothing, the terminator is
-        # lost and the generation guard can never realign: flag a rebuild so the
-        # next /test-message starts the SDK client fresh. Runs above the active-turn
-        # guard because a reaped turn is no longer active.
+        # Resolve a pending post-interrupt terminator window (armed at the reap
+        # below). The reaped turn's terminator is the ResultMessage that advances
+        # _results_seen to that turn's recorded GENERATION — only that specific
+        # evidence clears the window (review: a bare "_results_seen advanced"
+        # check let any later turn's ResultMessage impersonate the lost
+        # terminator and cancel the rebuild decision). If the window elapses
+        # first, the terminator is lost and the generation guard can never
+        # realign: flag a rebuild so the next /test-message starts the SDK client
+        # fresh. Runs above the active-turn guard because a reaped turn is no
+        # longer active.
         if run._pending_terminator_deadline is not None:
-            if run._results_seen > run._pending_terminator_seen:
+            if run._results_seen >= run._pending_terminator_gen:
                 run._pending_terminator_deadline = None
             elif time.monotonic() >= run._pending_terminator_deadline:
                 run._pending_terminator_deadline = None
@@ -4308,6 +4311,18 @@ async def _test_stall_watchdog(run: "TestRun") -> None:
         run._stall_reaped = True
         run._turn_active = False
         run._turn_text = []           # the wedged attempt produced nothing usable
+        # Arm the pending-terminator guard NOW, before any await: the turn_done
+        # below frees the UI, and a retry can land while interrupt() is still in
+        # flight — /test-message must already see the unresolved window and
+        # rebuild (review: arming only after interrupt() returned left a gap in
+        # which a retry armed a misaligned turn on the wedged client, and its
+        # ResultMessage then impersonated the reaped turn's terminator). The
+        # guard records the reaped turn's GENERATION: its terminator is the
+        # ResultMessage that advances _results_seen to that generation, so the
+        # resolver at the top of this loop compares against the generation
+        # rather than trusting any bare counter advance.
+        run._pending_terminator_gen = run._turn_generation
+        run._pending_terminator_deadline = time.monotonic() + _TEST_STALL_REBUILD_WINDOW_S
         _print_test_lifecycle(
             "turn.stalled", run, extra=f"idle={round(idle, 1)}s bound={round(bound, 1)}s")
         await run.emit({
@@ -4330,21 +4345,24 @@ async def _test_stall_watchdog(run: "TestRun") -> None:
         except Exception as e:
             # A swallowed interrupt cannot un-wedge the receive loop and its
             # torn-down result will never arrive, so the generation stream can
-            # never realign. Flag a rebuild immediately: the next /test-message
-            # reconnects a fresh client. The UI already recovered above; do not
-            # disconnect here (spec: keep the session live). Surface the interrupt
-            # failure for pod-log triage.
-            run._needs_rebuild = True
-            _print_test_lifecycle("turn.rebuild_armed", run, extra="reason=interrupt_failed")
-            await run.emit({"type": "summary", "text": _loc(run,
-                f"Test session: interrupt after stall failed {e!r}",
-                f"测试会话:停滞后中断失败 {e!r}")})
-        else:
-            # interrupt() was accepted; the torn-down ResultMessage should still
-            # arrive and advance _results_seen. Arm a bounded window (resolved at
-            # the top of this loop) — if the terminator never lands, flag a rebuild.
-            run._pending_terminator_seen = run._results_seen
-            run._pending_terminator_deadline = time.monotonic() + _TEST_STALL_REBUILD_WINDOW_S
+            # never realign. Escalate the armed window to an immediate rebuild
+            # flag: the next /test-message reconnects a fresh client. The UI
+            # already recovered above; do not disconnect here (spec: keep the
+            # session live). Surface the interrupt failure for pod-log triage.
+            # Guard on the client still being current — a retry may have already
+            # rebuilt underneath this await (disconnecting `client` is exactly
+            # what makes interrupt() raise then), and re-flagging would force a
+            # second, spurious rebuild of the fresh client.
+            if run.client is client:
+                run._pending_terminator_deadline = None
+                run._needs_rebuild = True
+                _print_test_lifecycle("turn.rebuild_armed", run, extra="reason=interrupt_failed")
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Test session: interrupt after stall failed {e!r}",
+                    f"测试会话:停滞后中断失败 {e!r}")})
+        # On success the window armed above stands: the torn-down ResultMessage
+        # should arrive and advance _results_seen to the reaped generation; the
+        # resolver clears the window then, or flags a rebuild when it elapses.
 
 
 async def _reap_idle_test_sessions() -> int:
@@ -4433,7 +4451,7 @@ def _reset_test_turn_state(run: "TestRun") -> None:
     run._turn_text = []
     run._needs_rebuild = False
     run._pending_terminator_deadline = None
-    run._pending_terminator_seen = 0
+    run._pending_terminator_gen = 0
 
 
 async def test_session_driver(run: "TestRun"):
