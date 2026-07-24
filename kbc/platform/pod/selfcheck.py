@@ -750,11 +750,14 @@ def append_exclusions(workdir: str, entries: list[dict]) -> list[dict]:
         if not isinstance(data, list):
             return []
     have = {str(item.get("pattern")) for item in data if isinstance(item, dict)}
-    added = [
-        {"pattern": str(e["pattern"]), "reason": str(e["reason"])}
-        for e in entries
-        if e.get("pattern") and e.get("reason") and str(e["pattern"]) not in have
-    ]
+    added: list[dict] = []
+    for e in entries:
+        pattern = str(e.get("pattern") or "")
+        reason = str(e.get("reason") or "")
+        if not pattern or not reason or pattern in have:
+            continue
+        have.add(pattern)  # de-duplicate within this call, not just vs the file
+        added.append({"pattern": pattern, "reason": reason})
     if not added:
         return []
     path.parent.mkdir(parents=True, exist_ok=True)
