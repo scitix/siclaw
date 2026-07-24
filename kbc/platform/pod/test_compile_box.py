@@ -4566,6 +4566,301 @@ async def test_model_stall_exhausts_to_error():
     print("✓ model stall: retries exhausted → ModelStallError (fails fast, no hang)")
 
 
+# ── Batch-path stall recovery: client rebuild + continue (07-24 incident) ─────
+
+
+class _FakeExitedTransport:
+    """Duck-types the SDK subprocess transport so _client_process_exited(client)
+    reads a terminated child (returncode set)."""
+
+    def __init__(self, returncode):
+        self._process = type("_P", (), {"returncode": returncode})()
+
+
+class _BatchTurnFake:
+    """A per-attempt fake compile-session client for _drive_batch_session.
+
+    mode:
+      'ok'          — a clean turn: AssistantMessage(reply) + ResultMessage.
+      'lost_term'   — emit the content once (AssistantMessage), then black-hole
+                      the terminator forever; interrupt() is SWALLOWED (produces
+                      nothing), reproducing the 07-24 incident (stream terminator
+                      lost AND interrupt black-holed).
+      'dead'        — the CLI subprocess has exited (returncode set) and the
+                      stream hangs; the watchdog's liveness probe must reap it.
+    """
+
+    def __init__(self, mode, reply="batch reply", returncode=None):
+        self.mode = mode
+        self.reply = reply
+        self.interrupts = 0
+        self.disconnects = 0
+        self._gate = asyncio.Event()
+        self._closed = False
+        if returncode is not None:
+            self._transport = _FakeExitedTransport(returncode)
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        # 'dead' never opens the gate — the stream hangs until the liveness probe
+        # reaps and disconnect() unblocks it.
+        if self.mode in ("ok", "lost_term"):
+            self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1          # swallowed: nothing is ever produced
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if self.mode == "ok":
+                yield AssistantMessage(self.reply)
+                yield ResultMessage()
+                self._closed = True
+                return
+            if self.mode == "lost_term":
+                yield AssistantMessage(self.reply)   # content lands…
+                self.mode = "blackhole"              # …then the terminator never comes
+            # blackhole / dead → loop back and block on the (cleared) gate
+
+    async def disconnect(self):
+        self.disconnects += 1
+        self._closed = True
+        self._gate.set()              # let a blocked receive_messages() exit
+
+
+def _batch_client_factory(modes):
+    """Return a _compile_session_client stand-in that hands out one _BatchTurnFake
+    per connect, following `modes` in order (last mode repeats if drained). Records
+    the built clients so a test can assert interrupts/disconnects/rebuild count."""
+    built: list[_BatchTurnFake] = []
+
+    def factory(run, wd, system_prompt, session_id, **kwargs):
+        spec = modes[len(built)] if len(built) < len(modes) else modes[-1]
+        client = _BatchTurnFake(**spec) if isinstance(spec, dict) else _BatchTurnFake(spec)
+        built.append(client)
+        return client
+
+    return built, factory
+
+
+async def _drive_batch_with_watchdog(modes, *, label="batch 1/2", batch_active=True,
+                                     idle=0.05, poll=0.02, max_retries=1,
+                                     interrupt_deadline=0.1, rebuild_max=3):
+    """Run the REAL _drive_batch_session with the REAL _model_stall_watchdog over a
+    scripted sequence of fake clients, at test-tuned knobs (restored after). The
+    de-stream floor is 0 in tests (the shim never binds), so bounds are the raw
+    idle/deadline values. Returns (run, drained events, reply, raised, built)."""
+    saved = (
+        compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+        compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+        compile_box._BATCH_REBUILD_MAX_RETRIES, compile_box._compile_session_client,
+        compile_box._compile_system_prompt, compile_box._engine_kind,
+    )
+    built, factory = _batch_client_factory(modes)
+    compile_box._MODEL_IDLE_TIMEOUT_S = idle
+    compile_box._MODEL_WATCHDOG_POLL_S = poll
+    compile_box._MODEL_MAX_RETRIES = max_retries
+    compile_box._STALL_INTERRUPT_DEADLINE_S = interrupt_deadline
+    compile_box._BATCH_REBUILD_MAX_RETRIES = rebuild_max
+    compile_box._compile_session_client = factory
+    compile_box._compile_system_prompt = lambda run: "sys"
+    compile_box._engine_kind = lambda: "claude_agent_sdk"
+    raised = None
+    reply = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("bd", td, 1)
+            run._batch_active = batch_active
+            wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+            try:
+                reply = await asyncio.wait_for(
+                    compile_box._drive_batch_session(run, "批 1/2 指令", label), timeout=5)
+            except compile_box.ModelStallError as e:
+                raised = e
+            finally:
+                run.done = True
+                wdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wdog
+    finally:
+        (
+            compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+            compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+            compile_box._BATCH_REBUILD_MAX_RETRIES, compile_box._compile_session_client,
+            compile_box._compile_system_prompt, compile_box._engine_kind,
+        ) = saved
+    return run, _drain(run), reply, raised, built
+
+
+async def test_batch_lost_terminator_reaps_and_rebuilds():
+    """(a) A batch turn whose content completed but whose stream terminator was
+    lost (and interrupt() swallowed) is reaped by the watchdog within bounds, then
+    _drive_batch_session rebuilds a fresh client and the batch completes — instead
+    of hanging for 40+ minutes on the wedged transport."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        ["lost_term", "ok"])
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert reply == "batch reply", reply
+    assert len(built) == 2, built                 # exactly one rebuild
+    assert built[0].interrupts >= 1, built[0].interrupts   # watchdog tried in place first
+    assert built[0].disconnects >= 1, built[0].disconnects  # dead client torn down
+    assert "turn_stalled" in types, types         # the watchdog fired (checkpoint within bounds)
+    print("✓ batch stall: lost terminator reaped within bounds → client rebuilt → batch completes")
+
+
+async def test_batch_subprocess_death_rebuilds_and_continues():
+    """(b) The CLI subprocess dies mid-batch (returncode set) and the stream
+    hangs. The watchdog's liveness probe detects the exit in one poll (not the
+    idle floor), _drive_batch_session rebuilds, and the batch continues."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        [{"mode": "dead", "returncode": 0}, {"mode": "ok"}])
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert reply == "batch reply", reply
+    assert len(built) == 2, built
+    assert built[0].interrupts == 0, built[0].interrupts   # a dead process is not interrupted
+    assert built[0].disconnects >= 1, built[0].disconnects
+    stalled = [e for e in evs if e["type"] == "turn_stalled"]
+    assert any(e.get("code") == "model_turn_unrecoverable" for e in stalled), stalled
+    print("✓ batch stall: dead subprocess detected by liveness probe → rebuilt → batch continues")
+
+
+async def test_batch_rebuild_exhaustion_raises_resumable():
+    """(c) A batch whose every client dies exhausts the bounded rebuilds and
+    raises ModelStallError; _run_batch_compile turns that into the resumable
+    checkpoint (finished batches stay stamped, run ends closable)."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        [{"mode": "dead", "returncode": 1}], rebuild_max=2)
+    assert isinstance(raised, compile_box.ModelStallError), raised
+    assert "exhausted" in str(raised), raised
+    assert len(built) == 3, built                 # initial + 2 rebuilds, then give up
+    assert all(c.disconnects >= 1 for c in built), [c.disconnects for c in built]
+
+    # The orchestrator converts that raise into the resumable-checkpoint turn_done.
+    real_drive = compile_box._drive_batch_session
+
+    async def always_stall(run_, directive, label, pdf_page_ranges=None,
+                           raw_read_allowlist=None):
+        raise compile_box.ModelStallError("batch session stalled; exhausted rebuilds")
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+        (wd / "raw" / "a" / "two.md").write_bytes(b"y" * 300)
+        run2 = compile_box.CompileRun("bx", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+        compile_box._drive_batch_session = always_stall
+        try:
+            await compile_box._run_batch_compile(run2, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        evs2 = _drain(run2)
+        types2 = [e["type"] for e in evs2]
+        assert types2.count("turn_done") == 1, types2   # the single logical turn still CLOSES
+        done = next(e for e in evs2 if e["type"] == "turn_done")
+        assert "resume" in done["text"] or "断点" in done["text"], done
+        assert run2._batch_active is False, "batch flag must clear so the next trigger can resume"
+    print("✓ batch stall: rebuilds exhausted → ModelStallError → run ends resumable (checkpoint)")
+
+
+async def test_resumed_batch_phase_is_watchdog_armed():
+    """(d) The resumed-batching phase (the suspected coverage gap) runs each
+    pending batch through _drive_batch_session, which arms the watchdog via
+    _begin_turn exactly like a first-pass batch. Resume a plan with one pending
+    batch whose first client loses its terminator: the watchdog must reap it and
+    the rebuild must recover — proving the resumed phase is covered."""
+    import batching
+
+    real_drive = compile_box._drive_batch_session
+    real_accounted = compile_box._unaccounted_batch_sources
+    real_selfcheck = compile_box._post_turn_selfcheck
+    real_media = compile_box._media_verify_enabled
+    saved = (
+        compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+        compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+        compile_box._compile_session_client, compile_box._compile_system_prompt,
+        compile_box._engine_kind,
+    )
+    built, factory = _batch_client_factory(["lost_term", "ok"])
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+        (wd / "raw" / "a" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("rz", str(wd), 1)
+        # A pinned plan already exists with batch 1 done, batch 2 pending → the
+        # resume branch of _run_batch_compile drives ONLY batch 2.
+        inventory = batching.scan_sources(wd / "raw")
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+        plan = batching.build_plan(inventory, batching.pack_batches(inventory), planner="code")
+        assert len(plan["batches"]) >= 2, plan
+        plan["batches"][0]["status"] = "done"
+        for b in plan["batches"][1:]:
+            b["status"] = "pending"
+        (wd / batching.BATCH_PLAN_PATH).parent.mkdir(parents=True, exist_ok=True)
+        (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+        (wd / batching.SOURCES_INVENTORY_PATH).write_text(json.dumps(inventory))
+
+        compile_box._MODEL_IDLE_TIMEOUT_S = 0.05
+        compile_box._MODEL_WATCHDOG_POLL_S = 0.02
+        compile_box._MODEL_MAX_RETRIES = 1
+        compile_box._STALL_INTERRUPT_DEADLINE_S = 0.1
+        compile_box._compile_session_client = factory
+        compile_box._compile_system_prompt = lambda run_: "sys"
+        compile_box._engine_kind = lambda: "claude_agent_sdk"
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        compile_box._post_turn_selfcheck = lambda run_: _async_none()
+        compile_box._media_verify_enabled = lambda: False
+        # The watchdog normally lives in _run_wrapper; _run_batch_compile is
+        # driven directly here, so arm it alongside (exactly as production runs
+        # it concurrently with the orchestrator).
+        wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+        try:
+            await asyncio.wait_for(
+                compile_box._run_batch_compile(run, "直接开始编译"), timeout=8)
+        finally:
+            run.done = True
+            wdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wdog
+            (
+                compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+                compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+                compile_box._compile_session_client, compile_box._compile_system_prompt,
+                compile_box._engine_kind,
+            ) = saved
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            compile_box._post_turn_selfcheck = real_selfcheck
+            compile_box._media_verify_enabled = real_media
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        evs = _drain(run)
+        types = [e["type"] for e in evs]
+        # The resumed batch stalled and was reaped (armed watchdog), then rebuilt.
+        assert "turn_stalled" in types, types
+        assert built[0].disconnects >= 1, built[0].disconnects
+        assert len(built) >= 2, built                 # the resumed batch rebuilt at least once
+        assert types.count("turn_done") == 1, types   # the resumed run still closes exactly once
+        final_plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] == "done" for b in final_plan["batches"]), final_plan
+    print("✓ resumed batch phase: watchdog armed on the pending batch → reaped → rebuilt → completes")
+
+
+async def _async_none():
+    return None
+
+
 # ── Rate-limit resilience (C2) ───────────────────────────────────────────────
 
 
@@ -4922,6 +5217,10 @@ async def main():
     await test_model_stall_tool_gap_not_reaped()
     await test_model_stall_exhausts_to_error()
     await test_stall_interrupt_deadline_closes_turn()
+    await test_batch_lost_terminator_reaps_and_rebuilds()
+    await test_batch_subprocess_death_rebuilds_and_continues()
+    await test_batch_rebuild_exhaustion_raises_resumable()
+    await test_resumed_batch_phase_is_watchdog_armed()
     await test_run_wrapper_closes_turn_on_driver_crash()
     await test_run_wrapper_cancels_detached_verify_tasks()
     await test_model_rate_limit_backoff_then_completes()

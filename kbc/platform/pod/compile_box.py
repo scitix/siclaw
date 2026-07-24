@@ -60,6 +60,8 @@ from claude_agent_sdk import (
     tool,
     create_sdk_mcp_server,
     InMemorySessionStore,
+    CLIConnectionError,
+    ProcessError,
 )
 
 import batching
@@ -234,6 +236,16 @@ _MODEL_WATCHDOG_POLL_S = float(os.environ.get("KBC_MODEL_WATCHDOG_POLL_S", "10")
 # compiles retain the established 90s failure-detection bound.
 _HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = float(os.environ.get(
     "KBC_HIERARCHICAL_MODEL_IDLE_TIMEOUT_S", "240"))
+# Bounded in-place client REBUILDS for one batch/reduce/final/repair sub-session.
+# The watchdog's interrupt+re-issue (above) recovers a transiently-slow model on
+# the SAME transport; it cannot cure a dead/wedged CLI subprocess or a gateway
+# stream that black-holes every re-issue (07-24 incident: a lost stream
+# terminator wedged one batch, in-place retries burned the 900s de-stream floor
+# each cycle, and when the subprocess later died receive_messages() hung with no
+# recovery). A rebuild swaps in a fresh subprocess + HTTP connection and re-runs
+# the SAME (idempotent, checkpoint-persisted) batch directive. Exhaustion ends
+# the run via the resumable checkpoint path in _run_batch_compile.
+_BATCH_REBUILD_MAX_RETRIES = int(os.environ.get("KBC_BATCH_REBUILD_MAX_RETRIES", "3"))
 
 # ── Test-session resilience (read-only consumer turns) ───────────────────────
 # A test session streams faithfully (no de-stream shim), so the compile-path
@@ -281,6 +293,39 @@ def _print_test_lifecycle(label: str, run: "TestRun", extra: str = "") -> None:
     leaking the KB or the consumer's questions. Same [compile_box] prefix style."""
     tail = f" {extra}" if extra else ""
     print(f"[compile_box] {label} tid={run.tid} parent={run.parent_run_id}{tail}", flush=True)
+
+
+def _print_compile_lifecycle(label: str, run: "CompileRun", extra: str = "") -> None:
+    """One stdout line per compile-path lifecycle event (turn.start / turn.done /
+    turn.stalled / turn.rebuilt / turn.dead / batch.start / batch.done). run_id +
+    round ONLY — never KB content, directives, or model text — so pod logs can
+    answer "what is the box doing" during a long batched compile. The 07-24
+    incident had ZERO stdout for 40+ minutes; the test-session path already prints
+    its own lifecycle (see _print_test_lifecycle), this is the compile analogue.
+    Same [compile_box] prefix style."""
+    tail = f" {extra}" if extra else ""
+    print(f"[compile_box] {label} run={run.run_id} round={run.round}{tail}", flush=True)
+
+
+def _client_process_exited(client) -> int | None:
+    """Best-effort exit code of the SDK's CLI subprocess if it has terminated,
+    else None (still alive, or unknown).
+
+    Duck-typed on the Claude Agent SDK's subprocess transport internals; any
+    deviation (CodexSDKClient, a swapped-in fake, an SDK refactor) simply returns
+    None and the idle-latency watchdog remains the backstop. NEVER raises — a
+    liveness probe that itself throws would be worse than the stall it guards.
+
+    Motivation (07-24): a half-dead CLI child whose stdout never closes leaves
+    receive_messages() blocked forever; the model-idle clock alone then takes the
+    full de-stream floor to react. Polling the process return code catches an
+    exited/killed subprocess in one watchdog tick instead."""
+    try:
+        transport = getattr(client, "_transport", None)
+        proc = getattr(transport, "_process", None) if transport is not None else None
+        return getattr(proc, "returncode", None) if proc is not None else None
+    except Exception:
+        return None
 
 
 def _touch_test_activity(run: "TestRun") -> None:
@@ -445,6 +490,15 @@ class CompileRun:
         self._model_retries = 0             # stall retries used on the in-flight turn
         self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
         self._stall_fatal = False           # stall retries exhausted → fail this turn
+        # Set by the watchdog when it gives up on the in-flight turn (subprocess
+        # exited, or a double-black-hole swallowed interrupt() past the deadline)
+        # while a batch sub-session owns the client. It disconnects to unblock the
+        # wedged receive loop; _consume_turn_stream then raises ModelStallError so
+        # _drive_batch_session rebuilds a fresh client and continues from the
+        # checkpoint. Cleared by _begin_turn. Never set on the persistent
+        # (run_session) path — that keeps its terminal "recreated on next
+        # message" behavior.
+        self._turn_dead = False
         # Temporary orchestrator-scoped override. Only hierarchical batch mode
         # sets this; every other turn continues to use _MODEL_IDLE_TIMEOUT_S.
         self._model_idle_timeout_s: float | None = None
@@ -476,6 +530,7 @@ class CompileRun:
         self._model_retries = 0
         self._stall_retrying = False
         self._stall_fatal = False
+        self._turn_dead = False
         self._rate_retries = 0
         self._last_model_activity = time.monotonic()
         self._last_sdk_message_type = "query"
@@ -2825,37 +2880,86 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
     """One bounded internal session: fresh session_id, same role/tools/workspace.
     Streams its output through _emit_message with turn_done suppressed; returns
     the session's final reply text. run.client points at the live session so the
-    park/ruling MCP tools and the inject seam keep working."""
+    park/ruling MCP tools and the inject seam keep working.
+
+    Self-healing (07-24): the model turn is wrapped in a bounded client-REBUILD
+    loop. A stall the watchdog cannot recover in place (dead subprocess, or a
+    gateway stream that black-holes every re-issue) surfaces as ModelStallError /
+    a transport error out of _consume_turn_stream; a rebuild disconnects the dead
+    client and re-runs the SAME (idempotent, checkpoint-persisted) batch directive
+    on a fresh subprocess + HTTP connection. Exhausting _BATCH_REBUILD_MAX_RETRIES
+    re-raises, and _run_batch_compile turns that into the resumable checkpoint
+    (finished batches stay stamped; the next trigger resumes from the first
+    pending batch). Batches are idempotent, so re-running an unstamped batch is
+    always safe."""
     root = Path(run.workdir).resolve()
     wd = str(root)
-    session_id = str(uuid.uuid4())
     source_view = None
     client = None
     prev_client = run.client
     run._suppress_turn_done = True
     run._last_turn_reply = ""
+    attempt = 0
     try:
-        if _engine_kind() == "codex_sdk" and raw_read_allowlist is not None:
-            source_view = _materialize_codex_batch_source_view(
-                root, raw_read_allowlist, pdf_page_ranges, session_id)
-            directive += _codex_batch_source_view_note(
-                root, source_view, raw_read_allowlist, pdf_page_ranges,
-                getattr(run, "locale", None),
-            )
-        client = _compile_session_client(
-            run, wd, _compile_system_prompt(run), session_id,
-            pdf_page_ranges=pdf_page_ranges,
-            raw_read_allowlist=raw_read_allowlist,
-            codex_source_view=source_view,
-        )
-        await client.connect()
-        run.client = client
-        await run.emit({"type": "log", "text": _loc(run, f"—— {label} started ——", f"—— {label} 开始 ——")})
-        run._begin_turn(directive)
-        await client.query(directive)
-        await _consume_turn_stream(
-            run, client, stop_on_result=True, fail_on_error_result=True)
-        return run._last_turn_reply
+        while True:
+            session_id = str(uuid.uuid4())
+            directive_full = directive
+            try:
+                if _engine_kind() == "codex_sdk" and raw_read_allowlist is not None:
+                    source_view = _materialize_codex_batch_source_view(
+                        root, raw_read_allowlist, pdf_page_ranges, session_id)
+                    directive_full = directive + _codex_batch_source_view_note(
+                        root, source_view, raw_read_allowlist, pdf_page_ranges,
+                        getattr(run, "locale", None),
+                    )
+                client = _compile_session_client(
+                    run, wd, _compile_system_prompt(run), session_id,
+                    pdf_page_ranges=pdf_page_ranges,
+                    raw_read_allowlist=raw_read_allowlist,
+                    codex_source_view=source_view,
+                )
+                await client.connect()
+                run.client = client
+                if attempt == 0:
+                    await run.emit({"type": "log", "text": _loc(run, f"—— {label} started ——", f"—— {label} 开始 ——")})
+                    _print_compile_lifecycle("turn.start", run, extra=f"label={label}")
+                else:
+                    _print_compile_lifecycle(
+                        "turn.rebuilt", run, extra=f"label={label} attempt={attempt}")
+                run._begin_turn(directive_full)
+                await client.query(directive_full)
+                await _consume_turn_stream(
+                    run, client, stop_on_result=True, fail_on_error_result=True)
+                _print_compile_lifecycle("turn.done", run, extra=f"label={label}")
+                return run._last_turn_reply
+            except (ModelStallError, CLIConnectionError, ProcessError) as exc:
+                attempt += 1
+                # Tear down the dead/wedged client before rebuilding. Disconnect
+                # may itself raise on a broken transport — best-effort.
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        await client.disconnect()
+                    client = None
+                run.client = prev_client
+                if source_view is not None:
+                    shutil.rmtree(source_view, ignore_errors=True)
+                    source_view = None
+                if attempt > _BATCH_REBUILD_MAX_RETRIES:
+                    _print_compile_lifecycle(
+                        "turn.rebuild_exhausted", run,
+                        extra=f"label={label} attempts={attempt - 1}")
+                    raise ModelStallError(
+                        f"batch session '{label}' stalled; exhausted "
+                        f"{_BATCH_REBUILD_MAX_RETRIES} client rebuild(s)") from exc
+                _print_compile_lifecycle(
+                    "turn.rebuild_armed", run,
+                    extra=f"label={label} attempt={attempt} reason={type(exc).__name__}")
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Compile session stalled ({label}); rebuilding the model session and retrying "
+                    f"(attempt {attempt}/{_BATCH_REBUILD_MAX_RETRIES}).",
+                    f"编译会话停滞({label}),正在重建模型会话并重试"
+                    f"(第 {attempt}/{_BATCH_REBUILD_MAX_RETRIES} 次)。")})
+                # loop → rebuild on a fresh client, same directive
     finally:
         run._suppress_turn_done = False
         run.client = prev_client
@@ -3274,6 +3378,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     run._batch_active = True
     previous_model_idle_timeout = run._model_idle_timeout_s
     replies: list[str] = []
+    _print_compile_lifecycle("batch.start", run)
     try:
         raw_dir = Path(run.workdir) / "raw"
         inventory = batching.scan_sources(raw_dir)
@@ -3359,6 +3464,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     await _sync_workspace(run, sent)
                 except Exception:
                     pass  # periodic sync will retry; the local stamp is already on disk
+            _print_compile_lifecycle("batch.done", run, extra=f"batch={k}/{n} id={batch['id']}")
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
         if plan.get("mode") == "hierarchical":
@@ -3526,9 +3632,11 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 plan["phase"] = "final"
                 _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
                 raise
+        _print_compile_lifecycle("batch.complete", run)
         await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
                         or _loc(run, "Batch compile complete.", "分批编译完成。")})
     except Exception as e:
+        _print_compile_lifecycle("batch.interrupted", run, extra=f"reason={type(e).__name__}")
         await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
         # never-block: the single logical turn must still CLOSE — a consumer
         # gating on turn_done would otherwise hang on an orchestrator error.
@@ -3651,6 +3759,23 @@ async def _consume_turn_stream(
                 return
             continue
         await _emit_message(run, msg)
+    # The stream ended without a real ResultMessage. For a bounded sub-session
+    # (stop_on_result) this is never a normal end — it means the model turn died
+    # under us: the watchdog reaped a dead/wedged subprocess and disconnected to
+    # unblock this loop (_turn_dead), or the CLI child exited cleanly between
+    # watchdog polls so its stdout closed and receive_messages() ended with the
+    # turn's terminator lost (_turn_active still set — no result was consumed).
+    # Either way raise so _drive_batch_session rebuilds a fresh client and
+    # continues from the checkpoint. The persistent driver (stop_on_result=False)
+    # ends its stream normally on session close and must fall through cleanly, so
+    # it is gated out here; its own mid-turn death is handled by the watchdog's
+    # terminal path (_reap_unrecoverable_turn, non-batch branch).
+    if run._turn_dead or (stop_on_result and run._turn_active):
+        run._turn_active = False
+        run._turn_dead = False
+        run._turn_text = []           # discard the dead attempt's partial text
+        raise ModelStallError(
+            "model stream ended without a result (subprocess exit / transport closed)")
 
 
 _STALL_INTERRUPT_DEADLINE_S = int(os.environ.get("KBC_STALL_INTERRUPT_DEADLINE_S", "120"))
@@ -3668,11 +3793,58 @@ def _watchdog_idle_bound(tool_pending: bool, model_idle_timeout: float, destream
     return max(model_idle_timeout, destream_floor) if destream_floor else model_idle_timeout
 
 
+async def _reap_unrecoverable_turn(run: CompileRun, client, reason: str) -> None:
+    """Give up on the in-flight turn and disconnect the client to unblock the
+    wedged receive loop. Two recovery contracts, chosen by whether a batch
+    orchestrator owns the client:
+
+    - Batch sub-session (run._batch_active): flag _turn_dead so
+      _consume_turn_stream raises ModelStallError once the disconnect ends its
+      stream; _drive_batch_session then rebuilds a fresh client and continues
+      from the persisted checkpoint. Emit a content-free diagnostic only — the
+      single logical batch turn's turn_done is owned by the orchestrator, never
+      by the watchdog (a terminal turn_done here would falsely close the batch).
+
+    - Persistent run_session (no batch active): keep the established terminal
+      behavior — error + a turn_done that promises the session is recreated on
+      the next message (run_session has no reconnect loop; the platform
+      find-or-starts a fresh run/box with workspace rehydration)."""
+    run._stall_retrying = False
+    run._turn_active = False
+    run._turn_text = []               # the wedged attempt produced nothing usable
+    if run._batch_active:
+        run._turn_dead = True
+        _print_compile_lifecycle("turn.dead", run, extra=f"reason={reason}")
+        await run.emit({"type": "turn_stalled", "code": "model_turn_unrecoverable",
+                        "stage": "model_turn", "reason": reason, "fatal": True,
+                        "last_sdk_message": run._last_sdk_message_type})
+    else:
+        _print_compile_lifecycle("turn.dead", run, extra=f"reason={reason} terminal=1")
+        await run.emit({"type": "error",
+                        "error": f"model stall: {reason}"})
+        # Disconnecting ENDS this box's session (run_session has no reconnect
+        # loop — deliberately: recovery is owned by the platform). The turn_done
+        # text must promise exactly that — not an in-place retry this box can no
+        # longer serve (/message would 409 on run.client=None).
+        await run.emit({"type": "turn_done", "text": _loc(run,
+            "The turn stalled and could not be recovered — nothing was applied. "
+            "The compile session will be recreated automatically on your next message.",
+            "本轮模型停滞且中断无响应——未产生结果;编译会话将在你下一条消息时自动重建,届时重发即可。")})
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+
 async def _model_stall_watchdog(run: CompileRun) -> None:
-    """Reap a turn wedged on a black-holed model request. Interrupt the attempt;
-    _consume_turn_stream then re-issues it (or fails). Only judges an ACTIVE turn,
-    and relaxes to the tool bound while a tool is pending — never false-kills a
-    live turn or a long tool (I4)."""
+    """Reap a turn wedged on a black-holed model request OR a dead CLI subprocess.
+    Interrupt a merely-slow attempt; _consume_turn_stream then re-issues it (or
+    fails). A subprocess that has EXITED, or an interrupt() the black-hole
+    swallowed past the deadline, cannot be recovered in place — hand off to
+    _reap_unrecoverable_turn (rebuild+continue for a batch sub-session, terminal
+    for the persistent session). Only judges an ACTIVE turn, and relaxes to the
+    tool bound while a tool is pending — never false-kills a live turn or a long
+    tool (I4)."""
     while not run.done:
         await asyncio.sleep(_MODEL_WATCHDOG_POLL_S)
         if not run._turn_active:
@@ -3681,31 +3853,29 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
             # Interrupted, waiting for the interrupted result. A true black-hole
             # can swallow interrupt() too — then the latch stays set and the
             # receive loop blocks forever. Bound the wait; past the deadline,
-            # close the turn honestly and disconnect to unblock the loop.
+            # give up on the turn and disconnect to unblock the loop.
             if time.monotonic() - run._stall_interrupted_at > _STALL_INTERRUPT_DEADLINE_S:
-                run._stall_retrying = False
-                run._turn_active = False
-                await run.emit({"type": "error",
-                                "error": f"model stall: interrupt produced nothing within {_STALL_INTERRUPT_DEADLINE_S}s"})
-                # Disconnecting ENDS this box's session (run_session has no
-                # reconnect loop — deliberately: this fires only on a double
-                # black-hole, and recovery is owned by the platform: the run
-                # terminalizes via `end`, and the consumer's next message
-                # find-or-starts a fresh run/box with workspace rehydration).
-                # The turn_done text must promise exactly that — not an
-                # in-place retry this box can no longer serve (/message would
-                # 409 on run.client=None).
-                await run.emit({"type": "turn_done", "text": _loc(run,
-                    "The turn stalled and could not be recovered — nothing was applied. "
-                    "The compile session will be recreated automatically on your next message.",
-                    "本轮模型停滞且中断无响应——未产生结果;编译会话将在你下一条消息时自动重建,届时重发即可。")})
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+                client = run.client
+                if client is not None:
+                    await _reap_unrecoverable_turn(
+                        run, client,
+                        f"interrupt produced nothing within {_STALL_INTERRUPT_DEADLINE_S}s")
+                else:
+                    run._stall_retrying = False
+                    run._turn_active = False
             continue
         client = run.client
         if client is None:
+            continue
+        # Subprocess-liveness probe (07-24): a CLI child that has exited but whose
+        # stdout never closed leaves receive_messages() blocked forever; the
+        # model-idle clock alone would take the full (de-stream) idle floor to
+        # react. An exited process cannot be interrupted or re-issued on — reap it
+        # immediately so a batch sub-session rebuilds within one poll instead of
+        # 15+ minutes.
+        exit_code = _client_process_exited(client)
+        if exit_code is not None:
+            await _reap_unrecoverable_turn(run, client, f"subprocess exited (code {exit_code})")
             continue
         model_idle_timeout = (
             run._model_idle_timeout_s
