@@ -1430,6 +1430,38 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.im.image.create).not.toHaveBeenCalled();
   });
 
+  it("persists a delta-only reply and appends feedback linked to that message", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-delta-only" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "content_block_delta", delta: { text: "delta-only " } };
+      yield { type: "content_block_delta", delta: { text: "answer" } };
+    });
+    appendMessageMock.mockImplementation(async (message: { role: string }) =>
+      message.role === "assistant" ? "msg-assistant-delta" : "msg-user",
+    );
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content).toContain("delta-only answer");
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "s-delta-only",
+      role: "assistant",
+      content: "delta-only answer",
+    }));
+    const feedbackAppend = lark.cardkit.v1.cardElement.create.mock.calls[0][0];
+    const [feedbackRow] = JSON.parse(feedbackAppend.data.elements);
+    expect(feedbackRow.columns[0].elements[0].behaviors[0].value.message_id).toBe("msg-assistant-delta");
+  });
+
   it("does not append feedback buttons when the final assistant row fails to persist", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-persist-fail" });
@@ -2499,6 +2531,29 @@ describe("collectChannelResponse — audit persistence", () => {
     expect(toolRows[0]).toMatchObject({ sessionId: "s-audit", toolName: "bash", outcome: "success" });
     expect(toolRows[0].toolInput).toContain("kubectl get nodes");
     expect(toolRows[0].content).toBe("node ok");
+  });
+
+  it("persists the synthesized assistant reply when the stream is delta-only", async () => {
+    appendMessageMock.mockResolvedValueOnce("msg-assistant-delta");
+    const events = [
+      { type: "content_block_delta", delta: { text: "Hello" } },
+      { type: "content_block_delta", delta: { text: " world" } },
+    ];
+
+    const collected = await collectChannelResponse(fakeClient(events), "s-delta", "lark", {
+      persist: { agentId: "a1" },
+    });
+
+    expect(collected).toMatchObject({
+      text: "Hello world",
+      assistantMessageId: "msg-assistant-delta",
+    });
+    expect(appendMessageMock).toHaveBeenCalledTimes(1);
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "s-delta",
+      role: "assistant",
+      content: "Hello world",
+    }));
   });
 
   it("does NOT persist anything when persist is omitted (reply-only path)", async () => {
