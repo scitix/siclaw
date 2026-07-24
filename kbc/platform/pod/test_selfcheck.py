@@ -1576,6 +1576,96 @@ def test_orphan_skips_directly_cited_asset():
     print("OK  orphan assets: a directly-cited standalone asset is accounted, not orphaned")
 
 
+def test_trailing_comma_repair_is_string_aware():
+    """R2-4: the trailing-comma repair must NOT touch commas inside JSON strings.
+    A pattern like `a,].md` or a reason like `literal ,} marker` legitimately
+    contain `,}`/`,]` sequences; the old regex mangled them. Only a STRUCTURAL
+    trailing comma (outside any string, before } or ]) is dropped."""
+    import selfcheck
+    # In-string commas preserved verbatim (both reviewer repros).
+    src = '[{"pattern": "a,].md", "reason": "literal ,} marker"},]'
+    data, repaired = selfcheck._parse_exclusions_tolerant(src)
+    assert repaired and data == [{"pattern": "a,].md", "reason": "literal ,} marker"}], (data, repaired)
+    # A genuine structural trailing comma is still repaired.
+    data2, repaired2 = selfcheck._parse_exclusions_tolerant('[\n  {"pattern": "x.md", "reason": "r"},\n]')
+    assert repaired2 and data2 == [{"pattern": "x.md", "reason": "r"}], (data2, repaired2)
+    # Strictly-valid JSON is untouched (repaired=False).
+    data3, repaired3 = selfcheck._parse_exclusions_tolerant('[{"pattern": "x.md", "reason": "r"}]')
+    assert repaired3 is False and data3 == [{"pattern": "x.md", "reason": "r"}], (data3, repaired3)
+    print("OK  trailing-comma repair is string-aware (in-string ,] / ,} preserved; structural slip fixed)")
+
+
+def test_append_not_blocked_by_invalid_legacy_row():
+    """R2-2: an invalid legacy row (pattern, no reason) is SKIPPED by load, so its
+    source stays unaccounted. It must never shadow a real exclude_source call for
+    the same pattern (that left the source unaccounted forever with no tool path).
+    Dedupe is against VALID rows only; the post-turn normalizer then prunes the
+    now-redundant invalid duplicate — but keeps a lone invalid row (surfaced as a
+    load error) rather than silently dropping its pattern."""
+    import selfcheck
+    with tempfile.TemporaryDirectory() as td:
+        excl = Path(td) / selfcheck.EXCLUSIONS_PATH
+        excl.parent.mkdir(parents=True)
+        excl.write_text('[{"pattern": "a.md"}]', encoding="utf-8")  # invalid: no reason
+
+        # The tool append is NOT a no-op — the valid row lands.
+        added, err = selfcheck.append_exclusions(td, [{"pattern": "a.md", "reason": "empty nav page"}])
+        assert err is None and added == [{"pattern": "a.md", "reason": "empty nav page"}], (added, err)
+        entries, _ = selfcheck.load_exclusions(td)
+        assert any(e["pattern"] == "a.md" and e["reason"] == "empty nav page" for e in entries), entries
+
+        # Normalizer prunes the redundant invalid duplicate; load is then clean.
+        assert selfcheck.normalize_exclusions_file(td) is None
+        rows = json.loads(excl.read_text(encoding="utf-8"))
+        assert rows == [{"pattern": "a.md", "reason": "empty nav page"}], rows
+        entries2, errs2 = selfcheck.load_exclusions(td)
+        assert not errs2 and entries2 == [{"pattern": "a.md", "reason": "empty nav page"}], (entries2, errs2)
+
+    # A lone invalid row (no valid row for its pattern) is KEPT and surfaced.
+    with tempfile.TemporaryDirectory() as td:
+        excl = Path(td) / selfcheck.EXCLUSIONS_PATH
+        excl.parent.mkdir(parents=True)
+        excl.write_text('[{"pattern": "lonely.md"}]', encoding="utf-8")
+        assert selfcheck.normalize_exclusions_file(td) is None
+        assert json.loads(excl.read_text(encoding="utf-8")) == [{"pattern": "lonely.md"}]  # not silently dropped
+        entries, errs = selfcheck.load_exclusions(td)
+        assert errs and entries == [], (entries, errs)  # surfaced for a human, not accounted
+    print("OK  invalid legacy row never blocks exclude_source; redundant dup pruned, lone one surfaced")
+
+
+def test_exclusion_writes_are_atomic():
+    """R2-5: append_exclusions and normalize_exclusions_file must write through a
+    same-directory temp file + os.replace so a kill mid-write can never truncate
+    the machine-owned ledger. Observe that the on-disk swap goes through
+    os.replace(temp → EXCLUSIONS.json)."""
+    import selfcheck
+    real_replace = selfcheck.os.replace
+    for driver in ("append", "normalize"):
+        with tempfile.TemporaryDirectory() as td:
+            excl = Path(td) / selfcheck.EXCLUSIONS_PATH
+            excl.parent.mkdir(parents=True)
+            calls = []
+
+            def observing_replace(src, dst):
+                calls.append((str(src), str(dst)))
+                return real_replace(src, dst)
+
+            selfcheck.os.replace = observing_replace
+            try:
+                if driver == "append":
+                    selfcheck.append_exclusions(td, [{"pattern": "x.md", "reason": "r"}])
+                else:
+                    excl.write_text('[{"pattern": "x.md", "reason": "r"},]', encoding="utf-8")  # slip forces a rewrite
+                    selfcheck.normalize_exclusions_file(td)
+            finally:
+                selfcheck.os.replace = real_replace
+            assert calls, f"{driver}: no os.replace — write was not atomic"
+            src, dst = calls[-1]
+            assert dst.endswith("EXCLUSIONS.json") and ".tmp" in src, (driver, calls)
+            assert json.loads(excl.read_text(encoding="utf-8")) == [{"pattern": "x.md", "reason": "r"}]
+    print("OK  exclusion writes are atomic (same-dir temp + os.replace) for append and normalize")
+
+
 def test_converge_phase_helper():
     """set_converge_phase: writes the durable authoritative signal (verifying/
     revising/settled), preserves the L1 coverage section, ignores junk phases."""
@@ -1883,6 +1973,9 @@ def main():
     asyncio.run(test_seam_settles_when_nothing_pending())
     test_orphan_assets_and_machine_exclusions()
     test_orphan_skips_directly_cited_asset()
+    test_trailing_comma_repair_is_string_aware()
+    test_append_not_blocked_by_invalid_legacy_row()
+    test_exclusion_writes_are_atomic()
     test_converge_phase_helper()
     print("ALL OK  test_selfcheck")
 

@@ -229,21 +229,58 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
     return pages
 
 
-_TRAILING_COMMA_RE = re.compile(r",\s*(?=[}\]])")
+def _strip_trailing_commas(text: str) -> str:
+    """Drop STRUCTURAL trailing commas — a comma whose next non-whitespace
+    character is ``}`` or ``]`` AND that sits OUTSIDE any JSON string.
+
+    String-aware by construction (the old regex `,\\s*(?=[}\\]])` was not): a
+    comma inside a value like a pattern ``"a,].md"`` or a reason
+    ``"literal ,} marker"`` is preserved — only the structural slip a model
+    hand-editing the ledger keeps making is removed. Walks the text tracking
+    in-string / escape state; the closing-container lookahead reads the original
+    (unmodified) tail, so whitespace and brackets after the comma are exact."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+    n = len(text)
+    for i, ch in enumerate(text):
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                continue  # structural trailing comma → drop
+            out.append(ch)
+            continue
+        out.append(ch)
+    return "".join(out)
 
 
 def _parse_exclusions_tolerant(text: str):
-    """Strict JSON parse with ONE mechanical fallback: stripping trailing
-    commas (`},]` / `,}`), the exact slip a model hand-editing the ledger keeps
-    making. Returns (data, repaired) or (None, False) when even the repaired
-    text does not parse — anything beyond this one deterministic fix is a real
-    corruption a human/model must look at, not something to guess at."""
+    """Strict JSON parse with ONE mechanical fallback: stripping structural
+    trailing commas (`},]` / `,}`), the exact slip a model hand-editing the
+    ledger keeps making. Returns (data, repaired) or (None, False) when even the
+    repaired text does not parse — anything beyond this one deterministic fix is a
+    real corruption a human/model must look at, not something to guess at."""
     try:
         return json.loads(text), False
     except json.JSONDecodeError:
         pass
     try:
-        return json.loads(_TRAILING_COMMA_RE.sub("", text)), True
+        return json.loads(_strip_trailing_commas(text)), True
     except json.JSONDecodeError:
         return None, False
 
@@ -773,6 +810,16 @@ def glob_escape_path(path: str) -> str:
     return re.sub(r"([*?\[])", r"[\1]", path)
 
 
+def _valid_exclusion_row(item) -> bool:
+    """A row the ledger ACCOUNTS with: a dict carrying both a non-empty pattern
+    and a non-empty reason (same acceptance load_exclusions applies). An invalid
+    row (e.g. a legacy ``{"pattern": "a.md"}`` with no reason) is skipped by load
+    → its source stays unaccounted, so it must NOT shadow a real exclude_source
+    call for the same pattern."""
+    return bool(
+        isinstance(item, dict) and item.get("pattern") and item.get("reason"))
+
+
 def append_exclusions(workdir: str, entries: list[dict]) -> tuple[list[dict], str | None]:
     """Append machine-written exclusion rows, de-duplicated by pattern. Returns
     (rows actually added, error). A trailing-comma slip is repaired in place
@@ -781,7 +828,13 @@ def append_exclusions(workdir: str, entries: list[dict]) -> tuple[list[dict], st
     recur. Anything less mechanical leaves the file untouched and reports an
     explicit error: appending to a file we cannot parse risks destroying
     model-authored rows, and a silent no-op here once left batch sources
-    neither cited nor excluded."""
+    neither cited nor excluded.
+
+    De-duplication is against VALID rows only: an invalid legacy row that load
+    skips (missing reason) must never make exclude_source(pattern, reason) a
+    no-op — that left the pattern unaccounted forever with no path to fix it via
+    the tool (the ONLY sanctioned write path). The append lands the valid row;
+    the post-turn normalizer then prunes the now-redundant invalid duplicate."""
     path = Path(workdir) / EXCLUSIONS_PATH
     data: list = []
     if path.is_file():
@@ -795,7 +848,7 @@ def append_exclusions(workdir: str, entries: list[dict]) -> tuple[list[dict], st
         if not isinstance(parsed, list):
             return [], f"{EXCLUSIONS_PATH} must be a JSON array; machine exclusions were NOT written"
         data = parsed
-    have = {str(item.get("pattern")) for item in data if isinstance(item, dict)}
+    have = {str(item["pattern"]) for item in data if _valid_exclusion_row(item)}
     added: list[dict] = []
     for e in entries:
         pattern = str(e.get("pattern") or "")
@@ -806,12 +859,10 @@ def append_exclusions(workdir: str, entries: list[dict]) -> tuple[list[dict], st
         added.append({"pattern": pattern, "reason": reason})
     if not added:
         return [], None
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Canonical rewrite: also heals a tolerated trailing-comma slip on disk.
-    path.write_text(
-        json.dumps(data + added, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    # Atomic (same-dir temp + os.replace): a kill mid-write must never truncate
+    # the whole ledger. Canonical rewrite also heals a tolerated comma slip.
+    _write_text_atomic(
+        path, json.dumps(data + added, ensure_ascii=False, indent=2) + "\n")
     return added, None
 
 
@@ -835,9 +886,21 @@ def normalize_exclusions_file(workdir: str) -> str | None:
     data, repaired = _parse_exclusions_tolerant(raw)
     if data is None or not isinstance(data, list):
         return f"{EXCLUSIONS_PATH} is corrupted beyond the mechanical repair"
-    canonical = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    # Prune an invalid row (missing reason) ONLY when a valid row already covers
+    # its pattern — that invalid duplicate is dead weight load already ignores.
+    # An invalid row that is the ONLY row for its pattern is KEPT: pruning it
+    # would silently drop the pattern; load surfaces it as an error for a human.
+    valid_patterns = {str(item["pattern"]) for item in data if _valid_exclusion_row(item)}
+    kept = [
+        item for item in data
+        if _valid_exclusion_row(item)
+        or not (isinstance(item, dict) and item.get("pattern")
+                and str(item["pattern"]) in valid_patterns)
+    ]
+    canonical = json.dumps(kept, ensure_ascii=False, indent=2) + "\n"
     if repaired or raw != canonical:
-        path.write_text(canonical, encoding="utf-8")
+        # Atomic: a torn write would truncate the machine-owned ledger.
+        _write_text_atomic(path, canonical)
     return None
 
 
