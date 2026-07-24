@@ -1086,6 +1086,7 @@ describe("handleLarkCardAction — 👍/👎 feedback", () => {
           session_id: "sess-1",
           card_id: "CARD-1",
           channel_id: "lark",
+          message_id: "msg-assistant-1",
           locale: "zh-CN",
         },
       },
@@ -1102,6 +1103,25 @@ describe("handleLarkCardAction — 👍/👎 feedback", () => {
     const result = handleLarkCardAction(makeCardAction(), makeLarkClient());
     expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("反馈") } });
 
+    await flush();
+    expect(recordChannelFeedbackMock).toHaveBeenCalledWith({
+      sessionId: "sess-1",
+      messageRef: "CARD-1",
+      messageId: "msg-assistant-1",
+      rating: "up",
+      senderExternalId: "ou_clicker",
+      channelId: "lark",
+      source: "lark",
+    });
+  });
+
+  it("keeps legacy cards without message_id compatible", async () => {
+    recordChannelFeedbackMock.mockResolvedValue({ success: true });
+    const data = makeCardAction();
+    delete (data.action as any).value.message_id;
+
+    const result = handleLarkCardAction(data, makeLarkClient());
+    expect(result).toEqual({ toast: { type: "success", content: expect.any(String) } });
     await flush();
     expect(recordChannelFeedbackMock).toHaveBeenCalledWith({
       sessionId: "sess-1",
@@ -1355,6 +1375,7 @@ describe("handleLarkMessage — streaming card flow", () => {
           },
           cardElement: {
             content: vi.fn().mockResolvedValue({ code: 0 }),
+            create: vi.fn().mockResolvedValue({ code: 0 }),
           },
         },
       },
@@ -1373,6 +1394,9 @@ describe("handleLarkMessage — streaming card flow", () => {
         },
       };
     });
+    appendMessageMock.mockImplementation(async (message: { role: string }) =>
+      message.role === "assistant" ? "msg-assistant-final" : "msg-user",
+    );
     const lark = makeCardAwareLarkClient();
 
     await handleLarkMessage(
@@ -1400,7 +1424,69 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(lark.cardkit.v1.card.settings).toHaveBeenCalledTimes(1);
     const settingsPayload = JSON.parse(lark.cardkit.v1.card.settings.mock.calls[0][0].data.settings);
     expect(settingsPayload.config.streaming_mode).toBe(false);
+    const feedbackAppend = lark.cardkit.v1.cardElement.create.mock.calls[0][0];
+    const [feedbackRow] = JSON.parse(feedbackAppend.data.elements);
+    expect(feedbackRow.columns[0].elements[0].behaviors[0].value.message_id).toBe("msg-assistant-final");
     expect(lark.im.image.create).not.toHaveBeenCalled();
+  });
+
+  it("persists a delta-only reply and appends feedback linked to that message", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-delta-only" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "content_block_delta", delta: { text: "delta-only " } };
+      yield { type: "content_block_delta", delta: { text: "answer" } };
+    });
+    appendMessageMock.mockImplementation(async (message: { role: string }) =>
+      message.role === "assistant" ? "msg-assistant-delta" : "msg-user",
+    );
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content).toContain("delta-only answer");
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "s-delta-only",
+      role: "assistant",
+      content: "delta-only answer",
+    }));
+    const feedbackAppend = lark.cardkit.v1.cardElement.create.mock.calls[0][0];
+    const [feedbackRow] = JSON.parse(feedbackAppend.data.elements);
+    expect(feedbackRow.columns[0].elements[0].behaviors[0].value.message_id).toBe("msg-assistant-delta");
+  });
+
+  it("does not append feedback buttons when the final assistant row fails to persist", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-persist-fail" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "answer still delivered" }] },
+      };
+    });
+    appendMessageMock
+      .mockResolvedValueOnce("msg-user")
+      .mockRejectedValueOnce(new Error("db down"));
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content).toContain("answer still delivered");
+    expect(lark.cardkit.v1.cardElement.create).not.toHaveBeenCalled();
   });
 
   it("updates the Lark card when a background channel report arrives after the first SSE turn", async () => {
@@ -2420,6 +2506,10 @@ describe("collectChannelResponse — audit persistence", () => {
   }
 
   it("persists every assistant turn + each tool call when persist is set", async () => {
+    appendMessageMock
+      .mockResolvedValueOnce("msg-assistant-intermediate")
+      .mockResolvedValueOnce("msg-tool")
+      .mockResolvedValueOnce("msg-assistant-final");
     const events = [
       { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Checking nodes" }] } },
       { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get nodes" } },
@@ -2431,6 +2521,7 @@ describe("collectChannelResponse — audit persistence", () => {
     });
     // Reply text is still the final assistant turn.
     expect(collected.text).toBe("All healthy.");
+    expect(collected.assistantMessageId).toBe("msg-assistant-final");
 
     const calls = appendMessageMock.mock.calls.map((c) => c[0] as any);
     expect(calls.filter((m) => m.role === "assistant").map((m) => m.content)).toEqual(["Checking nodes", "All healthy."]);
@@ -2440,6 +2531,29 @@ describe("collectChannelResponse — audit persistence", () => {
     expect(toolRows[0]).toMatchObject({ sessionId: "s-audit", toolName: "bash", outcome: "success" });
     expect(toolRows[0].toolInput).toContain("kubectl get nodes");
     expect(toolRows[0].content).toBe("node ok");
+  });
+
+  it("persists the synthesized assistant reply when the stream is delta-only", async () => {
+    appendMessageMock.mockResolvedValueOnce("msg-assistant-delta");
+    const events = [
+      { type: "content_block_delta", delta: { text: "Hello" } },
+      { type: "content_block_delta", delta: { text: " world" } },
+    ];
+
+    const collected = await collectChannelResponse(fakeClient(events), "s-delta", "lark", {
+      persist: { agentId: "a1" },
+    });
+
+    expect(collected).toMatchObject({
+      text: "Hello world",
+      assistantMessageId: "msg-assistant-delta",
+    });
+    expect(appendMessageMock).toHaveBeenCalledTimes(1);
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "s-delta",
+      role: "assistant",
+      content: "Hello world",
+    }));
   });
 
   it("does NOT persist anything when persist is omitted (reply-only path)", async () => {
@@ -2471,6 +2585,7 @@ describe("collectChannelResponse — audit persistence", () => {
     ];
     const collected = await collectChannelResponse(fakeClient(events), "s-fail", "lark", { persist: { agentId: "a1" } });
     expect(collected.text).toBe("still replies");
+    expect(collected.assistantMessageId).toBeNull();
   });
 });
 

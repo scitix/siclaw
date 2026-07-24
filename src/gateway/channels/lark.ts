@@ -476,6 +476,7 @@ export function handleLarkCardAction(
       const result = await recordChannelFeedback({
         sessionId,
         messageRef: cardId,
+        ...(typeof fb.message_id === "string" && fb.message_id.trim() ? { messageId: fb.message_id.trim() } : {}),
         rating,
         senderExternalId: operatorOpenId,
         channelId: channelId ?? null,
@@ -1256,6 +1257,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   };
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
+  let assistantMessageId: string | null = null;
   let agentError: Error | null = null;
   let sessionBusy = false;
   try {
@@ -1275,6 +1277,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     });
     resultText = collected.text;
     replyImages = collected.images;
+    assistantMessageId = collected.assistantMessageId;
   } catch (err) {
     if (isSessionBusyError(err)) {
       // Still busy after the retry window — surface a friendly notice, don't clobber.
@@ -1312,7 +1315,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     // non-answer and skew the feedback signal Metrics aggregates.
     const isAnswer = !agentError && resultText.trim().length > 0;
     const ok = await finalizeCard(larkClient, cardSession, finalCardBody,
-      isAnswer ? { ctx: { sessionId, channelId }, locale } : undefined);
+      isAnswer && assistantMessageId
+        ? { ctx: { sessionId, channelId, messageId: assistantMessageId }, locale }
+        : undefined);
     deliveredTextChars = finalCardBody.length;
     if (!ok) {
       // Partial-failure path: the card is visible but stuck in streaming
@@ -1534,6 +1539,8 @@ async function replyVisualImages(larkClient: any, messageId: string, images: Ren
 export interface CollectedChannelResponse {
   text: string;
   images: RenderedReplyImage[];
+  /** Persisted id of the final assistant turn, or null when audit persistence failed/was disabled. */
+  assistantMessageId: string | null;
 }
 
 export async function collectResponse(
@@ -1572,6 +1579,7 @@ export async function collectChannelResponse(
   // (tool-use turns emit intermediate message_end events that aren't meant
   // for the user). pi-agent's agent_end signals the last turn is complete.
   let lastAssistantText = "";
+  let lastAssistantMessageId: string | null = null;
 
   // ── Audit persistence (opt-in) ──────────────────────────────────────────
   // Mirrors the field mapping in sse-consumer.ts so a channel transcript looks
@@ -1589,9 +1597,12 @@ export async function collectChannelResponse(
   const toolStarts = new Map<string, number[]>();
   const pushQ = <T,>(m: Map<string, T[]>, k: string, v: T): void => { const a = m.get(k) ?? []; a.push(v); m.set(k, a); };
   const shiftQ = <T,>(m: Map<string, T[]>, k: string): T | undefined => m.get(k)?.shift();
-  const persistRow = async (msg: Parameters<typeof appendMessage>[0]): Promise<void> => {
-    try { await appendMessage({ ...msg, traceId: persist?.traceId ?? msg.traceId }); }
-    catch (err) { console.warn(`[${logPrefix}] audit persist failed session=${sessionId}:`, err); }
+  const persistRow = async (msg: Parameters<typeof appendMessage>[0]): Promise<string | null> => {
+    try { return await appendMessage({ ...msg, traceId: persist?.traceId ?? msg.traceId }); }
+    catch (err) {
+      console.warn(`[${logPrefix}] audit persist failed session=${sessionId}:`, err);
+      return null;
+    }
   };
 
   try {
@@ -1683,7 +1694,11 @@ export async function collectChannelResponse(
           // Persist every assistant turn (intermediate narration + final answer),
           // mirroring sse-consumer. Awaited so its created_at precedes the next
           // tool row in the transcript.
-          if (persist) await persistRow({ sessionId, role: "assistant", content: redact(turnText) });
+          // Replace the id even when this write fails: retaining an earlier
+          // narration id would link the final card to the wrong assistant turn.
+          lastAssistantMessageId = persist
+            ? await persistRow({ sessionId, role: "assistant", content: redact(turnText) })
+            : null;
         }
       }
     }
@@ -1693,7 +1708,18 @@ export async function collectChannelResponse(
   // Prefer the last full assistant turn; fall back to streamed deltas if the
   // brain only emits content_block_delta events.
   const text = lastAssistantText || parts.join("");
-  return { text, images };
+  // A delta-only stream has no assistant message_end, so persist the exact
+  // synthesized reply once the stream finishes. This gives feedback cards the
+  // same precise message linkage as the normal message_end path without
+  // duplicating assistant rows when a full turn was already persisted.
+  if (!lastAssistantText && text.trim() && persist) {
+    lastAssistantMessageId = await persistRow({
+      sessionId,
+      role: "assistant",
+      content: redact(text),
+    });
+  }
+  return { text, images, assistantMessageId: lastAssistantMessageId };
 }
 
 /**
