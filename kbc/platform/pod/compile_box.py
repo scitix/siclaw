@@ -3887,6 +3887,41 @@ def _note_model_activity(run: CompileRun, msg) -> None:
         run._tool_pending = False
 
 
+async def _guarded_model_stream(run: "CompileRun", client):
+    """Pull the SDK message stream, normalizing a dead-transport surprise into a
+    rebuildable ModelStallError.
+
+    claude-agent-sdk 0.2.110's background reader (Query._read_messages) CONSUMES a
+    ProcessError when the CLI subprocess dies and re-emits it as a
+    ``{"type": "error"}`` frame, which receive_messages() then re-raises as a
+    PLAIN ``Exception`` (see the SDK's _internal/query.py). _drive_batch_session
+    only catches ModelStallError / CLIConnectionError / ProcessError, so without
+    this normalization that plain Exception escapes the rebuild loop and kills the
+    whole run — a dead subprocess with the turn still 'active'. Any exception
+    raised while CONSUMING the stream — except cancellation and our own control
+    exceptions — is therefore a transport fault: discard the dead attempt's
+    partial text and re-raise as ModelStallError so the existing rebuild loop
+    disconnects the dead client and continues from the checkpoint.
+
+    Only the SDK PULL is wrapped (per-message __anext__): deliberate control
+    raises from the consume BODY (ModelStallError on stall exhaustion,
+    ModelResultError on an is_error result) originate in _consume_turn_stream, not
+    here, and propagate unchanged."""
+    stream = client.receive_messages()
+    while True:
+        try:
+            msg = await stream.__anext__()
+        except StopAsyncIteration:
+            return
+        except (asyncio.CancelledError, ModelStallError, ModelResultError, BatchOutputError):
+            raise
+        except Exception as exc:  # dead subprocess / broken transport surfaced as a plain error
+            run._turn_active = False
+            run._turn_text = []
+            raise ModelStallError(f"transport: {type(exc).__name__}") from exc
+        yield msg
+
+
 async def _consume_turn_stream(
     run: CompileRun,
     client,
@@ -3899,8 +3934,11 @@ async def _consume_turn_stream(
     is NOT a real turn end: discard it and re-issue the directive (bounded), or
     raise ModelStallError when retries are spent. A REAL ResultMessage ends the
     turn — cleared BEFORE _emit_message, which may inject a follow-up turn that
-    re-arms the watchdog. stop_on_result mirrors the batch driver's break."""
-    async for msg in client.receive_messages():
+    re-arms the watchdog. stop_on_result mirrors the batch driver's break.
+
+    The stream is pulled through _guarded_model_stream so a dead subprocess the
+    SDK surfaces as a plain Exception becomes a rebuildable ModelStallError."""
+    async for msg in _guarded_model_stream(run, client):
         _note_model_activity(run, msg)
         if type(msg).__name__ == "ResultMessage":
             if run._stall_retrying:

@@ -4827,6 +4827,11 @@ class _BatchTurnFake:
                       lost AND interrupt black-holed).
       'dead'        — the CLI subprocess has exited (returncode set) and the
                       stream hangs; the watchdog's liveness probe must reap it.
+      'plain_exc'   — emit the content once, then receive_messages() raises a
+                      PLAIN RuntimeError mid-turn (no watchdog involved): the
+                      real claude-agent-sdk 0.2.110 shape when its background
+                      reader consumes a dead-subprocess ProcessError and re-raises
+                      it as a bare Exception. Must still trigger a client rebuild.
     """
 
     def __init__(self, mode, reply="batch reply", returncode=None):
@@ -4845,7 +4850,7 @@ class _BatchTurnFake:
     async def query(self, prompt, session_id="default"):
         # 'dead' never opens the gate — the stream hangs until the liveness probe
         # reaps and disconnect() unblocks it.
-        if self.mode in ("ok", "lost_term"):
+        if self.mode in ("ok", "lost_term", "plain_exc"):
             self._gate.set()
 
     async def interrupt(self):
@@ -4860,6 +4865,10 @@ class _BatchTurnFake:
                 yield ResultMessage()
                 self._closed = True
                 return
+            if self.mode == "plain_exc":
+                yield AssistantMessage(self.reply)   # content lands…
+                # …then the SDK surfaces a dead subprocess as a plain Exception.
+                raise RuntimeError("SDK background reader surfaced a dead subprocess")
             if self.mode == "lost_term":
                 yield AssistantMessage(self.reply)   # content lands…
                 self.mode = "blackhole"              # …then the terminator never comes
@@ -4967,6 +4976,25 @@ async def test_batch_subprocess_death_rebuilds_and_continues():
     stalled = [e for e in evs if e["type"] == "turn_stalled"]
     assert any(e.get("code") == "model_turn_unrecoverable" for e in stalled), stalled
     print("✓ batch stall: dead subprocess detected by liveness probe → rebuilt → batch continues")
+
+
+async def test_batch_plain_sdk_exception_rebuilds_and_continues():
+    """Finding 1 (07-24 review): claude-agent-sdk 0.2.110 can consume a dead
+    subprocess's ProcessError inside its background reader and re-raise a PLAIN
+    Exception out of receive_messages(). _drive_batch_session only names
+    ModelStallError/CLIConnectionError/ProcessError, so that plain Exception would
+    escape the rebuild loop and kill the run with the turn still active. The SDK
+    boundary now normalizes ANY consume-stream exception into a rebuildable stall:
+    the dead client is torn down and the batch completes on a fresh one. No
+    watchdog is involved — the exception is synchronous, mid-turn."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        ["plain_exc", "ok"])
+    assert raised is None, raised
+    assert reply == "batch reply", reply          # rebuilt turn's reply, not the dead attempt's
+    assert len(built) == 2, built                 # exactly one rebuild
+    assert built[0].interrupts == 0, built[0].interrupts   # not a stall — a raised transport fault
+    assert built[0].disconnects >= 1, built[0].disconnects  # dead client torn down
+    print("✓ batch stall: a plain SDK stream Exception is normalized → client rebuilt → batch completes")
 
 
 async def test_batch_rebuild_exhaustion_raises_resumable():
@@ -5462,6 +5490,7 @@ async def main():
     await test_stall_interrupt_deadline_closes_turn()
     await test_batch_lost_terminator_reaps_and_rebuilds()
     await test_batch_subprocess_death_rebuilds_and_continues()
+    await test_batch_plain_sdk_exception_rebuilds_and_continues()
     await test_batch_rebuild_exhaustion_raises_resumable()
     await test_resumed_batch_phase_is_watchdog_armed()
     await test_run_wrapper_closes_turn_on_driver_crash()
