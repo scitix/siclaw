@@ -1494,6 +1494,47 @@ async def test_seam_settles_when_nothing_pending():
     print("OK  seam settles converge_phase when nothing pending (verify-off authoritative)")
 
 
+def test_orphan_assets_and_machine_exclusions():
+    """The batch train's content-robustness primitives: orphan detection sees
+    only assets no document embeds; glob escaping keeps a literal path from
+    swallowing siblings; append_exclusions de-duplicates and refuses to touch a
+    malformed ledger."""
+    import selfcheck
+    with tempfile.TemporaryDirectory() as td:
+        raw = Path(td) / "raw"
+        (raw / "assets").mkdir(parents=True)
+        (raw / "one.md").write_text("![pic](assets/linked.png)\n", encoding="utf-8")
+        (raw / "assets" / "linked.png").write_bytes(b"png")
+        (raw / "assets" / "orphan.png").write_bytes(b"png")
+        (raw / "assets" / "notes.md").write_text("content file, not media", encoding="utf-8")
+        orphans = selfcheck.orphan_media_assets(td)
+        assert orphans == ["assets/orphan.png"], orphans
+
+        # glob escaping: a title with [brackets] must match itself and ONLY itself
+        weird = "docs/table [v2]*.png"
+        pat = selfcheck.glob_escape_path(weird)
+        assert selfcheck._matches(weird, pat)
+        assert not selfcheck._matches("docs/table Xv2Y_anything.png", pat)
+
+        added = selfcheck.append_exclusions(td, [
+            {"pattern": "assets/orphan.png", "reason": "auto: orphan"},
+            {"pattern": "assets/orphan.png", "reason": "dup ignored"},
+        ])
+        assert len(added) == 1, added
+        again = selfcheck.append_exclusions(td, [
+            {"pattern": "assets/orphan.png", "reason": "still dup"}])
+        assert again == [], again
+        entries, errs = selfcheck.load_exclusions(td)
+        assert not errs and len(entries) == 1, (entries, errs)
+
+        # malformed ledger: refuse to rewrite, surface nothing silently
+        excl = Path(td) / selfcheck.EXCLUSIONS_PATH
+        excl.write_text("{not json", encoding="utf-8")
+        assert selfcheck.append_exclusions(td, [{"pattern": "x.md", "reason": "r"}]) == []
+        assert excl.read_text(encoding="utf-8") == "{not json"
+    print("OK  orphan assets + machine exclusions (detect / escape / dedupe / malformed untouched)")
+
+
 def test_converge_phase_helper():
     """set_converge_phase: writes the durable authoritative signal (verifying/
     revising/settled), preserves the L1 coverage section, ignores junk phases."""
@@ -1799,6 +1840,7 @@ def main():
     asyncio.run(test_pk_failed_state_settles_converge())
     asyncio.run(test_pk_wiring())
     asyncio.run(test_seam_settles_when_nothing_pending())
+    test_orphan_assets_and_machine_exclusions()
     test_converge_phase_helper()
     print("ALL OK  test_selfcheck")
 

@@ -2807,23 +2807,38 @@ def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
     p.write_text(batching.dump_json(value))
 
 
-def _materialize_batch_slices(run: "CompileRun", plan: dict) -> None:
+def _materialize_batch_slices(run: "CompileRun", plan: dict) -> dict[str, str]:
     """Build ephemeral, read-bounded excerpts for oversized Markdown sources.
 
     The fragment is never a provenance identity and never enters durable
     authoring state. It is recreated from Raw on every resume so a model turn
     cannot read the entire oversized source behind the planner's back.
+
+    Returns {batch_id: reason} for batches whose slice views could not be
+    built — a per-batch content/plan-shape fault must not kill the whole train
+    (the caller skips those batches with a recorded exclusion), while the other
+    batches keep their read-bounded views.
     """
     workdir = Path(run.workdir).resolve()
     raw_root = (workdir / "raw").resolve()
     slice_root = (workdir / ".kbc-batch-slices").resolve()
     shutil.rmtree(slice_root, ignore_errors=True)
+    failed: dict[str, str] = {}
     for batch in plan.get("batches", []):
         if batch.get("status") == "done":
             continue
-        ranges = batch.get("source_ranges")
-        if not isinstance(ranges, dict):
-            continue
+        try:
+            _materialize_one_batch_slices(workdir, raw_root, slice_root, batch)
+        except BatchOutputError as e:
+            failed[str(batch.get("id"))] = str(e)
+    return failed
+
+
+def _materialize_one_batch_slices(
+    workdir: Path, raw_root: Path, slice_root: Path, batch: dict,
+) -> None:
+    ranges = batch.get("source_ranges")
+    if isinstance(ranges, dict):
         for source, source_range in ranges.items():
             if not isinstance(source_range, dict):
                 raise BatchOutputError(f"invalid source range for {source}")
@@ -2862,6 +2877,20 @@ def _materialize_batch_slices(run: "CompileRun", plan: dict) -> None:
             ).encode("utf-8")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(header + b"".join(lines[start - 1:end]))
+
+
+def _auto_exclude_batch_sources(run: "CompileRun", sources: list[str], reason: str) -> list[dict]:
+    """Write machine exclusion rows for sources the train cannot account.
+
+    The 2026-07-24 robustness mandate: a validation gate may keep the ledger
+    honest, but no content shape may deterministically kill the train. Rows are
+    exact-path (glob-escaped) and carry a machine reason a human can read in the
+    exclusion ledger, revisit, and lift."""
+    entries = [
+        {"pattern": selfcheck.glob_escape_path(s), "reason": reason}
+        for s in sources
+    ]
+    return selfcheck.append_exclusions(run.workdir, entries)
 
 
 def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[str]:
@@ -3385,27 +3414,68 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         total_kb = batching.corpus_bytes(inventory) // 1024
         plan = _load_batch_plan(run)
         resuming = _batch_plan_resumable(plan)
+        # Orphan media assets (standalone wiki file nodes no document embeds)
+        # can never satisfy the accounting gate — pre-exclude them with a
+        # machine reason BEFORE planning/resuming so no batch ever carries one.
+        inventory_paths = [i["path"] for i in inventory]
+        orphans = selfcheck.orphan_media_assets(run.workdir, inventory_paths)
+        if orphans:
+            added = selfcheck.append_exclusions(run.workdir, [
+                {"pattern": selfcheck.glob_escape_path(p),
+                 "reason": "auto-excluded: media asset not embedded by any document (sync residue)"}
+                for p in orphans])
+            if added:
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"{len(added)} standalone media asset(s) are embedded by no document — "
+                    f"auto-excluded from accounting (visible in the exclusion ledger).",
+                    f"{len(added)} 个未被任何文档引用的独立媒体资产已自动豁免记账"
+                    f"(豁免清单可见)。")})
+        exclusions_now, _ = selfcheck.load_exclusions(run.workdir)
+        plannable = {
+            p for p in inventory_paths
+            if not any(selfcheck._matches(p, e["pattern"]) for e in exclusions_now)
+        }
         if not resuming:
             _write_batch_file(run, batching.SOURCES_INVENTORY_PATH, inventory)
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Corpus {total_kb}KB exceeds the single-session threshold — batch compile engaged.",
                 f"语料 {total_kb}KB 超过单会话阈值,启用分批编译。")})
-            plan = await _plan_batches(run, inventory)
+            plan = await _plan_batches(run, [i for i in inventory if i["path"] in plannable])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         else:
             # The pinned plan predates this run; a source deleted from raw/ in
-            # between would leave a batch directive pointing at a missing file.
-            # (Added sources are caught later by the coverage ledger.)
-            dropped = batching.prune_missing_sources(plan, {i["path"] for i in inventory})
+            # between would leave a batch directive pointing at a missing file,
+            # and a source excluded since (orphan assets above included) no
+            # longer needs a batch seat. (Added sources are caught later by the
+            # coverage ledger.)
+            dropped = batching.prune_missing_sources(plan, plannable)
             if dropped:
                 _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
                 await run.emit({"type": "summary",
                                 "text": _loc(run,
-                                             f"Batch resume: {len(dropped)} source(s) no longer in raw/ — removed from pending batches: ",
-                                             f"断点续批:{len(dropped)} 个源已不在 raw/ 中,已从待编批次剔除:")
+                                             f"Batch resume: {len(dropped)} source(s) no longer in raw/ or excluded since — removed from pending batches: ",
+                                             f"断点续批:{len(dropped)} 个源已不在 raw/ 中或已被豁免,已从待编批次剔除:")
                                         + ", ".join(sorted(dropped)[:5])
                                         + ("…" if len(dropped) > 5 else "")})
-        _materialize_batch_slices(run, plan)
+        slice_failures = _materialize_batch_slices(run, plan)
+        if slice_failures:
+            for bad_id, why in sorted(slice_failures.items()):
+                bad = next((b for b in plan["batches"] if str(b.get("id")) == bad_id), None)
+                if bad is None:
+                    continue
+                _auto_exclude_batch_sources(
+                    run,
+                    _unaccounted_batch_sources(run, bad.get("sources") or []),
+                    f"auto-excluded: batch {bad_id} was skipped (slice view failed: {why})",
+                )
+                batching.stamp_done(plan, bad.get("id"))
+                _print_compile_lifecycle("batch.skipped", run, extra=f"id={bad_id} reason={why}")
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"{len(slice_failures)} batch(es) had unusable read-bounded views and were skipped; "
+                f"their unaccounted sources were auto-excluded with a reason. The train continues.",
+                f"{len(slice_failures)} 个批次的读界视图无法构建,已跳过;未记账的源已自动豁免并写明理由,"
+                f"列车继续。")})
         n = len(plan["batches"])
         pending = batching.pending_batches(plan)
         if plan.get("mode") == "hierarchical":
@@ -3434,25 +3504,73 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         })
         for batch in list(pending):
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
-            directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run), locale=getattr(run, "locale", None))
-            reply = await _drive_batch_session(
-                run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"),
-                pdf_page_ranges=batch.get("source_page_ranges"),
-                raw_read_allowlist=_batch_raw_read_allowlist(batch),
-            )
-            if reply:
-                replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
-            still_unaccounted = (
-                [] if batch.get("defer_accounting")
-                else _unaccounted_batch_sources(run, batch.get("sources") or [])
-            )
-            if still_unaccounted:
-                shown = ", ".join(still_unaccounted[:5])
-                suffix = "…" if len(still_unaccounted) > 5 else ""
-                raise BatchOutputError(
-                    f"batch {batch['id']} left {len(still_unaccounted)} assigned "
-                    f"source(s) unaccounted: {shown}{suffix}"
+            try:
+                directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run), locale=getattr(run, "locale", None))
+                reply = await _drive_batch_session(
+                    run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"),
+                    pdf_page_ranges=batch.get("source_page_ranges"),
+                    raw_read_allowlist=_batch_raw_read_allowlist(batch),
                 )
+                if reply:
+                    replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
+                still_unaccounted = (
+                    [] if batch.get("defer_accounting")
+                    else _unaccounted_batch_sources(run, batch.get("sources") or [])
+                )
+                if still_unaccounted:
+                    # One bounded corrective pass: most gaps are a model that
+                    # cited a page but forgot a source token, and it can fix
+                    # its own ledger cheaper than any machine heuristic.
+                    listed = "\n".join(f"- raw/{s}" for s in still_unaccounted[:40])
+                    fix_reply = await _drive_batch_session(
+                        run,
+                        _loc(run,
+                             "The following sources assigned to this batch are still unaccounted "
+                             "(neither cited by any Candidate page's compiled_from nor covered by an "
+                             "exclusion). For each one: cite it from the page that digests it, or add "
+                             "an exclusion row with a concrete reason.\n" + listed,
+                             "本批分配的下列源仍未记账(既没有被任何候选页的 compiled_from 引用,也没有"
+                             "豁免记录)。请逐个处理:要么在消化它的候选页里补引用,要么在豁免清单里"
+                             "写明具体理由:\n" + listed),
+                        _loc(run, f"batch {k} accounting fix", f"批 {k} 补账"),
+                        pdf_page_ranges=batch.get("source_page_ranges"),
+                        raw_read_allowlist=_batch_raw_read_allowlist(batch),
+                    )
+                    if fix_reply:
+                        replies.append(_loc(run, f"[Batch {k} fix] {fix_reply}", f"【批 {k} 补账】{fix_reply}"))
+                    still_unaccounted = _unaccounted_batch_sources(run, batch.get("sources") or [])
+                if still_unaccounted:
+                    # Content shape must never wedge the train (2026-07-24 mandate:
+                    # humans may pile ANYTHING into a wiki). The ledger stays honest
+                    # instead: auto-exclude with a machine reason a human can read,
+                    # revisit and lift.
+                    _auto_exclude_batch_sources(
+                        run, still_unaccounted,
+                        f"auto-excluded: batch {batch['id']} could not account for this source after a corrective pass",
+                    )
+                    await run.emit({"type": "summary", "text": _loc(run,
+                        f"Batch {k}/{n}: {len(still_unaccounted)} source(s) could not be accounted and were "
+                        f"auto-excluded with a reason (see the exclusion ledger); the train continues.",
+                        f"批 {k}/{n}:{len(still_unaccounted)} 个源无法记账,已自动豁免并写明理由"
+                        f"(见豁免清单),列车继续。")})
+            except (ModelStallError, asyncio.CancelledError):
+                # Infra faults (gateway stall, cancellation) stay interrupting:
+                # they heal on resume, and excluding content over them would lie.
+                raise
+            except BatchOutputError as e:
+                # A content/output-shape fault is deterministic: retrying the same
+                # batch forever is the wedge this train must never enter. Skip the
+                # batch, account its sources as machine exclusions, keep going.
+                _auto_exclude_batch_sources(
+                    run,
+                    _unaccounted_batch_sources(run, batch.get("sources") or []),
+                    f"auto-excluded: batch {batch['id']} was skipped ({e})",
+                )
+                _print_compile_lifecycle("batch.skipped", run, extra=f"batch={k}/{n} id={batch['id']} reason={e}")
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Batch {k}/{n} could not complete ({e}); its unaccounted sources were auto-excluded "
+                    f"with a reason and the train continues.",
+                    f"批 {k}/{n} 无法完成({e});未记账的源已自动豁免并写明理由,列车继续。")})
             batching.stamp_done(plan, batch["id"])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
             # Push the done-stamp (and the batch's pages) to the durable store
@@ -3547,19 +3665,21 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 rounds += 1
                 if rounds > round_limit:
                     # Repair turns can add new image citations that re-enter
-                    # pending. Flat mode keeps its established fail-open tail;
-                    # a hierarchical train must not claim complete while a
-                    # large image backlog is still unverified. Its persisted
-                    # `final` phase makes the next trigger resume the tail
-                    # without replaying the map batches.
+                    # pending. Reaching the cap is recorded honestly — pages
+                    # with unverified images are named in the reply — but it
+                    # must NOT fail the train (2026-07-24 mandate: a quality
+                    # tail may degrade with a visible record, never wedge the
+                    # whole compile into a deterministic interrupt loop).
                     await run.emit({"type": "summary", "text": _loc(run,
-                        f"Self-check (images): verify/repair round cap ({round_limit}) reached — remaining pages will be picked up on the next trigger.",
-                        f"自检(图像):验修轮达到上限({round_limit} 轮)——剩余页将在下一轮触发时继续复核。")})
-                    if plan.get("mode") == "hierarchical":
-                        raise BatchOutputError(
-                            f"hierarchical image verification left {len(pending)} "
-                            f"page(s) pending after {round_limit} round(s)"
-                        )
+                        f"Self-check (images): verify/repair round cap ({round_limit}) reached — "
+                        f"{len(pending)} page(s) keep image assertions that could not be verified; recorded, not blocking.",
+                        f"自检(图像):验修轮达到上限({round_limit} 轮)——{len(pending)} 页的图像断言未能核验,"
+                        f"已记录,不阻塞完成。")})
+                    replies.append(_loc(run,
+                        f"[Image verify] {len(pending)} page(s) completed with UNVERIFIED image assertions "
+                        f"after {round_limit} round(s): " + ", ".join(sorted(pending)[:10]) + ("…" if len(pending) > 10 else ""),
+                        f"【图像核验】{len(pending)} 页在 {round_limit} 轮后仍带未核验的图像断言:"
+                        + ", ".join(sorted(pending)[:10]) + ("…" if len(pending) > 10 else "")))
                     break
                 # Blind transcribe+compare per ≤max-images chunk (v2): engine
                 # sessions read one image each — no in-session image pileup.
@@ -3636,7 +3756,11 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
                         or _loc(run, "Batch compile complete.", "分批编译完成。")})
     except Exception as e:
-        _print_compile_lifecycle("batch.interrupted", run, extra=f"reason={type(e).__name__}")
+        # The message text is load-bearing for operators: the class name alone
+        # cost a full pod-log stakeout to diagnose a deterministic wedge.
+        _print_compile_lifecycle(
+            "batch.interrupted", run,
+            extra=f"reason={type(e).__name__}: {str(e)[:300]}")
         await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
         # never-block: the single logical turn must still CLOSE — a consumer
         # gating on turn_done would otherwise hang on an orchestrator error.

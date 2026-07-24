@@ -3502,6 +3502,179 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+async def test_batch_orphan_assets_pre_excluded_and_pruned():
+    """2026-07-24 robustness mandate: a standalone media asset no document
+    embeds (a synced wiki file node) must never occupy a batch seat or wedge
+    the accounting gate. Reproduces the live incident: a pinned plan whose
+    batch carries an orphan PNG — plan-time pre-exclusion writes the ledger
+    row and the resume prune drops it from the pending batch."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        (raw / "docs" / "assets").mkdir(parents=True)
+        (raw / "docs" / "one.md").write_bytes(
+            "# One\n![embedded](assets/linked.png)\n".encode("utf-8") + b"x" * 300)
+        (raw / "docs" / "assets" / "linked.png").write_bytes(b"\x89PNG-linked")
+        (raw / "docs" / "assets" / "orphan.png").write_bytes(b"\x89PNG-orphan")
+        run = compile_box.CompileRun("orb1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        # The live shape: a PINNED plan already carries the orphan asset.
+        inventory = batching.scan_sources(raw)
+        plan = batching.build_plan(
+            inventory, [[i["path"] for i in inventory]], planner="code")
+        compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_read_allowlist=None):
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+
+        exclusions, errs = selfcheck.load_exclusions(str(wd))
+        assert not errs, errs
+        reasons = {e["pattern"]: e["reason"] for e in exclusions}
+        orphan_rows = [p for p in reasons if "orphan.png" in p]
+        assert orphan_rows and "not embedded by any document" in reasons[orphan_rows[0]], exclusions
+        assert not any("linked.png" in p for p in reasons), exclusions
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        for b in plan["batches"]:
+            assert not any("orphan.png" in s for s in b["sources"]), b
+            assert b["status"] == "done", b
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        assert not [e for e in events if e["type"] == "error"], events
+        assert [e for e in events if e["type"] == "turn_done"], events
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch orphan assets: pre-excluded with reason, pruned from pinned plan, train completes")
+
+
+async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
+    """The accounting gate is an accountant, not a gatekeeper: an unaccounted
+    source gets ONE corrective session; whatever remains is auto-excluded with
+    a machine reason and the train continues — it must never raise."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        raw.mkdir(parents=True)
+        (raw / "stubborn.md").write_bytes(b"z" * 400)
+        run = compile_box.CompileRun("gate1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        driven: list[str] = []
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_read_allowlist=None):
+            driven.append(label)
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        # The model never fixes it: unaccounted before AND after the corrective.
+        compile_box._unaccounted_batch_sources = (
+            lambda run_, sources: ["stubborn.md"] if sources else [])
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+
+        assert any("补账" in l or "accounting fix" in l for l in driven), driven
+        exclusions, _ = selfcheck.load_exclusions(str(wd))
+        row = next(e for e in exclusions if "stubborn.md" in e["pattern"])
+        assert "could not account" in row["reason"], row
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] == "done" for b in plan["batches"]), plan
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        assert not [e for e in events if e["type"] == "error"], events
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch accounting gate: corrective pass then auto-exclusion, never a raise")
+
+
+async def test_batch_content_fault_skips_batch_but_stall_interrupts():
+    """Failure classification is the load-bearing wall: a content/output-shape
+    fault (BatchOutputError) skips ONLY its batch with a recorded exclusion and
+    the train completes; an infra fault (ModelStallError) still interrupts the
+    train resumably — auto-excluding content over a gateway stall would lie."""
+    import batching
+
+    async def run_train(raiser):
+        td = tempfile.mkdtemp()
+        wd = Path(td)
+        raw = wd / "raw"
+        (raw / "a").mkdir(parents=True)
+        (raw / "b").mkdir(parents=True)
+        (raw / "a" / "one.md").write_bytes(b"x" * 300)
+        (raw / "b" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("cls1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_read_allowlist=None):
+            if label.startswith(("batch 1/", "批 1/")):
+                raise raiser
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        return wd, events, plan
+
+    # Content fault: batch 1 skipped+stamped, batch 2 ran, train completed clean.
+    wd, events, plan = await run_train(
+        compile_box.BatchOutputError("batch h001 produced an unusable page"))
+    assert all(b["status"] == "done" for b in plan["batches"]), plan
+    assert not [e for e in events if e["type"] == "error"], events
+    skipped = [e for e in events if e["type"] == "summary" and ("skipped" in e["text"] or "无法完成" in e["text"])]
+    assert skipped, events
+
+    # Infra fault: the train interrupts resumably — batch 1 NOT stamped, an
+    # error event surfaces, and the turn closes with the resumable story.
+    wd, events, plan = await run_train(compile_box.ModelStallError("gateway stalled"))
+    statuses = [b["status"] for b in plan["batches"]]
+    assert statuses[0] != "done", plan
+    assert [e for e in events if e["type"] == "error"], events
+    turn = next(e for e in events if e["type"] == "turn_done")
+    assert "断点" in turn["text"] or "resume" in turn["text"], turn
+    print("✓ batch failure classification: content skips one batch, infra interrupts resumably")
+
+
 def test_small_kb_batch_gate_skips_poppler_metadata():
     """Ordinary compile routing keeps the pre-PDF-slicing cheap scan. Poppler
     metadata is execution detail for a selected batch plan, never a new cost on
@@ -5203,6 +5376,9 @@ async def main():
     await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
+    await test_batch_orphan_assets_pre_excluded_and_pruned()
+    await test_batch_unaccounted_gets_corrective_then_auto_excluded()
+    await test_batch_content_fault_skips_batch_but_stall_interrupts()
     test_small_kb_batch_gate_skips_poppler_metadata()
     test_hierarchical_text_slice_materialization_and_directive()
     test_hierarchical_resume_state_contract()

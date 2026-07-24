@@ -711,6 +711,60 @@ def asset_attribution_edges(
     return edges
 
 
+def orphan_media_assets(workdir: str, sources: list[str] | None = None) -> list[str]:
+    """Media assets embedded by NO raw document — standalone wiki file nodes and
+    other sync residue with no text home. Coverage v2 deliberately refuses to
+    auto-attach them (a human must still see them), so without an exclusion row
+    they stay unaccounted forever; the batch train pre-excludes them with a
+    machine reason instead of demanding the model account for a bare image."""
+    sources = source_inventory(workdir) if sources is None else sources
+    media = {s for s in sources if is_media_asset(s)}
+    if not media:
+        return []
+    embedded: set[str] = set()
+    for targets in asset_attribution_edges(workdir, sources).values():
+        embedded.update(targets)
+    return sorted(media - embedded)
+
+
+def glob_escape_path(path: str) -> str:
+    """Escape a literal path for use as an exclusion pattern. Exclusion patterns
+    are segment-aware globs, and human titles legally contain `*`, `?`, `[` —
+    without escaping, a machine-written exact-path row could silently swallow
+    sibling files (the over-exclusion false-PASS)."""
+    return re.sub(r"([*?\[])", r"[\1]", path)
+
+
+def append_exclusions(workdir: str, entries: list[dict]) -> list[dict]:
+    """Append machine-written exclusion rows, de-duplicated by pattern. Returns
+    the rows actually added. An unreadable or malformed EXCLUSIONS.json is left
+    UNTOUCHED (returns []) — the lint already surfaces it, and appending to a
+    file we cannot parse risks destroying model-authored rows."""
+    path = Path(workdir) / EXCLUSIONS_PATH
+    data: list = []
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return []
+        if not isinstance(data, list):
+            return []
+    have = {str(item.get("pattern")) for item in data if isinstance(item, dict)}
+    added = [
+        {"pattern": str(e["pattern"]), "reason": str(e["reason"])}
+        for e in entries
+        if e.get("pattern") and e.get("reason") and str(e["pattern"]) not in have
+    ]
+    if not added:
+        return []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data + added, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return added
+
+
 def _body_source_payload_spans(text: str) -> list[tuple[int, int, str]]:
     """Extract source payloads and exact source-text offsets outside code."""
     payloads: list[tuple[int, int, str]] = []
