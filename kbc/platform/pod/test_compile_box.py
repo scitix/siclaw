@@ -4133,6 +4133,47 @@ async def test_lifecycle_line_drops_unsafe_batch_id():
     print("✓ lifecycle line: a pre-fix pinned hostile batch id is dropped from stdout (index only)")
 
 
+async def test_post_turn_normalizes_hand_edited_ledger():
+    """R2-1c: the escape hatch stays open (a model MAY hand-edit EXCLUSIONS.json
+    when exclude_source cannot express a fix), so the normalizer must run at the
+    interactive/flat turn seam too — not only in the batch path. _post_turn_selfcheck
+    normalizes the ledger at its head: a hand-edit with a trailing comma AND a
+    redundant invalid duplicate is absorbed back to canonical strict JSON."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw").mkdir()
+        (wd / "raw" / "one.md").write_text("one", encoding="utf-8")
+        (wd / "raw" / "skip.md").write_text("meta", encoding="utf-8")
+        (wd / "candidate").mkdir()
+        (wd / "candidate" / "index.md").write_text(
+            "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n", encoding="utf-8")
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\ntitle: a\ncompiled_from:\n  - one.md\n---\nbody a\n", encoding="utf-8")
+        (wd / "authoring").mkdir()
+        # A hand edit: trailing comma (invalid strict JSON) + a redundant invalid
+        # duplicate row (skip.md with no reason) alongside the valid one.
+        (wd / selfcheck.EXCLUSIONS_PATH).write_text(
+            '[\n  {"pattern": "skip.md", "reason": "meta file"},\n  {"pattern": "skip.md"},\n]\n',
+            encoding="utf-8")
+        try:
+            json.loads((wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8"))
+            raise AssertionError("test setup should be strictly-invalid JSON")
+        except json.JSONDecodeError:
+            pass
+
+        run = compile_box.CompileRun("normseam", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        await compile_box._post_turn_selfcheck(run)
+
+        # After the turn: canonical strict JSON, invalid duplicate pruned.
+        rows = json.loads((wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8"))
+        assert rows == [{"pattern": "skip.md", "reason": "meta file"}], rows
+    print("✓ post-turn seam normalizes a hand-edited ledger (escape hatch stays open, file kept honest)")
+
+
 def test_small_kb_batch_gate_skips_poppler_metadata():
     """Ordinary compile routing keeps the pre-PDF-slicing cheap scan. Poppler
     metadata is execution detail for a selected batch plan, never a new cost on
@@ -5872,6 +5913,7 @@ async def main():
     await test_batch_auto_exclude_refused_interrupts_resumably()
     await test_slice_failure_auto_exclude_refused_interrupts_resumably()
     await test_lifecycle_line_drops_unsafe_batch_id()
+    await test_post_turn_normalizes_hand_edited_ledger()
     test_small_kb_batch_gate_skips_poppler_metadata()
     test_hierarchical_text_slice_materialization_and_directive()
     test_hierarchical_resume_state_contract()

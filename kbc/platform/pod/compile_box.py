@@ -2069,6 +2069,20 @@ async def _post_turn_selfcheck(run) -> str | None:
     workdir = getattr(run, "workdir", None)
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
+    # The exclusion ledger is machine-owned, but the escape hatch stays open: a
+    # model MAY hand-edit authoring/EXCLUSIONS.json when the exclude_source tool
+    # cannot express a fix. Normalize it back to canonical strict JSON (and prune
+    # invalid duplicates) at EVERY interactive/flat compile turn end, BEFORE the
+    # coverage ledger reads it — so a hand-edit is absorbed, not relied upon. The
+    # batch path has its own normalize in _drive_batch_session's finally.
+    norm_err = selfcheck.normalize_exclusions_file(workdir)
+    if norm_err:
+        # stdout stays whitelisted; the owner gets the detail on their SSE stream.
+        _print_compile_lifecycle("exclusions.normalize_failed", run, extra="code=ledger_normalize_failed")
+        await run.emit({"type": "summary", "text": _loc(
+            run,
+            f"Exclusion ledger could not be normalized: {norm_err}",
+            f"豁免清单无法规范化:{norm_err}")})
     turn_start_key = getattr(run, "_turn_selfcheck_key", None)
     run._turn_selfcheck_key = None
     turn_format_guard = getattr(run, "_turn_format_guard", None)

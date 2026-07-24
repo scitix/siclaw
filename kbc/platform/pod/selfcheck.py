@@ -869,13 +869,19 @@ def append_exclusions(workdir: str, entries: list[dict]) -> tuple[list[dict], st
 def normalize_exclusions_file(workdir: str) -> str | None:
     """Restore the exclusion ledger to canonical form after a model turn.
 
-    The ledger is MACHINE-OWNED: the model expresses exclusion intent through
-    the exclude_source tool, never by editing the file. This normalizer is the
-    enforcement backstop for a model that edits it anyway — every parseable row
-    survives verbatim, mechanical slips (trailing commas) are absorbed, and the
-    canonical rewrite guarantees a strictly-parseable file at rest after every
-    turn. Returns an error string only when the file is corrupted beyond the
-    mechanical repair (left untouched for a human/model to inspect)."""
+    The ledger is MACHINE-OWNED, but the escape hatch stays OPEN (stability-first
+    mandate): the model is steered to the exclude_source tool, yet may hand-edit
+    the file when the tool cannot express a fix. This normalizer is the
+    enforcement backstop that makes that safe — every parseable row survives
+    verbatim, mechanical slips (trailing commas) are absorbed, a redundant invalid
+    duplicate is pruned (see _valid_exclusion_row), and the canonical atomic
+    rewrite guarantees a strictly-parseable file at rest after every turn.
+
+    Call sites that make "after every turn" true: compile_box._drive_batch_session's
+    finally (every batch map/reduce/final/repair sub-session) and
+    compile_box._post_turn_selfcheck's head (every interactive/flat compile turn).
+    Returns an error string only when the file is corrupted beyond the mechanical
+    repair (left untouched for a human/model to inspect)."""
     path = Path(workdir) / EXCLUSIONS_PATH
     if not path.is_file():
         return None
@@ -1317,6 +1323,32 @@ def dup_candidates(pages: dict[str, dict], cap: int = 20) -> list[dict]:
     return out
 
 
+def detect_over_broad_exclusions(workdir: str, exclusions: list[dict]) -> list[dict]:
+    """Exclusion patterns that swallow a large share of the corpus — a `**` bomb
+    or an over-broad prefix, almost always a mistake that launders 'never
+    compiled' into 'accounted'. Flags any single pattern matching >25% of the raw
+    inventory AND >5 sources, sorted by pattern, as [{"pattern", "matched"}].
+
+    DETECTION ONLY (stability-first mandate: never prevention): the caller surfaces
+    it loudly in the self-check narration/repair prompt so a human narrows it; it is
+    never auto-removed and never blocks the train. Kept OUT of coverage() on purpose
+    — coverage is the accounting contract mirrored byte-for-byte by sicore's
+    adoption ledger; this is a box-side compile heuristic, not part of that ledger."""
+    sources = source_inventory(workdir)
+    if not sources:
+        return []
+    counts: dict[str, int] = {}
+    for s in sources:
+        for e in exclusions:
+            if _matches(s, e["pattern"]):
+                counts[e["pattern"]] = counts.get(e["pattern"], 0) + 1
+    return [
+        {"pattern": p, "matched": counts[p]}
+        for p in sorted(counts)
+        if counts[p] > 5 and counts[p] > 0.25 * len(sources)
+    ]
+
+
 def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> dict:
     """The ledger (coverage v2): raw inventory − compiled_from union − exclusions
     − auto-attached media = unaccounted.
@@ -1467,6 +1499,7 @@ def run_layer1(workdir: str) -> dict:
     exclusions, exclusion_errors = load_exclusions(workdir)
     cov = coverage(workdir, pages, exclusions)
     lint = lint_candidate(pages, exclusion_errors)
+    over_broad = detect_over_broad_exclusions(workdir, exclusions)
     previous = read_selfcheck(workdir) or {}
     media_verify = previous.get("media_verify")
     citing_media = media_citing_pages(workdir)
@@ -1480,6 +1513,10 @@ def run_layer1(workdir: str) -> dict:
         "candidate_tree_hash": candidate_tree_hash(workdir),
         "coverage": cov,
         "lint": {"ok": lint["ok"], "violations": lint["violations"]},
+        # Box-side compile heuristic (NOT part of the coverage accounting
+        # contract): over-broad exclusion patterns flagged for a human, never
+        # blocking. Report-level so coverage() stays byte-identical to sicore's.
+        "over_broad_exclusions": over_broad,
         "dup_candidates": dup_candidates(pages),
         "pk": previous.get("pk"),  # Layer-2 results survive L1 re-checks
         "media_verify": media_verify,
@@ -1595,11 +1632,15 @@ def narration(report: dict, locale: str | None = None) -> str:
     cov, lint = report["coverage"], report["lint"]
     en = _is_en(locale)
     noop = cov.get("noop_exclusions") or []
+    over_broad = report.get("over_broad_exclusions") or []
     auto = cov.get("auto_attached") or 0
     warn = ""
     if noop:
         warn = (f" ⚠ {len(noop)} exclusion(s) match no source — likely a typo" if en
                 else f" ⚠ {len(noop)} 条排除未命中任何源——疑似写错")
+    if over_broad:
+        warn += (f" ⚠ {len(over_broad)} exclusion(s) look over-broad (each matches >25% of sources) — likely a mistake" if en
+                 else f" ⚠ {len(over_broad)} 条排除疑似过宽(各命中超 25% 的源)——多半写错了")
     auto_note = ""
     if auto:
         auto_note = (f"; {auto} media auto-attached" if en
@@ -1649,9 +1690,12 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
             lines.append(
                 "For each, choose one: (1) Compile it — fold the source's content into the relevant candidate "
                 "page (new or merged) and register that source path in the page's frontmatter compiled_from; "
-                "(2) Explicitly exclude — if it genuinely should not be compiled (meta files / live data / "
-                'highly time-sensitive, etc.), add it to authoring/EXCLUSIONS.json (a JSON array of '
-                '{"pattern": "path or glob relative to raw", "reason": "one-line reason the owner can understand"}).')
+                "(2) Exclude it — if it genuinely should not be compiled (meta files / live data / "
+                "highly time-sensitive, etc.), call the exclude_source(path, reason) tool (the preferred, "
+                "validated path; do NOT hand-write authoring/EXCLUSIONS.json for a new exclusion). Directly "
+                "editing authoring/EXCLUSIONS.json stays permitted only as a fallback when the tool cannot "
+                "express the fix — e.g. correcting or removing an existing wrong row — and the system "
+                "re-normalizes the ledger after this turn either way.")
         if cov["dangling_citations"]:
             lines.append(f"\ncompiled_from cites nonexistent sources (dangling, {len(cov['dangling_citations'])}):")
             lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
@@ -1661,6 +1705,11 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
             lines += [f"- {p}" for p in cov["noop_exclusions"][:_REPAIR_LIST_CAP]]
             lines.append("Matching is SEGMENT-aware: a bare `logs` matches only a file literally named logs; "
                          "`logs/*` matches only direct children; a whole subtree needs `logs/**` (or the `logs/` prefix form). Fix the pattern.")
+        if report.get("over_broad_exclusions"):
+            over_broad = report["over_broad_exclusions"]
+            lines.append(f"\nExclusion patterns that look OVER-BROAD ({len(over_broad)}) — each swallows >25% of the corpus, likely a mistake that launders 'never compiled' into 'accounted':")
+            lines += [f"- {ob['pattern']} — matches {ob['matched']} source(s)" for ob in over_broad[:_REPAIR_LIST_CAP]]
+            lines.append("If that breadth is truly intended, keep it; otherwise narrow it or split it into per-source exclude_source calls with concrete reasons.")
         if not lint["ok"]:
             lines.append(f"\nLint issues ({len(lint['violations'])}):")
             lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
@@ -1676,8 +1725,9 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
         lines.append(
             "逐个二选一(图片/PDF 等媒体同样适用):① 补编 — 把该源内容编进相应 candidate 页(新增或并入),"
             "并在该页 frontmatter 的 compiled_from 登记该源路径;② 显式排除 — 确属不该编的(元文件/活数据/时效性强等),"
-            '加入 authoring/EXCLUSIONS.json(JSON 数组,元素 {"pattern": "相对 raw 的路径或 glob", '
-            '"reason": "一句话理由,让负责人看得懂"}).')
+            "调用 exclude_source(path, reason) 工具(首选的、带校验的正路;新增豁免不要手写 authoring/EXCLUSIONS.json)。"
+            "仅当工具无法表达该修改时(例如更正或删除一条已有的错误豁免行),才允许直接编辑 authoring/EXCLUSIONS.json 作为兜底——"
+            "无论哪种,系统都会在本轮结束后重新规范化该账本。")
     if cov["dangling_citations"]:
         lines.append(f"\ncompiled_from 引用了不存在的源(悬空引用,{len(cov['dangling_citations'])} 处):")
         lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
@@ -1687,6 +1737,11 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
         lines += [f"- {p}" for p in cov["noop_exclusions"][:_REPAIR_LIST_CAP]]
         lines.append("匹配是按路径段的:裸 `logs` 只匹配名字恰为 logs 的文件;`logs/*` 只匹配直接子级;"
                      "整个子树要写 `logs/**`(或 `logs/` 前缀形式)。请修正模式。")
+    if report.get("over_broad_exclusions"):
+        over_broad = report["over_broad_exclusions"]
+        lines.append(f"\n疑似过宽的排除模式({len(over_broad)} 条)——每条吞掉超 25% 的语料,多半是把'从没编过'洗成了'已入账':")
+        lines += [f"- {ob['pattern']} — 命中 {ob['matched']} 个源" for ob in over_broad[:_REPAIR_LIST_CAP]]
+        lines.append("若这个覆盖面确属有意,保留即可;否则请收窄,或拆成逐源的 exclude_source 调用并各写明理由。")
     if not lint["ok"]:
         lines.append(f"\nlint 问题({len(lint['violations'])} 处):")
         lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"

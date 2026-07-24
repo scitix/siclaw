@@ -1666,6 +1666,75 @@ def test_exclusion_writes_are_atomic():
     print("OK  exclusion writes are atomic (same-dir temp + os.replace) for append and normalize")
 
 
+def test_repair_prompt_prefers_exclude_source_tool():
+    """R2-1b: the unaccounted repair instruction must steer to the exclude_source
+    TOOL as the preferred path (no longer 'add it to authoring/EXCLUSIONS.json'),
+    while keeping one sentence that direct file repair is a permitted fallback
+    when the tool cannot express the fix. Both locales."""
+    import selfcheck
+    report = {
+        "coverage": {"unaccounted": ["meta.md"], "dangling_citations": [],
+                     "noop_exclusions": [], "over_broad_exclusions": []},
+        "lint": {"ok": True, "violations": []},
+    }
+    en = selfcheck.build_repair_prompt(report, "en")
+    assert "exclude_source(path, reason)" in en, en
+    assert "preferred" in en and "fallback" in en, en
+    assert "add it to authoring/EXCLUSIONS.json (a JSON array" not in en, en   # old direct-edit copy gone
+    zh = selfcheck.build_repair_prompt(report, "zh")
+    assert "exclude_source(path, reason)" in zh and "兜底" in zh, zh
+    assert "加入 authoring/EXCLUSIONS.json(JSON 数组" not in zh, zh
+    print("OK  repair prompt prefers exclude_source (tool), keeps hand-edit as an explicit fallback")
+
+
+def test_over_broad_exclusion_flagged_not_blocking():
+    """R2-1c2: a single exclusion pattern swallowing >25% of the inventory AND >5
+    sources (a `**` bomb, an over-broad prefix) is flagged LOUDLY in the report,
+    the narration warn line, and the repair prompt — but is NEVER blocking (it is
+    a report-level heuristic, kept OUT of coverage()/`closed`) and NEVER
+    auto-removed. A normal dir-prefix under the threshold is not flagged. It stays
+    out of the coverage() accounting dict (sicore mirrors that byte-for-byte)."""
+    import selfcheck
+    with tempfile.TemporaryDirectory() as td:
+        raw = Path(td) / "raw"
+        raw.mkdir()
+        for i in range(20):
+            (raw / f"f{i}.md").write_text("x", encoding="utf-8")
+        (Path(td) / "authoring").mkdir()
+        (Path(td) / selfcheck.EXCLUSIONS_PATH).write_text(
+            json.dumps([{"pattern": "**", "reason": "bomb"}]), encoding="utf-8")
+        excl, _ = selfcheck.load_exclusions(td)
+        ob = selfcheck.detect_over_broad_exclusions(td, excl)
+        assert ob == [{"pattern": "**", "matched": 20}], ob
+        cov = selfcheck.coverage(td, {}, excl)
+        assert "over_broad_exclusions" not in cov, "must stay out of the shared coverage contract"
+        assert cov["closed"] is True, "over-broad must not block: closed stays true"  # non-blocking
+        assert (Path(td) / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8"), "never auto-removed"
+        # run_layer1 surfaces it at the report level; narration + repair prompt read it there.
+        report = selfcheck.run_layer1(td)
+        assert report["over_broad_exclusions"] == [{"pattern": "**", "matched": 20}], report["over_broad_exclusions"]
+        report["state"] = "passed"
+        assert "over-broad" in selfcheck.narration(report, "en")
+        assert "过宽" in selfcheck.narration(report, "zh")
+        assert "OVER-BROAD" in selfcheck.build_repair_prompt(report, "en")
+        assert "过宽" in selfcheck.build_repair_prompt(report, "zh")
+
+    # A normal dir-prefix exclusion under the threshold is NOT flagged.
+    with tempfile.TemporaryDirectory() as td:
+        raw = Path(td) / "raw"
+        (raw / "logs").mkdir(parents=True)
+        for i in range(20):
+            (raw / f"doc{i}.md").write_text("x", encoding="utf-8")
+        (raw / "logs" / "a.log").write_text("x", encoding="utf-8")
+        (raw / "logs" / "b.log").write_text("x", encoding="utf-8")
+        (Path(td) / "authoring").mkdir()
+        (Path(td) / selfcheck.EXCLUSIONS_PATH).write_text(
+            json.dumps([{"pattern": "logs/", "reason": "runtime logs"}]), encoding="utf-8")
+        excl, _ = selfcheck.load_exclusions(td)
+        assert selfcheck.detect_over_broad_exclusions(td, excl) == []  # 2 of 22 → under threshold
+    print("OK  over-broad exclusion flagged (report/narration/repair), non-blocking, out of coverage, never auto-removed")
+
+
 def test_converge_phase_helper():
     """set_converge_phase: writes the durable authoritative signal (verifying/
     revising/settled), preserves the L1 coverage section, ignores junk phases."""
@@ -1976,6 +2045,8 @@ def main():
     test_trailing_comma_repair_is_string_aware()
     test_append_not_blocked_by_invalid_legacy_row()
     test_exclusion_writes_are_atomic()
+    test_repair_prompt_prefers_exclude_source_tool()
+    test_over_broad_exclusion_flagged_not_blocking()
     test_converge_phase_helper()
     print("ALL OK  test_selfcheck")
 
