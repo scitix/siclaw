@@ -3505,6 +3505,10 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         for batch in list(pending):
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
             try:
+                unaccounted_before = (
+                    [] if batch.get("defer_accounting")
+                    else _unaccounted_batch_sources(run, batch.get("sources") or [])
+                )
                 directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run), locale=getattr(run, "locale", None))
                 reply = await _drive_batch_session(
                     run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"),
@@ -3540,8 +3544,23 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         replies.append(_loc(run, f"[Batch {k} fix] {fix_reply}", f"【批 {k} 补账】{fix_reply}"))
                     still_unaccounted = _unaccounted_batch_sources(run, batch.get("sources") or [])
                 if still_unaccounted:
+                    if unaccounted_before and set(still_unaccounted) == set(unaccounted_before):
+                        # ZERO accounting progress across the batch turn AND the
+                        # corrective pass. That is the empty/authentication-error
+                        # provider-result shape (the GPU-corpus incident), not
+                        # stubborn content — auto-excluding a whole batch over a
+                        # provider blip would silently drop good sources. Keep the
+                        # batch pending and interrupt resumably.
+                        stalled = BatchOutputError(
+                            f"batch {batch['id']} made no accounting progress over "
+                            f"{len(still_unaccounted)} assigned source(s) — treating as a "
+                            f"provider/model fault; the batch stays pending for resume"
+                        )
+                        stalled.provider_fault = True
+                        raise stalled
                     # Content shape must never wedge the train (2026-07-24 mandate:
-                    # humans may pile ANYTHING into a wiki). The ledger stays honest
+                    # humans may pile ANYTHING into a wiki). The batch made real
+                    # progress and only stragglers remain — the ledger stays honest
                     # instead: auto-exclude with a machine reason a human can read,
                     # revisit and lift.
                     _auto_exclude_batch_sources(
@@ -3558,6 +3577,8 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 # they heal on resume, and excluding content over them would lie.
                 raise
             except BatchOutputError as e:
+                if getattr(e, "provider_fault", False):
+                    raise  # zero-progress: interrupt resumably, batch stays pending
                 # A content/output-shape fault is deterministic: retrying the same
                 # batch forever is the wedge this train must never enter. Skip the
                 # batch, account its sources as machine exclusions, keep going.

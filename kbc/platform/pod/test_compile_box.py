@@ -3578,6 +3578,7 @@ async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
         wd = Path(td)
         raw = wd / "raw"
         raw.mkdir(parents=True)
+        (raw / "good.md").write_bytes(b"g" * 400)
         (raw / "stubborn.md").write_bytes(b"z" * 400)
         run = compile_box.CompileRun("gate1", str(wd), 1)
         os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
@@ -3591,12 +3592,21 @@ async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
             driven.append(label)
             return f"done {label}"
 
+        # PARTIAL progress: before the turn both sources are unaccounted; the
+        # turn lands good.md but stubborn.md resists the corrective pass too.
+        # (Zero progress would instead be classified as a provider fault.)
+        calls = {"n": 0}
+
+        def fake_unaccounted(run_, sources):
+            if not sources:
+                return []
+            calls["n"] += 1
+            return ["good.md", "stubborn.md"] if calls["n"] == 1 else ["stubborn.md"]
+
         real_drive = compile_box._drive_batch_session
         real_accounted = compile_box._unaccounted_batch_sources
         compile_box._drive_batch_session = fake_drive
-        # The model never fixes it: unaccounted before AND after the corrective.
-        compile_box._unaccounted_batch_sources = (
-            lambda run_, sources: ["stubborn.md"] if sources else [])
+        compile_box._unaccounted_batch_sources = fake_unaccounted
         try:
             await compile_box._run_batch_compile(run, "直接开始编译")
         finally:
@@ -3607,6 +3617,7 @@ async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
         exclusions, _ = selfcheck.load_exclusions(str(wd))
         row = next(e for e in exclusions if "stubborn.md" in e["pattern"])
         assert "could not account" in row["reason"], row
+        assert not any("good.md" in e["pattern"] for e in exclusions), exclusions
         plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
         assert all(b["status"] == "done" for b in plan["batches"]), plan
         events = []
@@ -3615,7 +3626,7 @@ async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
         assert not [e for e in events if e["type"] == "error"], events
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
         del os.environ["KBC_BATCH_BUDGET_BYTES"]
-    print("✓ batch accounting gate: corrective pass then auto-exclusion, never a raise")
+    print("✓ batch accounting gate: partial progress → corrective pass → auto-exclusion, never a raise")
 
 
 async def test_batch_content_fault_skips_batch_but_stall_interrupts():
