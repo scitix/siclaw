@@ -171,6 +171,8 @@ Consumer rules:
 - **Frame type** = the single top-level key: `task` | `statusUpdate` | `artifactUpdate`.
 - `artifactUpdate` with `append: true` → **concatenate** `artifact.parts[].text` to
   build the answer. `lastChunk: true` marks the final chunk.
+- `artifactUpdate` with `append: false` → **replace** the current answer. Siclaw
+  uses this when a complete assistant message corrects missing or divergent deltas.
 - `statusUpdate` with a terminal `status.state` → the stream is done.
 - Lines starting with `:` are heartbeat comments (every ~25s) — ignore them.
 
@@ -187,8 +189,12 @@ with requests.post(f"{base}/message:stream", headers=H, stream=True,
             continue
         obj = json.loads(line[6:])
         if "artifactUpdate" in obj:
-            for p in obj["artifactUpdate"]["artifact"].get("parts", []):
-                buf.append(p.get("text", ""))
+            update = obj["artifactUpdate"]
+            text = "".join(p.get("text", "") for p in update["artifact"].get("parts", []))
+            if update.get("append", False):
+                buf.append(text)
+            else:
+                buf = [text]
         elif "statusUpdate" in obj:
             state = obj["statusUpdate"]["status"]["state"]
             if state.startswith("TASK_STATE_") and state not in ("TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"):
@@ -203,7 +209,9 @@ print("".join(buf))
 - **Continue the same investigation thread**: pass the same `contextId` on the next
   `message:send`/`message:stream`. Omit it to start fresh (the server generates one
   and returns it on the task). Each call still creates a new task; the `contextId`
-  reuses the underlying session.
+  reuses the underlying session. Calls in one context are sequential: wait for the
+  current task to become terminal (or cancel it) before submitting the next one.
+  A concurrent submission returns `409 CONTEXT_BUSY`.
 - **Reconnect a dropped stream**: `POST .../tasks/<taskId>:subscribe` (only while the
   task is non-terminal; a terminal task returns `400`). Or just fall back to polling
   `GET .../tasks/<taskId>` — polling always works.
@@ -238,6 +246,7 @@ JSON error envelope (google.rpc shape):
 | 401  | `UNAUTHENTICATED` | missing/invalid key |
 | 403  | `PERMISSION_DENIED` | key not bound to this `agentId` |
 | 404  | `NOT_FOUND` | task does not exist (or not yours) |
+| 409  | `ABORTED` | another non-terminal task already owns this context |
 | 413  | `RESOURCE_EXHAUSTED` | body over 1 MB |
 | 502  | `UNAVAILABLE`/runtime error | runtime command failed |
 | 503  | `UNAVAILABLE` | agent runtime not connected |
@@ -249,6 +258,8 @@ JSON error envelope (google.rpc shape):
 - **Text parts only.** `message.parts[].text`; `raw`/`url`/`data`/file parts are rejected.
 - `message.role`, if present, must be `ROLE_USER`.
 - Body ≤ **1 MB**; any id (`messageId`/`contextId`) ≤ **255 bytes**.
+- Partial artifacts are checkpointed while a task is `WORKING` (first update,
+  then at most once per `SICLAW_A2A_PROGRESS_FLUSH_MS`, default 3000 ms).
 - `message.taskId` continuation / `input-required` is **not** supported yet — start a
   new task in the same `contextId` instead.
 - Push notifications, Agent Card signing, OAuth/mTLS, and the full A2A JSON-RPC

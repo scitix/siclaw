@@ -240,7 +240,7 @@ describe("registerA2aRoutes", () => {
     expect(sent[2].systemPrompt).toBe("你是 SRE 专家。");
   });
 
-  it("maps a non-UUID A2A context to a stable internal Siclaw session", async () => {
+  it("reuses a non-UUID context session only after the previous task completes", async () => {
     const { router, conn } = await makeRouter();
     const first = await runRoute(router, fakeReq({
       url: "/api/v1/a2a/agents/a1/message:send",
@@ -248,6 +248,11 @@ describe("registerA2aRoutes", () => {
       headers: { authorization: `Bearer ${API_KEY}` },
       body: { message: { role: "ROLE_USER", contextId: "external-context", parts: [{ text: "first" }] } },
     }));
+    const firstSessionId = (conn.map.sendCommand as any).mock.calls
+      .find((call: any[]) => call[1] === "chat.send")[2].sessionId;
+    conn.emit({ sessionId: firstSessionId, event: { type: "prompt_done" } });
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+
     const second = await runRoute(router, fakeReq({
       url: "/api/v1/a2a/agents/a1/message:send",
       method: "POST",
@@ -259,9 +264,55 @@ describe("registerA2aRoutes", () => {
     expect(second._status).toBe(200);
     const sendCalls = (conn.map.sendCommand as any).mock.calls.filter((call: any[]) => call[1] === "chat.send");
     expect(sendCalls).toHaveLength(2);
-    expect(sendCalls[0][2].sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(sendCalls[0][2].sessionId).toBe(firstSessionId);
     expect(sendCalls[1][2].sessionId).toBe(sendCalls[0][2].sessionId);
     expect(parseJsonBody(second).task.contextId).toBe("external-context");
+  });
+
+  it("rejects a concurrent task in the same context before dispatching it", async () => {
+    const { router, conn } = await makeRouter();
+    const first = await runRoute(router, fakeReq({
+      url: "/api/v1/a2a/agents/a1/message:send",
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: { message: { role: "ROLE_USER", contextId: "busy-context", parts: [{ text: "first" }] } },
+    }));
+    const second = await runRoute(router, fakeReq({
+      url: "/api/v1/a2a/agents/a1/message:send",
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: { message: { role: "ROLE_USER", contextId: "busy-context", parts: [{ text: "second" }] } },
+    }));
+
+    expect(first._status).toBe(200);
+    expect(second._status).toBe(409);
+    const error = parseJsonBody(second).error;
+    expect(error.status).toBe("ABORTED");
+    expect(error.details[0].reason).toBe("CONTEXT_BUSY");
+    const sendCalls = (conn.map.sendCommand as any).mock.calls.filter((call: any[]) => call[1] === "chat.send");
+    expect(sendCalls).toHaveLength(1);
+  });
+
+  it("serializes racing submissions with a database-backed context lease", async () => {
+    const { router, conn } = await makeRouter();
+    const request = (text: string) => runRoute(router, fakeReq({
+      url: "/api/v1/a2a/agents/a1/message:send",
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: { message: { role: "ROLE_USER", contextId: "racing-context", parts: [{ text }] } },
+    }));
+
+    const responses = await Promise.all([request("first"), request("second")]);
+    expect(responses.map((response) => response._status).sort()).toEqual([200, 409]);
+    const sendCalls = (conn.map.sendCommand as any).mock.calls.filter((call: any[]) => call[1] === "chat.send");
+    expect(sendCalls).toHaveLength(1);
+
+    const [rows] = await getDb().query<Array<{ c: number }>>(
+      `SELECT COUNT(*) AS c FROM a2a_tasks
+        WHERE context_id = ? AND state IN ('TASK_STATE_SUBMITTED', 'TASK_STATE_WORKING')`,
+      ["racing-context"],
+    );
+    expect(Number(rows[0].c)).toBe(1);
   });
 
   it("rejects oversized A2A context identifiers before dispatching", async () => {
@@ -320,6 +371,99 @@ describe("registerA2aRoutes", () => {
     expect(frames.some((f) => f.artifactUpdate?.artifact?.parts?.[0]?.text === "hello")).toBe(true);
     expect(frames.some((f) => f.statusUpdate?.status?.state === "TASK_STATE_COMPLETED")).toBe(true);
     expect(res.writableEnded).toBe(true);
+  });
+
+  it("checkpoints a partial artifact while the task is still working", async () => {
+    const { router, conn } = await makeRouter();
+    const createRes = await runRoute(router, fakeReq({
+      url: "/api/v1/a2a/agents/a1/message:send",
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: { message: { role: "ROLE_USER", parts: [{ text: "stream it" }] } },
+    }));
+    const taskId = parseJsonBody(createRes).task.id;
+    const sent = (conn.map.sendCommand as any).mock.calls.find((call: any[]) => call[1] === "chat.send");
+
+    conn.emit({
+      sessionId: sent[2].sessionId,
+      event: { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "partial" } },
+    });
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+
+    const [rows] = await getDb().query<Array<{ state: string; artifact_text: string }>>(
+      "SELECT state, artifact_text FROM a2a_tasks WHERE id = ?",
+      [taskId],
+    );
+    expect(rows[0]).toEqual({ state: "TASK_STATE_WORKING", artifact_text: "partial" });
+  });
+
+  it("uses the full assistant message when no text deltas were emitted", async () => {
+    const { router, conn } = await makeRouter();
+    const createRes = await runRoute(router, fakeReq({
+      url: "/api/v1/a2a/agents/a1/message:send",
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: { message: { role: "ROLE_USER", parts: [{ text: "answer without deltas" }] } },
+    }));
+    const taskId = parseJsonBody(createRes).task.id;
+    const sent = (conn.map.sendCommand as any).mock.calls.find((call: any[]) => call[1] === "chat.send");
+
+    conn.emit({
+      sessionId: sent[2].sessionId,
+      event: {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "complete answer" }] },
+      },
+    });
+    conn.emit({ sessionId: sent[2].sessionId, event: { type: "prompt_done" } });
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+
+    const [rows] = await getDb().query<Array<{ state: string; artifact_text: string }>>(
+      "SELECT state, artifact_text FROM a2a_tasks WHERE id = ?",
+      [taskId],
+    );
+    expect(rows[0]).toEqual({ state: "TASK_STATE_COMPLETED", artifact_text: "complete answer" });
+  });
+
+  it("reconciles divergent deltas to the authoritative message_end content", async () => {
+    const { router, conn } = await makeRouter();
+    const res = fakeRes();
+    router.handle(fakeReq({
+      url: "/api/v1/a2a/agents/a1/message:stream",
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: { message: { role: "ROLE_USER", parts: [{ text: "recover dropped deltas" }] } },
+    }), res);
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+    const sent = (conn.map.sendCommand as any).mock.calls.find((call: any[]) => call[1] === "chat.send");
+
+    conn.emit({
+      sessionId: sent[2].sessionId,
+      event: { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "helx" } },
+    });
+    conn.emit({
+      sessionId: sent[2].sessionId,
+      event: {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    conn.emit({ sessionId: sent[2].sessionId, event: { type: "prompt_done" } });
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+
+    const frames = parseSseDataChunks(res);
+    expect(frames).toContainEqual(expect.objectContaining({
+      artifactUpdate: expect.objectContaining({
+        append: false,
+        artifact: expect.objectContaining({ parts: [expect.objectContaining({ text: "hello" })] }),
+      }),
+    }));
+    const taskId = frames.find((frame) => frame.task)?.task.id;
+    const [rows] = await getDb().query<Array<{ artifact_text: string }>>(
+      "SELECT artifact_text FROM a2a_tasks WHERE id = ?",
+      [taskId],
+    );
+    expect(rows[0].artifact_text).toBe("hello");
   });
 
   it("lists A2A tasks with context and status filters", async () => {

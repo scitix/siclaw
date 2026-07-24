@@ -378,6 +378,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     api_key_id CHAR(36) DEFAULT NULL,
     context_id VARCHAR(255) NOT NULL,
     session_id CHAR(36) NOT NULL,
+    active_context_key VARCHAR(64) DEFAULT NULL,
     state VARCHAR(40) NOT NULL,
     status_message TEXT,
     artifact_text TEXT,
@@ -579,6 +580,11 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_agent_key", "agent_id, api_key_id, created_at");
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_session", "session_id");
   await ensureIndex(db, "a2a_tasks", "idx_a2a_tasks_context_key", "agent_id, api_key_id, context_id, created_at");
+  // A non-NULL lease exists only while a task is non-terminal. Its SHA-256 value covers
+  // (agent, API key, context), so this unique index serializes same-context submissions
+  // across concurrent requests and Portal replicas. Both SQLite and MySQL allow multiple
+  // NULL values, which releases the lease without deleting task history.
+  await ensureUniqueIndex(db, "a2a_tasks", "uq_a2a_tasks_active_context", "active_context_key");
   await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_agent");
   await dropIndexIfExists(db, "a2a_tasks", "idx_a2a_tasks_context");
   // notifications
@@ -659,6 +665,7 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "target_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "trace_id", "CHAR(32) DEFAULT NULL");
+  await safeAlterTable(db, "a2a_tasks", "active_context_key", "VARCHAR(64) DEFAULT NULL");
 
   // Widen delegation_id CHAR(36)→VARCHAR(64) on EXISTING deployments. A group reduce child's id
   // `${toolCallId}#reduce` reaches 36 chars for a 29-char provider id and would overflow CHAR(36)
