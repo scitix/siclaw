@@ -1708,6 +1708,17 @@ export async function collectChannelResponse(
   // Prefer the last full assistant turn; fall back to streamed deltas if the
   // brain only emits content_block_delta events.
   const text = lastAssistantText || parts.join("");
+  // A delta-only stream has no assistant message_end, so persist the exact
+  // synthesized reply once the stream finishes. This gives feedback cards the
+  // same precise message linkage as the normal message_end path without
+  // duplicating assistant rows when a full turn was already persisted.
+  if (!lastAssistantText && text.trim() && persist) {
+    lastAssistantMessageId = await persistRow({
+      sessionId,
+      role: "assistant",
+      content: redact(text),
+    });
+  }
   return { text, images, assistantMessageId: lastAssistantMessageId };
 }
 
