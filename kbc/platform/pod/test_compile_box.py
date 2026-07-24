@@ -3509,6 +3509,7 @@ async def test_batch_orphan_assets_pre_excluded_and_pruned():
     batch carries an orphan PNG — plan-time pre-exclusion writes the ledger
     row and the resume prune drops it from the pending batch."""
     import batching
+    import selfcheck
 
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
@@ -3571,6 +3572,7 @@ async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
     source gets ONE corrective session; whatever remains is auto-excluded with
     a machine reason and the train continues — it must never raise."""
     import batching
+    import selfcheck
 
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
