@@ -3526,7 +3526,10 @@ async def test_batch_orphan_assets_pre_excluded_and_pruned():
         # The live shape: a PINNED plan already carries the orphan asset.
         inventory = batching.scan_sources(raw)
         plan = batching.build_plan(
-            inventory, [[i["path"] for i in inventory]], planner="code")
+            inventory, batching.pack_batches(inventory), planner="code")
+        assert any(
+            any("orphan.png" in s for s in b["sources"]) for b in plan["batches"]
+        ), plan  # the pinned plan really carries the orphan, like the incident
         compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
 
         async def fake_drive(run_, directive, label, pdf_page_ranges=None,
