@@ -3502,6 +3502,678 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+async def test_exclude_source_tool_owns_the_ledger():
+    """The 2026-07-24 mandate: the model never hand-authors a machine format.
+    exclude_source is the ONLY write path (validated, canonical, de-duplicated),
+    and the post-session normalizer guarantees a hand-edited ledger is strictly
+    parseable at rest again."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "docs").mkdir(parents=True)
+        (wd / "raw" / "docs" / "empty-nav.md").write_text("# nav\n", encoding="utf-8")
+        (wd / "raw" / "docs" / "real.md").write_text("# real\ncontent\n", encoding="utf-8")
+        run = compile_box.CompileRun("tool1", str(wd), 1)
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        exclude = tools["exclude_source"].handler
+
+        # Valid path (raw/ prefix tolerated) → canonical row lands once.
+        out = await exclude({"path": "raw/docs/empty-nav.md", "reason": "empty navigation page"})
+        assert "docs/empty-nav.md" in out, out
+        entries, errs = selfcheck.load_exclusions(str(wd))
+        assert not errs and len(entries) == 1, (entries, errs)
+        again = await exclude({"path": "docs/empty-nav.md", "reason": "dup"})
+        assert "already" in again or "早已" in again, again
+
+        # Unknown path → refused with a close-match hint, ledger untouched.
+        miss = await exclude({"path": "docs/empty-nav2.md", "reason": "typo"})
+        assert "empty-nav.md" in miss, miss
+        entries, _ = selfcheck.load_exclusions(str(wd))
+        assert len(entries) == 1, entries
+
+        # Missing reason → refused.
+        bad = await exclude({"path": "docs/real.md", "reason": " "})
+        assert "reason" in bad or "path" in bad or "需要" in bad, bad
+
+        # Machine-owned at rest: a hand edit with a trailing comma is
+        # re-canonicalized by the post-session normalizer, rows preserved.
+        excl = wd / selfcheck.EXCLUSIONS_PATH
+        excl.write_text('[\n  {"pattern": "docs/empty[-]nav.md", "reason": "empty navigation page"},\n]\n', encoding="utf-8")
+        assert selfcheck.normalize_exclusions_file(str(wd)) is None
+        strict = json.loads(excl.read_text(encoding="utf-8"))
+        assert isinstance(strict, list) and len(strict) == 1, strict
+        # Corruption beyond mechanical repair: reported, file untouched.
+        excl.write_text("{nope", encoding="utf-8")
+        err = selfcheck.normalize_exclusions_file(str(wd))
+        assert err and "corrupted" in err, err
+        assert excl.read_text(encoding="utf-8") == "{nope"
+    print("✓ exclude_source tool: validated canonical writes; ledger machine-owned at rest")
+
+
+async def test_batch_orphan_assets_pre_excluded_and_pruned():
+    """2026-07-24 robustness mandate: a standalone media asset no document
+    embeds (a synced wiki file node) must never occupy a batch seat or wedge
+    the accounting gate. Reproduces the live incident: a pinned plan whose
+    batch carries an orphan PNG — plan-time pre-exclusion writes the ledger
+    row and the resume prune drops it from the pending batch."""
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        (raw / "docs" / "assets").mkdir(parents=True)
+        (raw / "docs" / "one.md").write_bytes(
+            "# One\n![embedded](assets/linked.png)\n".encode("utf-8") + b"x" * 300)
+        (raw / "docs" / "assets" / "linked.png").write_bytes(b"\x89PNG-linked")
+        (raw / "docs" / "assets" / "orphan.png").write_bytes(b"\x89PNG-orphan")
+        run = compile_box.CompileRun("orb1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        # The live shape: a PINNED plan already carries the orphan asset.
+        inventory = batching.scan_sources(raw)
+        plan = batching.build_plan(
+            inventory, batching.pack_batches(inventory), planner="code")
+        assert any(
+            any("orphan.png" in s for s in b["sources"]) for b in plan["batches"]
+        ), plan  # the pinned plan really carries the orphan, like the incident
+        compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_read_allowlist=None):
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+
+        exclusions, errs = selfcheck.load_exclusions(str(wd))
+        assert not errs, errs
+        reasons = {e["pattern"]: e["reason"] for e in exclusions}
+        orphan_rows = [p for p in reasons if "orphan.png" in p]
+        assert orphan_rows and "not embedded by any document" in reasons[orphan_rows[0]], exclusions
+        assert not any("linked.png" in p for p in reasons), exclusions
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        for b in plan["batches"]:
+            assert not any("orphan.png" in s for s in b["sources"]), b
+            assert b["status"] == "done", b
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        assert not [e for e in events if e["type"] == "error"], events
+        assert [e for e in events if e["type"] == "turn_done"], events
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch orphan assets: pre-excluded with reason, pruned from pinned plan, train completes")
+
+
+async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
+    """The accounting gate is an accountant, not a gatekeeper: an unaccounted
+    source gets ONE corrective session; whatever remains is auto-excluded with
+    a machine reason and the train continues — it must never raise."""
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        raw.mkdir(parents=True)
+        (raw / "good.md").write_bytes(b"g" * 400)
+        (raw / "stubborn.md").write_bytes(b"z" * 400)
+        run = compile_box.CompileRun("gate1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        driven: list[str] = []
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_read_allowlist=None):
+            driven.append(label)
+            return f"done {label}"
+
+        # PARTIAL progress: before the turn both sources are unaccounted; the
+        # turn lands good.md but stubborn.md resists the corrective pass too.
+        # (Zero progress would instead be classified as a provider fault.)
+        # The stub is LEDGER-AWARE: once a source is auto-excluded it must read as
+        # accounted, so the post-exclude landed-check (F6) sees the write took.
+        calls = {"n": 0}
+
+        def fake_unaccounted(run_, sources):
+            if not sources:
+                return []
+            excluded = {e["pattern"] for e in selfcheck.load_exclusions(str(wd))[0]}
+            calls["n"] += 1
+            base = ["good.md", "stubborn.md"] if calls["n"] == 1 else ["stubborn.md"]
+            return [s for s in base if s not in excluded]
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = fake_unaccounted
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+
+        assert any("补账" in l or "accounting fix" in l for l in driven), driven
+        exclusions, _ = selfcheck.load_exclusions(str(wd))
+        row = next(e for e in exclusions if "stubborn.md" in e["pattern"])
+        assert "could not account" in row["reason"], row
+        assert not any("good.md" in e["pattern"] for e in exclusions), exclusions
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] == "done" for b in plan["batches"]), plan
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        assert not [e for e in events if e["type"] == "error"], events
+        del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+        del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch accounting gate: partial progress → corrective pass → auto-exclusion, never a raise")
+
+
+async def test_batch_content_fault_skips_batch_but_stall_interrupts():
+    """Failure classification is the load-bearing wall: a content/output-shape
+    fault (BatchOutputError) skips ONLY its batch with a recorded exclusion and
+    the train completes; an infra fault (ModelStallError) still interrupts the
+    train resumably — auto-excluding content over a gateway stall would lie."""
+    import batching
+
+    async def run_train(raiser):
+        td = tempfile.mkdtemp()
+        wd = Path(td)
+        raw = wd / "raw"
+        (raw / "a").mkdir(parents=True)
+        (raw / "b").mkdir(parents=True)
+        (raw / "a" / "one.md").write_bytes(b"x" * 300)
+        (raw / "b" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("cls1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None,
+                             raw_read_allowlist=None):
+            if label.startswith(("batch 1/", "批 1/")):
+                raise raiser
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        events = []
+        while not run.events.empty():
+            events.append(run.events.get_nowait())
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        return wd, events, plan
+
+    # Content fault: batch 1 skipped+stamped, batch 2 ran, train completed clean.
+    wd, events, plan = await run_train(
+        compile_box.BatchOutputError("batch h001 produced an unusable page"))
+    assert all(b["status"] == "done" for b in plan["batches"]), plan
+    assert not [e for e in events if e["type"] == "error"], events
+    skipped = [e for e in events if e["type"] == "summary"
+               and ("could not complete" in e["text"] or "无法完成" in e["text"])]
+    assert skipped, events
+
+    # Infra fault: the train interrupts resumably — batch 1 NOT stamped, an
+    # error event surfaces, and the turn closes with the resumable story.
+    wd, events, plan = await run_train(compile_box.ModelStallError("gateway stalled"))
+    statuses = [b["status"] for b in plan["batches"]]
+    assert statuses[0] != "done", plan
+    assert [e for e in events if e["type"] == "error"], events
+    turn = next(e for e in events if e["type"] == "turn_done")
+    assert "断点" in turn["text"] or "resume" in turn["text"], turn
+    print("✓ batch failure classification: content skips one batch, infra interrupts resumably")
+
+
+async def test_batch_zero_progress_second_run_auto_excludes():
+    """Finding 2 (07-24 review): a healthy model that simply never writes
+    compiled_from would loop provider-fault → sicore auto-resume → provider-fault
+    until the breaker suspends it for a human. The FIRST zero-progress run stays a
+    provider blip (batch pending, no exclusion — a blip must not drop good
+    content); a SECOND independent zero-progress run for the SAME batch reclassifies
+    as content and auto-excludes, so the train converges without a human. A
+    per-batch accounting_stalls counter persisted in BATCH_PLAN.json separates the
+    two runs."""
+    import batching
+    import selfcheck
+
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media = compile_box._media_verify_enabled
+    real_pk = compile_box._maybe_start_pk
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 400)
+        (wd / "raw" / "a" / "two.md").write_bytes(b"y" * 400)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"   # both sources in ONE batch
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            return f"done {label}"   # a valid session that never writes a candidate page → nothing accounts
+
+        async def noop_repairs(run_, replies):
+            return None
+
+        compile_box._drive_batch_session = fake_drive
+        compile_box._run_ledger_repairs = noop_repairs
+        compile_box._media_verify_enabled = lambda: False
+        compile_box._maybe_start_pk = lambda run_: False
+        try:
+            # RUN 1: zero progress across turn + corrective → provider fault. The
+            # batch stays PENDING, no content is excluded, the counter is persisted.
+            run1 = compile_box.CompileRun("zp1", str(wd), 1)
+            await compile_box._run_batch_compile(run1, "直接开始编译")
+            plan1 = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert all(b["status"] != "done" for b in plan1["batches"]), plan1
+            assert any(int(b.get("accounting_stalls") or 0) >= 1 for b in plan1["batches"]), plan1
+            assert selfcheck.load_exclusions(str(wd))[0] == [], "a provider blip must not exclude content"
+            evs1 = _drain(run1)
+            assert [e for e in evs1 if e["type"] == "error"], evs1
+
+            # RUN 2 (the auto-resume): STILL zero progress, but the counter is now
+            # ≥1 → reclassify as content, auto-exclude the stragglers, complete.
+            run2 = compile_box.CompileRun("zp1", str(wd), 1)
+            await compile_box._run_batch_compile(run2, "直接开始编译")
+            plan2 = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert all(b["status"] == "done" for b in plan2["batches"]), plan2
+            reasons = [e["reason"] for e in selfcheck.load_exclusions(str(wd))[0]]
+            assert reasons and all("no accounting progress across two independent runs" in r for r in reasons), reasons
+            evs2 = _drain(run2)
+            assert not [e for e in evs2 if e["type"] == "error"], evs2
+            assert [e for e in evs2 if e["type"] == "turn_done"], evs2
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._run_ledger_repairs = real_repairs
+            compile_box._media_verify_enabled = real_media
+            compile_box._maybe_start_pk = real_pk
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch zero-progress: 1st run provider-fault (pending, no exclusion), 2nd run auto-excludes and completes")
+
+
+async def test_batch_media_round_cap_marks_pending_exhausted():
+    """Finding 3 (07-24 review): when the image verify/repair loop hits its round
+    cap with pages still pending, it must mark those pages EXHAUSTED through the
+    per-page mechanism — recording their current fingerprint (so
+    pending_media_verification stops reporting them) and flagging them visibly.
+    Before, the cap just broke: the plan went complete and converge settled while
+    pending_media_verification still named pages, and _pk_due refused to start — a
+    contradictory settled-but-pending state."""
+    import batching
+    import selfcheck
+
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media_enabled = compile_box._media_verify_enabled
+    real_blind_verify = compile_box.mediaverify.run_blind_verify
+    real_engine = compile_box.selected_readonly_engine
+    real_pk = compile_box._maybe_start_pk
+    previous = {k: os.environ.get(k) for k in
+                ("KBC_MEDIA_VERIFY_ROUNDS", "KBC_MEDIA_VERIFY_ATTEMPTS")}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw").mkdir()
+            (wd / "raw" / "chart.png").write_bytes(b"image-bytes")
+            (wd / "candidate").mkdir()
+            (wd / "candidate" / "page.md").write_text(
+                "---\ntype: Topic\ntitle: Page\ncompiled_from:\n"
+                "  - chart.png\n---\nasserts a number (source: chart.png)\n")
+            (wd / "authoring").mkdir()
+            plan = {
+                "version": 1, "planner": "code", "mode": "flat", "phase": "final",
+                "batches": [{"id": "b01", "sources": ["chart.png"], "bytes": 11, "status": "done"}],
+            }
+            (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+            run = compile_box.CompileRun("mediacap", str(wd), 1)
+
+            # Round cap = 1 (flat), attempts high so a page can NEVER exhaust via
+            # the attempt budget in one round — the only route to exhausted here is
+            # the round-cap fix under test.
+            os.environ["KBC_MEDIA_VERIFY_ROUNDS"] = "1"
+            os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "5"
+
+            verify_calls = {"n": 0}
+
+            async def never_verifies(engine, workdir, pending, progress=None, locale=None):
+                verify_calls["n"] += 1
+                return {"findings": [], "errors": [], "images": 1,
+                        "completed_pages": [], "failed_pages": ["page.md"]}
+
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+                return f"done {label}"
+
+            async def noop_repairs(run_, replies):
+                return None
+
+            compile_box._drive_batch_session = fake_drive
+            compile_box._run_ledger_repairs = noop_repairs
+            compile_box._media_verify_enabled = lambda: True
+            compile_box.mediaverify.run_blind_verify = never_verifies
+            compile_box.selected_readonly_engine = lambda: object()
+            compile_box._maybe_start_pk = lambda run_: False
+
+            # Sanity: the page really is pending before the train runs.
+            assert "page.md" in selfcheck.pending_media_verification(str(wd))
+            await compile_box._run_batch_compile(run, "直接开始编译")
+
+            assert verify_calls["n"] == 1, verify_calls          # exactly one real round before the cap
+            # HONEST settle: nothing pending, but the page is VISIBLY exhausted.
+            assert selfcheck.pending_media_verification(str(wd)) == {}, "cap must clear pending"
+            report = selfcheck.read_selfcheck(str(wd))
+            assert "page.md" in (report["media_verify"].get("exhausted") or []), report
+            assert report["media_verify"]["summary"]["pending_pages"] == 0, report
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert saved["phase"] == "complete", saved
+            evs = _drain(run)
+            assert not [e for e in evs if e["type"] == "error"], evs
+            assert [e for e in evs if e["type"] == "turn_done"], evs
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._run_ledger_repairs = real_repairs
+        compile_box._media_verify_enabled = real_media_enabled
+        compile_box.mediaverify.run_blind_verify = real_blind_verify
+        compile_box.selected_readonly_engine = real_engine
+        compile_box._maybe_start_pk = real_pk
+        for k, v in previous.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("✓ batch media round cap: remaining pending pages marked exhausted → settles honestly, PK unblocked")
+
+
+async def test_batch_lifecycle_logs_never_leak_content_to_stdout():
+    """Finding 4 (07-24 review): batch.skipped / batch.interrupted lifecycle lines
+    are pod stdout (operator-visible). A batch failure MESSAGE can carry raw source
+    paths or provider fragments, so stdout gets a WHITELIST only (class name +
+    batch id/index + machine code); the full message keeps flowing to the
+    OWNER-facing SSE events. Assert the source path never reaches stdout on either
+    a skip or an interrupt path, while the SSE event does carry it."""
+    import batching
+
+    secret = "secret/private-leak-path.md"
+
+    async def run_train_capturing(raiser):
+        td = tempfile.mkdtemp()
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "b").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+        (wd / "raw" / "b" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("leak1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            if label.startswith(("batch 1/", "批 1/")):
+                raise raiser
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        return buf.getvalue(), _drain(run)
+
+    # Skip path (content/output-shape fault): the exception message names a source.
+    out, events = await run_train_capturing(
+        compile_box.BatchOutputError(f"batch produced an unusable page from raw/{secret}"))
+    assert "batch.skipped" in out, out                    # the lifecycle line is still emitted…
+    assert "code=content_shape" in out, out               # …with a routable machine code…
+    assert secret not in out, out                         # …but never the source path.
+    assert any(secret in e.get("text", "") for e in events if e["type"] == "summary"), events
+
+    # Interrupt path (unclassified fault): the exception message names a source.
+    out, events = await run_train_capturing(RuntimeError(f"boom reading raw/{secret}"))
+    assert "batch.interrupted" in out, out
+    assert "class=RuntimeError" in out, out
+    assert secret not in out, out
+    assert any(secret in e.get("error", "") for e in events if e["type"] == "error"), events
+    print("✓ batch lifecycle logs: stdout whitelisted (class/id/code); full message only on owner SSE")
+
+
+async def test_batch_auto_exclude_refused_interrupts_resumably():
+    """Finding 6 (07-24 review): after an auto-exclude the code must confirm the
+    rows actually landed. If the ledger is corrupted beyond mechanical repair the
+    write is refused and the source is STILL unaccounted — stamping the batch done
+    would silently drop it. That is a protect-integrity hard stop (the charset-guard
+    class), not a content-shape gate: the train interrupts RESUMABLY (batch stays
+    pending) with a message that names authoring/EXCLUSIONS.json."""
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        raw.mkdir(parents=True)
+        (raw / "good.md").write_bytes(b"g" * 400)
+        (raw / "stubborn.md").write_bytes(b"z" * 400)
+        # Corrupt the ledger beyond the mechanical trailing-comma repair.
+        (wd / "authoring").mkdir()
+        (wd / selfcheck.EXCLUSIONS_PATH).write_text("{nope", encoding="utf-8")
+        run = compile_box.CompileRun("led-corrupt", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            return f"done {label}"
+
+        # PARTIAL progress so the GATE (auto-exclude) path runs, not the
+        # zero-progress provider-fault branch: before → both unaccounted, after →
+        # only stubborn.md. The corrupt ledger then refuses the exclusion, so
+        # stubborn.md stays unaccounted and the landed-check must fire.
+        calls = {"n": 0}
+
+        def fake_unaccounted(run_, sources):
+            if not sources:
+                return []
+            calls["n"] += 1
+            return ["good.md", "stubborn.md"] if calls["n"] == 1 else ["stubborn.md"]
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = fake_unaccounted
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] != "done" for b in plan["batches"]), plan   # NOT stamped over corruption
+        events = _drain(run)
+        errors = [e for e in events if e["type"] == "error"]
+        assert errors and any("EXCLUSIONS.json" in e["error"] for e in errors), errors
+        assert (wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8") == "{nope"  # left for a human
+    print("✓ batch auto-exclude landed-check: a corrupted ledger interrupts resumably, batch not stamped done")
+
+
+async def test_slice_failure_auto_exclude_refused_interrupts_resumably():
+    """R2-3: the slice-failures pre-loop auto-excludes a batch whose read-bounded
+    view could not be built, then stamps it done. If the ledger is corrupted the
+    exclusion write is refused and the source stays unaccounted — it must NOT be
+    stamped done. Same resumable protect-integrity hard stop as the per-batch
+    gate/skip paths, naming authoring/EXCLUSIONS.json."""
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw").mkdir()
+        (wd / "raw" / "big.md").write_text("line1\nline2\n", encoding="utf-8")
+        (wd / "authoring").mkdir()
+        (wd / selfcheck.EXCLUSIONS_PATH).write_text("{nope", encoding="utf-8")  # corrupt beyond repair
+        # A pinned plan whose one batch is a text slice with an out-of-range span
+        # → _materialize_batch_slices raises → slice_failures for that batch.
+        plan = {
+            "version": 3, "planner": "hierarchical-code", "mode": "hierarchical", "phase": "map",
+            "batches": [{
+                "id": "h001", "sources": ["big.md"], "context_sources": [],
+                "source_ranges": {"big.md": {
+                    "slice_file": ".kbc-batch-slices/big.md.p1",
+                    "start_line": 1, "end_line": 9999, "bytes": 10, "part": 1, "parts": 1}},
+                "bytes": 10, "status": "pending",
+            }],
+            "reductions": [],
+        }
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        run = compile_box.CompileRun("slicecorrupt", str(wd), 1)
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        compile_box._drive_batch_session = fake_drive
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+
+        saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] != "done" for b in saved["batches"]), saved   # NOT stamped over corruption
+        events = _drain(run)
+        errors = [e for e in events if e["type"] == "error"]
+        assert errors and any("EXCLUSIONS.json" in e["error"] for e in errors), errors
+        assert (wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8") == "{nope"  # left for a human
+    print("✓ slice-failure landed-check: corrupted ledger interrupts resumably, batch not stamped done")
+
+
+async def test_lifecycle_line_drops_unsafe_batch_id():
+    """R2-6: a batch id reaches pod stdout via batch.done / batch.skipped. Plan
+    validation now rejects unsafe ids, but a PINNED plan created before the check
+    can still carry one — so the lifecycle logger prints the index always and the
+    id ONLY when it is a safe token."""
+    import batching
+    # Unit: the safe-token gate on the log ref.
+    assert compile_box._lifecycle_batch_ref({"id": "h001"}, 1, 3) == "batch=1/3 id=h001"
+    forged = "x\nFORGED=1 id=evil"
+    ref = compile_box._lifecycle_batch_ref({"id": forged}, 2, 3)
+    assert ref == "batch=2/3" and "FORGED" not in ref, ref
+
+    # Integration: a pinned plan carrying a hostile id drives to batch.done; the
+    # forged value never reaches stdout, the index-only identity does.
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw").mkdir()
+        (wd / "raw" / "a.md").write_bytes(b"x" * 50)
+        (wd / "authoring").mkdir()
+        plan = {
+            "version": 1, "planner": "code", "mode": "flat", "phase": "map",
+            "batches": [{"id": "safe/../\nFORGED-LOGLEAK", "sources": ["a.md"], "status": "pending"}],
+        }
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        run = compile_box.CompileRun("logleak", str(wd), 1)
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            return f"done {label}"
+
+        async def noop_repairs(run_, replies):
+            return None
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        real_repairs = compile_box._run_ledger_repairs
+        real_media = compile_box._media_verify_enabled
+        real_pk = compile_box._maybe_start_pk
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        compile_box._run_ledger_repairs = noop_repairs
+        compile_box._media_verify_enabled = lambda: False
+        compile_box._maybe_start_pk = lambda run_: False
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            compile_box._run_ledger_repairs = real_repairs
+            compile_box._media_verify_enabled = real_media
+            compile_box._maybe_start_pk = real_pk
+        out = buf.getvalue()
+        assert "FORGED-LOGLEAK" not in out, out            # hostile id never hits stdout
+        assert "batch.done" in out and "batch=1/1" in out, out   # index-only identity present
+    print("✓ lifecycle line: a pre-fix pinned hostile batch id is dropped from stdout (index only)")
+
+
+async def test_post_turn_normalizes_hand_edited_ledger():
+    """R2-1c: the escape hatch stays open (a model MAY hand-edit EXCLUSIONS.json
+    when exclude_source cannot express a fix), so the normalizer must run at the
+    interactive/flat turn seam too — not only in the batch path. _post_turn_selfcheck
+    normalizes the ledger at its head: a hand-edit with a trailing comma AND a
+    redundant invalid duplicate is absorbed back to canonical strict JSON."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw").mkdir()
+        (wd / "raw" / "one.md").write_text("one", encoding="utf-8")
+        (wd / "raw" / "skip.md").write_text("meta", encoding="utf-8")
+        (wd / "candidate").mkdir()
+        (wd / "candidate" / "index.md").write_text(
+            "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n", encoding="utf-8")
+        (wd / "candidate" / "a.md").write_text(
+            "---\ntype: Topic\ntitle: a\ncompiled_from:\n  - one.md\n---\nbody a\n", encoding="utf-8")
+        (wd / "authoring").mkdir()
+        # A hand edit: trailing comma (invalid strict JSON) + a redundant invalid
+        # duplicate row (skip.md with no reason) alongside the valid one.
+        (wd / selfcheck.EXCLUSIONS_PATH).write_text(
+            '[\n  {"pattern": "skip.md", "reason": "meta file"},\n  {"pattern": "skip.md"},\n]\n',
+            encoding="utf-8")
+        try:
+            json.loads((wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8"))
+            raise AssertionError("test setup should be strictly-invalid JSON")
+        except json.JSONDecodeError:
+            pass
+
+        run = compile_box.CompileRun("normseam", str(wd), 1)
+        run._selfcheck_key = None
+        run._l1_repairs_used = 0
+        await compile_box._post_turn_selfcheck(run)
+
+        # After the turn: canonical strict JSON, invalid duplicate pruned.
+        rows = json.loads((wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8"))
+        assert rows == [{"pattern": "skip.md", "reason": "meta file"}], rows
+    print("✓ post-turn seam normalizes a hand-edited ledger (escape hatch stays open, file kept honest)")
+
+
 def test_small_kb_batch_gate_skips_poppler_metadata():
     """Ordinary compile routing keeps the pre-PDF-slicing cheap scan. Poppler
     metadata is execution detail for a selected batch plan, never a new cost on
@@ -4566,6 +5238,329 @@ async def test_model_stall_exhausts_to_error():
     print("✓ model stall: retries exhausted → ModelStallError (fails fast, no hang)")
 
 
+# ── Batch-path stall recovery: client rebuild + continue (07-24 incident) ─────
+
+
+class _FakeExitedTransport:
+    """Duck-types the SDK subprocess transport so _client_process_exited(client)
+    reads a terminated child (returncode set)."""
+
+    def __init__(self, returncode):
+        self._process = type("_P", (), {"returncode": returncode})()
+
+
+class _BatchTurnFake:
+    """A per-attempt fake compile-session client for _drive_batch_session.
+
+    mode:
+      'ok'          — a clean turn: AssistantMessage(reply) + ResultMessage.
+      'lost_term'   — emit the content once (AssistantMessage), then black-hole
+                      the terminator forever; interrupt() is SWALLOWED (produces
+                      nothing), reproducing the 07-24 incident (stream terminator
+                      lost AND interrupt black-holed).
+      'dead'        — the CLI subprocess has exited (returncode set) and the
+                      stream hangs; the watchdog's liveness probe must reap it.
+      'plain_exc'   — emit the content once, then receive_messages() raises a
+                      PLAIN RuntimeError mid-turn (no watchdog involved): the
+                      real claude-agent-sdk 0.2.110 shape when its background
+                      reader consumes a dead-subprocess ProcessError and re-raises
+                      it as a bare Exception. Must still trigger a client rebuild.
+    """
+
+    def __init__(self, mode, reply="batch reply", returncode=None):
+        self.mode = mode
+        self.reply = reply
+        self.interrupts = 0
+        self.disconnects = 0
+        self._gate = asyncio.Event()
+        self._closed = False
+        if returncode is not None:
+            self._transport = _FakeExitedTransport(returncode)
+
+    async def connect(self, prompt=None):
+        pass
+
+    async def query(self, prompt, session_id="default"):
+        # 'dead' never opens the gate — the stream hangs until the liveness probe
+        # reaps and disconnect() unblocks it.
+        if self.mode in ("ok", "lost_term", "plain_exc"):
+            self._gate.set()
+
+    async def interrupt(self):
+        self.interrupts += 1          # swallowed: nothing is ever produced
+
+    async def receive_messages(self):
+        while not self._closed:
+            await self._gate.wait()
+            self._gate.clear()
+            if self.mode == "ok":
+                yield AssistantMessage(self.reply)
+                yield ResultMessage()
+                self._closed = True
+                return
+            if self.mode == "plain_exc":
+                yield AssistantMessage(self.reply)   # content lands…
+                # …then the SDK surfaces a dead subprocess as a plain Exception.
+                raise RuntimeError("SDK background reader surfaced a dead subprocess")
+            if self.mode == "lost_term":
+                yield AssistantMessage(self.reply)   # content lands…
+                self.mode = "blackhole"              # …then the terminator never comes
+            # blackhole / dead → loop back and block on the (cleared) gate
+
+    async def disconnect(self):
+        self.disconnects += 1
+        self._closed = True
+        self._gate.set()              # let a blocked receive_messages() exit
+
+
+def _batch_client_factory(modes):
+    """Return a _compile_session_client stand-in that hands out one _BatchTurnFake
+    per connect, following `modes` in order (last mode repeats if drained). Records
+    the built clients so a test can assert interrupts/disconnects/rebuild count."""
+    built: list[_BatchTurnFake] = []
+
+    def factory(run, wd, system_prompt, session_id, **kwargs):
+        spec = modes[len(built)] if len(built) < len(modes) else modes[-1]
+        client = _BatchTurnFake(**spec) if isinstance(spec, dict) else _BatchTurnFake(spec)
+        built.append(client)
+        return client
+
+    return built, factory
+
+
+async def _drive_batch_with_watchdog(modes, *, label="batch 1/2", batch_active=True,
+                                     idle=0.05, poll=0.02, max_retries=1,
+                                     interrupt_deadline=0.1, rebuild_max=3):
+    """Run the REAL _drive_batch_session with the REAL _model_stall_watchdog over a
+    scripted sequence of fake clients, at test-tuned knobs (restored after). The
+    de-stream floor is 0 in tests (the shim never binds), so bounds are the raw
+    idle/deadline values. Returns (run, drained events, reply, raised, built)."""
+    saved = (
+        compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+        compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+        compile_box._BATCH_REBUILD_MAX_RETRIES, compile_box._compile_session_client,
+        compile_box._compile_system_prompt, compile_box._engine_kind,
+    )
+    built, factory = _batch_client_factory(modes)
+    compile_box._MODEL_IDLE_TIMEOUT_S = idle
+    compile_box._MODEL_WATCHDOG_POLL_S = poll
+    compile_box._MODEL_MAX_RETRIES = max_retries
+    compile_box._STALL_INTERRUPT_DEADLINE_S = interrupt_deadline
+    compile_box._BATCH_REBUILD_MAX_RETRIES = rebuild_max
+    compile_box._compile_session_client = factory
+    compile_box._compile_system_prompt = lambda run: "sys"
+    compile_box._engine_kind = lambda: "claude_agent_sdk"
+    raised = None
+    reply = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run = compile_box.CompileRun("bd", td, 1)
+            run._batch_active = batch_active
+            wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+            try:
+                reply = await asyncio.wait_for(
+                    compile_box._drive_batch_session(run, "批 1/2 指令", label), timeout=5)
+            except compile_box.ModelStallError as e:
+                raised = e
+            finally:
+                run.done = True
+                wdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wdog
+    finally:
+        (
+            compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+            compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+            compile_box._BATCH_REBUILD_MAX_RETRIES, compile_box._compile_session_client,
+            compile_box._compile_system_prompt, compile_box._engine_kind,
+        ) = saved
+    return run, _drain(run), reply, raised, built
+
+
+async def test_batch_lost_terminator_reaps_and_rebuilds():
+    """(a) A batch turn whose content completed but whose stream terminator was
+    lost (and interrupt() swallowed) is reaped by the watchdog within bounds, then
+    _drive_batch_session rebuilds a fresh client and the batch completes — instead
+    of hanging for 40+ minutes on the wedged transport."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        ["lost_term", "ok"])
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert reply == "batch reply", reply
+    assert len(built) == 2, built                 # exactly one rebuild
+    assert built[0].interrupts >= 1, built[0].interrupts   # watchdog tried in place first
+    assert built[0].disconnects >= 1, built[0].disconnects  # dead client torn down
+    assert "turn_stalled" in types, types         # the watchdog fired (checkpoint within bounds)
+    print("✓ batch stall: lost terminator reaped within bounds → client rebuilt → batch completes")
+
+
+async def test_batch_subprocess_death_rebuilds_and_continues():
+    """(b) The CLI subprocess dies mid-batch (returncode set) and the stream
+    hangs. The watchdog's liveness probe detects the exit in one poll (not the
+    idle floor), _drive_batch_session rebuilds, and the batch continues."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        [{"mode": "dead", "returncode": 0}, {"mode": "ok"}])
+    types = [e["type"] for e in evs]
+    assert raised is None, raised
+    assert reply == "batch reply", reply
+    assert len(built) == 2, built
+    assert built[0].interrupts == 0, built[0].interrupts   # a dead process is not interrupted
+    assert built[0].disconnects >= 1, built[0].disconnects
+    stalled = [e for e in evs if e["type"] == "turn_stalled"]
+    assert any(e.get("code") == "model_turn_unrecoverable" for e in stalled), stalled
+    print("✓ batch stall: dead subprocess detected by liveness probe → rebuilt → batch continues")
+
+
+async def test_batch_plain_sdk_exception_rebuilds_and_continues():
+    """Finding 1 (07-24 review): claude-agent-sdk 0.2.110 can consume a dead
+    subprocess's ProcessError inside its background reader and re-raise a PLAIN
+    Exception out of receive_messages(). _drive_batch_session only names
+    ModelStallError/CLIConnectionError/ProcessError, so that plain Exception would
+    escape the rebuild loop and kill the run with the turn still active. The SDK
+    boundary now normalizes ANY consume-stream exception into a rebuildable stall:
+    the dead client is torn down and the batch completes on a fresh one. No
+    watchdog is involved — the exception is synchronous, mid-turn."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        ["plain_exc", "ok"])
+    assert raised is None, raised
+    assert reply == "batch reply", reply          # rebuilt turn's reply, not the dead attempt's
+    assert len(built) == 2, built                 # exactly one rebuild
+    assert built[0].interrupts == 0, built[0].interrupts   # not a stall — a raised transport fault
+    assert built[0].disconnects >= 1, built[0].disconnects  # dead client torn down
+    print("✓ batch stall: a plain SDK stream Exception is normalized → client rebuilt → batch completes")
+
+
+async def test_batch_rebuild_exhaustion_raises_resumable():
+    """(c) A batch whose every client dies exhausts the bounded rebuilds and
+    raises ModelStallError; _run_batch_compile turns that into the resumable
+    checkpoint (finished batches stay stamped, run ends closable)."""
+    run, evs, reply, raised, built = await _drive_batch_with_watchdog(
+        [{"mode": "dead", "returncode": 1}], rebuild_max=2)
+    assert isinstance(raised, compile_box.ModelStallError), raised
+    assert "exhausted" in str(raised), raised
+    assert len(built) == 3, built                 # initial + 2 rebuilds, then give up
+    assert all(c.disconnects >= 1 for c in built), [c.disconnects for c in built]
+
+    # The orchestrator converts that raise into the resumable-checkpoint turn_done.
+    real_drive = compile_box._drive_batch_session
+
+    async def always_stall(run_, directive, label, pdf_page_ranges=None,
+                           raw_read_allowlist=None):
+        raise compile_box.ModelStallError("batch session stalled; exhausted rebuilds")
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+        (wd / "raw" / "a" / "two.md").write_bytes(b"y" * 300)
+        run2 = compile_box.CompileRun("bx", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+        compile_box._drive_batch_session = always_stall
+        try:
+            await compile_box._run_batch_compile(run2, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        evs2 = _drain(run2)
+        types2 = [e["type"] for e in evs2]
+        assert types2.count("turn_done") == 1, types2   # the single logical turn still CLOSES
+        done = next(e for e in evs2 if e["type"] == "turn_done")
+        assert "resume" in done["text"] or "断点" in done["text"], done
+        assert run2._batch_active is False, "batch flag must clear so the next trigger can resume"
+    print("✓ batch stall: rebuilds exhausted → ModelStallError → run ends resumable (checkpoint)")
+
+
+async def test_resumed_batch_phase_is_watchdog_armed():
+    """(d) The resumed-batching phase (the suspected coverage gap) runs each
+    pending batch through _drive_batch_session, which arms the watchdog via
+    _begin_turn exactly like a first-pass batch. Resume a plan with one pending
+    batch whose first client loses its terminator: the watchdog must reap it and
+    the rebuild must recover — proving the resumed phase is covered."""
+    import batching
+
+    real_drive = compile_box._drive_batch_session
+    real_accounted = compile_box._unaccounted_batch_sources
+    real_selfcheck = compile_box._post_turn_selfcheck
+    real_media = compile_box._media_verify_enabled
+    saved = (
+        compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+        compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+        compile_box._compile_session_client, compile_box._compile_system_prompt,
+        compile_box._engine_kind,
+    )
+    built, factory = _batch_client_factory(["lost_term", "ok"])
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+        (wd / "raw" / "a" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("rz", str(wd), 1)
+        # A pinned plan already exists with batch 1 done, batch 2 pending → the
+        # resume branch of _run_batch_compile drives ONLY batch 2.
+        inventory = batching.scan_sources(wd / "raw")
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+        plan = batching.build_plan(inventory, batching.pack_batches(inventory), planner="code")
+        assert len(plan["batches"]) >= 2, plan
+        plan["batches"][0]["status"] = "done"
+        for b in plan["batches"][1:]:
+            b["status"] = "pending"
+        (wd / batching.BATCH_PLAN_PATH).parent.mkdir(parents=True, exist_ok=True)
+        (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+        (wd / batching.SOURCES_INVENTORY_PATH).write_text(json.dumps(inventory))
+
+        compile_box._MODEL_IDLE_TIMEOUT_S = 0.05
+        compile_box._MODEL_WATCHDOG_POLL_S = 0.02
+        compile_box._MODEL_MAX_RETRIES = 1
+        compile_box._STALL_INTERRUPT_DEADLINE_S = 0.1
+        compile_box._compile_session_client = factory
+        compile_box._compile_system_prompt = lambda run_: "sys"
+        compile_box._engine_kind = lambda: "claude_agent_sdk"
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        compile_box._post_turn_selfcheck = lambda run_: _async_none()
+        compile_box._media_verify_enabled = lambda: False
+        # The watchdog normally lives in _run_wrapper; _run_batch_compile is
+        # driven directly here, so arm it alongside (exactly as production runs
+        # it concurrently with the orchestrator).
+        wdog = asyncio.create_task(compile_box._model_stall_watchdog(run))
+        try:
+            await asyncio.wait_for(
+                compile_box._run_batch_compile(run, "直接开始编译"), timeout=8)
+        finally:
+            run.done = True
+            wdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wdog
+            (
+                compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
+                compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S,
+                compile_box._compile_session_client, compile_box._compile_system_prompt,
+                compile_box._engine_kind,
+            ) = saved
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            compile_box._post_turn_selfcheck = real_selfcheck
+            compile_box._media_verify_enabled = real_media
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        evs = _drain(run)
+        types = [e["type"] for e in evs]
+        # The resumed batch stalled and was reaped (armed watchdog), then rebuilt.
+        assert "turn_stalled" in types, types
+        assert built[0].disconnects >= 1, built[0].disconnects
+        assert len(built) >= 2, built                 # the resumed batch rebuilt at least once
+        assert types.count("turn_done") == 1, types   # the resumed run still closes exactly once
+        final_plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] == "done" for b in final_plan["batches"]), final_plan
+    print("✓ resumed batch phase: watchdog armed on the pending batch → reaped → rebuilt → completes")
+
+
+async def _async_none():
+    return None
+
+
 # ── Rate-limit resilience (C2) ───────────────────────────────────────────────
 
 
@@ -4908,6 +5903,17 @@ async def main():
     await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
+    await test_exclude_source_tool_owns_the_ledger()
+    await test_batch_orphan_assets_pre_excluded_and_pruned()
+    await test_batch_unaccounted_gets_corrective_then_auto_excluded()
+    await test_batch_content_fault_skips_batch_but_stall_interrupts()
+    await test_batch_zero_progress_second_run_auto_excludes()
+    await test_batch_media_round_cap_marks_pending_exhausted()
+    await test_batch_lifecycle_logs_never_leak_content_to_stdout()
+    await test_batch_auto_exclude_refused_interrupts_resumably()
+    await test_slice_failure_auto_exclude_refused_interrupts_resumably()
+    await test_lifecycle_line_drops_unsafe_batch_id()
+    await test_post_turn_normalizes_hand_edited_ledger()
     test_small_kb_batch_gate_skips_poppler_metadata()
     test_hierarchical_text_slice_materialization_and_directive()
     test_hierarchical_resume_state_contract()
@@ -4922,6 +5928,11 @@ async def main():
     await test_model_stall_tool_gap_not_reaped()
     await test_model_stall_exhausts_to_error()
     await test_stall_interrupt_deadline_closes_turn()
+    await test_batch_lost_terminator_reaps_and_rebuilds()
+    await test_batch_subprocess_death_rebuilds_and_continues()
+    await test_batch_plain_sdk_exception_rebuilds_and_continues()
+    await test_batch_rebuild_exhaustion_raises_resumable()
+    await test_resumed_batch_phase_is_watchdog_armed()
     await test_run_wrapper_closes_turn_on_driver_crash()
     await test_run_wrapper_cancels_detached_verify_tasks()
     await test_model_rate_limit_backoff_then_completes()

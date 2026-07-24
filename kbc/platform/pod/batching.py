@@ -715,6 +715,18 @@ def build_plan(
     }
 
 
+# A batch id reaches operator-visible pod logs verbatim; keep it a safe token.
+_SAFE_BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def is_safe_batch_id(bid: object) -> bool:
+    """True when a batch id is a safe log token (the same rule validate_plan
+    enforces). The lifecycle logger uses this to decide whether to print the id
+    or fall back to the batch index for a pre-fix pinned plan whose id slipped
+    through before validation gained the check."""
+    return bool(isinstance(bid, str) and _SAFE_BATCH_ID_RE.match(bid))
+
+
 def validate_plan(
     plan: dict[str, Any], inventory: list[dict[str, Any]], budget: int | None = None,
     text_budget: int | None = None, pdf_slice_pages: int | None = None,
@@ -746,9 +758,18 @@ def validate_plan(
         bid = str(batch.get("id", "?"))
         # Batch ids must be unique and non-empty: stamp_done marks EVERY batch
         # with the matching id, so a duplicate would get stamped alongside its
-        # twin and silently never run.
-        if not str(batch.get("id") or "").strip():
+        # twin and silently never run. They must ALSO be a safe token: a
+        # model-proposed id flows verbatim into pod-log lifecycle lines
+        # (batch.done / batch.skipped), so a value like
+        # "secret/file.md\nFORGED=1" could inject forged log records or leak a
+        # path. Reject anything outside [A-Za-z0-9_-]{1,64} here so the plan
+        # falls back to the deterministic code baseline (whose ids are always
+        # safe) — the error message never echoes the offending value.
+        raw_id = str(batch.get("id") or "").strip()
+        if not raw_id:
             errors.append("batch with empty or missing id")
+        elif not _SAFE_BATCH_ID_RE.match(raw_id):
+            errors.append("batch id must match ^[A-Za-z0-9_-]{1,64}$")
         elif bid in seen_ids:
             errors.append(f"duplicate batch id {bid}")
         seen_ids.add(bid)

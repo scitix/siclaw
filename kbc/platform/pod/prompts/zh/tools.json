@@ -24,5 +24,14 @@
     "not_found": "没找到工单 {tid};现有 id: {ids}",
     "write_failed": "写 CONTRADICTIONS.json 失败: {e}",
     "registered": "工单 {tid} 已登记回修(agent_report 已写入)"
+  },
+  "exclude_source": {
+    "desc": "声明某个 raw 源【不编入】知识库。传 `path`(相对 raw/ 的精确文件路径,不接受 glob)和 `reason`(一句让负责人看得懂的理由,用知识库自己的语言)。系统会校验路径确实在源清单里、以规范格式写入豁免账本并去重。这是登记豁免的【唯一】方式——绝不要手工编辑 authoring/EXCLUSIONS.json。",
+    "need_args": "exclude_source 需要同时给 `path` 和 `reason`。",
+    "not_in_inventory": "不是清单在册的 raw 源:{path}{hint}",
+    "hint_close": " —— 你是不是想说:{close}?",
+    "already": "早已豁免(无需重复):{path}",
+    "failed": "豁免写入失败:{e}",
+    "done": "已豁免并记录理由:{path}"
   }
 }

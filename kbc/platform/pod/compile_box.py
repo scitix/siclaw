@@ -37,6 +37,7 @@ client cert (runtime/gateway); otherwise plain HTTP (local).
 import asyncio
 import base64
 import contextlib
+import difflib
 import hashlib
 import io
 import json
@@ -60,6 +61,8 @@ from claude_agent_sdk import (
     tool,
     create_sdk_mcp_server,
     InMemorySessionStore,
+    CLIConnectionError,
+    ProcessError,
 )
 
 import batching
@@ -234,6 +237,16 @@ _MODEL_WATCHDOG_POLL_S = float(os.environ.get("KBC_MODEL_WATCHDOG_POLL_S", "10")
 # compiles retain the established 90s failure-detection bound.
 _HIERARCHICAL_MODEL_IDLE_TIMEOUT_S = float(os.environ.get(
     "KBC_HIERARCHICAL_MODEL_IDLE_TIMEOUT_S", "240"))
+# Bounded in-place client REBUILDS for one batch/reduce/final/repair sub-session.
+# The watchdog's interrupt+re-issue (above) recovers a transiently-slow model on
+# the SAME transport; it cannot cure a dead/wedged CLI subprocess or a gateway
+# stream that black-holes every re-issue (07-24 incident: a lost stream
+# terminator wedged one batch, in-place retries burned the 900s de-stream floor
+# each cycle, and when the subprocess later died receive_messages() hung with no
+# recovery). A rebuild swaps in a fresh subprocess + HTTP connection and re-runs
+# the SAME (idempotent, checkpoint-persisted) batch directive. Exhaustion ends
+# the run via the resumable checkpoint path in _run_batch_compile.
+_BATCH_REBUILD_MAX_RETRIES = int(os.environ.get("KBC_BATCH_REBUILD_MAX_RETRIES", "3"))
 
 # ── Test-session resilience (read-only consumer turns) ───────────────────────
 # A test session streams faithfully (no de-stream shim), so the compile-path
@@ -281,6 +294,46 @@ def _print_test_lifecycle(label: str, run: "TestRun", extra: str = "") -> None:
     leaking the KB or the consumer's questions. Same [compile_box] prefix style."""
     tail = f" {extra}" if extra else ""
     print(f"[compile_box] {label} tid={run.tid} parent={run.parent_run_id}{tail}", flush=True)
+
+
+def _print_compile_lifecycle(label: str, run: "CompileRun", extra: str = "") -> None:
+    """One stdout line per compile-path lifecycle event (turn.start / turn.done /
+    turn.stalled / turn.rebuilt / turn.dead / batch.start / batch.done). run_id +
+    round ONLY — never KB content, directives, or model text — so pod logs can
+    answer "what is the box doing" during a long batched compile. The 07-24
+    incident had ZERO stdout for 40+ minutes; the test-session path already prints
+    its own lifecycle (see _print_test_lifecycle), this is the compile analogue.
+    Same [compile_box] prefix style.
+
+    `extra` CONTRACT: whitelisted machine tokens only — exception class names,
+    batch id/index, and machine error CODES (see _batch_error_code). Never an
+    exception MESSAGE or any free text: a batch failure message can carry raw
+    source paths or provider response fragments, and pod stdout is
+    operator-visible. The full message belongs on the OWNER-facing SSE events
+    (run.emit error/summary), which the owner owns."""
+    tail = f" {extra}" if extra else ""
+    print(f"[compile_box] {label} run={run.run_id} round={run.round}{tail}", flush=True)
+
+
+def _client_process_exited(client) -> int | None:
+    """Best-effort exit code of the SDK's CLI subprocess if it has terminated,
+    else None (still alive, or unknown).
+
+    Duck-typed on the Claude Agent SDK's subprocess transport internals; any
+    deviation (CodexSDKClient, a swapped-in fake, an SDK refactor) simply returns
+    None and the idle-latency watchdog remains the backstop. NEVER raises — a
+    liveness probe that itself throws would be worse than the stall it guards.
+
+    Motivation (07-24): a half-dead CLI child whose stdout never closes leaves
+    receive_messages() blocked forever; the model-idle clock alone then takes the
+    full de-stream floor to react. Polling the process return code catches an
+    exited/killed subprocess in one watchdog tick instead."""
+    try:
+        transport = getattr(client, "_transport", None)
+        proc = getattr(transport, "_process", None) if transport is not None else None
+        return getattr(proc, "returncode", None) if proc is not None else None
+    except Exception:
+        return None
 
 
 def _touch_test_activity(run: "TestRun") -> None:
@@ -345,6 +398,40 @@ class ModelResultError(Exception):
 
 class BatchOutputError(Exception):
     """A successful internal session did not account for its assigned sources."""
+
+
+def _batch_error_code(exc: BaseException) -> str:
+    """A machine-routable code for a batch failure — the whitelist token that may
+    reach pod stdout. NEVER embed the exception MESSAGE in a log line: a
+    BatchOutputError / slice-view error can carry raw source paths, and a model
+    result error can carry provider response fragments; pod logs are
+    operator-visible, and the owner's KB content is theirs alone (it flows to the
+    OWNER-facing SSE events instead). The class name + this code route the fault
+    without leaking any of that."""
+    if isinstance(exc, ModelStallError):
+        return "model_stall"
+    if isinstance(exc, ModelResultError):
+        return "model_result_error"
+    if isinstance(exc, BatchOutputError):
+        return "provider_fault" if getattr(exc, "provider_fault", False) else "content_shape"
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled"
+    return "other"
+
+
+def _lifecycle_batch_ref(batch: dict, k: int, n: int) -> str:
+    """Whitelisted stdout identity for a batch lifecycle line: the index (k/n)
+    ALWAYS, plus the id ONLY when it is a safe log token
+    (batching.is_safe_batch_id). Plan validation now rejects unsafe ids, but a
+    pinned plan created before that check can still carry a hostile id (newline
+    injection forging log records, or a path leak); the index identifies the
+    batch either way, so an unsafe id is dropped rather than echoed to the
+    operator-visible pod log."""
+    bid = batch.get("id") if isinstance(batch, dict) else None
+    ref = f"batch={k}/{n}"
+    if batching.is_safe_batch_id(bid):
+        ref += f" id={bid}"
+    return ref
 
 
 class CompileRun:
@@ -445,6 +532,15 @@ class CompileRun:
         self._model_retries = 0             # stall retries used on the in-flight turn
         self._stall_retrying = False        # watchdog interrupted; awaiting the interrupted result
         self._stall_fatal = False           # stall retries exhausted → fail this turn
+        # Set by the watchdog when it gives up on the in-flight turn (subprocess
+        # exited, or a double-black-hole swallowed interrupt() past the deadline)
+        # while a batch sub-session owns the client. It disconnects to unblock the
+        # wedged receive loop; _consume_turn_stream then raises ModelStallError so
+        # _drive_batch_session rebuilds a fresh client and continues from the
+        # checkpoint. Cleared by _begin_turn. Never set on the persistent
+        # (run_session) path — that keeps its terminal "recreated on next
+        # message" behavior.
+        self._turn_dead = False
         # Temporary orchestrator-scoped override. Only hierarchical batch mode
         # sets this; every other turn continues to use _MODEL_IDLE_TIMEOUT_S.
         self._model_idle_timeout_s: float | None = None
@@ -476,6 +572,7 @@ class CompileRun:
         self._model_retries = 0
         self._stall_retrying = False
         self._stall_fatal = False
+        self._turn_dead = False
         self._rate_retries = 0
         self._last_model_activity = time.monotonic()
         self._last_sdk_message_type = "query"
@@ -1282,6 +1379,31 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
         await run.emit({"type": "summary", "summary": strings["deleted"].format(path=rel.as_posix())})
         return strings["deleted"].format(path=rel.as_posix())
 
+    async def exclude_source(args):
+        """The ONLY write path into the exclusion ledger (2026-07-24 mandate:
+        the model's job is understanding knowledge, never hand-authoring a
+        machine-parsed format — one hand-written trailing comma once blanked
+        the whole ledger and wedged a 145-batch train). Machine-validated,
+        machine-serialized, de-duplicated."""
+        es = ts["exclude_source"]
+        raw_path = str(args.get("path", "")).strip()
+        reason = str(args.get("reason", "")).strip()
+        if not raw_path or not reason:
+            return es["need_args"]
+        rel = selfcheck._strip_source_prefix(raw_path)
+        inventory = selfcheck.source_inventory(run.workdir)
+        if rel not in inventory:
+            close = difflib.get_close_matches(rel, inventory, n=3, cutoff=0.6)
+            hint = es["hint_close"].format(close=", ".join(close)) if close else ""
+            return es["not_in_inventory"].format(path=rel, hint=hint)
+        added, err = selfcheck.append_exclusions(run.workdir, [
+            {"pattern": selfcheck.glob_escape_path(rel), "reason": reason}])
+        if err:
+            return es["failed"].format(e=err)
+        if not added:
+            return es["already"].format(path=rel)
+        return es["done"].format(path=rel)
+
     async def resolve_ticket(args):
         rt = ts["resolve_ticket"]
         tid = str(args.get("ticket_id", "")).strip()
@@ -1339,6 +1461,16 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
                 "required": ["path"],
             },
             delete_candidate_page,
+        ),
+        EngineTool(
+            "exclude_source",
+            ts["exclude_source"]["desc"],
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "reason": {"type": "string"}},
+                "required": ["path", "reason"],
+            },
+            exclude_source,
         ),
         EngineTool(
             "resolve_ticket",
@@ -1937,6 +2069,20 @@ async def _post_turn_selfcheck(run) -> str | None:
     workdir = getattr(run, "workdir", None)
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
+    # The exclusion ledger is machine-owned, but the escape hatch stays open: a
+    # model MAY hand-edit authoring/EXCLUSIONS.json when the exclude_source tool
+    # cannot express a fix. Normalize it back to canonical strict JSON (and prune
+    # invalid duplicates) at EVERY interactive/flat compile turn end, BEFORE the
+    # coverage ledger reads it — so a hand-edit is absorbed, not relied upon. The
+    # batch path has its own normalize in _drive_batch_session's finally.
+    norm_err = selfcheck.normalize_exclusions_file(workdir)
+    if norm_err:
+        # stdout stays whitelisted; the owner gets the detail on their SSE stream.
+        _print_compile_lifecycle("exclusions.normalize_failed", run, extra="code=ledger_normalize_failed")
+        await run.emit({"type": "summary", "text": _loc(
+            run,
+            f"Exclusion ledger could not be normalized: {norm_err}",
+            f"豁免清单无法规范化:{norm_err}")})
     turn_start_key = getattr(run, "_turn_selfcheck_key", None)
     run._turn_selfcheck_key = None
     turn_format_guard = getattr(run, "_turn_format_guard", None)
@@ -2752,23 +2898,38 @@ def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
     p.write_text(batching.dump_json(value))
 
 
-def _materialize_batch_slices(run: "CompileRun", plan: dict) -> None:
+def _materialize_batch_slices(run: "CompileRun", plan: dict) -> dict[str, str]:
     """Build ephemeral, read-bounded excerpts for oversized Markdown sources.
 
     The fragment is never a provenance identity and never enters durable
     authoring state. It is recreated from Raw on every resume so a model turn
     cannot read the entire oversized source behind the planner's back.
+
+    Returns {batch_id: reason} for batches whose slice views could not be
+    built — a per-batch content/plan-shape fault must not kill the whole train
+    (the caller skips those batches with a recorded exclusion), while the other
+    batches keep their read-bounded views.
     """
     workdir = Path(run.workdir).resolve()
     raw_root = (workdir / "raw").resolve()
     slice_root = (workdir / ".kbc-batch-slices").resolve()
     shutil.rmtree(slice_root, ignore_errors=True)
+    failed: dict[str, str] = {}
     for batch in plan.get("batches", []):
         if batch.get("status") == "done":
             continue
-        ranges = batch.get("source_ranges")
-        if not isinstance(ranges, dict):
-            continue
+        try:
+            _materialize_one_batch_slices(workdir, raw_root, slice_root, batch)
+        except BatchOutputError as e:
+            failed[str(batch.get("id"))] = str(e)
+    return failed
+
+
+def _materialize_one_batch_slices(
+    workdir: Path, raw_root: Path, slice_root: Path, batch: dict,
+) -> None:
+    ranges = batch.get("source_ranges")
+    if isinstance(ranges, dict):
         for source, source_range in ranges.items():
             if not isinstance(source_range, dict):
                 raise BatchOutputError(f"invalid source range for {source}")
@@ -2809,6 +2970,31 @@ def _materialize_batch_slices(run: "CompileRun", plan: dict) -> None:
             target.write_bytes(header + b"".join(lines[start - 1:end]))
 
 
+def _auto_exclude_batch_sources(run: "CompileRun", sources: list[str], reason: str) -> list[dict]:
+    """Write machine exclusion rows for sources the train cannot account.
+
+    The 2026-07-24 robustness mandate: a validation gate may keep the ledger
+    honest, but no content shape may deterministically kill the train. Rows are
+    exact-path (glob-escaped) and carry a machine reason a human can read in the
+    exclusion ledger, revisit, and lift."""
+    entries = [
+        {"pattern": selfcheck.glob_escape_path(s), "reason": reason}
+        for s in sources
+    ]
+    added, err = selfcheck.append_exclusions(run.workdir, entries)
+    if err:
+        # A refused write must be LOUD: a silent no-op here leaves sources
+        # neither cited nor excluded and only the end-of-train ledger repair
+        # would ever notice. stdout gets a whitelisted code only; the err text
+        # (may name the ledger path / parse offset) rides the owner SSE below.
+        _print_compile_lifecycle("exclusions.write_failed", run, extra="code=exclusion_write_refused")
+        asyncio.get_running_loop().create_task(run.emit({"type": "summary", "text": _loc(
+            run,
+            f"Machine exclusions could not be written: {err}",
+            f"机器豁免写入失败:{err}")}))
+    return added
+
+
 def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[str]:
     """Assigned sources still absent from both Candidate provenance and exclusions."""
     pages = selfcheck.candidate_pages(run.workdir)
@@ -2819,43 +3005,111 @@ def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[st
     )
 
 
+def _assert_exclusions_landed(run: "CompileRun", batch: dict) -> None:
+    """Confirm a machine auto-exclude actually accounted the batch's sources.
+
+    With the machine-owned ledger a refused write is nearly impossible — but
+    "nearly" is not a contract. If any assigned source is STILL unaccounted after
+    the auto-exclude, the exclusion write was refused: EXCLUSIONS.json is
+    corrupted beyond the mechanical trailing-comma repair. That is a
+    protect-INTEGRITY case, not a content-shape gate: do NOT stamp the batch done.
+    Raise a plain exception (the charset-guard class of legitimate hard stop) so
+    the train interrupts RESUMABLY with a message that names the ledger — a human
+    fixes authoring/EXCLUSIONS.json and the next trigger resumes the pending
+    batch. The count (never the paths) keeps the message operator-safe."""
+    leftover = _unaccounted_batch_sources(run, batch.get("sources") or [])
+    if leftover:
+        raise RuntimeError(
+            "exclusion ledger is corrupted; fix authoring/EXCLUSIONS.json "
+            f"({len(leftover)} source(s) could be neither cited nor excluded)")
+
+
 async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                                pdf_page_ranges: dict | None = None,
                                raw_read_allowlist: list[str] | None = None) -> str:
     """One bounded internal session: fresh session_id, same role/tools/workspace.
     Streams its output through _emit_message with turn_done suppressed; returns
     the session's final reply text. run.client points at the live session so the
-    park/ruling MCP tools and the inject seam keep working."""
+    park/ruling MCP tools and the inject seam keep working.
+
+    Self-healing (07-24): the model turn is wrapped in a bounded client-REBUILD
+    loop. A stall the watchdog cannot recover in place (dead subprocess, or a
+    gateway stream that black-holes every re-issue) surfaces as ModelStallError /
+    a transport error out of _consume_turn_stream; a rebuild disconnects the dead
+    client and re-runs the SAME (idempotent, checkpoint-persisted) batch directive
+    on a fresh subprocess + HTTP connection. Exhausting _BATCH_REBUILD_MAX_RETRIES
+    re-raises, and _run_batch_compile turns that into the resumable checkpoint
+    (finished batches stay stamped; the next trigger resumes from the first
+    pending batch). Batches are idempotent, so re-running an unstamped batch is
+    always safe."""
     root = Path(run.workdir).resolve()
     wd = str(root)
-    session_id = str(uuid.uuid4())
     source_view = None
     client = None
     prev_client = run.client
     run._suppress_turn_done = True
     run._last_turn_reply = ""
+    attempt = 0
     try:
-        if _engine_kind() == "codex_sdk" and raw_read_allowlist is not None:
-            source_view = _materialize_codex_batch_source_view(
-                root, raw_read_allowlist, pdf_page_ranges, session_id)
-            directive += _codex_batch_source_view_note(
-                root, source_view, raw_read_allowlist, pdf_page_ranges,
-                getattr(run, "locale", None),
-            )
-        client = _compile_session_client(
-            run, wd, _compile_system_prompt(run), session_id,
-            pdf_page_ranges=pdf_page_ranges,
-            raw_read_allowlist=raw_read_allowlist,
-            codex_source_view=source_view,
-        )
-        await client.connect()
-        run.client = client
-        await run.emit({"type": "log", "text": _loc(run, f"—— {label} started ——", f"—— {label} 开始 ——")})
-        run._begin_turn(directive)
-        await client.query(directive)
-        await _consume_turn_stream(
-            run, client, stop_on_result=True, fail_on_error_result=True)
-        return run._last_turn_reply
+        while True:
+            session_id = str(uuid.uuid4())
+            directive_full = directive
+            try:
+                if _engine_kind() == "codex_sdk" and raw_read_allowlist is not None:
+                    source_view = _materialize_codex_batch_source_view(
+                        root, raw_read_allowlist, pdf_page_ranges, session_id)
+                    directive_full = directive + _codex_batch_source_view_note(
+                        root, source_view, raw_read_allowlist, pdf_page_ranges,
+                        getattr(run, "locale", None),
+                    )
+                client = _compile_session_client(
+                    run, wd, _compile_system_prompt(run), session_id,
+                    pdf_page_ranges=pdf_page_ranges,
+                    raw_read_allowlist=raw_read_allowlist,
+                    codex_source_view=source_view,
+                )
+                await client.connect()
+                run.client = client
+                if attempt == 0:
+                    await run.emit({"type": "log", "text": _loc(run, f"—— {label} started ——", f"—— {label} 开始 ——")})
+                    _print_compile_lifecycle("turn.start", run, extra=f"label={label}")
+                else:
+                    _print_compile_lifecycle(
+                        "turn.rebuilt", run, extra=f"label={label} attempt={attempt}")
+                run._begin_turn(directive_full)
+                await client.query(directive_full)
+                await _consume_turn_stream(
+                    run, client, stop_on_result=True, fail_on_error_result=True)
+                _print_compile_lifecycle("turn.done", run, extra=f"label={label}")
+                return run._last_turn_reply
+            except (ModelStallError, CLIConnectionError, ProcessError) as exc:
+                attempt += 1
+                # Tear down the dead/wedged client before rebuilding. Disconnect
+                # may itself raise on a broken transport — best-effort.
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        await client.disconnect()
+                    client = None
+                run.client = prev_client
+                if source_view is not None:
+                    shutil.rmtree(source_view, ignore_errors=True)
+                    source_view = None
+                if attempt > _BATCH_REBUILD_MAX_RETRIES:
+                    _print_compile_lifecycle(
+                        "turn.rebuild_exhausted", run,
+                        extra=f"label={label} attempts={attempt - 1}")
+                    raise ModelStallError(
+                        f"batch session '{label}' stalled; exhausted "
+                        f"{_BATCH_REBUILD_MAX_RETRIES} client rebuild(s)") from exc
+                _print_compile_lifecycle(
+                    "turn.rebuild_armed", run,
+                    extra=f"label={label} attempt={attempt} reason={type(exc).__name__}")
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Compile session stalled ({label}); rebuilding the model session and retrying "
+                    f"(attempt {attempt}/{_BATCH_REBUILD_MAX_RETRIES}).",
+                    f"编译会话停滞({label}),正在重建模型会话并重试"
+                    f"(第 {attempt}/{_BATCH_REBUILD_MAX_RETRIES} 次)。")})
+                # loop → rebuild on a fresh client, same directive
     finally:
         run._suppress_turn_done = False
         run.client = prev_client
@@ -2866,6 +3120,18 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                 pass
         if source_view is not None:
             shutil.rmtree(source_view, ignore_errors=True)
+        # The exclusion ledger is machine-owned: whatever the model did this
+        # session, the file at rest is canonical strict JSON again (parseable
+        # hand-written rows survive; mechanical slips are absorbed).
+        norm_err = selfcheck.normalize_exclusions_file(run.workdir)
+        if norm_err:
+            # stdout stays whitelisted (the err text can name the ledger path);
+            # the owner gets the full detail on their SSE stream.
+            _print_compile_lifecycle("exclusions.normalize_failed", run, extra="code=ledger_normalize_failed")
+            await run.emit({"type": "summary", "text": _loc(
+                run,
+                f"Exclusion ledger could not be normalized: {norm_err}",
+                f"豁免清单无法规范化:{norm_err}")})
 
 
 def _drain_batch_notes(run: "CompileRun") -> str:
@@ -3274,33 +3540,90 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     run._batch_active = True
     previous_model_idle_timeout = run._model_idle_timeout_s
     replies: list[str] = []
+    _print_compile_lifecycle("batch.start", run)
     try:
         raw_dir = Path(run.workdir) / "raw"
         inventory = batching.scan_sources(raw_dir)
         total_kb = batching.corpus_bytes(inventory) // 1024
         plan = _load_batch_plan(run)
         resuming = _batch_plan_resumable(plan)
+        # Orphan media assets (standalone wiki file nodes no document embeds)
+        # can never satisfy the accounting gate — pre-exclude them with a
+        # machine reason BEFORE planning/resuming so no batch ever carries one.
+        inventory_paths = [i["path"] for i in inventory]
+        orphans = selfcheck.orphan_media_assets(run.workdir, inventory_paths)
+        if orphans:
+            added, aerr = selfcheck.append_exclusions(run.workdir, [
+                {"pattern": selfcheck.glob_escape_path(p),
+                 "reason": "auto-excluded: media asset not embedded by any document (sync residue)"}
+                for p in orphans])
+            if aerr:
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Machine exclusions could not be written: {aerr}",
+                    f"机器豁免写入失败:{aerr}")})
+            if added:
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"{len(added)} standalone media asset(s) are embedded by no document — "
+                    f"auto-excluded from accounting (visible in the exclusion ledger).",
+                    f"{len(added)} 个未被任何文档引用的独立媒体资产已自动豁免记账"
+                    f"(豁免清单可见)。")})
+        exclusions_now, _ = selfcheck.load_exclusions(run.workdir)
+        plannable = {
+            p for p in inventory_paths
+            if not any(selfcheck._matches(p, e["pattern"]) for e in exclusions_now)
+        }
         if not resuming:
             _write_batch_file(run, batching.SOURCES_INVENTORY_PATH, inventory)
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Corpus {total_kb}KB exceeds the single-session threshold — batch compile engaged.",
                 f"语料 {total_kb}KB 超过单会话阈值,启用分批编译。")})
-            plan = await _plan_batches(run, inventory)
+            plan = await _plan_batches(run, [i for i in inventory if i["path"] in plannable])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         else:
             # The pinned plan predates this run; a source deleted from raw/ in
-            # between would leave a batch directive pointing at a missing file.
-            # (Added sources are caught later by the coverage ledger.)
-            dropped = batching.prune_missing_sources(plan, {i["path"] for i in inventory})
+            # between would leave a batch directive pointing at a missing file,
+            # and a source excluded since (orphan assets above included) no
+            # longer needs a batch seat. (Added sources are caught later by the
+            # coverage ledger.)
+            dropped = batching.prune_missing_sources(plan, plannable)
             if dropped:
                 _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
                 await run.emit({"type": "summary",
                                 "text": _loc(run,
-                                             f"Batch resume: {len(dropped)} source(s) no longer in raw/ — removed from pending batches: ",
-                                             f"断点续批:{len(dropped)} 个源已不在 raw/ 中,已从待编批次剔除:")
+                                             f"Batch resume: {len(dropped)} source(s) no longer in raw/ or excluded since — removed from pending batches: ",
+                                             f"断点续批:{len(dropped)} 个源已不在 raw/ 中或已被豁免,已从待编批次剔除:")
                                         + ", ".join(sorted(dropped)[:5])
                                         + ("…" if len(dropped) > 5 else "")})
-        _materialize_batch_slices(run, plan)
+        slice_failures = _materialize_batch_slices(run, plan)
+        if slice_failures:
+            n_all = len(plan["batches"])
+            for bad_id, why in sorted(slice_failures.items()):
+                bad = next((b for b in plan["batches"] if str(b.get("id")) == bad_id), None)
+                if bad is None:
+                    continue
+                k_bad = next(i + 1 for i, b in enumerate(plan["batches"]) if b is bad)
+                _auto_exclude_batch_sources(
+                    run,
+                    _unaccounted_batch_sources(run, bad.get("sources") or []),
+                    f"auto-excluded: batch {bad_id} was skipped (slice view failed: {why})",
+                )
+                # Protect integrity: if a corrupted ledger refused the write the
+                # sources are still unaccounted — do NOT stamp done over it. Same
+                # resumable hard stop as the per-batch gate/skip paths.
+                _assert_exclusions_landed(run, bad)
+                batching.stamp_done(plan, bad.get("id"))
+                # `why` names the source path the slice view could not build →
+                # whitelisted code + safe index/id only on stdout (owner gets the
+                # detail in the summary emit below and the machine exclusion reason).
+                _print_compile_lifecycle(
+                    "batch.skipped", run,
+                    extra=f"{_lifecycle_batch_ref(bad, k_bad, n_all)} code=slice_view_failed")
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            await run.emit({"type": "summary", "text": _loc(run,
+                f"{len(slice_failures)} batch(es) had unusable read-bounded views and were skipped; "
+                f"their unaccounted sources were auto-excluded with a reason. The train continues.",
+                f"{len(slice_failures)} 个批次的读界视图无法构建,已跳过;未记账的源已自动豁免并写明理由,"
+                f"列车继续。")})
         n = len(plan["batches"])
         pending = batching.pending_batches(plan)
         if plan.get("mode") == "hierarchical":
@@ -3329,25 +3652,121 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         })
         for batch in list(pending):
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
-            directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run), locale=getattr(run, "locale", None))
-            reply = await _drive_batch_session(
-                run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"),
-                pdf_page_ranges=batch.get("source_page_ranges"),
-                raw_read_allowlist=_batch_raw_read_allowlist(batch),
-            )
-            if reply:
-                replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
-            still_unaccounted = (
-                [] if batch.get("defer_accounting")
-                else _unaccounted_batch_sources(run, batch.get("sources") or [])
-            )
-            if still_unaccounted:
-                shown = ", ".join(still_unaccounted[:5])
-                suffix = "…" if len(still_unaccounted) > 5 else ""
-                raise BatchOutputError(
-                    f"batch {batch['id']} left {len(still_unaccounted)} assigned "
-                    f"source(s) unaccounted: {shown}{suffix}"
+            try:
+                unaccounted_before = (
+                    [] if batch.get("defer_accounting")
+                    else _unaccounted_batch_sources(run, batch.get("sources") or [])
                 )
+                directive = _compose_batch_directive(batch, k, n, _drain_batch_notes(run), locale=getattr(run, "locale", None))
+                reply = await _drive_batch_session(
+                    run, directive, _loc(run, f"batch {k}/{n}", f"批 {k}/{n}"),
+                    pdf_page_ranges=batch.get("source_page_ranges"),
+                    raw_read_allowlist=_batch_raw_read_allowlist(batch),
+                )
+                if reply:
+                    replies.append(_loc(run, f"[Batch {k}/{n}] {reply}", f"【批 {k}/{n}】{reply}"))
+                still_unaccounted = (
+                    [] if batch.get("defer_accounting")
+                    else _unaccounted_batch_sources(run, batch.get("sources") or [])
+                )
+                if still_unaccounted:
+                    # One bounded corrective pass: most gaps are a model that
+                    # cited a page but forgot a source token, and it can fix
+                    # its own ledger cheaper than any machine heuristic.
+                    listed = "\n".join(f"- raw/{s}" for s in still_unaccounted[:40])
+                    fix_reply = await _drive_batch_session(
+                        run,
+                        _loc(run,
+                             "The following sources assigned to this batch are still unaccounted "
+                             "(neither cited by any Candidate page's compiled_from nor covered by an "
+                             "exclusion). For each one: cite it from the page that digests it, or call "
+                             "the exclude_source(path, reason) tool with a concrete reason — never edit "
+                             "EXCLUSIONS.json by hand.\n" + listed,
+                             "本批分配的下列源仍未记账(既没有被任何候选页的 compiled_from 引用,也没有"
+                             "豁免记录)。请逐个处理:要么在消化它的候选页里补引用,要么调用 "
+                             "exclude_source(path, reason) 工具写明具体理由——不要手工编辑 "
+                             "EXCLUSIONS.json:\n" + listed),
+                        _loc(run, f"batch {k} accounting fix", f"批 {k} 补账"),
+                        pdf_page_ranges=batch.get("source_page_ranges"),
+                        raw_read_allowlist=_batch_raw_read_allowlist(batch),
+                    )
+                    if fix_reply:
+                        replies.append(_loc(run, f"[Batch {k} fix] {fix_reply}", f"【批 {k} 补账】{fix_reply}"))
+                    still_unaccounted = _unaccounted_batch_sources(run, batch.get("sources") or [])
+                if still_unaccounted:
+                    zero_progress = bool(
+                        unaccounted_before
+                        and set(still_unaccounted) == set(unaccounted_before))
+                    if zero_progress and int(batch.get("accounting_stalls") or 0) < 1:
+                        # FIRST zero-progress run for this batch. Zero progress
+                        # across the batch turn AND the corrective pass is the
+                        # empty/authentication-error provider-result shape (the
+                        # GPU-corpus incident), not stubborn content — auto-
+                        # excluding a whole batch over a provider blip would
+                        # silently drop good sources. Persist a per-batch counter
+                        # so a SECOND independent run can tell a transient provider
+                        # blip from a model that simply never accounts, then keep
+                        # the batch pending and interrupt resumably.
+                        batch["accounting_stalls"] = int(batch.get("accounting_stalls") or 0) + 1
+                        _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                        stalled = BatchOutputError(
+                            f"batch {batch['id']} made no accounting progress over "
+                            f"{len(still_unaccounted)} assigned source(s) — treating as a "
+                            f"provider/model fault; the batch stays pending for resume"
+                        )
+                        stalled.provider_fault = True
+                        raise stalled
+                    # Either the batch made real progress and only stragglers
+                    # remain, OR a SECOND independent run again made zero progress
+                    # (counter already ≥1). A healthy model that simply never
+                    # writes compiled_from would otherwise loop provider-fault →
+                    # resume → provider-fault until the sicore breaker suspends it
+                    # for a human. Two independent runs of zero progress is content
+                    # the train cannot digest: account it. Content shape must never
+                    # wedge the train (2026-07-24 mandate) — auto-exclude with a
+                    # machine reason a human can read, revisit and lift.
+                    reason = (
+                        f"auto-excluded: batch {batch['id']} made no accounting progress across two independent runs"
+                        if zero_progress
+                        else f"auto-excluded: batch {batch['id']} could not account for this source after a corrective pass"
+                    )
+                    _auto_exclude_batch_sources(run, still_unaccounted, reason)
+                    # Protect integrity: if the write was REFUSED the source is
+                    # still unaccounted — do not stamp done over a corrupted ledger.
+                    _assert_exclusions_landed(run, batch)
+                    await run.emit({"type": "summary", "text": _loc(run,
+                        f"Batch {k}/{n}: {len(still_unaccounted)} source(s) could not be accounted and were "
+                        f"auto-excluded with a reason (see the exclusion ledger); the train continues.",
+                        f"批 {k}/{n}:{len(still_unaccounted)} 个源无法记账,已自动豁免并写明理由"
+                        f"(见豁免清单),列车继续。")})
+            except (ModelStallError, asyncio.CancelledError):
+                # Infra faults (gateway stall, cancellation) stay interrupting:
+                # they heal on resume, and excluding content over them would lie.
+                raise
+            except BatchOutputError as e:
+                if getattr(e, "provider_fault", False):
+                    raise  # zero-progress: interrupt resumably, batch stays pending
+                # A content/output-shape fault is deterministic: retrying the same
+                # batch forever is the wedge this train must never enter. Skip the
+                # batch, account its sources as machine exclusions, keep going.
+                _auto_exclude_batch_sources(
+                    run,
+                    _unaccounted_batch_sources(run, batch.get("sources") or []),
+                    f"auto-excluded: batch {batch['id']} was skipped ({e})",
+                )
+                # Protect integrity: a refused write leaves the source unaccounted
+                # → do not claim the batch skipped/stamp it done over a corrupted
+                # ledger; interrupt resumably instead (names the ledger for a human).
+                _assert_exclusions_landed(run, batch)
+                # stdout: class + code only. `e`'s message can carry raw source
+                # paths / provider fragments; it rides the owner SSE summary below.
+                _print_compile_lifecycle(
+                    "batch.skipped", run,
+                    extra=f"{_lifecycle_batch_ref(batch, k, n)} class={type(e).__name__} code={_batch_error_code(e)}")
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Batch {k}/{n} could not complete ({e}); its unaccounted sources were auto-excluded "
+                    f"with a reason and the train continues.",
+                    f"批 {k}/{n} 无法完成({e});未记账的源已自动豁免并写明理由,列车继续。")})
             batching.stamp_done(plan, batch["id"])
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
             # Push the done-stamp (and the batch's pages) to the durable store
@@ -3359,6 +3778,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     await _sync_workspace(run, sent)
                 except Exception:
                     pass  # periodic sync will retry; the local stamp is already on disk
+            _print_compile_lifecycle("batch.done", run, extra=_lifecycle_batch_ref(batch, k, n))
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
         if plan.get("mode") == "hierarchical":
@@ -3441,19 +3861,29 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 rounds += 1
                 if rounds > round_limit:
                     # Repair turns can add new image citations that re-enter
-                    # pending. Flat mode keeps its established fail-open tail;
-                    # a hierarchical train must not claim complete while a
-                    # large image backlog is still unverified. Its persisted
-                    # `final` phase makes the next trigger resume the tail
-                    # without replaying the map batches.
+                    # pending. Reaching the cap is recorded honestly — pages
+                    # with unverified images are named in the reply — but it
+                    # must NOT fail the train (2026-07-24 mandate: a quality
+                    # tail may degrade with a visible record, never wedge the
+                    # whole compile into a deterministic interrupt loop).
+                    # Mark every still-pending page EXHAUSTED through the existing
+                    # per-page mechanism: it records the page's current fingerprint
+                    # as verified (so pending_media_verification stops reporting it)
+                    # AND flags it in media_verify.exhausted (fail-open must never
+                    # read as a clean pass). Without this, converge would settle
+                    # while these pages still report pending and _pk_due would
+                    # refuse to start — a contradictory settled-but-pending state.
+                    selfcheck.mark_media_verified(run.workdir, sorted(pending), exhausted=True)
                     await run.emit({"type": "summary", "text": _loc(run,
-                        f"Self-check (images): verify/repair round cap ({round_limit}) reached — remaining pages will be picked up on the next trigger.",
-                        f"自检(图像):验修轮达到上限({round_limit} 轮)——剩余页将在下一轮触发时继续复核。")})
-                    if plan.get("mode") == "hierarchical":
-                        raise BatchOutputError(
-                            f"hierarchical image verification left {len(pending)} "
-                            f"page(s) pending after {round_limit} round(s)"
-                        )
+                        f"Self-check (images): verify/repair round cap ({round_limit}) reached — "
+                        f"{len(pending)} page(s) keep image assertions that could not be verified; recorded, not blocking.",
+                        f"自检(图像):验修轮达到上限({round_limit} 轮)——{len(pending)} 页的图像断言未能核验,"
+                        f"已记录,不阻塞完成。")})
+                    replies.append(_loc(run,
+                        f"[Image verify] {len(pending)} page(s) completed with UNVERIFIED image assertions "
+                        f"after {round_limit} round(s): " + ", ".join(sorted(pending)[:10]) + ("…" if len(pending) > 10 else ""),
+                        f"【图像核验】{len(pending)} 页在 {round_limit} 轮后仍带未核验的图像断言:"
+                        + ", ".join(sorted(pending)[:10]) + ("…" if len(pending) > 10 else "")))
                     break
                 # Blind transcribe+compare per ≤max-images chunk (v2): engine
                 # sessions read one image each — no in-session image pileup.
@@ -3526,9 +3956,17 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 plan["phase"] = "final"
                 _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
                 raise
+        _print_compile_lifecycle("batch.complete", run)
         await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
                         or _loc(run, "Batch compile complete.", "分批编译完成。")})
     except Exception as e:
+        # stdout stays whitelisted: exception class + a machine-routable code.
+        # The MESSAGE (which can carry raw source paths / provider response
+        # fragments) is load-bearing for operators, but it belongs on the
+        # owner-facing SSE error below, not in the operator-visible pod log.
+        _print_compile_lifecycle(
+            "batch.interrupted", run,
+            extra=f"class={type(e).__name__} code={_batch_error_code(e)}")
         await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
         # never-block: the single logical turn must still CLOSE — a consumer
         # gating on turn_done would otherwise hang on an orchestrator error.
@@ -3576,6 +4014,41 @@ def _note_model_activity(run: CompileRun, msg) -> None:
         run._tool_pending = False
 
 
+async def _guarded_model_stream(run: "CompileRun", client):
+    """Pull the SDK message stream, normalizing a dead-transport surprise into a
+    rebuildable ModelStallError.
+
+    claude-agent-sdk 0.2.110's background reader (Query._read_messages) CONSUMES a
+    ProcessError when the CLI subprocess dies and re-emits it as a
+    ``{"type": "error"}`` frame, which receive_messages() then re-raises as a
+    PLAIN ``Exception`` (see the SDK's _internal/query.py). _drive_batch_session
+    only catches ModelStallError / CLIConnectionError / ProcessError, so without
+    this normalization that plain Exception escapes the rebuild loop and kills the
+    whole run — a dead subprocess with the turn still 'active'. Any exception
+    raised while CONSUMING the stream — except cancellation and our own control
+    exceptions — is therefore a transport fault: discard the dead attempt's
+    partial text and re-raise as ModelStallError so the existing rebuild loop
+    disconnects the dead client and continues from the checkpoint.
+
+    Only the SDK PULL is wrapped (per-message __anext__): deliberate control
+    raises from the consume BODY (ModelStallError on stall exhaustion,
+    ModelResultError on an is_error result) originate in _consume_turn_stream, not
+    here, and propagate unchanged."""
+    stream = client.receive_messages()
+    while True:
+        try:
+            msg = await stream.__anext__()
+        except StopAsyncIteration:
+            return
+        except (asyncio.CancelledError, ModelStallError, ModelResultError, BatchOutputError):
+            raise
+        except Exception as exc:  # dead subprocess / broken transport surfaced as a plain error
+            run._turn_active = False
+            run._turn_text = []
+            raise ModelStallError(f"transport: {type(exc).__name__}") from exc
+        yield msg
+
+
 async def _consume_turn_stream(
     run: CompileRun,
     client,
@@ -3588,8 +4061,11 @@ async def _consume_turn_stream(
     is NOT a real turn end: discard it and re-issue the directive (bounded), or
     raise ModelStallError when retries are spent. A REAL ResultMessage ends the
     turn — cleared BEFORE _emit_message, which may inject a follow-up turn that
-    re-arms the watchdog. stop_on_result mirrors the batch driver's break."""
-    async for msg in client.receive_messages():
+    re-arms the watchdog. stop_on_result mirrors the batch driver's break.
+
+    The stream is pulled through _guarded_model_stream so a dead subprocess the
+    SDK surfaces as a plain Exception becomes a rebuildable ModelStallError."""
+    async for msg in _guarded_model_stream(run, client):
         _note_model_activity(run, msg)
         if type(msg).__name__ == "ResultMessage":
             if run._stall_retrying:
@@ -3651,6 +4127,23 @@ async def _consume_turn_stream(
                 return
             continue
         await _emit_message(run, msg)
+    # The stream ended without a real ResultMessage. For a bounded sub-session
+    # (stop_on_result) this is never a normal end — it means the model turn died
+    # under us: the watchdog reaped a dead/wedged subprocess and disconnected to
+    # unblock this loop (_turn_dead), or the CLI child exited cleanly between
+    # watchdog polls so its stdout closed and receive_messages() ended with the
+    # turn's terminator lost (_turn_active still set — no result was consumed).
+    # Either way raise so _drive_batch_session rebuilds a fresh client and
+    # continues from the checkpoint. The persistent driver (stop_on_result=False)
+    # ends its stream normally on session close and must fall through cleanly, so
+    # it is gated out here; its own mid-turn death is handled by the watchdog's
+    # terminal path (_reap_unrecoverable_turn, non-batch branch).
+    if run._turn_dead or (stop_on_result and run._turn_active):
+        run._turn_active = False
+        run._turn_dead = False
+        run._turn_text = []           # discard the dead attempt's partial text
+        raise ModelStallError(
+            "model stream ended without a result (subprocess exit / transport closed)")
 
 
 _STALL_INTERRUPT_DEADLINE_S = int(os.environ.get("KBC_STALL_INTERRUPT_DEADLINE_S", "120"))
@@ -3668,11 +4161,58 @@ def _watchdog_idle_bound(tool_pending: bool, model_idle_timeout: float, destream
     return max(model_idle_timeout, destream_floor) if destream_floor else model_idle_timeout
 
 
+async def _reap_unrecoverable_turn(run: CompileRun, client, reason: str) -> None:
+    """Give up on the in-flight turn and disconnect the client to unblock the
+    wedged receive loop. Two recovery contracts, chosen by whether a batch
+    orchestrator owns the client:
+
+    - Batch sub-session (run._batch_active): flag _turn_dead so
+      _consume_turn_stream raises ModelStallError once the disconnect ends its
+      stream; _drive_batch_session then rebuilds a fresh client and continues
+      from the persisted checkpoint. Emit a content-free diagnostic only — the
+      single logical batch turn's turn_done is owned by the orchestrator, never
+      by the watchdog (a terminal turn_done here would falsely close the batch).
+
+    - Persistent run_session (no batch active): keep the established terminal
+      behavior — error + a turn_done that promises the session is recreated on
+      the next message (run_session has no reconnect loop; the platform
+      find-or-starts a fresh run/box with workspace rehydration)."""
+    run._stall_retrying = False
+    run._turn_active = False
+    run._turn_text = []               # the wedged attempt produced nothing usable
+    if run._batch_active:
+        run._turn_dead = True
+        _print_compile_lifecycle("turn.dead", run, extra=f"reason={reason}")
+        await run.emit({"type": "turn_stalled", "code": "model_turn_unrecoverable",
+                        "stage": "model_turn", "reason": reason, "fatal": True,
+                        "last_sdk_message": run._last_sdk_message_type})
+    else:
+        _print_compile_lifecycle("turn.dead", run, extra=f"reason={reason} terminal=1")
+        await run.emit({"type": "error",
+                        "error": f"model stall: {reason}"})
+        # Disconnecting ENDS this box's session (run_session has no reconnect
+        # loop — deliberately: recovery is owned by the platform). The turn_done
+        # text must promise exactly that — not an in-place retry this box can no
+        # longer serve (/message would 409 on run.client=None).
+        await run.emit({"type": "turn_done", "text": _loc(run,
+            "The turn stalled and could not be recovered — nothing was applied. "
+            "The compile session will be recreated automatically on your next message.",
+            "本轮模型停滞且中断无响应——未产生结果;编译会话将在你下一条消息时自动重建,届时重发即可。")})
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+
 async def _model_stall_watchdog(run: CompileRun) -> None:
-    """Reap a turn wedged on a black-holed model request. Interrupt the attempt;
-    _consume_turn_stream then re-issues it (or fails). Only judges an ACTIVE turn,
-    and relaxes to the tool bound while a tool is pending — never false-kills a
-    live turn or a long tool (I4)."""
+    """Reap a turn wedged on a black-holed model request OR a dead CLI subprocess.
+    Interrupt a merely-slow attempt; _consume_turn_stream then re-issues it (or
+    fails). A subprocess that has EXITED, or an interrupt() the black-hole
+    swallowed past the deadline, cannot be recovered in place — hand off to
+    _reap_unrecoverable_turn (rebuild+continue for a batch sub-session, terminal
+    for the persistent session). Only judges an ACTIVE turn, and relaxes to the
+    tool bound while a tool is pending — never false-kills a live turn or a long
+    tool (I4)."""
     while not run.done:
         await asyncio.sleep(_MODEL_WATCHDOG_POLL_S)
         if not run._turn_active:
@@ -3681,31 +4221,29 @@ async def _model_stall_watchdog(run: CompileRun) -> None:
             # Interrupted, waiting for the interrupted result. A true black-hole
             # can swallow interrupt() too — then the latch stays set and the
             # receive loop blocks forever. Bound the wait; past the deadline,
-            # close the turn honestly and disconnect to unblock the loop.
+            # give up on the turn and disconnect to unblock the loop.
             if time.monotonic() - run._stall_interrupted_at > _STALL_INTERRUPT_DEADLINE_S:
-                run._stall_retrying = False
-                run._turn_active = False
-                await run.emit({"type": "error",
-                                "error": f"model stall: interrupt produced nothing within {_STALL_INTERRUPT_DEADLINE_S}s"})
-                # Disconnecting ENDS this box's session (run_session has no
-                # reconnect loop — deliberately: this fires only on a double
-                # black-hole, and recovery is owned by the platform: the run
-                # terminalizes via `end`, and the consumer's next message
-                # find-or-starts a fresh run/box with workspace rehydration).
-                # The turn_done text must promise exactly that — not an
-                # in-place retry this box can no longer serve (/message would
-                # 409 on run.client=None).
-                await run.emit({"type": "turn_done", "text": _loc(run,
-                    "The turn stalled and could not be recovered — nothing was applied. "
-                    "The compile session will be recreated automatically on your next message.",
-                    "本轮模型停滞且中断无响应——未产生结果;编译会话将在你下一条消息时自动重建,届时重发即可。")})
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+                client = run.client
+                if client is not None:
+                    await _reap_unrecoverable_turn(
+                        run, client,
+                        f"interrupt produced nothing within {_STALL_INTERRUPT_DEADLINE_S}s")
+                else:
+                    run._stall_retrying = False
+                    run._turn_active = False
             continue
         client = run.client
         if client is None:
+            continue
+        # Subprocess-liveness probe (07-24): a CLI child that has exited but whose
+        # stdout never closed leaves receive_messages() blocked forever; the
+        # model-idle clock alone would take the full (de-stream) idle floor to
+        # react. An exited process cannot be interrupted or re-issued on — reap it
+        # immediately so a batch sub-session rebuilds within one poll instead of
+        # 15+ minutes.
+        exit_code = _client_process_exited(client)
+        if exit_code is not None:
+            await _reap_unrecoverable_turn(run, client, f"subprocess exited (code {exit_code})")
             continue
         model_idle_timeout = (
             run._model_idle_timeout_s

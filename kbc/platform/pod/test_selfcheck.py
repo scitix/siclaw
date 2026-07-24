@@ -1494,6 +1494,247 @@ async def test_seam_settles_when_nothing_pending():
     print("OK  seam settles converge_phase when nothing pending (verify-off authoritative)")
 
 
+def test_orphan_assets_and_machine_exclusions():
+    """The batch train's content-robustness primitives: orphan detection sees
+    only assets no document embeds; glob escaping keeps a literal path from
+    swallowing siblings; append_exclusions de-duplicates and refuses to touch a
+    malformed ledger."""
+    import selfcheck
+    with tempfile.TemporaryDirectory() as td:
+        raw = Path(td) / "raw"
+        (raw / "assets").mkdir(parents=True)
+        (raw / "one.md").write_text("![pic](assets/linked.png)\n", encoding="utf-8")
+        (raw / "assets" / "linked.png").write_bytes(b"png")
+        (raw / "assets" / "orphan.png").write_bytes(b"png")
+        (raw / "assets" / "notes.md").write_text("content file, not media", encoding="utf-8")
+        orphans = selfcheck.orphan_media_assets(td)
+        assert orphans == ["assets/orphan.png"], orphans
+
+        # glob escaping: a title with [brackets] must match itself and ONLY itself
+        weird = "docs/table [v2]*.png"
+        pat = selfcheck.glob_escape_path(weird)
+        assert selfcheck._matches(weird, pat)
+        assert not selfcheck._matches("docs/table Xv2Y_anything.png", pat)
+
+        added, aerr = selfcheck.append_exclusions(td, [
+            {"pattern": "assets/orphan.png", "reason": "auto: orphan"},
+            {"pattern": "assets/orphan.png", "reason": "dup ignored"},
+        ])
+        assert aerr is None and len(added) == 1, (added, aerr)
+        again, aerr = selfcheck.append_exclusions(td, [
+            {"pattern": "assets/orphan.png", "reason": "still dup"}])
+        assert again == [] and aerr is None, (again, aerr)
+        entries, errs = selfcheck.load_exclusions(td)
+        assert not errs and len(entries) == 1, (entries, errs)
+
+        # The live incident shape: a model hand-edit leaves a trailing comma.
+        # READ tolerates it (the ledger must not blank out) but still surfaces
+        # an error; APPEND repairs the file canonically and adds the row.
+        excl = Path(td) / selfcheck.EXCLUSIONS_PATH
+        excl.write_text('[\n  {"pattern": "a.md", "reason": "empty nav page"},\n]\n', encoding="utf-8")
+        entries, errs = selfcheck.load_exclusions(td)
+        assert len(entries) == 1 and entries[0]["pattern"] == "a.md", entries
+        assert errs and "trailing-comma" in errs[0], errs
+        added, aerr = selfcheck.append_exclusions(td, [{"pattern": "b.md", "reason": "auto"}])
+        assert aerr is None and len(added) == 1, (added, aerr)
+        entries, errs = selfcheck.load_exclusions(td)
+        assert not errs and [e["pattern"] for e in entries] == ["a.md", "b.md"], (entries, errs)
+
+        # Corruption beyond the mechanical repair: refuse LOUDLY, file untouched.
+        excl.write_text("{not json", encoding="utf-8")
+        refused, aerr = selfcheck.append_exclusions(td, [{"pattern": "x.md", "reason": "r"}])
+        assert refused == [] and aerr and "corrupted" in aerr, (refused, aerr)
+        assert excl.read_text(encoding="utf-8") == "{not json"
+    print("OK  orphan assets + machine exclusions (detect / escape / dedupe / malformed untouched)")
+
+
+def test_orphan_skips_directly_cited_asset():
+    """Coverage v1 compatibility: a candidate page may cite a standalone media
+    asset DIRECTLY in its compiled_from with NO document embedding it. coverage()
+    counts a directly-cited asset as accounted, so orphan_media_assets must NOT
+    report it — otherwise the batch train pre-excludes and prunes a source the
+    ledger already accepts. The same asset with no citation IS a true orphan."""
+    import selfcheck
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "assets").mkdir(parents=True)
+        (wd / "raw" / "assets" / "chart.png").write_bytes(b"png")  # no document embeds it
+        (wd / "candidate").mkdir()
+        page = wd / "candidate" / "page.md"
+
+        # Cited directly by a candidate page → accounted, not an orphan.
+        page.write_text(
+            "---\ntype: Topic\ncompiled_from:\n  - assets/chart.png\n---\nbody\n",
+            encoding="utf-8")
+        assert selfcheck.orphan_media_assets(td) == [], selfcheck.orphan_media_assets(td)
+
+        # Drop the citation → the SAME asset is now a true orphan.
+        page.write_text(
+            "---\ntype: Topic\ncompiled_from:\n  - other.md\n---\nbody\n",
+            encoding="utf-8")
+        assert selfcheck.orphan_media_assets(td) == ["assets/chart.png"], selfcheck.orphan_media_assets(td)
+    print("OK  orphan assets: a directly-cited standalone asset is accounted, not orphaned")
+
+
+def test_trailing_comma_repair_is_string_aware():
+    """R2-4: the trailing-comma repair must NOT touch commas inside JSON strings.
+    A pattern like `a,].md` or a reason like `literal ,} marker` legitimately
+    contain `,}`/`,]` sequences; the old regex mangled them. Only a STRUCTURAL
+    trailing comma (outside any string, before } or ]) is dropped."""
+    import selfcheck
+    # In-string commas preserved verbatim (both reviewer repros).
+    src = '[{"pattern": "a,].md", "reason": "literal ,} marker"},]'
+    data, repaired = selfcheck._parse_exclusions_tolerant(src)
+    assert repaired and data == [{"pattern": "a,].md", "reason": "literal ,} marker"}], (data, repaired)
+    # A genuine structural trailing comma is still repaired.
+    data2, repaired2 = selfcheck._parse_exclusions_tolerant('[\n  {"pattern": "x.md", "reason": "r"},\n]')
+    assert repaired2 and data2 == [{"pattern": "x.md", "reason": "r"}], (data2, repaired2)
+    # Strictly-valid JSON is untouched (repaired=False).
+    data3, repaired3 = selfcheck._parse_exclusions_tolerant('[{"pattern": "x.md", "reason": "r"}]')
+    assert repaired3 is False and data3 == [{"pattern": "x.md", "reason": "r"}], (data3, repaired3)
+    print("OK  trailing-comma repair is string-aware (in-string ,] / ,} preserved; structural slip fixed)")
+
+
+def test_append_not_blocked_by_invalid_legacy_row():
+    """R2-2: an invalid legacy row (pattern, no reason) is SKIPPED by load, so its
+    source stays unaccounted. It must never shadow a real exclude_source call for
+    the same pattern (that left the source unaccounted forever with no tool path).
+    Dedupe is against VALID rows only; the post-turn normalizer then prunes the
+    now-redundant invalid duplicate — but keeps a lone invalid row (surfaced as a
+    load error) rather than silently dropping its pattern."""
+    import selfcheck
+    with tempfile.TemporaryDirectory() as td:
+        excl = Path(td) / selfcheck.EXCLUSIONS_PATH
+        excl.parent.mkdir(parents=True)
+        excl.write_text('[{"pattern": "a.md"}]', encoding="utf-8")  # invalid: no reason
+
+        # The tool append is NOT a no-op — the valid row lands.
+        added, err = selfcheck.append_exclusions(td, [{"pattern": "a.md", "reason": "empty nav page"}])
+        assert err is None and added == [{"pattern": "a.md", "reason": "empty nav page"}], (added, err)
+        entries, _ = selfcheck.load_exclusions(td)
+        assert any(e["pattern"] == "a.md" and e["reason"] == "empty nav page" for e in entries), entries
+
+        # Normalizer prunes the redundant invalid duplicate; load is then clean.
+        assert selfcheck.normalize_exclusions_file(td) is None
+        rows = json.loads(excl.read_text(encoding="utf-8"))
+        assert rows == [{"pattern": "a.md", "reason": "empty nav page"}], rows
+        entries2, errs2 = selfcheck.load_exclusions(td)
+        assert not errs2 and entries2 == [{"pattern": "a.md", "reason": "empty nav page"}], (entries2, errs2)
+
+    # A lone invalid row (no valid row for its pattern) is KEPT and surfaced.
+    with tempfile.TemporaryDirectory() as td:
+        excl = Path(td) / selfcheck.EXCLUSIONS_PATH
+        excl.parent.mkdir(parents=True)
+        excl.write_text('[{"pattern": "lonely.md"}]', encoding="utf-8")
+        assert selfcheck.normalize_exclusions_file(td) is None
+        assert json.loads(excl.read_text(encoding="utf-8")) == [{"pattern": "lonely.md"}]  # not silently dropped
+        entries, errs = selfcheck.load_exclusions(td)
+        assert errs and entries == [], (entries, errs)  # surfaced for a human, not accounted
+    print("OK  invalid legacy row never blocks exclude_source; redundant dup pruned, lone one surfaced")
+
+
+def test_exclusion_writes_are_atomic():
+    """R2-5: append_exclusions and normalize_exclusions_file must write through a
+    same-directory temp file + os.replace so a kill mid-write can never truncate
+    the machine-owned ledger. Observe that the on-disk swap goes through
+    os.replace(temp → EXCLUSIONS.json)."""
+    import selfcheck
+    real_replace = selfcheck.os.replace
+    for driver in ("append", "normalize"):
+        with tempfile.TemporaryDirectory() as td:
+            excl = Path(td) / selfcheck.EXCLUSIONS_PATH
+            excl.parent.mkdir(parents=True)
+            calls = []
+
+            def observing_replace(src, dst):
+                calls.append((str(src), str(dst)))
+                return real_replace(src, dst)
+
+            selfcheck.os.replace = observing_replace
+            try:
+                if driver == "append":
+                    selfcheck.append_exclusions(td, [{"pattern": "x.md", "reason": "r"}])
+                else:
+                    excl.write_text('[{"pattern": "x.md", "reason": "r"},]', encoding="utf-8")  # slip forces a rewrite
+                    selfcheck.normalize_exclusions_file(td)
+            finally:
+                selfcheck.os.replace = real_replace
+            assert calls, f"{driver}: no os.replace — write was not atomic"
+            src, dst = calls[-1]
+            assert dst.endswith("EXCLUSIONS.json") and ".tmp" in src, (driver, calls)
+            assert json.loads(excl.read_text(encoding="utf-8")) == [{"pattern": "x.md", "reason": "r"}]
+    print("OK  exclusion writes are atomic (same-dir temp + os.replace) for append and normalize")
+
+
+def test_repair_prompt_prefers_exclude_source_tool():
+    """R2-1b: the unaccounted repair instruction must steer to the exclude_source
+    TOOL as the preferred path (no longer 'add it to authoring/EXCLUSIONS.json'),
+    while keeping one sentence that direct file repair is a permitted fallback
+    when the tool cannot express the fix. Both locales."""
+    import selfcheck
+    report = {
+        "coverage": {"unaccounted": ["meta.md"], "dangling_citations": [],
+                     "noop_exclusions": [], "over_broad_exclusions": []},
+        "lint": {"ok": True, "violations": []},
+    }
+    en = selfcheck.build_repair_prompt(report, "en")
+    assert "exclude_source(path, reason)" in en, en
+    assert "preferred" in en and "fallback" in en, en
+    assert "add it to authoring/EXCLUSIONS.json (a JSON array" not in en, en   # old direct-edit copy gone
+    zh = selfcheck.build_repair_prompt(report, "zh")
+    assert "exclude_source(path, reason)" in zh and "兜底" in zh, zh
+    assert "加入 authoring/EXCLUSIONS.json(JSON 数组" not in zh, zh
+    print("OK  repair prompt prefers exclude_source (tool), keeps hand-edit as an explicit fallback")
+
+
+def test_over_broad_exclusion_flagged_not_blocking():
+    """R2-1c2: a single exclusion pattern swallowing >25% of the inventory AND >5
+    sources (a `**` bomb, an over-broad prefix) is flagged LOUDLY in the report,
+    the narration warn line, and the repair prompt — but is NEVER blocking (it is
+    a report-level heuristic, kept OUT of coverage()/`closed`) and NEVER
+    auto-removed. A normal dir-prefix under the threshold is not flagged. It stays
+    out of the coverage() accounting dict (sicore mirrors that byte-for-byte)."""
+    import selfcheck
+    with tempfile.TemporaryDirectory() as td:
+        raw = Path(td) / "raw"
+        raw.mkdir()
+        for i in range(20):
+            (raw / f"f{i}.md").write_text("x", encoding="utf-8")
+        (Path(td) / "authoring").mkdir()
+        (Path(td) / selfcheck.EXCLUSIONS_PATH).write_text(
+            json.dumps([{"pattern": "**", "reason": "bomb"}]), encoding="utf-8")
+        excl, _ = selfcheck.load_exclusions(td)
+        ob = selfcheck.detect_over_broad_exclusions(td, excl)
+        assert ob == [{"pattern": "**", "matched": 20}], ob
+        cov = selfcheck.coverage(td, {}, excl)
+        assert "over_broad_exclusions" not in cov, "must stay out of the shared coverage contract"
+        assert cov["closed"] is True, "over-broad must not block: closed stays true"  # non-blocking
+        assert (Path(td) / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8"), "never auto-removed"
+        # run_layer1 surfaces it at the report level; narration + repair prompt read it there.
+        report = selfcheck.run_layer1(td)
+        assert report["over_broad_exclusions"] == [{"pattern": "**", "matched": 20}], report["over_broad_exclusions"]
+        report["state"] = "passed"
+        assert "over-broad" in selfcheck.narration(report, "en")
+        assert "过宽" in selfcheck.narration(report, "zh")
+        assert "OVER-BROAD" in selfcheck.build_repair_prompt(report, "en")
+        assert "过宽" in selfcheck.build_repair_prompt(report, "zh")
+
+    # A normal dir-prefix exclusion under the threshold is NOT flagged.
+    with tempfile.TemporaryDirectory() as td:
+        raw = Path(td) / "raw"
+        (raw / "logs").mkdir(parents=True)
+        for i in range(20):
+            (raw / f"doc{i}.md").write_text("x", encoding="utf-8")
+        (raw / "logs" / "a.log").write_text("x", encoding="utf-8")
+        (raw / "logs" / "b.log").write_text("x", encoding="utf-8")
+        (Path(td) / "authoring").mkdir()
+        (Path(td) / selfcheck.EXCLUSIONS_PATH).write_text(
+            json.dumps([{"pattern": "logs/", "reason": "runtime logs"}]), encoding="utf-8")
+        excl, _ = selfcheck.load_exclusions(td)
+        assert selfcheck.detect_over_broad_exclusions(td, excl) == []  # 2 of 22 → under threshold
+    print("OK  over-broad exclusion flagged (report/narration/repair), non-blocking, out of coverage, never auto-removed")
+
+
 def test_converge_phase_helper():
     """set_converge_phase: writes the durable authoritative signal (verifying/
     revising/settled), preserves the L1 coverage section, ignores junk phases."""
@@ -1799,6 +2040,13 @@ def main():
     asyncio.run(test_pk_failed_state_settles_converge())
     asyncio.run(test_pk_wiring())
     asyncio.run(test_seam_settles_when_nothing_pending())
+    test_orphan_assets_and_machine_exclusions()
+    test_orphan_skips_directly_cited_asset()
+    test_trailing_comma_repair_is_string_aware()
+    test_append_not_blocked_by_invalid_legacy_row()
+    test_exclusion_writes_are_atomic()
+    test_repair_prompt_prefers_exclude_source_tool()
+    test_over_broad_exclusion_flagged_not_blocking()
     test_converge_phase_helper()
     print("ALL OK  test_selfcheck")
 
