@@ -3502,6 +3502,55 @@ async def test_batch_orchestrator_routing_and_resume():
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
 
 
+async def test_exclude_source_tool_owns_the_ledger():
+    """The 2026-07-24 mandate: the model never hand-authors a machine format.
+    exclude_source is the ONLY write path (validated, canonical, de-duplicated),
+    and the post-session normalizer guarantees a hand-edited ledger is strictly
+    parseable at rest again."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "docs").mkdir(parents=True)
+        (wd / "raw" / "docs" / "empty-nav.md").write_text("# nav\n", encoding="utf-8")
+        (wd / "raw" / "docs" / "real.md").write_text("# real\ncontent\n", encoding="utf-8")
+        run = compile_box.CompileRun("tool1", str(wd), 1)
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        exclude = tools["exclude_source"].handler
+
+        # Valid path (raw/ prefix tolerated) → canonical row lands once.
+        out = await exclude({"path": "raw/docs/empty-nav.md", "reason": "empty navigation page"})
+        assert "docs/empty-nav.md" in out, out
+        entries, errs = selfcheck.load_exclusions(str(wd))
+        assert not errs and len(entries) == 1, (entries, errs)
+        again = await exclude({"path": "docs/empty-nav.md", "reason": "dup"})
+        assert "already" in again or "早已" in again, again
+
+        # Unknown path → refused with a close-match hint, ledger untouched.
+        miss = await exclude({"path": "docs/empty-nav2.md", "reason": "typo"})
+        assert "empty-nav.md" in miss, miss
+        entries, _ = selfcheck.load_exclusions(str(wd))
+        assert len(entries) == 1, entries
+
+        # Missing reason → refused.
+        bad = await exclude({"path": "docs/real.md", "reason": " "})
+        assert "reason" in bad or "path" in bad or "需要" in bad, bad
+
+        # Machine-owned at rest: a hand edit with a trailing comma is
+        # re-canonicalized by the post-session normalizer, rows preserved.
+        excl = wd / selfcheck.EXCLUSIONS_PATH
+        excl.write_text('[\n  {"pattern": "docs/empty[-]nav.md", "reason": "empty navigation page"},\n]\n', encoding="utf-8")
+        assert selfcheck.normalize_exclusions_file(str(wd)) is None
+        strict = json.loads(excl.read_text(encoding="utf-8"))
+        assert isinstance(strict, list) and len(strict) == 1, strict
+        # Corruption beyond mechanical repair: reported, file untouched.
+        excl.write_text("{nope", encoding="utf-8")
+        err = selfcheck.normalize_exclusions_file(str(wd))
+        assert err and "corrupted" in err, err
+        assert excl.read_text(encoding="utf-8") == "{nope"
+    print("✓ exclude_source tool: validated canonical writes; ledger machine-owned at rest")
+
+
 async def test_batch_orphan_assets_pre_excluded_and_pruned():
     """2026-07-24 robustness mandate: a standalone media asset no document
     embeds (a synced wiki file node) must never occupy a batch seat or wedge
@@ -5393,6 +5442,7 @@ async def main():
     await test_unchanged_owner_turn_does_not_migrate_legacy_format()
     await test_batch_final_ledger_check_requires_index()
     await test_batch_orchestrator_routing_and_resume()
+    await test_exclude_source_tool_owns_the_ledger()
     await test_batch_orphan_assets_pre_excluded_and_pruned()
     await test_batch_unaccounted_gets_corrective_then_auto_excluded()
     await test_batch_content_fault_skips_batch_but_stall_interrupts()

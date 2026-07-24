@@ -806,6 +806,32 @@ def append_exclusions(workdir: str, entries: list[dict]) -> tuple[list[dict], st
     return added, None
 
 
+def normalize_exclusions_file(workdir: str) -> str | None:
+    """Restore the exclusion ledger to canonical form after a model turn.
+
+    The ledger is MACHINE-OWNED: the model expresses exclusion intent through
+    the exclude_source tool, never by editing the file. This normalizer is the
+    enforcement backstop for a model that edits it anyway — every parseable row
+    survives verbatim, mechanical slips (trailing commas) are absorbed, and the
+    canonical rewrite guarantees a strictly-parseable file at rest after every
+    turn. Returns an error string only when the file is corrupted beyond the
+    mechanical repair (left untouched for a human/model to inspect)."""
+    path = Path(workdir) / EXCLUSIONS_PATH
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return f"{EXCLUSIONS_PATH} unreadable: {e}"
+    data, repaired = _parse_exclusions_tolerant(raw)
+    if data is None or not isinstance(data, list):
+        return f"{EXCLUSIONS_PATH} is corrupted beyond the mechanical repair"
+    canonical = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    if repaired or raw != canonical:
+        path.write_text(canonical, encoding="utf-8")
+    return None
+
+
 def _body_source_payload_spans(text: str) -> list[tuple[int, int, str]]:
     """Extract source payloads and exact source-text offsets outside code."""
     payloads: list[tuple[int, int, str]] = []

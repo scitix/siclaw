@@ -37,6 +37,7 @@ client cert (runtime/gateway); otherwise plain HTTP (local).
 import asyncio
 import base64
 import contextlib
+import difflib
 import hashlib
 import io
 import json
@@ -1337,6 +1338,31 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
         await run.emit({"type": "summary", "summary": strings["deleted"].format(path=rel.as_posix())})
         return strings["deleted"].format(path=rel.as_posix())
 
+    async def exclude_source(args):
+        """The ONLY write path into the exclusion ledger (2026-07-24 mandate:
+        the model's job is understanding knowledge, never hand-authoring a
+        machine-parsed format — one hand-written trailing comma once blanked
+        the whole ledger and wedged a 145-batch train). Machine-validated,
+        machine-serialized, de-duplicated."""
+        es = ts["exclude_source"]
+        raw_path = str(args.get("path", "")).strip()
+        reason = str(args.get("reason", "")).strip()
+        if not raw_path or not reason:
+            return es["need_args"]
+        rel = selfcheck._strip_source_prefix(raw_path)
+        inventory = selfcheck.source_inventory(run.workdir)
+        if rel not in inventory:
+            close = difflib.get_close_matches(rel, inventory, n=3, cutoff=0.6)
+            hint = es["hint_close"].format(close=", ".join(close)) if close else ""
+            return es["not_in_inventory"].format(path=rel, hint=hint)
+        added, err = selfcheck.append_exclusions(run.workdir, [
+            {"pattern": selfcheck.glob_escape_path(rel), "reason": reason}])
+        if err:
+            return es["failed"].format(e=err)
+        if not added:
+            return es["already"].format(path=rel)
+        return es["done"].format(path=rel)
+
     async def resolve_ticket(args):
         rt = ts["resolve_ticket"]
         tid = str(args.get("ticket_id", "")).strip()
@@ -1394,6 +1420,16 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
                 "required": ["path"],
             },
             delete_candidate_page,
+        ),
+        EngineTool(
+            "exclude_source",
+            ts["exclude_source"]["desc"],
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "reason": {"type": "string"}},
+                "required": ["path", "reason"],
+            },
+            exclude_source,
         ),
         EngineTool(
             "resolve_ticket",
@@ -3009,6 +3045,12 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                 pass
         if source_view is not None:
             shutil.rmtree(source_view, ignore_errors=True)
+        # The exclusion ledger is machine-owned: whatever the model did this
+        # session, the file at rest is canonical strict JSON again (parseable
+        # hand-written rows survive; mechanical slips are absorbed).
+        norm_err = selfcheck.normalize_exclusions_file(run.workdir)
+        if norm_err:
+            _print_compile_lifecycle("exclusions.normalize_failed", run, extra=norm_err)
 
 
 def _drain_batch_notes(run: "CompileRun") -> str:
@@ -3545,11 +3587,13 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         _loc(run,
                              "The following sources assigned to this batch are still unaccounted "
                              "(neither cited by any Candidate page's compiled_from nor covered by an "
-                             "exclusion). For each one: cite it from the page that digests it, or add "
-                             "an exclusion row with a concrete reason.\n" + listed,
+                             "exclusion). For each one: cite it from the page that digests it, or call "
+                             "the exclude_source(path, reason) tool with a concrete reason — never edit "
+                             "EXCLUSIONS.json by hand.\n" + listed,
                              "本批分配的下列源仍未记账(既没有被任何候选页的 compiled_from 引用,也没有"
-                             "豁免记录)。请逐个处理:要么在消化它的候选页里补引用,要么在豁免清单里"
-                             "写明具体理由:\n" + listed),
+                             "豁免记录)。请逐个处理:要么在消化它的候选页里补引用,要么调用 "
+                             "exclude_source(path, reason) 工具写明具体理由——不要手工编辑 "
+                             "EXCLUSIONS.json:\n" + listed),
                         _loc(run, f"batch {k} accounting fix", f"批 {k} 补账"),
                         pdf_page_ranges=batch.get("source_page_ranges"),
                         raw_read_allowlist=_batch_raw_read_allowlist(batch),

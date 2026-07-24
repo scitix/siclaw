@@ -24,5 +24,14 @@
     "not_found": "ticket {tid} not found; existing ids: {ids}",
     "write_failed": "failed to write CONTRADICTIONS.json: {e}",
     "registered": "ticket {tid} registered as patched (agent_report written)"
+  },
+  "exclude_source": {
+    "desc": "Declare that one raw source will NOT be compiled. Pass `path` (relative to raw/, exact file path — no globs) and `reason` (one line the owner can understand, in the KB's language). The system validates the path against the source inventory, writes the exclusion ledger entry canonically, and de-duplicates. This is the ONLY way to record an exclusion — never edit authoring/EXCLUSIONS.json by hand.",
+    "need_args": "exclude_source needs both `path` and `reason`.",
+    "not_in_inventory": "not a raw source on record: {path}{hint}",
+    "hint_close": " — did you mean: {close}?",
+    "already": "already excluded (nothing to do): {path}",
+    "failed": "exclusion could not be written: {e}",
+    "done": "excluded with reason on record: {path}"
   }
 }
