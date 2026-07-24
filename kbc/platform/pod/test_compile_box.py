@@ -3666,7 +3666,8 @@ async def test_batch_content_fault_skips_batch_but_stall_interrupts():
         compile_box.BatchOutputError("batch h001 produced an unusable page"))
     assert all(b["status"] == "done" for b in plan["batches"]), plan
     assert not [e for e in events if e["type"] == "error"], events
-    skipped = [e for e in events if e["type"] == "summary" and ("skipped" in e["text"] or "无法完成" in e["text"])]
+    skipped = [e for e in events if e["type"] == "summary"
+               and ("could not complete" in e["text"] or "无法完成" in e["text"])]
     assert skipped, events
 
     # Infra fault: the train interrupts resumably — batch 1 NOT stamped, an
