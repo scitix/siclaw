@@ -419,6 +419,21 @@ def _batch_error_code(exc: BaseException) -> str:
     return "other"
 
 
+def _lifecycle_batch_ref(batch: dict, k: int, n: int) -> str:
+    """Whitelisted stdout identity for a batch lifecycle line: the index (k/n)
+    ALWAYS, plus the id ONLY when it is a safe log token
+    (batching.is_safe_batch_id). Plan validation now rejects unsafe ids, but a
+    pinned plan created before that check can still carry a hostile id (newline
+    injection forging log records, or a path leak); the index identifies the
+    batch either way, so an unsafe id is dropped rather than echoed to the
+    operator-visible pod log."""
+    bid = batch.get("id") if isinstance(batch, dict) else None
+    ref = f"batch={k}/{n}"
+    if batching.is_safe_batch_id(bid):
+        ref += f" id={bid}"
+    return ref
+
+
 class CompileRun:
     def __init__(self, run_id: str, workdir: str, round_: int, instruction: str = ""):
         self.run_id = run_id
@@ -3567,20 +3582,28 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                                         + ("…" if len(dropped) > 5 else "")})
         slice_failures = _materialize_batch_slices(run, plan)
         if slice_failures:
+            n_all = len(plan["batches"])
             for bad_id, why in sorted(slice_failures.items()):
                 bad = next((b for b in plan["batches"] if str(b.get("id")) == bad_id), None)
                 if bad is None:
                     continue
+                k_bad = next(i + 1 for i, b in enumerate(plan["batches"]) if b is bad)
                 _auto_exclude_batch_sources(
                     run,
                     _unaccounted_batch_sources(run, bad.get("sources") or []),
                     f"auto-excluded: batch {bad_id} was skipped (slice view failed: {why})",
                 )
+                # Protect integrity: if a corrupted ledger refused the write the
+                # sources are still unaccounted — do NOT stamp done over it. Same
+                # resumable hard stop as the per-batch gate/skip paths.
+                _assert_exclusions_landed(run, bad)
                 batching.stamp_done(plan, bad.get("id"))
                 # `why` names the source path the slice view could not build →
-                # whitelisted code only on stdout (owner gets the detail in the
-                # summary emit below and the machine exclusion reason).
-                _print_compile_lifecycle("batch.skipped", run, extra=f"id={bad_id} code=slice_view_failed")
+                # whitelisted code + safe index/id only on stdout (owner gets the
+                # detail in the summary emit below and the machine exclusion reason).
+                _print_compile_lifecycle(
+                    "batch.skipped", run,
+                    extra=f"{_lifecycle_batch_ref(bad, k_bad, n_all)} code=slice_view_failed")
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
             await run.emit({"type": "summary", "text": _loc(run,
                 f"{len(slice_failures)} batch(es) had unusable read-bounded views and were skipped; "
@@ -3725,7 +3748,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 # paths / provider fragments; it rides the owner SSE summary below.
                 _print_compile_lifecycle(
                     "batch.skipped", run,
-                    extra=f"batch={k}/{n} id={batch['id']} class={type(e).__name__} code={_batch_error_code(e)}")
+                    extra=f"{_lifecycle_batch_ref(batch, k, n)} class={type(e).__name__} code={_batch_error_code(e)}")
                 await run.emit({"type": "summary", "text": _loc(run,
                     f"Batch {k}/{n} could not complete ({e}); its unaccounted sources were auto-excluded "
                     f"with a reason and the train continues.",
@@ -3741,7 +3764,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     await _sync_workspace(run, sent)
                 except Exception:
                     pass  # periodic sync will retry; the local stamp is already on disk
-            _print_compile_lifecycle("batch.done", run, extra=f"batch={k}/{n} id={batch['id']}")
+            _print_compile_lifecycle("batch.done", run, extra=_lifecycle_batch_ref(batch, k, n))
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
         if plan.get("mode") == "hierarchical":

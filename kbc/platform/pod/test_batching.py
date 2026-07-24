@@ -490,6 +490,26 @@ def test_validate_plan_rejects_duplicate_and_empty_batch_ids(tmp_path: Path):
     assert sum("empty or missing id" in e for e in errs) == 2, errs
 
 
+def test_validate_plan_rejects_unsafe_batch_ids(tmp_path: Path):
+    """R2-6: a batch id flows verbatim into pod-log lifecycle lines, so a
+    model-proposed id outside [A-Za-z0-9_-]{1,64} (newline injection / path leak)
+    must be rejected at validation → the plan falls back to the safe code
+    baseline. The error must not echo the offending value."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.md").write_bytes(b"x" * 10)
+    inv = bt.scan_sources(raw)
+    forged = "secret/customer/file.md\nFORGED=1"
+    errs = bt.validate_plan({"batches": [{"id": forged, "sources": ["a.md"]}]}, inv, budget=100)
+    assert any("must match" in e for e in errs), errs
+    assert not any(("FORGED" in e) or ("secret" in e) or ("\n" in e) for e in errs), errs  # value never echoed
+    # A safe id passes the id check (the deterministic code baseline uses these).
+    assert bt.validate_plan({"batches": [{"id": "b01", "sources": ["a.md"]}]}, inv, budget=100) == []
+    # The shared helper mirrors the rule (used by the lifecycle logger).
+    assert bt.is_safe_batch_id("h001") and bt.is_safe_batch_id("b_2-x")
+    assert not bt.is_safe_batch_id(forged) and not bt.is_safe_batch_id("") and not bt.is_safe_batch_id("x" * 65)
+
+
 def test_scan_confines_symlinks(tmp_path: Path):
     """Review fix (defense-in-depth): a symlink under raw/ pointing outside must
     not be inventoried — same realpath confinement as the snapshot pinner."""
@@ -544,6 +564,7 @@ def main():
         test_validate_plan_accepts_code_baseline,
         test_validate_plan_rejects_missing_duplicate_unknown_overflow,
         test_validate_plan_rejects_duplicate_and_empty_batch_ids,
+        test_validate_plan_rejects_unsafe_batch_ids,
         test_scan_confines_symlinks,
         test_prune_missing_sources,
         test_normalize_model_plan_and_progress,

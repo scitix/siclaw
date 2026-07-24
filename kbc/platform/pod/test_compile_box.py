@@ -4025,6 +4025,114 @@ async def test_batch_auto_exclude_refused_interrupts_resumably():
     print("✓ batch auto-exclude landed-check: a corrupted ledger interrupts resumably, batch not stamped done")
 
 
+async def test_slice_failure_auto_exclude_refused_interrupts_resumably():
+    """R2-3: the slice-failures pre-loop auto-excludes a batch whose read-bounded
+    view could not be built, then stamps it done. If the ledger is corrupted the
+    exclusion write is refused and the source stays unaccounted — it must NOT be
+    stamped done. Same resumable protect-integrity hard stop as the per-batch
+    gate/skip paths, naming authoring/EXCLUSIONS.json."""
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw").mkdir()
+        (wd / "raw" / "big.md").write_text("line1\nline2\n", encoding="utf-8")
+        (wd / "authoring").mkdir()
+        (wd / selfcheck.EXCLUSIONS_PATH).write_text("{nope", encoding="utf-8")  # corrupt beyond repair
+        # A pinned plan whose one batch is a text slice with an out-of-range span
+        # → _materialize_batch_slices raises → slice_failures for that batch.
+        plan = {
+            "version": 3, "planner": "hierarchical-code", "mode": "hierarchical", "phase": "map",
+            "batches": [{
+                "id": "h001", "sources": ["big.md"], "context_sources": [],
+                "source_ranges": {"big.md": {
+                    "slice_file": ".kbc-batch-slices/big.md.p1",
+                    "start_line": 1, "end_line": 9999, "bytes": 10, "part": 1, "parts": 1}},
+                "bytes": 10, "status": "pending",
+            }],
+            "reductions": [],
+        }
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        run = compile_box.CompileRun("slicecorrupt", str(wd), 1)
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        compile_box._drive_batch_session = fake_drive
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+
+        saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] != "done" for b in saved["batches"]), saved   # NOT stamped over corruption
+        events = _drain(run)
+        errors = [e for e in events if e["type"] == "error"]
+        assert errors and any("EXCLUSIONS.json" in e["error"] for e in errors), errors
+        assert (wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8") == "{nope"  # left for a human
+    print("✓ slice-failure landed-check: corrupted ledger interrupts resumably, batch not stamped done")
+
+
+async def test_lifecycle_line_drops_unsafe_batch_id():
+    """R2-6: a batch id reaches pod stdout via batch.done / batch.skipped. Plan
+    validation now rejects unsafe ids, but a PINNED plan created before the check
+    can still carry one — so the lifecycle logger prints the index always and the
+    id ONLY when it is a safe token."""
+    import batching
+    # Unit: the safe-token gate on the log ref.
+    assert compile_box._lifecycle_batch_ref({"id": "h001"}, 1, 3) == "batch=1/3 id=h001"
+    forged = "x\nFORGED=1 id=evil"
+    ref = compile_box._lifecycle_batch_ref({"id": forged}, 2, 3)
+    assert ref == "batch=2/3" and "FORGED" not in ref, ref
+
+    # Integration: a pinned plan carrying a hostile id drives to batch.done; the
+    # forged value never reaches stdout, the index-only identity does.
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw").mkdir()
+        (wd / "raw" / "a.md").write_bytes(b"x" * 50)
+        (wd / "authoring").mkdir()
+        plan = {
+            "version": 1, "planner": "code", "mode": "flat", "phase": "map",
+            "batches": [{"id": "safe/../\nFORGED-LOGLEAK", "sources": ["a.md"], "status": "pending"}],
+        }
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+        run = compile_box.CompileRun("logleak", str(wd), 1)
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            return f"done {label}"
+
+        async def noop_repairs(run_, replies):
+            return None
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        real_repairs = compile_box._run_ledger_repairs
+        real_media = compile_box._media_verify_enabled
+        real_pk = compile_box._maybe_start_pk
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        compile_box._run_ledger_repairs = noop_repairs
+        compile_box._media_verify_enabled = lambda: False
+        compile_box._maybe_start_pk = lambda run_: False
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            compile_box._run_ledger_repairs = real_repairs
+            compile_box._media_verify_enabled = real_media
+            compile_box._maybe_start_pk = real_pk
+        out = buf.getvalue()
+        assert "FORGED-LOGLEAK" not in out, out            # hostile id never hits stdout
+        assert "batch.done" in out and "batch=1/1" in out, out   # index-only identity present
+    print("✓ lifecycle line: a pre-fix pinned hostile batch id is dropped from stdout (index only)")
+
+
 def test_small_kb_batch_gate_skips_poppler_metadata():
     """Ordinary compile routing keeps the pre-PDF-slicing cheap scan. Poppler
     metadata is execution detail for a selected batch plan, never a new cost on
@@ -5762,6 +5870,8 @@ async def main():
     await test_batch_media_round_cap_marks_pending_exhausted()
     await test_batch_lifecycle_logs_never_leak_content_to_stdout()
     await test_batch_auto_exclude_refused_interrupts_resumably()
+    await test_slice_failure_auto_exclude_refused_interrupts_resumably()
+    await test_lifecycle_line_drops_unsafe_batch_id()
     test_small_kb_batch_gate_skips_poppler_metadata()
     test_hierarchical_text_slice_materialization_and_directive()
     test_hierarchical_resume_state_contract()
