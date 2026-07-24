@@ -110,8 +110,9 @@ export interface CardSession {
 //
 // The final answer card carries a feedback row. Clicks arrive as a
 // `card.action.trigger` callback over the SAME long connection as messages;
-// the button's `value` payload is self-contained (session/card/channel), so
-// persistence never needs a Feishu-message-id → session mapping.
+// the button's `value` payload is self-contained (session/card/channel plus
+// the persisted assistant message), so persistence never needs an in-memory
+// Feishu-card → chat-message mapping.
 
 /** Discriminator inside `action.value` so unrelated card actions are ignored. */
 export const FEEDBACK_ACTION_KIND = "siclaw_feedback";
@@ -124,6 +125,8 @@ export type FeedbackRating = "up" | "down";
 export interface FeedbackContext {
   sessionId: string;
   channelId: string;
+  /** Exact persisted assistant reply rated by this card. Absent on legacy cards. */
+  messageId?: string;
 }
 
 /** Payload embedded in each button; comes back verbatim in the callback. */
@@ -133,6 +136,8 @@ export interface FeedbackActionValue {
   session_id: string;
   card_id: string;
   channel_id: string;
+  /** Added after channel audit persistence exposed the final assistant id. */
+  message_id?: string;
   locale: LarkLocale;
 }
 
@@ -162,6 +167,7 @@ function buildFeedbackRow(
       session_id: ctx.sessionId,
       card_id: cardId,
       channel_id: ctx.channelId,
+      ...(ctx.messageId ? { message_id: ctx.messageId } : {}),
       locale,
     };
     return {
@@ -359,7 +365,7 @@ async function appendFeedbackRow(
  */
 export async function applyFeedbackSelection(
   larkClient: any,
-  value: Pick<FeedbackActionValue, "card_id" | "session_id" | "channel_id" | "locale">,
+  value: Pick<FeedbackActionValue, "card_id" | "session_id" | "channel_id" | "message_id" | "locale">,
   rating: FeedbackRating,
 ): Promise<boolean> {
   const session = feedbackEchoSessions.get(value.card_id);
@@ -371,7 +377,7 @@ export async function applyFeedbackSelection(
       data: {
         element: JSON.stringify(buildFeedbackRow(
           value.card_id,
-          { sessionId: value.session_id, channelId: value.channel_id },
+          { sessionId: value.session_id, channelId: value.channel_id, messageId: value.message_id },
           locale,
           rating,
         )),
