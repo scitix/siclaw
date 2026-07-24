@@ -2890,7 +2890,17 @@ def _auto_exclude_batch_sources(run: "CompileRun", sources: list[str], reason: s
         {"pattern": selfcheck.glob_escape_path(s), "reason": reason}
         for s in sources
     ]
-    return selfcheck.append_exclusions(run.workdir, entries)
+    added, err = selfcheck.append_exclusions(run.workdir, entries)
+    if err:
+        # A refused write must be LOUD: a silent no-op here leaves sources
+        # neither cited nor excluded and only the end-of-train ledger repair
+        # would ever notice.
+        _print_compile_lifecycle("exclusions.write_failed", run, extra=err)
+        asyncio.get_running_loop().create_task(run.emit({"type": "summary", "text": _loc(
+            run,
+            f"Machine exclusions could not be written: {err}",
+            f"机器豁免写入失败:{err}")}))
+    return added
 
 
 def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[str]:
@@ -3420,10 +3430,14 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         inventory_paths = [i["path"] for i in inventory]
         orphans = selfcheck.orphan_media_assets(run.workdir, inventory_paths)
         if orphans:
-            added = selfcheck.append_exclusions(run.workdir, [
+            added, aerr = selfcheck.append_exclusions(run.workdir, [
                 {"pattern": selfcheck.glob_escape_path(p),
                  "reason": "auto-excluded: media asset not embedded by any document (sync residue)"}
                 for p in orphans])
+            if aerr:
+                await run.emit({"type": "summary", "text": _loc(run,
+                    f"Machine exclusions could not be written: {aerr}",
+                    f"机器豁免写入失败:{aerr}")})
             if added:
                 await run.emit({"type": "summary", "text": _loc(run,
                     f"{len(added)} standalone media asset(s) are embedded by no document — "

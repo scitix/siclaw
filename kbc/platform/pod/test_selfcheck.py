@@ -1516,21 +1516,34 @@ def test_orphan_assets_and_machine_exclusions():
         assert selfcheck._matches(weird, pat)
         assert not selfcheck._matches("docs/table Xv2Y_anything.png", pat)
 
-        added = selfcheck.append_exclusions(td, [
+        added, aerr = selfcheck.append_exclusions(td, [
             {"pattern": "assets/orphan.png", "reason": "auto: orphan"},
             {"pattern": "assets/orphan.png", "reason": "dup ignored"},
         ])
-        assert len(added) == 1, added
-        again = selfcheck.append_exclusions(td, [
+        assert aerr is None and len(added) == 1, (added, aerr)
+        again, aerr = selfcheck.append_exclusions(td, [
             {"pattern": "assets/orphan.png", "reason": "still dup"}])
-        assert again == [], again
+        assert again == [] and aerr is None, (again, aerr)
         entries, errs = selfcheck.load_exclusions(td)
         assert not errs and len(entries) == 1, (entries, errs)
 
-        # malformed ledger: refuse to rewrite, surface nothing silently
+        # The live incident shape: a model hand-edit leaves a trailing comma.
+        # READ tolerates it (the ledger must not blank out) but still surfaces
+        # an error; APPEND repairs the file canonically and adds the row.
         excl = Path(td) / selfcheck.EXCLUSIONS_PATH
+        excl.write_text('[\n  {"pattern": "a.md", "reason": "empty nav page"},\n]\n', encoding="utf-8")
+        entries, errs = selfcheck.load_exclusions(td)
+        assert len(entries) == 1 and entries[0]["pattern"] == "a.md", entries
+        assert errs and "trailing-comma" in errs[0], errs
+        added, aerr = selfcheck.append_exclusions(td, [{"pattern": "b.md", "reason": "auto"}])
+        assert aerr is None and len(added) == 1, (added, aerr)
+        entries, errs = selfcheck.load_exclusions(td)
+        assert not errs and [e["pattern"] for e in entries] == ["a.md", "b.md"], (entries, errs)
+
+        # Corruption beyond the mechanical repair: refuse LOUDLY, file untouched.
         excl.write_text("{not json", encoding="utf-8")
-        assert selfcheck.append_exclusions(td, [{"pattern": "x.md", "reason": "r"}]) == []
+        refused, aerr = selfcheck.append_exclusions(td, [{"pattern": "x.md", "reason": "r"}])
+        assert refused == [] and aerr and "corrupted" in aerr, (refused, aerr)
         assert excl.read_text(encoding="utf-8") == "{not json"
     print("OK  orphan assets + machine exclusions (detect / escape / dedupe / malformed untouched)")
 

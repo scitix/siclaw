@@ -229,20 +229,49 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
     return pages
 
 
+_TRAILING_COMMA_RE = re.compile(r",\s*(?=[}\]])")
+
+
+def _parse_exclusions_tolerant(text: str):
+    """Strict JSON parse with ONE mechanical fallback: stripping trailing
+    commas (`},]` / `,}`), the exact slip a model hand-editing the ledger keeps
+    making. Returns (data, repaired) or (None, False) when even the repaired
+    text does not parse — anything beyond this one deterministic fix is a real
+    corruption a human/model must look at, not something to guess at."""
+    try:
+        return json.loads(text), False
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_TRAILING_COMMA_RE.sub("", text)), True
+    except json.JSONDecodeError:
+        return None, False
+
+
 def load_exclusions(workdir: str) -> tuple[list[dict], list[str]]:
     """Read authoring/EXCLUSIONS.json → (entries, errors). Missing file is fine
-    (no exclusions declared yet). Malformed content is an error the lint
-    surfaces — a broken exclusion list must not silently exclude nothing."""
+    (no exclusions declared yet). A trailing-comma slip is tolerated on READ so
+    one hand-edit typo cannot blank the whole ledger (2026-07-24 live incident:
+    every previously excluded source went "unaccounted" at once) — but it still
+    surfaces as an error so the lint/repair loop gets the file fixed on disk.
+    Anything less mechanical stays a hard parse error."""
     path = Path(workdir) / EXCLUSIONS_PATH
     if not path.is_file():
         return [], []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-        return [], [f"{EXCLUSIONS_PATH} unreadable/invalid JSON: {e}"]
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return [], [f"{EXCLUSIONS_PATH} unreadable: {e}"]
+    data, repaired = _parse_exclusions_tolerant(raw)
+    if data is None:
+        return [], [f"{EXCLUSIONS_PATH} unreadable/invalid JSON"]
+    errors_prefix = (
+        [f"{EXCLUSIONS_PATH} has a trailing-comma JSON slip (tolerated for accounting; please fix the file)"]
+        if repaired else []
+    )
     if not isinstance(data, list):
-        return [], [f"{EXCLUSIONS_PATH} must be a JSON array"]
-    entries, errors = [], []
+        return [], errors_prefix + [f"{EXCLUSIONS_PATH} must be a JSON array"]
+    entries, errors = [], list(errors_prefix)
     for i, item in enumerate(data):
         if not isinstance(item, dict) or not item.get("pattern") or not item.get("reason"):
             errors.append(f"{EXCLUSIONS_PATH}[{i}] needs {{pattern, reason}}")
@@ -735,20 +764,28 @@ def glob_escape_path(path: str) -> str:
     return re.sub(r"([*?\[])", r"[\1]", path)
 
 
-def append_exclusions(workdir: str, entries: list[dict]) -> list[dict]:
+def append_exclusions(workdir: str, entries: list[dict]) -> tuple[list[dict], str | None]:
     """Append machine-written exclusion rows, de-duplicated by pattern. Returns
-    the rows actually added. An unreadable or malformed EXCLUSIONS.json is left
-    UNTOUCHED (returns []) — the lint already surfaces it, and appending to a
-    file we cannot parse risks destroying model-authored rows."""
+    (rows actually added, error). A trailing-comma slip is repaired in place
+    (model-authored rows preserved verbatim, file rewritten canonical) — the
+    model hand-edits this ledger across hundreds of batches, so that typo WILL
+    recur. Anything less mechanical leaves the file untouched and reports an
+    explicit error: appending to a file we cannot parse risks destroying
+    model-authored rows, and a silent no-op here once left batch sources
+    neither cited nor excluded."""
     path = Path(workdir) / EXCLUSIONS_PATH
     data: list = []
     if path.is_file():
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return []
-        if not isinstance(data, list):
-            return []
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            return [], f"{EXCLUSIONS_PATH} unreadable: {e}"
+        parsed, _ = _parse_exclusions_tolerant(raw)
+        if parsed is None:
+            return [], f"{EXCLUSIONS_PATH} is corrupted beyond the mechanical trailing-comma repair; machine exclusions were NOT written"
+        if not isinstance(parsed, list):
+            return [], f"{EXCLUSIONS_PATH} must be a JSON array; machine exclusions were NOT written"
+        data = parsed
     have = {str(item.get("pattern")) for item in data if isinstance(item, dict)}
     added: list[dict] = []
     for e in entries:
@@ -759,13 +796,14 @@ def append_exclusions(workdir: str, entries: list[dict]) -> list[dict]:
         have.add(pattern)  # de-duplicate within this call, not just vs the file
         added.append({"pattern": pattern, "reason": reason})
     if not added:
-        return []
+        return [], None
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Canonical rewrite: also heals a tolerated trailing-comma slip on disk.
     path.write_text(
         json.dumps(data + added, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    return added
+    return added, None
 
 
 def _body_source_payload_spans(text: str) -> list[tuple[int, int, str]]:
