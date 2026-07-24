@@ -303,7 +303,14 @@ def _print_compile_lifecycle(label: str, run: "CompileRun", extra: str = "") -> 
     answer "what is the box doing" during a long batched compile. The 07-24
     incident had ZERO stdout for 40+ minutes; the test-session path already prints
     its own lifecycle (see _print_test_lifecycle), this is the compile analogue.
-    Same [compile_box] prefix style."""
+    Same [compile_box] prefix style.
+
+    `extra` CONTRACT: whitelisted machine tokens only — exception class names,
+    batch id/index, and machine error CODES (see _batch_error_code). Never an
+    exception MESSAGE or any free text: a batch failure message can carry raw
+    source paths or provider response fragments, and pod stdout is
+    operator-visible. The full message belongs on the OWNER-facing SSE events
+    (run.emit error/summary), which the owner owns."""
     tail = f" {extra}" if extra else ""
     print(f"[compile_box] {label} run={run.run_id} round={run.round}{tail}", flush=True)
 
@@ -391,6 +398,25 @@ class ModelResultError(Exception):
 
 class BatchOutputError(Exception):
     """A successful internal session did not account for its assigned sources."""
+
+
+def _batch_error_code(exc: BaseException) -> str:
+    """A machine-routable code for a batch failure — the whitelist token that may
+    reach pod stdout. NEVER embed the exception MESSAGE in a log line: a
+    BatchOutputError / slice-view error can carry raw source paths, and a model
+    result error can carry provider response fragments; pod logs are
+    operator-visible, and the owner's KB content is theirs alone (it flows to the
+    OWNER-facing SSE events instead). The class name + this code route the fault
+    without leaking any of that."""
+    if isinstance(exc, ModelStallError):
+        return "model_stall"
+    if isinstance(exc, ModelResultError):
+        return "model_result_error"
+    if isinstance(exc, BatchOutputError):
+        return "provider_fault" if getattr(exc, "provider_fault", False) else "content_shape"
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled"
+    return "other"
 
 
 class CompileRun:
@@ -2930,8 +2956,9 @@ def _auto_exclude_batch_sources(run: "CompileRun", sources: list[str], reason: s
     if err:
         # A refused write must be LOUD: a silent no-op here leaves sources
         # neither cited nor excluded and only the end-of-train ledger repair
-        # would ever notice.
-        _print_compile_lifecycle("exclusions.write_failed", run, extra=err)
+        # would ever notice. stdout gets a whitelisted code only; the err text
+        # (may name the ledger path / parse offset) rides the owner SSE below.
+        _print_compile_lifecycle("exclusions.write_failed", run, extra="code=exclusion_write_refused")
         asyncio.get_running_loop().create_task(run.emit({"type": "summary", "text": _loc(
             run,
             f"Machine exclusions could not be written: {err}",
@@ -2947,6 +2974,25 @@ def _unaccounted_batch_sources(run: "CompileRun", sources: list[str]) -> list[st
         set(sources)
         & set(selfcheck.coverage(run.workdir, pages, exclusions)["unaccounted"])
     )
+
+
+def _assert_exclusions_landed(run: "CompileRun", batch: dict) -> None:
+    """Confirm a machine auto-exclude actually accounted the batch's sources.
+
+    With the machine-owned ledger a refused write is nearly impossible — but
+    "nearly" is not a contract. If any assigned source is STILL unaccounted after
+    the auto-exclude, the exclusion write was refused: EXCLUSIONS.json is
+    corrupted beyond the mechanical trailing-comma repair. That is a
+    protect-INTEGRITY case, not a content-shape gate: do NOT stamp the batch done.
+    Raise a plain exception (the charset-guard class of legitimate hard stop) so
+    the train interrupts RESUMABLY with a message that names the ledger — a human
+    fixes authoring/EXCLUSIONS.json and the next trigger resumes the pending
+    batch. The count (never the paths) keeps the message operator-safe."""
+    leftover = _unaccounted_batch_sources(run, batch.get("sources") or [])
+    if leftover:
+        raise RuntimeError(
+            "exclusion ledger is corrupted; fix authoring/EXCLUSIONS.json "
+            f"({len(leftover)} source(s) could be neither cited nor excluded)")
 
 
 async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
@@ -3050,7 +3096,13 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
         # hand-written rows survive; mechanical slips are absorbed).
         norm_err = selfcheck.normalize_exclusions_file(run.workdir)
         if norm_err:
-            _print_compile_lifecycle("exclusions.normalize_failed", run, extra=norm_err)
+            # stdout stays whitelisted (the err text can name the ledger path);
+            # the owner gets the full detail on their SSE stream.
+            _print_compile_lifecycle("exclusions.normalize_failed", run, extra="code=ledger_normalize_failed")
+            await run.emit({"type": "summary", "text": _loc(
+                run,
+                f"Exclusion ledger could not be normalized: {norm_err}",
+                f"豁免清单无法规范化:{norm_err}")})
 
 
 def _drain_batch_notes(run: "CompileRun") -> str:
@@ -3525,7 +3577,10 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     f"auto-excluded: batch {bad_id} was skipped (slice view failed: {why})",
                 )
                 batching.stamp_done(plan, bad.get("id"))
-                _print_compile_lifecycle("batch.skipped", run, extra=f"id={bad_id} reason={why}")
+                # `why` names the source path the slice view could not build →
+                # whitelisted code only on stdout (owner gets the detail in the
+                # summary emit below and the machine exclusion reason).
+                _print_compile_lifecycle("batch.skipped", run, extra=f"id={bad_id} code=slice_view_failed")
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
             await run.emit({"type": "summary", "text": _loc(run,
                 f"{len(slice_failures)} batch(es) had unusable read-bounded views and were skipped; "
@@ -3602,13 +3657,21 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         replies.append(_loc(run, f"[Batch {k} fix] {fix_reply}", f"【批 {k} 补账】{fix_reply}"))
                     still_unaccounted = _unaccounted_batch_sources(run, batch.get("sources") or [])
                 if still_unaccounted:
-                    if unaccounted_before and set(still_unaccounted) == set(unaccounted_before):
-                        # ZERO accounting progress across the batch turn AND the
-                        # corrective pass. That is the empty/authentication-error
-                        # provider-result shape (the GPU-corpus incident), not
-                        # stubborn content — auto-excluding a whole batch over a
-                        # provider blip would silently drop good sources. Keep the
-                        # batch pending and interrupt resumably.
+                    zero_progress = bool(
+                        unaccounted_before
+                        and set(still_unaccounted) == set(unaccounted_before))
+                    if zero_progress and int(batch.get("accounting_stalls") or 0) < 1:
+                        # FIRST zero-progress run for this batch. Zero progress
+                        # across the batch turn AND the corrective pass is the
+                        # empty/authentication-error provider-result shape (the
+                        # GPU-corpus incident), not stubborn content — auto-
+                        # excluding a whole batch over a provider blip would
+                        # silently drop good sources. Persist a per-batch counter
+                        # so a SECOND independent run can tell a transient provider
+                        # blip from a model that simply never accounts, then keep
+                        # the batch pending and interrupt resumably.
+                        batch["accounting_stalls"] = int(batch.get("accounting_stalls") or 0) + 1
+                        _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
                         stalled = BatchOutputError(
                             f"batch {batch['id']} made no accounting progress over "
                             f"{len(still_unaccounted)} assigned source(s) — treating as a "
@@ -3616,15 +3679,24 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         )
                         stalled.provider_fault = True
                         raise stalled
-                    # Content shape must never wedge the train (2026-07-24 mandate:
-                    # humans may pile ANYTHING into a wiki). The batch made real
-                    # progress and only stragglers remain — the ledger stays honest
-                    # instead: auto-exclude with a machine reason a human can read,
-                    # revisit and lift.
-                    _auto_exclude_batch_sources(
-                        run, still_unaccounted,
-                        f"auto-excluded: batch {batch['id']} could not account for this source after a corrective pass",
+                    # Either the batch made real progress and only stragglers
+                    # remain, OR a SECOND independent run again made zero progress
+                    # (counter already ≥1). A healthy model that simply never
+                    # writes compiled_from would otherwise loop provider-fault →
+                    # resume → provider-fault until the sicore breaker suspends it
+                    # for a human. Two independent runs of zero progress is content
+                    # the train cannot digest: account it. Content shape must never
+                    # wedge the train (2026-07-24 mandate) — auto-exclude with a
+                    # machine reason a human can read, revisit and lift.
+                    reason = (
+                        f"auto-excluded: batch {batch['id']} made no accounting progress across two independent runs"
+                        if zero_progress
+                        else f"auto-excluded: batch {batch['id']} could not account for this source after a corrective pass"
                     )
+                    _auto_exclude_batch_sources(run, still_unaccounted, reason)
+                    # Protect integrity: if the write was REFUSED the source is
+                    # still unaccounted — do not stamp done over a corrupted ledger.
+                    _assert_exclusions_landed(run, batch)
                     await run.emit({"type": "summary", "text": _loc(run,
                         f"Batch {k}/{n}: {len(still_unaccounted)} source(s) could not be accounted and were "
                         f"auto-excluded with a reason (see the exclusion ledger); the train continues.",
@@ -3645,7 +3717,15 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     _unaccounted_batch_sources(run, batch.get("sources") or []),
                     f"auto-excluded: batch {batch['id']} was skipped ({e})",
                 )
-                _print_compile_lifecycle("batch.skipped", run, extra=f"batch={k}/{n} id={batch['id']} reason={e}")
+                # Protect integrity: a refused write leaves the source unaccounted
+                # → do not claim the batch skipped/stamp it done over a corrupted
+                # ledger; interrupt resumably instead (names the ledger for a human).
+                _assert_exclusions_landed(run, batch)
+                # stdout: class + code only. `e`'s message can carry raw source
+                # paths / provider fragments; it rides the owner SSE summary below.
+                _print_compile_lifecycle(
+                    "batch.skipped", run,
+                    extra=f"batch={k}/{n} id={batch['id']} class={type(e).__name__} code={_batch_error_code(e)}")
                 await run.emit({"type": "summary", "text": _loc(run,
                     f"Batch {k}/{n} could not complete ({e}); its unaccounted sources were auto-excluded "
                     f"with a reason and the train continues.",
@@ -3749,6 +3829,14 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     # must NOT fail the train (2026-07-24 mandate: a quality
                     # tail may degrade with a visible record, never wedge the
                     # whole compile into a deterministic interrupt loop).
+                    # Mark every still-pending page EXHAUSTED through the existing
+                    # per-page mechanism: it records the page's current fingerprint
+                    # as verified (so pending_media_verification stops reporting it)
+                    # AND flags it in media_verify.exhausted (fail-open must never
+                    # read as a clean pass). Without this, converge would settle
+                    # while these pages still report pending and _pk_due would
+                    # refuse to start — a contradictory settled-but-pending state.
+                    selfcheck.mark_media_verified(run.workdir, sorted(pending), exhausted=True)
                     await run.emit({"type": "summary", "text": _loc(run,
                         f"Self-check (images): verify/repair round cap ({round_limit}) reached — "
                         f"{len(pending)} page(s) keep image assertions that could not be verified; recorded, not blocking.",
@@ -3835,11 +3923,13 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
                         or _loc(run, "Batch compile complete.", "分批编译完成。")})
     except Exception as e:
-        # The message text is load-bearing for operators: the class name alone
-        # cost a full pod-log stakeout to diagnose a deterministic wedge.
+        # stdout stays whitelisted: exception class + a machine-routable code.
+        # The MESSAGE (which can carry raw source paths / provider response
+        # fragments) is load-bearing for operators, but it belongs on the
+        # owner-facing SSE error below, not in the operator-visible pod log.
         _print_compile_lifecycle(
             "batch.interrupted", run,
-            extra=f"reason={type(e).__name__}: {str(e)[:300]}")
+            extra=f"class={type(e).__name__} code={_batch_error_code(e)}")
         await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
         # never-block: the single logical turn must still CLOSE — a consumer
         # gating on turn_done would otherwise hang on an orchestrator error.

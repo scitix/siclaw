@@ -3644,13 +3644,17 @@ async def test_batch_unaccounted_gets_corrective_then_auto_excluded():
         # PARTIAL progress: before the turn both sources are unaccounted; the
         # turn lands good.md but stubborn.md resists the corrective pass too.
         # (Zero progress would instead be classified as a provider fault.)
+        # The stub is LEDGER-AWARE: once a source is auto-excluded it must read as
+        # accounted, so the post-exclude landed-check (F6) sees the write took.
         calls = {"n": 0}
 
         def fake_unaccounted(run_, sources):
             if not sources:
                 return []
+            excluded = {e["pattern"] for e in selfcheck.load_exclusions(str(wd))[0]}
             calls["n"] += 1
-            return ["good.md", "stubborn.md"] if calls["n"] == 1 else ["stubborn.md"]
+            base = ["good.md", "stubborn.md"] if calls["n"] == 1 else ["stubborn.md"]
+            return [s for s in base if s not in excluded]
 
         real_drive = compile_box._drive_batch_session
         real_accounted = compile_box._unaccounted_batch_sources
@@ -3739,6 +3743,286 @@ async def test_batch_content_fault_skips_batch_but_stall_interrupts():
     turn = next(e for e in events if e["type"] == "turn_done")
     assert "断点" in turn["text"] or "resume" in turn["text"], turn
     print("✓ batch failure classification: content skips one batch, infra interrupts resumably")
+
+
+async def test_batch_zero_progress_second_run_auto_excludes():
+    """Finding 2 (07-24 review): a healthy model that simply never writes
+    compiled_from would loop provider-fault → sicore auto-resume → provider-fault
+    until the breaker suspends it for a human. The FIRST zero-progress run stays a
+    provider blip (batch pending, no exclusion — a blip must not drop good
+    content); a SECOND independent zero-progress run for the SAME batch reclassifies
+    as content and auto-excludes, so the train converges without a human. A
+    per-batch accounting_stalls counter persisted in BATCH_PLAN.json separates the
+    two runs."""
+    import batching
+    import selfcheck
+
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media = compile_box._media_verify_enabled
+    real_pk = compile_box._maybe_start_pk
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 400)
+        (wd / "raw" / "a" / "two.md").write_bytes(b"y" * 400)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"   # both sources in ONE batch
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            return f"done {label}"   # a valid session that never writes a candidate page → nothing accounts
+
+        async def noop_repairs(run_, replies):
+            return None
+
+        compile_box._drive_batch_session = fake_drive
+        compile_box._run_ledger_repairs = noop_repairs
+        compile_box._media_verify_enabled = lambda: False
+        compile_box._maybe_start_pk = lambda run_: False
+        try:
+            # RUN 1: zero progress across turn + corrective → provider fault. The
+            # batch stays PENDING, no content is excluded, the counter is persisted.
+            run1 = compile_box.CompileRun("zp1", str(wd), 1)
+            await compile_box._run_batch_compile(run1, "直接开始编译")
+            plan1 = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert all(b["status"] != "done" for b in plan1["batches"]), plan1
+            assert any(int(b.get("accounting_stalls") or 0) >= 1 for b in plan1["batches"]), plan1
+            assert selfcheck.load_exclusions(str(wd))[0] == [], "a provider blip must not exclude content"
+            evs1 = _drain(run1)
+            assert [e for e in evs1 if e["type"] == "error"], evs1
+
+            # RUN 2 (the auto-resume): STILL zero progress, but the counter is now
+            # ≥1 → reclassify as content, auto-exclude the stragglers, complete.
+            run2 = compile_box.CompileRun("zp1", str(wd), 1)
+            await compile_box._run_batch_compile(run2, "直接开始编译")
+            plan2 = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert all(b["status"] == "done" for b in plan2["batches"]), plan2
+            reasons = [e["reason"] for e in selfcheck.load_exclusions(str(wd))[0]]
+            assert reasons and all("no accounting progress across two independent runs" in r for r in reasons), reasons
+            evs2 = _drain(run2)
+            assert not [e for e in evs2 if e["type"] == "error"], evs2
+            assert [e for e in evs2 if e["type"] == "turn_done"], evs2
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._run_ledger_repairs = real_repairs
+            compile_box._media_verify_enabled = real_media
+            compile_box._maybe_start_pk = real_pk
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+    print("✓ batch zero-progress: 1st run provider-fault (pending, no exclusion), 2nd run auto-excludes and completes")
+
+
+async def test_batch_media_round_cap_marks_pending_exhausted():
+    """Finding 3 (07-24 review): when the image verify/repair loop hits its round
+    cap with pages still pending, it must mark those pages EXHAUSTED through the
+    per-page mechanism — recording their current fingerprint (so
+    pending_media_verification stops reporting them) and flagging them visibly.
+    Before, the cap just broke: the plan went complete and converge settled while
+    pending_media_verification still named pages, and _pk_due refused to start — a
+    contradictory settled-but-pending state."""
+    import batching
+    import selfcheck
+
+    real_drive = compile_box._drive_batch_session
+    real_repairs = compile_box._run_ledger_repairs
+    real_media_enabled = compile_box._media_verify_enabled
+    real_blind_verify = compile_box.mediaverify.run_blind_verify
+    real_engine = compile_box.selected_readonly_engine
+    real_pk = compile_box._maybe_start_pk
+    previous = {k: os.environ.get(k) for k in
+                ("KBC_MEDIA_VERIFY_ROUNDS", "KBC_MEDIA_VERIFY_ATTEMPTS")}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            (wd / "raw").mkdir()
+            (wd / "raw" / "chart.png").write_bytes(b"image-bytes")
+            (wd / "candidate").mkdir()
+            (wd / "candidate" / "page.md").write_text(
+                "---\ntype: Topic\ntitle: Page\ncompiled_from:\n"
+                "  - chart.png\n---\nasserts a number (source: chart.png)\n")
+            (wd / "authoring").mkdir()
+            plan = {
+                "version": 1, "planner": "code", "mode": "flat", "phase": "final",
+                "batches": [{"id": "b01", "sources": ["chart.png"], "bytes": 11, "status": "done"}],
+            }
+            (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
+            run = compile_box.CompileRun("mediacap", str(wd), 1)
+
+            # Round cap = 1 (flat), attempts high so a page can NEVER exhaust via
+            # the attempt budget in one round — the only route to exhausted here is
+            # the round-cap fix under test.
+            os.environ["KBC_MEDIA_VERIFY_ROUNDS"] = "1"
+            os.environ["KBC_MEDIA_VERIFY_ATTEMPTS"] = "5"
+
+            verify_calls = {"n": 0}
+
+            async def never_verifies(engine, workdir, pending, progress=None, locale=None):
+                verify_calls["n"] += 1
+                return {"findings": [], "errors": [], "images": 1,
+                        "completed_pages": [], "failed_pages": ["page.md"]}
+
+            async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+                return f"done {label}"
+
+            async def noop_repairs(run_, replies):
+                return None
+
+            compile_box._drive_batch_session = fake_drive
+            compile_box._run_ledger_repairs = noop_repairs
+            compile_box._media_verify_enabled = lambda: True
+            compile_box.mediaverify.run_blind_verify = never_verifies
+            compile_box.selected_readonly_engine = lambda: object()
+            compile_box._maybe_start_pk = lambda run_: False
+
+            # Sanity: the page really is pending before the train runs.
+            assert "page.md" in selfcheck.pending_media_verification(str(wd))
+            await compile_box._run_batch_compile(run, "直接开始编译")
+
+            assert verify_calls["n"] == 1, verify_calls          # exactly one real round before the cap
+            # HONEST settle: nothing pending, but the page is VISIBLY exhausted.
+            assert selfcheck.pending_media_verification(str(wd)) == {}, "cap must clear pending"
+            report = selfcheck.read_selfcheck(str(wd))
+            assert "page.md" in (report["media_verify"].get("exhausted") or []), report
+            assert report["media_verify"]["summary"]["pending_pages"] == 0, report
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert saved["phase"] == "complete", saved
+            evs = _drain(run)
+            assert not [e for e in evs if e["type"] == "error"], evs
+            assert [e for e in evs if e["type"] == "turn_done"], evs
+    finally:
+        compile_box._drive_batch_session = real_drive
+        compile_box._run_ledger_repairs = real_repairs
+        compile_box._media_verify_enabled = real_media_enabled
+        compile_box.mediaverify.run_blind_verify = real_blind_verify
+        compile_box.selected_readonly_engine = real_engine
+        compile_box._maybe_start_pk = real_pk
+        for k, v in previous.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("✓ batch media round cap: remaining pending pages marked exhausted → settles honestly, PK unblocked")
+
+
+async def test_batch_lifecycle_logs_never_leak_content_to_stdout():
+    """Finding 4 (07-24 review): batch.skipped / batch.interrupted lifecycle lines
+    are pod stdout (operator-visible). A batch failure MESSAGE can carry raw source
+    paths or provider fragments, so stdout gets a WHITELIST only (class name +
+    batch id/index + machine code); the full message keeps flowing to the
+    OWNER-facing SSE events. Assert the source path never reaches stdout on either
+    a skip or an interrupt path, while the SSE event does carry it."""
+    import batching
+
+    secret = "secret/private-leak-path.md"
+
+    async def run_train_capturing(raiser):
+        td = tempfile.mkdtemp()
+        wd = Path(td)
+        (wd / "raw" / "a").mkdir(parents=True)
+        (wd / "raw" / "b").mkdir(parents=True)
+        (wd / "raw" / "a" / "one.md").write_bytes(b"x" * 300)
+        (wd / "raw" / "b" / "two.md").write_bytes(b"y" * 300)
+        run = compile_box.CompileRun("leak1", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "400"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            if label.startswith(("batch 1/", "批 1/")):
+                raise raiser
+            return f"done {label}"
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+        return buf.getvalue(), _drain(run)
+
+    # Skip path (content/output-shape fault): the exception message names a source.
+    out, events = await run_train_capturing(
+        compile_box.BatchOutputError(f"batch produced an unusable page from raw/{secret}"))
+    assert "batch.skipped" in out, out                    # the lifecycle line is still emitted…
+    assert "code=content_shape" in out, out               # …with a routable machine code…
+    assert secret not in out, out                         # …but never the source path.
+    assert any(secret in e.get("text", "") for e in events if e["type"] == "summary"), events
+
+    # Interrupt path (unclassified fault): the exception message names a source.
+    out, events = await run_train_capturing(RuntimeError(f"boom reading raw/{secret}"))
+    assert "batch.interrupted" in out, out
+    assert "class=RuntimeError" in out, out
+    assert secret not in out, out
+    assert any(secret in e.get("error", "") for e in events if e["type"] == "error"), events
+    print("✓ batch lifecycle logs: stdout whitelisted (class/id/code); full message only on owner SSE")
+
+
+async def test_batch_auto_exclude_refused_interrupts_resumably():
+    """Finding 6 (07-24 review): after an auto-exclude the code must confirm the
+    rows actually landed. If the ledger is corrupted beyond mechanical repair the
+    write is refused and the source is STILL unaccounted — stamping the batch done
+    would silently drop it. That is a protect-integrity hard stop (the charset-guard
+    class), not a content-shape gate: the train interrupts RESUMABLY (batch stays
+    pending) with a message that names authoring/EXCLUSIONS.json."""
+    import batching
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        raw = wd / "raw"
+        raw.mkdir(parents=True)
+        (raw / "good.md").write_bytes(b"g" * 400)
+        (raw / "stubborn.md").write_bytes(b"z" * 400)
+        # Corrupt the ledger beyond the mechanical trailing-comma repair.
+        (wd / "authoring").mkdir()
+        (wd / selfcheck.EXCLUSIONS_PATH).write_text("{nope", encoding="utf-8")
+        run = compile_box.CompileRun("led-corrupt", str(wd), 1)
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100"
+        os.environ["KBC_BATCH_BUDGET_BYTES"] = "100000"
+        os.environ["KBC_BATCH_PLANNER"] = "code"
+
+        async def fake_drive(run_, directive, label, pdf_page_ranges=None, raw_read_allowlist=None):
+            return f"done {label}"
+
+        # PARTIAL progress so the GATE (auto-exclude) path runs, not the
+        # zero-progress provider-fault branch: before → both unaccounted, after →
+        # only stubborn.md. The corrupt ledger then refuses the exclusion, so
+        # stubborn.md stays unaccounted and the landed-check must fire.
+        calls = {"n": 0}
+
+        def fake_unaccounted(run_, sources):
+            if not sources:
+                return []
+            calls["n"] += 1
+            return ["good.md", "stubborn.md"] if calls["n"] == 1 else ["stubborn.md"]
+
+        real_drive = compile_box._drive_batch_session
+        real_accounted = compile_box._unaccounted_batch_sources
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = fake_unaccounted
+        try:
+            await compile_box._run_batch_compile(run, "直接开始编译")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+            del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
+            del os.environ["KBC_BATCH_BUDGET_BYTES"]
+
+        plan = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        assert all(b["status"] != "done" for b in plan["batches"]), plan   # NOT stamped over corruption
+        events = _drain(run)
+        errors = [e for e in events if e["type"] == "error"]
+        assert errors and any("EXCLUSIONS.json" in e["error"] for e in errors), errors
+        assert (wd / selfcheck.EXCLUSIONS_PATH).read_text(encoding="utf-8") == "{nope"  # left for a human
+    print("✓ batch auto-exclude landed-check: a corrupted ledger interrupts resumably, batch not stamped done")
 
 
 def test_small_kb_batch_gate_skips_poppler_metadata():
@@ -5474,6 +5758,10 @@ async def main():
     await test_batch_orphan_assets_pre_excluded_and_pruned()
     await test_batch_unaccounted_gets_corrective_then_auto_excluded()
     await test_batch_content_fault_skips_batch_but_stall_interrupts()
+    await test_batch_zero_progress_second_run_auto_excludes()
+    await test_batch_media_round_cap_marks_pending_exhausted()
+    await test_batch_lifecycle_logs_never_leak_content_to_stdout()
+    await test_batch_auto_exclude_refused_interrupts_resumably()
     test_small_kb_batch_gate_skips_poppler_metadata()
     test_hierarchical_text_slice_materialization_and_directive()
     test_hierarchical_resume_state_contract()
