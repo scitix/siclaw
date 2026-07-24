@@ -745,7 +745,13 @@ def orphan_media_assets(workdir: str, sources: list[str] | None = None) -> list[
     other sync residue with no text home. Coverage v2 deliberately refuses to
     auto-attach them (a human must still see them), so without an exclusion row
     they stay unaccounted forever; the batch train pre-excludes them with a
-    machine reason instead of demanding the model account for a bare image."""
+    machine reason instead of demanding the model account for a bare image.
+
+    An asset a candidate page cites DIRECTLY in its compiled_from is NOT an
+    orphan: coverage v1 compatibility counts a directly-cited asset as accounted
+    (see coverage()), so pre-excluding and pruning it at plan time would drop a
+    source the ledger already accepts. Subtract both the document-embed edges and
+    every asset a current candidate page cites."""
     sources = source_inventory(workdir) if sources is None else sources
     media = {s for s in sources if is_media_asset(s)}
     if not media:
@@ -753,7 +759,10 @@ def orphan_media_assets(workdir: str, sources: list[str] | None = None) -> list[
     embedded: set[str] = set()
     for targets in asset_attribution_edges(workdir, sources).values():
         embedded.update(targets)
-    return sorted(media - embedded)
+    cited: set[str] = set()
+    for page in candidate_pages(workdir).values():
+        cited.update(page.get("sources") or [])
+    return sorted(media - embedded - cited)
 
 
 def glob_escape_path(path: str) -> str:

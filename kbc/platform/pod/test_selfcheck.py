@@ -1548,6 +1548,34 @@ def test_orphan_assets_and_machine_exclusions():
     print("OK  orphan assets + machine exclusions (detect / escape / dedupe / malformed untouched)")
 
 
+def test_orphan_skips_directly_cited_asset():
+    """Coverage v1 compatibility: a candidate page may cite a standalone media
+    asset DIRECTLY in its compiled_from with NO document embedding it. coverage()
+    counts a directly-cited asset as accounted, so orphan_media_assets must NOT
+    report it — otherwise the batch train pre-excludes and prunes a source the
+    ledger already accepts. The same asset with no citation IS a true orphan."""
+    import selfcheck
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        (wd / "raw" / "assets").mkdir(parents=True)
+        (wd / "raw" / "assets" / "chart.png").write_bytes(b"png")  # no document embeds it
+        (wd / "candidate").mkdir()
+        page = wd / "candidate" / "page.md"
+
+        # Cited directly by a candidate page → accounted, not an orphan.
+        page.write_text(
+            "---\ntype: Topic\ncompiled_from:\n  - assets/chart.png\n---\nbody\n",
+            encoding="utf-8")
+        assert selfcheck.orphan_media_assets(td) == [], selfcheck.orphan_media_assets(td)
+
+        # Drop the citation → the SAME asset is now a true orphan.
+        page.write_text(
+            "---\ntype: Topic\ncompiled_from:\n  - other.md\n---\nbody\n",
+            encoding="utf-8")
+        assert selfcheck.orphan_media_assets(td) == ["assets/chart.png"], selfcheck.orphan_media_assets(td)
+    print("OK  orphan assets: a directly-cited standalone asset is accounted, not orphaned")
+
+
 def test_converge_phase_helper():
     """set_converge_phase: writes the durable authoritative signal (verifying/
     revising/settled), preserves the L1 coverage section, ignores junk phases."""
@@ -1854,6 +1882,7 @@ def main():
     asyncio.run(test_pk_wiring())
     asyncio.run(test_seam_settles_when_nothing_pending())
     test_orphan_assets_and_machine_exclusions()
+    test_orphan_skips_directly_cited_asset()
     test_converge_phase_helper()
     print("ALL OK  test_selfcheck")
 
