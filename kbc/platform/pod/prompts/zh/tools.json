@@ -24,5 +24,23 @@
     "not_found": "没找到工单 {tid};现有 id: {ids}",
     "write_failed": "写 CONTRADICTIONS.json 失败: {e}",
     "registered": "工单 {tid} 已登记回修(agent_report 已写入)"
+  },
+  "exclude_source": {
+    "desc": "声明某个 raw 源【不编入】知识库,或【更正】一条你已登记的豁免。传 `path`(相对 raw/ 的精确文件路径,不接受 glob)和 `reason`(一句让负责人看得懂的理由,用知识库自己的语言)。系统会校验路径确实在源清单里、以规范格式写入豁免账本并去重。同一个 path 换一条新理由再调一次,即更新该行;理由完全相同则是空操作。要撤销一条豁免用 remove_exclusion。维护 authoring/EXCLUSIONS.json 的常规方式就是这两个工具;仅当工具无法表达该修改时,才允许手工编辑该文件作为兜底——无论哪种,系统都会在每轮结束后重新规范化该账本。",
+    "need_args": "exclude_source 需要同时给 `path` 和 `reason`。",
+    "not_in_inventory": "不是清单在册的 raw 源:{path}{hint}",
+    "hint_close": " —— 你是不是想说:{close}?",
+    "already": "早已豁免且理由相同(无需重复):{path}",
+    "updated": "豁免理由已更新:{path}",
+    "failed": "豁免写入失败:{e}",
+    "done": "已豁免并记录理由:{path}"
+  },
+  "remove_exclusion": {
+    "desc": "撤销一条豁免——当某个源是被误排除、其实该编,或者有一条错误的豁免行要清掉时用它。传 `path`:相对 raw/ 的精确源路径;若要删的是历史遗留的手写行,就原样传那行的 pattern 字符串(例如 `logs/**`)。匹配按 pattern 精确相等,绝不按【这个 pattern 能匹配到谁】来删,不会顺带带走邻近的行;返回实际删除了几行。若只是想改豁免【理由】,请改调 exclude_source 传新理由。",
+    "need_args": "remove_exclusion 需要给 `path`。",
+    "not_found": "账本里没有匹配的豁免行:{path}{hint}",
+    "hint_close": " —— 你是不是想说:{close}?",
+    "failed": "豁免删除失败:{e}",
+    "done": "豁免已撤销(删除 {count} 行):{path}"
   }
 }

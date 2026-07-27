@@ -24,5 +24,23 @@
     "not_found": "ticket {tid} not found; existing ids: {ids}",
     "write_failed": "failed to write CONTRADICTIONS.json: {e}",
     "registered": "ticket {tid} registered as patched (agent_report written)"
+  },
+  "exclude_source": {
+    "desc": "Declare that one raw source will NOT be compiled, or CORRECT an exclusion you already recorded. Pass `path` (relative to raw/, exact file path — no globs) and `reason` (one line the owner can understand, in the KB's language). The system validates the path against the source inventory, writes the exclusion ledger entry canonically, and de-duplicates. Calling it again for the same path with a different reason updates that row; with the same reason it is a no-op. Use remove_exclusion to lift an exclusion. These tools are the normal way to maintain authoring/EXCLUSIONS.json; editing that file by hand is permitted only as a last resort when no tool can express the fix, and the system re-canonicalizes the ledger after every turn either way.",
+    "need_args": "exclude_source needs both `path` and `reason`.",
+    "not_in_inventory": "not a raw source on record: {path}{hint}",
+    "hint_close": " — did you mean: {close}?",
+    "already": "already excluded with that same reason (nothing to do): {path}",
+    "updated": "exclusion reason updated: {path}",
+    "failed": "exclusion could not be written: {e}",
+    "done": "excluded with reason on record: {path}"
+  },
+  "remove_exclusion": {
+    "desc": "Lift an exclusion — use it when a source was excluded by mistake and should be compiled after all, or when a wrong row has to go. Pass `path`: the exact raw-relative source path, or, for a legacy hand-written row, that row's pattern string verbatim (for example `logs/**`). Matching is by exact pattern, never by what the pattern would match, so neighbouring rows are never taken out with it; it reports how many rows were removed. To only change an exclusion's REASON, call exclude_source again with the new reason instead.",
+    "need_args": "remove_exclusion needs `path`.",
+    "not_found": "no exclusion row matches: {path}{hint}",
+    "hint_close": " — did you mean: {close}?",
+    "failed": "exclusion could not be removed: {e}",
+    "done": "exclusion lifted ({count} row(s) removed): {path}"
   }
 }
