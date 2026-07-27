@@ -401,10 +401,10 @@ export function Models() {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium mb-1">Provider Name</label>
-              <input placeholder="e.g. openai" value={providerForm.name} onChange={(e) => setProviderForm({ ...providerForm, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+              <input autoComplete="off" placeholder="e.g. openai" value={providerForm.name} onChange={(e) => setProviderForm({ ...providerForm, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1">API Type</label>
+              <label className="block text-sm font-medium mb-1">Default API Type <span className="font-normal text-muted-foreground">— individual models can override this</span></label>
               <select value={providerForm.api_type} onChange={(e) => setProviderForm({ ...providerForm, api_type: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background">
                 <option value="openai-completions">OpenAI Compatible</option>
                 <option value="anthropic-messages">Anthropic</option>
@@ -413,12 +413,12 @@ export function Models() {
           </div>
           <div>
             <label className="block text-sm font-medium mb-1">Base URL</label>
-            <input placeholder="e.g. https://api.openai.com/v1" value={providerForm.base_url} onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background font-mono" />
+            <input autoComplete="off" placeholder="e.g. https://api.openai.com/v1" value={providerForm.base_url} onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background font-mono" />
             <p className="text-xs text-muted-foreground mt-1">The API endpoint URL. Must support OpenAI-compatible or Anthropic chat completions.</p>
           </div>
           <div>
             <label className="block text-sm font-medium mb-1">API Key</label>
-            <input type="password" placeholder="Bearer token for authentication" value={providerForm.api_key} onChange={(e) => setProviderForm({ ...providerForm, api_key: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            <input type="password" autoComplete="new-password" placeholder="Bearer token for authentication" value={providerForm.api_key} onChange={(e) => setProviderForm({ ...providerForm, api_key: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
           </div>
           <div className="flex gap-2">
             <button onClick={handleCreateProvider} disabled={creating || !providerForm.name || !providerForm.base_url} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "..." : "Create"}</button>
@@ -463,14 +463,14 @@ export function Models() {
                       <div className="p-3 mb-3 rounded-md border border-border bg-card space-y-2">
                         <p className="text-xs font-medium text-muted-foreground">Edit Provider</p>
                         <div className="grid grid-cols-2 gap-2">
-                          <input placeholder="Name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
+                          <input autoComplete="off" placeholder="Name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
                           <select value={editForm.api_type} onChange={(e) => setEditForm({ ...editForm, api_type: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background">
                             <option value="openai-completions">OpenAI Compatible</option>
                             <option value="anthropic-messages">Anthropic</option>
                           </select>
                         </div>
-                        <input placeholder="Base URL" value={editForm.base_url} onChange={(e) => setEditForm({ ...editForm, base_url: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" />
-                        <input type="password" placeholder="API Key (leave empty to keep current)" value={editForm.api_key} onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" />
+                        <input autoComplete="off" placeholder="Base URL" value={editForm.base_url} onChange={(e) => setEditForm({ ...editForm, base_url: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" />
+                        <input type="password" autoComplete="new-password" placeholder="API Key (leave empty to keep current)" value={editForm.api_key} onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" />
                         <div className="flex gap-2">
                           <button onClick={handleSaveEdit} disabled={saving || !editForm.name || !editForm.base_url} className="h-7 px-3 text-xs rounded-md bg-primary text-primary-foreground disabled:opacity-50">{saving ? "..." : "Save"}</button>
                           <button onClick={() => setEditingId(null)} className="h-7 px-3 text-xs rounded-md border border-border text-muted-foreground">Cancel</button>
