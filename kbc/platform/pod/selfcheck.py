@@ -112,6 +112,17 @@ def is_media_asset(rel: str) -> bool:
     # Segment match is case-INSENSITIVE, matching the sicore ledger mirror (an
     # `Assets/` dir counts too); the platform always writes lowercase `assets/`,
     # so this only matters for hand-authored trees, but the two repos must agree.
+    return has_assets_segment(rel)
+
+
+def has_assets_segment(rel: str) -> bool:
+    """True when some path SEGMENT is an export attachment directory — `assets`
+    (what the platform writes today) or the legacy `<name>.assets` form.
+
+    Extension-agnostic on purpose: `is_media_asset` narrows to images for the
+    COVERAGE question ('may this be auto-attached?'), while batch planning asks
+    a different question ('does this file belong beside a document?') and must
+    also keep `assets/sheets/*.md` placeholders with the doc that embeds them."""
     return any(seg.lower() == "assets" or seg.lower().endswith(".assets")
                for seg in rel.split("/"))
 
@@ -229,20 +240,86 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
     return pages
 
 
+def _strip_trailing_commas(text: str) -> str:
+    """Drop STRUCTURAL trailing commas — a comma whose next non-whitespace
+    character is ``}`` or ``]`` AND that sits OUTSIDE any JSON string.
+
+    String-aware by construction (the old regex `,\\s*(?=[}\\]])` was not): a
+    comma inside a value like a pattern ``"a,].md"`` or a reason
+    ``"literal ,} marker"`` is preserved — only the structural slip a model
+    hand-editing the ledger keeps making is removed. Walks the text tracking
+    in-string / escape state; the closing-container lookahead reads the original
+    (unmodified) tail, so whitespace and brackets after the comma are exact."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+    n = len(text)
+    for i, ch in enumerate(text):
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                continue  # structural trailing comma → drop
+            out.append(ch)
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _parse_exclusions_tolerant(text: str):
+    """Strict JSON parse with ONE mechanical fallback: stripping structural
+    trailing commas (`},]` / `,}`), the exact slip a model hand-editing the
+    ledger keeps making. Returns (data, repaired) or (None, False) when even the
+    repaired text does not parse — anything beyond this one deterministic fix is a
+    real corruption a human/model must look at, not something to guess at."""
+    try:
+        return json.loads(text), False
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_strip_trailing_commas(text)), True
+    except json.JSONDecodeError:
+        return None, False
+
+
 def load_exclusions(workdir: str) -> tuple[list[dict], list[str]]:
     """Read authoring/EXCLUSIONS.json → (entries, errors). Missing file is fine
-    (no exclusions declared yet). Malformed content is an error the lint
-    surfaces — a broken exclusion list must not silently exclude nothing."""
+    (no exclusions declared yet). A trailing-comma slip is tolerated on READ so
+    one hand-edit typo cannot blank the whole ledger (2026-07-24 live incident:
+    every previously excluded source went "unaccounted" at once) — but it still
+    surfaces as an error so the lint/repair loop gets the file fixed on disk.
+    Anything less mechanical stays a hard parse error."""
     path = Path(workdir) / EXCLUSIONS_PATH
     if not path.is_file():
         return [], []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-        return [], [f"{EXCLUSIONS_PATH} unreadable/invalid JSON: {e}"]
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return [], [f"{EXCLUSIONS_PATH} unreadable: {e}"]
+    data, repaired = _parse_exclusions_tolerant(raw)
+    if data is None:
+        return [], [f"{EXCLUSIONS_PATH} unreadable/invalid JSON"]
+    errors_prefix = (
+        [f"{EXCLUSIONS_PATH} has a trailing-comma JSON slip (tolerated for accounting; please fix the file)"]
+        if repaired else []
+    )
     if not isinstance(data, list):
-        return [], [f"{EXCLUSIONS_PATH} must be a JSON array"]
-    entries, errors = [], []
+        return [], errors_prefix + [f"{EXCLUSIONS_PATH} must be a JSON array"]
+    entries, errors = [], list(errors_prefix)
     for i, item in enumerate(data):
         if not isinstance(item, dict) or not item.get("pattern") or not item.get("reason"):
             errors.append(f"{EXCLUSIONS_PATH}[{i}] needs {{pattern, reason}}")
@@ -675,6 +752,30 @@ def document_link_targets(md_text: str) -> list[str]:
     return targets
 
 
+# An Office source lands in raw/ TWICE: the original bytes, and the readable
+# `<name>.md` the compile box pre-renders beside it at install time. They are
+# one source in two forms, not two sources — but only media assets had an
+# attribution rule, so the rendering fell through to "must be cited or
+# excluded" while the prompt tells the compiler to cite the ORIGINAL. A real
+# run hit exactly that: the page cited `X.xlsx`, the ledger reported `X.xlsx.md`
+# unaccounted, and the session spent a whole extra round rewriting its
+# compiled_from to the derived path — obeying the ledger by disobeying the
+# prompt. Neither the check nor the prompt was wrong; the pair had no rule.
+OFFICE_RENDER_EXTS = (".pptx", ".xlsx", ".docx")
+
+
+def office_render_pairs(sources: list[str]) -> list[tuple[str, str]]:
+    """(original, rendered) for every Office source whose sibling render is
+    also in the inventory. Both directions matter downstream: whichever form a
+    page cites, the other is the same source and is accounted with it."""
+    present = set(sources)
+    pairs = []
+    for source in sources:
+        if source.lower().endswith(OFFICE_RENDER_EXTS) and source + ".md" in present:
+            pairs.append((source, source + ".md"))
+    return sorted(pairs)
+
+
 def asset_attribution_edges(
     workdir: str, sources: list[str] | None = None,
 ) -> dict[str, list[str]]:
@@ -709,6 +810,275 @@ def asset_attribution_edges(
         if hits:
             edges[doc] = sorted(hits)
     return edges
+
+
+def document_attachment_edges(
+    workdir: str, sources: list[str] | None = None,
+) -> dict[str, list[str]]:
+    """Map each raw ``.md`` document to EVERY attachment it embeds — images and
+    non-image attachment files alike (notably `assets/sheets/*.md` placeholders
+    holding an embedded spreadsheet's data).
+
+    This is the batch planner's document-family input. It deliberately differs
+    from ``asset_attribution_edges``:
+
+    - that one answers a COVERAGE question and is narrowed to images, because
+      auto-attaching a sheet placeholder would launder 'never compiled' into
+      'covered' (§4.1). Widening it would be a fail-open regression.
+    - this one answers a CO-LOCATION question — 'which files must be readable
+      in the same batch as this document?' Splitting a document from its
+      embedded spreadsheet costs real information (the batch that got the doc
+      cannot read the table; the batch that got the table has no context), so
+      here every embedded attachment counts.
+
+    Only targets that live under an `assets` segment are edges: a plain relative
+    link to a SIBLING DOCUMENT is cross-referencing, not attachment, and must not
+    drag unrelated documents into one family."""
+    sources = source_inventory(workdir) if sources is None else sources
+    attachments = {s for s in sources if has_assets_segment(s)}
+    raw = Path(workdir) / "raw"
+    edges: dict[str, list[str]] = {}
+    for doc in sources:
+        if not doc.lower().endswith(".md") or doc in attachments:
+            continue
+        try:
+            text = (raw / doc).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        base = posixpath.dirname(doc)
+        hits: set[str] = set()
+        for target in document_link_targets(text):
+            if target.startswith(("http://", "https://", "//", "/")):
+                continue
+            resolved = posixpath.normpath(posixpath.join(base, target))
+            if resolved in attachments:
+                hits.add(resolved)
+        if hits:
+            edges[doc] = sorted(hits)
+    return edges
+
+
+def orphan_media_assets(workdir: str, sources: list[str] | None = None) -> list[str]:
+    """Media assets embedded by NO raw document — standalone wiki file nodes and
+    other sync residue with no text home. Coverage v2 deliberately refuses to
+    auto-attach them (a human must still see them), so without an exclusion row
+    they stay unaccounted forever; the batch train pre-excludes them with a
+    machine reason instead of demanding the model account for a bare image.
+
+    An asset a candidate page cites DIRECTLY in its compiled_from is NOT an
+    orphan: coverage v1 compatibility counts a directly-cited asset as accounted
+    (see coverage()), so pre-excluding and pruning it at plan time would drop a
+    source the ledger already accepts. Subtract both the document-embed edges and
+    every asset a current candidate page cites."""
+    sources = source_inventory(workdir) if sources is None else sources
+    media = {s for s in sources if is_media_asset(s)}
+    if not media:
+        return []
+    embedded: set[str] = set()
+    for targets in asset_attribution_edges(workdir, sources).values():
+        embedded.update(targets)
+    cited: set[str] = set()
+    for page in candidate_pages(workdir).values():
+        cited.update(page.get("sources") or [])
+    return sorted(media - embedded - cited)
+
+
+def glob_escape_path(path: str) -> str:
+    """Escape a literal path for use as an exclusion pattern. Exclusion patterns
+    are segment-aware globs, and human titles legally contain `*`, `?`, `[` —
+    without escaping, a machine-written exact-path row could silently swallow
+    sibling files (the over-exclusion false-PASS)."""
+    return re.sub(r"([*?\[])", r"[\1]", path)
+
+
+def _valid_exclusion_row(item) -> bool:
+    """A row the ledger ACCOUNTS with: a dict carrying both a non-empty pattern
+    and a non-empty reason (same acceptance load_exclusions applies). An invalid
+    row (e.g. a legacy ``{"pattern": "a.md"}`` with no reason) is skipped by load
+    → its source stays unaccounted, so it must NOT shadow a real exclude_source
+    call for the same pattern."""
+    return bool(
+        isinstance(item, dict) and item.get("pattern") and item.get("reason"))
+
+
+def append_exclusions(workdir: str, entries: list[dict]) -> tuple[list[dict], str | None]:
+    """Append machine-written exclusion rows, de-duplicated by pattern. Returns
+    (rows actually added, error). A trailing-comma slip is repaired in place
+    (model-authored rows preserved verbatim, file rewritten canonical) — the
+    model hand-edits this ledger across hundreds of batches, so that typo WILL
+    recur. Anything less mechanical leaves the file untouched and reports an
+    explicit error: appending to a file we cannot parse risks destroying
+    model-authored rows, and a silent no-op here once left batch sources
+    neither cited nor excluded.
+
+    De-duplication is against VALID rows only: an invalid legacy row that load
+    skips (missing reason) must never make exclude_source(pattern, reason) a
+    no-op — that left the pattern unaccounted forever with no path to fix it via
+    the tool (the ONLY sanctioned write path). The append lands the valid row;
+    the post-turn normalizer then prunes the now-redundant invalid duplicate."""
+    path = Path(workdir) / EXCLUSIONS_PATH
+    data: list = []
+    if path.is_file():
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            return [], f"{EXCLUSIONS_PATH} unreadable: {e}"
+        parsed, _ = _parse_exclusions_tolerant(raw)
+        if parsed is None:
+            return [], f"{EXCLUSIONS_PATH} is corrupted beyond the mechanical trailing-comma repair; machine exclusions were NOT written"
+        if not isinstance(parsed, list):
+            return [], f"{EXCLUSIONS_PATH} must be a JSON array; machine exclusions were NOT written"
+        data = parsed
+    have = {str(item["pattern"]) for item in data if _valid_exclusion_row(item)}
+    added: list[dict] = []
+    for e in entries:
+        pattern = str(e.get("pattern") or "")
+        reason = str(e.get("reason") or "")
+        if not pattern or not reason or pattern in have:
+            continue
+        have.add(pattern)  # de-duplicate within this call, not just vs the file
+        added.append({"pattern": pattern, "reason": reason})
+    if not added:
+        return [], None
+    # Atomic (same-dir temp + os.replace): a kill mid-write must never truncate
+    # the whole ledger. Canonical rewrite also heals a tolerated comma slip.
+    _write_text_atomic(
+        path, json.dumps(data + added, ensure_ascii=False, indent=2) + "\n")
+    return added, None
+
+
+def _read_exclusions_for_write(workdir: str) -> tuple[list | None, str]:
+    """Shared read half of every tool-driven ledger mutation → (rows, error).
+    Same tolerant parse + same refuse-rather-than-clobber contract as
+    append_exclusions: a file we cannot parse is left untouched."""
+    path = Path(workdir) / EXCLUSIONS_PATH
+    if not path.is_file():
+        return [], ""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return None, f"{EXCLUSIONS_PATH} unreadable: {e}"
+    parsed, _ = _parse_exclusions_tolerant(raw)
+    if parsed is None:
+        return None, f"{EXCLUSIONS_PATH} is corrupted beyond the mechanical trailing-comma repair; the ledger was NOT changed"
+    if not isinstance(parsed, list):
+        return None, f"{EXCLUSIONS_PATH} must be a JSON array; the ledger was NOT changed"
+    return parsed, ""
+
+
+def _write_exclusions_canonical(workdir: str, rows: list) -> None:
+    """Atomic canonical rewrite (same-dir temp + os.replace): a kill mid-write
+    must never truncate the machine-owned ledger."""
+    _write_text_atomic(
+        Path(workdir) / EXCLUSIONS_PATH,
+        json.dumps(rows, ensure_ascii=False, indent=2) + "\n")
+
+
+def set_exclusion_reason(workdir: str, pattern: str, reason: str) -> tuple[str, str | None]:
+    """Add an exclusion row, or CORRECT the reason of the existing one(s) for the
+    same pattern → (status, error) with status in {"added", "updated", "unchanged"}.
+
+    The lifecycle half the tool surface was missing: with append-only semantics a
+    wrong reason could only be fixed by hand-editing the ledger, which the standing
+    role prompt forbade — a mandate-3 deadlock (a prohibition with no legal path
+    forward). Re-calling exclude_source with a better reason now IS the fix.
+
+    Same de-duplication rule as append_exclusions: only VALID rows count as
+    present, so a legacy row missing its reason never shadows a real call (the
+    post-turn normalizer prunes the redundant invalid duplicate)."""
+    data, err = _read_exclusions_for_write(workdir)
+    if data is None:
+        return "unchanged", err
+    hits = [item for item in data
+            if _valid_exclusion_row(item) and str(item["pattern"]) == pattern]
+    if not hits:
+        _write_exclusions_canonical(
+            workdir, data + [{"pattern": pattern, "reason": reason}])
+        return "added", None
+    if all(str(item["reason"]) == reason for item in hits):
+        return "unchanged", None
+    for item in hits:
+        item["reason"] = reason
+    _write_exclusions_canonical(workdir, data)
+    return "updated", None
+
+
+def remove_exclusions(workdir: str, patterns: list[str]) -> tuple[int, str | None]:
+    """Drop every row whose pattern is EXACTLY one of `patterns` → (rows removed,
+    error). Exact string match, never glob evaluation: removing by "what this
+    pattern happens to match" would silently take out neighbouring rows.
+
+    The delete half of the ledger lifecycle. Callers pass several spellings of the
+    same intent (the glob-escaped exact path AND the verbatim string) so a wrong
+    row written by hand — the shape the tools could not previously express — is
+    still removable with a tool call instead of another hand edit."""
+    wanted = {p for p in patterns if p}
+    if not wanted:
+        return 0, None
+    data, err = _read_exclusions_for_write(workdir)
+    if data is None:
+        return 0, err
+    kept = [item for item in data
+            if not (isinstance(item, dict) and item.get("pattern")
+                    and str(item["pattern"]) in wanted)]
+    removed = len(data) - len(kept)
+    if removed:
+        _write_exclusions_canonical(workdir, kept)
+    return removed, None
+
+
+def exclusion_patterns(workdir: str) -> list[str]:
+    """Every pattern string currently in the ledger, valid rows or not — the
+    candidate set a remove-by-pattern close-match hint is drawn from."""
+    data, _ = _read_exclusions_for_write(workdir)
+    if not data:
+        return []
+    return [str(item["pattern"]) for item in data
+            if isinstance(item, dict) and item.get("pattern")]
+
+
+def normalize_exclusions_file(workdir: str) -> str | None:
+    """Restore the exclusion ledger to canonical form after a model turn.
+
+    The ledger is MACHINE-OWNED, but the escape hatch stays OPEN (stability-first
+    mandate): the model is steered to the exclude_source tool, yet may hand-edit
+    the file when the tool cannot express a fix. This normalizer is the
+    enforcement backstop that makes that safe — every parseable row survives
+    verbatim, mechanical slips (trailing commas) are absorbed, a redundant invalid
+    duplicate is pruned (see _valid_exclusion_row), and the canonical atomic
+    rewrite guarantees a strictly-parseable file at rest after every turn.
+
+    Call sites that make "after every turn" true: compile_box._drive_batch_session's
+    finally (every batch map/reduce/final/repair sub-session) and
+    compile_box._post_turn_selfcheck's head (every interactive/flat compile turn).
+    Returns an error string only when the file is corrupted beyond the mechanical
+    repair (left untouched for a human/model to inspect)."""
+    path = Path(workdir) / EXCLUSIONS_PATH
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return f"{EXCLUSIONS_PATH} unreadable: {e}"
+    data, repaired = _parse_exclusions_tolerant(raw)
+    if data is None or not isinstance(data, list):
+        return f"{EXCLUSIONS_PATH} is corrupted beyond the mechanical repair"
+    # Prune an invalid row (missing reason) ONLY when a valid row already covers
+    # its pattern — that invalid duplicate is dead weight load already ignores.
+    # An invalid row that is the ONLY row for its pattern is KEPT: pruning it
+    # would silently drop the pattern; load surfaces it as an error for a human.
+    valid_patterns = {str(item["pattern"]) for item in data if _valid_exclusion_row(item)}
+    kept = [
+        item for item in data
+        if _valid_exclusion_row(item)
+        or not (isinstance(item, dict) and item.get("pattern")
+                and str(item["pattern"]) in valid_patterns)
+    ]
+    canonical = json.dumps(kept, ensure_ascii=False, indent=2) + "\n"
+    if repaired or raw != canonical:
+        # Atomic: a torn write would truncate the machine-owned ledger.
+        _write_text_atomic(path, canonical)
+    return None
 
 
 def _body_source_payload_spans(text: str) -> list[tuple[int, int, str]]:
@@ -1124,6 +1494,38 @@ def dup_candidates(pages: dict[str, dict], cap: int = 20) -> list[dict]:
     return out
 
 
+def detect_over_broad_exclusions(workdir: str, exclusions: list[dict]) -> list[dict]:
+    """Exclusion patterns that swallow a large share of the corpus — a `**` bomb
+    or an over-broad prefix, almost always a mistake that launders 'never
+    compiled' into 'accounted'. Flags any single pattern matching >25% of the raw
+    inventory AND >5 sources, sorted by pattern, as [{"pattern", "matched"}].
+
+    DETECTION ONLY (stability-first mandate: never prevention): the caller surfaces
+    it loudly in the self-check narration/repair prompt so a human narrows it; it is
+    never auto-removed and never blocks the train. Kept OUT of coverage() on purpose
+    — coverage is the accounting contract mirrored byte-for-byte by sicore's
+    adoption ledger; this is a box-side compile heuristic, not part of that ledger.
+
+    Counts DISTINCT sources per pattern, never row hits: the ledger legitimately
+    carries duplicate valid rows (the normalizer prunes only redundant INVALID
+    ones), so a legacy or hand-edited file with the same pattern twice used to
+    double-count — 3 matched sources of 20 reported as 6, a false over-broad flag
+    on a perfectly narrow exclusion."""
+    sources = source_inventory(workdir)
+    if not sources:
+        return []
+    matched: dict[str, set[str]] = {}
+    for s in sources:
+        for e in exclusions:
+            if _matches(s, e["pattern"]):
+                matched.setdefault(e["pattern"], set()).add(s)
+    return [
+        {"pattern": p, "matched": len(matched[p])}
+        for p in sorted(matched)
+        if len(matched[p]) > 5 and len(matched[p]) > 0.25 * len(sources)
+    ]
+
+
 def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> dict:
     """The ledger (coverage v2): raw inventory − compiled_from union − exclusions
     − auto-attached media = unaccounted.
@@ -1162,8 +1564,29 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
     # embedding accounted document (not already cited/excluded); the subtraction
     # below is identical either way, but reporting the net-new set keeps cited /
     # excluded / auto_attached a disjoint, auditable decomposition of accounted.
+    # An Office original and its pre-rendered sibling are one source in two
+    # forms: accounting either accounts both. Reported as its own bucket for the
+    # same reason auto-attach is — an accounting path nobody can see is a
+    # fail-open dressed as a pass.
+    #
+    # This runs BEFORE auto-attach, and that order is load-bearing: the images a
+    # deck embeds live under `<name>.pptx.assets/` and are embedded by the
+    # RENDER, while the playbook has the model cite the ORIGINAL. Resolve the
+    # pair second and the render is not yet an accounted document, so its images
+    # auto-attach to nothing and the model is handed a pile of orphans to excuse
+    # by hand — which is exactly what it did. One pass suffices and no fixpoint
+    # is needed: office_render_pairs only ever matches Office extensions and
+    # is_media_asset only ever matches image extensions, so a pair member can
+    # never arrive via `auto`.
+    render_edges = sorted(
+        (partner, owner)
+        for original, rendered in office_render_pairs(sources)
+        for owner, partner in ((original, rendered), (rendered, original))
+        if owner in (cited | excluded) and partner not in (cited | excluded)
+    )
+    derived = {partner for partner, _ in render_edges}
     media_assets = {s for s in source_set if is_media_asset(s)}
-    accounted_docs = cited | excluded
+    accounted_docs = cited | excluded | derived
     edges = asset_attribution_edges(workdir, sources)
     auto_edges = sorted(
         (asset, doc)
@@ -1172,7 +1595,7 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
         if asset in media_assets and asset not in cited and asset not in excluded
     )
     auto = {asset for asset, _ in auto_edges}
-    unaccounted = sorted(source_set - cited - excluded - auto)
+    unaccounted = sorted(source_set - cited - excluded - auto - derived)
     dangling = sorted(cited - source_set)
     return {
         "total_sources": len(sources),
@@ -1184,6 +1607,9 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
         "auto_attached": len(auto),
         "auto_attached_sample": [{"asset": asset, "via": doc}
                                  for asset, doc in auto_edges[:20]],
+        "office_renders": len(derived),
+        "office_renders_sample": [{"source": partner, "via": owner}
+                                  for partner, owner in render_edges[:20]],
         "unaccounted": unaccounted,
         "dangling_citations": dangling,
         "noop_exclusions": noop_exclusions,
@@ -1274,6 +1700,7 @@ def run_layer1(workdir: str) -> dict:
     exclusions, exclusion_errors = load_exclusions(workdir)
     cov = coverage(workdir, pages, exclusions)
     lint = lint_candidate(pages, exclusion_errors)
+    over_broad = detect_over_broad_exclusions(workdir, exclusions)
     previous = read_selfcheck(workdir) or {}
     media_verify = previous.get("media_verify")
     citing_media = media_citing_pages(workdir)
@@ -1287,6 +1714,10 @@ def run_layer1(workdir: str) -> dict:
         "candidate_tree_hash": candidate_tree_hash(workdir),
         "coverage": cov,
         "lint": {"ok": lint["ok"], "violations": lint["violations"]},
+        # Box-side compile heuristic (NOT part of the coverage accounting
+        # contract): over-broad exclusion patterns flagged for a human, never
+        # blocking. Report-level so coverage() stays byte-identical to sicore's.
+        "over_broad_exclusions": over_broad,
         "dup_candidates": dup_candidates(pages),
         "pk": previous.get("pk"),  # Layer-2 results survive L1 re-checks
         "media_verify": media_verify,
@@ -1402,11 +1833,15 @@ def narration(report: dict, locale: str | None = None) -> str:
     cov, lint = report["coverage"], report["lint"]
     en = _is_en(locale)
     noop = cov.get("noop_exclusions") or []
+    over_broad = report.get("over_broad_exclusions") or []
     auto = cov.get("auto_attached") or 0
     warn = ""
     if noop:
         warn = (f" ⚠ {len(noop)} exclusion(s) match no source — likely a typo" if en
                 else f" ⚠ {len(noop)} 条排除未命中任何源——疑似写错")
+    if over_broad:
+        warn += (f" ⚠ {len(over_broad)} exclusion(s) look over-broad (each matches >25% of sources) — likely a mistake" if en
+                 else f" ⚠ {len(over_broad)} 条排除疑似过宽(各命中超 25% 的源)——多半写错了")
     auto_note = ""
     if auto:
         auto_note = (f"; {auto} media auto-attached" if en
@@ -1456,9 +1891,12 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
             lines.append(
                 "For each, choose one: (1) Compile it — fold the source's content into the relevant candidate "
                 "page (new or merged) and register that source path in the page's frontmatter compiled_from; "
-                "(2) Explicitly exclude — if it genuinely should not be compiled (meta files / live data / "
-                'highly time-sensitive, etc.), add it to authoring/EXCLUSIONS.json (a JSON array of '
-                '{"pattern": "path or glob relative to raw", "reason": "one-line reason the owner can understand"}).')
+                "(2) Exclude it — if it genuinely should not be compiled (meta files / live data / "
+                "highly time-sensitive, etc.), call the exclude_source(path, reason) tool (the preferred, "
+                "validated path — call it again with a better reason to CORRECT a row, and use "
+                "remove_exclusion(path) to lift one). Directly editing authoring/EXCLUSIONS.json stays "
+                "permitted as a last resort when no tool can express the fix, and the system "
+                "re-normalizes the ledger after this turn either way.")
         if cov["dangling_citations"]:
             lines.append(f"\ncompiled_from cites nonexistent sources (dangling, {len(cov['dangling_citations'])}):")
             lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
@@ -1468,6 +1906,11 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
             lines += [f"- {p}" for p in cov["noop_exclusions"][:_REPAIR_LIST_CAP]]
             lines.append("Matching is SEGMENT-aware: a bare `logs` matches only a file literally named logs; "
                          "`logs/*` matches only direct children; a whole subtree needs `logs/**` (or the `logs/` prefix form). Fix the pattern.")
+        if report.get("over_broad_exclusions"):
+            over_broad = report["over_broad_exclusions"]
+            lines.append(f"\nExclusion patterns that look OVER-BROAD ({len(over_broad)}) — each swallows >25% of the corpus, likely a mistake that launders 'never compiled' into 'accounted':")
+            lines += [f"- {ob['pattern']} — matches {ob['matched']} source(s)" for ob in over_broad[:_REPAIR_LIST_CAP]]
+            lines.append("If that breadth is truly intended, keep it; otherwise narrow it or split it into per-source exclude_source calls with concrete reasons.")
         if not lint["ok"]:
             lines.append(f"\nLint issues ({len(lint['violations'])}):")
             lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"
@@ -1483,8 +1926,9 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
         lines.append(
             "逐个二选一(图片/PDF 等媒体同样适用):① 补编 — 把该源内容编进相应 candidate 页(新增或并入),"
             "并在该页 frontmatter 的 compiled_from 登记该源路径;② 显式排除 — 确属不该编的(元文件/活数据/时效性强等),"
-            '加入 authoring/EXCLUSIONS.json(JSON 数组,元素 {"pattern": "相对 raw 的路径或 glob", '
-            '"reason": "一句话理由,让负责人看得懂"}).')
+            "调用 exclude_source(path, reason) 工具(首选的、带校验的正路——同一 path 换新理由再调一次即【更正】该行,"
+            "撤销一条豁免用 remove_exclusion(path))。仅当工具无法表达该修改时,才允许直接编辑 "
+            "authoring/EXCLUSIONS.json 作为兜底——无论哪种,系统都会在本轮结束后重新规范化该账本。")
     if cov["dangling_citations"]:
         lines.append(f"\ncompiled_from 引用了不存在的源(悬空引用,{len(cov['dangling_citations'])} 处):")
         lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
@@ -1494,6 +1938,11 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
         lines += [f"- {p}" for p in cov["noop_exclusions"][:_REPAIR_LIST_CAP]]
         lines.append("匹配是按路径段的:裸 `logs` 只匹配名字恰为 logs 的文件;`logs/*` 只匹配直接子级;"
                      "整个子树要写 `logs/**`(或 `logs/` 前缀形式)。请修正模式。")
+    if report.get("over_broad_exclusions"):
+        over_broad = report["over_broad_exclusions"]
+        lines.append(f"\n疑似过宽的排除模式({len(over_broad)} 条)——每条吞掉超 25% 的语料,多半是把'从没编过'洗成了'已入账':")
+        lines += [f"- {ob['pattern']} — 命中 {ob['matched']} 个源" for ob in over_broad[:_REPAIR_LIST_CAP]]
+        lines.append("若这个覆盖面确属有意,保留即可;否则请收窄,或拆成逐源的 exclude_source 调用并各写明理由。")
     if not lint["ok"]:
         lines.append(f"\nlint 问题({len(lint['violations'])} 处):")
         lines += [f"- {v['page']}: {v['kind']} — {v['detail']}"

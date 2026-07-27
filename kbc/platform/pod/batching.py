@@ -31,14 +31,41 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-DEFAULT_BATCH_THRESHOLD_BYTES = 400 * 1024
-DEFAULT_BATCH_BUDGET_BYTES = 200 * 1024
+# The planner and the ledger must agree, to the byte, on what counts as one
+# source in two forms — a disagreement is how a family gets split across batches
+# while the ledger insists it is whole.
+from selfcheck import office_render_pairs
+
+# ── how much source text one session may hold ────────────────────────────────
+# ONE number, on every route. The gate that decides a corpus needs batching at
+# all, the flat per-batch budget, the very-large text budget, and the slice size
+# are four spellings of the same question, and they had drifted into three
+# different historical values — a corpus taking the FLAT route ran at 200KB a
+# batch while the very-large route had already been raised, so the route a
+# corpus happened to take decided how much its sessions saw.
+#
+# 1MB ≈ 350K tokens at this corpus's ~3 bytes/token (CJK prose 3.5-5; record
+# dumps with long opaque IDs 2.5-3.5). Against a 1M window whose agreed SAFE
+# ceiling is 750K, that is the source side sitting near a third, leaving ample
+# room for the system prompt and BRIEF/INTENT/index (~36K measured) plus
+# everything a session accumulates — pages read and written, grep results, its
+# own reasoning.
+#
+# The previous 512KB was half this, and the frugality was not free: a smaller
+# budget forces more families through the splitting paths, and splitting a
+# family is what separated a 54MB deck from the document that embeds it and
+# killed two compiles outright. Context is the cheap resource here and stability
+# is the expensive one; spending the former to avoid exercising fragile code is
+# the right trade. _record_turn_usage measures where a session actually lands,
+# so the next move on this number is arithmetic rather than judgement.
+DEFAULT_BATCH_THRESHOLD_BYTES = 1024 * 1024
+DEFAULT_BATCH_BUDGET_BYTES = 1024 * 1024
 DEFAULT_HIERARCHICAL_THRESHOLD_BYTES = 8 * 1024 * 1024
 DEFAULT_HIERARCHICAL_BATCH_BUDGET_BYTES = 1024 * 1024
-DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 128 * 1024
-DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES = 64 * 1024
+DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 1024 * 1024
+DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES = 1024 * 1024
 DEFAULT_HIERARCHICAL_PDF_SLICE_PAGES = 20
-DEFAULT_REDUCTION_BUDGET_BYTES = 512 * 1024
+DEFAULT_REDUCTION_BUDGET_BYTES = 1024 * 1024
 
 # ── effective-size weighting ─────────────────────────────────────────────────
 # Raw bytes are a terrible proxy for context cost on non-text sources: a 168KB
@@ -52,15 +79,20 @@ TEXT_EXTS = {".md", ".txt", ".tsv", ".csv", ".json", ".jsonl", ".yaml", ".yml", 
 
 
 def _image_cost() -> int:
-    return int(os.environ.get("KBC_BATCH_IMAGE_COST_BYTES", str(30 * 1024)))
+    """One screenshot is ~1.5-2.5K vision tokens; the long edge is capped, so
+    even a full-page render stays under ~1.6K. At ~3 bytes/token that is 5-8KB
+    of budget-equivalent. 8KB keeps a small margin without pricing an image
+    like a whole document — the old 30KB over-charged by 4-6x, which is how
+    batches of nothing but screenshots got planned."""
+    return int(os.environ.get("KBC_BATCH_IMAGE_COST_BYTES", str(8 * 1024)))
 
 
 def _hierarchical_image_cost() -> int:
-    """High-resolution page renders accumulate vision tokens across a long
-    map session. Keep the established flat-planner estimate for medium corpora,
-    but use a conservative cost in the very-large hierarchical path."""
+    """Vision tokens do accumulate across a long map session, so the very-large
+    path stays more conservative than the flat one — but 2x the true cost, not
+    the former 16-25x that made image-only batches the norm."""
     return int(os.environ.get(
-        "KBC_HIERARCHICAL_IMAGE_COST_BYTES", str(128 * 1024)))
+        "KBC_HIERARCHICAL_IMAGE_COST_BYTES", str(16 * 1024)))
 
 
 def _hierarchical_context_anchor_max_bytes() -> int:
@@ -88,10 +120,17 @@ def hierarchical_pdf_slice_pages() -> int:
 
 
 def _text_slices(path: Path, size: int) -> tuple[int, list[dict[str, int]]] | None:
-    """Line-bounded chunks for a Markdown source that cannot safely fit one
+    """Line-bounded chunks for a text source that cannot safely fit one
     hierarchical model turn. The Raw file remains the provenance identity;
-    these ranges only bound what each internal map session may read."""
-    if path.suffix.lower() != ".md" or size <= hierarchical_text_budget_bytes():
+    these ranges only bound what each internal map session may read.
+
+    Every text format, not only Markdown. Line-bounded slicing needs nothing
+    Markdown-specific, and the restriction meant an oversized .csv / .jsonl /
+    .txt could not be sliced at all — it became one solo batch pointing at the
+    whole file, which is a context blow-out rather than a slow compile. No such
+    source exists at that size in the corpora seen so far, so this closes a
+    latent hole rather than a live one."""
+    if path.suffix.lower() not in TEXT_EXTS or size <= hierarchical_text_budget_bytes():
         return None
     lines = path.read_bytes().splitlines(keepends=True)
     if not lines:
@@ -340,19 +379,49 @@ def should_hierarchical(
     return corpus_effective_bytes(inventory) > limit
 
 
+# A batch that is still nearly empty must not be flushed just because the next
+# family sits under a different top-level directory. Sections and the pages
+# NAMED after them interleave in path order (`X-2d66.md` sorts before `X/…`),
+# so a 19-byte section placeholder would open a batch, meet the very next
+# family under `X/`, and be flushed alone — a whole model session, spawned pod
+# and all, to read one heading. Topical coherence is worth a flush; it is not
+# worth one per placeholder, and a batch this far below budget has no coherence
+# to protect yet.
+# Deliberately a SCRAP, not a fraction of the budget: at a 512KB budget a plain
+# 10% would be 51KB, and a batch holding 40KB of real content would start
+# swallowing the next section. Coherence is cheap to protect once a batch holds
+# anything substantial; it is only the near-empty case that is not worth a
+# session of its own.
+BATCH_COHERENCE_FLUSH_FLOOR_RATIO = 0.05
+BATCH_COHERENCE_FLUSH_FLOOR_CAP = 32 * 1024
+
+
+def _too_small_to_flush(current_bytes: int, budget: int) -> bool:
+    floor = min(int(budget * BATCH_COHERENCE_FLUSH_FLOOR_RATIO),
+                BATCH_COHERENCE_FLUSH_FLOOR_CAP)
+    return current_bytes < floor
+
+
 def _top_dir(path: str) -> str:
     head, sep, _ = path.partition("/")
     return head if sep else ""
 
 
-def pack_batches(inventory: list[dict[str, Any]], budget: int | None = None) -> list[dict[str, Any]]:
+def pack_batches(
+    inventory: list[dict[str, Any]], budget: int | None = None,
+    attachment_edges: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
     """Deterministic baseline: group by top-level directory (natural topical
     grouping in practice), greedy-pack in path order within the budget. A batch
     never mixes top-level directories unless a directory itself is tiny —
     deliberate: cross-dir mixing buys packing efficiency but costs topical
     coherence, and coherence is the goal function (效果好/细节覆盖).
 
-    Exception to the budget: one file > budget forms its own batch whole."""
+    Packs document FAMILIES, never bare files: a document and the attachments
+    its body embeds always land in the same batch, so no session is ever handed
+    a table it cannot read or an image whose owning document is elsewhere.
+
+    Exception to the budget: one family > budget forms its own batch whole."""
     b = budget if budget is not None else batch_budget_bytes()
     batches: list[dict[str, Any]] = []
     cur: list[dict[str, Any]] = []
@@ -373,16 +442,17 @@ def pack_batches(inventory: list[dict[str, Any]], budget: int | None = None) -> 
             cur = []
             cur_bytes = 0
 
-    for item in inventory:
-        d = _top_dir(item["path"])
-        size = _eff(item)
-        if cur and (cur_dir != d or cur_bytes + size > b):
+    for family in source_families(inventory, attachment_edges):
+        d = _top_dir(str(family[0]["path"]))
+        size = sum(_eff(item) for item in family)
+        crosses_section = cur_dir != d and not _too_small_to_flush(cur_bytes, b)
+        if cur and (crosses_section or cur_bytes + size > b):
             flush()
         cur_dir = d
-        cur.append(item)
+        cur.extend(family)
         cur_bytes += size
         if cur_bytes > b:
-            # single oversized file (it was alone: anything before it flushed)
+            # single oversized family (it was alone: anything before it flushed)
             flush()
     flush()
     return batches
@@ -467,28 +537,91 @@ def _attachment_anchors(known: set[str]) -> dict[tuple[str, str, str], str]:
     }
 
 
-def source_families(inventory: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+def attachment_owners(
+    attachment_edges: dict[str, list[str]] | None, known: set[str],
+) -> dict[str, str]:
+    """Invert doc→attachments edges into attachment→owning-doc.
+
+    The edges come from the real document bodies (selfcheck.document_attachment_
+    edges), so this is the ONLY reliable ownership signal for the export layout
+    the platform actually writes: one shared ``assets/`` directory per folder
+    holding opaquely-named files for every sibling document. Path shape cannot
+    answer "whose image is this?" there — only the embed link can.
+
+    An attachment embedded by several documents is owned by the lexicographically
+    smallest one, so planning stays deterministic across runs."""
+    owners: dict[str, str] = {}
+    if not isinstance(attachment_edges, dict):
+        return owners
+    for doc in sorted(attachment_edges):
+        if doc not in known:
+            continue
+        for target in attachment_edges.get(doc) or []:
+            if not isinstance(target, str) or target not in known or target == doc:
+                continue
+            owners.setdefault(target, doc)
+    return owners
+
+
+def source_families(
+    inventory: list[dict[str, Any]],
+    attachment_edges: dict[str, list[str]] | None = None,
+) -> list[list[dict[str, Any]]]:
     """Group every source into one deterministic document family.
 
-    A family is an anchor Markdown file plus all media below its sibling
+    A family is an anchor Markdown file plus every attachment its body embeds
+    (resolved through ``attachment_edges``), plus media below a legacy sibling
     ``*.assets`` directory, plus an exactly matched original/sidecar below
     ``_attachments/``. Everything else is a one-source family. Returning
     inventory records (rather than just paths) keeps this function pure and
     lets the packer enforce effective-byte budgets without rescanning disk.
+
+    Without ``attachment_edges`` only the path-shape anchors apply — and on a
+    current-platform export (shared ``assets/`` dir) that means NO attachment
+    ever joins its document. Callers planning a real compile must pass edges.
     """
     by_path = {str(i["path"]): i for i in inventory}
     known = set(by_path)
     attachment_anchors = _attachment_anchors(known)
-    grouped: dict[str, list[dict[str, Any]]] = {}
+    edge_owner = attachment_owners(attachment_edges, known)
+    key_of: dict[str, str] = {}
     for item in inventory:
         path = str(item["path"])
         attachment_identity = _attachment_identity(path)
-        key = (
-            _asset_anchor(path, known)
+        key_of[path] = (
+            edge_owner.get(path)
+            or _asset_anchor(path, known)
             or (attachment_anchors.get(attachment_identity) if attachment_identity else None)
             or path
         )
-        grouped.setdefault(key, []).append(item)
+    # An Office original and its pre-rendered sibling are one source in two
+    # forms, and the render also anchors the deck's images (`<name>.pptx.assets/`
+    # resolves through _asset_anchor to `<name>.pptx.md`). Keep the whole set in
+    # ONE batch: the binary is unreadable on its own, so a batch holding only it
+    # has nothing to read and burns a session rediscovering what another batch
+    # already compiled. Merge AFTER keying, because the two halves are keyed by
+    # different rules — an attachment original is owned by the document that
+    # embeds it while its render is owned by nobody — so neither half can simply
+    # adopt the other's anchor. Union by root keeps it order-independent.
+    merge: dict[str, str] = {}
+
+    def _root(k: str) -> str:
+        while merge.get(k, k) != k:
+            k = merge[k]
+        return k
+
+    for original, rendered in office_render_pairs(sorted(known)):
+        a, b = _root(key_of[original]), _root(key_of[rendered])
+        if a == b:
+            continue
+        # Anchor on a genuine third-party owner when there is one, else on the
+        # readable render — never on the binary nobody can open.
+        outside = sorted(k for k in (a, b) if k not in (original, rendered))
+        target = outside[0] if outside else (rendered if rendered in (a, b) else a)
+        merge[a if target == b else b] = target
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in inventory:
+        grouped.setdefault(_root(key_of[str(item["path"])]), []).append(item)
     families: list[list[dict[str, Any]]] = []
     for key in sorted(grouped):
         items = grouped[key]
@@ -507,9 +640,36 @@ def source_families(inventory: list[dict[str, Any]]) -> list[list[dict[str, Any]
     return families
 
 
+def pack_one_family_per_batch(
+    inventory: list[dict[str, Any]],
+    attachment_edges: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """The plan of last resort: one family, one batch. Nothing merged, nothing
+    split, nothing sliced.
+
+    It satisfies every invariant validate_plan checks, by construction and
+    without needing to reason about budgets — a family is never separated from
+    its attachments because a family is never divided, and an oversized family
+    carries the whole-family budget exemption. It is not the plan we want (more
+    batches, slower run), but it is a plan we can always trust.
+
+    This exists so that a defect in the real planner degrades the compile
+    instead of ending it. A validator that checks OUR OWN packing quality must
+    never be the reason a knowledge base cannot be compiled at all: the sources
+    still need reading, and a slower correct run beats no run. Contrast the
+    coverage ledger, whose absoluteness is load-bearing because it protects
+    against silently dropping knowledge — that one stays fail-closed.
+    """
+    return [
+        {"id": f"f{index:03d}", "sources": [str(item["path"]) for item in family]}
+        for index, family in enumerate(source_families(inventory, attachment_edges), 1)
+    ]
+
+
 def pack_hierarchical_batches(
     inventory: list[dict[str, Any]], budget: int | None = None,
     text_budget: int | None = None,
+    attachment_edges: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Pack very large corpora without separating a document from its media.
 
@@ -545,7 +705,7 @@ def pack_hierarchical_batches(
         source_key = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
         count = len(slices)
         for index, text_slice in enumerate(slices, start=1):
-            result.append({
+            batch = {
                 "id": f"h{len(result) + 1:03d}",
                 "sources": [source],
                 "context_sources": [],
@@ -561,7 +721,8 @@ def pack_hierarchical_batches(
                 "bytes": int(text_slice["bytes"]),
                 "text_bytes": int(text_slice["bytes"]),
                 "status": "pending",
-            })
+            }
+            result.append(batch)
 
     def append_pdf_slices(item: dict[str, Any]) -> None:
         slices = item.get("pdf_slices") or []
@@ -588,14 +749,18 @@ def pack_hierarchical_batches(
             current_bytes = 0
             current_text_bytes = 0
 
-    for family in source_families(inventory):
+    for family in source_families(inventory, attachment_edges):
         family_bytes = sum(_hierarchical_eff(i) for i in family)
         family_text_bytes = sum(_text_eff(i) for i in family)
         section = _top_dir(str(family[0]["path"]))
         has_slices = any(i.get("text_slices") or i.get("pdf_slices") for i in family)
         if not has_slices and family_bytes <= limit and family_text_bytes <= text_limit:
-            if current and (
+            crosses_section = (
                 current_dir != section
+                and not _too_small_to_flush(current_bytes, limit)
+            )
+            if current and (
+                crosses_section
                 or current_bytes + family_bytes > limit
                 or current_text_bytes + family_text_bytes > text_limit
             ):
@@ -607,6 +772,24 @@ def pack_hierarchical_batches(
             continue
 
         flush()
+        if not has_slices:
+            # A family NEVER splits — the same rule pack_batches has always used
+            # ("one family > budget forms its own batch whole"). Chunking an
+            # oversized family is what separated a 54MB deck from the document
+            # that embeds it, which validate_plan then rejected, which killed
+            # the whole compile. The same hole had already been patched once
+            # (a 9MB PDF, anchor shed because the family was not solo) — a
+            # conditional cannot hold an invariant that the structure violates.
+            #
+            # The cost is a bigger batch and a slower run. Both are acceptable:
+            # stability and complete understanding outrank wall-clock, and the
+            # model reads what it needs from a family it can see whole. Only a
+            # family containing genuinely sliceable single files (text/PDF
+            # slices, which carry their own reachability exemption) still goes
+            # through the chunking path below.
+            append_batch(family)
+            current_dir = section
+            continue
         anchor = family[0] if str(family[0]["path"]).lower().endswith(".md") else None
         remaining = family[:]
         sliced_anchor = anchor if anchor is not None and anchor.get("text_slices") else None
@@ -648,13 +831,17 @@ def pack_hierarchical_batches(
                 append_pdf_slices(remaining.pop(0))
                 continue
             batch_context = context
-            if context and (
+            if context and len(remaining) > 1 and (
                 context_bytes + _hierarchical_eff(remaining[0]) > limit
                 or context_text_bytes + _text_eff(remaining[0]) > text_limit
             ):
-                # A single oversized asset/file is allowed as a solo batch; do
-                # not turn it into an invalid multi-source batch by repeating
-                # the anchor beside it.
+                # Multiple sources cannot exceed the budget together; shed the
+                # anchor context rather than pack an invalid batch. A SOLO
+                # oversized attachment keeps its anchor: budget validation
+                # exempts single-source batches, and shedding the anchor there
+                # would separate the attachment from the document that embeds
+                # it — the exact hole that killed a real compile (a 9MB PDF
+                # attachment packed anchor-less, then rejected by validation).
                 batch_context = []
             chunk: list[dict[str, Any]] = []
             chunk_bytes = sum(_hierarchical_eff(i) for i in batch_context)
@@ -715,21 +902,55 @@ def build_plan(
     }
 
 
+# A batch id reaches operator-visible pod logs verbatim; keep it a safe token.
+_SAFE_BATCH_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def is_safe_batch_id(bid: object) -> bool:
+    """True when a batch id is a safe log token — the SINGLE rule, which
+    validate_plan calls too, so the two can never diverge. The lifecycle logger
+    uses it to decide whether to print the id or fall back to the batch index
+    for a pinned plan whose id predates the check.
+
+    fullmatch, never match(r"^...$"): Python's `$` also matches BEFORE a final
+    newline, so `"b01\\n"` passed the old anchored match — a raw newline in a
+    pod-log line splits one lifecycle event across two lines. Every other
+    validator in this codebase already uses fullmatch; this one strayed. The
+    value is judged EXACTLY as the logger will print it — never a stripped or
+    str()-coerced copy, or the check would bless a value that reaches stdout
+    unnormalized."""
+    return bool(isinstance(bid, str) and _SAFE_BATCH_ID_RE.fullmatch(bid))
+
+
 def validate_plan(
     plan: dict[str, Any], inventory: list[dict[str, Any]], budget: int | None = None,
     text_budget: int | None = None, pdf_slice_pages: int | None = None,
+    attachment_edges: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """Errors for a (possibly model-proposed) plan. Empty list = valid.
     Rules: every inventory source in exactly one batch, no unknown sources,
     every batch within budget unless it is a single oversized file. Optional
     context sources may repeat across batches but are read-only and still count
-    toward the per-session budget."""
+    toward the per-session budget.
+
+    With ``attachment_edges`` an attachment must always be REACHABLE from the
+    document that embeds it — same batch, or that document listed as read-only
+    ``context_sources``. This is what stops a model-proposed regrouping (the
+    default planner) from handing one session a spreadsheet with no document and
+    another the document with no spreadsheet."""
     b = budget if budget is not None else batch_budget_bytes()
     errors: list[str] = []
     effective = _hierarchical_eff if plan.get("mode") == "hierarchical" else _eff
     records = {i["path"]: i for i in inventory}
     sizes = {path: effective(item) for path, item in records.items()}
     text_sizes = {path: _text_eff(item) for path, item in records.items()}
+    # Which family each source belongs to — the SAME grouping the packer used,
+    # so the validator cannot demand a shape the packer is forbidden to produce.
+    family_of: dict[str, str] = {}
+    for _fam in source_families(list(records.values()), attachment_edges):
+        _key = str(_fam[0]["path"])
+        for _item in _fam:
+            family_of[str(_item["path"])] = _key
     seen: dict[str, str] = {}
     slice_appearances: dict[str, list[dict[str, Any]]] = {}
     page_slice_appearances: dict[str, list[dict[str, Any]]] = {}
@@ -746,9 +967,27 @@ def validate_plan(
         bid = str(batch.get("id", "?"))
         # Batch ids must be unique and non-empty: stamp_done marks EVERY batch
         # with the matching id, so a duplicate would get stamped alongside its
-        # twin and silently never run.
-        if not str(batch.get("id") or "").strip():
+        # twin and silently never run. They must ALSO be a safe token: a
+        # model-proposed id flows verbatim into pod-log lifecycle lines
+        # (batch.done / batch.skipped), so a value like
+        # "secret/file.md\nFORGED=1" could inject forged log records or leak a
+        # path. Reject anything outside [A-Za-z0-9_-]{1,64} here so the plan
+        # falls back to the deterministic code baseline (whose ids are always
+        # safe) — the error message never echoes the offending value.
+        # Judge the id EXACTLY as stored and printed — no .strip(), no str()
+        # coercion. A stripped copy passing while " b01 " is what downstream
+        # stamps and logs is how a guard blesses a value it never checked.
+        original_id = batch.get("id")
+        blank = original_id is None or (
+            isinstance(original_id, str) and not original_id.strip())
+        if blank:
+            # Missing / empty / whitespace-only: diagnose as absent (kinder and
+            # more accurate for a human than a charset complaint). Every OTHER
+            # value is judged exactly as stored — a stripped copy is never what
+            # gets blessed.
             errors.append("batch with empty or missing id")
+        elif not is_safe_batch_id(original_id):
+            errors.append("batch id must match ^[A-Za-z0-9_-]{1,64}$")
         elif bid in seen_ids:
             errors.append(f"duplicate batch id {bid}")
         seen_ids.add(bid)
@@ -872,15 +1111,56 @@ def validate_plan(
                 continue
             total += sizes[path]
             text_total += text_sizes[path]
-        if total > b and len(sources) + len(context) > 1:
+        # A single oversized source forms its own batch whole; small read-only
+        # context (its embedding document) may ride along without voiding the
+        # exemption — context exists precisely so an oversized attachment is
+        # never separated from its anchor.
+        #
+        # A whole FAMILY earns the same exemption, for the same reason. Since a
+        # family never splits, an oversized one has no smaller legal form: the
+        # only way to bring it under budget would be to separate a document from
+        # the attachments it embeds, which the rule directly below forbids. Two
+        # checks that cannot both be satisfied is how a planning hiccup became a
+        # dead box — so the exemption has to cover the shape the packer is
+        # required to produce.
+        one_family = len({family_of.get(p) for p in sources if isinstance(p, str)}) == 1
+        if total > b and len(sources) > 1 and not one_family:
             errors.append(f"batch {bid}: {total} bytes exceeds budget {b}")
         if (
             text_budget is not None
             and text_total > text_budget
-            and len(sources) + len(context) > 1
+            and len(sources) > 1
         ):
             errors.append(
                 f"batch {bid}: {text_total} text bytes exceeds text budget {text_budget}")
+    owners = attachment_owners(attachment_edges, set(records))
+    sliced_paths = {
+        path for path, item in records.items()
+        if item.get("text_slices") or item.get("pdf_slices")
+    }
+    for batch in batches:
+        sources = batch.get("sources")
+        if not isinstance(sources, list):
+            continue
+        bid = str(batch.get("id", "?"))
+        context = batch.get("context_sources")
+        reachable = set(sources) | set(context if isinstance(context, list) else [])
+        ranges = batch.get("source_ranges") or {}
+        page_ranges = batch.get("source_page_ranges") or {}
+        for path in sources:
+            owner = owners.get(path) if isinstance(path, str) else None
+            if owner is None or owner in reachable:
+                continue
+            # Sliced views are exempt from co-batching: a slice batch is forced
+            # solo by the slice rules above, and an owner that is itself sliced
+            # is too large to ride along as context anywhere. Reachability for
+            # these shapes comes from the consulting read scope (a batch
+            # session may Read any raw source), not from packing.
+            if path in ranges or path in page_ranges or path in sliced_paths or owner in sliced_paths:
+                continue
+            errors.append(
+                f"batch {bid}: attachment {path} is separated from the document "
+                f"that embeds it ({owner})")
     for path, appearances in slice_appearances.items():
         line_count = int(records.get(path, {}).get("line_count", 0))
         ordered = sorted(appearances, key=lambda item: item["part"])
@@ -1012,10 +1292,19 @@ def stamp_reduction_done(plan: dict[str, Any], reduction_id: str) -> dict[str, A
     return plan
 
 
-def stamp_done(plan: dict[str, Any], batch_id: str) -> dict[str, Any]:
+def stamp_done(plan: dict[str, Any], batch_id: str,
+               usage: dict[str, int] | None = None) -> dict[str, Any]:
+    """Mark a batch finished, and record what its session actually cost.
+
+    The usage rides the plan because the plan is the durable, resumable record
+    of the run: after a compile the owner can read exactly how much context
+    each batch consumed and judge the budget against measurements rather than
+    against the estimate that set it."""
     for b in plan.get("batches", []):
         if b.get("id") == batch_id:
             b["status"] = "done"
+            if usage:
+                b["usage"] = dict(usage)
     return plan
 
 

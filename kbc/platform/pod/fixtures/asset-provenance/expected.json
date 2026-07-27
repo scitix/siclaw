@@ -71,6 +71,8 @@
         "via": "overview.md"
       }
     ],
+    "office_renders": 0,
+    "office_renders_sample": [],
     "unaccounted": [
       "archive.md",
       "assets/orphan.png"
