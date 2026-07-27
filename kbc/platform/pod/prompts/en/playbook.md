@@ -100,6 +100,31 @@ pages. If a source truly will not fit, split it along a dimension it already has
 (month, tenant, cluster), one page per slice, indexed from the understanding
 page.
 
+## Overlapping sources: compile the delta, point at the canonical page
+
+The same body of fact often arrives in several shapes — an aggregate ledger and
+the weekly exports it was built from, another system's dump of the same period,
+one specification presented twice, a table that exists as both a screenshot and
+text. All of them belong in the base. **None of them deserves to be transcribed
+record by record a second and third time.**
+
+Deciding they are the same body of fact is your judgement. Once you have:
+
+- **Pick one as the canonical carrier** and compile it fully;
+- **Give each of the others a page** saying what shape it is, what range it
+  covers, and **what it adds over the canonical page** — compile that delta, and
+  point at the canonical page for everything they share;
+- **Every one still gets its `compiled_from`** — they were all understood; they
+  simply were not copied out twice.
+
+**This is not an exclusion.** Exclusion means "this does not belong in the base";
+this is "it is already there, and here is only what is new."
+
+The test is the reader: he wants **one place holding the complete fact, plus a
+line saying what the other copies add** — not the same records transcribed onto
+three pages with small discrepancies between them, leaving him unsure which to
+believe.
+
 ## Page format (what a compiled page looks like)
 
 Each page:
