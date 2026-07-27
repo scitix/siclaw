@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { modelNeedsRebind } from "./brain-session.js";
 import type {
   BrainType,
   BrainModelInfo,
@@ -84,5 +85,55 @@ describe("BrainSession interface", () => {
       // no registerProvider
     };
     expect(fake.registerProvider).toBeUndefined();
+  });
+});
+
+
+describe("modelNeedsRebind", () => {
+  const base: BrainModelInfo = {
+    id: "claude-sonnet-5",
+    name: "claude-sonnet-5",
+    provider: "scitix",
+    contextWindow: 1000000,
+    maxTokens: 65536,
+    reasoning: true,
+    api: "openai-completions",
+  };
+
+  it("rebinds when nothing is bound yet", () => {
+    expect(modelNeedsRebind(undefined, base)).toBe(true);
+  });
+
+  it("does not rebind an identical model", () => {
+    expect(modelNeedsRebind(base, { ...base })).toBe(false);
+  });
+
+  // The regression this function exists for: toggling a per-model api_type
+  // override in Portal changes ONLY the protocol. Every other field stays
+  // identical, so a comparison that omits `api` reports "no change" — the
+  // session keeps the previously-bound model object and the provider rejects
+  // the turn with unsupported_protocol, i.e. the exact 400 the per-model
+  // override was built to fix, reappearing one layer down.
+  it("rebinds when only the wire protocol changed", () => {
+    expect(modelNeedsRebind(base, { ...base, api: "anthropic-messages" })).toBe(true);
+  });
+
+  it("rebinds when the protocol appears or disappears", () => {
+    expect(modelNeedsRebind({ ...base, api: undefined }, base)).toBe(true);
+    expect(modelNeedsRebind(base, { ...base, api: undefined })).toBe(true);
+  });
+
+  it.each([
+    ["id", { id: "claude-opus-4-8" }],
+    ["provider", { provider: "siflow" }],
+    ["reasoning", { reasoning: false }],
+    ["contextWindow", { contextWindow: 200000 }],
+    ["maxTokens", { maxTokens: 8192 }],
+  ])("rebinds when %s changed", (_field, patch) => {
+    expect(modelNeedsRebind(base, { ...base, ...patch } as BrainModelInfo)).toBe(true);
+  });
+
+  it("ignores display name — it does not affect how a turn is issued", () => {
+    expect(modelNeedsRebind(base, { ...base, name: "Claude Sonnet 5" })).toBe(false);
   });
 });

@@ -42,6 +42,41 @@ export interface BrainModelInfo {
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
+  /**
+   * Wire protocol the model speaks ("openai-completions", "anthropic-messages",
+   * …). Carried so callers can tell that a re-bind is needed when ONLY the
+   * protocol changed — a per-model `api_type` override toggled in Portal leaves
+   * id, provider and every size field untouched, and without this the session
+   * silently keeps talking the old protocol.
+   */
+  api?: string;
+}
+
+/**
+ * Whether a session bound to `current` has to be re-bound to `next`.
+ *
+ * Compares every field that changes how a turn is issued. `api` matters as much
+ * as the rest: a per-model `api_type` override toggled in Portal changes the
+ * wire protocol while leaving id, provider and all size fields identical, and
+ * omitting it here leaves the session talking the old protocol even after the
+ * model registry has been re-registered — which the provider rejects outright
+ * ("unsupported_protocol"), not silently.
+ *
+ * Single definition on purpose: this rule previously existed twice (the model
+ * routing runner and the agentbox prompt path) and both copies were missing the
+ * same field.
+ */
+export function modelNeedsRebind(
+  current: BrainModelInfo | undefined,
+  next: BrainModelInfo,
+): boolean {
+  return !current
+    || current.id !== next.id
+    || current.provider !== next.provider
+    || current.api !== next.api
+    || current.reasoning !== next.reasoning
+    || current.contextWindow !== next.contextWindow
+    || current.maxTokens !== next.maxTokens;
 }
 
 /**

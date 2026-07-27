@@ -41,6 +41,7 @@ import {
   type ModelRouteEvent,
   type ModelRoutePolicy,
 } from "../core/model-routing.js";
+import { modelNeedsRebind } from "../core/brain-session.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
 
 type RequestHandler = (
@@ -813,12 +814,7 @@ export function createHttpServer(
         const found = managed.brain.findModel(body.modelProvider, body.modelId);
         if (found) {
           const currentModel = managed.brain.getModel();
-          const needsUpdate = !currentModel
-            || currentModel.id !== found.id
-            || currentModel.provider !== found.provider
-            || currentModel.reasoning !== found.reasoning
-            || currentModel.contextWindow !== found.contextWindow
-            || currentModel.maxTokens !== found.maxTokens;
+          const needsUpdate = modelNeedsRebind(currentModel, found);
           if (needsUpdate) {
             console.log(`[agentbox-http] Setting model for session ${managed.id}: ${found.provider}/${found.id} (reasoning=${found.reasoning})`);
             await managed.brain.setModel(found);

@@ -241,6 +241,7 @@ export class PiAgentBrain implements BrainSession {
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
       reasoning: model.reasoning,
+      api: model.api,
     };
   }
 
@@ -275,6 +276,7 @@ export class PiAgentBrain implements BrainSession {
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
       reasoning: model.reasoning,
+      api: model.api,
     };
   }
 
