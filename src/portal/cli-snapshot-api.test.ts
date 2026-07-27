@@ -181,6 +181,43 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.default).toEqual({ provider: "openai", modelId: "gpt-4o" });
   });
 
+  it("carries per-model api overrides and omits the key for inheriting models", async () => {
+    // The production shape this exists for: one aggregator gateway hosting both
+    // OpenAI-protocol and Claude-protocol models. Exercises migration + SELECT +
+    // descriptor against a real DB, including the empty-string row that only a
+    // real INSERT can produce.
+    const db = getDb();
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-gw", "default", "gateway", "https://api.scitix.ai/model-api", "sk-test", "openai-completions", 0],
+    );
+    const insertModel = (id: string, modelId: string, apiType: string | null, sort: number) =>
+      db.query(
+        "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, api_type, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [id, "p-gw", modelId, modelId, 0, 128000, 8192, apiType, 0, sort],
+      );
+    await insertModel("m-inherit", "DeepSeek-V4-Pro", null, 0);
+    await insertModel("m-override", "claude-sonnet-5", "anthropic-messages", 1);
+    // An explicit empty string must behave exactly like NULL. Emitting `api: ""`
+    // would make pi drop the model from its registry entirely.
+    await insertModel("m-empty", "GLM-5.1", "", 2);
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
+    );
+    expect(status).toBe(200);
+    const byId = Object.fromEntries(
+      body.providers.gateway.models.map((m: Record<string, unknown>) => [m.id, m]),
+    );
+
+    expect("api" in byId["DeepSeek-V4-Pro"]).toBe(false);
+    expect("api" in byId["GLM-5.1"]).toBe(false);
+    expect(byId["claude-sonnet-5"].api).toBe("anthropic-messages");
+    // Provider-level api is untouched by a model overriding.
+    expect(body.providers.gateway.api).toBe("openai-completions");
+  });
+
   it("marks non-OpenAI compatible providers as not supporting developer-role messages", async () => {
     const db = getDb();
     await db.query(

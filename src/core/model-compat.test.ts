@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildProviderModelDescriptor, defaultProviderModelCompat, normalizeProviderApi } from "./model-compat.js";
+import {
+  buildProviderModelDescriptor,
+  defaultProviderModelCompat,
+  normalizeProviderApi,
+  resolveModelApi,
+} from "./model-compat.js";
 
 describe("defaultProviderModelCompat", () => {
   it("keeps developer-role messages for the official OpenAI API", () => {
@@ -57,6 +62,85 @@ describe("buildProviderModelDescriptor", () => {
       provider,
     );
     expect(d.input).toEqual(["text"]);
+  });
+});
+
+describe("resolveModelApi", () => {
+  const anthropicProvider = { api: "anthropic-messages", baseUrl: "https://api.anthropic.com/v1" };
+  const row = (api_type?: string | null) => ({
+    model_id: "m", context_window: 1000, max_tokens: 100, api_type,
+  });
+
+  it("inherits the provider api when the model does not override", () => {
+    expect(resolveModelApi(row(undefined), anthropicProvider))
+      .toEqual({ api: "anthropic-messages", isOverride: false });
+  });
+
+  // The empty-string trap: normalizeProviderApi("") is "openai-completions", so
+  // a `row.api_type ?? provider.api` implementation would report a hard OpenAI
+  // override here and silently un-inherit the Anthropic provider.
+  it.each(["", "   ", null])("inherits (never openai-completions) for %j", (api_type) => {
+    expect(resolveModelApi(row(api_type), anthropicProvider))
+      .toEqual({ api: "anthropic-messages", isOverride: false });
+  });
+
+  it("normalizes a legacy override value", () => {
+    expect(resolveModelApi(row("anthropic"), { api: "openai-completions" }))
+      .toEqual({ api: "anthropic-messages", isOverride: true });
+  });
+
+  it("falls back to openai-completions when neither model nor provider sets an api", () => {
+    expect(resolveModelApi(row(null), {})).toEqual({ api: "openai-completions", isOverride: false });
+  });
+});
+
+describe("buildProviderModelDescriptor — per-model api override", () => {
+  const row = (api_type?: string | null) => ({
+    model_id: "m", context_window: 1000, max_tokens: 100, api_type,
+  });
+
+  it("omits the api key entirely when the model inherits", () => {
+    const d = buildProviderModelDescriptor(row(undefined), { api: "anthropic-messages" });
+    expect("api" in d).toBe(false);
+  });
+
+  // An emitted `api: ""` is worse than a wrong protocol: pi's parseModels does
+  // `if (!api) continue`, dropping the model from the registry ("model not
+  // found") instead of erroring on the protocol.
+  it.each(["", "   ", null])("emits no api key for %j — never an empty string", (api_type) => {
+    const d = buildProviderModelDescriptor(row(api_type), { api: "anthropic-messages" });
+    expect("api" in d).toBe(false);
+    expect((d as { api?: string }).api).not.toBe("");
+    expect((d as { api?: string }).api).not.toBe("openai-completions");
+  });
+
+  // The production case this feature exists for: one aggregator gateway hosting
+  // OpenAI-protocol and Claude-protocol models side by side.
+  it("emits the override for a Claude model on an OpenAI-protocol gateway", () => {
+    const gateway = { api: "openai-completions", baseUrl: "https://api.scitix.ai/model-api" };
+    expect(buildProviderModelDescriptor(
+      { ...row("anthropic-messages"), model_id: "claude-sonnet-5" }, gateway,
+    ).api).toBe("anthropic-messages");
+    // sibling models on the same provider keep inheriting
+    expect("api" in buildProviderModelDescriptor(
+      { ...row(null), model_id: "DeepSeek-V4-Pro" }, gateway,
+    )).toBe(false);
+  });
+
+  it("derives compat from the effective api, not the provider api", () => {
+    // Provider says chat-completions on the official OpenAI host (which alone
+    // would yield supportsDeveloperRole: true) — the model's override wins.
+    expect(buildProviderModelDescriptor(
+      row("anthropic-messages"),
+      { api: "openai-completions", baseUrl: "https://api.openai.com/v1" },
+    ).compat.supportsDeveloperRole).toBe(false);
+
+    // And the reverse: an anthropic-messages provider with a model overriding
+    // back to chat-completions on the official host.
+    expect(buildProviderModelDescriptor(
+      row("openai-completions"),
+      { api: "anthropic-messages", baseUrl: "https://api.openai.com/v1" },
+    ).compat.supportsDeveloperRole).toBe(true);
   });
 });
 

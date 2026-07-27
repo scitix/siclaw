@@ -13,6 +13,8 @@ export interface ProviderModelRow {
   vision?: unknown;
   context_window: number;
   max_tokens: number;
+  /** Per-model protocol override; null/empty = inherit the provider's api. */
+  api_type?: string | null;
 }
 
 /**
@@ -33,6 +35,31 @@ export function normalizeProviderApi(api: string | null | undefined): string {
   const raw = (api ?? "").trim();
   if (!raw) return "openai-completions";
   return LEGACY_API_ALIASES[raw.toLowerCase()] ?? raw;
+}
+
+/**
+ * Resolve the wire protocol a single model speaks: its own `api_type` when set,
+ * else the provider's. `isOverride` tells the caller whether the model actually
+ * overrode — see `buildProviderModelDescriptor` for why that distinction is
+ * load-bearing.
+ *
+ * Two details in the guard are deliberate and must not be "simplified":
+ *
+ * 1. `.trim()` before the truthiness test — a whitespace-only value inherits
+ *    rather than being passed through as an api id.
+ * 2. `||`, never `??` — `normalizeProviderApi("")` returns "openai-completions"
+ *    (the no-value fallback), so `row.api_type ?? provider.api` would turn an
+ *    empty-string column into a HARD OpenAI override, silently un-inheriting an
+ *    anthropic-messages provider. `??` only guards null/undefined; '' sails
+ *    through it. The DB coerces '' to NULL on write (siclaw-api.ts), but this
+ *    guard also covers rows written by anything else.
+ */
+export function resolveModelApi(
+  row: ProviderModelRow,
+  provider: ProviderCompatInput,
+): { api: string; isOverride: boolean } {
+  const override = (row.api_type ?? "").trim();
+  return { api: normalizeProviderApi(override || provider.api), isOverride: override !== "" };
 }
 
 function isOfficialOpenAIBaseUrl(baseUrl?: string | null): boolean {
@@ -61,24 +88,40 @@ export function defaultProviderModelCompat(provider: ProviderCompatInput): Requi
  * Build a single `ProviderModelConfig` descriptor from a `model_entries` row.
  *
  * This is the SINGLE place that translates the persisted `vision` boolean into
- * the runtime `input` capability list. Keeping it centralized prevents the
+ * the runtime `input` capability list, and the single place that resolves a
+ * model's wire protocol. Keeping it centralized prevents the
  * descriptor-construction drift that hardcoded `input: ["text"]` causes across
  * the (6+) production paths that hydrate model bindings — a vision model whose
  * `input` was missed would have its image request silently filtered by
  * model-routing's `filterCandidatesForPromptMedia`.
+ *
+ * `api` is emitted ONLY when the model overrides the provider. pi resolves
+ * `modelDef.api ?? providerConfig.api`, so an absent key is exactly equivalent
+ * to the provider value — while emitting an empty string would be actively
+ * harmful: pi's `if (!api) continue` drops such a model from the registry
+ * entirely, surfacing as "model not found" rather than a protocol error.
+ * Omitting on inherit makes that state unreachable by construction, and keeps
+ * settings.json following a later provider-level api_type change.
+ *
+ * `compat` is derived from the EFFECTIVE api, not the provider's: compat
+ * describes the wire protocol (`supportsDeveloperRole` keys off
+ * chat-completions, `maxTokensField` is protocol-shaped), so once `api` is
+ * per-model, compat is per-model by definition.
  */
 export function buildProviderModelDescriptor(
   row: ProviderModelRow,
   provider: ProviderCompatInput,
 ) {
+  const { api, isOverride } = resolveModelApi(row, provider);
   return {
     id: row.model_id,
     name: row.name ?? row.model_id,
+    ...(isOverride ? { api } : {}),
     reasoning: !!row.reasoning,
     input: (row.vision ? ["text", "image"] : ["text"]) as string[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: row.context_window,
     maxTokens: row.max_tokens,
-    compat: defaultProviderModelCompat({ api: provider.api, baseUrl: provider.baseUrl }),
+    compat: defaultProviderModelCompat({ api, baseUrl: provider.baseUrl }),
   };
 }

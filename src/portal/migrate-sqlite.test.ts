@@ -209,6 +209,72 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(rows.every((r) => r.seq > 0)).toBe(true);
   });
 
+  it("model_entries.api_type is added nullable with no default", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string; notnull: number; dflt_value: string | null }>>(
+      "PRAGMA table_info(model_entries)",
+    );
+    const col = rows.find((r) => r.name === "api_type");
+    expect(col).toBeDefined();
+    // NULL must stay representable — it is how "inherit the provider" is stored.
+    // A NOT NULL DEFAULT '' would bake the empty-string trap into the schema.
+    expect(col!.notnull).toBe(0);
+    // SQLite stores the literal DEFAULT text, so "NULL" and an absent default
+    // both mean the column defaults to NULL. What must never show up here is an
+    // empty-string default — that would read as a hard override, not inherit.
+    expect([null, "NULL"]).toContain(col!.dflt_value);
+  });
+
+  it("backfills model_entries.api_type onto a legacy table that predates it", async () => {
+    // The real regression this guards: without the safeAlterTable line, an
+    // existing MySQL deployment throws "Unknown column 'api_type'" on every
+    // agent-settings fetch, because all five descriptor SELECTs name the column.
+    const db = getDb();
+    await db.query(`CREATE TABLE model_providers (
+      id CHAR(36) PRIMARY KEY,
+      org_id CHAR(36),
+      name VARCHAR(100) NOT NULL,
+      base_url VARCHAR(500) NOT NULL,
+      api_key VARCHAR(500),
+      api_type VARCHAR(50) NOT NULL DEFAULT 'openai-completions',
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
+    // Legacy shape: no api_type, and no vision either (added in an earlier
+    // migration) — both must be backfilled by the ALTER pass.
+    await db.query(`CREATE TABLE model_entries (
+      id CHAR(36) PRIMARY KEY,
+      provider_id CHAR(36) NOT NULL,
+      model_id VARCHAR(255) NOT NULL,
+      name VARCHAR(255),
+      reasoning TINYINT(1) NOT NULL DEFAULT 0,
+      context_window INT NOT NULL DEFAULT 128000,
+      max_tokens INT NOT NULL DEFAULT 65536,
+      is_default TINYINT(1) NOT NULL DEFAULT 0,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (provider_id, model_id)
+    )`);
+    await db.query(
+      "INSERT INTO model_providers (id, name, base_url) VALUES ('p1', 'gw', 'https://gw.example/v1')",
+    );
+    await db.query("INSERT INTO model_entries (id, provider_id, model_id) VALUES ('m1', 'p1', 'legacy')");
+
+    await runPortalMigrations();
+
+    const [cols] = await db.query<Array<{ name: string }>>("PRAGMA table_info(model_entries)");
+    expect(cols.map((c) => c.name)).toEqual(expect.arrayContaining(["api_type", "vision"]));
+
+    // Pre-existing row survives, and an INSERT that omits api_type inherits (NULL).
+    await db.query("INSERT INTO model_entries (id, provider_id, model_id) VALUES ('m2', 'p1', 'fresh')");
+    const [rows] = await db.query<Array<{ id: string; api_type: string | null }>>(
+      "SELECT id, api_type FROM model_entries ORDER BY id",
+    );
+    expect(rows).toEqual([{ id: "m1", api_type: null }, { id: "m2", api_type: null }]);
+  });
+
   it("agents.model_routing column exists after migration", async () => {
     await runPortalMigrations();
     const db = getDb();

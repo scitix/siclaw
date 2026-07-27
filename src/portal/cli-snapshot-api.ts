@@ -103,6 +103,8 @@ interface ModelRow {
   vision: number;
   context_window: number;
   max_tokens: number;
+  /** Per-model protocol override; null = inherit ProviderRow.api_type. */
+  api_type: string | null;
   is_default: number;
 }
 
@@ -216,6 +218,8 @@ export interface CliSnapshot {
     models: Array<{
       id: string;
       name: string;
+      /** Per-model protocol override; absent = inherit the provider's `api`. */
+      api?: string;
       reasoning: boolean;
       input: string[];
       cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
@@ -297,7 +301,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE api_key IS NOT NULL AND api_key != '' ORDER BY sort_order, name",
     );
     const [models] = await db.query<ModelRow[]>(
-      "SELECT provider_id, model_id, name, reasoning, vision, context_window, max_tokens, is_default FROM model_entries ORDER BY provider_id, sort_order, model_id",
+      "SELECT provider_id, model_id, name, reasoning, vision, context_window, max_tokens, api_type, is_default FROM model_entries ORDER BY provider_id, sort_order, model_id",
     );
     // MCP: scoped to agent via agent_mcp_servers when active, else all enabled.
     const [mcps] = activeAgentId

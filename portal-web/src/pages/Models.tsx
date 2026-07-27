@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react"
-import { Plus, Trash2, Loader2, ChevronDown, ChevronRight, Settings } from "lucide-react"
+import { useState, useEffect, useRef } from "react"
+import { Plus, Trash2, Loader2, ChevronDown, ChevronRight, Settings, Download, X } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
@@ -13,7 +13,28 @@ interface ModelEntry {
   vision: boolean
   context_window: number
   max_tokens: number
+  /**
+   * Per-model protocol override. Optional AND nullable: the row arrives via
+   * `SELECT *` and is NULL for every model predating this column, which is what
+   * "inherit the provider's api_type" is stored as.
+   */
+  api_type?: string | null
   is_default: boolean
+}
+
+/** A model advertised by the provider's own /models endpoint (import dialog). */
+export interface ListedModel {
+  id: string
+  name?: string
+  /** Server-inferred protocol; "" = inherit the provider. Operator can change it. */
+  suggested_api_type: string
+  /** Row looks like a Claude model on an OpenAI-protocol provider — flagged, not decided. */
+  protocol_hint?: "claude"
+  context_window?: number
+  max_tokens?: number
+  vision?: boolean
+  reasoning?: boolean
+  already_exists: boolean
 }
 
 export interface Provider {
@@ -38,6 +59,110 @@ export function normalizeApiType(apiType: string): string {
   return LEGACY_API_TYPES[apiType] ?? apiType
 }
 
+/**
+ * Label for a model's protocol override in the summary line — empty string when
+ * the model inherits, so the common row renders unchanged and only the
+ * exception draws the eye.
+ *
+ * Note this deliberately does NOT default to "openai-completions" the way the
+ * server's normalizeProviderApi does: on the frontend an absent value means
+ * "inherit", and picking the fallback is the server's job.
+ */
+export function modelApiLabel(apiType: string | null | undefined): string {
+  const raw = (apiType ?? "").trim()
+  return raw ? normalizeApiType(raw) : ""
+}
+
+/** Defaults the batch endpoint applies when the listing carried no value. */
+const IMPORT_DEFAULT_CONTEXT_WINDOW = 128000
+const IMPORT_DEFAULT_MAX_TOKENS = 65536
+
+/**
+ * What a listed model will actually be imported as. The OpenAI listing spec
+ * carries none of these fields, so most rows fall back — and `context_window`
+ * is load-bearing (too low and turns get rejected in preflight, siclaw-side),
+ * so the dialog says plainly which numbers are real and which are guesses.
+ */
+export function describeListedModel(m: ListedModel): string {
+  const ctx = m.context_window
+    ? `${Math.round(m.context_window / 1000)}K ctx`
+    : `${Math.round(IMPORT_DEFAULT_CONTEXT_WINDOW / 1000)}K ctx (default)`
+  const out = m.max_tokens
+    ? `${Math.round(m.max_tokens / 1000)}K out`
+    : `${Math.round(IMPORT_DEFAULT_MAX_TOKENS / 1000)}K out (default)`
+  const parts = [ctx, out]
+  if (m.vision) parts.push("vision")
+  if (m.reasoning) parts.push("reasoning")
+  return parts.join(" · ")
+}
+
+/** Per-row state in the import dialog: ticked, plus the (editable) protocol. */
+export interface FetchSelection { checked: boolean; api_type: string }
+
+/**
+ * Rows the operator may actually import — models the provider already has are
+ * shown for context but can never be selected.
+ */
+export function importableModels(models: ListedModel[]): ListedModel[] {
+  return models.filter((m) => !m.already_exists)
+}
+
+/**
+ * Body for the batch-import request. Takes the protocol from the row's current
+ * selection, NOT from `suggested_api_type`: the inference is only a pre-fill,
+ * and an operator correction must win.
+ */
+export function buildImportPayload(
+  models: ListedModel[],
+  selection: Record<string, FetchSelection>,
+) {
+  return importableModels(models)
+    .filter((m) => selection[m.id]?.checked)
+    .map((m) => ({
+      model_id: m.id,
+      name: m.name || m.id,
+      api_type: selection[m.id]?.api_type || "",
+      context_window: m.context_window,
+      max_tokens: m.max_tokens,
+      vision: m.vision,
+      reasoning: m.reasoning,
+    }))
+}
+
+/**
+ * Apply one protocol to every hinted row at once. A gateway serving its whole
+ * Claude family over the Claude protocol otherwise means repeating the same
+ * dropdown edit N times — and the listing cannot infer it (no field in the
+ * OpenAI /models spec carries protocol), so the operator has to say it once.
+ */
+export function applyProtocolToHinted(
+  models: ListedModel[],
+  selection: Record<string, FetchSelection>,
+  apiType: string,
+): Record<string, FetchSelection> {
+  const next = { ...selection }
+  for (const m of models) {
+    if (m.already_exists || m.protocol_hint !== "claude") continue
+    next[m.id] = { checked: next[m.id]?.checked ?? false, api_type: apiType }
+  }
+  return next
+}
+
+/**
+ * Select-all / clear-all. Already-added rows stay unticked either way, and each
+ * row keeps whatever protocol the operator had chosen.
+ */
+export function toggleSelectAll(
+  models: ListedModel[],
+  selection: Record<string, FetchSelection>,
+  selectAll: boolean,
+): Record<string, FetchSelection> {
+  return Object.fromEntries(models.map((m) => [
+    m.id,
+    { checked: selectAll && !m.already_exists, api_type: selection[m.id]?.api_type ?? "" },
+  ]))
+}
+
 export function Models() {
   const [providers, setProviders] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
@@ -57,12 +182,25 @@ export function Models() {
 
   // Add model
   const [showAddModel, setShowAddModel] = useState<string | null>(null)
-  const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", reasoning: false, vision: false, is_default: false })
+  const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "", reasoning: false, vision: false, is_default: false })
   const [addingModel, setAddingModel] = useState(false)
+
+  // Fetch models from the provider's own /models endpoint
+  const [fetchDialogProvider, setFetchDialogProvider] = useState<Provider | null>(null)
+  const [fetchLoading, setFetchLoading] = useState(false)
+  const [fetchError, setFetchError] = useState<string | null>(null)
+  const [fetchedModels, setFetchedModels] = useState<ListedModel[]>([])
+  // Per-row selection state, keyed by model id. Holds the (editable) protocol
+  // alongside the checkbox so the operator can correct a bad inference before
+  // importing.
+  const [fetchSelection, setFetchSelection] = useState<Record<string, { checked: boolean; api_type: string }>>({})
+  const [importing, setImporting] = useState(false)
+  // Monotonic token identifying the newest listing request; see openFetchDialog.
+  const fetchRequestRef = useRef(0)
 
   // Edit model
   const [editingModelId, setEditingModelId] = useState<string | null>(null)
-  const [editModelForm, setEditModelForm] = useState({ model_id: "", name: "", context_window: "", max_tokens: "", reasoning: false, vision: false, is_default: false })
+  const [editModelForm, setEditModelForm] = useState({ model_id: "", name: "", context_window: "", max_tokens: "", api_type: "", reasoning: false, vision: false, is_default: false })
   const [savingModel, setSavingModel] = useState(false)
 
   const fetchProviders = async () => {
@@ -131,10 +269,73 @@ export function Models() {
         body: { ...modelForm, context_window: parseInt(modelForm.context_window), max_tokens: parseInt(modelForm.max_tokens) },
       })
       setShowAddModel(null)
-      setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", reasoning: false, vision: false, is_default: false })
+      setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "", reasoning: false, vision: false, is_default: false })
       await fetchProviders()
       toast.success("Model added")
     } catch (err: any) { toast.error(err.message) } finally { setAddingModel(false) }
+  }
+
+  const openFetchDialog = async (provider: Provider) => {
+    // Every response is checked against this token before it touches state. A
+    // listing can take the endpoint's full 15s timeout, and the operator is free
+    // to close the dialog and open another provider's meanwhile — without the
+    // guard the slow response repopulates the dialog under the NEW provider's
+    // header, and Import then writes the stale provider's models into it.
+    const requestId = ++fetchRequestRef.current
+    const isStale = () => fetchRequestRef.current !== requestId
+
+    setFetchDialogProvider(provider)
+    setFetchLoading(true)
+    setFetchError(null)
+    setFetchedModels([])
+    setFetchSelection({})
+    try {
+      // The endpoint answers 200 with ok:false for a reachable-but-unhappy
+      // provider (bad key, non-JSON body, Azure-style incompatible path), so
+      // the failure text lands in the dialog rather than as a thrown error.
+      const res = await api<{ ok: boolean; message?: string; models?: ListedModel[] }>(
+        `/siclaw/admin/models/providers/${provider.id}/fetch-models`,
+        { method: "POST", body: {} },
+      )
+      if (isStale()) return
+      if (!res.ok) { setFetchError(res.message || "Could not list models") ; return }
+      const models = res.models || []
+      setFetchedModels(models)
+      setFetchSelection(Object.fromEntries(
+        models.map((m) => [m.id, { checked: false, api_type: m.suggested_api_type || "" }]),
+      ))
+      if (models.length === 0) setFetchError("Provider returned no models")
+    } catch (err: any) {
+      if (isStale()) return
+      setFetchError(err.message)
+    } finally {
+      if (!isStale()) setFetchLoading(false)
+    }
+  }
+
+  const closeFetchDialog = () => {
+    // Invalidate any in-flight listing so it can't land on the next dialog.
+    fetchRequestRef.current++
+    setFetchDialogProvider(null)
+    setFetchLoading(false)
+  }
+
+  const importable = importableModels(fetchedModels)
+  const selectedIds = importable.filter((m) => fetchSelection[m.id]?.checked).map((m) => m.id)
+
+  const handleImportModels = async () => {
+    if (!fetchDialogProvider || selectedIds.length === 0) return
+    setImporting(true)
+    try {
+      const payload = buildImportPayload(fetchedModels, fetchSelection)
+      const res = await api<{ imported: number; skipped: number }>(
+        `/siclaw/admin/models/providers/${fetchDialogProvider.id}/models/batch`,
+        { method: "POST", body: { models: payload } },
+      )
+      closeFetchDialog()
+      await fetchProviders()
+      toast.success(`Imported ${res.imported} model${res.imported === 1 ? "" : "s"}${res.skipped ? `, skipped ${res.skipped}` : ""}`)
+    } catch (err: any) { toast.error(err.message) } finally { setImporting(false) }
   }
 
   const handleDeleteModel = async (providerId: string, modelId: string) => {
@@ -149,6 +350,7 @@ export function Models() {
       name: model.name || "",
       context_window: String(model.context_window),
       max_tokens: String(model.max_tokens),
+      api_type: model.api_type ? normalizeApiType(model.api_type) : "",
       reasoning: !!model.reasoning,
       vision: !!model.vision,
       is_default: !!model.is_default,
@@ -166,6 +368,7 @@ export function Models() {
           name: editModelForm.name,
           context_window: parseInt(editModelForm.context_window),
           max_tokens: parseInt(editModelForm.max_tokens),
+          api_type: editModelForm.api_type,
           reasoning: editModelForm.reasoning,
           vision: editModelForm.vision,
           is_default: editModelForm.is_default,
@@ -275,6 +478,15 @@ export function Models() {
                       </div>
                     )}
 
+                    {/* Always visible — opening the Add Model form must not hide
+                        the other way to add models. */}
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] uppercase tracking-wide text-muted-foreground/70">Models</span>
+                      <button onClick={() => openFetchDialog(provider)} title={`List the models ${provider.base_url}/models advertises`} className="flex items-center gap-1 h-7 px-2.5 text-xs rounded-md border border-border text-muted-foreground hover:text-foreground hover:bg-secondary">
+                        <Download className="h-3 w-3" /> Fetch from provider
+                      </button>
+                    </div>
+
                     {/* Models list */}
                     {provider.models && provider.models.length > 0 && (
                       <div className="space-y-1.5 mb-3">
@@ -285,6 +497,7 @@ export function Models() {
                                 <p className="text-sm font-mono">{model.model_id}</p>
                                 <p className="text-xs text-muted-foreground">
                                   {model.name || model.model_id}{model.reasoning ? " · reasoning" : ""}{model.vision ? " · vision" : ""} · {(model.context_window / 1000).toFixed(0)}K
+                                  {!!modelApiLabel(model.api_type) && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/20 text-amber-500 font-mono">{modelApiLabel(model.api_type)}</span>}
                                   {!!model.is_default && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-primary/20 text-primary">default</span>}
                                 </p>
                               </div>
@@ -294,12 +507,14 @@ export function Models() {
                               </div>
                             </div>
                             {editingModelId === model.id && (
-                              <div className="ml-4 mt-1.5 mb-1.5 p-3 rounded-md border border-border bg-card space-y-2">
+                              <div className="ml-4 mt-1.5 mb-1.5 p-3 rounded-md border border-primary/40 bg-card space-y-2">
+                                <p className="text-[11px] font-medium text-muted-foreground">Editing <span className="font-mono text-foreground">{model.model_id}</span></p>
                                 <div className="grid grid-cols-2 gap-2">
                                   <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Model ID</label><input value={editModelForm.model_id} onChange={(e) => setEditModelForm({ ...editModelForm, model_id: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" /></div>
                                   <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Display Name</label><input value={editModelForm.name} onChange={(e) => setEditModelForm({ ...editModelForm, name: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                                   <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Context Window</label><input value={editModelForm.context_window} onChange={(e) => setEditModelForm({ ...editModelForm, context_window: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                                   <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={editModelForm.max_tokens} onChange={(e) => setEditModelForm({ ...editModelForm, max_tokens: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
+                                  <div className="col-span-2"><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">API Type <span className="font-normal opacity-70">— overrides the provider protocol for this model only</span></label><select value={editModelForm.api_type} onChange={(e) => setEditModelForm({ ...editModelForm, api_type: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background"><option value="">Inherit from provider</option><option value="openai-completions">OpenAI Compatible</option><option value="anthropic-messages">Anthropic</option></select></div>
                                 </div>
                                 <div className="flex items-center gap-5">
                                   <div className="flex items-center gap-2">
@@ -328,12 +543,14 @@ export function Models() {
 
                     {/* Add model form */}
                     {showAddModel === provider.id ? (
-                      <div className="p-3 rounded-md border border-border bg-card space-y-2">
+                      <div className="p-3 rounded-md border border-dashed border-border bg-card space-y-2">
+                        <p className="text-[11px] font-medium text-muted-foreground">New model</p>
                         <div className="grid grid-cols-2 gap-2">
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Model ID</label><input placeholder="e.g. gpt-4o" value={modelForm.model_id} onChange={(e) => setModelForm({ ...modelForm, model_id: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" /></div>
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Display Name</label><input placeholder="e.g. GPT-4o" value={modelForm.name} onChange={(e) => setModelForm({ ...modelForm, name: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Context Window</label><input value={modelForm.context_window} onChange={(e) => setModelForm({ ...modelForm, context_window: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={modelForm.max_tokens} onChange={(e) => setModelForm({ ...modelForm, max_tokens: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
+                          <div className="col-span-2"><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">API Type <span className="font-normal opacity-70">— overrides the provider protocol for this model only</span></label><select value={modelForm.api_type} onChange={(e) => setModelForm({ ...modelForm, api_type: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background"><option value="">Inherit from provider</option><option value="openai-completions">OpenAI Compatible</option><option value="anthropic-messages">Anthropic</option></select></div>
                         </div>
                         <div className="flex items-center gap-5">
                           <div className="flex items-center gap-2">
@@ -366,6 +583,102 @@ export function Models() {
           </div>
         )}
       </div>
+
+      {/* Fetch-models dialog */}
+      {fetchDialogProvider && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => !importing && closeFetchDialog()}>
+          <div className="w-full max-w-2xl max-h-[80vh] flex flex-col rounded-lg border border-border bg-background shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-start justify-between px-4 py-3 border-b border-border">
+              <div>
+                <h2 className="text-sm font-semibold">Fetch models — {fetchDialogProvider.name}</h2>
+                <p className="text-xs text-muted-foreground font-mono mt-0.5">{fetchDialogProvider.base_url}/models</p>
+              </div>
+              <button onClick={closeFetchDialog} disabled={importing} className="p-1 rounded-md hover:bg-secondary text-muted-foreground disabled:opacity-50"><X className="h-4 w-4" /></button>
+            </div>
+
+            <div className="flex-1 overflow-auto px-4 py-3">
+              {fetchLoading ? (
+                <div className="flex items-center justify-center py-10 gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" /> Listing models…
+                </div>
+              ) : fetchError ? (
+                <div className="py-8 text-center">
+                  <p className="text-sm text-red-400">{fetchError}</p>
+                  <p className="text-xs text-muted-foreground mt-2">The provider may not expose a /models endpoint. You can still add models manually.</p>
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  {fetchedModels.map((m) => {
+                    const sel = fetchSelection[m.id]
+                    return (
+                      <label key={m.id} className={`flex items-center gap-3 px-2 py-1.5 rounded-md ${m.already_exists ? "opacity-40" : "hover:bg-secondary/40 cursor-pointer"}`}>
+                        <input
+                          type="checkbox"
+                          disabled={m.already_exists}
+                          checked={!!sel?.checked}
+                          onChange={(e) => setFetchSelection({ ...fetchSelection, [m.id]: { ...sel, checked: e.target.checked, api_type: sel?.api_type ?? "" } })}
+                          className="h-3.5 w-3.5 shrink-0"
+                        />
+                        <span className="flex-1 min-w-0">
+                          <span className="block text-xs font-mono truncate">{m.id}</span>
+                          <span className="block text-[10px] text-muted-foreground">{describeListedModel(m)}</span>
+                          {m.protocol_hint === "claude" && !m.already_exists && (
+                            <span className="block text-[10px] text-amber-500/90">Claude-named — pick Anthropic if this gateway serves it over the Claude protocol</span>
+                          )}
+                        </span>
+                        {m.already_exists ? (
+                          <span className="text-[10px] text-muted-foreground shrink-0">already added</span>
+                        ) : (
+                          <select
+                            value={sel?.api_type ?? ""}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => setFetchSelection({ ...fetchSelection, [m.id]: { checked: sel?.checked ?? false, api_type: e.target.value } })}
+                            className="h-6 px-1.5 text-[11px] rounded border border-border bg-background shrink-0"
+                          >
+                            <option value="">Inherit</option>
+                            <option value="openai-completions">OpenAI Compatible</option>
+                            <option value="anthropic-messages">Anthropic</option>
+                          </select>
+                        )}
+                      </label>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between px-4 py-3 border-t border-border">
+              <div className="flex items-center gap-3">
+              {fetchedModels.some((m) => m.protocol_hint === "claude" && !m.already_exists) && (
+                <button
+                  onClick={() => setFetchSelection(applyProtocolToHinted(fetchedModels, fetchSelection, "anthropic-messages"))}
+                  className="text-xs text-amber-600 hover:text-amber-500"
+                  title="Set every Claude-named row to the Anthropic protocol"
+                >
+                  Set all Claude rows → Anthropic
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  const allSelected = selectedIds.length === importable.length && importable.length > 0
+                  setFetchSelection(toggleSelectAll(fetchedModels, fetchSelection, !allSelected))
+                }}
+                disabled={importable.length === 0}
+                className="text-xs text-muted-foreground hover:text-foreground disabled:opacity-40"
+              >
+                {selectedIds.length === importable.length && importable.length > 0 ? "Clear selection" : "Select all"}
+              </button>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={closeFetchDialog} disabled={importing} className="h-7 px-3 text-xs rounded-md border border-border text-muted-foreground disabled:opacity-50">Cancel</button>
+                <button onClick={handleImportModels} disabled={importing || selectedIds.length === 0} className="h-7 px-3 text-xs rounded-md bg-primary text-primary-foreground disabled:opacity-50">
+                  {importing ? "Importing…" : `Import ${selectedIds.length} model${selectedIds.length === 1 ? "" : "s"}`}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

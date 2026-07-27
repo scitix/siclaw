@@ -26,6 +26,13 @@ export interface ProviderModelCompat {
 export interface ProviderModelConfig {
   id: string;
   name: string;
+  /**
+   * Per-model wire protocol. Absent = inherit `ProviderConfig.api` (pi resolves
+   * `modelDef.api ?? providerConfig.api`). Never emit an empty string: pi drops
+   * such a model from its registry outright. Set by
+   * `buildProviderModelDescriptor` only when the model overrides its provider.
+   */
+  api?: string;
   reasoning?: boolean;
   input?: string[];
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
@@ -512,7 +519,9 @@ export function getDefaultLlm(): { baseUrl: string; apiKey: string; authHeader: 
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
     authHeader: provider.authHeader ?? true,
-    api: provider.api ?? "openai-completions",
+    // Model-level api wins, same inherit rule as resolveModelApi (model-compat):
+    // `||`, not `??`, so an empty string inherits instead of reading as a value.
+    api: (model.api ?? "").trim() || provider.api || "openai-completions",
     model,
   };
 }

@@ -204,30 +204,84 @@ export function tracingTestSsrfGuard(rawUrl: string): { ok: boolean; error?: str
   return { ok: true };
 }
 
-function isBlockedIpLiteral(host: string): boolean {
-  // IPv4 literal
-  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+/**
+ * Normalize every literal spelling of an IPv4 address to dotted-quad, or null
+ * when the host isn't one.
+ *
+ * `getaddrinfo` accepts far more than dotted-quad — `inet_aton` also parses
+ * decimal (`2852039166`), octal (`0251.0376.0251.0376`) and hex (`0xA9FEA9FE`)
+ * forms, all of which reach 169.254.169.254. A guard that only pattern-matches
+ * four dotted decimals is bypassed by every one of them.
+ */
+function canonicalIpv4(host: string): string | null {
+  // IPv4-mapped IPv6, textual (::ffff:169.254.169.254) or hex-normalised by
+  // `new URL()` (::ffff:a9fe:a9fe).
+  const mappedDotted = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (mappedDotted) return canonicalIpv4(mappedDotted[1]);
+  const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mappedHex) {
+    const hi = parseInt(mappedHex[1], 16);
+    const lo = parseInt(mappedHex[2], 16);
+    return [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join(".");
+  }
+  if (host.includes(":")) return null; // a real IPv6 literal
+
+  // 1–4 inet_aton parts, each decimal / 0-prefixed octal / 0x-prefixed hex.
+  const parts = host.split(".");
+  if (parts.length < 1 || parts.length > 4) return null;
+  const nums: number[] = [];
+  for (const part of parts) {
+    if (part === "") return null;
+    let n: number;
+    if (/^0[xX][0-9a-fA-F]+$/.test(part)) n = parseInt(part, 16);
+    else if (/^0[0-7]+$/.test(part)) n = parseInt(part, 8);
+    else if (/^\d+$/.test(part)) n = parseInt(part, 10);
+    else return null; // contains a letter → hostname, not a literal
+    if (!Number.isFinite(n)) return null;
+    nums.push(n);
+  }
+  // inet_aton: the final part absorbs all remaining low-order bytes.
+  const last = nums.pop()!;
+  if (last >= 2 ** (8 * (4 - nums.length))) return null; // out of range → not a literal
+  if (nums.some((n) => n > 255)) return null;
+  let addr = last;
+  for (let i = nums.length - 1; i >= 0; i--) addr += nums[i] * 2 ** (8 * (3 - i));
+  return [(addr >>> 24) & 0xff, (addr >>> 16) & 0xff, (addr >>> 8) & 0xff, addr & 0xff].join(".");
+}
+
+/**
+ * Literal-address denylist shared by the tracing-exporter probe and the
+ * provider-listing proxy.
+ *
+ * `allowLoopback` is the only difference between the two callers: a local
+ * Ollama (`http://localhost:11434/v1`) is a legitimate model provider and the
+ * runtime already dials it, whereas an OTLP exporter has no such case.
+ *
+ * KNOWN LIMIT — literals only. A hostname resolving to a blocked address
+ * (`metadata.google.internal`, `169-254-169-254.nip.io`) passes; closing that
+ * needs resolve-then-pinned-connect to survive DNS rebinding, which nothing in
+ * this codebase does yet.
+ */
+export function isBlockedIpLiteral(host: string, opts?: { allowLoopback?: boolean }): boolean {
+  const v4 = canonicalIpv4(host);
   if (v4) {
-    const o = v4.slice(1).map((n) => Number(n));
-    if (o.some((n) => n > 255)) return true; // malformed → block
+    const o = v4.split(".").map(Number);
     // 169.254.0.0/16 link-local (covers 169.254.169.254 cloud metadata)
     if (o[0] === 169 && o[1] === 254) return true;
     // 127.0.0.0/8 loopback
-    if (o[0] === 127) return true;
+    if (o[0] === 127) return !opts?.allowLoopback;
     // 0.0.0.0/8 "this host"
-    if (o[0] === 0) return true;
+    if (o[0] === 0) return !opts?.allowLoopback;
     return false; // RFC1918 (10/8, 172.16/12, 192.168/16) and public → allowed
   }
   // IPv6 literal
   if (host.includes(":")) {
-    if (host === "::1") return true; // loopback
-    if (host === "::") return true; // unspecified
+    if (host === "::1") return !opts?.allowLoopback; // loopback
+    if (host === "::") return !opts?.allowLoopback; // unspecified
     // fe80::/10 link-local
     if (/^fe[89ab][0-9a-f]?:/.test(host)) return true;
-    // IPv4-mapped link-local / loopback (::ffff:169.254.x.x, ::ffff:127.x.x.x)
-    const mapped = host.match(/::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-    if (mapped) return isBlockedIpLiteral(mapped[1]);
     return false; // fc00::/7 unique-local (private) and public → allowed
   }
+  if (opts?.allowLoopback && host === "localhost") return false;
   return false; // hostname — not resolved here
 }

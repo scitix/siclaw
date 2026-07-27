@@ -51,6 +51,8 @@ export interface PromptOptions {
     models: Array<{
       id: string;
       name: string;
+      /** Per-model protocol override; absent = inherit the provider's `api`. */
+      api?: string;
       reasoning: boolean;
       input: string[];
       cost: { input: number; output: number; cacheRead: number; cacheWrite: number };

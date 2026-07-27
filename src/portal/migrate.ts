@@ -414,6 +414,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     vision TINYINT(1) NOT NULL DEFAULT 0,
     context_window INT NOT NULL DEFAULT 128000,
     max_tokens INT NOT NULL DEFAULT 65536,
+    api_type VARCHAR(50) DEFAULT NULL,
     is_default TINYINT(1) NOT NULL DEFAULT 0,
     sort_order INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -631,6 +632,12 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
   await safeAlterTable(db, "model_entries", "vision", "TINYINT(1) NOT NULL DEFAULT 0");
+  // Per-model protocol override. NULL = inherit model_providers.api_type — an
+  // aggregator gateway can host OpenAI-protocol and Claude-protocol models side
+  // by side, so the wire protocol is a per-model property. Must stay nullable
+  // with no non-NULL default: an empty string would read as a hard override
+  // (see resolveModelApi in core/model-compat.ts) instead of inheritance.
+  await safeAlterTable(db, "model_entries", "api_type", "VARCHAR(50) DEFAULT NULL");
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
   await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "skills", "files", "MEDIUMTEXT DEFAULT NULL");
