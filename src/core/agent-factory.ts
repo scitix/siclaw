@@ -41,6 +41,14 @@ import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
 import { convertOpenAIPdfPayload } from "./openai-file-payload.js";
 import { McpClientManager } from "./mcp-client.js";
+import {
+  buildKnowledgeRuntime,
+  loadKnowledgeRuntimeBindings,
+} from "../knowledge/runtime.js";
+import type {
+  KnowledgeRetrieveExecutor,
+  KnowledgeRuntimeBinding,
+} from "../knowledge/contracts.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
@@ -79,6 +87,10 @@ export interface CreateSiclawSessionOpts {
   mcpManager?: McpClientManager;
   /** Pre-resolved MCP tools from shared mcpManager — avoids re-discovery */
   mcpTools?: ToolDefinition[];
+  /** Runtime-resolved knowledge bindings. Omit to load the AgentBox sync manifest. */
+  knowledgeBindings?: KnowledgeRuntimeBinding[];
+  /** Runtime bridge used by the stable knowledge_retrieve tool. */
+  knowledgeRetrieveExecutor?: KnowledgeRetrieveExecutor;
   /** User ID for per-user skill directory isolation (local spawner mode) */
   userId?: string;
   /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (TUI/CLI). */
@@ -491,6 +503,16 @@ export async function createSiclawSession(
   const knowledgeDir = opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
     ? opts.portalKnowledgeDir
     : path.resolve(cwd, config.paths.knowledgeDir);
+  const knowledgeBindings = opts?.knowledgeBindings ?? loadKnowledgeRuntimeBindings(knowledgeDir);
+  const knowledgeRuntime = buildKnowledgeRuntime({
+    bindings: knowledgeBindings,
+    retrieve: opts?.knowledgeRetrieveExecutor,
+    knowledgeDir,
+  });
+  // Knowledge tools are governed by the orthogonal agent↔knowledge binding.
+  // Provider-specific tools never reach pi-agent, and the generic tool still
+  // revalidates the binding server-side on every execution.
+  customTools.push(...knowledgeRuntime.tools);
   const readAllowedDirs = [
     builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir,
     os.tmpdir(),
@@ -662,6 +684,9 @@ export async function createSiclawSession(
       systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
       appendSystemPromptOverride: () => {
         const parts = buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir);
+        if (knowledgeRuntime.promptContext) {
+          parts.push("\n\n" + knowledgeRuntime.promptContext);
+        }
         if (agentSystemPromptAppend) {
           parts.push("\n\n" + agentSystemPromptAppend);
         }

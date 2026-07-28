@@ -79,6 +79,7 @@ import {
   handleToolCapabilities,
   handleSkillsBundle,
   handleKnowledgeBundle,
+  handleKnowledgeRetrieve,
   handleAgentTasksList,
   handleAgentTasksCreate,
   handleAgentTasksUpdate,
@@ -1492,6 +1493,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/knowledge/bundle" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleKnowledgeBundle(req, res, identity, frontendClient);
+            return;
+          }
+
+          if (url === "/api/internal/knowledge/retrieve" && method === "POST") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            handleKnowledgeRetrieve(req, res, identity, frontendClient);
             return;
           }
 

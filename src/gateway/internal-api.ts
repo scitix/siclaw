@@ -355,6 +355,79 @@ export async function handleKnowledgeBundle(
 }
 
 /**
+ * POST /api/internal/knowledge/retrieve
+ *
+ * Executes knowledge.retrieve/v1 for the calling AgentBox. Agent identity comes
+ * only from mTLS; session_id recovers the current user for audit and future
+ * query-time ACL enforcement.
+ */
+export async function handleKnowledgeRetrieve(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  frontendClient: FrontendWsClient,
+): Promise<void> {
+  try {
+    const body = await readJsonBody(req) as Record<string, unknown>;
+    const query = typeof body.query === "string" ? body.query.trim() : "";
+    if (!query || query.length > 4_000) {
+      sendJson(res, 400, { error: "query must contain 1-4000 characters" });
+      return;
+    }
+    const repoIDs = body.repo_ids;
+    if (repoIDs !== undefined && (
+      !Array.isArray(repoIDs) ||
+      repoIDs.length > 50 ||
+      repoIDs.some((id) => typeof id !== "string" || !id)
+    )) {
+      sendJson(res, 400, { error: "repo_ids must be an array of at most 50 non-empty strings" });
+      return;
+    }
+    if (body.top_k !== undefined && (
+      typeof body.top_k !== "number" ||
+      !Number.isInteger(body.top_k) ||
+      body.top_k < 1 ||
+      body.top_k > 50
+    )) {
+      sendJson(res, 400, { error: "top_k must be an integer between 1 and 50" });
+      return;
+    }
+    if (body.filters !== undefined && (
+      !body.filters ||
+      typeof body.filters !== "object" ||
+      Array.isArray(body.filters)
+    )) {
+      sendJson(res, 400, { error: "filters must be an object" });
+      return;
+    }
+
+    const sessionID = typeof body.session_id === "string" ? body.session_id : "";
+    const { userId, ok } = await resolveUserForIdentity(sessionID, identity);
+    if (!ok) {
+      sendJson(res, 403, { error: "session ownership mismatch" });
+      return;
+    }
+    const data = await frontendClient.request("knowledge.retrieve", {
+      agentId: identity.agentId,
+      userId,
+      sessionId: sessionID,
+      query,
+      repo_ids: repoIDs,
+      filters: body.filters,
+      top_k: body.top_k,
+    }, 15_000);
+    sendJson(res, 200, data);
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      sendJson(res, 400, { error: "Invalid JSON body" });
+      return;
+    }
+    console.error("[internal-api] knowledge/retrieve error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
  * GET /api/internal/agent-tasks
  *
  * Returns the scheduled tasks for the agent identified by the mTLS certificate.

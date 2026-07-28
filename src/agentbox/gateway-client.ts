@@ -12,6 +12,10 @@ import path from "node:path";
 import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
 import type { MetricsFlushPayload } from "../shared/metrics-types.js";
 import type { DelegateRequest, DelegateResponse, DelegatesResponse } from "../shared/agent-delegate.js";
+import type {
+  KnowledgeEvidenceSet,
+  KnowledgeRetrieveRequest,
+} from "../knowledge/contracts.js";
 
 export interface GatewayClientOptions {
   gatewayUrl: string;
@@ -83,6 +87,24 @@ export class GatewayClient {
    */
   async fetchTracingConfig(): Promise<any> {
     return this.request("/api/internal/tracing-config", "GET");
+  }
+
+  /**
+   * Execute the stable knowledge.retrieve/v1 contract through Runtime.
+   * Runtime derives agent identity from mTLS and resolves sessionId to the
+   * current user before forwarding to the management plane.
+   */
+  async retrieveKnowledge(
+    request: KnowledgeRetrieveRequest,
+    sessionId: string,
+  ): Promise<KnowledgeEvidenceSet> {
+    return this.request("/api/internal/knowledge/retrieve", "POST", {
+      session_id: sessionId,
+      query: request.query,
+      repo_ids: request.repoIds,
+      filters: request.filters,
+      top_k: request.topK,
+    }, 15_000);
   }
 
   /**

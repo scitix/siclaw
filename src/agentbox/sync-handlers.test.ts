@@ -943,7 +943,7 @@ describe("knowledgeHandler empty-bundle guard", () => {
   it("wipes and returns 0 when empty bundle arrives and knowledgeDir is empty (first spawn)", async () => {
     const count = await knowledgeHandler.materialize({ version: "v1", repos: [] });
     expect(count).toBe(0);
-    expect(fs.readdirSync(knowledgeTmpDir)).toEqual([]);
+    expect(fs.readdirSync(knowledgeTmpDir)).toEqual([".sync-manifest.json"]);
   });
 
   it("preserves knowledgeDir contents when empty bundle arrives but content already materialized", async () => {
@@ -970,6 +970,26 @@ describe("knowledgeHandler empty-bundle guard", () => {
     const count = await knowledgeHandler.materialize({ version: "v1", repos: [] });
     // No meaningful content → falls through to wipe path → reports 0.
     expect(count).toBe(0);
+  });
+
+  it("treats v2 bindings as authoritative and clears stale Wiki content for retrieval-only bindings", async () => {
+    fs.writeFileSync(path.join(knowledgeTmpDir, "index.md"), "# stale");
+    const count = await knowledgeHandler.materialize({
+      version: "2",
+      repos: [],
+      bindings: [{
+        repoId: "ticket-1",
+        name: "Ticket History",
+        version: "index-4",
+        capabilities: [{ kind: "retrieve", contract: "knowledge.retrieve/v1" }],
+      }],
+    });
+    expect(count).toBe(1);
+    expect(fs.existsSync(path.join(knowledgeTmpDir, "index.md"))).toBe(false);
+    const manifest = JSON.parse(fs.readFileSync(path.join(knowledgeTmpDir, ".sync-manifest.json"), "utf8"));
+    expect(manifest.bindings).toEqual([
+      expect.objectContaining({ repoId: "ticket-1", capabilities: [{ kind: "retrieve", contract: "knowledge.retrieve/v1" }] }),
+    ]);
   });
 });
 
@@ -1015,5 +1035,27 @@ describe("knowledgeHandler multi-repo identity", () => {
     const index = fs.readFileSync(path.join(knowledgeTmpDir, "index.md"), "utf8");
     expect(index).toContain(`[[repos/${platformDir}/index]] - 平台知识 v3`);
     expect(index).toContain(`[[repos/${businessDir}/index]] - 业务知识 v7`);
+
+    const manifest = JSON.parse(fs.readFileSync(path.join(knowledgeTmpDir, ".sync-manifest.json"), "utf8"));
+    expect(manifest.bindings).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        repoId: "repo-cn-platform",
+        capabilities: [expect.objectContaining({ kind: "materialized", rootPath: `repos/${platformDir}` })],
+      }),
+      expect.objectContaining({
+        repoId: "repo-cn-business",
+        capabilities: [expect.objectContaining({ kind: "materialized", rootPath: `repos/${businessDir}` })],
+      }),
+    ]));
+  });
+});
+
+describe("knowledgeHandler postReload", () => {
+  it("invalidates sessions because knowledge capability changes may alter the tool schema", async () => {
+    const invalidate = vi.fn();
+    await knowledgeHandler.postReload!({
+      sessions: [{ id: "s1", brain: { reload: vi.fn(async () => {}) }, invalidate }],
+    });
+    expect(invalidate).toHaveBeenCalledOnce();
   });
 });

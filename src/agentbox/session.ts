@@ -80,6 +80,7 @@ import {
   type ModelRouteState,
 } from "../core/model-routing.js";
 import type { GatewayClient } from "./gateway-client.js";
+import type { KnowledgeRetrieveExecutor } from "../knowledge/contracts.js";
 // topic-consolidator import removed — consolidation disabled
 
 /**
@@ -629,6 +630,12 @@ export class AgentBoxSessionManager {
         throttled?.cancel();
       }
     };
+  }
+
+  private createKnowledgeRetrieveExecutor(sessionId: string): KnowledgeRetrieveExecutor | undefined {
+    const client = this.gatewayClient;
+    if (!client) return undefined;
+    return (request) => client.retrieveKnowledge(request, sessionId);
   }
 
   /**
@@ -2009,6 +2016,7 @@ export class AgentBoxSessionManager {
       isSubagent: true,
       // The agent-type's prompt flavour for this child.
       systemPromptAppend: type.systemPromptAddendum,
+      knowledgeRetrieveExecutor: this.createKnowledgeRetrieveExecutor(childSessionId),
       // Deliberately omit spawnSubagentExecutor + delegate executors → the child
       // never sees spawn_subagent (no recursion).
     });
@@ -2549,6 +2557,7 @@ export class AgentBoxSessionManager {
       backgroundExecExecutor: this.createBackgroundExecExecutor(),
       taskOutputReader: this.createTaskOutputReader(),
       channelMessageExecutor: this.createChannelMessageExecutor(),
+      knowledgeRetrieveExecutor: this.createKnowledgeRetrieveExecutor(id),
     });
 
     // Populate sessionIdRef so skill_call events can associate with this session

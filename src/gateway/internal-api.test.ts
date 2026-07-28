@@ -8,6 +8,7 @@ import {
   handleToolCapabilities,
   handleSkillsBundle,
   handleKnowledgeBundle,
+  handleKnowledgeRetrieve,
   handleAgentTasksList,
   handleAgentTasksCreate,
   handleAgentTasksUpdate,
@@ -281,6 +282,49 @@ describe("handleKnowledgeBundle", () => {
     await handleKnowledgeBundle(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
     expect(frontend.calls[0].params).toEqual({ agentId: "agent-1" });
     expect(res.statusCode).toBe(200);
+  });
+});
+
+describe("handleKnowledgeRetrieve", () => {
+  it("derives the agent from mTLS and forwards the normalized retrieval request", async () => {
+    frontend.responses.set("knowledge.retrieve", { retrievalId: "ret-1", evidence: [] });
+    const res = new FakeRes();
+    await handleKnowledgeRetrieve(
+      asReq(new FakeReq(JSON.stringify({
+        session_id: "unknown-session",
+        query: " GPU scheduling ",
+        repo_ids: ["repo-1"],
+        top_k: 5,
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(frontend.calls[0]).toEqual({
+      method: "knowledge.retrieve",
+      params: {
+        agentId: "agent-1",
+        userId: "",
+        sessionId: "unknown-session",
+        query: "GPU scheduling",
+        repo_ids: ["repo-1"],
+        filters: undefined,
+        top_k: 5,
+      },
+    });
+  });
+
+  it("rejects malformed retrieval requests before RPC", async () => {
+    const res = new FakeRes();
+    await handleKnowledgeRetrieve(
+      asReq(new FakeReq(JSON.stringify({ query: "", top_k: 100 }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(frontend.calls).toEqual([]);
   });
 });
 

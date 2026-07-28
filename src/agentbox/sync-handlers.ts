@@ -26,6 +26,10 @@ import type {
 import { GATEWAY_SYNC_DESCRIPTORS } from "../shared/gateway-sync.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
 import { decodeSkillFileContent, normalizeSkillFiles, type SkillPackageFile } from "../shared/skill-package.js";
+import {
+  normalizeKnowledgeRuntimeBindings,
+  type KnowledgeRuntimeBinding,
+} from "../knowledge/contracts.js";
 
 // ── MCP handler ───────────────────────────────────────────────────────
 
@@ -236,7 +240,7 @@ export const skillsHandler: AgentBoxSyncHandler<SkillBundlePayload> = {
 
 // ── Knowledge handler ─────────────────────────────────────────────────
 
-interface KnowledgeBundlePayload {
+export interface KnowledgeBundlePayload {
   version: string;
   repos: Array<{
     id: string;
@@ -248,6 +252,12 @@ interface KnowledgeBundlePayload {
     fileCount?: number | null;
     dataBase64: string;
   }>;
+  /**
+   * v2 runtime descriptors. Omitted by legacy management servers. Presence,
+   * including an empty array, is authoritative for non-materialized capability
+   * state; active bundles below are still projected as materialized bindings.
+   */
+  bindings?: KnowledgeRuntimeBinding[];
 }
 
 interface KnowledgeSyncStatus {
@@ -263,6 +273,50 @@ interface KnowledgeSyncStatus {
 let lastKnowledgeSyncStatus: KnowledgeSyncStatus | null = null;
 export function getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null { return lastKnowledgeSyncStatus; }
 
+function resolvedKnowledgeBindings(
+  payload: KnowledgeBundlePayload,
+  roots: Map<string, string>,
+): KnowledgeRuntimeBinding[] {
+  const supplied = normalizeKnowledgeRuntimeBindings(payload.bindings);
+  const byID = new Map(supplied.map((binding) => [binding.repoId, binding]));
+  for (const repo of payload.repos ?? []) {
+    const existing = byID.get(repo.id);
+    const capabilities = [
+      ...(existing?.capabilities.filter((capability) => capability.kind !== "materialized") ?? []),
+      {
+        kind: "materialized" as const,
+        contract: "knowledge.materialize/v1" as const,
+        rootPath: roots.get(repo.id) ?? ".",
+      },
+    ];
+    byID.set(repo.id, {
+      repoId: repo.id,
+      name: existing?.name ?? repo.name,
+      description: existing?.description,
+      version: existing?.version ?? String(repo.version),
+      capabilities,
+    });
+  }
+  return [...byID.values()];
+}
+
+function writeKnowledgeManifest(
+  targetDir: string,
+  payload: KnowledgeBundlePayload,
+  syncedAt: string,
+  repos: KnowledgeSyncStatus["repos"],
+  bindings: KnowledgeRuntimeBinding[],
+): void {
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.writeFileSync(path.join(targetDir, ".sync-manifest.json"),
+    JSON.stringify({
+      syncedAt,
+      version: payload.version ?? "1",
+      repos,
+      bindings,
+    }, null, 2) + "\n");
+}
+
 export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
   type: "knowledge",
 
@@ -275,6 +329,7 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
 
   async materialize(payload: KnowledgeBundlePayload): Promise<number> {
     const repos = payload?.repos ?? [];
+    const hasAuthoritativeBindings = Array.isArray(payload?.bindings);
     const config = loadConfig();
     const knowledgeDir = path.resolve(process.cwd(), config.paths.knowledgeDir);
     const syncedAt = new Date().toISOString();
@@ -286,7 +341,7 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
       // knowledge materialized, keep what we have and let the next reload retry.
       // Legitimate "unbind-all" admin operations can force a fresh wipe by
       // restarting the pod — which is cheap and explicit.
-      if (fs.existsSync(knowledgeDir)) {
+      if (!hasAuthoritativeBindings && fs.existsSync(knowledgeDir)) {
         const existing = fs.readdirSync(knowledgeDir).filter((name) => {
           if (name.startsWith(".sync-staging")) return false;
           try { return fs.statSync(path.join(knowledgeDir, name)).isDirectory() || fs.statSync(path.join(knowledgeDir, name)).isFile(); }
@@ -308,14 +363,17 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
           fs.rmSync(path.join(knowledgeDir, entry), { recursive: true, force: true });
         }
       }
+      const bindings = resolvedKnowledgeBindings(payload, new Map());
+      writeKnowledgeManifest(knowledgeDir, payload, syncedAt, [], bindings);
       lastKnowledgeSyncStatus = { syncedAt, targetDir: knowledgeDir, repoCount: 0, repos: [] };
-      return 0;
+      return bindings.length;
     }
 
     fs.mkdirSync(knowledgeDir, { recursive: true });
     const stagingDir = path.join(knowledgeDir, `.sync-staging-${Date.now()}-${process.pid}`);
     fs.mkdirSync(stagingDir, { recursive: true });
     const syncedRepos: KnowledgeSyncStatus["repos"] = [];
+    const roots = new Map<string, string>();
 
     try {
       if (repos.length === 1) {
@@ -326,6 +384,7 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
         }
         syncedRepos.push({ id: repos[0].id, name: repos[0].name, version: repos[0].version,
           sha256: info.sha256, expectedSha256: repos[0].sha256 ?? null, fileCount: info.fileCount, sizeBytes: repos[0].sizeBytes });
+        roots.set(repos[0].id, ".");
       } else {
         const repoRoot = path.join(stagingDir, "repos");
         fs.mkdirSync(repoRoot, { recursive: true });
@@ -350,16 +409,17 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
           }
           syncedRepos.push({ id: repo.id, name: repo.name, version: repo.version,
             sha256: info.sha256, expectedSha256: repo.sha256 ?? null, fileCount: info.fileCount, sizeBytes: repo.sizeBytes });
+          roots.set(repo.id, `repos/${dirName}`);
           indexLines.push(`- [[repos/${dirName}/index]] - ${repo.name} v${repo.version}`);
         }
         fs.writeFileSync(path.join(stagingDir, "index.md"), indexLines.join("\n") + "\n");
       }
 
-      fs.writeFileSync(path.join(stagingDir, ".sync-manifest.json"),
-        JSON.stringify({ syncedAt, version: payload.version ?? "1", repos: syncedRepos }, null, 2) + "\n");
+      const bindings = resolvedKnowledgeBindings(payload, roots);
+      writeKnowledgeManifest(stagingDir, payload, syncedAt, syncedRepos, bindings);
       await replaceDirectoryContentsFromStaging(knowledgeDir, stagingDir);
       lastKnowledgeSyncStatus = { syncedAt, targetDir: knowledgeDir, repoCount: syncedRepos.length, repos: syncedRepos };
-      return repos.length;
+      return bindings.length;
     } catch (err) {
       fs.rmSync(stagingDir, { recursive: true, force: true });
       throw err;
@@ -369,13 +429,11 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
   async postReload(context: ReloadContext): Promise<void> {
     if (!context.sessions?.length) return;
     for (const session of context.sessions) {
-      try {
-        await session.brain.reload();
-        console.log(`[resource-sync] Knowledge reloaded for session ${session.id}`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[resource-sync] Failed to reload knowledge for session ${session.id}: ${msg}`);
-      }
+      // v2 knowledge bindings may add or remove the stable
+      // knowledge_retrieve tool. Tool schemas are immutable for an in-memory
+      // pi-agent session, so use the same in-flight-safe turnover contract as
+      // MCP instead of hot-reloading only the file catalog.
+      session.invalidate?.();
     }
   },
 };
