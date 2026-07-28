@@ -461,6 +461,15 @@ def _arm_test_turn(run: "TestRun") -> None:
 # scope), so this is graceful handling, not a fix. Exhaustion ends the turn with a
 # clear owner-facing note instead of a crash.
 _MODEL_RATE_STATUSES = frozenset({429, 503, 529})
+
+# 402 is 429's near relative and its opposite. A rate limit clears on its own in
+# seconds, so backing off is right; a spend cap does not clear until the billing
+# window rolls, so every retry is a request that cannot succeed. Production hit
+# `daily cost limit exceeded (504.29/500.00) … retry_after 84596` — twenty-three
+# hours — and the owner was told only "batch compile interrupted; trigger again
+# to resume", which invites exactly the retry that cannot work. Neither the code
+# nor the message knew what had happened: there was no 402 anywhere in this file.
+_MODEL_QUOTA_STATUS = 402
 _MODEL_RATE_MAX_RETRIES = int(os.environ.get("KBC_MODEL_RATE_MAX_RETRIES", "5"))
 _MODEL_RATE_BACKOFF_BASE_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_BASE_S", "2"))
 _MODEL_RATE_BACKOFF_CAP_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_CAP_S", "30"))
@@ -473,6 +482,26 @@ _MODEL_RATE_BACKOFF_CAP_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_CAP_S",
 # window to drain. Best-effort within the grace period (F1 is the durable fix).
 _SHUTDOWN_DRAIN_S = float(os.environ.get("KBC_SHUTDOWN_DRAIN_S", "0.5"))
 _SHUTDOWN_DRAIN_MAX_S = float(os.environ.get("KBC_SHUTDOWN_DRAIN_MAX_S", "8"))
+
+
+def _quota_retry_after(msg) -> int:
+    """Seconds until the provider's spend window rolls, when it said so.
+
+    Reads a number and nothing else. The provider's message names the account's
+    spend ("504.29/500.00") and pod logs are operator-visible, so the text stays
+    out of stdout on the same whitelist grounds as every other provider payload
+    here; the owner gets the human sentence over SSE instead.
+    """
+    for attr in ("api_error_retry_after", "retry_after_sec", "retry_after"):
+        value = getattr(msg, attr, None)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+    raw = getattr(msg, "result", None) or getattr(msg, "subtype", None) or ""
+    match = re.search(r'"?retry_after_sec"?\s*[:=]\s*(\d+)', str(raw))
+    if match:
+        return int(match.group(1))
+    match = re.search(r"[Rr]etry after (\d+)s", str(raw))
+    return int(match.group(1)) if match else 0
 
 
 def _rate_backoff_delay(attempt: int) -> float:
@@ -497,6 +526,21 @@ class ModelResultError(Exception):
 
 class BatchOutputError(Exception):
     """A successful internal session did not account for its assigned sources."""
+
+
+class ModelQuotaExhausted(RuntimeError):
+    """The model provider refused on billing, not on capacity.
+
+    Deterministic for a known, stated duration: retrying before the window rolls
+    cannot succeed, so `retry_after_s` carries the provider's own number and a
+    consumer is expected to wait it out rather than sweep. Separate from
+    ModelStallError (transient) and the rate-limit path (clears in seconds)."""
+
+    deterministic = True
+
+    def __init__(self, message: str, retry_after_s: int = 0):
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
 
 
 class PlanIntegrityError(RuntimeError):
@@ -528,6 +572,8 @@ def _batch_error_code(exc: BaseException) -> str:
         return "model_result_error"
     if isinstance(exc, BatchOutputError):
         return "provider_fault" if getattr(exc, "provider_fault", False) else "content_shape"
+    if isinstance(exc, ModelQuotaExhausted):
+        return "quota_exhausted"
     if isinstance(exc, PlanIntegrityError):
         return "plan_integrity"
     if isinstance(exc, asyncio.CancelledError):
@@ -4492,11 +4538,32 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # gating on turn_done would otherwise hang on an orchestrator error.
         # Done batches are stamped in BATCH_PLAN.json, so the honest story is
         # "interrupted, resumable from the first pending batch".
+        # A spend cap gets its own sentence. "Trigger again to resume" is true of
+        # every other interruption and false of this one — it sends the owner to
+        # do the single thing that cannot work, for as long as the window lasts.
+        if isinstance(e, ModelQuotaExhausted) and e.retry_after_s > 0:
+            hours = e.retry_after_s / 3600.0
+            when = (f"{hours:.1f} hours" if hours >= 1
+                    else f"{e.retry_after_s // 60} minutes")
+            when_zh = (f"约 {hours:.1f} 小时" if hours >= 1
+                       else f"约 {e.retry_after_s // 60} 分钟")
+            done_note = _loc(
+                run,
+                f"The model provider refused this request on billing: the API key's "
+                f"spend limit for the period is used up. It clears in about {when}. "
+                f"Finished batches are stored — triggering a compile before then "
+                f"will be refused the same way; after it clears, the run resumes "
+                f"from the first pending batch.",
+                f"模型服务按计费拒绝了本次请求:该 API key 本周期的额度已用尽,"
+                f"{when_zh}后恢复。已完成的批已落库——在恢复之前再次发起会被同样拒绝;"
+                f"恢复之后再发起,将从断点继续。")
+        else:
+            done_note = _loc(
+                run,
+                "Batch compile interrupted: finished batches are stored; trigger a compile again to resume from the first pending batch.",
+                "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。")
         try:
-            await run.emit({"type": "turn_done",
-                            "text": _loc(run,
-                                         "Batch compile interrupted: finished batches are stored; trigger a compile again to resume from the first pending batch.",
-                                         "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。")})
+            await run.emit({"type": "turn_done", "text": done_note})
         except Exception:
             pass
     finally:
@@ -4605,6 +4672,20 @@ async def _consume_turn_stream(
             # surfacing it as a finished turn.
             status = getattr(msg, "api_error_status", None)
             is_error = bool(getattr(msg, "is_error", False))
+            # A spend cap, before the rate-limit branch it would otherwise fall
+            # past. Retrying is the one thing that cannot help, so this does not
+            # back off: it ends the turn with the provider's own numbers, in
+            # words the owner can act on. Completed batches are already durable,
+            # which is what makes "come back after the window" a real answer
+            # rather than a loss.
+            if is_error and status == _MODEL_QUOTA_STATUS:
+                retry_after = _quota_retry_after(msg)
+                run._turn_active = False
+                run._turn_text = []
+                run._last_turn_reply = ""
+                raise ModelQuotaExhausted(
+                    f"model provider refused on billing (HTTP {status})",
+                    retry_after_s=retry_after)
             if is_error and status in _MODEL_RATE_STATUSES:
                 if run._rate_retries < _MODEL_RATE_MAX_RETRIES:
                     run._rate_retries += 1

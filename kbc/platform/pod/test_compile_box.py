@@ -6302,6 +6302,44 @@ async def test_typed_authoring_commands():
         await client.close()
 
 
+def test_a_spend_cap_is_not_a_rate_limit():
+    """402 and 429 look alike and want opposite handling. A rate limit clears in
+    seconds, so the backoff loop is right for it; a spend cap does not clear
+    until the billing window rolls, so every retry is a request that cannot
+    succeed.
+
+    Production hit `daily cost limit exceeded (504.29/500.00) … retry_after
+    84596` — twenty-three hours — and the owner was told "batch compile
+    interrupted; trigger a compile again to resume", which is true of every
+    other interruption and false of this one. There was no 402 anywhere in the
+    box before this test.
+    """
+    class Msg:
+        pass
+
+    # Routable, and marked as not worth retrying.
+    err = compile_box.ModelQuotaExhausted("refused on billing", retry_after_s=84596)
+    assert compile_box._batch_error_code(err) == "quota_exhausted"
+    assert getattr(err, "deterministic", False) is True
+    assert err.retry_after_s == 84596
+
+    # 402 must not be mistaken for the rate-limit family it sits beside.
+    assert compile_box._MODEL_QUOTA_STATUS not in compile_box._MODEL_RATE_STATUSES
+
+    # The provider's own number is read from whatever shape it arrived in, and
+    # only the number — the message names the account's spend.
+    m = Msg(); m.result = '{"code":"billing_denied","retry_after_sec":84596}'
+    assert compile_box._quota_retry_after(m) == 84596
+    m2 = Msg(); m2.result = "API key daily cost limit exceeded. Retry after 3600s."
+    assert compile_box._quota_retry_after(m2) == 3600
+    m3 = Msg(); m3.api_error_retry_after = 120
+    assert compile_box._quota_retry_after(m3) == 120
+    m4 = Msg(); m4.result = "no number here"
+    assert compile_box._quota_retry_after(m4) == 0
+
+    print("OK  a spend cap is routable, deterministic, and not a rate limit")
+
+
 async def main():
     # PK never fires in these wiring tests — a qualifying fixture must not spawn
     # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
@@ -6405,6 +6443,7 @@ async def main():
     await test_model_rate_limit_exhausts_gracefully()
     await test_shutdown_flush_syncs_active_runs()
     test_pr382_review_fixes()
+    test_a_spend_cap_is_not_a_rate_limit()
     await test_typed_authoring_commands()
 
     compile_box._COMPILE_IMPL = fake_driver
@@ -6627,3 +6666,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
