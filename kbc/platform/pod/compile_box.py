@@ -571,6 +571,18 @@ class CompileRun:
         self.allowed_tools: list[str] | None = None
         # Consumer-declared prompt/output locale (capability.fetchInput → /session).
         self.locale: str | None = None
+        # The dispatch round resolve_ticket receipts belong to, stamped by
+        # _prepare_command when an apply_rulings command is accepted.
+        #
+        # The runtime already validates this nonce as REQUIRED on the way in and
+        # then used to hand it to the model in prose to type back, defaulting to
+        # "" when it didn't. A fact the runtime holds does not become more true
+        # for having passed through the model's attention, and a bookkeeping
+        # field the model can silently omit is one the consumer cannot rely on:
+        # five tickets in production stuck at "已答·待重试" because the echo
+        # carried a superseded round, and closed only when a later retry omitted
+        # the nonce entirely and fell through to the weaker timestamp rule.
+        self.apply_dispatch_nonce: str = ""
         # Set once connect() has returned (success OR failure). A /message that
         # races ahead of the async connect waits on this so client.query() never
         # hits the SDK's "Not connected. Call connect() first." error.
@@ -1445,6 +1457,10 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         plan = _load_batch_plan(run)
         if not _batch_plan_resumable(plan):
             raise CommandRejected("no interrupted batch plan is available to resume", 409)
+    if action == "compile.apply_rulings":
+        # Own the round here, where it is already validated, rather than asking
+        # the model to carry it. resolve_ticket stamps from this.
+        run.apply_dispatch_nonce = params["dispatch_nonce"]
     brief = params.get("brief")
     if brief is not None:
         # Structured command data replaces the old localized-text parser. The
@@ -1607,10 +1623,16 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
             "applied_value": str(args.get("applied_value", "")),
             "pages_edited": [str(p) for p in (args.get("pages_edited") or []) if str(p).strip()],
             "note": str(args.get("note", "")),
-            # Echo of the dispatch nonce from the apply directive: lets the
-            # consumer match this receipt to the EXACT dispatch round it answers
-            # (timestamps alone cannot distinguish two overlapping rounds).
-            "dispatch_nonce": str(args.get("dispatch_nonce", "")),
+            # The dispatch round this receipt answers, stamped by the runtime
+            # from the accepted apply_rulings command — NOT read back from the
+            # model. It lets the consumer match a receipt to the EXACT round
+            # (timestamps alone cannot separate two overlapping ones), which
+            # makes it a control-plane fact, and control-plane facts the runtime
+            # already holds never route through the model. The argument stays in
+            # the schema so an older directive still calls cleanly; its value is
+            # ignored. Empty here means the box resolved a ticket outside any
+            # apply round, which is exactly what the consumer should not close.
+            "dispatch_nonce": run.apply_dispatch_nonce,
             "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         try:
@@ -1672,9 +1694,13 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
                     "applied_value": {"type": "string"},
                     "pages_edited": {"type": "array", "items": {"type": "string"}},
                     "note": {"type": "string"},
+                    # Accepted and ignored: the runtime stamps the round itself.
+                    # Kept in the schema so a directive from an older runtime,
+                    # which still asks for the echo, calls cleanly instead of
+                    # failing schema validation mid-repair.
                     "dispatch_nonce": {"type": "string"},
                 },
-                "required": ["ticket_id", "applied_value", "pages_edited", "note", "dispatch_nonce"],
+                "required": ["ticket_id", "applied_value", "pages_edited", "note"],
             },
             resolve_ticket,
         ),

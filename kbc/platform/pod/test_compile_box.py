@@ -6405,6 +6405,7 @@ async def main():
     await test_model_rate_limit_exhausts_gracefully()
     await test_shutdown_flush_syncs_active_runs()
     test_pr382_review_fixes()
+    await test_the_runtime_owns_the_dispatch_round_not_the_model()
     await test_typed_authoring_commands()
 
     compile_box._COMPILE_IMPL = fake_driver
@@ -6623,6 +6624,126 @@ async def main():
         print("OK  compile_box protocol smoke (sources / authoring / health / session idempotent / SSE summary+turn_done+syncArtifacts+end / 409 / 404)")
     finally:
         await client.close()
+
+
+async def test_the_runtime_owns_the_dispatch_round_not_the_model():
+    """A resolve_ticket receipt is stamped with the round the RUNTIME accepted,
+    never with what the model typed.
+
+    The nonce exists so a consumer can match a receipt to the exact dispatch it
+    answers. The runtime validates it as REQUIRED on the way in, then used to
+    render it into prose for the model to hand back — and read it back with an
+    empty default. Production paid for that twice over: five tickets sat at
+    "已答·待重试" because the echo carried a superseded round, and they closed
+    only when a later retry omitted the nonce entirely, which fell through to
+    the weaker timestamp rule and let an unmatched receipt close a ticket.
+
+    Both halves are asserted here: the model cannot get the round WRONG, and the
+    model cannot get the round OMITTED.
+    """
+    class QueryClient:
+        def __init__(self):
+            self.queries = []
+
+        async def query(self, text):
+            self.queries.append(text)
+
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    td = tempfile.TemporaryDirectory()
+    try:
+        run = compile_box.CompileRun("nonce-run", td.name, 1)
+        run.locale = "zh"
+        run.client = QueryClient()
+        run.connected.set()
+        compile_box.RUNS["nonce-run"] = run
+
+        tickets_path = Path(td.name) / "authoring" / "CONTRADICTIONS.json"
+        tickets_path.parent.mkdir(parents=True, exist_ok=True)
+        tickets_path.write_text(json.dumps([
+            {"id": "tk-1", "title": "H2O 还是 H200", "affected_pages": ["p1.md"]},
+            {"id": "tk-2", "title": "两个电话号", "affected_pages": ["p2.md"]},
+        ], ensure_ascii=False), "utf-8")
+
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        resolve = tools["resolve_ticket"]
+
+        # Before any dispatch the round is empty — a self-resolve the owner never
+        # asked for must not look like an answer to one.
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "H200",
+            "pages_edited": ["p1.md"], "note": "", "dispatch_nonce": "invented-by-the-model",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        assert rows["tk-1"]["agent_report"]["dispatch_nonce"] == "", rows["tk-1"]["agent_report"]
+
+        # Dispatch round "round-A".
+        r = await client.post("/command/nonce-run", json={
+            "command_id": "cmd-apply-A",
+            "command": {
+                "version": 1, "action": "compile.apply_rulings",
+                "operation_id": "op-apply-A", "generation": 1,
+                "parameters": {
+                    "dispatch_nonce": "round-A",
+                    "rulings": [{"ticket_id": "tk-1", "affected_pages": ["p1.md"],
+                                 "kind": "value", "value": "H200"}],
+                },
+            },
+        })
+        assert r.status == 200, await r.text()
+
+        # The model echoes a SUPERSEDED round — exactly what production did.
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "H200",
+            "pages_edited": ["p1.md"], "note": "", "dispatch_nonce": "3a413abb-stale",
+        })
+        # ...and omits it entirely — the other half of the same production bug.
+        await resolve.handler({
+            "ticket_id": "tk-2", "applied_value": "保留双源",
+            "pages_edited": ["p2.md"], "note": "",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        for tid in ("tk-1", "tk-2"):
+            got = rows[tid]["agent_report"]["dispatch_nonce"]
+            assert got == "round-A", f"{tid} stamped {got!r}, want the accepted round"
+            assert rows[tid]["status"] == "applied", rows[tid]
+
+        # A second dispatch re-stamps: receipts follow the CURRENT round. The
+        # first round's turn has to end first — a live turn refuses a second
+        # command, which is the same reason a real re-dispatch waits for idle.
+        run._turn_active = False
+        r = await client.post("/command/nonce-run", json={
+            # A re-dispatch is a new COMMAND inside the same authoring
+            # operation: the run pins to (operation_id, generation) for life.
+            "command_id": "cmd-apply-B",
+            "command": {
+                "version": 1, "action": "compile.apply_rulings",
+                "operation_id": "op-apply-A", "generation": 1,
+                "parameters": {
+                    "dispatch_nonce": "round-B",
+                    "rulings": [{"ticket_id": "tk-1", "affected_pages": ["p1.md"],
+                                 "kind": "value", "value": "H200"}],
+                },
+            },
+        })
+        assert r.status == 200, await r.text()
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "H200",
+            "pages_edited": ["p1.md"], "note": "", "dispatch_nonce": "round-A",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        assert rows["tk-1"]["agent_report"]["dispatch_nonce"] == "round-B", rows["tk-1"]
+
+        # The directive no longer asks the model for bookkeeping it cannot own.
+        directive = run.client.queries[-1]
+        assert "nonce" not in directive.lower(), directive
+        assert "resolve_ticket" in directive, directive
+    finally:
+        compile_box.RUNS.clear()
+        await client.close()
+        td.cleanup()
+    print("✓ dispatch round is stamped by the runtime; a wrong or missing echo cannot mislead it")
 
 
 if __name__ == "__main__":
