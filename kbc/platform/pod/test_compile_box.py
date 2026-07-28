@@ -6303,41 +6303,66 @@ async def test_typed_authoring_commands():
 
 
 def test_a_spend_cap_is_not_a_rate_limit():
-    """402 and 429 look alike and want opposite handling. A rate limit clears in
-    seconds, so the backoff loop is right for it; a spend cap does not clear
-    until the billing window rolls, so every retry is a request that cannot
-    succeed.
+    """402 and 429 look alike and want different handling. A rate limit clears
+    in seconds, so the backoff loop is right for it; a spend cap does not, so
+    burning five retries over thirty seconds achieves nothing.
 
     Production hit `daily cost limit exceeded (504.29/500.00) … retry_after
-    84596` — twenty-three hours — and the owner was told "batch compile
-    interrupted; trigger a compile again to resume", which is true of every
-    other interruption and false of this one. There was no 402 anywhere in the
-    box before this test.
-    """
-    class Msg:
-        pass
+    84596` and the owner was told "batch compile interrupted; trigger a compile
+    again to resume", which is true of every other interruption and misleading
+    here. There was no 402 anywhere in the box before this test.
 
-    # Routable, and marked as not worth retrying.
-    err = compile_box.ModelQuotaExhausted("refused on billing", retry_after_s=84596)
+    The correction must not overshoot into the mirror-image error. A spend cap
+    is lifted by a PERSON — raise the limit, top up, swap the key — so the box
+    may not claim the refusal is deterministic, and may not state a
+    time-to-clear it cannot stand behind. What it CAN state is where the work
+    stopped, so that is what the owner gets.
+    """
+    err = compile_box.ModelQuotaExhausted("refused on billing")
     assert compile_box._batch_error_code(err) == "quota_exhausted"
-    assert getattr(err, "deterministic", False) is True
-    assert err.retry_after_s == 84596
+
+    # Neither claim may come back. `deterministic` is what a consumer would read
+    # to stop retrying, and a stated deadline is what an owner would wait out —
+    # both take a decision that belongs to whoever can raise the limit.
+    assert not hasattr(err, "deterministic"), "a spend cap is lifted by a person"
+    assert not hasattr(err, "retry_after_s"), "the box does not forecast the window"
+    assert not hasattr(compile_box, "_quota_retry_after")
 
     # 402 must not be mistaken for the rate-limit family it sits beside.
     assert compile_box._MODEL_QUOTA_STATUS not in compile_box._MODEL_RATE_STATUSES
 
-    # The provider's own number is read from whatever shape it arrived in, and
-    # only the number — the message names the account's spend.
-    m = Msg(); m.result = '{"code":"billing_denied","retry_after_sec":84596}'
-    assert compile_box._quota_retry_after(m) == 84596
-    m2 = Msg(); m2.result = "API key daily cost limit exceeded. Retry after 3600s."
-    assert compile_box._quota_retry_after(m2) == 3600
-    m3 = Msg(); m3.api_error_retry_after = 120
-    assert compile_box._quota_retry_after(m3) == 120
-    m4 = Msg(); m4.result = "no number here"
-    assert compile_box._quota_retry_after(m4) == 0
+    # What the owner is told instead: which batch the next compile starts at.
+    # Positional and 1-based; done batches are counted, not the ids.
+    plan = {"batches": [{"status": "done"}, {"status": "done"}, {"status": "pending"}]}
+    assert compile_box._batch_resume_point(plan) == (3, 3)
+    assert compile_box._batch_resume_point({"batches": [{"status": "pending"}]}) == (1, 1)
+    # Fully stamped, or no plan at all: nothing to point at, so say nothing.
+    assert compile_box._batch_resume_point({"batches": [{"status": "done"}]}) is None
+    assert compile_box._batch_resume_point(None) is None
+    assert compile_box._batch_resume_point({}) is None
 
-    print("OK  a spend cap is routable, deterministic, and not a rate limit")
+    print("OK  a spend cap is named, not forecast, and reports its resume point")
+
+
+async def test_a_spend_cap_does_not_kill_a_live_session():
+    """The typed refusal is scoped to the batch orchestrator (which cannot carry
+    on without model calls). A live session must be left exactly as it was.
+
+    Deciding that an owner should stop trying is not the box's decision to take:
+    the limit can be raised at any moment, and a session that killed itself has
+    removed the owner's ability to find out. This drives the live path — the
+    default fail_on_error_result=False — and asserts nothing propagates: the
+    turn ends, the run stays up, and no backoff retries are spent on a refusal
+    backing off cannot clear.
+    """
+    fake = _RateLimitedFakeClient(succeed_on_query=999, status=402)
+    run, evs, raised = await _run_stall_scenario(
+        fake, idle=90, poll=0.03, max_retries=3, rate_base=0.01, rate_cap=0.02, rate_max=2)
+    assert raised is None, raised                          # the session survives
+    assert [e for e in evs if e["type"] == "rate_limited"] == [], evs
+    assert run._turn_active is False                       # the turn ended cleanly
+    assert fake.queries == ["批 1/10"], fake.queries        # never re-issued
+    print("✓ spend cap: a live session ends the turn and stays up, no backoff")
 
 
 async def main():
@@ -6444,6 +6469,7 @@ async def main():
     await test_shutdown_flush_syncs_active_runs()
     test_pr382_review_fixes()
     test_a_spend_cap_is_not_a_rate_limit()
+    await test_a_spend_cap_does_not_kill_a_live_session()
     await test_typed_authoring_commands()
 
     compile_box._COMPILE_IMPL = fake_driver
