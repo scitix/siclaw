@@ -15,6 +15,23 @@ describe("resolveCapabilitySessionLlm", () => {
     expect(resolved).toEqual({ base_url: "https://tenant.example/v1" });
   });
 
+  it("passes an authoritative Pi SDK binding through as one opaque block", () => {
+    const consumer = {
+      engine: "pi_sdk" as const,
+      protocol: "openai_compatible" as const,
+      provider: "moonshotai",
+      base_url: "https://api.moonshot.cn/v1",
+      api_key: "tenant-secret",
+      model: "kimi-k3",
+    };
+    const resolved = resolveCapabilitySessionLlm(consumer, {
+      ANTHROPIC_AUTH_TOKEN: "runtime-secret",
+    });
+
+    expect(resolved).toBe(consumer);
+    expect(resolved).toEqual(consumer);
+  });
+
   it("uses the complete Runtime Helm fallback only when the consumer object is absent", () => {
     expect(resolveCapabilitySessionLlm(undefined, {
       ANTHROPIC_BASE_URL: "https://runtime.example/v1",

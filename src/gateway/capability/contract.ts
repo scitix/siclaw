@@ -521,9 +521,11 @@ export interface CapabilityFetchInputRequest {
  */
 export interface CapabilityLlmConfig {
   /** Agent harness selected by the consumer; absent preserves Claude compatibility. */
-  engine?: "claude_agent_sdk" | "codex_sdk";
+  engine?: "claude_agent_sdk" | "codex_sdk" | "pi_sdk";
   /** Wire protocol expected by the selected engine/model provider. */
-  protocol?: "anthropic" | "openai_responses";
+  protocol?: "anthropic" | "openai_responses" | "openai_compatible" | "openai_completions";
+  /** Pi catalog provider identity; endpoint inference is used when omitted. */
+  provider?: string;
   base_url?: string;
   auth_token?: string;
   api_key?: string;
