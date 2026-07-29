@@ -310,10 +310,71 @@ class CodexEngine:
         return "\n\n".join(parts)
 
 
+class PiEngine:
+    """ReadonlyAgentEngine on Pi SDK 0.82.1.
+
+    Pi's model-visible file tools are implemented by the companion runner and
+    mechanically confined to ``allowed_read_roots``; no native shell, network
+    tool, project configuration, skill, or external memory is loaded.
+    """
+
+    async def run_readonly_agent(
+        self, *, cwd: str, system_prompt: str, user_message: str,
+        model: str, effort: str | None = None,
+        allowed_read_roots: list[str], timeout_secs: float,
+    ) -> str:
+        from pi_engine import PiSDKClient
+
+        roots = [str(Path(value).resolve()) for value in (allowed_read_roots or [cwd])]
+        root_contract = (
+            "\n\nClosed-book filesystem contract: read only these declared roots "
+            "through Read, Glob, and Grep; no shell or mutation tools are available: "
+            + ", ".join(roots)
+        )
+        client = PiSDKClient(
+            cwd=cwd,
+            system_prompt=system_prompt + root_contract,
+            model=model,
+            session_id=str(uuid.uuid4()),
+            read_only=True,
+            allowed_read_roots=roots,
+            allowed_read_tools=["Read", "Glob", "Grep"],
+            reasoning_effort=effort,
+            max_tool_calls=int(os.environ.get("KBC_PK_MAX_TURNS", "40")),
+        )
+        parts: list[str] = []
+
+        async def _run():
+            await client.connect()
+            await client.query(user_message)
+            async for msg in client.receive_messages():
+                if type(msg).__name__ == "ResultMessage":
+                    if getattr(msg, "is_error", False):
+                        raise RuntimeError(
+                            f"Pi readonly run failed: {getattr(msg, 'subtype', 'error')}"
+                        )
+                    break
+                if type(msg).__name__ != "AssistantMessage":
+                    continue
+                for block in getattr(msg, "content", []) or []:
+                    if type(block).__name__ == "TextBlock":
+                        text = str(getattr(block, "text", "") or "").strip()
+                        if text:
+                            parts.append(text)
+
+        try:
+            await asyncio.wait_for(_run(), timeout=timeout_secs)
+        finally:
+            await client.disconnect()
+        return "\n\n".join(parts)
+
+
 def selected_readonly_engine() -> ReadonlyAgentEngine:
     kind = os.environ.get("KBC_ENGINE", "claude_agent_sdk").strip().lower()
     if kind in {"codex", "codex_sdk"}:
         return CodexEngine()
+    if kind in {"pi", "pi_sdk"}:
+        return PiEngine()
     if kind in {"claude", "claude_agent_sdk"}:
         return ClaudeEngine()
     raise ValueError(f"unknown KBC_ENGINE {kind!r}")

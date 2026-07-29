@@ -1,7 +1,9 @@
-# platform/pod — compile box (Claude Agent SDK / Codex SDK + kbc brain)
+# platform/pod — compile box (Claude Agent SDK / Codex SDK / Pi SDK + kbc brain)
 
-The siclaw platform's **compile box**: runs the kbc compile brain as a **Claude Agent SDK** persistent session = a "headless
-Claude Code with a wrapped entry point". The engine / tools / compact are not rewritten by a single line; it only adds structured-signal tools for the kbc moat.
+The siclaw platform's **compile box** runs the kbc compile brain as a persistent
+coding-agent session. Claude Agent SDK remains the default; Codex SDK and the
+pinned Pi SDK `0.82.1` are selectable engines behind the same KBC-owned tool and
+message contract.
 Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to start it per BoxProfile
 (`kb-compile` / `kb-test`), and events are translated by the runtime into the generic `capability.*` and forwarded to consumers (a downstream platform, etc.).
 
@@ -45,7 +47,35 @@ platform/pod/.venv/bin/python platform/pod/compile_agent.py --workdir /tmp/wd
 
 # served form + protocol smoke test (fake driver, does not burn LLM)
 platform/pod/.venv/bin/python platform/pod/test_compile_box.py
+
+# Pi runner contract tests (no provider request)
+cd platform/pod/pi-runner && npm ci && npm test
 ```
+
+## Pi SDK engine
+
+Select Pi through the session `llm` block:
+
+```json
+{
+  "llm": {
+    "engine": "pi_sdk",
+    "protocol": "openai_compatible",
+    "provider": "moonshotai",
+    "model": "kimi-k3",
+    "base_url": "https://api.moonshot.cn/v1",
+    "api_key": "<injected at session start>"
+  }
+}
+```
+
+`api.kimi.com/coding` defaults to the Pi catalog identity
+`kimi-coding/k3`; `api.moonshot.cn` defaults to `moonshotai-cn/kimi-k3`.
+An explicit `provider` and `model` override endpoint inference. The credential
+is sent once over the private runner stdin, is not placed in the child
+environment, and is not written to the workspace. Pi gets only the KBC-selected
+tools: `raw/` remains read-only for writer sessions, read-only test/PK sessions
+receive only their declared roots, and shell access is not exposed.
 
 ## Run (container, production form)
 
@@ -68,7 +98,7 @@ docker run --rm -p 3000:3000 \
 
 ## Auth / mTLS
 
-- **LLM**: locally reuses the `~/.claude` subscription (no key needed). In production the consumer's whole `llm` block is authoritative; only when it is absent does Runtime send its Helm `ANTHROPIC_*` fallback in the authenticated `/session` body. Runtime credentials are never merged into a consumer block or copied into the KB PodSpec. A live SDK client keeps its session-start credential until the documented grace-window + box-respawn rotation.
+- **LLM**: the default Claude engine locally reuses the `~/.claude` subscription (no key needed). In production the consumer's whole `llm` block is authoritative; only when it is absent does Runtime send its Helm `ANTHROPIC_*` fallback in the authenticated `/session` body. Runtime credentials are never merged into a consumer block or copied into the KB PodSpec. Pi credentials follow the same session-start authority boundary and are passed to the Node runner only over private stdin. A live SDK client keeps its session-start credential until the documented grace-window + box-respawn rotation.
 - **Transport**: if `tls.crt/tls.key/ca.crt` exist under `SICLAW_CERT_PATH` (default `/etc/siclaw/certs`), the box serves HTTPS. `/health` remains certificate-optional for the in-container Kubernetes probe; every data/session/event route requires a verified client certificate whose OU is `Runtime` or `Gateway`. Partial TLS material fails startup. Without TLS material the server uses HTTP for explicit local development only.
 
 ## Layer-1 self-check: coverage ledger + lint (`selfcheck.py`)
@@ -93,7 +123,8 @@ An asymmetric "one writer, many examiners" design: the **judge** (strong tier, r
 
 - **resume**: the session does not survive a box restart (`InMemorySessionStore`); the runtime side falls back on "re-hydrate a cold box" (re-materialize raw + durable workspace), with SDK `resume` + a file-backed `session_store` as a later increment.
 - **Codex writer isolation**: native shell/file tools run under the `kbc_writer` permission profile, which exposes only platform-minimal system files, the pinned Codex runtime, the current workspace, and its isolated shell home; network access and unified exec are disabled.
+- **Pi writer isolation**: the runner loads no project configuration, skills, extensions, or builtin tools. It exposes only bounded KBC file tools plus explicit Python-owned engine tools; every filesystem target is checked against canonical roots and symlinks cannot cross the boundary.
 - **Codex Linux host prerequisite**: writer runs use the dedicated `kb-compile-codex` Runtime profile. It permits the installed `bubblewrap` to create user, PID, and network namespaces while ordinary AgentBoxes, Claude `kb-compile`, and read-only `kb-test` boxes retain the outer RuntimeDefault policy. The writer runs a namespace/mount preflight before contacting the model; failure is explicit and never falls back to `full_access` or an unsandboxed shell.
-- **test session isolation**: the immutable snapshot is also the mechanical read boundary. Claude receives the exact effective `Read/Glob/Grep` subset plus a path guard; Codex disables native shell/file tools and exposes the same effective subset through root-confined KBC MCP tools. The effective contract is included in the consumer fingerprint.
+- **test session isolation**: the immutable snapshot is also the mechanical read boundary. Claude receives the exact effective `Read/Glob/Grep` subset plus a path guard; Codex disables native shell/file tools and exposes the same effective subset through root-confined KBC MCP tools; Pi uses the same root-confined file-tool subset in its runner. The effective contract is included in the consumer fingerprint.
 - Test-session cap `KBC_MAX_TEST_SESSIONS` (default 3), snapshots land in `KBC_TEST_SNAPSHOT_ROOT` (default `/tmp/kbc-tests`), destroyed on close.
 - `KBC_SMOKE=1` → fake driver (does not call the LLM), verifies the box↔runtime↔consumer wiring (events + artifact sync) for free in the cluster.

@@ -80,6 +80,7 @@ import redblue
 import selfcheck
 from engine import selected_readonly_engine
 from codex_engine import CodexSDKClient, EngineTool, isolated_readonly_workspace
+from pi_engine import PI_SDK_VERSION, PiConnectionError, PiSDKClient
 import source_snapshot
 
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches
@@ -2791,6 +2792,7 @@ COMPILE_DISALLOWED_TOOLS = [
 def _compile_model() -> str:
     """Resolve the model shared by every compiler-owned SDK session."""
     return (os.environ.get("KBC_COMPILE_MODEL")
+            or os.environ.get("KBC_PI_MODEL")
             or os.environ.get("ANTHROPIC_MODEL")
             or os.environ.get("OPENAI_MODEL")
             or "claude-opus-4-6")
@@ -2801,11 +2803,27 @@ def _engine_kind() -> str:
     aliases = {
         "claude": "claude_agent_sdk",
         "codex": "codex_sdk",
+        "pi": "pi_sdk",
     }
     kind = aliases.get(kind, kind)
-    if kind not in {"claude_agent_sdk", "codex_sdk"}:
+    if kind not in {"claude_agent_sdk", "codex_sdk", "pi_sdk"}:
         raise ValueError(f"unknown KBC_ENGINE {kind!r}")
     return kind
+
+
+def _pi_selected_file_tools(allowed_tools: list[str] | None, *, read_only: bool = False) -> list[str]:
+    defaults = DEFAULT_TEST_ALLOWED_TOOLS if read_only else DEFAULT_COMPILE_ALLOWED_TOOLS
+    allowed = set(allowed_tools or defaults)
+    candidates = ("Read", "Glob", "Grep") if read_only else ("Read", "Write", "Edit", "Glob", "Grep")
+    return [name for name in candidates if name in allowed]
+
+
+def _pi_selected_engine_tools(run: "CompileRun") -> list[EngineTool]:
+    allowed = set(run.allowed_tools or DEFAULT_COMPILE_ALLOWED_TOOLS)
+    return [
+        item for item in _compile_engine_tools(run)
+        if item.name in allowed or f"mcp__compile__{item.name}" in allowed
+    ]
 
 
 def _reference_assist_model() -> str:
@@ -3140,6 +3158,23 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
                 # Raw), never to None (allow all of Raw).
                 Path(wd), (raw_scope.get("account") or []) if raw_scope is not None else None,
                 codex_source_view
+            ),
+            max_tool_calls=int(os.environ.get("KBC_MAX_TURNS", "150")),
+        )
+    if _engine_kind() == "pi_sdk":
+        tools = _pi_selected_engine_tools(run)
+        if pdf_page_ranges:
+            tools.append(_codex_pdf_pages_engine_tool(Path(wd), pdf_page_ranges))
+        return PiSDKClient(
+            cwd=wd,
+            system_prompt=system_prompt,
+            model=_compile_model(),
+            session_id=session_id,
+            allowed_read_tools=_pi_selected_file_tools(run.allowed_tools),
+            tools=tools,
+            writer_filesystem_access=_codex_batch_filesystem_access(
+                Path(wd), (raw_scope.get("account") or []) if raw_scope is not None else None,
+                codex_source_view,
             ),
             max_tool_calls=int(os.environ.get("KBC_MAX_TURNS", "150")),
         )
@@ -3598,7 +3633,7 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
             session_id = str(uuid.uuid4())
             directive_full = directive
             try:
-                if _engine_kind() == "codex_sdk" and raw_scope is not None:
+                if _engine_kind() in {"codex_sdk", "pi_sdk"} and raw_scope is not None:
                     account = (raw_scope or {}).get("account") or []
                     source_view = _materialize_codex_batch_source_view(
                         root, account, pdf_page_ranges, session_id)
@@ -3626,7 +3661,7 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                     run, client, stop_on_result=True, fail_on_error_result=True)
                 _print_compile_lifecycle("turn.done", run, extra=f"label={label}")
                 return run._last_turn_reply
-            except (ModelStallError, CLIConnectionError, ProcessError) as exc:
+            except (ModelStallError, CLIConnectionError, ProcessError, PiConnectionError) as exc:
                 attempt += 1
                 # Tear down the dead/wedged client before rebuilding. Disconnect
                 # may itself raise on a broken transport — best-effort.
@@ -3912,7 +3947,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         f'{paged_sources[0][1]}-{paged_sources[0][2]}'
         if paged_sources else ""
     )
-    if paged_sources and _engine_kind() == "codex_sdk":
+    if paged_sources and _engine_kind() in {"codex_sdk", "pi_sdk"}:
         page_en = (
             "\n\nThis batch is one bounded page range of an oversized PDF. The original PDF is "
             "mechanically hidden from shell/file tools. Call the KBC `read_assigned_pdf_pages` tool "
@@ -4208,6 +4243,15 @@ async def _plan_batches(run: "CompileRun", inventory: list) -> dict:
                 system_prompt=planner_prompt,
                 model=_compile_model(),
                 session_id=planner_session_id,
+                max_tool_calls=8,
+            )
+        elif _engine_kind() == "pi_sdk":
+            client = PiSDKClient(
+                cwd=wd,
+                system_prompt=planner_prompt,
+                model=_compile_model(),
+                session_id=planner_session_id,
+                allowed_read_tools=["Read", "Write", "Glob"],
                 max_tool_calls=8,
             )
         else:
@@ -5294,6 +5338,8 @@ def _test_max_turns() -> int:
 
 
 def _test_sdk_version() -> str:
+    if _engine_kind() == "pi_sdk":
+        return PI_SDK_VERSION
     try:
         package = "openai-codex" if _engine_kind() == "codex_sdk" else "claude-agent-sdk"
         return package_version(package)
@@ -5859,6 +5905,17 @@ def _build_test_client(run: "TestRun", sid: str):
             allowed_read_tools=effective_tools,
             max_tool_calls=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
         )
+    if _engine_kind() == "pi_sdk":
+        return PiSDKClient(
+            cwd=run.cwd,
+            system_prompt=_prompt("test_role", run.locale),
+            model=run.consumer_model or _test_model(),
+            session_id=sid,
+            read_only=True,
+            allowed_read_roots=[run.cwd],
+            allowed_read_tools=_pi_selected_file_tools(effective_tools, read_only=True),
+            max_tool_calls=run.consumer_max_turns if run.consumer_max_turns is not None else _test_max_turns(),
+        )
     opts = ClaudeAgentOptions(
         cwd=run.cwd,
         system_prompt={"type": "preset", "preset": "claude_code", "append": _prompt("test_role", run.locale)},
@@ -6157,7 +6214,7 @@ async def recommend_test_question(parent: "CompileRun") -> dict:
         "Inspect raw/ and candidate/, then call submit_recommended_test exactly once. Do not merely print JSON.",
         "检查 raw/ 与 candidate/，然后仅调用一次 submit_recommended_test；不要只输出 JSON。",
     )
-    if _engine_kind() == "codex_sdk":
+    if _engine_kind() in {"codex_sdk", "pi_sdk"}:
         # The model sees only these two immutable views.  This preserves the
         # Claude path guard's blind-review contract with an OS-enforced Codex
         # workspace boundary instead of trusting model instructions/hooks.
@@ -6165,7 +6222,8 @@ async def recommend_test_question(parent: "CompileRun") -> dict:
             "raw": root / "raw",
             "candidate": root / "candidate",
         }) as session_root:
-            client = CodexSDKClient(
+            client_cls = CodexSDKClient if _engine_kind() == "codex_sdk" else PiSDKClient
+            client = client_cls(
                 cwd=str(session_root),
                 system_prompt=_prompt("recommend_test_role", parent.locale),
                 model=_compile_model(),
@@ -6427,12 +6485,13 @@ async def assist_reference_answer(parent: "CompileRun", payload: dict) -> dict:
         "\n\nTimebox retrieval. Once the necessary evidence is found, stop reading and call the submit tool; always reserve a turn for submission.",
         "\n\n请限制检索范围。找到足以回答的证据后立即停止读取并调用提交工具，务必为提交保留一轮。",
     )
-    if _engine_kind() == "codex_sdk":
+    if _engine_kind() in {"codex_sdk", "pi_sdk"}:
         with isolated_readonly_workspace({
             "raw": root / "raw",
             "candidate": root / "candidate",
         }) as session_root:
-            client = CodexSDKClient(
+            client_cls = CodexSDKClient if _engine_kind() == "codex_sdk" else PiSDKClient
+            client = client_cls(
                 cwd=str(session_root),
                 system_prompt=_prompt("reference_assist_role", parent.locale),
                 model=_reference_assist_model(),
@@ -6524,53 +6583,89 @@ def _apply_session_config(body: dict) -> None:
     llm = body.get("llm")
     if isinstance(llm, dict):
         engine = str(llm.get("engine") or "claude_agent_sdk").strip().lower()
-        engine = {"claude": "claude_agent_sdk", "codex": "codex_sdk"}.get(engine, engine)
-        if engine not in {"claude_agent_sdk", "codex_sdk"}:
+        engine = {
+            "claude": "claude_agent_sdk",
+            "codex": "codex_sdk",
+            "pi": "pi_sdk",
+        }.get(engine, engine)
+        if engine not in {"claude_agent_sdk", "codex_sdk", "pi_sdk"}:
             raise ValueError(f"unsupported llm.engine {engine!r}")
         protocol = str(llm.get("protocol") or "").strip().lower()
-        expected_protocol = "openai_responses" if engine == "codex_sdk" else "anthropic"
-        if protocol and protocol != expected_protocol:
+        allowed_protocols = {
+            "claude_agent_sdk": {"anthropic"},
+            "codex_sdk": {"openai_responses"},
+            # Pi selects the concrete provider transport from its 0.82.1 model
+            # catalog. Kimi Open Platform is OpenAI-compatible; Kimi Code uses
+            # Anthropic Messages. Keep the consumer spelling explicit.
+            "pi_sdk": {"openai_compatible", "openai_completions", "anthropic"},
+        }[engine]
+        if protocol and protocol not in allowed_protocols:
             raise ValueError(
-                f"llm.engine {engine!r} requires protocol {expected_protocol!r}, got {protocol!r}"
+                f"llm.engine {engine!r} requires one of {sorted(allowed_protocols)!r}, got {protocol!r}"
             )
         os.environ["KBC_ENGINE"] = engine
+        token = llm.get("api_key") or llm.get("auth_token")
+
+        if engine == "pi_sdk":
+            for field, env_name in (
+                ("base_url", "KBC_PI_BASE_URL"),
+                ("model", "KBC_PI_MODEL"),
+                ("provider", "KBC_PI_PROVIDER"),
+            ):
+                value = llm.get(field)
+                if value:
+                    os.environ[env_name] = str(value)
+                else:
+                    os.environ.pop(env_name, None)
+            if token:
+                os.environ["KBC_PI_API_KEY"] = str(token)
+            else:
+                os.environ.pop("KBC_PI_API_KEY", None)
+            # A Pi run receives its credential only over the private JSONL pipe.
+            # Remove every inherited provider credential from the box process.
+            for prefix in ("OPENAI", "ANTHROPIC"):
+                for suffix in ("BASE_URL", "MODEL", "API_KEY", "AUTH_TOKEN"):
+                    os.environ.pop(f"{prefix}_{suffix}", None)
+        else:
+            for key in ("KBC_PI_BASE_URL", "KBC_PI_MODEL", "KBC_PI_PROVIDER", "KBC_PI_API_KEY"):
+                os.environ.pop(key, None)
         # The LLM object is one authority block, not field-level overrides. If
         # the consumer supplied it, omitted fields must not inherit a Runtime or
         # image credential that belongs to another endpoint.
-        prefix = "OPENAI" if engine == "codex_sdk" else "ANTHROPIC"
-        other_prefix = "ANTHROPIC" if prefix == "OPENAI" else "OPENAI"
-        for field, env_name in (
-            ("base_url", f"{prefix}_BASE_URL"),
-            ("model", f"{prefix}_MODEL"),
-        ):
-            value = llm.get(field)
-            if value:
-                os.environ[env_name] = str(value)
-            else:
-                os.environ.pop(env_name, None)
+        if engine != "pi_sdk":
+            prefix = "OPENAI" if engine == "codex_sdk" else "ANTHROPIC"
+            other_prefix = "ANTHROPIC" if prefix == "OPENAI" else "OPENAI"
+            for field, env_name in (
+                ("base_url", f"{prefix}_BASE_URL"),
+                ("model", f"{prefix}_MODEL"),
+            ):
+                value = llm.get(field)
+                if value:
+                    os.environ[env_name] = str(value)
+                else:
+                    os.environ.pop(env_name, None)
 
-        token = llm.get("api_key") or llm.get("auth_token")
-        if engine == "codex_sdk":
-            if token:
-                os.environ["OPENAI_API_KEY"] = str(token)
+            if engine == "codex_sdk":
+                if token:
+                    os.environ["OPENAI_API_KEY"] = str(token)
+                else:
+                    os.environ.pop("OPENAI_API_KEY", None)
+                os.environ.pop("OPENAI_AUTH_TOKEN", None)
             else:
-                os.environ.pop("OPENAI_API_KEY", None)
-            os.environ.pop("OPENAI_AUTH_TOKEN", None)
-        else:
-            if llm.get("auth_token"):
-                os.environ["ANTHROPIC_AUTH_TOKEN"] = str(llm["auth_token"])
-                os.environ.pop("ANTHROPIC_API_KEY", None)
-            elif llm.get("api_key"):
-                os.environ["ANTHROPIC_API_KEY"] = str(llm["api_key"])
-                os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-            else:
-                os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-                os.environ.pop("ANTHROPIC_API_KEY", None)
+                if llm.get("auth_token"):
+                    os.environ["ANTHROPIC_AUTH_TOKEN"] = str(llm["auth_token"])
+                    os.environ.pop("ANTHROPIC_API_KEY", None)
+                elif llm.get("api_key"):
+                    os.environ["ANTHROPIC_API_KEY"] = str(llm["api_key"])
+                    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+                else:
+                    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+                    os.environ.pop("ANTHROPIC_API_KEY", None)
 
-        # A present consumer block is authoritative for one engine. Never leave
-        # the other engine's endpoint or credential in the process environment.
-        for suffix in ("BASE_URL", "MODEL", "API_KEY", "AUTH_TOKEN"):
-            os.environ.pop(f"{other_prefix}_{suffix}", None)
+            # A present consumer block is authoritative for one engine. Never
+            # leave the other engine's endpoint or credential in process state.
+            for suffix in ("BASE_URL", "MODEL", "API_KEY", "AUTH_TOKEN"):
+                os.environ.pop(f"{other_prefix}_{suffix}", None)
     settings = body.get("settings")
     if isinstance(settings, dict):
         for key, value in settings.items():
