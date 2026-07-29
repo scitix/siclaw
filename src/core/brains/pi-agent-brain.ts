@@ -21,7 +21,7 @@ import { estimateMessagesTokens } from "../compaction.js";
 import { rememberPromptFiles } from "../openai-file-payload.js";
 
 /** Valid pi thinking levels; guards reasoningEffort coming off the wire. */
-const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 /**
  * Read `maxTokensField` off pi's compat union.
@@ -274,14 +274,14 @@ export class PiAgentBrain implements BrainSession {
   }
 
   async setModel(info: BrainModelInfo): Promise<void> {
-    const model = this.session.modelRegistry.find(info.provider, info.id);
+    const model = this.session.modelRuntime.getModel(info.provider, info.id);
     if (model) {
       await this.session.setModel(model);
     }
   }
 
   findModel(provider: string, modelId: string): BrainModelInfo | undefined {
-    const model = this.session.modelRegistry.find(provider, modelId);
+    const model = this.session.modelRuntime.getModel(provider, modelId);
     if (!model) return undefined;
     return {
       id: model.id,
@@ -296,7 +296,7 @@ export class PiAgentBrain implements BrainSession {
   }
 
   registerProvider(name: string, config: Record<string, unknown>): void {
-    this.session.modelRegistry.registerProvider(name, config as any);
+    this.session.modelRuntime.registerProvider(name, config as any);
   }
 
   applyModelParams(params: BrainModelParams): void {
