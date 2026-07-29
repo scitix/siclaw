@@ -41,6 +41,8 @@ const handlePersonalPairingCodeMock = vi.fn();
 const resetPersonalSessionMock = vi.fn();
 const updateBindingMetaMock = vi.fn();
 const setChannelContextModeMock = vi.fn();
+const issuePersonalApiKeyMock = vi.fn();
+const getPersonalApiKeyStatusMock = vi.fn();
 
 vi.mock("../channel-manager.js", () => ({
   resolveBinding: (...args: unknown[]) => resolveBindingMock(...args),
@@ -49,6 +51,8 @@ vi.mock("../channel-manager.js", () => ({
   resolvePersonalBinding: (...args: unknown[]) => resolvePersonalBindingMock(...args),
   handlePersonalPairingCode: (...args: unknown[]) => handlePersonalPairingCodeMock(...args),
   resetPersonalSession: (...args: unknown[]) => resetPersonalSessionMock(...args),
+  issuePersonalApiKey: (...args: unknown[]) => issuePersonalApiKeyMock(...args),
+  getPersonalApiKeyStatus: (...args: unknown[]) => getPersonalApiKeyStatusMock(...args),
   updateBindingMeta: (...args: unknown[]) => updateBindingMetaMock(...args),
   setChannelContextMode: (...args: unknown[]) => setChannelContextModeMock(...args),
   isChannelAccessDenied: (v: unknown) =>
@@ -199,6 +203,8 @@ beforeEach(() => {
   resolvePersonalBindingMock.mockReset();
   handlePersonalPairingCodeMock.mockReset();
   resetPersonalSessionMock.mockReset();
+  issuePersonalApiKeyMock.mockReset();
+  getPersonalApiKeyStatusMock.mockReset();
   resolveAgentModelBindingMock.mockReset();
   ensureChatSessionMock.mockReset();
   appendMessageMock.mockReset();
@@ -2794,5 +2800,238 @@ describe("extractInbound — post receive shapes", () => {
     expect(text).toContain("Report");
     expect(text).toContain("see");
     expect(text).toContain("https://oss.siflow.cn/x.png"); // href surfaced for the unified URL resolver
+  });
+});
+
+// ── /apikey — self-service API key issuing (personal chat only) ─────
+//
+// Contract under test (docs/design/2026-07-28-feishu-apikey-command.md):
+// deterministic parsing that never reaches the agent, only a bare `/apikey`
+// may rotate, and the group path stays silent.
+
+describe("handleLarkMessage — /apikey", () => {
+  const PICKUP = "https://upstream.example/siclaw/api-key/pickup/9f3a2b";
+
+  // Always an `open` personal bot: the handler never branches on the access mode (admission is
+  // the frontend's call), so there is no mode-specific path left to parameterise here.
+  function sendPersonal(text: string, lark: ReturnType<typeof makeLarkClient>) {
+    return handleLarkMessage(
+      makeTextEvent(text, { chat_type: "p2p" }),
+      lark,
+      "personal-bot-1",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      makePersonalConfig("open"),
+    );
+  }
+
+  const replyText = (lark: ReturnType<typeof makeLarkClient>) =>
+    lark.im.message.reply.mock.calls[0][0].data.content as string;
+
+  it("issues a key and replies with the single-use pickup link", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: true, agentId: "a1", pickupUrl: PICKUP, expiresAt: 1753689600000, rotated: false,
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    // channel_id is the personal-bot config id; sender_open_id is the only identity source.
+    expect(issuePersonalApiKeyMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything());
+    expect(replyText(lark)).toContain(PICKUP);
+    expect(replyText(lark)).toContain("仅可打开一次");
+    expect(replyText(lark)).toContain("2025-07-28 16:00"); // link expiry, Asia/Shanghai
+    expect(promptMock).not.toHaveBeenCalled();             // never reaches the agent
+  });
+
+  it("warns that the previous key died when the frontend reports a rotation", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: PICKUP, rotated: true });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    expect(replyText(lark)).toContain("旧 Key 已失效");
+  });
+
+  it("surfaces the frontend's failure reason verbatim", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: false,
+      error: "你的飞书账号还没完成授权，无法领取此 Agent 的 Key。",
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    expect(replyText(lark)).toContain("你的飞书账号还没完成授权");
+  });
+
+  it("works on an OPEN personal bot — unlike PAIR, issuing is not gated on the authorized mode", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: PICKUP });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    expect(issuePersonalApiKeyMock).toHaveBeenCalledTimes(1);
+    expect(replyText(lark)).toContain(PICKUP);
+  });
+
+  it("/apikey status reports the current key and rotates nothing", async () => {
+    getPersonalApiKeyStatusMock.mockResolvedValue({
+      success: true, exists: true, keyPrefix: "sk-a1b2c3d4",
+      lastUsedAt: 1753605840000, expiresAt: 1756197840000,
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey status", lark);
+
+    expect(getPersonalApiKeyStatusMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything());
+    expect(issuePersonalApiKeyMock).not.toHaveBeenCalled(); // read-only path
+    const reply = replyText(lark);
+    expect(reply).toContain("sk-a1b2c3d4");
+    expect(reply).toContain("2025-07-27 16:44"); // last used
+    expect(reply).toContain("2025-08-26");       // sliding expiry (date only)
+  });
+
+  it("/apikey status tells a first-time user how to get one", async () => {
+    getPersonalApiKeyStatusMock.mockResolvedValue({ success: true, exists: false });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey status", lark);
+
+    expect(replyText(lark)).toContain("还没有这个 Agent 的 API Key");
+  });
+
+  it("an unrecognised subcommand shows usage and issues NO rpc (a typo must not rotate)", async () => {
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey statu", lark);
+
+    expect(issuePersonalApiKeyMock).not.toHaveBeenCalled();
+    expect(getPersonalApiKeyStatusMock).not.toHaveBeenCalled();
+    expect(replyText(lark)).toContain("无法识别的 /apikey 子命令");
+  });
+
+  it("replies (does not go silent) when the rpc throws", async () => {
+    issuePersonalApiKeyMock.mockRejectedValue(new Error("frontend ws closed"));
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    expect(replyText(lark)).toContain("暂时无法处理 API Key 请求");
+  });
+
+  it("replies when no frontend client is wired", async () => {
+    const lark = makeLarkClient();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Called directly, not via sendPersonal: passing `undefined` to a defaulted parameter
+    // would fall back to the stub client and defeat the point of this case.
+    await handleLarkMessage(
+      makeTextEvent("/apikey", { chat_type: "p2p" }),
+      lark,
+      "personal-bot-1",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      undefined,
+      "zh-CN",
+      makePersonalConfig("open"),
+    );
+
+    expect(issuePersonalApiKeyMock).not.toHaveBeenCalled();
+    expect(replyText(lark)).toContain("暂时无法处理 API Key 请求");
+  });
+
+  it("treats an out-of-range or zero timestamp as absent instead of throwing or printing 1970", async () => {
+    // A frontend sending nanoseconds passes Number.isFinite but makes Intl.format throw
+    // RangeError; that throw would surface as "unavailable" AFTER the key was already rotated.
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: true, pickupUrl: PICKUP, expiresAt: 1753800000000000000, rotated: true,
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain(PICKUP);            // the link still reaches the user
+    expect(reply).not.toContain("暂时无法处理");  // not swallowed as an outage
+    expect(reply).not.toContain("链接过期时间");  // unusable value simply omitted
+
+    getPersonalApiKeyStatusMock.mockResolvedValue({
+      success: true, exists: true, keyPrefix: "sk-a1b2c3d4", lastUsedAt: 0, expiresAt: 0,
+    });
+    const lark2 = makeLarkClient();
+    await sendPersonal("/apikey status", lark2);
+    expect(replyText(lark2)).toContain("从未使用");
+    expect(replyText(lark2)).not.toContain("1970");
+  });
+
+  it("does not advise the destructive /apikey when a prefix proves a key exists", async () => {
+    // `exists` is optional on the wire; inferring absence from a missing field would tell the
+    // user to run the rotating command against the key they were trying to inspect.
+    getPersonalApiKeyStatusMock.mockResolvedValue({ success: true, keyPrefix: "sk-a1b2c3d4" });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey status", lark);
+
+    expect(replyText(lark)).toContain("sk-a1b2c3d4");
+    expect(replyText(lark)).not.toContain("还没有这个 Agent 的 API Key");
+  });
+
+  it("rejects a second concurrent request so a double-tap cannot rotate twice", async () => {
+    let release!: (v: unknown) => void;
+    issuePersonalApiKeyMock.mockReturnValue(new Promise((r) => { release = r; }));
+    const first = makeLarkClient();
+    const second = makeLarkClient();
+
+    const inflight = sendPersonal("/apikey", first);
+    await sendPersonal("/apikey", second); // lands while the first is still open
+
+    expect(issuePersonalApiKeyMock).toHaveBeenCalledTimes(1); // no second rotation
+    expect(replyText(second)).toContain("正在处理你上一条 API Key 请求");
+
+    release({ success: true, pickupUrl: PICKUP });
+    await inflight;
+    expect(replyText(first)).toContain(PICKUP);
+
+    // The slot is freed once settled, so a later request works normally.
+    issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: PICKUP });
+    const third = makeLarkClient();
+    await sendPersonal("/apikey", third);
+    expect(issuePersonalApiKeyMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("claims the whole namespace — /apikeys never reaches the agent", async () => {
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikeys", lark);
+
+    expect(replyText(lark)).toContain("无法识别的 /apikey 子命令");
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(issuePersonalApiKeyMock).not.toHaveBeenCalled();
+  });
+
+  it("is ignored in a group chat — no reply, no rpc, never routed to the agent", async () => {
+    const lark = makeLarkClient();
+
+    for (const text of ["/apikey", "/apikey status", "/apikeys"]) {
+      await handleLarkMessage(
+        makeTextEvent(text, { chat_type: "group" }),
+        lark,
+        "group-channel-1",
+        makeAgentBoxManager("a1") as any,
+        undefined,
+        {} as any,
+        "zh-CN",
+      );
+    }
+
+    // The group gate must claim exactly what the personal gate claims — it is the side whose
+    // failure mode is posting a credential reply to a whole room.
+    expect(issuePersonalApiKeyMock).not.toHaveBeenCalled();
+    expect(getPersonalApiKeyStatusMock).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
   });
 });

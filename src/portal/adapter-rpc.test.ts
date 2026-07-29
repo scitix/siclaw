@@ -2196,9 +2196,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 56 handlers", () => {
+  it("registers exactly 58 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(56);
+    expect(handlers.size).toBe(58);
   });
 
   it("all expected handler names are registered", () => {
@@ -2217,11 +2217,25 @@ describe("buildAdapterRpcHandlers", () => {
       "channel.list", "channel.resolveBinding", "channel.pair", "channel.resetSession",
       "channel.updateBindingMeta", "channel.updateName", "channel.setContextMode",
       "channel.resolvePersonalBinding", "channel.pairPersonal", "channel.resetPersonalSession",
+      "channel.issueApiKey", "channel.apiKeyStatus",
       "agent.listForSkill", "agent.listForMcp", "agent.listForCluster", "agent.listForHost",
       "metrics.summary", "metrics.audit", "metrics.auditDetail",
     ];
     for (const name of expected) {
       expect(handlers.has(name), `Missing handler: ${name}`).toBe(true);
+    }
+  });
+
+  // These two exist purely so the runtime can call them unconditionally against ANY frontend
+  // (see docs/design/2026-07-28-feishu-apikey-command.md): channel-issued keys are an
+  // Upstream-mode capability, and without a stub the runtime's `/apikey` would hit
+  // method-not-found and leave the user with no reply at all.
+  it("channel-issued API key handlers are graceful Upstream-mode-only stubs", async () => {
+    const handlers = buildAdapterRpcHandlers();
+    for (const name of ["channel.issueApiKey", "channel.apiKeyStatus"]) {
+      const result = await handlers.get(name)!({ channel_id: "pb1", sender_open_id: "ou_1" }, "a1");
+      expect(result.success).toBe(false);
+      expect(String(result.error)).toContain("Upstream mode");
     }
   });
 });

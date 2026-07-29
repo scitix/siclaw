@@ -3113,6 +3113,18 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     error: "Sicore authorization is only available through the Sicore adapter",
   }));
 
+  // Channel-issued API keys (the `/apikey` personal-chat command) are an Upstream-mode
+  // capability: issuing depends on the control plane's account model and its single-use pickup
+  // page, neither of which exists here. These stubs let the runtime call the RPCs
+  // unconditionally — it stays frontend-agnostic, and against this adapter the user gets a
+  // readable "not here" instead of an unanswered request. `error` reaches the user verbatim.
+  const CHANNEL_API_KEY_UNSUPPORTED = {
+    success: false,
+    error: "Channel-issued API keys are only available in Upstream mode",
+  } as const;
+  handlers.set("channel.issueApiKey", async () => ({ ...CHANNEL_API_KEY_UNSUPPORTED }));
+  handlers.set("channel.apiKeyStatus", async () => ({ ...CHANNEL_API_KEY_UNSUPPORTED }));
+
   // --- agent.* ---
 
   handlers.set("agent.listForSkill", async (params) => {

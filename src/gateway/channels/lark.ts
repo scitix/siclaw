@@ -17,11 +17,15 @@ import {
   resolvePersonalBinding,
   handlePersonalPairingCode,
   resetPersonalSession,
+  issuePersonalApiKey,
+  getPersonalApiKeyStatus,
   updateBindingMeta,
   updateChannelName,
   isChannelAccessDenied,
   type ResolvedChannelBinding,
   type ChannelAccessDenied,
+  type PersonalApiKeyIssueResult,
+  type PersonalApiKeyStatusResult,
 } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
@@ -94,6 +98,19 @@ const GROUP_ACCESS_UNBOUND_NOTICE_BY_LOCALE = {
 const GROUP_ACCESS_DENIED_NOTICE_BY_LOCALE = {
   "zh-CN": "❌ 你没有这个助手的访问权限，请联系管理员授权。",
   "en-US": "❌ You don't have access to this assistant. Ask an admin to grant access.",
+} as const;
+// /apikey: the frontend RPC threw (transport down, or a frontend that doesn't
+// implement it at all). The user is waiting on a pickup link, so say something —
+// staying silent here reads as "the bot is broken".
+const API_KEY_UNAVAILABLE_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 暂时无法处理 API Key 请求，请稍后重试。",
+  "en-US": "❌ The API key service is unavailable right now — please try again later.",
+} as const;
+// /apikey: one request for this sender is already in flight. Issuing ROTATES, so letting a
+// second one through would mint a second key and silently kill the first pickup link.
+const API_KEY_BUSY_NOTICE_BY_LOCALE = {
+  "zh-CN": "⏳ 正在处理你上一条 API Key 请求，请稍等几秒。",
+  "en-US": "⏳ Your previous API key request is still running — give it a few seconds.",
 } as const;
 // The card only ever shows the single latest step, so the milestone list is
 // just an internal buffer for dedup against the previous step. Bound it anyway
@@ -868,6 +885,62 @@ export async function handleLarkMessage(
       return;
     }
 
+    // /apikey — self-service API key issuing. Claims the WHOLE `/apikey …` namespace so a
+    // malformed subcommand can never fall through to the agent. Parsing is deliberately
+    // deterministic and returns here: the LLM must never sit in the credential-issuing loop,
+    // or one prompt injection becomes an issuing primitive.
+    //
+    // Placed BEFORE binding resolution on purpose — an `open` personal bot is the primary use
+    // case and its users need no binding at all. Admission is the frontend's call (it also
+    // fails closed on an inactive personal bot); the runtime only forwards the sender identity.
+    const apiKeyCommand = parseApiKeyCommand(text);
+    if (apiKeyCommand) {
+      const { subcommand } = apiKeyCommand;
+      // Only an EXACT bare `/apikey` may rotate. Anything else gets usage help and issues no
+      // RPC at all, so a typo can't destroy the key the user meant to inspect.
+      if (subcommand !== "" && subcommand !== "status") {
+        await replyToLark(larkClient, messageId, formatApiKeyUsageReply(locale));
+        return;
+      }
+      if (!frontendClient) {
+        console.warn(`[lark] /apikey unavailable — no frontend client (channel=${personalChannelId})`);
+        await replyToLark(larkClient, messageId, API_KEY_UNAVAILABLE_NOTICE_BY_LOCALE[locale]);
+        return;
+      }
+      const label = subcommand === "status" ? "status" : "issue";
+      const inFlightKey = `${personalChannelId}:${senderOpenId}`;
+      if (apiKeyRequestsInFlight.has(inFlightKey)) {
+        console.log(`[lark] /apikey ${label} rejected — already in flight for sender=${senderOpenId}`);
+        await replyToLark(larkClient, messageId, API_KEY_BUSY_NOTICE_BY_LOCALE[locale]);
+        return;
+      }
+      apiKeyRequestsInFlight.add(inFlightKey);
+      try {
+        let reply: string;
+        if (subcommand === "status") {
+          const status = await getPersonalApiKeyStatus(personalChannelId, senderOpenId, frontendClient);
+          reply = formatApiKeyStatusReply(status, locale);
+          console.log(`[lark] /apikey status channel=${personalChannelId} sender=${senderOpenId} ok=${status.success} exists=${status.exists ?? "?"}`);
+        } else {
+          const issued = await issuePersonalApiKey(personalChannelId, senderOpenId, frontendClient);
+          reply = formatApiKeyIssueReply(issued, locale);
+          // Audit line for a credential-mutating command: this path bypasses chat persistence,
+          // so without it a "my key stopped working" report has no runtime-side evidence of who
+          // rotated what and when. Never log the pickup URL — it is a bearer credential.
+          console.log(`[lark] /apikey issue channel=${personalChannelId} sender=${senderOpenId} ok=${issued.success} rotated=${issued.rotated ?? false}`);
+        }
+        await replyToLark(larkClient, messageId, reply);
+      } catch (err) {
+        // Unlike PAIR (whose failure escapes to the top-level catch), stay explicit here: the
+        // user is waiting on a pickup link, and silence reads as a broken bot.
+        console.error(`[lark] /apikey ${label} failed for channel=${personalChannelId} sender=${senderOpenId}:`, err);
+        await replyToLark(larkClient, messageId, API_KEY_UNAVAILABLE_NOTICE_BY_LOCALE[locale]);
+      } finally {
+        apiKeyRequestsInFlight.delete(inFlightKey);
+      }
+      return;
+    }
+
     const binding = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient!);
     if (!binding) {
       if (personalBot.access_mode === "sicore_authorized") {
@@ -918,6 +991,15 @@ export async function handleLarkMessage(
 
     const replyText = formatPairReply(result, locale);
     await replyToLark(larkClient, messageId, replyText);
+    return;
+  }
+
+  // /apikey is personal-chat only. Drop it here — silently, and before the @-gate so an
+  // @bot mention can't route it to the agent either. A group reply is visible to everyone
+  // in the group, and this flow hands back a credential pickup link; answering at all
+  // (even "DM me") turns someone's provisioning into group noise.
+  if (parseApiKeyCommand(text)) {
+    console.log(`[lark] /apikey ignored in group chat=${chatId} — personal chat only`);
     return;
   }
 
@@ -1445,6 +1527,161 @@ function formatPersonalPairReply(
   return locale === "en-US"
     ? `\u274C Authorization failed: ${result.error}`
     : `\u274C 授权失败: ${result.error}`;
+}
+
+/**
+ * The whole `/apikey …` namespace. Intentionally has NO trailing word boundary: `\b` lets
+ * `/apikeys` slip through to the agent, which both breaks the documented "runtime claims the
+ * whole namespace" contract and — in a group — routes credential-adjacent text to the model in
+ * a room where this flow must stay invisible. Anything starting with `/apikey` is claimed and
+ * answered deterministically instead.
+ */
+const API_KEY_COMMAND_RE = /^\/apikey/i;
+
+/**
+ * Parse a `/apikey …` message, or null when the text is outside the namespace. Shared by the
+ * personal-chat handler and the group drop-gate so the two can never claim different sets — the
+ * group side is the one whose failure mode is leaking a credential reply into a room.
+ */
+function parseApiKeyCommand(text: string): { subcommand: string } | null {
+  const trimmed = text.trim();
+  if (!API_KEY_COMMAND_RE.test(trimmed)) return null;
+  return { subcommand: trimmed.slice("/apikey".length).trim().toLowerCase() };
+}
+
+/**
+ * `/apikey` requests in flight, keyed by `${channelId}:${senderOpenId}`. Issuing rotates, and
+ * this command deliberately bypasses the per-binding queue that serialises ordinary messages,
+ * so without this a double-tap (or a Feishu at-least-once redelivery) mints two keys: the user
+ * opens the first link they see and collects a key the second rotation already invalidated.
+ */
+const apiKeyRequestsInFlight = new Set<string>();
+
+/** Display time zone per locale, so a rendered timestamp means what the reader expects. */
+const API_KEY_TIME_ZONE_BY_LOCALE: Record<LarkLocale, string> = {
+  "zh-CN": "Asia/Shanghai",
+  "en-US": "UTC",
+};
+
+/**
+ * Render an epoch-ms instant for `/apikey` copy. Uses the `sv-SE` locale purely for its
+ * ISO-like `YYYY-MM-DD HH:mm` output — the format must not drift with the host's default
+ * locale, or the copy stops being testable. Returns null for a missing/invalid value so
+ * callers can just drop the line.
+ */
+function formatApiKeyTimestamp(
+  epochMs: number | undefined,
+  locale: LarkLocale,
+  withTime: boolean,
+): string | null {
+  // `<= 0` covers a zero/negative timestamp (a NOT NULL column's zero value, or a Go zero
+  // time) — rendering that as "1970-01-01" would tell the user their live key expired 55 years
+  // ago. The Invalid-Date check is load-bearing, not paranoia: `Intl.format` THROWS RangeError
+  // past ±8.64e15 (e.g. a frontend that sends nanoseconds), `Number.isFinite` happily passes
+  // such a value, and the throw would surface as "service unavailable" AFTER the key was
+  // already rotated — leaving the user permanently unable to see any pickup link.
+  if (typeof epochMs !== "number" || !Number.isFinite(epochMs) || epochMs <= 0) return null;
+  if (Number.isNaN(new Date(epochMs).getTime())) return null;
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: API_KEY_TIME_ZONE_BY_LOCALE[locale],
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    ...(withTime ? { hour: "2-digit", minute: "2-digit" } : {}),
+  }).format(new Date(epochMs));
+}
+
+/**
+ * `/apikey` reply. On success this carries the single-use pickup link — never the key
+ * itself (plaintext must not enter a searchable, exportable chat log).
+ *
+ * `rotated` MUST be called out: the requester's old key dies instantly, and an unexplained
+ * break gets reported as a bug by whoever had it configured in an MCP client. On failure the
+ * frontend's `error` is already user-facing wording, so it is surfaced verbatim.
+ */
+function formatApiKeyIssueReply(result: PersonalApiKeyIssueResult, locale: LarkLocale): string {
+  if (!result.success || !result.pickupUrl) {
+    const reason = result.error ?? (locale === "en-US" ? "unknown error" : "未知错误");
+    return locale === "en-US"
+      ? `❌ Could not issue an API key: ${reason}`
+      : `❌ 领取 API Key 失败: ${reason}`;
+  }
+  const linkExpiry = formatApiKeyTimestamp(result.expiresAt, locale, true);
+  const lines =
+    locale === "en-US"
+      ? [
+          result.rotated
+            ? "✅ New API key generated — your PREVIOUS key is now invalid. Update anything configured with it."
+            : "✅ Your API key is ready.",
+          "Open within 5 minutes; the link works only ONCE:",
+          result.pickupUrl,
+          linkExpiry ? `Link expires at: ${linkExpiry}` : "",
+          "The key itself expires after 30 days without use.",
+        ]
+      : [
+          result.rotated
+            ? "✅ 已为你生成新的 API Key（旧 Key 已失效，如有配置请更新）"
+            : "✅ 你的 API Key 已就绪",
+          "5 分钟内点击查看，仅可打开一次：",
+          result.pickupUrl,
+          linkExpiry ? `链接过期时间：${linkExpiry}` : "",
+          "有效期：30 天未使用后自动失效",
+        ];
+  return lines.filter(Boolean).join("\n");
+}
+
+/** `/apikey status` reply — read-only, so it must never imply anything was rotated. */
+function formatApiKeyStatusReply(result: PersonalApiKeyStatusResult, locale: LarkLocale): string {
+  if (!result.success) {
+    const reason = result.error ?? (locale === "en-US" ? "unknown error" : "未知错误");
+    return locale === "en-US"
+      ? `❌ Could not read your API key status: ${reason}`
+      : `❌ 查询 API Key 状态失败: ${reason}`;
+  }
+  // Only claim "no key" when the frontend actually says so. `exists` is optional on the wire, and
+  // the advice attached to this branch ("send /apikey") ROTATES — so inferring absence from a
+  // merely-missing field would destroy the very key the user asked us to inspect. A present
+  // prefix is sufficient evidence that a key exists.
+  const hasKey = result.exists === true || Boolean(result.keyPrefix);
+  if (!hasKey) {
+    return locale === "en-US"
+      ? "You don't have an API key for this agent yet — send /apikey to get one."
+      : "你还没有这个 Agent 的 API Key，发送 /apikey 领取。";
+  }
+  const lastUsed = formatApiKeyTimestamp(result.lastUsedAt, locale, true);
+  const expiry = formatApiKeyTimestamp(result.expiresAt, locale, false);
+  const lines =
+    locale === "en-US"
+      ? [
+          `Current key: ${result.keyPrefix ?? "(unknown prefix)"}…`,
+          lastUsed ? `Last used: ${lastUsed}` : "Last used: never",
+          expiry ? `Expires: ${expiry} (30 days after last use)` : "",
+        ]
+      : [
+          `当前 Key：${result.keyPrefix ?? "(前缀未知)"}…`,
+          lastUsed ? `最后使用：${lastUsed}` : "最后使用：从未使用",
+          expiry ? `失效时间：${expiry}（30 天未使用后自动失效）` : "",
+        ];
+  return lines.filter(Boolean).join("\n");
+}
+
+/**
+ * Reply for an unrecognised `/apikey` subcommand. Reached INSTEAD of issuing, because
+ * `/apikey` rotates: letting a typo like `/apikey statu` fall through to issuing would
+ * silently kill the very key the user was trying to inspect.
+ */
+function formatApiKeyUsageReply(locale: LarkLocale): string {
+  return locale === "en-US"
+    ? [
+        "Unrecognised /apikey subcommand.",
+        "/apikey — issue or rotate your key (invalidates the old one)",
+        "/apikey status — show your current key (read-only)",
+      ].join("\n")
+    : [
+        "无法识别的 /apikey 子命令。",
+        "/apikey —— 领取或轮换 Key（会使旧 Key 失效）",
+        "/apikey status —— 查看当前 Key（只读）",
+      ].join("\n");
 }
 
 async function replyToLark(larkClient: any, messageId: string, text: string): Promise<void> {

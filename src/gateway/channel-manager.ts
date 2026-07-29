@@ -216,6 +216,66 @@ export async function resetPersonalSession(
   });
 }
 
+/**
+ * Result of `/apikey` — self-service API key issuing from a personal-bot chat.
+ * `pickupUrl` is a short-lived, single-use link; the plaintext key NEVER travels
+ * over this RPC (see docs/design/2026-07-28-feishu-apikey-command.md).
+ */
+export interface PersonalApiKeyIssueResult {
+  success: boolean;
+  agentId?: string;
+  pickupUrl?: string;
+  /** Epoch ms after which the pickup link is dead. */
+  expiresAt?: number;
+  /** True ⇒ the requester's previous key was just invalidated. */
+  rotated?: boolean;
+  /** Already user-facing wording — surface it verbatim, do not rewrite. */
+  error?: string;
+}
+
+/** Result of `/apikey status` — read-only, never rotates. */
+export interface PersonalApiKeyStatusResult {
+  success: boolean;
+  agentId?: string;
+  exists?: boolean;
+  keyPrefix?: string;
+  lastUsedAt?: number;
+  /** SLIDING deadline (last use + 30d), not a fixed issue term. */
+  expiresAt?: number;
+  error?: string;
+}
+
+/**
+ * Issue (or rotate) the sender's API key for the personal bot's agent.
+ *
+ * Upstream-mode-only RPC: the Portal adapter answers with a `success:false` stub (see
+ * `channel.issueApiKey` in src/portal/adapter.ts), so the runtime stays frontend-agnostic
+ * instead of hard-depending on a control plane that may not be there. Admission is decided
+ * entirely by the frontend — the runtime only forwards the sender's identity.
+ */
+export async function issuePersonalApiKey(
+  channelId: string,
+  senderOpenId: string,
+  frontendClient: FrontendWsClient,
+): Promise<PersonalApiKeyIssueResult> {
+  return frontendClient.request("channel.issueApiKey", {
+    channel_id: channelId,
+    sender_open_id: senderOpenId,
+  });
+}
+
+/** Read-only key status for the sender. Same Upstream-mode contract as {@link issuePersonalApiKey}. */
+export async function getPersonalApiKeyStatus(
+  channelId: string,
+  senderOpenId: string,
+  frontendClient: FrontendWsClient,
+): Promise<PersonalApiKeyStatusResult> {
+  return frontendClient.request("channel.apiKeyStatus", {
+    channel_id: channelId,
+    sender_open_id: senderOpenId,
+  });
+}
+
 export interface ChannelManagerOptions {
   /** Max retry attempts for bootFromDb when channel.list races with WS connect. */
   bootRetryAttempts?: number;
