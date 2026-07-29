@@ -7,6 +7,8 @@ import {
   resolvePersonalBinding,
   handlePersonalPairingCode,
   resetPersonalSession,
+  issuePersonalApiKey,
+  getPersonalApiKeyStatus,
   type ChannelHandler,
 } from "./channel-manager.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
@@ -155,6 +157,40 @@ describe("personal binding RPC wrappers", () => {
     expect(frontend.calls[0]).toEqual({
       method: "channel.resetPersonalSession",
       params: { channel_id: "pb1", session_key: "sicore_user:u1" },
+    });
+  });
+
+  it("issues a personal API key, forwarding only the channel + sender identity", async () => {
+    frontend.responses.set("channel.issueApiKey", {
+      success: true, agentId: "a1", pickupUrl: "https://s/pickup/tok", expiresAt: 1753689600000, rotated: true,
+    });
+    const result = await issuePersonalApiKey("pb1", "ou_1", frontend as unknown as FrontendWsClient, "msg-77");
+    expect(result).toEqual({
+      success: true, agentId: "a1", pickupUrl: "https://s/pickup/tok", expiresAt: 1753689600000, rotated: true,
+    });
+    expect(frontend.calls[0]).toEqual({
+      method: "channel.issueApiKey",
+      // request_id carries the stable inbound message id so the frontend can deduplicate a
+      // destructive rotation durably; omitted entirely when the caller has no id to offer.
+      params: { channel_id: "pb1", sender_open_id: "ou_1", request_id: "msg-77" },
+    });
+  });
+
+  it("omits request_id when no stable id is available", async () => {
+    frontend.responses.set("channel.issueApiKey", { success: true });
+    await issuePersonalApiKey("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+    expect(frontend.calls[0].params).toEqual({ channel_id: "pb1", sender_open_id: "ou_1" });
+  });
+
+  it("reads personal API key status without rotating anything", async () => {
+    frontend.responses.set("channel.apiKeyStatus", {
+      success: true, exists: true, keyPrefix: "sk-a1b2c3d4", lastUsedAt: 1753605840000, expiresAt: 1756197840000,
+    });
+    const result = await getPersonalApiKeyStatus("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+    expect(result.keyPrefix).toBe("sk-a1b2c3d4");
+    expect(frontend.calls[0]).toEqual({
+      method: "channel.apiKeyStatus",
+      params: { channel_id: "pb1", sender_open_id: "ou_1" },
     });
   });
 });
