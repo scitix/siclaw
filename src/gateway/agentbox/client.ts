@@ -70,6 +70,7 @@ export interface PromptOptions {
 }
 
 export type PromptMediaOptions = Pick<PromptOptions, "images" | "files">;
+export type ResumeSessionOptions = Omit<PromptOptions, "text" | "images" | "files">;
 
 export interface PromptResponse {
   ok: boolean;
@@ -215,6 +216,23 @@ export class AgentBoxClient {
     });
     const result: PromptResponse = await resp.json();
     console.log(`[agentbox-client] prompt → ok=${result.ok} sessionId=${result.sessionId}`);
+    return result;
+  }
+
+  /**
+   * Continue a rehydrated session after its previous AgentBox died. The type
+   * deliberately excludes text/media so callers cannot re-send the original
+   * user input and repeat completed tools.
+   */
+  async resumeSession(opts: ResumeSessionOptions): Promise<PromptResponse> {
+    console.log(`[agentbox-client] resume sessionId=${opts.sessionId ?? "missing"}`);
+    const resp = await this.fetch("/api/prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...opts, resumeFromHistory: true }),
+    });
+    const result: PromptResponse = await resp.json();
+    console.log(`[agentbox-client] resume → ok=${result.ok} sessionId=${result.sessionId}`);
     return result;
   }
 

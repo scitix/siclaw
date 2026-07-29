@@ -143,11 +143,28 @@ export interface BrainContextPreflightResult {
   errorMessage?: string;
 }
 
+export interface BrainRecoveryState {
+  eligible: boolean;
+  reason: string;
+  lastRole?: string;
+  pendingToolCalls: number;
+  completedToolResults: number;
+}
+
 export interface BrainSession {
   readonly brainType: BrainType;
 
   /** Send a prompt to the agent. Resolves when the agent finishes responding. */
   prompt(text: string, media?: PromptMedia): Promise<void>;
+
+  /**
+   * Inspect whether a rehydrated transcript can safely continue without
+   * appending/re-sending the original user prompt.
+   */
+  getRecoveryState?(): BrainRecoveryState;
+
+  /** Continue directly from the rehydrated transcript. */
+  resumeFromHistory?(): Promise<void>;
 
   /** Abort the current agent run. */
   abort(): Promise<void>;

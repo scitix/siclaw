@@ -31,9 +31,16 @@ vi.mock("./output-redactor.js", () => ({
 // that is mid-tool when the user hits Stop. capturedSignal lets the test observe
 // whether chat.abort actually aborted it.
 let capturedSignal: AbortSignal | undefined;
+const consumeOutcomes: Array<Error | null> = [];
 vi.mock("./sse-consumer.js", () => ({
   consumeAgentSse: vi.fn((opts: { signal?: AbortSignal }) => {
     capturedSignal = opts.signal;
+    if (consumeOutcomes.length > 0) {
+      const outcome = consumeOutcomes.shift();
+      return outcome ? Promise.reject(outcome) : Promise.resolve({
+        resultText: "", taskReportText: "", errorMessage: "", eventCount: 0, durationMs: 0,
+      });
+    }
     return new Promise((resolve) => {
       const done = () =>
         resolve({ resultText: "", taskReportText: "", errorMessage: "", eventCount: 0, durationMs: 0 });
@@ -45,6 +52,7 @@ vi.mock("./sse-consumer.js", () => ({
 
 const abortSessionCalls: string[] = [];
 const promptCalls: unknown[] = [];
+const resumeCalls: unknown[] = [];
 let promptError: Error | undefined;
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
@@ -56,6 +64,10 @@ vi.mock("./agentbox/client.js", () => ({
       promptCalls.push(opts);
       if (promptError) throw promptError;
       return { sessionId: opts.sessionId, traceId: "0123456789abcdef0123456789abcdef" };
+    });
+    resumeSession = vi.fn(async (opts: { sessionId: string }) => {
+      resumeCalls.push(opts);
+      return { sessionId: opts.sessionId, traceId: "fedcba9876543210fedcba9876543210" };
     });
     abortSession = vi.fn(async (sessionId: string) => {
       abortSessionCalls.push(sessionId);
@@ -82,6 +94,14 @@ function fakeAgentBoxManager() {
     setSpawnEnvResolver: vi.fn(),
     setPersistenceResolver: vi.fn(),
     getOrCreate: vi.fn(async () => ({ endpoint: "https://fake.internal" })),
+    inspect: vi.fn(async () => ({
+      boxId: "agentbox-a",
+      agentId: "a",
+      status: "error",
+      endpoint: "",
+      createdAt: new Date(),
+      lastActiveAt: new Date(),
+    })),
     list: vi.fn(() => []),
     cleanup: vi.fn(async () => {}),
   } as any;
@@ -111,11 +131,60 @@ afterEach(async () => {
   capturedSignal = undefined;
   abortSessionCalls.length = 0;
   promptCalls.length = 0;
+  resumeCalls.length = 0;
+  consumeOutcomes.length = 0;
   promptError = undefined;
   vi.clearAllMocks();
 });
 
 describe("startRuntime — chat.abort wiring", () => {
+  it("rebuilds a failed AgentBox and resumes history without the original prompt", async () => {
+    consumeOutcomes.push(
+      Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
+      null,
+    );
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await send({ agentId: "a", userId: "u", text: "do not repeat", sessionId: "S" }, ctx);
+    await waitFor(() => ctx.sendEvent.mock.calls.some((call) => call[1]?.event?.type === "prompt_done"));
+
+    expect(resumeCalls).toHaveLength(1);
+    expect(resumeCalls[0]).toMatchObject({ sessionId: "S", userId: "u" });
+    expect(resumeCalls[0]).not.toHaveProperty("text");
+    expect(resumeCalls[0]).not.toHaveProperty("images");
+    expect(resumeCalls[0]).not.toHaveProperty("files");
+    expect(ctx.sendEvent).toHaveBeenCalledWith("chat.event", {
+      sessionId: "S",
+      event: { type: "agentbox_recovery_start", attempt: 1, maxAttempts: 3 },
+    });
+    expect(ctx.sendEvent.mock.calls.some((call) => call[1]?.event?.type === "stream_error")).toBe(false);
+  });
+
+  it("stops after three AgentBox recovery attempts", async () => {
+    for (let i = 0; i < 4; i++) {
+      consumeOutcomes.push(Object.assign(new Error(`socket reset ${i}`), { code: "ECONNRESET" }));
+    }
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await send({ agentId: "a", userId: "u", text: "inspect", sessionId: "S" }, ctx);
+    await waitFor(() => ctx.sendEvent.mock.calls.some((call) => call[1]?.event?.type === "stream_error"));
+
+    expect(resumeCalls).toHaveLength(3);
+    expect(ctx.sendEvent.mock.calls.filter((call) => call[1]?.event?.type === "agentbox_recovery_start"))
+      .toHaveLength(3);
+    expect(ctx.sendEvent.mock.calls.filter((call) => call[1]?.event?.type === "prompt_done"))
+      .toHaveLength(1);
+    expect(ctx.sendEvent.mock.calls.find((call) => call[1]?.event?.type === "stream_error")?.[1]?.event?.error)
+      .toMatchObject({
+        code: "AGENTBOX_FAILED",
+        details: { recoveryAttempts: 3, maxRecoveryAttempts: 3 },
+      });
+  });
+
   it("starts consuming the reply without waiting for trace binding", async () => {
     bindMessageTraceIdMock.mockImplementationOnce(() => new Promise<void>(() => {}));
     server = await bootRuntime();

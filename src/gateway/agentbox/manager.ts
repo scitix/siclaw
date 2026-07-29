@@ -1199,6 +1199,19 @@ export class AgentBoxManager {
     return this.get(agentId);
   }
 
+  /**
+   * Read the authoritative box state without creating or mutating it. Runtime
+   * uses this to distinguish a dead AgentBox from a transient SSE/network break
+   * before attempting recovery.
+   */
+  async inspect(agentId: string, profile?: string): Promise<AgentBoxInfo | null> {
+    if (this.isK8s) {
+      return this.spawner.get(this.podName(agentId, this.prefixForProfile(profile)));
+    }
+    const managed = this.boxes.get(agentId);
+    return managed ? this.spawner.get(managed.handle.boxId) : null;
+  }
+
   async stop(agentId: string, profile?: string): Promise<void> {
     if (this.isK8s) {
       const name = this.podName(agentId, profile);

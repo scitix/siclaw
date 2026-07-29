@@ -19,7 +19,8 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
     getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 100, percent: 10 })),
     getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 }, cost: 0.001 })),
     model: { id: "m", name: "M", provider: "p", contextWindow: 100, maxTokens: 10, reasoning: false },
-    agent: { onResponse: vi.fn(async () => {}), state: { messages: [] } },
+    agent: { onResponse: vi.fn(async () => {}), continue: vi.fn(async () => {}), state: { messages: [] } },
+    messages: [],
     compact: vi.fn(async () => ({ summary: "ok", firstKeptEntryId: "entry-1", tokensBefore: 100 })),
     settingsManager: {
       getCompactionSettings: vi.fn(() => ({ enabled: true, reserveTokens: 16, keepRecentTokens: 20 })),
@@ -50,6 +51,66 @@ describe("PiAgentBrain", () => {
   it("brainType is pi-agent", () => {
     const brain = new PiAgentBrain(makeFakeSession());
     expect(brain.brainType).toBe("pi-agent");
+  });
+
+  it("allows recovery only after a completed successful tool result", () => {
+    const session = makeFakeSession({
+      messages: [
+        { role: "user", content: "inspect" },
+        { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "bash" }] },
+        { role: "toolResult", toolCallId: "call_1", isError: false, content: [{ type: "text", text: "ok" }] },
+      ],
+    });
+    const brain = new PiAgentBrain(session);
+    expect(brain.getRecoveryState()).toMatchObject({
+      eligible: true,
+      pendingToolCalls: 0,
+      completedToolResults: 1,
+      lastRole: "toolResult",
+    });
+  });
+
+  it("rejects recovery with a pending tool call", () => {
+    const session = makeFakeSession({
+      messages: [
+        { role: "user", content: "inspect" },
+        { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "bash" }] },
+      ],
+    });
+    const brain = new PiAgentBrain(session);
+    expect(brain.getRecoveryState()).toMatchObject({
+      eligible: false,
+      pendingToolCalls: 1,
+    });
+  });
+
+  it("rejects recovery after a failed tool result", () => {
+    const session = makeFakeSession({
+      messages: [
+        { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "bash" }] },
+        { role: "toolResult", toolCallId: "call_1", isError: true, content: [] },
+      ],
+    });
+    const brain = new PiAgentBrain(session);
+    expect(brain.getRecoveryState()).toMatchObject({
+      eligible: false,
+      reason: "Last persisted tool result failed",
+    });
+  });
+
+  it("continues the agent transcript without prompting again", async () => {
+    const continueFn = vi.fn(async () => {});
+    const session = makeFakeSession({
+      agent: { onResponse: vi.fn(async () => {}), continue: continueFn, state: { messages: [] } },
+      messages: [
+        { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "bash" }] },
+        { role: "toolResult", toolCallId: "call_1", isError: false, content: [] },
+      ],
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.resumeFromHistory();
+    expect(continueFn).toHaveBeenCalledOnce();
+    expect(session.prompt).not.toHaveBeenCalled();
   });
 
   it("subscribe subscribes to session and allows unsub", () => {

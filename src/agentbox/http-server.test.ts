@@ -112,6 +112,14 @@ function makeFakeBrain() {
     },
     reload: vi.fn(async () => {}),
     prompt: vi.fn(async () => {}),
+    getRecoveryState: vi.fn(() => ({
+      eligible: true,
+      reason: "completed tool result",
+      lastRole: "toolResult",
+      pendingToolCalls: 0,
+      completedToolResults: 1,
+    })),
+    resumeFromHistory: vi.fn(async () => {}),
     abort: vi.fn(async () => {}),
     steer: vi.fn(async () => {}),
     clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
@@ -314,6 +322,51 @@ describe("http-server — prompt + session lifecycle", () => {
     const r = await getJson(port, "/api/prompt", "POST", {});
     expect(r.status).toBe(400);
     expect(r.data.error).toMatch(/Missing.*text/);
+  });
+
+  it("POST /api/prompt resumes history without sending prompt text", async () => {
+    const session = await sm.getOrCreate("recoverable");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "recoverable",
+      userId: "u",
+      resumeFromHistory: true,
+    });
+    await flushAsync();
+    expect(r.status).toBe(200);
+    expect(session.brain.resumeFromHistory).toHaveBeenCalledOnce();
+    expect(session.brain.prompt).not.toHaveBeenCalled();
+  });
+
+  it("POST /api/prompt rejects unsafe history continuation", async () => {
+    const session = await sm.getOrCreate("unsafe");
+    session.brain.getRecoveryState.mockReturnValue({
+      eligible: false,
+      reason: "Session has pending tool calls",
+      lastRole: "assistant",
+      pendingToolCalls: 1,
+      completedToolResults: 0,
+    });
+    const r = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "unsafe",
+      resumeFromHistory: true,
+    });
+    expect(r.status).toBe(409);
+    expect(r.data.error).toMatchObject({
+      code: "RECOVERY_UNSAFE",
+      retriable: false,
+      message: "Session has pending tool calls",
+    });
+    expect(session.brain.resumeFromHistory).not.toHaveBeenCalled();
+  });
+
+  it("POST /api/prompt rejects recovery requests containing original input", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      sessionId: "bad-recovery",
+      resumeFromHistory: true,
+      text: "repeat me",
+    });
+    expect(r.status).toBe(400);
+    expect(r.data.error).toMatch(/must not include text or media/);
   });
 
   it("POST /api/prompt forwards images to brain.prompt as vision input", async () => {

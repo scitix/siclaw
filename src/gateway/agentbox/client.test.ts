@@ -139,6 +139,26 @@ describe("AgentBoxClient — prompt + session CRUD", () => {
     });
   });
 
+  it("resumeSession() sends only the session context and recovery marker", async () => {
+    await client.resumeSession({
+      sessionId: "s1",
+      userId: "u1",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+    });
+    const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
+    expect(JSON.parse(req.body)).toEqual({
+      sessionId: "s1",
+      userId: "u1",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      resumeFromHistory: true,
+    });
+    expect(req.body).not.toContain("text");
+    expect(req.body).not.toContain("images");
+    expect(req.body).not.toContain("files");
+  });
+
   it("prompt() preserves native PDF files", async () => {
     await client.prompt({
       text: "read this",

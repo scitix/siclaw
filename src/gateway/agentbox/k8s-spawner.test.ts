@@ -582,6 +582,8 @@ describe("K8sSpawner — spawn branches", () => {
     await s.spawn({ agentId: "default" });
     expect(calls.createNamespacedPod[0].body.metadata.labels["siclaw.io/ca-fp"]).toBe(FAKE_CA_FP);
     expect(calls.createNamespacedSecret[0].body.metadata.labels["siclaw.io/ca-fp"]).toBe(FAKE_CA_FP);
+    expect(calls.createNamespacedPod[0].body.spec.containers[0].terminationMessagePolicy)
+      .toBe("FallbackToLogsOnError");
   });
 
   it("caFingerprint() reflects the cert manager (undefined before setCertManager)", () => {
@@ -600,7 +602,27 @@ describe("K8sSpawner — spawn branches", () => {
     readPodImpl.fn = async () => {
       reads++;
       if (reads === 1) {
-        return { status: { phase: "Failed" }, metadata: { labels: {} } };
+        return {
+          spec: { nodeName: "cpu-091" },
+          status: {
+            phase: "Failed",
+            podIP: "10.0.0.4",
+            containerStatuses: [{
+              name: "agentbox",
+              ready: false,
+              restartCount: 0,
+              state: {
+                terminated: {
+                  reason: "OOMKilled",
+                  exitCode: 137,
+                  signal: 9,
+                  message: "heap exhausted",
+                },
+              },
+            }],
+          },
+          metadata: { name: "agentbox-default", uid: "pod-uid", labels: {} },
+        };
       }
       if (reads === 2) {
         // called by waitForPodDeleted
@@ -614,6 +636,9 @@ describe("K8sSpawner — spawn branches", () => {
     expect(calls.deleteNamespacedPod).toHaveLength(1);
     expect(calls.createNamespacedPod).toHaveLength(1);
     expect(handle.endpoint).toBe("https://10.0.0.5:3000");
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("AgentBox terminal evidence"));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("\"reason\":\"OOMKilled\""));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("\"exitCode\":137"));
   });
 
   it("replaces cert Secret on 409 conflict (stale secret handling)", async () => {

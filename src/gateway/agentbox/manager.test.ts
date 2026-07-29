@@ -173,6 +173,22 @@ describe("AgentBoxManager — Local mode", () => {
 // ── K8s-mode tests ─────────────────────────────────────────────────────
 
 describe("AgentBoxManager — K8s mode", () => {
+  it("inspects authoritative pod state without spawning", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    const info: AgentBoxInfo = {
+      boxId: "agentbox-agent-a",
+      agentId: "agent-a",
+      status: "error",
+      endpoint: "",
+      createdAt: new Date(),
+      lastActiveAt: new Date(),
+    };
+    spawner.getReturns.set("agentbox-agent-a", info);
+    await expect(mgr.inspect("agent-a")).resolves.toBe(info);
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+
   it("returns existing pod info if already running", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);

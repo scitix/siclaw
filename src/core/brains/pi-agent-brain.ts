@@ -15,6 +15,7 @@ import type {
   BrainSessionStats,
   BrainProviderResponse,
   BrainContextPreflightResult,
+  BrainRecoveryState,
   PromptMedia,
 } from "../brain-session.js";
 import { estimateMessagesTokens } from "../compaction.js";
@@ -181,6 +182,54 @@ export class PiAgentBrain implements BrainSession {
     } finally {
       unsub();
     }
+  }
+
+  getRecoveryState(): BrainRecoveryState {
+    const messages = Array.isArray(this.session.messages) ? this.session.messages : [];
+    const pending = new Set<string>();
+    let completedToolResults = 0;
+
+    for (const message of messages as any[]) {
+      if (message?.role === "assistant" && Array.isArray(message.content)) {
+        for (const item of message.content) {
+          if (item?.type === "toolCall" && typeof item.id === "string" && item.id) {
+            pending.add(item.id);
+          }
+        }
+      } else if (message?.role === "toolResult") {
+        completedToolResults++;
+        if (typeof message.toolCallId === "string") pending.delete(message.toolCallId);
+      }
+    }
+
+    const last = messages[messages.length - 1] as any;
+    const base = {
+      lastRole: typeof last?.role === "string" ? last.role : undefined,
+      pendingToolCalls: pending.size,
+      completedToolResults,
+    };
+    if (!last) {
+      return { ...base, eligible: false, reason: "Session history is empty" };
+    }
+    if (pending.size > 0) {
+      return { ...base, eligible: false, reason: "Session has pending tool calls" };
+    }
+    if (last.role !== "toolResult") {
+      return { ...base, eligible: false, reason: `Last persisted message is ${String(last.role)}` };
+    }
+    if (last.isError === true) {
+      return { ...base, eligible: false, reason: "Last persisted tool result failed" };
+    }
+    return { ...base, eligible: true, reason: "Last persisted tool result completed successfully" };
+  }
+
+  async resumeFromHistory(): Promise<void> {
+    const state = this.getRecoveryState();
+    if (!state.eligible) {
+      throw new Error(`Session cannot resume from history: ${state.reason}`);
+    }
+    this.aborted = false;
+    await this.session.agent.continue();
   }
 
   async abort(): Promise<void> {

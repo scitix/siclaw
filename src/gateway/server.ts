@@ -98,6 +98,11 @@ import { sessionRegistry } from "./session-registry.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
 import { pendingUserRows } from "./pending-user-rows.js";
 import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "./agent-model-binding.js";
+import {
+  isRecoverableAgentBoxStreamError,
+  MAX_AGENTBOX_RECOVERY_ATTEMPTS,
+  waitForConfirmedAgentBoxFailure,
+} from "./agentbox/stream-recovery.js";
 
 function stablePayloadDigest(value: unknown): string {
   const canonicalize = (input: unknown): unknown => {
@@ -460,11 +465,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // Persistence is resolved by agentId in the manager's persistenceResolver
         // (registered in startRuntime), not from per-request params — so every
         // entry point lands the same mode for the same agent.
+        // Session-aware acquisition (multi-box pool): pin this turn's box by sessionId.
         const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
         // Which box this turn went to. Placement reads it back as a hint while the turn
         // runs; it is dropped on release, so it can never become a stale binding.
         sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
-        const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+        // `let`: stream recovery may swap the client onto a replacement pod.
+        let client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
         try {
@@ -520,38 +527,140 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         activeStreamAborts.set(promptResult.sessionId, abortCtrl);
 
         try {
-          await consumeAgentSse({
-            client,
-            sessionId: promptResult.sessionId,
-            userId,
-            traceId: promptResult.traceId,
-            persistMessages: true,
-            // The box has started consuming a user message: give that row its place in
-            // the conversation now, which is the only moment processing order is visible.
-            onUserMessageStarted: async (echoedText) => {
-              const messageId = pendingUserRows.claim(promptResult.sessionId, echoedText);
-              if (!messageId) return; // an echo for a turn this Runtime did not start
-              await sequenceMessage(messageId, promptResult.sessionId).catch((err) => {
-                warnTraceBindFailure("sequence", promptResult.sessionId, messageId, err);
+          let recoveryAttempts = 0;
+          let finalError: unknown;
+
+          while (!abortCtrl.signal.aborted) {
+            try {
+              await consumeAgentSse({
+                client,
+                sessionId: promptResult.sessionId,
+                userId,
+                traceId: promptResult.traceId,
+                persistMessages: true,
+                // The box has started consuming a user message: give that row its place in
+                // the conversation now, which is the only moment processing order is visible.
+                onUserMessageStarted: async (echoedText) => {
+                  const messageId = pendingUserRows.claim(promptResult.sessionId, echoedText);
+                  if (!messageId) return; // an echo for a turn this Runtime did not start
+                  await sequenceMessage(messageId, promptResult.sessionId).catch((err) => {
+                    warnTraceBindFailure("sequence", promptResult.sessionId, messageId, err);
+                  });
+                },
+                redactionConfig,
+                signal: abortCtrl.signal,
+                turnStartTime: turnStartMs,
+                onEvent: (evt, _eventType, extras) => {
+                  context.sendEvent("chat.event", {
+                    sessionId: promptResult.sessionId,
+                    event: extras.dbMessageId ? { ...evt, dbMessageId: extras.dbMessageId } : evt,
+                  });
+                },
               });
-            },
-            redactionConfig,
-            signal: abortCtrl.signal,
-            turnStartTime: turnStartMs,
-            onEvent: (evt, _eventType, extras) => {
+              finalError = undefined;
+              break;
+            } catch (err) {
+              finalError = err;
+              if (
+                abortCtrl.signal.aborted
+                || recoveryAttempts >= MAX_AGENTBOX_RECOVERY_ATTEMPTS
+                || !isRecoverableAgentBoxStreamError(err)
+                || typeof (agentBoxManager as { inspect?: unknown }).inspect !== "function"
+              ) {
+                break;
+              }
+
+              const confirmedDead = await waitForConfirmedAgentBoxFailure(
+                agentBoxManager,
+                agentId,
+                abortCtrl.signal,
+              );
+              if (!confirmedDead || abortCtrl.signal.aborted) break;
+
+              recoveryAttempts++;
               context.sendEvent("chat.event", {
                 sessionId: promptResult.sessionId,
-                event: extras.dbMessageId ? { ...evt, dbMessageId: extras.dbMessageId } : evt,
+                event: {
+                  type: "agentbox_recovery_start",
+                  attempt: recoveryAttempts,
+                  maxAttempts: MAX_AGENTBOX_RECOVERY_ATTEMPTS,
+                },
               });
-            },
-          });
-          context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
-        } catch (err) {
-          if (!abortCtrl.signal.aborted) {
-            console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
-            const detail = wrapError(err, {
-              code: ErrorCodes.STREAM_INTERRUPTED,
+              console.warn(
+                `[runtime] AgentBox failure confirmed; recovering session=${promptResult.sessionId} ` +
+                `attempt=${recoveryAttempts}/${MAX_AGENTBOX_RECOVERY_ATTEMPTS}`,
+              );
+
+              try {
+                // Session-aware: rebuild the same pool slot this session was on
+                // (multi-AgentBox). Ready wait then rehydrates Pi JSONL from PVC.
+                const replacement = await agentBoxManager.getOrCreate(
+                  agentId,
+                  undefined,
+                  promptResult.sessionId,
+                );
+                sessionTurnLocks.noteBox(sessionId, replacement.boxId, replacement.endpoint);
+                client = new AgentBoxClient(replacement.endpoint, 30000, agentBoxTlsOptions);
+                const {
+                  text: _originalText,
+                  images: _originalImages,
+                  files: _originalFiles,
+                  ...resumeOpts
+                } = promptOpts;
+                promptResult = await client.resumeSession({
+                  ...resumeOpts,
+                  sessionId: promptResult.sessionId,
+                });
+                context.sendEvent("chat.event", {
+                  sessionId: promptResult.sessionId,
+                  event: {
+                    type: "agentbox_recovery_end",
+                    attempt: recoveryAttempts,
+                    success: true,
+                  },
+                });
+                finalError = undefined;
+                // Consume the replacement pod's new stream. Its in-memory SSE
+                // buffer starts after JSONL hydration, so completed tool events
+                // from the dead pod are not replayed.
+                continue;
+              } catch (recoveryErr) {
+                finalError = recoveryErr;
+                context.sendEvent("chat.event", {
+                  sessionId: promptResult.sessionId,
+                  event: {
+                    type: "agentbox_recovery_end",
+                    attempt: recoveryAttempts,
+                    success: false,
+                    error: wrapError(recoveryErr, { retriable: recoveryAttempts < MAX_AGENTBOX_RECOVERY_ATTEMPTS }),
+                  },
+                });
+                // A structured RECOVERY_UNSAFE/HTTP failure is terminal. A
+                // transport failure may be retried only after the next loop can
+                // confirm that the replacement also died.
+                if (!isRecoverableAgentBoxStreamError(recoveryErr)) break;
+                if (recoveryAttempts >= MAX_AGENTBOX_RECOVERY_ATTEMPTS) break;
+                const replacementDead = await waitForConfirmedAgentBoxFailure(
+                  agentBoxManager,
+                  agentId,
+                  abortCtrl.signal,
+                );
+                if (!replacementDead || abortCtrl.signal.aborted) break;
+              }
+            }
+          }
+
+          if (finalError && !abortCtrl.signal.aborted) {
+            console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, finalError);
+            const detail = wrapError(finalError, {
+              code: recoveryAttempts > 0 ? ErrorCodes.AGENTBOX_FAILED : ErrorCodes.STREAM_INTERRUPTED,
               retriable: true,
+              details: recoveryAttempts > 0
+                ? {
+                    recoveryAttempts,
+                    maxRecoveryAttempts: MAX_AGENTBOX_RECOVERY_ATTEMPTS,
+                  }
+                : undefined,
             });
             context.sendEvent("chat.event", {
               sessionId: promptResult.sessionId,

@@ -43,6 +43,7 @@ import {
 } from "../core/model-routing.js";
 import { modelNeedsRebind } from "../core/brain-session.js";
 import type { BrainSession, PromptFile, PromptImage, PromptMedia } from "../core/brain-session.js";
+import { ErrorCodes } from "../lib/error-envelope.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -59,6 +60,11 @@ interface Route {
 
 interface PromptRequestBody {
   sessionId?: string;
+  /**
+   * Continue the rehydrated session transcript without appending another user
+   * message. Used only after Runtime confirms the previous AgentBox died.
+   */
+  resumeFromHistory?: boolean;
   /** User who initiated this prompt (per-request), forwarded to the trace
    *  recorder as the root span's user.id. */
   userId?: string;
@@ -682,9 +688,13 @@ export function createHttpServer(
     }
     const promptMedia = buildPromptMedia(promptMediaValidation.images, promptMediaValidation.files);
 
+    if (body.resumeFromHistory && (body.text || promptMedia)) {
+      sendJson(res, 400, { error: "Recovery continuation must not include text or media" });
+      return;
+    }
     // Media-only messages are valid; reject only when there is neither text nor
     // usable image/PDF media after validation.
-    if (!body.text && !promptMedia) {
+    if (!body.resumeFromHistory && !body.text && !promptMedia) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
@@ -694,6 +704,21 @@ export function createHttpServer(
     // downgrade it. readOnly is honored only when explicitly set true.
     const delegation = resolveDelegation(body.delegation, body.origin);
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, activeMode, delegation);
+    if (body.resumeFromHistory) {
+      const recoveryState = managed.brain.getRecoveryState?.();
+      if (!managed.brain.resumeFromHistory || !recoveryState?.eligible) {
+        sendJson(res, 409, {
+          error: {
+            code: ErrorCodes.RECOVERY_UNSAFE,
+            retriable: false,
+            message: recoveryState?.reason ?? "Brain does not support history continuation",
+            details: recoveryState,
+          },
+          sessionId: managed.id,
+        });
+        return;
+      }
+    }
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
       // be holding the brain even when _promptDone has already flipped
@@ -847,7 +872,9 @@ export function createHttpServer(
         }
       }
 
-      promptText = body.text && body.text.length > 0
+      promptText = body.resumeFromHistory
+        ? "[AgentBox recovery: continue persisted session]"
+        : body.text && body.text.length > 0
         ? body.text
         : defaultPromptTextForMedia(promptMedia);
     } catch (err) {
@@ -1026,36 +1053,40 @@ export function createHttpServer(
     // UX to a bare prompt, but still emitting model_route_* so every turn carries
     // its model identity on one channel. effectivePolicy is read AFTER model setup
     // so the single candidate reflects the model just pinned for this turn.
-    const effectivePolicy = resolveEffectivePolicy(
-      configuredModelRouting,
-      managed.modelRouteState,
-      managed.brain.getModel?.(),
-    );
+    const effectivePolicy = body.resumeFromHistory
+      ? undefined
+      : resolveEffectivePolicy(
+          configuredModelRouting,
+          managed.modelRouteState,
+          managed.brain.getModel?.(),
+        );
     // Only the no-current-model edge falls back to a bare brain.prompt (runner
     // guard) whose events flow through the live _eventBuffer subscription.
     managed._routeBrainEventsThroughExtra = effectivePolicy !== undefined;
-    const promptPromise = runPromptWithModelRouting(
-      managed.brain,
-      promptText,
-      effectivePolicy,
-      managed.modelRouteState,
-      {
-        emitEvent: emitRouteEvent,
-        // The runner streams/replays brain events through this callback instead
-        // of the live SSE subscription that enriches agent_end — re-apply the
-        // same enrichment so token/cost stats survive on every turn.
-        emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
-        onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
-        shouldAbort: () => managed._aborted,
-      },
-      promptMedia,
-    );
+    const promptPromise = body.resumeFromHistory
+      ? managed.brain.resumeFromHistory!()
+      : runPromptWithModelRouting(
+          managed.brain,
+          promptText,
+          effectivePolicy,
+          managed.modelRouteState,
+          {
+            emitEvent: emitRouteEvent,
+            // The runner streams/replays brain events through this callback instead
+            // of the live SSE subscription that enriches agent_end — re-apply the
+            // same enrichment so token/cost stats survive on every turn.
+            emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
+            onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
+            shouldAbort: () => managed._aborted,
+          },
+          promptMedia,
+        );
 
     promptPromise.then((result) => {
       // The routing runner reports exhaustion (and user aborts) as a result,
       // not a rejection — logging those as "completed" hid silent-failure
       // turns during incident triage.
-      if (result && result.success === false) {
+      if (result && typeof result === "object" && "success" in result && result.success === false) {
         console.warn(`[agentbox-http] Prompt finished without success for session ${managed.id} (${result.finalFailureKind ?? "unknown"}: ${result.finalErrorMessage ?? "no error message"})`);
         promptOutcome = "error";
       } else {

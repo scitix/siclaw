@@ -11,6 +11,7 @@ import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo, AgentBoxStatus } from "./types.js";
 import { getBoxProfile } from "./box-profile.js";
 import { CertificateManager } from "../security/cert-manager.js";
+import { buildRedactionConfig, redactText } from "../../shared/output-redactor.js";
 
 export interface K8sSpawnerConfig {
   /** K8s namespace */
@@ -42,6 +43,7 @@ const DEFAULT_CONFIG: Required<Omit<K8sSpawnerConfig, "persistence" | "nodeSelec
   imagePullPolicy: "Always",
   labelPrefix: "siclaw.io",
 };
+const POD_EVIDENCE_REDACTION = buildRedactionConfig();
 
 /** K8s resource quantity → number (comparable within one resource kind).
  *  Handles the shapes our profiles use: bare numbers, cpu millicores ("500m"),
@@ -261,6 +263,51 @@ export class K8sSpawner implements BoxSpawner {
   /**
    * Create an AgentBox Pod
    */
+  private logPodFailureEvidence(pod: k8s.V1Pod, trigger: string): void {
+    const truncate = (value: unknown): string | undefined => {
+      if (typeof value !== "string" || value.length === 0) return undefined;
+      return redactText(value.slice(0, 4096), POD_EVIDENCE_REDACTION);
+    };
+    const terminated = (state: any): Record<string, unknown> | undefined => {
+      const value = state?.terminated;
+      if (!value) return undefined;
+      return {
+        reason: value.reason,
+        exitCode: value.exitCode,
+        signal: value.signal,
+        startedAt: value.startedAt,
+        finishedAt: value.finishedAt,
+        message: truncate(value.message),
+      };
+    };
+    const waiting = (state: any): Record<string, unknown> | undefined => {
+      const value = state?.waiting;
+      if (!value) return undefined;
+      return { reason: value.reason, message: truncate(value.message) };
+    };
+
+    const evidence = {
+      trigger,
+      podName: pod.metadata?.name,
+      podUid: pod.metadata?.uid,
+      phase: pod.status?.phase,
+      reason: pod.status?.reason,
+      message: truncate(pod.status?.message),
+      nodeName: pod.spec?.nodeName,
+      podIP: pod.status?.podIP,
+      deletionTimestamp: pod.metadata?.deletionTimestamp,
+      containers: (pod.status?.containerStatuses ?? []).map((status: any) => ({
+        name: status.name,
+        ready: status.ready,
+        restartCount: status.restartCount,
+        waiting: waiting(status.state),
+        terminated: terminated(status.state),
+        lastTerminated: terminated(status.lastState),
+      })),
+    };
+    console.warn(`[k8s-spawner] AgentBox terminal evidence ${JSON.stringify(evidence)}`);
+  }
+
   async spawn(boxConfig: AgentBoxConfig): Promise<AgentBoxHandle> {
     const { namespace, imagePullPolicy, labelPrefix } = this.config;
     // A box's shape (image, extra env/HOME/volumes, tool/trust envelope) comes
@@ -326,6 +373,9 @@ export class K8sSpawner implements BoxSpawner {
       const profileMismatch = existingProfile !== profile.name;
       const terminating = existing.metadata?.deletionTimestamp != null;
       if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown" || profileMismatch || terminating) {
+        if (phase === "Failed" || phase === "Succeeded" || phase === "Unknown" || terminating) {
+          this.logPodFailureEvidence(existing, "stale-pod-before-recreate");
+        }
         console.log(
           `[k8s-spawner] Removing stale pod ${podName} (phase: ${phase}, profile: ${existingProfile}→${profile.name})`,
         );
@@ -688,6 +738,7 @@ export class K8sSpawner implements BoxSpawner {
             name: "agentbox",
             image,
             imagePullPolicy,
+            terminationMessagePolicy: "FallbackToLogsOnError",
             securityContext: {
               capabilities: needsBubblewrap
                 ? { drop: ["ALL"] }
