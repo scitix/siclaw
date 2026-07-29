@@ -2862,6 +2862,30 @@ export class AgentBoxSessionManager {
   }
 
   /**
+   * Sessions with a prompt actually running.
+   *
+   * Distinct from activeCount(): a session stays resident for SESSION_RELEASE_TTL_MS
+   * after its turn ends, so a box can hold many sessions while doing no work at all.
+   * This is the count that tracks real concurrent load — see capacity-metrics.ts.
+   */
+  inFlightCount(): number {
+    let n = 0;
+    for (const managed of this.sessions.values()) {
+      if (!managed._promptDone) n++;
+    }
+    return n;
+  }
+
+  /** Sub-agent limiter occupancy, for the capacity gauges. */
+  subagentStats(): { active: number; pending: number; limit: number } {
+    return {
+      active: this.subagentLimiter.activeCount,
+      pending: this.subagentLimiter.pendingCount,
+      limit: this.subagentLimiter.limit,
+    };
+  }
+
+  /**
    * Schedule a delayed release for a session.
    *
    * Defaults to SESSION_RELEASE_TTL_MS (idle-release grace window). Callers can

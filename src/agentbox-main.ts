@@ -21,6 +21,7 @@ import { initTracing, shutdownTracing } from "./shared/tracing/otel-provider.js"
 // but ESM guarantees single module evaluation — the subscriber registers only once.
 import "./shared/metrics.js";
 import { getMetricsAsJSON, processIncarnation } from "./shared/metrics.js";
+import { startCapacityMetrics } from "./shared/capacity-metrics.js";
 
 const config = loadConfig();
 const PORT = config.server.port;
@@ -84,6 +85,17 @@ async function main() {
   const sessionManager = new AgentBoxSessionManager();
   if (process.env.USER_ID) sessionManager.userId = process.env.USER_ID;
   if (process.env.SICLAW_AGENT_ID) sessionManager.agentId = process.env.SICLAW_AGENT_ID;
+
+  // Capacity gauges (per-box load, memory, event-loop lag). Registered here rather
+  // than on import because the Gateway shares this prom-client registry and has no
+  // box capacity to report. Started before the server listens so the first scrape
+  // after a cold start already carries real values.
+  startCapacityMetrics({
+    turnsInFlight: () => sessionManager.inFlightCount(),
+    subagentActive: () => sessionManager.subagentStats().active,
+    subagentPending: () => sessionManager.subagentStats().pending,
+    subagentLimit: () => sessionManager.subagentStats().limit,
+  });
 
   // Graceful shutdown — defined before the server so the idle self-destruct
   // timer can route through it (see onIdleShutdown below). Idempotent: the idle
