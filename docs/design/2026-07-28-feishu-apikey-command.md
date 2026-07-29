@@ -1,7 +1,7 @@
 # Feishu `/apikey` — self-service API key issuing
 
 **Status**: Implemented, 2026-07-28
-**Related**: `docs/design/channels.md`, `src/gateway/channels/lark.ts`,
+**Related**: `docs/features/channels.mdx`, `src/gateway/channels/lark.ts`,
 `src/gateway/channel-manager.ts`, `helm/siclaw/values.yaml` (Standalone vs Upstream mode)
 
 ## Motivation
@@ -79,6 +79,36 @@ the surrounding handler and reported as "service unavailable" *after* the key wa
 rotated, leaving the user unable to ever reach a pickup link. Likewise `exists` is optional on
 the wire, so "you have no key" is only claimed when the frontend says so or no `keyPrefix` came
 back — the advice attached to that branch is the destructive command.
+
+### Runtime copy must not restate the frontend's TTLs
+
+Replies name no durations. Expiry policy belongs to the frontend, and a sentence like "open
+within 5 minutes" silently starts lying the moment that TTL changes — while the runtime has no
+way to notice. The pickup line therefore states only "opens once, expires shortly" plus the
+**derived** absolute `expiresAt`, and status renders the derived date with the sliding mechanism
+("using the key pushes this out") rather than the window length. If a duration must ever be
+shown, derive it from the wire values instead of hard-coding it here.
+
+### Issuing needs idempotency, which the runtime cannot provide alone
+
+The in-process single-flight guard only collapses *overlapping* requests. It cannot span a
+sequential redelivery of the same inbound message, nor a second gateway replica — and because
+issuing rotates by invalidating the previous key, a duplicate makes the first pickup link resolve
+to a dead key. The runtime therefore forwards the inbound Feishu `message_id` as `request_id`;
+**durable deduplication is the frontend's half of this contract** (replay the same pending result
+instead of rotating again). Until the frontend honours it, the field is inert and duplicate
+issuing remains possible.
+
+### Rotation commits before delivery, so a lost reply is escalated
+
+The frontend rotates before the runtime can reply, and `replyToLark` swallows both thrown send
+failures and non-zero Feishu API codes — so delivery is **checked**, never inferred from the
+absence of an exception. When a committed rotation's reply fails, the send is retried once and, if
+still lost, an audit line names the affected sender: their previous key is already invalid and the
+replacement link never arrived. What keeps this recoverable rather than a lost credential is that
+the command is safely retryable — another `/apikey` rotates again and returns a fresh link.
+Removing the window entirely (defer invalidation until the pickup is consumed, or replay a pending
+pickup for an idempotent request) is a frontend-side change.
 
 ### Plaintext never enters the chat log
 

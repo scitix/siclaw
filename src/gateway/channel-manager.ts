@@ -257,10 +257,18 @@ export async function issuePersonalApiKey(
   channelId: string,
   senderOpenId: string,
   frontendClient: FrontendWsClient,
+  requestId?: string,
 ): Promise<PersonalApiKeyIssueResult> {
   return frontendClient.request("channel.issueApiKey", {
     channel_id: channelId,
     sender_open_id: senderOpenId,
+    // Stable per-inbound-message id (the Feishu message_id). Issuing is destructive — it rotates
+    // — so it needs idempotency, not just the runtime's in-process single-flight guard, which
+    // cannot span a sequential redelivery or a second gateway replica. Forwarding the id is the
+    // runtime half of that contract; DEDUPLICATION MUST BE DURABLE ON THE FRONTEND (replay the
+    // same pending result rather than rotating again). A frontend that ignores this field simply
+    // keeps today's behaviour.
+    ...(requestId ? { request_id: requestId } : {}),
   });
 }
 

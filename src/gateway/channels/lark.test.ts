@@ -2838,8 +2838,10 @@ describe("handleLarkMessage — /apikey", () => {
 
     await sendPersonal("/apikey", lark);
 
-    // channel_id is the personal-bot config id; sender_open_id is the only identity source.
-    expect(issuePersonalApiKeyMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything());
+    // channel_id is the personal-bot config id; sender_open_id is the only identity source. The
+    // inbound message_id rides along as a stable request id so the frontend can make a
+    // destructive rotation idempotent across redelivery or a second gateway replica.
+    expect(issuePersonalApiKeyMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything(), "mid-1");
     expect(replyText(lark)).toContain(PICKUP);
     expect(replyText(lark)).toContain("仅可打开一次");
     expect(replyText(lark)).toContain("2025-07-28 16:00"); // link expiry, Asia/Shanghai
@@ -3000,6 +3002,42 @@ describe("handleLarkMessage — /apikey", () => {
     const third = makeLarkClient();
     await sendPersonal("/apikey", third);
     expect(issuePersonalApiKeyMock).toHaveBeenCalledTimes(2);
+  });
+
+  // Rotation commits upstream BEFORE we can reply, and replyToLark swallows both failure shapes,
+  // so a lost reply means the requester's old key is dead with no link to show for it. Delivery
+  // must therefore be checked, retried once, and — if still lost — recorded loudly.
+  for (const [shape, makeFailingLark] of [
+    ["thrown send failure", () => ({ im: { message: { reply: vi.fn().mockRejectedValue(new Error("feishu down")) } } })],
+    ["non-zero Feishu code", () => ({ im: { message: { reply: vi.fn().mockResolvedValue({ code: 99991672, msg: "no permission" }) } } })],
+  ] as const) {
+    it(`retries and records an audit line when a ${shape} loses a delivered rotation`, async () => {
+      issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: PICKUP, rotated: true });
+      const errors: string[] = [];
+      (console.error as any).mockImplementation((...args: unknown[]) => { errors.push(args.join(" ")); });
+      const lark = makeFailingLark();
+
+      await sendPersonal("/apikey", lark as any);
+
+      expect(lark.im.message.reply).toHaveBeenCalledTimes(2); // one retry for the transient case
+      expect(errors.join("\n")).toContain("UNDELIVERED after rotation");
+      expect(errors.join("\n")).toContain("ou_user_1");       // names the affected sender
+      expect(errors.join("\n")).not.toContain(PICKUP);        // never logs the bearer link
+    });
+  }
+
+  it("does not escalate a lost reply when nothing was rotated", async () => {
+    // A failed issue has no committed side effect, so a lost reply is an ordinary retriable
+    // no-op — it must not be retried or reported as a lost credential.
+    issuePersonalApiKeyMock.mockResolvedValue({ success: false, error: "not authorized" });
+    const errors: string[] = [];
+    (console.error as any).mockImplementation((...args: unknown[]) => { errors.push(args.join(" ")); });
+    const lark = { im: { message: { reply: vi.fn().mockResolvedValue({ code: 99991672 }) } } };
+
+    await sendPersonal("/apikey", lark as any);
+
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+    expect(errors.join("\n")).not.toContain("UNDELIVERED after rotation");
   });
 
   it("claims the whole namespace — /apikeys never reaches the agent", async () => {

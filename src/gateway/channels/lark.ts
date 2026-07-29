@@ -917,19 +917,41 @@ export async function handleLarkMessage(
       apiKeyRequestsInFlight.add(inFlightKey);
       try {
         let reply: string;
+        // True once the frontend has COMMITTED a rotation for this request: the requester's old
+        // key is already dead, so failing to hand over the new pickup link is a real loss rather
+        // than a retriable no-op.
+        let carriesCommittedRotation = false;
         if (subcommand === "status") {
           const status = await getPersonalApiKeyStatus(personalChannelId, senderOpenId, frontendClient);
           reply = formatApiKeyStatusReply(status, locale);
           console.log(`[lark] /apikey status channel=${personalChannelId} sender=${senderOpenId} ok=${status.success} exists=${status.exists ?? "?"}`);
         } else {
-          const issued = await issuePersonalApiKey(personalChannelId, senderOpenId, frontendClient);
+          // messageId is forwarded as a stable request id so the frontend CAN make issuing
+          // idempotent across a redelivery or a second replica — the in-process guard above
+          // cannot span either.
+          const issued = await issuePersonalApiKey(personalChannelId, senderOpenId, frontendClient, messageId);
           reply = formatApiKeyIssueReply(issued, locale);
+          carriesCommittedRotation = Boolean(issued.success && issued.pickupUrl);
           // Audit line for a credential-mutating command: this path bypasses chat persistence,
           // so without it a "my key stopped working" report has no runtime-side evidence of who
           // rotated what and when. Never log the pickup URL — it is a bearer credential.
           console.log(`[lark] /apikey issue channel=${personalChannelId} sender=${senderOpenId} ok=${issued.success} rotated=${issued.rotated ?? false}`);
         }
-        await replyToLark(larkClient, messageId, reply);
+        // `replyToLark` swallows both throws and non-zero Feishu codes, so delivery has to be
+        // CHECKED here rather than inferred from the absence of an exception. When a rotation has
+        // already committed, retry once for the transient case and then leave a high-signal line
+        // naming the sender: their previous key is invalid and the new link never arrived. The
+        // command stays safely retryable — another `/apikey` rotates again and returns a fresh
+        // link — which is what keeps this recoverable instead of a lost credential.
+        if (!(await replyToLark(larkClient, messageId, reply)) && carriesCommittedRotation) {
+          if (!(await replyToLark(larkClient, messageId, reply))) {
+            console.error(
+              `[lark] /apikey issue UNDELIVERED after rotation — channel=${personalChannelId} ` +
+              `sender=${senderOpenId}: the previous key is already invalid and the new pickup link ` +
+              `did not reach them; they must send /apikey again`,
+            );
+          }
+        }
       } catch (err) {
         // Unlike PAIR (whose failure escapes to the top-level catch), stay explicit here: the
         // user is waiting on a pickup link, and silence reads as a broken bot.
@@ -1613,19 +1635,19 @@ function formatApiKeyIssueReply(result: PersonalApiKeyIssueResult, locale: LarkL
           result.rotated
             ? "✅ New API key generated — your PREVIOUS key is now invalid. Update anything configured with it."
             : "✅ Your API key is ready.",
-          "Open within 5 minutes; the link works only ONCE:",
+          "Open it now — the link works only ONCE and expires shortly:",
           result.pickupUrl,
           linkExpiry ? `Link expires at: ${linkExpiry}` : "",
-          "The key itself expires after 30 days without use.",
+          "Send /apikey status any time to check the key's own expiry.",
         ]
       : [
           result.rotated
             ? "✅ 已为你生成新的 API Key（旧 Key 已失效，如有配置请更新）"
             : "✅ 你的 API Key 已就绪",
-          "5 分钟内点击查看，仅可打开一次：",
+          "请立即点击查看：仅可打开一次，且很快过期：",
           result.pickupUrl,
           linkExpiry ? `链接过期时间：${linkExpiry}` : "",
-          "有效期：30 天未使用后自动失效",
+          "随时发送 /apikey status 查看 Key 本身的失效时间",
         ];
   return lines.filter(Boolean).join("\n");
 }
@@ -1655,12 +1677,12 @@ function formatApiKeyStatusReply(result: PersonalApiKeyStatusResult, locale: Lar
       ? [
           `Current key: ${result.keyPrefix ?? "(unknown prefix)"}…`,
           lastUsed ? `Last used: ${lastUsed}` : "Last used: never",
-          expiry ? `Expires: ${expiry} (30 days after last use)` : "",
+          expiry ? `Expires: ${expiry} (using the key pushes this out)` : "",
         ]
       : [
           `当前 Key：${result.keyPrefix ?? "(前缀未知)"}…`,
           lastUsed ? `最后使用：${lastUsed}` : "最后使用：从未使用",
-          expiry ? `失效时间：${expiry}（30 天未使用后自动失效）` : "",
+          expiry ? `失效时间：${expiry}（继续使用会自动延后）` : "",
         ];
   return lines.filter(Boolean).join("\n");
 }
@@ -1684,7 +1706,13 @@ function formatApiKeyUsageReply(locale: LarkLocale): string {
       ].join("\n");
 }
 
-async function replyToLark(larkClient: any, messageId: string, text: string): Promise<void> {
+/**
+ * Send a plain-text reply. Never throws — callers that only need best-effort delivery can keep
+ * ignoring the result. It RETURNS whether the message actually landed, because a caller that has
+ * already committed a side effect (see `/apikey`, which rotates before it can reply) must be able
+ * to tell delivery failure from success instead of inferring it from a log line.
+ */
+async function replyToLark(larkClient: any, messageId: string, text: string): Promise<boolean> {
   try {
     // Feishu's SDK does NOT throw on a non-zero API code (e.g. missing
     // im:message send scope) — it returns {code,msg} in the body. Surface it,
@@ -1695,9 +1723,12 @@ async function replyToLark(larkClient: any, messageId: string, text: string): Pr
     });
     if (resp && typeof resp.code === "number" && resp.code !== 0) {
       console.error(`[lark] reply API returned non-zero code for messageId=${messageId}: code=${resp.code} msg=${resp.msg}`);
+      return false;
     }
+    return true;
   } catch (err) {
     console.error(`[lark] Failed to reply to messageId=${messageId}:`, err);
+    return false;
   }
 }
 
