@@ -2024,7 +2024,23 @@ export class AgentBoxSessionManager {
     const type = getSubagentType(request.subagentType) ?? getSubagentType(DEFAULT_SUBAGENT_TYPE)!;
     const agentId = request.parentAgentId ?? this.agentId ?? null;
 
+    /**
+     * Reuse the parent's MCP connections instead of dialling the same servers again.
+     *
+     * Without this the child takes agent-factory's `new McpClientManager(...)` branch
+     * and AWAITS `initialize()` inside the spawn — for stdio servers that is a child
+     * process per sub-agent per server, and a wide fan-out pays it once per item
+     * before any of them can start work. The servers and their tools are identical to
+     * the parent's, since the child inherits the parent's agent and config.
+     *
+     * Undefined when the parent has no MCP configured or is no longer resident (a
+     * background child outliving its parent's release): the child then owns its own
+     * manager exactly as before.
+     */
+    const sharedMcpManager = this.sessions.get(request.parentSessionId)?.mcpManager;
+
     const child = await createSiclawSession({
+      mcpManager: sharedMcpManager,
       sessionManager: childSessionManager,
       kubeconfigRef,
       mode: "web",
@@ -2250,9 +2266,13 @@ export class AgentBoxSessionManager {
       }
     } finally {
       unsubscribe();
-      await child.mcpManager?.shutdown().catch((err) =>
-        console.warn(`[agentbox-session] spawned sub-agent MCP shutdown failed for ${childSessionId}:`, err),
-      );
+      // Shut down only connections this child opened. A manager shared with the
+      // parent outlives every child and is torn down with the parent session.
+      if (child.mcpManager && child.mcpManager !== sharedMcpManager) {
+        await child.mcpManager.shutdown().catch((err) =>
+          console.warn(`[agentbox-session] spawned sub-agent MCP shutdown failed for ${childSessionId}:`, err),
+        );
+      }
     }
 
     // If job_stop aborted but prompt() resolved instead of throwing, reflect it.
