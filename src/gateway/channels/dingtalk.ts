@@ -302,7 +302,7 @@ export async function handleDingTalkMessage(
 
   console.log(`[dingtalk] Message channel=${channelId} conversation=${conversationId} type=${routeType} \u2192 agent=${agentId} session=${sessionId}: "${text.slice(0, 80)}"`);
 
-  const handle = await agentBoxManager.getOrCreate(agentId);
+  const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
   // Apply the agent's custom system prompt (best-effort — undefined falls back
@@ -454,7 +454,8 @@ async function handleNewCommand(
     try {
       const binding = await resolveBinding(channelId, conversationId, frontendClient!);
       if (binding && !isChannelAccessDenied(binding)) {
-        const handle = await agentBoxManager.getOrCreate(binding.agentId);
+        // The OLD session id — closeSession must reach the box that holds it (see lark.ts).
+        const handle = await agentBoxManager.getOrCreate(binding.agentId, undefined, oldSessionId);
         const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
         await client.closeSession(oldSessionId);
       }

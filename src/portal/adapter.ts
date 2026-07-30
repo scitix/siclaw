@@ -2131,6 +2131,9 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       icon: agent.icon,
       color: agent.color,
       idle_timeout_sec: agent.idle_timeout_sec,
+      // How many AgentBox pods this agent runs. Absent or 1 means one box — the shape
+      // every agent had before this column, and what the Runtime falls back to.
+      replicas: agent.replicas,
       // Per-agent tool capability group keys (JSON array; null/empty = no
       // restriction). Parsed defensively across the three JSON-column states
       // (legacy MySQL JSON, new MySQL TEXT, SQLite TEXT). The Gateway resolves

@@ -235,6 +235,28 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return binding?.persistence;
   });
 
+  // How many boxes an agent runs. Unlike persistence (fixed at pod creation by the volume
+  // mount), the pool size is something a running agent can change, so this is consulted on
+  // every acquisition. Absent ⇒ 1 ⇒ the original single-box path, unchanged.
+  //
+  // Optional-call for the same reason as startOrphanSweep: startRuntime tests inject minimal
+  // manager fakes, and pooling is an ops capability, never a boot requirement.
+  agentBoxManager.setReplicasResolver?.(async (agentId) => {
+    const agent = await frontendClient.request("config.getAgent", { agentId }) as
+      | { replicas?: number | null }
+      | null;
+    return agent?.replicas ?? undefined;
+  });
+
+  // How to ask a box what it holds — placement scores on it, and the drain reaper needs the
+  // box's own `drained` answer because a background sub-agent under an idle session is
+  // invisible from out here.
+  // The box's internal port is mTLS: without the client cert every probe fails the
+  // handshake, placement scores every box as unreachable, and the drain reaper can never
+  // observe `drained` — so a drain would only ever end at its force-kill deadline.
+  agentBoxManager.setBoxStatusProbe?.(async (endpoint) =>
+    new AgentBoxClient(endpoint, 10000, agentBoxTlsOptions).getJson("/api/internal/box-status"));
+
   // Per-session AbortController for the in-flight chat.send SSE consumer, keyed
   // by sessionId. chat.abort looks this up to break the gateway's consumeAgentSse
   // loop so its abort-finalization runs (in-flight tool rows → "stopped", partial
@@ -340,7 +362,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // Persistence is resolved by agentId in the manager's persistenceResolver
         // (registered in startRuntime), not from per-request params — so every
         // entry point lands the same mode for the same agent.
-        const handle = await agentBoxManager.getOrCreate(agentId);
+        const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
@@ -1084,7 +1106,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
     activeStreamAborts.get(sessionId)?.abort();
 
-    const handle = await agentBoxManager.getOrCreate(agentId);
+    const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.abortSession(sessionId);
     return { ok: true };
@@ -1108,7 +1130,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const steerMessageId = await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
     await incrementMessageCount(sessionId);
 
-    const handle = await agentBoxManager.getOrCreate(agentId);
+    const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     const steerResult = await client.steerSession(sessionId, text, { images, files });
     void bindMessageTraceId(steerMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
@@ -1122,7 +1144,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const sessionId = params.sessionId as string;
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
 
-    const handle = await agentBoxManager.getOrCreate(agentId);
+    const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     const cleared = await client.clearQueue(sessionId);
     return { ok: true, ...cleared };

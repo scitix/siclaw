@@ -532,14 +532,27 @@ export function createHttpServer(
     }
   }
 
+  /**
+   * Nothing left in this box that would be lost by removing it.
+   *
+   * Deliberately the SAME predicate the idle self-destruct uses, so a drain decision and a
+   * self-destruct decision can never disagree. Both a resident session and an open SSE
+   * stream count as work: a session holding a background sub-agent is not released (its
+   * `_backgroundWorkCount` defers the release), so residency already covers background work
+   * without a separate term.
+   */
+  function isDrained(): boolean {
+    return activeSseCount === 0 && sessionManager.activeCount() === 0;
+  }
+
   function checkIdle(): void {
     if (idleDisabled) return;
-    if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
+    if (isDrained()) {
       if (idleTimer) return; // already scheduled
       idleTimer = setTimeout(() => {
         idleTimer = null;
         // Re-check before tearing down (new connection may have arrived)
-        if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
+        if (isDrained()) {
           console.log(`[agentbox] No connections for ${resolvedIdleMs / 1000}s, shutting down`);
           triggerIdleShutdown();
         }
@@ -596,7 +609,35 @@ export function createHttpServer(
    */
   addRoute("GET", "/api/internal/metrics-snapshot", async (_req, res) => {
     const { getMetricsAsJSON, processIncarnation } = await import("../shared/metrics.js");
-    sendJson(res, 200, { incarnation: processIncarnation, prom: await getMetricsAsJSON() });
+    sendJson(res, 200, {
+      incarnation: processIncarnation,
+      prom: await getMetricsAsJSON(),
+      // See MetricsFlushPayload: a claim, authorized against the mTLS cert on arrival.
+      ...(process.env.SICLAW_POD_NAME ? { boxId: process.env.SICLAW_POD_NAME } : {}),
+    });
+  });
+
+  /**
+   * GET /api/internal/box-status — what this box is currently holding.
+   *
+   * The Runtime routes a session to a box and keeps it there, so it needs to know what a
+   * box would lose if it were removed. `drained` is reported BY the box and never inferred
+   * from the outside: a session can have no in-flight turn while a background sub-agent
+   * still runs under it, and only the box can see that.
+   */
+  addRoute("GET", "/api/internal/box-status", async (_req, res) => {
+    const sessions = sessionManager.list();
+    sendJson(res, 200, {
+      boxId: process.env.SICLAW_POD_NAME ?? null,
+      sessionIds: sessions.map((s) => s.id),
+      sessionCount: sessions.length,
+      // What placement scores on: sessions resident is not load, turns running is.
+      turnsInFlight: sessionManager.inFlightCount(),
+      backgroundWork: sessions.reduce((n, s) => n + s._backgroundWorkCount, 0),
+      activeStreams: activeSseCount,
+      drained: isDrained(),
+      subagents: sessionManager.subagentStats(),
+    });
   });
 
   /**

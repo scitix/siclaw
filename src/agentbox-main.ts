@@ -120,7 +120,15 @@ async function main() {
     if (federationFlushEnabled) {
       try {
         const client = new GatewayClient({ gatewayUrl: config.server.gatewayUrl });
-        await client.sendMetricsFlush({ incarnation: processIncarnation, prom: await getMetricsAsJSON() });
+        await client.sendMetricsFlush({
+          incarnation: processIncarnation,
+          prom: await getMetricsAsJSON(),
+          // Which replica this is. Every box of an agent presents the same certificate,
+          // so without this the Gateway can only attribute the flush to the agent and
+          // sibling replicas overwrite each other's per-box series. Authorized against
+          // the cert on arrival; absent (local mode) it falls back to the cert value.
+          ...(process.env.SICLAW_POD_NAME ? { boxId: process.env.SICLAW_POD_NAME } : {}),
+        });
         console.log("[agentbox] Final metrics flush sent to Gateway");
       } catch (err) {
         console.warn("[agentbox] Final metrics flush failed (continuing shutdown):", err);

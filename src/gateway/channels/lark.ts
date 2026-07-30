@@ -1621,7 +1621,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   });
 
   // Get or create AgentBox for this agent (shared across all callers).
-  const handle = await agentBoxManager.getOrCreate(agentId);
+  const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
   const modelBinding = frontendClient
@@ -2044,7 +2044,10 @@ async function handleNewCommand(
   if (reset.oldSessionId) {
     sessionRegistry.forget(reset.oldSessionId);
     try {
-      const handle = await agentBoxManager.getOrCreate(reset.agentId);
+      // The OLD session id, not none: closeSession has to reach the box that actually
+      // holds it. Without it a pooled agent closes on an arbitrary box, the real session
+      // stays resident forever (pooled boxes never idle out), and that box never drains.
+      const handle = await agentBoxManager.getOrCreate(reset.agentId, undefined, reset.oldSessionId);
       const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
       await client.closeSession(reset.oldSessionId);
     } catch (err) {

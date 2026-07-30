@@ -279,8 +279,9 @@ describe("handleDingTalkMessage — routing to AgentBox", () => {
 
     await handleDingTalkMessage(makeDownstream("hi there"), "ch", mgr as any, undefined, {} as any);
 
-    expect(mgr.getOrCreate).toHaveBeenCalledWith("agent-7");
-    expect(mgr.getOrCreate.mock.calls[0]).toHaveLength(1);
+    // Pod identity stays the agentId alone; the third argument is the session id, which
+    // only chooses WHICH box of that agent serves this conversation.
+    expect(mgr.getOrCreate).toHaveBeenCalledWith("agent-7", undefined, expect.any(String));
 
     expect(rememberSpy).toHaveBeenCalledTimes(1);
     const [sessionId, conversationKey, agentId] = rememberSpy.mock.calls[0];

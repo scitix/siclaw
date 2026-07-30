@@ -142,17 +142,50 @@ export class K8sSpawner implements BoxSpawner {
   }
 
   /**
-   * Generate Pod name — keyed on agentId only (one pod per agent, shared
-   * across callers). Sanitized to the K8s name charset and capped so the
-   * full name stays under 63 chars.
+   * Generate Pod name. Sanitized to the K8s name charset and capped so the full name
+   * stays under 63 chars.
    *
    * The prefix comes from the BoxProfile (default "agentbox"; compile boxes use
    * "kbc-box"). Both prefixes are ≤ 8 chars, so the 50-char agentId cap keeps the
    * full name well under 63.
+   *
+   * **Instance 0 is deliberately unsuffixed** — it is the name every existing pod
+   * already has. Suffixing it would rename every pod in a running deployment, and each
+   * old one would be orphaned behind a name nothing looks up any more, for no benefit
+   * until an agent actually runs more than one box. Replicas 1..N-1 carry `-{n}`.
+   *
+   * Nothing parses the index back out of a name; the `instance` label is the record.
    */
-  private podName(agentId: string, prefix = "agentbox"): string {
+  private podName(agentId: string, prefix = "agentbox", instance = 0): string {
     const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
-    return `${prefix}-${sanitized}`;
+    const base = `${prefix}-${sanitized}`;
+    return instance > 0 ? `${base}-${instance}` : base;
+  }
+
+  /**
+   * Name of the certificate Secret for an agent — derived from the INSTANCE-0 pod name,
+   * so every box of the agent mounts the same one.
+   *
+   * The certificate asserts the agent, not the pod (`CN = agentId`, every SAN
+   * agentId-derived; the pod name appears only in the informational `serialNumber`), so
+   * one Secret per agent is what it already meant. Naming it per pod instead would mint
+   * and orphan one per replica on every scale change.
+   *
+   * For a single-box agent this is byte-identical to the previous `${podName}-cert`.
+   */
+  private certSecretName(agentId: string, prefix = "agentbox"): string {
+    return `${this.podName(agentId, prefix)}-cert`;
+  }
+
+  /** CA fingerprint stamped on an existing cert Secret, or undefined if unreadable. */
+  private async certSecretCaFingerprint(name: string): Promise<string | undefined> {
+    const { namespace, labelPrefix } = this.config;
+    try {
+      const s = await this.coreApi.readNamespacedSecret({ name, namespace });
+      return s.metadata?.labels?.[`${labelPrefix}/ca-fp`];
+    } catch {
+      return undefined; // unreadable ⇒ treat as stale and take the replace path
+    }
   }
 
   /**
@@ -209,7 +242,7 @@ export class K8sSpawner implements BoxSpawner {
     const agentId = boxConfig.agentId;
     if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
     const podPrefix = profile.podNamePrefix ?? "agentbox";
-    const podName = this.podName(agentId, podPrefix);
+    const podName = this.podName(agentId, podPrefix, boxConfig.instance ?? 0);
     const orgId = boxConfig.orgId || "";
 
     console.log(`[k8s-spawner] Creating pod: ${podName} for agent: ${agentId}`);
@@ -237,6 +270,22 @@ export class K8sSpawner implements BoxSpawner {
     try {
       const existing = await this.coreApi.readNamespacedPod({ name: podName, namespace });
       const phase = existing.status?.phase;
+
+      // 🔴 Cross-agent name collision. podName() sanitizes and truncates, so distinct
+      // agentIds can map to one pod name ("a.b" and "a-b" both become "a-b"), and the
+      // instance suffix adds the pair X / X-<n> ("foo" instance 1 and agent "foo-1"
+      // instance 0 are both agentbox-foo-1). Reusing another agent's pod would serve this
+      // agent's sessions from a box holding the OTHER agent's certificate and PVC subPath.
+      //
+      // Fail loudly instead. Deleting it would be worse — that is someone else's live box.
+      // The caller treats a failed instance as unavailable and moves on to another index.
+      const owner = existing.metadata?.labels?.[`${labelPrefix}/agent`];
+      if (owner !== undefined && owner !== agentId) {
+        throw new Error(
+          `Pod name collision: ${podName} belongs to agent "${owner}", not "${agentId}". ` +
+          `Refusing to reuse or replace another agent's box.`,
+        );
+      }
       // A pod being torn down (or spawned) under this name for a DIFFERENT profile
       // must not be reused — its image/tools/volumes are the old shape. Treat a
       // profile mismatch (or an in-progress deletion) like a stale pod: delete +
@@ -277,9 +326,13 @@ export class K8sSpawner implements BoxSpawner {
       // Pod doesn't exist, proceed to create
     }
 
-    // Issue client certificate for mTLS authentication.
-    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, podName);
-    const certSecretName = `${podName}-cert`;
+    // Issue client certificate for mTLS authentication. The serialNumber carries the
+    // agent's BASE pod name, not this instance's: it is the identity every box of the
+    // agent presents, and the Gateway uses it as the authorization root when a box
+    // reports which pod it actually is (see handleMetricsFlush).
+    const certBase = this.podName(agentId, podPrefix);
+    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, certBase);
+    const certSecretName = this.certSecretName(agentId, podPrefix);
 
     // Create certificate Secret
     const secretLabels = {
@@ -308,23 +361,47 @@ export class K8sSpawner implements BoxSpawner {
       console.log(`[k8s-spawner] Created certificate Secret ${certSecretName}`);
     } catch (err: any) {
       if (err.code === 409 || err.statusCode === 409) {
-        // Secret exists with stale cert — replace it
-        await this.coreApi.deleteNamespacedSecret({ name: certSecretName, namespace });
-        await this.coreApi.createNamespacedSecret({
-          namespace,
-          body: {
-            apiVersion: "v1",
-            kind: "Secret",
-            metadata: { name: certSecretName, labels: secretLabels },
-            type: "kubernetes.io/tls",
-            data: {
-              "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
-              "tls.key": Buffer.from(certBundle.key).toString("base64"),
-              "ca.crt": Buffer.from(certBundle.ca).toString("base64"),
-            },
-          },
-        });
-        console.log(`[k8s-spawner] Replaced certificate Secret ${certSecretName}`);
+        // 🔴 The Secret is per-AGENT, so two replicas of one agent spawning at the same
+        // time both land here — and blindly replacing it would delete a certificate a
+        // sibling pod is already mounting, or race the sibling's own replace (observed as
+        // a 404 on the second delete). A Secret signed by the CURRENT CA is equally valid
+        // for every box of the agent, so leave it alone: the certificate asserts the
+        // agent, not the pod.
+        const existingFp = await this.certSecretCaFingerprint(certSecretName);
+        if (existingFp === caFp) {
+          // Nothing to do — the pod below mounts the existing Secret. The certificate we
+          // just minted is simply discarded.
+          console.log(`[k8s-spawner] Reusing certificate Secret ${certSecretName} (signed by the current CA)`);
+        } else {
+          // CA rotated: the cert is genuinely stale, and every pod of this agent is being
+          // recreated for that same reason, so replacing is safe. The delete is
+          // 404-tolerant because a sibling replica may have replaced it first.
+          try {
+            await this.coreApi.deleteNamespacedSecret({ name: certSecretName, namespace });
+          } catch (delErr: any) {
+            if (delErr?.code !== 404 && delErr?.statusCode !== 404) throw delErr;
+          }
+          try {
+            await this.coreApi.createNamespacedSecret({
+              namespace,
+              body: {
+                apiVersion: "v1",
+                kind: "Secret",
+                metadata: { name: certSecretName, labels: secretLabels },
+                type: "kubernetes.io/tls",
+                data: {
+                  "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
+                  "tls.key": Buffer.from(certBundle.key).toString("base64"),
+                  "ca.crt": Buffer.from(certBundle.ca).toString("base64"),
+                },
+              },
+            });
+            console.log(`[k8s-spawner] Replaced certificate Secret ${certSecretName}`);
+          } catch (recreateErr: any) {
+            // A sibling won the race and already recreated it under the current CA.
+            if (recreateErr?.code !== 409 && recreateErr?.statusCode !== 409) throw recreateErr;
+          }
+        }
       } else {
         throw err;
       }
@@ -335,6 +412,11 @@ export class K8sSpawner implements BoxSpawner {
       { name: "PI_CODING_AGENT_DIR", value: ".siclaw/user-data/agent" },
       { name: "SICLAW_GATEWAY_URL", value: this.gatewayUrl(namespace) },
       { name: "SICLAW_AGENT_ID", value: agentId },
+      // Which pod this process is. Every box of an agent presents the SAME certificate,
+      // so the cert can no longer tell the Gateway which replica is reporting — the box
+      // has to say, and the Gateway authorizes the claim against the cert (see
+      // handleMetricsFlush). Downward API rather than a literal so it cannot drift.
+      { name: "SICLAW_POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
     ];
     // Normal AgentBoxes need Runtime-level memory/embedding/sub-agent settings.
     // Lean capability profiles do not use those features, and inheriting this
@@ -476,6 +558,9 @@ export class K8sSpawner implements BoxSpawner {
           [`${labelPrefix}/agent`]: agentId,
           [caFpLabel]: caFp,
           [`${labelPrefix}/boxType`]: profile.name,
+          // Which replica of the agent this is. The label is the record — the pod NAME
+          // is not, because instance 0 is deliberately unsuffixed (see podName).
+          [`${labelPrefix}/instance`]: String(boxConfig.instance ?? 0),
         },
       },
       spec: {
@@ -757,27 +842,28 @@ export class K8sSpawner implements BoxSpawner {
    * Stop an AgentBox
    */
   async stop(boxId: string): Promise<void> {
-    const { namespace } = this.config;
+    const { namespace, labelPrefix } = this.config;
 
     console.log(`[k8s-spawner] Stopping pod: ${boxId}`);
 
     try {
-      // Delete Pod
       await this.coreApi.deleteNamespacedPod({ name: boxId, namespace });
-
-      // Attempt to delete the associated cert Secret
-      const secretName = `${boxId}-cert`;
-      try {
-        await this.coreApi.deleteNamespacedSecret({ name: secretName, namespace });
-      } catch {
-        // Secret may not exist, ignore
-      }
     } catch (err: any) {
       if (err.code !== 404 && err.statusCode !== 404) {
         throw err;
       }
-      // Pod does not exist, ignore
+      // Pod does not exist, ignore.
     }
+
+    // 🔴 The certificate Secret is NOT deleted here. It belongs to the agent, not to this
+    // pod, so stopping one box says nothing about whether it is still in use — and any
+    // "does the agent still have pods?" check is a point-in-time read that races the spawn
+    // of a replacement: the Secret is created BEFORE its pod, so a concurrent stop of the
+    // last old box would see no sibling, delete it, and leave the new pod stuck in
+    // ContainerCreating forever on a missing volume (restartPolicy is Never).
+    //
+    // `sweepOrphans` owns Secret lifetime instead. It has the age guard that closes exactly
+    // this race and can see the whole namespace at once.
   }
 
   /**
@@ -803,23 +889,34 @@ export class K8sSpawner implements BoxSpawner {
     const capabilityTypes = new Set(["kb-compile", "kb-compile-codex", "kb-test"]);
     const pods = await this.coreApi.listNamespacedPod({ namespace, labelSelector: selector });
     const keptPods = new Set<string>();
+    // Agents that still have at least one pod after this sweep. A cert Secret now belongs to
+    // the AGENT, so pod-name matching can no longer decide whether it is in use.
+    const liveAgents = new Set<string>();
+    // Pods this sweep actually removed. `pods.items` is the pre-sweep snapshot, so without
+    // this a just-reaped pod would still "exist" and shield its own Secret for another
+    // round — which used to be masked by stop() deleting the Secret itself.
+    const removedPods = new Set<string>();
     for (const pod of pods.items ?? []) {
       const name = pod.metadata?.name;
       if (!name) continue;
       const boxType = pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent";
       const phase = pod.status?.phase;
       const terminal = phase === "Succeeded" || phase === "Failed";
+      const agentOf = pod.metadata?.labels?.[`${labelPrefix}/agent`];
       if (!capabilityTypes.has(boxType)) {
         if (!terminal) {
-          keptPods.add(name); // live chat box — not ours to manage; its Secret is kept too
+          keptPods.add(name); // live chat box — not ours to manage
+          if (agentOf) liveAgents.add(agentOf); // …and its agent's Secret stays
           continue;
         }
         console.log(`[k8s-spawner] orphan sweep: removing terminal chat box ${name} (phase=${phase})`);
         try {
-          await this.stop(name); // deletes the pod + its cert Secret, 404-tolerant
+          await this.stop(name);
+          removedPods.add(name);
         } catch (err: any) {
           console.warn(`[k8s-spawner] orphan sweep: stop ${name} failed:`, err?.message ?? err);
-          keptPods.add(name); // keep its Secret this round; retry next sweep
+          keptPods.add(name);
+          if (agentOf) liveAgents.add(agentOf); // still there → keep its Secret
         }
         continue;
       }
@@ -833,14 +930,17 @@ export class K8sSpawner implements BoxSpawner {
       const live = !terminal && (await isLive(runRef));
       if (live) {
         keptPods.add(name);
+        if (agentOf) liveAgents.add(agentOf);
         continue;
       }
       console.log(`[k8s-spawner] orphan sweep: removing ${name} (phase=${phase ?? "?"}, live=${live})`);
       try {
-        await this.stop(name); // deletes the pod + its cert Secret, 404-tolerant
+        await this.stop(name);
+        removedPods.add(name);
       } catch (err: any) {
         console.warn(`[k8s-spawner] orphan sweep: stop ${name} failed:`, err?.message ?? err);
-        keptPods.add(name); // keep its Secret this round; retry next sweep
+        keptPods.add(name);
+        if (agentOf) liveAgents.add(agentOf);
       }
     }
     // Cert Secrets whose pod is gone entirely (e.g. pod deleted out-of-band, or an
@@ -854,8 +954,15 @@ export class K8sSpawner implements BoxSpawner {
     // list is already scoped to `app=agentbox`, so nothing outside this system is
     // reachable from here.
     //
-    // The age guard closes the spawn TOCTOU: Secrets are created BEFORE their pod,
-    // so a just-spawned box's cert must never be swept between the two creates.
+    // 🔴 A Secret is matched to its owner by the `agent` LABEL, not by stripping "-cert"
+    // off its name. The Secret is now per-agent while pods are per-replica, so the name of
+    // `agentbox-foo-cert` corresponds to instance 0 alone: if instance 0 were gone while
+    // instance 1 still ran, name-matching would delete the certificate instance 1 has
+    // mounted. Name-stripping survives only as the fallback for label-less debris.
+    //
+    // The age guard closes the spawn TOCTOU: Secrets are created BEFORE their pod, so a
+    // just-spawned box's cert must never be swept between the two creates. It is also what
+    // makes it safe for `stop()` to leave Secret lifetime entirely to this sweep.
     const secrets = await this.coreApi.listNamespacedSecret({ namespace, labelSelector: selector });
     const minAgeMs = 10 * 60_000;
     const sweepableTypes = new Set([...capabilityTypes, "agent"]);
@@ -869,8 +976,14 @@ export class K8sSpawner implements BoxSpawner {
       // will still be old next sweep.
       const createdMs = s.metadata?.creationTimestamp ? new Date(s.metadata.creationTimestamp).getTime() : NaN;
       if (!Number.isFinite(createdMs) || Date.now() - createdMs < minAgeMs) continue;
-      if (keptPods.has(name.slice(0, -"-cert".length))) continue;
-      if (pods.items?.some((p: any) => p.metadata?.name === name.slice(0, -"-cert".length))) continue;
+      const secretAgent = s.metadata?.labels?.[`${labelPrefix}/agent`];
+      if (secretAgent) {
+        if (liveAgents.has(secretAgent)) continue; // some box of this agent survives
+      } else {
+        if (keptPods.has(name.slice(0, -"-cert".length))) continue;
+        const base = name.slice(0, -"-cert".length);
+        if (!removedPods.has(base) && pods.items?.some((p: any) => p.metadata?.name === base)) continue;
+      }
       console.log(`[k8s-spawner] orphan sweep: removing orphaned Secret ${name}`);
       try {
         await this.coreApi.deleteNamespacedSecret({ name, namespace });
@@ -915,6 +1028,7 @@ export class K8sSpawner implements BoxSpawner {
         lastActiveAt: new Date(),
         caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
         profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
+        ...this.replicaFields(pod),
       };
     } catch (err: any) {
       if (err.code === 404 || err.statusCode === 404) {
@@ -922,6 +1036,56 @@ export class K8sSpawner implements BoxSpawner {
       }
       throw err;
     }
+  }
+
+  /** Replica index + running image, read off a pod. Absent label ⇒ instance 0 (pre-replica). */
+  private replicaFields(pod: any): { instance: number; image: string | undefined } {
+    const { labelPrefix } = this.config;
+    const raw = pod.metadata?.labels?.[`${labelPrefix}/instance`];
+    const parsed = raw === undefined ? 0 : Number(raw);
+    return {
+      instance: Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0,
+      image: pod.spec?.containers?.[0]?.image,
+    };
+  }
+
+  /**
+   * Every box currently existing for an agent.
+   *
+   * The pool is DISCOVERED, never remembered: the spawner holds no registry, so a Runtime
+   * restart re-derives the same answer from the cluster instead of resuming from state
+   * that may have gone stale while it was down.
+   */
+  async listForAgent(agentId: string): Promise<AgentBoxInfo[]> {
+    const { namespace, labelPrefix } = this.config;
+    const pods = await this.coreApi.listNamespacedPod({
+      namespace,
+      labelSelector: `${labelPrefix}/app=agentbox,${labelPrefix}/agent=${agentId}`,
+    });
+    return (pods.items ?? []).flatMap((pod: any) => {
+      const boxId = pod.metadata?.name;
+      if (!boxId) return [];
+      const podIP = pod.status?.podIP;
+      return [{
+        boxId,
+        agentId,
+        status: this.mapPodStatus(pod),
+        endpoint: podIP ? `https://${podIP}:3000` : "",
+        createdAt: pod.metadata?.creationTimestamp ? new Date(pod.metadata.creationTimestamp) : new Date(),
+        lastActiveAt: new Date(),
+        caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
+        profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
+        ...this.replicaFields(pod),
+      } satisfies AgentBoxInfo];
+    });
+  }
+
+  /**
+   * The image a box for this profile WOULD be spawned with — the comparison target for
+   * spotting a pod a deploy left behind. Same precedence as spawn().
+   */
+  expectedImage(profile?: string): string {
+    return getBoxProfile(profile).image ?? this.config.image;
   }
 
   /**
@@ -950,6 +1114,9 @@ export class K8sSpawner implements BoxSpawner {
           : new Date(),
         lastActiveAt: new Date(),
         profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
+        // Without these, every box reads as instance 0 and the pool-size reconciler's
+        // "drain the highest indices first" ordering silently degrades to list order.
+        ...this.replicaFields(pod),
       };
     });
   }

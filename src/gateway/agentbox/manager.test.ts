@@ -606,3 +606,284 @@ describe("AgentBoxManager — injected spawnEnvResolver", () => {
     expect(spawner.spawnCalls[0].env).toBeUndefined();
   });
 });
+
+// ── Pooled agents (replicas > 1) ──────────────────────────────────────
+
+/**
+ * A spawner that can report a pool, so the manager's multi-box path can be driven without
+ * a cluster. `listForAgent` and `expectedImage` are duck-typed on the real K8s spawner.
+ */
+class PoolSpawner extends FakeSpawner {
+  pool: AgentBoxInfo[] = [];
+  image = "agentbox:v2";
+  async listForAgent(_agentId: string): Promise<AgentBoxInfo[]> { return this.pool; }
+  expectedImage(_profile?: string): string { return this.image; }
+  async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
+    this.spawnCalls.push(config);
+    const boxId = (config.instance ?? 0) > 0
+      ? `agentbox-${config.agentId}-${config.instance}`
+      : `agentbox-${config.agentId}`;
+    return { boxId, endpoint: `http://10.0.0.${(config.instance ?? 0) + 1}:3000`, agentId: config.agentId };
+  }
+}
+
+function poolBox(boxId: string, instance: number, over: Partial<AgentBoxInfo> = {}): AgentBoxInfo {
+  return {
+    boxId, agentId: "agent-a", status: "running", endpoint: `http://10.0.0.${instance + 1}:3000`,
+    createdAt: new Date(), lastActiveAt: new Date(), profile: "agent", instance, image: "agentbox:v2",
+    ...over,
+  };
+}
+
+function pooledManager(spawner: PoolSpawner, replicas: number, statuses: Record<string, any> = {}) {
+  const mgr = new AgentBoxManager(spawner);
+  mgr.setReplicasResolver(async () => replicas);
+  mgr.setBoxStatusProbe(async (endpoint) => {
+    const found = Object.entries(statuses).find(([, s]) => (s as any).endpoint === endpoint);
+    return (found?.[1] as any) ?? { sessionIds: [], turnsInFlight: 0, drained: true };
+  });
+  return mgr;
+}
+
+describe("AgentBoxManager — pooled agents", () => {
+  it("keeps a session on the same box across turns", async () => {
+    // The property everything else serves: a session being served never changes box, because
+    // its background jobs' abort handles are in-memory closures that cannot follow it.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = pooledManager(spawner, 2);
+
+    const first = await mgr.getOrCreate("agent-a", undefined, "s1");
+    for (let i = 0; i < 4; i++) {
+      expect((await mgr.getOrCreate("agent-a", undefined, "s1")).boxId).toBe(first.boxId);
+    }
+    expect(spawner.spawnCalls).toHaveLength(0); // pool already at size
+  });
+
+  it("spreads different sessions across the pool", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = pooledManager(spawner, 2);
+    const a = await mgr.getOrCreate("agent-a", undefined, "s1");
+    const b = await mgr.getOrCreate("agent-a", undefined, "s2");
+    expect(a.boxId).not.toBe(b.boxId);
+  });
+
+  it("adopts what boxes report instead of re-placing a live session after a restart", async () => {
+    // A fresh manager has an empty binding table while sessions are still live in boxes.
+    // Placing one fresh would send a running conversation to a box holding none of its state.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = pooledManager(spawner, 2, {
+      one: { endpoint: "http://10.0.0.1:3000", sessionIds: [], turnsInFlight: 0, drained: true },
+      two: { endpoint: "http://10.0.0.2:3000", sessionIds: ["s-live"], turnsInFlight: 1, drained: false },
+    });
+    expect((await mgr.getOrCreate("agent-a", undefined, "s-live")).boxId).toBe("agentbox-agent-a-1");
+  });
+
+  it("drains a box running a stale image instead of killing it", async () => {
+    // Pod reuse never compared the image, which is why a new AgentBox image only took effect
+    // when someone deleted pods by hand — and that delete was a hard kill.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0, { image: "agentbox:v1" }), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = pooledManager(spawner, 2);
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(spawner.stopCalls).toHaveLength(0);          // still serving what it holds
+    expect(handle.boxId).toBe("agentbox-agent-a-1");    // but takes no new sessions
+  });
+
+  it("spawns pooled boxes as resident, or the pool would shrink itself between turns", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [];
+    const mgr = pooledManager(spawner, 3);
+    await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(spawner.spawnCalls[0].env?.SICLAW_AGENTBOX_IDLE_TIMEOUT).toBe("0");
+  });
+
+  it("falls back to ONE box when the replicas lookup fails", async () => {
+    // Fail closed on scale: a config blip must never multiply an agent's pods.
+    const spawner = new PoolSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => { throw new Error("portal down"); });
+    await mgr.getOrCreate("agent-a", undefined, "s1");
+    // Single-box path: spawned without an instance index.
+    expect(spawner.spawnCalls[0].instance).toBeUndefined();
+  });
+
+  it("leaves an agent at replicas=1 on the original single-box path", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const mgr = pooledManager(spawner, 1);
+    await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(spawner.spawnCalls[0].instance).toBeUndefined();
+    expect(spawner.spawnCalls[0].env?.SICLAW_AGENTBOX_IDLE_TIMEOUT).toBeUndefined();
+  });
+});
+
+describe("AgentBoxManager — drain reaper", () => {
+  function drainingManager(statusByEndpoint: Record<string, any>, probeThrows = false) {
+    const spawner = new PoolSpawner("k8s");
+    spawner.getReturns.set("old-box", poolBox("old-box", 0, { endpoint: "http://10.0.0.9:3000" }));
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setBoxStatusProbe(async (endpoint) => {
+      if (probeThrows) throw new Error("unreachable");
+      return statusByEndpoint[endpoint] ?? { sessionIds: [], turnsInFlight: 0, drained: false };
+    });
+    (mgr as any).draining.set("old-box", Date.now());
+    return { mgr, spawner };
+  }
+
+  it("removes a box once the box itself says it is drained", async () => {
+    const { mgr, spawner } = drainingManager({ "http://10.0.0.9:3000": { sessionIds: [], turnsInFlight: 0, drained: true } });
+    await (mgr as any).reapDrainedBoxes();
+    expect(spawner.stopCalls).toEqual(["old-box"]);
+  });
+
+  it("waits while the box still reports work", async () => {
+    // `drained` has to come from the box: a session with no in-flight turn can still have a
+    // background sub-agent running under it, which is invisible from the Runtime.
+    const { mgr, spawner } = drainingManager({
+      "http://10.0.0.9:3000": { sessionIds: ["s1"], turnsInFlight: 0, drained: false },
+    });
+    await (mgr as any).reapDrainedBoxes();
+    expect(spawner.stopCalls).toHaveLength(0);
+  });
+
+  it("waits when the box cannot be asked at all", async () => {
+    // Unreachable is not evidence of empty. Guessing here deletes live work.
+    const { mgr, spawner } = drainingManager({}, true);
+    await (mgr as any).reapDrainedBoxes();
+    expect(spawner.stopCalls).toHaveLength(0);
+  });
+
+  it("removes a box that never drains, once its deadline passes", async () => {
+    // A sub-agent may run ten minutes; a deploy cannot wait indefinitely.
+    const { mgr, spawner } = drainingManager({
+      "http://10.0.0.9:3000": { sessionIds: ["s1"], turnsInFlight: 1, drained: false },
+    });
+    (mgr as any).draining.set("old-box", Date.now() - 6 * 60_000);
+    await (mgr as any).reapDrainedBoxes();
+    expect(spawner.stopCalls).toEqual(["old-box"]);
+  });
+
+  it("forgets a box that is already gone without trying to stop it", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+    (mgr as any).draining.set("vanished", Date.now());
+    await (mgr as any).reapDrainedBoxes();
+    expect(spawner.stopCalls).toHaveLength(0);
+    expect((mgr as any).draining.size).toBe(0);
+  });
+});
+
+describe("AgentBoxManager — regressions found in review", () => {
+  it("never builds a replacement under a draining box's own pod name", async () => {
+    // A draining box keeps its name until it is deleted. Treating its index as free
+    // produced a spawn for the identical name, which the spawner then either reused (the
+    // drain never rolls) or — on a CA-triggered drain — DELETED outright, mid-conversation.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0, { image: "agentbox:v1" }), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = pooledManager(spawner, 2);
+
+    await mgr.getOrCreate("agent-a", undefined, "s1");
+    await new Promise((r) => setTimeout(r, 5)); // the pool fill is deliberately backgrounded
+
+    expect(spawner.spawnCalls.map((c) => c.instance)).not.toContain(0);
+    expect(spawner.spawnCalls.map((c) => c.instance)).toEqual([2]); // next free index
+    expect(spawner.stopCalls).toHaveLength(0);
+  });
+
+  it("does not treat an unreachable box as the least loaded one", async () => {
+    // Failing to answer is what a wedged box does. Scoring it 0 in-flight made
+    // least-loaded placement steer every new session straight onto it.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 2);
+    mgr.setBoxStatusProbe(async (endpoint) => {
+      if (endpoint === "http://10.0.0.1:3000") throw new Error("wedged");
+      return { sessionIds: [], turnsInFlight: 3, drained: false };
+    });
+    // The healthy box reports 3 in-flight turns and still wins over the silent one.
+    for (const sid of ["s1", "s2", "s3"]) {
+      expect((await mgr.getOrCreate("agent-a", undefined, sid)).boxId).toBe("agentbox-agent-a-1");
+    }
+  });
+
+  it("drains the extra boxes when replicas is lowered", async () => {
+    // Acquisition cannot see this: at replicas=1 it takes the single-box path, which only
+    // ever looks up instance 0 by name. The extras are resident, so nothing else stops them.
+    const spawner = new PoolSpawner("k8s");
+    spawner.listReturns = [
+      poolBox("agentbox-agent-a", 0),
+      poolBox("agentbox-agent-a-1", 1),
+      poolBox("agentbox-agent-a-2", 2),
+    ];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+
+    await (mgr as any).reconcilePoolSizes();
+    // Highest indices first — index 0 is the oldest and likeliest to be busy.
+    expect([...(mgr as any).draining.keys()].sort()).toEqual(["agentbox-agent-a-1", "agentbox-agent-a-2"]);
+  });
+
+  it("leaves a correctly-sized pool alone", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.listReturns = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 2);
+    await (mgr as any).reconcilePoolSizes();
+    expect((mgr as any).draining.size).toBe(0);
+  });
+});
+
+describe("AgentBoxManager — a single-box agent still rolls onto a new image", () => {
+  it("drains a stale box and serves from a replacement, rather than keeping the old image forever", async () => {
+    // The single-box path compares phase, profile and CA but never the image, and a box
+    // under continuous traffic never idles out — so before this, a Runtime rollout left
+    // every default agent (replicas=1) on the old AgentBox image indefinitely.
+    const spawner = new PoolSpawner("k8s");
+    const stale = poolBox("agentbox-agent-a", 0, { image: "agentbox:v1" });
+    spawner.pool = [stale];
+    spawner.getReturns.set("agentbox-agent-a", stale);
+    const mgr = pooledManager(spawner, 1);
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s1");
+
+    // The stale box keeps serving what it holds; it is not killed.
+    expect(spawner.stopCalls).toHaveLength(0);
+    // A replacement comes up under the next FREE index — instance 0's name is still taken.
+    expect(spawner.spawnCalls.map((c) => c.instance)).toEqual([1]);
+    // …and the new session goes to the replacement, not to the box about to be removed.
+    expect(handle.boxId).toBe("agentbox-agent-a-1");
+  });
+
+  it("leaves a current-image box alone on the fast path", async () => {
+    const spawner = new PoolSpawner("k8s");
+    const fresh = poolBox("agentbox-agent-a", 0); // image === spawner.image
+    spawner.pool = [fresh];
+    spawner.getReturns.set("agentbox-agent-a", fresh);
+    const mgr = pooledManager(spawner, 1);
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(handle.boxId).toBe("agentbox-agent-a");
+    expect(spawner.spawnCalls).toHaveLength(0);
+    expect(spawner.stopCalls).toHaveLength(0);
+  });
+
+  it("treats an unknown image as fresh rather than recycling every box", async () => {
+    // A legacy pod may not report an image at all. Guessing stale would respawn on
+    // every single acquisition.
+    const spawner = new PoolSpawner("k8s");
+    const unlabelled = poolBox("agentbox-agent-a", 0, { image: undefined });
+    spawner.pool = [unlabelled];
+    spawner.getReturns.set("agentbox-agent-a", unlabelled);
+    const mgr = pooledManager(spawner, 1);
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(handle.boxId).toBe("agentbox-agent-a");
+    expect(spawner.spawnCalls).toHaveLength(0);
+  });
+});

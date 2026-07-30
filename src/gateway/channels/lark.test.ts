@@ -825,9 +825,10 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       {} as any,
     );
 
-    expect(mgr.getOrCreate).toHaveBeenCalledWith("agent-7");
-    // One and only one argument — no userId leakage into AgentBox pod identity.
-    expect(mgr.getOrCreate.mock.calls[0]).toHaveLength(1);
+    // Pod IDENTITY is the agentId alone — no userId leakage. The third argument is the
+    // SESSION id, which only chooses WHICH box of that agent serves this conversation;
+    // it never becomes part of a pod's name or certificate.
+    expect(mgr.getOrCreate).toHaveBeenCalledWith("agent-7", undefined, "session-agent-7");
 
     expect(rememberSpy).toHaveBeenCalledTimes(1);
     const [sessionId, ownerUserId, agentId] = rememberSpy.mock.calls[0];
@@ -1073,7 +1074,10 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     );
 
     expect(resetBindingSessionMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1");
-    expect(mgr.getOrCreate).toHaveBeenCalledWith("a1");
+    // The OLD session id is passed so closeSession reaches the box that actually holds
+    // it — a pooled agent has more than one, and closing on the wrong box would leave the
+    // real session resident forever (pooled boxes never idle out).
+    expect(mgr.getOrCreate).toHaveBeenCalledWith("a1", undefined, "old-session");
     expect(closeSessionMock).toHaveBeenCalledWith("old-session");
     expect(promptMock).not.toHaveBeenCalled();
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("已开启新会话");

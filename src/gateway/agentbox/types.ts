@@ -1,9 +1,9 @@
 /**
  * AgentBox type definitions.
  *
- * One AgentBox pod per agent. The pod is shared by every user who addresses
- * that agent; per-user state is carried in the request's sessionId, not in
- * the pod identity. No userId here.
+ * An agent's boxes are shared by every user who addresses that agent; per-user state
+ * is carried in the request's sessionId, not in the pod identity. No userId here.
+ * An agent may run several boxes — see `AgentBoxConfig.instance`.
  */
 
 /** AgentBox status */
@@ -45,6 +45,15 @@ export interface AgentBoxConfig {
    * Only honored by K8sSpawner; ignored by Local/Process spawners.
    */
   persistence?: boolean;
+  /**
+   * Which replica of the agent this box is. Defaults to 0.
+   *
+   * Instance 0 keeps the historic unsuffixed pod name, so an agent that never scales
+   * past one box is byte-identical to before this existed. The value is also stamped
+   * as the `instance` label, which is what anything reading the index should use — the
+   * name is not parseable back into an index.
+   */
+  instance?: number;
 }
 
 /** AgentBox information */
@@ -68,6 +77,12 @@ export interface AgentBoxInfo {
    *  box (image/tools/volumes), breaking the "different scenario = different box"
    *  isolation. */
   profile?: string;
+  /** Replica index from the pod's `instance` label; 0 when absent (pre-replica pods). */
+  instance?: number;
+  /** Image the pod is actually running — compared against the configured one to
+   *  detect a box left behind by a deploy. Pod reuse historically ignored this,
+   *  which is why a new AgentBox image never took effect on its own. */
+  image?: string;
 }
 
 /** AgentBox handle, used for subsequent operations */

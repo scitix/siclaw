@@ -252,7 +252,7 @@ export async function handleDelegate(
   writeFrame({ type: "delegate_session", peerSessionId });
 
   try {
-    const handle = await deps.agentBoxManager.getOrCreate(peerAgentId);
+    const handle = await deps.agentBoxManager.getOrCreate(peerAgentId, undefined, peerSessionId);
     const client = new AgentBoxClient(handle.endpoint, 30000, deps.agentBoxTlsOptions);
     peerClient = client;
     // Cancellation during cold spawn: if the coordinator disconnected while

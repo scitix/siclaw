@@ -294,16 +294,18 @@ replication, regions.
    about, and phases 1–2 supplied the measurement and the memory headroom it needs.
 6. ✅ **Affinity and reporting** — `BoxBindings` plus the box's `box-status` endpoint. Nothing routes
    through them yet; with one box per agent there is only one answer.
-7. **Fixed replicas** — the `replicas` field, the reconciliation loop, RR placement,
-   `idle_timeout = 0`. Multi-box becomes real here.
-8. **Image-mismatch draining** — plus the breaking-release flag and the frontend's interrupted-turn
-   surface. **Same release as phase 7**, and not merely for the residency reason recorded above:
-   draining requires the old and new box to exist AT THE SAME TIME, and until an agent can run two
-   boxes they collide on one pod name. Splitting them yields only a hard kill under a different
-   trigger — worse than today's manual one, because an unrelated user's turn would fire it.
+7. ✅ **Fixed replicas** — the `replicas` field, pool reconciliation, RR placement, residency.
+   Multi-box becomes real here.
+8. ✅ **Image-mismatch draining** — shipped with phase 7, and not merely for the residency reason
+   recorded above: draining requires the old and new box to exist AT THE SAME TIME, and until an
+   agent can run two boxes they collide on one pod name. Splitting them would have yielded only a
+   hard kill under a worse trigger — an unrelated user's turn.
    (`terminationGracePeriodSeconds` did not need to wait and shipped with phase 6.)
 
-Phases 1–6 are worth doing whether or not multi-box ships, and all of them are in.
+Everything above is implemented. Two items from the original scope were deliberately NOT built:
+the breaking-release flag (there is no protocol version to compare yet — a helm-declared flag is
+guesswork until one exists) and the frontend's interrupted-turn surface (a force-killed turn still
+fails the way any interrupted turn does today).
 
 ## Open
 

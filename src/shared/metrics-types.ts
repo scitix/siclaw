@@ -35,13 +35,17 @@ export interface PromSampleGroup {
  * the SIGTERM final-flush push (POST /api/internal/metrics-flush, agentbox-initiated);
  * the two messages are byte-identical.
  *
- * Deliberately does NOT carry a boxId/podId: the agentbox process does not know its
- * own pod name, and the Gateway must not trust a client-supplied identity anyway.
- * The Gateway derives boxId from the mTLS client certificate identity. Only the
- * per-process `incarnation` (which the process does own) and the cumulative `prom`
- * snapshot travel on the wire. See metrics-federation-DESIGN.md module 5.
+ * `boxId` is a CLAIM, not an identity. Every box of an agent presents the same
+ * certificate, so the cert alone can no longer say which replica is reporting — but the
+ * Gateway still must not simply believe a client. The cert's own boxId is the agent's
+ * BASE pod name, and the Gateway accepts a claim only if it is that base or one of its
+ * instance suffixes, so a box can name itself precisely and can never name another
+ * agent's. An absent or unacceptable claim falls back to the cert value, which is what
+ * every pre-replica box reported. See `handleMetricsFlush`.
  */
 export interface MetricsFlushPayload {
   incarnation: string;
   prom: PromSampleGroup[];
+  /** This pod's name (downward API). Authorized against the certificate, never trusted raw. */
+  boxId?: string;
 }

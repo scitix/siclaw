@@ -21,7 +21,7 @@ import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
 import { AGENT_TYPES, effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
-import { normalizeIdleTimeoutSec } from "../core/config.js";
+import { normalizeIdleTimeoutSec, normalizeReplicas } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
 
 /**
@@ -90,7 +90,7 @@ export function registerAgentRoutes(
 
     const listParams = [...params, pageSize, offset];
     const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id, a.model_routing,
-        a.agent_type, a.is_production, a.idle_timeout_sec, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
+        a.agent_type, a.is_production, a.idle_timeout_sec, a.replicas, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
         (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
@@ -129,8 +129,8 @@ export function registerAgentRoutes(
 
     const agentType = normalizeAgentType(body.agent_type);
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, agent_type, system_prompt, is_production, idle_timeout_sec, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -147,6 +147,7 @@ export function registerAgentRoutes(
         effectiveAgentPrompt(agentType, body.system_prompt) ?? null,
         body.is_production ?? 1,
         normalizeIdleTimeoutSec(body.idle_timeout_sec),
+        normalizeReplicas(body.replicas),
         body.icon ?? null,
         body.color ?? null,
         auth.userId,
@@ -285,7 +286,7 @@ export function registerAgentRoutes(
     // Build dynamic SET clause
     const fields = [
       "name", "description", "status", "model_provider",
-      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "icon", "color", "agent_type",
+      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "replicas", "icon", "color", "agent_type",
     ];
     const setClauses: string[] = [];
     const values: unknown[] = [];
@@ -302,7 +303,11 @@ export function registerAgentRoutes(
           setClauses.push(`${field} = ?`);
           // newIdleTimeoutSec is non-null here: field === "idle_timeout_sec" implies
           // "idle_timeout_sec" in body, which is exactly when it was computed above.
-          values.push(field === "idle_timeout_sec" ? newIdleTimeoutSec! : body[field]);
+          values.push(
+            field === "idle_timeout_sec" ? newIdleTimeoutSec!
+              : field === "replicas" ? normalizeReplicas(body.replicas)
+              : body[field],
+          );
         }
       }
     }
