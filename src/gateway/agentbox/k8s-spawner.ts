@@ -60,6 +60,32 @@ export function parseK8sQuantity(q: string): number {
   return suffix in scale ? n * scale[suffix] : NaN;
 }
 
+/**
+ * Baseline resources for a spawned box, when neither the call nor the profile says.
+ *
+ * The memory REQUEST is what the scheduler packs nodes on, and the old 256Mi sat
+ * BELOW what a box uses while doing nothing (measured: 164–282Mi idle across three
+ * production pods). That both overcommits the node and, because the request/limit
+ * split makes these Burstable, puts them first in line for eviction under node
+ * pressure. 1Gi is the same request the KB compile profile already declared for
+ * itself. Raising the limit costs nothing at schedule time — a limit reserves no
+ * capacity — and buys headroom for the sub-agent fan-out.
+ *
+ * These are the FALLBACK for the no-env case (LocalSpawner, a hand-rolled manifest).
+ * A helm deployment sets the same numbers through `agentbox.resources`; keep the two
+ * in step. The right values depend on the sub-agent concurrency in use —
+ * `siclaw_box_rss_bytes` (labelled by box_id) is the measurement to set them from.
+ * Read per call so a test can vary the environment.
+ */
+function defaultBoxResources(): { cpu: string; cpuRequest: string; memory: string; memoryRequest: string } {
+  return {
+    cpu: process.env.SICLAW_AGENTBOX_CPU_LIMIT || "2000m",
+    cpuRequest: process.env.SICLAW_AGENTBOX_CPU_REQUEST || "100m",
+    memory: process.env.SICLAW_AGENTBOX_MEMORY_LIMIT || "8Gi",
+    memoryRequest: process.env.SICLAW_AGENTBOX_MEMORY_REQUEST || "1Gi",
+  };
+}
+
 /** requests ≤ limits guard (review): the request/limit split lets a profile
  *  declare a request ABOVE the (possibly default) limit — the API server
  *  rejects such a pod outright, taking the capability down on a config typo.
@@ -552,14 +578,17 @@ export class K8sSpawner implements BoxSpawner {
             // OOM). Same precedence as profile.image / profile.volumes above.
             resources: (() => {
               const res = boxConfig.resources ?? profile.resources;
+              const dflt = defaultBoxResources();
+              const cpuLimit = res?.cpu || dflt.cpu;
+              const memoryLimit = res?.memory || dflt.memory;
               return {
                 requests: {
-                  cpu: clampRequestToLimit(res?.cpuRequest || res?.cpu || "100m", res?.cpu || "2000m", podName, "cpu"),
-                  memory: clampRequestToLimit(res?.memoryRequest || res?.memory || "256Mi", res?.memory || "4Gi", podName, "memory"),
+                  cpu: clampRequestToLimit(res?.cpuRequest || res?.cpu || dflt.cpuRequest, cpuLimit, podName, "cpu"),
+                  memory: clampRequestToLimit(res?.memoryRequest || res?.memory || dflt.memoryRequest, memoryLimit, podName, "memory"),
                 },
                 limits: {
-                  cpu: res?.cpu || "2000m",
-                  memory: res?.memory || "4Gi",
+                  cpu: cpuLimit,
+                  memory: memoryLimit,
                 },
               };
             })(),

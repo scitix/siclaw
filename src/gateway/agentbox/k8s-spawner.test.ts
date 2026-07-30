@@ -1122,12 +1122,12 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
       if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
       return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
-    await s.spawn({ agentId: "clamp-test", profile: "agent", resources: { memoryRequest: "8Gi", cpuRequest: "4" } } as any);
+    await s.spawn({ agentId: "clamp-test", profile: "agent", resources: { memoryRequest: "16Gi", cpuRequest: "4" } } as any);
     const created = g.__k8sCalls.createNamespacedPod.at(-1);
     const res = created.body.spec.containers[0].resources;
-    expect(res.requests.memory).toBe("4Gi"); // clamped to the default limit
+    expect(res.requests.memory).toBe("8Gi"); // clamped to the default limit
     expect(res.requests.cpu).toBe("2000m");  // clamped to the default limit
-    expect(res.limits.memory).toBe("4Gi");
+    expect(res.limits.memory).toBe("8Gi");
   });
 
   it("parseK8sQuantity + clampRequestToLimit cover the profile shapes", () => {
@@ -1161,7 +1161,7 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
     const created = g.__k8sCalls.createNamespacedPod.at(-1);
     const res = created.body.spec.containers[0].resources;
     expect(res.requests.memory).toBe("1Gi");
-    expect(res.limits.memory).toBe("4Gi");   // limit stays at the default
+    expect(res.limits.memory).toBe("8Gi");   // limit stays at the default
     expect(res.requests.cpu).toBe("100m");
   });
 });

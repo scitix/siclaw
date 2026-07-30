@@ -56,6 +56,30 @@ spec:
                   fieldPath: metadata.namespace
             - name: SICLAW_AGENTBOX_IMAGE
               value: {{ include "siclaw.agentboxImage" . }}
+            {{- /* Resources for the pods the Runtime SPAWNS, not for this pod —
+                   passed as env because the PodSpec is built at spawn time. */}}
+            {{- with .Values.agentbox.resources }}
+            {{- with .requests }}
+            {{- if .cpu }}
+            - name: SICLAW_AGENTBOX_CPU_REQUEST
+              value: {{ .cpu | quote }}
+            {{- end }}
+            {{- if .memory }}
+            - name: SICLAW_AGENTBOX_MEMORY_REQUEST
+              value: {{ .memory | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .limits }}
+            {{- if .cpu }}
+            - name: SICLAW_AGENTBOX_CPU_LIMIT
+              value: {{ .cpu | quote }}
+            {{- end }}
+            {{- if .memory }}
+            - name: SICLAW_AGENTBOX_MEMORY_LIMIT
+              value: {{ .memory | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             - name: SICLAW_GATEWAY_HOSTNAME
               value: "{{ include "siclaw.fullname" . }}-runtime.{{ .Release.Namespace }}.svc.cluster.local"
             - name: SICLAW_MEMORY_ENABLED
