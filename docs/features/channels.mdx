@@ -80,6 +80,56 @@ app receives only mention events, users can still continue by mentioning the
 bot on each topic reply. Unrelated topics are ignored unless the bot already
 has a session for that topic root.
 
+### Feishu test-bot capability checklist
+
+Do not treat a successful long connection or an `im.message.receive_v1`
+subscription as proof that every message path is enabled. Feishu filters that
+single event by the app's scopes; for example, group messages can work while
+direct messages are silently not delivered.
+
+Use these application-identity scopes for a complete Siclaw Agent test bot:
+
+| Capability unit | Scope | Why Siclaw needs it |
+|---|---|---|
+| Send and reply to messages | `im:message` | Plain-text replies, CardKit card replies, topic replies, mode-switch announcements, and downloading images attached to received messages |
+| Receive direct messages | `im:message.p2p_msg:readonly` | Required separately even when `im:message` is enabled |
+| Receive group `@bot` messages | `im:message.group_at_msg:readonly` | Starts an investigation from a group root message |
+| Receive no-mention topic follow-ups | `im:message.group_msg` | Required for natural follow-up messages inside an existing bot topic; this is a sensitive permission, so restrict the app's availability for pilots |
+| Read group metadata | `im:chat:readonly` | Resolves the group title shown in Siclaw |
+| Create and stream cards | `cardkit:card:write` | Creates the thinking card, streams milestones, finalizes the answer, and updates feedback controls |
+| Upload reply images and files | `im:resource` | Uploads charts and other Agent-generated message resources; received-message downloads are covered by `im:message` |
+| Read bot metadata (recommended) | `application:bot.basic_info:read` | Keeps the bot name and identity lookup explicit in the app configuration |
+
+Do not add contacts, Drive, Docs, Calendar, or tenant-admin scopes for this
+channel. The optional Sicore identity-binding flow only calls
+`authen/v1/user_info`, which requires no additional API scope for `open_id`,
+display name, and avatar.
+
+The matching platform configuration is:
+
+1. Enable the **Bot** capability.
+2. Select **Long connection** for events and callbacks.
+3. Subscribe to the `im.message.receive_v1` event.
+4. Subscribe to the `card.action.trigger` callback.
+5. Add the Sicore callback URL
+   `/api/v1/siclaw/personal-bot/oauth/feishu/callback` as an exact redirect URL
+   when identity binding is tested.
+6. Publish the app version after changing capabilities, events, callbacks,
+   permissions, redirect URLs, or availability.
+7. Restrict a pilot app to the intended test users, especially when
+   `im:message.group_msg` is enabled.
+
+Acceptance should cover each permission unit independently:
+
+- Direct message: send a unique text and confirm the bot replies.
+- Group root: `@bot` with a unique text and confirm the first reply opens a topic.
+- Topic continuity: reply inside that topic without another mention and confirm
+  the same Siclaw session is reused.
+- Streaming card: confirm the thinking state, milestone updates, and final state.
+- Card callback: click feedback or a mode button and confirm the toast and state
+  update.
+- Media: send an image to the bot and request a chart/image response.
+
 ## Discord Integration
 
 Configure a Discord bot in **Channels** with:
