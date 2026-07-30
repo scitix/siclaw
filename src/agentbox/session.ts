@@ -35,7 +35,7 @@ import type {
   ChannelMessageExecutor,
   AgentMode,
 } from "../core/tool-registry.js";
-import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency, getGroupWorkerShare, getSubagentGroupMaxRuntimeMs } from "../core/subagent-registry.js";
+import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentPodConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency, getGroupWorkerShare, getGroupPodShare, getSubagentGroupMaxRuntimeMs } from "../core/subagent-registry.js";
 import { buildReduceInput, GroupCircuitBreaker, truncateReduceSummary, type GroupItemOutcome, type GroupItemStatus } from "./subagent-group.js";
 import { JobRegistry, type JobStatus } from "../core/job-registry.js";
 import { buildNotificationBatch, buildGroupNotificationSummary, summarizeItemStatuses, type TaskNotification } from "../core/task-notification.js";
@@ -161,6 +161,12 @@ export interface ManagedSession {
   _invalidated: boolean;
   /** Background work currently owned by this parent session (e.g. detached sub-agent jobs). */
   _backgroundWorkCount: number;
+  /**
+   * This conversation's share of the box's sub-agent capacity. Held per session so one
+   * conversation's fan-out queues its own children rather than everyone else's; the box-wide
+   * ceiling is the manager's `podSubagentLimiter`.
+   */
+  _subagentLimiter: ConcurrencyLimiter;
   /** Per-session model routing state, persisted as a sidecar under the session directory. */
   modelRouteState: ModelRouteState;
   /** Last normalized model routing policy supplied by Runtime/Portal for this session. */
@@ -451,23 +457,37 @@ export class AgentBoxSessionManager {
   private ledgerHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
-   * Bounds concurrent sub-agent child sessions across this AgentBox — a single spawn_subagent
-   * batch fans its items out through this same limiter (via a bounded worker pool), so a wide
-   * fan-out never spins up one child agent + LLM stream per target at once. Shared by every
-   * session in the pod so the cap is per-pod, not per-conversation.
+   * Ceiling on concurrent sub-agent child sessions across the WHOLE process, every conversation
+   * included. This is the memory guard: a child is a full agent session, and queueing costs one
+   * user latency where an OOMKill costs every session in the box its work.
+   *
+   * Fairness is a separate concern, held by each session's own `_subagentLimiter` — see
+   * {@link sessionSubagentLimiter}. This limiter used to serve both purposes at a cap of 4,
+   * which made one conversation's fan-out everyone else's queue.
    */
-  private subagentLimiter = new ConcurrencyLimiter(getSubagentConcurrency());
+  private podSubagentLimiter = new ConcurrencyLimiter(getSubagentPodConcurrency());
 
   /**
    * Collective cap on GROUP-spawned children (map workers AND the reduce child) across ALL live
-   * groups in this AgentBox: `max(1, concurrency - 1)` — one below the global `subagentLimiter`.
-   * A single group's worker pool already stays one below the global cap, but that guarantee is
-   * per-group: two concurrent batches (sessions share this manager) would together saturate the
-   * global limiter and park an interactive single spawn behind a ~10-min child. Group children
-   * acquire this slot BEFORE the global one (strict ordering — group-slot holders only ever wait
-   * on the global limiter, and global holders never wait on a group slot, so no cycle).
+   * groups in this AgentBox: `max(1, pod - 1)`. A single group's worker pool already stays one
+   * below its SESSION's cap, but that guarantee is per-group and per-session: several batches in
+   * different conversations would together saturate the pod ceiling and park an interactive
+   * single spawn behind a ~10-min child.
+   *
+   * ⚠️ Acquisition order is fixed at **group → session → pod**, and every path takes them in that
+   * order. A pod-slot holder therefore never waits on a session slot, and a session-slot holder
+   * never waits on a group slot, so the wait-for graph stays acyclic.
    */
-  private groupChildLimiter = new ConcurrencyLimiter(getGroupWorkerShare());
+  private podGroupLimiter = new ConcurrencyLimiter(getGroupPodShare());
+
+  /**
+   * Where children whose parent session is no longer resident compete.
+   *
+   * A background group outlives its parent's release, so its remaining children would otherwise
+   * have no session limiter at all and be bounded only by the pod ceiling. One shared limiter
+   * keeps them collectively bounded rather than minting a fresh full-size one per orphan.
+   */
+  private detachedSubagentLimiter = new ConcurrencyLimiter(getSubagentConcurrency());
 
   /**
    * Unified background-job registry (sub-agents + bash), keyed by jobId.
@@ -607,11 +627,18 @@ export class AgentBoxSessionManager {
         }
         // Cap concurrent foreground children: a wide fan-out queues past the limit
         // instead of spinning up one child agent + LLM stream per target at once.
-        const lim = this.subagentLimiter;
-        if (lim.atCapacity) {
+        // Session slot first, then the pod ceiling — see podGroupLimiter for why the
+        // order is fixed.
+        const sessionLim = this.sessionSubagentLimiter(childReq.parentSessionId);
+        const podLim = this.podSubagentLimiter;
+        // Report whichever gate is actually holding this child back; blaming the
+        // session cap when the box is full sends an operator to the wrong knob.
+        const lim = sessionLim.atCapacity ? sessionLim : podLim;
+        const knob = lim === sessionLim ? "SICLAW_SUBAGENT_CONCURRENCY" : "SICLAW_SUBAGENT_POD_CONCURRENCY";
+        if (sessionLim.atCapacity || podLim.atCapacity) {
           console.log(
             `[agentbox-session] sub-agent "${childReq.description}" queued — ` +
-            `${lim.activeCount}/${lim.limit} running, ${lim.pendingCount + 1} waiting (SICLAW_SUBAGENT_CONCURRENCY=${lim.limit})`,
+            `${lim.activeCount}/${lim.limit} running, ${lim.pendingCount + 1} waiting (${knob}=${lim.limit})`,
           );
           // Tell the UI this child is waiting for a slot, not running — otherwise pi's
           // batch tool_execution_start already painted it as "running" (spinner).
@@ -619,16 +646,18 @@ export class AgentBoxSessionManager {
             status: "queued",
             toolCalls: 0,
             steps: [],
-            activity: `Waiting for a free slot (${lim.limit} sub-agents run at a time)…`,
+            activity: lim === sessionLim
+              ? `Waiting for a free slot (${lim.limit} sub-agents run at a time)…`
+              : `Waiting for a free slot (this agent's box is at its ${lim.limit}-sub-agent ceiling)…`,
           });
         }
-        return lim.run(() => {
-          console.log(`[agentbox-session] sub-agent "${childReq.description}" started — ${lim.activeCount}/${lim.limit} running`);
+        return sessionLim.run(() => podLim.run(() => {
+          console.log(`[agentbox-session] sub-agent "${childReq.description}" started — ${sessionLim.activeCount}/${sessionLim.limit} in session, ${podLim.activeCount}/${podLim.limit} in box`);
           // Flip a previously-queued card to "running" immediately on slot acquisition,
           // before the child's first tool call emits progress (avoids a stale "Queued").
           onProgress?.({ status: "running", toolCalls: 0, steps: [] });
           return this.runSpawnedSubagent(childReq, { ...traceCtx }, onProgress, signal);
-        });
+        }));
       }
 
       // ── Batch (map→reduce): background (default for a multi-item batch) → register a job, return
@@ -665,15 +694,14 @@ export class AgentBoxSessionManager {
   /**
    * Core group orchestration (design §"Orchestration (batch path)"). Shared by the foreground and background
    * paths. Contract:
-   *  - The orchestrator itself NEVER holds a `subagentLimiter` slot (that would deadlock
-   *    when several groups run at once). It submits children INTO the global limiter via a
-   *    worker pool that keeps at most `getGroupWorkerShare()` in flight, so an interactive
-   *    spawn_subagent always keeps ≥1 slot.
+   *  - The orchestrator itself NEVER holds a sub-agent slot (that would deadlock when several
+   *    groups run at once). It submits children INTO the limiters via a worker pool that keeps
+   *    at most `getGroupWorkerShare()` in flight, so an interactive spawn_subagent always keeps
+   *    ≥1 of the session's slots.
    *  - Child sessions are created LAZILY inside each worker (via runSpawnedSubagent) — never
    *    all N at once.
-   *  - Each child goes through the UNCHANGED runSpawnedSubagent (global limiter, 600s child
-   *    backstop, transcript persistence, delegation_event). Group children are tagged
-   *    `{groupId}#{index}`.
+   *  - Each child goes through the UNCHANGED runSpawnedSubagent (600s child backstop, transcript
+   *    persistence, delegation_event). Group children are tagged `{groupId}#{index}`.
    *  - A single failed/timed-out item does NOT abort the group; its status + summary flow
    *    into the reduce input (a bounded, deliberate exception to fail-fast: a failure is a
    *    valid diagnostic signal, not dirty data to propagate).
@@ -699,6 +727,11 @@ export class AgentBoxSessionManager {
     //  - mapAbort fires on userAbort OR the group timeout OR a circuit-break. It cancels
     //    only the MAP children — a map-phase timeout must NOT kill a still-valuable reduce
     //    (which keeps its own 600s child backstop).
+    // Resolved ONCE for the whole group, not per child: a background group outlives its
+    // parent session's release, and re-resolving mid-run would silently move the surviving
+    // children onto the detached limiter while their siblings still hold the session's.
+    const sessionLim = this.sessionSubagentLimiter(request.parentSessionId);
+
     const userAbort = new AbortController();
     const mapAbort = new AbortController();
     const onExternalAbort = () => { userAbort.abort(); mapAbort.abort(); };
@@ -764,7 +797,7 @@ export class AgentBoxSessionManager {
       let skippedInSlot = false;
       let res: SpawnSubagentResult | undefined;
       try {
-        res = await this.groupChildLimiter.run(() => this.subagentLimiter.run(async () => {
+        res = await this.podGroupLimiter.run(() => sessionLim.run(() => this.podSubagentLimiter.run(async () => {
           if (mapAbort.signal.aborted) {
             skippedInSlot = true;
             return undefined;
@@ -774,7 +807,7 @@ export class AgentBoxSessionManager {
           state.status = "running";
           emit("map");
           return this.runSpawnedSubagent(childReq, { ...traceCtx }, undefined, mapAbort.signal);
-        }));
+        })));
       } catch (err) {
         res = {
           status: "failed",
@@ -814,11 +847,11 @@ export class AgentBoxSessionManager {
     };
 
     // Worker pool via the shared ConcurrencyLimiter (reuse — one concurrency primitive, not a
-    // hand-rolled index counter): at most `getGroupWorkerShare()` items are submitted per group.
-    // The "interactive single spawn always keeps ≥1 global slot" guarantee is enforced by the
-    // manager-wide `groupChildLimiter` (collective cap across ALL live groups — this per-group
-    // pool alone can't provide it once two batches run concurrently). runOne never throws (it
-    // catches internally), so no pool.run() rejects.
+    // hand-rolled index counter): at most `getGroupWorkerShare()` items are submitted per group,
+    // one below the SESSION cap, so this conversation keeps a slot for an interactive spawn.
+    // The same guarantee at the BOX level is the manager-wide `podGroupLimiter` — this per-group
+    // pool alone can't provide it once two batches run in different sessions. runOne never throws
+    // (it catches internally), so no pool.run() rejects.
     const pool = new ConcurrencyLimiter(Math.min(getGroupWorkerShare(), total));
     await Promise.all(tasks.map((_, i) => pool.run(() => runOne(i))));
 
@@ -873,9 +906,9 @@ export class AgentBoxSessionManager {
           spawnId: `${groupId}#reduce`,
         };
         try {
-          const reduceRes = await this.groupChildLimiter.run(() => this.subagentLimiter.run(() =>
+          const reduceRes = await this.podGroupLimiter.run(() => sessionLim.run(() => this.podSubagentLimiter.run(() =>
             this.runSpawnedSubagent(reduceReq, { ...traceCtx }, undefined, userAbort.signal),
-          ));
+          )));
           if (reduceRes.status === "done") {
             // Use the FULL reduce report, not the 1800-char capsule, before applying the group's
             // 6000-char budget (design decision #21): the capsule is already ≤1800, so truncating it
@@ -2682,6 +2715,7 @@ export class AgentBoxSessionManager {
       _releaseTimer: null,
       _invalidated: false,
       _backgroundWorkCount: 0,
+      _subagentLimiter: new ConcurrencyLimiter(getSubagentConcurrency()),
       modelRouteState,
       modelRoutePolicy: undefined,
       _routeBrainEventsThroughExtra: false,
@@ -2896,13 +2930,28 @@ export class AgentBoxSessionManager {
     return n;
   }
 
-  /** Sub-agent limiter occupancy, for the capacity gauges. */
+  /**
+   * Box-wide sub-agent occupancy, for the capacity gauges. Reports the POD limiter: the
+   * gauges describe the process, and a per-session number summed across sessions would
+   * exceed what the box can actually run.
+   */
   subagentStats(): { active: number; pending: number; limit: number } {
     return {
-      active: this.subagentLimiter.activeCount,
-      pending: this.subagentLimiter.pendingCount,
-      limit: this.subagentLimiter.limit,
+      active: this.podSubagentLimiter.activeCount,
+      pending: this.podSubagentLimiter.pendingCount,
+      limit: this.podSubagentLimiter.limit,
     };
+  }
+
+  /**
+   * The limiter a child spawned by `sessionId` competes in.
+   *
+   * Falls back to one shared detached limiter when the parent is no longer resident — a
+   * background group outlives its parent's release, and giving each orphan a fresh full-size
+   * limiter would leave them bounded only by the pod ceiling.
+   */
+  private sessionSubagentLimiter(sessionId: string): ConcurrencyLimiter {
+    return this.sessions.get(sessionId)?._subagentLimiter ?? this.detachedSubagentLimiter;
   }
 
   /**

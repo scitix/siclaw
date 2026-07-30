@@ -130,6 +130,8 @@ import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
 import { createMemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import * as subagentRegistry from "../core/subagent-registry.js";
+import { getSubagentConcurrency } from "../core/subagent-registry.js";
+import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 
 // ── Test setup ────────────────────────────────────────────────────────
 
@@ -1071,53 +1073,90 @@ describe("AgentBoxSessionManager — spawn_subagent batch (foreground)", () => {
     }
   });
 
-  it("caps children COLLECTIVELY across concurrent groups — an interactive slot stays free", async () => {
+  /**
+   * Two concurrent groups in two DIFFERENT conversations, four items each.
+   *
+   * `runTwoGroups` returns the peak number of children running at once, which is the whole
+   * observable difference between the per-session and pod-wide caps.
+   */
+  async function runTwoGroups(mgr: any): Promise<number> {
+    let active = 0;
+    let maxActive = 0;
+    for (let i = 0; i < 8; i++) {
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async () => {
+          active++;
+          maxActive = Math.max(maxActive, active);
+          await new Promise((r) => setTimeout(r, 10));
+          active--;
+          emitter.emit("event", {
+            type: "message_end",
+            message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+          });
+        },
+        abort: async () => {},
+      }));
+    }
+    const mkReq = (id: string) => ({
+      description: `batch ${id}`,
+      renderedTasks: Array.from({ length: 4 }, (_, i) => ({ item: `${id}-t${i}`, prompt: `do ${id}-t${i}` })),
+      subagentType: "general-purpose",
+      runInBackground: false,
+      parentSessionId: `p-${id}`,
+      parentAgentId: null,
+      userId: "u1",
+      taskListId: "tl1",
+      spawnId: `grp-${id}`,
+    });
+    // Make both parents RESIDENT so each group resolves its own session limiter. A
+    // non-resident parent falls back to one shared detached limiter, which is the safety
+    // net for an orphaned background group — not the path a live group takes.
+    for (const id of ["a", "b"]) {
+      mgr.sessions.set(`p-${id}`, { _subagentLimiter: new ConcurrencyLimiter(getSubagentConcurrency()) });
+    }
+    const exec = mgr.createSpawnSubagentExecutor();
+    const [a, b] = await Promise.all([
+      exec(mkReq("a"), undefined, undefined),
+      exec(mkReq("b"), undefined, undefined),
+    ]);
+    expect(a.status).toBe("done");
+    expect(b.status).toBe("done");
+    return maxActive;
+  }
+
+  it("does NOT cap two conversations' groups against each other — that was the shared-cap bug", async () => {
     const prev = process.env.SICLAW_SUBAGENT_CONCURRENCY;
-    process.env.SICLAW_SUBAGENT_CONCURRENCY = "4"; // limiter cap 4 → collective group cap 3
+    const prevPod = process.env.SICLAW_SUBAGENT_POD_CONCURRENCY;
+    process.env.SICLAW_SUBAGENT_CONCURRENCY = "4";      // per session: 4 → 3 group workers each
+    process.env.SICLAW_SUBAGENT_POD_CONCURRENCY = "50"; // box ceiling well clear
     try {
-      const mgr = new AgentBoxSessionManager() as any;
-      let active = 0;
-      let maxActive = 0;
-      for (let i = 0; i < 8; i++) {
-        (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
-          prompt: async () => {
-            active++;
-            maxActive = Math.max(maxActive, active);
-            await new Promise((r) => setTimeout(r, 10));
-            active--;
-            emitter.emit("event", {
-              type: "message_end",
-              message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
-            });
-          },
-          abort: async () => {},
-        }));
-      }
-      const mkReq = (id: string) => ({
-        description: `batch ${id}`,
-        renderedTasks: Array.from({ length: 4 }, (_, i) => ({ item: `${id}-t${i}`, prompt: `do ${id}-t${i}` })),
-        subagentType: "general-purpose",
-        runInBackground: false,
-        parentSessionId: `p-${id}`,
-        parentAgentId: null,
-        userId: "u1",
-        taskListId: "tl1",
-        spawnId: `grp-${id}`,
-      });
-      const exec = mgr.createSpawnSubagentExecutor();
-      const [a, b] = await Promise.all([
-        exec(mkReq("a"), undefined, undefined),
-        exec(mkReq("b"), undefined, undefined),
-      ]);
-      expect(a.status).toBe("done");
-      expect(b.status).toBe("done");
-      // Each group's own pool allows 3 workers (share = 4-1), so two groups would submit 6 and
-      // saturate the global limiter (4) without the shared groupChildLimiter. The collective cap
-      // keeps ALL group children at 3, leaving ≥1 global slot for an interactive single spawn.
+      const maxActive = await runTwoGroups(new AgentBoxSessionManager() as any);
+      // Under the old pod-wide cap of 4 this was 3 in total, so one conversation's batch
+      // decided how fast another's ran. Each session now gets its own 3.
+      expect(maxActive).toBe(6);
+    } finally {
+      if (prev === undefined) delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_CONCURRENCY = prev;
+      if (prevPod === undefined) delete process.env.SICLAW_SUBAGENT_POD_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_POD_CONCURRENCY = prevPod;
+    }
+  });
+
+  it("still reserves a box slot: group children collectively stay one below the pod ceiling", async () => {
+    const prev = process.env.SICLAW_SUBAGENT_CONCURRENCY;
+    const prevPod = process.env.SICLAW_SUBAGENT_POD_CONCURRENCY;
+    process.env.SICLAW_SUBAGENT_CONCURRENCY = "4";     // per session: 4 → both groups want 6 together
+    process.env.SICLAW_SUBAGENT_POD_CONCURRENCY = "4"; // box ceiling 4 → group reserve 3
+    try {
+      const maxActive = await runTwoGroups(new AgentBoxSessionManager() as any);
+      // Without the pod-level reserve the two groups would fill all 4 box slots and an
+      // interactive spawn — from any conversation — would queue behind a ten-minute child.
       expect(maxActive).toBe(3);
     } finally {
       if (prev === undefined) delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
       else process.env.SICLAW_SUBAGENT_CONCURRENCY = prev;
+      if (prevPod === undefined) delete process.env.SICLAW_SUBAGENT_POD_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_POD_CONCURRENCY = prevPod;
     }
   });
 

@@ -54,10 +54,18 @@ drain. A CA change takes the same hard-kill path.
 
 ### Two defects found while inspecting a live cluster
 
-- **Cert Secrets leak.** A `${podName}-cert` Secret is created per pod with no `ownerReferences`,
-  so nothing collects it when the pod goes. 47 orphans across four namespaces, the oldest 99 days.
 - **Completed pods are never reaped.** `restartPolicy: Never` plus a clean idle exit leaves the
-  pod in `Succeeded` indefinitely; the existing orphan sweep covers only capability boxes.
+  pod in `Succeeded` indefinitely; the orphan sweep covered only capability boxes.
+- **Cert Secrets leak.** 47 orphans across four namespaces, the oldest 99 days.
+
+  The cause is not what it first looks like. A pod name is already derived from the agentId
+  alone, so `${podName}-cert` is already **one Secret per agent** and a respawn replaces it —
+  there is no per-pod churn today. What leaked is simply that **nothing ever collected a chat
+  box's Secret** once its agent was gone: the sweep's scope was capability boxes, and its own
+  comment said chat Secrets were "not this sweep's contract".
+
+  Both were fixed by widening the sweep, which is why a per-agent certificate is listed below
+  as a **precondition for instance-suffixed pod names** rather than as the fix for this leak.
 
 ## Decision
 
@@ -128,8 +136,10 @@ certificate already means, not a compromise. Hostname verification is explicitly
 Runtime→box path (`src/gateway/agentbox/client.ts:151`), so sharing changes nothing about
 verification.
 
-This also **removes the Secret leak as a class** rather than patching it: the Secret's lifetime
-follows the agent, so pods come and go without leaving orphans.
+This is a **precondition for instance-suffixed pod names**, not a fix for the leak above (which
+the widened sweep handles). Once a pod is `agentbox-{agent}-{n}`, a pod-named Secret would become
+one per replica and churn with every scale change; anchoring the Secret to the agent keeps exactly
+one regardless of how many boxes the agent runs.
 
 **One thing must change in the same release.** Metrics federation is keyed on the `boxId` carried
 in the certificate (`src/gateway/internal-api.ts:730`); with a shared certificate every box
@@ -141,19 +151,44 @@ name in the request body instead. Shipping this later would mean the phase-1 met
 Today's cap of 4 is pod-wide, so one session's fan-out starves everyone else's. Per-session is the
 right shape — but it cannot be the only limit.
 
-| Limit | Guards against |
-|---|---|
-| **Per session: 10** | one conversation's batch starving its neighbours |
-| **Per pod: 50** | OOM |
+| Limit | Default | Guards against |
+|---|---|---|
+| **Per session** | 10 | one conversation's batch starving its neighbours |
+| **Per pod** | 50 | OOM |
 
 Without a pod ceiling, ten sessions × ten children is a hundred full agent sessions in one process.
-Queueing makes one user wait; **an OOMKill takes down every session on that box.** Both numbers
-ship as helm values, mirroring the existing `SICLAW_SUBAGENT_CONCURRENCY` env path
-(`subagent-registry.ts:97`). `groupChildLimiter` (`session.ts:461`) becomes per-session for the
-same reason.
+Queueing makes one user wait; **an OOMKill takes down every session on that box.**
 
 The pod ceiling of 50 is a **guess** — the only inputs are the measured idle floor (~200Mi) and the
 memory limit. Per-child-session memory has never been measured, which is what phase 1 is for.
+
+#### The reserve that keeps an interactive spawn from queueing behind a batch
+
+Today a group's children are held one below the single cap so an interactive `spawn_subagent`
+always finds a slot. That guarantee has to be restated at **both** levels, because each level has
+its own way of losing it:
+
+| Gate | Scope | Cap | Why it exists |
+|---|---|---|---|
+| group worker pool | one group | `min(S-1, items)` | a session keeps ≥1 of its own slots while its batch runs |
+| group reserve | pod | `P-1` | five sessions × ten-wide batches would otherwise fill all 50 |
+| session limiter | session | `S` | fair share between conversations |
+| pod limiter | pod | `P` | memory ceiling |
+
+Deriving the group worker pool from `S-1` rather than adding a fifth limiter is what keeps the
+intra-session reserve free. It holds for one group per session; two concurrent background groups in
+one session can still fill that session's own slots, which is a wait a user causes for themselves
+and can see.
+
+**Acquisition order is fixed: group reserve → session → pod.** Every path — plain spawn, map child,
+reduce child — takes them in that order or not at all. A holder of a pod slot therefore never waits
+on a session slot, so the wait-for graph has no cycle. This is the same strict-nesting argument the
+current two-limiter code relies on, extended by one level.
+
+`SICLAW_SUBAGENT_CONCURRENCY` **changes meaning**: pod-wide before, per-session after. That is the
+meaning operators already assume it has, and the new pod ceiling bounds what the reinterpretation
+can cost — but an existing deployment that lowered it as a memory guard is now guarding one
+conversation, not the box, and should move that number to the pod knob.
 
 ### Residency needs no new mechanism
 
@@ -238,7 +273,7 @@ replication, regions.
   the test cluster (`helm.sh/resource-policy: keep`; the CA is 48 days older than the Runtime pod).
 - **Memory stays disabled** unless `memoryDir` is first moved off the shared subPath — otherwise N
   processes write one SQLite file.
-- **Phases 5 and 6 ship together.** Once boxes are resident they never idle out, so without
+- **Phases 7 and 8 ship together.** Once boxes are resident they never idle out, so without
   image-mismatch draining a new AgentBox image can never take effect.
 
 ## Phasing
@@ -249,17 +284,23 @@ replication, regions.
    parent's `mcpManager` (`session.ts:1992` omits it, so each child takes the
    `new McpClientManager(...).initialize()` branch at `agent-factory.ts:459-462` — a child process
    per sub-agent per stdio server, awaited inside every spawn).
-3. **Pod identity and certificates** — instance-suffixed pod names; one certificate per agent;
-   `boxId` self-reported. Fixes both defects above. Still one box per agent, so no behaviour change.
-4. **Affinity and reporting** — the binding table; the box exposes which sessions it holds and
+3. **Defect sweep** — collect terminal chat boxes and orphaned cert Secrets. Independent of
+   everything else. *(done)*
+4. **Pod identity and certificates** — one certificate per agent, `boxId` self-reported, and the
+   instance suffix. **Instance 0 keeps today's unsuffixed name**; only replicas 1..N-1 are
+   suffixed, and the index lives in a label rather than being parsed back out of a name. Renaming
+   every existing pod would orphan each one behind a new name for no benefit at this phase.
+5. **Concurrency** — per-session 10 and a pod ceiling of 50, both from helm values. Moved ahead of
+   the multi-box work: it is the change users feel, it is what the reported slowness is actually
+   about, and phases 1–2 supplied the measurement and the memory headroom it needs.
+6. **Affinity and reporting** — the binding table; the box exposes which sessions it holds and
    whether it is drained. Behaviour still unchanged; the interfaces multi-box needs exist.
-5. **Fixed replicas** — the `replicas` field, the reconciliation loop, RR placement,
+7. **Fixed replicas** — the `replicas` field, the reconciliation loop, RR placement,
    `idle_timeout = 0`. Multi-box becomes real here.
-6. **Image-mismatch draining** — plus `terminationGracePeriodSeconds`, the breaking-release flag,
-   and the frontend's interrupted-turn surface. **Same release as phase 5.**
-7. **Concurrency** — per-session 10 and a pod ceiling of 50, both from helm values.
+8. **Image-mismatch draining** — plus `terminationGracePeriodSeconds`, the breaking-release flag,
+   and the frontend's interrupted-turn surface. **Same release as phase 7.**
 
-Phases 1–3 are worth doing whether or not multi-box ships.
+Phases 1–5 are worth doing whether or not multi-box ships.
 
 ## Open
 

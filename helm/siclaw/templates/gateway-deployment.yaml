@@ -105,10 +105,14 @@ spec:
             {{- end }}
             {{- end }}
             {{- if .Values.runtime.subagentConcurrency }}
-            # Forwarded by the runtime spawner into each AgentBox pod; if unset the
-            # agentbox falls back to its built-in default (5).
+            # Both are read inside the AgentBox; the spawner forwards them into the
+            # PodSpec. Unset ⇒ the agentbox falls back to its own defaults (10 / 50).
             - name: SICLAW_SUBAGENT_CONCURRENCY
               value: {{ .Values.runtime.subagentConcurrency | quote }}
+            {{- end }}
+            {{- if .Values.runtime.subagentPodConcurrency }}
+            - name: SICLAW_SUBAGENT_POD_CONCURRENCY
+              value: {{ .Values.runtime.subagentPodConcurrency | quote }}
             {{- end }}
             {{- if .Values.agentbox.persistence.enabled }}
             # Global default policy: callers that omit per-agent persistence use the PVC.

@@ -6,6 +6,7 @@ import {
   getSubagentGroupMaxRuntimeMs, GROUP_RUNTIME_FLOOR_MS, DEFAULT_GROUP_RUNTIME_HARD_CAP_MS,
   getGroupWorkerShare, getGroupItemBudgetMs, DEFAULT_GROUP_ITEM_BUDGET_MS,
   getGroupHardCapMs, isSubagentGroupEnabled, parsePositiveIntEnv,
+  getSubagentPodConcurrency, getGroupPodShare,
 } from "./subagent-registry.js";
 
 describe("getSubagentMaxRuntimeMs", () => {
@@ -72,10 +73,25 @@ describe("getSubagentGroupMaxRuntimeMs", () => {
 });
 
 describe("getGroupWorkerShare", () => {
-  it("is concurrency - 1, floored at 1", () => {
-    expect(getGroupWorkerShare({})).toBe(3); // default concurrency 4
+  it("is per-SESSION concurrency - 1, floored at 1", () => {
+    expect(getGroupWorkerShare({})).toBe(9); // default per-session concurrency 10
     expect(getGroupWorkerShare({ SICLAW_SUBAGENT_CONCURRENCY: "1" })).toBe(1);
     expect(getGroupWorkerShare({ SICLAW_SUBAGENT_CONCURRENCY: "8" })).toBe(7);
+  });
+});
+
+describe("pod-wide sub-agent ceiling", () => {
+  it("defaults to 50, with the group share one below it", () => {
+    expect(getSubagentPodConcurrency({})).toBe(50);
+    expect(getGroupPodShare({})).toBe(49);
+  });
+  it("is read independently of the per-session knob", () => {
+    const env = { SICLAW_SUBAGENT_CONCURRENCY: "10", SICLAW_SUBAGENT_POD_CONCURRENCY: "20" };
+    expect(getSubagentPodConcurrency(env)).toBe(20);
+    expect(getGroupPodShare(env)).toBe(19);
+  });
+  it("floors the group share at 1, so a ceiling of 1 still admits a group child", () => {
+    expect(getGroupPodShare({ SICLAW_SUBAGENT_POD_CONCURRENCY: "1" })).toBe(1);
   });
 });
 

@@ -331,7 +331,10 @@ export class K8sSpawner implements BoxSpawner {
       }
 
       const AGENTBOX_FORWARDED_ENV = [
+        // Sub-agent capacity: per conversation, and the box-wide ceiling. Both are read
+        // inside the box, so forwarding is what makes the runtime-level setting real.
         "SICLAW_SUBAGENT_CONCURRENCY",
+        "SICLAW_SUBAGENT_POD_CONCURRENCY",
         // Embedding endpoint for the memory indexer. The agentbox reads these via
         // loadConfig() env overrides (config.ts); set on the runtime deployment to
         // configure every normal AgentBox it spawns.
