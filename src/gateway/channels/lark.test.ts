@@ -149,6 +149,11 @@ function makeTextEvent(text: string, overrides: Record<string, unknown> = {}, se
   };
 }
 
+/** The personal wrapper returns {binding, denied}; group callers still get the bare binding. */
+function wrapBinding(binding: unknown) {
+  return { binding };
+}
+
 function makeBinding(overrides: Record<string, unknown> = {}) {
   return {
     agentId: "a1",
@@ -391,13 +396,13 @@ describe("handleLarkMessage — PAIR command", () => {
 
 describe("handleLarkMessage — personal bot p2p", () => {
   it("uses personal_bot.channel_id for p2p binding inside a shared Feishu app handler", async () => {
-    resolvePersonalBindingMock.mockResolvedValue(makeBinding({
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({
       bindingId: "pb-1",
       sessionId: "session-open-ou1",
       sessionKey: "open_id:ou_user_1",
       routeType: "user",
       createdBy: "owner-1",
-    }));
+    })));
     promptMock.mockResolvedValue({ sessionId: "session-open-ou1" });
     streamEventsMock.mockImplementation(async function* () { /* empty */ });
 
@@ -427,13 +432,13 @@ describe("handleLarkMessage — personal bot p2p", () => {
   });
 
   it("open mode resolves a p2p sender and uses the returned per-openid session", async () => {
-    resolvePersonalBindingMock.mockResolvedValue(makeBinding({
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({
       bindingId: "personal-bot-1",
       sessionId: "session-open-ou1",
       sessionKey: "open_id:ou_user_1",
       routeType: "user",
       createdBy: "owner-1",
-    }));
+    })));
     promptMock.mockResolvedValue({ sessionId: "session-open-ou1" });
     streamEventsMock.mockImplementation(async function* () { /* empty */ });
 
@@ -467,8 +472,8 @@ describe("handleLarkMessage — personal bot p2p", () => {
     }));
   });
 
-  it("authorized mode prompts for Sicore OAuth authorization when the open_id is not bound", async () => {
-    resolvePersonalBindingMock.mockResolvedValue(null);
+  it("a gated tier with no refusal reason still answers, with the console URL when configured", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null });
     const lark = makeLarkClient();
 
     await handleLarkMessage(
@@ -483,8 +488,11 @@ describe("handleLarkMessage — personal bot p2p", () => {
     );
 
     expect(promptMock).not.toHaveBeenCalled();
-    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("授权飞书账号");
-    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("https://sicore.example/siclaw/a1?tab=channels");
+    const reply = lark.im.message.reply.mock.calls[0][0].data.content as string;
+    // Generic notice: what makes a refusal specific is the frontend's `denied`, not the tier name.
+    // The copy no longer names the system that holds the authorization — the sender doesn't need it.
+    expect(reply).toContain("需要先获得授权");
+    expect(reply).toContain("?tab=channels");   // console URL from config still appended
   });
 
   it("authorized p2p PAIR consumes the personal pairing code instead of group binding", async () => {
@@ -507,14 +515,42 @@ describe("handleLarkMessage — personal bot p2p", () => {
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("授权成功");
   });
 
+  it("forwards PAIR on any gated tier, not just the legacy spelling", async () => {
+    // Keying this branch on `sicore_authorized` alone told a gated bot's users "this bot is open,
+    // no PAIR needed" and discarded their code — a gated bot described as public.
+    for (const tier of ["identified", "granted", "some_future_tier"]) {
+      handlePersonalPairingCodeMock.mockResolvedValue({ success: true, agentName: "Secure Agent" });
+      const lark = makeLarkClient();
+      await handleLarkMessage(
+        makeTextEvent("PAIR abc123", { chat_type: "p2p" }),
+        lark, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
+        "zh-CN", makePersonalConfig(tier as any),
+      );
+      expect(handlePersonalPairingCodeMock, `tier=${tier}`).toHaveBeenCalled();
+      expect(lark.im.message.reply.mock.calls[0][0].data.content, `tier=${tier}`).not.toContain("不需要 PAIR");
+      handlePersonalPairingCodeMock.mockClear();
+    }
+  });
+
+  it("still rejects PAIR on an open tier", async () => {
+    const lark = makeLarkClient();
+    await handleLarkMessage(
+      makeTextEvent("PAIR abc123", { chat_type: "p2p" }),
+      lark, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "zh-CN", makePersonalConfig("public" as any),
+    );
+    expect(handlePersonalPairingCodeMock).not.toHaveBeenCalled();
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("不需要 PAIR");
+  });
+
   it("p2p /new resets only the current personal session", async () => {
-    resolvePersonalBindingMock.mockResolvedValue(makeBinding({
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({
       bindingId: "personal-bot-1",
       sessionId: "old-personal",
       sessionKey: "sicore_user:user-1",
       routeType: "user",
       createdBy: "user-1",
-    }));
+    })));
     resetPersonalSessionMock.mockResolvedValue({
       success: true,
       agentId: "a1",
@@ -634,9 +670,33 @@ describe("handleLarkMessage — routing to AgentBox", () => {
 
     const replyArg = lark.im.message.reply.mock.calls[0][0];
     const text = JSON.parse(replyArg.data.content).text as string;
-    expect(text).toContain("https://sicore.example/auth");
+    // Sent to the private chat, NOT handed a URL in front of the whole room: the group reply is
+    // visible to everyone, and the real next step differs per sender (link vs request access) —
+    // the DM resolves that and can deliver a single-use link, which must never be posted here.
+    expect(text).toContain("私聊我");
+    expect(text).not.toContain("http");   // no URL of any kind reaches the room
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("group-only channel keeps the console URL — there is no DM that would answer", async () => {
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", authorizeUrl: "https://console.example/auth" });
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hi"), lark, "lark-runtime", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN",
+      // No personal_bot: telling this sender to DM would send them somewhere that never replies.
+      { app_id: "cli_x", app_secret: "secret" },
+    );
+
+    const text = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text as string;
+    expect(text).not.toContain("私聊我");
+    // The URL is the sender's OWN authorization page, so the copy tells them to open it rather
+    // than sending them to an admin who cannot link their account for them.
+    expect(text).toContain("请打开下面的链接");
+    expect(text).not.toContain("管理员");
+    expect(text).toContain("https://console.example/auth");
   });
 
   it("backfills the binding display name once when the platform reports a new title", async () => {
@@ -3118,6 +3178,373 @@ describe("extractInbound — post receive shapes", () => {
   });
 });
 
+// ── Personal-chat admission refusals ───────────────────────────────
+//
+// The frontend owns the decision; the runtime's gate is only "did a binding come back". What is
+// tested here is what the sender is TOLD — a gated tier answering with silence is
+// indistinguishable from a broken bot, and copy that says "go link your account" to someone who
+// already linked it sends them in circles.
+
+describe("handleLarkMessage — personal access denial", () => {
+  const ACTION_URL = "https://upstream.example/siclaw/agent-access/9f3a2b";
+
+  // `makeLarkClient()` has NO cardkit, so card creation fails and the handler degrades to the text
+  // form — which means the text-asserting tests below are exercising the FALLBACK path. This
+  // client has cardkit and therefore takes the card path.
+  function makeCardClient() {
+    return {
+      im: { message: { reply: vi.fn().mockResolvedValue({}) } },
+      cardkit: {
+        v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "CARD-DENY" } }) } },
+      },
+    };
+  }
+
+  const sentCard = (lark: ReturnType<typeof makeCardClient>) =>
+    JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data);
+
+  function sendGated(
+    lark: ReturnType<typeof makeLarkClient>,
+    accessMode = "identified",
+    overrides: Record<string, unknown> = {},
+  ) {
+    return handleLarkMessage(
+      makeTextEvent("查一下集群", { chat_type: "p2p" }),
+      lark,
+      "personal-bot-1",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      makePersonalConfig(accessMode as any, overrides),
+    );
+  }
+
+  const denialText = (lark: ReturnType<typeof makeLarkClient>) =>
+    lark.im.message.reply.mock.calls[0][0].data.content as string;
+
+  it("renders the link-account reason with a DERIVED expiry, not a hard-coded TTL", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      // A few seconds ABOVE a whole minute: the renderer floors (never overstating a single-use
+      // link), so sitting just under 10min would legitimately read 9 and the assertion would be
+      // asserting the wrong thing.
+      denied: { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 10 * 60_000 + 5_000 },
+    });
+    const lark = makeLarkClient();
+
+    await sendGated(lark);
+
+    const reply = denialText(lark);
+    expect(reply).toContain("需要先关联账号");
+    expect(reply).toContain(ACTION_URL);
+    expect(reply).toContain("10 分钟内");        // from expiresAtMs, never a constant
+    expect(promptMock).not.toHaveBeenCalled();  // never enters the conversation
+  });
+
+  it("does NOT tell an already-linked sender to link again", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "access_request_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = makeLarkClient();
+
+    await sendGated(lark, "granted");
+
+    const reply = denialText(lark);
+    expect(reply).toContain("申请");
+    expect(reply).not.toContain("关联账号");     // they already did that
+    expect(reply).toContain(ACTION_URL);
+  });
+
+  it("offers no link when self-service is closed", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null, denied: { reason: "access_denied" } });
+    const lark = makeLarkClient();
+
+    await sendGated(lark, "granted");
+
+    expect(denialText(lark)).toContain("负责人");
+    expect(denialText(lark)).not.toContain("http");
+  });
+
+  it("renders English copy for a global-domain channel", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("check the cluster", { chat_type: "p2p" }),
+      lark, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "en-US", makePersonalConfig("identified" as any),
+    );
+
+    expect(denialText(lark)).toContain("linking your account");
+    expect(denialText(lark)).toContain("within 1 minute");
+  });
+
+  it("falls back to the frontend message on an unknown reason, without duplicating the link", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "some_future_reason", actionUrl: ACTION_URL, message: `Do this: ${ACTION_URL}` },
+    });
+    const lark = makeLarkClient();
+
+    await sendGated(lark);
+
+    const reply = denialText(lark);
+    expect(reply).toContain("Do this:");
+    // The message already embeds whatever link the frontend wanted shown.
+    expect(reply.split(ACTION_URL).length - 1).toBe(1);
+  });
+
+  it("sends a live link as a card with an action button, keeping the URL off the text body", async () => {
+    // A bare URL in a text message gets unfurled by the client, and an automated fetch of a
+    // one-time token can burn the sender's only chance to use it. The URL therefore lives on the
+    // button and nowhere else.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 10 * 60_000 + 5_000 },
+    });
+    const lark = makeCardClient();
+
+    await sendGated(lark as any);
+
+    const card = sentCard(lark);
+    const json = JSON.stringify(card);
+    expect(card.schema).toBe("2.0");
+    // CardKit rejected a bare body-level `button` and a `note` element (create returned no
+    // card_id and the handler degraded to text). Only the shapes already proven in production.
+    const elements = (card as any).body.elements as any[];
+    expect(elements.some((e) => e.tag === "note")).toBe(false);
+    expect(elements.some((e) => e.tag === "button")).toBe(false);
+    const buttonHost = elements.find((e) => e.tag === "column_set");
+    expect(buttonHost.columns[0].elements[0].tag).toBe("button");
+    expect(json).toContain("关联账号");                       // reason-specific button label
+    expect(json).toContain("open_url");
+    expect(json).toContain(ACTION_URL);                       // on the button
+    expect(json).toContain("10 分钟内有效");                   // derived footnote
+    // Posted as an interactive card, and the text payload never carries the link.
+    const posted = lark.im.message.reply.mock.calls[0][0];
+    expect(posted.data.msg_type).toBe("interactive");
+    expect(posted.data.content).not.toContain(ACTION_URL);
+  });
+
+  it("labels the button for the request-access reason", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "access_request_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = makeCardClient();
+
+    await sendGated(lark as any, "granted");
+
+    expect(JSON.stringify(sentCard(lark))).toContain("申请权限");
+  });
+
+  it("falls back to the text form when the card cannot be created", async () => {
+    // The link is the whole point of the message: losing the card must never mean losing the link.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = makeCardClient();
+    lark.cardkit.v1.card.create.mockRejectedValue(new Error("cardkit unavailable"));
+
+    await sendGated(lark as any);
+
+    const posted = lark.im.message.reply.mock.calls[0][0];
+    expect(posted.data.msg_type).toBe("text");
+    expect(posted.data.content).toContain(ACTION_URL);
+  });
+
+  it("uses text, not a card, when there is no live link to put on a button", async () => {
+    for (const denied of [
+      { reason: "access_denied" },                                                        // no link at all
+      { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() - 1 }, // already dead
+    ]) {
+      resolvePersonalBindingMock.mockResolvedValue({ binding: null, denied });
+      const lark = makeCardClient();
+      await sendGated(lark as any, "granted");
+      expect(lark.cardkit.v1.card.create, `reason=${denied.reason}`).not.toHaveBeenCalled();
+      expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("text");
+    }
+  });
+
+  it("does not treat an Object.prototype key as a template", async () => {
+    // `reason` is frontend-controlled. An object lookup would return Object.prototype.toString
+    // here — truthy, so the message fallback is skipped, and the reply becomes a Function that
+    // JSON-serializes to `{}`; the platform rejects it and the sender gets nothing at all.
+    for (const reason of ["toString", "constructor", "__proto__", "hasOwnProperty"]) {
+      resolvePersonalBindingMock.mockResolvedValue({
+        binding: null,
+        denied: { reason, message: "Contact your admin." },
+      });
+      const lark = makeLarkClient();
+      await sendGated(lark);
+      const reply = denialText(lark);
+      expect(reply, `reason=${reason}`).toContain("Contact your admin.");
+      // A prototype hit would render the function source, or serialize to {"text":{}}.
+      expect(reply, `reason=${reason}`).not.toContain("native code");
+      expect(reply, `reason=${reason}`).not.toContain('"text":{}');
+    }
+  });
+
+  it("tells the sender to resend instead of handing over an already-expired link", async () => {
+    // Reachable through ordinary clock skew + event-delivery latency, not just a stale send. The
+    // frontend mints a fresh link on the next message, so resending is the real recovery.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() - 1_000 },
+    });
+    const lark = makeLarkClient();
+
+    await sendGated(lark);
+
+    const reply = denialText(lark);
+    expect(reply).toContain("已过期");
+    expect(reply).toContain("再发一条消息");
+    expect(reply).not.toContain(ACTION_URL);   // never hand over a dead link
+  });
+
+  it("never overstates how long a single-use link lasts", async () => {
+    // 91s must not read "2 minutes" — a sender who follows that at 1m50s finds it already gone.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 91_000 },
+    });
+    const lark = makeLarkClient();
+
+    await sendGated(lark);
+
+    expect(denialText(lark)).toContain("1 分钟内");
+  });
+
+  it("never truncates the link — only the frontend's prose is capped", async () => {
+    // Capping the rendered result severed long URLs, handing the sender a mutilated dead link with
+    // no hint it was cut — the very outcome the expired-link branch exists to prevent. The
+    // platform's text limit sits far above anything rendered here, so the trade bought nothing.
+    const longUrl = `https://x/${"y".repeat(5000)}`;
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "binding_required", actionUrl: longUrl, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = makeLarkClient();
+
+    await sendGated(lark);
+
+    expect(denialText(lark)).toContain(longUrl);   // intact, not sliced
+  });
+
+  it("answers even on an open tier when the refusal cannot be rendered", async () => {
+    // An explicit refusal we have no template for is STILL a refusal. Gating the silent branch on
+    // the tier alone swallowed it on public/open — the exact "bot looks dead" failure this feature
+    // exists to remove.
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null, denied: { reason: "quota_exceeded" } });
+    for (const tier of ["public", "open"]) {
+      const lark = makeLarkClient();
+      await sendGated(lark, tier);
+      expect(denialText(lark), `tier=${tier}`).toContain("需要先获得授权");
+    }
+  });
+
+  it("offers no link or button for a reason with no self-service step", async () => {
+    // access_denied means "ask the owner". An actionUrl arriving on it must not become a generic
+    // "Continue" button, nor a "click within N minutes" line contradicting the sentence above it.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "access_denied", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 600_000 },
+    });
+    const lark = makeCardClient();
+
+    await sendGated(lark as any, "granted");
+
+    expect(lark.cardkit.v1.card.create).not.toHaveBeenCalled();
+    const reply = lark.im.message.reply.mock.calls[0][0].data.content as string;
+    expect(reply).toContain("负责人");
+    expect(reply).not.toContain(ACTION_URL);
+    expect(reply).not.toContain("分钟内");
+  });
+
+  it("tells the sender to open their own authorization page, not to find an admin", async () => {
+    // The configured console URL IS the sender's self-service page; an admin cannot link someone
+    // else's chat account, so naming an admin while dangling that link is a dead end.
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null });
+    const lark = makeLarkClient();
+
+    await sendGated(lark, "granted", { authorize_url: "https://console.example/authz" });
+
+    const reply = denialText(lark);
+    expect(reply).toContain("请打开下面的链接");
+    expect(reply).toContain("https://console.example/authz");
+    expect(reply).not.toContain("管理员");
+  });
+
+  it("names an admin only when there is no link the sender could use", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null });
+    const lark = makeLarkClient();
+
+    await sendGated(lark, "granted");   // no authorize_url configured
+
+    expect(denialText(lark)).toContain("请联系管理员");
+  });
+
+  it("truncates a pathological message instead of losing the reply to a size limit", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "unknown", message: "x".repeat(5000) },
+    });
+    const lark = makeLarkClient();
+
+    await sendGated(lark);
+
+    expect(denialText(lark).length).toBeLessThan(1100);
+  });
+
+  it("still answers a gated tier when the frontend sends no reason at all", async () => {
+    // Regression: any tier this build did not recognise used to fall through to a log line only,
+    // so the sender's message vanished with no reply and the bot looked dead.
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null });
+    for (const tier of ["identified", "granted", "some_future_tier"]) {
+      const lark = makeLarkClient();
+      await sendGated(lark, tier);
+      expect(denialText(lark), `tier=${tier}`).toContain("需要先获得授权");
+    }
+  });
+
+  it("stays silent for an open tier with no binding — an anomaly, not a refusal", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({ binding: null });
+    for (const tier of ["public", "open"]) {
+      const lark = makeLarkClient();
+      await sendGated(lark, tier);
+      expect(lark.im.message.reply, `tier=${tier}`).not.toHaveBeenCalled();
+    }
+  });
+
+  it("re-evaluates every message, so linking in another tab is picked up on the next one", async () => {
+    const admitted = wrapBinding(makeBinding({
+      bindingId: "personal-bot-1", sessionKey: "open_id:ou_user_1", routeType: "user", createdBy: "u1",
+    }));
+    // The admitted message resolves twice — once before enqueue, once after dequeue to catch
+    // revocation — so the granted value must be the standing default, not a single `once`.
+    resolvePersonalBindingMock
+      .mockResolvedValue(admitted)
+      .mockResolvedValueOnce({ binding: null, denied: { reason: "binding_required", actionUrl: ACTION_URL } });
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+
+    const first = makeLarkClient();
+    await sendGated(first);
+    expect(denialText(first)).toContain(ACTION_URL);
+
+    const second = makeLarkClient();
+    await sendGated(second);
+    expect(resolvePersonalBindingMock.mock.calls.length).toBeGreaterThanOrEqual(2);  // not cached
+    expect(promptMock).toHaveBeenCalled();                                           // admitted on the retry
+  });
+});
+
 // ── /apikey — self-service API key issuing (personal chat only) ─────
 //
 // Contract under test (docs/design/2026-07-28-feishu-apikey-command.md):
@@ -3163,6 +3590,53 @@ describe("handleLarkMessage — /apikey", () => {
     expect(promptMock).not.toHaveBeenCalled();             // never reaches the agent
   });
 
+  it("delivers the pickup link as a card with a button, not as an unfurlable URL", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: true, pickupUrl: PICKUP, expiresAt: Date.now() + 5 * 60_000 + 5_000, rotated: true,
+    });
+    const lark = {
+      im: { message: { reply: vi.fn().mockResolvedValue({}) } },
+      cardkit: { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "CARD-KEY" } }) } } },
+    };
+
+    await handleLarkMessage(
+      makeTextEvent("/apikey", { chat_type: "p2p" }),
+      lark as any, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "zh-CN", makePersonalConfig("open"),
+    );
+
+    const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));
+    expect(card).toContain("查看 API Key");     // button label
+    expect(card).toContain("open_url");
+    expect(card).toContain(PICKUP);             // on the button only
+    expect(card).toContain("旧 Key 已失效");     // rotation warning survives the card form
+    expect(card).toContain("5 分钟内有效");      // derived from expiresAt
+    const posted = lark.im.message.reply.mock.calls[0][0];
+    expect(posted.data.msg_type).toBe("interactive");
+    expect(posted.data.content).not.toContain(PICKUP);
+  });
+
+  it("escalates when a committed rotation's card AND its text fallback both fail", async () => {
+    // The rotation already happened, so losing both delivery paths means the sender's old key is
+    // dead with no link to show for it — that must not pass silently.
+    issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: PICKUP, rotated: true });
+    const errors: string[] = [];
+    (console.error as any).mockImplementation((...args: unknown[]) => { errors.push(args.join(" ")); });
+    const lark = {
+      im: { message: { reply: vi.fn().mockResolvedValue({ code: 99991672 }) } },
+      cardkit: { v1: { card: { create: vi.fn().mockRejectedValue(new Error("cardkit down")) } } },
+    };
+
+    await handleLarkMessage(
+      makeTextEvent("/apikey", { chat_type: "p2p" }),
+      lark as any, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "zh-CN", makePersonalConfig("open"),
+    );
+
+    expect(errors.join("\n")).toContain("UNDELIVERED after rotation");
+    expect(errors.join("\n")).not.toContain(PICKUP);
+  });
+
   it("warns that the previous key died when the frontend reports a rotation", async () => {
     issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: PICKUP, rotated: true });
     const lark = makeLarkClient();
@@ -3170,6 +3644,61 @@ describe("handleLarkMessage — /apikey", () => {
     await sendPersonal("/apikey", lark);
 
     expect(replyText(lark)).toContain("旧 Key 已失效");
+  });
+
+  it("refuses with ONE ❌ about getting a key, and says how to resume", async () => {
+    // The bug this replaces: two stacked ❌ lines for one refusal, the second talking about
+    // "using this assistant" when the sender had asked for a key — and nothing telling them that
+    // after linking they must send /apikey again, so the flow looked broken.
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: false,
+      denied: { reason: "binding_required", actionUrl: PICKUP, expiresAtMs: Date.now() + 9 * 60_000 + 5_000 },
+    });
+    const lark = makeLarkClient();   // no cardkit → text fallback
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply.split("❌").length - 1).toBe(1);        // exactly one
+    expect(reply).toContain("领取 API Key 需要先关联账号");
+    expect(reply).not.toContain("使用这个助手");           // wrong action
+    expect(reply).toContain("回来重发 /apikey");           // how to resume
+  });
+
+  it("sends an /apikey refusal as a card when it carries a live link", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: false,
+      denied: { reason: "access_request_required", actionUrl: PICKUP, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = {
+      im: { message: { reply: vi.fn().mockResolvedValue({}) } },
+      cardkit: { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "CARD-DENY" } }) } } },
+    };
+
+    await handleLarkMessage(
+      makeTextEvent("/apikey", { chat_type: "p2p" }),
+      lark as any, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "zh-CN", makePersonalConfig("open"),
+    );
+
+    const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));
+    expect(card).toContain("需要该 Agent 的使用授权");
+    expect(card).toContain("审批通过后回来重发");
+    expect(card).toContain("申请权限");     // button label
+    expect(card).toContain(PICKUP);
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).not.toContain(PICKUP);
+  });
+
+  it("gives no link for a closed-self-service /apikey refusal", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({ success: false, denied: { reason: "access_denied" } });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("未开放自助申请");
+    expect(reply).not.toContain("http");
+    expect(reply).not.toContain("重发 /apikey");   // nothing for them to retry into
   });
 
   it("surfaces the frontend's failure reason verbatim", async () => {

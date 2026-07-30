@@ -470,6 +470,16 @@ async function selectPersonalChannel(
   };
 }
 
+/**
+ * True for the tiers that admit anyone. `public` is the modern spelling of `open` — both must be
+ * accepted here or a `public` personal bot never auto-binds, the runtime sees a null binding with
+ * no refusal reason, treats the tier as open, and answers the sender with silence.
+ */
+function isOpenPersonalTier(accessMode: unknown): boolean {
+  const mode = typeof accessMode === "string" ? accessMode.trim().toLowerCase() : "";
+  return mode === "open" || mode === "public";
+}
+
 async function resolvePersonalChannelBinding(
   db: Db,
   channelId: string,
@@ -478,7 +488,7 @@ async function resolvePersonalChannelBinding(
   const channel = await selectPersonalChannel(db, channelId);
   const personalBot = channel?.config.personal_bot;
   if (!channel || !personalBot?.agent_id || !senderOpenId.trim()) return null;
-  if (personalBot.access_mode !== "open") {
+  if (!isOpenPersonalTier(personalBot.access_mode)) {
     return null;
   }
   const sessionKey = `open_id:${senderOpenId.trim()}`;
@@ -537,7 +547,7 @@ async function resolveOpenGroupBinding(
   const channel = await selectPersonalChannel(db, channelId);
   const personalBot = channel?.config.personal_bot;
   if (!channel || !personalBot?.agent_id) return null;
-  if (personalBot.access_mode !== "open") return null;
+  if (!isOpenPersonalTier(personalBot.access_mode)) return null;
   if (personalBot.group_auto_bind === false) return null;
 
   const createdBy = personalBot.owner_user_id ?? channel.created_by;
@@ -3162,7 +3172,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("channel.pairPersonal", async () => ({
     success: false,
-    error: "Sicore authorization is only available through the Sicore adapter",
+    error: "Personal-bot authorization is only available in Upstream mode",
   }));
 
   // Channel-issued API keys (the `/apikey` personal-chat command) are an Upstream-mode

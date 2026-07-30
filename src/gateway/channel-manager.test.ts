@@ -133,11 +133,27 @@ describe("personal binding RPC wrappers", () => {
     const binding = { agentId: "a1", bindingId: "pb1", sessionId: "s1", sessionKey: "open_id:ou_1", createdBy: "owner", routeType: "user" };
     frontend.responses.set("channel.resolvePersonalBinding", { binding });
     const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
-    expect(result).toEqual(binding);
+    expect(result).toEqual({ binding });
     expect(frontend.calls[0]).toEqual({
       method: "channel.resolvePersonalBinding",
       params: { channel_id: "pb1", sender_open_id: "ou_1" },
     });
+  });
+
+  it("carries the refusal reason through instead of collapsing it to null", async () => {
+    // Dropping everything but `binding` is what forced the runtime to emit one generic "no
+    // access" line, leaving a gated user with no idea what to do next.
+    const denied = { reason: "binding_required", actionUrl: "https://x/y", expiresAtMs: 1785300000000 };
+    frontend.responses.set("channel.resolvePersonalBinding", { binding: null, denied });
+    const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+    expect(result).toEqual({ binding: null, denied });
+  });
+
+  it("omits denied for a frontend that predates the field", async () => {
+    frontend.responses.set("channel.resolvePersonalBinding", { binding: null });
+    const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+    expect(result).toEqual({ binding: null });
+    expect("denied" in result).toBe(false);
   });
 
   it("pairs a personal Sicore user binding", async () => {

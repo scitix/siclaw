@@ -73,6 +73,34 @@ export function isChannelAccessDenied(
 }
 
 /**
+ * Why a PERSONAL-chat sender was turned away, plus the self-service next step.
+ *
+ * Deliberately NOT merged with {@link ChannelAccessDenied}, despite the overlap: that type's
+ * `authorizeUrl` is a shareable console address, while `actionUrl` here is a SINGLE-USE personal
+ * credential. A one-time link must never reach a group — anyone in the room could open it and
+ * bind the sender's chat identity to their own account, after which the victim's messages execute
+ * as the attacker. Keeping the types apart encodes "group fields must not carry a one-time token"
+ * in the signature instead of relying on everyone remembering it. Render both next to each other
+ * (see the personal/group reply builders) so the copy cannot drift.
+ */
+export interface PersonalAccessDenied {
+  /** Contract field — drives which localized template renders. */
+  reason?: string;
+  /** Single-use next step (link/apply). Absent when the tier accepts no self-service. */
+  actionUrl?: string;
+  /** Epoch ms the `actionUrl` dies. Render durations FROM this, never hard-code the TTL. */
+  expiresAtMs?: number;
+  /** Non-localized English fallback, used only when `reason` has no template. May embed the URL. */
+  message?: string;
+}
+
+/** Resolved personal-chat access: a binding to proceed with, or the reason it was refused. */
+export interface PersonalBindingResult {
+  binding: ResolvedChannelBinding | null;
+  denied?: PersonalAccessDenied;
+}
+
+/**
  * Resolve agent_id for a (channel_id, route_key) pair via RPC.
  *
  * `senderOpenId` is threaded so the Portal can resolve a per-sender identity
@@ -188,16 +216,29 @@ export async function resetBindingSession(
   });
 }
 
+/**
+ * Resolve a personal-chat sender's binding, or why they were refused.
+ *
+ * Returns the refusal alongside the binding rather than just `binding ?? null`: without the
+ * reason the runtime can only emit one generic "no access" line, which leaves a user on a
+ * gated tier with no idea what to do next — the tier is then effectively unusable. A frontend
+ * that does not populate `denied` simply yields `{ binding: null }` and the caller falls back
+ * to its generic refusal, so this stays backward compatible.
+ */
 export async function resolvePersonalBinding(
   channelId: string,
   senderOpenId: string,
   frontendClient: FrontendWsClient,
-): Promise<ResolvedChannelBinding | null> {
+): Promise<PersonalBindingResult> {
   const data = await frontendClient.request("channel.resolvePersonalBinding", {
     channel_id: channelId,
     sender_open_id: senderOpenId,
   });
-  return data.binding ?? null;
+  const denied = data?.denied;
+  return {
+    binding: data?.binding ?? null,
+    ...(denied && typeof denied === "object" ? { denied: denied as PersonalAccessDenied } : {}),
+  };
 }
 
 export async function handlePersonalPairingCode(
@@ -237,8 +278,14 @@ export interface PersonalApiKeyIssueResult {
   expiresAt?: number;
   /** True ⇒ the requester's previous key was just invalidated. */
   rotated?: boolean;
-  /** Already user-facing wording — surface it verbatim, do not rewrite. */
+  /** Non-localized English fallback. Surfaced verbatim only when `denied` yields no template. */
   error?: string;
+  /**
+   * Present only on the AUTHORIZATION refusal (the other failure exits carry `error` alone).
+   * Preferred over `error` when this build has a template for the reason, so a gated user gets
+   * localized copy plus a self-service link instead of an English sentence.
+   */
+  denied?: PersonalAccessDenied;
 }
 
 /** Result of `/apikey status` — read-only, never rotates. */
