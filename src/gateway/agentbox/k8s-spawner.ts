@@ -766,8 +766,12 @@ export class K8sSpawner implements BoxSpawner {
    *     completed run used to leave behind (the relay-close stop now covers
    *     the common path; this sweep covers crashes, runtime restarts, and
    *     pre-existing debris).
-   * Chat agent boxes (boxType "agent") are NEVER touched — they have their own
-   * idle self-destruct lifecycle.
+   * A RUNNING chat agent box (boxType "agent") is never touched — its idle
+   * self-destruct owns that lifecycle, and the `isLive` oracle is scoped to
+   * capability runs, so it cannot speak for a chat agent at all. A TERMINAL one is
+   * reaped: `restartPolicy: Never` plus the clean exit that self-destruct performs
+   * leaves the pod `Succeeded` forever, and the next spawn creates a fresh pod under
+   * the same name rather than reviving it. Nothing else collects those.
    */
   async sweepOrphans(isLive: (runRef: string) => boolean | Promise<boolean>): Promise<void> {
     const { namespace, labelPrefix } = this.config;
@@ -779,12 +783,22 @@ export class K8sSpawner implements BoxSpawner {
       const name = pod.metadata?.name;
       if (!name) continue;
       const boxType = pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent";
-      if (!capabilityTypes.has(boxType)) {
-        keptPods.add(name); // not ours to manage — its Secret is kept too
-        continue;
-      }
       const phase = pod.status?.phase;
       const terminal = phase === "Succeeded" || phase === "Failed";
+      if (!capabilityTypes.has(boxType)) {
+        if (!terminal) {
+          keptPods.add(name); // live chat box — not ours to manage; its Secret is kept too
+          continue;
+        }
+        console.log(`[k8s-spawner] orphan sweep: removing terminal chat box ${name} (phase=${phase})`);
+        try {
+          await this.stop(name); // deletes the pod + its cert Secret, 404-tolerant
+        } catch (err: any) {
+          console.warn(`[k8s-spawner] orphan sweep: stop ${name} failed:`, err?.message ?? err);
+          keptPods.add(name); // keep its Secret this round; retry next sweep
+        }
+        continue;
+      }
       // Hand the oracle the RAW run id from the pod's `agent` label (stamped at
       // spawn), not the pod name: podName() sanitizes/lowercases/truncates, so
       // reconstructing the id by prefix-strip is exact only for the minted
@@ -805,18 +819,26 @@ export class K8sSpawner implements BoxSpawner {
         keptPods.add(name); // keep its Secret this round; retry next sweep
       }
     }
-    // Cert Secrets whose pod is gone entirely (e.g. pod deleted out-of-band).
-    // Scoped like the pod pass (review finding): pre-boxType-label Secrets and
-    // chat-box Secrets are skipped — a chat box's idle self-destruct may leave
-    // an orphan Secret, but deleting it is not this sweep's contract. The age
-    // guard closes the spawn TOCTOU: Secrets are created BEFORE their pod, so
-    // a just-spawned box's cert must never be swept between the two creates.
+    // Cert Secrets whose pod is gone entirely (e.g. pod deleted out-of-band, or an
+    // agent that no longer exists). Chat-box Secrets are now in scope too: nothing
+    // else ever collected them, so they accumulated for as long as the deployment
+    // had been running. Deleting one is recoverable by construction — the next
+    // spawn mints a fresh certificate under the same name.
+    //
+    // An unlabelled boxType reads as "agent", matching the pod pass, so cert
+    // Secrets predating the label are collected rather than pinned forever. The
+    // list is already scoped to `app=agentbox`, so nothing outside this system is
+    // reachable from here.
+    //
+    // The age guard closes the spawn TOCTOU: Secrets are created BEFORE their pod,
+    // so a just-spawned box's cert must never be swept between the two creates.
     const secrets = await this.coreApi.listNamespacedSecret({ namespace, labelSelector: selector });
     const minAgeMs = 10 * 60_000;
+    const sweepableTypes = new Set([...capabilityTypes, "agent"]);
     for (const s of secrets.items ?? []) {
       const name = s.metadata?.name;
       if (!name || !name.endsWith("-cert")) continue;
-      if (!capabilityTypes.has(s.metadata?.labels?.[`${labelPrefix}/boxType`] ?? "")) continue;
+      if (!sweepableTypes.has(s.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent")) continue;
       // Missing/unparseable creationTimestamp must read as YOUNG, not ancient
       // (review: the `: 0` fallback made it look infinitely old, silently
       // bypassing the TOCTOU age guard). Skip it this round — a real orphan

@@ -65,12 +65,13 @@ export class AgentBoxManager {
   }
 
   /**
-   * Periodic capability-box orphan GC (K8s spawner only; duck-typed like
+   * Periodic orphan GC for spawned boxes (K8s spawner only; duck-typed like
    * setCertManager). `isLive(boxId)` is the caller's run-liveness oracle —
-   * the manager/spawner have no knowledge of capability runs. First pass runs
-   * one minute after boot (post-recovery, so live runs are known), then every
-   * `intervalMs`. Without it, completed/crashed runs' pods + cert Secrets
-   * accumulate forever (audit finding).
+   * the manager/spawner have no knowledge of capability runs, and it is consulted
+   * ONLY for capability boxes; a chat box's liveness is its pod phase. First pass
+   * runs one minute after boot (post-recovery, so live runs are known), then every
+   * `intervalMs`. Without it, terminal pods and their cert Secrets accumulate
+   * forever (audit finding).
    */
   startOrphanSweep(isLive: (boxId: string) => boolean | Promise<boolean>, intervalMs = 10 * 60_000): void {
     const s: any = this.spawner;

@@ -1053,7 +1053,7 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
       items: [
         { metadata: { name: "agentbox-live-run-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-compile" } } },
         { metadata: { name: "agentbox-ghost-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-compile" } } }, // no pod at all → orphan
-        { metadata: { name: "agentbox-chat-gone-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "agent" } } },  // chat box's orphan Secret: NOT ours
+        { metadata: { name: "agentbox-chat-gone-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "agent" } } },  // chat box that no longer exists → orphan
         { metadata: { name: "agentbox-fresh-cert", creationTimestamp: new Date().toISOString(), labels: { "siclaw.io/boxType": "kb-compile" } } }, // just spawning (Secret precedes pod): TOCTOU guard
       ],
     });
@@ -1068,9 +1068,47 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
     const deletedSecrets = g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name);
     expect(deletedSecrets).toEqual(expect.arrayContaining(["agentbox-dead-run-cert", "agentbox-done-run-cert", "agentbox-ghost-cert"]));
     expect(deletedSecrets).not.toContain("agentbox-live-run-cert");
-    expect(deletedSecrets).not.toContain("agentbox-chat-1-cert");
-    expect(deletedSecrets).not.toContain("agentbox-chat-gone-cert"); // chat Secrets are never this sweep's business
-    expect(deletedSecrets).not.toContain("agentbox-fresh-cert");     // Secret-before-pod TOCTOU guarded by age
+    expect(deletedSecrets).not.toContain("agentbox-chat-1-cert"); // its box is running
+    expect(deletedSecrets).toContain("agentbox-chat-gone-cert");  // its box is gone; nothing else collects it
+    expect(deletedSecrets).not.toContain("agentbox-fresh-cert");  // Secret-before-pod TOCTOU guarded by age
+  });
+
+  it("sweep reaps a TERMINAL chat box but never a running one", async () => {
+    // restartPolicy:Never + the clean exit idle self-destruct performs leaves the
+    // pod Succeeded forever. A running one belongs to that self-destruct, and the
+    // isLive oracle only speaks for capability runs — so it is never consulted here.
+    let oracleCalls = 0;
+    g.__k8sImpls.listNamespacedPod = async () => ({
+      items: [
+        mkPod("agentbox-chat-running", "agent", "Running"),
+        mkPod("agentbox-chat-done", "agent", "Succeeded"),
+        mkPod("agentbox-chat-crashed", "agent", "Failed"),
+      ],
+    });
+    g.__k8sImpls.listNamespacedSecret = async () => ({ items: [] });
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async () => { oracleCalls++; return false; });
+
+    const deletedPods = g.__k8sCalls.deleteNamespacedPod.map((c: any) => c.name);
+    expect(deletedPods).toEqual(expect.arrayContaining(["agentbox-chat-done", "agentbox-chat-crashed"]));
+    expect(deletedPods).not.toContain("agentbox-chat-running");
+    expect(oracleCalls).toBe(0);
+  });
+
+  it("collects a cert Secret predating the boxType label once its pod is gone", async () => {
+    // The oldest orphans in a long-lived namespace carry no boxType label at all.
+    // Reading a missing label as "agent" (as the pod pass does) is what lets them
+    // be collected instead of pinned forever; the list is already scoped to
+    // app=agentbox, and a fresh certificate is minted on the next spawn.
+    g.__k8sImpls.listNamespacedPod = async () => ({ items: [] });
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [
+        { metadata: { name: "agentbox-ancient-cert", creationTimestamp: new Date(Date.now() - 99 * 86400_000).toISOString(), labels: {} } },
+      ],
+    });
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async () => false);
+    expect(g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name)).toContain("agentbox-ancient-cert");
   });
 
   it("sweep hands the oracle the RAW run id from the pod's agent label (non-UUID ids survive)", async () => {
