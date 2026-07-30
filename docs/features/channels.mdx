@@ -73,12 +73,19 @@ Create a Lark bot app, enable message event subscriptions, then configure it in 
 - `appSecret`
 
 For a controlled group-topic pilot, set `runtime.env.SICLAW_LARK_THREAD_MODE`
-to `"1"`. A root `@bot` message then opens a Feishu topic with the streaming
-card inside it; follow-ups in that topic reuse its Agent session. Follow-ups
-without another `@bot` require the app's group-message event permission. If the
-app receives only mention events, users can still continue by mentioning the
-bot on each topic reply. Unrelated topics are ignored unless the bot already
-has a session for that topic root.
+to `"1"`. This is a rollout gate, not a second mode selector: the existing
+group context selector controls the user experience.
+
+- **Personal (per-user)**: a root `@bot` message opens a Feishu topic with the
+  streaming card inside it. Follow-ups in that topic reuse that user's Agent
+  session without another mention. Unrelated topics and another user's
+  unmentioned replies do not create or inherit the private session.
+- **Team (shared)**: users continue to `@bot` in the main group and the bot
+  replies on the existing main-group path. The whole group keeps one shared
+  Agent session; the topic rollout does not split it by Feishu topic.
+
+No additional Topic switch is required in the UI. Follow-ups without another
+`@bot` require the app's group-message event permission.
 
 ### Feishu test-bot capability checklist
 
@@ -94,7 +101,7 @@ Use these application-identity scopes for a complete Siclaw Agent test bot:
 | Send and reply to messages | `im:message` | Plain-text replies, CardKit card replies, topic replies, mode-switch announcements, and downloading images attached to received messages |
 | Receive direct messages | `im:message.p2p_msg:readonly` | Required separately even when `im:message` is enabled |
 | Receive group `@bot` messages | `im:message.group_at_msg:readonly` | Starts an investigation from a group root message |
-| Receive no-mention topic follow-ups | `im:message.group_msg` | Required for natural follow-up messages inside an existing bot topic; this is a sensitive permission, so restrict the app's availability for pilots |
+| Receive group messages without a mention | `im:message.group_msg` | Required for natural follow-ups inside an existing personal-mode bot topic and for passive shared-group discussion context; this is a sensitive permission, so restrict the app's availability for pilots |
 | Read group metadata | `im:chat:readonly` | Resolves the group title shown in Siclaw |
 | Create and stream cards | `cardkit:card:write` | Creates the thinking card, streams milestones, finalizes the answer, and updates feedback controls |
 | Upload reply images and files | `im:resource` | Uploads charts and other Agent-generated message resources; received-message downloads are covered by `im:message` |
@@ -122,9 +129,14 @@ The matching platform configuration is:
 Acceptance should cover each permission unit independently:
 
 - Direct message: send a unique text and confirm the bot replies.
-- Group root: `@bot` with a unique text and confirm the first reply opens a topic.
-- Topic continuity: reply inside that topic without another mention and confirm
-  the same Siclaw session is reused.
+- Personal-mode root: select **Personal**, send `@bot` with a unique text, and
+  confirm the first reply opens a topic.
+- Personal-mode continuity: reply inside that topic without another mention and
+  confirm the same Siclaw session is reused.
+- Team-mode root: select **Team**, send `@bot` with a unique text, and confirm
+  the bot replies in the main group without opening a topic.
+- Team-mode continuity: have another member `@bot` and confirm both turns reuse
+  the one shared group session.
 - Streaming card: confirm the thinking state, milestone updates, and final state.
 - Card callback: click feedback or a mode button and confirm the toast and state
   update.
