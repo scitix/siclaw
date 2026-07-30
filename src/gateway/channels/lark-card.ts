@@ -292,6 +292,7 @@ export async function sendModeCard(
   channelId: string,
   routeKey: string,
   locale: LarkLocale,
+  replyInThread: boolean = false,
 ): Promise<boolean> {
   try {
     const createRes = await larkClient.cardkit.v1.card.create({
@@ -304,7 +305,11 @@ export async function sendModeCard(
     }
     const replyRes = await larkClient.im.message.reply({
       path: { message_id: messageId },
-      data: { msg_type: "interactive", content: JSON.stringify({ type: "card", data: { card_id: cardId } }) },
+      data: {
+        msg_type: "interactive",
+        content: JSON.stringify({ type: "card", data: { card_id: cardId } }),
+        ...(replyInThread ? { reply_in_thread: true } : {}),
+      },
     });
     if (replyRes && typeof replyRes.code === "number" && replyRes.code !== 0) {
       console.error(`[lark-card] posting mode card failed: code=${replyRes.code} msg=${replyRes.msg}`);
@@ -473,6 +478,7 @@ export async function openTypingCard(
   larkClient: any,
   messageId: string,
   placeholder: string = DEFAULT_PLACEHOLDER,
+  replyInThread: boolean = false,
 ): Promise<CardSession | null> {
   try {
     const createRes = await larkClient.cardkit.v1.card.create({
@@ -496,6 +502,7 @@ export async function openTypingCard(
       data: {
         msg_type: "interactive",
         content: JSON.stringify({ type: "card", data: { card_id: cardId } }),
+        ...(replyInThread ? { reply_in_thread: true } : {}),
       },
     });
     if (replyRes && typeof replyRes.code === "number" && replyRes.code !== 0) {

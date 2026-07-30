@@ -45,6 +45,12 @@ describe("replyImageToLark", () => {
     expect(JSON.parse(replyArg.data.content)).toEqual({ image_key: "img-nested" });
   });
 
+  it("can post the image inside a topic", async () => {
+    const lark = makeLarkClient();
+    await expect(replyImageToLark(lark, "mid-1", Buffer.from([1]), true)).resolves.toBe(true);
+    expect(lark.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
+  });
+
   it("falls back to the im.v1.image namespace when needed", async () => {
     const lark = {
       im: {

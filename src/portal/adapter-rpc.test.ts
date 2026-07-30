@@ -1705,6 +1705,85 @@ describe("channel.resolveBinding", () => {
     });
   });
 
+  it("scopes a shared group session to the Feishu topic root", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", context_mode: "shared", created_by: "u1" }],
+      [],
+      [],
+      [{ session_id: "topic-session" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      {
+        channel_id: "ch1",
+        route_key: "group-123",
+        session_key: "open_id:ou_1",
+        conversation_key: "lark_thread:mid-root",
+      },
+      "a1",
+    );
+
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "lark_thread:mid-root",
+      expect.any(String),
+    ]);
+    expect(result.binding).toEqual(expect.objectContaining({
+      sessionId: "topic-session",
+      sessionKey: "lark_thread:mid-root",
+      contextMode: "shared",
+    }));
+  });
+
+  it("keeps per-user isolation inside a Feishu topic", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", context_mode: "per_user", created_by: "u1" }],
+      [],
+      [],
+      [{ session_id: "private-topic-session" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      {
+        channel_id: "ch1",
+        route_key: "group-123",
+        session_key: "open_id:ou_1",
+        conversation_key: "lark_thread:mid-root",
+      },
+      "a1",
+    );
+
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "open_id:ou_1:lark_thread:mid-root",
+      expect.any(String),
+    ]);
+    expect(result.binding.sessionKey).toBe("open_id:ou_1:lark_thread:mid-root");
+  });
+
+  it("does not create a session for an unmentioned unrelated topic", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", context_mode: "shared", created_by: "u1" }],
+      [],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      {
+        channel_id: "ch1",
+        route_key: "group-123",
+        session_key: "open_id:ou_1",
+        conversation_key: "lark_thread:unrelated",
+        conversation_existing_only: true,
+      },
+      "a1",
+    );
+
+    expect(result).toEqual({ binding: null });
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
   it("NULL context_mode grandfathers to per_user (uses the passed per-sender key, not chat:)", async () => {
     const query = mockQuery(
       [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", created_by: "u1" }], // context_mode absent → NULL

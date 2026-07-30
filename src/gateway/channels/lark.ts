@@ -135,6 +135,10 @@ export interface LarkChannelConfig {
   domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
   app_id: string;
   app_secret: string;
+  /** Reply to group root messages as Feishu topics and scope sessions to the
+   *  topic root. Default-off; the test runtime can enable it with
+   *  SICLAW_LARK_THREAD_MODE=1 without changing stored channel config. */
+  thread_mode?: "group";
   group_channel_id?: string;
   verification_token?: string;
   encrypt_key?: string;
@@ -328,6 +332,12 @@ function getLarkSenderOpenId(data: any): string | null {
 
 function buildLarkSessionKey(senderOpenId: string | null, chatId: string): string {
   return senderOpenId ? `open_id:${senderOpenId}` : `chat:${chatId}`;
+}
+
+function larkGroupThreadModeEnabled(config?: LarkChannelConfig): boolean {
+  if (config?.thread_mode === "group") return true;
+  const env = process.env.SICLAW_LARK_THREAD_MODE?.trim().toLowerCase();
+  return env === "1" || env === "true";
 }
 
 /**
@@ -844,6 +854,15 @@ export async function handleLarkMessage(
   const chatType: string | undefined = message.chat_type;
   const senderOpenId = getLarkSenderOpenId(data);
   const sessionKey = buildLarkSessionKey(senderOpenId, chatId);
+  const threadMode = chatType === "group" && larkGroupThreadModeEnabled(channelConfig);
+  const rootMessageId = typeof message.root_id === "string" && message.root_id.trim()
+    ? message.root_id.trim()
+    : messageId;
+  const threadId = typeof message.thread_id === "string" && message.thread_id.trim()
+    ? message.thread_id.trim()
+    : null;
+  const conversationKey = threadMode ? `lark_thread:${rootMessageId}` : undefined;
+  const replyInThread = threadMode;
 
   // Raw receipt log: fires for EVERY delivered event before any drop, so a
   // group message that arrives but is filtered (non-text, empty after @-strip)
@@ -1012,7 +1031,7 @@ export async function handleLarkMessage(
     const result = await handlePairingCode(code, groupChannelId, chatId, "group", frontendClient!, chatName ?? undefined);
 
     const replyText = formatPairReply(result, locale);
-    await replyToLark(larkClient, messageId, replyText);
+    await replyToLark(larkClient, messageId, replyText, replyInThread);
     return;
   }
 
@@ -1028,32 +1047,42 @@ export async function handleLarkMessage(
   // /mode — summon the context-mode switch card. Handled before the @-gate so
   // it works with or without an @bot (like PAIR); command words are exact.
   if (/^\/mode$/i.test(text.trim())) {
-    const modeBinding = await resolveBinding(groupChannelId, chatId, frontendClient!, sessionKey, senderOpenId ?? undefined);
+    const modeBinding = await resolveBinding(
+      groupChannelId,
+      chatId,
+      frontendClient!,
+      sessionKey,
+      senderOpenId ?? undefined,
+      conversationKey,
+    );
     if (isChannelAccessDenied(modeBinding)) {
-      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale));
+      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale), replyInThread);
       return;
     }
     if (!modeBinding) {
-      await replyToLark(larkClient, messageId, MODE_UNBOUND_NOTICE_BY_LOCALE[locale]);
+      await replyToLark(larkClient, messageId, MODE_UNBOUND_NOTICE_BY_LOCALE[locale], replyInThread);
       return;
     }
     const current: GroupContextMode = modeBinding.contextMode === "shared" ? "shared" : "per_user";
     rememberGroupMode(groupChannelId, chatId, current);
-    const sent = await sendModeCard(larkClient, messageId, current, groupChannelId, chatId, locale);
+    const sent = await sendModeCard(larkClient, messageId, current, groupChannelId, chatId, locale, replyInThread);
     if (!sent) {
-      await replyToLark(larkClient, messageId, `${MODE_LABEL_BY_LOCALE[locale][current]}`);
+      await replyToLark(larkClient, messageId, `${MODE_LABEL_BY_LOCALE[locale][current]}`, replyInThread);
     }
     return;
   }
 
-  // Only respond when THIS bot is individually @-mentioned. Feishu also
+  // Only respond when THIS bot is individually @-mentioned, except inside a
+  // topic that thread mode already scoped to a root message. Feishu also
   // delivers "@所有人" to an @bot-scoped app (it mentions everyone, the bot
   // included), so an @所有人 announcement arrives looking just like a real
   // @bot — without this gate the bot replies to group-wide announcements that
   // were never aimed at it. Skips "@所有人" and "@someone-else"; PAIR above is
   // exempt (explicit command). Gated on chat_type==="group" so the binding/
   // access checks below stay reachable only for messages aimed at the bot.
-  if (chatType === "group" && !isBotMentioned(message, botOpenId)) {
+  const isThreadFollowup = threadMode && rootMessageId !== messageId;
+  const conversationExistingOnly = isThreadFollowup && !isBotMentioned(message, botOpenId);
+  if (chatType === "group" && !isBotMentioned(message, botOpenId) && !isThreadFollowup) {
     // Non-@ group message. In a group KNOWN to be shared, retain it as passive
     // discussion context for the next @-turn — WITHOUT running the agent or
     // touching the AgentBox (idle pods must not be woken by group chatter).
@@ -1061,7 +1090,7 @@ export async function handleLarkMessage(
     // drop it immediately: privacy discipline — only a confirmed-shared group
     // may retain chatter (the receive-all-messages scope is app-level, so the
     // bot sees chatter from groups it must not buffer).
-    if (text.length > 0 && cachedGroupMode(groupChannelId, chatId) === "shared") {
+    if (!threadMode && text.length > 0 && cachedGroupMode(groupChannelId, chatId) === "shared") {
       appendDiscussion(groupChannelId, chatId, senderLabel(senderOpenId), text);
       console.log(`[lark] Buffered non-@ discussion for shared group chat=${chatId}`);
     } else {
@@ -1072,12 +1101,20 @@ export async function handleLarkMessage(
 
   // Look up binding for this chat. Pass sender_open_id so the Portal can
   // auto-bind / per-sender resolve group bots and pick the session key.
-  const binding = await resolveBinding(groupChannelId, chatId, frontendClient!, sessionKey, senderOpenId ?? undefined);
+  const binding = await resolveBinding(
+    groupChannelId,
+    chatId,
+    frontendClient!,
+    sessionKey,
+    senderOpenId ?? undefined,
+    conversationKey,
+    conversationExistingOnly,
+  );
   if (isChannelAccessDenied(binding)) {
-    // sicore_authorized group: this sender isn't allowed. Feishu only delivers
-    // @-mentioned group messages, so the message is already directed at the bot
-    // — a single short hint is fine, not spam.
-    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale));
+    // sicore_authorized group: this sender isn't allowed. The message is either
+    // an explicit @ or a follow-up in a previously established bot topic, so a
+    // single short hint is appropriate.
+    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale), replyInThread);
     return;
   }
   if (!binding) {
@@ -1094,6 +1131,7 @@ export async function handleLarkMessage(
   // both the queue and the queued context, so the two-path contract holds:
   //   - open group     → open_id:<sender>  (per-sender: concurrent + isolated)
   //   - authorized group → sicore_user:<id> (per-user)
+  //   - thread-mode shared group → lark_thread:<root message>
   //   - legacy single binding session → "" (binding-level queue + /new reset)
   // /new then resets the right session, and same-session senders serialize.
   // Cache the group's mode so the non-@ ingestion gate can decide whether to
@@ -1120,6 +1158,11 @@ export async function handleLarkMessage(
     channelId: groupChannelId,
     route: "group",
     contextMode,
+    conversationKey,
+    rootMessageId,
+    threadId,
+    replyInThread,
+    conversationExistingOnly,
     larkClient,
     agentBoxManager,
     tlsOptions,
@@ -1127,7 +1170,7 @@ export async function handleLarkMessage(
     locale,
   }));
   if (!queued.accepted) {
-    await replyToLark(larkClient, messageId, QUEUE_FULL_NOTICE_BY_LOCALE[locale]);
+    await replyToLark(larkClient, messageId, QUEUE_FULL_NOTICE_BY_LOCALE[locale], replyInThread);
     return;
   }
   await queued.done;
@@ -1145,6 +1188,15 @@ interface QueuedLarkMessageContext {
   /** Group route only: "shared" drains the discussion buffer into the prompt
    *  and attributes the asker; absent/"per_user" behaves as an isolated chat. */
   contextMode?: GroupContextMode;
+  /** Provider-native conversation scope. For Feishu topics this is rooted at
+   *  the root message id and remains stable before/after thread_id exists. */
+  conversationKey?: string;
+  rootMessageId?: string;
+  threadId?: string | null;
+  replyInThread?: boolean;
+  /** No-@ topic follow-ups may reuse an existing topic session, but must never
+   *  create one for an unrelated Feishu topic. */
+  conversationExistingOnly?: boolean;
   larkClient: any;
   agentBoxManager: AgentBoxManager;
   tlsOptions?: { cert: string; key: string; ca: string };
@@ -1163,6 +1215,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     channelId,
     route,
     contextMode,
+    conversationKey,
+    rootMessageId,
+    threadId,
+    replyInThread = false,
+    conversationExistingOnly = false,
     larkClient,
     agentBoxManager,
     tlsOptions,
@@ -1175,11 +1232,23 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     // would clear everyone's context — reject it instead of resetting. (A
     // confirmation-gated "reset the whole room" is deferred.) per_user groups
     // and personal chats reset the caller's own session as before.
-    if (contextMode === "shared") {
-      await replyToLark(larkClient, messageId, SHARED_NEW_REJECTED_NOTICE_BY_LOCALE[locale]);
+    if (contextMode === "shared" && !conversationKey) {
+      await replyToLark(larkClient, messageId, SHARED_NEW_REJECTED_NOTICE_BY_LOCALE[locale], replyInThread);
       return;
     }
-    await handleNewCommand(route, channelId, chatId, sessionKey, messageId, larkClient, agentBoxManager, tlsOptions, frontendClient, locale);
+    await handleNewCommand(
+      route,
+      channelId,
+      chatId,
+      sessionKey,
+      messageId,
+      larkClient,
+      agentBoxManager,
+      tlsOptions,
+      frontendClient,
+      locale,
+      replyInThread,
+    );
     return;
   }
 
@@ -1191,13 +1260,22 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   // persisted user row, and logs all show "user sent image(s)".
   const effectiveText = text.length === 0 && imageRefs.length > 0 ? IMAGE_ONLY_PLACEHOLDER : text;
 
-  const binding = await resolveQueuedBinding(route, channelId, chatId, senderOpenId, frontendClient!, sessionKey);
+  const binding = await resolveQueuedBinding(
+    route,
+    channelId,
+    chatId,
+    senderOpenId,
+    frontendClient!,
+    sessionKey,
+    conversationKey,
+    conversationExistingOnly,
+  );
   if (!binding) {
     console.log(`[lark] Binding disappeared before queued run channel=${channelId} chat=${chatId} route=${route}`);
     return;
   }
   if (!binding.createdBy) {
-    await replyToLark(larkClient, messageId, MISSING_OWNER_NOTICE_BY_LOCALE[locale]);
+    await replyToLark(larkClient, messageId, MISSING_OWNER_NOTICE_BY_LOCALE[locale], replyInThread);
     return;
   }
 
@@ -1223,18 +1301,40 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       sessionId,
       role: "user",
       content: persistedText,
-      metadata: { source: "lark", channelId, chatId, messageId, bindingId: binding.bindingId, senderOpenId, sessionKey, route },
+      metadata: {
+        source: "lark",
+        channelId,
+        chatId,
+        messageId,
+        bindingId: binding.bindingId,
+        senderOpenId,
+        sessionKey,
+        route,
+        ...(conversationKey ? { conversationKey } : {}),
+        ...(rootMessageId ? { rootMessageId } : {}),
+        ...(threadId ? { threadId } : {}),
+      },
     });
   } catch (err) {
     console.error(`[lark] Failed to persist channel user message session=${sessionId}:`, err);
-    await replyToLark(larkClient, messageId, `❌ ${err instanceof Error ? err.message : String(err)}`.slice(0, 500));
+    await replyToLark(
+      larkClient,
+      messageId,
+      `❌ ${err instanceof Error ? err.message : String(err)}`.slice(0, 500),
+      replyInThread,
+    );
     return;
   }
 
   // Open the typing-indicator card FIRST so the user sees immediate feedback.
   // If the CardKit APIs fail we fall back to posting a plain text reply
   // once the agent is done (preserves the pre-card behaviour).
-  const cardSession = await openTypingCard(larkClient, messageId, PLACEHOLDER_BY_LOCALE[locale]);
+  const cardSession = await openTypingCard(
+    larkClient,
+    messageId,
+    PLACEHOLDER_BY_LOCALE[locale],
+    replyInThread,
+  );
   let deliveredTextChars = 0;
   // Live "current step" indicator. Two milestone sources feed it: explicit
   // channel_update tool calls (agent-curated) AND auto-derived first lines of
@@ -1286,7 +1386,14 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
 
       if (backgroundMessage.kind === "final") {
         const md = buildMilestoneCardMarkdown({ milestones: [], finalText: display });
-        const delivered = await deliverVisibleChannelText(larkClient, messageId, cardSession, md, true);
+        const delivered = await deliverVisibleChannelText(
+          larkClient,
+          messageId,
+          cardSession,
+          md,
+          true,
+          replyInThread,
+        );
         if (delivered) deliveredTextChars = md.length;
         return delivered;
       }
@@ -1307,7 +1414,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       }
       console.warn(`[lark] Background card update failed for session=${sessionId}; falling back to text reply`);
     }
-    await replyToLark(larkClient, messageId, md);
+    await replyToLark(larkClient, messageId, md, replyInThread);
     deliveredTextChars = md.length;
     return true;
   });
@@ -1343,7 +1450,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     : effectiveText;
   // Shared group: drain the chatter buffered since the last reply and attribute
   // the asker, so the agent answers @-turns with the whole group's context.
-  const drained = contextMode === "shared" ? drainDiscussion(channelId, chatId) : undefined;
+  const drained = contextMode === "shared" && !conversationKey
+    ? drainDiscussion(channelId, chatId)
+    : undefined;
   const sharedContext: SharedGroupContext | undefined = drained
     ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
     : undefined;
@@ -1433,11 +1542,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     // Card could not be opened; fall back to a plain text reply with whatever we have —
     // a real answer, an error notice, OR the session-busy notice (sessionBusy carries no
     // resultText/agentError, so it must be listed explicitly or the busy notice is dropped).
-    await replyToLark(larkClient, messageId, finalCardBody);
+    await replyToLark(larkClient, messageId, finalCardBody, replyInThread);
     deliveredTextChars = finalCardBody.length;
   }
 
-  await replyVisualImages(larkClient, messageId, replyImages);
+  await replyVisualImages(larkClient, messageId, replyImages, replyInThread);
 }
 
 async function resolveQueuedBinding(
@@ -1447,12 +1556,22 @@ async function resolveQueuedBinding(
   senderOpenId: string | null,
   frontendClient: FrontendWsClient,
   sessionKey: string,
+  conversationKey?: string,
+  conversationExistingOnly: boolean = false,
 ): Promise<ResolvedChannelBinding | null> {
   if (route === "personal") {
     if (!senderOpenId) return null;
     return resolvePersonalBinding(channelId, senderOpenId, frontendClient);
   }
-  const result = await resolveBinding(channelId, chatId, frontendClient, sessionKey, senderOpenId ?? undefined);
+  const result = await resolveBinding(
+    channelId,
+    chatId,
+    frontendClient,
+    sessionKey,
+    senderOpenId ?? undefined,
+    conversationKey,
+    conversationExistingOnly,
+  );
   // If access was revoked between enqueue and run, treat as gone (the queued
   // task then skips). The pre-enqueue check already replied any access hint.
   return isChannelAccessDenied(result) ? null : result;
@@ -1484,12 +1603,13 @@ async function handleNewCommand(
   tlsOptions?: { cert: string; key: string; ca: string },
   frontendClient?: FrontendWsClient,
   locale: "zh-CN" | "en-US" = "zh-CN",
+  replyInThread: boolean = false,
 ): Promise<void> {
   const reset = route === "personal"
     ? await resetPersonalSession(channelId, sessionKey, frontendClient!)
     : await resetBindingSession(channelId, chatId, frontendClient!, sessionKey);
   if (!reset.success || !reset.sessionId || !reset.agentId) {
-    await replyToLark(larkClient, messageId, `❌ ${reset.error ?? "Failed to reset session"}`);
+    await replyToLark(larkClient, messageId, `❌ ${reset.error ?? "Failed to reset session"}`, replyInThread);
     return;
   }
 
@@ -1504,7 +1624,7 @@ async function handleNewCommand(
     }
   }
 
-  await replyToLark(larkClient, messageId, NEW_SESSION_NOTICE_BY_LOCALE[locale]);
+  await replyToLark(larkClient, messageId, NEW_SESSION_NOTICE_BY_LOCALE[locale], replyInThread);
 }
 
 /**
@@ -1712,14 +1832,23 @@ function formatApiKeyUsageReply(locale: LarkLocale): string {
  * already committed a side effect (see `/apikey`, which rotates before it can reply) must be able
  * to tell delivery failure from success instead of inferring it from a log line.
  */
-async function replyToLark(larkClient: any, messageId: string, text: string): Promise<boolean> {
+async function replyToLark(
+  larkClient: any,
+  messageId: string,
+  text: string,
+  replyInThread: boolean = false,
+): Promise<boolean> {
   try {
     // Feishu's SDK does NOT throw on a non-zero API code (e.g. missing
     // im:message send scope) — it returns {code,msg} in the body. Surface it,
     // otherwise a permission failure looks like a silent no-op.
     const resp = await larkClient.im.message.reply({
       path: { message_id: messageId },
-      data: { content: JSON.stringify({ text }), msg_type: "text" },
+      data: {
+        content: JSON.stringify({ text }),
+        msg_type: "text",
+        ...(replyInThread ? { reply_in_thread: true } : {}),
+      },
     });
     if (resp && typeof resp.code === "number" && resp.code !== 0) {
       console.error(`[lark] reply API returned non-zero code for messageId=${messageId}: code=${resp.code} msg=${resp.msg}`);
@@ -1781,6 +1910,7 @@ async function deliverVisibleChannelText(
   cardSession: Awaited<ReturnType<typeof openTypingCard>>,
   text: string,
   terminal: boolean,
+  replyInThread: boolean = false,
 ): Promise<boolean> {
   if (cardSession) {
     const ok = terminal
@@ -1789,13 +1919,18 @@ async function deliverVisibleChannelText(
     if (ok) return true;
     console.warn(`[lark] Channel-visible card update failed for messageId=${messageId}; falling back to text reply`);
   }
-  await replyToLark(larkClient, messageId, text);
+  await replyToLark(larkClient, messageId, text, replyInThread);
   return true;
 }
 
-async function replyVisualImages(larkClient: any, messageId: string, images: RenderedReplyImage[]): Promise<void> {
+async function replyVisualImages(
+  larkClient: any,
+  messageId: string,
+  images: RenderedReplyImage[],
+  replyInThread: boolean = false,
+): Promise<void> {
   for (const { kind, image } of images) {
-    const ok = await replyImageToLark(larkClient, messageId, image);
+    const ok = await replyImageToLark(larkClient, messageId, image, replyInThread);
     if (!ok) {
       console.warn(`[lark] ${kind} image reply failed for messageId=${messageId}; markdown card remains primary`);
     }

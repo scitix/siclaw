@@ -207,6 +207,12 @@ describe("openTypingCard", () => {
     expect(cardJson.body.elements[0].content).toBe("Running tools…");
   });
 
+  it("can post the placeholder as a topic reply", async () => {
+    const { client, replySpy } = makeLarkClient();
+    await openTypingCard(client as any, "msg-1", "Running tools…", true);
+    expect(replySpy.mock.calls[0][0].data.reply_in_thread).toBe(true);
+  });
+
   it("returns null when card.create throws — caller should fall back", async () => {
     const { client } = makeLarkClient({ createThrows: new Error("boom") });
     vi.spyOn(console, "error").mockImplementation(() => {});

@@ -72,6 +72,14 @@ Create a Lark bot app, enable message event subscriptions, then configure it in 
 - `appId`
 - `appSecret`
 
+For a controlled group-topic pilot, set `runtime.env.SICLAW_LARK_THREAD_MODE`
+to `"1"`. A root `@bot` message then opens a Feishu topic with the streaming
+card inside it; follow-ups in that topic reuse its Agent session. Follow-ups
+without another `@bot` require the app's group-message event permission. If the
+app receives only mention events, users can still continue by mentioning the
+bot on each topic reply. Unrelated topics are ignored unless the bot already
+has a session for that topic root.
+
 ## Discord Integration
 
 Configure a Discord bot in **Channels** with:
