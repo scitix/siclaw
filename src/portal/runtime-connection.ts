@@ -134,17 +134,45 @@ export function createConnectionMap(): RuntimeConnectionMap {
   }
 
   /**
-   * Get a WS for the given agentId. Falls back to any connected Runtime
-   * because a single Runtime process serves all agents.
+   * Get a WS for the given agentId. Falls back to any connected Runtime because a single
+   * Runtime process serves all agents.
+   *
+   * 🔴 That fallback is only correct while there is exactly ONE Runtime. With two, an RPC
+   * for agent A can land on a Runtime that does not own A's box, and the failure is silent
+   * — the wrong Runtime answers plausibly. `warnOnMultipleRuntimes` makes the condition
+   * loud rather than leaving it to be discovered from confusing behaviour. The Runtime
+   * Deployment is pinned to one replica with `strategy: Recreate` for this reason; anything
+   * that lifts that pin has to replace this fallback with real ownership routing.
    */
   function getWs(agentId: string): WebSocket | null {
     const exact = connections.get(agentId);
     if (exact && exact.size > 0) return exact.values().next().value!;
+    warnOnMultipleRuntimes();
     // Fallback: pick any connected Runtime
     for (const set of connections.values()) {
       if (set.size > 0) return set.values().next().value!;
     }
     return null;
+  }
+
+  /**
+   * Say so, once, when the single-Runtime assumption stops holding.
+   *
+   * Distinct sockets, not distinct agentId keys: one Runtime registers under several
+   * agentIds while sharing a socket, which is normal and must not warn.
+   */
+  let multiRuntimeWarned = false;
+  function warnOnMultipleRuntimes(): void {
+    if (multiRuntimeWarned) return;
+    const sockets = new Set<WebSocket>();
+    for (const set of connections.values()) for (const ws of set) sockets.add(ws);
+    if (sockets.size <= 1) return;
+    multiRuntimeWarned = true;
+    console.error(
+      `[runtime-ws] ${sockets.size} Runtimes are connected, but agent-to-Runtime routing ` +
+      `assumes exactly one: an RPC for an agent this Runtime does not own will be answered ` +
+      `anyway. Scale the Runtime Deployment back to 1 replica.`,
+    );
   }
 
   const map: RuntimeConnectionMap = {
