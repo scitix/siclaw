@@ -278,29 +278,32 @@ replication, regions.
 
 ## Phasing
 
-1. **Metrics** — in-flight turns, sub-agent active/pending, RSS, event-loop lag, under `siclaw_`
+1. ✅ **Metrics** — in-flight turns, sub-agent active/pending, RSS, event-loop lag, under `siclaw_`
    names. Every later threshold is read from these, and they are useful against today's single box.
-2. **Resources and prerequisites** — memory request to 1Gi and limit to 8Gi; sub-agents reuse the
-   parent's `mcpManager` (`session.ts:1992` omits it, so each child takes the
-   `new McpClientManager(...).initialize()` branch at `agent-factory.ts:459-462` — a child process
-   per sub-agent per stdio server, awaited inside every spawn).
-3. **Defect sweep** — collect terminal chat boxes and orphaned cert Secrets. Independent of
-   everything else. *(done)*
-4. **Pod identity and certificates** — one certificate per agent, `boxId` self-reported, and the
-   instance suffix. **Instance 0 keeps today's unsuffixed name**; only replicas 1..N-1 are
-   suffixed, and the index lives in a label rather than being parsed back out of a name. Renaming
-   every existing pod would orphan each one behind a new name for no benefit at this phase.
-5. **Concurrency** — per-session 10 and a pod ceiling of 50, both from helm values. Moved ahead of
+2. ✅ **Resources and prerequisites** — memory request to 1Gi and limit to 8Gi; sub-agents reuse the
+   parent's `mcpManager` instead of dialling the same servers again inside every spawn.
+3. ✅ **Defect sweep** — collect terminal chat boxes and orphaned cert Secrets. Independent of
+   everything else.
+4. ✅ **Pod identity and certificates** — one certificate per agent, `boxId` self-reported and
+   authorized against the certificate, and the instance suffix. **Instance 0 keeps today's
+   unsuffixed name**; only replicas 1..N-1 are suffixed, and the index lives in a label rather than
+   being parsed back out of a name. Renaming every existing pod would orphan each one behind a name
+   nothing looks up, for no benefit at this phase.
+5. ✅ **Concurrency** — per-session 10 and a pod ceiling of 50, both from helm values. Moved ahead of
    the multi-box work: it is the change users feel, it is what the reported slowness is actually
    about, and phases 1–2 supplied the measurement and the memory headroom it needs.
-6. **Affinity and reporting** — the binding table; the box exposes which sessions it holds and
-   whether it is drained. Behaviour still unchanged; the interfaces multi-box needs exist.
+6. ✅ **Affinity and reporting** — `BoxBindings` plus the box's `box-status` endpoint. Nothing routes
+   through them yet; with one box per agent there is only one answer.
 7. **Fixed replicas** — the `replicas` field, the reconciliation loop, RR placement,
    `idle_timeout = 0`. Multi-box becomes real here.
-8. **Image-mismatch draining** — plus `terminationGracePeriodSeconds`, the breaking-release flag,
-   and the frontend's interrupted-turn surface. **Same release as phase 7.**
+8. **Image-mismatch draining** — plus the breaking-release flag and the frontend's interrupted-turn
+   surface. **Same release as phase 7**, and not merely for the residency reason recorded above:
+   draining requires the old and new box to exist AT THE SAME TIME, and until an agent can run two
+   boxes they collide on one pod name. Splitting them yields only a hard kill under a different
+   trigger — worse than today's manual one, because an unrelated user's turn would fire it.
+   (`terminationGracePeriodSeconds` did not need to wait and shipped with phase 6.)
 
-Phases 1–5 are worth doing whether or not multi-box ships.
+Phases 1–6 are worth doing whether or not multi-box ships, and all of them are in.
 
 ## Open
 

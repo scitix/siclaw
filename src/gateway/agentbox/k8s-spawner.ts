@@ -86,6 +86,21 @@ function defaultBoxResources(): { cpu: string; cpuRequest: string; memory: strin
   };
 }
 
+/**
+ * How long a box gets to shut down cleanly before SIGKILL.
+ *
+ * Chosen against what the teardown actually does rather than a round number: a metrics
+ * flush over the network, one kubectl eviction per cached debug pod, an MCP shutdown per
+ * live session, and a tracing flush (self-capped at 3s). The K8s default of 30s can be
+ * exceeded by the debug-pod evictions alone on a busy box.
+ *
+ * This is a CEILING, not a delay — a box that finishes in two seconds exits in two seconds.
+ */
+function gracePeriodSeconds(): number {
+  const raw = Number(process.env.SICLAW_AGENTBOX_TERMINATION_GRACE_SECONDS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 60;
+}
+
 /** requests ≤ limits guard (review): the request/limit split lets a profile
  *  declare a request ABOVE the (possibly default) limit — the API server
  *  rejects such a pod outright, taking the capability down on a config typo.
@@ -468,6 +483,12 @@ export class K8sSpawner implements BoxSpawner {
         subdomain: "agentbox-hs",
         automountServiceAccountToken: false,
         restartPolicy: "Never",
+        // A box's SIGTERM path is not instant: it flushes its final metrics over the
+        // network, evicts cached debug pods (a kubectl call each), closes every session's
+        // MCP connections, then flushes tracing. K8s defaults to 30s, after which the
+        // process is SIGKILLed mid-teardown — losing the trailing metrics and orphaning
+        // debug pods, which then survive only on their Job TTL.
+        terminationGracePeriodSeconds: gracePeriodSeconds(),
         ...(this.config.nodeSelector && Object.keys(this.config.nodeSelector).length > 0
           ? { nodeSelector: this.config.nodeSelector }
           : {}),
