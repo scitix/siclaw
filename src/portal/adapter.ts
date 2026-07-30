@@ -150,15 +150,17 @@ function buildGroupSessionKey(
   participantKey?: string | null,
   conversationKey?: string | null,
 ): string | null {
+  const participant = participantKey?.trim() || null;
+  if (contextMode === "shared") return `chat:${routeKey}`;
+
   const conversation = conversationKey?.trim();
   if (conversation) {
-    return contextMode === "shared"
-      ? conversation
-      : participantKey
-        ? `${participantKey}:${conversation}`
-        : conversation;
+    if (!participant || participant === conversation || participant.endsWith(`:${conversation}`)) {
+      return participant ?? conversation;
+    }
+    return `${participant}:${conversation}`;
   }
-  return contextMode === "shared" ? `chat:${routeKey}` : participantKey?.trim() || null;
+  return participant;
 }
 
 async function resolveLegacyChannelBindingSession(

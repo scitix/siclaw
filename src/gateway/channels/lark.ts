@@ -278,6 +278,8 @@ export function createLarkHandler(
 
 export function resetLarkBindingQueuesForTest(): void {
   bindingQueues.clear();
+  groupModeCache.clear();
+  discussionBuffers.clear();
 }
 
 function enqueueBindingTask(bindingId: string, run: () => Promise<void>): { accepted: true; done: Promise<void> } | { accepted: false } {
@@ -858,12 +860,16 @@ export async function handleLarkMessage(
   // topics. The binding's server-authoritative contextMode decides whether
   // this specific message actually uses the topic path.
   const topicFeatureEnabled = chatType === "group" && larkGroupThreadModeEnabled(channelConfig);
-  const rootMessageId = typeof message.root_id === "string" && message.root_id.trim()
+  const eventRootMessageId = typeof message.root_id === "string" && message.root_id.trim()
     ? message.root_id.trim()
     : messageId;
   const threadId = typeof message.thread_id === "string" && message.thread_id.trim()
     ? message.thread_id.trim()
     : null;
+  // Ordinary Feishu quote replies also carry root_id. Only thread_id proves
+  // that this event belongs to a Topic; otherwise an explicit @ starts a new
+  // bot conversation rooted at the current message.
+  const rootMessageId = threadId ? eventRootMessageId : messageId;
   const topicConversationKey = topicFeatureEnabled ? `lark_thread:${rootMessageId}` : undefined;
 
   // Raw receipt log: fires for EVERY delivered event before any drop, so a
@@ -1055,7 +1061,7 @@ export async function handleLarkMessage(
       frontendClient!,
       sessionKey,
       senderOpenId ?? undefined,
-      topicConversationKey,
+      undefined,
     );
     if (isChannelAccessDenied(modeBinding)) {
       await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale));
@@ -1083,9 +1089,10 @@ export async function handleLarkMessage(
   // were never aimed at it. Skips "@所有人" and "@someone-else"; PAIR above is
   // exempt (explicit command). Gated on chat_type==="group" so the binding/
   // access checks below stay reachable only for messages aimed at the bot.
-  const isThreadFollowup = topicFeatureEnabled && rootMessageId !== messageId;
-  const conversationExistingOnly = isThreadFollowup && !isBotMentioned(message, botOpenId);
-  if (chatType === "group" && !isBotMentioned(message, botOpenId) && !isThreadFollowup) {
+  const botMentioned = isBotMentioned(message, botOpenId);
+  const isThreadFollowup = topicFeatureEnabled && threadId !== null && rootMessageId !== messageId;
+  const conversationExistingOnly = isThreadFollowup && !botMentioned;
+  if (chatType === "group" && !botMentioned) {
     // Non-@ group message. In a group KNOWN to be shared, retain it as passive
     // discussion context for the next @-turn — WITHOUT running the agent or
     // touching the AgentBox (idle pods must not be woken by group chatter).
@@ -1096,10 +1103,12 @@ export async function handleLarkMessage(
     if (text.length > 0 && cachedGroupMode(groupChannelId, chatId) === "shared") {
       appendDiscussion(groupChannelId, chatId, senderLabel(senderOpenId), text);
       console.log(`[lark] Buffered non-@ discussion for shared group chat=${chatId}`);
-    } else {
-      console.log(`[lark] Group message not directed at bot (chat=${chatId}) — ignoring (@所有人 / @others / no @bot)`);
+      return;
     }
-    return;
+    if (!isThreadFollowup) {
+      console.log(`[lark] Group message not directed at bot (chat=${chatId}) — ignoring (@所有人 / @others / no @bot)`);
+      return;
+    }
   }
 
   // Look up binding for this chat. Pass sender_open_id so the Portal can
@@ -1114,6 +1123,10 @@ export async function handleLarkMessage(
     conversationExistingOnly,
   );
   if (isChannelAccessDenied(binding)) {
+    // A no-@ Topic/quote follow-up is never an authorization prompt. If the
+    // server cannot reuse an existing authorized topic session, stay silent;
+    // explicit @ messages still receive the normal access hint.
+    if (conversationExistingOnly) return;
     // sicore_authorized group: this sender isn't allowed. The message is either
     // an explicit @ or a follow-up in a previously established bot topic, so a
     // single short hint is appropriate.
@@ -1153,8 +1166,11 @@ export async function handleLarkMessage(
   // A no-@ message inside a Feishu topic is a continuation only in personal
   // mode. Team mode deliberately stays on the old main-group path; an
   // unrelated/manual topic must not wake the shared Agent session.
-  if (isThreadFollowup && !isBotMentioned(message, botOpenId) && contextMode === "shared") {
-    console.log(`[lark] Ignoring no-@ topic message for shared group chat=${chatId}`);
+  if (isThreadFollowup && !botMentioned && contextMode === "shared") {
+    if (text.length > 0) {
+      appendDiscussion(groupChannelId, chatId, senderLabel(senderOpenId), text);
+      console.log(`[lark] Buffered no-@ topic discussion after resolving shared group chat=${chatId}`);
+    }
     return;
   }
 

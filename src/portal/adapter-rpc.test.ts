@@ -1705,12 +1705,12 @@ describe("channel.resolveBinding", () => {
     });
   });
 
-  it("scopes a shared group session to the Feishu topic root", async () => {
+  it("keeps a shared group on its chat session when a topic candidate is present", async () => {
     const query = mockQuery(
       [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", context_mode: "shared", created_by: "u1" }],
       [],
       [],
-      [{ session_id: "topic-session" }],
+      [{ session_id: "chat-session" }],
     );
 
     const result = await getHandler("channel.resolveBinding")(
@@ -1726,12 +1726,12 @@ describe("channel.resolveBinding", () => {
     expect(query.mock.calls[2][1]).toEqual([
       expect.any(String),
       "b1",
-      "lark_thread:mid-root",
+      "chat:group-123",
       expect.any(String),
     ]);
     expect(result.binding).toEqual(expect.objectContaining({
-      sessionId: "topic-session",
-      sessionKey: "lark_thread:mid-root",
+      sessionId: "chat-session",
+      sessionKey: "chat:group-123",
       contextMode: "shared",
     }));
   });
@@ -1749,6 +1749,33 @@ describe("channel.resolveBinding", () => {
         channel_id: "ch1",
         route_key: "group-123",
         session_key: "open_id:ou_1",
+        conversation_key: "lark_thread:mid-root",
+      },
+      "a1",
+    );
+
+    expect(query.mock.calls[2][1]).toEqual([
+      expect.any(String),
+      "b1",
+      "open_id:ou_1:lark_thread:mid-root",
+      expect.any(String),
+    ]);
+    expect(result.binding.sessionKey).toBe("open_id:ou_1:lark_thread:mid-root");
+  });
+
+  it("keeps the per-user topic transform idempotent on the queued re-resolve", async () => {
+    const query = mockQuery(
+      [{ id: "b1", agent_id: "a1", session_id: "legacy", route_type: "group", context_mode: "per_user", created_by: "u1" }],
+      [],
+      [],
+      [{ session_id: "private-topic-session" }],
+    );
+
+    const result = await getHandler("channel.resolveBinding")(
+      {
+        channel_id: "ch1",
+        route_key: "group-123",
+        session_key: "open_id:ou_1:lark_thread:mid-root",
         conversation_key: "lark_thread:mid-root",
       },
       "a1",
