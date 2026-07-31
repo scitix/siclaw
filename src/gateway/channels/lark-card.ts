@@ -568,6 +568,74 @@ function buildPlaceholderCard(placeholder: string): Record<string, unknown> {
   };
 }
 
+/** The answer baked in at creation — no streaming window left to expire. */
+function buildFinalCard(markdown: string): Record<string, unknown> {
+  return {
+    schema: "2.0",
+    body: {
+      elements: [
+        { tag: "markdown", content: markdown, element_id: MD_ELEMENT_ID },
+      ],
+    },
+  };
+}
+
+/**
+ * Post a finished answer as a NEW static card.
+ *
+ * Recovery path for a streaming card that can no longer be written to: Feishu
+ * closes streaming mode on a timeout (code 200850) and then refuses every
+ * further update with 300309 — which is how a long investigation left its card
+ * frozen on the last ⏳ line. A plain-text reply does deliver the answer, but it
+ * strips the rendering: the markdown arrives as literal `##` headings and
+ * `|---|` table rows. A fresh card keeps the formatting, can carry the feedback
+ * row (a text message cannot), and being static has no window left to expire.
+ */
+export async function postFinalCard(
+  larkClient: any,
+  messageId: string,
+  finalText: string,
+  feedback?: { ctx: FeedbackContext; locale: LarkLocale },
+  replyInThread: boolean = false,
+): Promise<boolean> {
+  const sanitized = sanitizeMarkdownForFeishu(finalText);
+  try {
+    const createRes = await larkClient.cardkit.v1.card.create({
+      data: { type: "card_json", data: JSON.stringify(buildFinalCard(sanitized)) },
+    });
+    const cardId: string | undefined = createRes?.data?.card_id;
+    if (!cardId) {
+      console.error(`[lark-card] postFinalCard: create returned no card_id for messageId=${messageId}`);
+      return false;
+    }
+    const replyRes = await larkClient.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        msg_type: "interactive",
+        content: JSON.stringify({ type: "card", data: { card_id: cardId } }),
+        ...(replyInThread ? { reply_in_thread: true } : {}),
+      },
+    });
+    if (cardApiFailed(replyRes)) {
+      console.error(`[lark-card] postFinalCard: posting to chat failed for messageId=${messageId}: ${describeCardApiError(replyRes)}`);
+      return false;
+    }
+    // Safe here in a way it is not on a streaming card: this one is static.
+    if (feedback) {
+      await appendFeedbackRow(
+        larkClient,
+        { cardId, elementId: MD_ELEMENT_ID, sequence: 0 },
+        feedback.ctx,
+        feedback.locale,
+      );
+    }
+    return true;
+  } catch (err) {
+    console.error(`[lark-card] postFinalCard failed for messageId=${messageId}:`, err);
+    return false;
+  }
+}
+
 /**
  * Create a streaming-mode placeholder card and reply with it to the
  * triggering message. Returns the card handle on success, or `null` if

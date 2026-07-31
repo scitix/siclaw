@@ -2734,30 +2734,60 @@ describe("handleLarkMessage — streaming card flow", () => {
     }
   });
 
-  it("delivers the answer as text when the terminal card update is rejected (non-zero code)", async () => {
+  it("posts a replacement CARD (not raw text) when the terminal card update is rejected", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-reject" });
+    const answer = "## 结论\n\n| 维度 | 结果 |\n|------|------|\n| RoCE | 正常 |";
     streamEventsMock.mockImplementation(async function* () {
-      yield {
-        type: "message_end",
-        message: { role: "assistant", content: [{ type: "text", text: "很长的最终结论" }] },
-      };
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: answer }] } };
     });
     const lark = makeCardAwareLarkClient();
-    // The SDK does NOT throw on a non-zero code. Reading that as success is what
-    // left the card frozen on its ⏳ placeholder while the answer existed only in
-    // the DB — visible in Portal, invisible in the group.
-    lark.cardkit.v1.cardElement.content = vi.fn().mockResolvedValue({ code: 300401, msg: "content too large" });
+    // Observed in production: a long turn outlives the card's streaming window,
+    // so Feishu refuses the terminal write (200850 → then 300309). The SDK does
+    // not throw on those, which is what used to freeze the card on its ⏳ line.
+    lark.cardkit.v1.cardElement.content = vi.fn().mockResolvedValue({ code: 300309, msg: "streaming mode is closed" });
     vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await handleLarkMessage(makeTextEvent("hi"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
 
-    // reply #1 posted the card; reply #2 is the text fallback carrying the answer.
+    // A SECOND card carries the answer — a text reply would ship the markdown as
+    // literal `##` and `|---|` rows, which is unreadable on a long report.
+    expect(lark.cardkit.v1.card.create).toHaveBeenCalledTimes(2);
+    const replacement = JSON.parse(lark.cardkit.v1.card.create.mock.calls[1][0].data.data);
+    expect(replacement.body.elements[0].content).toContain("## 结论");
+    expect(replacement.body.elements[0].content).toContain("| 维度 | 结果 |");
+    // Static card — no streaming window left to expire.
+    expect(replacement.config?.streaming_mode).toBeUndefined();
+
     expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
-    const fallback = JSON.parse(lark.im.message.reply.mock.calls[1][0].data.content).text as string;
-    expect(fallback).toContain("很长的最终结论");
-    // No 👍/👎 row under an answer the card never showed.
-    expect(lark.cardkit.v1.cardElement.create).not.toHaveBeenCalled();
+    expect(lark.im.message.reply.mock.calls[1][0].data.msg_type).toBe("interactive");
+    // Never a plain-text reply while a card is still possible.
+    const textReplies = lark.im.message.reply.mock.calls.filter((c: any) => c[0].data.msg_type === "text");
+    expect(textReplies).toHaveLength(0);
+  });
+
+  it("falls back to plain text only when the replacement card also fails", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-reject-2" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "最终结论" }] } };
+    });
+    const lark = makeCardAwareLarkClient();
+    lark.cardkit.v1.cardElement.content = vi.fn().mockResolvedValue({ code: 300309, msg: "streaming mode is closed" });
+    // First create opens the typing card; the replacement create yields no card_id.
+    lark.cardkit.v1.card.create = vi.fn()
+      .mockResolvedValueOnce({ data: { card_id: "CARD-99" } })
+      .mockResolvedValueOnce({ data: {} });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await handleLarkMessage(makeTextEvent("hi"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    // Degraded, but the answer still reaches the user rather than vanishing.
+    const textReplies = lark.im.message.reply.mock.calls.filter((c: any) => c[0].data.msg_type === "text");
+    expect(textReplies).toHaveLength(1);
+    expect(JSON.parse(textReplies[0][0].data.content).text).toContain("最终结论");
   });
 
   it("does NOT double-post when only the streaming-mode flip is rejected (answer is on the card)", async () => {

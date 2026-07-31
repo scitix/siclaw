@@ -38,6 +38,8 @@ import {
   openTypingCard,
   updateCardContent,
   finalizeCard,
+  postFinalCard,
+  type FeedbackContext,
   buildMilestoneCardMarkdown,
   applyFeedbackSelection,
   FEEDBACK_ACTION_KIND,
@@ -1611,9 +1613,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
         deliveredTextChars = md.length;
         return true;
       }
-      console.warn(`[lark] Background card update failed for session=${sessionId}; falling back to text reply`);
+      console.warn(`[lark] Background card update failed for session=${sessionId}; posting a replacement card`);
     }
-    await replyToLark(larkClient, messageId, md, replyInThread);
+    await deliverAnswerOutsideCard(larkClient, messageId, md, replyInThread);
     deliveredTextChars = md.length;
     return true;
   });
@@ -1736,8 +1738,16 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       // is frozen on its ⏳ placeholder and the answer would exist ONLY in the
       // DB — visible in Portal, invisible in the group. A text reply here is not
       // a duplicate: nothing else delivered this answer.
-      console.error(`[lark] Card body not delivered for cardId=${cardSession.cardId}; replying as text instead`);
-      await replyToLark(larkClient, messageId, finalCardBody, replyInThread);
+      console.error(`[lark] Card body not delivered for cardId=${cardSession.cardId}; posting a replacement card`);
+      await deliverAnswerOutsideCard(
+        larkClient,
+        messageId,
+        finalCardBody,
+        replyInThread,
+        isAnswer && assistantMessageId
+          ? { ctx: { sessionId, channelId, messageId: assistantMessageId }, locale }
+          : undefined,
+      );
     } else if (!ok) {
       // Content landed, only the streaming-mode flip failed: the answer IS
       // visible, so a second message would duplicate it.
@@ -2444,6 +2454,27 @@ async function promptWithBusyRetry(
   }
 }
 
+/**
+ * Deliver an answer the live card could not carry.
+ *
+ * A NEW static card first, plain text only if even that fails. Text is the last
+ * resort rather than the fallback because Feishu does not render markdown in a
+ * text message: the answer arrives as literal `##` headings and `|---|` table
+ * rows, which on a long structured report is barely readable. A fresh card also
+ * still admits the 👍/👎 row.
+ */
+async function deliverAnswerOutsideCard(
+  larkClient: any,
+  messageId: string,
+  body: string,
+  replyInThread: boolean,
+  feedback?: { ctx: FeedbackContext; locale: LarkLocale },
+): Promise<void> {
+  if (await postFinalCard(larkClient, messageId, body, feedback, replyInThread)) return;
+  console.warn(`[lark] Replacement card failed for messageId=${messageId}; replying as plain text (markdown will not render)`);
+  await replyToLark(larkClient, messageId, body, replyInThread);
+}
+
 async function deliverVisibleChannelText(
   larkClient: any,
   messageId: string,
@@ -2454,14 +2485,14 @@ async function deliverVisibleChannelText(
 ): Promise<boolean> {
   if (cardSession) {
     // Terminal: judge by contentOk — a failed streaming-mode flip still leaves
-    // the text on the card, so it must not trigger a duplicate text reply.
+    // the text on the card, so it must not trigger a duplicate reply.
     const delivered = terminal
       ? (await finalizeCard(larkClient, cardSession, text)).contentOk
       : await updateCardContent(larkClient, cardSession, text);
     if (delivered) return true;
-    console.warn(`[lark] Channel-visible card update failed for messageId=${messageId}; falling back to text reply`);
+    console.warn(`[lark] Channel-visible card update failed for messageId=${messageId}; posting a replacement card`);
   }
-  await replyToLark(larkClient, messageId, text, replyInThread);
+  await deliverAnswerOutsideCard(larkClient, messageId, text, replyInThread);
   return true;
 }
 
