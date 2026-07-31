@@ -1315,14 +1315,17 @@ _FULL_COMPILE_ACTIONS = {
     "compile.generate", "compile.regenerate", "compile.approve_plan", "compile.resume",
 }
 # Chat / display-message adapters for the domain-refresh turn (typed action is
-# authoritative when present).
+# authoritative when present). Phrases are specific full intents — bare
+# English like "update domain" is NOT used: it is ordinary imperative vocabulary
+# and a prefix match would steal owner messages about domain *rulings*.
+# Matching is exact (after strip / case-fold), not prefix.
 _DOMAIN_REFRESH_TRIGGERS = (
     "请更新领域描述",
     "请生成领域描述",
     "请补全领域描述",
-    "refresh domain",
-    "update domain",
-    "generate domain",
+    "please refresh the domain description",
+    "please update the domain description",
+    "please generate the domain description",
 )
 _BRIEF_AUDIENCES = {"", "internal-eng", "frontline", "external", "newcomer"}
 _BRIEF_INTENTS = {"", "understand", "execute", "troubleshoot"}
@@ -1501,6 +1504,10 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         plan = _load_batch_plan(run)
         if not _batch_plan_resumable(plan):
             raise CommandRejected("no interrupted batch plan is available to resume", 409)
+    if action == "compile.refresh_domain":
+        index = Path(run.workdir) / "candidate" / "index.md"
+        if not index.is_file():
+            raise CommandRejected("candidate/index.md is required before domain refresh", 409)
     brief = params.get("brief")
     if brief is not None:
         # Structured command data replaces the old localized-text parser. The
@@ -1612,7 +1619,21 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
             selfcheck.write_repo_meta(run.workdir, domain)
         except Exception as e:
             _print_compile_lifecycle("meta.write_failed", run, extra=f"class={type(e).__name__}")
-            return rs["need_args"]
+            # Distinct from need_args: the model already supplied a domain; a
+            # disk refusal must not look like "you forgot the argument" or it
+            # will resubmit the same sentence forever.
+            try:
+                await run.emit({
+                    "type": "summary",
+                    "text": _loc(
+                        run,
+                        f"Domain write failed: {type(e).__name__}",
+                        f"领域描述写入失败: {type(e).__name__}",
+                    ),
+                })
+            except Exception:
+                pass
+            return rs["failed"].format(e=f"{type(e).__name__}: {e}")
         return rs["done"].format(domain=domain)
 
     async def exclude_source(args):
@@ -3183,13 +3204,17 @@ def _should_route_to_domain_refresh(run: "CompileRun", text: str, action: str | 
     if not stripped:
         return False
     lower = stripped.lower()
-    for prefix in _DOMAIN_REFRESH_TRIGGERS:
-        if stripped.startswith(prefix) or lower.startswith(prefix.lower()):
+    for phrase in _DOMAIN_REFRESH_TRIGGERS:
+        if stripped == phrase or lower == phrase.lower():
             return True
     return False
 
 
-def build_domain_refresh_directive(workdir: str, locale: str | None = None) -> str:
+def build_domain_refresh_directive(
+    workdir: str,
+    locale: str | None = None,
+    owner_text: str | None = None,
+) -> str:
     """Kickoff for compile.refresh_domain: whole-library view, one report_domain.
 
     Domain is AI-maintained metadata anchored on the latest full catalog — same
@@ -3225,6 +3250,9 @@ def build_domain_refresh_directive(workdir: str, locale: str | None = None) -> s
             "· Do **not** recompile pages, edit raw/, or run an incremental repair. "
             "When done, state the domain you wrote in one short line."
         )
+        note = (owner_text or "").strip()
+        if note:
+            lines.append(f"· Owner message (keep in mind if relevant): {note}")
         return "\n".join(lines)
     lines = [
         "【领域维护】AI 自维护的整库领域句（report_domain），锚点是**当前最新完整目录**,"
@@ -3249,12 +3277,19 @@ def build_domain_refresh_directive(workdir: str, locale: str | None = None) -> s
     lines.append(
         "· **不要**重编页面、不要改 raw/、不要当增量修页。完成后用一行汇报你写的 domain。"
     )
+    note = (owner_text or "").strip()
+    if note:
+        lines.append(f"· 负责人原话（相关则参考）: {note}")
     return "\n".join(lines)
 
 
-async def _start_domain_refresh(run: "CompileRun") -> None:
+async def _start_domain_refresh(run: "CompileRun", text: str = "") -> None:
     """One ordinary model turn dedicated to report_domain under a full-catalog ask."""
-    directive = build_domain_refresh_directive(run.workdir, locale=getattr(run, "locale", None))
+    directive = build_domain_refresh_directive(
+        run.workdir,
+        locale=getattr(run, "locale", None),
+        owner_text=text,
+    )
     await run.emit({
         "type": "summary",
         "text": _loc(
@@ -3264,10 +3299,7 @@ async def _start_domain_refresh(run: "CompileRun") -> None:
         ),
     })
     run._begin_turn(directive)
-    try:
-        await run.client.query(directive)
-    except BaseException:
-        raise
+    await run.client.query(directive)
 
 
 def _should_route_to_incremental(run: "CompileRun", text: str, action: str | None = None) -> bool:
@@ -6758,7 +6790,7 @@ async def _dispatch_authoring_turn(
     # scoped incremental route: an incremental kickoff must not invent a first
     # domain from a partial diff; this path forces reading the whole catalog.
     if _should_route_to_domain_refresh(run, text, action):
-        await _start_domain_refresh(run)
+        await _start_domain_refresh(run, text=text or "")
         return {"ok": True, "domain_refresh": True}
     # Scoped incremental (真增量): a compile trigger + a machine-computed changeset
     # from the consumer → re-touch only affected pages, NOT a whole-corpus re-plan. Takes

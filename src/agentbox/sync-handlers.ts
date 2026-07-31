@@ -242,9 +242,11 @@ interface KnowledgeBundlePayload {
     id: string;
     name: string;
     /** One sentence naming the field this library covers, written by the compile
-     *  box (kbc `report_domain`). Absent for libraries compiled before that tool
-     *  existed, and for every bundle a Portal serves — the catalog then reads
-     *  exactly as it does today. */
+     *  box (kbc `report_domain`). Wire key from sicore
+     *  `KnowledgeRepoBundle.consumerDomain` (JSON camelCase on
+     *  `versions.consumer_domain` / active-version snapshot). Absent when the
+     *  library predates report_domain, the version has no domain, or an older
+     *  portal path omits the field — the catalog then reads name-only. */
     consumerDomain?: string | null;
     version: number;
     message?: string | null;
@@ -261,6 +263,22 @@ interface KnowledgeBundlePayload {
  *  separately. */
 const KNOWLEDGE_DOMAIN_MAX_CHARS = 100;
 
+/** Max characters of a library name on the same catalog line. Admin-entered
+ *  names are not model-written, but a paste with an internal newline would
+ *  still forge a second catalog row in the system prompt. */
+const KNOWLEDGE_CATALOG_NAME_MAX_CHARS = 80;
+
+/**
+ * Collapse whitespace and admit at most `maxChars` code points for a catalog
+ * line field. Empty when over-cap (no mid-clip).
+ */
+function catalogOneLine(raw: string | null | undefined, maxChars: number): string {
+  if (!raw) return "";
+  const oneLine = raw.replace(/\s+/g, " ").trim();
+  if (!oneLine || [...oneLine].length > maxChars) return "";
+  return oneLine;
+}
+
 /**
  * Normalise a box-written domain for a one-line catalog entry.
  *
@@ -275,10 +293,12 @@ const KNOWLEDGE_DOMAIN_MAX_CHARS = 100;
  * in the tail. Upstream should already refuse over-cap; this is defense only.
  */
 function catalogDomainLine(raw: string | null | undefined): string {
-  if (!raw) return "";
-  const oneLine = raw.replace(/\s+/g, " ").trim();
-  if ([...oneLine].length > KNOWLEDGE_DOMAIN_MAX_CHARS) return "";
-  return oneLine;
+  return catalogOneLine(raw, KNOWLEDGE_DOMAIN_MAX_CHARS);
+}
+
+/** Library display name on the catalog line — same newline/cap rules as domain. */
+function catalogNameLine(raw: string | null | undefined): string {
+  return catalogOneLine(raw, KNOWLEDGE_CATALOG_NAME_MAX_CHARS) || "library";
 }
 
 interface KnowledgeSyncStatus {
@@ -411,10 +431,23 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
           // libraries one at a time to find out. The domain is what makes the
           // line answerable — and the directory can't help, since an all-CJK
           // name sanitizes to `repo--<hash>`.
+          const displayName = catalogNameLine(repo.name);
           const domain = catalogDomainLine(repo.consumerDomain);
           indexLines.push(
-            `- [[repos/${dirName}/index]] - ${repo.name} v${repo.version}${domain ? ` — ${domain}` : ""}`,
+            `- [[repos/${dirName}/index]] - ${displayName} v${repo.version}${domain ? ` — ${domain}` : ""}`,
           );
+        }
+        if (repos.length > 1) {
+          const withDomain = repos.filter((r) => catalogDomainLine(r.consumerDomain)).length;
+          if (withDomain === 0) {
+            // Distinguish "upstream never sends consumerDomain" from "no library
+            // has reported one yet" when debugging silent name-only catalogs.
+            console.debug(
+              `[sync-handlers.knowledge] multi-library bundle: ${repos.length} repos, ` +
+                `0 with consumerDomain (JSON key must be consumerDomain from sicore; ` +
+                `empty is also normal before any library has report_domain)`,
+            );
+          }
         }
         fs.writeFileSync(path.join(stagingDir, "index.md"), indexLines.join("\n") + "\n");
       }

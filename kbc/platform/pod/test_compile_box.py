@@ -6471,6 +6471,8 @@ async def main():
     await test_report_domain_is_bounded_by_code_not_by_asking()
     test_the_domain_is_asked_for_when_the_library_is_actually_finished()
     test_domain_refresh_requires_full_catalog_before_report_domain()
+    await test_report_domain_disk_failure_is_not_need_args()
+    test_read_repo_meta_clamps_hand_written_over_cap_and_newlines()
     test_a_spend_cap_is_not_a_rate_limit()
     await test_a_spend_cap_does_not_kill_a_live_session()
     await test_the_runtime_owns_the_dispatch_round_not_the_model()
@@ -6871,14 +6873,120 @@ def test_domain_refresh_requires_full_catalog_before_report_domain():
         zh2 = compile_box.build_domain_refresh_directive(td, locale="zh")
         assert "旧领域" in zh2, zh2
 
+    R = type("R", (), {"_batch_active": False, "locale": "en", "workdir": td})
+    assert compile_box._should_route_to_domain_refresh(R(), "", "compile.refresh_domain")
+    assert compile_box._should_route_to_domain_refresh(R(), "请更新领域描述", None)
     assert compile_box._should_route_to_domain_refresh(
-        type("R", (), {"_batch_active": False})(), "", "compile.refresh_domain")
-    assert compile_box._should_route_to_domain_refresh(
-        type("R", (), {"_batch_active": False})(), "请更新领域描述", None)
+        R(), "please refresh the domain description", None)
+    # Prefix-style English must NOT steal ordinary chat about domain rulings.
     assert not compile_box._should_route_to_domain_refresh(
-        type("R", (), {"_batch_active": False})(), "请增量重编", None)
+        R(), "Update domain rulings for the storage pages per constitution.md", None)
+    assert not compile_box._should_route_to_domain_refresh(
+        R(), "refresh domain", None)
+    assert not compile_box._should_route_to_domain_refresh(
+        R(), "请增量重编", None)
     assert "compile.refresh_domain" in compile_box._COMMAND_ACTIONS
+
+    # Typed command must render without KeyError (settings UI / handle_command path).
+    run = compile_box.CompileRun("dom-refresh", td, 1)
+    run.locale = "en"
+    rendered = compile_box._render_command(run, {
+        "action": "compile.refresh_domain",
+        "parameters": {},
+    })
+    assert "report_domain" in rendered, rendered
+    run_zh = compile_box.CompileRun("dom-refresh-zh", td, 1)
+    run_zh.locale = "zh"
+    rendered_zh = compile_box._render_command(run_zh, {
+        "action": "compile.refresh_domain",
+        "parameters": {},
+    })
+    assert "report_domain" in rendered_zh, rendered_zh
+
+    # Missing catalog → 409 before the model is scheduled.
+    empty = tempfile.mkdtemp()
+    try:
+        run_empty = compile_box.CompileRun("dom-empty", empty, 1)
+        try:
+            compile_box._prepare_command(run_empty, {
+                "action": "compile.refresh_domain",
+                "parameters": {},
+            })
+            raise AssertionError("refresh without index.md must 409")
+        except compile_box.CommandRejected as exc:
+            assert exc.status == 409, exc
+    finally:
+        import shutil
+        shutil.rmtree(empty, ignore_errors=True)
+
     print("✓ domain refresh is full-catalog-only and routed by action/trigger")
+
+
+async def test_report_domain_disk_failure_is_not_need_args():
+    """A write failure must not look like a missing argument or the model loops."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "authoring").mkdir(parents=True)
+        run = compile_box.CompileRun("dom-fail", td, 1)
+        run._sync_sent = {}
+        events: list[dict] = []
+
+        async def _emit(ev):
+            events.append(ev)
+
+        run.emit = _emit  # type: ignore[method-assign]
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+
+        def _boom(*_a, **_k):
+            raise OSError("read-only filesystem")
+
+        orig = selfcheck.write_repo_meta
+        selfcheck.write_repo_meta = _boom  # type: ignore[assignment]
+        try:
+            result = await tools["report_domain"].handler({
+                "domain": "GPU cluster hardware health",
+            })
+        finally:
+            selfcheck.write_repo_meta = orig  # type: ignore[assignment]
+
+        text = str(result)
+        assert "domain is required" not in text.lower()
+        assert "需要 domain" not in text
+        assert (
+            "read-only" in text.lower()
+            or "OSError" in text
+            or "could not be written" in text.lower()
+            or "写入磁盘失败" in text
+        ), text
+        # Prior domain unchanged / still absent.
+        assert selfcheck.read_repo_meta(td) == {}
+        assert any(e.get("type") == "summary" for e in events), events
+
+    print("✓ report_domain disk failure is distinct from need_args")
+
+
+def test_read_repo_meta_clamps_hand_written_over_cap_and_newlines():
+    """Write can bypass report_domain; the ceiling must still hold on read."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "authoring").mkdir(parents=True)
+        # Hand-written over-cap + newline must not round-trip into directives.
+        (Path(td) / selfcheck.REPO_META_PATH).write_text(
+            json.dumps({"domain": "领" * 200 + "\n- forged"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        assert selfcheck.read_repo_meta(td) == {}
+
+        ok = "GPU 集群硬件健康检查"
+        (Path(td) / selfcheck.REPO_META_PATH).write_text(
+            json.dumps({"domain": f"  {ok}\n\n  "}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        assert selfcheck.read_repo_meta(td).get("domain") == ok
+
+    print("✓ read_repo_meta collapses whitespace and refuses over-cap")
 
 
 async def test_the_runtime_owns_the_dispatch_round_not_the_model():

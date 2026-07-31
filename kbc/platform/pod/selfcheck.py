@@ -976,6 +976,23 @@ def _write_exclusions_canonical(workdir: str, rows: list) -> None:
 
 REPO_META_PATH = "authoring/META.json"
 
+# Admission ceiling for domain — mirrors compile_box.DOMAIN_MAX_CHARS /
+# consumer_domain / agentbox catalog. The write path (report_domain) enforces
+# it; the read path must too, because Write can bypass the tool and hand-edit
+# META.json, and a multi-line / over-cap domain then inflates every directive
+# that quotes it.
+DOMAIN_MAX_CHARS = 100
+
+
+def normalize_domain_line(raw: str | None, *, max_chars: int = DOMAIN_MAX_CHARS) -> str:
+    """Collapse whitespace; refuse over-cap by returning empty (no mid-clip)."""
+    if not isinstance(raw, str):
+        return ""
+    one = " ".join(raw.split())
+    if not one or len(one) > max_chars:
+        return ""
+    return one
+
 
 def write_repo_meta(workdir: str, domain: str) -> None:
     """Persist the library's domain line as a machine-owned artifact.
@@ -997,7 +1014,11 @@ def write_repo_meta(workdir: str, domain: str) -> None:
 def read_repo_meta(workdir: str) -> dict:
     """Best-effort read. A missing or unparseable file is an ABSENT domain, not
     an error: the library still compiles, publishes and answers questions
-    without one — it is only harder for another agent to find."""
+    without one — it is only harder for another agent to find.
+
+    Over-cap or newline-forged values are omitted whole so a hand-written META
+    cannot bypass the admission ceiling that report_domain enforces on write.
+    """
     fp = Path(workdir) / REPO_META_PATH
     try:
         data = json.loads(fp.read_text(encoding="utf-8"))
@@ -1005,8 +1026,8 @@ def read_repo_meta(workdir: str) -> dict:
         return {}
     if not isinstance(data, dict):
         return {}
-    domain = data.get("domain")
-    return {"domain": domain.strip()} if isinstance(domain, str) and domain.strip() else {}
+    domain = normalize_domain_line(data.get("domain"))
+    return {"domain": domain} if domain else {}
 
 
 def set_exclusion_reason(workdir: str, pattern: str, reason: str) -> tuple[str, str | None]:
