@@ -388,9 +388,22 @@ export class AgentBoxManager {
     // while background sub-agents run under it (residency is deferred until they finish),
     // so one signal covers both reasons a session may not move.
     const statuses = sessionId ? await this.sampleBoxStatuses(reachable) : new Map<string, BoxStatusReport>();
-    const holder = sessionId
+    let holder = sessionId
       ? [...statuses].find(([, st]) => st.sessionIds.includes(sessionId))?.[0]
       : undefined;
+
+    // A box that did not answer has NOT told us it is empty. Treating silence as "holds
+    // nothing" is how a session gets handed to a second box while the first is still
+    // writing its transcript — during a rollout the old boxes have no box-status endpoint
+    // at all, so every one of them is silent. If this session last ran on a box we cannot
+    // currently ask, assume it is still there.
+    if (!holder && sessionId) {
+      const last = this.bindings.get(agentId, sessionId);
+      if (last && reachable.some((b) => b.boxId === last) && !statuses.has(last)) {
+        console.log(`[agentbox-manager] ${last} did not answer; keeping session ${sessionId} on it rather than assuming it is free`);
+        holder = last;
+      }
+    }
 
     // Held somewhere reachable: that box has the conversation in memory and is the one
     // appending to the transcript. Nothing else may take the turn.

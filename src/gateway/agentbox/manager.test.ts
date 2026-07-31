@@ -994,3 +994,35 @@ describe("AgentBoxManager — the replica count is cached", () => {
     expect(lookups).toBe(2);
   });
 });
+
+describe("AgentBoxManager — silence is not emptiness", () => {
+  it("keeps a session on its last box when that box cannot be asked", async () => {
+    // During a rollout the old boxes have no box-status endpoint at all, so every one of
+    // them is silent. Reading silence as "holds nothing" hands the session to a second box
+    // while the first may still be writing its transcript.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 2);
+    mgr.setBoxStatusProbe(async (endpoint) => {
+      if (endpoint === "http://10.0.0.1:3000") throw new Error("404 — old image, no such endpoint");
+      return { sessionIds: [], turnsInFlight: 0, drained: true };
+    });
+    (mgr as any).bindings.remember("agent-a", "s1", "agentbox-agent-a");
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(handle.boxId).toBe("agentbox-agent-a");
+  });
+
+  it("still places a session that never ran anywhere", async () => {
+    // No last box means nothing to protect — silence must not block a first placement.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 2);
+    mgr.setBoxStatusProbe(async () => { throw new Error("everything silent"); });
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "brand-new");
+    expect(handle.boxId).toMatch(/^agentbox-agent-a/);
+  });
+})
