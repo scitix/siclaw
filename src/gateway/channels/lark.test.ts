@@ -3551,6 +3551,52 @@ describe("handleLarkMessage — personal access denial", () => {
     expect(lark.im.message.reply.mock.calls[0][0].data.content).not.toContain(ACTION_URL);
   });
 
+  it("delivers an unknown reason's link even with no prose from the frontend", async () => {
+    // The formatter returned null without a template or a message, so the caller dropped to its own
+    // generic text and the structured actionUrl was lost — link delivery must not depend on whether
+    // prose was supplied.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "quota_exceeded", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 600_000 },
+    });
+    const lark = makeCardClient();
+
+    await sendGated(lark as any);
+
+    expect(lark.cardkit.v1.card.create).toHaveBeenCalled();
+    expect(JSON.stringify(sentCard(lark))).toContain(ACTION_URL);
+  });
+
+  it("keeps the link in the text degradation when the card cannot be created", async () => {
+    // The fallback text was the prose-only reply, so a CardKit failure lost the link a second way.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "quota_exceeded", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 600_000, message: "Quota exceeded." },
+    });
+    const lark = makeCardClient();
+    lark.cardkit.v1.card.create.mockRejectedValue(new Error("cardkit down"));
+
+    await sendGated(lark as any);
+
+    const reply = lark.im.message.reply.mock.calls[0][0].data.content as string;
+    expect(reply).toContain("Quota exceeded.");
+    expect(reply).toContain(ACTION_URL);
+    // Present exactly once — the prose may already embed it, and a second copy is noise.
+    expect(reply.split(ACTION_URL).length - 1).toBe(1);
+  });
+
+  it("does not duplicate a link the frontend already embedded in its prose", async () => {
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "quota_exceeded", actionUrl: ACTION_URL, message: `Go here: ${ACTION_URL}` },
+    });
+    const lark = makeLarkClient();   // no cardkit → text degradation
+
+    await sendGated(lark);
+
+    expect(denialText(lark).split(ACTION_URL).length - 1).toBe(1);
+  });
+
   it("survives a non-string message instead of going silent", async () => {
     // `denied.message?.trim()` assumed a string. An object made it throw, the detached event
     // wrapper only logged, and the sender got NO reply — the failure this feature removes.

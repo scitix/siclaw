@@ -72,6 +72,19 @@ whole purpose in precisely the frontend-first skew case the contract must surviv
 **known** to carry no self-service step is excluded; unknown is not the same as known-linkless, and
 withholding an unknown reason's link would strand the sender.
 
+Delivery is therefore decided by whether a usable link EXISTS — never by whether the frontend also
+supplied prose. Coupling the two stranded the sender twice: a refusal carrying `actionUrl` but no
+`message` produced no reply worth sending, so the caller fell back to its own generic text and lost
+the link; and when CardKit failed, the text degradation was the prose alone. With no template and no
+prose the generic notice becomes the body, and the link is appended to the text form as well —
+present **exactly once**, guarded by checking the prose about to be sent rather than by skipping the
+append wholesale, since the frontend's message may embed its own copy.
+
+One predicate governs this, `rendersActionLink`, and it is a DENY-list (`actionUrl` usable AND the
+reason is not known-linkless). `offersSelfService` remains an allow-list but only chooses the button
+label. Using the allow-list for the render decision made the formatter disagree with the dispatch
+and silently dropped unknown-reason links.
+
 Stated precisely, because the earlier wording overclaimed: the text form is a *degradation* (card
 creation failed) and it does carry the URL. The invariant is that a structured `actionUrl` is never
 sent as text **while a card is possible**, not that a URL never appears in text at all.

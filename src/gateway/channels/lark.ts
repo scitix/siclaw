@@ -1139,12 +1139,12 @@ export async function handleLarkMessage(
         // URL where a client unfurl could fetch and consume the token before the sender tapped it,
         // which is the whole property this delivery path exists to hold. Only a reason KNOWN to
         // have no self-service step (`access_denied`) is excluded, by `rendersActionLink`.
-        if (denied && isRenderableActionUrl(denied.actionUrl) && !knownLinklessReason(denied.reason, locale)) {
+        if (denied && rendersActionLink(denied, locale)) {
           await deliverSingleUseLink(larkClient, messageId, locale, {
             body: template ?? truncateDenialProse(denied.message) ?? PERSONAL_ACCESS_GATED_NOTICE_BY_LOCALE[locale],
             buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason ?? "")
               ?? PERSONAL_DENIAL_BUTTON_NEUTRAL_BY_LOCALE[locale],
-            url: denied.actionUrl!,
+            url: denied.actionUrl,
             expiresAtMs: denied.expiresAtMs,
           }, deniedReply);
         } else {
@@ -1867,7 +1867,11 @@ function rendersActionLink(
   denied: PersonalAccessDenied,
   locale: LarkLocale,
 ): denied is PersonalAccessDenied & { actionUrl: string } {
-  return offersSelfService(denied.reason, locale) && isRenderableActionUrl(denied.actionUrl);
+  // Deny-list, not allow-list: an UNKNOWN reason must still get its link (withholding it strands
+  // the sender), so only a reason we KNOW carries no step is excluded. `offersSelfService` remains
+  // the allow-list, but its job is choosing the button LABEL — using it here made the formatter
+  // disagree with the dispatch and silently dropped unknown-reason links.
+  return !knownLinklessReason(denied.reason, locale) && isRenderableActionUrl(denied.actionUrl);
 }
 
 /** Bound the frontend's free-form prose. Applied to prose ONLY — never to a URL or to our own
@@ -1928,16 +1932,24 @@ function formatPersonalDenialReply(denied: PersonalAccessDenied, locale: LarkLoc
   // Only the frontend's free-form prose is capped. The URL and our own lines must stay intact:
   // truncating a link GUARANTEES a dead one, which is the very outcome the expired-link branch
   // exists to avoid, and the platform's text limit sits far above anything we render here.
-  const body = template ?? truncateDenialProse(denied.message)?.trim();
+  const offersLink = rendersActionLink(denied, locale);
+  // Falling back to the GENERIC notice rather than null when a link must still be delivered:
+  // returning null stranded a refusal that carried a usable `actionUrl` but no prose — the caller
+  // dropped to its own generic text and the structured link was lost entirely.
+  const body = template
+    ?? truncateDenialProse(denied.message)?.trim()
+    ?? (offersLink ? PERSONAL_ACCESS_GATED_NOTICE_BY_LOCALE[locale] : undefined);
   if (!body) return null;
   const lines = [body];
-  // Only the templated path appends the URL. On the fallback path the frontend's prose is expected
-  // to carry its own link, and appending would print it twice.
-  if (template && rendersActionLink(denied, locale)) {
+  // Link delivery is decided by whether we HAVE a usable link, never by whether prose was supplied
+  // — coupling the two is what lost the link on the prose-less and card-failure paths. Duplication
+  // is prevented by checking the prose we are about to send, not by skipping the append wholesale:
+  // the frontend's message MAY embed its own copy of the URL, and only then must we not add a second.
+  if (offersLink) {
     const remaining = minutesUntil(denied.expiresAtMs);
     if (remaining === "expired") {
       lines.push(PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE[locale]);
-    } else {
+    } else if (!body.includes(denied.actionUrl)) {
       lines.push(PERSONAL_DENIAL_LINK_HINT_BY_LOCALE[locale](remaining), denied.actionUrl);
     }
   }
