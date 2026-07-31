@@ -9,6 +9,9 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { getDb, type Db } from "../gateway/db.js";
 import { buildUpsert, insertIgnorePrefix, safeParseJson, toSqlTimestamp } from "../gateway/dialect-helpers.js";
+// Shared with the gateway so both layers normalize the admission tier identically — a drift here
+// means the runtime treats a bot as open while this adapter refuses to bind it.
+import { isOpenAccessTier } from "../gateway/channel-manager.js";
 import { createTaskNotification } from "./notification-api.js";
 import {
   sendJson,
@@ -445,7 +448,8 @@ async function updateChannelBindingContextMode(
 interface PersonalChannelConfig {
   personal_bot?: {
     agent_id?: string;
-    access_mode?: "open" | "sicore_authorized";
+    // Legacy spellings kept alongside the current tiers; `isOpenAccessTier` normalizes both.
+    access_mode?: "open" | "public" | "identified" | "granted" | "sicore_authorized" | (string & {});
     owner_user_id?: string;
     // When not explicitly false, an open per-agent bot also auto-serves any
     // group it is added to (no PAIR). Mirrors Sicore's group_auto_bind.
@@ -478,7 +482,7 @@ async function resolvePersonalChannelBinding(
   const channel = await selectPersonalChannel(db, channelId);
   const personalBot = channel?.config.personal_bot;
   if (!channel || !personalBot?.agent_id || !senderOpenId.trim()) return null;
-  if (personalBot.access_mode !== "open") {
+  if (!isOpenAccessTier(personalBot.access_mode)) {
     return null;
   }
   const sessionKey = `open_id:${senderOpenId.trim()}`;
@@ -537,7 +541,7 @@ async function resolveOpenGroupBinding(
   const channel = await selectPersonalChannel(db, channelId);
   const personalBot = channel?.config.personal_bot;
   if (!channel || !personalBot?.agent_id) return null;
-  if (personalBot.access_mode !== "open") return null;
+  if (!isOpenAccessTier(personalBot.access_mode)) return null;
   if (personalBot.group_auto_bind === false) return null;
 
   const createdBy = personalBot.owner_user_id ?? channel.created_by;
@@ -3162,7 +3166,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("channel.pairPersonal", async () => ({
     success: false,
-    error: "Sicore authorization is only available through the Sicore adapter",
+    error: "Personal-bot authorization is only available in Upstream mode",
   }));
 
   // Channel-issued API keys (the `/apikey` personal-chat command) are an Upstream-mode

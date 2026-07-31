@@ -283,6 +283,95 @@ export function buildModeCard(
   };
 }
 
+/**
+ * A one-action card: some copy, an optional footnote, and a single button that opens a URL.
+ *
+ * Used for the flows that hand a sender a SINGLE-USE link (account linking, access request, API
+ * key pickup). Putting the URL behind a button is not cosmetic — a bare URL in a text message gets
+ * unfurled by the client for a link preview, and an automated fetch of a one-time token can burn
+ * the sender's only chance to use it. A button is fetched only when a human taps it.
+ *
+ * The URL is therefore stripped from the body if a caller passes prose that embeds it: the button is
+ * the single rendering path, and this function enforces that rather than trusting every caller to.
+ */
+export function buildLinkActionCard(opts: {
+  body: string;
+  /** Smaller line under the body — validity window, "opens once", etc. */
+  note?: string;
+  buttonLabel: string;
+  url: string;
+}): Record<string, unknown> {
+  // The invariant that the URL is not repeated in the body is enforced HERE, in the function that
+  // states it — not at each call site. A caller can legitimately pass frontend prose that already
+  // embeds the exact link (an unfamiliar refusal reason renders it verbatim), which gave the
+  // single-use URL a second rendering path outside the button. Repeatedly patching the callers is
+  // what let this recur, so the guarantee lives with the claim.
+  const body = opts.body.split(opts.url).join("").replace(/[ \t]+$/gm, "").trim();
+  const elements: Record<string, unknown>[] = body ? [{ tag: "markdown", content: body }] : [];
+  // `markdown`, not a `note` element: every card this codebase ships uses only the element tags
+  // below, and a `note` was rejected outright by CardKit (create returned no card_id, so the
+  // handler silently degraded to plain text).
+  if (opts.note) elements.push({ tag: "markdown", content: opts.note });
+  // Wrapped in column_set exactly like the mode card and the feedback row — the two button layouts
+  // already proven in production. A bare `button` at body level was the other half of the rejection.
+  elements.push({
+    tag: "column_set",
+    columns: [
+      {
+        tag: "column",
+        width: "auto",
+        elements: [
+          {
+            tag: "button",
+            element_id: "link_action",
+            text: { tag: "plain_text", content: opts.buttonLabel },
+            type: "primary",
+            behaviors: [{ type: "open_url", default_url: opts.url }],
+          },
+        ],
+      },
+    ],
+  });
+  return { schema: "2.0", body: { elements } };
+}
+
+/**
+ * Post a {@link buildLinkActionCard} as a reply. Returns false on ANY failure so the caller falls
+ * back to the plain-text form — these messages carry the sender's only path forward, so losing the
+ * card must never mean losing the link.
+ */
+export async function sendLinkActionCard(
+  larkClient: any,
+  messageId: string,
+  opts: { body: string; note?: string; buttonLabel: string; url: string },
+): Promise<boolean> {
+  try {
+    const createRes = await larkClient.cardkit.v1.card.create({
+      data: { type: "card_json", data: JSON.stringify(buildLinkActionCard(opts)) },
+    });
+    const cardId: string | undefined = createRes?.data?.card_id;
+    if (!cardId) {
+      // Include code/msg: CardKit rejects a bad card JSON without throwing, and a bare "no card_id"
+      // line gives no way to tell a schema error from a permission problem.
+      const res = createRes as { code?: unknown; msg?: unknown } | undefined;
+      console.warn(`[lark-card] link-action card create returned no card_id: code=${res?.code} msg=${res?.msg}`);
+      return false;
+    }
+    const replyRes = await larkClient.im.message.reply({
+      path: { message_id: messageId },
+      data: { msg_type: "interactive", content: JSON.stringify({ type: "card", data: { card_id: cardId } }) },
+    });
+    if (cardApiFailed(replyRes)) {
+      console.error(`[lark-card] posting link-action card failed: code=${(replyRes as any)?.code} msg=${(replyRes as any)?.msg}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("[lark-card] sendLinkActionCard failed:", err);
+    return false;
+  }
+}
+
 /** Post the mode-switch card as a reply. Returns false on any failure so the
  *  caller can fall back to a plain-text mode notice. */
 export async function sendModeCard(
