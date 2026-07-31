@@ -135,6 +135,16 @@ export interface StartRuntimeOptions {
   certManager?: CertificateManager;
 }
 
+/**
+ * How long a steer waits for its target box to finish creating the session.
+ *
+ * /api/prompt returns when the turn STARTS, so there is a short window in which the box
+ * has accepted the prompt but not yet registered the session — a cold spawn widens it to
+ * seconds. Long enough to cover that; short enough that a genuinely missing session fails
+ * while the user is still looking at the screen.
+ */
+const STEER_SESSION_WAIT_MS = 3_000;
+
 export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeServer> {
   const { config, agentBoxManager, spawner, frontendClient } = opts;
 
@@ -1143,6 +1153,33 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return response;
   });
 
+  /**
+   * The box running this session's turn, for operations that reach into that turn.
+   *
+   * steer, abort and clearQueue all act on a turn that is ALREADY running, so they have to
+   * land on the box running it. Resolving them through placement was correct only while a
+   * session belonged to one box for its lifetime: with free placement the same lookup can
+   * return a different box of the same agent, which has never heard of the session and
+   * answers 404 — the user sees a failure they did not cause, and a frontend that resends
+   * the text as a new prompt gets the message answered twice.
+   *
+   * Three sources, most exact first. The turn lock knows where THIS Runtime dispatched the
+   * turn. The holder lookup asks the boxes, covering a turn this Runtime has forgotten
+   * across a restart. Placement is the last resort — no evidence anywhere is not a reason
+   * to do nothing, because the turn may still be running somewhere.
+   */
+  async function boxForRunningTurn(agentId: string, sessionId: string): Promise<AgentBoxClient> {
+    const endpoint = sessionTurnLocks.busyOn(sessionId)?.endpoint
+      ?? (await agentBoxManager.getHolder?.(agentId, sessionId).catch(() => undefined))?.endpoint
+      ?? (await agentBoxManager.getOrCreate(agentId, undefined, sessionId)).endpoint;
+    return new AgentBoxClient(endpoint, 10000, agentBoxTlsOptions);
+  }
+
+  /** A box that has not created the session yet answers exactly like one that never will. */
+  function isSessionNotFound(err: unknown): boolean {
+    return /session not found/i.test(String((err as Error)?.message ?? err));
+  }
+
   rpcMethods.set("chat.abort", async (params) => {
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
@@ -1156,9 +1193,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
     activeStreamAborts.get(sessionId)?.abort();
 
-    const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
-    const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
-    await client.abortSession(sessionId);
+    const client = await boxForRunningTurn(agentId, sessionId);
+    // Stopping a session a box does not have is already the outcome the user asked for;
+    // reporting it as a failed Stop would be a lie.
+    await client.abortSession(sessionId).catch((err) => {
+      if (!isSessionNotFound(err)) throw err;
+      console.log(`[runtime] abort: session=${sessionId} not on the box we asked; treating as already stopped`);
+    });
     return { ok: true };
   });
 
@@ -1180,9 +1221,21 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const steerMessageId = await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
     await incrementMessageCount(sessionId);
 
-    const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
-    const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
-    const steerResult = await client.steerSession(sessionId, text, { images, files });
+    // The prompt returns as soon as the turn STARTS, so a steer can arrive while the box is
+    // still creating the session — it answers 404 for a moment before it would accept. Retry
+    // briefly rather than reporting a failure the user would have to resend around.
+    const deadline = Date.now() + STEER_SESSION_WAIT_MS;
+    let steerResult: Awaited<ReturnType<AgentBoxClient["steerSession"]>> | undefined;
+    for (;;) {
+      const client = await boxForRunningTurn(agentId, sessionId);
+      try {
+        steerResult = await client.steerSession(sessionId, text, { images, files });
+        break;
+      } catch (err) {
+        if (!isSessionNotFound(err) || Date.now() >= deadline) throw err;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
     void bindMessageTraceId(steerMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
       console.warn(`[runtime] failed to bind explicit steer trace session=${sessionId} message=${steerMessageId}:`, bindErr);
     });
@@ -1194,8 +1247,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const sessionId = params.sessionId as string;
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
 
-    const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
-    const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
+    const client = await boxForRunningTurn(agentId, sessionId);
     const cleared = await client.clearQueue(sessionId);
     return { ok: true, ...cleared };
   });

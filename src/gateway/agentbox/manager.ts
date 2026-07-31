@@ -536,6 +536,33 @@ export class AgentBoxManager {
     return undefined;
   }
 
+  /**
+   * The box that is actually HOLDING this session, or nothing.
+   *
+   * Distinct from placement, and deliberately not a fallback to "any box of this agent":
+   * steer, abort and clearQueue act on a turn that is already running, so a box that never
+   * saw the session is not an answer — it replies 404 and the user is shown a failure they
+   * did not cause. Silence is treated the way placement treats it: a box we could not ask
+   * may still hold it, so a hint pointing at an unreachable-but-live box counts.
+   */
+  async getHolder(agentId: string, sessionId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
+    const wantProfile = profile ?? "agent";
+    const pool = (await this.listPool(agentId)).filter((b) => this.isReachable(b, wantProfile));
+    if (pool.length === 0) return undefined;
+    const statuses = await this.sampleBoxStatuses(pool);
+    for (const [boxId, status] of statuses) {
+      if (!status.sessionIds.includes(sessionId)) continue;
+      const box = pool.find((b) => b.boxId === boxId);
+      if (box?.endpoint) return { boxId, endpoint: box.endpoint, agentId };
+    }
+    const hint = this.bindings.get(agentId, sessionId);
+    if (hint && !statuses.has(hint)) {
+      const box = pool.find((b) => b.boxId === hint);
+      if (box?.endpoint) return { boxId: hint, endpoint: box.endpoint, agentId };
+    }
+    return undefined;
+  }
+
   /** Every box of an agent, for operations that must act on the whole pool. */
   async listForAgent(agentId: string): Promise<AgentBoxInfo[]> {
     return this.listPool(agentId);

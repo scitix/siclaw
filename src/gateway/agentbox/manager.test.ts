@@ -1067,3 +1067,50 @@ describe("AgentBoxManager — asking a box that predates box-status", () => {
   });
 });
 
+describe("AgentBoxManager — who is holding this session", () => {
+  it("names the box that reports holding it", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setBoxStatusProbe(async (endpoint) => endpoint === "http://10.0.0.2:3000"
+      ? { sessionIds: ["s1"], turnsInFlight: 1, drained: false }
+      : { sessionIds: [], turnsInFlight: 0, drained: true });
+
+    expect((await mgr.getHolder("agent-a", "s1"))?.boxId).toBe("agentbox-agent-a-1");
+  });
+
+  it("answers nothing rather than offering a box that never saw the session", async () => {
+    // steer/abort/clearQueue act on a RUNNING turn. Handing them any box of the agent means
+    // a 404 the user did not cause — and a frontend that resends the text as a new prompt,
+    // so the message gets answered twice.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+
+    expect(await mgr.getHolder("agent-a", "s1")).toBeUndefined();
+  });
+
+  it("keeps trusting a box that cannot be asked", async () => {
+    // Same rule placement uses: silence is not evidence the session moved.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setBoxStatusProbe(async (endpoint) => {
+      if (endpoint === "http://10.0.0.1:3000") throw new Error("silent");
+      return { sessionIds: [], turnsInFlight: 0, drained: true };
+    });
+    (mgr as any).bindings.remember("agent-a", "s1", "agentbox-agent-a");
+
+    expect((await mgr.getHolder("agent-a", "s1"))?.boxId).toBe("agentbox-agent-a");
+  });
+
+  it("answers nothing when the agent has no boxes at all", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [];
+    const mgr = new AgentBoxManager(spawner);
+    expect(await mgr.getHolder("agent-a", "s1")).toBeUndefined();
+    expect(spawner.spawnCalls).toHaveLength(0); // must never spawn
+  });
+});
+
