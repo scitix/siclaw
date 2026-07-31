@@ -76,29 +76,40 @@ removes the machinery multi-writer designs need — **no lease, no registry, no 
 Adding Runtime replicas later means replacing "sole writer" with a K8s Lease; nothing else in this
 design changes.
 
-### A session belongs to one box for that box's lifetime
+### A session is pinned by live work, not by ownership
 
-**Round-robin places a new session. Affinity keeps it there.** RR is not applied per request — a
-second turn landing on a different box would find none of its state.
+**No session belongs to a box.** The only thing that pins one is work in progress: while a
+box is running its turn, or still has background sub-agents under it, that box holds the
+conversation in memory and is the one appending to the transcript. The next request has to
+go there. With no such work, the session is free and goes wherever the load says.
 
-Bouncing a session discards warm state that directly costs latency:
+The boxes report this themselves — a session stays resident while background work defers
+its release — so the answer is **observed, never remembered**. That matters because a
+Runtime restart drops anything remembered, and a correctness property must not depend on
+a table that can be lost.
 
-| Warm state | Cost of bouncing |
+What this buys, beyond correctness: raising `replicas` now relieves EXISTING conversations
+too, not only new ones. A conversation that goes quiet and comes back is re-placed.
+
+Two turns for one session must never overlap — that is what would put two boxes on one
+transcript, each appending from its own in-memory copy. The AgentBox refuses a second
+concurrent prompt, but only for sessions it can see, so with several boxes the guarantee
+has to sit where every request passes: a per-session turn lock in the Runtime
+(`session-turn-lock.ts`), taken by all five prompt paths.
+
+**The last box is a preference, not a rule.** Returning to it skips re-initialising MCP
+connections and re-creating the per-box debug pod, which a follow-up about the same node
+would otherwise pay for. It yields the moment that box is draining or has become the
+busier one, and losing the whole hint map costs one cold tool environment, nothing else.
+
+Moving a session that is NOT held costs only warm state:
+
+| Warm state | Cost of moving |
 |---|---|
-| Debug pod cache (keyed `userId+cluster+node`, 60s idle evict) | next `node_exec` may pay a full pod cold start |
-| Brain instance / tool set / guards | full `createSiclawSession` rebuild |
-| MCP connections | rebuild |
-| `_eventBuffer` SSE replay buffer | reconnect loses the in-flight stream |
-| **Background jobs in `JobRegistry`** | **cannot move at all** |
-
-The last row is the hard limit: `job_stop`'s abort handle is an in-memory closure over a running
-child agent or shell process. It is a live async operation, not serialisable state. This design
-never moves a session rather than answering for it.
-
-**Re-binding is permitted in exactly one case:** the session has been released from box memory
-*and* the pool changed (a new box appeared, or its box is draining). A released session has no
-in-flight turn and no background work, so moving it costs warm state and nothing else. Without
-this narrow exception, raising `replicas` would never rebalance anything.
+| Debug pod cache (keyed `userId+cluster+node`, 60s idle evict) | next `node_exec` may pay a pod cold start |
+| Brain instance / tool set / guards | rebuilt from the transcript |
+| MCP connections | re-initialised, awaited |
+| Conversation history | none — the shared PVC subPath is per AGENT, so every box of it reads the same tree |
 
 ### Losing a box loses in-flight work, not history
 

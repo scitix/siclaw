@@ -903,44 +903,44 @@ describe("AgentBoxManager — PR review regressions", () => {
     expect(handle.boxId).toBe("agentbox-agent-a"); // stays on the box actually running it
   });
 
-  it("moves a RELEASED session off a draining box once somewhere else can take it", async () => {
-    // Review #5. The legal re-binding: released means no in-flight turn and no background
-    // work, so moving costs warm state and nothing else. Pinning it would keep
-    // reactivating an old-image box and hold the drain to its force-kill deadline.
+  it("moves a released session off a draining box", async () => {
     const spawner = new PoolSpawner("k8s");
     const stale = poolBox("agentbox-agent-a", 0, { image: "agentbox:v1" });
     spawner.pool = [stale, poolBox("agentbox-agent-a-1", 1)];
     const mgr = new AgentBoxManager(spawner);
     mgr.setReplicasResolver(async () => 2);
+    // No box reports holding it → free.
     mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
-    (mgr as any).bindings.bind("agent-a", "s-released", "agentbox-agent-a");
+    (mgr as any).bindings.remember("agent-a", "s-released", "agentbox-agent-a");
     (mgr as any).draining.set("agentbox-agent-a", Date.now());
 
     const handle = await mgr.getOrCreate("agent-a", undefined, "s-released");
     expect(handle.boxId).toBe("agentbox-agent-a-1");
   });
 
-  it("keeps a released session put when there is nowhere to move it", async () => {
+  it("keeps a session on the box that still reports holding it", async () => {
+    // Background sub-agents keep a session resident after its turn returned, so the box
+    // is still appending to the transcript and the next turn has to go there.
     const spawner = new PoolSpawner("k8s");
-    spawner.pool = [poolBox("agentbox-agent-a", 0, { image: "agentbox:v1" })];
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
     const mgr = new AgentBoxManager(spawner);
-    mgr.setReplicasResolver(async () => 1);
-    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
-    (mgr as any).bindings.bind("agent-a", "s", "agentbox-agent-a");
-    (mgr as any).draining.set("agentbox-agent-a", Date.now());
+    mgr.setReplicasResolver(async () => 2);
+    mgr.setBoxStatusProbe(async (endpoint) => endpoint === "http://10.0.0.1:3000"
+      ? { sessionIds: ["s-busy"], turnsInFlight: 0, drained: false }
+      : { sessionIds: [], turnsInFlight: 0, drained: true });
 
-    const handle = await mgr.getOrCreate("agent-a", undefined, "s");
-    expect(handle.boxId).toBe("agentbox-agent-a"); // better than failing the turn
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s-busy");
+    expect(handle.boxId).toBe("agentbox-agent-a");
   });
 
-  it("finds a session's box by binding, not by deriving instance 0", async () => {
+  it("finds a session's box without deriving instance 0", async () => {
     // Review #3. A session pinned to instance 1 must not read as not-running.
     const spawner = new PoolSpawner("k8s");
     const one = poolBox("agentbox-agent-a-1", 1);
     spawner.pool = [poolBox("agentbox-agent-a", 0), one];
     spawner.getReturns.set("agentbox-agent-a-1", one);
     const mgr = new AgentBoxManager(spawner);
-    (mgr as any).bindings.bind("agent-a", "s1", "agentbox-agent-a-1");
+    (mgr as any).bindings.remember("agent-a", "s1", "agentbox-agent-a-1");
 
     const handle = await mgr.getForSession("agent-a", "s1");
     expect(handle?.boxId).toBe("agentbox-agent-a-1");

@@ -366,51 +366,26 @@ export class AgentBoxManager {
     // input every rule below turns on, and two separate bugs came from branches that
     // decided first and sampled afterwards: a rollout re-placed a session that was still
     // running, and a released session was pinned to a draining box forever.
+    // Ask the boxes what they are holding. A session is held while its turn runs AND
+    // while background sub-agents run under it (residency is deferred until they finish),
+    // so one signal covers both reasons a session may not move.
     const statuses = sessionId ? await this.sampleBoxStatuses(reachable) : new Map<string, BoxStatusReport>();
-    const resident = new Set<string>();
-    for (const st of statuses.values()) for (const id of st.sessionIds) resident.add(id);
+    const holder = sessionId
+      ? [...statuses].find(([, st]) => st.sessionIds.includes(sessionId))?.[0]
+      : undefined;
 
-    // Adopt what the boxes report: after a Runtime restart the binding table is empty
-    // while sessions are still live in boxes, and placing one fresh would send a running
-    // conversation to a box holding none of its state.
-    for (const [boxId, status] of statuses) {
-      for (const id of status.sessionIds) {
-        if (!this.bindings.get(agentId, id)) this.bindings.bind(agentId, id, boxId);
-      }
-    }
-
-    // Affinity: this session already belongs to a box that is still up. It wins over
-    // everything below — including a drain, which means "no NEW sessions", not "abandon
-    // what you are holding".
-    //
-    // The ONE exception is the legal re-binding: a box that is draining AND no longer
-    // holds this session has nothing left to lose by letting it move, and keeping it
-    // pinned there would repeatedly reactivate an old-image box and push the drain to its
-    // force-kill deadline.
-    const bound = sessionId ? this.bindings.get(agentId, sessionId) : undefined;
-    if (bound) {
-      const box = reachable.find((b) => b.boxId === bound);
-      const stillHolding = resident.has(sessionId!);
-      if (box && (stillHolding || !this.draining.has(box.boxId))) {
-        return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
-      }
-      if (box && sessionId) {
-        const moved = this.bindings.rebalanceOff(agentId, box.boxId, this.candidatesFrom(reachable, statuses), resident);
-        if (moved.includes(sessionId)) {
-          const target = reachable.find((b) => b.boxId === this.bindings.get(agentId, sessionId));
-          if (target) {
-            console.log(`[agentbox-manager] session ${sessionId} released; moving off draining ${box.boxId} to ${target.boxId}`);
-            return { handle: { boxId: target.boxId, endpoint: target.endpoint, agentId }, created: false };
-          }
-        }
-        // Nowhere to move it yet — stay put rather than fail the turn.
+    // Held somewhere reachable: that box has the conversation in memory and is the one
+    // appending to the transcript. Nothing else may take the turn.
+    if (holder) {
+      const box = reachable.find((b) => b.boxId === holder);
+      if (box) {
+        this.bindings.remember(agentId, sessionId!, box.boxId);
         return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
       }
     }
 
     // Growing the pool normally happens in the BACKGROUND: blocking this turn on a cold
-    // start would make growing the pool feel slower than not having grown it, and the
-    // session in hand can be served by whatever is already up.
+    // start would make growing the pool feel slower than not having grown it.
     //
     // "Already up" means ACCEPTING, not merely reachable. When every box is draining — a
     // rollout replacing the whole pool, or a single-box agent rolling onto a new image —
@@ -428,24 +403,11 @@ export class AgentBoxManager {
           console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
       }
       if (handle) {
-        // 🔴 Only bind a session the draining boxes are NOT still holding. During a
-        // rollout a live turn keeps running on the old box; re-binding here would send
-        // that conversation's next Stop/Steer/send to a box holding none of its state.
-        if (sessionId && !resident.has(sessionId)) {
-          this.bindings.bind(agentId, sessionId, handle.boxId);
-          return { handle, created: true };
-        }
-        if (!sessionId) return { handle, created: true };
-        const holder = reachable.find((b) => b.boxId === this.bindings.get(agentId, sessionId));
-        if (holder) {
-          console.log(`[agentbox-manager] session ${sessionId} is still resident on ${holder.boxId}; not moving it to ${handle.boxId}`);
-          return { handle: { boxId: holder.boxId, endpoint: holder.endpoint, agentId }, created: false };
-        }
-        this.bindings.bind(agentId, sessionId, handle.boxId);
+        if (sessionId) this.bindings.remember(agentId, sessionId, handle.boxId);
         return { handle, created: true };
       }
-      // The spawn failed. Fall through: serving from a draining box beats failing the
-      // turn outright, and the reaper will not remove it while it holds work.
+      // The spawn failed. Serving from a draining box beats failing the turn; the reaper
+      // leaves it alone while it holds work.
       if (reachable.length === 0) throw new Error(`Failed to spawn an AgentBox for agent ${agentId}`);
     } else if (missing.length > 0) {
       void this.spawnInstances(agentId, config, missing).catch((err) =>
@@ -454,25 +416,19 @@ export class AgentBoxManager {
 
     if (!sessionId) {
       // No session to route (admin probe, capability-style call). Prefer a box that is
-      // still accepting — handing the caller a draining one works but is about to be
-      // deleted, and there is no binding here to keep it alive.
+      // still accepting — a draining one works but is about to be deleted.
       const box = reachable.find((b) => !this.draining.has(b.boxId)) ?? reachable[0];
       return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
     }
 
-    const candidates = this.candidatesFrom(reachable, statuses);
-
-    const placed = this.bindings.place(agentId, sessionId, candidates, resident);
+    const placed = this.bindings.place(agentId, sessionId, this.candidatesFrom(reachable, statuses), undefined);
     const chosen = placed ? reachable.find((b) => b.boxId === placed.boxId) : undefined;
     if (chosen) {
       return { handle: { boxId: chosen.boxId, endpoint: chosen.endpoint, agentId }, created: false };
     }
 
-    // Placement declined and the awaited-spawn branch above did not run or did not
-    // produce a box. Serving from a draining box beats failing the turn: the reaper
-    // leaves it alone while it holds work, and the binding moves on its next release.
     const fallback = reachable[0];
-    this.bindings.bind(agentId, sessionId, fallback.boxId);
+    this.bindings.remember(agentId, sessionId, fallback.boxId);
     return { handle: { boxId: fallback.boxId, endpoint: fallback.endpoint, agentId }, created: false };
   }
 

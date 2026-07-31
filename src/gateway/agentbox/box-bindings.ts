@@ -1,30 +1,25 @@
 /**
- * Which box serves which session.
+ * Where a session's next turn should run.
  *
- * An agent may run several AgentBox pods. A session's state — its brain, tool set, MCP
- * connections, SSE replay buffer, and above all its background jobs — lives in ONE of
- * them, in memory. `job_stop`'s abort handle is a closure over a running child process:
- * a live async operation, not serialisable state. So a session cannot be moved while it
- * is being served, and this table exists to make sure it never is.
+ * A session is NOT owned by a box. The only thing that pins it is live work: while a box
+ * is running its turn or still has background sub-agents for it, that box holds the
+ * session's in-memory conversation and is the one appending to its transcript, so the
+ * next request has to go there. The boxes report this themselves — a session stays
+ * resident while background work defers its release — so the answer is observed, never
+ * remembered.
  *
- * The rules, in the order they matter:
+ * With no live work, the session is free. It goes wherever the load says, which is what
+ * lets a scale-up actually relieve existing conversations rather than only new ones.
  *
- *  1. **Round-robin places, affinity keeps.** RR chooses a box for a session that has
- *     none. It is never re-applied per request — a second turn landing elsewhere would
- *     find none of the first turn's state.
+ * The last box is kept only as a PREFERENCE. Returning to it skips rebuilding the tool
+ * environment — MCP connections are re-initialised on a cold session, and the debug-pod
+ * cache is keyed per box, so a follow-up about the same node pays a pod cold start
+ * elsewhere. It is a latency win, never a correctness rule: losing the whole hint map
+ * changes nothing but speed.
  *
- *  2. **A binding survives as long as its box does.** Raising the replica count relieves
- *     FUTURE sessions; it never migrates existing ones.
- *
- *  3. **One re-binding is legal**: a session that the box has released, when its box is
- *     gone or draining. A released session holds no in-flight turn and no background
- *     work, so moving it costs warm state and nothing else. Without this, a box could
- *     never actually be drained and a scale-up would never rebalance anything.
- *
- * Deliberately pure and in-memory: no clock, no I/O, no K8s. The Runtime is a single
- * replica and therefore the sole writer, so this needs no lease and no coordination —
- * and rebuilding it from the pod list after a restart is correct, because a binding to a
- * box that no longer exists is exactly what rule 3 discards.
+ * Correctness against two concurrent turns is NOT this module's job — that is the
+ * Runtime's per-session turn lock (session-turn-lock.ts). This module only decides where
+ * a turn that is allowed to start should go.
  */
 
 /** A box that can currently accept work, as observed this round. */
@@ -36,143 +31,119 @@ export interface BoxCandidate {
   turnsInFlight: number;
 }
 
+/** Cap on remembered per-session hints for one agent. */
+const MAX_HINTS_PER_AGENT = 5_000;
+
 export interface PlacementResult {
   boxId: string;
-  /** True when this call changed the binding (new session, or a legal re-bind). */
+  /** True when the session moved to a different box than last time. */
   bound: boolean;
 }
 
 export class BoxBindings {
-  /** agentId → sessionId → boxId. */
-  private byAgent = new Map<string, Map<string, string>>();
-  /** agentId → rotor position, so RR does not restart at 0 on every call. */
+  /** agentId → sessionId → last box that served it. A hint; safe to lose entirely. */
+  private lastBox = new Map<string, Map<string, string>>();
+  /** agentId → rotor position, so round-robin does not restart at 0 on every call. */
   private rotor = new Map<string, number>();
 
-  /** The box currently serving a session, if any. */
+  /** The box that last served a session, if this Runtime still remembers. */
   get(agentId: string, sessionId: string): string | undefined {
-    return this.byAgent.get(agentId)?.get(sessionId);
-  }
-
-  /** Sessions bound to a given box. */
-  sessionsOn(agentId: string, boxId: string): string[] {
-    const map = this.byAgent.get(agentId);
-    if (!map) return [];
-    return [...map].filter(([, b]) => b === boxId).map(([s]) => s);
-  }
-
-  /** How many sessions each box of an agent currently holds. */
-  countsByBox(agentId: string): Map<string, number> {
-    const counts = new Map<string, number>();
-    for (const boxId of this.byAgent.get(agentId)?.values() ?? []) {
-      counts.set(boxId, (counts.get(boxId) ?? 0) + 1);
-    }
-    return counts;
+    return this.lastBox.get(agentId)?.get(sessionId);
   }
 
   /**
-   * Decide which box serves `sessionId`, binding it if it has none.
+   * Decide where this session's next turn runs.
    *
-   * `residentSessionIds` is what the boxes report they are actually holding. A session
-   * that is bound but NOT resident has been released from box memory, which is the only
-   * state in which it may be moved.
+   * `holder` is the box currently reported to be holding the session — a turn in flight or
+   * background sub-agents still running under it. When set, that is the answer: the
+   * conversation is in that box's memory and it is the one writing the transcript.
    *
-   * Returns undefined when no box can take it — the caller has to spawn one rather than
-   * pick a draining box and lose the work a moment later.
+   * Otherwise the session is free. The last box wins only if it is still accepting and no
+   * more loaded than the least-loaded one, so a preference never keeps a session on a box
+   * that has become the busy one.
+   *
+   * Returns undefined when nothing can take it — the caller must spawn rather than hand
+   * the turn to a box that is about to be removed.
    */
   place(
     agentId: string,
     sessionId: string,
     candidates: BoxCandidate[],
-    residentSessionIds: ReadonlySet<string>,
+    holder: string | undefined,
   ): PlacementResult | undefined {
-    const current = this.get(agentId, sessionId);
-    if (current !== undefined) {
-      const box = candidates.find((c) => c.boxId === current);
-      // Rule 2: keep it where it is, even on a box that has stopped accepting NEW
-      // sessions — draining means "no new work", not "abandon what you are holding".
-      if (box) return { boxId: current, bound: false };
-      // Its box is gone. Rule 3 permits a move only if the session is not resident
-      // anywhere — but a box that vanished is holding nothing, so this is always legal.
-      this.unbind(agentId, sessionId);
-    } else if (residentSessionIds.has(sessionId)) {
-      // Resident somewhere without a binding: the Runtime restarted and lost the table.
-      // Adopting the observation beats placing it somewhere it has no state.
-      return undefined;
+    if (holder && candidates.some((c) => c.boxId === holder)) {
+      this.remember(agentId, sessionId, holder);
+      return { boxId: holder, bound: false };
     }
 
-    const chosen = this.pickRoundRobin(agentId, candidates);
+    const open = candidates.filter((c) => c.accepting);
+    if (open.length === 0) return undefined;
+
+    const previous = this.get(agentId, sessionId);
+    const prev = previous ? open.find((c) => c.boxId === previous) : undefined;
+    if (prev) {
+      const lightest = Math.min(...open.map((c) => c.turnsInFlight));
+      if (prev.turnsInFlight <= lightest) {
+        this.remember(agentId, sessionId, prev.boxId);
+        return { boxId: prev.boxId, bound: false };
+      }
+    }
+
+    const chosen = this.pickRoundRobin(agentId, open);
     if (!chosen) return undefined;
-    this.bind(agentId, sessionId, chosen);
-    return { boxId: chosen, bound: true };
+    this.remember(agentId, sessionId, chosen);
+    return { boxId: chosen, bound: previous !== chosen };
   }
 
-  /**
-   * Move sessions off a box that is draining, where that is legal.
-   *
-   * Only sessions the box has RELEASED are moved; anything still resident stays until the
-   * box reports it gone. Returns the sessions actually re-bound.
-   */
-  rebalanceOff(
-    agentId: string,
-    drainingBoxId: string,
-    candidates: BoxCandidate[],
-    residentSessionIds: ReadonlySet<string>,
-  ): string[] {
-    const moved: string[] = [];
-    for (const sessionId of this.sessionsOn(agentId, drainingBoxId)) {
-      if (residentSessionIds.has(sessionId)) continue; // still in memory → not movable
-      const chosen = this.pickRoundRobin(agentId, candidates.filter((c) => c.boxId !== drainingBoxId));
-      if (!chosen) break; // nowhere to go; leave the binding alone
-      this.bind(agentId, sessionId, chosen);
-      moved.push(sessionId);
+  /** Record which box served a session, for the next turn's preference. */
+  remember(agentId: string, sessionId: string, boxId: string): void {
+    let map = this.lastBox.get(agentId);
+    if (!map) {
+      map = new Map();
+      this.lastBox.set(agentId, map);
     }
-    return moved;
+    map.set(sessionId, boxId);
+    // The hint is per-session and unbounded otherwise; a busy agent would accumulate one
+    // entry per session forever. Losing an old hint costs a cold tool environment once.
+    if (map.size > MAX_HINTS_PER_AGENT) {
+      const oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
+    }
   }
 
-  /** Drop bindings to boxes that no longer exist. Safe to run every reconciliation round. */
+  forget(agentId: string, sessionId: string): void {
+    const map = this.lastBox.get(agentId);
+    if (!map) return;
+    map.delete(sessionId);
+    if (map.size === 0) this.lastBox.delete(agentId);
+  }
+
+  /** Drop hints pointing at boxes that no longer exist. */
   retainBoxes(agentId: string, liveBoxIds: ReadonlySet<string>): void {
-    const map = this.byAgent.get(agentId);
+    const map = this.lastBox.get(agentId);
     if (!map) return;
     for (const [sessionId, boxId] of [...map]) {
       if (!liveBoxIds.has(boxId)) map.delete(sessionId);
     }
-    if (map.size === 0) this.byAgent.delete(agentId);
-  }
-
-  /** Adopt an observed binding — used to rebuild the table from what boxes report. */
-  bind(agentId: string, sessionId: string, boxId: string): void {
-    let map = this.byAgent.get(agentId);
-    if (!map) {
-      map = new Map();
-      this.byAgent.set(agentId, map);
-    }
-    map.set(sessionId, boxId);
-  }
-
-  unbind(agentId: string, sessionId: string): void {
-    const map = this.byAgent.get(agentId);
-    if (!map) return;
-    map.delete(sessionId);
-    if (map.size === 0) this.byAgent.delete(agentId);
+    if (map.size === 0) this.lastBox.delete(agentId);
   }
 
   /** Forget an agent entirely (its boxes are all gone). */
-  forget(agentId: string): void {
-    this.byAgent.delete(agentId);
+  forgetAgent(agentId: string): void {
+    this.lastBox.delete(agentId);
     this.rotor.delete(agentId);
   }
 
   /**
-   * Next accepting box, rotating, with ties broken by fewest in-flight turns.
+   * Next box, rotating, with the least-loaded winning.
    *
-   * Rotation rather than pure least-loaded because in-flight turns is a sample: a burst
-   * of placements between two observations would otherwise all pile onto whichever box
-   * happened to read as idle.
+   * In-flight turns is the primary criterion; rotation only breaks ties. That matters
+   * because the count is a sample taken up to a couple of seconds ago — with every box
+   * reading equal (all idle, the common case) pure least-loaded would put a whole burst
+   * onto whichever box was listed first.
    */
-  private pickRoundRobin(agentId: string, candidates: BoxCandidate[]): string | undefined {
-    const open = candidates.filter((c) => c.accepting);
+  private pickRoundRobin(agentId: string, open: BoxCandidate[]): string | undefined {
     if (open.length === 0) return undefined;
-
     const start = (this.rotor.get(agentId) ?? 0) % open.length;
     const rotated = [...open.slice(start), ...open.slice(0, start)];
     this.rotor.set(agentId, (start + 1) % open.length);
