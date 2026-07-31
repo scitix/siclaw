@@ -2571,14 +2571,14 @@ export async function collectChannelResponse(
             ? `Running sub-agents… ${done}/${total} done`
             : `子任务执行中… ${done}/${total} 完成`;
         } else {
-          // Non-group progress (single-agent step activity): fall back to the raw activity text.
+          // Non-group progress (single-agent step activity).
           const blocks = Array.isArray(ev.partialResult?.content) ? ev.partialResult.content : [];
           const activity = blocks
             .filter((b: any) => b?.type === "text")
             .map((b: any) => (b.text ?? "") as string)
             .join(" ")
             .trim();
-          milestone = activity ? (condenseMilestone(activity) || activity) : "";
+          milestone = channelActivityMilestone(activity, options.locale);
         }
         if (milestone) options.onMilestone(milestone);
       }
@@ -2677,6 +2677,32 @@ function condenseMilestone(text: string): string {
   const clean = firstLine.replace(/^#{1,6}\s+/, "").trim();
   if (!clean) return "";
   return clean.length > 90 ? `${clean.slice(0, 88)}…` : clean;
+}
+
+/**
+ * What a single-agent step activity should say ON A CHAT CARD — or nothing.
+ *
+ * The producer's activity text is developer-facing: `Ran <tool>` is exactly what
+ * Portal's work card wants (a tool log is the point there). A group chat is not
+ * that audience — a bare tool name tells the asker nothing, and because the card
+ * shows only the CURRENT step it also pushes the agent's real narration off the
+ * card. So keep the agent's own words, drop the machine echo. The card still
+ * advances while a long tool runs: the sub-agent's own narration keeps arriving.
+ *
+ * Filtered here, at the channel boundary, rather than at the producer: the
+ * gateway and agentbox ship as separate images, so a gateway-side filter holds
+ * whatever agentbox version it is paired with (and Portal keeps its tool log).
+ */
+function channelActivityMilestone(activity: string, locale?: LarkLocale): string {
+  const clean = activity.trim();
+  if (!clean) return "";
+  // `Ran <tool>` — a tool name, not a milestone.
+  if (/^Ran\s+\S+$/.test(clean)) return "";
+  // Sub-agent slot wait: real information, but hard-coded English at the source.
+  if (/^Waiting for a free slot/i.test(clean)) {
+    return locale === "en-US" ? "Waiting for a free sub-agent slot…" : "排队等待子任务空位…";
+  }
+  return condenseMilestone(clean) || clean;
 }
 
 function contentBlocksToMarkdown(blocks: unknown[]): string {
