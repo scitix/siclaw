@@ -316,11 +316,32 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
             f"· {n_del} deleted source(s) → remove that source's content/references from its"
             " affected_pages; if a page ends up empty, delete it.",
             "· If the page set changes (pages created/deleted) → refresh index.md.",
+            # Domain is AI-maintained metadata anchored on the LATEST WHOLE library,
+            # not on this round's diff alone and not on a human button. Page edits
+            # stay scoped; domain maintenance is a separate obligation that always
+            # re-reads the full catalog after those edits (index may have just moved).
+            "· **Domain (AI-owned, whole-library anchor):** after the page work above,"
+            " maintain authoring/META.json domain for other agents' routing."
+            " **First read candidate/index.md in full** (every entry/description) —"
+            " that catalog *after this round's edits* is the anchor, never the"
+            " CHANGESET alone."
+            " (1) **No domain yet → you MUST call report_domain once** with one"
+            " sentence naming the field the finished library covers; a library with"
+            " content and no domain is incomplete metadata, not a safe default."
+            " (2) **Domain already present → re-judge against the full catalog plus"
+            " this round's diff** (page-set change is not required). Rewrite via"
+            " report_domain if it is empty of meaning, too narrow for the catalog,"
+            " claims a capability this diff removed, or would make a router skip"
+            " the library for a problem class this round added; same-theme adds,"
+            " in-page fact fixes, slightly broad wording, or unsure → leave it."
+            " One sentence, not a page list. Do not skip domain maintenance.",
             "· **Do not touch a single byte of any page outside affected_pages (plus your declared"
             " added-target pages and index)** — the closing guard compares per-page sha256 hashes,"
-            " and any out-of-scope edit triggers a repair round.",
+            " and any out-of-scope edit triggers a repair round."
+            " (Reading index.md for domain is required; rewriting pages outside"
+            " scope is still forbidden.)",
             "· Domain rulings follow constitution.md as usual; file a ticket for any new contradiction"
-            " as usual. When done, briefly state which pages you changed.",
+            " as usual. When done, briefly state which pages you changed and whether domain moved.",
         ]
         return "\n".join(lines)
     lines = [
@@ -331,8 +352,20 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
         "必须把该页名追加进 authoring/ADDED_TARGETS.json(页名数组)**,否则收尾护栏会当它越界。",
         f"· 删除源 {n_del} 个 → 从其 affected_pages 移除该源内容/引用;页因此清空则删页。",
         "· 页集若变(建/删页)→ 刷新 index.md。",
-        "· **affected_pages(及你申报的 added 落笔页、index)之外的页,一个字节都别碰** —— 收尾逐页比对 sha256,碰了要回修。",
-        "· 领域裁决照常按 constitution.md;遇新矛盾照走工单。改完简短说动了哪几页。",
+        # 领域是 AI 自维护、以「本轮改完后的最新整库」为锚;页编辑仍 scoped,领域维护另义务。
+        "· **领域描述(AI 维护,整库锚点):** 上面的页工作做完后,维护 authoring/META.json 的 domain,"
+        "给别的智能体做路由用。"
+        "**先完整阅读本轮之后的 candidate/index.md**（每一条与 description）——锚点是**最新整库目录**,"
+        "绝不是单靠 CHANGESET。"
+        " (1) **还没有 domain → 必须调一次 report_domain**,用一句话说清整库领域;"
+        "有内容却无领域是未完成元数据,不是安全默认。"
+        " (2) **已有 domain → 对照完整目录 + 本轮 diff 再审**（不要求页集先变）。"
+        "空泛、相对目录过窄、仍宣称本轮已删能力、或会让路由漏掉本轮新增问题类 → 才 report_domain 重写;"
+        "同主题加页、只改事实、略宽、吃不准 → 保持。"
+        "一句领域,不要列页。领域维护不许跳过。",
+        "· **affected_pages(及你申报的 added 落笔页、index)之外的页,一个字节都别碰** —— 收尾逐页比对 sha256,碰了要回修。"
+        "（为 domain **读** index.md 是必须的;改范围外正文仍禁止。）",
+        "· 领域裁决照常按 constitution.md;遇新矛盾照走工单。改完简短说动了哪几页、domain 是否变了。",
     ]
     return "\n".join(lines)
 

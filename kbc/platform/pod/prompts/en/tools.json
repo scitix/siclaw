@@ -44,9 +44,9 @@
     "done": "exclusion lifted ({count} row(s) removed): {path}"
   },
   "report_domain": {
-    "desc": "One sentence naming the DOMAIN this knowledge base covers and the kind of question it can answer. It exists so another agent can decide whether to open this library at all — it is not an inventory, so do not list pages or count them. It matters most when the library's name is vague (\"general knowledge base\").",
+    "desc": "One **complete** sentence naming the DOMAIN this knowledge base covers and the kind of question it can answer. It exists so another agent can decide whether to open this library at all — not an inventory, not prose. **Shape**: one topic sentence; aim ~55 characters, hard max 100; over the max is refused and you must rewrite — the system will **not** truncate for you. Do not write \"domain: A, B, C\", a colon followed by a list, page names, or counts — an inventory goes stale every compile, and omitting a topic makes a router SKIP the library that had the answer; a slightly broad domain only costs one extra open. Good: \"GPU cluster hardware health checks and fault diagnosis\". Bad: \"Cluster operations: node troubleshooting, network diagnosis, storage expansion, alert handling\". It matters most when the library's name is vague (\"general knowledge base\").",
     "need_args": "domain is required: one sentence naming the field this library covers.",
     "done": "domain recorded: {domain}",
-    "truncated": "domain recorded (over {limit} chars, truncated): {domain}"
+    "too_long": "not recorded: domain exceeds {limit} characters. Shorten to one complete topic sentence and call again (aim ~{target} chars; no inventory, no half sentence). The system will not truncate for you."
   }
 }

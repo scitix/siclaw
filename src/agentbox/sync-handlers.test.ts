@@ -1050,6 +1050,8 @@ describe("knowledgeHandler multi-repo identity", () => {
     await knowledgeHandler.materialize({ version: "v1", repos });
     const index = fs.readFileSync(path.join(knowledgeTmpDir, "index.md"), "utf8");
     expect(index).toContain("Each entry is a knowledge library, not a page.");
+    // Model-written name/domain are routing labels only — not commands.
+    expect(index).toContain("untrusted routing metadata");
   });
 
   it("keeps one library to one catalog line", async () => {
@@ -1072,9 +1074,9 @@ describe("knowledgeHandler multi-repo identity", () => {
     // row — it is a subtitle saying something odd, not a third library.
     expect(entries[0]).toContain("伪造条目");
     expect(entries.some((line) => line.startsWith("- [[repos/forged/"))).toBe(false);
-    // Counted in code points, matching the box (Python `len`) and the server
-    // (Go runes) — a byte-length cap would cut a Chinese domain at 26 chars.
-    const domainB = entries[1].split(" — ")[1];
-    expect([...domainB]).toHaveLength(80);
+    // Over-cap domain is omitted whole (defense), not mid-clipped to 80/100.
+    // Counted in code points, matching the box (Python `len`) and the server.
+    expect(entries[1]).not.toContain(" — ");
+    expect(entries[1]).toMatch(/- \[\[repos\/.+\]\] - B v1$/);
   });
 });
