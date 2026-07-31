@@ -1159,7 +1159,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const sessionId = params.sessionId as string;
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
 
-    const handle = await agentBoxManager.getAsync(agentId);
+    // Session-aware: an agent may run several boxes, and this session lives on exactly
+    // one of them. Deriving the instance-0 pod name would report a session pinned to
+    // instance 1 as not running — losing stream reattachment on refresh, and making a
+    // live A2A task look orphaned after a Portal restart.
+    const handle = await (agentBoxManager.getForSession?.(agentId, sessionId) ?? agentBoxManager.getAsync(agentId));
     if (!handle) return { ok: true, running: false };
     try {
       const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
@@ -1206,7 +1210,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const results = await Promise.all(
       targets.map(async (box) => {
         try {
-          await agentBoxManager.stop(box.agentId);
+          // The CONCRETE box, not the agent: stop(agentId) always derives the instance-0
+          // pod name, so an N-box agent issued N deletes for instance 0, left 1..N-1
+          // running, and still reported them stopped.
+          await (agentBoxManager.stopBox?.(box.boxId) ?? agentBoxManager.stop(box.agentId));
           return { ok: true, boxId: box.boxId };
         } catch (err: any) {
           console.warn(`[rpc] agent.terminate: failed to stop ${box.boxId}: ${err.message}`);

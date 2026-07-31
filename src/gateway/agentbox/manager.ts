@@ -362,13 +362,50 @@ export class AgentBoxManager {
 
     const reachable = pool.filter((b) => this.isReachable(b, wantProfile));
 
-    // Fast path: this session already belongs to a box that is still up. Affinity wins
-    // over everything below — including a drain, which means "no NEW sessions", not
-    // "abandon what you are holding".
+    // Ask the boxes what they are HOLDING before deciding anything. Residency is the
+    // input every rule below turns on, and two separate bugs came from branches that
+    // decided first and sampled afterwards: a rollout re-placed a session that was still
+    // running, and a released session was pinned to a draining box forever.
+    const statuses = sessionId ? await this.sampleBoxStatuses(reachable) : new Map<string, BoxStatusReport>();
+    const resident = new Set<string>();
+    for (const st of statuses.values()) for (const id of st.sessionIds) resident.add(id);
+
+    // Adopt what the boxes report: after a Runtime restart the binding table is empty
+    // while sessions are still live in boxes, and placing one fresh would send a running
+    // conversation to a box holding none of its state.
+    for (const [boxId, status] of statuses) {
+      for (const id of status.sessionIds) {
+        if (!this.bindings.get(agentId, id)) this.bindings.bind(agentId, id, boxId);
+      }
+    }
+
+    // Affinity: this session already belongs to a box that is still up. It wins over
+    // everything below — including a drain, which means "no NEW sessions", not "abandon
+    // what you are holding".
+    //
+    // The ONE exception is the legal re-binding: a box that is draining AND no longer
+    // holds this session has nothing left to lose by letting it move, and keeping it
+    // pinned there would repeatedly reactivate an old-image box and push the drain to its
+    // force-kill deadline.
     const bound = sessionId ? this.bindings.get(agentId, sessionId) : undefined;
     if (bound) {
       const box = reachable.find((b) => b.boxId === bound);
-      if (box) return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
+      const stillHolding = resident.has(sessionId!);
+      if (box && (stillHolding || !this.draining.has(box.boxId))) {
+        return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
+      }
+      if (box && sessionId) {
+        const moved = this.bindings.rebalanceOff(agentId, box.boxId, this.candidatesFrom(reachable, statuses), resident);
+        if (moved.includes(sessionId)) {
+          const target = reachable.find((b) => b.boxId === this.bindings.get(agentId, sessionId));
+          if (target) {
+            console.log(`[agentbox-manager] session ${sessionId} released; moving off draining ${box.boxId} to ${target.boxId}`);
+            return { handle: { boxId: target.boxId, endpoint: target.endpoint, agentId }, created: false };
+          }
+        }
+        // Nowhere to move it yet — stay put rather than fail the turn.
+        return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
+      }
     }
 
     // Growing the pool normally happens in the BACKGROUND: blocking this turn on a cold
@@ -391,7 +428,20 @@ export class AgentBoxManager {
           console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
       }
       if (handle) {
-        if (sessionId) this.bindings.bind(agentId, sessionId, handle.boxId);
+        // 🔴 Only bind a session the draining boxes are NOT still holding. During a
+        // rollout a live turn keeps running on the old box; re-binding here would send
+        // that conversation's next Stop/Steer/send to a box holding none of its state.
+        if (sessionId && !resident.has(sessionId)) {
+          this.bindings.bind(agentId, sessionId, handle.boxId);
+          return { handle, created: true };
+        }
+        if (!sessionId) return { handle, created: true };
+        const holder = reachable.find((b) => b.boxId === this.bindings.get(agentId, sessionId));
+        if (holder) {
+          console.log(`[agentbox-manager] session ${sessionId} is still resident on ${holder.boxId}; not moving it to ${handle.boxId}`);
+          return { handle: { boxId: holder.boxId, endpoint: holder.endpoint, agentId }, created: false };
+        }
+        this.bindings.bind(agentId, sessionId, handle.boxId);
         return { handle, created: true };
       }
       // The spawn failed. Fall through: serving from a draining box beats failing the
@@ -410,28 +460,7 @@ export class AgentBoxManager {
       return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
     }
 
-    const statuses = await this.sampleBoxStatuses(reachable);
-    const resident = new Set<string>();
-    for (const s of statuses.values()) for (const id of s.sessionIds) resident.add(id);
-
-    // Adopt what the boxes report before placing: after a Runtime restart the binding
-    // table is empty while sessions are still live in boxes, and placing one fresh would
-    // send a running conversation to a box holding none of its state.
-    for (const [boxId, status] of statuses) {
-      for (const id of status.sessionIds) {
-        if (!this.bindings.get(agentId, id)) this.bindings.bind(agentId, id, boxId);
-      }
-    }
-
-    const candidates = reachable.map((b) => ({
-      boxId: b.boxId,
-      accepting: !this.draining.has(b.boxId),
-      // A box that did not answer must NOT read as idle. Failing to answer is what a
-      // wedged box does — blocked event loop, GC thrash, OOM churn — and scoring it 0
-      // would make least-loaded placement steer every new session straight onto it.
-      // Ranked last instead, so it is still usable when nothing else is.
-      turnsInFlight: statuses.get(b.boxId)?.turnsInFlight ?? Number.MAX_SAFE_INTEGER,
-    }));
+    const candidates = this.candidatesFrom(reachable, statuses);
 
     const placed = this.bindings.place(agentId, sessionId, candidates, resident);
     const chosen = placed ? reachable.find((b) => b.boxId === placed.boxId) : undefined;
@@ -445,6 +474,62 @@ export class AgentBoxManager {
     const fallback = reachable[0];
     this.bindings.bind(agentId, sessionId, fallback.boxId);
     return { handle: { boxId: fallback.boxId, endpoint: fallback.endpoint, agentId }, created: false };
+  }
+
+  /**
+   * Placement candidates from what the boxes reported.
+   *
+   * A box that did not answer must NOT read as idle. Failing to answer is what a wedged
+   * box does — blocked event loop, GC thrash, OOM churn — and scoring it 0 would make
+   * least-loaded placement steer every new session straight onto it. Ranked last instead,
+   * so it stays usable when nothing else is.
+   */
+  private candidatesFrom(reachable: AgentBoxInfo[], statuses: Map<string, BoxStatusReport>) {
+    return reachable.map((b) => ({
+      boxId: b.boxId,
+      accepting: !this.draining.has(b.boxId),
+      turnsInFlight: statuses.get(b.boxId)?.turnsInFlight ?? Number.MAX_SAFE_INTEGER,
+    }));
+  }
+
+  /**
+   * The box currently serving a session, WITHOUT spawning anything.
+   *
+   * Liveness and termination must not fall back to "the instance-0 pod name": a session
+   * pinned to instance 1 would read as not-running (losing stream reattachment, and
+   * making a live task look orphaned), and a terminate would delete instance 0 N times
+   * while the rest kept serving.
+   *
+   * Returns undefined when the agent has no box or the session is not bound to one —
+   * which is the honest answer, not a reason to guess at instance 0.
+   */
+  async getForSession(agentId: string, sessionId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
+    const bound = this.bindings.get(agentId, sessionId);
+    if (bound) {
+      const info = await this.spawner.get(bound).catch(() => null);
+      if (info && info.status === "running" && info.endpoint) {
+        return { boxId: bound, endpoint: info.endpoint, agentId };
+      }
+      // The bound box is gone; fall through to the agent's remaining boxes.
+    }
+    for (const box of await this.listPool(agentId)) {
+      if (box.status === "running" && box.endpoint && (box.profile ?? "agent") === (profile ?? "agent")) {
+        return { boxId: box.boxId, endpoint: box.endpoint, agentId };
+      }
+    }
+    return undefined;
+  }
+
+  /** Every box of an agent, for operations that must act on the whole pool. */
+  async listForAgent(agentId: string): Promise<AgentBoxInfo[]> {
+    return this.listPool(agentId);
+  }
+
+  /** Stop one specific box by its pod name (as opposed to `stop(agentId)`). */
+  async stopBox(boxId: string): Promise<void> {
+    await this.spawner.stop(boxId);
+    this.draining.delete(boxId);
+    this.statusCache.delete(boxId);
   }
 
   /** Pool listing, when the spawner supports it (K8s only; duck-typed like setCertManager). */

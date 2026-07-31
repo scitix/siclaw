@@ -887,3 +887,78 @@ describe("AgentBoxManager — a single-box agent still rolls onto a new image", 
     expect(spawner.spawnCalls).toHaveLength(0);
   });
 });
+
+describe("AgentBoxManager — PR review regressions", () => {
+  it("does NOT move a session that is still resident on the draining box", async () => {
+    // Review #1. During a rollout the old box keeps running the in-flight turn. Binding
+    // the session to the replacement would send its next Stop/Steer/send to a box holding
+    // none of its state — the exact loss affinity exists to prevent.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0, { image: "agentbox:v1" })];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: ["s-live"], turnsInFlight: 1, drained: false }));
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s-live");
+    expect(handle.boxId).toBe("agentbox-agent-a"); // stays on the box actually running it
+  });
+
+  it("moves a RELEASED session off a draining box once somewhere else can take it", async () => {
+    // Review #5. The legal re-binding: released means no in-flight turn and no background
+    // work, so moving costs warm state and nothing else. Pinning it would keep
+    // reactivating an old-image box and hold the drain to its force-kill deadline.
+    const spawner = new PoolSpawner("k8s");
+    const stale = poolBox("agentbox-agent-a", 0, { image: "agentbox:v1" });
+    spawner.pool = [stale, poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 2);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+    (mgr as any).bindings.bind("agent-a", "s-released", "agentbox-agent-a");
+    (mgr as any).draining.set("agentbox-agent-a", Date.now());
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s-released");
+    expect(handle.boxId).toBe("agentbox-agent-a-1");
+  });
+
+  it("keeps a released session put when there is nowhere to move it", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0, { image: "agentbox:v1" })];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 1);
+    mgr.setBoxStatusProbe(async () => ({ sessionIds: [], turnsInFlight: 0, drained: true }));
+    (mgr as any).bindings.bind("agent-a", "s", "agentbox-agent-a");
+    (mgr as any).draining.set("agentbox-agent-a", Date.now());
+
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s");
+    expect(handle.boxId).toBe("agentbox-agent-a"); // better than failing the turn
+  });
+
+  it("finds a session's box by binding, not by deriving instance 0", async () => {
+    // Review #3. A session pinned to instance 1 must not read as not-running.
+    const spawner = new PoolSpawner("k8s");
+    const one = poolBox("agentbox-agent-a-1", 1);
+    spawner.pool = [poolBox("agentbox-agent-a", 0), one];
+    spawner.getReturns.set("agentbox-agent-a-1", one);
+    const mgr = new AgentBoxManager(spawner);
+    (mgr as any).bindings.bind("agent-a", "s1", "agentbox-agent-a-1");
+
+    const handle = await mgr.getForSession("agent-a", "s1");
+    expect(handle?.boxId).toBe("agentbox-agent-a-1");
+  });
+
+  it("reports no box rather than guessing instance 0 for an unknown session", async () => {
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [];
+    const mgr = new AgentBoxManager(spawner);
+    expect(await mgr.getForSession("agent-a", "nobody")).toBeUndefined();
+  });
+
+  it("stops the concrete box it was given", async () => {
+    // Review #4. stop(agentId) always derives instance 0, so terminating an N-box agent
+    // deleted instance 0 N times and reported the survivors as stopped.
+    const spawner = new PoolSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.stopBox("agentbox-agent-a-2");
+    expect(spawner.stopCalls).toEqual(["agentbox-agent-a-2"]);
+  });
+});

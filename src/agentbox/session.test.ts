@@ -1615,3 +1615,58 @@ describe("AgentBoxSessionManager — spawn_subagent batch (background)", () => {
     expect(groupProgress().length).toBe(before);
   });
 });
+
+describe("AgentBoxSessionManager — background sub-agents obey the ceilings", () => {
+  it("does not let detached children exceed the pod limit", async () => {
+    // Review #2. A background child is still a full agent session in this process, so it
+    // must take the same slots a foreground one does. Returning "launched" before the
+    // limiters let a wide detached fan-out ignore the box-wide ceiling entirely — the one
+    // guard between that fan-out and an OOMKill that costs every session in the box.
+    const prev = process.env.SICLAW_SUBAGENT_CONCURRENCY;
+    const prevPod = process.env.SICLAW_SUBAGENT_POD_CONCURRENCY;
+    process.env.SICLAW_SUBAGENT_CONCURRENCY = "1";
+    process.env.SICLAW_SUBAGENT_POD_CONCURRENCY = "1";
+    try {
+      const mgr = new AgentBoxSessionManager() as any;
+      let active = 0, maxActive = 0, finished = 0;
+      for (let i = 0; i < 2; i++) {
+        (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+          prompt: async () => {
+            active++; maxActive = Math.max(maxActive, active);
+            await new Promise((r) => setTimeout(r, 40));
+            active--; finished++;
+            emitter.emit("event", {
+              type: "message_end",
+              message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+            });
+          },
+          abort: async () => {},
+        }));
+      }
+      const mkReq = (id: string) => ({
+        description: `bg ${id}`,
+        renderedTasks: [{ item: id, prompt: `do ${id}` }],
+        subagentType: "general-purpose",
+        runInBackground: true,
+        parentSessionId: "p1",
+        parentAgentId: null,
+        userId: "u1",
+        taskListId: "tl1",
+        spawnId: `bg-${id}`,
+      });
+      const exec = mgr.createSpawnSubagentExecutor();
+      // Both return "launched" immediately — queueing must delay the CHILD, not the call.
+      expect((await exec(mkReq("a"), undefined, undefined)).status).toBe("launched");
+      expect((await exec(mkReq("b"), undefined, undefined)).status).toBe("launched");
+
+      for (let i = 0; i < 60 && finished < 2; i++) await new Promise((r) => setTimeout(r, 20));
+      expect(finished).toBe(2);   // both still run
+      expect(maxActive).toBe(1);  // …but never at the same time
+    } finally {
+      if (prev === undefined) delete process.env.SICLAW_SUBAGENT_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_CONCURRENCY = prev;
+      if (prevPod === undefined) delete process.env.SICLAW_SUBAGENT_POD_CONCURRENCY;
+      else process.env.SICLAW_SUBAGENT_POD_CONCURRENCY = prevPod;
+    }
+  });
+});

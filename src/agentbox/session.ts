@@ -1434,7 +1434,17 @@ export class AgentBoxSessionManager {
       }
     }
 
-    void this.runSpawnedSubagent(request, { childSessionId, jobId, ...traceCtx })
+    // 🔴 A detached child is still a child: it holds a full agent session in this
+    // process, so it must take the same session -> pod slots a foreground spawn does.
+    // Returning before the limiters — as this path used to — let background fan-out
+    // ignore the box-wide ceiling entirely, which is the one guard standing between a
+    // wide detached batch and an OOMKill that takes every session in the box with it.
+    //
+    // The slots are acquired INSIDE the detached promise, so the caller still returns
+    // "launched" immediately; queueing delays the child's start, never the tool call.
+    const sessionLim = this.sessionSubagentLimiter(request.parentSessionId);
+    void sessionLim.run(() => this.podSubagentLimiter.run(() =>
+      this.runSpawnedSubagent(request, { childSessionId, jobId, ...traceCtx })))
       .then((res) => {
         const job = this.jobs.get(jobId);
         const status: JobStatus =
