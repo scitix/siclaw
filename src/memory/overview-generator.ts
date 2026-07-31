@@ -81,8 +81,19 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
   return parts.join("");
 }
 
-/** Max chars of the knowledge wiki index injected into the prompt before truncation. */
-const KNOWLEDGE_WIKI_BUDGET = 4000;
+/**
+ * Max chars of the knowledge wiki index injected into the prompt before
+ * truncation.
+ *
+ * Sized against real compiled indexes rather than a round number: three
+ * measured 7453, 6651 and 2668 characters, so 4000 cut roughly half the page
+ * list of the single-library case — which is the common one, since one library
+ * unpacks its own index at the root. A truncated catalog reads exactly like a
+ * complete one; the agent finds no page for the task and concludes the wiki has
+ * nothing, and the "read index.md for the full list" footer only helps an agent
+ * that already suspects something is missing.
+ */
+const KNOWLEDGE_WIKI_BUDGET = 8000;
 
 /**
  * Inject the knowledge wiki's page catalog into the system prompt.

@@ -302,6 +302,24 @@ describe("buildKnowledgeWikiCatalog", () => {
     expect(out).not.toContain("truncated");
   });
 
+  it("carries a real compiled index whole", () => {
+    // Measured from three shipped libraries: 7453, 6651 and 2668 characters.
+    // The budget has to clear the largest of those, because a catalog cut in
+    // half reads exactly like a complete one — the agent finds no page for the
+    // task and concludes the wiki has nothing to say about it.
+    const realistic = [
+      "---", "title: Siclaw SRE Knowledge", "type: index", "---", "",
+      "# Siclaw SRE Knowledge", "", "## Components", "",
+      ...Array.from({ length: 60 }, (_, i) =>
+        `| [[component-${i}]] | what it is, how it fails, and which signals distinguish the two |`),
+    ].join("\n");
+    expect(realistic.length).toBeGreaterThan(4000);
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), realistic);
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(out).not.toContain("truncated");
+    expect(out).toContain("[[component-59]]");
+  });
+
   it("truncates an oversized index and points to the full file", () => {
     const big = Array.from({ length: 500 }, (_, i) => `- [[page-${i}]] — description number ${i} with some padding text`).join("\n");
     fs.writeFileSync(path.join(knowledgeDir, "index.md"), big);

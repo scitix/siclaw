@@ -256,7 +256,35 @@ def test_scoped_directive():
     d = incremental.build_scoped_directive(cs)                # default locale = English
     assert "CHANGESET.json" in d and "2 modified source(s)" in d and "1 added source(s)" in d
     assert "ADDED_TARGETS.json" in d and "sha256" in d  # declares the two contracts the guard depends on
-    print("OK  scoped directive (counts + CHANGESET + added-target + byte-guard mentioned)")
+    # Domain is AI-maintained against the latest whole catalog after page work:
+    # empty → must report_domain; present → re-judge full catalog + this diff.
+    # Anchor is index.md, never CHANGESET alone.
+    for locale in (None, "zh"):
+        text = incremental.build_scoped_directive(cs, locale=locale)
+        assert "report_domain" in text, (locale, text)
+        assert "index.md" in text, (locale, text)
+    zh = incremental.build_scoped_directive(cs, locale="zh")
+    assert "吃不准" in zh and "保持" in zh, zh
+    assert "还没有 domain → 必须" in zh or "必须调一次 report_domain" in zh, zh
+    assert "完整阅读" in zh or "完整" in zh, zh
+    assert "CHANGESET" in zh and "绝不是" in zh, zh
+    en = incremental.build_scoped_directive(cs, locale=None)
+    assert "leave it" in en or "leave the domain" in en.lower() or "unsure" in en, en
+    assert "MUST call report_domain" in en, en
+    assert "index.md in full" in en or "read candidate/index.md" in en.lower(), en
+    assert "never the CHANGESET alone" in en or "CHANGESET alone" in en, en
+    # Pure modified/deleted rounds still maintain domain (empty → must write).
+    mod_only = incremental.build_scoped_directive(
+        {"added": [], "modified": ["snap/a.md"], "deleted": ["snap/b.md"]},
+        locale=None,
+    )
+    assert "0 added source(s)" in mod_only
+    assert "report_domain" in mod_only
+    assert "MUST call report_domain" in mod_only
+    # Index refresh stays gated on page-set change; domain is a separate bullet.
+    assert "If the page set changes" in en
+    assert en.index("If the page set changes") < en.index("Domain (AI-owned")
+    print("OK  scoped directive (counts + CHANGESET + added-target + byte-guard + whole-library domain)")
 
 
 def test_integrity_repair_directive():

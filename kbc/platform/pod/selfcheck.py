@@ -974,6 +974,62 @@ def _write_exclusions_canonical(workdir: str, rows: list) -> None:
         json.dumps(rows, ensure_ascii=False, indent=2) + "\n")
 
 
+REPO_META_PATH = "authoring/META.json"
+
+# Admission ceiling for domain — mirrors compile_box.DOMAIN_MAX_CHARS /
+# consumer_domain / agentbox catalog. The write path (report_domain) enforces
+# it; the read path must too, because Write can bypass the tool and hand-edit
+# META.json, and a multi-line / over-cap domain then inflates every directive
+# that quotes it.
+DOMAIN_MAX_CHARS = 100
+
+
+def normalize_domain_line(raw: str | None, *, max_chars: int = DOMAIN_MAX_CHARS) -> str:
+    """Collapse whitespace; refuse over-cap by returning empty (no mid-clip)."""
+    if not isinstance(raw, str):
+        return ""
+    one = " ".join(raw.split())
+    if not one or len(one) > max_chars:
+        return ""
+    return one
+
+
+def write_repo_meta(workdir: str, domain: str) -> None:
+    """Persist the library's domain line as a machine-owned artifact.
+
+    Same rule as the exclusion ledger: the model supplies natural language and
+    NOTHING else, the format is generated here. The 2026-07-24 mandate exists
+    because a hand-authored trailing comma once blanked a ledger and wedged a
+    145-batch train, and a field disclosed to every agent that can see this
+    library is not the place to relax it.
+
+    Rewritten whole, atomically. This is one value, not an append-only log — a
+    later compile that renames the domain is correcting it, not adding to it.
+    """
+    _write_text_atomic(
+        Path(workdir) / REPO_META_PATH,
+        json.dumps({"domain": domain}, ensure_ascii=False, indent=2) + "\n")
+
+
+def read_repo_meta(workdir: str) -> dict:
+    """Best-effort read. A missing or unparseable file is an ABSENT domain, not
+    an error: the library still compiles, publishes and answers questions
+    without one — it is only harder for another agent to find.
+
+    Over-cap or newline-forged values are omitted whole so a hand-written META
+    cannot bypass the admission ceiling that report_domain enforces on write.
+    """
+    fp = Path(workdir) / REPO_META_PATH
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    domain = normalize_domain_line(data.get("domain"))
+    return {"domain": domain} if domain else {}
+
+
 def set_exclusion_reason(workdir: str, pattern: str, reason: str) -> tuple[str, str | None]:
     """Add an exclusion row, or CORRECT the reason of the existing one(s) for the
     same pattern → (status, error) with status in {"added", "updated", "unchanged"}.

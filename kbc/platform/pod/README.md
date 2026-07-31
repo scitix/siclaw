@@ -21,9 +21,11 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
 
   The moat relies on custom tools that let the agent **signal explicitly** (rather than guessing from output):
   `report_summary`→`summary`, `propose_plan`→`plan_proposed`,
-  `resolve_ticket`→writes the `agent_report` in `authoring/CONTRADICTIONS.json` (contradiction-ticket fix-up registration).
+  `resolve_ticket`→writes the `agent_report` in `authoring/CONTRADICTIONS.json` (contradiction-ticket fix-up registration),
+  `report_domain`→writes `authoring/META.json` with one field sentence for multi-library routing (cap enforced in code; typed command `compile.refresh_domain` is the on-demand whole-catalog path).
   **Contradictions never block**: the agent lands a best-guess page + marks it uncertain + files a ticket, and the owner adjudicates asynchronously afterward (contradiction-as-turn model).
   Compilation does not generate suggested test questions as a hidden completion side effect; question recommendation belongs to an explicit test workflow over a pinned draft.
+  Behavior changes need a `siclaw-kbc-box` image rebuild and runtime env `SICLAW_COMPILE_BOX_IMAGE` (existing live sessions keep their old image).
 
 ## Protocol v3: linear-wizard enhancements (BOX_ROLE contract, never-block invariant unchanged)
 

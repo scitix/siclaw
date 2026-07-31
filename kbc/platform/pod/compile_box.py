@@ -460,7 +460,26 @@ def _arm_test_turn(run: "TestRun") -> None:
 # rather than failing the run — massapi's limits are not ours to fix (out of
 # scope), so this is graceful handling, not a fix. Exhaustion ends the turn with a
 # clear owner-facing note instead of a crash.
+# DOMAIN_MAX_CHARS is an admission ceiling for the ONE piece of library metadata
+# disclosed per library rather than per use (console list, binding picker, multi-
+# library catalog). Cost multiplies by how many libraries an agent can see.
+# It is NOT a scissors width: over-cap text is refused so the model rewrites a
+# complete sentence; silent truncation once stored mid-token garbage
+# ("……以及 MCP/Skill/") into another agent's system prompt.
+# DOMAIN_TARGET_CHARS is the writing aim in prompts — most good domains land here;
+# the hard top leaves headroom for a full clause without inviting an inventory.
+DOMAIN_TARGET_CHARS = 55
+DOMAIN_MAX_CHARS = 100
+
 _MODEL_RATE_STATUSES = frozenset({429, 503, 529})
+
+# 402 sits one status away from the rate-limit family and is not one: a rate
+# limit clears on its own in seconds, so backing off is right, while a spend cap
+# is cleared by a person raising the limit, which no amount of backoff reaches.
+# Production hit `daily cost limit exceeded (504.29/500.00)` and the owner was
+# told only "batch compile interrupted; trigger again to resume" — the cause was
+# never named, because there was no 402 anywhere in this file.
+_MODEL_QUOTA_STATUS = 402
 _MODEL_RATE_MAX_RETRIES = int(os.environ.get("KBC_MODEL_RATE_MAX_RETRIES", "5"))
 _MODEL_RATE_BACKOFF_BASE_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_BASE_S", "2"))
 _MODEL_RATE_BACKOFF_CAP_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_CAP_S", "30"))
@@ -499,6 +518,17 @@ class BatchOutputError(Exception):
     """A successful internal session did not account for its assigned sources."""
 
 
+class ModelQuotaExhausted(RuntimeError):
+    """The model provider refused on billing (HTTP 402), not on capacity.
+
+    Backing off is wrong here — a spend cap does not clear in seconds, so the
+    rate-limit loop would spend its retries for nothing — and that is the only
+    claim this type makes. It deliberately carries no time-to-clear: a spend cap
+    is lifted by a person raising the limit, so any deadline the box stated
+    would be a guess presented as a fact. Separate from ModelStallError
+    (transient) and the rate-limit path."""
+
+
 class PlanIntegrityError(RuntimeError):
     """The batch plan could not be made valid — a defect in OUR planning, not in
     the user's sources.
@@ -528,6 +558,8 @@ def _batch_error_code(exc: BaseException) -> str:
         return "model_result_error"
     if isinstance(exc, BatchOutputError):
         return "provider_fault" if getattr(exc, "provider_fault", False) else "content_shape"
+    if isinstance(exc, ModelQuotaExhausted):
+        return "quota_exhausted"
     if isinstance(exc, PlanIntegrityError):
         return "plan_integrity"
     if isinstance(exc, asyncio.CancelledError):
@@ -571,6 +603,18 @@ class CompileRun:
         self.allowed_tools: list[str] | None = None
         # Consumer-declared prompt/output locale (capability.fetchInput → /session).
         self.locale: str | None = None
+        # The dispatch round resolve_ticket receipts belong to, scoped by the
+        # dispatch seam to the turn created for an accepted apply_rulings command.
+        #
+        # The runtime already validates this nonce as REQUIRED on the way in and
+        # then used to hand it to the model in prose to type back, defaulting to
+        # "" when it didn't. A fact the runtime holds does not become more true
+        # for having passed through the model's attention, and a bookkeeping
+        # field the model can silently omit is one the consumer cannot rely on:
+        # five tickets in production stuck at "已答·待重试" because the echo
+        # carried a superseded round, and closed only when a later retry omitted
+        # the nonce entirely and fell through to the weaker timestamp rule.
+        self.apply_dispatch_nonce: str = ""
         # Set once connect() has returned (success OR failure). A /message that
         # races ahead of the async connect waits on this so client.query() never
         # hits the SDK's "Not connected. Call connect() first." error.
@@ -1264,10 +1308,25 @@ _COMMAND_ACTIONS = {
     "compile.submit_decisions",
     "compile.apply_rulings",
     "compile.repair_test",
+    # Full-library domain write/update only — not a scoped incremental turn.
+    "compile.refresh_domain",
 }
 _FULL_COMPILE_ACTIONS = {
     "compile.generate", "compile.regenerate", "compile.approve_plan", "compile.resume",
 }
+# Chat / display-message adapters for the domain-refresh turn (typed action is
+# authoritative when present). Phrases are specific full intents — bare
+# English like "update domain" is NOT used: it is ordinary imperative vocabulary
+# and a prefix match would steal owner messages about domain *rulings*.
+# Matching is exact (after strip / case-fold), not prefix.
+_DOMAIN_REFRESH_TRIGGERS = (
+    "请更新领域描述",
+    "请生成领域描述",
+    "请补全领域描述",
+    "please refresh the domain description",
+    "please update the domain description",
+    "please generate the domain description",
+)
 _BRIEF_AUDIENCES = {"", "internal-eng", "frontline", "external", "newcomer"}
 _BRIEF_INTENTS = {"", "understand", "execute", "troubleshoot"}
 _CONTENT_LOCALE_RE = re.compile(r"^(?:auto|[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*)$")
@@ -1445,6 +1504,10 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         plan = _load_batch_plan(run)
         if not _batch_plan_resumable(plan):
             raise CommandRejected("no interrupted batch plan is available to resume", 409)
+    if action == "compile.refresh_domain":
+        index = Path(run.workdir) / "candidate" / "index.md"
+        if not index.is_file():
+            raise CommandRejected("candidate/index.md is required before domain refresh", 409)
     brief = params.get("brief")
     if brief is not None:
         # Structured command data replaces the old localized-text parser. The
@@ -1524,6 +1587,54 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
             return strings["failed"].format(path=raw_path, e=e)
         await run.emit({"type": "summary", "summary": strings["deleted"].format(path=rel.as_posix())})
         return strings["deleted"].format(path=rel.as_posix())
+
+    async def report_domain(args):
+        """Name the DOMAIN this library covers, for another agent's routing.
+
+        Its only job is the coarse question — "should I open this library at
+        all?". Precise routing already has a grounded surface: index.md carries
+        a per-page description documented as the sentence that routes an agent
+        to a page. This is one layer above that, and answering the coarse
+        question with an inventory makes it worse, not better: an inventory goes
+        stale on every compile, and an inventory that omits a topic makes a
+        router SKIP the library that had the answer — a false negative nobody
+        ever learns about. A domain that is slightly too broad only costs one
+        extra open.
+
+        Length is admission control, not editing. A cap written only into a
+        prompt is a wish; several libraries disclose this text at once, so the
+        budget is a fact enforced HERE. Over the ceiling we refuse without
+        writing: a complete shorter sentence on retry beats a clipped one that
+        looks fine in the head and corrupted in the tail. Empty is also
+        refused — blank is worse than absent in a picker.
+        """
+        rs = ts["report_domain"]
+        domain = " ".join(str(args.get("domain", "")).split())
+        if not domain:
+            return rs["need_args"]
+        if len(domain) > DOMAIN_MAX_CHARS:
+            return rs["too_long"].format(
+                limit=DOMAIN_MAX_CHARS, target=DOMAIN_TARGET_CHARS)
+        try:
+            selfcheck.write_repo_meta(run.workdir, domain)
+        except Exception as e:
+            _print_compile_lifecycle("meta.write_failed", run, extra=f"class={type(e).__name__}")
+            # Distinct from need_args: the model already supplied a domain; a
+            # disk refusal must not look like "you forgot the argument" or it
+            # will resubmit the same sentence forever.
+            try:
+                await run.emit({
+                    "type": "summary",
+                    "text": _loc(
+                        run,
+                        f"Domain write failed: {type(e).__name__}",
+                        f"领域描述写入失败: {type(e).__name__}",
+                    ),
+                })
+            except Exception:
+                pass
+            return rs["failed"].format(e=f"{type(e).__name__}: {e}")
+        return rs["done"].format(domain=domain)
 
     async def exclude_source(args):
         """The sanctioned ADD/UPDATE path into the exclusion ledger (2026-07-24
@@ -1607,10 +1718,16 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
             "applied_value": str(args.get("applied_value", "")),
             "pages_edited": [str(p) for p in (args.get("pages_edited") or []) if str(p).strip()],
             "note": str(args.get("note", "")),
-            # Echo of the dispatch nonce from the apply directive: lets the
-            # consumer match this receipt to the EXACT dispatch round it answers
-            # (timestamps alone cannot distinguish two overlapping rounds).
-            "dispatch_nonce": str(args.get("dispatch_nonce", "")),
+            # The dispatch round this receipt answers, stamped by the runtime
+            # from the accepted apply_rulings command — NOT read back from the
+            # model. It lets the consumer match a receipt to the EXACT round
+            # (timestamps alone cannot separate two overlapping ones), which
+            # makes it a control-plane fact, and control-plane facts the runtime
+            # already holds never route through the model. The argument stays in
+            # the schema so an older directive still calls cleanly; its value is
+            # ignored. Empty here means the box resolved a ticket outside any
+            # apply round, which is exactly what the consumer should not close.
+            "dispatch_nonce": run.apply_dispatch_nonce,
             "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         try:
@@ -1620,6 +1737,12 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
         return rt["registered"].format(tid=tid)
 
     return [
+        EngineTool(
+            "report_domain",
+            ts["report_domain"]["desc"],
+            {"type": "object", "properties": {"domain": {"type": "string"}}, "required": ["domain"]},
+            report_domain,
+        ),
         EngineTool(
             "report_summary",
             ts["report_summary"]["desc"],
@@ -1672,9 +1795,13 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
                     "applied_value": {"type": "string"},
                     "pages_edited": {"type": "array", "items": {"type": "string"}},
                     "note": {"type": "string"},
+                    # Accepted and ignored: the runtime stamps the round itself.
+                    # Kept in the schema so a directive from an older runtime,
+                    # which still asks for the echo, calls cleanly instead of
+                    # failing schema validation mid-repair.
                     "dispatch_nonce": {"type": "string"},
                 },
-                "required": ["ticket_id", "applied_value", "pages_edited", "note", "dispatch_nonce"],
+                "required": ["ticket_id", "applied_value", "pages_edited", "note"],
             },
             resolve_ticket,
         ),
@@ -2535,6 +2662,12 @@ async def _emit_message(run: CompileRun, msg) -> None:
                 )
                 await run.emit({"type": "step", "text": label})
     elif name == "ResultMessage":
+        if isinstance(run, CompileRun):
+            # The nonce is a fact about one accepted apply_rulings turn, not
+            # persistent session state. Tool calls for that turn have already
+            # completed when its ResultMessage arrives; clearing here prevents
+            # any later owner or internal turn from inheriting the old round.
+            run.apply_dispatch_nonce = ""
         reply = "\n\n".join(run._turn_text).strip()
         run._turn_text = []
         if getattr(run, "_suppress_turn_done", False):
@@ -2617,6 +2750,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
 # that DOES declare a list (e.g. kb-test) overrides this.
 DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "Read", "Write", "Edit", "Glob", "Grep",
+    "mcp__compile__report_domain",
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
     "mcp__compile__delete_candidate_page",
@@ -3053,6 +3187,121 @@ def _batch_mode_enabled() -> bool:
     return os.environ.get("KBC_BATCH_MODE", "on") != "off"
 
 
+def _should_route_to_domain_refresh(run: "CompileRun", text: str, action: str | None = None) -> bool:
+    """Dedicated full-library domain write/update.
+
+    Scoped incremental must not invent a first domain from a partial diff.
+    This route is the unified on-demand path: any time (empty or rewrite) as long
+    as the turn is instructed to understand the whole candidate catalog first.
+    """
+    if run._batch_active:
+        return False
+    if action == "compile.refresh_domain":
+        return True
+    if action is not None:
+        return False
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    for phrase in _DOMAIN_REFRESH_TRIGGERS:
+        if stripped == phrase or lower == phrase.lower():
+            return True
+    return False
+
+
+def build_domain_refresh_directive(
+    workdir: str,
+    locale: str | None = None,
+    owner_text: str | None = None,
+) -> str:
+    """Kickoff for compile.refresh_domain: whole-library view, one report_domain.
+
+    Domain is AI-maintained metadata anchored on the latest full catalog — same
+    obligation as the end of an incremental round, without page edits.
+    """
+    domain_now = selfcheck.read_repo_meta(workdir).get("domain", "")
+    if selfcheck._is_en(locale):
+        lines = [
+            "[Domain maintenance] AI-owned library field sentence (report_domain) for "
+            "another agent deciding whether to open this library. Anchor = latest "
+            "whole catalog, not a change set and not a human form.",
+            "· First **read candidate/index.md in full** (every entry and description). "
+            "If index is thin, sample page titles/descriptions — never invent the field "
+            "from one page alone.",
+            "· Call report_domain **once**: one natural-language sentence naming the "
+            "field this finished library covers. Not a page list, not counts, not a "
+            "colon-followed inventory.",
+            f"· Aim for about {DOMAIN_TARGET_CHARS} characters; over "
+            f"{DOMAIN_MAX_CHARS} is refused so you rewrite a complete sentence.",
+        ]
+        if domain_now:
+            lines.append(
+                f"· Current domain is {domain_now!r}. Rewrite if empty of meaning, too "
+                "narrow for the catalog you just read, or claims a field the corpus no "
+                "longer covers; if still accurate, you may report the same sentence."
+            )
+        else:
+            lines.append(
+                "· **No domain yet → you MUST write one** from the full catalog. A "
+                "library with content and no domain is incomplete metadata."
+            )
+        lines.append(
+            "· Do **not** recompile pages, edit raw/, or run an incremental repair. "
+            "When done, state the domain you wrote in one short line."
+        )
+        note = (owner_text or "").strip()
+        if note:
+            lines.append(f"· Owner message (keep in mind if relevant): {note}")
+        return "\n".join(lines)
+    lines = [
+        "【领域维护】AI 自维护的整库领域句（report_domain），锚点是**当前最新完整目录**,"
+        "不是变更集、不是给人填的表单。",
+        "· **先完整阅读 candidate/index.md**（每一条与 description）。"
+        "index 过薄时再抽样页标题/描述——不要只凭单页推断。",
+        "· **只调一次** report_domain：一句话说清这个**编完的库**属于什么领域。"
+        "不要列页面、不要报数量、不要写成冒号后的清单。",
+        f"· 写作目标约 {DOMAIN_TARGET_CHARS} 字；超过 {DOMAIN_MAX_CHARS} 字会被拒绝，"
+        "请重写完整短句。",
+    ]
+    if domain_now:
+        lines.append(
+            f"· 当前领域是 {domain_now!r}。空泛、相对目录过窄、或已宣称库不再覆盖的能力 → 改写；"
+            "仍准确可报同一句。"
+        )
+    else:
+        lines.append(
+            "· **还没有 domain → 必须根据完整目录写第一句**。"
+            "有内容却无领域是未完成元数据。"
+        )
+    lines.append(
+        "· **不要**重编页面、不要改 raw/、不要当增量修页。完成后用一行汇报你写的 domain。"
+    )
+    note = (owner_text or "").strip()
+    if note:
+        lines.append(f"· 负责人原话（相关则参考）: {note}")
+    return "\n".join(lines)
+
+
+async def _start_domain_refresh(run: "CompileRun", text: str = "") -> None:
+    """One ordinary model turn dedicated to report_domain under a full-catalog ask."""
+    directive = build_domain_refresh_directive(
+        run.workdir,
+        locale=getattr(run, "locale", None),
+        owner_text=text,
+    )
+    await run.emit({
+        "type": "summary",
+        "text": _loc(
+            run,
+            "Domain refresh: read the full catalog, then report_domain once.",
+            "领域描述：通读完整目录后调用一次 report_domain。",
+        ),
+    })
+    run._begin_turn(directive)
+    await run.client.query(directive)
+
+
 def _should_route_to_incremental(run: "CompileRun", text: str, action: str | None = None) -> bool:
     """A compile trigger + a machine-computed changeset from the consumer
     (authoring/RAW_CHANGES.json with real changes) → the SCOPED incremental path,
@@ -3156,6 +3405,20 @@ def _load_batch_plan(run: "CompileRun") -> dict | None:
         return plan if isinstance(plan, dict) and isinstance(plan.get("batches"), list) else None
     except Exception:
         return None
+
+
+def _batch_resume_point(plan: dict | None) -> tuple[int, int] | None:
+    """(1-based index of the first unstamped batch, total batches), or None.
+
+    Positional, never the batch id: ids can be model-written and are only
+    conditionally safe to echo (see _lifecycle_batch_ref), while the position is
+    always both safe and the thing an owner can count.
+    """
+    batches = (plan or {}).get("batches") or []
+    for i, b in enumerate(batches):
+        if isinstance(b, dict) and b.get("status") != "done":
+            return i + 1, len(batches)
+    return None
 
 
 def _batch_plan_resumable(plan: dict | None) -> bool:
@@ -3757,6 +4020,12 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
     orphans = [v["page"] for v in selfcheck.lint_candidate(pages, excl_errors)["violations"]
                if v["kind"] == "orphan"]
     suspect = sum((p.get("text") or "").count("⚠️") for p in pages.values())
+    # The domain is instructed once, in the persistent role prompt, as something
+    # to do "when you finish". In a batched compile every batch ends, and none of
+    # them is the finish — so it was reported from one batch's worth of corpus, or
+    # never. Final review is the one moment the whole library exists, and it is
+    # already the place where machine-computed worklists make silence impossible.
+    domain_now = selfcheck.read_repo_meta(workdir).get("domain", "")
     if selfcheck._is_en(locale):
         lines = [f"[Batch compile · final review] All {n} batches are compiled. Now do the cross-batch "
                  "close-out (the checklists below are machine-computed — handle every item, silent skipping "
@@ -3784,6 +4053,15 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
         step += 1
         lines.append(f"{step}) Check authoring/EXCLUSIONS.json: sources you decided not to compile (including "
                      "images/PDF and other media) must be explicitly accounted for.")
+        step += 1
+        lines.append(f"{step}) Call report_domain once for the FINISHED library — one sentence naming the "
+                     "field it covers, for another agent deciding whether to open it at all. "
+                     + (f"It currently reads {domain_now!r}; correct it if the finished corpus is wider "
+                        "or different from what that describes."
+                        if domain_now else
+                        "Nothing has been reported yet, so without this the library reaches every chooser "
+                        "as a bare name.")
+                     + " Do not list pages or counts — index.md already routes to a page.")
         lines.append("Close out only — do not read raw/ or recompile pages that are already fine. "
                      "Use Candidate and the authoring ledgers for this cross-batch review. When done, report "
                      "briefly: total pages, which pages this close-out touched, which pairs were "
@@ -3806,6 +4084,13 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
                  "(如时间序取最新并保留沿革),定不了的才 best-guess+⚠️存疑+落工单;顺带检查既有 ⚠️ 里有没有其实能收敛的;")
     step += 1
     lines.append(f"{step}) 核对 authoring/EXCLUSIONS.json:决定不编的源(含图片/PDF 等媒体)必须显式入账。")
+    step += 1
+    lines.append(f"{step}) 对**编完的整库**调一次 report_domain:一句话说清这个库属于什么领域,"
+                 "给别的智能体判断「要不要打开这个库」用。"
+                 + (f"当前是 {domain_now!r};如果编完的全库比这句更宽或已不是这个领域,就改正它。"
+                    if domain_now else
+                    "目前还没报过——不报的话,这个库到每个选择者那里就只剩一个名字。")
+                 + "不要罗列页面、不要报数量——精确找页有 index.md。")
     lines.append("只做收口,不要读 raw/,也不重编已经完好的页;跨批核对只使用 Candidate 和 authoring 账本。"
                  "完成后简短汇报:总页数、本次收口动了哪些页、合并/豁免了哪几对及理由、还有什么值得负责人注意。")
     return "\n".join(lines) + notes
@@ -4492,11 +4777,37 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # gating on turn_done would otherwise hang on an orchestrator error.
         # Done batches are stamped in BATCH_PLAN.json, so the honest story is
         # "interrupted, resumable from the first pending batch".
+        # A spend cap gets its own sentence: the generic one names a remedy that
+        # is not the one that applies. State only what is known — the provider
+        # refused on billing — and where the work stopped. Nothing about when it
+        # clears: that depends on a person raising the limit, and the provider's
+        # retry_after describes only the case where nobody does. A time the box
+        # cannot stand behind is worse here than no time at all.
+        if isinstance(e, ModelQuotaExhausted):
+            resume = _batch_resume_point(_load_batch_plan(run))
+            if resume:
+                k, n = resume
+                at = _loc(run,
+                          f" {k - 1} of {n} batches are stored; the next compile starts at batch {k}."
+                          if k > 1 else
+                          f" No batch of {n} is stored yet; the next compile starts at batch 1.",
+                          f"已完成 {k - 1}/{n} 批并已落库,下次编译从第 {k} 批开始。"
+                          if k > 1 else
+                          f"共 {n} 批,尚无已完成的批,下次编译从第 1 批开始。")
+            else:
+                at = _loc(run, " Finished batches are stored.", "已完成的批已落库。")
+            done_note = _loc(
+                run,
+                f"The model provider refused this request on billing (HTTP 402): "
+                f"the API key's spend limit for the period is used up.{at}",
+                f"模型服务按计费拒绝了本次请求(HTTP 402):该 API key 本周期的额度已用尽。{at}")
+        else:
+            done_note = _loc(
+                run,
+                "Batch compile interrupted: finished batches are stored; trigger a compile again to resume from the first pending batch.",
+                "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。")
         try:
-            await run.emit({"type": "turn_done",
-                            "text": _loc(run,
-                                         "Batch compile interrupted: finished batches are stored; trigger a compile again to resume from the first pending batch.",
-                                         "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。")})
+            await run.emit({"type": "turn_done", "text": done_note})
         except Exception:
             pass
     finally:
@@ -4605,6 +4916,19 @@ async def _consume_turn_stream(
             # surfacing it as a finished turn.
             status = getattr(msg, "api_error_status", None)
             is_error = bool(getattr(msg, "is_error", False))
+            # A spend cap, before the rate-limit branch it would otherwise fall
+            # past: backing off 5 times over 30s cannot clear a billing refusal.
+            # Gated on fail_on_error_result so this changes NOTHING outside the
+            # batch orchestrator — a live session keeps ending the turn and
+            # staying up, because whether to try again under a spend cap is the
+            # account holder's call (the limit can be raised at any moment) and
+            # a box that kills itself has taken that decision away.
+            if is_error and status == _MODEL_QUOTA_STATUS and fail_on_error_result:
+                run._turn_active = False
+                run._turn_text = []
+                run._last_turn_reply = ""
+                raise ModelQuotaExhausted(
+                    f"model provider refused on billing (HTTP {status})")
             if is_error and status in _MODEL_RATE_STATUSES:
                 if run._rate_retries < _MODEL_RATE_MAX_RETRIES:
                     run._rate_retries += 1
@@ -6444,7 +6768,13 @@ async def _await_session_live(run: CompileRun):
     return None
 
 
-async def _dispatch_authoring_turn(run: CompileRun, text: str, action: str | None = None) -> dict:
+async def _dispatch_authoring_turn(
+    run: CompileRun,
+    text: str,
+    action: str | None = None,
+    *,
+    apply_dispatch_nonce: str = "",
+) -> dict:
     """One execution seam for legacy chat turns and typed commands.
 
     `action` is authoritative when present. Text inspection exists only for the
@@ -6456,6 +6786,12 @@ async def _dispatch_authoring_turn(run: CompileRun, text: str, action: str | Non
     # agent reads it this turn. Fail-open — a parse hiccup never blocks the turn.
     if action is None:
         _capture_brief(run, text)
+    # Full-library domain write/update (empty or rewrite). Must run before the
+    # scoped incremental route: an incremental kickoff must not invent a first
+    # domain from a partial diff; this path forces reading the whole catalog.
+    if _should_route_to_domain_refresh(run, text, action):
+        await _start_domain_refresh(run, text=text or "")
+        return {"ok": True, "domain_refresh": True}
     # Scoped incremental (真增量): a compile trigger + a machine-computed changeset
     # from the consumer → re-touch only affected pages, NOT a whole-corpus re-plan. Takes
     # precedence over the batch/full route (which is the "recompile everything"
@@ -6508,6 +6844,12 @@ async def _dispatch_authoring_turn(run: CompileRun, text: str, action: str | Non
         return {"ok": True, "queued": True}
     if full_compile:
         run._full_compile_pending = True
+    # The runtime owns this control-plane fact, but only for the exact model
+    # turn created by the accepted apply_rulings command. Ordinary messages and
+    # every other typed command enter with the empty value.
+    run.apply_dispatch_nonce = (
+        apply_dispatch_nonce if action == "compile.apply_rulings" else ""
+    )
     run._begin_turn(
         text,
         # A normal owner edit may touch one page without conscripting untouched
@@ -6601,7 +6943,16 @@ async def handle_command(request: web.Request):
         run._command_context = context
         run._accepted_commands[command_id] = digest
         try:
-            result = await _dispatch_authoring_turn(run, text, command["action"])
+            result = await _dispatch_authoring_turn(
+                run,
+                text,
+                command["action"],
+                apply_dispatch_nonce=(
+                    command["parameters"]["dispatch_nonce"]
+                    if command["action"] == "compile.apply_rulings"
+                    else ""
+                ),
+            )
         except BaseException:
             run._accepted_commands.pop(command_id, None)
             raise

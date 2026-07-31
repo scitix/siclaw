@@ -6302,6 +6302,69 @@ async def test_typed_authoring_commands():
         await client.close()
 
 
+def test_a_spend_cap_is_not_a_rate_limit():
+    """402 and 429 look alike and want different handling. A rate limit clears
+    in seconds, so the backoff loop is right for it; a spend cap does not, so
+    burning five retries over thirty seconds achieves nothing.
+
+    Production hit `daily cost limit exceeded (504.29/500.00) … retry_after
+    84596` and the owner was told "batch compile interrupted; trigger a compile
+    again to resume", which is true of every other interruption and misleading
+    here. There was no 402 anywhere in the box before this test.
+
+    The correction must not overshoot into the mirror-image error. A spend cap
+    is lifted by a PERSON — raise the limit, top up, swap the key — so the box
+    may not claim the refusal is deterministic, and may not state a
+    time-to-clear it cannot stand behind. What it CAN state is where the work
+    stopped, so that is what the owner gets.
+    """
+    err = compile_box.ModelQuotaExhausted("refused on billing")
+    assert compile_box._batch_error_code(err) == "quota_exhausted"
+
+    # Neither claim may come back. `deterministic` is what a consumer would read
+    # to stop retrying, and a stated deadline is what an owner would wait out —
+    # both take a decision that belongs to whoever can raise the limit.
+    assert not hasattr(err, "deterministic"), "a spend cap is lifted by a person"
+    assert not hasattr(err, "retry_after_s"), "the box does not forecast the window"
+    assert not hasattr(compile_box, "_quota_retry_after")
+
+    # 402 must not be mistaken for the rate-limit family it sits beside.
+    assert compile_box._MODEL_QUOTA_STATUS not in compile_box._MODEL_RATE_STATUSES
+
+    # What the owner is told instead: which batch the next compile starts at.
+    # Positional and 1-based; done batches are counted, not the ids.
+    plan = {"batches": [{"status": "done"}, {"status": "done"}, {"status": "pending"}]}
+    assert compile_box._batch_resume_point(plan) == (3, 3)
+    assert compile_box._batch_resume_point({"batches": [{"status": "pending"}]}) == (1, 1)
+    # Fully stamped, or no plan at all: nothing to point at, so say nothing.
+    assert compile_box._batch_resume_point({"batches": [{"status": "done"}]}) is None
+    assert compile_box._batch_resume_point(None) is None
+    assert compile_box._batch_resume_point({}) is None
+
+    print("OK  a spend cap is named, not forecast, and reports its resume point")
+
+
+async def test_a_spend_cap_does_not_kill_a_live_session():
+    """The typed refusal is scoped to the batch orchestrator (which cannot carry
+    on without model calls). A live session must be left exactly as it was.
+
+    Deciding that an owner should stop trying is not the box's decision to take:
+    the limit can be raised at any moment, and a session that killed itself has
+    removed the owner's ability to find out. This drives the live path — the
+    default fail_on_error_result=False — and asserts nothing propagates: the
+    turn ends, the run stays up, and no backoff retries are spent on a refusal
+    backing off cannot clear.
+    """
+    fake = _RateLimitedFakeClient(succeed_on_query=999, status=402)
+    run, evs, raised = await _run_stall_scenario(
+        fake, idle=90, poll=0.03, max_retries=3, rate_base=0.01, rate_cap=0.02, rate_max=2)
+    assert raised is None, raised                          # the session survives
+    assert [e for e in evs if e["type"] == "rate_limited"] == [], evs
+    assert run._turn_active is False                       # the turn ended cleanly
+    assert fake.queries == ["批 1/10"], fake.queries        # never re-issued
+    print("✓ spend cap: a live session ends the turn and stays up, no backoff")
+
+
 async def main():
     # PK never fires in these wiring tests — a qualifying fixture must not spawn
     # a real ClaudeEngine in the background (test_selfcheck covers PK wiring).
@@ -6405,6 +6468,14 @@ async def main():
     await test_model_rate_limit_exhausts_gracefully()
     await test_shutdown_flush_syncs_active_runs()
     test_pr382_review_fixes()
+    await test_report_domain_is_bounded_by_code_not_by_asking()
+    test_the_domain_is_asked_for_when_the_library_is_actually_finished()
+    test_domain_refresh_requires_full_catalog_before_report_domain()
+    await test_report_domain_disk_failure_is_not_need_args()
+    test_read_repo_meta_clamps_hand_written_over_cap_and_newlines()
+    test_a_spend_cap_is_not_a_rate_limit()
+    await test_a_spend_cap_does_not_kill_a_live_session()
+    await test_the_runtime_owns_the_dispatch_round_not_the_model()
     await test_typed_authoring_commands()
 
     compile_box._COMPILE_IMPL = fake_driver
@@ -6623,6 +6694,435 @@ async def main():
         print("OK  compile_box protocol smoke (sources / authoring / health / session idempotent / SSE summary+turn_done+syncArtifacts+end / 409 / 404)")
     finally:
         await client.close()
+
+
+async def test_report_domain_is_bounded_by_code_not_by_asking():
+    """The domain line is the one piece of library metadata disclosed PER
+    LIBRARY rather than per use — a console list, a binding picker and an MCP
+    tool listing all carry it — so its budget is multiplied by however many
+    libraries an agent can see. A length asked for in a tool description is a
+    wish; this one has to be a fact, so the cap is applied here.
+
+    Over-cap is refused without writing: silent truncation once stored
+    mid-token garbage into another agent's system prompt. The model rewrites a
+    complete shorter sentence instead.
+
+    The model also never writes the file. It supplies one natural-language
+    sentence and the format is generated, which is the same rule the exclusion
+    ledger runs under after a hand-authored trailing comma once blanked it.
+    """
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "authoring").mkdir(parents=True)
+        run = compile_box.CompileRun("dom1", td, 1)
+        run._sync_sent = {}
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        if "report_domain" not in tools:
+            raise AssertionError(f"report_domain not registered: {sorted(tools)}")
+
+        # A domain the model kept short arrives intact.
+        short = "GPU 集群硬件健康检查与故障诊断"
+        await tools["report_domain"].handler({"domain": short})
+        assert selfcheck.read_repo_meta(td).get("domain") == short, selfcheck.read_repo_meta(td)
+
+        # Over-long: refuse, leave prior domain, tell the model to rewrite.
+        long = "领域" * 200
+        before = selfcheck.read_repo_meta(td)
+        result = await tools["report_domain"].handler({"domain": long})
+        assert selfcheck.read_repo_meta(td) == before, selfcheck.read_repo_meta(td)
+        assert str(compile_box.DOMAIN_MAX_CHARS) in str(result), result
+        assert str(compile_box.DOMAIN_TARGET_CHARS) in str(result), result
+        assert "未记录" in str(result) or "not recorded" in str(result).lower() or "超过" in str(result) or "exceeds" in str(result).lower(), result
+
+        # At the ceiling still admitted whole (no scissors).
+        at_cap = "领" * compile_box.DOMAIN_MAX_CHARS
+        await tools["report_domain"].handler({"domain": at_cap})
+        assert selfcheck.read_repo_meta(td).get("domain") == at_cap
+        assert len(selfcheck.read_repo_meta(td).get("domain", "")) == compile_box.DOMAIN_MAX_CHARS
+
+        # Whitespace the model may wrap across lines collapses: this text is
+        # rendered in one line in a picker.
+        await tools["report_domain"].handler({"domain": "  多行\n\n领域   描述  "})
+        assert selfcheck.read_repo_meta(td).get("domain") == "多行 领域 描述", selfcheck.read_repo_meta(td)
+
+        # Empty is refused rather than stored: an empty domain is worse than an
+        # absent one, because a picker renders it as a blank line that looks
+        # like a library nobody described AND like one described as nothing.
+        before = selfcheck.read_repo_meta(td)
+        await tools["report_domain"].handler({"domain": "   "})
+        assert selfcheck.read_repo_meta(td) == before
+
+    # A missing file is an ABSENT domain, never an exception: the library still
+    # compiles, publishes and answers questions without one.
+    with tempfile.TemporaryDirectory() as td2:
+        assert selfcheck.read_repo_meta(td2) == {}
+        (Path(td2) / "authoring").mkdir(parents=True)
+        (Path(td2) / selfcheck.REPO_META_PATH).write_text("{not json", encoding="utf-8")
+        assert selfcheck.read_repo_meta(td2) == {}
+
+    # Inventory-shaped over-cap text must not be stored (clipped or whole).
+    # The first production sample was ~98 cp (under today's 100 admission
+    # ceiling); extend it so this still exercises refuse-without-write.
+    with tempfile.TemporaryDirectory() as td3:
+        (Path(td3) / "authoring").mkdir(parents=True)
+        run3 = compile_box.CompileRun("dom3", td3, 1)
+        run3._sync_sent = {}
+        tools3 = {t.name: t for t in compile_box._compile_engine_tools(run3)}
+        real = ("领域平台接入智能诊断平台的工程最佳实践：如何设计 MCP 工具与结果契约、"
+                "编写 Skill 与 Knowledge、做交付验证与回滚，以及 MCP/Skill/Knowledge "
+                "的边界与协作方式、部署验收清单与回滚手册")
+        assert len(real) > compile_box.DOMAIN_MAX_CHARS, len(real)
+        result3 = await tools3["report_domain"].handler({"domain": real})
+        assert selfcheck.read_repo_meta(td3) == {}
+        assert str(compile_box.DOMAIN_MAX_CHARS) in str(result3), result3
+
+    # Comma-bearing one-liners under the cap are stored whole.
+    whole = "GPU 集群硬件健康检查、网络与存储的故障诊断"
+    assert len(whole) <= compile_box.DOMAIN_MAX_CHARS
+    with tempfile.TemporaryDirectory() as td4:
+        (Path(td4) / "authoring").mkdir(parents=True)
+        run4 = compile_box.CompileRun("dom4", td4, 1)
+        run4._sync_sent = {}
+        tools4 = {t.name: t for t in compile_box._compile_engine_tools(run4)}
+        await tools4["report_domain"].handler({"domain": whole})
+        assert selfcheck.read_repo_meta(td4).get("domain") == whole
+
+    print("✓ report_domain: bounded by code, refuse-over-cap, machine-serialised, absent-safe")
+
+
+def test_the_domain_is_asked_for_when_the_library_is_actually_finished():
+    """The domain is instructed once, in the persistent role prompt, as something
+    to do "when you finish". A batched compile has no such moment: every batch
+    ends, each batch directive says compile these sources and update the index,
+    and none of them is the finish. So the domain was reported from one batch's
+    worth of corpus — describing a fraction of the library, permanently — or it
+    was never reported and the library reaches every chooser as a bare name.
+    Neither failure is visible: nothing validates that a domain exists.
+
+    Final review is the one moment the whole library exists, and it already is
+    where machine-computed worklists make silence impossible. Asking there also
+    repairs the partial case, because report_domain overwrites.
+    """
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "candidate").mkdir(parents=True)
+        (Path(td) / "candidate" / "index.md").write_text("# idx\n- [a](a.md)\n", encoding="utf-8")
+        (Path(td) / "candidate" / "a.md").write_text(
+            "---\ntype: concept\ntitle: A\n---\nbody\n", encoding="utf-8")
+
+        for locale in ("zh", "en"):
+            directive = compile_box._compose_final_directive(td, 3, "", locale=locale)
+            assert "report_domain" in directive, (locale, directive)
+
+        # Never reported: the directive says what the silence costs rather than
+        # just naming the tool.
+        zh = compile_box._compose_final_directive(td, 3, "", locale="zh")
+        assert "还没报过" in zh, zh
+
+        # Reported from an earlier batch: the current value is quoted back, so
+        # the model can judge whether the FINISHED corpus outgrew it instead of
+        # guessing what it once wrote.
+        (Path(td) / "authoring").mkdir(parents=True)
+        selfcheck.write_repo_meta(td, "第一批写的领域")
+        zh = compile_box._compose_final_directive(td, 3, "", locale="zh")
+        assert "第一批写的领域" in zh, zh
+        assert "还没报过" not in zh, zh
+        en = compile_box._compose_final_directive(td, 3, "", locale="en")
+        assert "第一批写的领域" in en, en
+
+        # Still the coarse question — an inventory here would go stale on every
+        # compile and a missing entry would make a router skip the library.
+        assert "不要罗列页面" in zh, zh
+        assert "Do not list pages" in en, en
+
+    # The ask has to be actionable in that round: final review runs as a compile
+    # session, and a tool missing from the allowlist would be a dead end created
+    # by permissions instead of instructions.
+    assert "mcp__compile__report_domain" in compile_box.DEFAULT_COMPILE_ALLOWED_TOOLS
+
+    print("✓ final review asks for the domain of the finished library, quoting what a batch already wrote")
+
+
+def test_domain_refresh_requires_full_catalog_before_report_domain():
+    """On-demand domain update is allowed only with a whole-library view.
+
+    Scoped incremental must not invent a first domain from a partial diff; this
+    dedicated turn is the unified path for empty or rewrite cases.
+    """
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "candidate").mkdir(parents=True)
+        (Path(td) / "candidate" / "index.md").write_text(
+            "# idx\n- [a](a.md) — GPU health\n", encoding="utf-8")
+        for locale in ("zh", "en", None):
+            text = compile_box.build_domain_refresh_directive(td, locale=locale)
+            assert "report_domain" in text, (locale, text)
+            assert "index.md" in text, (locale, text)
+        zh = compile_box.build_domain_refresh_directive(td, locale="zh")
+        assert "完整阅读" in zh or "完整" in zh, zh
+        assert "不要" in zh and ("重编" in zh or "raw" in zh), zh
+        en = compile_box.build_domain_refresh_directive(td, locale="en")
+        assert "read candidate/index.md in full" in en.lower() or "index.md" in en
+        assert "Do not recompile" in en or "recompile" in en.lower()
+
+        (Path(td) / "authoring").mkdir(parents=True)
+        selfcheck.write_repo_meta(td, "旧领域")
+        zh2 = compile_box.build_domain_refresh_directive(td, locale="zh")
+        assert "旧领域" in zh2, zh2
+
+    R = type("R", (), {"_batch_active": False, "locale": "en", "workdir": td})
+    assert compile_box._should_route_to_domain_refresh(R(), "", "compile.refresh_domain")
+    assert compile_box._should_route_to_domain_refresh(R(), "请更新领域描述", None)
+    assert compile_box._should_route_to_domain_refresh(
+        R(), "please refresh the domain description", None)
+    # Prefix-style English must NOT steal ordinary chat about domain rulings.
+    assert not compile_box._should_route_to_domain_refresh(
+        R(), "Update domain rulings for the storage pages per constitution.md", None)
+    assert not compile_box._should_route_to_domain_refresh(
+        R(), "refresh domain", None)
+    assert not compile_box._should_route_to_domain_refresh(
+        R(), "请增量重编", None)
+    assert "compile.refresh_domain" in compile_box._COMMAND_ACTIONS
+
+    # Typed command must render without KeyError (settings UI / handle_command path).
+    run = compile_box.CompileRun("dom-refresh", td, 1)
+    run.locale = "en"
+    rendered = compile_box._render_command(run, {
+        "action": "compile.refresh_domain",
+        "parameters": {},
+    })
+    assert "report_domain" in rendered, rendered
+    run_zh = compile_box.CompileRun("dom-refresh-zh", td, 1)
+    run_zh.locale = "zh"
+    rendered_zh = compile_box._render_command(run_zh, {
+        "action": "compile.refresh_domain",
+        "parameters": {},
+    })
+    assert "report_domain" in rendered_zh, rendered_zh
+
+    # Missing catalog → 409 before the model is scheduled.
+    empty = tempfile.mkdtemp()
+    try:
+        run_empty = compile_box.CompileRun("dom-empty", empty, 1)
+        try:
+            compile_box._prepare_command(run_empty, {
+                "action": "compile.refresh_domain",
+                "parameters": {},
+            })
+            raise AssertionError("refresh without index.md must 409")
+        except compile_box.CommandRejected as exc:
+            assert exc.status == 409, exc
+    finally:
+        import shutil
+        shutil.rmtree(empty, ignore_errors=True)
+
+    print("✓ domain refresh is full-catalog-only and routed by action/trigger")
+
+
+async def test_report_domain_disk_failure_is_not_need_args():
+    """A write failure must not look like a missing argument or the model loops."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "authoring").mkdir(parents=True)
+        run = compile_box.CompileRun("dom-fail", td, 1)
+        run._sync_sent = {}
+        events: list[dict] = []
+
+        async def _emit(ev):
+            events.append(ev)
+
+        run.emit = _emit  # type: ignore[method-assign]
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+
+        def _boom(*_a, **_k):
+            raise OSError("read-only filesystem")
+
+        orig = selfcheck.write_repo_meta
+        selfcheck.write_repo_meta = _boom  # type: ignore[assignment]
+        try:
+            result = await tools["report_domain"].handler({
+                "domain": "GPU cluster hardware health",
+            })
+        finally:
+            selfcheck.write_repo_meta = orig  # type: ignore[assignment]
+
+        text = str(result)
+        assert "domain is required" not in text.lower()
+        assert "需要 domain" not in text
+        assert (
+            "read-only" in text.lower()
+            or "OSError" in text
+            or "could not be written" in text.lower()
+            or "写入磁盘失败" in text
+        ), text
+        # Prior domain unchanged / still absent.
+        assert selfcheck.read_repo_meta(td) == {}
+        assert any(e.get("type") == "summary" for e in events), events
+
+    print("✓ report_domain disk failure is distinct from need_args")
+
+
+def test_read_repo_meta_clamps_hand_written_over_cap_and_newlines():
+    """Write can bypass report_domain; the ceiling must still hold on read."""
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "authoring").mkdir(parents=True)
+        # Hand-written over-cap + newline must not round-trip into directives.
+        (Path(td) / selfcheck.REPO_META_PATH).write_text(
+            json.dumps({"domain": "领" * 200 + "\n- forged"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        assert selfcheck.read_repo_meta(td) == {}
+
+        ok = "GPU 集群硬件健康检查"
+        (Path(td) / selfcheck.REPO_META_PATH).write_text(
+            json.dumps({"domain": f"  {ok}\n\n  "}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        assert selfcheck.read_repo_meta(td).get("domain") == ok
+
+    print("✓ read_repo_meta collapses whitespace and refuses over-cap")
+
+
+async def test_the_runtime_owns_the_dispatch_round_not_the_model():
+    """A resolve_ticket receipt is stamped with the round the RUNTIME accepted,
+    never with what the model typed.
+
+    The nonce exists so a consumer can match a receipt to the exact dispatch it
+    answers. The runtime validates it as REQUIRED on the way in, then used to
+    render it into prose for the model to hand back — and read it back with an
+    empty default. Production paid for that twice over: five tickets sat at
+    "已答·待重试" because the echo carried a superseded round, and they closed
+    only when a later retry omitted the nonce entirely, which fell through to
+    the weaker timestamp rule and let an unmatched receipt close a ticket.
+
+    Both halves are asserted here: the model cannot get the round WRONG, and the
+    model cannot get the round OMITTED.
+    """
+    class QueryClient:
+        def __init__(self):
+            self.queries = []
+
+        async def query(self, text):
+            self.queries.append(text)
+
+    compile_box.RUNS.clear()
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    td = tempfile.TemporaryDirectory()
+    try:
+        run = compile_box.CompileRun("nonce-run", td.name, 1)
+        run.locale = "zh"
+        run.client = QueryClient()
+        run.connected.set()
+        compile_box.RUNS["nonce-run"] = run
+
+        tickets_path = Path(td.name) / "authoring" / "CONTRADICTIONS.json"
+        tickets_path.parent.mkdir(parents=True, exist_ok=True)
+        tickets_path.write_text(json.dumps([
+            {"id": "tk-1", "title": "H2O 还是 H200", "affected_pages": ["p1.md"]},
+            {"id": "tk-2", "title": "两个电话号", "affected_pages": ["p2.md"]},
+        ], ensure_ascii=False), "utf-8")
+
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        resolve = tools["resolve_ticket"]
+
+        # Before any dispatch the round is empty — a self-resolve the owner never
+        # asked for must not look like an answer to one.
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "H200",
+            "pages_edited": ["p1.md"], "note": "", "dispatch_nonce": "invented-by-the-model",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        assert rows["tk-1"]["agent_report"]["dispatch_nonce"] == "", rows["tk-1"]["agent_report"]
+
+        # Dispatch round "round-A".
+        r = await client.post("/command/nonce-run", json={
+            "command_id": "cmd-apply-A",
+            "command": {
+                "version": 1, "action": "compile.apply_rulings",
+                "operation_id": "op-apply-A", "generation": 1,
+                "parameters": {
+                    "dispatch_nonce": "round-A",
+                    "rulings": [{"ticket_id": "tk-1", "affected_pages": ["p1.md"],
+                                 "kind": "value", "value": "H200"}],
+                },
+            },
+        })
+        assert r.status == 200, await r.text()
+
+        # The model echoes a SUPERSEDED round — exactly what production did.
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "H200",
+            "pages_edited": ["p1.md"], "note": "", "dispatch_nonce": "3a413abb-stale",
+        })
+        # ...and omits it entirely — the other half of the same production bug.
+        await resolve.handler({
+            "ticket_id": "tk-2", "applied_value": "保留双源",
+            "pages_edited": ["p2.md"], "note": "",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        for tid in ("tk-1", "tk-2"):
+            got = rows[tid]["agent_report"]["dispatch_nonce"]
+            assert got == "round-A", f"{tid} stamped {got!r}, want the accepted round"
+            assert rows[tid]["status"] == "applied", rows[tid]
+
+        # The round ends with its ResultMessage. The nonce must end with it: an
+        # ordinary owner turn may still call resolve_ticket, but that receipt
+        # must be visibly outside every apply round.
+        await compile_box._emit_message(run, ResultMessage())
+        assert run.apply_dispatch_nonce == "", run.apply_dispatch_nonce
+        run._turn_active = False
+        r = await client.post("/message/nonce-run", json={"message": "继续检查剩余内容"})
+        assert r.status == 200, await r.text()
+        assert run.apply_dispatch_nonce == "", run.apply_dispatch_nonce
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "ordinary-turn edit",
+            "pages_edited": ["p1.md"], "note": "",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        assert rows["tk-1"]["agent_report"]["dispatch_nonce"] == "", rows["tk-1"]
+
+        # A second dispatch re-stamps: receipts follow the CURRENT round. The
+        # first round's turn has to end first — a live turn refuses a second
+        # command, which is the same reason a real re-dispatch waits for idle.
+        run._turn_active = False
+        r = await client.post("/command/nonce-run", json={
+            # A re-dispatch is a new COMMAND inside the same authoring
+            # operation: the run pins to (operation_id, generation) for life.
+            "command_id": "cmd-apply-B",
+            "command": {
+                "version": 1, "action": "compile.apply_rulings",
+                "operation_id": "op-apply-A", "generation": 1,
+                "parameters": {
+                    "dispatch_nonce": "round-B",
+                    "rulings": [{"ticket_id": "tk-1", "affected_pages": ["p1.md"],
+                                 "kind": "value", "value": "H200"}],
+                },
+            },
+        })
+        assert r.status == 200, await r.text()
+        await resolve.handler({
+            "ticket_id": "tk-1", "applied_value": "H200",
+            "pages_edited": ["p1.md"], "note": "", "dispatch_nonce": "round-A",
+        })
+        rows = {tk["id"]: tk for tk in json.loads(tickets_path.read_text("utf-8"))}
+        assert rows["tk-1"]["agent_report"]["dispatch_nonce"] == "round-B", rows["tk-1"]
+
+        # The directive no longer asks the model for bookkeeping it cannot own.
+        directive = run.client.queries[-1]
+        assert "nonce" not in directive.lower(), directive
+        assert "resolve_ticket" in directive, directive
+    finally:
+        compile_box.RUNS.clear()
+        await client.close()
+        td.cleanup()
+    print("✓ dispatch round is stamped by the runtime; a wrong or missing echo cannot mislead it")
 
 
 if __name__ == "__main__":
