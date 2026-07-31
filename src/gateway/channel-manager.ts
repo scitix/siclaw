@@ -79,6 +79,10 @@ export function isChannelAccessDenied(
  * for authorized group bots and choose the effective session key server-side
  * (open groups → shared chat session; authorized → per-user). It is separate
  * from `sessionKey` because the server may override the session key it returns.
+ * `conversationKey` is an optional provider conversation scope (for example a
+ * Feishu topic root). The Portal combines it with the binding's context mode
+ * and actor identity; the runtime must treat the returned `sessionKey` as
+ * authoritative.
  */
 export async function resolveBinding(
   channelId: string,
@@ -86,12 +90,16 @@ export async function resolveBinding(
   frontendClient: FrontendWsClient,
   sessionKey?: string,
   senderOpenId?: string,
+  conversationKey?: string,
+  conversationExistingOnly: boolean = false,
 ): Promise<ResolvedChannelBinding | ChannelAccessDenied | null> {
   const data = await frontendClient.request("channel.resolveBinding", {
     channel_id: channelId,
     route_key: routeKey,
     ...(sessionKey ? { session_key: sessionKey } : {}),
     ...(senderOpenId ? { sender_open_id: senderOpenId } : {}),
+    ...(conversationKey ? { conversation_key: conversationKey } : {}),
+    ...(conversationExistingOnly ? { conversation_existing_only: true } : {}),
   });
   return data.binding ?? null;
 }

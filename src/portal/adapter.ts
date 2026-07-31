@@ -96,12 +96,15 @@ async function resolveChannelBinding(
   channelId: string,
   routeKey: string,
   sessionKey?: string | null,
+  conversationKey?: string | null,
+  conversationExistingOnly: boolean = false,
 ): Promise<ResolvedChannelBinding | null> {
   const row = await selectChannelBinding(db, channelId, routeKey);
   if (!row) {
     // No explicit binding. A per-agent open bot auto-serves any group it joins
     // (standalone supports open only — authorized requires Sicore's im_bindings).
-    return resolveOpenGroupBinding(db, channelId, routeKey);
+    if (conversationExistingOnly && conversationKey) return null;
+    return resolveOpenGroupBinding(db, channelId, routeKey, conversationKey);
   }
 
   const routeType = normalizeRouteType(row.route_type);
@@ -115,12 +118,19 @@ async function resolveChannelBinding(
   //   per_user → the per-sender key the runtime passed (open_id:{sender}).
   // Non-group (1:1 user) routes ignore the mode — they are single-user by
   // nature — and keep the legacy passed-key-or-binding-session behavior.
-  const session =
-    routeType === "group" && contextMode === "shared"
-      ? await resolveChannelBindingParticipantSession(db, row.id, `chat:${routeKey}`)
-      : sessionKey
-        ? await resolveChannelBindingParticipantSession(db, row.id, sessionKey)
-        : await resolveLegacyChannelBindingSession(db, row, channelId, routeKey);
+  const effectiveSessionKey = routeType === "group"
+    ? buildGroupSessionKey(routeKey, contextMode, sessionKey, conversationKey)
+    : sessionKey;
+  let session: { sessionId: string; sessionKey: string | null };
+  if (effectiveSessionKey && conversationExistingOnly && conversationKey) {
+    const existing = await selectChannelBindingParticipantSession(db, row.id, effectiveSessionKey);
+    if (!existing) return null;
+    session = { sessionId: existing, sessionKey: effectiveSessionKey };
+  } else {
+    session = effectiveSessionKey
+      ? await resolveChannelBindingParticipantSession(db, row.id, effectiveSessionKey)
+      : await resolveLegacyChannelBindingSession(db, row, channelId, routeKey);
+  }
 
   return {
     agentId: row.agent_id,
@@ -132,6 +142,25 @@ async function resolveChannelBinding(
     displayName: row.display_name ?? null,
     contextMode,
   };
+}
+
+function buildGroupSessionKey(
+  routeKey: string,
+  contextMode: ContextMode,
+  participantKey?: string | null,
+  conversationKey?: string | null,
+): string | null {
+  const participant = participantKey?.trim() || null;
+  if (contextMode === "shared") return `chat:${routeKey}`;
+
+  const conversation = conversationKey?.trim();
+  if (conversation) {
+    if (!participant || participant === conversation || participant.endsWith(`:${conversation}`)) {
+      return participant ?? conversation;
+    }
+    return `${participant}:${conversation}`;
+  }
+  return participant;
 }
 
 async function resolveLegacyChannelBindingSession(
@@ -503,6 +532,7 @@ async function resolveOpenGroupBinding(
   db: Db,
   channelId: string,
   routeKey: string,
+  conversationKey?: string | null,
 ): Promise<ResolvedChannelBinding | null> {
   const channel = await selectPersonalChannel(db, channelId);
   const personalBot = channel?.config.personal_bot;
@@ -517,7 +547,7 @@ async function resolveOpenGroupBinding(
   // under the binding row id (not the channel id) so it stays consistent with
   // the row that now owns the group.
   const bindingId = await ensureOpenGroupBindingRow(db, channel.id, routeKey, personalBot.agent_id, createdBy);
-  const sessionKey = `chat:${routeKey}`;
+  const sessionKey = buildGroupSessionKey(routeKey, "shared", null, conversationKey) ?? `chat:${routeKey}`;
   const session = await resolveChannelBindingParticipantSession(db, bindingId, sessionKey);
   return {
     agentId: personalBot.agent_id,
@@ -1728,9 +1758,22 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
     }
-    const body = await parseBody<{ channel_id: string; route_key: string; session_key?: string }>(req);
+    const body = await parseBody<{
+      channel_id: string;
+      route_key: string;
+      session_key?: string;
+      conversation_key?: string;
+      conversation_existing_only?: boolean;
+    }>(req);
     const db = getDb();
-    const binding = await resolveChannelBinding(db, body.channel_id, body.route_key, body.session_key);
+    const binding = await resolveChannelBinding(
+      db,
+      body.channel_id,
+      body.route_key,
+      body.session_key,
+      body.conversation_key,
+      body.conversation_existing_only === true,
+    );
     sendJson(res, 200, { binding });
   });
 
@@ -3070,7 +3113,16 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("channel.resolveBinding", async (params) => {
     const db = getDb();
-    return { binding: await resolveChannelBinding(db, params.channel_id, params.route_key, params.session_key) };
+    return {
+      binding: await resolveChannelBinding(
+        db,
+        params.channel_id,
+        params.route_key,
+        params.session_key,
+        params.conversation_key,
+        params.conversation_existing_only === true,
+      ),
+    };
   });
 
   handlers.set("channel.pair", async (params) => {

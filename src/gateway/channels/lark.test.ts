@@ -564,7 +564,15 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     resolveBindingMock.mockResolvedValue(null);
     const mgr = makeAgentBoxManager();
     await handleLarkMessage(makeTextEvent("hello"), makeLarkClient(), "lark", mgr as any, undefined, {} as any);
-    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1", "ou_user_1");
+    expect(resolveBindingMock).toHaveBeenCalledWith(
+      "lark",
+      "oc_abc123",
+      expect.anything(),
+      "open_id:ou_user_1",
+      "ou_user_1",
+      undefined,
+      false,
+    );
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
   });
@@ -592,7 +600,15 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       },
     );
 
-    expect(resolveBindingMock).toHaveBeenCalledWith("lark", "oc_abc123", expect.anything(), "open_id:ou_user_1", "ou_user_1");
+    expect(resolveBindingMock).toHaveBeenCalledWith(
+      "lark",
+      "oc_abc123",
+      expect.anything(),
+      "open_id:ou_user_1",
+      "ou_user_1",
+      undefined,
+      false,
+    );
     expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
   });
 
@@ -998,6 +1014,44 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(lark.im.message.reply.mock.calls[0][0].data.content).toContain("不支持单人重置");
   });
 
+  it("/new in a per-user topic resets only that user's topic session", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      sessionId: "topic-old",
+      sessionKey: "open_id:ou_user_1:lark_thread:mid-1",
+      contextMode: "per_user",
+    }));
+    resetBindingSessionMock.mockResolvedValue({
+      success: true,
+      agentId: "a1",
+      oldSessionId: "topic-old",
+      sessionId: "topic-new",
+    });
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("/new", {
+        chat_type: "group",
+        mentions: [{ key: "@_user_1", id: { open_id: "ou_bot_self" } }],
+      }),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      { app_id: "x", app_secret: "y", thread_mode: "group" },
+      "ou_bot_self",
+    );
+
+    expect(resetBindingSessionMock).toHaveBeenCalledWith(
+      "lark",
+      "oc_abc123",
+      expect.anything(),
+      "open_id:ou_user_1:lark_thread:mid-1",
+    );
+    expect(lark.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
+  });
+
   it("queues concurrent messages for the same sender instead of starting a second prompt", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({ sessionId: "queued-session" }));
     let releaseFirst!: () => void;
@@ -1284,6 +1338,267 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     const data = groupEvent("随便聊两句", []);
     await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
     expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("/mode resolves only the group mode and does not allocate a topic session", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      sessionId: "shared-session",
+      sessionKey: "chat:oc_abc123",
+      contextMode: "shared",
+    }));
+
+    await handleLarkMessage(
+      makeTextEvent("/mode", { chat_type: "group", mentions: [] }),
+      makeLarkClient(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      { app_id: "x", app_secret: "y", thread_mode: "group" },
+      BOT,
+    );
+
+    expect(resolveBindingMock).toHaveBeenCalledWith(
+      "lark",
+      "oc_abc123",
+      expect.anything(),
+      "open_id:ou_user_1",
+      "ou_user_1",
+      undefined,
+    );
+  });
+
+  it("thread mode creates a topic reply and accepts an unmentioned follow-up in the same root", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      sessionId: "thread-session",
+      sessionKey: "open_id:ou_user_1:lark_thread:mid-1",
+      contextMode: "per_user",
+    }));
+    promptMock.mockResolvedValue({ sessionId: "thread-session" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "thread answer" }] },
+      };
+    });
+    const config = { app_id: "x", app_secret: "y", thread_mode: "group" } as const;
+
+    const rootClient = makeLarkClient();
+    await handleLarkMessage(
+      groupEvent("@_user_1 查一下集群", [{ key: "@_user_1", id: { open_id: BOT } }]),
+      rootClient,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      config,
+      BOT,
+    );
+
+    const followupClient = makeLarkClient();
+    await handleLarkMessage(
+      makeTextEvent("再看一下其他节点", {
+        message_id: "mid-followup",
+        chat_type: "group",
+        root_id: "mid-1",
+        thread_id: "omt-topic-1",
+        mentions: [],
+      }),
+      followupClient,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      config,
+      BOT,
+    );
+
+    expect(promptMock.mock.calls.map((call) => call[0].sessionId)).toEqual([
+      "thread-session",
+      "thread-session",
+    ]);
+    expect(resolveBindingMock.mock.calls.map((call) => call[5])).toEqual([
+      "lark_thread:mid-1",
+      "lark_thread:mid-1",
+      "lark_thread:mid-1",
+      "lark_thread:mid-1",
+    ]);
+    expect(resolveBindingMock.mock.calls.map((call) => call[6])).toEqual([
+      false,
+      false,
+      true,
+      true,
+    ]);
+    expect(rootClient.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
+    expect(followupClient.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        conversationKey: "lark_thread:mid-1",
+        rootMessageId: "mid-1",
+      }),
+    }));
+    expect(appendMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        threadId: "omt-topic-1",
+      }),
+    }));
+  });
+
+  it("starts an explicitly mentioned quoted message as a new topic rooted at the current message", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      sessionId: "quoted-topic-session",
+      sessionKey: "open_id:ou_user_1:lark_thread:mid-quoted-at",
+      contextMode: "per_user",
+    }));
+    promptMock.mockResolvedValue({ sessionId: "quoted-topic-session" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "quoted answer" }] },
+      };
+    });
+    const client = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("@_user_1 分析这条引用", {
+        message_id: "mid-quoted-at",
+        chat_type: "group",
+        root_id: "mid-older-message",
+        mentions: [{ key: "@_user_1", id: { open_id: BOT } }],
+      }),
+      client,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      { app_id: "x", app_secret: "y", thread_mode: "group" },
+      BOT,
+    );
+
+    expect(resolveBindingMock.mock.calls.map((call) => call[5])).toEqual([
+      "lark_thread:mid-quoted-at",
+      "lark_thread:mid-quoted-at",
+    ]);
+    expect(resolveBindingMock.mock.calls.map((call) => call[6])).toEqual([false, false]);
+    expect(client.im.message.reply.mock.calls[0][0].path.message_id).toBe("mid-quoted-at");
+    expect(client.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
+  });
+
+  it("thread rollout keeps a shared group on the main-group reply path", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({
+      sessionId: "shared-session",
+      sessionKey: "chat:oc_abc123",
+      contextMode: "shared",
+    }));
+    promptMock.mockResolvedValue({ sessionId: "shared-session" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "shared answer" }] },
+      };
+    });
+    const config = { app_id: "x", app_secret: "y", thread_mode: "group" } as const;
+    const rootClient = makeLarkClient();
+
+    await handleLarkMessage(
+      groupEvent("@_user_1 查一下集群", [{ key: "@_user_1", id: { open_id: BOT } }]),
+      rootClient,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      config,
+      BOT,
+    );
+
+    expect(promptMock).toHaveBeenCalledTimes(1);
+    expect(resolveBindingMock.mock.calls.map((call) => call[5])).toEqual([
+      "lark_thread:mid-1",
+      undefined,
+    ]);
+    expect(rootClient.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBeUndefined();
+    expect(appendMessageMock.mock.calls[0][0].metadata).not.toHaveProperty("conversationKey");
+
+    const quoteClient = makeLarkClient();
+    await handleLarkMessage(
+      makeTextEvent("引用回复里的共享讨论", {
+        message_id: "mid-shared-quote",
+        chat_type: "group",
+        root_id: "mid-1",
+        mentions: [],
+      }),
+      quoteClient,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      config,
+      BOT,
+    );
+
+    expect(promptMock).toHaveBeenCalledTimes(1);
+    expect(resolveBindingMock).toHaveBeenCalledTimes(2);
+    expect(quoteClient.im.message.reply).not.toHaveBeenCalled();
+
+    await handleLarkMessage(
+      makeTextEvent("@_user_1 继续分析", {
+        message_id: "mid-shared-next",
+        chat_type: "group",
+        mentions: [{ key: "@_user_1", id: { open_id: BOT } }],
+      }),
+      makeLarkClient(),
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      config,
+      BOT,
+    );
+
+    expect(promptMock).toHaveBeenCalledTimes(2);
+    expect(promptMock.mock.calls[1][0].text).toContain("引用回复里的共享讨论");
+  });
+
+  it("thread mode ignores an unmentioned topic that has no existing bot session", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("普通话题里的聊天", {
+        message_id: "mid-followup",
+        chat_type: "group",
+        root_id: "mid-unrelated-root",
+        thread_id: "omt-unrelated",
+        mentions: [],
+      }),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      { app_id: "x", app_secret: "y", thread_mode: "group" },
+      BOT,
+    );
+
+    expect(resolveBindingMock).toHaveBeenCalledWith(
+      "lark",
+      "oc_abc123",
+      expect.anything(),
+      "open_id:ou_user_1",
+      "ou_user_1",
+      "lark_thread:mid-unrelated-root",
+      true,
+    );
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(lark.im.message.reply).not.toHaveBeenCalled();
   });
 
   it("degraded (botOpenId unknown): still drops @所有人 by its @_all key", async () => {

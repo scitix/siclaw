@@ -2,6 +2,7 @@ export async function replyImageToLark(
   larkClient: any,
   messageId: string,
   image: Buffer,
+  replyInThread: boolean = false,
 ): Promise<boolean> {
   try {
     const imageApi = larkClient?.im?.image ?? larkClient?.im?.v1?.image;
@@ -27,6 +28,7 @@ export async function replyImageToLark(
       data: {
         msg_type: "image",
         content: JSON.stringify({ image_key: imageKey }),
+        ...(replyInThread ? { reply_in_thread: true } : {}),
       },
     });
     return true;
