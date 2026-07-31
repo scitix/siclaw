@@ -40,21 +40,50 @@ function renderMatched(label: string, all: string[], matched: string[]): string 
   return `${label} matched: ${shown.join(", ")}${more > 0 ? ` …(+${more} more)` : ""} (${all.length} total)`;
 }
 
-interface Match { m: DelegateRosterMember; mc: string[]; mh: string[]; }
+interface Match {
+  m: DelegateRosterMember;
+  mc: string[];
+  mh: string[];
+}
 
 function matchRoster(roster: DelegateRosterMember[], q: string): Match[] {
   const out: Match[] = [];
   for (const m of roster) {
-    if (!q) { out.push({ m, mc: [], mh: [] }); continue; }
-    const mc = m.clusters.filter((s) => s.toLowerCase().includes(q));
-    const mh = m.hosts.filter((s) => s.toLowerCase().includes(q));
-    const nameHit = m.name.toLowerCase().includes(q) || (m.description ?? "").toLowerCase().includes(q);
-    if (nameHit || mc.length > 0 || mh.length > 0) out.push({ m, mc, mh });
+    if (!q) {
+      out.push({ m, mc: [], mh: [] });
+      continue;
+    }
+    // Coverage is an authorization decision, so only an exact resource binding
+    // proves that a delegate covers the target. Agent names/descriptions and
+    // partial binding matches are discovery hints, not coverage evidence.
+    const mc = m.clusters.filter((s) => s.trim().toLowerCase() === q);
+    const mh = m.hosts.filter((s) => s.trim().toLowerCase() === q);
+    if (mc.length > 0 || mh.length > 0) out.push({ m, mc, mh });
   }
   return out;
 }
 
 export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
+  // The one outstanding retry offer on this tool instance (one per agent
+  // session), as an opaque single-use token.
+  //
+  // Neither `binding_name_confirmed` nor remembering the missed query string can
+  // bound the retries. The flag is caller-supplied. And a per-string memory only
+  // catches a repeat of the SAME string, while the real alias flow changes it —
+  // `local-alias` misses, the helper resolves it, and `canonical-name` is a
+  // different key, so an omitted flag would earn a second retry offer. Both holes
+  // are the same shape: the caller decides whether the retry has been used.
+  //
+  // The token closes them because the tool owns it: a miss issues one, the retry
+  // must present it, presenting it consumes it, and while one is outstanding a
+  // further miss is terminal. A terminal outcome clears the slot, so the NEXT
+  // routing question still gets its own single retry.
+  let pendingRetryToken: string | null = null;
+  // The turn the outstanding offer belongs to. An offer the model never spent —
+  // e.g. it was told to consult a helper, none was attached, so it correctly
+  // answered the user instead — must not survive into the next question and make
+  // that question's first miss look terminal.
+  let pendingRetryTurn = -1;
   return {
     name: "list_delegates",
     label: "List Delegates",
@@ -62,13 +91,22 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
     renderResult: renderTextResult,
     description:
       "Find which specialist agent you may delegate to covers a target resource. Pass `query` with a cluster " +
-      "name, host name, or node name (matched against each delegate's bound clusters/hosts, plus their " +
-      "name/description) to see WHICH agent covers it — then delegate to that one. Omit `query` to browse " +
+      "name, host name, or node name. Coverage requires an exact, case-insensitive match against a delegate's " +
+      "bound clusters/hosts; agent names, descriptions, and partial resource names never prove coverage. " +
+      "Omit `query` to browse " +
       "(counts + a sample of bindings; agents may be bound to many hosts, so the full list is never dumped — " +
       "search by the target instead). Results are capped; use `cursor` to page.",
     parameters: Type.Object({
       query: Type.Optional(Type.String({
-        description: "Target cluster / host / node name (substring, case-insensitive). Omit to browse all delegates.",
+        description: "Exact target cluster / host / node binding name (case-insensitive). Omit to browse all delegates.",
+      })),
+      binding_name_confirmed: Type.Optional(Type.Boolean({
+        description:
+          "Set true only when `query` is a canonical Siclaw binding name confirmed by an attached routing helper.",
+      })),
+      retry_token: Type.Optional(Type.String({
+        description:
+          "The retry_token handed back by a previous empty result. Required to spend that one retry; it is single-use.",
       })),
       limit: Type.Optional(Type.Number({ description: "Max delegates per page (default 20, max 100)." })),
       cursor: Type.Optional(Type.String({ description: "Opaque pagination cursor from a previous response's next_cursor." })),
@@ -78,9 +116,16 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
       if (roster.length === 0) {
         return { content: [{ type: "text" as const, text: "You have no delegate agents configured." }], details: {} };
       }
-      const params = (rawParams ?? {}) as { query?: string; limit?: number; cursor?: string };
+      const params = (rawParams ?? {}) as {
+        query?: string;
+        binding_name_confirmed?: boolean;
+        retry_token?: string;
+        limit?: number;
+        cursor?: string;
+      };
       const rawQuery = typeof params.query === "string" ? params.query.trim() : "";
       const q = rawQuery.toLowerCase();
+      const bindingNameConfirmed = params.binding_name_confirmed === true;
       const limit = Math.min(Math.max(1, Math.floor(params.limit ?? DEFAULT_LIMIT)), MAX_LIMIT);
       const offset = decodeCursor(params.cursor);
 
@@ -98,11 +143,58 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
         return `- ${m.name} [id: ${m.id}]${desc}\n    ${renderMatched("clusters", m.clusters, mc)}\n    ${renderMatched("hosts", m.hosts, mh)}`;
       });
 
+      // Resolve the outstanding retry offer BEFORE rendering, and independently of
+      // whether this result is empty: a successful canonical retry spends the offer
+      // just as a failed one does, and leaving it outstanding would make the NEXT
+      // routing question's first miss look terminal.
+      const currentTurn = refs.turnRef?.current ?? -1;
+      const presentedToken = typeof params.retry_token === "string" ? params.retry_token.trim() : "";
+      if (pendingRetryToken !== null && currentTurn !== pendingRetryTurn) {
+        // A new routing attempt: an offer the model never spent is retired rather
+        // than carried across the user's turns.
+        pendingRetryToken = null;
+        pendingRetryTurn = -1;
+      }
+      if (total > 0 && presentedToken !== "" && presentedToken === pendingRetryToken) {
+        pendingRetryToken = null;   // retry spent on a hit
+        pendingRetryTurn = -1;
+      }
+
       const nextOffset = offset + page.length;
       const hasMore = nextOffset < total;
       let hint = "";
       if (total === 0) {
-        hint = `\n\nNo delegate agent covers "${rawQuery}". Do not delegate — tell the user no authorized agent covers that resource.`;
+        // One retry per routing attempt, enforced by the tool. The retry is spent
+        // by presenting the token; while a token is outstanding a further miss is
+        // terminal, so a caller that changes the name (alias → canonical) or drops
+        // the flag cannot earn a second offer. Any terminal outcome frees the slot
+        // for the next question.
+        const spentRetry = presentedToken !== "" && presentedToken === pendingRetryToken;
+        const offerOutstanding = pendingRetryToken !== null;
+        if (bindingNameConfirmed || spentRetry || offerOutstanding) {
+          pendingRetryToken = null;
+          pendingRetryTurn = -1;
+          const because = bindingNameConfirmed
+            ? " (confirmed binding name)."
+            : spentRetry
+              ? " — the resolved name was already retried."
+              : " — the one alias-resolution retry for this attempt was already offered.";
+          hint =
+            `\n\nNo delegate agent covers "${rawQuery}"${because}` +
+            " Do not retry and do not delegate — tell the user no authorized agent covers that resource" +
+            (bindingNameConfirmed ? "." : ", and that the name may be an alias.");
+        } else {
+          pendingRetryToken = crypto.randomUUID();
+          pendingRetryTurn = currentTurn;
+          hint =
+            `\n\nNo exact delegate resource binding matches "${rawQuery}" as written. If this may be a cluster ` +
+            "alias, localized name, local nickname, or spelling variant, consult a routing-helper skill you " +
+            "were given, if any. Retry ONCE with its confirmed canonical binding name, " +
+            `\`binding_name_confirmed=true\` and \`retry_token="${pendingRetryToken}"\` — that token is single-use. ` +
+            "If no helper is attached or it cannot confirm one binding name, " +
+            "do not guess or retry — tell the user no authorized agent covers the name as written and that it " +
+            "may be an alias. Do not delegate until coverage is confirmed.";
+        }
       } else if (hasMore) {
         hint = `\n\nShowing ${page.length} of ${total}. Refine the query, or pass cursor="${nextOffset}" for the next page.`;
       }
@@ -112,7 +204,13 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
       const body = lines.length ? `${header}\n${lines.join("\n")}` : header;
       return {
         content: [{ type: "text" as const, text: `${body}${hint}` }],
-        details: { total, shown: page.length, ...(hasMore ? { next_cursor: String(nextOffset) } : {}) },
+        details: {
+          total,
+          shown: page.length,
+          match_basis: q ? "exact_resource_binding" : "browse",
+          binding_name_confirmed: bindingNameConfirmed,
+          ...(hasMore ? { next_cursor: String(nextOffset) } : {}),
+        },
       };
     },
   };

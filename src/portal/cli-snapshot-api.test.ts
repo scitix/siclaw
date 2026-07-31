@@ -7,6 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { COORDINATOR_DEFAULT_PROMPT } from "../core/agent-types.js";
 import { EventEmitter } from "node:events";
 import { initDb, closeDb, getDb } from "../gateway/db.js";
 import { runPortalMigrations } from "./migrate.js";
@@ -470,7 +471,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     );
 
     expect(status).toBe(200);
-    expect(body.activeAgent.systemPrompt).toContain("ONLY job is ROUTING");
+    expect(body.activeAgent.systemPrompt).toBe(COORDINATOR_DEFAULT_PROMPT);
   });
 
   it("scopes skills / mcp / knowledge / clusters / hosts to the agent's junction rows", async () => {

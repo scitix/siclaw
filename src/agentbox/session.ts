@@ -146,6 +146,13 @@ export interface ManagedSession {
   memoryIndexer?: MemoryIndexer;
   /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
   dpStateRef?: DpStateRef;
+  /**
+   * Per-turn counter handed to the tool layer (see ToolRefs.turnRef). Bumped where
+   * the prompt mutex is acquired — the one funnel both /prompt and the synthetic
+   * delegation prompt pass through — so tools can scope state to one routing
+   * attempt instead of the whole session.
+   */
+  turnRef?: { current: number };
   /** Number of JSONL message entries at the time of last memory auto-save (dedup) */
   _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
@@ -1585,6 +1592,7 @@ export class AgentBoxSessionManager {
         }
         let release!: () => void;
         managed._promptInflight = new Promise<void>((r) => { release = r; });
+        if (managed.turnRef) managed.turnRef.current += 1;
         // Buffer events so a reconnecting SSE client can replay the synthetic turn.
         // The /send SSE consumer is already gone (turn 1 closed it), so the synthetic
         // turn has NO gateway consumer — persist + live-emit its completed messages
@@ -2649,6 +2657,7 @@ export class AgentBoxSessionManager {
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
       dpStateRef: result.dpStateRef,
+      turnRef: result.turnRef,
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
       _invalidated: false,

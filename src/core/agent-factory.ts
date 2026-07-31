@@ -156,6 +156,8 @@ export interface SiclawSessionResult {
   dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
   sessionIdRef: { current: string };
+  /** Bumped once per turn by the prompt owner; scopes per-attempt tool state (ToolRefs.turnRef). */
+  turnRef: { current: number };
 
 }
 
@@ -336,6 +338,8 @@ export async function createSiclawSession(
   const userId = opts?.userId ?? "unknown";
   const agentId: string | null = opts?.agentId ?? null;
   const sessionIdRef: { current: string } = { current: "" };
+  // Turn counter for per-attempt tool state; the prompt owner bumps it (see ToolRefs).
+  const turnRef: { current: number } = { current: 0 };
   const mode = opts?.mode ?? "web";
   const memoryEnabled = isMemoryEnabled();
   // Mutable ref — populated after memoryIndexer is created (below) so memory-
@@ -408,7 +412,7 @@ export async function createSiclawSession(
   const customTools = registry.resolve({
     mode,
     refs: {
-      kubeconfigRef, userId, agentId, sessionIdRef, taskListId,
+      kubeconfigRef, userId, agentId, sessionIdRef, taskListId, turnRef,
       isSubagent: opts?.isSubagent ?? false,
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
@@ -755,5 +759,5 @@ export async function createSiclawSession(
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, services, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
+  return { brain, session, services, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, turnRef, dpStateRef };
 }

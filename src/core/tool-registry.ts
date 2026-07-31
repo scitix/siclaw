@@ -383,6 +383,14 @@ export interface ToolRefs {
   /** Agent ID — used for metrics labeling. Null when running outside an agent context (TUI/CLI). */
   agentId: string | null;
   sessionIdRef: { current: string };
+  /**
+   * Bumped once per turn by whoever owns the prompt, so a tool can scope state to
+   * ONE routing attempt instead of the whole session. Tools read it lazily and
+   * reset their own state when it changes — there is no registry-side reset, and
+   * tools stay correct when it is absent (they just keep session scope, the
+   * pre-existing behaviour).
+   */
+  turnRef?: { current: number };
   /** Shared task-ledger id. A session and the sub-agents it spawns share one taskListId. */
   taskListId: string;
   /**
