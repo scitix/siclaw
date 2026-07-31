@@ -258,6 +258,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   agentBoxManager.setBoxStatusProbe?.(async (endpoint) =>
     new AgentBoxClient(endpoint, 10000, agentBoxTlsOptions).getJson("/api/internal/box-status"));
 
+  // Boxes from before box-status existed still answer the older session list. During the
+  // rollout that introduces this, EVERY running box is one of those — and knowing which
+  // sessions they hold is what stops one being handed to a second box mid-conversation.
+  agentBoxManager.setLegacySessionLister?.(async (endpoint) => {
+    const { sessions } = await new AgentBoxClient(endpoint, 10000, agentBoxTlsOptions).listSessions();
+    return sessions.map((s) => s.id);
+  });
+
   // Per-session AbortController for the in-flight chat.send SSE consumer, keyed
   // by sessionId. chat.abort looks this up to break the gateway's consumeAgentSse
   // loop so its abort-finalization runs (in-flight tool rows → "stopped", partial

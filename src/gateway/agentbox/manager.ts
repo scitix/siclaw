@@ -35,6 +35,17 @@ const DRAIN_DEADLINE_MS = 5 * 60_000;
 const DRAIN_REAP_INTERVAL_MS = 10_000;
 
 /**
+ * Consecutive failed status probes before a box is treated as gone rather than busy.
+ *
+ * A box whose event loop is permanently blocked stays pod-phase Running with a valid
+ * endpoint forever, so nothing else ever removes it. Sessions that last ran there would be
+ * pinned to it indefinitely — every turn dispatched to a box that cannot answer. Marking
+ * it draining hands it to the reaper, which removes it at the drain deadline and frees
+ * those sessions.
+ */
+const UNRESPONSIVE_PROBE_LIMIT = 3;
+
+/**
  * How long a per-agent replica count stays usable.
  *
  * This is consulted on EVERY acquisition, which is once per turn from every entry point.
@@ -90,6 +101,9 @@ export class AgentBoxManager {
   private draining = new Map<string, number>();
   private statusCache = new Map<string, { at: number; status: BoxStatusReport }>();
   private replicasCache = new Map<string, { at: number; value: number }>();
+  /** Consecutive failed status probes per box — see UNRESPONSIVE_PROBE_LIMIT. */
+  private probeFailures = new Map<string, number>();
+  private legacySessionLister?: (endpoint: string) => Promise<string[]>;
   private drainReaperTimer?: ReturnType<typeof setInterval>;
 
   constructor(spawner: BoxSpawner, config?: AgentBoxManagerConfig) {
@@ -157,6 +171,17 @@ export class AgentBoxManager {
    * How to ask a box what it is holding. Injected rather than imported so the manager owns
    * no transport, and so the drain reaper can be exercised without mTLS in tests.
    */
+  /**
+   * Fallback for boxes predating `box-status`: list the sessions they hold.
+   *
+   * Only used when the status probe fails. It cannot report in-flight turns or background
+   * work, so it reports neither — but it answers the one question that decides whether a
+   * session may be moved, which is the one that matters during a rollout.
+   */
+  setLegacySessionLister(fn: (endpoint: string) => Promise<string[]>): void {
+    this.legacySessionLister = fn;
+  }
+
   setBoxStatusProbe(fn: (endpoint: string) => Promise<BoxStatusReport>): void {
     this.boxStatusProbe = fn;
     if (!this.drainReaperTimer && this.isK8s) {
@@ -399,14 +424,18 @@ export class AgentBoxManager {
     // currently ask, assume it is still there.
     if (!holder && sessionId) {
       const last = this.bindings.get(agentId, sessionId);
-      if (last && reachable.some((b) => b.boxId === last) && !statuses.has(last)) {
+      // …unless we have already given up on that box (see UNRESPONSIVE_PROBE_LIMIT), in
+      // which case pinning the session there would just fail every turn forever.
+      const givenUp = last ? (this.probeFailures.get(last) ?? 0) >= UNRESPONSIVE_PROBE_LIMIT : false;
+      if (last && !givenUp && reachable.some((b) => b.boxId === last) && !statuses.has(last)) {
         console.log(`[agentbox-manager] ${last} did not answer; keeping session ${sessionId} on it rather than assuming it is free`);
         holder = last;
       }
     }
 
+
     // Held somewhere reachable: that box has the conversation in memory and is the one
-    // appending to the transcript. Nothing else may take the turn.
+    // appending to the transcript, so nothing else may take the turn — not even a spawn.
     if (holder) {
       const box = reachable.find((b) => b.boxId === holder);
       if (box) {
@@ -452,7 +481,7 @@ export class AgentBoxManager {
       return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
     }
 
-    const placed = this.bindings.place(agentId, sessionId, this.candidatesFrom(reachable, statuses), undefined);
+    const placed = this.bindings.place(agentId, sessionId, this.candidatesFrom(reachable, statuses), holder);
     const chosen = placed ? reachable.find((b) => b.boxId === placed.boxId) : undefined;
     if (chosen) {
       return { handle: { boxId: chosen.boxId, endpoint: chosen.endpoint, agentId }, created: false };
@@ -661,8 +690,29 @@ export class AgentBoxManager {
       try {
         const status = await this.boxStatusProbe!(box.endpoint);
         this.statusCache.set(box.boxId, { at: now, status });
+        this.probeFailures.delete(box.boxId);
         out.set(box.boxId, status);
       } catch (err) {
+        // A box running an image from before box-status existed 404s here — which is every
+        // box during the rollout that introduces this. It still exposes the older session
+        // list, and knowing WHICH sessions it holds is the whole point: without it the
+        // Runtime would think they are free and hand them to a second box.
+        if (this.legacySessionLister) {
+          try {
+            const ids = await this.legacySessionLister(box.endpoint);
+            const status: BoxStatusReport = { sessionIds: ids, turnsInFlight: 0, drained: ids.length === 0 };
+            this.statusCache.set(box.boxId, { at: now, status });
+            this.probeFailures.delete(box.boxId);
+            out.set(box.boxId, status);
+            return;
+          } catch { /* older endpoint unavailable too — fall through to the warning */ }
+        }
+        const fails = (this.probeFailures.get(box.boxId) ?? 0) + 1;
+        this.probeFailures.set(box.boxId, fails);
+        if (fails >= UNRESPONSIVE_PROBE_LIMIT && !this.draining.has(box.boxId)) {
+          console.warn(`[agentbox-manager] ${box.boxId} failed ${fails} status probes; draining it so its sessions are not pinned to a box that cannot answer`);
+          this.draining.set(box.boxId, Date.now());
+        }
         // A box that cannot be asked is not evidence of anything; leave it out of the
         // sample rather than guessing it is idle and stacking new sessions onto it.
         console.warn(`[agentbox-manager] box-status probe failed for ${box.boxId}:`, err);

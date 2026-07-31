@@ -1025,4 +1025,45 @@ describe("AgentBoxManager — silence is not emptiness", () => {
     const handle = await mgr.getOrCreate("agent-a", undefined, "brand-new");
     expect(handle.boxId).toMatch(/^agentbox-agent-a/);
   });
-})
+});
+
+describe("AgentBoxManager — asking a box that predates box-status", () => {
+  it("falls back to the older session list, so a rollout does not split a live session", async () => {
+    // Every box is one of these during the rollout that introduces box-status. The older
+    // endpoint still says WHICH sessions it holds, which is the part placement needs.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 2);
+    mgr.setBoxStatusProbe(async () => { throw new Error("404 — old image"); });
+    mgr.setLegacySessionLister(async (endpoint) =>
+      endpoint === "http://10.0.0.2:3000" ? ["s1"] : []);
+
+    // No hint remembered: the fallback alone has to find the holder.
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(handle.boxId).toBe("agentbox-agent-a-1");
+  });
+
+  it("gives up on a box that answers neither, rather than pinning the session to it forever", async () => {
+    // Silence protects a session from being split — but a box that is silent because it is
+    // wedged would otherwise keep every session it ever ran, failing every turn.
+    const spawner = new PoolSpawner("k8s");
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => 2);
+    mgr.setBoxStatusProbe(async (endpoint) => {
+      if (endpoint === "http://10.0.0.1:3000") throw new Error("wedged");
+      return { sessionIds: [], turnsInFlight: 0, drained: true };
+    });
+    mgr.setLegacySessionLister(async () => { throw new Error("wedged too"); });
+    (mgr as any).bindings.remember("agent-a", "s1", "agentbox-agent-a");
+
+    // The first few turns hold it there — the box may just be slow.
+    expect((await mgr.getOrCreate("agent-a", undefined, "s1")).boxId).toBe("agentbox-agent-a");
+    expect((await mgr.getOrCreate("agent-a", undefined, "s1")).boxId).toBe("agentbox-agent-a");
+    // After the limit it is treated as gone and the session moves on.
+    const handle = await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(handle.boxId).toBe("agentbox-agent-a-1");
+  });
+});
+
