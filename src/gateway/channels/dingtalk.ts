@@ -309,10 +309,14 @@ export async function handleDingTalkMessage(
   let resultText = "";
   let replyImages: RenderedReplyImage[] = [];
   let agentError: Error | null = null;
-  const releaseTurn = await sessionTurnLocks.acquire(sessionId);
+  // Acquired INSIDE the try so a busy session surfaces through the SAME path the
+  // AgentBox's 409 already used — the friendly "still working" notice. Outside it the
+  // rejection escaped every handler and the user got nothing at all.
+  let releaseTurn: (() => void) | undefined;
   try {
+    releaseTurn = await sessionTurnLocks.acquire(sessionId);
   const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
-  sessionTurnLocks.noteBox(sessionId, handle.boxId);
+  sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
   // Apply the agent's custom system prompt (best-effort — undefined falls back
@@ -385,7 +389,7 @@ export async function handleDingTalkMessage(
     console.error(`[dingtalk] Agent execution failed for session=${sessionId}:`, agentError);
   }
   } finally {
-    releaseTurn();
+    releaseTurn?.();
   }
 
   // Concurrency: a 1:1 session is single-threaded in AgentBox. A second

@@ -351,13 +351,43 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // Released in the finally below so a throw cannot wedge the session.
       let releaseTurn: (() => void) | undefined;
       try {
-        releaseTurn = await sessionTurnLocks.acquire(sessionId);
         // Persist user message + ensure session row before any agent events
         // could land. consumeAgentSse writes assistant/tool rows with FK
         // referencing chat_sessions, so the row has to exist first.
+        //
+        // BEFORE taking the turn lock, deliberately: a send that ends up riding the
+        // running turn as a steer still has to appear in the transcript. Acquiring first
+        // meant a busy session dropped the user's message entirely — the RPC had already
+        // returned ok, so nothing retried it and a reload showed no trace of it.
         await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
         const promptMessageId = await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
+
+        // One turn at a time for this session, across every box (see session-turn-lock.ts).
+        // If the session is already running, fall back to the SAME steer the AgentBox's own
+        // 409 used to trigger — the message rides the in-flight turn's stream. Emitting a
+        // stream_error/prompt_done here instead would tell the frontend the RUNNING turn
+        // had ended: it stops rendering and hides Stop while the turn is still going.
+        try {
+          releaseTurn = await sessionTurnLocks.acquire(sessionId);
+        } catch (busyErr) {
+          const running = sessionTurnLocks.busyOn(sessionId);
+          const steered = running ? await new AgentBoxClient(running.endpoint, 10000, agentBoxTlsOptions)
+            .steerSession(sessionId, text, { images, files })
+            .catch((e) => { console.warn(`[runtime] steer into ${running.boxId} failed session=${sessionId}:`, e); return undefined; })
+            : undefined;
+          if (steered) {
+            console.log(`[runtime] session=${sessionId} busy; steered into the turn on ${running!.boxId}`);
+            await updateMessage({ messageId: promptMessageId, sessionId, content: text, metadata: { kind: "steer" } })
+              .catch((e) => console.warn(`[runtime] failed to mark steer message session=${sessionId}:`, e));
+            void bindMessageTraceId(promptMessageId, sessionId, steered.traceId).catch(() => {});
+            return; // the running turn owns the stream and will emit its own prompt_done
+          }
+          // No steer target, or the turn ended between the rejection and the steer. Ask
+          // for the lock once more; if it is genuinely still busy this throws and the
+          // caller gets the ordinary busy error.
+          releaseTurn = await sessionTurnLocks.acquire(sessionId);
+        }
 
         // Agent-prompt precedence for the box session. An explicit
         // params.systemPrompt (the portal-standalone path stamps it from the
@@ -380,7 +410,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
         // Which box this turn went to. Placement reads it back as a hint while the turn
         // runs; it is dropped on release, so it can never become a stale binding.
-        sessionTurnLocks.noteBox(sessionId, handle.boxId);
+        sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;

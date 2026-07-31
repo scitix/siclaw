@@ -276,7 +276,7 @@ export class TaskCoordinator {
       // One turn at a time for this task's session — see session-turn-lock.ts.
       releaseTurn = await sessionTurnLocks.acquire(sessionId);
       const handle = await this.manager.getOrCreate(agentId, { persistence: binding.persistence }, sessionId);
-      sessionTurnLocks.noteBox(sessionId, handle.boxId);
+      sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
       const client = new AgentBoxClient(handle.endpoint, 30_000, this.tlsOptions);
 
       const promptOpts: PromptOptions = {

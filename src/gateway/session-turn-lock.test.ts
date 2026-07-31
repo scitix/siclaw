@@ -65,18 +65,30 @@ describe("SessionTurnLocks", () => {
     expect(order).toEqual(["first", "second"]);
   });
 
-  it("reports which box the in-flight turn went to", async () => {
-    // Placement uses this as a hint. It is dropped the moment the turn ends, so it can
-    // never become a stale binding.
+  it("reports where the in-flight turn is running, so a busy send can steer into it", async () => {
+    // This is what lets a rejected second send reach the box ACTUALLY running the turn
+    // instead of failing: the message rides the running turn as a steer.
     const locks = new SessionTurnLocks();
     const held = locks.run("s1", async () => {
-      locks.noteBox("s1", "agentbox-a-1");
-      expect(locks.busyOn("s1")).toBe("agentbox-a-1");
+      locks.noteBox("s1", "agentbox-a-1", "https://10.0.0.5:3000");
+      expect(locks.busyOn("s1")).toEqual({ boxId: "agentbox-a-1", endpoint: "https://10.0.0.5:3000" });
       await tick(20);
     });
     await held;
+    // Dropped the moment the turn ends, so it can never become a stale binding.
     expect(locks.busyOn("s1")).toBeUndefined();
     expect(locks.isBusy("s1")).toBe(false);
+  });
+
+  it("reports nothing while a turn is queued but not yet dispatched", async () => {
+    // A waiter has not chosen a box yet; a steer target must never be guessed.
+    const locks = new SessionTurnLocks();
+    const held = locks.run("s1", async () => { locks.noteBox("s1", "a", "https://x:3000"); await tick(60); });
+    await tick(10);
+    const queued = locks.run("s1", async () => "second");
+    await held;
+    expect(locks.busyOn("s1")).toBeUndefined(); // handed over, not yet dispatched
+    await queued;
   });
 
   it("does not leak an entry once the queue drains", async () => {

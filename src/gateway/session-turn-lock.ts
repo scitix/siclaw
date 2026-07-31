@@ -46,8 +46,9 @@ interface Waiter {
 }
 
 interface Entry {
-  /** Box the holder dispatched to, when known — a hint for placement, never authority. */
+  /** Where the in-flight turn was dispatched, when known. Dropped on release. */
   boxId?: string;
+  endpoint?: string;
   queue: Waiter[];
 }
 
@@ -59,15 +60,22 @@ export class SessionTurnLocks {
     return this.held.has(sessionId);
   }
 
-  /** Box the in-flight turn was dispatched to, if any. */
-  busyOn(sessionId: string): string | undefined {
-    return this.held.get(sessionId)?.boxId;
+  /**
+   * Where the in-flight turn is running, if any.
+   *
+   * This is what lets a rejected second send reach the box that is ACTUALLY running the
+   * turn, so it can be injected as a steer rather than failed — which is what the box's
+   * own 409 used to achieve before the lock started rejecting earlier.
+   */
+  busyOn(sessionId: string): { boxId: string; endpoint: string } | undefined {
+    const e = this.held.get(sessionId);
+    return e?.boxId && e.endpoint ? { boxId: e.boxId, endpoint: e.endpoint } : undefined;
   }
 
-  /** Record which box the in-flight turn went to, once placement has decided. */
-  noteBox(sessionId: string, boxId: string): void {
+  /** Record where the in-flight turn went, once placement has decided. */
+  noteBox(sessionId: string, boxId: string, endpoint: string): void {
     const entry = this.held.get(sessionId);
-    if (entry) entry.boxId = boxId;
+    if (entry) { entry.boxId = boxId; entry.endpoint = endpoint; }
   }
 
   /**
@@ -136,6 +144,7 @@ export class SessionTurnLocks {
     // Hand the lock straight to the next waiter — dropping and re-acquiring would let a
     // request that arrived later jump the queue.
     entry.boxId = undefined;
+    entry.endpoint = undefined;
     next.resolve();
   }
 }
