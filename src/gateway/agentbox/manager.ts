@@ -103,6 +103,8 @@ export class AgentBoxManager {
   private replicasCache = new Map<string, { at: number; value: number }>();
   /** Consecutive failed status probes per box — see UNRESPONSIVE_PROBE_LIMIT. */
   private probeFailures = new Map<string, number>();
+  /** Agents already warned about pooling without shared session storage. */
+  private unsharedWarned = new Set<string>();
   private legacySessionLister?: (endpoint: string) => Promise<string[]>;
   private drainReaperTimer?: ReturnType<typeof setInterval>;
 
@@ -314,7 +316,10 @@ export class AgentBoxManager {
       // 🔴 `replicas <= 1` takes the ORIGINAL single-box path untouched. That is what makes
       // this safe to ship before anything sets the field: an agent that has not opted in
       // executes exactly the code it did before pooling existed.
-      if (replicas > 1) return this.getOrCreatePooled(agentId, config, sessionId, replicas);
+      if (replicas > 1) {
+        this.warnIfSessionsAreNotShared(agentId);
+        return this.getOrCreatePooled(agentId, config, sessionId, replicas);
+      }
       return this.getOrCreateK8s(agentId, config, sessionId);
     }
     return this.getOrCreateLocal(agentId, config);
@@ -534,6 +539,27 @@ export class AgentBoxManager {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Say so, once, when a pool has nowhere shared to keep its sessions.
+   *
+   * A pool works because any box can pick up a session another box wrote down. On per-pod
+   * storage each box keeps its own copy, so a session that moves finds nothing and starts
+   * over — the conversation loses its memory mid-way, with nothing in any log to explain
+   * it. Not fatal (a pool serving one-shot traffic never continues a session), so this
+   * warns rather than refusing, but it must be impossible to hit without being told.
+   */
+  private warnIfSessionsAreNotShared(agentId: string): void {
+    const probe = (this.spawner as { hasSharedSessionStorage?(id: string): boolean }).hasSharedSessionStorage;
+    if (typeof probe !== "function" || probe.call(this.spawner, agentId)) return;
+    if (this.unsharedWarned.has(agentId)) return;
+    this.unsharedWarned.add(agentId);
+    console.warn(
+      `[agentbox-manager] agent ${agentId} runs more than one box but its session transcripts are NOT on shared ` +
+      `storage — a conversation that moves between boxes will lose its history. Configure a shared volume ` +
+      `(SICLAW_PERSISTENCE_CLAIM_NAME) or set replicas back to 1.`,
+    );
   }
 
   /**

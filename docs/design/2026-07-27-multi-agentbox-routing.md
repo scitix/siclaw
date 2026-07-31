@@ -262,11 +262,21 @@ replication, regions.
 
 ## Contracts (what must hold)
 
-- **A resident session never changes box.** Every request for it routes to its box. The only legal
-  re-binding is a released session when the pool has changed.
-- **RR places; affinity keeps.** Round-robin applies to new sessions only, never per request.
-- **Placement never migrates load.** Raising `replicas` relieves future sessions only; existing
-  ones stay where they are.
+- **A session with live work never changes box.** While a turn runs — or a background sub-agent
+  runs under it — every request for that session routes to the box holding it. A session with no
+  live work is free: it belongs to no box and goes wherever the load says.
+- **Anything that reaches into a running turn targets the box running it**, not placement. steer,
+  abort and clearQueue act on a turn that already exists; resolving them through placement was
+  only ever correct while a session belonged to one box, and once placement became free it
+  started handing them a box that had never heard of the session (404, and a frontend that
+  resends the text as a new prompt — the message answered twice).
+- **A pool requires shared session storage.** Boxes take turns writing one session's transcript,
+  so they must write to the same place. On per-pod storage a session that moves finds no history
+  and starts over mid-conversation, silently. Nothing enforces this — the runtime falls back to
+  `emptyDir` when no claim is configured, and a live cluster was found running three boxes per
+  agent that way — so the manager warns once per agent instead.
+- **Placement never migrates load.** Raising `replicas` relieves future sessions only; sessions
+  already running stay where they are.
 - **Pool state is read fresh every reconciliation round** and never cached across rounds as
   authoritative. This is what lets the loop tolerate restarts without any coordination.
 - **A draining box does not count toward `replicas`**, so pod count exceeds it during a deploy.

@@ -1003,6 +1003,11 @@ export class K8sSpawner implements BoxSpawner {
    * Undefined before setCertManager() runs. The manager compares it to a pod's
    * stamped `ca-fp` label to decide whether the pod is still reachable over mTLS.
    */
+  /** True when session transcripts land on the shared PVC rather than a per-pod emptyDir. */
+  hasSharedSessionStorage(): boolean {
+    return !!this.config.persistence?.claimName;
+  }
+
   caFingerprint(): string | undefined {
     return this.certManager?.caFingerprint();
   }

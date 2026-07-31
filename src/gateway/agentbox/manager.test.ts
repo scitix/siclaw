@@ -1114,3 +1114,31 @@ describe("AgentBoxManager — who is holding this session", () => {
   });
 });
 
+describe("AgentBoxManager — pooling without shared session storage", () => {
+  it("says so once when a pool has nowhere shared to keep its sessions", async () => {
+    // Silent history loss is the failure this prevents someone from debugging blind.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const spawner = new PoolSpawner("k8s") as PoolSpawner & { hasSharedSessionStorage(): boolean };
+    spawner.hasSharedSessionStorage = () => false;
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = pooledManager(spawner, 2);
+
+    await mgr.getOrCreate("agent-a", undefined, "s1");
+    await mgr.getOrCreate("agent-a", undefined, "s2");
+
+    const hits = warn.mock.calls.filter((c) => /NOT on shared/.test(String(c[0])));
+    expect(hits).toHaveLength(1); // once per agent, not once per turn
+  });
+
+  it("stays quiet when the boxes do share a volume", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const spawner = new PoolSpawner("k8s") as PoolSpawner & { hasSharedSessionStorage(): boolean };
+    spawner.hasSharedSessionStorage = () => true;
+    spawner.pool = [poolBox("agentbox-agent-a", 0), poolBox("agentbox-agent-a-1", 1)];
+    const mgr = pooledManager(spawner, 2);
+
+    await mgr.getOrCreate("agent-a", undefined, "s1");
+    expect(warn.mock.calls.filter((c) => /NOT on shared/.test(String(c[0])))).toHaveLength(0);
+  });
+});
+
