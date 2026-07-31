@@ -3633,6 +3633,25 @@ describe("handleLarkMessage — personal access denial", () => {
     (Date.now as any).mockRestore();
   });
 
+  it("does not repeat the URL in the card body when the prose already embeds it", async () => {
+    // buildLinkActionCard documents the URL as button-only; passing prose that embeds it gave the
+    // link a second rendering path and made that claim false. Enforced in the builder itself now.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "quota_exceeded", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 600_000, message: `Continue here: ${ACTION_URL}` },
+    });
+    const lark = makeCardClient();
+
+    await sendGated(lark as any);
+
+    const card = sentCard(lark) as any;
+    const bodyText = card.body.elements.filter((e: any) => e.tag === "markdown").map((e: any) => e.content).join("\n");
+    expect(bodyText).not.toContain(ACTION_URL);
+    expect(bodyText).toContain("Continue here");          // the prose itself survives
+    expect(JSON.stringify(card)).toContain(ACTION_URL);   // still reachable, on the button
+    expect(JSON.stringify(card).split(ACTION_URL).length - 1).toBe(1);
+  });
+
   it("strips an embedded stale URL when the link lapses at the send boundary", async () => {
     // The expired branch reused card.body verbatim, and for an unknown reason that body IS the
     // frontend prose — which may carry the URL, putting the dead link straight back into the text.
@@ -3881,6 +3900,21 @@ describe("handleLarkMessage — /apikey", () => {
     expect(card).toContain(PICKUP);
     expect(card).toContain("继续");                 // neutral label for an unfamiliar reason
     expect(card).toContain("重发 /apikey");          // generic resume line
+  });
+
+  it("keeps the frontend's explanation when /apikey has neither template nor link", async () => {
+    // `message` is defined as the fallback for a reason this build has no template for; the failure
+    // path skipped straight to `error` and replaced a real explanation with "unknown error".
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: false,
+      denied: { reason: "quota_exceeded", message: "Quota exceeded for this account." },
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    expect(replyText(lark)).toContain("Quota exceeded for this account.");
+    expect(replyText(lark)).not.toContain("未知错误");
   });
 
   it("says nothing about links when /apikey is refused with no self-service step", async () => {

@@ -2147,7 +2147,12 @@ function formatApiKeyIssueReply(result: PersonalApiKeyIssueResult, locale: LarkL
     // fall through to `error` (a non-localized English fallback) unchanged.
     const localized = result.denied ? formatApiKeyDenialReply(result.denied, locale) : null;
     if (localized) return localized;
-    const reason = result.error ?? (locale === "en-US" ? "unknown error" : "未知错误");
+    // `denied.message` before `error`: it is defined as the fallback for a reason this build has no
+    // template for, so discarding it in favour of a generic "unknown error" throws away the only
+    // explanation the sender was given. Bounded on the way through, like every other prose field.
+    const reason = truncateDenialProse(result.denied?.message)
+      ?? result.error
+      ?? (locale === "en-US" ? "unknown error" : "未知错误");
     return locale === "en-US"
       ? `❌ Could not issue an API key: ${reason}`
       : `❌ 领取 API Key 失败: ${reason}`;
