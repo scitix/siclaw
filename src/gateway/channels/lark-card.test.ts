@@ -127,7 +127,9 @@ function makeLarkClient(overrides: Partial<{
   createThrows: Error;
   replyThrows: Error;
   contentThrows: Error;
+  contentRes: unknown;
   settingsThrows: Error;
+  settingsRes: unknown;
   elementCreateRes: unknown;
   elementCreateThrows: Error;
   elementUpdateThrows: Error;
@@ -139,10 +141,10 @@ function makeLarkClient(overrides: Partial<{
     overrides.replyThrows ? Promise.reject(overrides.replyThrows) : ({ code: 0 }),
   );
   const contentSpy = vi.fn(async () =>
-    overrides.contentThrows ? Promise.reject(overrides.contentThrows) : ({ code: 0 }),
+    overrides.contentThrows ? Promise.reject(overrides.contentThrows) : (overrides.contentRes ?? { code: 0 }),
   );
   const settingsSpy = vi.fn(async () =>
-    overrides.settingsThrows ? Promise.reject(overrides.settingsThrows) : ({ code: 0 }),
+    overrides.settingsThrows ? Promise.reject(overrides.settingsThrows) : (overrides.settingsRes ?? { code: 0 }),
   );
   const elementCreateSpy = vi.fn(async () =>
     overrides.elementCreateThrows ? Promise.reject(overrides.elementCreateThrows) : (overrides.elementCreateRes ?? { code: 0 }),
@@ -258,8 +260,8 @@ describe("finalizeCard", () => {
     const { client, contentSpy, settingsSpy } = makeLarkClient();
     const session = { cardId: "CARD-1", elementId: "md_main", sequence: 0 };
 
-    const ok = await finalizeCard(client as any, session, "# Heading\ntext **bold**");
-    expect(ok).toBe(true);
+    const res = await finalizeCard(client as any, session, "# Heading\ntext **bold**");
+    expect(res).toEqual({ ok: true, contentOk: true });
 
     // content call gets sanitized text (heading passes through unchanged now)
     const contentArg = contentSpy.mock.calls[0][0];
@@ -283,8 +285,8 @@ describe("finalizeCard", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
 
     const session = { cardId: "CARD-1", elementId: "md_main", sequence: 0 };
-    const ok = await finalizeCard(client as any, session, "final text");
-    expect(ok).toBe(false);
+    const res = await finalizeCard(client as any, session, "final text");
+    expect(res).toEqual({ ok: false, contentOk: false });
     expect(contentSpy).toHaveBeenCalledTimes(1);
     // Still tries settings so the card doesn't stay visually stuck in "streaming" state.
     expect(settingsSpy).toHaveBeenCalledTimes(1);
@@ -294,14 +296,59 @@ describe("finalizeCard", () => {
     const { client } = makeLarkClient({ settingsThrows: new Error("500") });
     vi.spyOn(console, "error").mockImplementation(() => {});
     const session = { cardId: "C", elementId: "md_main", sequence: 0 };
-    const ok = await finalizeCard(client as any, session, "x");
-    expect(ok).toBe(false);
+    // contentOk stays true: the answer IS on the card, only the streaming flip
+    // failed — the caller must NOT post a duplicate text reply.
+    const res = await finalizeCard(client as any, session, "x");
+    expect(res).toEqual({ ok: false, contentOk: true });
   });
 
   it("passes the empty-result notice through untouched (no heading/table transforms hit it)", async () => {
     const { client, contentSpy } = makeLarkClient();
     await finalizeCard(client as any, { cardId: "C", elementId: "md_main", sequence: 0 }, EMPTY_RESULT_NOTICE);
     expect(contentSpy.mock.calls[0][0].data.content).toBe(EMPTY_RESULT_NOTICE);
+  });
+
+  // The SDK does NOT throw on a non-zero code. Reporting such a rejection as
+  // success is what froze cards on their ⏳ placeholder while the answer lived
+  // only in the DB (visible in Portal, invisible in the group).
+  it("a non-zero code on the final element.content is a failure, not a silent success", async () => {
+    const { client, settingsSpy } = makeLarkClient({ contentRes: { code: 200671, msg: "sequence conflict" } });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const session = { cardId: "C", elementId: "md_main", sequence: 0 };
+
+    const res = await finalizeCard(client as any, session, "the long final answer");
+    expect(res).toEqual({ ok: false, contentOk: false });
+    // Still attempts the streaming flip so the card does not stay "typing".
+    expect(settingsSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("a non-zero code on card.settings keeps contentOk (answer is on the card)", async () => {
+    const { client } = makeLarkClient({ settingsRes: { code: 99991400, msg: "rate limited" } });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const session = { cardId: "C", elementId: "md_main", sequence: 0 };
+
+    const res = await finalizeCard(client as any, session, "answer");
+    expect(res).toEqual({ ok: false, contentOk: true });
+  });
+
+  it("a non-zero code suppresses the feedback row (no buttons under an undelivered answer)", async () => {
+    const { client, elementCreateSpy } = makeLarkClient({ contentRes: { code: 300401, msg: "content too large" } });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await finalizeCard(client as any, { cardId: "C", elementId: "md_main", sequence: 0 }, "big", {
+      ctx: { sessionId: "s", channelId: "c" },
+      locale: "zh-CN",
+    });
+    expect(res.contentOk).toBe(false);
+    expect(elementCreateSpy).not.toHaveBeenCalled();
+  });
+
+  it("updateCardContent reports a non-zero code as failure (milestone updates are not silently lost)", async () => {
+    const { client } = makeLarkClient({ contentRes: { code: 200671, msg: "sequence conflict" } });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const ok = await updateCardContent(client as any, { cardId: "C", elementId: "md_main", sequence: 0 }, "step");
+    expect(ok).toBe(false);
   });
 });
 
@@ -313,11 +360,11 @@ describe("feedback buttons", () => {
     const { client, contentSpy, settingsSpy, elementCreateSpy } = makeLarkClient();
     const session = { cardId: "CARD-FB-1", elementId: "md_main", sequence: 0 };
 
-    const ok = await finalizeCard(client as any, session, "done", {
+    const res = await finalizeCard(client as any, session, "done", {
       ctx: { sessionId: "sess-1", channelId: "ch-1", messageId: "msg-assistant-1" },
       locale: "zh-CN",
     });
-    expect(ok).toBe(true);
+    expect(res.ok).toBe(true);
 
     expect(elementCreateSpy).toHaveBeenCalledTimes(1);
     const arg = elementCreateSpy.mock.calls[0][0];
@@ -357,11 +404,11 @@ describe("feedback buttons", () => {
     const { client } = makeLarkClient({ elementCreateThrows: new Error("500") });
     const session = { cardId: "CARD-FB-2", elementId: "md_main", sequence: 0 };
 
-    const ok = await finalizeCard(client as any, session, "done", {
+    const res = await finalizeCard(client as any, session, "done", {
       ctx: { sessionId: "s", channelId: "c" },
       locale: "en-US",
     });
-    expect(ok).toBe(true);
+    expect(res.ok).toBe(true);
     // Not remembered → no echo possible either.
     expect(await applyFeedbackSelection(client as any, feedbackValue("CARD-FB-2"), "up")).toBe(false);
   });
@@ -372,11 +419,11 @@ describe("feedback buttons", () => {
     const { client, elementUpdateSpy } = makeLarkClient({ elementCreateRes: { code: 300301, msg: "invalid element" } });
     const session = { cardId: "CARD-FB-CODE", elementId: "md_main", sequence: 0 };
 
-    const ok = await finalizeCard(client as any, session, "done", {
+    const res = await finalizeCard(client as any, session, "done", {
       ctx: { sessionId: "s", channelId: "c" },
       locale: "zh-CN",
     });
-    expect(ok).toBe(true);
+    expect(res.ok).toBe(true);
     expect(await applyFeedbackSelection(client as any, feedbackValue("CARD-FB-CODE"), "up")).toBe(false);
     expect(elementUpdateSpy).not.toHaveBeenCalled();
   });

@@ -418,6 +418,16 @@ function cardApiFailed(res: unknown): boolean {
 }
 
 /**
+ * Render a rejected card call for the log. The code is the only handle on WHY
+ * an update was refused (oversized body, out-of-order sequence, …), and until
+ * it was logged the failure was invisible: nothing threw, so nothing printed.
+ */
+function describeCardApiError(res: unknown): string {
+  const r = res as { code?: unknown; msg?: unknown } | undefined;
+  return `code=${String(r?.code)} msg=${String(r?.msg)}`;
+}
+
+/**
  * Append the feedback row to a finalized card. Best-effort: a failure only
  * loses the buttons, never the answer. Only a verified success registers the
  * card for the post-click echo — a rejected append must not leave a phantom
@@ -558,6 +568,76 @@ function buildPlaceholderCard(placeholder: string): Record<string, unknown> {
   };
 }
 
+/** The answer baked in at creation — no streaming window left to expire. */
+function buildFinalCard(markdown: string): Record<string, unknown> {
+  return {
+    schema: "2.0",
+    body: {
+      elements: [
+        { tag: "markdown", content: markdown, element_id: MD_ELEMENT_ID },
+      ],
+    },
+  };
+}
+
+/**
+ * Post a finished answer as a NEW static card.
+ *
+ * Recovery path for a streaming card that can no longer be written to: Feishu
+ * closes streaming mode on a timeout (code 200850) and then refuses every
+ * further update with 300309 — which is how a long investigation left its card
+ * frozen on the last ⏳ line. A plain-text reply does deliver the answer, but it
+ * strips the rendering: the markdown arrives as literal `##` headings and
+ * `|---|` table rows. A fresh card keeps the formatting, can carry the feedback
+ * row (a text message cannot), and being static has no window left to expire.
+ */
+export async function postFinalCard(
+  larkClient: any,
+  messageId: string,
+  finalText: string,
+  feedback?: { ctx: FeedbackContext; locale: LarkLocale },
+  replyInThread: boolean = false,
+): Promise<boolean> {
+  const sanitized = sanitizeMarkdownForFeishu(finalText);
+  try {
+    const createRes = await larkClient.cardkit.v1.card.create({
+      data: { type: "card_json", data: JSON.stringify(buildFinalCard(sanitized)) },
+    });
+    const cardId: string | undefined = createRes?.data?.card_id;
+    if (!cardId) {
+      // Report the code, not just the absence: this is the recovery path for a
+      // silently-rejected write, so it must not become one itself.
+      console.error(`[lark-card] postFinalCard: create returned no card_id for messageId=${messageId}: ${describeCardApiError(createRes)} chars=${sanitized.length}`);
+      return false;
+    }
+    const replyRes = await larkClient.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        msg_type: "interactive",
+        content: JSON.stringify({ type: "card", data: { card_id: cardId } }),
+        ...(replyInThread ? { reply_in_thread: true } : {}),
+      },
+    });
+    if (cardApiFailed(replyRes)) {
+      console.error(`[lark-card] postFinalCard: posting to chat failed for messageId=${messageId}: ${describeCardApiError(replyRes)}`);
+      return false;
+    }
+    // Safe here in a way it is not on a streaming card: this one is static.
+    if (feedback) {
+      await appendFeedbackRow(
+        larkClient,
+        { cardId, elementId: MD_ELEMENT_ID, sequence: 0 },
+        feedback.ctx,
+        feedback.locale,
+      );
+    }
+    return true;
+  } catch (err) {
+    console.error(`[lark-card] postFinalCard failed for messageId=${messageId}:`, err);
+    return false;
+  }
+}
+
 /**
  * Create a streaming-mode placeholder card and reply with it to the
  * triggering message. Returns the card handle on success, or `null` if
@@ -617,10 +697,14 @@ export async function updateCardContent(
 ): Promise<boolean> {
   const sanitized = sanitizeMarkdownForFeishu(text);
   try {
-    await larkClient.cardkit.v1.cardElement.content({
+    const res = await larkClient.cardkit.v1.cardElement.content({
       path: { card_id: session.cardId, element_id: session.elementId },
       data: { content: sanitized, sequence: ++session.sequence },
     });
+    if (cardApiFailed(res)) {
+      console.error(`[lark-card] element.content rejected for cardId=${session.cardId}: ${describeCardApiError(res)} chars=${sanitized.length}`);
+      return false;
+    }
     return true;
   } catch (err) {
     console.error(`[lark-card] element.content failed for cardId=${session.cardId}:`, err);
@@ -628,12 +712,25 @@ export async function updateCardContent(
   }
 }
 
+export interface CardFinalizeResult {
+  /** Both the content update and the streaming-mode flip landed. */
+  ok: boolean;
+  /**
+   * The final text is actually ON the card. When false the user still sees the
+   * previous body (the ⏳ placeholder / last milestone), so the caller MUST fall
+   * back to a plain-text reply — that is the only case where a second message
+   * is not a duplicate.
+   */
+  contentOk: boolean;
+}
+
 /**
- * Replace the card's markdown body with `finalText` and disable streaming
- * mode. Returns `true` iff both the content update and the settings flip
- * succeeded; `false` if either step failed (caller should log — at this
- * point the card is already visible, so a plain-text fallback would create
- * duplicate replies).
+ * Replace the card's markdown body with `finalText` and disable streaming mode.
+ *
+ * `contentOk` is reported separately from `ok` because the two failures need
+ * opposite handling: a failed settings flip only leaves the card in streaming
+ * state (answer visible — a text reply would duplicate it), while a failed
+ * content update leaves the answer nowhere the user can see it.
  *
  * When `feedback` is passed, a 👍/👎 button row is appended after the final
  * content (best-effort — losing the buttons never fails the finalize).
@@ -643,29 +740,39 @@ export async function finalizeCard(
   session: CardSession,
   finalText: string,
   feedback?: { ctx: FeedbackContext; locale: LarkLocale },
-): Promise<boolean> {
+): Promise<CardFinalizeResult> {
   const sanitized = sanitizeMarkdownForFeishu(finalText);
   let contentOk = false;
   try {
-    await larkClient.cardkit.v1.cardElement.content({
+    const res = await larkClient.cardkit.v1.cardElement.content({
       path: { card_id: session.cardId, element_id: session.elementId },
       data: { content: sanitized, sequence: ++session.sequence },
     });
-    contentOk = true;
+    // A non-zero code does NOT throw. Treating it as success is what froze the
+    // card on its last milestone while the answer only existed in the DB.
+    if (cardApiFailed(res)) {
+      console.error(`[lark-card] final element.content rejected for cardId=${session.cardId}: ${describeCardApiError(res)} chars=${sanitized.length}`);
+    } else {
+      contentOk = true;
+    }
   } catch (err) {
     console.error(`[lark-card] element.content failed for cardId=${session.cardId}:`, err);
   }
 
   let settingsOk = false;
   try {
-    await larkClient.cardkit.v1.card.settings({
+    const res = await larkClient.cardkit.v1.card.settings({
       path: { card_id: session.cardId },
       data: {
         settings: JSON.stringify({ config: { streaming_mode: false } }),
         sequence: ++session.sequence,
       },
     });
-    settingsOk = true;
+    if (cardApiFailed(res)) {
+      console.error(`[lark-card] card.settings(streaming_mode=false) rejected for cardId=${session.cardId}: ${describeCardApiError(res)}`);
+    } else {
+      settingsOk = true;
+    }
   } catch (err) {
     console.error(`[lark-card] card.settings(streaming_mode=false) failed for cardId=${session.cardId}:`, err);
   }
@@ -677,5 +784,5 @@ export async function finalizeCard(
     await appendFeedbackRow(larkClient, session, feedback.ctx, feedback.locale);
   }
 
-  return contentOk && settingsOk;
+  return { ok: contentOk && settingsOk, contentOk };
 }
