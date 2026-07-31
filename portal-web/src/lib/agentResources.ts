@@ -8,6 +8,19 @@ export interface AgentResourceBindingIds {
   delegate_agent_ids: string[]
 }
 
+const RESOURCE_BINDING_TABS = new Set([
+  "skills",
+  "mcp",
+  "knowledge",
+  "resources",
+  "delegates",
+  "channels",
+])
+
+export function requiresLoadedResourceBindings(tab: string): boolean {
+  return RESOURCE_BINDING_TABS.has(tab)
+}
+
 function normalizedIds(ids: string[]): string[] {
   return [...new Set(ids)].sort()
 }

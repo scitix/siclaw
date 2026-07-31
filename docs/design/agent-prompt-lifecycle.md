@@ -41,8 +41,10 @@ each message. The reload only invalidates warm sessions.
 - An idle, quiescent session is scheduled for immediate release.
 - Detached background work is allowed to finish rather than being torn down.
   Because it does not own `brain.prompt()`, the chat may continue on the old
-  in-memory prompt while that work is outstanding. Completion forces the
-  deferred release immediately; it does not wait for the idle TTL.
+  in-memory prompt while that work is outstanding. Its buffered completion
+  notification drains first, including the coalescing window and any synthetic
+  model turn; only then is the deferred release scheduled. An invalidated
+  session uses a next-tick release at that point rather than the idle TTL.
 - The next turn restores the existing JSONL conversation into a new in-memory
   brain with the latest prompt.
 - The AgentBox process/pod is not killed, and the 30-second idle release TTL is

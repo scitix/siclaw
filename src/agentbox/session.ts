@@ -519,8 +519,30 @@ export class AgentBoxSessionManager {
   discardPendingNotifications(sessionId: string): void {
     const managed = this.sessions.get(sessionId);
     if (!managed) return;
+    this.discardPendingNotificationsFor(sessionId, managed);
+  }
+
+  private discardPendingNotificationsFor(sessionId: string, managed: ManagedSession): void {
+    // A queued synthetic turn can outlive an explicit close followed by a new
+    // session with the same id. Never let stale work drain or schedule release
+    // on that replacement.
+    if (this.sessions.get(sessionId) !== managed) return;
+    this.clearPendingNotificationState(managed);
+    // scheduleRelease() may have declined to arm while the notification buffer
+    // owned the session. Once Stop abandons that work, restore the ordinary
+    // lifecycle only if no prompt or detached owner is still using the brain.
+    if (
+      managed._backgroundWorkCount === 0 &&
+      managed._promptDone &&
+      !managed._promptInflight
+    ) {
+      this.scheduleRelease(sessionId);
+    }
+  }
+
+  private clearPendingNotificationState(managed: ManagedSession): void {
     managed._pendingNotifications.length = 0;
-    if (managed._coalesceTimer) {
+    if (managed._coalesceTimer !== null) {
       clearTimeout(managed._coalesceTimer);
       managed._coalesceTimer = null;
     }
@@ -1497,12 +1519,7 @@ export class AgentBoxSessionManager {
     // resets it. Do NOT flush a synthetic turn during the Stop window — that would wake the
     // model on a completion it cancelled ("comes back to life after Stop").
     if (managed._aborted) {
-      managed._pendingNotifications.length = 0;
-      // A release may have been deferred while this notification owned the
-      // session. Once Stop discards the buffered notice, re-arm the ordinary
-      // lifecycle (an invalidated session upgrades this to an immediate
-      // release in scheduleRelease).
-      if (managed._backgroundWorkCount === 0) this.scheduleRelease(sessionId);
+      this.discardPendingNotificationsFor(sessionId, managed);
       return;
     }
     if (!managed._promptDone) {
@@ -1545,7 +1562,10 @@ export class AgentBoxSessionManager {
         // Stop is terminal: if the user pressed Stop while this synthetic turn was queued, do
         // NOT start it (and do NOT followUp — that would ride a turn too). _aborted stays true
         // until the next real user prompt resets it. Checked under the queue, before the reset.
-        if (managed._aborted) return;
+        if (managed._aborted) {
+          this.discardPendingNotificationsFor(managed.id, managed);
+          return;
+        }
         // Re-check under the queue: an HTTP /prompt may have started since notifyParent
         // decided "idle". If so, degrade to followUp (delivered to that running turn).
         if (!managed._promptDone || managed._promptInflight) {
@@ -2980,7 +3000,7 @@ export class AgentBoxSessionManager {
     // Guard: only delete if the map still holds the same instance — a new
     // getOrCreate() may have replaced it while release() was running async.
     if (this.sessions.get(sessionId) === managed) {
-      if (managed._coalesceTimer) { clearTimeout(managed._coalesceTimer); managed._coalesceTimer = null; }
+      this.clearPendingNotificationState(managed);
       this.sessions.delete(sessionId);
       this.teardownTracing(sessionId, managed);
       emitDiagnostic({ type: "session_released", sessionId });
@@ -3043,6 +3063,7 @@ export class AgentBoxSessionManager {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
       }
+      this.clearPendingNotificationState(managed);
       // Shutdown per-session MCP connections
       if (managed.mcpManager) {
         try {
@@ -3089,6 +3110,7 @@ export class AgentBoxSessionManager {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
       }
+      this.clearPendingNotificationState(managed);
       // Shutdown per-session MCP connections
       if (managed.mcpManager) {
         try {

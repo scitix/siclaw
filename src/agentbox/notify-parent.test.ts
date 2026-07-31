@@ -156,6 +156,39 @@ describe("notifyParent", () => {
     expect(brain.prompt).not.toHaveBeenCalled();
   });
 
+  it("re-arms an immediate release after Stop discards an invalidated completion", async () => {
+    const { mgr, brain, managed } = setup(true);
+    managed._backgroundWorkCount = 0;
+    managed._invalidated = true;
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "completed", summary: "done" });
+
+    mgr.scheduleRelease("s1");
+    expect(managed._releaseTimer ?? null).toBeNull();
+
+    mgr.discardPendingNotifications("s1");
+    expect(managed._pendingNotifications).toHaveLength(0);
+    expect(managed._coalesceTimer).toBeNull();
+    expect(managed._releaseTimer).not.toBeNull();
+    expect(brain.prompt).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mgr.sessions.has("s1")).toBe(false);
+  });
+
+  it("re-arms release when Stop reaches a queued synthetic turn", async () => {
+    const { mgr, brain, managed } = setup(true);
+    managed._backgroundWorkCount = 0;
+    managed._invalidated = true;
+    managed._aborted = true;
+
+    await mgr.runSyntheticPrompt(managed, "completion");
+
+    expect(brain.prompt).not.toHaveBeenCalled();
+    expect(managed._releaseTimer).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mgr.sessions.has("s1")).toBe(false);
+  });
+
   it("restores _promptDone after a synthetic turn", async () => {
     const { mgr, managed } = setup(true);
     await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "completed", summary: "x" });

@@ -7,7 +7,11 @@ import { AgentApiKeys } from "./AgentApiKeys"
 import { CapabilityGroupSelector } from "./CapabilityGroupSelector"
 import { toCapabilitySet } from "../lib/toolCapabilities"
 import { AGENT_TYPES, agentTypeOption, type AgentTypeKey } from "../lib/agentTypes"
-import { diffAgentResourceBindings, type AgentResourceBindingIds } from "../lib/agentResources"
+import {
+  diffAgentResourceBindings,
+  requiresLoadedResourceBindings,
+  type AgentResourceBindingIds,
+} from "../lib/agentResources"
 
 interface Agent {
   id: string; name: string; description: string; status: string
@@ -185,6 +189,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [providers, setProviders] = useState<Provider[]>([])
   const [resources, setResources] = useState<AgentResources | null>(null)
   const [resourceBaseline, setResourceBaseline] = useState<AgentResourceBindingIds | null>(null)
+  const [resourceLoadError, setResourceLoadError] = useState<string | null>(null)
   const [loadingResources, setLoadingResources] = useState(true)
   const [allClusters, setAllClusters] = useState<AvailableCluster[]>([])
   const [allHosts, setAllHosts] = useState<AvailableHost[]>([])
@@ -233,10 +238,23 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     let cancelled = false
     setResources(null)
     setResourceBaseline(null)
+    setResourceLoadError(null)
+    setSelectedClusterIds(new Set())
+    setSelectedHostIds(new Set())
+    setSelectedSkillIds(new Set())
+    setSelectedMcpIds(new Set())
+    setSelectedChannelIds(new Set())
+    setSelectedKnowledgeRepoIds(new Set())
+    setSelectedDelegateIds(new Set())
     setLoadingResources(true)
     api<AgentResources>(`/agents/${agent.id}/resources`)
       .then(data => { if (!cancelled) setResources(data) })
-      .catch(() => { if (!cancelled) setResources(null) })
+      .catch(() => {
+        if (!cancelled) {
+          setResources(null)
+          setResourceLoadError("Resource bindings failed to load. Refresh and try again.")
+        }
+      })
       .finally(() => { if (!cancelled) setLoadingResources(false) })
     return () => { cancelled = true }
   }, [agent.id])
@@ -265,9 +283,15 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
   const selectedProvider = providers.find(p => p.name === modelProvider)
   const availableModels = selectedProvider?.models || []
+  const activeTabNeedsResourceBindings = requiresLoadedResourceBindings(activeTab)
+  const resourceBindingsUnavailable = activeTabNeedsResourceBindings && resourceBaseline === null
 
   const handleSave = async () => {
     if (!name.trim()) return
+    if (resourceBindingsUnavailable) {
+      toast.error(resourceLoadError || "Resource bindings are still loading")
+      return
+    }
     let modelRouting: ModelRoutePolicy | null = null
     if (routingEnabled) {
       if (!modelProvider.trim() || !modelId.trim()) {
@@ -339,7 +363,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
         {showSave && (
           <button
             onClick={handleSave}
-            disabled={!name.trim() || saving}
+            disabled={!name.trim() || saving || resourceBindingsUnavailable}
             className="ml-auto flex items-center gap-1.5 h-8 px-3 text-[12px] rounded-md bg-primary text-primary-foreground disabled:opacity-50 hover:opacity-90 shrink-0"
           >
             {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
@@ -350,6 +374,11 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
       {/* Tab content */}
       <div className="flex-1 overflow-auto">
+        {resourceLoadError && activeTabNeedsResourceBindings && (
+          <div role="alert" className="mx-6 mt-4 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+            {resourceLoadError}
+          </div>
+        )}
         {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} />}
         {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} routingEnabled={routingEnabled} setRoutingEnabled={setRoutingEnabled} fallbackCandidates={fallbackCandidates} setFallbackCandidates={setFallbackCandidates} />}
         {activeTab === "tools" && (

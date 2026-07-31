@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest"
-import { diffAgentResourceBindings, type AgentResourceBindingIds } from "./agentResources"
+import {
+  diffAgentResourceBindings,
+  requiresLoadedResourceBindings,
+  type AgentResourceBindingIds,
+} from "./agentResources"
 
 function bindings(overrides: Partial<AgentResourceBindingIds> = {}): AgentResourceBindingIds {
   return {
@@ -30,5 +34,16 @@ describe("diffAgentResourceBindings", () => {
       cluster_ids: ["c1", "c2"],
       delegate_agent_ids: ["a2"],
     })
+  })
+})
+
+describe("requiresLoadedResourceBindings", () => {
+  it("fails closed only on tabs that edit resource bindings", () => {
+    for (const tab of ["skills", "mcp", "knowledge", "resources", "delegates", "channels"]) {
+      expect(requiresLoadedResourceBindings(tab)).toBe(true)
+    }
+    for (const tab of ["basic", "model", "tools", "tasks", "api-keys"]) {
+      expect(requiresLoadedResourceBindings(tab)).toBe(false)
+    }
   })
 })
