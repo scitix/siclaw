@@ -1134,12 +1134,17 @@ export async function handleLarkMessage(
         // unfurl (and thereby consume) it. An expired link, or a refusal with no link at all,
         // has nothing to put on a button — send the text form.
         const template = denied?.reason ? PERSONAL_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason) : undefined;
-        const linkIsLive = Boolean(denied?.actionUrl) && minutesUntil(denied?.expiresAtMs) !== "expired";
-        if (template && denied && linkIsLive && rendersActionLink(denied, locale)) {
+        // A structured `actionUrl` goes on a button whenever we have one that is usable — including
+        // for a reason this build has never seen. Falling straight to text there printed a one-time
+        // URL where a client unfurl could fetch and consume the token before the sender tapped it,
+        // which is the whole property this delivery path exists to hold. Only a reason KNOWN to
+        // have no self-service step (`access_denied`) is excluded, by `rendersActionLink`.
+        if (denied && isRenderableActionUrl(denied.actionUrl) && !knownLinklessReason(denied.reason, locale)) {
           await deliverSingleUseLink(larkClient, messageId, locale, {
-            body: template,
-            buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason!)!,
-            url: denied.actionUrl,
+            body: template ?? truncateDenialProse(denied.message) ?? PERSONAL_ACCESS_GATED_NOTICE_BY_LOCALE[locale],
+            buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason ?? "")
+              ?? PERSONAL_DENIAL_BUTTON_NEUTRAL_BY_LOCALE[locale],
+            url: denied.actionUrl!,
             expiresAtMs: denied.expiresAtMs,
           }, deniedReply);
         } else {
@@ -1838,6 +1843,23 @@ function offersSelfService(reason: string | undefined, locale: LarkLocale): bool
   return Boolean(reason && PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].has(reason));
 }
 
+/** True only for a reason this build knows to carry NO self-service step. An unknown reason is not
+ *  in this set: we cannot claim it has no step, and withholding its link would strand the sender. */
+function knownLinklessReason(reason: string | undefined, locale: LarkLocale): boolean {
+  return Boolean(reason
+    && PERSONAL_DENIAL_COPY_BY_LOCALE[locale].has(reason)
+    && !PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].has(reason));
+}
+
+/** Neutral button label for a reason this build does not know. Used ONLY for an unknown reason: it
+ *  keeps a structured one-time URL on a button instead of printing it as text, where a client
+ *  unfurl could fetch and consume the token. A reason KNOWN to have no self-service step
+ *  (`access_denied`) still gets no button at all — a verb describing nothing is worse than none. */
+const PERSONAL_DENIAL_BUTTON_NEUTRAL_BY_LOCALE: Record<LarkLocale, string> = {
+  "zh-CN": "继续",
+  "en-US": "Continue",
+};
+
 /** The one predicate for "render a link for this refusal": the reason has a step the sender can
  *  take, AND the URL is something we are willing to put in front of them. Narrows `actionUrl` to
  *  defined so callers need no assertions. */
@@ -1850,8 +1872,8 @@ function rendersActionLink(
 
 /** Bound the frontend's free-form prose. Applied to prose ONLY — never to a URL or to our own
  *  lines, since a truncated link is a guaranteed dead one. */
-function truncateDenialProse(prose: string | undefined): string | undefined {
-  if (!prose) return undefined;
+function truncateDenialProse(prose: unknown): string | undefined {
+  if (typeof prose !== "string" || !prose.trim()) return undefined;
   return prose.length > PERSONAL_DENIAL_MESSAGE_MAX_CHARS
     ? `${prose.slice(0, PERSONAL_DENIAL_MESSAGE_MAX_CHARS)}…`
     : prose;
@@ -1873,9 +1895,16 @@ async function deliverSingleUseLink(
   textFallback: string,
 ): Promise<boolean> {
   const remaining = minutesUntil(card.expiresAtMs);
+  // Re-checked HERE, not just when the reply was composed: a link can lapse between the two, and
+  // the render decision earlier says nothing about the state at the send boundary. An expired link
+  // must reach neither the button nor the text — hand over the resend instruction instead, which is
+  // the only thing that actually helps (the frontend mints a fresh link on the next message).
+  if (remaining === "expired") {
+    return replyToLark(larkClient, messageId, `${card.body}\n${PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE[locale]}`);
+  }
   const sent = await sendLinkActionCard(larkClient, messageId, {
     body: card.body,
-    note: SINGLE_USE_LINK_NOTE_BY_LOCALE[locale](remaining === "expired" ? null : remaining),
+    note: SINGLE_USE_LINK_NOTE_BY_LOCALE[locale](remaining),
     buttonLabel: card.buttonLabel,
     url: card.url,
   });
@@ -1899,7 +1928,7 @@ function formatPersonalDenialReply(denied: PersonalAccessDenied, locale: LarkLoc
   // Only the frontend's free-form prose is capped. The URL and our own lines must stay intact:
   // truncating a link GUARANTEES a dead one, which is the very outcome the expired-link branch
   // exists to avoid, and the platform's text limit sits far above anything we render here.
-  const body = template ?? truncateDenialProse(denied.message?.trim());
+  const body = template ?? truncateDenialProse(denied.message)?.trim();
   if (!body) return null;
   const lines = [body];
   // Only the templated path appends the URL. On the fallback path the frontend's prose is expected

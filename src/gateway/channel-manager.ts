@@ -251,11 +251,34 @@ export async function resolvePersonalBinding(
     channel_id: channelId,
     sender_open_id: senderOpenId,
   });
-  const denied = data?.denied;
   return {
     binding: data?.binding ?? null,
-    ...(denied && typeof denied === "object" ? { denied: denied as PersonalAccessDenied } : {}),
+    ...(normalizeDenied(data?.denied) ?? {}),
   };
+}
+
+/**
+ * Narrow `denied` at the RPC boundary so no downstream renderer has to defend itself.
+ *
+ * Every field is frontend-supplied, and "present" does not imply "the type we expect": a
+ * `message` that arrives as an object made `message.trim()` throw, the event wrapper only logged
+ * it, and the sender got NO reply — the exact silent failure this contract exists to remove.
+ * Wrong-typed fields are dropped rather than coerced: a refusal with a missing field degrades to
+ * a generic notice, whereas a stringified object would be shown to the user as copy.
+ */
+export function normalizeDenied(raw: unknown): { denied: PersonalAccessDenied } | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const src = raw as Record<string, unknown>;
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v : undefined);
+  const denied: PersonalAccessDenied = {
+    ...(str(src.reason) ? { reason: str(src.reason) } : {}),
+    ...(str(src.actionUrl) ? { actionUrl: str(src.actionUrl) } : {}),
+    ...(str(src.message) ? { message: str(src.message) } : {}),
+    ...(typeof src.expiresAtMs === "number" && Number.isFinite(src.expiresAtMs)
+      ? { expiresAtMs: src.expiresAtMs }
+      : {}),
+  };
+  return { denied };
 }
 
 export async function handlePersonalPairingCode(
@@ -331,7 +354,7 @@ export async function issuePersonalApiKey(
   frontendClient: FrontendWsClient,
   requestId?: string,
 ): Promise<PersonalApiKeyIssueResult> {
-  return frontendClient.request("channel.issueApiKey", {
+  const result = await frontendClient.request("channel.issueApiKey", {
     channel_id: channelId,
     sender_open_id: senderOpenId,
     // Stable per-inbound-message id (the Feishu message_id). Issuing is destructive — it rotates
@@ -342,6 +365,9 @@ export async function issuePersonalApiKey(
     // keeps today's behaviour.
     ...(requestId ? { request_id: requestId } : {}),
   });
+  // Same untrusted shape as the binding path — narrow it here so the renderers cannot be handed
+  // a non-string where they expect one.
+  return { ...result, ...(normalizeDenied(result?.denied) ?? { denied: undefined }) };
 }
 
 /** Read-only key status for the sender. Same Upstream-mode contract as {@link issuePersonalApiKey}. */

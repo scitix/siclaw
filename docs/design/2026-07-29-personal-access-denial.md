@@ -63,7 +63,34 @@ The out-of-range case is load-bearing rather than paranoid — `Intl` throws `Ra
 ±8.64e15 while `Number.isFinite` passes such a value, and here the throw would replace the user's
 only path forward with a generic error.
 
+### A structured link reaches the sender through a button — including for an unknown reason
+
+Whenever `actionUrl` is present and usable it rides a card button, and that includes a `reason` this
+build has never seen (neutral label). Falling straight to text there printed a one-time URL where a
+client unfurl can fetch and consume the token before the sender taps it — defeating this path's
+whole purpose in precisely the frontend-first skew case the contract must survive. Only a reason
+**known** to carry no self-service step is excluded; unknown is not the same as known-linkless, and
+withholding an unknown reason's link would strand the sender.
+
+Stated precisely, because the earlier wording overclaimed: the text form is a *degradation* (card
+creation failed) and it does carry the URL. The invariant is that a structured `actionUrl` is never
+sent as text **while a card is possible**, not that a URL never appears in text at all.
+
+### Expiry is re-checked at the send boundary
+
+The render decision says nothing about the state when the message actually goes out, and a link can
+lapse in between. `deliverSingleUseLink` re-checks: if expired it calls neither CardKit nor the
+URL-carrying text form, and sends the resend instruction instead — the only thing that helps, since
+the frontend mints a fresh link on the next message.
+
 ### Every field of `denied` is untrusted input
+
+Types are narrowed at the **RPC boundary** (`normalizeDenied`), so no renderer has to defend
+itself, and wrong-typed fields are *dropped* rather than coerced — a stringified object would
+otherwise be shown to the user as copy. "Present" did not imply "the expected type": a `message`
+arriving as an object made `message.trim()` throw, the detached event wrapper only logged it, and
+the sender got no reply — the same silent failure this contract exists to remove. The renderers keep
+a `typeof` guard anyway, so a future caller that skips the boundary degrades instead of throwing.
 
 `reason` indexes a **Map**, not an object literal: an object lookup walks the prototype chain, so
 `reason: "toString"` would return a Function, pass the "do I have a template" check, and be

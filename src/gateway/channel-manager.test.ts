@@ -149,6 +149,26 @@ describe("personal binding RPC wrappers", () => {
     expect(result).toEqual({ binding: null, denied });
   });
 
+  it("drops wrong-typed denied fields instead of passing them to a renderer", async () => {
+    // "Present" does not imply "the type we expect". A non-string `message` made `message.trim()`
+    // throw downstream, the detached event wrapper only logged it, and the sender got NO reply.
+    frontend.responses.set("channel.resolvePersonalBinding", {
+      binding: null,
+      denied: { reason: "binding_required", message: { text: "obj" }, actionUrl: 42, expiresAtMs: "soon" },
+    });
+    const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+    // Dropped, not coerced: a stringified object would be shown to the user as copy.
+    expect(result.denied).toEqual({ reason: "binding_required" });
+  });
+
+  it("ignores a denied that is not an object at all", async () => {
+    for (const denied of ["nope", 7, [], null]) {
+      frontend.responses.set("channel.resolvePersonalBinding", { binding: null, denied });
+      const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+      expect(result.denied, JSON.stringify(denied)).toBeUndefined();
+    }
+  });
+
   it("omits denied for a frontend that predates the field", async () => {
     frontend.responses.set("channel.resolvePersonalBinding", { binding: null });
     const result = await resolvePersonalBinding("pb1", "ou_1", frontend as unknown as FrontendWsClient);

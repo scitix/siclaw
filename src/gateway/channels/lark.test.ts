@@ -3533,6 +3533,60 @@ describe("handleLarkMessage — personal access denial", () => {
     expect(denialText(lark)).toContain("请联系管理员");
   });
 
+  it("puts an unknown reason's link on a button too, never as unfurlable text", async () => {
+    // Falling straight to text for an unfamiliar reason printed a one-time URL where a client
+    // unfurl could fetch and consume the token before the sender tapped it — the exact property
+    // this delivery path exists to hold, defeated by the version-skew case it must survive.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "quota_exceeded", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 600_000, message: "Quota exceeded." },
+    });
+    const lark = makeCardClient();
+
+    await sendGated(lark as any);
+
+    const card = JSON.stringify(sentCard(lark));
+    expect(card).toContain(ACTION_URL);        // on the button
+    expect(card).toContain("继续");             // neutral label: we cannot name an unknown step
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).not.toContain(ACTION_URL);
+  });
+
+  it("survives a non-string message instead of going silent", async () => {
+    // `denied.message?.trim()` assumed a string. An object made it throw, the detached event
+    // wrapper only logged, and the sender got NO reply — the failure this feature removes.
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "some_future_reason", message: { text: "not a string" } as any },
+    });
+    const lark = makeLarkClient();
+
+    await sendGated(lark);
+
+    expect(lark.im.message.reply).toHaveBeenCalled();
+    expect(denialText(lark)).toContain("需要先获得授权");   // degrades to the generic notice
+  });
+
+  it("withholds a link that lapses between composing and sending", async () => {
+    // The render decision says nothing about the state at the send boundary; a link can lapse in
+    // between, and a dead URL must reach neither the button nor the text.
+    const lark = makeCardClient();
+    let calls = 0;
+    const realNow = Date.now;
+    vi.spyOn(Date, "now").mockImplementation(() => (++calls <= 1 ? realNow() : realNow() + 10 * 60_000));
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: realNow() + 60_000 },
+    });
+
+    await sendGated(lark as any);
+
+    expect(lark.cardkit.v1.card.create).not.toHaveBeenCalled();
+    const reply = lark.im.message.reply.mock.calls[0][0].data.content as string;
+    expect(reply).not.toContain(ACTION_URL);
+    expect(reply).toContain("已过期");
+    (Date.now as any).mockRestore();
+  });
+
   it("truncates a pathological message instead of losing the reply to a size limit", async () => {
     resolvePersonalBindingMock.mockResolvedValue({
       binding: null,
@@ -3616,8 +3670,11 @@ describe("handleLarkMessage — /apikey", () => {
     lark.im.message.reply.mock.calls[0][0].data.content as string;
 
   it("issues a key and replies with the single-use pickup link", async () => {
+    // RELATIVE, not a fixed instant: a hardcoded date silently became the past and the delivery
+    // boundary then (correctly) withheld the link as expired, so the fixture — not the code — was
+    // what broke. Exact timestamp formatting is covered by the dedicated timestamp cases.
     issuePersonalApiKeyMock.mockResolvedValue({
-      success: true, agentId: "a1", pickupUrl: PICKUP, expiresAt: 1753689600000, rotated: false,
+      success: true, agentId: "a1", pickupUrl: PICKUP, expiresAt: Date.now() + 5 * 60_000, rotated: false,
     });
     const lark = makeLarkClient();
 
@@ -3629,7 +3686,7 @@ describe("handleLarkMessage — /apikey", () => {
     expect(issuePersonalApiKeyMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything(), "mid-1");
     expect(replyText(lark)).toContain(PICKUP);
     expect(replyText(lark)).toContain("仅可打开一次");
-    expect(replyText(lark)).toContain("2025-07-28 16:00"); // link expiry, Asia/Shanghai
+    expect(replyText(lark)).toContain("链接过期时间");
     expect(promptMock).not.toHaveBeenCalled();             // never reaches the agent
   });
 
