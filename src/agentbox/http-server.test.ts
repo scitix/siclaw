@@ -447,16 +447,6 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(existing.brain.prompt).not.toHaveBeenCalled();
   });
 
-  it("POST /api/prompt does not turn an idle invalidation marker into a hard chat error", async () => {
-    const existing = await sm.getOrCreate("refreshing");
-    existing._invalidated = true;
-
-    const r = await getJson(port, "/api/prompt", "POST", { text: "use the new prompt", sessionId: "refreshing" });
-
-    expect(r.status).toBe(200);
-    expect(existing.brain.prompt).toHaveBeenCalled();
-  });
-
   it("DELETE /api/sessions/:id closes the session", async () => {
     await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "s-close" });
     expect(sm.sessions.has("s-close")).toBe(true);

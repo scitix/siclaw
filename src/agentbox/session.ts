@@ -1498,6 +1498,11 @@ export class AgentBoxSessionManager {
     // model on a completion it cancelled ("comes back to life after Stop").
     if (managed._aborted) {
       managed._pendingNotifications.length = 0;
+      // A release may have been deferred while this notification owned the
+      // session. Once Stop discards the buffered notice, re-arm the ordinary
+      // lifecycle (an invalidated session upgrades this to an immediate
+      // release in scheduleRelease).
+      if (managed._backgroundWorkCount === 0) this.scheduleRelease(sessionId);
       return;
     }
     if (!managed._promptDone) {
@@ -2334,7 +2339,8 @@ export class AgentBoxSessionManager {
         existing._invalidated &&
         existing._promptDone &&
         !existing._promptInflight &&
-        existing._backgroundWorkCount === 0
+        existing._backgroundWorkCount === 0 &&
+        !this.hasPendingNotificationWork(existing)
       ) {
         await this.releaseForRebuild(id, existing);
       } else if (
@@ -2848,6 +2854,20 @@ export class AgentBoxSessionManager {
       return;
     }
 
+    // Completion notifications own the parent session until their coalescing
+    // window has drained into a synthetic turn. Releasing here would make
+    // flushPendingNotifications() find no session and silently lose the
+    // detached job/sub-agent result. The synthetic turn's finally block
+    // re-arms release after delivery; the aborted path does the same after
+    // explicitly discarding the notification.
+    if (this.hasPendingNotificationWork(managed)) {
+      console.log(
+        `[agentbox-session] Deferring release for session ${sessionId}; ` +
+        "a background completion notification is still pending",
+      );
+      return;
+    }
+
     // A configuration invalidation is a mandatory rebuild, not an ordinary
     // idle eviction. This also closes the recovery path when detached
     // background work deferred the original 0ms schedule: whichever later
@@ -2866,6 +2886,10 @@ export class AgentBoxSessionManager {
         console.warn(`[agentbox-session] Scheduled release failed for ${sessionId}:`, err);
       });
     }, effectiveTtlMs);
+  }
+
+  private hasPendingNotificationWork(managed: ManagedSession): boolean {
+    return managed._pendingNotifications.length > 0 || managed._coalesceTimer !== null;
   }
 
   /**

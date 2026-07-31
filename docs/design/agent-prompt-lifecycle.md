@@ -15,7 +15,9 @@ The same contract applies in AgentBox sessions and the Portal-backed TUI.
 Persisted prompt fragments retain the legacy template conveniences:
 `{{mode}}`, `{{settingsPath}}`, `{{credentialsPath}}`, `{{memoryIntro}}`,
 `{{memorySection}}`, and web/CLI conditional blocks are resolved before the
-fragment is appended.
+fragment is inserted. The Agent-owned fragment is placed before Siclaw's
+hardcoded Safety and Language sections, so editable identity text cannot gain
+recency precedence over those platform-owned instructions.
 
 For `custom` agents this is an intentional semantic migration: their stored
 prompt used to replace the whole Siclaw template. It now replaces only the

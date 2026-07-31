@@ -18,10 +18,15 @@ const MODE_LABELS: Record<string, string> = {
  * Mode-conditional blocks: `<!-- web-only -->...<!-- /web-only -->` and
  * `<!-- cli-only -->...<!-- /cli-only -->` — the non-matching block is stripped.
  *
- * Safety and Language sections are hardcoded and always appended — they cannot
- * be overridden by agent templates.
+ * The optional agent-owned identity fragment is rendered after the platform
+ * template but before Safety. Safety and Language therefore remain later than
+ * editable Agent text and cannot be displaced by an Agent template.
  */
-export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", templateOverride?: string): string {
+export function buildSreSystemPrompt(
+  mode?: "cli" | "web" | "channel" | "task",
+  templateOverride?: string,
+  agentPromptFragment?: string,
+): string {
   const template = templateOverride?.trim() || DEFAULT_TEMPLATE;
   let prompt = renderSystemPromptFragment(template, mode);
 
@@ -33,6 +38,10 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", 
   }
   if (mode === "channel") {
     prompt += CHANNEL_SECTION;
+  }
+
+  if (agentPromptFragment?.trim()) {
+    prompt += `\n\n${renderSystemPromptFragment(agentPromptFragment, mode)}`;
   }
 
   // Append hardcoded safety section — NOT overridable by agent templates

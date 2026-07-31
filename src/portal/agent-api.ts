@@ -237,14 +237,21 @@ export function registerAgentRoutes(
 
     const promptSupplied = "system_prompt" in body;
     let nextSystemPrompt = promptSupplied ? body.system_prompt : current?.system_prompt;
+    let resetToTypeDefault = false;
     // A type switch from an unchanged textarea means "take the new type's
     // initial prompt", not "pin the previous type's persona to new tools".
-    // An actually edited prompt remains authoritative.
+    // An actually edited prompt remains authoritative. Custom has no default,
+    // so switching to it must retain the visible admin-authored prompt rather
+    // than silently replacing it with NULL.
     if (
       agentTypeChanged &&
       (!promptSupplied || normalizedPrompt(body.system_prompt) === normalizedPrompt(current?.system_prompt))
     ) {
-      nextSystemPrompt = effectiveAgentPrompt(nextAgentType, null) ?? null;
+      const typeDefault = effectiveAgentPrompt(nextAgentType, null);
+      if (typeDefault !== undefined) {
+        nextSystemPrompt = typeDefault;
+        resetToTypeDefault = true;
+      }
     }
     const promptChanged =
       (promptSupplied || agentTypeChanged) &&
@@ -301,7 +308,7 @@ export function registerAgentRoutes(
     }
     // If a caller changes the type without supplying a prompt, initialize the
     // new type's default as the editable row truth.
-    if (agentTypeChanged && !promptSupplied) {
+    if (agentTypeChanged && !promptSupplied && resetToTypeDefault) {
       setClauses.push("system_prompt = ?");
       values.push(nextSystemPrompt);
     }
@@ -521,11 +528,28 @@ export function registerAgentRoutes(
 
     sendJson(res, 200, { ok: true });
 
-    // Notify running AgentBox to reload (fire-and-forget)
-    connectionMap.notify(params.id, "agent.reload", { agentId: params.id });
+    // Reload only the resource surfaces the caller actually changed. In
+    // particular, omitting the default MCP fan-out prevents an unrelated
+    // cluster/skill/channel save from invalidating every warm brain.
+    const reloadResources = [
+      ...(body.cluster_ids !== undefined ? ["cluster"] : []),
+      ...(body.host_ids !== undefined ? ["host"] : []),
+      ...(body.skill_ids !== undefined ? ["skills"] : []),
+      ...(body.mcp_server_ids !== undefined ? ["mcp"] : []),
+      ...(body.knowledge_repo_ids !== undefined ? ["knowledge"] : []),
+      ...(body.delegate_agent_ids !== undefined ? ["tools"] : []),
+    ];
+    if (reloadResources.length > 0) {
+      connectionMap.notify(params.id, "agent.reload", {
+        agentId: params.id,
+        resources: reloadResources,
+      });
+    }
     // This agent's cluster/host bindings changed → its coverage in any coordinator's
     // roster is now stale; refresh the coordinators that delegate to it.
-    void notifyCoordinatorsForMembers(connectionMap, [params.id]);
+    if (body.cluster_ids !== undefined || body.host_ids !== undefined) {
+      void notifyCoordinatorsForMembers(connectionMap, [params.id]);
+    }
   });
 
   // GET /api/v1/agents/:id/resources — get bindings

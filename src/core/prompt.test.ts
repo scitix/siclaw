@@ -120,4 +120,20 @@ describe("renderSystemPromptFragment", () => {
     expect(cli).not.toContain("web instruction");
     expect(cli).not.toContain("<!--");
   });
+
+  it("renders the agent fragment before non-overridable platform safety", () => {
+    process.env.SICLAW_MEMORY_ENABLED = "false";
+    const fragment = [
+      "agent mode={{mode}}",
+      "<!-- cli-only -->CLI identity<!-- /cli-only -->",
+      "<!-- web-only -->Web identity<!-- /web-only -->",
+    ].join("\n");
+
+    const prompt = buildSreSystemPrompt("cli", undefined, fragment);
+
+    expect(prompt).toContain("agent mode=TUI");
+    expect(prompt).toContain("CLI identity");
+    expect(prompt).not.toContain("Web identity");
+    expect(prompt.indexOf("agent mode=TUI")).toBeLessThan(prompt.indexOf("# Safety"));
+  });
 });

@@ -7,6 +7,7 @@ import { AgentApiKeys } from "./AgentApiKeys"
 import { CapabilityGroupSelector } from "./CapabilityGroupSelector"
 import { toCapabilitySet } from "../lib/toolCapabilities"
 import { AGENT_TYPES, agentTypeOption, type AgentTypeKey } from "../lib/agentTypes"
+import { diffAgentResourceBindings, type AgentResourceBindingIds } from "../lib/agentResources"
 
 interface Agent {
   id: string; name: string; description: string; status: string
@@ -183,6 +184,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   // ── Data ──
   const [providers, setProviders] = useState<Provider[]>([])
   const [resources, setResources] = useState<AgentResources | null>(null)
+  const [resourceBaseline, setResourceBaseline] = useState<AgentResourceBindingIds | null>(null)
   const [loadingResources, setLoadingResources] = useState(true)
   const [allClusters, setAllClusters] = useState<AvailableCluster[]>([])
   const [allHosts, setAllHosts] = useState<AvailableHost[]>([])
@@ -229,6 +231,8 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
   useEffect(() => {
     let cancelled = false
+    setResources(null)
+    setResourceBaseline(null)
     setLoadingResources(true)
     api<AgentResources>(`/agents/${agent.id}/resources`)
       .then(data => { if (!cancelled) setResources(data) })
@@ -239,13 +243,23 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
   useEffect(() => {
     if (resources) {
-      setSelectedClusterIds(new Set(resources.clusters?.map(c => c.id) || []))
-      setSelectedHostIds(new Set(resources.hosts?.map(h => h.id) || []))
-      setSelectedSkillIds(new Set(resources.skills?.map(s => s.id) || []))
-      setSelectedMcpIds(new Set(resources.mcp_servers?.map(m => m.id) || []))
-      setSelectedChannelIds(new Set(resources.channels?.map(c => c.id) || []))
-      setSelectedKnowledgeRepoIds(new Set(resources.knowledge_repos?.map((k: any) => k.id) || []))
-      setSelectedDelegateIds(new Set(resources.delegates?.map(d => d.id) || []))
+      const bindingIds: AgentResourceBindingIds = {
+        cluster_ids: resources.clusters?.map(c => c.id) || [],
+        host_ids: resources.hosts?.map(h => h.id) || [],
+        skill_ids: resources.skills?.map(s => s.id) || [],
+        mcp_server_ids: resources.mcp_servers?.map(m => m.id) || [],
+        channel_ids: resources.channels?.map(c => c.id) || [],
+        knowledge_repo_ids: resources.knowledge_repos?.map(k => k.id) || [],
+        delegate_agent_ids: resources.delegates?.map(d => d.id) || [],
+      }
+      setResourceBaseline(bindingIds)
+      setSelectedClusterIds(new Set(bindingIds.cluster_ids))
+      setSelectedHostIds(new Set(bindingIds.host_ids))
+      setSelectedSkillIds(new Set(bindingIds.skill_ids))
+      setSelectedMcpIds(new Set(bindingIds.mcp_server_ids))
+      setSelectedChannelIds(new Set(bindingIds.channel_ids))
+      setSelectedKnowledgeRepoIds(new Set(bindingIds.knowledge_repo_ids))
+      setSelectedDelegateIds(new Set(bindingIds.delegate_agent_ids))
     }
   }, [resources])
 
@@ -273,10 +287,25 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
         method: "PUT",
         body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, tool_capabilities: Array.from(selectedCapabilities), agent_type: agentType },
       })
-      await api(`/agents/${agent.id}/resources`, {
-        method: "PUT",
-        body: { cluster_ids: Array.from(selectedClusterIds), host_ids: Array.from(selectedHostIds), skill_ids: Array.from(selectedSkillIds), mcp_server_ids: Array.from(selectedMcpIds), channel_ids: Array.from(selectedChannelIds), knowledge_repo_ids: Array.from(selectedKnowledgeRepoIds), delegate_agent_ids: Array.from(selectedDelegateIds) },
-      })
+      const nextResourceBindings: AgentResourceBindingIds = {
+        cluster_ids: Array.from(selectedClusterIds),
+        host_ids: Array.from(selectedHostIds),
+        skill_ids: Array.from(selectedSkillIds),
+        mcp_server_ids: Array.from(selectedMcpIds),
+        channel_ids: Array.from(selectedChannelIds),
+        knowledge_repo_ids: Array.from(selectedKnowledgeRepoIds),
+        delegate_agent_ids: Array.from(selectedDelegateIds),
+      }
+      const resourceChanges = resourceBaseline
+        ? diffAgentResourceBindings(resourceBaseline, nextResourceBindings)
+        : {}
+      if (Object.keys(resourceChanges).length > 0) {
+        await api(`/agents/${agent.id}/resources`, {
+          method: "PUT",
+          body: resourceChanges,
+        })
+        setResourceBaseline(nextResourceBindings)
+      }
       onUpdate(updated)
       toast.success("Saved — agent will reload automatically")
     } catch (err: any) {

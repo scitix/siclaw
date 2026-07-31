@@ -419,6 +419,33 @@ describe("registerAgentRoutes", () => {
       )).toBe(true);
     });
 
+    it("keeps the visible prompt when switching to custom with an unchanged textarea", async () => {
+      query
+        .mockResolvedValueOnce([[{
+          idle_timeout_sec: 300,
+          system_prompt: "H100 fleet SRE; check ECC counters first",
+          agent_type: "sre",
+          is_production: 1,
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "custom" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: {
+          agent_type: "custom",
+          system_prompt: "H100 fleet SRE; check ECC counters first",
+        },
+      }));
+
+      expect(status).toBe(200);
+      const updateArgs = query.mock.calls[1][1] as unknown[];
+      expect(updateArgs).toContain("custom");
+      expect(updateArgs).toContain("H100 fleet SRE; check ECC counters first");
+      expect(updateArgs).not.toContain(null);
+    });
+
     it("notifies prompt.reload when system_prompt changes", async () => {
       query
         .mockResolvedValueOnce([[{
@@ -829,7 +856,24 @@ describe("registerAgentRoutes", () => {
       const inserts = conn.query.mock.calls.filter(c => (c[0] as string).startsWith("INSERT"));
       expect(inserts.length).toBe(3);
 
-      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { agentId: "a1" });
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["cluster", "host", "skills"],
+      });
+    });
+
+    it("does not reload AgentBox resources for a channel-only binding change", async () => {
+      query.mockResolvedValueOnce([[{ id: "a1" }], []]);
+      conn.query.mockResolvedValue([undefined, []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1/resources",
+        method: "PUT",
+        body: { channel_ids: ["ch1"] },
+      }));
+
+      expect(status).toBe(200);
+      expect(connMap.notify).not.toHaveBeenCalled();
     });
 
     it("rolls back on transaction failure", async () => {

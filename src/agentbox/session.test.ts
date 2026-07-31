@@ -462,6 +462,27 @@ describe("AgentBoxSessionManager — invalidate", () => {
       vi.useRealTimers();
     }
   });
+
+  it("does not rebuild an invalidated session while a completion notification is pending", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
+      first._pendingNotifications.push({
+        taskId: "job-1",
+        status: "completed",
+        summary: "done",
+      });
+      first._coalesceTimer = setTimeout(() => {}, 600);
+
+      mgr.invalidate("sess-1");
+
+      expect(await mgr.getOrCreate("sess-1", "web", "new prompt")).toBe(first);
+      expect(first._invalidated).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("AgentBoxSessionManager — getPersistedDpState", () => {
