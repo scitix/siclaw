@@ -1995,6 +1995,60 @@ describe("handleLarkMessage — streaming card flow", () => {
     expect(contentCalls.at(-1)).toContain("统一结论");
   });
 
+  it("never shows a bare tool name as a step, but keeps the agent's own narration", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-tool-noise" });
+    streamEventsMock.mockImplementation(async function* () {
+      // No details.items → the single-agent activity branch. `Ran <tool>` is the
+      // producer's developer-facing text (right for Portal's work log, noise in a
+      // group): it must not reach the card.
+      yield {
+        type: "tool_execution_update",
+        toolCallId: "t1",
+        partialResult: { content: [{ type: "text", text: "Ran host_list" }] },
+      };
+      // The child's own words ARE a milestone — this is what the asker wants to see.
+      yield {
+        type: "tool_execution_update",
+        toolCallId: "t1",
+        partialResult: { content: [{ type: "text", text: "正在核对 conntrack 会话时间线" }] },
+      };
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "结论：公网入口丢包。" }] },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(makeTextEvent("排查"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls.map((c: any) => c[0].data.content as string);
+    expect(contentCalls.some((c) => c.includes("host_list"))).toBe(false);
+    expect(contentCalls.some((c) => c.includes("Ran "))).toBe(false);
+    expect(contentCalls.some((c) => c.includes("正在核对 conntrack 会话时间线"))).toBe(true);
+    expect(contentCalls.at(-1)).toContain("结论：公网入口丢包。");
+  });
+
+  it("localizes the sub-agent slot wait instead of leaking its English source text", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-slot-wait" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "tool_execution_update",
+        toolCallId: "t1",
+        partialResult: { content: [{ type: "text", text: "Waiting for a free slot (4 sub-agents run at a time)…" }] },
+      };
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "完成。" }] } };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(makeTextEvent("排查"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    const contentCalls = lark.cardkit.v1.cardElement.content.mock.calls.map((c: any) => c[0].data.content as string);
+    expect(contentCalls.some((c) => c.includes("排队等待子任务空位"))).toBe(true);
+    expect(contentCalls.some((c) => c.includes("Waiting for a free slot"))).toBe(false);
+  });
+
   it("shows only the latest step on the card and replaces it with the conclusion on finalize", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-explicit-channel" });
