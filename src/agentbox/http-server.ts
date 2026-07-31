@@ -703,6 +703,8 @@ export function createHttpServer(
     // #2/#3 in the PR review thread.
     let releasePromptInflight!: () => void;
     managed._promptInflight = new Promise<void>((resolve) => { releasePromptInflight = resolve; });
+    // New turn: lets tools retire per-attempt state (see ToolRefs.turnRef).
+    if (managed.turnRef) managed.turnRef.current += 1;
     managed._eventBuffer = [];
     // Unsubscribe previous buffer listener if any
     if (managed._bufferUnsub) {

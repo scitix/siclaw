@@ -25,8 +25,8 @@ export const AGENT_TYPES: AgentTypeOption[] = [
   {
     key: "coordinator",
     label: "Coordinator Agent",
-    description: "Read-only router: sees the fleet and delegates hands-on troubleshooting to specialist agents.",
-    capabilities: ["inspect_infra", "read_files", "search_memory", "delegate_agents"],
+    description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
+    capabilities: ["inspect_infra", "read_files", "delegate_agents"],
     defaultNoSkills: true,
   },
   {

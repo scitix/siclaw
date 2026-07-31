@@ -413,7 +413,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
                   <span key={c} className="px-2 py-1 rounded-md text-[11px] font-mono bg-secondary text-muted-foreground border border-border">{c}</span>
                 ))}
                 {typeDef.defaultNoSkills && (
-                  <p className="w-full text-[11px] text-muted-foreground/70 mt-1">No skills bound by default; attach only the routing helpers this coordinator needs (Skills tab).</p>
+                  <p className="w-full text-[11px] text-muted-foreground/70 mt-1">No skills bound by default. Attach the routing helpers it needs (Skills tab) and any knowledge it should answer from (Knowledge tab) — without them it can only route, never answer.</p>
                 )}
               </div>
             ) : (

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { COORDINATOR_DEFAULT_PROMPT } from "../core/agent-types.js";
 import { EventEmitter } from "node:events";
 
 vi.mock("../gateway/db.js", () => ({
@@ -290,7 +291,7 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(201);
       const insertArgs = query.mock.calls[0][1];
       expect(insertArgs[8]).toBe("coordinator"); // agent_type
-      expect(insertArgs[9]).toContain("ONLY job is ROUTING");
+      expect(insertArgs[9]).toBe(COORDINATOR_DEFAULT_PROMPT);
     });
 
     it("persists a maintainer-supplied prompt for a built-in type", async () => {
@@ -415,7 +416,7 @@ describe("registerAgentRoutes", () => {
       const updateArgs = query.mock.calls[1][1] as unknown[];
       expect(updateArgs).toContain("coordinator");
       expect(updateArgs.some((value) =>
-        typeof value === "string" && value.includes("ONLY job is ROUTING"),
+        value === COORDINATOR_DEFAULT_PROMPT,
       )).toBe(true);
     });
 
