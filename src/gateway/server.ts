@@ -1207,7 +1207,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // All types route through GATEWAY_SYNC_DESCRIPTORS — the legacy
     // "credentials" umbrella type is replaced by the more granular
     // "cluster" + "host" so CRUD events can notify only what changed.
-    const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "cluster", "host", "knowledge", "prompt"];
+    // Prompt invalidation is intentionally explicit. The resources endpoint
+    // omits `resources` for its legacy all-bindings refresh; including prompt
+    // here would rebuild every warm brain for unrelated binding changes.
+    const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "cluster", "host", "knowledge"];
 
     const boxes = await agentBoxManager.list();
     // Only "running" boxes are reachable — Pending/Terminating/Succeeded/Failed

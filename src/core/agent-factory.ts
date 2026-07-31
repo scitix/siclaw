@@ -29,7 +29,7 @@ import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from 
 import { ToolRegistry, type AgentMode } from "./tool-registry.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
-import { buildSreSystemPrompt } from "./prompt.js";
+import { buildSreSystemPrompt, renderSystemPromptFragment } from "./prompt.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
 import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
@@ -619,8 +619,12 @@ export async function createSiclawSession(
     ? opts.portalCredentialsDir
     : (kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir));
 
-  // Agent system prompt append (shared between pi-agent and SDK brain)
-  const agentSystemPromptAppend = opts?.systemPromptAppend;
+  // Agent system prompt append. Render it with the same placeholder/mode-block
+  // contract as the platform template so existing custom prompts remain
+  // compatible after moving from template replacement to identity append.
+  const agentSystemPromptAppend = opts?.systemPromptAppend
+    ? renderSystemPromptFragment(opts.systemPromptAppend, mode)
+    : undefined;
 
   // Forward-declared so the CLI-only /ls extension factory can close over it.
   // Safe because extension command handlers run long after the constructor

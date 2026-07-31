@@ -382,7 +382,9 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
     getDb().query("SELECT agent_id FROM agent_hosts WHERE host_id = ?", [params.id])
       .then(([rows]: any) => {
         const agentIds = (rows as { agent_id: string }[]).map((r) => r.agent_id);
-        if (agentIds.length > 0) connectionMap.notifyMany(agentIds, "agent.reload", { resources: ["host"] });
+        for (const agentId of agentIds) {
+          connectionMap.notify(agentId, "agent.reload", { agentId, resources: ["host"] });
+        }
         // Same treatment for coordinators delegating to those members (this host's
         // rename changes the member's coverage in their roster manifest).
         void notifyCoordinatorsForMembers(connectionMap, agentIds);
@@ -415,7 +417,9 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
     // cached list/credentials (mirror of the PUT notify; the host vanishing from
     // the snapshot makes reconcileFullList unlink it on the next refresh).
     const agentIds = ((boundRows ?? []) as { agent_id: string }[]).map((r) => r.agent_id);
-    if (agentIds.length > 0) connectionMap.notifyMany(agentIds, "agent.reload", { resources: ["host"] });
+    for (const agentId of agentIds) {
+      connectionMap.notify(agentId, "agent.reload", { agentId, resources: ["host"] });
+    }
     // Coordinators delegating to those members: the deleted host vanishes from their
     // roster coverage too (captured before the cascade, same as agentIds).
     void notifyCoordinatorsForMembers(connectionMap, agentIds);

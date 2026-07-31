@@ -36,6 +36,14 @@ interface McpPayload {
   mcpServers: Record<string, unknown>;
 }
 
+/** Apply the shared immutable-session invalidation contract consistently. */
+function invalidateSessions(context: ReloadContext): void {
+  if (!context.sessions?.length) return;
+  for (const session of context.sessions) {
+    session.invalidate?.();
+  }
+}
+
 export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
   type: "mcp",
 
@@ -70,10 +78,7 @@ export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
     //
     // See docs/design/mcp-session-lifecycle.md for the full contract.
     reloadConfig();
-    if (!context.sessions?.length) return;
-    for (const session of context.sessions) {
-      session.invalidate?.();
-    }
+    invalidateSessions(context);
   },
 };
 
@@ -96,10 +101,7 @@ export const promptHandler: AgentBoxSyncHandler<null> = {
     return 0;
   },
   async postReload(context: ReloadContext): Promise<void> {
-    if (!context.sessions?.length) return;
-    for (const session of context.sessions) {
-      session.invalidate?.();
-    }
+    invalidateSessions(context);
   },
 };
 
@@ -518,10 +520,7 @@ export function createToolsHandler(
       // session at creation time, so a live session must be rebuilt to pick up
       // a new whitelist. invalidate() defers the release until any in-flight
       // prompt completes, so tool execution is not torn down mid-turn.
-      if (!context.sessions?.length) return;
-      for (const session of context.sessions) {
-        session.invalidate?.();
-      }
+      invalidateSessions(context);
     },
   };
 }

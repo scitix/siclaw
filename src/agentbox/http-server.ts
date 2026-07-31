@@ -652,13 +652,6 @@ export function createHttpServer(
     // downgrade it. readOnly is honored only when explicitly set true.
     const delegation = resolveDelegation(body.delegation, body.origin);
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, activeMode, delegation);
-    if (managed._invalidated) {
-      sendJson(res, 409, {
-        error: "Session configuration is refreshing. Retry this prompt shortly.",
-        sessionId: managed.id,
-      });
-      return;
-    }
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
       // be holding the brain even when _promptDone has already flipped

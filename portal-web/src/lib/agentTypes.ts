@@ -32,7 +32,7 @@ export const AGENT_TYPES: AgentTypeOption[] = [
   {
     key: "custom",
     label: "Custom Agent",
-    description: "Free-form: pick the tool capabilities and write the system prompt yourself.",
+    description: "Free-form capabilities with the same editable prompt field as every agent type.",
     capabilities: null,
     defaultNoSkills: false,
   },

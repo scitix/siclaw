@@ -251,6 +251,23 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(opts.agentId).toBe("agent-a");
   });
 
+  it("uses the delegated read-only persona exclusively", async () => {
+    const mgr = new AgentBoxSessionManager();
+    mgr.agentTypeState = "sre";
+    await mgr.getOrCreate(
+      "sess-readonly",
+      "web",
+      "custom prompt that says to remediate",
+      "normal",
+      { delegationId: "d1", readOnly: true },
+    );
+
+    const opts = lastCreateSiclawSession.calls.at(-1);
+    expect(opts.systemPromptAppend).toMatch(/read-only/i);
+    expect(opts.systemPromptAppend).not.toContain("custom prompt that says to remediate");
+    expect(opts.systemPromptAppend).not.toContain("Take the task end to end");
+  });
+
   it("defaults mode to 'web' when none supplied", async () => {
     const mgr = new AgentBoxSessionManager();
     await mgr.getOrCreate("sess-1");
@@ -421,14 +438,29 @@ describe("AgentBoxSessionManager — invalidate", () => {
     expect(first._invalidated).toBe(true);
   });
 
-  it("does not reuse an invalidated session while background work still owns it", async () => {
-    const mgr = new AgentBoxSessionManager();
-    const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
-    first._backgroundWorkCount = 1;
-    mgr.invalidate("sess-1");
+  it("serves the old brain during detached work, then rebuilds immediately", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
+      first._backgroundWorkCount = 1;
+      mgr.invalidate("sess-1");
 
-    expect(await mgr.getOrCreate("sess-1", "web", "new prompt")).toBe(first);
-    expect(first._invalidated).toBe(true);
+      expect(await mgr.getOrCreate("sess-1", "web", "new prompt")).toBe(first);
+      expect(first._invalidated).toBe(true);
+
+      // Model the detached job completing. Even though this call asks for the
+      // ordinary idle TTL, invalidation upgrades it to an immediate rebuild.
+      first._backgroundWorkCount = 0;
+      mgr.scheduleRelease("sess-1");
+      await vi.runAllTimersAsync();
+
+      const rebuilt = await mgr.getOrCreate("sess-1", "web", "new prompt");
+      expect(rebuilt).not.toBe(first);
+      expect(lastCreateSiclawSession.calls.at(-1).systemPromptAppend).toBe("new prompt");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -86,7 +86,9 @@ Portal mutation → Upstream notify → Gateway notify → AgentBox /api/reload-
   → handler.postReload(context)
        └→ for each session: session.invalidate()
              ├── prompt-in-flight? register post-prompt callback → release()
-             └── idle?             release() immediately
+             ├── idle/quiescent?   release() immediately
+             └── detached work?    keep serving the old brain; release as
+                                   soon as detached ownership reaches zero
 ```
 
 `release()` runs `McpClientManager.shutdown()`, which drops transports
@@ -98,6 +100,12 @@ Effect: **Delete / Toggle-off take effect as soon as the current turn
 finishes**, not after 30 s idle. For Update (where the server still
 exists), the rebuild also happens but carries no security
 implication; the extra work is cheap.
+
+Detached jobs do not hold `brain.prompt()`, so invalidation must not make chat
+unavailable for the lifetime of a long-running background command or sub-agent
+group. The session remains marked invalid, continues with its old immutable
+configuration while detached work owns it, and upgrades the next release
+schedule to immediate.
 
 ### 3.3 Explicit session close
 

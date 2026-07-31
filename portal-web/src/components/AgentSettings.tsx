@@ -328,7 +328,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
             {/* Agent type governs the capability set and initial prompt default. */}
             <div>
               <h3 className="text-[13px] font-medium text-foreground">Agent type</h3>
-              <p className="text-[12px] text-muted-foreground mt-0.5">The type sets this agent's role. SRE / Coordinator lock the capabilities and the system prompt; Custom lets you choose both.</p>
+              <p className="text-[12px] text-muted-foreground mt-0.5">The type locks built-in capabilities and seeds an initial prompt. Every agent's prompt remains editable in Basic.</p>
               <div className="mt-2 space-y-1.5">
                 {AGENT_TYPES.map(t => (
                   <label key={t.key} className="flex items-start gap-2 p-2 rounded-md border border-border hover:bg-secondary/30 cursor-pointer">

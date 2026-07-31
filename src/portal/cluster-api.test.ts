@@ -174,7 +174,7 @@ describe("registerClusterRoutes", () => {
         .mockResolvedValueOnce([undefined, []])  // update
         .mockResolvedValueOnce([[{ id: "c1" }], []]);  // select-back
       // Third query (select agent_clusters for notification) is fire-and-forget;
-      // we need to include it so the connMap.notifyMany path has something to consume:
+      // include bound agents so each Runtime receives an agentId-bearing reload:
       query.mockResolvedValueOnce([[], []]);
 
       const kubeconfig = "server: https://new-api:6443\n";
@@ -203,7 +203,8 @@ describe("registerClusterRoutes", () => {
 
       // Notification is fire-and-forget; wait a tick
       await new Promise(r => setImmediate(r));
-      expect(connMap.notifyMany).toHaveBeenCalledWith(["a1", "a2"], "agent.reload", { resources: ["cluster"] });
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { agentId: "a1", resources: ["cluster"] });
+      expect(connMap.notify).toHaveBeenCalledWith("a2", "agent.reload", { agentId: "a2", resources: ["cluster"] });
     });
   });
 
@@ -232,7 +233,7 @@ describe("registerClusterRoutes", () => {
         .mockResolvedValueOnce([undefined, []]);            // delete
       await runRoute(router, fakeReq({ url: "/api/v1/clusters/c1", method: "DELETE" }));
       await new Promise(r => setImmediate(r));
-      expect(connMap.notifyMany).toHaveBeenCalledWith(["a1"], "agent.reload", { resources: ["cluster"] });
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { agentId: "a1", resources: ["cluster"] });
     });
   });
 

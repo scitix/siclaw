@@ -224,7 +224,7 @@ describe("registerHostRoutes", () => {
       await runRoute(router, fakeReq({ url: "/api/v1/hosts/h1", method: "PUT", body: { name: "renamed" } }));
       await new Promise(r => setImmediate(r));
 
-      expect(connMap.notifyMany).toHaveBeenCalledWith(["a1"], "agent.reload", { resources: ["host"] });
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { agentId: "a1", resources: ["host"] });
     });
   });
 
@@ -252,7 +252,7 @@ describe("registerHostRoutes", () => {
         .mockResolvedValueOnce([undefined, []]);            // delete
       await runRoute(router, fakeReq({ url: "/api/v1/hosts/h1", method: "DELETE" }));
       await new Promise(r => setImmediate(r));
-      expect(connMap.notifyMany).toHaveBeenCalledWith(["a1"], "agent.reload", { resources: ["host"] });
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { agentId: "a1", resources: ["host"] });
     });
   });
 

@@ -2307,6 +2307,14 @@ export class AgentBoxSessionManager {
    * After Phase 2, sessions are released after each prompt completes.
    * getOrCreate() restores from JSONL, reusing shared components for fast recovery.
    */
+  private async releaseForRebuild(sessionId: string, managed: ManagedSession): Promise<void> {
+    if (managed._releaseTimer) {
+      clearTimeout(managed._releaseTimer);
+      managed._releaseTimer = null;
+    }
+    await this.release(sessionId);
+  }
+
   async getOrCreate(
     sessionId?: string,
     mode?: SessionMode,
@@ -2328,15 +2336,16 @@ export class AgentBoxSessionManager {
         !existing._promptInflight &&
         existing._backgroundWorkCount === 0
       ) {
-        if (existing._releaseTimer) {
-          clearTimeout(existing._releaseTimer);
-          existing._releaseTimer = null;
-        }
-        await this.release(id);
-      } else if (existing._invalidated) {
-        // Background work or the active prompt still owns the brain. Do not
-        // mutate/reuse it for another turn; the HTTP boundary returns 409 and
-        // the caller can retry once the session becomes quiescent.
+        await this.releaseForRebuild(id, existing);
+      } else if (
+        existing._invalidated &&
+        (!existing._promptDone || existing._promptInflight)
+      ) {
+        // The active prompt still owns the brain. Return it so the ordinary
+        // busy-session boundary rejects/steers the concurrent turn. Detached
+        // background work does not own brain.prompt(), so an otherwise-idle
+        // invalidated session remains usable with its old prompt until that
+        // work finishes; scheduleRelease() then forces the deferred rebuild.
         return existing;
       } else {
         // Cancel pending release — session is being reused
@@ -2356,7 +2365,7 @@ export class AgentBoxSessionManager {
         // it is the SAME object we store here (agent-factory passes it by reference), so an
         // in-place update makes report_findings / request_input stamp the CURRENT call's id
         // instead of the previous one — no rebuild needed, conversation preserved.
-      //
+        //
         // ONLY when the session is idle: a concurrent continuation targeting the SAME busy
         // peer session is rejected with 409 by the HTTP layer AFTER this getOrCreate returns
         // — mutating the shared context first would stamp the running turn's later
@@ -2375,7 +2384,7 @@ export class AgentBoxSessionManager {
         console.log(
           `[agentbox-session] Rebuilding session ${id} for mode change ${existing.activeMode}/${delegationSignature(existing.delegation)} -> ${activeMode}/${delegationSignature(delegation)}`,
         );
-        await this.release(id);
+        await this.releaseForRebuild(id, existing);
       }
     }
 
@@ -2557,12 +2566,12 @@ export class AgentBoxSessionManager {
       // the model knows to end with report_findings.
       delegation,
       // Persisted system_prompt replaces the built-in type default. Delegated
-      // read-only is a runtime constraint, so it is appended independently and
-      // never becomes editable agent configuration.
-      systemPromptAppend: [
-        effectiveAgentPrompt(normalizeAgentType(this.agentTypeState), systemPromptTemplate),
-        delegation?.readOnly ? DELEGATED_READONLY_PERSONA : undefined,
-      ].filter((part): part is string => Boolean(part)).join("\n\n") || undefined,
+      // read-only is an exclusive runtime constraint: composing it with an SRE
+      // or Coordinator identity would instruct the model to use tools that the
+      // read-only gate deliberately removed.
+      systemPromptAppend: delegation?.readOnly
+        ? DELEGATED_READONLY_PERSONA
+        : effectiveAgentPrompt(normalizeAgentType(this.agentTypeState), systemPromptTemplate),
       // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
       delegationRoster,
       delegateToAgentExecutor,
@@ -2839,18 +2848,24 @@ export class AgentBoxSessionManager {
       return;
     }
 
+    // A configuration invalidation is a mandatory rebuild, not an ordinary
+    // idle eviction. This also closes the recovery path when detached
+    // background work deferred the original 0ms schedule: whichever later
+    // caller re-arms release must still use 0ms rather than the idle TTL.
+    const effectiveTtlMs = managed._invalidated ? 0 : ttlMs;
+
     // Clear any existing timer
     if (managed._releaseTimer) {
       clearTimeout(managed._releaseTimer);
     }
 
-    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${ttlMs}ms`);
+    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${effectiveTtlMs}ms`);
     managed._releaseTimer = setTimeout(() => {
       managed._releaseTimer = null;
       this.release(sessionId).catch((err) => {
         console.warn(`[agentbox-session] Scheduled release failed for ${sessionId}:`, err);
       });
-    }, ttlMs);
+    }, effectiveTtlMs);
   }
 
   /**

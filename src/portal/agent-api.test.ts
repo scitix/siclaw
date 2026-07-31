@@ -371,27 +371,62 @@ describe("registerAgentRoutes", () => {
     });
 
     it("keeps an explicitly supplied prompt when switching to a built-in type", async () => {
-      // agent_type in body → effective type resolved without a pre-read: UPDATE then SELECT-back.
       query
-        .mockResolvedValueOnce([undefined, []])                    // UPDATE
-        .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]); // SELECT-back
+        .mockResolvedValueOnce([[{
+          idle_timeout_sec: 300,
+          system_prompt: "old custom prompt",
+          agent_type: "custom",
+          is_production: 1,
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]);
 
       const { status } = await runRoute(router, fakeReq({
         url: "/api/v1/agents/a1",
         method: "PUT",
-        body: { agent_type: "coordinator", system_prompt: "stale custom prompt" },
+        body: { agent_type: "coordinator", system_prompt: "maintainer override" },
       }));
 
       expect(status).toBe(200);
-      const updateSql = query.mock.calls[0][0] as string;
-      const updateArgs = query.mock.calls[0][1] as unknown[];
+      const updateSql = query.mock.calls[1][0] as string;
+      const updateArgs = query.mock.calls[1][1] as unknown[];
       expect(updateSql).toContain("system_prompt = ?");
-      expect(updateArgs).toContain("coordinator");        // agent_type set
-      expect(updateArgs).toContain("stale custom prompt");
+      expect(updateArgs).toContain("coordinator");
+      expect(updateArgs).toContain("maintainer override");
+    });
+
+    it("resets an unchanged old persona when switching built-in types", async () => {
+      query
+        .mockResolvedValueOnce([[{
+          idle_timeout_sec: 300,
+          system_prompt: "old SRE persona",
+          agent_type: "sre",
+          is_production: 1,
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { agent_type: "coordinator", system_prompt: "old SRE persona" },
+      }));
+
+      const updateArgs = query.mock.calls[1][1] as unknown[];
+      expect(updateArgs).toContain("coordinator");
+      expect(updateArgs.some((value) =>
+        typeof value === "string" && value.includes("ONLY job is ROUTING"),
+      )).toBe(true);
     });
 
     it("notifies prompt.reload when system_prompt changes", async () => {
       query
+        .mockResolvedValueOnce([[{
+          system_prompt: "old truth",
+          agent_type: "custom",
+          is_production: 1,
+          idle_timeout_sec: 300,
+        }], []])
         .mockResolvedValueOnce([undefined, []])
         .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]);
 
@@ -408,8 +443,47 @@ describe("registerAgentRoutes", () => {
       );
     });
 
+    it("does not reload prompt or tools when the complete form resubmits identical values", async () => {
+      query
+        .mockResolvedValueOnce([[{
+          system_prompt: "same truth",
+          agent_type: "sre",
+          is_production: 1,
+          idle_timeout_sec: 300,
+          tool_capabilities: '["read_files"]',
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "same" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: {
+          name: "same",
+          system_prompt: "same truth",
+          agent_type: "sre",
+          is_production: true,
+          idle_timeout_sec: 300,
+          tool_capabilities: ["read_files"],
+        },
+      }));
+
+      expect(connMap.sendCommand).not.toHaveBeenCalled();
+      expect(connMap.notify).not.toHaveBeenCalledWith(
+        "a1",
+        "agent.reload",
+        expect.anything(),
+      );
+    });
+
     it("notifies agent.reload when is_production changes", async () => {
       query
+        .mockResolvedValueOnce([[{
+          system_prompt: null,
+          agent_type: "custom",
+          is_production: 1,
+          idle_timeout_sec: 300,
+        }], []])
         .mockResolvedValueOnce([undefined, []])
         .mockResolvedValueOnce([[{ id: "a1", name: "x" }], []]);
 
@@ -419,7 +493,10 @@ describe("registerAgentRoutes", () => {
         body: { is_production: false },
       }));
 
-      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { resources: ["skills", "cluster", "host"] });
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["skills", "cluster", "host"],
+      });
     });
 
     it("does not notify when is_production not changed", async () => {
@@ -586,6 +663,7 @@ describe("registerAgentRoutes", () => {
 
     it("stores tool_capabilities and pushes a tools reload on change", async () => {
       query
+        .mockResolvedValueOnce([[{ tool_capabilities: '["read_files"]' }], []])
         .mockResolvedValueOnce([undefined, []])
         .mockResolvedValueOnce([[{ id: "a1" }], []]);
 
@@ -596,9 +674,9 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(200);
-      expect(query.mock.calls[0][0]).toContain("tool_capabilities = ?");
+      expect(query.mock.calls[1][0]).toContain("tool_capabilities = ?");
       // Deduped JSON array of group keys.
-      expect(JSON.parse(query.mock.calls[0][1][0])).toEqual(["read_files", "run_commands"]);
+      expect(JSON.parse(query.mock.calls[1][1][0])).toEqual(["read_files", "run_commands"]);
       expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
         agentId: "a1",
         resources: ["tools"],
@@ -607,6 +685,7 @@ describe("registerAgentRoutes", () => {
 
     it("clears tool_capabilities (empty array → null) and still pushes a reload", async () => {
       query
+        .mockResolvedValueOnce([[{ tool_capabilities: '["read_files"]' }], []])
         .mockResolvedValueOnce([undefined, []])
         .mockResolvedValueOnce([[{ id: "a1" }], []]);
 
@@ -617,8 +696,8 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(200);
-      expect(query.mock.calls[0][0]).toContain("tool_capabilities = ?");
-      expect(query.mock.calls[0][1][0]).toBeNull();
+      expect(query.mock.calls[1][0]).toContain("tool_capabilities = ?");
+      expect(query.mock.calls[1][1][0]).toBeNull();
       expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
         agentId: "a1",
         resources: ["tools"],

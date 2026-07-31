@@ -447,15 +447,14 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(existing.brain.prompt).not.toHaveBeenCalled();
   });
 
-  it("POST /api/prompt rejects reuse while an invalidated session is refreshing", async () => {
+  it("POST /api/prompt does not turn an idle invalidation marker into a hard chat error", async () => {
     const existing = await sm.getOrCreate("refreshing");
     existing._invalidated = true;
 
     const r = await getJson(port, "/api/prompt", "POST", { text: "use the new prompt", sessionId: "refreshing" });
 
-    expect(r.status).toBe(409);
-    expect(r.data.error).toMatch(/configuration is refreshing/i);
-    expect(existing.brain.prompt).not.toHaveBeenCalled();
+    expect(r.status).toBe(200);
+    expect(existing.brain.prompt).toHaveBeenCalled();
   });
 
   it("DELETE /api/sessions/:id closes the session", async () => {

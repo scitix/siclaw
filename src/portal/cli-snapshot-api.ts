@@ -45,6 +45,7 @@ import type {
 import { safeParseSkillFiles } from "../shared/skill-package.js";
 import type { ModelRoutePolicy } from "../core/model-routing.js";
 import { resolveSnapshotModelRouting } from "./model-routing-config.js";
+import { effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js";
 
 export type {
   CliSnapshotKnowledgeRepo,
@@ -200,6 +201,7 @@ interface AgentRow {
   model_id: string | null;
   model_routing: unknown;
   tool_capabilities: unknown;
+  agent_type: unknown;
   system_prompt: string | null;
   icon: string | null;
   color: string | null;
@@ -269,7 +271,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     // the request is scoped, so the TUI can render its picker without a
     // second round-trip.
     const [allAgents] = await db.query<AgentRow[]>(
-      "SELECT id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, system_prompt, icon, color FROM agents WHERE status = 'active' ORDER BY name",
+      "SELECT id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, agent_type, system_prompt, icon, color FROM agents WHERE status = 'active' ORDER BY name",
     );
 
     // Resolve the scoping agent (if any). Return 404 early so the client
@@ -539,7 +541,10 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       ? {
           name: activeAgent.name,
           description: activeAgent.description,
-          systemPrompt: activeAgent.system_prompt,
+          systemPrompt: effectiveAgentPrompt(
+            normalizeAgentType(activeAgent.agent_type),
+            activeAgent.system_prompt,
+          ) ?? null,
           modelProvider: activeAgent.model_provider,
           modelId: activeAgent.model_id,
           ...(modelRoutingOut ? { modelRouting: modelRoutingOut } : {}),

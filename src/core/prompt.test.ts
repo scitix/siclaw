@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { buildSreSystemPrompt } from "./prompt.js";
+import { buildSreSystemPrompt, renderSystemPromptFragment } from "./prompt.js";
 
 const ORIGINAL_MEMORY_ENABLED = process.env.SICLAW_MEMORY_ENABLED;
 
@@ -93,5 +93,31 @@ describe("buildSreSystemPrompt visual output guidance", () => {
     expect(prompt).toContain("Do not force details from a previous incident into the new answer");
     expect(prompt).not.toContain("may render a fallback image");
     expect(prompt).not.toContain("readable fallback source");
+  });
+});
+
+describe("renderSystemPromptFragment", () => {
+  it("preserves variables and mode blocks for persisted agent prompts", () => {
+    process.env.SICLAW_MEMORY_ENABLED = "false";
+    const fragment = [
+      "mode={{mode}} settings={{settingsPath}} credentials={{credentialsPath}}",
+      "<!-- web-only -->web instruction<!-- /web-only -->",
+      "<!-- cli-only -->cli instruction<!-- /cli-only -->",
+      "{{memoryIntro}}{{memorySection}}",
+    ].join("\n");
+
+    const web = renderSystemPromptFragment(fragment, "web");
+    expect(web).toContain("mode=Web UI");
+    expect(web).toContain("sidebar **Settings**");
+    expect(web).toContain("web instruction");
+    expect(web).not.toContain("cli instruction");
+    expect(web).not.toContain("{{");
+
+    const cli = renderSystemPromptFragment(fragment, "cli");
+    expect(cli).toContain("mode=TUI");
+    expect(cli).toContain("`/setup`");
+    expect(cli).toContain("cli instruction");
+    expect(cli).not.toContain("web instruction");
+    expect(cli).not.toContain("<!--");
   });
 });

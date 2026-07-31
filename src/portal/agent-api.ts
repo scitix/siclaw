@@ -44,6 +44,16 @@ function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
   };
 }
 
+function normalizedPrompt(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizedToolCapabilities(value: unknown): string {
+  const parsed = safeParseJson<string[] | null>(value, null);
+  if (!Array.isArray(parsed) || parsed.length === 0) return "";
+  return JSON.stringify([...new Set(parsed)].sort());
+}
+
 
 export function registerAgentRoutes(
   router: RestRouter,
@@ -189,6 +199,64 @@ export function registerAgentRoutes(
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
+    let encodedToolCapabilities: string | null | undefined;
+    if ("tool_capabilities" in body) {
+      try {
+        encodedToolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+
+    // The Web settings form sends a complete snapshot on every Save. Read the
+    // fields whose side effects must be change-driven so an unrelated rename,
+    // model edit, or binding save does not invalidate warm sessions.
+    const needsCurrentState = ["idle_timeout_sec", "system_prompt", "agent_type", "is_production", "tool_capabilities"]
+      .some((field) => field in body);
+    let current: {
+      idle_timeout_sec?: unknown;
+      system_prompt?: unknown;
+      agent_type?: unknown;
+      is_production?: unknown;
+      tool_capabilities?: unknown;
+    } | undefined;
+    if (needsCurrentState) {
+      const [rows] = await db.query(
+        "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities FROM agents WHERE id = ?",
+        [params.id],
+      ) as any;
+      current = rows[0];
+    }
+
+    const currentAgentType = normalizeAgentType(current?.agent_type);
+    const nextAgentType = "agent_type" in body
+      ? normalizeAgentType(body.agent_type)
+      : currentAgentType;
+    const agentTypeChanged = "agent_type" in body && nextAgentType !== currentAgentType;
+
+    const promptSupplied = "system_prompt" in body;
+    let nextSystemPrompt = promptSupplied ? body.system_prompt : current?.system_prompt;
+    // A type switch from an unchanged textarea means "take the new type's
+    // initial prompt", not "pin the previous type's persona to new tools".
+    // An actually edited prompt remains authoritative.
+    if (
+      agentTypeChanged &&
+      (!promptSupplied || normalizedPrompt(body.system_prompt) === normalizedPrompt(current?.system_prompt))
+    ) {
+      nextSystemPrompt = effectiveAgentPrompt(nextAgentType, null) ?? null;
+    }
+    const promptChanged =
+      (promptSupplied || agentTypeChanged) &&
+      normalizedPrompt(nextSystemPrompt) !== normalizedPrompt(current?.system_prompt);
+    const isProductionChanged =
+      "is_production" in body &&
+      current !== undefined &&
+      Boolean(body.is_production) !== Boolean(current.is_production);
+    const toolCapabilitiesChanged =
+      encodedToolCapabilities !== undefined &&
+      normalizedToolCapabilities(encodedToolCapabilities) !== normalizedToolCapabilities(current?.tool_capabilities);
+
     // Capture the current idle window before the update — needed to detect the
     // resident(0) → finite transition, which (unlike every other transition)
     // does NOT self-heal: a resident pod never self-destructs, so it never
@@ -197,14 +265,10 @@ export function registerAgentRoutes(
     let oldIdleTimeoutSec: number | null = null;
     let newIdleTimeoutSec: number | null = null;
     if ("idle_timeout_sec" in body) {
-      const [cur] = await db.query(
-        "SELECT idle_timeout_sec FROM agents WHERE id = ?",
-        [params.id],
-      ) as any;
       // Coerce to a number: the column is INT (drivers return a number), but a
       // stringified "0" would silently dodge the `=== 0` resident check below.
       // Keep null as null so a missing row can't read as 0 (Number(null) === 0).
-      const raw = cur[0]?.idle_timeout_sec;
+      const raw = current?.idle_timeout_sec;
       oldIdleTimeoutSec = raw == null ? null : Number(raw);
       // Normalize once here and reuse for both the SET clause and the
       // resident→finite terminate decision below.
@@ -223,7 +287,10 @@ export function registerAgentRoutes(
       if (field in body) {
         if (field === "agent_type") {
           setClauses.push("agent_type = ?");
-          values.push(normalizeAgentType(body.agent_type));
+          values.push(nextAgentType);
+        } else if (field === "system_prompt") {
+          setClauses.push("system_prompt = ?");
+          values.push(nextSystemPrompt);
         } else {
           setClauses.push(`${field} = ?`);
           // newIdleTimeoutSec is non-null here: field === "idle_timeout_sec" implies
@@ -234,13 +301,9 @@ export function registerAgentRoutes(
     }
     // If a caller changes the type without supplying a prompt, initialize the
     // new type's default as the editable row truth.
-    if ("agent_type" in body && !("system_prompt" in body)) {
-      const nextType = normalizeAgentType(body.agent_type);
-      const nextPrompt = effectiveAgentPrompt(nextType, null);
-      if (nextPrompt) {
-        setClauses.push("system_prompt = ?");
-        values.push(nextPrompt);
-      }
+    if (agentTypeChanged && !promptSupplied) {
+      setClauses.push("system_prompt = ?");
+      values.push(nextSystemPrompt);
     }
     if ("model_routing" in body) {
       try {
@@ -255,19 +318,9 @@ export function registerAgentRoutes(
       }
     }
 
-    let toolCapabilitiesChanged = false;
-    if ("tool_capabilities" in body) {
-      try {
-        const toolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
-        if (toolCapabilities !== undefined) {
-          setClauses.push("tool_capabilities = ?");
-          values.push(toolCapabilities);
-          toolCapabilitiesChanged = true;
-        }
-      } catch (err) {
-        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
-        return;
-      }
+    if (encodedToolCapabilities !== undefined) {
+      setClauses.push("tool_capabilities = ?");
+      values.push(encodedToolCapabilities);
     }
 
     if (setClauses.length === 0) {
@@ -290,25 +343,32 @@ export function registerAgentRoutes(
     // is_production change affects skills bundle (prod=approved only, dev=all)
     // and also the visible cluster/host set — credential-list filters out
     // cross-env bindings, so the AgentBox must drop its cached list.
-    if ("is_production" in body) {
-      connectionMap.notify(params.id, "agent.reload", { resources: ["skills", "cluster", "host"] });
+    if (isProductionChanged) {
+      connectionMap.notify(params.id, "agent.reload", {
+        agentId: params.id,
+        resources: ["skills", "cluster", "host"],
+      });
     }
 
     // Capability/type changes rebuild the tool surface. Prompt/type changes
     // invalidate warm sessions so the next turn immediately restores with the
     // latest editable prompt (no AgentBox kill and no 30s idle wait).
     const reloadResources: string[] = [];
-    if (toolCapabilitiesChanged || ("agent_type" in body)) reloadResources.push("tools");
-    if ("system_prompt" in body || ("agent_type" in body)) reloadResources.push("prompt");
+    if (toolCapabilitiesChanged || agentTypeChanged) reloadResources.push("tools");
+    if (promptChanged) reloadResources.push("prompt");
     if (reloadResources.length > 0) {
       const payload = { agentId: params.id, resources: reloadResources };
       if (reloadResources.includes("prompt")) {
         // Order the successful save response after Runtime/AgentBox has
         // invalidated warm sessions. Persistence still succeeds if Runtime is
         // offline; the next cold box resolves the latest row.
-        const result = await connectionMap.sendCommand(params.id, "agent.reload", payload);
-        if (!result.ok) {
-          console.warn(`[agent-api] prompt saved but hot reload was not acknowledged for ${params.id}: ${result.error}`);
+        try {
+          const result = await connectionMap.sendCommand(params.id, "agent.reload", payload);
+          if (!result.ok) {
+            console.warn(`[agent-api] prompt saved but hot reload was not acknowledged for ${params.id}: ${result.error}`);
+          }
+        } catch (err) {
+          console.warn(`[agent-api] prompt saved but hot reload failed for ${params.id}:`, err);
         }
       } else {
         connectionMap.notify(params.id, "agent.reload", payload);

@@ -134,7 +134,9 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string, con
     getDb().query("SELECT agent_id FROM agent_clusters WHERE cluster_id = ?", [params.id])
       .then(([rows]: any) => {
         const agentIds = (rows as { agent_id: string }[]).map((r) => r.agent_id);
-        if (agentIds.length > 0) connectionMap.notifyMany(agentIds, "agent.reload", { resources: ["cluster"] });
+        for (const agentId of agentIds) {
+          connectionMap.notify(agentId, "agent.reload", { agentId, resources: ["cluster"] });
+        }
         // Same treatment for coordinators that delegate to those members: this
         // cluster's rename changes the member's coverage in their roster manifest.
         void notifyCoordinatorsForMembers(connectionMap, agentIds);
@@ -166,7 +168,9 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string, con
     // Notify formerly-bound agents so they drop the now-deleted cluster from
     // their cached list/credentials (mirror of the PUT notify).
     const agentIds = ((boundRows ?? []) as { agent_id: string }[]).map((r) => r.agent_id);
-    if (agentIds.length > 0) connectionMap.notifyMany(agentIds, "agent.reload", { resources: ["cluster"] });
+    for (const agentId of agentIds) {
+      connectionMap.notify(agentId, "agent.reload", { agentId, resources: ["cluster"] });
+    }
     // Coordinators delegating to those members: the deleted cluster vanishes from
     // their roster coverage too (captured before the cascade, same as agentIds).
     void notifyCoordinatorsForMembers(connectionMap, agentIds);

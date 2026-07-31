@@ -454,6 +454,25 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.availableAgents).toContain("real-agent");
   });
 
+  it("supplies the built-in prompt fallback to a scoped legacy row", async () => {
+    const db = getDb();
+    await db.query(
+      "INSERT INTO agents (id, name, status, agent_type, system_prompt, is_production, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["coord-legacy", "legacy-coordinator", "active", "coordinator", null, 1, "u"],
+    );
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({
+        url: "/api/v1/cli-snapshot?agent=legacy-coordinator",
+        headers: authedHeaders(),
+      }),
+    );
+
+    expect(status).toBe(200);
+    expect(body.activeAgent.systemPrompt).toContain("ONLY job is ROUTING");
+  });
+
   it("scopes skills / mcp / knowledge / clusters / hosts to the agent's junction rows", async () => {
     const db = getDb();
     // Insert an agent
