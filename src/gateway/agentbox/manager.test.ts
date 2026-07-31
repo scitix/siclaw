@@ -962,3 +962,35 @@ describe("AgentBoxManager — PR review regressions", () => {
     expect(spawner.stopCalls).toEqual(["agentbox-agent-a-2"]);
   });
 });
+
+describe("AgentBoxManager — the replica count is cached", () => {
+  it("does not ask the control plane on every acquisition", async () => {
+    // This runs once per turn from every entry point. Against an upstream control plane
+    // that is a network round trip on the hot path of every conversation.
+    const spawner = new PoolSpawner("k8s");
+    const box = poolBox("agentbox-agent-a", 0);
+    spawner.pool = [box];
+    spawner.getReturns.set("agentbox-agent-a", box);
+    let lookups = 0;
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => { lookups++; return 1; });
+
+    for (let i = 0; i < 5; i++) await mgr.getOrCreate("agent-a", undefined, `s${i}`);
+    expect(lookups).toBe(1);
+  });
+
+  it("retries a failed lookup instead of remembering the fallback", async () => {
+    // A blip must not pin the agent at one box for the whole TTL.
+    const spawner = new PoolSpawner("k8s");
+    const box = poolBox("agentbox-agent-a", 0);
+    spawner.pool = [box];
+    spawner.getReturns.set("agentbox-agent-a", box);
+    let lookups = 0;
+    const mgr = new AgentBoxManager(spawner);
+    mgr.setReplicasResolver(async () => { lookups++; throw new Error("control plane down"); });
+
+    await mgr.getOrCreate("agent-a", undefined, "s1");
+    await mgr.getOrCreate("agent-a", undefined, "s2");
+    expect(lookups).toBe(2);
+  });
+});

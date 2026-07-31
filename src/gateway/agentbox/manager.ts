@@ -34,6 +34,17 @@ const DRAIN_DEADLINE_MS = 5 * 60_000;
 /** How often drained boxes are collected. */
 const DRAIN_REAP_INTERVAL_MS = 10_000;
 
+/**
+ * How long a per-agent replica count stays usable.
+ *
+ * This is consulted on EVERY acquisition, which is once per turn from every entry point.
+ * Against a local Portal that is free; against an upstream control plane it is a network
+ * round trip added to the hot path of every conversation. Ten seconds keeps a change
+ * taking effect promptly — a scale-up is not an interactive operation — while collapsing
+ * the steady-state cost to nearly nothing.
+ */
+const REPLICAS_TTL_MS = 10_000;
+
 export interface AgentBoxManagerConfig {
   /** Health check interval (ms) — local dev only */
   healthCheckIntervalMs?: number;
@@ -78,6 +89,7 @@ export class AgentBoxManager {
   /** boxId → when it was marked draining. In memory only; re-derived after a restart. */
   private draining = new Map<string, number>();
   private statusCache = new Map<string, { at: number; status: BoxStatusReport }>();
+  private replicasCache = new Map<string, { at: number; value: number }>();
   private drainReaperTimer?: ReturnType<typeof setInterval>;
 
   constructor(spawner: BoxSpawner, config?: AgentBoxManagerConfig) {
@@ -158,10 +170,16 @@ export class AgentBoxManager {
 
   private async resolveReplicas(agentId: string): Promise<number> {
     if (!this.replicasResolver) return 1;
+    const cached = this.replicasCache.get(agentId);
+    if (cached && Date.now() - cached.at < REPLICAS_TTL_MS) return cached.value;
     try {
-      return normalizeReplicas(await this.replicasResolver(agentId));
+      const value = normalizeReplicas(await this.replicasResolver(agentId));
+      this.replicasCache.set(agentId, { at: Date.now(), value });
+      return value;
     } catch (err) {
       // Fail to ONE, never to many: a config lookup blip must not scale an agent up.
+      // Deliberately NOT cached — a blip should be retried on the next turn, not
+      // remembered for the next ten seconds.
       console.warn(`[agentbox-manager] replicas lookup failed for agent=${agentId}; using 1:`, err);
       return 1;
     }
