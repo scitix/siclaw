@@ -70,11 +70,14 @@ describe("list_delegates tool", () => {
     expect(t).not.toContain("net-agent");
   });
 
-  it("tells the coordinator to ask/not-delegate when nothing covers the target", async () => {
+  it("tells the coordinator to resolve aliases before concluding nothing covers the target", async () => {
     const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
     const r = await tool.execute("c1", { query: "does-not-exist" });
     const t = text(r);
     expect(t).toMatch(/No delegate agent covers "does-not-exist"/);
+    expect(t).toMatch(/routing-helper skill/i);
+    expect(t).toMatch(/retry `list_delegates` with that binding name/i);
+    expect(t).toMatch(/Only after a confirmed binding-name query/i);
     expect(t).toMatch(/Do not delegate/i);
     expect((r as any).details.total).toBe(0);
   });

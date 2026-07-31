@@ -27,4 +27,12 @@ describe("agent-types", () => {
     expect(effectiveCapabilityKeys("custom", ["read_files"])).toEqual(["read_files"]);
     expect(effectiveCapabilityKeys("custom", null)).toBeNull();
   });
+
+  it("coordinator resolves cluster aliases before coverage lookup", () => {
+    const persona = AGENT_TYPES.coordinator.persona!;
+    expect(persona).toContain("BEFORE the first `list_delegates` query");
+    expect(persona).toContain("confirmed `binding_names[]` value");
+    expect(persona).toContain("never send an unresolved localized name");
+    expect(persona).toContain("Only after `list_delegates` returns no match for a confirmed binding name");
+  });
 });

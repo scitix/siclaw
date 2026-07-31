@@ -102,7 +102,13 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
       const hasMore = nextOffset < total;
       let hint = "";
       if (total === 0) {
-        hint = `\n\nNo delegate agent covers "${rawQuery}". Do not delegate — tell the user no authorized agent covers that resource.`;
+        hint =
+          `\n\nNo delegate agent covers "${rawQuery}" as written. If this target may be a cluster alias, ` +
+          "localized name, local nickname, or spelling variant, do not conclude that coverage is absent yet: " +
+          "use an available routing-helper skill to resolve the canonical Siclaw binding name, then retry " +
+          "`list_delegates` with that binding name. Only after a confirmed binding-name query also returns no " +
+          "match should you tell the user that no authorized agent covers the resource. Do not delegate until " +
+          "coverage is confirmed.";
       } else if (hasMore) {
         hint = `\n\nShowing ${page.length} of ${total}. Refine the query, or pass cursor="${nextOffset}" for the next page.`;
       }
