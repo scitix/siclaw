@@ -26,6 +26,17 @@ describe("agent-types", () => {
     expect(persona).not.toContain("search_memory");
   });
 
+  it("coordinator keeps its triage invisible — the reply must not narrate its own rules", () => {
+    // Observed in a real Feishu reply: "这是知识性问题,我已从内部知识库查到原理" and
+    // "由于我是协调者,不做直接的 hands-on 诊断". The user asked about RoCE, not about
+    // how the bot decides things.
+    const persona = AGENT_TYPES.coordinator.persona!;
+    expect(persona).toContain("KEEP THIS TRIAGE INVISIBLE");
+    expect(persona).toContain("never announce which mode you picked");
+    // On failure, report the outcome the user needs — not the role that blocks it.
+    expect(persona).toContain("state the OUTCOME the user needs");
+  });
+
   it("normalizeAgentType defaults unknown/absent to custom", () => {
     expect(normalizeAgentType("sre")).toBe("sre");
     expect(normalizeAgentType("coordinator")).toBe("coordinator");
