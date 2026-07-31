@@ -3633,6 +3633,27 @@ describe("handleLarkMessage — personal access denial", () => {
     (Date.now as any).mockRestore();
   });
 
+  it("strips an embedded stale URL when the link lapses at the send boundary", async () => {
+    // The expired branch reused card.body verbatim, and for an unknown reason that body IS the
+    // frontend prose — which may carry the URL, putting the dead link straight back into the text.
+    const lark = makeCardClient();
+    let calls = 0;
+    const realNow = Date.now;
+    vi.spyOn(Date, "now").mockImplementation(() => (++calls <= 1 ? realNow() : realNow() + 10 * 60_000));
+    resolvePersonalBindingMock.mockResolvedValue({
+      binding: null,
+      denied: { reason: "quota_exceeded", actionUrl: ACTION_URL, expiresAtMs: realNow() + 60_000, message: `Continue here: ${ACTION_URL}` },
+    });
+
+    await sendGated(lark as any);
+
+    expect(lark.cardkit.v1.card.create).not.toHaveBeenCalled();
+    const reply = lark.im.message.reply.mock.calls[0][0].data.content as string;
+    expect(reply).toContain("已过期");
+    expect(reply).not.toContain(ACTION_URL);   // neither button nor text
+    (Date.now as any).mockRestore();
+  });
+
   it("truncates a pathological message instead of losing the reply to a size limit", async () => {
     resolvePersonalBindingMock.mockResolvedValue({
       binding: null,
@@ -3834,6 +3855,32 @@ describe("handleLarkMessage — /apikey", () => {
     expect(card).toContain("申请权限");     // button label
     expect(card).toContain(PICKUP);
     expect(lark.im.message.reply.mock.calls[0][0].data.content).not.toContain(PICKUP);
+  });
+
+  it("delivers a future reason's link on the /apikey path too", async () => {
+    // rendersActionLink accepted the refusal but the /apikey copy lookup vetoed it afterwards, so a
+    // reason this build has never seen lost its structured link — the sibling path of the fix made
+    // for ordinary messages.
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: false,
+      denied: { reason: "quota_exceeded", actionUrl: PICKUP, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = {
+      im: { message: { reply: vi.fn().mockResolvedValue({}) } },
+      cardkit: { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "C" } }) } } },
+    };
+
+    await handleLarkMessage(
+      makeTextEvent("/apikey", { chat_type: "p2p" }),
+      lark as any, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "zh-CN", makePersonalConfig("open"),
+    );
+
+    expect(lark.cardkit.v1.card.create).toHaveBeenCalled();
+    const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));
+    expect(card).toContain(PICKUP);
+    expect(card).toContain("继续");                 // neutral label for an unfamiliar reason
+    expect(card).toContain("重发 /apikey");          // generic resume line
   });
 
   it("says nothing about links when /apikey is refused with no self-service step", async () => {

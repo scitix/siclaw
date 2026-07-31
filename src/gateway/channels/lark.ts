@@ -1904,7 +1904,14 @@ async function deliverSingleUseLink(
   // must reach neither the button nor the text — hand over the resend instruction instead, which is
   // the only thing that actually helps (the frontend mints a fresh link on the next message).
   if (remaining === "expired") {
-    return replyToLark(larkClient, messageId, `${card.body}\n${PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE[locale]}`);
+    // The body may itself embed the URL (an unknown reason renders the frontend's prose), so it
+    // cannot be reused verbatim here — that put the dead link back in the text and made the
+    // boundary invariant false for exactly the case it was added to cover. Swap in a URL-free
+    // notice when the body carries the link.
+    const urlFreeBody = card.body.includes(card.url)
+      ? PERSONAL_ACCESS_GATED_NOTICE_BY_LOCALE[locale]
+      : card.body;
+    return replyToLark(larkClient, messageId, `${urlFreeBody}\n${PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE[locale]}`);
   }
   const sent = await sendLinkActionCard(larkClient, messageId, {
     body: card.body,
@@ -2209,21 +2216,44 @@ function buildApiKeyDenialCard(
   // No self-service step (or an unusable URL) ⇒ no button. `access_denied` says "ask the owner";
   // a generic button under that sentence points nowhere the sender can act on.
   if (!rendersActionLink(denied, locale)) return null;
-  const copy = denied.reason ? API_KEY_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason) : undefined;
+  const copy = apiKeyDenialCopy(denied, locale);
   if (!copy) return null;
   return {
     // The resume line belongs in the BODY, not the footnote: it is what stops the sender from
     // thinking the flow ended once the web step finishes.
     body: copy.resume ? `${copy.lead}\n${copy.resume}` : copy.lead,
-    buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason!)!,
+    buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason ?? "")
+      ?? PERSONAL_DENIAL_BUTTON_NEUTRAL_BY_LOCALE[locale],
     url: denied.actionUrl,
     expiresAtMs: denied.expiresAtMs,
   };
 }
 
+/** Fallback `/apikey` copy for a reason this build does not know. Without it the copy lookup vetoed
+ *  a refusal `rendersActionLink` had already accepted, and a future reason's structured link was
+ *  dropped on the very version-skew path the contract must keep usable. */
+const API_KEY_DENIAL_GENERIC_BY_LOCALE: Record<LarkLocale, { lead: string; resume: string }> = {
+  "zh-CN": { lead: "❌ 领取 API Key 需要先获得授权。", resume: "完成后回来重发 /apikey" },
+  "en-US": { lead: "❌ Getting an API key requires authorization first.", resume: "Once done, send /apikey again." },
+};
+
+/**
+ * Copy for an `/apikey` refusal: the reason's own wording when known, else the generic pair — but
+ * only when there is actually a link to offer. A reason with neither known copy nor an actionable
+ * link has nothing `/apikey`-specific to say and falls through to the frontend's `error`.
+ */
+function apiKeyDenialCopy(
+  denied: PersonalAccessDenied,
+  locale: LarkLocale,
+): { lead: string; resume?: string } | undefined {
+  const known = denied.reason ? API_KEY_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason) : undefined;
+  if (known) return known;
+  return rendersActionLink(denied, locale) ? API_KEY_DENIAL_GENERIC_BY_LOCALE[locale] : undefined;
+}
+
 /** `/apikey` refusal in text form: one ❌ line, the link, then how to resume. */
 function formatApiKeyDenialReply(denied: PersonalAccessDenied, locale: LarkLocale): string | null {
-  const copy = denied.reason ? API_KEY_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason) : undefined;
+  const copy = apiKeyDenialCopy(denied, locale);
   if (!copy) return null;
   const lines = [copy.lead];
   // Nested, not chained: a reason with no self-service step must say NOTHING about links. Chaining

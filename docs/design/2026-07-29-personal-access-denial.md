@@ -139,8 +139,9 @@ plus present falls through to the generic notice regardless of tier.
 
 ### A link is offered only for a reason that has a self-service step
 
-`rendersActionLink` is the single predicate — the reason has a step (iff it has a button label) AND
-the URL is plain `http(s)` — used by every renderer and both card builders. The scheme is checked
+`rendersActionLink` is the single predicate — the URL is plain `http(s)` AND the reason is not one
+we KNOW to be link-less — used by every renderer and both card builders. It is a deny-list on
+purpose: an unknown reason must keep its link. The scheme is checked
 because the value lands on a Feishu `open_url` button, where other schemes resolve as deeplinks;
 every other field of `denied` is already treated as untrusted, so this one gets the same treatment.
 The expired-link notice sits INSIDE that guard: chained onto `actionUrl` alone, a refusal with no
