@@ -2680,6 +2680,53 @@ describe("handleLarkMessage — streaming card flow", () => {
     }
   });
 
+  it("delivers the answer as text when the terminal card update is rejected (non-zero code)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-reject" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "很长的最终结论" }] },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+    // The SDK does NOT throw on a non-zero code. Reading that as success is what
+    // left the card frozen on its ⏳ placeholder while the answer existed only in
+    // the DB — visible in Portal, invisible in the group.
+    lark.cardkit.v1.cardElement.content = vi.fn().mockResolvedValue({ code: 300401, msg: "content too large" });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await handleLarkMessage(makeTextEvent("hi"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    // reply #1 posted the card; reply #2 is the text fallback carrying the answer.
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(2);
+    const fallback = JSON.parse(lark.im.message.reply.mock.calls[1][0].data.content).text as string;
+    expect(fallback).toContain("很长的最终结论");
+    // No 👍/👎 row under an answer the card never showed.
+    expect(lark.cardkit.v1.cardElement.create).not.toHaveBeenCalled();
+  });
+
+  it("does NOT double-post when only the streaming-mode flip is rejected (answer is on the card)", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    promptMock.mockResolvedValue({ sessionId: "s-settings-reject" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "答复正文" }] },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+    lark.cardkit.v1.card.settings = vi.fn().mockResolvedValue({ code: 99991400, msg: "rate limited" });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await handleLarkMessage(makeTextEvent("hi"), lark, "lark", makeAgentBoxManager("a1") as any, undefined, {} as any);
+
+    // Only the card post — the body landed, so a text reply would duplicate it.
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
+  });
+
   it("renders English placeholder when the channel domain is 'lark' (global)", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-en" });
