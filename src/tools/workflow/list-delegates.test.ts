@@ -4,7 +4,13 @@ import { createListDelegatesTool, registration } from "./list-delegates.js";
 import type { DelegateRosterMember } from "../../shared/agent-delegate.js";
 
 const ROSTER: DelegateRosterMember[] = [
-  { id: "agent-net", name: "net-agent", description: "network SRE", clusters: ["sh-1", "roce-test"], hosts: [] },
+  {
+    id: "agent-net",
+    name: "net-agent",
+    description: "network SRE for production testing",
+    clusters: ["sh-1", "roce-test", "cluster-alpha"],
+    hosts: [],
+  },
   { id: "agent-gpu", name: "gpu-agent", description: "GPU SRE", clusters: [], hosts: ["gpu-1", "gpu-2"] },
 ];
 
@@ -40,7 +46,7 @@ describe("list_delegates tool", () => {
     const r = await tool.execute("c1", {});
     const t = text(r);
     expect(t).toContain("net-agent [id: agent-net]");
-    expect(t).toContain("(clusters: 2, hosts: 0)");
+    expect(t).toContain("(clusters: 3, hosts: 0)");
     expect(t).toContain("gpu-agent [id: agent-gpu]");
     expect(t).toContain("(clusters: 0, hosts: 2)");
     // The actual binding names must NOT leak into a browse.
@@ -49,7 +55,7 @@ describe("list_delegates tool", () => {
     expect((r as any).details.total).toBe(2);
   });
 
-  it("query returns only agents covering the target, showing the matched binding", async () => {
+  it("an exact cluster query returns only the delegate covering that binding", async () => {
     const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
     const r = await tool.execute("c1", { query: "roce-test" });
     const t = text(r);
@@ -59,9 +65,10 @@ describe("list_delegates tool", () => {
     // The non-covering agent is excluded.
     expect(t).not.toContain("gpu-agent");
     expect((r as any).details.total).toBe(1);
+    expect((r as any).details.match_basis).toBe("exact_resource_binding");
   });
 
-  it("query matches host names too (case-insensitive substring)", async () => {
+  it("matches exact host bindings case-insensitively", async () => {
     const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
     const r = await tool.execute("c1", { query: "GPU-1" });
     const t = text(r);
@@ -70,16 +77,56 @@ describe("list_delegates tool", () => {
     expect(t).not.toContain("net-agent");
   });
 
-  it("tells the coordinator to resolve aliases before concluding nothing covers the target", async () => {
+  it("does not treat partial bindings, agent names, or descriptions as coverage", async () => {
+    const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
+    for (const query of ["test", "net-agent", "production"]) {
+      const r = await tool.execute("c1", { query });
+      expect((r as any).details.total).toBe(0);
+      expect(text(r)).not.toContain("[id: agent-net]");
+    }
+  });
+
+  it("a first miss offers one optional alias-resolution retry", async () => {
     const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
     const r = await tool.execute("c1", { query: "does-not-exist" });
     const t = text(r);
-    expect(t).toMatch(/No delegate agent covers "does-not-exist"/);
+    expect(t).toMatch(/No exact delegate resource binding matches "does-not-exist"/);
     expect(t).toMatch(/routing-helper skill/i);
-    expect(t).toMatch(/retry `list_delegates` with that binding name/i);
-    expect(t).toMatch(/Only after a confirmed binding-name query/i);
+    expect(t).toContain("binding_name_confirmed=true");
     expect(t).toMatch(/Do not delegate/i);
     expect((r as any).details.total).toBe(0);
+    expect((r as any).details.binding_name_confirmed).toBe(false);
+  });
+
+  it("supports one alias-resolution retry with a confirmed binding name", async () => {
+    const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
+    const first = await tool.execute("c1", { query: "local-alias" });
+    expect((first as any).details.total).toBe(0);
+    expect((first as any).details.binding_name_confirmed).toBe(false);
+
+    const retry = await tool.execute("c2", {
+      query: "cluster-alpha",
+      binding_name_confirmed: true,
+    });
+    expect((retry as any).details.total).toBe(1);
+    expect((retry as any).details.binding_name_confirmed).toBe(true);
+    expect(text(retry)).toContain("clusters matched: cluster-alpha");
+    expect(text(retry)).not.toMatch(/routing-helper skill/i);
+  });
+
+  it("a confirmed binding-name miss is terminal", async () => {
+    const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
+    const r = await tool.execute("c1", {
+      query: "canonical-does-not-exist",
+      binding_name_confirmed: true,
+    });
+    const t = text(r);
+    expect(t).toMatch(/No delegate agent covers the confirmed binding name/);
+    expect(t).not.toMatch(/routing-helper skill/i);
+    expect(t).not.toContain("binding_name_confirmed=true");
+    expect(t).toMatch(/Do not delegate/i);
+    expect((r as any).details.total).toBe(0);
+    expect((r as any).details.binding_name_confirmed).toBe(true);
   });
 
   it("caps a page and emits a next_cursor", async () => {

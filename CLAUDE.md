@@ -96,7 +96,8 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 | `src/core/tool-result-context-guard.ts` | guards.md §5 | `npm test` | Context guard; context budget enforcement |
 | `src/core/stream-wrappers.ts` | guards.md §5 | `npm test` | Output guards; stream event repair |
 | `src/core/tool-call-repair.ts` | guards.md §5 | `npm test` | Input guard; malformed tool call sanitization |
-| `src/core/prompt.ts` | **⚠️ REQUIRES HUMAN APPROVAL** | — | Describe intent and wait for OK before editing |
+| `src/core/prompt.ts`, `src/core/agent-types.ts` (persona text) | **⚠️ REQUIRES HUMAN APPROVAL**; coordinator-routing.md for coordinator changes | — | Describe intent and wait for OK before editing; persona changes alter agent behavior and product tone |
+| `src/tools/workflow/list-delegates.ts` | tools.md §2, coordinator-routing.md | `npm test` (`list-delegates.test.ts`) | Coverage requires exact cluster/host binding matches; names, descriptions, and partial matches are not authorization evidence; confirmed alias retry must terminate |
 | `src/memory/` | invariants.md §7, decisions.md ADR-005 | `npm test` | Requires embedding config; pi-agent only |
 | `Dockerfile.agentbox` | security.md §3-5 | `docker build` | Dual-user model; capability set; setgid kubectl |
 | `kbc/platform/pod/*` (KB compile box, Python) | kbc/platform/pod/README.md | `cd kbc/platform/pod && python test_compile_box.py` (needs `pip install claude-agent-sdk aiohttp`; CI: kbc-ci.yml, path-filtered) | Box↔runtime HTTP+SSE contract is shared with `src/gateway/capability/session-driver.ts` + `server.ts` (`/session` body, event vocabulary) and `agentbox/box-profile.ts` (allowedTools names, ANTHROPIC env forward) — change both sides together. Behavior changes need a `siclaw-kbc-box` image rebuild + redeploy (runtime env `SICLAW_COMPILE_BOX_IMAGE`); a rolled-out runtime does NOT pick up a new box image for existing live sessions |

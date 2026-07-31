@@ -40,16 +40,25 @@ function renderMatched(label: string, all: string[], matched: string[]): string 
   return `${label} matched: ${shown.join(", ")}${more > 0 ? ` …(+${more} more)` : ""} (${all.length} total)`;
 }
 
-interface Match { m: DelegateRosterMember; mc: string[]; mh: string[]; }
+interface Match {
+  m: DelegateRosterMember;
+  mc: string[];
+  mh: string[];
+}
 
 function matchRoster(roster: DelegateRosterMember[], q: string): Match[] {
   const out: Match[] = [];
   for (const m of roster) {
-    if (!q) { out.push({ m, mc: [], mh: [] }); continue; }
-    const mc = m.clusters.filter((s) => s.toLowerCase().includes(q));
-    const mh = m.hosts.filter((s) => s.toLowerCase().includes(q));
-    const nameHit = m.name.toLowerCase().includes(q) || (m.description ?? "").toLowerCase().includes(q);
-    if (nameHit || mc.length > 0 || mh.length > 0) out.push({ m, mc, mh });
+    if (!q) {
+      out.push({ m, mc: [], mh: [] });
+      continue;
+    }
+    // Coverage is an authorization decision, so only an exact resource binding
+    // proves that a delegate covers the target. Agent names/descriptions and
+    // partial binding matches are discovery hints, not coverage evidence.
+    const mc = m.clusters.filter((s) => s.trim().toLowerCase() === q);
+    const mh = m.hosts.filter((s) => s.trim().toLowerCase() === q);
+    if (mc.length > 0 || mh.length > 0) out.push({ m, mc, mh });
   }
   return out;
 }
@@ -62,13 +71,18 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
     renderResult: renderTextResult,
     description:
       "Find which specialist agent you may delegate to covers a target resource. Pass `query` with a cluster " +
-      "name, host name, or node name (matched against each delegate's bound clusters/hosts, plus their " +
-      "name/description) to see WHICH agent covers it — then delegate to that one. Omit `query` to browse " +
+      "name, host name, or node name. Coverage requires an exact, case-insensitive match against a delegate's " +
+      "bound clusters/hosts; agent names, descriptions, and partial resource names never prove coverage. " +
+      "Omit `query` to browse " +
       "(counts + a sample of bindings; agents may be bound to many hosts, so the full list is never dumped — " +
       "search by the target instead). Results are capped; use `cursor` to page.",
     parameters: Type.Object({
       query: Type.Optional(Type.String({
-        description: "Target cluster / host / node name (substring, case-insensitive). Omit to browse all delegates.",
+        description: "Exact target cluster / host / node binding name (case-insensitive). Omit to browse all delegates.",
+      })),
+      binding_name_confirmed: Type.Optional(Type.Boolean({
+        description:
+          "Set true only when `query` is a canonical Siclaw binding name confirmed by an attached routing helper.",
       })),
       limit: Type.Optional(Type.Number({ description: "Max delegates per page (default 20, max 100)." })),
       cursor: Type.Optional(Type.String({ description: "Opaque pagination cursor from a previous response's next_cursor." })),
@@ -78,9 +92,15 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
       if (roster.length === 0) {
         return { content: [{ type: "text" as const, text: "You have no delegate agents configured." }], details: {} };
       }
-      const params = (rawParams ?? {}) as { query?: string; limit?: number; cursor?: string };
+      const params = (rawParams ?? {}) as {
+        query?: string;
+        binding_name_confirmed?: boolean;
+        limit?: number;
+        cursor?: string;
+      };
       const rawQuery = typeof params.query === "string" ? params.query.trim() : "";
       const q = rawQuery.toLowerCase();
+      const bindingNameConfirmed = params.binding_name_confirmed === true;
       const limit = Math.min(Math.max(1, Math.floor(params.limit ?? DEFAULT_LIMIT)), MAX_LIMIT);
       const offset = decodeCursor(params.cursor);
 
@@ -102,13 +122,19 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
       const hasMore = nextOffset < total;
       let hint = "";
       if (total === 0) {
-        hint =
-          `\n\nNo delegate agent covers "${rawQuery}" as written. If this target may be a cluster alias, ` +
-          "localized name, local nickname, or spelling variant, do not conclude that coverage is absent yet: " +
-          "use an available routing-helper skill to resolve the canonical Siclaw binding name, then retry " +
-          "`list_delegates` with that binding name. Only after a confirmed binding-name query also returns no " +
-          "match should you tell the user that no authorized agent covers the resource. Do not delegate until " +
-          "coverage is confirmed.";
+        if (bindingNameConfirmed) {
+          hint =
+            `\n\nNo delegate agent covers the confirmed binding name "${rawQuery}". ` +
+            "Do not delegate — tell the user no authorized agent covers that resource.";
+        } else {
+          hint =
+            `\n\nNo exact delegate resource binding matches "${rawQuery}" as written. If this may be a cluster ` +
+            "alias, localized name, local nickname, or spelling variant, consult a routing-helper skill you " +
+            "were given, if any. Retry once with its confirmed canonical binding name and set " +
+            "`binding_name_confirmed=true`. If no helper is attached or it cannot confirm one binding name, " +
+            "do not guess or retry — tell the user no authorized agent covers the name as written and that it " +
+            "may be an alias. Do not delegate until coverage is confirmed.";
+        }
       } else if (hasMore) {
         hint = `\n\nShowing ${page.length} of ${total}. Refine the query, or pass cursor="${nextOffset}" for the next page.`;
       }
@@ -118,7 +144,13 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
       const body = lines.length ? `${header}\n${lines.join("\n")}` : header;
       return {
         content: [{ type: "text" as const, text: `${body}${hint}` }],
-        details: { total, shown: page.length, ...(hasMore ? { next_cursor: String(nextOffset) } : {}) },
+        details: {
+          total,
+          shown: page.length,
+          match_basis: q ? "exact_resource_binding" : "browse",
+          binding_name_confirmed: bindingNameConfirmed,
+          ...(hasMore ? { next_cursor: String(nextOffset) } : {}),
+        },
       };
     },
   };
