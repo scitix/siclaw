@@ -22,6 +22,7 @@ import {
   updateBindingMeta,
   updateChannelName,
   isChannelAccessDenied,
+  isOpenAccessTier,
   type ResolvedChannelBinding,
   type ChannelAccessDenied,
   type PersonalApiKeyIssueResult,
@@ -211,10 +212,9 @@ const PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE: Record<LarkLocale, string> = {
   "zh-CN": "之前的链接已过期，请再发一条消息获取新链接。",
   "en-US": "The previous link has expired — send another message to get a fresh one.",
 };
-// Every part of a denial reply (`message`, `actionUrl`, `reason`) comes from the frontend and is
-// unbounded. The platform rejects oversized text outright and `replyToLark` cannot un-reject it,
-// so a single pathological field would cost the sender their whole reply — cap the RENDERED
-// result, not just one field.
+// Bound on the frontend's free-form prose. Deliberately NOT applied to the rendered result: a
+// truncated URL is a guaranteed dead link, and the platform's text limit sits far above anything
+// rendered here (see truncateDenialProse).
 const PERSONAL_DENIAL_MESSAGE_MAX_CHARS = 1000;
 // The card only ever shows the single latest step, so the milestone list is
 // just an internal buffer for dedup against the previous step. Bound it anyway
@@ -1135,7 +1135,7 @@ export async function handleLarkMessage(
         // has nothing to put on a button — send the text form.
         const template = denied?.reason ? PERSONAL_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason) : undefined;
         const linkIsLive = Boolean(denied?.actionUrl) && minutesUntil(denied?.expiresAtMs) !== "expired";
-        if (template && denied?.actionUrl && linkIsLive && offersSelfService(denied.reason, locale)) {
+        if (template && denied && linkIsLive && rendersActionLink(denied, locale)) {
           await deliverSingleUseLink(larkClient, messageId, locale, {
             body: template,
             buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason!)!,
@@ -1226,7 +1226,7 @@ export async function handleLarkMessage(
       undefined,
     );
     if (isChannelAccessDenied(modeBinding)) {
-      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale, Boolean(personalBot)));
+      await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale, dmCanResolveAccess(personalBot)));
       return;
     }
     if (!modeBinding) {
@@ -1291,7 +1291,7 @@ export async function handleLarkMessage(
     if (conversationExistingOnly) return;
     // Gated group: this sender isn't allowed. The message is either an explicit @ or a follow-up
     // in a previously established bot topic, so a single short hint is appropriate.
-    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale, Boolean(personalBot)));
+    await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(binding, locale, dmCanResolveAccess(personalBot)));
     return;
   }
   if (!binding) {
@@ -1780,18 +1780,6 @@ async function resolveQueuedBinding(
  * replace the user's only path forward with a generic error.
  */
 /**
- * True for the tiers that admit anyone (`public`, and its legacy spelling `open`).
- *
- * Everything else — including a tier this build has never seen — counts as gated. The direction
- * matters: an unknown value must fail toward "you need authorization", never toward silence or
- * admission, because a frontend can introduce a tier before the runtime learns about it.
- */
-function isOpenAccessTier(accessMode: string | undefined): boolean {
-  const mode = (accessMode ?? "").trim().toLowerCase();
-  return mode === "public" || mode === "open";
-}
-
-/**
  * Generic gated-tier notice, used when the frontend gave no refusal reason.
  *
  * When a console URL is configured it is the sender's OWN self-service page, so the copy must tell
@@ -1819,11 +1807,45 @@ function minutesUntil(expiresAtMs: number | undefined, now = Date.now()): number
   return Math.max(1, Math.floor(remaining / 60_000));
 }
 
+/**
+ * Whether pointing a refused group sender at the private chat would actually get them anywhere.
+ *
+ * Requires a personal bot that is itself GATED: an `open` one binds the sender on first message and
+ * offers no authorization step, so "DM me" would be a dead end — and the console URL the group
+ * reply would otherwise carry was the only path they had.
+ */
+function dmCanResolveAccess(personalBot: LarkChannelConfig["personal_bot"]): boolean {
+  return Boolean(personalBot) && !isOpenAccessTier(personalBot!.access_mode);
+}
+
+/** A link is only ever rendered when it is plain http(s). Everything else in `denied` is treated as
+ *  untrusted, and this value reaches a Feishu `open_url` button, where other schemes resolve as
+ *  deeplinks. An unusable value is withheld exactly like a missing one. */
+function isRenderableActionUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const scheme = new URL(url).protocol;
+    return scheme === "https:" || scheme === "http:";
+  } catch {
+    return false;
+  }
+}
+
 /** True when this reason has a self-service step the sender can actually take (i.e. a button label
  *  exists for it). `access_denied` has none, so an actionUrl arriving on it must not be rendered as
  *  "click to continue" directly under "ask the owner". */
 function offersSelfService(reason: string | undefined, locale: LarkLocale): boolean {
   return Boolean(reason && PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].has(reason));
+}
+
+/** The one predicate for "render a link for this refusal": the reason has a step the sender can
+ *  take, AND the URL is something we are willing to put in front of them. Narrows `actionUrl` to
+ *  defined so callers need no assertions. */
+function rendersActionLink(
+  denied: PersonalAccessDenied,
+  locale: LarkLocale,
+): denied is PersonalAccessDenied & { actionUrl: string } {
+  return offersSelfService(denied.reason, locale) && isRenderableActionUrl(denied.actionUrl);
 }
 
 /** Bound the frontend's free-form prose. Applied to prose ONLY — never to a URL or to our own
@@ -1882,7 +1904,7 @@ function formatPersonalDenialReply(denied: PersonalAccessDenied, locale: LarkLoc
   const lines = [body];
   // Only the templated path appends the URL. On the fallback path the frontend's prose is expected
   // to carry its own link, and appending would print it twice.
-  if (template && denied.actionUrl && offersSelfService(denied.reason, locale)) {
+  if (template && rendersActionLink(denied, locale)) {
     const remaining = minutesUntil(denied.expiresAtMs);
     if (remaining === "expired") {
       lines.push(PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE[locale]);
@@ -1908,16 +1930,26 @@ function formatGroupAccessDeniedReply(
   // Only the explicit not-linked reason claims "you haven't linked yet". Every other value —
   // including one this build has never seen — gets the generic line: it is never wrong, whereas
   // telling an already-linked sender to go link sends them round a loop with no exit.
-  const base = denied.reason === "unbound"
+  const notLinked = denied.reason === "unbound";
+  const base = notLinked
     ? GROUP_ACCESS_UNBOUND_NOTICE_BY_LOCALE[locale]
     : GROUP_ACCESS_DENIED_NOTICE_BY_LOCALE[locale];
-  // Send them to the private chat, NOT to a URL in the group. The DM resolves the sender's actual
-  // next step and can deliver a single-use link, which must never be posted where anyone in the
-  // room could open it and bind the sender's chat identity to their own account.
+
+  // Prefer the private chat: the room sees this reply, and the DM resolves the sender's actual next
+  // step per person. NOTE this is a UX judgement, not a leak fix — the single-use `actionUrl` lives
+  // on `PersonalAccessDenied` and the type separation already keeps it out of this renderer, which
+  // only ever carries the shareable console `authorizeUrl`.
+  //
+  // Gated on the personal bot being ABLE to resolve it: an `open` personal bot binds the sender
+  // immediately and offers no authorization step at all, so "DM me" would be a dead end — and the
+  // console URL we would otherwise have shown is the only path they had.
   if (hasPersonalBot) return `${base}\n${GROUP_ACCESS_DM_HINT_BY_LOCALE[locale]}`;
-  // Group-only channel: no DM answers here, so the console URL is the only path left. When it is
-  // present it is the sender's OWN authorization page — say "open it", not "ask an admin".
-  return denied.authorizeUrl
+
+  // Group-only channel: no DM answers here, so the console URL is the only path left. Offer it as
+  // an instruction ONLY for the not-linked case — that page is the linking step. For a sender who
+  // is already linked but lacks access, telling them to "complete authorization" there points at
+  // something they have already done, which is the same loop; name the admin route instead.
+  return notLinked && denied.authorizeUrl
     ? `${base}\n${GROUP_ACCESS_SELF_SERVE_HINT_BY_LOCALE[locale]}\n${denied.authorizeUrl}`
     : `${base}\n${GROUP_ACCESS_ADMIN_HINT_BY_LOCALE[locale]}`;
 }
@@ -2132,10 +2164,10 @@ function buildApiKeyDenialCard(
   denied: PersonalAccessDenied | undefined,
   locale: LarkLocale,
 ): { body: string; buttonLabel: string; url: string; expiresAtMs?: number } | null {
-  if (!denied?.actionUrl || minutesUntil(denied.expiresAtMs) === "expired") return null;
-  // No self-service step ⇒ no button. `access_denied` says "ask the owner"; a generic "Continue"
-  // button under that sentence points nowhere the sender can act on.
-  if (!offersSelfService(denied.reason, locale)) return null;
+  if (!denied || minutesUntil(denied.expiresAtMs) === "expired") return null;
+  // No self-service step (or an unusable URL) ⇒ no button. `access_denied` says "ask the owner";
+  // a generic button under that sentence points nowhere the sender can act on.
+  if (!rendersActionLink(denied, locale)) return null;
   const copy = denied.reason ? API_KEY_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason) : undefined;
   if (!copy) return null;
   return {
@@ -2153,11 +2185,16 @@ function formatApiKeyDenialReply(denied: PersonalAccessDenied, locale: LarkLocal
   const copy = denied.reason ? API_KEY_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason) : undefined;
   if (!copy) return null;
   const lines = [copy.lead];
-  const remaining = minutesUntil(denied.expiresAtMs);
-  if (denied.actionUrl && remaining !== "expired" && offersSelfService(denied.reason, locale)) {
-    lines.push(PERSONAL_DENIAL_LINK_HINT_BY_LOCALE[locale](remaining), denied.actionUrl);
-  } else if (denied.actionUrl) {
-    lines.push(PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE[locale]);
+  // Nested, not chained: a reason with no self-service step must say NOTHING about links. Chaining
+  // the expired notice onto `actionUrl` alone told `access_denied` senders their live link had
+  // expired and to resend — and the resend refuses identically.
+  if (rendersActionLink(denied, locale)) {
+    const remaining = minutesUntil(denied.expiresAtMs);
+    if (remaining === "expired") {
+      lines.push(PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE[locale]);
+    } else {
+      lines.push(PERSONAL_DENIAL_LINK_HINT_BY_LOCALE[locale](remaining), denied.actionUrl);
+    }
   }
   if (copy.resume) lines.push(copy.resume);
   return lines.join("\n");
@@ -2172,14 +2209,23 @@ function formatApiKeyDenialReply(denied: PersonalAccessDenied, locale: LarkLocal
  * break gets reported as a bug by whoever had it configured in an MCP client.
  */
 function formatApiKeyIssueCardBody(result: PersonalApiKeyIssueResult, locale: LarkLocale): string {
+  // The `status` hint is kept: unlike the URL and the validity window (which become the button and
+  // the footnote), it has nowhere else to live, and the card is now the primary delivery path — so
+  // dropping it here would quietly remove the affordance for checking the key's own expiry.
   if (locale === "en-US") {
-    return result.rotated
-      ? "✅ New API key generated — your PREVIOUS key is now invalid. Update anything configured with it."
-      : "✅ Your API key is ready.";
+    return [
+      result.rotated
+        ? "✅ New API key generated — your PREVIOUS key is now invalid. Update anything configured with it."
+        : "✅ Your API key is ready.",
+      "Send /apikey status any time to check the key's own expiry.",
+    ].join("\n");
   }
-  return result.rotated
-    ? "✅ 已为你生成新的 API Key（旧 Key 已失效，如有配置请更新）"
-    : "✅ 你的 API Key 已就绪";
+  return [
+    result.rotated
+      ? "✅ 已为你生成新的 API Key（旧 Key 已失效，如有配置请更新）"
+      : "✅ 你的 API Key 已就绪",
+    "随时发送 /apikey status 查看 Key 本身的失效时间",
+  ].join("\n");
 }
 
 /** `/apikey status` reply — read-only, so it must never imply anything was rotated. */

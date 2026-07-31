@@ -73,6 +73,23 @@ export function isChannelAccessDenied(
 }
 
 /**
+ * True for the admission tiers that admit anyone: `public`, and its legacy spelling `open`.
+ *
+ * Lives here because BOTH layers must agree on it — the gateway picks refusal copy from it and the
+ * Portal adapter decides whether to auto-bind. Two copies drifting apart produces the exact failure
+ * this contract exists to prevent: the runtime treats a tier as open while the Portal refuses to
+ * bind, and the sender is answered with silence.
+ *
+ * Anything else — including a tier this build has never seen — is gated. The direction is
+ * deliberate: a frontend can introduce a tier before the runtime learns about it, and the safe
+ * failure is "you need authorization", never silence and never admission.
+ */
+export function isOpenAccessTier(accessMode: unknown): boolean {
+  const mode = typeof accessMode === "string" ? accessMode.trim().toLowerCase() : "";
+  return mode === "public" || mode === "open";
+}
+
+/**
  * Why a PERSONAL-chat sender was turned away, plus the self-service next step.
  *
  * Deliberately NOT merged with {@link ChannelAccessDenied}, despite the overlap: that type's

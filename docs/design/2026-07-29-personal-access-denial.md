@@ -99,8 +99,13 @@ plus present falls through to the generic notice regardless of tier.
 
 ### A link is offered only for a reason that has a self-service step
 
-`offersSelfService` is the single predicate (a reason has a step iff it has a button label), used by
-the text renderer, the card dispatch, and the `/apikey` card builder alike. `access_denied` means
+`rendersActionLink` is the single predicate — the reason has a step (iff it has a button label) AND
+the URL is plain `http(s)` — used by every renderer and both card builders. The scheme is checked
+because the value lands on a Feishu `open_url` button, where other schemes resolve as deeplinks;
+every other field of `denied` is already treated as untrusted, so this one gets the same treatment.
+The expired-link notice sits INSIDE that guard: chained onto `actionUrl` alone, a refusal with no
+self-service step told the sender their live link had expired and to resend — and the resend refuses
+identically, which is the dead-end loop this feature exists to remove. `access_denied` means
 "ask the owner": an `actionUrl` arriving on it must not become a "click within N minutes" line under
 that sentence, nor a generic button pointing somewhere the sender cannot act. Because a link is only
 ever rendered for a labelled reason, no generic fallback label exists.
@@ -124,6 +129,14 @@ config, transient error) rather than a refusal — there is nothing useful to te
 **This is what makes frontend-first deployment safe.** Without it, a frontend that starts emitting
 new tier spellings turns every refusal on this path into silence.
 
+### One predicate for the tier, shared across layers
+
+`isOpenAccessTier` is exported from `channel-manager.ts` and used by BOTH the gateway (which picks
+refusal copy) and the Portal adapter (which decides whether to auto-bind). It was briefly duplicated
+in the two layers; two copies of the same normalization drifting apart produces exactly the failure
+this contract prevents — the runtime treats a tier as open while the adapter refuses to bind, and
+the sender is answered with silence.
+
 ### One-time links must never reach a group
 
 `PersonalAccessDenied.actionUrl` is a single-use personal credential; `ChannelAccessDenied.authorizeUrl`
@@ -135,10 +148,18 @@ reviewers remembering it. The two renderers sit next to each other so the copy c
 
 Only the explicit not-linked reason claims "you haven't linked yet"; every other value — including
 one this build has never seen — takes the generic "no access" line, which is never wrong, whereas
-telling an already-linked sender to go link loops them with no exit.
+telling an already-linked sender to go link loops them with no exit. For the same reason the console
+URL is offered as an instruction only on the not-linked path: to a sender who is already linked, the
+linking page is somewhere they have been.
 
-Group copy points a refused sender at the **private chat** to obtain access — but only
-when the channel actually has a personal bot. Telling someone to DM a group-only bot sends them to
+Group copy points a refused sender at the **private chat** — but only when the DM can actually
+resolve it, i.e. a personal bot exists AND is itself gated. An `open` personal bot binds on first
+message and offers no authorization step, so "DM me" would be a dead end while removing the console
+URL that was the sender's only path.
+
+To be precise about the rationale: preferring the DM is a **UX** judgement, not a leak fix. The
+single-use `actionUrl` lives on `PersonalAccessDenied`, and the type separation already keeps it out
+of the group renderer, which only ever carries the shareable console `authorizeUrl`. Telling someone to DM a group-only bot sends them to
 a path that answers nothing, so without one the copy names the admin route alone.
 
 ### `/apikey` refusals use the same path

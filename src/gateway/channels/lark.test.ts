@@ -57,6 +57,12 @@ vi.mock("../channel-manager.js", () => ({
   setChannelContextMode: (...args: unknown[]) => setChannelContextModeMock(...args),
   isChannelAccessDenied: (v: unknown) =>
     v !== null && typeof v === "object" && (v as { walled?: unknown }).walled === true,
+  // Pure tier normalization shared with the Portal adapter — use the real thing, not a stub, so a
+  // divergence between the two layers would actually fail here.
+  isOpenAccessTier: (mode: unknown) => {
+    const m = typeof mode === "string" ? mode.trim().toLowerCase() : "";
+    return m === "public" || m === "open";
+  },
 }));
 
 const resolveAgentModelBindingMock = vi.fn();
@@ -677,6 +683,43 @@ describe("handleLarkMessage — routing to AgentBox", () => {
     expect(text).not.toContain("http");   // no URL of any kind reaches the room
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("group-only channel does NOT offer the linking page to an already-linked sender", async () => {
+    // reason "denied" = linked but lacks agent access. Telling them to "complete authorization" on
+    // the linking page points at something they already did — the same loop, different path.
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "denied", authorizeUrl: "https://console.example/auth" });
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hi"), lark, "lark-runtime", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN", { app_id: "cli_x", app_secret: "secret" },
+    );
+
+    const text = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text as string;
+    expect(text).toContain("没有这个助手的使用权限");
+    expect(text).toContain("管理员");
+    expect(text).not.toContain("https://console.example/auth");
+  });
+
+  it("keeps the console URL when the personal bot is open — the DM could not help", async () => {
+    // An `open` personal bot binds on first message and offers no authorization step, so "DM me"
+    // would be a dead end while removing the only path the sender had.
+    resolveBindingMock.mockResolvedValue({ walled: true, reason: "unbound", authorizeUrl: "https://console.example/auth" });
+    const lark = makeLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hi"), lark, "lark-runtime", makeAgentBoxManager() as any, undefined, {} as any,
+      "zh-CN",
+      {
+        app_id: "cli_x", app_secret: "secret", group_channel_id: "lark:personal:pb-1",
+        personal_bot: { channel_id: "pb-1", agent_id: "a1", access_mode: "open", owner_user_id: "o1" },
+      },
+    );
+
+    const text = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text as string;
+    expect(text).not.toContain("私聊我");
+    expect(text).toContain("https://console.example/auth");
   });
 
   it("group-only channel keeps the console URL — there is no DM that would answer", async () => {
@@ -3611,6 +3654,7 @@ describe("handleLarkMessage — /apikey", () => {
     expect(card).toContain(PICKUP);             // on the button only
     expect(card).toContain("旧 Key 已失效");     // rotation warning survives the card form
     expect(card).toContain("5 分钟内有效");      // derived from expiresAt
+    expect(card).toContain("/apikey status");   // affordance survives the card form
     const posted = lark.im.message.reply.mock.calls[0][0];
     expect(posted.data.msg_type).toBe("interactive");
     expect(posted.data.content).not.toContain(PICKUP);
@@ -3687,6 +3731,38 @@ describe("handleLarkMessage — /apikey", () => {
     expect(card).toContain("申请权限");     // button label
     expect(card).toContain(PICKUP);
     expect(lark.im.message.reply.mock.calls[0][0].data.content).not.toContain(PICKUP);
+  });
+
+  it("says nothing about links when /apikey is refused with no self-service step", async () => {
+    // The expired notice used to hang off `actionUrl` alone, so access_denied + a LIVE link was told
+    // "your link expired, resend" — and the resend refuses identically. That is the dead-end loop.
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: false,
+      denied: { reason: "access_denied", actionUrl: "https://x.example/live", expiresAtMs: Date.now() + 600_000 },
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("未开放自助申请");
+    expect(reply).not.toContain("已过期");
+    expect(reply).not.toContain("https://x.example/live");
+    expect(reply).not.toContain("分钟内");
+  });
+
+  it("withholds an actionUrl that is not plain http(s)", async () => {
+    // It lands on a Feishu open_url button, where other schemes resolve as deeplinks. Every other
+    // field of `denied` is treated as untrusted; the scheme gets the same treatment.
+    for (const actionUrl of ["javascript:alert(1)", "lark://open", "not a url"]) {
+      issuePersonalApiKeyMock.mockResolvedValue({
+        success: false,
+        denied: { reason: "binding_required", actionUrl, expiresAtMs: Date.now() + 600_000 },
+      });
+      const lark = makeLarkClient();
+      await sendPersonal("/apikey", lark);
+      expect(replyText(lark), actionUrl).not.toContain(actionUrl);
+    }
   });
 
   it("gives no link for a closed-self-service /apikey refusal", async () => {
