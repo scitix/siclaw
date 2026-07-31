@@ -275,7 +275,7 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(201);
     });
 
-    it("nulls system_prompt for a built-in agent type on create (locked persona)", async () => {
+    it("persists a built-in default when create omits a prompt", async () => {
       // Coordinator has defaultNoSkills → no auto-bind: INSERT then SELECT-back.
       query
         .mockResolvedValueOnce([undefined, []])                        // insert agent
@@ -284,13 +284,28 @@ describe("registerAgentRoutes", () => {
       const { status } = await runRoute(router, fakeReq({
         url: "/api/v1/agents",
         method: "POST",
-        body: { name: "coord", agent_type: "coordinator", system_prompt: "SHOULD BE DROPPED" },
+        body: { name: "coord", agent_type: "coordinator" },
       }));
 
       expect(status).toBe(201);
       const insertArgs = query.mock.calls[0][1];
       expect(insertArgs[8]).toBe("coordinator"); // agent_type
-      expect(insertArgs[9]).toBeNull();          // system_prompt dropped for built-in type
+      expect(insertArgs[9]).toContain("ONLY job is ROUTING");
+    });
+
+    it("persists a maintainer-supplied prompt for a built-in type", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a-new", name: "coord" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents",
+        method: "POST",
+        body: { name: "coord", agent_type: "coordinator", system_prompt: "single truth" },
+      }));
+
+      expect(status).toBe(201);
+      expect(query.mock.calls[0][1][9]).toBe("single truth");
     });
 
     it("keeps a custom agent's system_prompt on create", async () => {
@@ -355,28 +370,147 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(400);
     });
 
-    it("nulls the stale Custom system_prompt when switching to a built-in type", async () => {
-      // agent_type in body → effective type resolved without a pre-read: UPDATE then SELECT-back.
+    it("keeps an explicitly supplied prompt when switching to a built-in type", async () => {
       query
-        .mockResolvedValueOnce([undefined, []])                    // UPDATE
-        .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]); // SELECT-back
+        .mockResolvedValueOnce([[{
+          idle_timeout_sec: 300,
+          system_prompt: "old custom prompt",
+          agent_type: "custom",
+          is_production: 1,
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]);
 
       const { status } = await runRoute(router, fakeReq({
         url: "/api/v1/agents/a1",
         method: "PUT",
-        body: { agent_type: "coordinator", system_prompt: "stale custom prompt" },
+        body: { agent_type: "coordinator", system_prompt: "maintainer override" },
       }));
 
       expect(status).toBe(200);
-      const updateSql = query.mock.calls[0][0] as string;
-      const updateArgs = query.mock.calls[0][1] as unknown[];
+      const updateSql = query.mock.calls[1][0] as string;
+      const updateArgs = query.mock.calls[1][1] as unknown[];
       expect(updateSql).toContain("system_prompt = ?");
-      expect(updateArgs).toContain("coordinator");        // agent_type set
-      expect(updateArgs).not.toContain("stale custom prompt"); // stale prompt dropped, not persisted
+      expect(updateArgs).toContain("coordinator");
+      expect(updateArgs).toContain("maintainer override");
+    });
+
+    it("resets an unchanged old persona when switching built-in types", async () => {
+      query
+        .mockResolvedValueOnce([[{
+          idle_timeout_sec: 300,
+          system_prompt: "old SRE persona",
+          agent_type: "sre",
+          is_production: 1,
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { agent_type: "coordinator", system_prompt: "old SRE persona" },
+      }));
+
+      const updateArgs = query.mock.calls[1][1] as unknown[];
+      expect(updateArgs).toContain("coordinator");
+      expect(updateArgs.some((value) =>
+        typeof value === "string" && value.includes("ONLY job is ROUTING"),
+      )).toBe(true);
+    });
+
+    it("keeps the visible prompt when switching to custom with an unchanged textarea", async () => {
+      query
+        .mockResolvedValueOnce([[{
+          idle_timeout_sec: 300,
+          system_prompt: "H100 fleet SRE; check ECC counters first",
+          agent_type: "sre",
+          is_production: 1,
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "custom" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: {
+          agent_type: "custom",
+          system_prompt: "H100 fleet SRE; check ECC counters first",
+        },
+      }));
+
+      expect(status).toBe(200);
+      const updateArgs = query.mock.calls[1][1] as unknown[];
+      expect(updateArgs).toContain("custom");
+      expect(updateArgs).toContain("H100 fleet SRE; check ECC counters first");
+      expect(updateArgs).not.toContain(null);
+    });
+
+    it("notifies prompt.reload when system_prompt changes", async () => {
+      query
+        .mockResolvedValueOnce([[{
+          system_prompt: "old truth",
+          agent_type: "custom",
+          is_production: 1,
+          idle_timeout_sec: 300,
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { system_prompt: "new truth" },
+      }));
+
+      expect(connMap.sendCommand).toHaveBeenCalledWith(
+        "a1",
+        "agent.reload",
+        { agentId: "a1", resources: ["prompt"] },
+      );
+    });
+
+    it("does not reload prompt or tools when the complete form resubmits identical values", async () => {
+      query
+        .mockResolvedValueOnce([[{
+          system_prompt: "same truth",
+          agent_type: "sre",
+          is_production: 1,
+          idle_timeout_sec: 300,
+          tool_capabilities: '["read_files"]',
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "same" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: {
+          name: "same",
+          system_prompt: "same truth",
+          agent_type: "sre",
+          is_production: true,
+          idle_timeout_sec: 300,
+          tool_capabilities: ["read_files"],
+        },
+      }));
+
+      expect(connMap.sendCommand).not.toHaveBeenCalled();
+      expect(connMap.notify).not.toHaveBeenCalledWith(
+        "a1",
+        "agent.reload",
+        expect.anything(),
+      );
     });
 
     it("notifies agent.reload when is_production changes", async () => {
       query
+        .mockResolvedValueOnce([[{
+          system_prompt: null,
+          agent_type: "custom",
+          is_production: 1,
+          idle_timeout_sec: 300,
+        }], []])
         .mockResolvedValueOnce([undefined, []])
         .mockResolvedValueOnce([[{ id: "a1", name: "x" }], []]);
 
@@ -386,7 +520,10 @@ describe("registerAgentRoutes", () => {
         body: { is_production: false },
       }));
 
-      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { resources: ["skills", "cluster", "host"] });
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["skills", "cluster", "host"],
+      });
     });
 
     it("does not notify when is_production not changed", async () => {
@@ -553,6 +690,7 @@ describe("registerAgentRoutes", () => {
 
     it("stores tool_capabilities and pushes a tools reload on change", async () => {
       query
+        .mockResolvedValueOnce([[{ tool_capabilities: '["read_files"]' }], []])
         .mockResolvedValueOnce([undefined, []])
         .mockResolvedValueOnce([[{ id: "a1" }], []]);
 
@@ -563,9 +701,9 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(200);
-      expect(query.mock.calls[0][0]).toContain("tool_capabilities = ?");
+      expect(query.mock.calls[1][0]).toContain("tool_capabilities = ?");
       // Deduped JSON array of group keys.
-      expect(JSON.parse(query.mock.calls[0][1][0])).toEqual(["read_files", "run_commands"]);
+      expect(JSON.parse(query.mock.calls[1][1][0])).toEqual(["read_files", "run_commands"]);
       expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
         agentId: "a1",
         resources: ["tools"],
@@ -574,6 +712,7 @@ describe("registerAgentRoutes", () => {
 
     it("clears tool_capabilities (empty array → null) and still pushes a reload", async () => {
       query
+        .mockResolvedValueOnce([[{ tool_capabilities: '["read_files"]' }], []])
         .mockResolvedValueOnce([undefined, []])
         .mockResolvedValueOnce([[{ id: "a1" }], []]);
 
@@ -584,8 +723,8 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(status).toBe(200);
-      expect(query.mock.calls[0][0]).toContain("tool_capabilities = ?");
-      expect(query.mock.calls[0][1][0]).toBeNull();
+      expect(query.mock.calls[1][0]).toContain("tool_capabilities = ?");
+      expect(query.mock.calls[1][1][0]).toBeNull();
       expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
         agentId: "a1",
         resources: ["tools"],
@@ -717,7 +856,24 @@ describe("registerAgentRoutes", () => {
       const inserts = conn.query.mock.calls.filter(c => (c[0] as string).startsWith("INSERT"));
       expect(inserts.length).toBe(3);
 
-      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { agentId: "a1" });
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", {
+        agentId: "a1",
+        resources: ["cluster", "host", "skills"],
+      });
+    });
+
+    it("does not reload AgentBox resources for a channel-only binding change", async () => {
+      query.mockResolvedValueOnce([[{ id: "a1" }], []]);
+      conn.query.mockResolvedValue([undefined, []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1/resources",
+        method: "PUT",
+        body: { channel_ids: ["ch1"] },
+      }));
+
+      expect(status).toBe(200);
+      expect(connMap.notify).not.toHaveBeenCalled();
     });
 
     it("rolls back on transaction failure", async () => {

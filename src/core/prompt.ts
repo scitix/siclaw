@@ -18,19 +18,55 @@ const MODE_LABELS: Record<string, string> = {
  * Mode-conditional blocks: `<!-- web-only -->...<!-- /web-only -->` and
  * `<!-- cli-only -->...<!-- /cli-only -->` — the non-matching block is stripped.
  *
- * Safety and Language sections are hardcoded and always appended — they cannot
- * be overridden by agent templates.
+ * The optional agent-owned identity fragment is rendered after the platform
+ * template but before Safety. Safety and Language therefore remain later than
+ * editable Agent text and cannot be displaced by an Agent template.
  */
-export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", templateOverride?: string): string {
+export function buildSreSystemPrompt(
+  mode?: "cli" | "web" | "channel" | "task",
+  templateOverride?: string,
+  agentPromptFragment?: string,
+): string {
   const template = templateOverride?.trim() || DEFAULT_TEMPLATE;
+  let prompt = renderSystemPromptFragment(template, mode);
 
+  const credentialsPath = mode === "cli" ? "`/setup` → Credentials" : "**Settings → Credentials**";
+
+  // Append task-specific section for automated task mode
+  if (mode === "task") {
+    prompt += CRON_SECTION;
+  }
+  if (mode === "channel") {
+    prompt += CHANNEL_SECTION;
+  }
+
+  if (agentPromptFragment?.trim()) {
+    prompt += `\n\n${renderSystemPromptFragment(agentPromptFragment, mode)}`;
+  }
+
+  // Append hardcoded safety section — NOT overridable by agent templates
+  prompt += SAFETY_SECTION(credentialsPath);
+
+  return prompt;
+}
+
+/**
+ * Resolve variables and mode-conditional blocks in one system-prompt
+ * fragment. Agent-owned prompt text is appended to the platform template, but
+ * keeps the same placeholder contract that persisted custom templates had
+ * before agent prompts became a separate identity/behaviour layer.
+ */
+export function renderSystemPromptFragment(
+  fragment: string,
+  mode?: "cli" | "web" | "channel" | "task",
+): string {
   const modeLabel = MODE_LABELS[mode ?? "cli"] ?? "Web UI";
   const settingsPath = mode === "cli" ? "`/setup`" : "sidebar **Settings**";
   const credentialsPath = mode === "cli" ? "`/setup` → Credentials" : "**Settings → Credentials**";
   const memoryEnabled = isMemoryEnabled();
 
   // Variable substitution
-  let prompt = template
+  let prompt = fragment
     .replace(/\{\{mode\}\}/g, modeLabel)
     .replace(/\{\{settingsPath\}\}/g, settingsPath)
     .replace(/\{\{credentialsPath\}\}/g, credentialsPath)
@@ -44,17 +80,6 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", 
   prompt = prompt.replace(new RegExp(`<!-- ${dropMode}-only -->[\\s\\S]*?<!-- /${dropMode}-only -->`, "g"), "");
   // Unwrap the matching mode block (keep content, remove markers)
   prompt = prompt.replace(new RegExp(`<!-- ${keepMode}-only -->([\\s\\S]*?)<!-- /${keepMode}-only -->`, "g"), "$1");
-
-  // Append task-specific section for automated task mode
-  if (mode === "task") {
-    prompt += CRON_SECTION;
-  }
-  if (mode === "channel") {
-    prompt += CHANNEL_SECTION;
-  }
-
-  // Append hardcoded safety section — NOT overridable by agent templates
-  prompt += SAFETY_SECTION(credentialsPath);
 
   return prompt;
 }

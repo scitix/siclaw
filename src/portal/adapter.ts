@@ -2136,8 +2136,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       // (legacy MySQL JSON, new MySQL TEXT, SQLite TEXT). The Gateway resolves
       // these group keys → concrete allowedTools at its boundary.
       tool_capabilities: safeParseJson<string[] | null>(agent.tool_capabilities, null),
-      // Agent type (sre/coordinator/custom). Built-in types lock the capability
-      // set + persona at the box; custom uses tool_capabilities + system_prompt.
+      // Agent type (sre/coordinator/custom). Built-in types lock capabilities;
+      // system_prompt is the editable instruction for every type.
       agent_type: agent.agent_type ?? "custom",
     };
   });

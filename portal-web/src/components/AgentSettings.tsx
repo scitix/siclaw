@@ -7,6 +7,11 @@ import { AgentApiKeys } from "./AgentApiKeys"
 import { CapabilityGroupSelector } from "./CapabilityGroupSelector"
 import { toCapabilitySet } from "../lib/toolCapabilities"
 import { AGENT_TYPES, agentTypeOption, type AgentTypeKey } from "../lib/agentTypes"
+import {
+  diffAgentResourceBindings,
+  requiresLoadedResourceBindings,
+  type AgentResourceBindingIds,
+} from "../lib/agentResources"
 
 interface Agent {
   id: string; name: string; description: string; status: string
@@ -183,6 +188,8 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   // ── Data ──
   const [providers, setProviders] = useState<Provider[]>([])
   const [resources, setResources] = useState<AgentResources | null>(null)
+  const [resourceBaseline, setResourceBaseline] = useState<AgentResourceBindingIds | null>(null)
+  const [resourceLoadError, setResourceLoadError] = useState<string | null>(null)
   const [loadingResources, setLoadingResources] = useState(true)
   const [allClusters, setAllClusters] = useState<AvailableCluster[]>([])
   const [allHosts, setAllHosts] = useState<AvailableHost[]>([])
@@ -229,31 +236,62 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
   useEffect(() => {
     let cancelled = false
+    setResources(null)
+    setResourceBaseline(null)
+    setResourceLoadError(null)
+    setSelectedClusterIds(new Set())
+    setSelectedHostIds(new Set())
+    setSelectedSkillIds(new Set())
+    setSelectedMcpIds(new Set())
+    setSelectedChannelIds(new Set())
+    setSelectedKnowledgeRepoIds(new Set())
+    setSelectedDelegateIds(new Set())
     setLoadingResources(true)
     api<AgentResources>(`/agents/${agent.id}/resources`)
       .then(data => { if (!cancelled) setResources(data) })
-      .catch(() => { if (!cancelled) setResources(null) })
+      .catch(() => {
+        if (!cancelled) {
+          setResources(null)
+          setResourceLoadError("Resource bindings failed to load. Refresh and try again.")
+        }
+      })
       .finally(() => { if (!cancelled) setLoadingResources(false) })
     return () => { cancelled = true }
   }, [agent.id])
 
   useEffect(() => {
     if (resources) {
-      setSelectedClusterIds(new Set(resources.clusters?.map(c => c.id) || []))
-      setSelectedHostIds(new Set(resources.hosts?.map(h => h.id) || []))
-      setSelectedSkillIds(new Set(resources.skills?.map(s => s.id) || []))
-      setSelectedMcpIds(new Set(resources.mcp_servers?.map(m => m.id) || []))
-      setSelectedChannelIds(new Set(resources.channels?.map(c => c.id) || []))
-      setSelectedKnowledgeRepoIds(new Set(resources.knowledge_repos?.map((k: any) => k.id) || []))
-      setSelectedDelegateIds(new Set(resources.delegates?.map(d => d.id) || []))
+      const bindingIds: AgentResourceBindingIds = {
+        cluster_ids: resources.clusters?.map(c => c.id) || [],
+        host_ids: resources.hosts?.map(h => h.id) || [],
+        skill_ids: resources.skills?.map(s => s.id) || [],
+        mcp_server_ids: resources.mcp_servers?.map(m => m.id) || [],
+        channel_ids: resources.channels?.map(c => c.id) || [],
+        knowledge_repo_ids: resources.knowledge_repos?.map(k => k.id) || [],
+        delegate_agent_ids: resources.delegates?.map(d => d.id) || [],
+      }
+      setResourceBaseline(bindingIds)
+      setSelectedClusterIds(new Set(bindingIds.cluster_ids))
+      setSelectedHostIds(new Set(bindingIds.host_ids))
+      setSelectedSkillIds(new Set(bindingIds.skill_ids))
+      setSelectedMcpIds(new Set(bindingIds.mcp_server_ids))
+      setSelectedChannelIds(new Set(bindingIds.channel_ids))
+      setSelectedKnowledgeRepoIds(new Set(bindingIds.knowledge_repo_ids))
+      setSelectedDelegateIds(new Set(bindingIds.delegate_agent_ids))
     }
   }, [resources])
 
   const selectedProvider = providers.find(p => p.name === modelProvider)
   const availableModels = selectedProvider?.models || []
+  const activeTabNeedsResourceBindings = requiresLoadedResourceBindings(activeTab)
+  const resourceBindingsUnavailable = activeTabNeedsResourceBindings && resourceBaseline === null
 
   const handleSave = async () => {
     if (!name.trim()) return
+    if (resourceBindingsUnavailable) {
+      toast.error(resourceLoadError || "Resource bindings are still loading")
+      return
+    }
     let modelRouting: ModelRoutePolicy | null = null
     if (routingEnabled) {
       if (!modelProvider.trim() || !modelId.trim()) {
@@ -273,10 +311,25 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
         method: "PUT",
         body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, tool_capabilities: Array.from(selectedCapabilities), agent_type: agentType },
       })
-      await api(`/agents/${agent.id}/resources`, {
-        method: "PUT",
-        body: { cluster_ids: Array.from(selectedClusterIds), host_ids: Array.from(selectedHostIds), skill_ids: Array.from(selectedSkillIds), mcp_server_ids: Array.from(selectedMcpIds), channel_ids: Array.from(selectedChannelIds), knowledge_repo_ids: Array.from(selectedKnowledgeRepoIds), delegate_agent_ids: Array.from(selectedDelegateIds) },
-      })
+      const nextResourceBindings: AgentResourceBindingIds = {
+        cluster_ids: Array.from(selectedClusterIds),
+        host_ids: Array.from(selectedHostIds),
+        skill_ids: Array.from(selectedSkillIds),
+        mcp_server_ids: Array.from(selectedMcpIds),
+        channel_ids: Array.from(selectedChannelIds),
+        knowledge_repo_ids: Array.from(selectedKnowledgeRepoIds),
+        delegate_agent_ids: Array.from(selectedDelegateIds),
+      }
+      const resourceChanges = resourceBaseline
+        ? diffAgentResourceBindings(resourceBaseline, nextResourceBindings)
+        : {}
+      if (Object.keys(resourceChanges).length > 0) {
+        await api(`/agents/${agent.id}/resources`, {
+          method: "PUT",
+          body: resourceChanges,
+        })
+        setResourceBaseline(nextResourceBindings)
+      }
       onUpdate(updated)
       toast.success("Saved — agent will reload automatically")
     } catch (err: any) {
@@ -310,7 +363,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
         {showSave && (
           <button
             onClick={handleSave}
-            disabled={!name.trim() || saving}
+            disabled={!name.trim() || saving || resourceBindingsUnavailable}
             className="ml-auto flex items-center gap-1.5 h-8 px-3 text-[12px] rounded-md bg-primary text-primary-foreground disabled:opacity-50 hover:opacity-90 shrink-0"
           >
             {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
@@ -321,14 +374,19 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
       {/* Tab content */}
       <div className="flex-1 overflow-auto">
-        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} promptLocked={typeDef.lockedPrompt} typeLabel={typeDef.label} />}
+        {resourceLoadError && activeTabNeedsResourceBindings && (
+          <div role="alert" className="mx-6 mt-4 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+            {resourceLoadError}
+          </div>
+        )}
+        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} />}
         {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} routingEnabled={routingEnabled} setRoutingEnabled={setRoutingEnabled} fallbackCandidates={fallbackCandidates} setFallbackCandidates={setFallbackCandidates} />}
         {activeTab === "tools" && (
           <div className="px-6 py-6 space-y-4 max-w-2xl">
-            {/* Agent type — governs the capability set (and, for built-in types, the persona). */}
+            {/* Agent type governs the capability set and initial prompt default. */}
             <div>
               <h3 className="text-[13px] font-medium text-foreground">Agent type</h3>
-              <p className="text-[12px] text-muted-foreground mt-0.5">The type sets this agent's role. SRE / Coordinator lock the capabilities and the system prompt; Custom lets you choose both.</p>
+              <p className="text-[12px] text-muted-foreground mt-0.5">The type locks built-in capabilities and seeds an initial prompt. Every agent's prompt remains editable in Basic.</p>
               <div className="mt-2 space-y-1.5">
                 {AGENT_TYPES.map(t => (
                   <label key={t.key} className="flex items-start gap-2 p-2 rounded-md border border-border hover:bg-secondary/30 cursor-pointer">
@@ -538,11 +596,10 @@ function IdleTimeoutField({ value, onChange }: { value: number; onChange: (v: nu
   )
 }
 
-function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec, promptLocked, typeLabel }: {
+function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec }: {
   name: string; setName: (v: string) => void; description: string; setDescription: (v: string) => void
   systemPrompt: string; setSystemPrompt: (v: string) => void; isProduction: boolean; setIsProduction: (v: boolean) => void
   idleTimeoutSec: number; setIdleTimeoutSec: (v: number) => void
-  promptLocked: boolean; typeLabel: string
 }) {
   return (
     <div className="px-6 py-6 space-y-5 max-w-2xl">
@@ -556,13 +613,7 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
       </div>
       <div className="space-y-1.5">
         <label className="text-[12px] text-muted-foreground">System Prompt</label>
-        {promptLocked ? (
-          <p className="text-[12px] text-muted-foreground/70 rounded-md border border-border bg-secondary/30 px-3 py-2">
-            Defined by the <span className="font-medium text-foreground">{typeLabel}</span> type — this agent's system prompt is built in and not editable. Switch to a Custom agent to write your own.
-          </p>
-        ) : (
-          <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional system prompt..." />
-        )}
+        <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional agent identity and behavior instructions..." />
       </div>
       <IdleTimeoutField value={idleTimeoutSec} onChange={setIdleTimeoutSec} />
       <div className="space-y-2 pt-2">

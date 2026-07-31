@@ -45,7 +45,7 @@ import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
 import type { KubeconfigRef, SessionMode, DpStateRef, DelegationContext } from "../core/types.js";
 import type { DelegateToAgentExecutor, DelegateStep } from "../core/tool-registry.js";
-import { AGENT_TYPES, normalizeAgentType } from "../core/agent-types.js";
+import { effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js";
 import type { DelegateRosterMember } from "../shared/agent-delegate.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
@@ -150,6 +150,8 @@ export interface ManagedSession {
   _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
   _releaseTimer: ReturnType<typeof setTimeout> | null;
+  /** A config reload requires this in-memory brain to rebuild before its next idle prompt. */
+  _invalidated: boolean;
   /** Background work currently owned by this parent session (e.g. detached sub-agent jobs). */
   _backgroundWorkCount: number;
   /** Per-session model routing state, persisted as a sidecar under the session directory. */
@@ -340,8 +342,8 @@ export class AgentBoxSessionManager {
    */
   allowedToolsState: string[] | null = null;
 
-  /** Agent type (sre/coordinator/custom), fetched alongside allowedTools. Drives
-   *  the locked persona injected at session build. Default custom = no persona. */
+  /** Agent type (sre/coordinator/custom), fetched alongside allowedTools.
+   *  Drives capabilities and the legacy-row prompt fallback. */
   agentTypeState: string = "custom";
 
   /** Callback fired after a session is released — used by http-server to check idle status */
@@ -517,8 +519,30 @@ export class AgentBoxSessionManager {
   discardPendingNotifications(sessionId: string): void {
     const managed = this.sessions.get(sessionId);
     if (!managed) return;
+    this.discardPendingNotificationsFor(sessionId, managed);
+  }
+
+  private discardPendingNotificationsFor(sessionId: string, managed: ManagedSession): void {
+    // A queued synthetic turn can outlive an explicit close followed by a new
+    // session with the same id. Never let stale work drain or schedule release
+    // on that replacement.
+    if (this.sessions.get(sessionId) !== managed) return;
+    this.clearPendingNotificationState(managed);
+    // scheduleRelease() may have declined to arm while the notification buffer
+    // owned the session. Once Stop abandons that work, restore the ordinary
+    // lifecycle only if no prompt or detached owner is still using the brain.
+    if (
+      managed._backgroundWorkCount === 0 &&
+      managed._promptDone &&
+      !managed._promptInflight
+    ) {
+      this.scheduleRelease(sessionId);
+    }
+  }
+
+  private clearPendingNotificationState(managed: ManagedSession): void {
     managed._pendingNotifications.length = 0;
-    if (managed._coalesceTimer) {
+    if (managed._coalesceTimer !== null) {
       clearTimeout(managed._coalesceTimer);
       managed._coalesceTimer = null;
     }
@@ -1495,7 +1519,7 @@ export class AgentBoxSessionManager {
     // resets it. Do NOT flush a synthetic turn during the Stop window — that would wake the
     // model on a completion it cancelled ("comes back to life after Stop").
     if (managed._aborted) {
-      managed._pendingNotifications.length = 0;
+      this.discardPendingNotificationsFor(sessionId, managed);
       return;
     }
     if (!managed._promptDone) {
@@ -1538,7 +1562,10 @@ export class AgentBoxSessionManager {
         // Stop is terminal: if the user pressed Stop while this synthetic turn was queued, do
         // NOT start it (and do NOT followUp — that would ride a turn too). _aborted stays true
         // until the next real user prompt resets it. Checked under the queue, before the reset.
-        if (managed._aborted) return;
+        if (managed._aborted) {
+          this.discardPendingNotificationsFor(managed.id, managed);
+          return;
+        }
         // Re-check under the queue: an HTTP /prompt may have started since notifyParent
         // decided "idle". If so, degrade to followUp (delivered to that running turn).
         if (!managed._promptDone || managed._promptInflight) {
@@ -2305,6 +2332,14 @@ export class AgentBoxSessionManager {
    * After Phase 2, sessions are released after each prompt completes.
    * getOrCreate() restores from JSONL, reusing shared components for fast recovery.
    */
+  private async releaseForRebuild(sessionId: string, managed: ManagedSession): Promise<void> {
+    if (managed._releaseTimer) {
+      clearTimeout(managed._releaseTimer);
+      managed._releaseTimer = null;
+    }
+    await this.release(sessionId);
+  }
+
   async getOrCreate(
     sessionId?: string,
     mode?: SessionMode,
@@ -2317,43 +2352,66 @@ export class AgentBoxSessionManager {
     const existing = this.sessions.get(id);
     if (existing) {
       existing.lastActiveAt = new Date();
-      // Cancel pending release — session is being reused
-      if (existing._releaseTimer) {
-        clearTimeout(existing._releaseTimer);
-        existing._releaseTimer = null;
-        console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
-      }
-      // Reuse unless the operating mode OR the delegation tier changed mid-session
-      // (e.g. user toggled Deep Investigation, or a reused session id flips between a
-      // delegated and a direct turn): rebuild so tools scoped by `availableModes` /
-      // the read-only delegation filter are re-resolved. Don't rebuild mid-first-prompt.
-      const sameDelegation = delegationSignature(existing.delegation) === delegationSignature(delegation);
-      // Refresh the delegation CORRELATION on reuse. The tier is unchanged here (a tier
-      // change falls through to a rebuild below), but every delegation turn gets a NEW
-      // delegationId (and possibly parent ids). The tools read `refs.delegation` LIVE and
-      // it is the SAME object we store here (agent-factory passes it by reference), so an
-      // in-place update makes report_findings / request_input stamp the CURRENT call's id
-      // instead of the previous one — no rebuild needed, conversation preserved.
-      //
-      // ONLY when the session is idle: a concurrent continuation targeting the SAME busy
-      // peer session is rejected with 409 by the HTTP layer AFTER this getOrCreate returns
-      // — mutating the shared context first would stamp the running turn's later
-      // report_findings/request_input with the REJECTED request's id. The gate MUST match
-      // the 409 condition exactly (`!_promptDone || _promptInflight`): `_promptInflight`
-      // can be set while `_promptDone` is momentarily true during synthetic-parent-prompt
-      // setup (background-job completion turn), so check both.
-      if (sameDelegation && existing._promptDone && !existing._promptInflight && existing.delegation && delegation) {
-        existing.delegation.delegationId = delegation.delegationId;
-        existing.delegation.parentSessionId = delegation.parentSessionId;
-        existing.delegation.parentAgentId = delegation.parentAgentId;
-      }
-      if ((existing.activeMode === activeMode && sameDelegation) || !existing._promptDone) {
+      // Config invalidation is stronger than the ordinary release timer:
+      // even if the next message races the 0ms timer, an idle session must be
+      // rebuilt so it cannot run one extra turn with stale prompt/tool state.
+      if (
+        existing._invalidated &&
+        existing._promptDone &&
+        !existing._promptInflight &&
+        existing._backgroundWorkCount === 0 &&
+        !this.hasPendingNotificationWork(existing)
+      ) {
+        await this.releaseForRebuild(id, existing);
+      } else if (
+        existing._invalidated &&
+        (!existing._promptDone || existing._promptInflight)
+      ) {
+        // The active prompt still owns the brain. Return it so the ordinary
+        // busy-session boundary rejects/steers the concurrent turn. Detached
+        // background work does not own brain.prompt(), so an otherwise-idle
+        // invalidated session remains usable with its old prompt until that
+        // work finishes; scheduleRelease() then forces the deferred rebuild.
         return existing;
+      } else {
+        // Cancel pending release — session is being reused
+        if (existing._releaseTimer) {
+          clearTimeout(existing._releaseTimer);
+          existing._releaseTimer = null;
+          console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
+        }
+        // Reuse unless the operating mode OR the delegation tier changed mid-session
+        // (e.g. user toggled Deep Investigation, or a reused session id flips between a
+        // delegated and a direct turn): rebuild so tools scoped by `availableModes` /
+        // the read-only delegation filter are re-resolved. Don't rebuild mid-first-prompt.
+        const sameDelegation = delegationSignature(existing.delegation) === delegationSignature(delegation);
+        // Refresh the delegation CORRELATION on reuse. The tier is unchanged here (a tier
+        // change falls through to a rebuild below), but every delegation turn gets a NEW
+        // delegationId (and possibly parent ids). The tools read `refs.delegation` LIVE and
+        // it is the SAME object we store here (agent-factory passes it by reference), so an
+        // in-place update makes report_findings / request_input stamp the CURRENT call's id
+        // instead of the previous one — no rebuild needed, conversation preserved.
+        //
+        // ONLY when the session is idle: a concurrent continuation targeting the SAME busy
+        // peer session is rejected with 409 by the HTTP layer AFTER this getOrCreate returns
+        // — mutating the shared context first would stamp the running turn's later
+        // report_findings/request_input with the REJECTED request's id. The gate MUST match
+        // the 409 condition exactly (`!_promptDone || _promptInflight`): `_promptInflight`
+        // can be set while `_promptDone` is momentarily true during synthetic-parent-prompt
+        // setup (background-job completion turn), so check both.
+        if (sameDelegation && existing._promptDone && !existing._promptInflight && existing.delegation && delegation) {
+          existing.delegation.delegationId = delegation.delegationId;
+          existing.delegation.parentSessionId = delegation.parentSessionId;
+          existing.delegation.parentAgentId = delegation.parentAgentId;
+        }
+        if ((existing.activeMode === activeMode && sameDelegation) || !existing._promptDone) {
+          return existing;
+        }
+        console.log(
+          `[agentbox-session] Rebuilding session ${id} for mode change ${existing.activeMode}/${delegationSignature(existing.delegation)} -> ${activeMode}/${delegationSignature(delegation)}`,
+        );
+        await this.releaseForRebuild(id, existing);
       }
-      console.log(
-        `[agentbox-session] Rebuilding session ${id} for mode change ${existing.activeMode}/${delegationSignature(existing.delegation)} -> ${activeMode}/${delegationSignature(delegation)}`,
-      );
-      await this.release(id);
     }
 
     // Ensure shared components are ready
@@ -2524,17 +2582,22 @@ export class AgentBoxSessionManager {
       // global config.allowedTools in agent-factory — today's behaviour for any
       // agent that never set tool_capabilities).
       allowedTools: this.allowedToolsState,
-      systemPromptTemplate,
+      // The stored system_prompt is the agent-owned identity/behaviour
+      // instruction, not a replacement for Siclaw's platform prompt. Keep the
+      // platform template so safety/mode rules and dynamic context continue to
+      // be assembled by agent-factory.
+      systemPromptTemplate: undefined,
       // Delegated read-only turn: gate the toolset (agent-factory filters to
       // readOnlyDelegable + read file tools) and prepend the worker persona so
       // the model knows to end with report_findings.
       delegation,
-      // Worker (delegated read-only) persona takes precedence; otherwise the
-      // agent TYPE's locked persona (sre/coordinator). Custom = no append (uses
-      // the agent's own system_prompt).
+      // Persisted system_prompt replaces the built-in type default. Delegated
+      // read-only is an exclusive runtime constraint: composing it with an SRE
+      // or Coordinator identity would instruct the model to use tools that the
+      // read-only gate deliberately removed.
       systemPromptAppend: delegation?.readOnly
         ? DELEGATED_READONLY_PERSONA
-        : (AGENT_TYPES[normalizeAgentType(this.agentTypeState)].persona ?? undefined),
+        : effectiveAgentPrompt(normalizeAgentType(this.agentTypeState), systemPromptTemplate),
       // Coordinator side: expose delegate_to_agent + feed it the roster manifest.
       delegationRoster,
       delegateToAgentExecutor,
@@ -2588,6 +2651,7 @@ export class AgentBoxSessionManager {
       dpStateRef: result.dpStateRef,
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
+      _invalidated: false,
       _backgroundWorkCount: 0,
       modelRouteState,
       modelRoutePolicy: undefined,
@@ -2810,18 +2874,60 @@ export class AgentBoxSessionManager {
       return;
     }
 
+    // Completion notifications own the parent session until their coalescing
+    // window has drained into a synthetic turn. Releasing here would make
+    // flushPendingNotifications() find no session and silently lose the
+    // detached job/sub-agent result. The synthetic turn's finally block
+    // re-arms release after delivery; the aborted path does the same after
+    // explicitly discarding the notification.
+    if (this.hasPendingNotificationWork(managed)) {
+      console.log(
+        `[agentbox-session] Deferring release for session ${sessionId}; ` +
+        "a background completion notification is still pending",
+      );
+      return;
+    }
+
+    // A configuration invalidation is a mandatory rebuild, not an ordinary
+    // idle eviction. This also closes the recovery path when detached
+    // background work deferred the original 0ms schedule: whichever later
+    // caller re-arms release must still use 0ms rather than the idle TTL.
+    const effectiveTtlMs = managed._invalidated ? 0 : ttlMs;
+
     // Clear any existing timer
     if (managed._releaseTimer) {
       clearTimeout(managed._releaseTimer);
     }
 
-    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${ttlMs}ms`);
+    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${effectiveTtlMs}ms`);
     managed._releaseTimer = setTimeout(() => {
       managed._releaseTimer = null;
       this.release(sessionId).catch((err) => {
         console.warn(`[agentbox-session] Scheduled release failed for ${sessionId}:`, err);
       });
-    }, ttlMs);
+    }, effectiveTtlMs);
+  }
+
+  private hasPendingNotificationWork(managed: ManagedSession): boolean {
+    return managed._pendingNotifications.length > 0 || managed._coalesceTimer !== null;
+  }
+
+  /**
+   * Mark a warm session for mandatory rebuild before its next idle prompt.
+   * Busy turns are never torn down; their prompt-done callback schedules the
+   * release. The flag closes the race where getOrCreate() arrives before that
+   * 0ms timer and would otherwise cancel it and reuse stale configuration.
+   */
+  invalidate(sessionId: string): void {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+    managed._invalidated = true;
+    const schedule = () => this.scheduleRelease(sessionId, 0);
+    if (managed._promptDone && !managed._promptInflight) {
+      schedule();
+    } else {
+      managed._promptDoneCallbacks.add(schedule);
+    }
   }
 
   /**
@@ -2894,7 +3000,7 @@ export class AgentBoxSessionManager {
     // Guard: only delete if the map still holds the same instance — a new
     // getOrCreate() may have replaced it while release() was running async.
     if (this.sessions.get(sessionId) === managed) {
-      if (managed._coalesceTimer) { clearTimeout(managed._coalesceTimer); managed._coalesceTimer = null; }
+      this.clearPendingNotificationState(managed);
       this.sessions.delete(sessionId);
       this.teardownTracing(sessionId, managed);
       emitDiagnostic({ type: "session_released", sessionId });
@@ -2957,6 +3063,7 @@ export class AgentBoxSessionManager {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
       }
+      this.clearPendingNotificationState(managed);
       // Shutdown per-session MCP connections
       if (managed.mcpManager) {
         try {
@@ -3003,6 +3110,7 @@ export class AgentBoxSessionManager {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
       }
+      this.clearPendingNotificationState(managed);
       // Shutdown per-session MCP connections
       if (managed.mcpManager) {
         try {

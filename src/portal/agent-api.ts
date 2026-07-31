@@ -19,7 +19,7 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
-import { AGENT_TYPES, normalizeAgentType } from "../core/agent-types.js";
+import { AGENT_TYPES, effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
@@ -42,6 +42,16 @@ function decodeAgentRow<T extends Record<string, unknown>>(row: T): T {
     model_routing: safeParseJson(row.model_routing, null),
     tool_capabilities: safeParseJson(row.tool_capabilities, null),
   };
+}
+
+function normalizedPrompt(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizedToolCapabilities(value: unknown): string {
+  const parsed = safeParseJson<string[] | null>(value, null);
+  if (!Array.isArray(parsed) || parsed.length === 0) return "";
+  return JSON.stringify([...new Set(parsed)].sort());
 }
 
 
@@ -131,10 +141,10 @@ export function registerAgentRoutes(
         modelRouting ?? null,
         toolCapabilities ?? null,
         agentType,
-        // Built-in types (sre/coordinator) use a LOCKED persona — never store a
-        // Custom system_prompt for them (the runtime would use it as the base
-        // prompt and merely append the type persona). Only custom keeps its own.
-        agentType === "custom" ? (body.system_prompt ?? null) : null,
+        // Materialize the type default into the row so system_prompt becomes
+        // the agent's visible, editable instruction instead of a hidden runtime
+        // overlay. Custom agents keep their supplied prompt (or null).
+        effectiveAgentPrompt(agentType, body.system_prompt) ?? null,
         body.is_production ?? 1,
         normalizeIdleTimeoutSec(body.idle_timeout_sec),
         body.icon ?? null,
@@ -189,6 +199,71 @@ export function registerAgentRoutes(
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
+    let encodedToolCapabilities: string | null | undefined;
+    if ("tool_capabilities" in body) {
+      try {
+        encodedToolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+
+    // The Web settings form sends a complete snapshot on every Save. Read the
+    // fields whose side effects must be change-driven so an unrelated rename,
+    // model edit, or binding save does not invalidate warm sessions.
+    const needsCurrentState = ["idle_timeout_sec", "system_prompt", "agent_type", "is_production", "tool_capabilities"]
+      .some((field) => field in body);
+    let current: {
+      idle_timeout_sec?: unknown;
+      system_prompt?: unknown;
+      agent_type?: unknown;
+      is_production?: unknown;
+      tool_capabilities?: unknown;
+    } | undefined;
+    if (needsCurrentState) {
+      const [rows] = await db.query(
+        "SELECT idle_timeout_sec, system_prompt, agent_type, is_production, tool_capabilities FROM agents WHERE id = ?",
+        [params.id],
+      ) as any;
+      current = rows[0];
+    }
+
+    const currentAgentType = normalizeAgentType(current?.agent_type);
+    const nextAgentType = "agent_type" in body
+      ? normalizeAgentType(body.agent_type)
+      : currentAgentType;
+    const agentTypeChanged = "agent_type" in body && nextAgentType !== currentAgentType;
+
+    const promptSupplied = "system_prompt" in body;
+    let nextSystemPrompt = promptSupplied ? body.system_prompt : current?.system_prompt;
+    let resetToTypeDefault = false;
+    // A type switch from an unchanged textarea means "take the new type's
+    // initial prompt", not "pin the previous type's persona to new tools".
+    // An actually edited prompt remains authoritative. Custom has no default,
+    // so switching to it must retain the visible admin-authored prompt rather
+    // than silently replacing it with NULL.
+    if (
+      agentTypeChanged &&
+      (!promptSupplied || normalizedPrompt(body.system_prompt) === normalizedPrompt(current?.system_prompt))
+    ) {
+      const typeDefault = effectiveAgentPrompt(nextAgentType, null);
+      if (typeDefault !== undefined) {
+        nextSystemPrompt = typeDefault;
+        resetToTypeDefault = true;
+      }
+    }
+    const promptChanged =
+      (promptSupplied || agentTypeChanged) &&
+      normalizedPrompt(nextSystemPrompt) !== normalizedPrompt(current?.system_prompt);
+    const isProductionChanged =
+      "is_production" in body &&
+      current !== undefined &&
+      Boolean(body.is_production) !== Boolean(current.is_production);
+    const toolCapabilitiesChanged =
+      encodedToolCapabilities !== undefined &&
+      normalizedToolCapabilities(encodedToolCapabilities) !== normalizedToolCapabilities(current?.tool_capabilities);
+
     // Capture the current idle window before the update — needed to detect the
     // resident(0) → finite transition, which (unlike every other transition)
     // does NOT self-heal: a resident pod never self-destructs, so it never
@@ -197,34 +272,15 @@ export function registerAgentRoutes(
     let oldIdleTimeoutSec: number | null = null;
     let newIdleTimeoutSec: number | null = null;
     if ("idle_timeout_sec" in body) {
-      const [cur] = await db.query(
-        "SELECT idle_timeout_sec FROM agents WHERE id = ?",
-        [params.id],
-      ) as any;
       // Coerce to a number: the column is INT (drivers return a number), but a
       // stringified "0" would silently dodge the `=== 0` resident check below.
       // Keep null as null so a missing row can't read as 0 (Number(null) === 0).
-      const raw = cur[0]?.idle_timeout_sec;
+      const raw = current?.idle_timeout_sec;
       oldIdleTimeoutSec = raw == null ? null : Number(raw);
       // Normalize once here and reuse for both the SET clause and the
       // resident→finite terminate decision below.
       newIdleTimeoutSec = normalizeIdleTimeoutSec(body.idle_timeout_sec);
     }
-
-    // Built-in agent types (sre/coordinator) use a LOCKED persona and must NOT
-    // carry a Custom system_prompt (the runtime would use it as the base prompt
-    // and merely append the type persona → contradictory hidden instructions).
-    // Determine the EFFECTIVE type post-update (body override, else the stored
-    // value) and force system_prompt to null for non-custom — the UI hides the
-    // field for built-in types but still submits its stale value.
-    let effectiveAgentType: string | null = null;
-    if ("agent_type" in body) {
-      effectiveAgentType = normalizeAgentType(body.agent_type);
-    } else if ("system_prompt" in body) {
-      const [cur] = await db.query("SELECT agent_type FROM agents WHERE id = ?", [params.id]) as any;
-      effectiveAgentType = normalizeAgentType(cur[0]?.agent_type);
-    }
-    const forceNullPrompt = effectiveAgentType !== null && effectiveAgentType !== "custom";
 
     // Build dynamic SET clause
     const fields = [
@@ -236,12 +292,12 @@ export function registerAgentRoutes(
 
     for (const field of fields) {
       if (field in body) {
-        if (field === "system_prompt" && forceNullPrompt) {
-          setClauses.push("system_prompt = ?");
-          values.push(null);
-        } else if (field === "agent_type") {
+        if (field === "agent_type") {
           setClauses.push("agent_type = ?");
-          values.push(normalizeAgentType(body.agent_type));
+          values.push(nextAgentType);
+        } else if (field === "system_prompt") {
+          setClauses.push("system_prompt = ?");
+          values.push(nextSystemPrompt);
         } else {
           setClauses.push(`${field} = ?`);
           // newIdleTimeoutSec is non-null here: field === "idle_timeout_sec" implies
@@ -250,11 +306,11 @@ export function registerAgentRoutes(
         }
       }
     }
-    // Switching to a built-in type without an explicit system_prompt in the body:
-    // still clear any stale Custom prompt left on the row.
-    if (forceNullPrompt && !("system_prompt" in body)) {
+    // If a caller changes the type without supplying a prompt, initialize the
+    // new type's default as the editable row truth.
+    if (agentTypeChanged && !promptSupplied && resetToTypeDefault) {
       setClauses.push("system_prompt = ?");
-      values.push(null);
+      values.push(nextSystemPrompt);
     }
     if ("model_routing" in body) {
       try {
@@ -269,19 +325,9 @@ export function registerAgentRoutes(
       }
     }
 
-    let toolCapabilitiesChanged = false;
-    if ("tool_capabilities" in body) {
-      try {
-        const toolCapabilities = encodeToolCapabilitiesForDb(body.tool_capabilities);
-        if (toolCapabilities !== undefined) {
-          setClauses.push("tool_capabilities = ?");
-          values.push(toolCapabilities);
-          toolCapabilitiesChanged = true;
-        }
-      } catch (err) {
-        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
-        return;
-      }
+    if (encodedToolCapabilities !== undefined) {
+      setClauses.push("tool_capabilities = ?");
+      values.push(encodedToolCapabilities);
     }
 
     if (setClauses.length === 0) {
@@ -301,21 +347,42 @@ export function registerAgentRoutes(
       return;
     }
 
-    sendJson(res, 200, decodeAgentRow(rows[0]));
-
     // is_production change affects skills bundle (prod=approved only, dev=all)
     // and also the visible cluster/host set — credential-list filters out
     // cross-env bindings, so the AgentBox must drop its cached list.
-    if ("is_production" in body) {
-      connectionMap.notify(params.id, "agent.reload", { resources: ["skills", "cluster", "host"] });
+    if (isProductionChanged) {
+      connectionMap.notify(params.id, "agent.reload", {
+        agentId: params.id,
+        resources: ["skills", "cluster", "host"],
+      });
     }
 
-    // tool_capabilities OR agent_type change → push a tools reload so the active
-    // AgentBox re-fetches its whitelist + type (caps/persona are type-locked) and
-    // invalidates live sessions (mid-turn-safe).
-    if (toolCapabilitiesChanged || ("agent_type" in body)) {
-      connectionMap.notify(params.id, "agent.reload", { agentId: params.id, resources: ["tools"] });
+    // Capability/type changes rebuild the tool surface. Prompt/type changes
+    // invalidate warm sessions so the next turn immediately restores with the
+    // latest editable prompt (no AgentBox kill and no 30s idle wait).
+    const reloadResources: string[] = [];
+    if (toolCapabilitiesChanged || agentTypeChanged) reloadResources.push("tools");
+    if (promptChanged) reloadResources.push("prompt");
+    if (reloadResources.length > 0) {
+      const payload = { agentId: params.id, resources: reloadResources };
+      if (reloadResources.includes("prompt")) {
+        // Order the successful save response after Runtime/AgentBox has
+        // invalidated warm sessions. Persistence still succeeds if Runtime is
+        // offline; the next cold box resolves the latest row.
+        try {
+          const result = await connectionMap.sendCommand(params.id, "agent.reload", payload);
+          if (!result.ok) {
+            console.warn(`[agent-api] prompt saved but hot reload was not acknowledged for ${params.id}: ${result.error}`);
+          }
+        } catch (err) {
+          console.warn(`[agent-api] prompt saved but hot reload failed for ${params.id}:`, err);
+        }
+      } else {
+        connectionMap.notify(params.id, "agent.reload", payload);
+      }
     }
+
+    sendJson(res, 200, decodeAgentRow(rows[0]));
 
     // Idle window changed from resident (0) → finite: the running box is
     // resident and will never self-destruct, so it would never cold-spawn to
@@ -461,11 +528,28 @@ export function registerAgentRoutes(
 
     sendJson(res, 200, { ok: true });
 
-    // Notify running AgentBox to reload (fire-and-forget)
-    connectionMap.notify(params.id, "agent.reload", { agentId: params.id });
+    // Reload only the resource surfaces the caller actually changed. In
+    // particular, omitting the default MCP fan-out prevents an unrelated
+    // cluster/skill/channel save from invalidating every warm brain.
+    const reloadResources = [
+      ...(body.cluster_ids !== undefined ? ["cluster"] : []),
+      ...(body.host_ids !== undefined ? ["host"] : []),
+      ...(body.skill_ids !== undefined ? ["skills"] : []),
+      ...(body.mcp_server_ids !== undefined ? ["mcp"] : []),
+      ...(body.knowledge_repo_ids !== undefined ? ["knowledge"] : []),
+      ...(body.delegate_agent_ids !== undefined ? ["tools"] : []),
+    ];
+    if (reloadResources.length > 0) {
+      connectionMap.notify(params.id, "agent.reload", {
+        agentId: params.id,
+        resources: reloadResources,
+      });
+    }
     // This agent's cluster/host bindings changed → its coverage in any coordinator's
     // roster is now stale; refresh the coordinators that delegate to it.
-    void notifyCoordinatorsForMembers(connectionMap, [params.id]);
+    if (body.cluster_ids !== undefined || body.host_ids !== undefined) {
+      void notifyCoordinatorsForMembers(connectionMap, [params.id]);
+    }
   });
 
   // GET /api/v1/agents/:id/resources — get bindings

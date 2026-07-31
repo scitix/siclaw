@@ -1,21 +1,20 @@
 /**
- * Agent types — the top-level "kind" of an agent, which (for the built-in types)
- * LOCKS its capability set and its system-prompt persona. Picking a type at
- * creation means the operator doesn't hand-pick tools or write a prompt; the
- * type defines both.
+ * Agent types — the top-level "kind" of an agent. Built-in types lock their
+ * capability set and provide an INITIAL agent prompt. The prompt is a creation
+ * default, not a hidden runtime overlay: once persisted, the agent's own
+ * system_prompt is the single editable identity/behaviour instruction.
  *
  *   - sre         — a specialist that operates hands-on within its authorized
- *                   clusters/hosts (full read + exec + scripts). Persona fixed.
+ *                   clusters/hosts (full read + exec + scripts).
  *   - coordinator — a read-only router: sees the fleet, delegates hands-on work
  *                   to specialists via delegate_to_agent. No skills by default.
- *                   Persona fixed.
+ *                   Starts with a routing-focused default prompt.
  *   - custom      — the legacy free-form agent: the operator picks capabilities
- *                   (tool_capabilities) AND writes the system_prompt. Nothing is
- *                   locked. Existing agents map here (zero behaviour change).
+ *                   (tool_capabilities). Existing agents map here.
  *
  * `capabilities` are CAPABILITY_GROUPS keys (src/core/tool-capabilities.ts);
- * null means "use the agent's own tool_capabilities" (custom). `persona` is a
- * systemPromptAppend; null means "use the agent's own system_prompt" (custom).
+ * null means "use the agent's own tool_capabilities" (custom). `defaultPrompt`
+ * is used only when the persisted system_prompt is absent.
  */
 
 export type AgentType = "sre" | "coordinator" | "custom";
@@ -25,18 +24,18 @@ export interface AgentTypeDef {
   description: string;
   /** Locked capability-group keys, or null to use the agent's own selection (custom). */
   capabilities: string[] | null;
-  /** Locked system-prompt persona, or null to use the agent's own system_prompt (custom). */
-  persona: string | null;
+  /** Initial/fallback agent identity prompt. Persisted system_prompt wins. */
+  defaultPrompt: string | null;
   /** Built-in default: whether this type should start with NO skills bound. */
   defaultNoSkills: boolean;
 }
 
-const SRE_PERSONA =
+export const SRE_DEFAULT_PROMPT =
   "You are a specialist SRE agent. You work hands-on within the clusters and hosts you are authorized " +
   "for: inspect, diagnose, and (only when explicitly asked) remediate, using your tools and skills. " +
   "Take the task end to end and report concrete, evidence-backed findings.";
 
-const COORDINATOR_PERSONA =
+export const COORDINATOR_DEFAULT_PROMPT =
   "You are a COORDINATOR whose ONLY job is ROUTING. To route: (1) determine the TARGET resource (cluster / " +
   "host / node) from the user's request; (2) call `list_delegates` with query=<that target> to find WHICH " +
   "delegate is bound to it — this authoritative coverage lookup (NOT your own cluster_list, which is YOUR " +
@@ -84,21 +83,21 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
     label: "SRE Agent",
     description: "Hands-on specialist: inspects, diagnoses and remediates within its authorized clusters/hosts.",
     capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "search_memory", "plan_tasks", "session_output"],
-    persona: SRE_PERSONA,
+    defaultPrompt: SRE_DEFAULT_PROMPT,
     defaultNoSkills: false,
   },
   coordinator: {
     label: "Coordinator Agent",
     description: "Read-only router: sees the fleet and delegates hands-on troubleshooting to specialist agents.",
     capabilities: ["inspect_infra", "read_files", "search_memory", "delegate_agents"],
-    persona: COORDINATOR_PERSONA,
+    defaultPrompt: COORDINATOR_DEFAULT_PROMPT,
     defaultNoSkills: true,
   },
   custom: {
     label: "Custom Agent",
     description: "Free-form: you pick the tool capabilities and write the system prompt yourself.",
     capabilities: null,
-    persona: null,
+    defaultPrompt: null,
     defaultNoSkills: false,
   },
 };
@@ -116,4 +115,20 @@ export function normalizeAgentType(v: unknown): AgentType {
 export function effectiveCapabilityKeys(agentType: AgentType, ownToolCapabilities: string[] | null): string[] | null {
   const def = AGENT_TYPES[agentType];
   return def.capabilities ?? ownToolCapabilities;
+}
+
+/**
+ * Resolve the agent-owned identity/behaviour instruction. A non-empty persisted
+ * prompt is authoritative for every agent type. Built-in defaults are only a
+ * compatibility/creation fallback for rows that have not materialized one yet.
+ *
+ * This is intentionally separate from the platform prompt assembled by
+ * buildSreSystemPrompt(): runtime safety/mode instructions and dynamic
+ * skill/knowledge/MCP context remain platform-owned.
+ */
+export function effectiveAgentPrompt(agentType: AgentType, storedPrompt: unknown): string | undefined {
+  if (typeof storedPrompt === "string" && storedPrompt.trim()) {
+    return storedPrompt.trim();
+  }
+  return AGENT_TYPES[agentType].defaultPrompt ?? undefined;
 }

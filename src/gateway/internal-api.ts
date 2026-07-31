@@ -293,7 +293,7 @@ export async function handleToolCapabilities(
     const agentType = normalizeAgentType(agent?.agent_type);
     const capsKeys = effectiveCapabilityKeys(agentType, (agent?.tool_capabilities ?? null) as string[] | null);
     const allowedTools = resolveCapabilities(capsKeys);
-    // agentType rides along so the box can apply the type's locked persona.
+    // agentType rides along for capabilities and legacy-row prompt fallback.
     sendJson(res, 200, { allowedTools, agentType });
   } catch (err) {
     console.error("[internal-api] tool-capabilities error:", err);

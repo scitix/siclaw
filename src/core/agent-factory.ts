@@ -619,9 +619,6 @@ export async function createSiclawSession(
     ? opts.portalCredentialsDir
     : (kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir));
 
-  // Agent system prompt append (shared between pi-agent and SDK brain)
-  const agentSystemPromptAppend = opts?.systemPromptAppend;
-
   // Forward-declared so the CLI-only /ls extension factory can close over it.
   // Safe because extension command handlers run long after the constructor
   // returns.
@@ -659,14 +656,14 @@ export async function createSiclawSession(
     authStorage,
     modelRegistry,
     resourceLoaderOptions: {
-      systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
-      appendSystemPromptOverride: () => {
-        const parts = buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir);
-        if (agentSystemPromptAppend) {
-          parts.push("\n\n" + agentSystemPromptAppend);
-        }
-        return parts;
-      },
+      // Agent-owned identity is rendered inside the assembled prompt before
+      // the hardcoded Safety section. Dynamic profile/knowledge context stays
+      // in the resource-loader append, but admin text no longer has recency
+      // precedence over platform safety.
+      systemPromptOverride: () =>
+        buildSreSystemPrompt(mode, opts?.systemPromptTemplate, opts?.systemPromptAppend),
+      appendSystemPromptOverride: () =>
+        buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir),
       // Extension registration order: compactionSafeguard handles session_before_compact.
       extensionFactories: [
         contextPruningExtension,

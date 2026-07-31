@@ -36,6 +36,14 @@ interface McpPayload {
   mcpServers: Record<string, unknown>;
 }
 
+/** Apply the shared immutable-session invalidation contract consistently. */
+function invalidateSessions(context: ReloadContext): void {
+  if (!context.sessions?.length) return;
+  for (const session of context.sessions) {
+    session.invalidate?.();
+  }
+}
+
 export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
   type: "mcp",
 
@@ -70,10 +78,30 @@ export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
     //
     // See docs/design/mcp-session-lifecycle.md for the full contract.
     reloadConfig();
-    if (!context.sessions?.length) return;
-    for (const session of context.sessions) {
-      session.invalidate?.();
-    }
+    invalidateSessions(context);
+  },
+};
+
+// ── Prompt handler ───────────────────────────────────────────────────
+
+/**
+ * Prompt values are resolved per message by the Gateway, so there is no
+ * AgentBox-local payload to materialize. A reload invalidates warm sessions:
+ * an in-flight turn finishes with its original prompt, while the next turn
+ * restores the same JSONL conversation into a freshly-built brain carrying
+ * the latest prompt. This removes the 30s idle-TTL delay without killing the
+ * AgentBox process.
+ */
+export const promptHandler: AgentBoxSyncHandler<null> = {
+  type: "prompt",
+  async fetch(): Promise<null> {
+    return null;
+  },
+  async materialize(): Promise<number> {
+    return 0;
+  },
+  async postReload(context: ReloadContext): Promise<void> {
+    invalidateSessions(context);
   },
 };
 
@@ -529,7 +557,7 @@ export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler
  */
 interface ToolsPayload {
   allowedTools: string[] | null;
-  /** Agent type (sre/coordinator/custom) — drives the box's locked persona. */
+  /** Agent type (sre/coordinator/custom) — drives capabilities and prompt fallback. */
   agentType?: string;
 }
 
@@ -541,7 +569,7 @@ interface ToolsPayload {
  */
 export interface ToolsStateTarget {
   allowedToolsState: string[] | null;
-  /** Agent type resolved from the tool-capabilities payload; drives the persona. */
+  /** Agent type resolved from the tool-capabilities payload. */
   agentTypeState?: string;
 }
 
@@ -589,10 +617,7 @@ export function createToolsHandler(
       // session at creation time, so a live session must be rebuilt to pick up
       // a new whitelist. invalidate() defers the release until any in-flight
       // prompt completes, so tool execution is not torn down mid-turn.
-      if (!context.sessions?.length) return;
-      for (const session of context.sessions) {
-        session.invalidate?.();
-      }
+      invalidateSessions(context);
     },
   };
 }
@@ -603,12 +628,12 @@ const handlers = new Map<GatewaySyncType, AgentBoxSyncHandler<any>>([
   ["mcp", mcpHandler],
   ["skills", skillsHandler],
   ["knowledge", knowledgeHandler],
+  ["prompt", promptHandler],
 ]);
 
 /**
- * Look up the static handler for a given sync type. Only mcp and skills
- * are registered here — their handlers are process-global and carry no
- * per-session state.
+ * Look up the static handler for a given sync type. MCP, skills, knowledge and
+ * prompt are process-global and carry no per-box broker state.
  *
  * cluster/host handlers are NOT registered in this map: each AgentBox
  * httpServer constructs its own factory-bound instance (closing over

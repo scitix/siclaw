@@ -322,20 +322,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         const promptMessageId = await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
 
-        // System-prompt precedence for the box session. An explicit
+        // Agent-prompt precedence for the box session. An explicit
         // params.systemPrompt (the portal-standalone path stamps it from the
         // agent's model binding) wins as-is. When the caller does NOT forward one
         // — e.g. sicore's web-chat proxy, which never sends systemPrompt — fall
-        // back to the agent's own custom template (agents.system_prompt via
-        // config.getAgent). Without this fallback a custom-prompt agent silently
-        // got AgentBox's built-in default SRE persona on the web path, even though
-        // the channel paths (dingtalk/lark) already resolved it and worked.
+        // back to the agent's persisted instruction (agents.system_prompt via
+        // config.getAgent). Every agent type uses the same precedence.
         //
         // Best-effort: resolveAgentSystemPrompt swallows RPC errors and returns
-        // undefined (no custom prompt / lookup failed) → built-in default, so a
-        // lookup failure never turns into a chat failure. AgentBox applies the
-        // template only at session creation, so this affects NEW sessions; a warm
-        // multi-turn session keeps the prompt it was created with (unchanged).
+        // undefined (no prompt / lookup failed) → type default, so a lookup
+        // failure never turns into a chat failure. Prompt publication invalidates
+        // warm sessions, so the next turn rebuilds with the latest value.
         if (promptOpts.systemPromptTemplate === undefined) {
           promptOpts.systemPromptTemplate = await resolveAgentSystemPrompt(agentId, frontendClient);
         }
@@ -1210,6 +1207,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // All types route through GATEWAY_SYNC_DESCRIPTORS — the legacy
     // "credentials" umbrella type is replaced by the more granular
     // "cluster" + "host" so CRUD events can notify only what changed.
+    // Prompt invalidation is intentionally explicit. The resources endpoint
+    // omits `resources` for its legacy all-bindings refresh; including prompt
+    // here would rebuild every warm brain for unrelated binding changes.
     const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "cluster", "host", "knowledge"];
 
     const boxes = await agentBoxManager.list();

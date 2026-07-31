@@ -238,16 +238,34 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(s._releaseTimer).toBeNull();
   });
 
-  it("passes effectiveMode and systemPromptTemplate through to createSiclawSession", async () => {
+  it("keeps the platform template and appends the persisted agent prompt", async () => {
     const mgr = new AgentBoxSessionManager();
     mgr.userId = "alice";
     mgr.agentId = "agent-a";
     await mgr.getOrCreate("sess-1", "channel", "custom prompt");
     const opts = lastCreateSiclawSession.calls[0];
     expect(opts.mode).toBe("channel");
-    expect(opts.systemPromptTemplate).toBe("custom prompt");
+    expect(opts.systemPromptTemplate).toBeUndefined();
+    expect(opts.systemPromptAppend).toBe("custom prompt");
     expect(opts.userId).toBe("alice");
     expect(opts.agentId).toBe("agent-a");
+  });
+
+  it("uses the delegated read-only persona exclusively", async () => {
+    const mgr = new AgentBoxSessionManager();
+    mgr.agentTypeState = "sre";
+    await mgr.getOrCreate(
+      "sess-readonly",
+      "web",
+      "custom prompt that says to remediate",
+      "normal",
+      { delegationId: "d1", readOnly: true },
+    );
+
+    const opts = lastCreateSiclawSession.calls.at(-1);
+    expect(opts.systemPromptAppend).toMatch(/read-only/i);
+    expect(opts.systemPromptAppend).not.toContain("custom prompt that says to remediate");
+    expect(opts.systemPromptAppend).not.toContain("Take the task end to end");
   });
 
   it("defaults mode to 'web' when none supplied", async () => {
@@ -337,22 +355,51 @@ describe("AgentBoxSessionManager — release", () => {
 });
 
 describe("AgentBoxSessionManager — close + closeAll", () => {
-  it("close removes the session and clears any release timer", async () => {
-    const mgr = new AgentBoxSessionManager();
-    const s = await mgr.getOrCreate("sess-1");
-    mgr.scheduleRelease("sess-1");
-    await mgr.close("sess-1");
-    expect(mgr.activeCount()).toBe(0);
-    expect(s._releaseTimer).toBeNull();
+  it("close removes the session and clears release + notification timers", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      const s = await mgr.getOrCreate("sess-1");
+      let staleNotificationFired = false;
+      mgr.scheduleRelease("sess-1");
+      expect(s._releaseTimer).not.toBeNull();
+      s._pendingNotifications.push({ taskId: "job-1", status: "completed" });
+      s._coalesceTimer = setTimeout(() => { staleNotificationFired = true; }, 600);
+
+      await mgr.close("sess-1");
+
+      expect(mgr.activeCount()).toBe(0);
+      expect(s._releaseTimer).toBeNull();
+      expect(s._coalesceTimer).toBeNull();
+      expect(s._pendingNotifications).toHaveLength(0);
+      await vi.runAllTimersAsync();
+      expect(staleNotificationFired).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("closeAll snapshots and clears all sessions", async () => {
-    const mgr = new AgentBoxSessionManager();
-    await mgr.getOrCreate("a");
-    await mgr.getOrCreate("b");
-    expect(mgr.activeCount()).toBe(2);
-    await mgr.closeAll();
-    expect(mgr.activeCount()).toBe(0);
+  it("closeAll snapshots sessions and clears their notification timers", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      const a = await mgr.getOrCreate("a");
+      const b = await mgr.getOrCreate("b");
+      let staleNotificationFired = false;
+      a._coalesceTimer = setTimeout(() => { staleNotificationFired = true; }, 600);
+      b._coalesceTimer = setTimeout(() => { staleNotificationFired = true; }, 600);
+      expect(mgr.activeCount()).toBe(2);
+
+      await mgr.closeAll();
+
+      expect(mgr.activeCount()).toBe(0);
+      expect(a._coalesceTimer).toBeNull();
+      expect(b._coalesceTimer).toBeNull();
+      await vi.runAllTimersAsync();
+      expect(staleNotificationFired).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -389,6 +436,81 @@ describe("AgentBoxSessionManager — scheduleRelease", () => {
     const t2 = s._releaseTimer;
     expect(t1).not.toBe(t2);
     clearTimeout(t2 as NodeJS.Timeout);
+  });
+});
+
+describe("AgentBoxSessionManager — invalidate", () => {
+  it("forces an idle session to rebuild even when getOrCreate races the zero-delay release", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
+      mgr.invalidate("sess-1");
+      expect(first._invalidated).toBe(true);
+
+      const second = await mgr.getOrCreate("sess-1", "web", "new prompt");
+      expect(second).not.toBe(first);
+      const opts = lastCreateSiclawSession.calls.at(-1);
+      expect(opts.systemPromptAppend).toBe("new prompt");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("defers invalidation until a busy prompt completes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
+    first._promptDone = false;
+    mgr.invalidate("sess-1");
+
+    expect(await mgr.getOrCreate("sess-1", "web", "new prompt")).toBe(first);
+    expect(first._invalidated).toBe(true);
+  });
+
+  it("serves the old brain during detached work, then rebuilds immediately", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
+      first._backgroundWorkCount = 1;
+      mgr.invalidate("sess-1");
+
+      expect(await mgr.getOrCreate("sess-1", "web", "new prompt")).toBe(first);
+      expect(first._invalidated).toBe(true);
+
+      // Model the detached job completing. Even though this call asks for the
+      // ordinary idle TTL, invalidation upgrades it to an immediate rebuild.
+      first._backgroundWorkCount = 0;
+      mgr.scheduleRelease("sess-1");
+      await vi.runAllTimersAsync();
+
+      const rebuilt = await mgr.getOrCreate("sess-1", "web", "new prompt");
+      expect(rebuilt).not.toBe(first);
+      expect(lastCreateSiclawSession.calls.at(-1).systemPromptAppend).toBe("new prompt");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not rebuild an invalidated session while a completion notification is pending", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
+      first._pendingNotifications.push({
+        taskId: "job-1",
+        status: "completed",
+        summary: "done",
+      });
+      first._coalesceTimer = setTimeout(() => {}, 600);
+
+      mgr.invalidate("sess-1");
+
+      expect(await mgr.getOrCreate("sess-1", "web", "new prompt")).toBe(first);
+      expect(first._invalidated).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

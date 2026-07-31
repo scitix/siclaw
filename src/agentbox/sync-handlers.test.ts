@@ -9,6 +9,7 @@ import {
   createToolsHandler,
   knowledgeHandler,
   mcpHandler,
+  promptHandler,
   skillsHandler,
 } from "./sync-handlers.js";
 import { knowledgeRepoDirName } from "../shared/knowledge-package.js";
@@ -275,6 +276,20 @@ describe("mcpHandler.postReload", () => {
     await expect(
       mcpHandler.postReload!({ sessions: [{ id: "s1", brain: dummyBrain }] }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("promptHandler.postReload", () => {
+  const dummyBrain = { reload: async () => {} };
+
+  it("invalidates warm sessions without fetching or materializing state", async () => {
+    const invalidate = vi.fn();
+    await expect(promptHandler.fetch(null)).resolves.toBeNull();
+    await expect(promptHandler.materialize(null)).resolves.toBe(0);
+    await promptHandler.postReload!({
+      sessions: [{ id: "s1", brain: dummyBrain, invalidate }],
+    });
+    expect(invalidate).toHaveBeenCalledOnce();
   });
 });
 

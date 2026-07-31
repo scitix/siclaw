@@ -83,6 +83,30 @@ describe("notifyParent", () => {
     expect(brain.followUp).not.toHaveBeenCalled();
   });
 
+  it("delivers a coalesced completion before releasing an invalidated parent", async () => {
+    const { mgr, brain, managed } = setup(true);
+    managed._invalidated = true;
+
+    await mgr.notifyParent("s1", "j1", {
+      taskId: "j1",
+      outputFile: "/o",
+      status: "completed",
+      summary: "done",
+    });
+
+    // Match the real settle ordering: notifyParent buffers first, then the
+    // detached owner decrements to zero and asks the manager to release.
+    mgr.releaseBackgroundWork("s1");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mgr.sessions.get("s1")).toBe(managed);
+    expect(brain.prompt).not.toHaveBeenCalled();
+
+    await flushCoalesce();
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+    expect(brain.prompt.mock.calls[0][0]).toContain("<task_notification>");
+  });
+
   it("coalesces a burst of idle completions into ONE synthetic turn", async () => {
     const { mgr, brain } = setup(true);
     mgr.jobs.register({
@@ -130,6 +154,39 @@ describe("notifyParent", () => {
     expect(managed._coalesceTimer).toBeNull();
     await flushCoalesce();
     expect(brain.prompt).not.toHaveBeenCalled();
+  });
+
+  it("re-arms an immediate release after Stop discards an invalidated completion", async () => {
+    const { mgr, brain, managed } = setup(true);
+    managed._backgroundWorkCount = 0;
+    managed._invalidated = true;
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "completed", summary: "done" });
+
+    mgr.scheduleRelease("s1");
+    expect(managed._releaseTimer ?? null).toBeNull();
+
+    mgr.discardPendingNotifications("s1");
+    expect(managed._pendingNotifications).toHaveLength(0);
+    expect(managed._coalesceTimer).toBeNull();
+    expect(managed._releaseTimer).not.toBeNull();
+    expect(brain.prompt).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mgr.sessions.has("s1")).toBe(false);
+  });
+
+  it("re-arms release when Stop reaches a queued synthetic turn", async () => {
+    const { mgr, brain, managed } = setup(true);
+    managed._backgroundWorkCount = 0;
+    managed._invalidated = true;
+    managed._aborted = true;
+
+    await mgr.runSyntheticPrompt(managed, "completion");
+
+    expect(brain.prompt).not.toHaveBeenCalled();
+    expect(managed._releaseTimer).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mgr.sessions.has("s1")).toBe(false);
   });
 
   it("restores _promptDone after a synthetic turn", async () => {

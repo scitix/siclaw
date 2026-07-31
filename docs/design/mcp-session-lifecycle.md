@@ -86,7 +86,9 @@ Portal mutation → Upstream notify → Gateway notify → AgentBox /api/reload-
   → handler.postReload(context)
        └→ for each session: session.invalidate()
              ├── prompt-in-flight? register post-prompt callback → release()
-             └── idle?             release() immediately
+             ├── idle/quiescent?   release() immediately
+             └── detached work?    keep serving the old brain; release as
+                                   soon as detached ownership reaches zero
 ```
 
 `release()` runs `McpClientManager.shutdown()`, which drops transports
@@ -94,10 +96,20 @@ and revokes the ability to call any `mcp__*` tool. The session is
 removed from the map; the next user prompt triggers `getOrCreate()`
 with fresh config — conversation history intact.
 
-Effect: **Delete / Toggle-off take effect as soon as the current turn
-finishes**, not after 30 s idle. For Update (where the server still
-exists), the rebuild also happens but carries no security
+Effect: **Delete / Toggle-off normally take effect as soon as the current turn
+finishes**, not after 30 s idle. A session with detached background ownership
+is the explicit exception described below: it continues temporarily with its
+old immutable MCP toolset until that ownership and any buffered completion
+notification drain. This residual exposure is accepted so a long-running job
+is neither torn down nor loses its completion result. For Update (where the
+server still exists), the rebuild also happens but carries no security
 implication; the extra work is cheap.
+
+Detached jobs do not hold `brain.prompt()`, so invalidation must not make chat
+unavailable for the lifetime of a long-running background command or sub-agent
+group. The session remains marked invalid, continues with its old immutable
+configuration while detached work owns it, and upgrades the next release
+schedule to immediate after any buffered completion notification is delivered.
 
 ### 3.3 Explicit session close
 
