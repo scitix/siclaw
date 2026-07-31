@@ -129,6 +129,9 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
     await brain.prompt("q");
     expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining("Empty response persisted after 0 retries, stopReason=error"),
+    );
   });
 
   it("prompt retries up to MAX_EMPTY_RETRIES when content is empty", async () => {

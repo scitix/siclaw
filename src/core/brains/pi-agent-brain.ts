@@ -159,7 +159,7 @@ export class PiAgentBrain implements BrainSession {
       if (!lastAssistantHadContent && !this.aborted) {
         const msg = lastAssistantMessage;
         console.error(
-          `[pi-agent-brain] Empty response persisted after ${PiAgentBrain.MAX_EMPTY_RETRIES} retries, ` +
+          `[pi-agent-brain] Empty response persisted after ${retries} retries, ` +
           `stopReason=${msg?.stopReason ?? "unknown"}, ` +
           `model=${msg?.model ?? "unknown"}, ` +
           `usage=${JSON.stringify(msg?.usage ?? {})}`,
