@@ -460,6 +460,14 @@ def _arm_test_turn(run: "TestRun") -> None:
 # rather than failing the run — massapi's limits are not ours to fix (out of
 # scope), so this is graceful handling, not a fix. Exhaustion ends the turn with a
 # clear owner-facing note instead of a crash.
+# DOMAIN_MAX_CHARS bounds the ONE piece of library metadata that is disclosed
+# per library rather than per use: a console listing, an agent's binding picker,
+# and an MCP tool listing all carry it, so the cost is multiplied by however many
+# libraries an agent can see. A domain fits well inside this — naming a field is
+# short by nature, and anything long enough to need the whole budget has stopped
+# naming a field and started listing contents.
+DOMAIN_MAX_CHARS = 80
+
 _MODEL_RATE_STATUSES = frozenset({429, 503, 529})
 _MODEL_RATE_MAX_RETRIES = int(os.environ.get("KBC_MODEL_RATE_MAX_RETRIES", "5"))
 _MODEL_RATE_BACKOFF_BASE_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_BASE_S", "2"))
@@ -1525,6 +1533,41 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
         await run.emit({"type": "summary", "summary": strings["deleted"].format(path=rel.as_posix())})
         return strings["deleted"].format(path=rel.as_posix())
 
+    async def report_domain(args):
+        """Name the DOMAIN this library covers, for another agent's routing.
+
+        Its only job is the coarse question — "should I open this library at
+        all?". Precise routing already has a grounded surface: index.md carries
+        a per-page description documented as the sentence that routes an agent
+        to a page. This is one layer above that, and answering the coarse
+        question with an inventory makes it worse, not better: an inventory goes
+        stale on every compile, and an inventory that omits a topic makes a
+        router SKIP the library that had the answer — a false negative nobody
+        ever learns about. A domain that is slightly too broad only costs one
+        extra open.
+
+        The cap is enforced HERE rather than asked for in the description. A
+        length written into a prompt is a wish; several libraries disclose this
+        text at once, so the budget is multiplied and has to be a fact. The
+        model is told when its text was cut so it can shorten it deliberately
+        instead of discovering a truncated sentence downstream.
+        """
+        rs = ts["report_domain"]
+        domain = " ".join(str(args.get("domain", "")).split())
+        if not domain:
+            return rs["need_args"]
+        truncated = len(domain) > DOMAIN_MAX_CHARS
+        if truncated:
+            domain = domain[:DOMAIN_MAX_CHARS].rstrip()
+        try:
+            selfcheck.write_repo_meta(run.workdir, domain)
+        except Exception as e:
+            _print_compile_lifecycle("meta.write_failed", run, extra=f"class={type(e).__name__}")
+            return rs["need_args"]
+        if truncated:
+            return rs["truncated"].format(limit=DOMAIN_MAX_CHARS, domain=domain)
+        return rs["done"].format(domain=domain)
+
     async def exclude_source(args):
         """The sanctioned ADD/UPDATE path into the exclusion ledger (2026-07-24
         mandate: the model's job is understanding knowledge, never hand-authoring a
@@ -1620,6 +1663,12 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
         return rt["registered"].format(tid=tid)
 
     return [
+        EngineTool(
+            "report_domain",
+            ts["report_domain"]["desc"],
+            {"type": "object", "properties": {"domain": {"type": "string"}}, "required": ["domain"]},
+            report_domain,
+        ),
         EngineTool(
             "report_summary",
             ts["report_summary"]["desc"],
@@ -2617,6 +2666,7 @@ async def _emit_message(run: CompileRun, msg) -> None:
 # that DOES declare a list (e.g. kb-test) overrides this.
 DEFAULT_COMPILE_ALLOWED_TOOLS = [
     "Read", "Write", "Edit", "Glob", "Grep",
+    "mcp__compile__report_domain",
     "mcp__compile__report_summary",
     "mcp__compile__propose_plan",
     "mcp__compile__delete_candidate_page",

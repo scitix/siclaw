@@ -6405,6 +6405,7 @@ async def main():
     await test_model_rate_limit_exhausts_gracefully()
     await test_shutdown_flush_syncs_active_runs()
     test_pr382_review_fixes()
+    await test_report_domain_is_bounded_by_code_not_by_asking()
     await test_typed_authoring_commands()
 
     compile_box._COMPILE_IMPL = fake_driver
@@ -6623,6 +6624,67 @@ async def main():
         print("OK  compile_box protocol smoke (sources / authoring / health / session idempotent / SSE summary+turn_done+syncArtifacts+end / 409 / 404)")
     finally:
         await client.close()
+
+
+
+async def test_report_domain_is_bounded_by_code_not_by_asking():
+    """The domain line is the one piece of library metadata disclosed PER
+    LIBRARY rather than per use — a console list, a binding picker and an MCP
+    tool listing all carry it — so its budget is multiplied by however many
+    libraries an agent can see. A length asked for in a tool description is a
+    wish; this one has to be a fact, so the cap is applied here.
+
+    The model also never writes the file. It supplies one natural-language
+    sentence and the format is generated, which is the same rule the exclusion
+    ledger runs under after a hand-authored trailing comma once blanked it.
+    """
+    import selfcheck
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "authoring").mkdir(parents=True)
+        run = compile_box.CompileRun("dom1", td, 1)
+        run._sync_sent = {}
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run)}
+        if "report_domain" not in tools:
+            raise AssertionError(f"report_domain not registered: {sorted(tools)}")
+
+        # A domain the model kept short arrives intact.
+        short = "GPU 集群硬件健康检查与故障诊断"
+        await tools["report_domain"].handler({"domain": short})
+        assert selfcheck.read_repo_meta(td).get("domain") == short, selfcheck.read_repo_meta(td)
+
+        # An over-long one is CUT, not rejected and not passed through: refusing
+        # would lose the metadata entirely over a formatting slip, and passing it
+        # through would blow the multiplied budget.
+        long = "领域" * 200
+        result = await tools["report_domain"].handler({"domain": long})
+        stored = selfcheck.read_repo_meta(td).get("domain", "")
+        assert len(stored) == compile_box.DOMAIN_MAX_CHARS, len(stored)
+        # And the model is TOLD, so it can shorten deliberately rather than
+        # discover a truncated sentence downstream.
+        assert str(compile_box.DOMAIN_MAX_CHARS) in str(result), result
+
+        # Whitespace the model may wrap across lines collapses: this text is
+        # rendered in one line in a picker.
+        await tools["report_domain"].handler({"domain": "  多行\n\n领域   描述  "})
+        assert selfcheck.read_repo_meta(td).get("domain") == "多行 领域 描述", selfcheck.read_repo_meta(td)
+
+        # Empty is refused rather than stored: an empty domain is worse than an
+        # absent one, because a picker renders it as a blank line that looks
+        # like a library nobody described AND like one described as nothing.
+        before = selfcheck.read_repo_meta(td)
+        await tools["report_domain"].handler({"domain": "   "})
+        assert selfcheck.read_repo_meta(td) == before
+
+    # A missing file is an ABSENT domain, never an exception: the library still
+    # compiles, publishes and answers questions without one.
+    with tempfile.TemporaryDirectory() as td2:
+        assert selfcheck.read_repo_meta(td2) == {}
+        (Path(td2) / "authoring").mkdir(parents=True)
+        (Path(td2) / selfcheck.REPO_META_PATH).write_text("{not json", encoding="utf-8")
+        assert selfcheck.read_repo_meta(td2) == {}
+
+    print("✓ report_domain: bounded by code, machine-serialised, absent-safe")
 
 
 if __name__ == "__main__":

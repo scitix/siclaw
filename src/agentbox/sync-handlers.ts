@@ -241,6 +241,11 @@ interface KnowledgeBundlePayload {
   repos: Array<{
     id: string;
     name: string;
+    /** One sentence naming the field this library covers, written by the compile
+     *  box (kbc `report_domain`). Absent for libraries compiled before that tool
+     *  existed, and for every bundle a Portal serves — the catalog then reads
+     *  exactly as it does today. */
+    consumerDomain?: string | null;
     version: number;
     message?: string | null;
     sha256?: string | null;
@@ -248,6 +253,26 @@ interface KnowledgeBundlePayload {
     fileCount?: number | null;
     dataBase64: string;
   }>;
+}
+
+/** Max characters of a domain admitted into the catalog. Mirrors the box's own
+ *  cap and the server's; enforced a third time here because this is where the
+ *  text enters a system prompt, and the three deploy separately. */
+const KNOWLEDGE_DOMAIN_MAX_CHARS = 80;
+
+/**
+ * Normalise a box-written domain for a one-line catalog entry.
+ *
+ * The catalog is a list where one line means one library, and it is injected
+ * into the system prompt verbatim. A domain carrying a newline would split into
+ * a second entry — model-written text forging a catalog row — so it collapses to
+ * one line before it can. Counted in code points, matching the box (Python
+ * `len`) and the server (Go runes), so the three caps mean the same thing.
+ */
+function catalogDomainLine(raw: string | null | undefined): string {
+  if (!raw) return "";
+  const oneLine = raw.replace(/\s+/g, " ").trim();
+  return [...oneLine].slice(0, KNOWLEDGE_DOMAIN_MAX_CHARS).join("").trim();
 }
 
 interface KnowledgeSyncStatus {
@@ -319,6 +344,11 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
 
     try {
       if (repos.length === 1) {
+        // No domain line here, deliberately. One library is not a choice, and
+        // this path unpacks that library's OWN index.md to the root — so the
+        // catalog the agent gets is already its page list with per-page
+        // descriptions, which says more than a domain could. Writing one in
+        // would also mean editing a published artifact on the way to disk.
         const buf = Buffer.from(repos[0].dataBase64, "base64");
         const info = await extractKnowledgePackageToDir(buf, stagingDir);
         if (repos[0].sha256 && repos[0].sha256 !== info.sha256) {
@@ -329,7 +359,19 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
       } else {
         const repoRoot = path.join(stagingDir, "repos");
         fs.mkdirSync(repoRoot, { recursive: true });
-        const indexLines = ["# Knowledge Index", "", "This index was generated from active knowledge repositories.", ""];
+        // The prompt that carries this file calls it a page catalog, which is
+        // true of the single-library case and false here: these are libraries,
+        // and each page catalog is one Read further in. An agent that reads the
+        // list as pages finds no page matching the task and concludes the
+        // knowledge has nothing — the same silent false negative the domain
+        // exists to prevent, so the file says what it is.
+        const indexLines = [
+          "# Knowledge Index",
+          "",
+          "Each entry is a knowledge library, not a page. Open the index of the one whose field " +
+          "covers the task, then read the page you need from that library's own catalog.",
+          "",
+        ];
         const seenRepoIds = new Set<string>();
         const seenDirNames = new Set<string>();
         for (const repo of repos) {
@@ -350,7 +392,18 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
           }
           syncedRepos.push({ id: repo.id, name: repo.name, version: repo.version,
             sha256: info.sha256, expectedSha256: repo.sha256 ?? null, fileCount: info.fileCount, sizeBytes: repo.sizeBytes });
-          indexLines.push(`- [[repos/${dirName}/index]] - ${repo.name} v${repo.version}`);
+          // This line is the whole of what the agent knows about a library
+          // before deciding to open it: the catalog goes into the system prompt,
+          // there is no search tool, and everything else costs a Read of that
+          // library's own index. A name routes only when it happens to carry the
+          // field ("集群运维知识库"); "sre通用知识库" leaves the agent opening
+          // libraries one at a time to find out. The domain is what makes the
+          // line answerable — and the directory can't help, since an all-CJK
+          // name sanitizes to `repo--<hash>`.
+          const domain = catalogDomainLine(repo.consumerDomain);
+          indexLines.push(
+            `- [[repos/${dirName}/index]] - ${repo.name} v${repo.version}${domain ? ` — ${domain}` : ""}`,
+          );
         }
         fs.writeFileSync(path.join(stagingDir, "index.md"), indexLines.join("\n") + "\n");
       }
