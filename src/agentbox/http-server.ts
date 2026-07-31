@@ -770,7 +770,12 @@ export function createHttpServer(
         const found = managed.brain.findModel(body.modelProvider, body.modelId);
         if (found) {
           const currentModel = managed.brain.getModel();
-          const needsUpdate = !currentModel
+          // registerProvider can replace fields that BrainModelInfo does not expose
+          // (notably compat, baseUrl, and custom headers). When the control plane
+          // supplies modelConfig, refresh the session model unconditionally so a
+          // compat-only edit takes effect on the very next prompt.
+          const needsUpdate = body.modelConfig !== undefined
+            || !currentModel
             || currentModel.id !== found.id
             || currentModel.provider !== found.provider
             || currentModel.reasoning !== found.reasoning

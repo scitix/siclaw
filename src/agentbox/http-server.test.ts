@@ -363,6 +363,27 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(session.brain.prompt.mock.calls[0][0]).toBe("hello there");
   });
 
+  it("POST /api/prompt refreshes the current model when control-plane modelConfig is supplied", async () => {
+    const session = await sm.getOrCreate("compat-refresh");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hi",
+      sessionId: "compat-refresh",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: {
+        ...modelConfigWithInput(["text"]),
+        models: [{
+          ...modelConfigWithInput(["text"]).models[0],
+          compat: { supportsUsageInStreaming: false },
+        }],
+      },
+    });
+
+    expect(r.status).toBe(200);
+    expect(session.brain.registerProvider).toHaveBeenCalledOnce();
+    expect(session.brain.setModel).toHaveBeenCalledOnce();
+  });
+
   it("POST /api/prompt forwards large valid images to brain.prompt", async () => {
     const session = await sm.getOrCreate("img-large");
     const data = "A".repeat(3 * 1024 * 1024);
