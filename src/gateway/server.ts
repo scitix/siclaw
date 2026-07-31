@@ -95,6 +95,7 @@ import { MetricsAggregator } from "./metrics-aggregator.js";
 import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
+import { sessionTurnLocks } from "./session-turn-lock.js";
 import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "./agent-model-binding.js";
 
 function stablePayloadDigest(value: unknown): string {
@@ -336,7 +337,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // agent_end / agent_message / stream_error / prompt_done) carries
     // every observable progress signal the frontend needs.
     (async () => {
+      // One turn at a time for this session, across every box. The AgentBox's own 409
+      // only sees its own sessions, so with more than one box two sends could be
+      // dispatched to two boxes and both would run — two writers on one transcript.
+      // Released in the finally below so a throw cannot wedge the session.
+      let releaseTurn: (() => void) | undefined;
       try {
+        releaseTurn = await sessionTurnLocks.acquire(sessionId);
         // Persist user message + ensure session row before any agent events
         // could land. consumeAgentSse writes assistant/tool rows with FK
         // referencing chat_sessions, so the row has to exist first.
@@ -363,6 +370,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // (registered in startRuntime), not from per-request params — so every
         // entry point lands the same mode for the same agent.
         const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
+        // Which box this turn went to. Placement reads it back as a hint while the turn
+        // runs; it is dropped on release, so it can never become a stale binding.
+        sessionTurnLocks.noteBox(sessionId, handle.boxId);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
@@ -465,6 +475,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           event: { type: "stream_error", error: detail },
         });
         context.sendEvent("chat.event", { sessionId, event: { type: "prompt_done" } });
+      } finally {
+        releaseTurn?.();
       }
     })();
 

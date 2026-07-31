@@ -31,6 +31,7 @@ import {
 } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
+import { sessionTurnLocks } from "../session-turn-lock.js";
 import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback } from "../chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
 import { resolveAgentModelBinding } from "../agent-model-binding.js";
@@ -1620,8 +1621,20 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     return true;
   });
 
+  // One turn at a time for this session. The AgentBox's own 409 only sees its own
+  // sessions, so once an agent runs more than one box two messages could be dispatched to
+  // two boxes and both would run — two writers on one transcript. Released in the finally
+  // that closes the agent-execution block below.
+  let resultText = "";
+  let replyImages: RenderedReplyImage[] = [];
+  let assistantMessageId: string | null = null;
+  let agentError: Error | null = null;
+  let sessionBusy = false;
+  const releaseTurn = await sessionTurnLocks.acquire(sessionId);
+  try {
   // Get or create AgentBox for this agent (shared across all callers).
   const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
+  sessionTurnLocks.noteBox(sessionId, handle.boxId);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
   const modelBinding = frontendClient
@@ -1669,11 +1682,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
     ...(images.length ? { images } : {}),
   };
-  let resultText = "";
-  let replyImages: RenderedReplyImage[] = [];
-  let assistantMessageId: string | null = null;
-  let agentError: Error | null = null;
-  let sessionBusy = false;
   try {
     // queue-until-idle: wait out a busy session instead of dumping a raw 409.
     const promptResult = await promptWithBusyRetry(client, promptOpts);
@@ -1701,6 +1709,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       agentError = err instanceof Error ? err : new Error(String(err));
       console.error(`[lark] Agent execution failed for session=${sessionId}:`, agentError);
     }
+  }
+  } finally {
+    releaseTurn();
   }
 
   // Session-busy and other errors both get a sanitized notice \u2014 the raw error (internal

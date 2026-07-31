@@ -25,6 +25,7 @@ import type { CertificateIdentity } from "./security/cert-manager.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type AgentBoxTlsOptions } from "./agentbox/client.js";
 import { consumeAgentSse } from "./sse-consumer.js";
+import { sessionTurnLocks } from "./session-turn-lock.js";
 import { ensureChatSession, appendMessage } from "./chat-repo.js";
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
 import type {
@@ -251,8 +252,12 @@ export async function handleDelegate(
   // card can offer "open full session" LIVE, before the final result arrives.
   writeFrame({ type: "delegate_session", peerSessionId });
 
+  // One turn at a time for this peer session — the AgentBox's 409 only sees its own
+  // sessions, so with more than one box two delegations could run on two boxes at once.
+  const releaseTurn = await sessionTurnLocks.acquire(peerSessionId);
   try {
     const handle = await deps.agentBoxManager.getOrCreate(peerAgentId, undefined, peerSessionId);
+    sessionTurnLocks.noteBox(peerSessionId, handle.boxId);
     const client = new AgentBoxClient(handle.endpoint, 30000, deps.agentBoxTlsOptions);
     peerClient = client;
     // Cancellation during cold spawn: if the coordinator disconnected while
@@ -383,6 +388,8 @@ export async function handleDelegate(
     });
     res.end();
     return;
+  } finally {
+    releaseTurn();
   }
 
   finished = true;
