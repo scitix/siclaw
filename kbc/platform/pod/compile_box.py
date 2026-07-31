@@ -469,6 +469,14 @@ def _arm_test_turn(run: "TestRun") -> None:
 DOMAIN_MAX_CHARS = 80
 
 _MODEL_RATE_STATUSES = frozenset({429, 503, 529})
+
+# 402 sits one status away from the rate-limit family and is not one: a rate
+# limit clears on its own in seconds, so backing off is right, while a spend cap
+# is cleared by a person raising the limit, which no amount of backoff reaches.
+# Production hit `daily cost limit exceeded (504.29/500.00)` and the owner was
+# told only "batch compile interrupted; trigger again to resume" — the cause was
+# never named, because there was no 402 anywhere in this file.
+_MODEL_QUOTA_STATUS = 402
 _MODEL_RATE_MAX_RETRIES = int(os.environ.get("KBC_MODEL_RATE_MAX_RETRIES", "5"))
 _MODEL_RATE_BACKOFF_BASE_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_BASE_S", "2"))
 _MODEL_RATE_BACKOFF_CAP_S = float(os.environ.get("KBC_MODEL_RATE_BACKOFF_CAP_S", "30"))
@@ -507,6 +515,17 @@ class BatchOutputError(Exception):
     """A successful internal session did not account for its assigned sources."""
 
 
+class ModelQuotaExhausted(RuntimeError):
+    """The model provider refused on billing (HTTP 402), not on capacity.
+
+    Backing off is wrong here — a spend cap does not clear in seconds, so the
+    rate-limit loop would spend its retries for nothing — and that is the only
+    claim this type makes. It deliberately carries no time-to-clear: a spend cap
+    is lifted by a person raising the limit, so any deadline the box stated
+    would be a guess presented as a fact. Separate from ModelStallError
+    (transient) and the rate-limit path."""
+
+
 class PlanIntegrityError(RuntimeError):
     """The batch plan could not be made valid — a defect in OUR planning, not in
     the user's sources.
@@ -536,6 +555,8 @@ def _batch_error_code(exc: BaseException) -> str:
         return "model_result_error"
     if isinstance(exc, BatchOutputError):
         return "provider_fault" if getattr(exc, "provider_fault", False) else "content_shape"
+    if isinstance(exc, ModelQuotaExhausted):
+        return "quota_exhausted"
     if isinstance(exc, PlanIntegrityError):
         return "plan_integrity"
     if isinstance(exc, asyncio.CancelledError):
@@ -3208,6 +3229,20 @@ def _load_batch_plan(run: "CompileRun") -> dict | None:
         return None
 
 
+def _batch_resume_point(plan: dict | None) -> tuple[int, int] | None:
+    """(1-based index of the first unstamped batch, total batches), or None.
+
+    Positional, never the batch id: ids can be model-written and are only
+    conditionally safe to echo (see _lifecycle_batch_ref), while the position is
+    always both safe and the thing an owner can count.
+    """
+    batches = (plan or {}).get("batches") or []
+    for i, b in enumerate(batches):
+        if isinstance(b, dict) and b.get("status") != "done":
+            return i + 1, len(batches)
+    return None
+
+
 def _batch_plan_resumable(plan: dict | None) -> bool:
     """Whether an interrupted batch train still owns executable work.
 
@@ -4542,11 +4577,37 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         # gating on turn_done would otherwise hang on an orchestrator error.
         # Done batches are stamped in BATCH_PLAN.json, so the honest story is
         # "interrupted, resumable from the first pending batch".
+        # A spend cap gets its own sentence: the generic one names a remedy that
+        # is not the one that applies. State only what is known — the provider
+        # refused on billing — and where the work stopped. Nothing about when it
+        # clears: that depends on a person raising the limit, and the provider's
+        # retry_after describes only the case where nobody does. A time the box
+        # cannot stand behind is worse here than no time at all.
+        if isinstance(e, ModelQuotaExhausted):
+            resume = _batch_resume_point(_load_batch_plan(run))
+            if resume:
+                k, n = resume
+                at = _loc(run,
+                          f" {k - 1} of {n} batches are stored; the next compile starts at batch {k}."
+                          if k > 1 else
+                          f" No batch of {n} is stored yet; the next compile starts at batch 1.",
+                          f"已完成 {k - 1}/{n} 批并已落库,下次编译从第 {k} 批开始。"
+                          if k > 1 else
+                          f"共 {n} 批,尚无已完成的批,下次编译从第 1 批开始。")
+            else:
+                at = _loc(run, " Finished batches are stored.", "已完成的批已落库。")
+            done_note = _loc(
+                run,
+                f"The model provider refused this request on billing (HTTP 402): "
+                f"the API key's spend limit for the period is used up.{at}",
+                f"模型服务按计费拒绝了本次请求(HTTP 402):该 API key 本周期的额度已用尽。{at}")
+        else:
+            done_note = _loc(
+                run,
+                "Batch compile interrupted: finished batches are stored; trigger a compile again to resume from the first pending batch.",
+                "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。")
         try:
-            await run.emit({"type": "turn_done",
-                            "text": _loc(run,
-                                         "Batch compile interrupted: finished batches are stored; trigger a compile again to resume from the first pending batch.",
-                                         "分批编译中断:已完成的批已落库,再次发起编译将从断点继续。")})
+            await run.emit({"type": "turn_done", "text": done_note})
         except Exception:
             pass
     finally:
@@ -4655,6 +4716,19 @@ async def _consume_turn_stream(
             # surfacing it as a finished turn.
             status = getattr(msg, "api_error_status", None)
             is_error = bool(getattr(msg, "is_error", False))
+            # A spend cap, before the rate-limit branch it would otherwise fall
+            # past: backing off 5 times over 30s cannot clear a billing refusal.
+            # Gated on fail_on_error_result so this changes NOTHING outside the
+            # batch orchestrator — a live session keeps ending the turn and
+            # staying up, because whether to try again under a spend cap is the
+            # account holder's call (the limit can be raised at any moment) and
+            # a box that kills itself has taken that decision away.
+            if is_error and status == _MODEL_QUOTA_STATUS and fail_on_error_result:
+                run._turn_active = False
+                run._turn_text = []
+                run._last_turn_reply = ""
+                raise ModelQuotaExhausted(
+                    f"model provider refused on billing (HTTP {status})")
             if is_error and status in _MODEL_RATE_STATUSES:
                 if run._rate_retries < _MODEL_RATE_MAX_RETRIES:
                     run._rate_retries += 1
