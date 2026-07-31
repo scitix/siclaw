@@ -15,7 +15,7 @@
 // ── Scalar types ──────────────────────────────────────────────────────
 
 /** Every syncable type is identified by a well-known key. */
-export type GatewaySyncType = "mcp" | "skills" | "cluster" | "host" | "knowledge" | "tools";
+export type GatewaySyncType = "mcp" | "skills" | "cluster" | "host" | "knowledge" | "tools" | "prompt";
 
 // ── Config / descriptor interfaces ────────────────────────────────────
 
@@ -182,6 +182,17 @@ export const GATEWAY_SYNC_DESCRIPTORS: Record<GatewaySyncType, GatewaySyncDescri
     //   • Local — LocalSpawner resolves capabilities and injects directly at spawn.
     // The reload PUSH path (POST /api/reload-tools) still routes through the
     // per-box handler regardless of this flag.
+    initialSync: false,
+  },
+  prompt: {
+    type: "prompt",
+    gatewayPath: "",
+    reloadPath: "/api/reload-prompt",
+    retry: { maxRetries: 1, baseDelayMs: 1000 },
+    requiresGatewayClient: false,
+    // There is no prompt payload to sync at startup. Each message already
+    // resolves the latest prompt through config.getAgent; reload only evicts
+    // warm sessions so the next turn rebuilds immediately.
     initialSync: false,
   },
 };

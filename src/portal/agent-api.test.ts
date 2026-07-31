@@ -275,7 +275,7 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(201);
     });
 
-    it("nulls system_prompt for a built-in agent type on create (locked persona)", async () => {
+    it("persists a built-in default when create omits a prompt", async () => {
       // Coordinator has defaultNoSkills → no auto-bind: INSERT then SELECT-back.
       query
         .mockResolvedValueOnce([undefined, []])                        // insert agent
@@ -284,13 +284,28 @@ describe("registerAgentRoutes", () => {
       const { status } = await runRoute(router, fakeReq({
         url: "/api/v1/agents",
         method: "POST",
-        body: { name: "coord", agent_type: "coordinator", system_prompt: "SHOULD BE DROPPED" },
+        body: { name: "coord", agent_type: "coordinator" },
       }));
 
       expect(status).toBe(201);
       const insertArgs = query.mock.calls[0][1];
       expect(insertArgs[8]).toBe("coordinator"); // agent_type
-      expect(insertArgs[9]).toBeNull();          // system_prompt dropped for built-in type
+      expect(insertArgs[9]).toContain("ONLY job is ROUTING");
+    });
+
+    it("persists a maintainer-supplied prompt for a built-in type", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a-new", name: "coord" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents",
+        method: "POST",
+        body: { name: "coord", agent_type: "coordinator", system_prompt: "single truth" },
+      }));
+
+      expect(status).toBe(201);
+      expect(query.mock.calls[0][1][9]).toBe("single truth");
     });
 
     it("keeps a custom agent's system_prompt on create", async () => {
@@ -355,7 +370,7 @@ describe("registerAgentRoutes", () => {
       expect(status).toBe(400);
     });
 
-    it("nulls the stale Custom system_prompt when switching to a built-in type", async () => {
+    it("keeps an explicitly supplied prompt when switching to a built-in type", async () => {
       // agent_type in body → effective type resolved without a pre-read: UPDATE then SELECT-back.
       query
         .mockResolvedValueOnce([undefined, []])                    // UPDATE
@@ -372,7 +387,25 @@ describe("registerAgentRoutes", () => {
       const updateArgs = query.mock.calls[0][1] as unknown[];
       expect(updateSql).toContain("system_prompt = ?");
       expect(updateArgs).toContain("coordinator");        // agent_type set
-      expect(updateArgs).not.toContain("stale custom prompt"); // stale prompt dropped, not persisted
+      expect(updateArgs).toContain("stale custom prompt");
+    });
+
+    it("notifies prompt.reload when system_prompt changes", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "coord" }], []]);
+
+      await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { system_prompt: "new truth" },
+      }));
+
+      expect(connMap.sendCommand).toHaveBeenCalledWith(
+        "a1",
+        "agent.reload",
+        { agentId: "a1", resources: ["prompt"] },
+      );
     });
 
     it("notifies agent.reload when is_production changes", async () => {

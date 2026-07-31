@@ -19,7 +19,7 @@ import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { encodeModelRoutingForDb } from "./model-routing-config.js";
 import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
-import { AGENT_TYPES, normalizeAgentType } from "../core/agent-types.js";
+import { AGENT_TYPES, effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec } from "../core/config.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
@@ -131,10 +131,10 @@ export function registerAgentRoutes(
         modelRouting ?? null,
         toolCapabilities ?? null,
         agentType,
-        // Built-in types (sre/coordinator) use a LOCKED persona — never store a
-        // Custom system_prompt for them (the runtime would use it as the base
-        // prompt and merely append the type persona). Only custom keeps its own.
-        agentType === "custom" ? (body.system_prompt ?? null) : null,
+        // Materialize the type default into the row so system_prompt becomes
+        // the agent's visible, editable instruction instead of a hidden runtime
+        // overlay. Custom agents keep their supplied prompt (or null).
+        effectiveAgentPrompt(agentType, body.system_prompt) ?? null,
         body.is_production ?? 1,
         normalizeIdleTimeoutSec(body.idle_timeout_sec),
         body.icon ?? null,
@@ -211,21 +211,6 @@ export function registerAgentRoutes(
       newIdleTimeoutSec = normalizeIdleTimeoutSec(body.idle_timeout_sec);
     }
 
-    // Built-in agent types (sre/coordinator) use a LOCKED persona and must NOT
-    // carry a Custom system_prompt (the runtime would use it as the base prompt
-    // and merely append the type persona → contradictory hidden instructions).
-    // Determine the EFFECTIVE type post-update (body override, else the stored
-    // value) and force system_prompt to null for non-custom — the UI hides the
-    // field for built-in types but still submits its stale value.
-    let effectiveAgentType: string | null = null;
-    if ("agent_type" in body) {
-      effectiveAgentType = normalizeAgentType(body.agent_type);
-    } else if ("system_prompt" in body) {
-      const [cur] = await db.query("SELECT agent_type FROM agents WHERE id = ?", [params.id]) as any;
-      effectiveAgentType = normalizeAgentType(cur[0]?.agent_type);
-    }
-    const forceNullPrompt = effectiveAgentType !== null && effectiveAgentType !== "custom";
-
     // Build dynamic SET clause
     const fields = [
       "name", "description", "status", "model_provider",
@@ -236,10 +221,7 @@ export function registerAgentRoutes(
 
     for (const field of fields) {
       if (field in body) {
-        if (field === "system_prompt" && forceNullPrompt) {
-          setClauses.push("system_prompt = ?");
-          values.push(null);
-        } else if (field === "agent_type") {
+        if (field === "agent_type") {
           setClauses.push("agent_type = ?");
           values.push(normalizeAgentType(body.agent_type));
         } else {
@@ -250,11 +232,15 @@ export function registerAgentRoutes(
         }
       }
     }
-    // Switching to a built-in type without an explicit system_prompt in the body:
-    // still clear any stale Custom prompt left on the row.
-    if (forceNullPrompt && !("system_prompt" in body)) {
-      setClauses.push("system_prompt = ?");
-      values.push(null);
+    // If a caller changes the type without supplying a prompt, initialize the
+    // new type's default as the editable row truth.
+    if ("agent_type" in body && !("system_prompt" in body)) {
+      const nextType = normalizeAgentType(body.agent_type);
+      const nextPrompt = effectiveAgentPrompt(nextType, null);
+      if (nextPrompt) {
+        setClauses.push("system_prompt = ?");
+        values.push(nextPrompt);
+      }
     }
     if ("model_routing" in body) {
       try {
@@ -301,8 +287,6 @@ export function registerAgentRoutes(
       return;
     }
 
-    sendJson(res, 200, decodeAgentRow(rows[0]));
-
     // is_production change affects skills bundle (prod=approved only, dev=all)
     // and also the visible cluster/host set — credential-list filters out
     // cross-env bindings, so the AgentBox must drop its cached list.
@@ -310,12 +294,28 @@ export function registerAgentRoutes(
       connectionMap.notify(params.id, "agent.reload", { resources: ["skills", "cluster", "host"] });
     }
 
-    // tool_capabilities OR agent_type change → push a tools reload so the active
-    // AgentBox re-fetches its whitelist + type (caps/persona are type-locked) and
-    // invalidates live sessions (mid-turn-safe).
-    if (toolCapabilitiesChanged || ("agent_type" in body)) {
-      connectionMap.notify(params.id, "agent.reload", { agentId: params.id, resources: ["tools"] });
+    // Capability/type changes rebuild the tool surface. Prompt/type changes
+    // invalidate warm sessions so the next turn immediately restores with the
+    // latest editable prompt (no AgentBox kill and no 30s idle wait).
+    const reloadResources: string[] = [];
+    if (toolCapabilitiesChanged || ("agent_type" in body)) reloadResources.push("tools");
+    if ("system_prompt" in body || ("agent_type" in body)) reloadResources.push("prompt");
+    if (reloadResources.length > 0) {
+      const payload = { agentId: params.id, resources: reloadResources };
+      if (reloadResources.includes("prompt")) {
+        // Order the successful save response after Runtime/AgentBox has
+        // invalidated warm sessions. Persistence still succeeds if Runtime is
+        // offline; the next cold box resolves the latest row.
+        const result = await connectionMap.sendCommand(params.id, "agent.reload", payload);
+        if (!result.ok) {
+          console.warn(`[agent-api] prompt saved but hot reload was not acknowledged for ${params.id}: ${result.error}`);
+        }
+      } else {
+        connectionMap.notify(params.id, "agent.reload", payload);
+      }
     }
+
+    sendJson(res, 200, decodeAgentRow(rows[0]));
 
     // Idle window changed from resident (0) → finite: the running box is
     // resident and will never self-destruct, so it would never cold-spawn to

@@ -6,9 +6,17 @@ import {
 } from "../gateway-sync.js";
 
 describe("GATEWAY_SYNC_DESCRIPTORS", () => {
-  const expectedTypes: GatewaySyncType[] = ["mcp", "skills", "cluster", "host", "knowledge", "tools"];
+  const expectedTypes: GatewaySyncType[] = [
+    "mcp",
+    "skills",
+    "cluster",
+    "host",
+    "knowledge",
+    "tools",
+    "prompt",
+  ];
 
-  it("contains exactly the six expected syncable types", () => {
+  it("contains exactly the seven expected syncable types", () => {
     const actual = Object.keys(GATEWAY_SYNC_DESCRIPTORS).sort();
     expect(actual).toEqual([...expectedTypes].sort());
   });
@@ -84,6 +92,14 @@ describe("GATEWAY_SYNC_DESCRIPTORS", () => {
     expect(d.initialSync).toBe(false);
     expect(d.gatewayPath).toBe("/api/internal/tool-capabilities");
     expect(d.reloadPath).toBe("/api/reload-tools");
+  });
+
+  it("prompt: rebuilds sessions without fetching a payload", () => {
+    const d = GATEWAY_SYNC_DESCRIPTORS.prompt;
+    expect(d.requiresGatewayClient).toBe(false);
+    expect(d.initialSync).toBe(false);
+    expect(d.gatewayPath).toBe("");
+    expect(d.reloadPath).toBe("/api/reload-prompt");
   });
 
   it("all reload paths are unique", () => {

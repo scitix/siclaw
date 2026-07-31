@@ -29,7 +29,7 @@ export interface ResolvedModelBinding {
     }>;
   };
   modelRouting?: ModelRoutePolicy;
-  /** Agent's custom system prompt template (agents.system_prompt). Null/absent = built-in default. */
+  /** Agent-owned identity/behaviour prompt (agents.system_prompt). */
   systemPrompt?: string | null;
   /**
    * Per-agent session/memory persistence toggle. siclaw core leaves this
@@ -53,7 +53,7 @@ export async function resolveAgentModelBinding(
 }
 
 /**
- * Resolve an agent's custom system prompt via Portal RPC (config.getAgent).
+ * Resolve an agent's persisted identity/behaviour prompt via Portal RPC.
  *
  * Best-effort: callers (channel handlers) must never fail a user message just
  * because the prompt lookup failed — on any error this returns undefined and

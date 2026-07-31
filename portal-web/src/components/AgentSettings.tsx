@@ -321,11 +321,11 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
       {/* Tab content */}
       <div className="flex-1 overflow-auto">
-        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} promptLocked={typeDef.lockedPrompt} typeLabel={typeDef.label} />}
+        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} />}
         {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} routingEnabled={routingEnabled} setRoutingEnabled={setRoutingEnabled} fallbackCandidates={fallbackCandidates} setFallbackCandidates={setFallbackCandidates} />}
         {activeTab === "tools" && (
           <div className="px-6 py-6 space-y-4 max-w-2xl">
-            {/* Agent type — governs the capability set (and, for built-in types, the persona). */}
+            {/* Agent type governs the capability set and initial prompt default. */}
             <div>
               <h3 className="text-[13px] font-medium text-foreground">Agent type</h3>
               <p className="text-[12px] text-muted-foreground mt-0.5">The type sets this agent's role. SRE / Coordinator lock the capabilities and the system prompt; Custom lets you choose both.</p>
@@ -538,11 +538,10 @@ function IdleTimeoutField({ value, onChange }: { value: number; onChange: (v: nu
   )
 }
 
-function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec, promptLocked, typeLabel }: {
+function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec }: {
   name: string; setName: (v: string) => void; description: string; setDescription: (v: string) => void
   systemPrompt: string; setSystemPrompt: (v: string) => void; isProduction: boolean; setIsProduction: (v: boolean) => void
   idleTimeoutSec: number; setIdleTimeoutSec: (v: number) => void
-  promptLocked: boolean; typeLabel: string
 }) {
   return (
     <div className="px-6 py-6 space-y-5 max-w-2xl">
@@ -556,13 +555,7 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
       </div>
       <div className="space-y-1.5">
         <label className="text-[12px] text-muted-foreground">System Prompt</label>
-        {promptLocked ? (
-          <p className="text-[12px] text-muted-foreground/70 rounded-md border border-border bg-secondary/30 px-3 py-2">
-            Defined by the <span className="font-medium text-foreground">{typeLabel}</span> type — this agent's system prompt is built in and not editable. Switch to a Custom agent to write your own.
-          </p>
-        ) : (
-          <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional system prompt..." />
-        )}
+        <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional agent identity and behavior instructions..." />
       </div>
       <IdleTimeoutField value={idleTimeoutSec} onChange={setIdleTimeoutSec} />
       <div className="space-y-2 pt-2">

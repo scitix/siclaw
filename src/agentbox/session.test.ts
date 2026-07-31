@@ -238,14 +238,15 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(s._releaseTimer).toBeNull();
   });
 
-  it("passes effectiveMode and systemPromptTemplate through to createSiclawSession", async () => {
+  it("keeps the platform template and appends the persisted agent prompt", async () => {
     const mgr = new AgentBoxSessionManager();
     mgr.userId = "alice";
     mgr.agentId = "agent-a";
     await mgr.getOrCreate("sess-1", "channel", "custom prompt");
     const opts = lastCreateSiclawSession.calls[0];
     expect(opts.mode).toBe("channel");
-    expect(opts.systemPromptTemplate).toBe("custom prompt");
+    expect(opts.systemPromptTemplate).toBeUndefined();
+    expect(opts.systemPromptAppend).toBe("custom prompt");
     expect(opts.userId).toBe("alice");
     expect(opts.agentId).toBe("agent-a");
   });
@@ -389,6 +390,45 @@ describe("AgentBoxSessionManager — scheduleRelease", () => {
     const t2 = s._releaseTimer;
     expect(t1).not.toBe(t2);
     clearTimeout(t2 as NodeJS.Timeout);
+  });
+});
+
+describe("AgentBoxSessionManager — invalidate", () => {
+  it("forces an idle session to rebuild even when getOrCreate races the zero-delay release", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
+      mgr.invalidate("sess-1");
+      expect(first._invalidated).toBe(true);
+
+      const second = await mgr.getOrCreate("sess-1", "web", "new prompt");
+      expect(second).not.toBe(first);
+      const opts = lastCreateSiclawSession.calls.at(-1);
+      expect(opts.systemPromptAppend).toBe("new prompt");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("defers invalidation until a busy prompt completes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
+    first._promptDone = false;
+    mgr.invalidate("sess-1");
+
+    expect(await mgr.getOrCreate("sess-1", "web", "new prompt")).toBe(first);
+    expect(first._invalidated).toBe(true);
+  });
+
+  it("does not reuse an invalidated session while background work still owns it", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const first = await mgr.getOrCreate("sess-1", "web", "old prompt");
+    first._backgroundWorkCount = 1;
+    mgr.invalidate("sess-1");
+
+    expect(await mgr.getOrCreate("sess-1", "web", "new prompt")).toBe(first);
+    expect(first._invalidated).toBe(true);
   });
 });
 

@@ -142,6 +142,7 @@ function makeFakeSession(id: string) {
     mode: "web" as const,
     _lastSavedMessageCount: 0,
     _releaseTimer: null,
+    _invalidated: false,
     _promptInflight: null,
     _syntheticPromptQueue: null,
     _backgroundWorkCount: 0,
@@ -183,6 +184,7 @@ function makeFakeSessionManager() {
     closeAll: async () => { sessions.clear(); },
     resetMemory: async () => {},
     scheduleRelease: (_id: string) => {},
+    invalidate: (_id: string) => {},
     setDelegationModel: vi.fn(),
     persistModelRouteState: vi.fn(),
     getPersistedDpState: (_id: string): { active: boolean } | null => null,
@@ -442,6 +444,17 @@ describe("http-server — prompt + session lifecycle", () => {
 
     expect(r.status).toBe(409);
     expect(r.data.error).toMatch(/already running/i);
+    expect(existing.brain.prompt).not.toHaveBeenCalled();
+  });
+
+  it("POST /api/prompt rejects reuse while an invalidated session is refreshing", async () => {
+    const existing = await sm.getOrCreate("refreshing");
+    existing._invalidated = true;
+
+    const r = await getJson(port, "/api/prompt", "POST", { text: "use the new prompt", sessionId: "refreshing" });
+
+    expect(r.status).toBe(409);
+    expect(r.data.error).toMatch(/configuration is refreshing/i);
     expect(existing.brain.prompt).not.toHaveBeenCalled();
   });
 

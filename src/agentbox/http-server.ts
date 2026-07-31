@@ -652,6 +652,13 @@ export function createHttpServer(
     // downgrade it. readOnly is honored only when explicitly set true.
     const delegation = resolveDelegation(body.delegation, body.origin);
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, activeMode, delegation);
+    if (managed._invalidated) {
+      sendJson(res, 409, {
+        error: "Session configuration is refreshing. Retry this prompt shortly.",
+        sessionId: managed.id,
+      });
+      return;
+    }
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
       // be holding the brain even when _promptDone has already flipped
@@ -1409,20 +1416,7 @@ export function createHttpServer(
         const sessions = sessionManager.list().map((s) => ({
           id: s.id,
           brain: s.brain,
-          invalidate: () => {
-            // Use scheduleRelease(0) instead of release() directly: the 0ms
-            // timer yields to the event loop, so any concurrent getOrCreate
-            // (e.g. user's next message arriving mid-invalidate) can cleanly
-            // clearTimeout() and keep the session alive. Calling release()
-            // synchronously would start an un-cancelable async shutdown that
-            // could tear down mcpManager out from under an in-flight prompt.
-            const doRelease = () => sessionManager.scheduleRelease(s.id, 0);
-            if (s._promptDone) {
-              doRelease();
-            } else {
-              s._promptDoneCallbacks.add(doRelease);
-            }
-          },
+          invalidate: () => sessionManager.invalidate(s.id),
         }));
 
         if (handler.postReload) {
