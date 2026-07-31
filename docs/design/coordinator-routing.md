@@ -37,6 +37,18 @@ Answering depends on the coordinator actually having skills or a knowledge base
 attached; it is `defaultNoSkills` at creation, so a coordinator left without
 them can only route.
 
+### The triage stays invisible
+
+Which mode was chosen is machinery, and the reader must never see it. A reply
+opens with the answer, not with the classification that produced it — no "this
+is a knowledge question", no "I looked this up in the knowledge base", no "as a
+coordinator I do not do hands-on work". Naming the mode is not merely noise: it
+invites the reader to doubt whether the answer is authoritative.
+
+When no answer is possible, the reply states the **outcome** the reader needs —
+the specialist covering that resource could not be reached, or which detail is
+still missing — rather than the internal rule that produced it.
+
 ## Coverage lookup
 
 - The first lookup uses the target exactly as established from the user's
