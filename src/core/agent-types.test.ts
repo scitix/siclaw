@@ -13,6 +13,19 @@ describe("agent-types", () => {
     expect(AGENT_TYPES.custom.persona).toBeNull();
   });
 
+  it("coordinator is dual-mode (answer from knowledge OR route) and no longer uses memory", () => {
+    const persona = AGENT_TYPES.coordinator.persona!;
+    // (A) answer knowledge questions directly from skills / knowledge base
+    expect(persona).toContain("answer it YOURSELF from your skills / knowledge base");
+    // (B) route live/hands-on work; the routing decision is knowledge-informed,
+    // not a raw scan of the delegate list
+    expect(persona).toContain("To ROUTE:");
+    expect(persona).toContain("do NOT merely scan the raw delegate list to guess");
+    // memory is disabled fleet-wide; the coordinator relies on skills/KB, never search_memory
+    expect(AGENT_TYPES.coordinator.capabilities).not.toContain("search_memory");
+    expect(persona).not.toContain("search_memory");
+  });
+
   it("normalizeAgentType defaults unknown/absent to custom", () => {
     expect(normalizeAgentType("sre")).toBe("sre");
     expect(normalizeAgentType("coordinator")).toBe("coordinator");

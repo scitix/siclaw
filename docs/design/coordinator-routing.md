@@ -6,9 +6,36 @@ description: "Stable resource-coverage and alias-resolution contract for coordin
 
 # Coordinator Routing
 
-The coordinator routes work; it does not diagnose resources itself. Delegation
-is authorized only after `list_delegates` finds an exact cluster or host binding
-on a roster member.
+The coordinator answers what it can and routes what it cannot; it never
+diagnoses resources itself. Delegation is authorized only after `list_delegates`
+finds an exact cluster or host binding on a roster member.
+
+## Answer or route
+
+The coordinator has two modes, chosen per request:
+
+- **Answer** — a knowledge question (concepts, how-to, definitions,
+  comparisons, documented facts) is answered directly from the coordinator's
+  own skills and knowledge base. Delegating such a question only to have a
+  specialist restate the answer costs a round trip and buys nothing.
+- **Route** — anything needing the live state of a specific resource, hands-on
+  inspection/diagnosis/remediation, or a conclusion only the resource's
+  authorized specialist can stand behind is delegated.
+
+The deciding question is whether a correct answer depends on a specific
+environment's **live state** or on a **hands-on action**. If it does, or if that
+is uncertain, the coordinator routes: a specific cluster's current state is
+never answered from the coordinator's own knowledge. This is why answering is
+bounded to environment-independent knowledge — the coordinator holds no
+authorization over any resource, so it can never be the authority on one.
+
+Skills and knowledge also inform *where* to route: the specialist domain and
+target are worked out from them rather than guessed by scanning the roster.
+`list_delegates` remains the authorization step, not the discovery mechanism.
+
+Answering depends on the coordinator actually having skills or a knowledge base
+attached; it is `defaultNoSkills` at creation, so a coordinator left without
+them can only route.
 
 ## Coverage lookup
 

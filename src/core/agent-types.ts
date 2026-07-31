@@ -6,9 +6,9 @@
  *
  *   - sre         — a specialist that operates hands-on within its authorized
  *                   clusters/hosts (full read + exec + scripts). Persona fixed.
- *   - coordinator — a read-only router: sees the fleet, delegates hands-on work
- *                   to specialists via delegate_to_agent. No skills by default.
- *                   Persona fixed.
+ *   - coordinator — answers knowledge questions from its skills/knowledge base and
+ *                   routes hands-on work to specialists via delegate_to_agent.
+ *                   No skills by default. Persona fixed.
  *   - custom      — the legacy free-form agent: the operator picks capabilities
  *                   (tool_capabilities) AND writes the system_prompt. Nothing is
  *                   locked. Existing agents map here (zero behaviour change).
@@ -37,7 +37,18 @@ const SRE_PERSONA =
   "Take the task end to end and report concrete, evidence-backed findings.";
 
 const COORDINATOR_PERSONA =
-  "You are a COORDINATOR whose ONLY job is ROUTING. To route: (1) determine the TARGET resource (cluster / " +
+  "You are a COORDINATOR. Your skills and knowledge base are your primary aid in BOTH of your modes. " +
+  "TRIAGE every request first. (A) ANSWER — when the request is a knowledge question answerable from your " +
+  "skills / knowledge base (concepts, how-to, definitions, comparisons, documented facts) WITHOUT the live " +
+  "state of a specific resource and WITHOUT any hands-on action, answer it YOURSELF from your skills / " +
+  "knowledge base; do NOT delegate a question just to have a specialist restate the answer. (B) ROUTE — when " +
+  "the request needs the live/current state of a specific resource, hands-on inspection / diagnosis / " +
+  "remediation, or a conclusion only the resource's authorized specialist can stand behind, ROUTE it. When " +
+  "you are unsure whether a correct answer depends on a specific environment's live state, ROUTE — never " +
+  "answer about a specific cluster's live state from your own knowledge. To decide WHERE to route, use your " +
+  "skills / knowledge to work out which specialist domain and which target the request belongs to — do NOT " +
+  "merely scan the raw delegate list to guess. " +
+  "To ROUTE: (1) determine the TARGET resource (cluster / " +
   "host / node) from the user's request; (2) call `list_delegates` first with query=<that target exactly as " +
   "established> to find WHICH " +
   "delegate is bound to it — this authoritative coverage lookup (NOT your own cluster_list, which is YOUR " +
@@ -59,8 +70,8 @@ const COORDINATOR_PERSONA =
   "Forward the task at a HIGH LEVEL, essentially as the user phrased it. You do NOT decide HOW the task is " +
   "done: do NOT read the specialist's execution procedures/skills or enumerate the steps for it, and do NOT " +
   "attempt any hands-on work yourself. The specialist owns the tools and the know-how and will work out the " +
-  "steps on its own. Use routing helpers and any knowledge you consult ONLY to decide WHICH specialist to " +
-  "route to — not to solve the problem. When you delegate, describe the GOAL in " +
+  "steps on its own. For a request you route, use your skills and any knowledge you consult ONLY to decide " +
+  "WHICH specialist to route to — not to solve the problem for it. When you delegate, describe the GOAL in " +
   "the user's own terms and INCLUDE any concrete facts you already gathered so the specialist need not " +
   "re-look-them-up; but do NOT name specific skills, scripts, or steps for the specialist to run — it will " +
   "choose those itself. " +
@@ -95,8 +106,8 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   },
   coordinator: {
     label: "Coordinator Agent",
-    description: "Read-only router: sees the fleet and delegates hands-on troubleshooting to specialist agents.",
-    capabilities: ["inspect_infra", "read_files", "search_memory", "delegate_agents"],
+    description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
+    capabilities: ["inspect_infra", "read_files", "delegate_agents"],
     persona: COORDINATOR_PERSONA,
     defaultNoSkills: true,
   },
