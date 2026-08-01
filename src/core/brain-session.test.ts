@@ -98,6 +98,7 @@ describe("modelNeedsRebind", () => {
     maxTokens: 65536,
     reasoning: true,
     api: "openai-completions",
+    maxTokensField: "max_tokens",
   };
 
   it("rebinds when nothing is bound yet", () => {
@@ -135,5 +136,19 @@ describe("modelNeedsRebind", () => {
 
   it("ignores display name — it does not affect how a turn is issued", () => {
     expect(modelNeedsRebind(base, { ...base, name: "Claude Sonnet 5" })).toBe(false);
+  });
+
+  // The same failure one layer down: a max-tokens-field correction also leaves
+  // every other compared attribute identical, so a check that omits it skips
+  // setModel and the fix looks applied everywhere except in the actual request.
+  it("rebinds when only the max-tokens field changed", () => {
+    expect(modelNeedsRebind(base, { ...base, maxTokensField: "max_completion_tokens" })).toBe(true);
+  });
+
+  it("rebinds when the max-tokens field appears or disappears", () => {
+    // A descriptor that stopped stating the field is not the same binding as
+    // one that stated it — don't silently keep the old value.
+    expect(modelNeedsRebind({ ...base, maxTokensField: undefined }, base)).toBe(true);
+    expect(modelNeedsRebind(base, { ...base, maxTokensField: undefined })).toBe(true);
   });
 });

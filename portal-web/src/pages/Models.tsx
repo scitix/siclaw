@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react"
-import { Plus, Trash2, Loader2, ChevronDown, ChevronRight, Settings, Download, X } from "lucide-react"
+import { Plus, Trash2, Loader2, ChevronDown, ChevronRight, Settings, Download, X, Plug } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
@@ -19,8 +19,18 @@ interface ModelEntry {
    * "inherit the provider's api_type" is stored as.
    */
   api_type?: string | null
+  // Same shape, same reason: NULL on every model predating the column, meaning
+  // "infer the max-tokens field name from the model id".
+  max_tokens_field?: string | null
   is_default: boolean
 }
+
+/** Which request field carries the output-token cap. "" = let the server infer. */
+const MAX_TOKENS_FIELD_OPTIONS = [
+  { value: "", label: "Auto" },
+  { value: "max_tokens", label: "max_tokens" },
+  { value: "max_completion_tokens", label: "max_completion_tokens (OpenAI reasoning)" },
+]
 
 /** A model advertised by the provider's own /models endpoint (import dialog). */
 export interface ListedModel {
@@ -182,7 +192,7 @@ export function Models() {
 
   // Add model
   const [showAddModel, setShowAddModel] = useState<string | null>(null)
-  const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "openai-completions", reasoning: false, vision: false, is_default: false })
+  const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "openai-completions", max_tokens_field: "", reasoning: false, vision: false, is_default: false })
   const [addingModel, setAddingModel] = useState(false)
 
   // Fetch models from the provider's own /models endpoint
@@ -200,8 +210,9 @@ export function Models() {
 
   // Edit model
   const [editingModelId, setEditingModelId] = useState<string | null>(null)
-  const [editModelForm, setEditModelForm] = useState({ model_id: "", name: "", context_window: "", max_tokens: "", api_type: "", reasoning: false, vision: false, is_default: false })
+  const [editModelForm, setEditModelForm] = useState({ model_id: "", name: "", context_window: "", max_tokens: "", api_type: "", max_tokens_field: "", reasoning: false, vision: false, is_default: false })
   const [savingModel, setSavingModel] = useState(false)
+  const [testingModelId, setTestingModelId] = useState<string | null>(null)
 
   const fetchProviders = async () => {
     try {
@@ -269,7 +280,7 @@ export function Models() {
         body: { ...modelForm, context_window: parseInt(modelForm.context_window), max_tokens: parseInt(modelForm.max_tokens) },
       })
       setShowAddModel(null)
-      setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "openai-completions", reasoning: false, vision: false, is_default: false })
+      setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "openai-completions", max_tokens_field: "", reasoning: false, vision: false, is_default: false })
       await fetchProviders()
       toast.success("Model added")
     } catch (err: any) { toast.error(err.message) } finally { setAddingModel(false) }
@@ -351,10 +362,31 @@ export function Models() {
       context_window: String(model.context_window),
       max_tokens: String(model.max_tokens),
       api_type: normalizeApiType(model.api_type || "openai-completions"),
+      max_tokens_field: model.max_tokens_field ?? "",
       reasoning: !!model.reasoning,
       vision: !!model.vision,
       is_default: !!model.is_default,
     })
+  }
+
+  const handleTestModel = async (providerId: string, modelId: string) => {
+    setTestingModelId(modelId)
+    try {
+      const r = await api<{ ok: boolean; latency_ms: number; corrected: boolean; message: string }>(
+        `/siclaw/admin/models/providers/${providerId}/models/${modelId}/test`,
+        { method: "POST" },
+      )
+      if (r.ok && r.corrected) {
+        // The server persisted the corrected field — refetch so the badge and
+        // the edit form show what will actually be sent from now on.
+        await fetchProviders()
+        toast.success(r.message)
+      } else if (r.ok) {
+        toast.success(`OK (${r.latency_ms}ms)`)
+      } else {
+        toast.error(r.message)
+      }
+    } catch (err: any) { toast.error(err.message) } finally { setTestingModelId(null) }
   }
 
   const handleSaveModel = async (providerId: string) => {
@@ -369,6 +401,10 @@ export function Models() {
           context_window: parseInt(editModelForm.context_window),
           max_tokens: parseInt(editModelForm.max_tokens),
           api_type: editModelForm.api_type,
+          // Send the raw "" so the server folds it to NULL. Omitting the key
+          // instead would make `"max_tokens_field" in body` false server-side,
+          // and an override could never be cleared back to Auto.
+          max_tokens_field: editModelForm.max_tokens_field,
           reasoning: editModelForm.reasoning,
           vision: editModelForm.vision,
           is_default: editModelForm.is_default,
@@ -499,9 +535,11 @@ export function Models() {
                                   {model.name || model.model_id}{model.reasoning ? " · reasoning" : ""}{model.vision ? " · vision" : ""} · {(model.context_window / 1000).toFixed(0)}K
                                   {!!modelApiLabel(model.api_type) && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-secondary text-muted-foreground font-mono">{modelApiLabel(model.api_type)}</span>}
                                   {!!model.is_default && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-primary/20 text-primary">default</span>}
+                                  {!!model.max_tokens_field && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-secondary text-muted-foreground font-mono">{model.max_tokens_field}</span>}
                                 </p>
                               </div>
                               <div className="flex items-center gap-1">
+                                <button onClick={() => handleTestModel(provider.id, model.id)} disabled={testingModelId === model.id} title="Send a 1-token request; fixes the max-tokens field if it's wrong" className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground disabled:opacity-50">{testingModelId === model.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plug className="h-3.5 w-3.5" />}</button>
                                 <button onClick={() => startEditModel(model)} title="Edit model" className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-3.5 w-3.5" /></button>
                                 <button onClick={() => handleDeleteModel(provider.id, model.id)} title="Delete model" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-3.5 w-3.5" /></button>
                               </div>
@@ -515,6 +553,12 @@ export function Models() {
                                   <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Context Window</label><input value={editModelForm.context_window} onChange={(e) => setEditModelForm({ ...editModelForm, context_window: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                                   <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={editModelForm.max_tokens} onChange={(e) => setEditModelForm({ ...editModelForm, max_tokens: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                                   <div className="col-span-2"><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">API Type <span className="font-normal opacity-70">— the wire protocol this model speaks</span></label><select value={editModelForm.api_type} onChange={(e) => setEditModelForm({ ...editModelForm, api_type: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background"><option value="openai-completions">OpenAI Compatible</option><option value="anthropic-messages">Anthropic</option></select></div>
+                                  <div className="col-span-2">
+                                    <label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max-Tokens Field <span className="font-normal opacity-70">— which request field carries the output cap</span></label>
+                                    <select value={editModelForm.max_tokens_field} onChange={(e) => setEditModelForm({ ...editModelForm, max_tokens_field: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background">
+                                      {MAX_TOKENS_FIELD_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                    </select>
+                                  </div>
                                 </div>
                                 <div className="flex items-center gap-5">
                                   <div className="flex items-center gap-2">
@@ -551,6 +595,12 @@ export function Models() {
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Context Window</label><input value={modelForm.context_window} onChange={(e) => setModelForm({ ...modelForm, context_window: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={modelForm.max_tokens} onChange={(e) => setModelForm({ ...modelForm, max_tokens: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                           <div className="col-span-2"><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">API Type <span className="font-normal opacity-70">— the wire protocol this model speaks</span></label><select value={modelForm.api_type} onChange={(e) => setModelForm({ ...modelForm, api_type: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background"><option value="openai-completions">OpenAI Compatible</option><option value="anthropic-messages">Anthropic</option></select></div>
+                          <div className="col-span-2">
+                            <label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max-Tokens Field <span className="font-normal opacity-70">— which request field carries the output cap</span></label>
+                            <select value={modelForm.max_tokens_field} onChange={(e) => setModelForm({ ...modelForm, max_tokens_field: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background">
+                              {MAX_TOKENS_FIELD_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                            </select>
+                          </div>
                         </div>
                         <div className="flex items-center gap-5">
                           <div className="flex items-center gap-2">

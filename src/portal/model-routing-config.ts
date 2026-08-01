@@ -30,6 +30,7 @@ interface ModelRow {
   max_tokens: number;
   /** Per-model protocol override; null = inherit ProviderRow.api_type. */
   api_type: string | null;
+  max_tokens_field: string | null;
 }
 
 export function encodeModelRoutingForDb(value: unknown): string | null | undefined {
@@ -99,7 +100,7 @@ async function loadProviderConfigs(providerNames: string[]): Promise<Map<string,
     if (!provider) continue;
 
     const [modelRows] = await db.query<ModelRow[]>(
-      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type FROM model_entries WHERE provider_id = ?",
+      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field FROM model_entries WHERE provider_id = ?",
       [provider.id],
     );
     const providerApi = normalizeProviderApi(provider.api_type);

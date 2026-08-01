@@ -188,6 +188,29 @@ export function mergeExporterAuthForUpdate(
  * not a full anti-rebinding defence.
  */
 export function tracingTestSsrfGuard(rawUrl: string): { ok: boolean; error?: string } {
+  return outboundProbeUrlGuard(rawUrl);
+}
+
+export interface OutboundProbeGuardOptions {
+  /**
+   * Permit loopback literals. Correct for probes whose target is an
+   * operator-configured LLM base URL: `http://127.0.0.1:11434/v1` (Ollama) is a
+   * legitimate provider that the runtime already dials on every turn, so
+   * refusing to let Portal reach it blocks a supported setup without closing
+   * any hole. Cloud metadata (169.254/16) stays blocked either way.
+   */
+  allowLoopback?: boolean;
+}
+
+/**
+ * Shared outbound-probe URL guard. One implementation, parameterised — earlier
+ * attempts at "just this one variant" produced divergent copies that each had
+ * to be patched separately when a bypass was found.
+ */
+export function outboundProbeUrlGuard(
+  rawUrl: string,
+  opts: OutboundProbeGuardOptions = {},
+): { ok: boolean; error?: string } {
   let u: URL;
   try {
     u = new URL(rawUrl);
@@ -198,8 +221,9 @@ export function tracingTestSsrfGuard(rawUrl: string): { ok: boolean; error?: str
     return { ok: false, error: `Unsupported protocol: ${u.protocol} (only http/https)` };
   }
   const host = u.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
-  if (isBlockedIpLiteral(host)) {
-    return { ok: false, error: `Blocked host (metadata/link-local/loopback): ${host}` };
+  if (isBlockedIpLiteral(host, opts)) {
+    const kinds = opts.allowLoopback ? "metadata/link-local" : "metadata/link-local/loopback";
+    return { ok: false, error: `Blocked host (${kinds}): ${host}` };
   }
   return { ok: true };
 }

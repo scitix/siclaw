@@ -65,8 +65,18 @@ function extractModelEntrySelects(src: string): string[] {
  *   ai-security-reviewer's bare chat/completions fetch) — no descriptor built.
  * - `me.id`: ownership checks in the admin CRUD.
  * - `*`: admin CRUD echoes the whole row back to the Portal UI.
+ * - `me.model_id, me.max_tokens_field, …`: the model-test probe, which joins
+ *   the provider for connection details and builds ONE request by hand rather
+ *   than a descriptor. It reads the protocol off the provider row it joined, so
+ *   the api_type assertion would pass anyway — the exclusion exists to keep the
+ *   call-site count below honest about what actually hydrates a descriptor.
  */
-const DESCRIPTOR_FREE_PROJECTIONS = [/^SELECT \* FROM model_entries/i, /^SELECT model_id FROM model_entries/i, /^SELECT me\.id FROM model_entries/i];
+const DESCRIPTOR_FREE_PROJECTIONS = [
+  /^SELECT \* FROM model_entries/i,
+  /^SELECT model_id FROM model_entries/i,
+  /^SELECT me\.id FROM model_entries/i,
+  /^SELECT me\.model_id, me\.max_tokens_field/i,
+];
 
 describe("model_entries SELECTs feeding buildProviderModelDescriptor", () => {
   it("all name the api_type column", () => {

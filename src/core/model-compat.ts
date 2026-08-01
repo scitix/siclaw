@@ -15,6 +15,84 @@ export interface ProviderModelRow {
   max_tokens: number;
   /** Wire protocol this model speaks. Required; see `resolveModelApi`. */
   api_type?: string | null;
+  /** Explicit `maxTokensField` override; NULL/empty = infer. */
+  max_tokens_field?: string | null;
+}
+
+/**
+ * The per-MODEL half of compat resolution.
+ *
+ * `compat` describes the wire shape of a request, and wire shape is a property
+ * of the model, not of the endpoint it happens to be served from: one gateway
+ * serves gpt-5 (which rejects `max_tokens`) next to DeepSeek (which requires
+ * it). Every caller must therefore say which model it is building for.
+ */
+export interface ModelCompatInput {
+  id: string;
+  maxTokensField?: string | null;
+}
+
+/** The two field names pi can emit — see MaxTokensField below. */
+export type MaxTokensField = "max_tokens" | "max_completion_tokens";
+
+export function isValidMaxTokensField(value: unknown): value is MaxTokensField {
+  return value === "max_tokens" || value === "max_completion_tokens";
+}
+
+/**
+ * Whether `modelId` names an OpenAI reasoning family, which rejects the legacy
+ * `max_tokens` field and requires `max_completion_tokens`.
+ *
+ * Same shape as sicore's `isReasoningModel` (sicore/pkg/llm/openai.go), which
+ * was added after the identical 400 from the same gateway. This is a NAMING
+ * CONVENTION, so it is only the fallback: an explicit `max_tokens_field` on the
+ * model row always wins, which is what covers renamed ids on aggregator
+ * gateways and families that ship after this code does.
+ */
+export function looksLikeOpenAiReasoningModel(modelId: string): boolean {
+  let id = modelId.trim().toLowerCase();
+  // Aggregators namespace ids as `vendor/model`; judge on the model part.
+  const slash = id.lastIndexOf("/");
+  if (slash >= 0) id = id.slice(slash + 1);
+  id = id.replaceAll("-", "");
+  return id.startsWith("gpt5") || id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4");
+}
+
+/**
+ * Decide which request field carries the output-token cap for one model.
+ *
+ * Validation is a strict WHITELIST rather than the passthrough used for
+ * provider api ids. pi types this field as a two-member union
+ * (`pi-coding-agent` model-registry: `Type.Union([max_completion_tokens,
+ * max_tokens])`), so an unrecognised value doesn't degrade — it fails the
+ * provider's schema and drops the model out of the registry entirely, which
+ * surfaces as "model not found" rather than as a field error.
+ */
+export function resolveMaxTokensField(
+  model: ModelCompatInput,
+  provider: ProviderCompatInput,
+): MaxTokensField {
+  const explicit = (model.maxTokensField ?? "").trim();
+  if (isValidMaxTokensField(explicit)) return explicit;
+
+  // Anthropic's messages API always names the field `max_tokens`, and pi's
+  // anthropic path ignores this setting entirely — never infer a switch there.
+  if (!usesChatCompletions(provider) || !looksLikeOpenAiReasoningModel(model.id)) return "max_tokens";
+  return "max_completion_tokens";
+}
+
+/** Build the model half of a compat input from a raw `model_entries` row. */
+export function modelCompatInputFromRow(row: ProviderModelRow): ModelCompatInput {
+  return { id: row.model_id, maxTokensField: row.max_tokens_field };
+}
+
+/**
+ * Judged on the RESOLVED api. Callers pass the model's own protocol (see
+ * `buildProviderModelDescriptor`), so on a mixed gateway this answers per model
+ * rather than per endpoint.
+ */
+function usesChatCompletions(provider: ProviderCompatInput): boolean {
+  return normalizeProviderApi(provider.api) === "openai-completions";
 }
 
 /**
@@ -63,16 +141,26 @@ function isOfficialOpenAIBaseUrl(baseUrl?: string | null): boolean {
   }
 }
 
-export function defaultProviderModelCompat(provider: ProviderCompatInput): Required<
+/**
+ * `model` is REQUIRED, not optional. `maxTokensField` was a per-provider
+ * constant for most of this repo's life, which is exactly how a per-model
+ * attribute ended up hardcoded: the function that decided it could not see
+ * which model it was deciding for. Making the parameter mandatory turns a new
+ * call site that hasn't thought about it into a compile error.
+ */
+export function defaultProviderModelCompat(
+  provider: ProviderCompatInput,
+  model: ModelCompatInput,
+): Required<
   Pick<ProviderModelCompat, "supportsDeveloperRole" | "supportsUsageInStreaming" | "maxTokensField">
 > {
-  const api = (provider.api ?? "").toLowerCase();
-  const usesChatCompletions = api === "openai" || api === "openai-completions";
-
   return {
-    supportsDeveloperRole: usesChatCompletions && isOfficialOpenAIBaseUrl(provider.baseUrl),
+    supportsDeveloperRole: usesChatCompletions(provider) && isOfficialOpenAIBaseUrl(provider.baseUrl),
     supportsUsageInStreaming: true,
-    maxTokensField: "max_tokens",
+    // Always emitted, never omitted: omitting hands the decision back to pi's
+    // own base-URL heuristic, and this value is precisely what we mean to state
+    // explicitly.
+    maxTokensField: resolveMaxTokensField(model, provider),
   };
 }
 
@@ -110,6 +198,9 @@ export function buildProviderModelDescriptor(
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: row.context_window,
     maxTokens: row.max_tokens,
-    compat: defaultProviderModelCompat({ api, baseUrl: provider.baseUrl }),
+    // `api` (already resolved per-model), not `provider.api`: every compat
+    // field describes the wire protocol, so both halves must agree on which
+    // protocol this particular model speaks.
+    compat: defaultProviderModelCompat({ api, baseUrl: provider.baseUrl }, modelCompatInputFromRow(row)),
   };
 }

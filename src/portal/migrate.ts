@@ -415,6 +415,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     context_window INT NOT NULL DEFAULT 128000,
     max_tokens INT NOT NULL DEFAULT 65536,
     api_type VARCHAR(50) NOT NULL DEFAULT 'openai-completions',
+    max_tokens_field VARCHAR(32) DEFAULT NULL,
     is_default TINYINT(1) NOT NULL DEFAULT 0,
     sort_order INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -656,6 +657,11 @@ export async function runPortalMigrations(): Promise<void> {
   // SQLite has no cheap MODIFY COLUMN, so there the constraint only reaches
   // fresh files via CREATE TABLE; the app layer never writes NULL either way.
   await tightenColumnNotNull(db, "model_entries", "api_type", "VARCHAR(50) NOT NULL DEFAULT 'openai-completions'");
+  // Which request field carries the output-token cap for THIS model. NULL =
+  // let resolveMaxTokensField() infer it; an explicit value overrides. Nullable
+  // on purpose: unlike the wire protocol, there is a sane automatic answer, so
+  // "unanswered" is a meaningful state rather than a hole to backfill.
+  await safeAlterTable(db, "model_entries", "max_tokens_field", "VARCHAR(32) DEFAULT NULL");
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
   await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "skills", "files", "MEDIUMTEXT DEFAULT NULL");

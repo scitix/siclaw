@@ -814,8 +814,7 @@ export function createHttpServer(
         const found = managed.brain.findModel(body.modelProvider, body.modelId);
         if (found) {
           const currentModel = managed.brain.getModel();
-          const needsUpdate = modelNeedsRebind(currentModel, found);
-          if (needsUpdate) {
+          if (modelNeedsRebind(currentModel, found)) {
             console.log(`[agentbox-http] Setting model for session ${managed.id}: ${found.provider}/${found.id} (reasoning=${found.reasoning})`);
             await managed.brain.setModel(found);
           }

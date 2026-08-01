@@ -1116,7 +1116,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
 
     const p = providerRows[0];
     const [modelRows] = await db.query(
-      `SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type
+      `SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field
        FROM model_entries WHERE provider_id = ? ORDER BY sort_order, created_at`,
       [p.id],
     ) as any;
@@ -1727,7 +1727,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const p = providerRows[0];
     const bindingApi = normalizeProviderApi(p.api_type);
     const [entryRows] = await db.query(
-      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type FROM model_entries WHERE provider_id = ?",
+      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field FROM model_entries WHERE provider_id = ?",
       [p.id],
     ) as any;
     const models = (entryRows as any[]).map((m: any) =>
@@ -2244,7 +2244,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
     const p = providerRows[0];
     const [modelRows] = await db.query(
-      `SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type
+      `SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field
        FROM model_entries WHERE provider_id = ? ORDER BY sort_order, created_at`,
       [p.id],
     ) as any;
@@ -2306,7 +2306,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const p = providerRows[0];
     const bindingApi = normalizeProviderApi(p.api_type);
     const [entryRows] = await db.query(
-      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type FROM model_entries WHERE provider_id = ?",
+      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field FROM model_entries WHERE provider_id = ?",
       [p.id],
     ) as any;
     const models = (entryRows as any[]).map((m: any) =>

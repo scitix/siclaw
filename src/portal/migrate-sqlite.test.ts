@@ -323,6 +323,53 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     ]);
   });
 
+  it("model_entries.max_tokens_field is nullable on a fresh install", async () => {
+    // NULL means "infer from the model id" — a real state, not a hole waiting
+    // to be backfilled. Unlike the wire protocol, there IS a sane automatic
+    // answer, so the column must not be NOT NULL.
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string; notnull: number }>>(
+      "PRAGMA table_info(model_entries)",
+    );
+    const col = rows.find((r) => r.name === "max_tokens_field");
+    expect(col).toBeDefined();
+    expect(col!.notnull).toBe(0);
+  });
+
+  it("adds max_tokens_field to a legacy model_entries table that predates it", async () => {
+    // Without this ALTER, an existing MySQL deployment answers every settings
+    // fetch with `Unknown column 'max_tokens_field'` — a hard failure, not a
+    // degradation.
+    const db = getDb();
+    await db.query(`CREATE TABLE model_entries (
+      id CHAR(36) PRIMARY KEY,
+      provider_id CHAR(36) NOT NULL,
+      model_id VARCHAR(255) NOT NULL,
+      name VARCHAR(255),
+      reasoning TINYINT(1) NOT NULL DEFAULT 0,
+      context_window INT NOT NULL DEFAULT 128000,
+      max_tokens INT NOT NULL DEFAULT 65536,
+      is_default TINYINT(1) NOT NULL DEFAULT 0,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (provider_id, model_id)
+    )`);
+    await db.query("INSERT INTO model_entries (id, provider_id, model_id) VALUES ('m1', 'p1', 'gpt-5')");
+
+    await runPortalMigrations();
+
+    const [cols] = await db.query<Array<{ name: string }>>("PRAGMA table_info(model_entries)");
+    expect(cols.map((c) => c.name)).toContain("max_tokens_field");
+
+    // Existing rows stay on "infer" rather than being pinned to a guess — even
+    // for gpt-5, where the inference would have been right.
+    const [rows] = await db.query<Array<{ id: string; max_tokens_field: string | null }>>(
+      "SELECT id, max_tokens_field FROM model_entries",
+    );
+    expect(rows).toEqual([{ id: "m1", max_tokens_field: null }]);
+  });
+
   it("agents.model_routing column exists after migration", async () => {
     await runPortalMigrations();
     const db = getDb();

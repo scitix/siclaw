@@ -30,7 +30,10 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128000,
         maxTokens: 16384,
-        compat: defaultProviderModelCompat({ api: "openai-completions", baseUrl: "https://api.openai.com/v1" }),
+        compat: defaultProviderModelCompat(
+          { api: "openai-completions", baseUrl: "https://api.openai.com/v1" },
+          { id: "gpt-4o" },
+        ),
       },
       {
         id: "gpt-4o-mini",
@@ -40,7 +43,10 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128000,
         maxTokens: 16384,
-        compat: defaultProviderModelCompat({ api: "openai-completions", baseUrl: "https://api.openai.com/v1" }),
+        compat: defaultProviderModelCompat(
+          { api: "openai-completions", baseUrl: "https://api.openai.com/v1" },
+          { id: "gpt-4o-mini" },
+        ),
       },
     ],
   },
@@ -60,7 +66,10 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 16000,
-        compat: defaultProviderModelCompat({ api: "anthropic-messages", baseUrl: "https://api.anthropic.com/v1" }),
+        compat: defaultProviderModelCompat(
+          { api: "anthropic-messages", baseUrl: "https://api.anthropic.com/v1" },
+          { id: "claude-sonnet-4-20250514" },
+        ),
       },
       {
         id: "claude-opus-4-20250514",
@@ -70,7 +79,10 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 16000,
-        compat: defaultProviderModelCompat({ api: "anthropic-messages", baseUrl: "https://api.anthropic.com/v1" }),
+        compat: defaultProviderModelCompat(
+          { api: "anthropic-messages", baseUrl: "https://api.anthropic.com/v1" },
+          { id: "claude-opus-4-20250514" },
+        ),
       },
     ],
   },
@@ -89,7 +101,7 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128000,
         maxTokens: 8192,
-        compat: defaultProviderModelCompat({ api: "openai-completions", baseUrl: "" }),
+        compat: defaultProviderModelCompat({ api: "openai-completions", baseUrl: "" }, { id: "default" }),
       },
     ],
   },

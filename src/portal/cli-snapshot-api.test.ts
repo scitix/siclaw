@@ -241,6 +241,38 @@ describe("GET /api/v1/cli-snapshot", () => {
     });
   });
 
+  it("gives three models on one gateway their own max-tokens field", async () => {
+    // The end-to-end check for the per-model wire attribute: real SQLite, real
+    // migration, real SELECT, real descriptor. A column the SELECT forgot to
+    // name would silently collapse all three onto the default here.
+    const db = getDb();
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-mixed", "default", "mixed", "https://api.scitix.ai/model-api", "sk-test", "openai-completions", 0],
+    );
+    const insert =
+      "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, max_tokens_field, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    // NULL → inferred from the id; explicit values → taken verbatim, including
+    // the one that contradicts the naming convention.
+    await db.query(insert, ["m-r", "p-mixed", "gpt-5", "GPT-5", 1, 400000, 8192, null, 1, 0]);
+    await db.query(insert, ["m-c", "p-mixed", "DeepSeek-V3", "DeepSeek", 0, 128000, 8192, null, 0, 1]);
+    await db.query(insert, ["m-o", "p-mixed", "house-reasoner", "House", 1, 128000, 8192, "max_completion_tokens", 0, 2]);
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
+    );
+    expect(status).toBe(200);
+    const byId = Object.fromEntries(
+      body.providers.mixed.models.map((m: any) => [m.id, m.compat.maxTokensField]),
+    );
+    expect(byId).toEqual({
+      "gpt-5": "max_completion_tokens",
+      "DeepSeek-V3": "max_tokens",
+      "house-reasoner": "max_completion_tokens",
+    });
+  });
+
   it("filters out providers with empty or NULL api_key", async () => {
     // A provider row without a usable api_key would land in the TUI as
     // `apiKey: ""`, causing the first upstream call to fail with a cryptic

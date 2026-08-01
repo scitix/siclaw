@@ -65,7 +65,7 @@ import {
   tracingTestSsrfGuard,
   type ExporterAuth,
 } from "./tracing-exporters.js";
-import { normalizeProviderApi } from "../core/model-compat.js";
+import { normalizeProviderApi, isValidMaxTokensField } from "../core/model-compat.js";
 import { readBodyWithCap } from "../lib/portal-snapshot-client.js";
 import {
   buildModelListUrl,
@@ -75,6 +75,7 @@ import {
   providerFetchSsrfGuard,
   type ListedModel,
 } from "./provider-model-listing.js";
+import { testModelWireConfig } from "./model-probe.js";
 
 /** Trace viewer message limit — matches siclaw.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
@@ -124,6 +125,28 @@ function clampTokenCount(value: unknown, fallback: number): number {
   if (!Number.isFinite(n) || n <= 0) return fallback;
   return Math.min(n, MAX_TOKEN_COUNT);
 }
+
+/**
+ * Normalise a client-supplied `max_tokens_field` for `model_entries`.
+ *
+ * `""` — the UI's "Auto" option — folds to SQL NULL so the row returns to
+ * inference. Anything outside pi's two-member union is REJECTED rather than
+ * passed through: an unknown value doesn't degrade, it fails pi's provider
+ * schema and drops the model from the registry ("model not found").
+ */
+function normalizeMaxTokensFieldInput(
+  value: unknown,
+): { ok: true; value: string | null } | { ok: false } {
+  if (value === null || value === undefined) return { ok: true, value: null };
+  if (typeof value !== "string") return { ok: false };
+  const trimmed = value.trim();
+  if (trimmed === "") return { ok: true, value: null };
+  if (!isValidMaxTokensField(trimmed)) return { ok: false };
+  return { ok: true, value: trimmed };
+}
+
+const INVALID_MAX_TOKENS_FIELD_MESSAGE =
+  'max_tokens_field must be "max_tokens", "max_completion_tokens", or empty for auto';
 
 // ── MCP config import / export ────────────────────────────────
 
@@ -3135,9 +3158,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const trim = (v: unknown): string | null => (typeof v === "string" ? v.trim() : null);
     const modelId = trim(body.model_id);
+    const maxTokensField = normalizeMaxTokensFieldInput(body.max_tokens_field);
+    if (!maxTokensField.ok) { sendJson(res, 400, { error: INVALID_MAX_TOKENS_FIELD_MESSAGE }); return; }
     await db.query(
-      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, vision, context_window, max_tokens, api_type, is_default, sort_order)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field, is_default, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, params.id, modelId, trim(body.name) || modelId,
         body.reasoning ? 1 : 0, body.vision ? 1 : 0,
@@ -3145,6 +3170,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         clampTokenCount(body.max_tokens, 65536),
         // Required column: fall back to the provider's default when unspecified.
         apiType.value ?? providerApiType,
+        // Nullable: NULL is the live "infer it" state, not a missing answer.
+        maxTokensField.value,
         body.is_default ? 1 : 0,
         body.sort_order ?? 0,
       ],
@@ -3201,6 +3228,16 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       if (apiType.value === null) { sendJson(res, 400, { error: "api_type cannot be empty" }); return; }
       sets.push("api_type = ?");
       values.push(apiType.value);
+    }
+    // Deliberately NOT in `fields`: that loop binds body[f] verbatim, which
+    // would store the form's "" for Auto instead of folding it to NULL. Must
+    // also come BEFORE the guard below, or a PUT carrying only this field is
+    // rejected as "Nothing to update".
+    if ("max_tokens_field" in body) {
+      const normalized = normalizeMaxTokensFieldInput(body.max_tokens_field);
+      if (!normalized.ok) { sendJson(res, 400, { error: INVALID_MAX_TOKENS_FIELD_MESSAGE }); return; }
+      sets.push("max_tokens_field = ?");
+      values.push(normalized.value);
     }
     if (sets.length === 0) { sendJson(res, 400, { error: "Nothing to update" }); return; }
 
@@ -3416,6 +3453,54 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     await db.query("DELETE FROM model_entries WHERE id = ?", [params.mid]);
     sendJson(res, 200, { ok: true });
+  });
+
+  // Test a model's wire configuration, self-correcting the max-tokens field.
+  router.post(`${P}/admin/models/providers/:pid/models/:mid/test`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "write")) return;
+    const db = getDb();
+
+    const [rows] = await db.query(
+      `SELECT me.model_id, me.max_tokens_field, mp.base_url, mp.api_key, mp.api_type
+       FROM model_entries me JOIN model_providers mp ON me.provider_id = mp.id
+       WHERE me.id = ? AND me.provider_id = ? AND (mp.org_id = ? OR mp.org_id IS NULL)`,
+      [params.mid, params.pid, auth.orgId],
+    ) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "Model entry not found" }); return; }
+
+    const row = rows[0];
+    const result = await testModelWireConfig(
+      {
+        modelId: row.model_id,
+        baseUrl: row.base_url,
+        apiKey: row.api_key ?? null,
+        apiType: row.api_type ?? null,
+        maxTokensField: row.max_tokens_field ?? null,
+      },
+      { api: row.api_type, baseUrl: row.base_url },
+    );
+
+    // Persist the correction so the next real turn uses the working field
+    // directly instead of re-deriving the wrong one.
+    if (result.corrected) {
+      await db.query("UPDATE model_entries SET max_tokens_field = ? WHERE id = ?", [
+        result.maxTokensField, params.mid,
+      ]);
+    }
+
+    // A failed probe is a successful API call — 200 with ok:false, matching the
+    // tracing exporter test endpoints.
+    sendJson(res, 200, {
+      ok: result.ok,
+      status: result.status,
+      latency_ms: result.latencyMs,
+      max_tokens_field: result.maxTokensField,
+      corrected: result.corrected,
+      message: result.message,
+    });
   });
 
   // ================================================================
