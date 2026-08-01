@@ -20,6 +20,7 @@ import { AgentBoxClient, type AgentBoxTlsOptions, type PromptOptions } from "./a
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
 import { appendMessage, ensureChatSession, incrementMessageCount } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
+import { sessionTurnLocks } from "./session-turn-lock.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { sessionRegistry } from "./session-registry.js";
@@ -262,6 +263,7 @@ export class TaskCoordinator {
       runId = "";
     }
 
+    let releaseTurn: (() => void) | undefined;
     try {
       console.log(`[task-coordinator] Executing task ${job.id} (${job.name}) agent=${agentId} user=${userId}`);
 
@@ -271,7 +273,10 @@ export class TaskCoordinator {
       // One pod per agent — shared across users who call the agent.
       // Caller/task-owner attribution flows to Upstream via the session registry.
       sessionRegistry.remember(sessionId, userId, agentId);
-      const handle = await this.manager.getOrCreate(agentId, { persistence: binding.persistence });
+      // One turn at a time for this task's session — see session-turn-lock.ts.
+      releaseTurn = await sessionTurnLocks.acquire(sessionId);
+      const handle = await this.manager.getOrCreate(agentId, { persistence: binding.persistence }, sessionId);
+      sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
       const client = new AgentBoxClient(handle.endpoint, 30_000, this.tlsOptions);
 
       const promptOpts: PromptOptions = {
@@ -322,6 +327,8 @@ export class TaskCoordinator {
       status = "failure";
       error = err instanceof Error ? err.message : String(err);
       console.error(`[task-coordinator] Task ${job.id} failed:`, error);
+    } finally {
+      releaseTurn?.();
     }
 
     const durationMs = Date.now() - startTime;

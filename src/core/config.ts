@@ -197,6 +197,31 @@ export function normalizeIdleTimeoutSec(v: unknown): number {
   return Math.max(MIN_AGENTBOX_IDLE_SEC, n);              // floor
 }
 
+/**
+ * Upper bound on how many AgentBox pods one agent may run.
+ *
+ * Not a resource statement — it is a guard against a typo (a stray zero) quietly asking
+ * the scheduler for a hundred pods. Real capacity is bounded by node headroom, which the
+ * cluster enforces on its own.
+ */
+export const MAX_AGENT_REPLICAS = 20;
+
+/**
+ * Normalize a per-agent replica count:
+ *  - invalid / missing / `< 1` → `1`
+ *  - above the cap            → the cap
+ *
+ * **1 is the identity value**: an agent that never opts in behaves exactly as it did
+ * before replicas existed, which is what makes every phase of the rollout safe to ship
+ * ahead of anything setting the field.
+ */
+export function normalizeReplicas(v: unknown): number {
+  if (v === null || v === undefined || v === "") return 1;
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(MAX_AGENT_REPLICAS, n);
+}
+
 export function isMemoryEnabled(): boolean {
   // Off by default — memory (memory_search/memory_get + session auto-save) is an
   // opt-in feature. Enable explicitly via SICLAW_MEMORY_ENABLED=true (helm:

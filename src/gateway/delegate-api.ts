@@ -25,6 +25,7 @@ import type { CertificateIdentity } from "./security/cert-manager.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type AgentBoxTlsOptions } from "./agentbox/client.js";
 import { consumeAgentSse } from "./sse-consumer.js";
+import { sessionTurnLocks } from "./session-turn-lock.js";
 import { ensureChatSession, appendMessage } from "./chat-repo.js";
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
 import type {
@@ -251,8 +252,17 @@ export async function handleDelegate(
   // card can offer "open full session" LIVE, before the final result arrives.
   writeFrame({ type: "delegate_session", peerSessionId });
 
+  // One turn at a time for this peer session — the AgentBox's 409 only sees its own
+  // sessions, so with more than one box two delegations could run on two boxes at once.
+  // Acquired INSIDE the try: this function runs detached (`void handleDelegate(...)`) with
+  // no catch of its own, and the SSE response headers are already written by now. A
+  // rejection escaping here would leave the coordinator hanging on an open stream and, on
+  // Node's default unhandled-rejection policy, take the whole Runtime process down.
+  let releaseTurn: (() => void) | undefined;
   try {
-    const handle = await deps.agentBoxManager.getOrCreate(peerAgentId);
+    releaseTurn = await sessionTurnLocks.acquire(peerSessionId);
+    const handle = await deps.agentBoxManager.getOrCreate(peerAgentId, undefined, peerSessionId);
+    sessionTurnLocks.noteBox(peerSessionId, handle.boxId, handle.endpoint);
     const client = new AgentBoxClient(handle.endpoint, 30000, deps.agentBoxTlsOptions);
     peerClient = client;
     // Cancellation during cold spawn: if the coordinator disconnected while
@@ -383,6 +393,8 @@ export async function handleDelegate(
     });
     res.end();
     return;
+  } finally {
+    releaseTurn?.();
   }
 
   finished = true;

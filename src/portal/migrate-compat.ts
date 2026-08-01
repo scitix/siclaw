@@ -44,13 +44,16 @@ export async function safeAlterTable(
   table: string,
   column: string,
   definition: string,
-): Promise<void> {
-  if (await columnExists(db, table, column)) return;
+): Promise<boolean> {
+  // Reports whether it actually added the column, so a caller can run a one-shot backfill
+  // exactly once: there is no migration bookkeeping table to record that it already ran.
+  if (await columnExists(db, table, column)) return false;
   try {
     await db.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
     console.log(`[portal-migrate] added ${table}.${column}`);
+    return true;
   } catch (err) {
-    if (isDuplicateColumnError(err)) return;
+    if (isDuplicateColumnError(err)) return false;
     throw err;
   }
 }

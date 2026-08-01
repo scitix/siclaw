@@ -37,6 +37,13 @@ export interface AppendMessageInput {
   targetAgentId?: string | null;
   /** per-prompt root trace id (OTel 32-hex) for message-level trace filtering. */
   traceId?: string | null;
+  /**
+   * Leave this row unordered for now; it will be ordered when it enters processing.
+   *
+   * Only for user input the runtime injects into a turn: it is written on arrival so it
+   * cannot be lost, but the box consumes it at a turn boundary that may be seconds later.
+   */
+  deferSequence?: boolean;
 }
 
 export interface UpdateMessageInput {
@@ -168,6 +175,7 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
     delegation_id: msg.delegationId ?? null,
     target_agent_id: msg.targetAgentId ?? null,
     trace_id: msg.traceId ?? null,
+    defer_sequence: msg.deferSequence === true ? true : undefined,
   });
   return result.id;
 }
@@ -273,6 +281,30 @@ export async function updateMessage(msg: UpdateMessageInput): Promise<void> {
     outcome: msg.outcome ?? null,
     duration_ms: msg.durationMs ?? null,
     delegation_id: msg.delegationId ?? null,
+  });
+}
+
+/**
+ * Ask the store to give this row its place in the conversation.
+ *
+ * A user row is written the moment it arrives so it cannot be lost, but the box may not
+ * consume it until a turn boundary seconds later — so arrival order is not processing
+ * order, and a user typing faster than the model answers reloads to find every question
+ * ahead of every answer. The store allocates the ordering key when we say the row entered
+ * processing, keyed by row id so a replayed echo is a no-op rather than a silent shift.
+ *
+ * Sends nothing but the identity and the request: a partial update must leave the row's
+ * content alone.
+ */
+export async function sequenceMessage(messageId: string, sessionId: string): Promise<void> {
+  // A METHOD OF ITS OWN, deliberately. chat.updateMessage replaces the row's columns from
+  // the payload, so a store implementing that contract literally — as this repo's own
+  // Portal did — would read the absent `content` as an empty one and blank the user's
+  // message. An upstream that has not implemented this answers "unknown method", which
+  // costs the row its ordering key and nothing else.
+  await getClient().request("chat.sequenceMessage", {
+    id: messageId,
+    session_id: sessionId,
   });
 }
 

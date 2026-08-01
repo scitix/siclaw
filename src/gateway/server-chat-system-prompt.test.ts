@@ -131,7 +131,7 @@ describe("startRuntime — chat.send custom system prompt", () => {
     const send = server.rpcMethods.get("chat.send")!;
 
     await send(
-      { agentId: "a", userId: "u", text: "hi", sessionId: "S", systemPrompt: "explicit-portal-prompt" },
+      { agentId: "a", userId: "u", text: "hi", sessionId: "S1", systemPrompt: "explicit-portal-prompt" },
       { sendEvent: vi.fn() },
     );
     await waitFor(() => promptCalls.length > 0);
@@ -145,7 +145,7 @@ describe("startRuntime — chat.send custom system prompt", () => {
     server = await bootRuntime();
     const send = server.rpcMethods.get("chat.send")!;
 
-    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, { sendEvent: vi.fn() });
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S2" }, { sendEvent: vi.fn() });
     await waitFor(() => promptCalls.length > 0);
 
     expect(getAgentCalls).toEqual([{ agentId: "a" }]);
@@ -157,7 +157,7 @@ describe("startRuntime — chat.send custom system prompt", () => {
     server = await bootRuntime();
     const send = server.rpcMethods.get("chat.send")!;
 
-    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, { sendEvent: vi.fn() });
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S3" }, { sendEvent: vi.fn() });
     await waitFor(() => promptCalls.length > 0);
 
     expect(promptCalls[0].systemPromptTemplate).toBeUndefined();
@@ -168,9 +168,9 @@ describe("startRuntime — chat.send custom system prompt", () => {
     server = await bootRuntime();
     const send = server.rpcMethods.get("chat.send")!;
 
-    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, { sendEvent: vi.fn() });
+    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S4" }, { sendEvent: vi.fn() });
     // The ack still returns ok — a resolve failure must not fail the send.
-    expect(ack).toMatchObject({ ok: true, sessionId: "S" });
+    expect(ack).toMatchObject({ ok: true, sessionId: "S4" });
     await waitFor(() => promptCalls.length > 0);
 
     expect(promptCalls[0].systemPromptTemplate).toBeUndefined();

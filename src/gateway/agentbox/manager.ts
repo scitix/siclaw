@@ -12,6 +12,49 @@
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 import { getBoxProfile } from "./box-profile.js";
+import { BoxBindings } from "./box-bindings.js";
+import { normalizeReplicas } from "../../core/config.js";
+
+/** What a box reports about itself (see the agentbox `/api/internal/box-status` route). */
+export interface BoxStatusReport {
+  sessionIds: string[];
+  turnsInFlight: number;
+  drained: boolean;
+}
+
+/**
+ * How long a placement sample stays usable. Placement wants a RECENT reading, not a fresh
+ * one — and affinity means most turns never sample at all.
+ */
+const BOX_STATUS_TTL_MS = 2_000;
+
+/** How long a draining box may keep work before it is removed anyway. */
+const DRAIN_DEADLINE_MS = 5 * 60_000;
+
+/** How often drained boxes are collected. */
+const DRAIN_REAP_INTERVAL_MS = 10_000;
+
+/**
+ * Consecutive failed status probes before a box is treated as gone rather than busy.
+ *
+ * A box whose event loop is permanently blocked stays pod-phase Running with a valid
+ * endpoint forever, so nothing else ever removes it. Sessions that last ran there would be
+ * pinned to it indefinitely — every turn dispatched to a box that cannot answer. Marking
+ * it draining hands it to the reaper, which removes it at the drain deadline and frees
+ * those sessions.
+ */
+const UNRESPONSIVE_PROBE_LIMIT = 3;
+
+/**
+ * How long a per-agent replica count stays usable.
+ *
+ * This is consulted on EVERY acquisition, which is once per turn from every entry point.
+ * Against a local Portal that is free; against an upstream control plane it is a network
+ * round trip added to the hot path of every conversation. Ten seconds keeps a change
+ * taking effect promptly — a scale-up is not an interactive operation — while collapsing
+ * the steady-state cost to nearly nothing.
+ */
+const REPLICAS_TTL_MS = 10_000;
 
 export interface AgentBoxManagerConfig {
   /** Health check interval (ms) — local dev only */
@@ -50,6 +93,20 @@ export class AgentBoxManager {
   private readonly isK8s: boolean;
   private spawnEnvResolver?: (agentId: string) => Promise<Record<string, string> | undefined>;
   private persistenceResolver?: (agentId: string) => Promise<boolean | undefined>;
+  private replicasResolver?: (agentId: string) => Promise<number | undefined>;
+  private boxStatusProbe?: (endpoint: string) => Promise<BoxStatusReport>;
+  /** Which box serves which session. Only consulted when an agent runs more than one. */
+  private readonly bindings = new BoxBindings();
+  /** boxId → when it was marked draining. In memory only; re-derived after a restart. */
+  private draining = new Map<string, number>();
+  private statusCache = new Map<string, { at: number; status: BoxStatusReport }>();
+  private replicasCache = new Map<string, { at: number; value: number }>();
+  /** Consecutive failed status probes per box — see UNRESPONSIVE_PROBE_LIMIT. */
+  private probeFailures = new Map<string, number>();
+  /** Agents already warned about pooling without shared session storage. */
+  private unsharedWarned = new Set<string>();
+  private legacySessionLister?: (endpoint: string) => Promise<string[]>;
+  private drainReaperTimer?: ReturnType<typeof setInterval>;
 
   constructor(spawner: BoxSpawner, config?: AgentBoxManagerConfig) {
     this.spawner = spawner;
@@ -65,12 +122,13 @@ export class AgentBoxManager {
   }
 
   /**
-   * Periodic capability-box orphan GC (K8s spawner only; duck-typed like
+   * Periodic orphan GC for spawned boxes (K8s spawner only; duck-typed like
    * setCertManager). `isLive(boxId)` is the caller's run-liveness oracle —
-   * the manager/spawner have no knowledge of capability runs. First pass runs
-   * one minute after boot (post-recovery, so live runs are known), then every
-   * `intervalMs`. Without it, completed/crashed runs' pods + cert Secrets
-   * accumulate forever (audit finding).
+   * the manager/spawner have no knowledge of capability runs, and it is consulted
+   * ONLY for capability boxes; a chat box's liveness is its pod phase. First pass
+   * runs one minute after boot (post-recovery, so live runs are known), then every
+   * `intervalMs`. Without it, terminal pods and their cert Secrets accumulate
+   * forever (audit finding).
    */
   startOrphanSweep(isLive: (boxId: string) => boolean | Promise<boolean>, intervalMs = 10 * 60_000): void {
     const s: any = this.spawner;
@@ -97,6 +155,61 @@ export class AgentBoxManager {
    */
   setSpawnEnvResolver(fn: (agentId: string) => Promise<Record<string, string> | undefined>): void {
     this.spawnEnvResolver = fn;
+  }
+
+  /**
+   * How many boxes an agent should run. Undefined / <1 means one, which routes through the
+   * ORIGINAL single-box path — the property that lets every earlier phase ship before this
+   * field exists anywhere.
+   *
+   * Consulted on every acquisition, not only on a cold spawn: unlike the volume mount, the
+   * pool size is something a running agent can actually change.
+   */
+  setReplicasResolver(fn: (agentId: string) => Promise<number | undefined>): void {
+    this.replicasResolver = fn;
+  }
+
+  /**
+   * How to ask a box what it is holding. Injected rather than imported so the manager owns
+   * no transport, and so the drain reaper can be exercised without mTLS in tests.
+   */
+  /**
+   * Fallback for boxes predating `box-status`: list the sessions they hold.
+   *
+   * Only used when the status probe fails. It cannot report in-flight turns or background
+   * work, so it reports neither — but it answers the one question that decides whether a
+   * session may be moved, which is the one that matters during a rollout.
+   */
+  setLegacySessionLister(fn: (endpoint: string) => Promise<string[]>): void {
+    this.legacySessionLister = fn;
+  }
+
+  setBoxStatusProbe(fn: (endpoint: string) => Promise<BoxStatusReport>): void {
+    this.boxStatusProbe = fn;
+    if (!this.drainReaperTimer && this.isK8s) {
+      this.drainReaperTimer = setInterval(() => {
+        void this.reapDrainedBoxes().catch((err) =>
+          console.warn("[agentbox-manager] drain reaper failed:", err));
+      }, DRAIN_REAP_INTERVAL_MS);
+      this.drainReaperTimer.unref?.();
+    }
+  }
+
+  private async resolveReplicas(agentId: string): Promise<number> {
+    if (!this.replicasResolver) return 1;
+    const cached = this.replicasCache.get(agentId);
+    if (cached && Date.now() - cached.at < REPLICAS_TTL_MS) return cached.value;
+    try {
+      const value = normalizeReplicas(await this.replicasResolver(agentId));
+      this.replicasCache.set(agentId, { at: Date.now(), value });
+      return value;
+    } catch (err) {
+      // Fail to ONE, never to many: a config lookup blip must not scale an agent up.
+      // Deliberately NOT cached — a blip should be retried on the next turn, not
+      // remembered for the next ten seconds.
+      console.warn(`[agentbox-manager] replicas lookup failed for agent=${agentId}; using 1:`, err);
+      return 1;
+    }
   }
 
   /**
@@ -129,17 +242,20 @@ export class AgentBoxManager {
   }
 
   /**
-   * Pod / box name. One pod per agent — we trim agentId to keep under the 63-char
-   * K8s name limit and only sanitize forbidden characters.
+   * Pod / box name. Trims agentId to stay under the 63-char K8s name limit and only
+   * sanitizes forbidden characters.
    *
-   * The prefix is profile-derived and MUST match K8sSpawner.podName (compile
-   * boxes are "kbc-box-", everything else "agentbox-"): the manager looks a pod
-   * up by this computed name for warm reuse, liveness and stop, so a mismatch
-   * would miss the real pod (a leaked box on stop, a missed re-attach on adopt).
+   * The prefix is profile-derived and this MUST stay identical to K8sSpawner.podName
+   * (compile boxes are "kbc-box-", everything else "agentbox-"): the manager looks a pod
+   * up by this computed name for warm reuse, liveness and stop, so a mismatch would miss
+   * the real pod (a leaked box on stop, a missed re-attach on adopt). That includes the
+   * instance rule — 0 is unsuffixed, so an agent running one box is named exactly as it
+   * always was.
    */
-  private podName(agentId: string, prefix = "agentbox"): string {
+  private podName(agentId: string, prefix = "agentbox", instance = 0): string {
     const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
-    return `${prefix}-${sanitized}`;
+    const base = `${prefix}-${sanitized}`;
+    return instance > 0 ? `${base}-${instance}` : base;
   }
 
   /** Pod-name prefix a profile spawns under (see K8sSpawner / BoxProfile.podNamePrefix). */
@@ -172,8 +288,12 @@ export class AgentBoxManager {
    * mounts), so a configuration change applies on the agent's next cold spawn
    * (after restart/idle-release), not immediately on a warm pod.
    */
-  async getOrCreate(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
-    return (await this.getOrCreateWithDisposition(agentId, config)).handle;
+  async getOrCreate(
+    agentId: string,
+    config?: Partial<AgentBoxConfig>,
+    sessionId?: string,
+  ): Promise<AgentBoxHandle> {
+    return (await this.getOrCreateWithDisposition(agentId, config, sessionId)).handle;
   }
 
   /**
@@ -186,10 +306,21 @@ export class AgentBoxManager {
   async getOrCreateWithDisposition(
     agentId: string,
     config?: Partial<AgentBoxConfig>,
+    sessionId?: string,
   ): Promise<AgentBoxAcquisition> {
     if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
     if (this.isK8s) {
-      return this.getOrCreateK8s(agentId, config);
+      // A capability box is a per-run job, not a long-lived agent, so it never pools.
+      const wantProfile = config?.profile ?? "agent";
+      const replicas = wantProfile === "agent" ? await this.resolveReplicas(agentId) : 1;
+      // 🔴 `replicas <= 1` takes the ORIGINAL single-box path untouched. That is what makes
+      // this safe to ship before anything sets the field: an agent that has not opted in
+      // executes exactly the code it did before pooling existed.
+      if (replicas > 1) {
+        this.warnIfSessionsAreNotShared(agentId);
+        return this.getOrCreatePooled(agentId, config, sessionId, replicas);
+      }
+      return this.getOrCreateK8s(agentId, config, sessionId);
     }
     return this.getOrCreateLocal(agentId, config);
   }
@@ -197,11 +328,33 @@ export class AgentBoxManager {
   private async getOrCreateK8s(
     agentId: string,
     config?: Partial<AgentBoxConfig>,
+    sessionId?: string,
   ): Promise<AgentBoxAcquisition> {
     const wantProfile = config?.profile ?? "agent";
     const name = this.podName(agentId, this.prefixForProfile(wantProfile));
 
     const info = await this.spawner.get(name);
+
+    // 🔴 A single-box agent must still pick up a new AgentBox image. Nothing else does it:
+    // this path compares phase, profile and CA but never the image, and a box under
+    // continuous traffic never idles out to be respawned — so a Runtime rollout would
+    // leave it on the old image indefinitely, which is the defect this whole change set
+    // exists to fix. It cannot drain in place (the replacement would collide on this same
+    // pod name), so hand the agent to the pool path with a size of one: the stale box is
+    // marked draining and keeps serving what it holds, the replacement comes up under the
+    // next free instance index, and new sessions go there.
+    //
+    // The pool then sits at instance 1 while `replicas` is 1, so the next acquisition
+    // creates instance 0 again and the size reconciler drains instance 1. That costs one
+    // extra pod lifecycle per rollout and converges on its own — cheaper than teaching
+    // this path to find a box by label instead of by name.
+    if (info && info.status === "running" && this.isStaleImage(info, wantProfile)) {
+      console.log(
+        `[agentbox-manager] agent=${agentId} is on a stale AgentBox image; rolling it through the pool path`,
+      );
+      return this.getOrCreatePooled(agentId, config, sessionId, 1);
+    }
+
     if (info && info.status === "running" && info.endpoint && this.isCertFresh(info)) {
       const hasProfile = info.profile ?? "agent";
       if (hasProfile === wantProfile) {
@@ -234,6 +387,481 @@ export class AgentBoxManager {
 
     handle.agentId = agentId;
     return { handle, created: true };
+  }
+
+  /**
+   * Multi-box path: keep the agent's pool at `replicas`, then route this session to one
+   * box and keep it there.
+   *
+   * Reads the pool fresh every call rather than remembering it. The Runtime is the sole
+   * writer, so there is nothing to coordinate — and re-deriving means a restart cannot
+   * act on state that went stale while it was down.
+   */
+  private async getOrCreatePooled(
+    agentId: string,
+    config: Partial<AgentBoxConfig> | undefined,
+    sessionId: string | undefined,
+    replicas: number,
+  ): Promise<AgentBoxAcquisition> {
+    const wantProfile = config?.profile ?? "agent";
+    const pool = await this.listPool(agentId);
+    this.markStaleBoxesDraining(agentId, pool, wantProfile);
+    this.bindings.retainBoxes(agentId, new Set(pool.map((b) => b.boxId)));
+
+    const reachable = pool.filter((b) => this.isReachable(b, wantProfile));
+
+    // Ask the boxes what they are HOLDING before deciding anything. Residency is the
+    // input every rule below turns on, and two separate bugs came from branches that
+    // decided first and sampled afterwards: a rollout re-placed a session that was still
+    // running, and a released session was pinned to a draining box forever.
+    // Ask the boxes what they are holding. A session is held while its turn runs AND
+    // while background sub-agents run under it (residency is deferred until they finish),
+    // so one signal covers both reasons a session may not move.
+    const statuses = sessionId ? await this.sampleBoxStatuses(reachable) : new Map<string, BoxStatusReport>();
+    let holder = sessionId
+      ? [...statuses].find(([, st]) => st.sessionIds.includes(sessionId))?.[0]
+      : undefined;
+
+    // A box that did not answer has NOT told us it is empty. Treating silence as "holds
+    // nothing" is how a session gets handed to a second box while the first is still
+    // writing its transcript — during a rollout the old boxes have no box-status endpoint
+    // at all, so every one of them is silent. If this session last ran on a box we cannot
+    // currently ask, assume it is still there.
+    if (!holder && sessionId) {
+      const last = this.bindings.get(agentId, sessionId);
+      // …unless we have already given up on that box (see UNRESPONSIVE_PROBE_LIMIT), in
+      // which case pinning the session there would just fail every turn forever.
+      const givenUp = last ? (this.probeFailures.get(last) ?? 0) >= UNRESPONSIVE_PROBE_LIMIT : false;
+      if (last && !givenUp && reachable.some((b) => b.boxId === last) && !statuses.has(last)) {
+        console.log(`[agentbox-manager] ${last} did not answer; keeping session ${sessionId} on it rather than assuming it is free`);
+        holder = last;
+      }
+    }
+
+
+    // Held somewhere reachable: that box has the conversation in memory and is the one
+    // appending to the transcript, so nothing else may take the turn — not even a spawn.
+    if (holder) {
+      const box = reachable.find((b) => b.boxId === holder);
+      if (box) {
+        this.bindings.remember(agentId, sessionId!, box.boxId);
+        return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
+      }
+    }
+
+    // Growing the pool normally happens in the BACKGROUND: blocking this turn on a cold
+    // start would make growing the pool feel slower than not having grown it.
+    //
+    // "Already up" means ACCEPTING, not merely reachable. When every box is draining — a
+    // rollout replacing the whole pool, or a single-box agent rolling onto a new image —
+    // there is nothing to serve from, so exactly one spawn is awaited and the rest are
+    // still backgrounded. Splitting it this way is what stops the wait path and the
+    // background fill from both targeting the same free index.
+    const missing = this.missingInstances(pool, replicas, agentId);
+    const accepting = reachable.filter((b) => !this.draining.has(b.boxId));
+
+    if (accepting.length === 0) {
+      const [first, ...rest] = missing.length > 0 ? missing : this.freeInstances(pool, 1);
+      const [handle] = await this.spawnInstances(agentId, config, [first]);
+      if (rest.length > 0) {
+        void this.spawnInstances(agentId, config, rest).catch((err) =>
+          console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
+      }
+      if (handle) {
+        if (sessionId) this.bindings.remember(agentId, sessionId, handle.boxId);
+        return { handle, created: true };
+      }
+      // The spawn failed. Serving from a draining box beats failing the turn; the reaper
+      // leaves it alone while it holds work.
+      if (reachable.length === 0) throw new Error(`Failed to spawn an AgentBox for agent ${agentId}`);
+    } else if (missing.length > 0) {
+      void this.spawnInstances(agentId, config, missing).catch((err) =>
+        console.warn(`[agentbox-manager] background pool fill failed for agent=${agentId}:`, err));
+    }
+
+    if (!sessionId) {
+      // No session to route (admin probe, capability-style call). Prefer a box that is
+      // still accepting — a draining one works but is about to be deleted.
+      const box = reachable.find((b) => !this.draining.has(b.boxId)) ?? reachable[0];
+      return { handle: { boxId: box.boxId, endpoint: box.endpoint, agentId }, created: false };
+    }
+
+    const placed = this.bindings.place(agentId, sessionId, this.candidatesFrom(reachable, statuses), holder);
+    const chosen = placed ? reachable.find((b) => b.boxId === placed.boxId) : undefined;
+    if (chosen) {
+      return { handle: { boxId: chosen.boxId, endpoint: chosen.endpoint, agentId }, created: false };
+    }
+
+    const fallback = reachable[0];
+    this.bindings.remember(agentId, sessionId, fallback.boxId);
+    return { handle: { boxId: fallback.boxId, endpoint: fallback.endpoint, agentId }, created: false };
+  }
+
+  /**
+   * Placement candidates from what the boxes reported.
+   *
+   * A box that did not answer must NOT read as idle. Failing to answer is what a wedged
+   * box does — blocked event loop, GC thrash, OOM churn — and scoring it 0 would make
+   * least-loaded placement steer every new session straight onto it. Ranked last instead,
+   * so it stays usable when nothing else is.
+   */
+  private candidatesFrom(reachable: AgentBoxInfo[], statuses: Map<string, BoxStatusReport>) {
+    return reachable.map((b) => ({
+      boxId: b.boxId,
+      accepting: !this.draining.has(b.boxId),
+      turnsInFlight: statuses.get(b.boxId)?.turnsInFlight ?? Number.MAX_SAFE_INTEGER,
+    }));
+  }
+
+  /**
+   * The box currently serving a session, WITHOUT spawning anything.
+   *
+   * Liveness and termination must not fall back to "the instance-0 pod name": a session
+   * pinned to instance 1 would read as not-running (losing stream reattachment, and
+   * making a live task look orphaned), and a terminate would delete instance 0 N times
+   * while the rest kept serving.
+   *
+   * Returns undefined when the agent has no box or the session is not bound to one —
+   * which is the honest answer, not a reason to guess at instance 0.
+   */
+  async getForSession(agentId: string, sessionId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
+    const bound = this.bindings.get(agentId, sessionId);
+    if (bound) {
+      const info = await this.spawner.get(bound).catch(() => null);
+      if (info && info.status === "running" && info.endpoint) {
+        return { boxId: bound, endpoint: info.endpoint, agentId };
+      }
+      // The bound box is gone; fall through to the agent's remaining boxes.
+    }
+    for (const box of await this.listPool(agentId)) {
+      if (box.status === "running" && box.endpoint && (box.profile ?? "agent") === (profile ?? "agent")) {
+        return { boxId: box.boxId, endpoint: box.endpoint, agentId };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Say so, once, when a pool has nowhere shared to keep its sessions.
+   *
+   * A pool works because any box can pick up a session another box wrote down. On per-pod
+   * storage each box keeps its own copy, so a session that moves finds nothing and starts
+   * over — the conversation loses its memory mid-way, with nothing in any log to explain
+   * it. Not fatal (a pool serving one-shot traffic never continues a session), so this
+   * warns rather than refusing, but it must be impossible to hit without being told.
+   */
+  private warnIfSessionsAreNotShared(agentId: string): void {
+    const probe = (this.spawner as { hasSharedSessionStorage?(id: string): boolean }).hasSharedSessionStorage;
+    if (typeof probe !== "function" || probe.call(this.spawner, agentId)) return;
+    if (this.unsharedWarned.has(agentId)) return;
+    this.unsharedWarned.add(agentId);
+    console.warn(
+      `[agentbox-manager] agent ${agentId} runs more than one box but its session transcripts are NOT on shared ` +
+      `storage — a conversation that moves between boxes will lose its history. Configure a shared volume ` +
+      `(SICLAW_PERSISTENCE_CLAIM_NAME) or set replicas back to 1.`,
+    );
+  }
+
+  /**
+   * The box that is actually HOLDING this session, or nothing.
+   *
+   * Distinct from placement, and deliberately not a fallback to "any box of this agent":
+   * steer, abort and clearQueue act on a turn that is already running, so a box that never
+   * saw the session is not an answer — it replies 404 and the user is shown a failure they
+   * did not cause. Silence is treated the way placement treats it: a box we could not ask
+   * may still hold it, so a hint pointing at an unreachable-but-live box counts.
+   */
+  async getHolder(agentId: string, sessionId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
+    const wantProfile = profile ?? "agent";
+    const pool = (await this.listPool(agentId)).filter((b) => this.isReachable(b, wantProfile));
+    if (pool.length === 0) return undefined;
+    const statuses = await this.sampleBoxStatuses(pool);
+    for (const [boxId, status] of statuses) {
+      if (!status.sessionIds.includes(sessionId)) continue;
+      const box = pool.find((b) => b.boxId === boxId);
+      if (box?.endpoint) return { boxId, endpoint: box.endpoint, agentId };
+    }
+    const hint = this.bindings.get(agentId, sessionId);
+    if (hint && !statuses.has(hint)) {
+      const box = pool.find((b) => b.boxId === hint);
+      if (box?.endpoint) return { boxId: hint, endpoint: box.endpoint, agentId };
+    }
+    return undefined;
+  }
+
+  /** Every box of an agent, for operations that must act on the whole pool. */
+  async listForAgent(agentId: string): Promise<AgentBoxInfo[]> {
+    return this.listPool(agentId);
+  }
+
+  /** Stop one specific box by its pod name (as opposed to `stop(agentId)`). */
+  async stopBox(boxId: string): Promise<void> {
+    await this.spawner.stop(boxId);
+    this.draining.delete(boxId);
+    this.statusCache.delete(boxId);
+  }
+
+  /** Pool listing, when the spawner supports it (K8s only; duck-typed like setCertManager). */
+  private async listPool(agentId: string): Promise<AgentBoxInfo[]> {
+    const s: any = this.spawner;
+    if (typeof s.listForAgent !== "function") return [];
+    return (await s.listForAgent(agentId)) as AgentBoxInfo[];
+  }
+
+  /**
+   * Whether a box is running an image other than the one it would be spawned with now.
+   *
+   * Undefined on either side means "cannot tell" — an unlabelled legacy pod, or a spawner
+   * that does not report an expected image — and MUST read as fresh. Guessing stale there
+   * would recycle every box on every acquisition.
+   */
+  private isStaleImage(box: AgentBoxInfo, wantProfile: string): boolean {
+    const s: any = this.spawner;
+    if (typeof s.expectedImage !== "function") return false;
+    const expected = s.expectedImage(wantProfile);
+    return !!expected && !!box.image && box.image !== expected;
+  }
+
+  /** A box the Runtime can talk to right now. Says nothing about whether it accepts NEW
+   *  sessions — a draining box is still reachable and still serves what it holds. */
+  private isReachable(box: AgentBoxInfo, wantProfile: string): boolean {
+    return box.status === "running" && !!box.endpoint && (box.profile ?? "agent") === wantProfile;
+  }
+
+  /**
+   * Mark boxes a deploy left behind as draining: stale image, stale CA, or wrong profile.
+   *
+   * This is where the image finally gets compared. Pod reuse never did, which is why a new
+   * AgentBox image only took effect when someone deleted pods by hand — and that delete was
+   * a hard kill. Marking drains instead: the box keeps serving what it holds and takes no
+   * new sessions, and the reaper removes it once it reports itself empty.
+   *
+   * Drain marks live in memory only. A Runtime restart re-derives them from exactly these
+   * comparisons, so there is nothing to persist and nothing to go stale.
+   */
+  private markStaleBoxesDraining(agentId: string, pool: AgentBoxInfo[], wantProfile: string): void {
+    for (const box of pool) {
+      if (box.status !== "running" || this.draining.has(box.boxId)) continue;
+      const reason =
+        !this.isCertFresh(box) ? "stale CA"
+        : (box.profile ?? "agent") !== wantProfile ? `profile ${box.profile} != ${wantProfile}`
+        : this.isStaleImage(box, wantProfile) ? `image ${box.image} != ${(this.spawner as any).expectedImage(wantProfile)}`
+        : null;
+      if (!reason) continue;
+      console.log(`[agentbox-manager] Draining ${box.boxId} (agent=${agentId}): ${reason}`);
+      this.draining.set(box.boxId, Date.now());
+    }
+  }
+
+  /**
+   * Indices for the boxes that still have to be created to reach `replicas`.
+   *
+   * Two separate questions, and conflating them is a name collision: HOW MANY to add is
+   * `replicas` minus the boxes still accepting work, but WHICH indices are free must
+   * exclude every existing pod — **including the draining ones**. A draining box keeps its
+   * name until it is actually deleted, so treating its index as free would build its
+   * replacement under the identical pod name: the spawn would find the live pod and either
+   * reuse it (the drain never rolls) or, on a CA-triggered drain, delete it outright — the
+   * hard kill draining exists to avoid.
+   *
+   * A replacement therefore takes the next free index, which may sit above `replicas`.
+   * Indices need not be contiguous; the pool converges as drained boxes are reaped.
+   */
+  private missingInstances(pool: AgentBoxInfo[], replicas: number, agentId: string): number[] {
+    const live = pool.filter((b) => b.status !== "stopped");
+    const occupied = new Set(live.map((b) => b.instance ?? 0));
+    const accepting = live.filter((b) => !this.draining.has(b.boxId)).length;
+    const need = replicas - accepting;
+    if (need <= 0) return [];
+
+    const missing: number[] = [];
+    for (let i = 0; missing.length < need && i < replicas + occupied.size + 1; i++) {
+      if (!occupied.has(i)) missing.push(i);
+    }
+    console.log(
+      `[agentbox-manager] agent=${agentId} pool short by ${need} (accepting=${accepting}/${replicas}); ` +
+      `spawning instances ${missing.join(",")}`,
+    );
+    return missing;
+  }
+
+  /** The `count` lowest instance indices no existing pod holds (draining ones included). */
+  private freeInstances(pool: AgentBoxInfo[], count: number): number[] {
+    const occupied = new Set(pool.filter((b) => b.status !== "stopped").map((b) => b.instance ?? 0));
+    const free: number[] = [];
+    for (let i = 0; free.length < count; i++) if (!occupied.has(i)) free.push(i);
+    return free;
+  }
+
+  private async spawnInstances(
+    agentId: string,
+    config: Partial<AgentBoxConfig> | undefined,
+    instances: number[],
+  ): Promise<AgentBoxHandle[]> {
+    const resolvedEnv = await this.resolveEnv(agentId, config?.env);
+    const persistence = await this.resolvePersistence(agentId, config?.persistence);
+    const results = await Promise.all(instances.map(async (instance) => {
+      try {
+        const handle = await this.spawner.spawn({
+          ...config,
+          agentId,
+          instance,
+          persistence,
+          env: {
+            ...resolvedEnv,
+            // A pooled box must be RESIDENT. With a finite idle window the pool would
+            // shrink itself the moment traffic dipped and pay a cold start on the next
+            // turn — the opposite of why replicas were raised. Reuses the existing
+            // non-positive-window contract rather than adding a second mechanism.
+            SICLAW_AGENTBOX_IDLE_TIMEOUT: "0",
+          },
+        });
+        handle.agentId = agentId;
+        return handle;
+      } catch (err) {
+        console.warn(`[agentbox-manager] spawn of instance ${instance} for agent=${agentId} failed:`, err);
+        return null;
+      }
+    }));
+    return results.filter((h): h is AgentBoxHandle => h !== null);
+  }
+
+  /**
+   * Ask each box what it is holding. Cached briefly: placement needs a recent sample, not
+   * a fresh one, and affinity means most turns never reach this path at all.
+   */
+  private async sampleBoxStatuses(boxes: AgentBoxInfo[]): Promise<Map<string, BoxStatusReport>> {
+    const out = new Map<string, BoxStatusReport>();
+    if (!this.boxStatusProbe) return out;
+    const now = Date.now();
+    await Promise.all(boxes.map(async (box) => {
+      const cached = this.statusCache.get(box.boxId);
+      if (cached && now - cached.at < BOX_STATUS_TTL_MS) {
+        out.set(box.boxId, cached.status);
+        return;
+      }
+      try {
+        const status = await this.boxStatusProbe!(box.endpoint);
+        this.statusCache.set(box.boxId, { at: now, status });
+        this.probeFailures.delete(box.boxId);
+        out.set(box.boxId, status);
+      } catch (err) {
+        // A box running an image from before box-status existed 404s here — which is every
+        // box during the rollout that introduces this. It still exposes the older session
+        // list, and knowing WHICH sessions it holds is the whole point: without it the
+        // Runtime would think they are free and hand them to a second box.
+        if (this.legacySessionLister) {
+          try {
+            const ids = await this.legacySessionLister(box.endpoint);
+            const status: BoxStatusReport = { sessionIds: ids, turnsInFlight: 0, drained: ids.length === 0 };
+            this.statusCache.set(box.boxId, { at: now, status });
+            this.probeFailures.delete(box.boxId);
+            out.set(box.boxId, status);
+            return;
+          } catch { /* older endpoint unavailable too — fall through to the warning */ }
+        }
+        const fails = (this.probeFailures.get(box.boxId) ?? 0) + 1;
+        this.probeFailures.set(box.boxId, fails);
+        if (fails >= UNRESPONSIVE_PROBE_LIMIT && !this.draining.has(box.boxId)) {
+          console.warn(`[agentbox-manager] ${box.boxId} failed ${fails} status probes; draining it so its sessions are not pinned to a box that cannot answer`);
+          this.draining.set(box.boxId, Date.now());
+        }
+        // A box that cannot be asked is not evidence of anything; leave it out of the
+        // sample rather than guessing it is idle and stacking new sessions onto it.
+        console.warn(`[agentbox-manager] box-status probe failed for ${box.boxId}:`, err);
+      }
+    }));
+    return out;
+  }
+
+  /**
+   * Remove boxes that finished draining, or ran out of time.
+   *
+   * A box reports `drained` itself — the Runtime cannot see a background sub-agent still
+   * running under a session with no in-flight turn. The deadline exists because that
+   * sub-agent may run for ten minutes and a deploy cannot wait indefinitely; five minutes
+   * covers ordinary conversations comfortably and only cuts long batches.
+   */
+  /**
+   * Bring every agent's pod count down to its configured `replicas`.
+   *
+   * Runs from the reaper rather than from acquisition, because acquisition cannot see it:
+   * an agent lowered from 3 to 1 takes the single-box path, which only ever looks up
+   * instance 0 by name — instances 1 and 2 would never be listed, never drained, and, being
+   * pooled and therefore resident, would never self-destruct either. The same blindness
+   * applies after a Runtime restart, which is why the scan is driven by the CLUSTER's pod
+   * list rather than by anything this process remembers.
+   *
+   * Victims are the highest instance indices: the least disruptive order available without
+   * asking every box what it holds, since index 0 is the oldest and likeliest to be busy.
+   */
+  private async reconcilePoolSizes(): Promise<void> {
+    const s: any = this.spawner;
+    if (typeof s.list !== "function") return;
+    let all: AgentBoxInfo[];
+    try {
+      all = await s.list();
+    } catch (err) {
+      console.warn("[agentbox-manager] pool size scan failed:", err);
+      return;
+    }
+
+    const byAgent = new Map<string, AgentBoxInfo[]>();
+    for (const box of all) {
+      if ((box.profile ?? "agent") !== "agent" || box.status === "stopped" || !box.agentId) continue;
+      const list = byAgent.get(box.agentId) ?? [];
+      list.push(box);
+      byAgent.set(box.agentId, list);
+    }
+
+    for (const [agentId, boxes] of byAgent) {
+      const accepting = boxes.filter((b) => !this.draining.has(b.boxId));
+      // One box is both "nothing to shrink" and the un-pooled shape — skip without
+      // paying a replicas lookup for every agent in the cluster on every tick.
+      if (accepting.length <= 1) continue;
+      const replicas = await this.resolveReplicas(agentId);
+      if (accepting.length <= replicas) continue;
+      const excess = [...accepting]
+        .sort((a, b) => (b.instance ?? 0) - (a.instance ?? 0))
+        .slice(0, accepting.length - replicas);
+      for (const box of excess) {
+        console.log(`[agentbox-manager] Draining ${box.boxId} (agent=${agentId}): replicas lowered to ${replicas}`);
+        this.draining.set(box.boxId, Date.now());
+      }
+    }
+  }
+
+  private async reapDrainedBoxes(): Promise<void> {
+    await this.reconcilePoolSizes();
+    if (this.draining.size === 0) return;
+    for (const [boxId, markedAt] of [...this.draining]) {
+      let info: AgentBoxInfo | null = null;
+      try {
+        info = await this.spawner.get(boxId);
+      } catch { /* transient; retry next round */ continue; }
+      if (!info || info.status === "stopped") {
+        this.draining.delete(boxId);
+        this.statusCache.delete(boxId);
+        continue;
+      }
+      const overdue = Date.now() - markedAt >= DRAIN_DEADLINE_MS;
+      let drained = false;
+      if (!overdue && this.boxStatusProbe && info.endpoint) {
+        try {
+          drained = (await this.boxStatusProbe(info.endpoint)).drained;
+        } catch { continue; } // can't tell → keep waiting rather than cut a live box
+      }
+      if (!drained && !overdue) continue;
+      console.log(`[agentbox-manager] Removing drained box ${boxId}${overdue ? " (deadline reached)" : ""}`);
+      try {
+        await this.spawner.stop(boxId);
+      } catch (err) {
+        console.warn(`[agentbox-manager] failed to remove drained box ${boxId}:`, err);
+        continue; // keep the mark; retry next round
+      }
+      this.draining.delete(boxId);
+      this.statusCache.delete(boxId);
+    }
   }
 
   private async getOrCreateLocal(
@@ -395,6 +1023,10 @@ export class AgentBoxManager {
     if (this.orphanSweepTimer) {
       clearInterval(this.orphanSweepTimer);
       this.orphanSweepTimer = undefined;
+    }
+    if (this.drainReaperTimer) {
+      clearInterval(this.drainReaperTimer);
+      this.drainReaperTimer = undefined;
     }
   }
 }

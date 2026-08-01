@@ -24,6 +24,7 @@ vi.mock("@kubernetes/client-node", () => {
     deleteNamespacedPod: [],
     createNamespacedPod: [],
     createNamespacedSecret: [],
+    readNamespacedSecret: [],
     deleteNamespacedSecret: [],
     listNamespacedPod: [],
     listNamespacedSecret: [],
@@ -35,6 +36,7 @@ vi.mock("@kubernetes/client-node", () => {
     deleteNamespacedPod: async () => ({}),
     createNamespacedPod: async () => ({}),
     createNamespacedSecret: async () => ({}),
+    readNamespacedSecret: async () => { throw Object.assign(new Error("nf"), { code: 404 }); },
     deleteNamespacedSecret: async () => ({}),
     listNamespacedPod: async () => ({ items: [] }),
     listNamespacedSecret: async () => ({ items: [] }),
@@ -47,6 +49,7 @@ vi.mock("@kubernetes/client-node", () => {
     async deleteNamespacedPod(args: any) { g.__k8sCalls.deleteNamespacedPod.push(args); return g.__k8sImpls.deleteNamespacedPod(args); }
     async createNamespacedPod(args: any) { g.__k8sCalls.createNamespacedPod.push(args); return g.__k8sImpls.createNamespacedPod(args); }
     async createNamespacedSecret(args: any) { g.__k8sCalls.createNamespacedSecret.push(args); return g.__k8sImpls.createNamespacedSecret(args); }
+    async readNamespacedSecret(args: any) { g.__k8sCalls.readNamespacedSecret.push(args); return g.__k8sImpls.readNamespacedSecret(args); }
     async deleteNamespacedSecret(args: any) { g.__k8sCalls.deleteNamespacedSecret.push(args); return g.__k8sImpls.deleteNamespacedSecret(args); }
     async listNamespacedPod(args: any) { g.__k8sCalls.listNamespacedPod.push(args); return g.__k8sImpls.listNamespacedPod(args); }
     async listNamespacedSecret(args: any) { g.__k8sCalls.listNamespacedSecret.push(args); return g.__k8sImpls.listNamespacedSecret(args); }
@@ -730,7 +733,8 @@ describe("K8sSpawner — pod-name prefix (compile boxes vs chat) + upgrade migra
     await s.spawn({ agentId: "migrated", profile: "kb-compile" });
 
     expect(calls.deleteNamespacedPod.some((c: any) => c.name === "agentbox-migrated")).toBe(true);
-    expect(calls.deleteNamespacedSecret.some((c: any) => c.name === "agentbox-migrated-cert")).toBe(true);
+    // The legacy pod's Secret is left to the sweep — stop() no longer owns Secret lifetime.
+    expect(calls.deleteNamespacedSecret).toHaveLength(0);
     // The new box is created under the renamed prefix, not the old one.
     expect(calls.createNamespacedPod.map((c: any) => c.body.metadata.name)).toEqual(["kbc-box-migrated"]);
   });
@@ -760,13 +764,16 @@ describe("K8sSpawner — pod-name prefix (compile boxes vs chat) + upgrade migra
 });
 
 describe("K8sSpawner — stop", () => {
-  it("deletes pod + cert Secret", async () => {
+  it("deletes the pod and leaves the cert Secret to the sweep", async () => {
+    // The Secret belongs to the AGENT, not this pod, so stopping one box says nothing
+    // about whether it is still in use — and any sibling check here is a point-in-time
+    // read that races a replacement's spawn, which creates the Secret BEFORE its pod.
+    // Deleting it then would strand the new pod in ContainerCreating forever.
     const s = new K8sSpawner();
     await s.stop("agentbox-default");
     expect(calls.deleteNamespacedPod).toHaveLength(1);
     expect(calls.deleteNamespacedPod[0].name).toBe("agentbox-default");
-    expect(calls.deleteNamespacedSecret).toHaveLength(1);
-    expect(calls.deleteNamespacedSecret[0].name).toBe("agentbox-default-cert");
+    expect(calls.deleteNamespacedSecret).toHaveLength(0);
   });
 
   it("swallows 404 on stop (pod already gone)", async () => {
@@ -1052,8 +1059,13 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
     g.__k8sImpls.listNamespacedSecret = async () => ({
       items: [
         { metadata: { name: "agentbox-live-run-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-compile" } } },
+        // Secrets of pods this sweep is about to remove. stop() no longer deletes them, so
+        // the Secret pass must collect them — and must not be fooled by the pre-sweep pod
+        // snapshot, which still lists their (now deleted) pods.
+        { metadata: { name: "agentbox-dead-run-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-compile" } } },
+        { metadata: { name: "agentbox-done-run-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-test" } } },
         { metadata: { name: "agentbox-ghost-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "kb-compile" } } }, // no pod at all → orphan
-        { metadata: { name: "agentbox-chat-gone-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "agent" } } },  // chat box's orphan Secret: NOT ours
+        { metadata: { name: "agentbox-chat-gone-cert", creationTimestamp: oldTs, labels: { "siclaw.io/boxType": "agent" } } },  // chat box that no longer exists → orphan
         { metadata: { name: "agentbox-fresh-cert", creationTimestamp: new Date().toISOString(), labels: { "siclaw.io/boxType": "kb-compile" } } }, // just spawning (Secret precedes pod): TOCTOU guard
       ],
     });
@@ -1068,9 +1080,47 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
     const deletedSecrets = g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name);
     expect(deletedSecrets).toEqual(expect.arrayContaining(["agentbox-dead-run-cert", "agentbox-done-run-cert", "agentbox-ghost-cert"]));
     expect(deletedSecrets).not.toContain("agentbox-live-run-cert");
-    expect(deletedSecrets).not.toContain("agentbox-chat-1-cert");
-    expect(deletedSecrets).not.toContain("agentbox-chat-gone-cert"); // chat Secrets are never this sweep's business
-    expect(deletedSecrets).not.toContain("agentbox-fresh-cert");     // Secret-before-pod TOCTOU guarded by age
+    expect(deletedSecrets).not.toContain("agentbox-chat-1-cert"); // its box is running
+    expect(deletedSecrets).toContain("agentbox-chat-gone-cert");  // its box is gone; nothing else collects it
+    expect(deletedSecrets).not.toContain("agentbox-fresh-cert");  // Secret-before-pod TOCTOU guarded by age
+  });
+
+  it("sweep reaps a TERMINAL chat box but never a running one", async () => {
+    // restartPolicy:Never + the clean exit idle self-destruct performs leaves the
+    // pod Succeeded forever. A running one belongs to that self-destruct, and the
+    // isLive oracle only speaks for capability runs — so it is never consulted here.
+    let oracleCalls = 0;
+    g.__k8sImpls.listNamespacedPod = async () => ({
+      items: [
+        mkPod("agentbox-chat-running", "agent", "Running"),
+        mkPod("agentbox-chat-done", "agent", "Succeeded"),
+        mkPod("agentbox-chat-crashed", "agent", "Failed"),
+      ],
+    });
+    g.__k8sImpls.listNamespacedSecret = async () => ({ items: [] });
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async () => { oracleCalls++; return false; });
+
+    const deletedPods = g.__k8sCalls.deleteNamespacedPod.map((c: any) => c.name);
+    expect(deletedPods).toEqual(expect.arrayContaining(["agentbox-chat-done", "agentbox-chat-crashed"]));
+    expect(deletedPods).not.toContain("agentbox-chat-running");
+    expect(oracleCalls).toBe(0);
+  });
+
+  it("collects a cert Secret predating the boxType label once its pod is gone", async () => {
+    // The oldest orphans in a long-lived namespace carry no boxType label at all.
+    // Reading a missing label as "agent" (as the pod pass does) is what lets them
+    // be collected instead of pinned forever; the list is already scoped to
+    // app=agentbox, and a fresh certificate is minted on the next spawn.
+    g.__k8sImpls.listNamespacedPod = async () => ({ items: [] });
+    g.__k8sImpls.listNamespacedSecret = async () => ({
+      items: [
+        { metadata: { name: "agentbox-ancient-cert", creationTimestamp: new Date(Date.now() - 99 * 86400_000).toISOString(), labels: {} } },
+      ],
+    });
+    const s = new K8sSpawner();
+    await (s as any).sweepOrphans(async () => false);
+    expect(g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name)).toContain("agentbox-ancient-cert");
   });
 
   it("sweep hands the oracle the RAW run id from the pod's agent label (non-UUID ids survive)", async () => {
@@ -1122,12 +1172,12 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
       if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
       return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
-    await s.spawn({ agentId: "clamp-test", profile: "agent", resources: { memoryRequest: "8Gi", cpuRequest: "4" } } as any);
+    await s.spawn({ agentId: "clamp-test", profile: "agent", resources: { memoryRequest: "16Gi", cpuRequest: "4" } } as any);
     const created = g.__k8sCalls.createNamespacedPod.at(-1);
     const res = created.body.spec.containers[0].resources;
-    expect(res.requests.memory).toBe("4Gi"); // clamped to the default limit
+    expect(res.requests.memory).toBe("8Gi"); // clamped to the default limit
     expect(res.requests.cpu).toBe("2000m");  // clamped to the default limit
-    expect(res.limits.memory).toBe("4Gi");
+    expect(res.limits.memory).toBe("8Gi");
   });
 
   it("parseK8sQuantity + clampRequestToLimit cover the profile shapes", () => {
@@ -1161,7 +1211,139 @@ describe("K8sSpawner — capability-box orphan sweep + burstable resources (audi
     const created = g.__k8sCalls.createNamespacedPod.at(-1);
     const res = created.body.spec.containers[0].resources;
     expect(res.requests.memory).toBe("1Gi");
-    expect(res.limits.memory).toBe("4Gi");   // limit stays at the default
+    expect(res.limits.memory).toBe("8Gi");   // limit stays at the default
     expect(res.requests.cpu).toBe("100m");
+  });
+});
+
+describe("K8sSpawner — replica identity and the shared certificate", () => {
+  const g = globalThis as any;
+
+  /** Spawn once, returning the created PodSpec. */
+  async function spawnOnce(config: any) {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+    const handle = await s.spawn(config);
+    return { handle, created: g.__k8sCalls.createNamespacedPod.at(-1) };
+  }
+
+  it("leaves instance 0 unsuffixed so no existing pod is renamed", async () => {
+    const { handle, created } = await spawnOnce({ agentId: "agent-x", profile: "agent" });
+    expect(created.body.metadata.name).toBe("agentbox-agent-x");
+    expect(handle.boxId).toBe("agentbox-agent-x");
+    expect(created.body.metadata.labels["siclaw.io/instance"]).toBe("0");
+  });
+
+  it("suffixes replicas above 0 and records the index in a label", async () => {
+    const { created } = await spawnOnce({ agentId: "agent-x", profile: "agent", instance: 2 });
+    expect(created.body.metadata.name).toBe("agentbox-agent-x-2");
+    // The label is the record; nothing parses the index back out of the name.
+    expect(created.body.metadata.labels["siclaw.io/instance"]).toBe("2");
+  });
+
+  it("names the cert Secret after the agent, not the replica, so all boxes share one", async () => {
+    await spawnOnce({ agentId: "agent-x", profile: "agent", instance: 3 });
+    const secret = g.__k8sCalls.createNamespacedSecret.at(-1);
+    expect(secret.body.metadata.name).toBe("agentbox-agent-x-cert");
+  });
+
+  it("tells the box which pod it is, via the downward API", async () => {
+    // Sibling replicas present the same certificate, so the box has to name itself for
+    // its per-box metrics to stay distinct.
+    const { created } = await spawnOnce({ agentId: "agent-x", profile: "agent" });
+    const podNameEnv = created.body.spec.containers[0].env.find((e: any) => e.name === "SICLAW_POD_NAME");
+    expect(podNameEnv?.valueFrom?.fieldRef?.fieldPath).toBe("metadata.name");
+  });
+
+  it("stopping one replica never touches the certificate its siblings mount", async () => {
+    const s = new K8sSpawner();
+    await s.stop("agentbox-agent-x-1");
+    expect(g.__k8sCalls.deleteNamespacedPod.map((c: any) => c.name)).toContain("agentbox-agent-x-1");
+    expect(g.__k8sCalls.deleteNamespacedSecret).toHaveLength(0);
+  });
+
+  it("refuses to reuse or replace a pod belonging to a DIFFERENT agent", async () => {
+    // podName() sanitizes and truncates, so distinct agentIds can collide — and the
+    // instance suffix adds the pair X / X-<n>: agent "foo" instance 1 and agent "foo-1"
+    // instance 0 are both `agentbox-foo-1`. Reusing it would serve one agent's sessions
+    // from a box holding the other's certificate and PVC subPath.
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    g.__k8sImpls.readNamespacedPod = async () => ({
+      status: { phase: "Running", podIP: "10.0.0.9" },
+      metadata: { labels: { "siclaw.io/agent": "foo-1", "siclaw.io/boxType": "agent", "siclaw.io/ca-fp": FAKE_CA_FP } },
+    });
+    await expect(s.spawn({ agentId: "foo", profile: "agent", instance: 1 } as any)).rejects.toThrow(/collision/i);
+    // Loudly, not destructively — that is someone else's live box.
+    expect(g.__k8sCalls.deleteNamespacedPod).toHaveLength(0);
+  });
+});
+
+describe("K8sSpawner — concurrent replica spawns share one certificate Secret", () => {
+  const g = globalThis as any;
+
+  it("reuses an existing Secret signed by the current CA instead of replacing it", async () => {
+    // Two replicas of one agent spawn at the same time and both reach the 409 branch.
+    // Replacing would delete a certificate the sibling pod is already mounting — observed
+    // in a live cluster as a 404 on the second delete, with the spawn then failing.
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+    g.__k8sImpls.createNamespacedSecret = async () => { throw Object.assign(new Error("exists"), { code: 409 }); };
+    g.__k8sImpls.readNamespacedSecret = async () => ({ metadata: { labels: { "siclaw.io/ca-fp": FAKE_CA_FP } } });
+
+    await s.spawn({ agentId: "agent-x", profile: "agent", instance: 1 } as any);
+
+    expect(g.__k8sCalls.deleteNamespacedSecret).toHaveLength(0);
+    expect(g.__k8sCalls.createNamespacedPod).toHaveLength(1); // spawn still completes
+  });
+
+  it("still replaces the Secret when the CA has rotated", async () => {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+    let creates = 0;
+    g.__k8sImpls.createNamespacedSecret = async () => {
+      creates++;
+      if (creates === 1) throw Object.assign(new Error("exists"), { code: 409 });
+      return {};
+    };
+    g.__k8sImpls.readNamespacedSecret = async () => ({ metadata: { labels: { "siclaw.io/ca-fp": "an-older-ca" } } });
+
+    await s.spawn({ agentId: "agent-x", profile: "agent" } as any);
+    expect(g.__k8sCalls.deleteNamespacedSecret.map((c: any) => c.name)).toEqual(["agentbox-agent-x-cert"]);
+  });
+
+  it("tolerates a sibling winning the replace race", async () => {
+    const s = new K8sSpawner();
+    s.setCertManager(new FakeCertManager() as any);
+    let reads = 0;
+    g.__k8sImpls.readNamespacedPod = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+    g.__k8sImpls.createNamespacedSecret = async () => { throw Object.assign(new Error("exists"), { code: 409 }); };
+    g.__k8sImpls.readNamespacedSecret = async () => ({ metadata: { labels: { "siclaw.io/ca-fp": "an-older-ca" } } });
+    g.__k8sImpls.deleteNamespacedSecret = async () => { throw Object.assign(new Error("nf"), { code: 404 }); };
+
+    // Neither the 404 on delete nor the 409 on re-create may fail the spawn.
+    await expect(s.spawn({ agentId: "agent-x", profile: "agent" } as any)).resolves.toBeTruthy();
   });
 });

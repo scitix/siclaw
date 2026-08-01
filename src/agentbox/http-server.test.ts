@@ -164,6 +164,9 @@ function makeFakeSessionManager() {
     userId: "u",
     agentId: "a",
     activeCount: () => sessions.size,
+    // Resident is not the same as busy — box-status reports both.
+    inFlightCount: () => Array.from(sessions.values()).filter((s) => !s._promptDone).length,
+    subagentStats: () => ({ active: 0, pending: 0, limit: 50 }),
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
     stopSessionJobs: vi.fn(() => 0),
@@ -275,6 +278,18 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
     const r = await getJson(port, "/api/sessions");
     expect(r.status).toBe(200);
     expect(r.data.sessions).toEqual([]);
+  });
+
+  it("GET /api/internal/box-status reports drained when the box holds nothing", async () => {
+    // The Runtime routes on this: `drained` must come FROM the box, because a session can
+    // have no in-flight turn while a background sub-agent still runs under it.
+    const r = await getJson(port, "/api/internal/box-status");
+    expect(r.status).toBe(200);
+    expect(r.data.drained).toBe(true);
+    expect(r.data.sessionIds).toEqual([]);
+    expect(r.data.turnsInFlight).toBe(0);
+    expect(r.data.backgroundWork).toBe(0);
+    expect(r.data.subagents).toMatchObject({ active: 0, pending: 0 });
   });
 
   it("GET /api/models returns models from config.providers", async () => {

@@ -31,6 +31,7 @@ import {
 } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
+import { sessionTurnLocks } from "../session-turn-lock.js";
 import { appendMessage, bindMessageTraceId, ensureChatSession, recordChannelFeedback } from "../chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText } from "../output-redactor.js";
 import { resolveAgentModelBinding } from "../agent-model-binding.js";
@@ -1620,8 +1621,24 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     return true;
   });
 
+  // One turn at a time for this session. The AgentBox's own 409 only sees its own
+  // sessions, so once an agent runs more than one box two messages could be dispatched to
+  // two boxes and both would run — two writers on one transcript. Released in the finally
+  // that closes the agent-execution block below.
+  let resultText = "";
+  let replyImages: RenderedReplyImage[] = [];
+  let assistantMessageId: string | null = null;
+  let agentError: Error | null = null;
+  let sessionBusy = false;
+  // Acquired INSIDE the try so a busy session surfaces through the SAME path the
+  // AgentBox's 409 already used — the friendly "still working" notice. Outside it the
+  // rejection escaped every handler and the user got nothing at all.
+  let releaseTurn: (() => void) | undefined;
+  try {
+    releaseTurn = await sessionTurnLocks.acquire(sessionId);
   // Get or create AgentBox for this agent (shared across all callers).
-  const handle = await agentBoxManager.getOrCreate(agentId);
+  const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
+  sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
   const modelBinding = frontendClient
@@ -1669,11 +1686,6 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
     ...(images.length ? { images } : {}),
   };
-  let resultText = "";
-  let replyImages: RenderedReplyImage[] = [];
-  let assistantMessageId: string | null = null;
-  let agentError: Error | null = null;
-  let sessionBusy = false;
   try {
     // queue-until-idle: wait out a busy session instead of dumping a raw 409.
     const promptResult = await promptWithBusyRetry(client, promptOpts);
@@ -1701,6 +1713,9 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       agentError = err instanceof Error ? err : new Error(String(err));
       console.error(`[lark] Agent execution failed for session=${sessionId}:`, agentError);
     }
+  }
+  } finally {
+    releaseTurn?.();
   }
 
   // Session-busy and other errors both get a sanitized notice \u2014 the raw error (internal
@@ -2044,7 +2059,10 @@ async function handleNewCommand(
   if (reset.oldSessionId) {
     sessionRegistry.forget(reset.oldSessionId);
     try {
-      const handle = await agentBoxManager.getOrCreate(reset.agentId);
+      // The OLD session id, not none: closeSession has to reach the box that actually
+      // holds it. Without it a pooled agent closes on an arbitrary box, the real session
+      // stays resident forever (pooled boxes never idle out), and that box never drains.
+      const handle = await agentBoxManager.getOrCreate(reset.agentId, undefined, reset.oldSessionId);
       const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
       await client.closeSession(reset.oldSessionId);
     } catch (err) {

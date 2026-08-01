@@ -14,6 +14,7 @@ import {
   handleAgentTasksDelete,
   handleDelegationEvents,
   handleMetricsFlush,
+  resolveFlushBoxId,
 } from "./internal-api.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
@@ -674,10 +675,10 @@ describe("handleMetricsFlush", () => {
     return fam?.values.find((v) => String(v.labels.type) === "input")?.value;
   }
 
-  it("ingests using boxId from the cert identity — NOT from the body", async () => {
+  it("rejects a body boxId outside the cert identity and attributes to the cert", async () => {
     const fed = new PromFederationAggregator();
     const res = new FakeRes();
-    // body tries to spoof a different box; handler must ignore it and use identity.boxId.
+    // "spoofed-box" is neither the cert's boxId nor one of its instance suffixes.
     await handleMetricsFlush(
       asReq(new FakeReq(JSON.stringify({ boxId: "spoofed-box", incarnation: "inc-1", prom: counterFrame(50) }))),
       asRes(res),
@@ -695,6 +696,34 @@ describe("handleMetricsFlush", () => {
     // Whereas the spoofed boxId was never used as a key:
     fed.ingest("spoofed-box", "inc-1", counterFrame(50));
     expect(counterVal(fed)).toBe(100); // counted as a fresh instance → +50
+  });
+
+  it("accepts an instance suffix of the cert's own boxId, so replicas stay distinct", async () => {
+    // Sibling replicas share one certificate, so without an accepted claim their per-box
+    // series would all land on the agent's base id and overwrite each other.
+    const fed = new PromFederationAggregator();
+    await handleMetricsFlush(
+      asReq(new FakeReq(JSON.stringify({ boxId: "box-1-2", incarnation: "inc-1", prom: counterFrame(30) }))),
+      asRes(new FakeRes()),
+      identity, // identity.boxId === "box-1"
+      fed,
+    );
+    expect(counterVal(fed)).toBe(30);
+    // Attributed to box-1-2, so a re-ingest under that key is idempotent...
+    fed.ingest("box-1-2", "inc-1", counterFrame(30));
+    expect(counterVal(fed)).toBe(30);
+    // ...and the base id is still a separate instance.
+    fed.ingest("box-1", "inc-1", counterFrame(30));
+    expect(counterVal(fed)).toBe(60);
+  });
+
+  it("rejects a claim that merely starts with the cert boxId but is not an instance", async () => {
+    // "box-10" and "box-1-evil" both share the "box-1" prefix; neither is a replica of it.
+    for (const claimed of ["box-10", "box-1-evil", "box-1-", "box-1-0", "box-1-01"]) {
+      expect(resolveFlushBoxId("box-1", claimed)).toBe("box-1");
+    }
+    expect(resolveFlushBoxId("box-1", "box-1-7")).toBe("box-1-7");
+    expect(resolveFlushBoxId("box-1", undefined)).toBe("box-1");
   });
 
   it("is idempotent: flush then pull of the same frame adds nothing", async () => {

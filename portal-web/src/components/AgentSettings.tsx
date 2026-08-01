@@ -19,6 +19,7 @@ interface Agent {
   is_production: boolean; icon: string; color: string; created_at: string
   model_routing?: unknown
   idle_timeout_sec?: number
+  replicas?: number
   agent_type?: string
   // Wire form: the raw `agents` TEXT column — a JSON string ('["read_files"]')
   // or null, not a decoded array (mirrors model_routing). toCapabilitySet
@@ -181,6 +182,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [systemPrompt, setSystemPrompt] = useState(agent.system_prompt || "")
   const [isProduction, setIsProduction] = useState(agent.is_production)
   const [idleTimeoutSec, setIdleTimeoutSec] = useState<number>(agent.idle_timeout_sec ?? 300)
+  const [replicas, setReplicas] = useState<number>(agent.replicas ?? 1)
   const [selectedCapabilities, setSelectedCapabilities] = useState<Set<string>>(toCapabilitySet(agent.tool_capabilities))
   const [agentType, setAgentType] = useState<AgentTypeKey>(agentTypeOption(agent.agent_type).key)
   const typeDef = agentTypeOption(agentType)
@@ -220,6 +222,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     setFallbackCandidates(normalizeRouteCandidates(modelRouting, agent.model_provider || "", agent.model_id || ""))
     setSystemPrompt(agent.system_prompt || ""); setIsProduction(agent.is_production)
     setIdleTimeoutSec(agent.idle_timeout_sec ?? 300)
+    setReplicas(agent.replicas ?? 1)
     setSelectedCapabilities(toCapabilitySet(agent.tool_capabilities))
   }, [agent])
 
@@ -309,7 +312,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
     try {
       const updated = await api<Agent>(`/agents/${agent.id}`, {
         method: "PUT",
-        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, tool_capabilities: Array.from(selectedCapabilities), agent_type: agentType },
+        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction, idle_timeout_sec: Number.isFinite(idleTimeoutSec) ? idleTimeoutSec : 300, replicas: Number.isFinite(replicas) ? replicas : 1, tool_capabilities: Array.from(selectedCapabilities), agent_type: agentType },
       })
       const nextResourceBindings: AgentResourceBindingIds = {
         cluster_ids: Array.from(selectedClusterIds),
@@ -379,7 +382,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
             {resourceLoadError}
           </div>
         )}
-        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} />}
+        {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} idleTimeoutSec={idleTimeoutSec} setIdleTimeoutSec={setIdleTimeoutSec} replicas={replicas} setReplicas={setReplicas} />}
         {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} routingEnabled={routingEnabled} setRoutingEnabled={setRoutingEnabled} fallbackCandidates={fallbackCandidates} setFallbackCandidates={setFallbackCandidates} />}
         {activeTab === "tools" && (
           <div className="px-6 py-6 space-y-4 max-w-2xl">
@@ -596,10 +599,34 @@ function IdleTimeoutField({ value, onChange }: { value: number; onChange: (v: nu
   )
 }
 
-function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec }: {
+function ReplicasField({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  return (
+    <div className="space-y-2">
+      <label className="text-[13px] font-medium text-foreground">Instances</label>
+      <div className="relative w-44">
+        <input
+          type="number"
+          min={1}
+          max={20}
+          value={value}
+          onChange={e => onChange(e.target.value === "" ? 1 : Math.min(20, Math.max(1, Math.floor(Number(e.target.value)))))}
+          className="w-full h-10 pl-3 pr-12 text-[15px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[12px] text-muted-foreground pointer-events-none">pods</span>
+      </div>
+      <p className="text-[12px] text-muted-foreground/80 leading-relaxed">
+        How many instances share this agent&apos;s traffic. Each conversation is pinned to one instance for as long as that instance lives, so raising this relieves NEW conversations — it does not move the ones already running. Above 1, instances are kept resident and the Idle Timeout above no longer applies. Lowering it drains the extras: they stop taking new conversations and are removed once they finish what they hold.
+      </p>
+    </div>
+  )
+}
+
+function BasicTab({ name, setName, description, setDescription, systemPrompt, setSystemPrompt, isProduction, setIsProduction, idleTimeoutSec, setIdleTimeoutSec, replicas, setReplicas }: {
   name: string; setName: (v: string) => void; description: string; setDescription: (v: string) => void
   systemPrompt: string; setSystemPrompt: (v: string) => void; isProduction: boolean; setIsProduction: (v: boolean) => void
   idleTimeoutSec: number; setIdleTimeoutSec: (v: number) => void
+  replicas: number; setReplicas: (v: number) => void
+
 }) {
   return (
     <div className="px-6 py-6 space-y-5 max-w-2xl">
@@ -616,6 +643,7 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
         <textarea value={systemPrompt} onChange={e => setSystemPrompt(e.target.value)} rows={6} className="w-full px-3 py-2 text-[13px] font-mono rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Optional agent identity and behavior instructions..." />
       </div>
       <IdleTimeoutField value={idleTimeoutSec} onChange={setIdleTimeoutSec} />
+      <ReplicasField value={replicas} onChange={setReplicas} />
       <div className="space-y-2 pt-2">
         <div className="flex items-center gap-3">
           <button

@@ -27,14 +27,18 @@ vi.mock("./chat-repo.js", () => ({
 
 class FakeAgentBoxClient {
   events: unknown[] = [];
+  /** Called just before each event is handed to the consumer — lets a test see what
+   *  had already been written to the DB at that point in the stream. */
+  onBeforeEvent?: (event: unknown) => void;
   async *streamEvents(_sessionId: string): AsyncIterable<unknown> {
-    for (const e of this.events) yield e;
+    for (const e of this.events) { this.onBeforeEvent?.(e); yield e; }
   }
 }
 
-function mkClient(events: unknown[]): AgentBoxClient {
+function mkClient(events: unknown[], onBeforeEvent?: (event: unknown) => void): AgentBoxClient {
   const c = new FakeAgentBoxClient();
   c.events = events;
+  c.onBeforeEvent = onBeforeEvent;
   return c as unknown as AgentBoxClient;
 }
 
@@ -381,7 +385,7 @@ describe("consumeAgentSse — assistant message flow", () => {
 describe("consumeAgentSse — routed turn commit gating", () => {
   it("defers the primary candidate's assistant row until model_route_success commits it", async () => {
     const events = [
-      { type: "model_route_start" },
+      { type: "model_route_start", candidateCount: 2 },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hello" } },
       { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hello" }], stopReason: "stop" } },
@@ -391,13 +395,60 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     expect(appendCalls.filter((r) => r.role === "assistant" && r.content === "hello")).toHaveLength(1);
   });
 
+  it("does NOT defer when the turn has a single candidate, so replies keep their place in the conversation", async () => {
+    // Every prompt runs through the routing entry now, so a turn with nothing to fall
+    // back to emits these events too. Deferring there buys nothing — a rollback is only
+    // ever emitted before a switch — and it costs ORDER. Steers are written by the RPC
+    // handler the moment they arrive; if the replies all wait for the commit point, the
+    // conversation reloads as every question followed by every answer, instead of the
+    // alternation the user watched. Measured in a cluster: 14 assistant rows in 26ms.
+    const events = [
+      { type: "model_route_start", candidateCount: 1 },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "spoken" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "spoken" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 1, candidateKey: "openai/gpt-4", provider: "openai", modelId: "gpt-4", isFallback: false, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    let writtenBeforeCommit = 0;
+    await consumeAgentSse({
+      client: mkClient(events, (e) => {
+        if ((e as { type: string }).type === "model_route_success") {
+          writtenBeforeCommit = appendCalls.filter((r) => r.role === "assistant").length;
+        }
+      }),
+      sessionId: "sid", userId: "u", persistMessages: true,
+    });
+    expect(writtenBeforeCommit).toBe(1); // written while the turn was still running
+  });
+
+  it("still defers when a fallback candidate exists, since that reply may yet be rolled back", async () => {
+    const events = [
+      { type: "model_route_start", candidateCount: 2 },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "maybe" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "maybe" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 1, candidateKey: "openai/gpt-4", provider: "openai", modelId: "gpt-4", isFallback: false, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    let writtenBeforeCommit = 0;
+    await consumeAgentSse({
+      client: mkClient(events, (e) => {
+        if ((e as { type: string }).type === "model_route_success") {
+          writtenBeforeCommit = appendCalls.filter((r) => r.role === "assistant").length;
+        }
+      }),
+      sessionId: "sid", userId: "u", persistMessages: true,
+    });
+    expect(writtenBeforeCommit).toBe(0);
+    expect(appendCalls.filter((r) => r.role === "assistant" && r.content === "maybe")).toHaveLength(1);
+  });
+
   it("folds the context-usage snapshot into the deferred assistant row (agent_end precedes commit)", async () => {
     // Real ordering: agent_end fires BEFORE model_route_success, and the assistant
     // persist is deferred to the commit — so the snapshot must ride the append, not
     // a post-hoc updateMessage (the row doesn't exist yet at agent_end).
     const cu = { tokens: 24252, contextWindow: 100000, percent: 24.25, inputTokens: 24230, outputTokens: 22 };
     const events = [
-      { type: "model_route_start" },
+      { type: "model_route_start", candidateCount: 2 },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
       { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }], stopReason: "stop" } },
@@ -414,7 +465,7 @@ describe("consumeAgentSse — routed turn commit gating", () => {
 
   it("discards a failed primary's partial reply and error on rollback, persisting only the fallback's answer", async () => {
     const events = [
-      { type: "model_route_start" },
+      { type: "model_route_start", candidateCount: 2 },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "half from primary" } },
       { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit" } },
@@ -436,7 +487,7 @@ describe("consumeAgentSse — routed turn commit gating", () => {
 
   it("persists the error row when a routed turn is exhausted (no fallback succeeded)", async () => {
     const events = [
-      { type: "model_route_start" },
+      { type: "model_route_start", candidateCount: 2 },
       { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "all candidates failed" } },
       { type: "model_route_exhausted", attempt: 1, failureKind: "rate_limit", errorMessage: "all candidates failed" },
     ];
@@ -449,7 +500,7 @@ describe("consumeAgentSse — routed turn commit gating", () => {
   it("re-arms stream_error after a rollback so a both-failed turn surfaces the final error live", async () => {
     const streamErrors: string[] = [];
     const events = [
-      { type: "model_route_start" },
+      { type: "model_route_start", candidateCount: 2 },
       { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },
       { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
       { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "fallback 503" } },
@@ -475,7 +526,7 @@ describe("consumeAgentSse — routed turn commit gating", () => {
 
   it("does not leak a rolled-back attempt's error into the run summary on a transport drop", async () => {
     const events = [
-      { type: "model_route_start" },
+      { type: "model_route_start", candidateCount: 2 },
       { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },
       { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
       // stream ends here without a fallback outcome (transport drop)
@@ -487,7 +538,7 @@ describe("consumeAgentSse — routed turn commit gating", () => {
 
   it("emits ttft_ms on only the first assistant row across two message_ends before commit", async () => {
     const events = [
-      { type: "model_route_start" },
+      { type: "model_route_start", candidateCount: 2 },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "first" } },
       { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first" }], stopReason: "stop" } },
@@ -510,7 +561,7 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     // rollback discards that op, so without re-arming the flag the surviving
     // fallback reply (the turn's real first assistant) loses its ttft anchor.
     const events = [
-      { type: "model_route_start" },
+      { type: "model_route_start", candidateCount: 2 },
       { type: "message_start" },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "primary text" } },
       { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "primary 429" } },

@@ -43,6 +43,16 @@ export interface ConsumeAgentSseOptions {
   redactionConfig?: RedactionConfig;
   /** Called for every SSE event after DB writes (so dbMessageId is available). */
   onEvent?: OnEventCallback;
+  /**
+   * Called when the box starts processing a user message it was given.
+   *
+   * This echo is the only place the PROCESSING order of user input is observable: a steer
+   * is written down the moment it arrives, but the box consumes it at a turn boundary that
+   * may be seconds later, and a user typing faster than the model answers would otherwise
+   * leave every question ordered before every answer. Fired for the turn's opening prompt
+   * as well as for each steer, so one rule covers every user row.
+   */
+  onUserMessageStarted?: (echoedText: string) => void | Promise<void>;
   /** Abort signal — breaks the loop when triggered. */
   signal?: AbortSignal;
   /**
@@ -310,7 +320,7 @@ function toolCallKey(evt: Record<string, unknown>, toolName: string): string {
 }
 
 export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<SseConsumptionResult> {
-  const { client, sessionId, userId, onEvent, signal } = opts;
+  const { client, sessionId, userId, onEvent, onUserMessageStarted, signal } = opts;
   const persist = opts.persistMessages === true;
   const redactionConfig = opts.redactionConfig ?? EMPTY_REDACTION;
   // Stamp this turn's root trace id onto every persisted row. traceId is constant
@@ -476,7 +486,14 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (eventType === "model_route_start") {
       latestModelRouteSwitch = null;
       currentModelRouteMetadata = null;
-      isRoutingTurn = true;
+      // Defer only when there is something to roll back TO. Since every prompt runs
+      // through the routing entry, a turn with one candidate emits these events too —
+      // and deferring there buys nothing (a rollback is only ever emitted before a
+      // switch) while costing message ORDER: the turn's assistant replies all land at
+      // the commit point, so a conversation the user steered several times reloads as
+      // every question followed by every answer, instead of the alternation they saw.
+      const candidateCount = Number((evt as { candidateCount?: unknown }).candidateCount ?? 0);
+      isRoutingTurn = candidateCount > 1;
       routingCommitted = false;
       discardRoutedAttempt();
     }
@@ -633,6 +650,21 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (eventType === "message_start") {
       currentMsgText = "";
       const message = evt.message as Record<string, unknown> | undefined;
+      if (message?.role === "user" && onUserMessageStarted) {
+        // The echoed text, so the caller can check the echo against the row it expects —
+        // the box wraps what it was given, so this is a guard, never an identity.
+        const echoed = Array.isArray(message.content)
+          ? (message.content as Array<{ type?: string; text?: string }>)
+              .filter((part) => part?.type === "text" && typeof part.text === "string")
+              .map((part) => part.text as string).join("")
+          : "";
+        // Never let bookkeeping break the stream the user is watching.
+        try {
+          await onUserMessageStarted(echoed);
+        } catch (err) {
+          console.warn(`[sse-consumer] ${userId}: failed to mark user message as started:`, err);
+        }
+      }
       if (message?.role === "assistant") {
         // Per-message resets only — the boundary anchor (turn-start /
         // last tool_execution_end) is intentionally NOT touched here, so
@@ -852,6 +884,12 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               lastAssistantDbMessageId = id;
               lastAssistantContent = assistantRowContent;
               lastAssistantMetadata = rowMetadata;
+              // Carry the row id out on the relayed message_end so a consumer can match
+              // its live bubble to the persisted row by identity. Only meaningful when
+              // the write happened inline (the deferred path runs after the event has
+              // already been relayed), which is every turn that has no fallback to
+              // switch to.
+              dbMessageId = id;
               await incrementMessageCount(sessionId);
             };
             // Flip the first-assistant flag NOW (not inside the deferred op):

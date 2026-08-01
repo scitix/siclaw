@@ -80,11 +80,23 @@ runtime:
                           # endpoint on a DIFFERENT origin than the LLM provider.
                           # If the embedding baseUrl is the SAME origin as the
                           # default LLM provider, that provider's key is reused.
-  # Max sub-agent child sessions a single AgentBox runs concurrently. A wide
+  # Max sub-agent child sessions ONE CONVERSATION runs concurrently. A wide
   # spawn_subagent fan-out queues past this instead of starting one child agent +
   # one LLM stream per target at once (avoids provider 429s / pod pressure).
-  # Forwarded to each AgentBox pod as SICLAW_SUBAGENT_CONCURRENCY. Default 5.
-  subagentConcurrency: 5
+  # Forwarded to each AgentBox pod as SICLAW_SUBAGENT_CONCURRENCY.
+  #
+  # NOTE: this used to mean per-BOX, so it decided how much one user's fan-out
+  # slowed everyone else sharing the agent. It is now per-conversation, and
+  # subagentPodConcurrency below took over protecting the process. If you had
+  # lowered this as a memory guard, that number belongs there instead.
+  subagentConcurrency: 10
+  # Ceiling on sub-agent child sessions across the WHOLE AgentBox process, every
+  # conversation included. The per-conversation cap above answers fairness; this
+  # one answers survival — queueing costs one user latency, an OOMKill costs every
+  # session in the box its work. Watch siclaw_box_subagent_active against
+  # siclaw_box_rss_bytes (both labelled by box_id) before raising it: per-child
+  # memory is unmeasured and 50 is provisional.
+  subagentPodConcurrency: 50
   # LLM endpoint for LEAN CAPABILITY BOXES (kb-compile / kb-test) ONLY. The chat
   # path does not read these — agent models come from the Portal/Upstream model
   # descriptors. On a fresh KB session Runtime sends these through the mTLS
@@ -194,6 +206,27 @@ ocr:
 # -- AgentBox (spawned at runtime by K8s spawner)
 agentbox:
   debugImage: ""
+  # Resources for every AgentBox pod the Runtime spawns — one per agent, NOT the
+  # Runtime's own pod (that is runtime.resources above). A BoxProfile that declares
+  # its own still wins over these.
+  #
+  # The memory REQUEST is what the scheduler packs nodes on. A box sits near
+  # 200-280Mi while completely idle, so a request below that both overcommits the
+  # node and — since request < limit makes the pod Burstable — puts it first in
+  # line for eviction under node pressure. Raise it as sub-agent concurrency goes
+  # up; siclaw_box_rss_bytes (labelled by box_id on gateway:3001/metrics) is the
+  # measurement to tune from. Limits reserve no capacity, so headroom is cheap.
+  #
+  # These values are the deployed defaults. src/gateway/agentbox/k8s-spawner.ts
+  # carries the same numbers as its fallback for the no-env case (LocalSpawner,
+  # a hand-rolled manifest); keep the two in step when changing either.
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "1Gi"
+    limits:
+      cpu: "2000m"
+      memory: "8Gi"
   # KB compile capability (kb-compile / kb-test boxes; built from this repo's
   # kbc/, ships with every release via `make docker`). The RELEASE-COUPLED
   # switch: true ⇒ the runtime spawns {image.registry}/siclaw-kbc-box:{image.tag}

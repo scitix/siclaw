@@ -703,13 +703,46 @@ export interface MetricsFlushCounters {
 }
 
 /**
+ * Resolve which box a flush should be attributed to.
+ *
+ * 🔴 The body's `boxId` is a CLAIM. Agent A must never be able to poison agent B's
+ * federated series, so a claim is accepted only when it is the certificate's own boxId
+ * (the agent's base pod name) or one of that base's instance suffixes — the only two
+ * shapes `K8sSpawner.podName` can produce for the authenticated agent.
+ *
+ * Anything else falls back to the certificate value rather than rejecting the flush:
+ * metrics must never become an availability risk, and the fallback is exactly what
+ * every box reported before replicas existed.
+ *
+ * ⚠️ RESIDUAL, stated plainly rather than papered over. Pod names are not a collision-free
+ * encoding of (agent, instance): agent `foo` instance 1 and agent `foo-1` instance 0 both
+ * name `agentbox-foo-1`, so a COMPROMISED box for `foo` can claim — and corrupt — the
+ * federated series of `foo-1`. Two things bound it. The spawner refuses to reuse or replace
+ * a pod whose `agent` label disagrees, so only one of the two agents can really own that
+ * name in a healthy cluster; and a box that is compromised enough to lie about its identity
+ * can already lie about the metric VALUES it reports, which is the larger problem and not
+ * one this check can solve. Closing it properly needs the claim verified against the pod
+ * list, which lives in the metrics aggregator, not here.
+ */
+export function resolveFlushBoxId(certBoxId: string, claimed: unknown): string {
+  if (typeof claimed !== "string" || claimed === "" || claimed === certBoxId) return certBoxId;
+  const suffix = claimed.startsWith(`${certBoxId}-`) ? claimed.slice(certBoxId.length + 1) : null;
+  // `-0` is not a replica: instance 0 is unsuffixed, so a "-0" claim is malformed by
+  // construction and only narrows what a lying box can name.
+  if (suffix !== null && /^[1-9]\d*$/.test(suffix)) return claimed;
+  console.warn(
+    `[internal-api] metrics-flush claimed boxId="${claimed}" outside cert identity "${certBoxId}"; attributing to the cert`,
+  );
+  return certBoxId;
+}
+
+/**
  * POST /api/internal/metrics-flush — SIGTERM final-flush from an AgentBox (module 5).
  *
- * 🔴 boxId comes from the mTLS certificate identity, NEVER from the body: the agentbox
- * process doesn't know its own pod name, and trusting a body-supplied id would let
- * agent A poison agent B's federated series. The body carries only the per-process
- * incarnation and the cumulative prom snapshot, fed through the SAME idempotent
- * `ingest()` entry point as the pull loop.
+ * The body carries the per-process incarnation, the cumulative prom snapshot, and the
+ * box's claim about which pod it is; the claim is authorized against the mTLS identity
+ * by {@link resolveFlushBoxId}. Everything is fed through the SAME idempotent `ingest()`
+ * entry point as the pull loop.
  */
 export async function handleMetricsFlush(
   req: http.IncomingMessage,
@@ -726,8 +759,7 @@ export async function handleMetricsFlush(
       sendJson(res, 400, { error: "metrics-flush requires { incarnation, prom }" });
       return;
     }
-    // boxId from the cert, not the body.
-    sink.ingest(identity.boxId, body.incarnation, body.prom);
+    sink.ingest(resolveFlushBoxId(identity.boxId, body.boxId), body.incarnation, body.prom);
     sendJson(res, 200, { ok: true });
   } catch (err) {
     counters?.flushErrorsTotal.inc();

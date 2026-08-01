@@ -39,6 +39,7 @@ import { resolveBinding, handlePairingCode, isChannelAccessDenied } from "../cha
 import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "../agent-model-binding.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
+import { sessionTurnLocks } from "../session-turn-lock.js";
 import { appendMessage, bindMessageTraceId, ensureChatSession } from "../chat-repo.js";
 import { collectChannelResponse } from "./lark.js";
 import type { RenderedReplyImage } from "./visual-image.js";
@@ -302,7 +303,20 @@ export async function handleDingTalkMessage(
 
   console.log(`[dingtalk] Message channel=${channelId} conversation=${conversationId} type=${routeType} \u2192 agent=${agentId} session=${sessionId}: "${text.slice(0, 80)}"`);
 
-  const handle = await agentBoxManager.getOrCreate(agentId);
+  // One turn at a time for this session. The AgentBox's own 409 only sees its own
+  // sessions, so once an agent runs more than one box two messages could be dispatched to
+  // two boxes and both would run — two writers on one transcript.
+  let resultText = "";
+  let replyImages: RenderedReplyImage[] = [];
+  let agentError: Error | null = null;
+  // Acquired INSIDE the try so a busy session surfaces through the SAME path the
+  // AgentBox's 409 already used — the friendly "still working" notice. Outside it the
+  // rejection escaped every handler and the user got nothing at all.
+  let releaseTurn: (() => void) | undefined;
+  try {
+    releaseTurn = await sessionTurnLocks.acquire(sessionId);
+  const handle = await agentBoxManager.getOrCreate(agentId, undefined, sessionId);
+  sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
   // Apply the agent's custom system prompt (best-effort — undefined falls back
@@ -355,9 +369,6 @@ export async function handleDingTalkMessage(
     modelRouting: modelBinding?.modelRouting,
     systemPromptTemplate,
   };
-  let resultText = "";
-  let replyImages: RenderedReplyImage[] = [];
-  let agentError: Error | null = null;
   try {
     const promptResult = await client.prompt(promptOpts);
     if (promptMessageId) {
@@ -376,6 +387,9 @@ export async function handleDingTalkMessage(
   } catch (err) {
     agentError = err instanceof Error ? err : new Error(String(err));
     console.error(`[dingtalk] Agent execution failed for session=${sessionId}:`, agentError);
+  }
+  } finally {
+    releaseTurn?.();
   }
 
   // Concurrency: a 1:1 session is single-threaded in AgentBox. A second
@@ -454,7 +468,8 @@ async function handleNewCommand(
     try {
       const binding = await resolveBinding(channelId, conversationId, frontendClient!);
       if (binding && !isChannelAccessDenied(binding)) {
-        const handle = await agentBoxManager.getOrCreate(binding.agentId);
+        // The OLD session id — closeSession must reach the box that holds it (see lark.ts).
+        const handle = await agentBoxManager.getOrCreate(binding.agentId, undefined, oldSessionId);
         const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
         await client.closeSession(oldSessionId);
       }

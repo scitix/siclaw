@@ -44,4 +44,14 @@ export interface BoxSpawner {
    * rotated CA and recycle them. Spawners without mTLS (local/process) omit it.
    */
   caFingerprint?(): string | undefined;
+
+  /**
+   * Whether boxes of this agent share one volume for session transcripts.
+   *
+   * A pool only works because any box can pick up a session the pool has written down.
+   * Without shared storage each box keeps its own copy, and a session that moves loses its
+   * history — silently, mid-conversation. The manager warns rather than refusing: a
+   * deployment may want a pool purely for one-shot traffic that never continues.
+   */
+  hasSharedSessionStorage?(agentId: string): boolean;
 }

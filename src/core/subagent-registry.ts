@@ -74,27 +74,56 @@ export function getBackgroundBashConcurrency(env: NodeJS.ProcessEnv = process.en
 }
 
 /**
- * Default cap on sub-agent child sessions running concurrently in one AgentBox.
+ * Default cap on sub-agent child sessions running concurrently for ONE CONVERSATION.
  *
- * Raised 2 → 4 with `spawn_subagent`'s batch (map→reduce) path (design §"Consequences"):
- * a multi-item batch defaults to background and is the primary fan-out path, and the group
- * worker share is `max(1, concurrency - 1)` (see {@link getGroupWorkerShare}) — at concurrency
- * 2 a batch would get a single worker, making a 50-item batch effectively serial and
- * unusable. 4 keeps ≥1 slot free for an interactive single spawn while giving a batch a
- * usable worker pool. This is a GLOBAL change to plain fan-out concurrency too; tune it
- * back with `SICLAW_SUBAGENT_CONCURRENCY`.
+ * Was 4 and pod-wide, which made a conversation's latency a function of how many other
+ * people happened to be using the same agent: every session in the box competed for the
+ * same four slots. It is now per-session, with {@link getSubagentPodConcurrency} taking
+ * over the job of protecting the process.
+ *
+ * 10 rather than 4 because the cap only binds on a deliberate fan-out — the prompt directs
+ * parallel work to `spawn_subagent` instead of the main agent doing it inline — and at 4 a
+ * ten-item batch ran in three waves for no reason but the cap. The group worker share is
+ * `max(1, concurrency - 1)` ({@link getGroupWorkerShare}), so the value also has to leave a
+ * batch a usable pool.
  */
-export const DEFAULT_SUBAGENT_CONCURRENCY = 4;
+export const DEFAULT_SUBAGENT_CONCURRENCY = 10;
 
 /**
- * Max sub-agent child sessions allowed to run at once within a single AgentBox,
- * from `SICLAW_SUBAGENT_CONCURRENCY` (default {@link DEFAULT_SUBAGENT_CONCURRENCY}).
+ * Max sub-agent child sessions one SESSION may run at once, from
+ * `SICLAW_SUBAGENT_CONCURRENCY` (default {@link DEFAULT_SUBAGENT_CONCURRENCY}).
  * pi runs a tool-call batch unbounded, so a wide fan-out would otherwise spin up
- * one child agent + one LLM stream per target from a single pod; this bounds it.
+ * one child agent + one LLM stream per target; this bounds it.
  * Invalid / non-positive values fall back to the default.
+ *
+ * ⚠️ This variable USED to mean "per AgentBox process". A deployment that lowered it as a
+ * memory guard is now guarding a single conversation, not the box — move that number to
+ * `SICLAW_SUBAGENT_POD_CONCURRENCY`.
  */
 export function getSubagentConcurrency(env: NodeJS.ProcessEnv = process.env): number {
   return parsePositiveIntEnv(env.SICLAW_SUBAGENT_CONCURRENCY, DEFAULT_SUBAGENT_CONCURRENCY);
+}
+
+/**
+ * Default ceiling on sub-agent child sessions running concurrently in ONE AgentBox process,
+ * across every conversation it holds.
+ *
+ * The per-session cap answers fairness; this one answers survival. Ten sessions each running
+ * their own ten children would be a hundred full agent sessions in a single Node process:
+ * queueing costs one user some latency, an OOMKill costs every session in the box its work.
+ *
+ * 50 is a PROVISIONAL number — per-child memory has never been measured. `siclaw_box_rss_bytes`
+ * against `siclaw_box_subagent_active` is the measurement that should replace it.
+ */
+export const DEFAULT_SUBAGENT_POD_CONCURRENCY = 50;
+
+/**
+ * Max sub-agent child sessions allowed to run at once across a whole AgentBox process, from
+ * `SICLAW_SUBAGENT_POD_CONCURRENCY` (default {@link DEFAULT_SUBAGENT_POD_CONCURRENCY}).
+ * Invalid / non-positive values fall back to the default.
+ */
+export function getSubagentPodConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  return parsePositiveIntEnv(env.SICLAW_SUBAGENT_POD_CONCURRENCY, DEFAULT_SUBAGENT_POD_CONCURRENCY);
 }
 
 /** Default wall-clock backstop for a sub-agent's whole run, in ms (10 minutes). */
@@ -246,11 +275,23 @@ export function getSubagentGroupMaxRuntimeMs(
 }
 
 /**
- * How many group children may be in flight at once: `max(1, concurrency - 1)`. A group
- * runs children through the SAME global `subagentLimiter` as plain fan-out (single
- * resource cap), but its orchestrator keeps at most this many submitted concurrently so
- * an interactive `spawn_subagent` always retains ≥1 slot (no head-of-line starvation).
+ * How many children of ONE group may be in flight at once: `max(1, session concurrency - 1)`.
+ * A group's children run through the same limiters as plain fan-out (single resource cap), but
+ * its orchestrator keeps at most this many submitted, so the session always retains ≥1 of its
+ * own slots for an interactive `spawn_subagent` (no head-of-line starvation within a
+ * conversation). Two concurrent background groups in the same session can still fill it —
+ * a wait that session caused itself.
  */
 export function getGroupWorkerShare(env: NodeJS.ProcessEnv = process.env): number {
   return Math.max(1, getSubagentConcurrency(env) - 1);
+}
+
+/**
+ * Collective ceiling on group children across ALL sessions in a box: `max(1, pod - 1)`.
+ * The per-group pool above is per-group, so N concurrent batches in N different sessions
+ * would together fill the pod ceiling and park an interactive spawn behind a ten-minute
+ * child. This reserves the last pod slot for something that is not a group child.
+ */
+export function getGroupPodShare(env: NodeJS.ProcessEnv = process.env): number {
+  return Math.max(1, getSubagentPodConcurrency(env) - 1);
 }

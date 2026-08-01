@@ -191,6 +191,40 @@ describe("PromFederationAggregator", () => {
     expect(gaugeVal(agg, "siclaw_sessions_active")).toBe(2);
   });
 
+  it("(6c) per-box gauges keep one series per box instead of being summed", () => {
+    const agg = new PromFederationAggregator();
+    agg.ingest("box-a", "inc-1", [gauge("siclaw_box_rss_bytes", 300)]);
+    agg.ingest("box-b", "inc-1", [gauge("siclaw_box_rss_bytes", 900)]);
+
+    // Two distinct series, not one series of 1200 — an RSS total says nothing about
+    // whether any single box is near its limit.
+    expect(gaugeVal(agg, "siclaw_box_rss_bytes", { box_id: "box-a" })).toBe(300);
+    expect(gaugeVal(agg, "siclaw_box_rss_bytes", { box_id: "box-b" })).toBe(900);
+    expect(gaugeVal(agg, "siclaw_box_rss_bytes")).toBeUndefined();
+  });
+
+  it("(6d) a per-box gauge series leaves with its box", () => {
+    const agg = new PromFederationAggregator();
+    agg.ingest("box-a", "inc-1", [gauge("siclaw_box_turns_in_flight", 2)]);
+    agg.ingest("box-b", "inc-1", [gauge("siclaw_box_turns_in_flight", 4)]);
+
+    agg.retainInstances(new Set(["box-a"]));
+    agg.retainInstances(new Set(["box-a"]));
+    expect(gaugeVal(agg, "siclaw_box_turns_in_flight", { box_id: "box-a" })).toBe(2);
+    expect(gaugeVal(agg, "siclaw_box_turns_in_flight", { box_id: "box-b" })).toBeUndefined();
+  });
+
+  it("(6e) a rebuilt pod replaces its own per-box series rather than doubling it", () => {
+    const agg = new PromFederationAggregator();
+    agg.ingest("box-a", "inc-1", [gauge("siclaw_box_rss_bytes", 300)]);
+    // Same boxId, new process → the old incarnation's gauges are dropped immediately.
+    agg.ingest("box-a", "inc-2", [gauge("siclaw_box_rss_bytes", 500)]);
+
+    const fam = agg.exportGroups().find((g) => g.name === "siclaw_box_rss_bytes");
+    expect(fam?.values).toHaveLength(1);
+    expect(gaugeVal(agg, "siclaw_box_rss_bytes", { box_id: "box-a" })).toBe(500);
+  });
+
   it("(7) admission control: non-siclaw_ counters/histograms are ignored", () => {
     const agg = new PromFederationAggregator();
     agg.ingest("box-a", "inc-1", [
