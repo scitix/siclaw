@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   buildProbeRequest,
+  isFieldRejection,
   probeModelOnce,
   redactSecret,
   siblingMaxTokensField,
@@ -150,15 +151,36 @@ describe("testModelWireConfig", () => {
     expect(fields).toEqual(["max_completion_tokens", "max_tokens"]);
   });
 
+  it.each([
+    ["a timeout", 0],
+    ["a rate limit", 429],
+    ["an outage", 503],
+    ["a bad key", 401],
+  ])("does not retry or persist on %s", async (_label, status) => {
+    // The regression this guards: a healthy gpt-4o times out once, the sibling
+    // probe lands two seconds later against a recovered gateway and returns
+    // 200, and the endpoint writes max_completion_tokens for a model that never
+    // needed it — leaving it worse than before the operator pressed Test.
+    let call = 0;
+    const impl: FetchLike = async () => (call++ === 0 ? reply(status, "nope") : reply(200));
+    const r = await testModelWireConfig(target({ modelId: "gpt-4o" }), GATEWAY, impl);
+    expect(r.ok).toBe(false);
+    expect(r.corrected).toBe(false);
+    expect(call).toBe(1);
+  });
+
   it("reports the original failure, not the hypothesis, when both fail", async () => {
     // The sibling attempt was our guess, not the operator's configuration —
     // leading with its error sends them chasing a field they never set.
     let call = 0;
-    const impl: FetchLike = async () => reply(call++ === 0 ? 401 : 400, "second");
+    // Both must be shape rejections, or the retry is gated off and this stops
+    // exercising the both-failed path at all.
+    const impl: FetchLike = async () => reply(call++ === 0 ? 422 : 400, "second");
     const r = await testModelWireConfig(target(), GATEWAY, impl);
     expect(r.ok).toBe(false);
     expect(r.corrected).toBe(false);
-    expect(r.status).toBe(401);
+    expect(call).toBe(2);
+    expect(r.status).toBe(422);
     expect(r.maxTokensField).toBe("max_completion_tokens");
   });
 
@@ -170,6 +192,19 @@ describe("testModelWireConfig", () => {
     expect(r.ok).toBe(false);
     expect(r.corrected).toBe(false);
     expect(fields).toHaveLength(1);
+  });
+});
+
+describe("isFieldRejection", () => {
+  it.each([400, 404, 422])("treats %d as a shape rejection", (s) => {
+    expect(isFieldRejection(s)).toBe(true);
+  });
+
+  // Everything here fails for a reason unrelated to the field name, and the
+  // probe PERSISTS a sibling success — so retrying on these would pin a correct
+  // model to the wrong field the moment the gateway hiccups.
+  it.each([0, 401, 403, 429, 500, 502, 503, 504, 200])("does not retry on %d", (s) => {
+    expect(isFieldRejection(s)).toBe(false);
   });
 });
 

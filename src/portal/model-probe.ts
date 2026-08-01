@@ -62,6 +62,21 @@ export function siblingMaxTokensField(field: MaxTokensField): MaxTokensField {
 }
 
 /**
+ * Whether `status` is the provider saying "this request was malformed" — the
+ * only class of failure from which the field name can be inferred.
+ *
+ * `status: 0` (timeout / DNS / connection refused) is excluded because no
+ * request was ever judged. 401/403 are excluded because a bad key rejects both
+ * field names identically. 429 and 5xx are excluded because they are about
+ * load, not shape, and are exactly when a second attempt is most likely to
+ * succeed for a reason that has nothing to do with what we changed.
+ */
+export function isFieldRejection(status: number): boolean {
+  if (status < 400 || status >= 500) return false;
+  return status !== 401 && status !== 403 && status !== 429;
+}
+
+/**
  * Strip the provider's own credential out of echoed text. The key rides in a
  * header rather than the URL, so it should never appear — but some gateways
  * reflect request headers into their error payloads, and this response goes
@@ -163,6 +178,16 @@ export async function testModelWireConfig(
   // Anthropic's field name is fixed, so there is no sibling to try — retrying
   // would send the identical request and report a misleading second failure.
   if (usesAnthropicMessages(target.apiType)) {
+    return { ...attempt, maxTokensField: first, corrected: false };
+  }
+
+  // Only a request the provider REJECTED tells us anything about the field
+  // name. A timeout, a refused connection, a 429 or a 5xx says nothing — and
+  // because this probe PERSISTS a success, retrying on those turns a transient
+  // blip into a permanent mis-configuration: the sibling attempt lands a second
+  // later, the gateway is healthy again, and a model that was correct gets
+  // pinned to the wrong field for every future turn.
+  if (!isFieldRejection(attempt.status)) {
     return { ...attempt, maxTokensField: first, corrected: false };
   }
 

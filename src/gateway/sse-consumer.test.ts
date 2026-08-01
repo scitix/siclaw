@@ -497,7 +497,7 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     expect(errorRows[0].content).toContain("all candidates failed");
   });
 
-  it("re-arms stream_error after a rollback so a both-failed turn surfaces the final error live", async () => {
+  it("surfaces only the final error of a both-failed turn, not the rolled-back one", async () => {
     const streamErrors: string[] = [];
     const events = [
       { type: "model_route_start", candidateCount: 2 },
@@ -515,13 +515,68 @@ describe("consumeAgentSse — routed turn commit gating", () => {
         if (type === "stream_error") streamErrors.push(String((evt as any).error?.message))
       },
     });
-    // The primary's stream_error fires (frontend drops it on rollback); without
-    // re-arming, the fallback's real failure would emit none. Both fire now.
-    expect(streamErrors).toEqual(["primary 429", "fallback 503"]);
+    // One bubble, carrying the failure that actually ended the turn. The
+    // primary's 429 belongs to a candidate that was rolled back — emitting it
+    // and relying on the frontend to drop it again put the burden in the wrong
+    // place, and the same eagerness is what showed operators a transport
+    // timeout instead of the provider's "unsupported_protocol" verdict.
+    expect(streamErrors).toEqual(["fallback 503"]);
     // Still exactly one persisted error row — the final, exhausted failure.
     const errorRows = appendCalls.filter((r) => r.metadata?.kind === "error_response");
     expect(errorRows).toHaveLength(1);
     expect(errorRows[0].content).toContain("fallback 503");
+  });
+
+  // The reported case: claude-sonnet-5 on an OpenAI-protocol gateway. pi-agent's
+  // first attempt gave up on the transport ("Request timed out."), the retry
+  // came back with the gateway's actual verdict, and the operator was shown the
+  // timeout — sending them to look at the network instead of at the protocol
+  // dropdown that was the whole problem.
+  it("shows the last error of an internal retry chain, not the first", async () => {
+    const streamErrors: string[] = [];
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "Request timed out." } },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: '400: {"code":"unsupported_protocol"}' } },
+    ];
+    await consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      onEvent: (evt, type) => {
+        if (type === "stream_error") streamErrors.push(String((evt as any).error?.message));
+      },
+    });
+    expect(streamErrors).toEqual(['400: {"code":"unsupported_protocol"}']);
+    // The reload must agree with the bubble the operator was just looking at.
+    const errorRows = appendCalls.filter((r) => r.metadata?.kind === "error_response");
+    expect(errorRows).toHaveLength(1);
+    expect(errorRows[0].content).toContain("unsupported_protocol");
+  });
+
+  it("leaves nothing behind when a retry recovers the turn", async () => {
+    // Previously a transient failure left a red bubble sitting above the answer
+    // that followed it, and an error row that outlived the reload.
+    const streamErrors: string[] = [];
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "Request timed out." } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hello" }], stopReason: "stop" } },
+    ];
+    const result = await consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      onEvent: (evt, type) => {
+        if (type === "stream_error") streamErrors.push(String((evt as any).error?.message));
+      },
+    });
+    expect(streamErrors).toEqual([]);
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(0);
+    // And the recovered turn must not report itself as failed to callers that
+    // quote errorMessage (cron notifications, channel replies).
+    expect(result.errorMessage).toBe("");
+    expect(result.resultText).toBe("hello");
   });
 
   it("does not leak a rolled-back attempt's error into the run summary on a transport drop", async () => {

@@ -334,7 +334,18 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let resultText = "";
   let taskReportText = "";
   let errorMessage = "";
-  let streamErrorEmitted = false;
+  /**
+   * The error to show for this turn, or null when there isn't one (yet).
+   *
+   * Buffered rather than emitted on sight. pi-agent retries internally, so a
+   * turn can produce several error `message_end`s; the FIRST one is the least
+   * informative — it is typically the transport giving up ("Request timed
+   * out.") while the retry that follows carries the provider's actual verdict
+   * ("unsupported_protocol"). Emitting on sight showed the operator the timeout
+   * and dropped the verdict. Buffering also means a retry that SUCCEEDS leaves
+   * no error bubble at all, instead of a red bubble sitting above the answer.
+   */
+  let pendingStreamError: string | null = null;
   let errorPersisted = false;
   // ── Routed-turn commit gating ──
   // When model routing streams the primary candidate live, this consumer sees a
@@ -359,6 +370,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   const commitRoutedTurn = async () => {
     routingCommitted = true;
     pendingErrorOps.length = 0;
+    pendingStreamError = null;
     // The turn produced committed output / succeeded — a failed earlier
     // attempt's error must not leak into the returned run summary.
     errorMessage = "";
@@ -373,7 +385,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     pendingAssistantOps.length = 0;
     pendingErrorOps.length = 0;
     errorPersisted = false;
-    streamErrorEmitted = false;
+    pendingStreamError = null;
     errorMessage = "";
     // The primary's deferred assistant op flipped firstAssistantPersisted when
     // it was enqueued; we're now discarding that op, so undo the flip — else the
@@ -743,25 +755,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         // Capture model-level errors (e.g. API 404, rate-limit) and surface
         // them upstream as a single stream_error event so the proxy/frontend
         // can render an inline error bubble instead of silently stopping.
-        // Dedupe within one consume run — pi-agent retries internally, which
-        // would otherwise produce one bubble per retry attempt.
+        // ONE bubble per run — pi-agent retries internally — and it is the LAST
+        // error, not the first: see pendingStreamError.
         if (message.stopReason === "error" && message.errorMessage) {
           errorMessage = String(message.errorMessage);
-          if (onEvent && !streamErrorEmitted) {
-            streamErrorEmitted = true;
-            onEvent(
-              {
-                type: "stream_error",
-                error: {
-                  code: ErrorCodes.MODEL_ERROR,
-                  message: errorMessage,
-                  retriable: true,
-                },
-              },
-              "stream_error",
-              {},
-            );
-          }
+          // Last one wins — see pendingStreamError. Flushed at the end of the
+          // run, or dropped if a later attempt succeeds.
+          pendingStreamError = errorMessage;
           // Persist the error as its own DB row so it survives a page refresh
           // or session re-open. The live frontend error bubble is client-only
           // (role="error", no DB row) and is dropped once history reloads from
@@ -769,9 +769,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           // message. The motivating case is model-routing exhausting during
           // setup: it emits a synthetic error message_end with EMPTY content,
           // so the assistantContent persist path below skips it entirely and
-          // nothing about the failure reaches the database. Dedup per consume
-          // run (pi-agent can retry and emit several error message_ends).
-          if (persist && !errorPersisted) {
+          // nothing about the failure reaches the database. One row per consume
+          // run, carrying the LAST error — the reload must not disagree with
+          // the bubble the operator was just looking at.
+          if (persist) {
             errorPersisted = true;
             const errorContent = redactText(errorMessage, redactionConfig);
             const persistError = async () => {
@@ -787,13 +788,22 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               });
               await incrementMessageCount(sessionId);
             };
-            // On a routed turn this error belongs to a candidate that may yet be
-            // replaced by a successful fallback — defer it to the commit point
-            // (only an exhausted turn actually writes it; success/rollback drop
-            // it). Non-routed turns write inline.
-            if (isRoutingTurn && !routingCommitted) pendingErrorOps.push(persistError);
-            else await persistError();
+            // Buffered for every turn, not just routed ones: an internal retry
+            // can still turn this failure into a success, and a row written on
+            // sight would leave a stale error above the answer on reload. The
+            // routing commit/rollback paths already clear this list, and so
+            // does a successful assistant message below.
+            pendingErrorOps.length = 0;
+            pendingErrorOps.push(persistError);
           }
+        } else if (message.stopReason && message.stopReason !== "error") {
+          // A later attempt produced a real assistant turn: the earlier failure
+          // was transient and must leave nothing behind — no bubble, no row, and
+          // nothing in the returned summary that a notification could quote.
+          pendingStreamError = null;
+          pendingErrorOps.length = 0;
+          errorPersisted = false;
+          errorMessage = "";
         }
 
         // Extract text for resultText
@@ -1002,6 +1012,18 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // (transport drop), flush whatever is still pending so a real answer or a
   // terminal error is not silently lost.
   await flushOps(pendingAssistantOps);
+  // The turn is over and nothing recovered it: now the operator gets the error,
+  // and it is the one that actually decided the outcome.
+  if (onEvent && pendingStreamError) {
+    onEvent(
+      {
+        type: "stream_error",
+        error: { code: ErrorCodes.MODEL_ERROR, message: pendingStreamError, retriable: true },
+      },
+      "stream_error",
+      {},
+    );
+  }
   await flushOps(pendingErrorOps);
 
   const durationMs = Date.now() - startTime;
