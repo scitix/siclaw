@@ -27,10 +27,13 @@ export interface ProviderModelConfig {
   id: string;
   name: string;
   /**
-   * Per-model wire protocol. Absent = inherit `ProviderConfig.api` (pi resolves
-   * `modelDef.api ?? providerConfig.api`). Never emit an empty string: pi drops
-   * such a model from its registry outright. Set by
-   * `buildProviderModelDescriptor` only when the model overrides its provider.
+   * Per-model wire protocol. ALWAYS set by `buildProviderModelDescriptor`, even
+   * when it equals the provider's: pi would fall back to `providerConfig.api`
+   * if the key were absent, and stating it is what stops the two layers from
+   * disagreeing. Never emit an empty string — pi drops such a model from its
+   * registry outright ("model not found", not a protocol error).
+   *
+   * Optional only because the TUI's hand-written settings.json may omit it.
    */
   api?: string;
   reasoning?: boolean;

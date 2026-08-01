@@ -554,6 +554,61 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     expect(errorRows[0].content).toContain("unsupported_protocol");
   });
 
+  it("still surfaces and persists the error when the stream dies mid-turn", async () => {
+    // The buffered error is the operator's only explanation of the failure. A
+    // pod recycle or dropped transport must not take it with it — before the
+    // buffering this row was written on sight, so losing it would be a straight
+    // regression for exactly the reload the buffering promises to fix.
+    const streamErrors: string[] = [];
+    const client = {
+      async *streamEvents() {
+        yield { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "400 unsupported_protocol" } };
+        throw new Error("socket hang up");
+      },
+    } as unknown as AgentBoxClient;
+
+    await expect(consumeAgentSse({
+      client,
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      onEvent: (evt, type) => {
+        if (type === "stream_error") streamErrors.push(String((evt as any).error?.message));
+      },
+    })).rejects.toThrow("socket hang up");
+
+    expect(streamErrors).toEqual(["400 unsupported_protocol"]);
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(1);
+  });
+
+  // A non-error stopReason is not the same as a recovered turn: pi surfaces an
+  // empty 200 as `stop` with zero content blocks — the case its own retry loop
+  // exists for — and a Stop as `aborted`. Clearing on those would erase the
+  // provider's verdict and report the turn as a success, which delegation and
+  // cron both read as ok with empty text.
+  it.each([
+    ["an empty 200", { role: "assistant", content: [], stopReason: "stop" }],
+    ["an aborted turn", { role: "assistant", content: [], stopReason: "aborted" }],
+  ])("does not treat %s as recovery", async (_label, second) => {
+    const streamErrors: string[] = [];
+    const events = [
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "provider verdict" } },
+      { type: "message_end", message: second },
+    ];
+    const result = await consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      onEvent: (evt, type) => {
+        if (type === "stream_error") streamErrors.push(String((evt as any).error?.message));
+      },
+    });
+    expect(streamErrors).toEqual(["provider verdict"]);
+    expect(result.errorMessage).toBe("provider verdict");
+    expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(1);
+  });
+
   it("leaves nothing behind when a retry recovers the turn", async () => {
     // Previously a transient failure left a red bubble sitting above the answer
     // that followed it, and an error row that outlived the reload.

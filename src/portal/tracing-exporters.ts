@@ -306,6 +306,10 @@ export function isBlockedIpLiteral(host: string, opts?: { allowLoopback?: boolea
     if (/^fe[89ab][0-9a-f]?:/.test(host)) return true;
     return false; // fc00::/7 unique-local (private) and public → allowed
   }
-  if (opts?.allowLoopback && host === "localhost") return false;
-  return false; // hostname — not resolved here
+  // `localhost` is a NAME, not a literal — and the only loopback name common
+  // enough to be worth special-casing. Both arms of this used to return false,
+  // so the condition read as if allowLoopback governed it while the guard let
+  // it through either way.
+  if (host === "localhost" || host.endsWith(".localhost")) return !opts?.allowLoopback;
+  return false; // any other hostname — not resolved here
 }

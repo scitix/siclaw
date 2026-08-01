@@ -219,7 +219,7 @@ export interface CliSnapshot {
     models: Array<{
       id: string;
       name: string;
-      /** Per-model protocol override; absent = inherit the provider's `api`. */
+      /** Per-model wire protocol. Always emitted — see ProviderModelConfig.api. */
       api?: string;
       reasoning: boolean;
       input: string[];

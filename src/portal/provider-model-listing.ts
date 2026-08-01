@@ -16,7 +16,7 @@
  * fetch; manual entry stays available.
  */
 
-import { isBlockedIpLiteral } from "./tracing-exporters.js";
+import { outboundProbeUrlGuard } from "./tracing-exporters.js";
 
 /** One row offered to the operator in the import dialog. */
 export interface ListedModel {
@@ -58,8 +58,25 @@ export interface ListedModel {
  * `owned_by` is only a tiebreaker; too many gateways return a constant there
  * ("system", "library", an org name) for it to carry weight alone.
  */
+export function isNativeClaudeId(id: string): boolean {
+  return /^claude/i.test(id.trim());
+}
+
+/**
+ * Whether a row is Claude-ish enough to FLAG. Broader than the pre-fill on
+ * purpose, and deliberately not the same predicate:
+ *
+ *   - `anthropic.claude-3-5-sonnet-…-v1:0` (a Bedrock-fronting gateway) is
+ *     served over the Claude protocol but is not a bare id. Flagging it keeps
+ *     it and the bulk action visible.
+ *   - `owned_by: "anthropic"` is a real signal but a weak one — aggregators put
+ *     the UPSTREAM vendor there while serving over their own protocol, so it
+ *     must never pre-fill an override, only draw the eye.
+ *
+ * Pre-fill needs to be right; a flag only needs to be worth looking at.
+ */
 export function looksLikeClaudeModel(id: string, ownedBy?: unknown): boolean {
-  if (/^claude/i.test(id.trim())) return true;
+  if (/claude/i.test(id)) return true;
   return typeof ownedBy === "string" && ownedBy.trim().toLowerCase() === "anthropic";
 }
 
@@ -157,12 +174,11 @@ export function parseOpenAiModelList(body: unknown): ListedModel[] {
     out.push({
       id,
       ...(displayName && displayName !== id ? { name: displayName } : {}),
-      // Pre-filled, not merely flagged — see looksLikeClaudeModel. The hint
-      // still rides along so the dialog can say WHY the row differs and offer
-      // the bulk escape hatch for aggregator gateways.
-      ...(looksLikeClaudeModel(id, entry.owned_by)
-        ? { suggested_api_type: "anthropic-messages", protocol_hint: "claude" as const }
-        : { suggested_api_type: "" }),
+      // Two predicates, on purpose: the anchored one decides the pre-fill (it
+      // has to be right), the broad one decides the flag (it only has to be
+      // worth looking at).
+      suggested_api_type: isNativeClaudeId(id) ? "anthropic-messages" : "",
+      ...(looksLikeClaudeModel(id, entry.owned_by) ? { protocol_hint: "claude" as const } : {}),
       context_window: extractContextWindow(entry),
       max_tokens: extractMaxTokens(entry),
       vision: extractVision(entry),
@@ -213,20 +229,7 @@ export function parseAnthropicModelList(body: unknown): ListedModel[] {
  * (169.254.0.0/16, fe80::/10) stays blocked in every literal spelling.
  */
 export function providerFetchSsrfGuard(rawUrl: string): { ok: boolean; error?: string } {
-  let u: URL;
-  try {
-    u = new URL(rawUrl);
-  } catch {
-    return { ok: false, error: "Invalid base URL" };
-  }
-  if (u.protocol !== "http:" && u.protocol !== "https:") {
-    return { ok: false, error: `Unsupported protocol: ${u.protocol} (only http/https)` };
-  }
-  const host = u.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
-  if (isBlockedIpLiteral(host, { allowLoopback: true })) {
-    return { ok: false, error: `Blocked host (link-local/metadata): ${host}` };
-  }
-  return { ok: true };
+  return outboundProbeUrlGuard(rawUrl, { allowLoopback: true });
 }
 
 /**

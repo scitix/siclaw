@@ -680,7 +680,11 @@ export function Models() {
                           <span className="block text-xs font-mono truncate">{m.id}</span>
                           <span className="block text-[10px] text-muted-foreground">{describeListedModel(m)}</span>
                           {m.protocol_hint === "claude" && !m.already_exists && (
-                            <span className="block text-[10px] text-amber-500/90">Pre-filled from the name — switch to OpenAI Compatible if this gateway re-serves it over that protocol</span>
+                            <span className="block text-[10px] text-amber-500/90">
+                              {m.suggested_api_type === "anthropic-messages"
+                                ? "Pre-filled from the name — switch if this gateway re-serves it over chat-completions"
+                                : "Claude-named but namespaced — pick Anthropic if this gateway serves it over the Claude protocol"}
+                            </span>
                           )}
                         </span>
                         {m.already_exists ? (
@@ -705,14 +709,30 @@ export function Models() {
 
             <div className="flex items-center justify-between px-4 py-3 border-t border-border">
               <div className="flex items-center gap-3">
+              {/* Both directions. The pre-fill only fires on a BARE claude-*
+                  id, so a Bedrock-fronting gateway (anthropic.claude-…-v1:0)
+                  is flagged but not pre-filled and needs → Anthropic, while an
+                  aggregator re-serving over chat-completions needs the
+                  opposite. Neither is inferable from the listing. */}
               {fetchedModels.some((m) => m.protocol_hint === "claude" && !m.already_exists) && (
-                <button
-                  onClick={() => setFetchSelection(applyProtocolToHinted(fetchedModels, fetchSelection, "openai-completions"))}
-                  className="text-xs text-amber-600 hover:text-amber-500"
-                  title="For an aggregator that re-serves Claude models over its own chat-completions API"
-                >
-                  Set all Claude rows → OpenAI Compatible
-                </button>
+                <span className="flex items-center gap-2 text-xs text-amber-600">
+                  <span className="text-muted-foreground">Set all Claude rows →</span>
+                  <button
+                    onClick={() => setFetchSelection(applyProtocolToHinted(fetchedModels, fetchSelection, "anthropic-messages"))}
+                    className="hover:text-amber-500 underline underline-offset-2"
+                    title="For a gateway that serves its Claude models over the Claude protocol"
+                  >
+                    Anthropic
+                  </button>
+                  <span className="text-muted-foreground">/</span>
+                  <button
+                    onClick={() => setFetchSelection(applyProtocolToHinted(fetchedModels, fetchSelection, "openai-completions"))}
+                    className="hover:text-amber-500 underline underline-offset-2"
+                    title="For an aggregator that re-serves Claude models over its own chat-completions API"
+                  >
+                    OpenAI Compatible
+                  </button>
+                </span>
               )}
               <button
                 onClick={() => {

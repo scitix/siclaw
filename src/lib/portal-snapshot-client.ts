@@ -41,6 +41,10 @@ export interface PortalSnapshot {
     models: Array<{
       id: string;
       name: string;
+      /** Per-model wire protocol. Always emitted by the producer — omitting it
+       *  here is how a field-by-field consumer silently drops it and sends
+       *  every model on a mixed gateway over the provider's protocol. */
+      api: string;
       reasoning: boolean;
       input: string[];
       cost: { input: number; output: number; cacheRead: number; cacheWrite: number };

@@ -220,24 +220,37 @@ describe("testModelWireConfig", () => {
     expect(call).toBe(3);
   });
 
-  it("leaves an unrecognised protocol alone", async () => {
-    // pi gains api ids without a siclaw release; there is no known sibling for
-    // one we've never heard of, so guessing would be inventing a pairing. The
-    // field-name step still runs, hence two attempts and no protocol change.
-    // (KNOWN LIMIT: buildProbeRequest sends every non-anthropic api as
-    // chat-completions, so a genuine openai-responses model is probed on the
-    // wrong endpoint and reports a false failure. Nothing is persisted, so it
-    // is a bad diagnosis rather than a bad write.)
-    const { impl, calls } = scriptedFetch([400, 400]);
+  it("changes nothing for an api id it does not know", async () => {
+    // pi gains api ids without a siclaw release, and buildProbeRequest sends
+    // everything non-anthropic to /chat/completions — so an openai-responses
+    // model is probed on an endpoint its real turns never touch. One attempt,
+    // no sibling protocol (no known pairing), no field retry, nothing written:
+    // a bad diagnosis is recoverable, a persisted correction inferred from the
+    // wrong endpoint is not.
+    const { impl, calls } = scriptedFetch([400, 200]);
     const r = await testModelWireConfig(target({ apiType: "openai-responses", modelId: "gpt-5" }), impl);
+    expect(r.ok).toBe(false);
     expect(r.correctedApiType).toBe(false);
+    expect(r.correctedMaxTokensField).toBe(false);
     expect(r.apiType).toBe("openai-responses");
-    // Starts on max_tokens, not max_completion_tokens: the reasoning-model
-    // inference is gated on chat-completions, and openai-responses is not it.
+    expect(calls).toHaveLength(1);
+  });
+
+  it("re-resolves the max-tokens field under the sibling protocol", async () => {
+    // Coming FROM anthropic the field is always max_tokens (the messages API
+    // has no choice), so inheriting it would probe an o-series model on
+    // chat-completions with the field that family rejects — a failure caused by
+    // our own second guess rather than by the operator's configuration.
+    const { impl, calls } = scriptedFetch([400, 200]);
+    const r = await testModelWireConfig(anth({ modelId: "o3-mini" }), impl);
     expect(calls).toEqual([
-      ["openai-completions", "max_tokens"],
+      ["anthropic-messages", "max_tokens"],
       ["openai-completions", "max_completion_tokens"],
     ]);
+    expect(r).toMatchObject({
+      ok: true, correctedApiType: true, apiType: "openai-completions",
+      maxTokensField: "max_completion_tokens", correctedMaxTokensField: true,
+    });
   });
 });
 

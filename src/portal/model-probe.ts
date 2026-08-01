@@ -224,10 +224,15 @@ export async function testModelWireConfig(
   //    the field name could have been learned from that failure.
   const altApi = siblingApiType(api);
   if (altApi) {
-    // The messages API names its cap `max_tokens` unconditionally, so the
-    // sibling protocol brings its own natural field rather than inheriting one
-    // that only means something under chat-completions.
-    const altField: MaxTokensField = usesAnthropicMessages(altApi) ? "max_tokens" : field;
+    // Re-resolved under the sibling, not inherited: `field` was decided for the
+    // protocol we are abandoning. Coming FROM anthropic that value is always
+    // `max_tokens` (the messages API has no choice), so inheriting it would
+    // probe an o-series model on chat-completions with the field that family
+    // rejects — and report a failure caused by our own second guess.
+    const altField = resolveMaxTokensField(
+      { id: target.modelId, maxTokensField: target.maxTokensField },
+      { api: altApi },
+    );
     const viaAltApi = await probeModelOnce(target, altApi, altField, fetchImpl);
     if (viaAltApi.ok) {
       return {
@@ -241,8 +246,12 @@ export async function testModelWireConfig(
     }
   }
 
-  // 2. Right protocol, wrong field name. Only chat-completions has a choice.
-  if (!usesAnthropicMessages(api)) {
+  // 2. Right protocol, wrong field name. Only chat-completions has a choice —
+  //    and only an api id we actually know, because `buildProbeRequest` sends
+  //    everything non-anthropic to /chat/completions. Probing an unrecognised
+  //    id there and PERSISTING the result would pin a field name inferred from
+  //    an endpoint that model's real turns never touch.
+  if (api === "openai-completions") {
     const altField = siblingMaxTokensField(field);
     const viaAltField = await probeModelOnce(target, api, altField, fetchImpl);
     if (viaAltField.ok) {

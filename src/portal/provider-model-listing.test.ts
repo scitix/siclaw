@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildModelListUrl,
+  isNativeClaudeId,
   looksLikeClaudeModel,
   parseAnthropicModelList,
   parseOpenAiModelList,
@@ -9,19 +10,13 @@ import {
 } from "./provider-model-listing.js";
 
 describe("looksLikeClaudeModel", () => {
-  it("matches a bare claude-* id, which is how a native Claude endpoint lists them", () => {
+  it("flags anything Claude-ish, including namespaced and owned_by-only rows", () => {
+    // A flag only has to be worth looking at, so it stays broad: a
+    // Bedrock-fronting gateway lists `anthropic.claude-…-v1:0` and DOES serve
+    // it over the Claude protocol.
     expect(looksLikeClaudeModel("claude-sonnet-5")).toBe(true);
-    expect(looksLikeClaudeModel("Claude-Opus-4-8")).toBe(true);
-    expect(looksLikeClaudeModel("  claude-haiku-4-5  ")).toBe(true);
-  });
-
-  // The anchoring is the whole trick. A namespaced id means an aggregator that
-  // re-serves the model over ITS protocol (chat-completions), so matching it
-  // would pre-fill an override that 404s every turn. The same gateway lists
-  // `Qwen/Qwen3.6-27B` namespaced and its Claude models bare.
-  it("does not match a vendor-namespaced id", () => {
-    expect(looksLikeClaudeModel("anthropic/claude-3.5-sonnet")).toBe(false);
-    expect(looksLikeClaudeModel("anthropic/Claude-Opus-4-8")).toBe(false);
+    expect(looksLikeClaudeModel("anthropic/claude-3.5-sonnet")).toBe(true);
+    expect(looksLikeClaudeModel("anthropic.claude-3-5-sonnet-20240620-v1:0")).toBe(true);
   });
 
   it("accepts owned_by as a tiebreaker only", () => {
@@ -37,6 +32,25 @@ describe("looksLikeClaudeModel", () => {
     expect(looksLikeClaudeModel("gpt-4o", "system")).toBe(false);
     expect(looksLikeClaudeModel("gpt-4o", undefined)).toBe(false);
     expect(looksLikeClaudeModel("gpt-4o", 42)).toBe(false);
+  });
+});
+
+describe("isNativeClaudeId", () => {
+  // Anchoring is the whole trick, and this is the predicate that must be RIGHT
+  // because it drives a value that gets persisted. A bare id is how a native
+  // Claude endpoint lists its models; a namespaced one means an aggregator
+  // re-serving over ITS protocol, where an override 404s every turn. The same
+  // gateway proves the shape: `Qwen/Qwen3.6-27B` namespaced, Claude bare.
+  it("matches a bare claude-* id", () => {
+    expect(isNativeClaudeId("claude-sonnet-5")).toBe(true);
+    expect(isNativeClaudeId("Claude-Opus-4-8")).toBe(true);
+    expect(isNativeClaudeId("  claude-haiku-4-5  ")).toBe(true);
+  });
+
+  it("does not match a namespaced id, however Claude-ish", () => {
+    expect(isNativeClaudeId("anthropic/claude-3.5-sonnet")).toBe(false);
+    expect(isNativeClaudeId("anthropic.claude-3-5-sonnet-20240620-v1:0")).toBe(false);
+    expect(isNativeClaudeId("openrouter/anthropic/claude-opus")).toBe(false);
   });
 });
 
@@ -198,10 +212,11 @@ describe("parseOpenAiModelList — vendor extensions", () => {
     expect(m.max_tokens).toBe(8192);
     expect(m.vision).toBe(true);
     expect(m.name).toBe("Anthropic: Claude 3.5 Sonnet");
-    // Still inherit, and NOT flagged — an OpenRouter Claude model speaks the
-    // OpenAI protocol, so there is nothing here for the operator to correct.
+    // Still inherit — an OpenRouter Claude model speaks the OpenAI protocol —
+    // but flagged, because a Bedrock-style gateway uses the same shape and does
+    // not, and the bulk action is how the operator says which one this is.
     expect(m.suggested_api_type).toBe("");
-    expect(m.protocol_hint).toBeUndefined();
+    expect(m.protocol_hint).toBe("claude");
   });
 
   it("reads the older architecture.modality spelling", () => {
