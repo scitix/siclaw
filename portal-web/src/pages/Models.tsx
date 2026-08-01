@@ -588,7 +588,13 @@ export function Models() {
                     {/* Add model form */}
                     {showAddModel === provider.id ? (
                       <div className="p-3 rounded-md border border-dashed border-border bg-card space-y-2">
-                        <p className="text-[11px] font-medium text-muted-foreground">New model</p>
+                        {/* Names the target provider: a provider with many
+                            models pushes this form far below its own header,
+                            leaving nothing on screen that says where the model
+                            is about to be written. */}
+                        <p className="text-[11px] font-medium text-muted-foreground">
+                          New model in <span className="font-mono text-foreground">{provider.name}</span>
+                        </p>
                         <div className="grid grid-cols-2 gap-2">
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Model ID</label><input placeholder="e.g. gpt-4o" value={modelForm.model_id} onChange={(e) => setModelForm({ ...modelForm, model_id: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" /></div>
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Display Name</label><input placeholder="e.g. GPT-4o" value={modelForm.name} onChange={(e) => setModelForm({ ...modelForm, name: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
