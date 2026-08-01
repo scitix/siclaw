@@ -88,7 +88,7 @@ import {
 } from "./internal-api.js";
 import { handleDelegate, handleDelegates } from "./delegate-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
-import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage } from "./chat-repo.js";
+import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
@@ -96,6 +96,7 @@ import { PromFederationAggregator } from "./prom-federation-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
+import { pendingUserRows } from "./pending-user-rows.js";
 import { resolveAgentModelBinding, resolveAgentSystemPrompt } from "./agent-model-binding.js";
 
 function stablePayloadDigest(value: unknown): string {
@@ -387,6 +388,27 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // After the ack, the existing chat.event stream (agent_start /
     // agent_end / agent_message / stream_error / prompt_done) carries
     // every observable progress signal the frontend needs.
+    // Persist the user's message BEFORE answering the RPC, and before the turn starts.
+    //
+    // Two reasons, and the second is the one that bites. consumeAgentSse writes rows that
+    // reference chat_sessions, so the session row has to exist first. And a write that
+    // happened after this RPC returned was a write nobody was waiting on: if it failed —
+    // or the process died — the message vanished while the turn ran anyway, so "your
+    // message was recorded" was not actually true when we said it.
+    //
+    // A failure here does NOT fail the send. The caller loses the row id and falls back
+    // to matching by content; blocking a whole conversation on one database hiccup is the
+    // worse trade.
+    let promptMessageId: string | undefined;
+    try {
+      await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
+      promptMessageId = await appendMessage({ sessionId, role: "user", content: text });
+      await incrementMessageCount(sessionId);
+      pendingUserRows.push(sessionId, promptMessageId);
+    } catch (persistErr) {
+      console.warn(`[runtime] failed to persist the user message session=${sessionId}; continuing without a row id:`, persistErr);
+    }
+
     (async () => {
       // One turn at a time for this session, across every box. The AgentBox's own 409
       // only sees its own sessions, so with more than one box two sends could be
@@ -394,18 +416,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // Released in the finally below so a throw cannot wedge the session.
       let releaseTurn: (() => void) | undefined;
       try {
-        // Persist user message + ensure session row before any agent events
-        // could land. consumeAgentSse writes assistant/tool rows with FK
-        // referencing chat_sessions, so the row has to exist first.
-        //
-        // BEFORE taking the turn lock, deliberately: a send that ends up riding the
-        // running turn as a steer still has to appear in the transcript. Acquiring first
-        // meant a busy session dropped the user's message entirely — the RPC had already
-        // returned ok, so nothing retried it and a reload showed no trace of it.
-        await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
-        const promptMessageId = await appendMessage({ sessionId, role: "user", content: text });
-        await incrementMessageCount(sessionId);
-
         // One turn at a time for this session, across every box (see session-turn-lock.ts).
         // If the session is already running, fall back to the SAME steer the AgentBox's own
         // 409 used to trigger — the message rides the in-flight turn's stream. Emitting a
@@ -421,9 +431,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             : undefined;
           if (steered) {
             console.log(`[runtime] session=${sessionId} busy; steered into the turn on ${running!.boxId}`);
-            await updateMessage({ messageId: promptMessageId, sessionId, content: text, metadata: { kind: "steer" } })
+            if (promptMessageId) await updateMessage({ messageId: promptMessageId, sessionId, content: text, metadata: { kind: "steer" } })
               .catch((e) => console.warn(`[runtime] failed to mark steer message session=${sessionId}:`, e));
-            void bindMessageTraceId(promptMessageId, sessionId, steered.traceId).catch(() => {});
+            if (promptMessageId) void bindMessageTraceId(promptMessageId, sessionId, steered.traceId).catch(() => {});
             return; // the running turn owns the stream and will emit its own prompt_done
           }
           // No steer target, or the turn ended between the rejection and the steer. Ask
@@ -476,7 +486,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             // reject a fresh prompt. Once the fallback steer is accepted, label the
             // existing row so transcript/trace readers do not mistake it for the
             // prompt that started the active trace.
-            await updateMessage({
+            if (promptMessageId) await updateMessage({
               messageId: promptMessageId,
               sessionId,
               content: text,
@@ -484,16 +494,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             }).catch((updateErr) => {
               console.warn(`[runtime] failed to mark automatic steer message session=${sessionId} message=${promptMessageId}:`, updateErr);
             });
-            void bindMessageTraceId(promptMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
-              console.warn(`[runtime] failed to bind steer trace session=${sessionId} message=${promptMessageId}:`, bindErr);
+            if (promptMessageId) void bindMessageTraceId(promptMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
+              warnTraceBindFailure("automatic steer", sessionId, promptMessageId!, bindErr);
             });
             return;
           }
           throw err;
         }
 
-        void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
-          warnTraceBindFailure("prompt", promptResult.sessionId, promptMessageId, bindErr);
+        if (promptMessageId) void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
+          warnTraceBindFailure("prompt", promptResult.sessionId, promptMessageId!, bindErr);
         });
 
         const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
@@ -513,6 +523,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             userId,
             traceId: promptResult.traceId,
             persistMessages: true,
+            // The box has started consuming a user message: give that row its place in
+            // the conversation now, which is the only moment processing order is visible.
+            onUserMessageStarted: async () => {
+              const messageId = pendingUserRows.claim(promptResult.sessionId);
+              if (!messageId) return; // an echo for a turn this Runtime did not start
+              await sequenceMessage(messageId, promptResult.sessionId).catch((err) => {
+                warnTraceBindFailure("sequence", promptResult.sessionId, messageId, err);
+              });
+            },
             redactionConfig,
             signal: abortCtrl.signal,
             turnStartTime: turnStartMs,
@@ -559,11 +578,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         });
         context.sendEvent("chat.event", { sessionId, event: { type: "prompt_done" } });
       } finally {
+        // Anything still queued was never consumed — a steer the user sent into a turn
+        // that finished first. It must not be claimed by the next turn's first echo.
+        pendingUserRows.clear(sessionId);
         releaseTurn?.();
       }
     })();
 
-    return { ok: true, sessionId };
+    // The row id, so a caller can reconcile its optimistic bubble by identity instead of
+    // by content — two messages with the same text are two messages. Absent when the
+    // write above failed.
+    return { ok: true, sessionId, ...(promptMessageId ? { messageId: promptMessageId } : {}) };
   });
 
   // ── Shared capability box client ───────────────────────────────────────────
@@ -1255,6 +1280,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // session, so the row exists and we must not clobber its title/preview.
     const steerMessageId = await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
     await incrementMessageCount(sessionId);
+    // Written now, ordered when the box actually consumes it (see pending-user-rows.ts).
+    pendingUserRows.push(sessionId, steerMessageId);
 
     // The prompt returns as soon as the turn STARTS, so a steer can arrive while the box is
     // still creating the session — it answers 404 for a moment before it would accept. Retry

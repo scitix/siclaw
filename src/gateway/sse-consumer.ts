@@ -43,6 +43,16 @@ export interface ConsumeAgentSseOptions {
   redactionConfig?: RedactionConfig;
   /** Called for every SSE event after DB writes (so dbMessageId is available). */
   onEvent?: OnEventCallback;
+  /**
+   * Called when the box starts processing a user message it was given.
+   *
+   * This echo is the only place the PROCESSING order of user input is observable: a steer
+   * is written down the moment it arrives, but the box consumes it at a turn boundary that
+   * may be seconds later, and a user typing faster than the model answers would otherwise
+   * leave every question ordered before every answer. Fired for the turn's opening prompt
+   * as well as for each steer, so one rule covers every user row.
+   */
+  onUserMessageStarted?: () => void | Promise<void>;
   /** Abort signal — breaks the loop when triggered. */
   signal?: AbortSignal;
   /**
@@ -310,7 +320,7 @@ function toolCallKey(evt: Record<string, unknown>, toolName: string): string {
 }
 
 export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<SseConsumptionResult> {
-  const { client, sessionId, userId, onEvent, signal } = opts;
+  const { client, sessionId, userId, onEvent, onUserMessageStarted, signal } = opts;
   const persist = opts.persistMessages === true;
   const redactionConfig = opts.redactionConfig ?? EMPTY_REDACTION;
   // Stamp this turn's root trace id onto every persisted row. traceId is constant
@@ -640,6 +650,14 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (eventType === "message_start") {
       currentMsgText = "";
       const message = evt.message as Record<string, unknown> | undefined;
+      if (message?.role === "user" && onUserMessageStarted) {
+        // Never let bookkeeping break the stream the user is watching.
+        try {
+          await onUserMessageStarted();
+        } catch (err) {
+          console.warn(`[sse-consumer] ${userId}: failed to mark user message as started:`, err);
+        }
+      }
       if (message?.role === "assistant") {
         // Per-message resets only — the boundary anchor (turn-start /
         // last tool_execution_end) is intentionally NOT touched here, so

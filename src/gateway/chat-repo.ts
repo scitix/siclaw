@@ -276,6 +276,26 @@ export async function updateMessage(msg: UpdateMessageInput): Promise<void> {
   });
 }
 
+/**
+ * Ask the store to give this row its place in the conversation.
+ *
+ * A user row is written the moment it arrives so it cannot be lost, but the box may not
+ * consume it until a turn boundary seconds later — so arrival order is not processing
+ * order, and a user typing faster than the model answers reloads to find every question
+ * ahead of every answer. The store allocates the ordering key when we say the row entered
+ * processing, keyed by row id so a replayed echo is a no-op rather than a silent shift.
+ *
+ * Sends nothing but the identity and the request: a partial update must leave the row's
+ * content alone.
+ */
+export async function sequenceMessage(messageId: string, sessionId: string): Promise<void> {
+  await getClient().request("chat.updateMessage", {
+    id: messageId,
+    session_id: sessionId,
+    sequence: true,
+  });
+}
+
 /** Update the parent async delegation tool row after its background batch finishes. */
 export async function updateDelegationToolMessage(msg: UpdateDelegationToolMessageInput): Promise<void> {
   await getClient().request("chat.updateDelegationToolMessage", {
