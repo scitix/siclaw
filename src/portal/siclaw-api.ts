@@ -80,8 +80,9 @@ import {
 const MAX_TRACE_MESSAGES = 200;
 
 /**
- * Coerce a caller-supplied api_type to what goes in the column: NULL for
- * inherit, the trimmed value for a plausible api id, `invalid` otherwise.
+ * Coerce a caller-supplied api_type: the trimmed value when it is a plausible
+ * api id, `null` when the caller omitted it (the write path substitutes the
+ * provider's default — the column is NOT NULL), `invalid` otherwise.
  *
  * Passthrough rather than an enum, so a newly-registered pi api id works
  * without a siclaw release — but an unconstrained string reaches pi's registry
@@ -93,6 +94,8 @@ const MAX_TRACE_MESSAGES = 200;
 function normalizeApiTypeInput(value: unknown): { ok: true; value: string | null } | { ok: false; raw: string } {
   if (typeof value !== "string") return { ok: true, value: null };
   const trimmed = value.trim();
+  // null here means "caller said nothing" — the write paths substitute the
+  // provider's default. It never reaches the column, which is NOT NULL.
   if (!trimmed) return { ok: true, value: null };
   if (!isValidApiType(trimmed)) return { ok: false, raw: trimmed };
   return { ok: true, value: trimmed };
@@ -3116,13 +3119,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     // Verify provider exists and belongs to org
     const [provider] = await db.query(
-      "SELECT id FROM model_providers WHERE id = ? AND (org_id = ? OR org_id IS NULL)",
+      "SELECT id, api_type FROM model_providers WHERE id = ? AND (org_id = ? OR org_id IS NULL)",
       [params.id, auth.orgId],
     ) as any;
     if (provider.length === 0) {
       sendJson(res, 404, { error: "Provider not found" });
       return;
     }
+    const providerApiType = normalizeProviderApi(provider[0].api_type);
 
     const apiType = normalizeApiTypeInput(body.api_type);
     if (!apiType.ok) { sendJson(res, 400, { error: INVALID_API_TYPE_MESSAGE }); return; }
@@ -3139,8 +3143,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         body.reasoning ? 1 : 0, body.vision ? 1 : 0,
         clampTokenCount(body.context_window, 128000),
         clampTokenCount(body.max_tokens, 65536),
-        // NULL for inherit; validated above so a typo can't reach pi's registry.
-        apiType.value,
+        // Required column: fall back to the provider's default when unspecified.
+        apiType.value ?? providerApiType,
         body.is_default ? 1 : 0,
         body.sort_order ?? 0,
       ],
@@ -3192,6 +3196,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if ("api_type" in body) {
       const apiType = normalizeApiTypeInput(body.api_type);
       if (!apiType.ok) { sendJson(res, 400, { error: INVALID_API_TYPE_MESSAGE }); return; }
+      // Protocol is required, so an empty value is a caller mistake rather than
+      // "unset it" — there is nothing to fall back to on an update.
+      if (apiType.value === null) { sendJson(res, 400, { error: "api_type cannot be empty" }); return; }
       sets.push("api_type = ?");
       values.push(apiType.value);
     }
@@ -3288,7 +3295,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     sendJson(res, 200, {
       ok: true,
-      models: listed.map((m) => ({ ...m, already_exists: existing.has(m.id) })),
+      // Every row carries a concrete protocol: it is a required model attribute,
+      // and the listing can't tell us (nothing in the OpenAI /models spec says
+      // it), so the provider's default is the honest starting point for the
+      // operator to correct.
+      models: listed.map((m) => ({
+        ...m,
+        suggested_api_type: m.suggested_api_type || api,
+        already_exists: existing.has(m.id),
+      })),
     });
   });
 
@@ -3303,10 +3318,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const db = getDb();
     const [providerRows] = await db.query(
-      "SELECT id FROM model_providers WHERE id = ? AND (org_id = ? OR org_id IS NULL)",
+      "SELECT id, api_type FROM model_providers WHERE id = ? AND (org_id = ? OR org_id IS NULL)",
       [params.id, auth.orgId],
     ) as any;
     if (providerRows.length === 0) { sendJson(res, 404, { error: "Provider not found" }); return; }
+    const providerApiType = normalizeProviderApi(providerRows[0].api_type);
 
     const body = await parseBody<{ models?: unknown }>(req);
     const incoming = Array.isArray(body.models) ? body.models : [];
@@ -3322,7 +3338,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     // Validate and normalise the whole batch BEFORE opening the transaction: a
     // bad row should be a 400 naming it, not a rollback of everything else.
     const trim = (v: unknown): string | null => (typeof v === "string" ? v.trim() : null);
-    const rows: Array<{ modelId: string; name: string; reasoning: number; vision: number; contextWindow: number; maxTokens: number; apiType: string | null }> = [];
+    const rows: Array<{ modelId: string; name: string; reasoning: number; vision: number; contextWindow: number; maxTokens: number; apiType: string }> = [];
     const batchSeen = new Set<string>();
     let skipped = 0;
     for (const raw of incoming) {
@@ -3345,7 +3361,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         vision: m.vision ? 1 : 0,
         contextWindow: clampTokenCount(m.context_window, 128000),
         maxTokens: clampTokenCount(m.max_tokens, 65536),
-        apiType: apiType.value,
+        apiType: apiType.value ?? providerApiType,
       });
     }
 

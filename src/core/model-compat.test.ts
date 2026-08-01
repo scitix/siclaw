@@ -66,77 +66,72 @@ describe("buildProviderModelDescriptor", () => {
 });
 
 describe("resolveModelApi", () => {
-  const anthropicProvider = { api: "anthropic-messages", baseUrl: "https://api.anthropic.com/v1" };
   const row = (api_type?: string | null) => ({
     model_id: "m", context_window: 1000, max_tokens: 100, api_type,
   });
 
-  it("inherits the provider api when the model does not override", () => {
-    expect(resolveModelApi(row(undefined), anthropicProvider))
-      .toEqual({ api: "anthropic-messages", isOverride: false });
+  it("uses the model's own protocol", () => {
+    expect(resolveModelApi(row("anthropic-messages"), { api: "openai-completions" }))
+      .toBe("anthropic-messages");
   });
 
-  // The empty-string trap: normalizeProviderApi("") is "openai-completions", so
-  // a `row.api_type ?? provider.api` implementation would report a hard OpenAI
-  // override here and silently un-inherit the Anthropic provider.
-  it.each(["", "   ", null])("inherits (never openai-completions) for %j", (api_type) => {
-    expect(resolveModelApi(row(api_type), anthropicProvider))
-      .toEqual({ api: "anthropic-messages", isOverride: false });
+  it("normalizes a legacy value", () => {
+    expect(resolveModelApi(row("anthropic"), {})).toBe("anthropic-messages");
   });
 
-  it("normalizes a legacy override value", () => {
-    expect(resolveModelApi(row("anthropic"), { api: "openai-completions" }))
-      .toEqual({ api: "anthropic-messages", isOverride: true });
+  // The column is NOT NULL on fresh installs and backfilled on upgrade, so an
+  // empty value only reaches here from a legacy SQLite file where the
+  // constraint could not be applied. Fall back to the provider, which is what
+  // those rows meant.
+  it.each(["", "   ", null, undefined])("falls back to the provider for %j", (api_type) => {
+    expect(resolveModelApi(row(api_type), { api: "anthropic-messages" })).toBe("anthropic-messages");
   });
 
-  it("falls back to openai-completions when neither model nor provider sets an api", () => {
-    expect(resolveModelApi(row(null), {})).toEqual({ api: "openai-completions", isOverride: false });
+  it("falls back to openai-completions when neither is set", () => {
+    expect(resolveModelApi(row(null), {})).toBe("openai-completions");
   });
 });
 
-describe("buildProviderModelDescriptor — per-model api override", () => {
+describe("buildProviderModelDescriptor — per-model protocol", () => {
   const row = (api_type?: string | null) => ({
     model_id: "m", context_window: 1000, max_tokens: 100, api_type,
   });
 
-  it("omits the api key entirely when the model inherits", () => {
-    const d = buildProviderModelDescriptor(row(undefined), { api: "anthropic-messages" });
-    expect("api" in d).toBe(false);
+  // Always emitted, never omitted: pi would fall back to the provider if the
+  // key were absent, but protocol is a per-model property here and stating it
+  // explicitly is what keeps the layers from disagreeing.
+  it("always emits api", () => {
+    expect(buildProviderModelDescriptor(row("anthropic-messages"), { api: "openai-completions" }).api)
+      .toBe("anthropic-messages");
+    expect(buildProviderModelDescriptor(row(null), { api: "anthropic-messages" }).api)
+      .toBe("anthropic-messages");
   });
 
-  // An emitted `api: ""` is worse than a wrong protocol: pi's parseModels does
-  // `if (!api) continue`, dropping the model from the registry ("model not
-  // found") instead of erroring on the protocol.
-  it.each(["", "   ", null])("emits no api key for %j — never an empty string", (api_type) => {
-    const d = buildProviderModelDescriptor(row(api_type), { api: "anthropic-messages" });
-    expect("api" in d).toBe(false);
-    expect((d as { api?: string }).api).not.toBe("");
-    expect((d as { api?: string }).api).not.toBe("openai-completions");
+  it("never emits an empty api", () => {
+    // pi's parseModels does `if (!api) continue` — an empty string would drop
+    // the model from the registry entirely ("model not found").
+    for (const v of ["", "   ", null, undefined]) {
+      expect(buildProviderModelDescriptor(row(v), {}).api).toBeTruthy();
+    }
   });
 
-  // The production case this feature exists for: one aggregator gateway hosting
-  // OpenAI-protocol and Claude-protocol models side by side.
-  it("emits the override for a Claude model on an OpenAI-protocol gateway", () => {
+  // The production case: one aggregator gateway, mixed protocols.
+  it("lets models on one gateway speak different protocols", () => {
     const gateway = { api: "openai-completions", baseUrl: "https://api.scitix.ai/model-api" };
     expect(buildProviderModelDescriptor(
       { ...row("anthropic-messages"), model_id: "claude-sonnet-5" }, gateway,
     ).api).toBe("anthropic-messages");
-    // sibling models on the same provider keep inheriting
-    expect("api" in buildProviderModelDescriptor(
-      { ...row(null), model_id: "DeepSeek-V4-Pro" }, gateway,
-    )).toBe(false);
+    expect(buildProviderModelDescriptor(
+      { ...row("openai-completions"), model_id: "DeepSeek-V4-Pro" }, gateway,
+    ).api).toBe("openai-completions");
   });
 
-  it("derives compat from the effective api, not the provider api", () => {
-    // Provider says chat-completions on the official OpenAI host (which alone
-    // would yield supportsDeveloperRole: true) — the model's override wins.
+  it("derives compat from the model's protocol, not the provider's", () => {
     expect(buildProviderModelDescriptor(
       row("anthropic-messages"),
       { api: "openai-completions", baseUrl: "https://api.openai.com/v1" },
     ).compat.supportsDeveloperRole).toBe(false);
 
-    // And the reverse: an anthropic-messages provider with a model overriding
-    // back to chat-completions on the official host.
     expect(buildProviderModelDescriptor(
       row("openai-completions"),
       { api: "anthropic-messages", baseUrl: "https://api.openai.com/v1" },

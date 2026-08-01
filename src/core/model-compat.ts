@@ -13,7 +13,7 @@ export interface ProviderModelRow {
   vision?: unknown;
   context_window: number;
   max_tokens: number;
-  /** Per-model protocol override; null/empty = inherit the provider's api. */
+  /** Wire protocol this model speaks. Required; see `resolveModelApi`. */
   api_type?: string | null;
 }
 
@@ -38,29 +38,21 @@ export function normalizeProviderApi(api: string | null | undefined): string {
 }
 
 /**
- * Resolve the wire protocol a single model speaks: its own `api_type` when set,
- * else the provider's. `isOverride` tells the caller whether the model actually
- * overrode — see `buildProviderModelDescriptor` for why that distinction is
- * load-bearing.
+ * The wire protocol a model speaks.
  *
- * Two details in the guard are deliberate and must not be "simplified":
- *
- * 1. `.trim()` before the truthiness test — a whitespace-only value inherits
- *    rather than being passed through as an api id.
- * 2. `||`, never `??` — `normalizeProviderApi("")` returns "openai-completions"
- *    (the no-value fallback), so `row.api_type ?? provider.api` would turn an
- *    empty-string column into a HARD OpenAI override, silently un-inheriting an
- *    anthropic-messages provider. `??` only guards null/undefined; '' sails
- *    through it. The DB coerces '' to NULL on write (siclaw-api.ts), but this
- *    guard also covers rows written by anything else.
+ * This is a PER-MODEL attribute — one endpoint can serve OpenAI-protocol and
+ * Claude-protocol models side by side, so there is no meaningful provider-wide
+ * answer and `model_entries.api_type` is required. `provider.api` remains only
+ * as a read-time floor for rows written before the column was backfilled (a
+ * legacy SQLite file, where the NOT NULL tightening is a no-op).
  */
 export function resolveModelApi(
   row: ProviderModelRow,
   provider: ProviderCompatInput,
-): { api: string; isOverride: boolean } {
-  const override = (row.api_type ?? "").trim();
-  return { api: normalizeProviderApi(override || provider.api), isOverride: override !== "" };
+): string {
+  return normalizeProviderApi((row.api_type ?? "").trim() || provider.api);
 }
+
 
 function isOfficialOpenAIBaseUrl(baseUrl?: string | null): boolean {
   if (!baseUrl) return false;
@@ -95,28 +87,24 @@ export function defaultProviderModelCompat(provider: ProviderCompatInput): Requi
  * `input` was missed would have its image request silently filtered by
  * model-routing's `filterCandidatesForPromptMedia`.
  *
- * `api` is emitted ONLY when the model overrides the provider. pi resolves
- * `modelDef.api ?? providerConfig.api`, so an absent key is exactly equivalent
- * to the provider value — while emitting an empty string would be actively
- * harmful: pi's `if (!api) continue` drops such a model from the registry
- * entirely, surfacing as "model not found" rather than a protocol error.
- * Omitting on inherit makes that state unreachable by construction, and keeps
- * settings.json following a later provider-level api_type change.
+ * `api` is ALWAYS emitted. pi would fall back to the provider's value if the
+ * key were absent, but protocol is a per-model property here, so stating it
+ * explicitly is what keeps the two layers from disagreeing — and it means
+ * nothing downstream has to reason about which layer won.
  *
- * `compat` is derived from the EFFECTIVE api, not the provider's: compat
- * describes the wire protocol (`supportsDeveloperRole` keys off
- * chat-completions, `maxTokensField` is protocol-shaped), so once `api` is
- * per-model, compat is per-model by definition.
+ * `compat` derives from that same api: compat describes the wire protocol
+ * (`supportsDeveloperRole` keys off chat-completions, `maxTokensField` is
+ * protocol-shaped), so it is per-model for the same reason.
  */
 export function buildProviderModelDescriptor(
   row: ProviderModelRow,
   provider: ProviderCompatInput,
 ) {
-  const { api, isOverride } = resolveModelApi(row, provider);
+  const api = resolveModelApi(row, provider);
   return {
     id: row.model_id,
     name: row.name ?? row.model_id,
-    ...(isOverride ? { api } : {}),
+    api,
     reasoning: !!row.reasoning,
     input: (row.vision ? ["text", "image"] : ["text"]) as string[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

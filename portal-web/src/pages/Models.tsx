@@ -182,7 +182,7 @@ export function Models() {
 
   // Add model
   const [showAddModel, setShowAddModel] = useState<string | null>(null)
-  const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "", reasoning: false, vision: false, is_default: false })
+  const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "openai-completions", reasoning: false, vision: false, is_default: false })
   const [addingModel, setAddingModel] = useState(false)
 
   // Fetch models from the provider's own /models endpoint
@@ -269,7 +269,7 @@ export function Models() {
         body: { ...modelForm, context_window: parseInt(modelForm.context_window), max_tokens: parseInt(modelForm.max_tokens) },
       })
       setShowAddModel(null)
-      setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "", reasoning: false, vision: false, is_default: false })
+      setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", api_type: "openai-completions", reasoning: false, vision: false, is_default: false })
       await fetchProviders()
       toast.success("Model added")
     } catch (err: any) { toast.error(err.message) } finally { setAddingModel(false) }
@@ -350,7 +350,7 @@ export function Models() {
       name: model.name || "",
       context_window: String(model.context_window),
       max_tokens: String(model.max_tokens),
-      api_type: model.api_type ? normalizeApiType(model.api_type) : "",
+      api_type: normalizeApiType(model.api_type || "openai-completions"),
       reasoning: !!model.reasoning,
       vision: !!model.vision,
       is_default: !!model.is_default,
@@ -497,7 +497,7 @@ export function Models() {
                                 <p className="text-sm font-mono">{model.model_id}</p>
                                 <p className="text-xs text-muted-foreground">
                                   {model.name || model.model_id}{model.reasoning ? " · reasoning" : ""}{model.vision ? " · vision" : ""} · {(model.context_window / 1000).toFixed(0)}K
-                                  {!!modelApiLabel(model.api_type) && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/20 text-amber-500 font-mono">{modelApiLabel(model.api_type)}</span>}
+                                  {!!modelApiLabel(model.api_type) && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-secondary text-muted-foreground font-mono">{modelApiLabel(model.api_type)}</span>}
                                   {!!model.is_default && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-primary/20 text-primary">default</span>}
                                 </p>
                               </div>
@@ -514,7 +514,7 @@ export function Models() {
                                   <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Display Name</label><input value={editModelForm.name} onChange={(e) => setEditModelForm({ ...editModelForm, name: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                                   <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Context Window</label><input value={editModelForm.context_window} onChange={(e) => setEditModelForm({ ...editModelForm, context_window: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                                   <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={editModelForm.max_tokens} onChange={(e) => setEditModelForm({ ...editModelForm, max_tokens: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
-                                  <div className="col-span-2"><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">API Type <span className="font-normal opacity-70">— overrides the provider protocol for this model only</span></label><select value={editModelForm.api_type} onChange={(e) => setEditModelForm({ ...editModelForm, api_type: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background"><option value="">Inherit from provider</option><option value="openai-completions">OpenAI Compatible</option><option value="anthropic-messages">Anthropic</option></select></div>
+                                  <div className="col-span-2"><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">API Type <span className="font-normal opacity-70">— the wire protocol this model speaks</span></label><select value={editModelForm.api_type} onChange={(e) => setEditModelForm({ ...editModelForm, api_type: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background"><option value="openai-completions">OpenAI Compatible</option><option value="anthropic-messages">Anthropic</option></select></div>
                                 </div>
                                 <div className="flex items-center gap-5">
                                   <div className="flex items-center gap-2">
@@ -550,7 +550,7 @@ export function Models() {
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Display Name</label><input placeholder="e.g. GPT-4o" value={modelForm.name} onChange={(e) => setModelForm({ ...modelForm, name: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Context Window</label><input value={modelForm.context_window} onChange={(e) => setModelForm({ ...modelForm, context_window: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                           <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={modelForm.max_tokens} onChange={(e) => setModelForm({ ...modelForm, max_tokens: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
-                          <div className="col-span-2"><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">API Type <span className="font-normal opacity-70">— overrides the provider protocol for this model only</span></label><select value={modelForm.api_type} onChange={(e) => setModelForm({ ...modelForm, api_type: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background"><option value="">Inherit from provider</option><option value="openai-completions">OpenAI Compatible</option><option value="anthropic-messages">Anthropic</option></select></div>
+                          <div className="col-span-2"><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">API Type <span className="font-normal opacity-70">— the wire protocol this model speaks</span></label><select value={modelForm.api_type} onChange={(e) => setModelForm({ ...modelForm, api_type: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background"><option value="openai-completions">OpenAI Compatible</option><option value="anthropic-messages">Anthropic</option></select></div>
                         </div>
                         <div className="flex items-center gap-5">
                           <div className="flex items-center gap-2">
@@ -572,7 +572,7 @@ export function Models() {
                         </div>
                       </div>
                     ) : (
-                      <button onClick={() => setShowAddModel(provider.id)} className="flex items-center gap-1 h-7 px-3 text-xs rounded-md border border-dashed border-border text-muted-foreground hover:text-foreground hover:border-foreground/30">
+                      <button onClick={() => { setModelForm({ ...modelForm, api_type: normalizeApiType(provider.api_type) }); setShowAddModel(provider.id) }} className="flex items-center gap-1 h-7 px-3 text-xs rounded-md border border-dashed border-border text-muted-foreground hover:text-foreground hover:border-foreground/30">
                         <Plus className="h-3 w-3" /> Add Model
                       </button>
                     )}
@@ -635,7 +635,6 @@ export function Models() {
                             onChange={(e) => setFetchSelection({ ...fetchSelection, [m.id]: { checked: sel?.checked ?? false, api_type: e.target.value } })}
                             className="h-6 px-1.5 text-[11px] rounded border border-border bg-background shrink-0"
                           >
-                            <option value="">Inherit</option>
                             <option value="openai-completions">OpenAI Compatible</option>
                             <option value="anthropic-messages">Anthropic</option>
                           </select>

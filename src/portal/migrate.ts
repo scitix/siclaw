@@ -15,7 +15,7 @@
  */
 
 import { getDb } from "../gateway/db.js";
-import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn } from "./migrate-compat.js";
+import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn, tightenColumnNotNull } from "./migrate-compat.js";
 import type { Db } from "../gateway/db.js";
 
 const PORTAL_SCHEMA_SQLS: string[] = [
@@ -414,7 +414,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     vision TINYINT(1) NOT NULL DEFAULT 0,
     context_window INT NOT NULL DEFAULT 128000,
     max_tokens INT NOT NULL DEFAULT 65536,
-    api_type VARCHAR(50) DEFAULT NULL,
+    api_type VARCHAR(50) NOT NULL DEFAULT 'openai-completions',
     is_default TINYINT(1) NOT NULL DEFAULT 0,
     sort_order INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -632,12 +632,30 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
   await safeAlterTable(db, "model_entries", "vision", "TINYINT(1) NOT NULL DEFAULT 0");
-  // Per-model protocol override. NULL = inherit model_providers.api_type — an
-  // aggregator gateway can host OpenAI-protocol and Claude-protocol models side
-  // by side, so the wire protocol is a per-model property. Must stay nullable
-  // with no non-NULL default: an empty string would read as a hard override
-  // (see resolveModelApi in core/model-compat.ts) instead of inheritance.
+  // The wire protocol a model speaks. A PER-MODEL attribute, not a provider one:
+  // one endpoint can serve OpenAI-protocol and Claude-protocol models side by
+  // side (api.scitix.ai does exactly that), so there is no meaningful
+  // provider-wide answer. model_providers.api_type survives only as the value
+  // pre-filled when adding a model.
+  //
+  // Added nullable so existing rows survive the ALTER, then backfilled from the
+  // provider (semantically identical to the inherit behaviour they had) and
+  // tightened to NOT NULL. Order matters: MySQL rejects the MODIFY while NULLs
+  // remain.
   await safeAlterTable(db, "model_entries", "api_type", "VARCHAR(50) DEFAULT NULL");
+  await db.query(
+    `UPDATE model_entries SET api_type = COALESCE(
+       (SELECT mp.api_type FROM model_providers mp WHERE mp.id = model_entries.provider_id),
+       'openai-completions')
+     WHERE api_type IS NULL OR api_type = ''`,
+  );
+  // NOT widenColumn: that compares COLUMN_TYPE, and varchar(50) → varchar(50)
+  // reads as "no change" however the nullability differs, so it silently skips.
+  // Any deployment that already had this column — including one whose table was
+  // created by an earlier build of this same branch — would stay nullable.
+  // SQLite has no cheap MODIFY COLUMN, so there the constraint only reaches
+  // fresh files via CREATE TABLE; the app layer never writes NULL either way.
+  await tightenColumnNotNull(db, "model_entries", "api_type", "VARCHAR(50) NOT NULL DEFAULT 'openai-completions'");
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
   await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "skills", "files", "MEDIUMTEXT DEFAULT NULL");

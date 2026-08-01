@@ -128,6 +128,7 @@ describe("config.getSettings", () => {
       {
         id: "gpt-4",
         name: "GPT-4",
+        api: "openai-completions",
         reasoning: false,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -139,9 +140,9 @@ describe("config.getSettings", () => {
     expect(result.default).toEqual({ provider: "openai", modelId: "gpt-4" });
   });
 
-  it("carries a per-model api override through the settings mirror", async () => {
+  it("carries each model's own protocol through the settings mirror", async () => {
     // Aggregator gateway: the provider speaks chat-completions, one model on it
-    // speaks the Claude protocol. Sibling models must keep inheriting.
+    // speaks the Claude protocol.
     mockQuery(
       [{ model_provider: "gateway", model_id: "claude-sonnet-5" }],
       [{ id: "p1", name: "gateway", base_url: "https://api.scitix.ai/model-api", api_key: "sk-key", api_type: "openai-completions" }],
@@ -157,7 +158,7 @@ describe("config.getSettings", () => {
     expect(result.providers.gateway.api).toBe("openai-completions");
     expect(result.providers.gateway.models[0].api).toBe("anthropic-messages");
     expect(result.providers.gateway.models[0].compat.supportsDeveloperRole).toBe(false);
-    expect("api" in result.providers.gateway.models[1]).toBe(false);
+    expect(result.providers.gateway.models[1].api).toBe("openai-completions");
   });
 
   it("marks OpenAI-compatible gateway settings as not supporting developer-role messages", async () => {
@@ -333,7 +334,7 @@ describe("config.getModelBinding", () => {
     });
   });
 
-  it("carries a per-model api override through the model-binding mirror", async () => {
+  it("carries each model's own protocol through the model-binding mirror", async () => {
     mockQuery(
       [{ model_provider: "gateway", model_id: "claude-sonnet-5" }],
       [{ id: "p1", name: "gateway", base_url: "https://api.scitix.ai/model-api", api_key: "sk-key", api_type: "openai-completions" }],

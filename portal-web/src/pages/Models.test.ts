@@ -26,7 +26,7 @@ describe("normalizeApiType", () => {
   // defaults "" to openai-completions. Here "" means "inherit"; defaulting it
   // would make the select show OpenAI Compatible for every inheriting model and
   // re-save that as a hard override.
-  it("leaves the empty value empty — the fallback is the server's job", () => {
+  it("leaves an empty value empty rather than inventing one", () => {
     expect(normalizeApiType("")).toBe("")
   })
 })
@@ -80,11 +80,15 @@ describe("fetch-models dialog selection", () => {
     expect(payload[0].api_type).toBe("openai-completions")
   })
 
-  it("sends an empty api_type as inherit", () => {
+  // Protocol is required per model; the dialog always seeds a concrete value
+  // (the provider's, since the listing can't tell us) and the operator corrects
+  // it. An empty selection would be a UI bug, so the payload passes it through
+  // rather than inventing a value the server would have to guess at.
+  it("passes the row's protocol through verbatim", () => {
     const payload = buildImportPayload(models, sel({
-      "DeepSeek-V4-Pro": { checked: true, api_type: "" },
+      "DeepSeek-V4-Pro": { checked: true, api_type: "openai-completions" },
     }))
-    expect(payload[0].api_type).toBe("")
+    expect(payload[0].api_type).toBe("openai-completions")
   })
 
   it("falls back to the model id when the listing carried no display name", () => {

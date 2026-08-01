@@ -181,7 +181,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.default).toEqual({ provider: "openai", modelId: "gpt-4o" });
   });
 
-  it("carries per-model api overrides and omits the key for inheriting models", async () => {
+  it("carries each model's own protocol", async () => {
     // The production shape this exists for: one aggregator gateway hosting both
     // OpenAI-protocol and Claude-protocol models. Exercises migration + SELECT +
     // descriptor against a real DB, including the empty-string row that only a
@@ -196,11 +196,12 @@ describe("GET /api/v1/cli-snapshot", () => {
         "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, api_type, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [id, "p-gw", modelId, modelId, 0, 128000, 8192, apiType, 0, sort],
       );
-    await insertModel("m-inherit", "DeepSeek-V4-Pro", null, 0);
-    await insertModel("m-override", "claude-sonnet-5", "anthropic-messages", 1);
-    // An explicit empty string must behave exactly like NULL. Emitting `api: ""`
+    await insertModel("m-openai", "DeepSeek-V4-Pro", "openai-completions", 0);
+    await insertModel("m-claude", "claude-sonnet-5", "anthropic-messages", 1);
+    // A legacy SQLite file can still hold an empty value (the NOT NULL
+    // tightening is MySQL-only); it must fall back, never emit `api: ""`, which
     // would make pi drop the model from its registry entirely.
-    await insertModel("m-empty", "GLM-5.1", "", 2);
+    await insertModel("m-legacy", "GLM-5.1", "", 2);
 
     const { status, body } = await runRoute(
       router,
@@ -211,10 +212,9 @@ describe("GET /api/v1/cli-snapshot", () => {
       body.providers.gateway.models.map((m: Record<string, unknown>) => [m.id, m]),
     );
 
-    expect("api" in byId["DeepSeek-V4-Pro"]).toBe(false);
-    expect("api" in byId["GLM-5.1"]).toBe(false);
+    expect(byId["DeepSeek-V4-Pro"].api).toBe("openai-completions");
     expect(byId["claude-sonnet-5"].api).toBe("anthropic-messages");
-    // Provider-level api is untouched by a model overriding.
+    expect(byId["GLM-5.1"].api).toBe("openai-completions");
     expect(body.providers.gateway.api).toBe("openai-completions");
   });
 

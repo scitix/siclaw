@@ -59,6 +59,36 @@ export async function safeAlterTable(
 }
 
 /**
+ * Tighten an existing nullable column to NOT NULL (MySQL only).
+ *
+ * Distinct from {@link widenColumn}, which compares COLUMN_TYPE and therefore
+ * skips a MODIFY whose only change is nullability — `varchar(50)` equals
+ * `varchar(50)` no matter what follows it. Guarded on IS_NULLABLE instead, so
+ * it is idempotent and never re-copies an already-tightened table.
+ *
+ * Callers MUST have backfilled every NULL first; MySQL rejects the MODIFY
+ * otherwise. SQLite has no cheap MODIFY COLUMN, so this is a no-op there and
+ * the constraint only reaches fresh SQLite files via CREATE TABLE.
+ */
+export async function tightenColumnNotNull(
+  db: Db,
+  table: string,
+  column: string,
+  definition: string,
+): Promise<void> {
+  if (db.driver !== "mysql") return;
+  if (!(await columnExists(db, table, column))) return;
+  const [rows] = await db.query<Array<{ IS_NULLABLE: string }>>(
+    `SELECT IS_NULLABLE FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [table, column],
+  );
+  if ((rows[0]?.IS_NULLABLE ?? "").toUpperCase() === "NO") return; // already tightened
+  await db.query(`ALTER TABLE \`${table}\` MODIFY COLUMN \`${column}\` ${definition}`);
+  console.log(`[portal-migrate] tightened ${table}.${column} to NOT NULL`);
+}
+
+/**
  * Idempotently widen a column's TYPE (MySQL only). CHAR→VARCHAR is a type change that
  * {@link safeAlterTable} (add-if-missing) never applies to an existing column, so widening an
  * existing deployment needs an explicit MODIFY. Guarded on the current COLUMN_TYPE so a large
