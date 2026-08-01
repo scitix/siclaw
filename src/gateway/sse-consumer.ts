@@ -476,7 +476,14 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (eventType === "model_route_start") {
       latestModelRouteSwitch = null;
       currentModelRouteMetadata = null;
-      isRoutingTurn = true;
+      // Defer only when there is something to roll back TO. Since every prompt runs
+      // through the routing entry, a turn with one candidate emits these events too —
+      // and deferring there buys nothing (a rollback is only ever emitted before a
+      // switch) while costing message ORDER: the turn's assistant replies all land at
+      // the commit point, so a conversation the user steered several times reloads as
+      // every question followed by every answer, instead of the alternation they saw.
+      const candidateCount = Number((evt as { candidateCount?: unknown }).candidateCount ?? 0);
+      isRoutingTurn = candidateCount > 1;
       routingCommitted = false;
       discardRoutedAttempt();
     }
