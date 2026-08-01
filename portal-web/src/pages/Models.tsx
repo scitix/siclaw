@@ -38,7 +38,8 @@ export interface ListedModel {
   name?: string
   /** Server-inferred protocol; "" = inherit the provider. Operator can change it. */
   suggested_api_type: string
-  /** Row looks like a Claude model on an OpenAI-protocol provider — flagged, not decided. */
+  /** Bare `claude-*` id: the row was pre-filled from the name, and the dialog
+   *  says so plus offers the bulk escape hatch for aggregator gateways. */
   protocol_hint?: "claude"
   context_window?: number
   max_tokens?: number
@@ -140,10 +141,10 @@ export function buildImportPayload(
 }
 
 /**
- * Apply one protocol to every hinted row at once. A gateway serving its whole
- * Claude family over the Claude protocol otherwise means repeating the same
- * dropdown edit N times — and the listing cannot infer it (no field in the
- * OpenAI /models spec carries protocol), so the operator has to say it once.
+ * Apply one protocol to every hinted row at once — the escape hatch for a
+ * gateway that re-serves its whole Claude family over chat-completions, where
+ * the name-based pre-fill is wrong for every row. Nothing in the OpenAI /models
+ * spec carries protocol, so the operator says it once instead of N times.
  */
 export function applyProtocolToHinted(
   models: ListedModel[],
@@ -679,7 +680,7 @@ export function Models() {
                           <span className="block text-xs font-mono truncate">{m.id}</span>
                           <span className="block text-[10px] text-muted-foreground">{describeListedModel(m)}</span>
                           {m.protocol_hint === "claude" && !m.already_exists && (
-                            <span className="block text-[10px] text-amber-500/90">Claude-named — pick Anthropic if this gateway serves it over the Claude protocol</span>
+                            <span className="block text-[10px] text-amber-500/90">Pre-filled from the name — switch to OpenAI Compatible if this gateway re-serves it over that protocol</span>
                           )}
                         </span>
                         {m.already_exists ? (
@@ -706,11 +707,11 @@ export function Models() {
               <div className="flex items-center gap-3">
               {fetchedModels.some((m) => m.protocol_hint === "claude" && !m.already_exists) && (
                 <button
-                  onClick={() => setFetchSelection(applyProtocolToHinted(fetchedModels, fetchSelection, "anthropic-messages"))}
+                  onClick={() => setFetchSelection(applyProtocolToHinted(fetchedModels, fetchSelection, "openai-completions"))}
                   className="text-xs text-amber-600 hover:text-amber-500"
-                  title="Set every Claude-named row to the Anthropic protocol"
+                  title="For an aggregator that re-serves Claude models over its own chat-completions API"
                 >
-                  Set all Claude rows → Anthropic
+                  Set all Claude rows → OpenAI Compatible
                 </button>
               )}
               <button

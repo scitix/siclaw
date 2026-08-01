@@ -36,27 +36,30 @@ export interface ListedModel {
 }
 
 /**
- * Whether a listing entry looks like a Claude model. A HINT ONLY — it must not
- * drive `suggested_api_type`.
+ * Whether a listing entry is a Claude model served over the CLAUDE protocol.
  *
- * The tempting inference (`/claude/i` ⇒ anthropic-messages) is wrong as often
- * as it is right, and the two cases are indistinguishable from the listing:
+ * The id must START with `claude`, and that anchoring is the whole trick — it
+ * separates the two cases that a substring match cannot:
  *
- *   - scitix's gateway (api_type=openai-completions) serves `claude-sonnet-5`
- *     over the CLAUDE protocol — it needs the override.
- *   - OpenRouter / LiteLLM / one-api (also openai-completions) serve
- *     `anthropic/claude-3.5-sonnet` over the OPENAI protocol — an override
- *     there makes the model 404 on every turn.
+ *   - scitix's gateway lists `claude-sonnet-5` (bare) and serves it over the
+ *     Claude protocol. Matched → pre-filled anthropic-messages.
+ *   - OpenRouter / LiteLLM / one-api namespace as `anthropic/claude-3.5-sonnet`
+ *     and serve it over the OPENAI protocol. Not matched → left alone, which is
+ *     what keeps an override from 404-ing every turn there.
  *
- * Guessing wrong costs a completely dead model with a confusing protocol error;
- * not guessing costs one dropdown click. So the row defaults to inherit and the
- * dialog surfaces this hint next to it.
+ * The same gateway proves the shape: it lists `Qwen/Qwen3.6-27B` and
+ * `bosonai/tts` namespaced, and its Claude models bare.
+ *
+ * This drives the pre-fill rather than a mere hint because a wrong guess is now
+ * cheap: the Test probe detects a protocol mismatch and corrects the row (see
+ * `model-probe.ts`). Before that existed, guessing wrong meant a dead model and
+ * a confusing 400, which is why this used to refuse to decide.
  *
  * `owned_by` is only a tiebreaker; too many gateways return a constant there
  * ("system", "library", an org name) for it to carry weight alone.
  */
 export function looksLikeClaudeModel(id: string, ownedBy?: unknown): boolean {
-  if (/claude/i.test(id)) return true;
+  if (/^claude/i.test(id.trim())) return true;
   return typeof ownedBy === "string" && ownedBy.trim().toLowerCase() === "anthropic";
 }
 
@@ -151,13 +154,15 @@ export function parseOpenAiModelList(body: unknown): ListedModel[] {
     const id = typeof entry.id === "string" ? entry.id.trim() : "";
     if (!id) continue;
     const displayName = typeof entry.name === "string" ? entry.name.trim() : "";
-    // Always inherit — the provider speaks chat-completions and we cannot tell
-    // from the listing whether this particular model is an exception.
     out.push({
       id,
       ...(displayName && displayName !== id ? { name: displayName } : {}),
-      suggested_api_type: "",
-      ...(looksLikeClaudeModel(id, entry.owned_by) ? { protocol_hint: "claude" as const } : {}),
+      // Pre-filled, not merely flagged — see looksLikeClaudeModel. The hint
+      // still rides along so the dialog can say WHY the row differs and offer
+      // the bulk escape hatch for aggregator gateways.
+      ...(looksLikeClaudeModel(id, entry.owned_by)
+        ? { suggested_api_type: "anthropic-messages", protocol_hint: "claude" as const }
+        : { suggested_api_type: "" }),
       context_window: extractContextWindow(entry),
       max_tokens: extractMaxTokens(entry),
       vision: extractVision(entry),

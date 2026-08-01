@@ -9,9 +9,19 @@ import {
 } from "./provider-model-listing.js";
 
 describe("looksLikeClaudeModel", () => {
-  it("keys off the model id, the one field every implementation populates", () => {
+  it("matches a bare claude-* id, which is how a native Claude endpoint lists them", () => {
     expect(looksLikeClaudeModel("claude-sonnet-5")).toBe(true);
-    expect(looksLikeClaudeModel("anthropic/Claude-Opus-4-8")).toBe(true);
+    expect(looksLikeClaudeModel("Claude-Opus-4-8")).toBe(true);
+    expect(looksLikeClaudeModel("  claude-haiku-4-5  ")).toBe(true);
+  });
+
+  // The anchoring is the whole trick. A namespaced id means an aggregator that
+  // re-serves the model over ITS protocol (chat-completions), so matching it
+  // would pre-fill an override that 404s every turn. The same gateway lists
+  // `Qwen/Qwen3.6-27B` namespaced and its Claude models bare.
+  it("does not match a vendor-namespaced id", () => {
+    expect(looksLikeClaudeModel("anthropic/claude-3.5-sonnet")).toBe(false);
+    expect(looksLikeClaudeModel("anthropic/Claude-Opus-4-8")).toBe(false);
   });
 
   it("accepts owned_by as a tiebreaker only", () => {
@@ -31,11 +41,10 @@ describe("looksLikeClaudeModel", () => {
 });
 
 describe("parseOpenAiModelList", () => {
-  // Every row inherits. A Claude-named model on an openai-completions provider
-  // is genuinely ambiguous — scitix serves claude-sonnet-5 over the Claude
-  // protocol, OpenRouter serves anthropic/claude-* over the OpenAI one — so the
-  // parser flags it and lets the operator decide rather than guessing wrong.
-  it("defaults every row to inherit and only flags Claude-looking ones", () => {
+  // A BARE claude-* id means a native Claude endpoint, so the row is pre-filled
+  // rather than merely flagged. The namespaced form (OpenRouter et al.) is a
+  // different case and is left to inherit — see looksLikeClaudeModel.
+  it("pre-fills anthropic-messages for bare Claude ids and inherits for the rest", () => {
     expect(parseOpenAiModelList({
       object: "list",
       data: [
@@ -44,7 +53,7 @@ describe("parseOpenAiModelList", () => {
       ],
     })).toEqual([
       { id: "DeepSeek-V4-Pro", suggested_api_type: "" },
-      { id: "claude-sonnet-5", suggested_api_type: "", protocol_hint: "claude" },
+      { id: "claude-sonnet-5", suggested_api_type: "anthropic-messages", protocol_hint: "claude" },
     ]);
   });
 
@@ -189,9 +198,10 @@ describe("parseOpenAiModelList — vendor extensions", () => {
     expect(m.max_tokens).toBe(8192);
     expect(m.vision).toBe(true);
     expect(m.name).toBe("Anthropic: Claude 3.5 Sonnet");
-    // Still inherit — an OpenRouter Claude model speaks the OpenAI protocol.
+    // Still inherit, and NOT flagged — an OpenRouter Claude model speaks the
+    // OpenAI protocol, so there is nothing here for the operator to correct.
     expect(m.suggested_api_type).toBe("");
-    expect(m.protocol_hint).toBe("claude");
+    expect(m.protocol_hint).toBeUndefined();
   });
 
   it("reads the older architecture.modality spelling", () => {
