@@ -297,10 +297,14 @@ export async function updateMessage(msg: UpdateMessageInput): Promise<void> {
  * content alone.
  */
 export async function sequenceMessage(messageId: string, sessionId: string): Promise<void> {
-  await getClient().request("chat.updateMessage", {
+  // A METHOD OF ITS OWN, deliberately. chat.updateMessage replaces the row's columns from
+  // the payload, so a store implementing that contract literally — as this repo's own
+  // Portal did — would read the absent `content` as an empty one and blank the user's
+  // message. An upstream that has not implemented this answers "unknown method", which
+  // costs the row its ordering key and nothing else.
+  await getClient().request("chat.sequenceMessage", {
     id: messageId,
     session_id: sessionId,
-    sequence: true,
   });
 }
 

@@ -108,9 +108,15 @@ export class SessionTurnLocks {
     if (!entry || entry.accepted) return Promise.resolve();
     return new Promise<void>((resolve) => {
       let settled = false;
-      const done = () => { if (!settled) { settled = true; resolve(); } };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
       entry.acceptWaiters.push(done);
-      const timer = setTimeout(done, timeoutMs);
+      timer = setTimeout(done, timeoutMs);
       timer.unref?.();
     });
   }

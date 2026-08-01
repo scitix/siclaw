@@ -672,6 +672,9 @@ export async function runPortalMigrations(): Promise<void> {
   if (await safeAlterTable(db, "chat_messages", "seq", "BIGINT DEFAULT NULL")) {
     await backfillChatMessageSeq(db);
   }
+  // The transcript reads a session ordered by seq; without this it is a filesort whose
+  // cost grows with the length of the conversation rather than the size of the page.
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_session_seq", "session_id, seq");
 
   // Widen delegation_id CHAR(36)→VARCHAR(64) on EXISTING deployments. A group reduce child's id
   // `${toolCallId}#reduce` reaches 36 chars for a 29-char provider id and would overflow CHAR(36)

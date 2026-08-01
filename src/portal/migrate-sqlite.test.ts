@@ -75,6 +75,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_chat_sessions_parent",
       "idx_chat_sessions_delegation",
       "idx_chat_messages_session",
+      "idx_chat_messages_session_seq",
       "idx_chat_messages_audit",
       "idx_chat_messages_parent",
       "idx_chat_messages_delegation",
@@ -195,6 +196,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     }
     // Simulate the pre-upgrade state: the column exists but nothing has an order yet.
     await db.query("UPDATE chat_messages SET seq = NULL");
+    await db.query("DROP INDEX IF EXISTS idx_chat_messages_session_seq");
     await db.query("ALTER TABLE chat_messages DROP COLUMN seq");
     await runPortalMigrations();
 

@@ -19,26 +19,49 @@
 /** Beyond this many unconsumed rows for one session, the oldest are dropped. */
 const MAX_PENDING_PER_SESSION = 200;
 
-export class PendingUserRows {
-  private bySession = new Map<string, string[]>();
+interface PendingRow {
+  messageId: string;
+  /** What was written, used only to reject an echo that clearly is not this row. */
+  text: string;
+}
 
-  /** Remember a row that has been written but not yet processed. */
-  push(sessionId: string, messageId: string): void {
+export class PendingUserRows {
+  private bySession = new Map<string, PendingRow[]>();
+
+  /**
+   * Remember a row the box has ACCEPTED but not yet started processing.
+   *
+   * Pushed after acceptance, never before: a message still queued behind the turn lock,
+   * or one whose delivery failed, has not been handed to any box — leaving it here would
+   * let the next echo claim it, giving it a place in the conversation it never occupied
+   * and leaving the message actually being answered without one.
+   */
+  push(sessionId: string, messageId: string, text: string): void {
     const queue = this.bySession.get(sessionId) ?? [];
-    queue.push(messageId);
+    queue.push({ messageId, text });
     // A turn that ends with steers still queued leaves them here; bound the damage
     // rather than growing without limit on a session someone hammers.
     if (queue.length > MAX_PENDING_PER_SESSION) queue.splice(0, queue.length - MAX_PENDING_PER_SESSION);
     this.bySession.set(sessionId, queue);
   }
 
-  /** Take the oldest row still waiting, or nothing when the echo belongs to a turn we did not start. */
-  claim(sessionId: string): string | undefined {
+  /**
+   * Take the oldest row still waiting, if the echo plausibly belongs to it.
+   *
+   * The text is a GUARD, not an identity: the box wraps what it was given (a mode preamble
+   * is prepended), so this asks whether the echo contains the row's text, and never uses it
+   * to search. Without the guard a REPLAYED echo — a routed turn re-runs the prompt on its
+   * next candidate, and the replay reaches this consumer — would claim the row behind it,
+   * ordering a steer the box has not consumed yet.
+   */
+  claim(sessionId: string, echoedText?: string): string | undefined {
     const queue = this.bySession.get(sessionId);
     if (!queue || queue.length === 0) return undefined;
-    const id = queue.shift();
+    const head = queue[0];
+    if (echoedText !== undefined && head.text.length > 0 && !echoedText.includes(head.text)) return undefined;
+    queue.shift();
     if (queue.length === 0) this.bySession.delete(sessionId);
-    return id;
+    return head.messageId;
   }
 
   /**

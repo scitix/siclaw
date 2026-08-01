@@ -52,7 +52,7 @@ export interface ConsumeAgentSseOptions {
    * leave every question ordered before every answer. Fired for the turn's opening prompt
    * as well as for each steer, so one rule covers every user row.
    */
-  onUserMessageStarted?: () => void | Promise<void>;
+  onUserMessageStarted?: (echoedText: string) => void | Promise<void>;
   /** Abort signal — breaks the loop when triggered. */
   signal?: AbortSignal;
   /**
@@ -651,9 +651,16 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       currentMsgText = "";
       const message = evt.message as Record<string, unknown> | undefined;
       if (message?.role === "user" && onUserMessageStarted) {
+        // The echoed text, so the caller can check the echo against the row it expects —
+        // the box wraps what it was given, so this is a guard, never an identity.
+        const echoed = Array.isArray(message.content)
+          ? (message.content as Array<{ type?: string; text?: string }>)
+              .filter((part) => part?.type === "text" && typeof part.text === "string")
+              .map((part) => part.text as string).join("")
+          : "";
         // Never let bookkeeping break the stream the user is watching.
         try {
-          await onUserMessageStarted();
+          await onUserMessageStarted(echoed);
         } catch (err) {
           console.warn(`[sse-consumer] ${userId}: failed to mark user message as started:`, err);
         }

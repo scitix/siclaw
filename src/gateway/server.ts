@@ -177,7 +177,7 @@ const STEER_SESSION_WAIT_MS = 3_000;
  * only matters when that never happens (a box that died between placement and dispatch),
  * and there the caller is better off trying and being told than waiting out the turn.
  */
-const STEER_PROMPT_WAIT_MS = 30_000;
+const STEER_PROMPT_WAIT_MS = 10_000;
 
 export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeServer> {
   const { config, agentBoxManager, spawner, frontendClient } = opts;
@@ -404,7 +404,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
       promptMessageId = await appendMessage({ sessionId, role: "user", content: text, deferSequence: true });
       await incrementMessageCount(sessionId);
-      pendingUserRows.push(sessionId, promptMessageId);
     } catch (persistErr) {
       console.warn(`[runtime] failed to persist the user message session=${sessionId}; continuing without a row id:`, persistErr);
     }
@@ -431,6 +430,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             : undefined;
           if (steered) {
             console.log(`[runtime] session=${sessionId} busy; steered into the turn on ${running!.boxId}`);
+            if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
             if (promptMessageId) await updateMessage({ messageId: promptMessageId, sessionId, content: text, metadata: { kind: "steer" } })
               .catch((e) => console.warn(`[runtime] failed to mark steer message session=${sessionId}:`, e));
             if (promptMessageId) void bindMessageTraceId(promptMessageId, sessionId, steered.traceId).catch(() => {});
@@ -469,8 +469,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
         try {
           promptResult = await client.prompt(promptOpts);
-          // The box now has the session: a steer racing this call can stop waiting.
+          // The box now has the session: a steer racing this call can stop waiting, and
+          // this row is in line to be processed (see pending-user-rows.ts).
           sessionTurnLocks.markPromptAccepted(sessionId);
+          if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
         } catch (err) {
           // Concurrent send: agentbox returns 409 "Session is already
           // running. Use the steer endpoint to add input to the active
@@ -482,6 +484,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // extra one would close the frontend stream prematurely.
           if (err instanceof Error && err.message.includes("Session is already running")) {
             const steerResult = await client.steerSession(sessionId, text, { images, files });
+            if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
             // chat.send persisted this row before it knew the active session would
             // reject a fresh prompt. Once the fallback steer is accepted, label the
             // existing row so transcript/trace readers do not mistake it for the
@@ -525,8 +528,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             persistMessages: true,
             // The box has started consuming a user message: give that row its place in
             // the conversation now, which is the only moment processing order is visible.
-            onUserMessageStarted: async () => {
-              const messageId = pendingUserRows.claim(promptResult.sessionId);
+            onUserMessageStarted: async (echoedText) => {
+              const messageId = pendingUserRows.claim(promptResult.sessionId, echoedText);
               if (!messageId) return; // an echo for a turn this Runtime did not start
               await sequenceMessage(messageId, promptResult.sessionId).catch((err) => {
                 warnTraceBindFailure("sequence", promptResult.sessionId, messageId, err);
@@ -1280,8 +1283,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // session, so the row exists and we must not clobber its title/preview.
     const steerMessageId = await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" }, deferSequence: true });
     await incrementMessageCount(sessionId);
-    // Written now, ordered when the box actually consumes it (see pending-user-rows.ts).
-    pendingUserRows.push(sessionId, steerMessageId);
 
     // The prompt returns as soon as the turn STARTS, so a steer can arrive while the box is
     // still creating the session — it answers 404 for a moment before it would accept. Retry
@@ -1304,6 +1305,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         await new Promise((r) => setTimeout(r, 200));
       }
     }
+    // Accepted by the box: this row is now in line to be processed, and is ordered when
+    // the box says it started (see pending-user-rows.ts). A steer that never got that far
+    // is deliberately NOT queued — it would take the place of the next message instead.
+    pendingUserRows.push(sessionId, steerMessageId, text);
     void bindMessageTraceId(steerMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
       warnTraceBindFailure("explicit steer", sessionId, steerMessageId, bindErr);
     });

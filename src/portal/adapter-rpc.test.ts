@@ -1314,12 +1314,12 @@ describe("chat.updateMessage", () => {
   });
 });
 
-describe("chat.updateMessage — ordering request", () => {
+describe("chat.sequenceMessage", () => {
   it("gives an unordered row its place without touching anything else", async () => {
-    // The caller sends identity and nothing else; the generic update path would blank the
-    // row's content, which is why this is a separate branch.
+    // A method of its own: chat.updateMessage replaces the row's columns from its payload,
+    // so a call carrying only an id would blank the user's message.
     const query = mockQuery([{ next_seq: 4 }], []);
-    await getHandler("chat.updateMessage")({ id: "m1", session_id: "s1", sequence: true }, "a1");
+    await getHandler("chat.sequenceMessage")({ id: "m1", session_id: "s1" }, "a1");
     expect(query).toHaveBeenCalledTimes(2); // order key, then the one UPDATE
     const sql = String(query.mock.calls[1][0]);
     expect(sql).toContain("seq = ?");
@@ -1328,7 +1328,7 @@ describe("chat.updateMessage — ordering request", () => {
     expect(query.mock.calls[1][1] as unknown[]).toEqual([4, "m1", "s1"]);
   });
 
-  it("still updates content when no ordering was requested", async () => {
+  it("leaves chat.updateMessage alone", async () => {
     const query = mockQuery([], []);
     await getHandler("chat.updateMessage")({ id: "m1", session_id: "s1", content: "edited" }, "a1");
     expect(String(query.mock.calls[0][0])).toContain("content = ?");
@@ -2343,9 +2343,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 58 handlers", () => {
+  it("registers exactly 59 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(58);
+    expect(handlers.size).toBe(59);
   });
 
   it("all expected handler names are registered", () => {
