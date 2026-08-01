@@ -3464,7 +3464,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const db = getDb();
 
     const [rows] = await db.query(
-      `SELECT me.model_id, me.max_tokens_field, mp.base_url, mp.api_key, mp.api_type
+      `SELECT me.model_id, me.api_type, me.max_tokens_field, mp.base_url, mp.api_key,
+              mp.api_type AS provider_api_type
        FROM model_entries me JOIN model_providers mp ON me.provider_id = mp.id
        WHERE me.id = ? AND me.provider_id = ? AND (mp.org_id = ? OR mp.org_id IS NULL)`,
       [params.mid, params.pid, auth.orgId],
@@ -3472,23 +3473,26 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (rows.length === 0) { sendJson(res, 404, { error: "Model entry not found" }); return; }
 
     const row = rows[0];
-    const result = await testModelWireConfig(
-      {
-        modelId: row.model_id,
-        baseUrl: row.base_url,
-        apiKey: row.api_key ?? null,
-        apiType: row.api_type ?? null,
-        maxTokensField: row.max_tokens_field ?? null,
-      },
-      { api: row.api_type, baseUrl: row.base_url },
-    );
+    const result = await testModelWireConfig({
+      modelId: row.model_id,
+      baseUrl: row.base_url,
+      apiKey: row.api_key ?? null,
+      // The MODEL's protocol. Reading mp.api_type here would test the provider
+      // default and silently pass a model that overrode it.
+      apiType: row.api_type ?? null,
+      providerApiType: row.provider_api_type ?? null,
+      maxTokensField: row.max_tokens_field ?? null,
+    });
 
-    // Persist the correction so the next real turn uses the working field
-    // directly instead of re-deriving the wrong one.
-    if (result.corrected) {
-      await db.query("UPDATE model_entries SET max_tokens_field = ? WHERE id = ?", [
-        result.maxTokensField, params.mid,
-      ]);
+    // Persist whatever the probe corrected, so the next real turn issues the
+    // working request directly instead of re-deriving the failing one.
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    if (result.correctedApiType) { sets.push("api_type = ?"); values.push(result.apiType); }
+    if (result.correctedMaxTokensField) { sets.push("max_tokens_field = ?"); values.push(result.maxTokensField); }
+    if (sets.length > 0) {
+      values.push(params.mid);
+      await db.query(`UPDATE model_entries SET ${sets.join(", ")} WHERE id = ?`, values);
     }
 
     // A failed probe is a successful API call — 200 with ok:false, matching the
@@ -3497,8 +3501,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       ok: result.ok,
       status: result.status,
       latency_ms: result.latencyMs,
+      api_type: result.apiType,
       max_tokens_field: result.maxTokensField,
-      corrected: result.corrected,
+      corrected: result.correctedApiType || result.correctedMaxTokensField,
       message: result.message,
     });
   });

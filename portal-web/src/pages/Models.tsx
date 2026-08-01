@@ -377,8 +377,8 @@ export function Models() {
         { method: "POST" },
       )
       if (r.ok && r.corrected) {
-        // The server persisted the corrected field — refetch so the badge and
-        // the edit form show what will actually be sent from now on.
+        // The server persisted the correction (protocol and/or max-tokens
+        // field) — refetch so the badges show what will actually be sent.
         await fetchProviders()
         toast.success(r.message)
       } else if (r.ok) {
@@ -539,7 +539,7 @@ export function Models() {
                                 </p>
                               </div>
                               <div className="flex items-center gap-1">
-                                <button onClick={() => handleTestModel(provider.id, model.id)} disabled={testingModelId === model.id} title="Send a 1-token request; fixes the max-tokens field if it's wrong" className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground disabled:opacity-50">{testingModelId === model.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plug className="h-3.5 w-3.5" />}</button>
+                                <button onClick={() => handleTestModel(provider.id, model.id)} disabled={testingModelId === model.id} title="Send a probe request; fixes the protocol / max-tokens field if either is wrong" className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground disabled:opacity-50">{testingModelId === model.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plug className="h-3.5 w-3.5" />}</button>
                                 <button onClick={() => startEditModel(model)} title="Edit model" className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-3.5 w-3.5" /></button>
                                 <button onClick={() => handleDeleteModel(provider.id, model.id)} title="Delete model" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-3.5 w-3.5" /></button>
                               </div>

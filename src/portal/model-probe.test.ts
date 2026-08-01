@@ -11,8 +11,6 @@ import {
   type ProbeTarget,
 } from "./model-probe.js";
 
-const GATEWAY = { api: "openai-completions", baseUrl: "https://api.example.com/model-api" };
-const ANTHROPIC = { api: "anthropic", baseUrl: "https://api.anthropic.com/v1" };
 
 function target(over: Partial<ProbeTarget> = {}): ProbeTarget {
   return {
@@ -29,21 +27,29 @@ function reply(status: number, body = "{}"): Response {
   return new Response(body, { status });
 }
 
-/** Records the max-tokens field of every attempt, answering per a script. */
+/**
+ * Answers a scripted sequence of statuses and records the [protocol, field] of
+ * every attempt — inferred from the request itself, so the assertions describe
+ * what actually went on the wire rather than what we passed in.
+ */
 function scriptedFetch(statuses: number[], body = '{"error":"nope"}') {
-  const fields: string[] = [];
+  const calls: Array<[string, string]> = [];
   let call = 0;
-  const impl: FetchLike = async (_url, init) => {
+  const impl: FetchLike = async (url, init) => {
     const parsed = JSON.parse(String(init.body));
-    fields.push("max_completion_tokens" in parsed ? "max_completion_tokens" : "max_tokens");
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    const api = url.endsWith("/messages") && headers["x-api-key"]
+      ? "anthropic-messages"
+      : String(headers["X-Probe-Api"] ?? "openai-completions");
+    calls.push([api, "max_completion_tokens" in parsed ? "max_completion_tokens" : "max_tokens"]);
     return reply(statuses[Math.min(call++, statuses.length - 1)], body);
   };
-  return { impl, fields };
+  return { impl, calls };
 }
 
 describe("buildProbeRequest", () => {
   it("targets chat/completions with the requested field for OpenAI-compatible providers", () => {
-    const r = buildProbeRequest(target(), "max_completion_tokens");
+    const r = buildProbeRequest(target(), "openai-completions", "max_completion_tokens");
     expect(r.url).toBe("https://api.example.com/model-api/chat/completions");
     expect(r.headers.Authorization).toBe("Bearer sk-secret-key-value");
     expect(r.body).toMatchObject({ model: "gpt-5", max_completion_tokens: 16 });
@@ -51,7 +57,7 @@ describe("buildProbeRequest", () => {
   });
 
   it("targets the messages API and ignores the field for anthropic providers", () => {
-    const r = buildProbeRequest(target({ apiType: "anthropic" }), "max_completion_tokens");
+    const r = buildProbeRequest(target(), "anthropic-messages", "max_completion_tokens");
     expect(r.url).toBe("https://api.example.com/model-api/messages");
     expect(r.headers["x-api-key"]).toBe("sk-secret-key-value");
     expect(r.headers["anthropic-version"]).toBe("2023-06-01");
@@ -59,14 +65,14 @@ describe("buildProbeRequest", () => {
   });
 
   it("does not double the slash on a base URL with a trailing one", () => {
-    expect(buildProbeRequest(target({ baseUrl: "https://api.example.com/v1/" }), "max_tokens").url)
+    expect(buildProbeRequest(target({ baseUrl: "https://api.example.com/v1/" }), "openai-completions", "max_tokens").url)
       .toBe("https://api.example.com/v1/chat/completions");
   });
 
   // The probe caps output at 16 because OpenAI's reasoning models reject
   // anything smaller — and those are the models this exists to diagnose.
   it("asks for at least 16 output tokens", () => {
-    expect(buildProbeRequest(target(), "max_completion_tokens").body.max_completion_tokens).toBe(16);
+    expect(buildProbeRequest(target(), "openai-completions", "max_completion_tokens").body.max_completion_tokens).toBe(16);
   });
 });
 
@@ -86,7 +92,8 @@ describe("probeModelOnce", () => {
   it("blocks cloud metadata even though loopback is permitted", async () => {
     const fetchImpl = vi.fn();
     const r = await probeModelOnce(
-      target({ baseUrl: "http://169.254.169.254/v1" }), "max_tokens", fetchImpl as unknown as FetchLike,
+      target({ baseUrl: "http://169.254.169.254/v1" }), "openai-completions", "max_tokens",
+      fetchImpl as unknown as FetchLike,
     );
     expect(r.ok).toBe(false);
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -96,13 +103,13 @@ describe("probeModelOnce", () => {
   // already dials on every turn.
   it("permits loopback", async () => {
     const { impl } = scriptedFetch([200]);
-    const r = await probeModelOnce(target({ baseUrl: "http://127.0.0.1:11434/v1" }), "max_tokens", impl);
+    const r = await probeModelOnce(target({ baseUrl: "http://127.0.0.1:11434/v1" }), "openai-completions", "max_tokens", impl);
     expect(r.ok).toBe(true);
   });
 
   it("reports the status and a bounded, redacted body on failure", async () => {
     const impl: FetchLike = async () => reply(400, `denied for key sk-secret-key-value ${"x".repeat(500)}`);
-    const r = await probeModelOnce(target(), "max_tokens", impl);
+    const r = await probeModelOnce(target(), "openai-completions", "max_tokens", impl);
     expect(r.ok).toBe(false);
     expect(r.status).toBe(400);
     expect(r.message).not.toContain("sk-secret-key-value");
@@ -114,41 +121,71 @@ describe("probeModelOnce", () => {
     const impl: FetchLike = async () => {
       throw Object.assign(new Error("fetch failed"), { cause: new Error("ECONNREFUSED") });
     };
-    const r = await probeModelOnce(target(), "max_tokens", impl);
+    const r = await probeModelOnce(target(), "openai-completions", "max_tokens", impl);
     expect(r.ok).toBe(false);
     expect(r.message).toBe("ECONNREFUSED");
   });
 });
 
 describe("testModelWireConfig", () => {
-  it("passes on the first try without correcting", async () => {
-    const { impl, fields } = scriptedFetch([200]);
-    const r = await testModelWireConfig(target({ modelId: "DeepSeek-V3" }), GATEWAY, impl);
-    expect(r).toMatchObject({ ok: true, corrected: false, maxTokensField: "max_tokens" });
-    expect(fields).toEqual(["max_tokens"]);
+  const oai = (over = {}) => target({ apiType: "openai-completions", ...over });
+  const anth = (over = {}) => target({ apiType: "anthropic-messages", ...over });
+
+  it("passes on the first try, correcting nothing", async () => {
+    const { impl, calls } = scriptedFetch([200]);
+    const r = await testModelWireConfig(oai({ modelId: "DeepSeek-V3" }), impl);
+    expect(r).toMatchObject({
+      ok: true, correctedApiType: false, correctedMaxTokensField: false,
+      apiType: "openai-completions", maxTokensField: "max_tokens",
+    });
+    expect(calls).toEqual([["openai-completions", "max_tokens"]]);
   });
 
-  // The whole point: the operator configured (or inherited) the wrong field and
-  // never has to work out which one is right.
-  it("retries on the sibling field and reports the correction", async () => {
-    const { impl, fields } = scriptedFetch([400, 200]);
-    const r = await testModelWireConfig(
-      target({ modelId: "scitix-reasoner-1", maxTokensField: "max_tokens" }), GATEWAY, impl,
-    );
+  // The motivating case: claude-sonnet-5 sitting on an OpenAI-protocol gateway.
+  // Protocol is tried FIRST — the endpoint and body are both wrong, so nothing
+  // about the field name could have been learned from that failure.
+  it("corrects the protocol before touching the field name", async () => {
+    const { impl, calls } = scriptedFetch([400, 200]);
+    const r = await testModelWireConfig(oai({ modelId: "claude-sonnet-5" }), impl);
     expect(r.ok).toBe(true);
-    expect(r.corrected).toBe(true);
-    expect(r.maxTokensField).toBe("max_completion_tokens");
+    expect(r.correctedApiType).toBe(true);
+    expect(r.apiType).toBe("anthropic-messages");
     expect(r.message).toContain("auto-corrected");
-    expect(fields).toEqual(["max_tokens", "max_completion_tokens"]);
+    expect(calls).toEqual([
+      ["openai-completions", "max_tokens"],
+      ["anthropic-messages", "max_tokens"],
+    ]);
   });
 
-  it("corrects in the other direction too", async () => {
-    const { impl, fields } = scriptedFetch([400, 200]);
+  it("falls through to the field name when the protocol was already right", async () => {
     // gpt-5 infers max_completion_tokens; a gateway that only speaks the legacy
-    // field pushes it back.
-    const r = await testModelWireConfig(target({ modelId: "gpt-5" }), GATEWAY, impl);
-    expect(r).toMatchObject({ ok: true, corrected: true, maxTokensField: "max_tokens" });
-    expect(fields).toEqual(["max_completion_tokens", "max_tokens"]);
+    // field rejects it, and the anthropic attempt in between also fails.
+    const { impl, calls } = scriptedFetch([400, 400, 200]);
+    const r = await testModelWireConfig(oai({ modelId: "gpt-5" }), impl);
+    expect(r.ok).toBe(true);
+    expect(r.correctedApiType).toBe(false);
+    expect(r.correctedMaxTokensField).toBe(true);
+    expect(r.maxTokensField).toBe("max_tokens");
+    expect(calls).toEqual([
+      ["openai-completions", "max_completion_tokens"],
+      ["anthropic-messages", "max_tokens"],
+      ["openai-completions", "max_tokens"],
+    ]);
+  });
+
+  // The messages API names its cap max_tokens unconditionally, so the sibling
+  // protocol must bring its own field rather than inherit one that only means
+  // something under chat-completions.
+  it("probes the sibling protocol with that protocol's own field", async () => {
+    const { impl, calls } = scriptedFetch([400, 200]);
+    await testModelWireConfig(oai({ modelId: "gpt-5" }), impl);
+    expect(calls[1]).toEqual(["anthropic-messages", "max_tokens"]);
+  });
+
+  it("corrects an anthropic model back to chat-completions", async () => {
+    const { impl } = scriptedFetch([400, 200]);
+    const r = await testModelWireConfig(anth({ modelId: "claude-x" }), impl);
+    expect(r).toMatchObject({ ok: true, correctedApiType: true, apiType: "openai-completions" });
   });
 
   it.each([
@@ -157,41 +194,50 @@ describe("testModelWireConfig", () => {
     ["an outage", 503],
     ["a bad key", 401],
   ])("does not retry or persist on %s", async (_label, status) => {
-    // The regression this guards: a healthy gpt-4o times out once, the sibling
-    // probe lands two seconds later against a recovered gateway and returns
-    // 200, and the endpoint writes max_completion_tokens for a model that never
-    // needed it — leaving it worse than before the operator pressed Test.
+    // The regression this guards: a healthy gpt-4o times out once, a sibling
+    // probe lands a second later against a recovered gateway and returns 200,
+    // and the endpoint writes a correction for a model that never needed one —
+    // leaving it worse than before the operator pressed Test.
     let call = 0;
     const impl: FetchLike = async () => (call++ === 0 ? reply(status, "nope") : reply(200));
-    const r = await testModelWireConfig(target({ modelId: "gpt-4o" }), GATEWAY, impl);
+    const r = await testModelWireConfig(oai({ modelId: "gpt-4o" }), impl);
     expect(r.ok).toBe(false);
-    expect(r.corrected).toBe(false);
+    expect(r.correctedApiType).toBe(false);
+    expect(r.correctedMaxTokensField).toBe(false);
     expect(call).toBe(1);
   });
 
-  it("reports the original failure, not the hypothesis, when both fail", async () => {
-    // The sibling attempt was our guess, not the operator's configuration —
-    // leading with its error sends them chasing a field they never set.
+  it("reports the original failure, not a hypothesis, when nothing works", async () => {
+    // The siblings were our guesses, not the operator's configuration — leading
+    // with their errors sends them chasing a setting they never touched.
     let call = 0;
-    // Both must be shape rejections, or the retry is gated off and this stops
-    // exercising the both-failed path at all.
-    const impl: FetchLike = async () => reply(call++ === 0 ? 422 : 400, "second");
-    const r = await testModelWireConfig(target(), GATEWAY, impl);
+    const impl: FetchLike = async () => reply(call++ === 0 ? 422 : 400, "later");
+    const r = await testModelWireConfig(oai(), impl);
     expect(r.ok).toBe(false);
-    expect(r.corrected).toBe(false);
-    expect(call).toBe(2);
     expect(r.status).toBe(422);
-    expect(r.maxTokensField).toBe("max_completion_tokens");
+    expect(r.correctedApiType).toBe(false);
+    expect(r.correctedMaxTokensField).toBe(false);
+    expect(call).toBe(3);
   });
 
-  // Anthropic's messages API names the field max_tokens unconditionally, so the
-  // sibling request would be byte-identical and its failure meaningless.
-  it("does not retry on an anthropic provider", async () => {
-    const { impl, fields } = scriptedFetch([400]);
-    const r = await testModelWireConfig(target({ apiType: "anthropic" }), ANTHROPIC, impl);
-    expect(r.ok).toBe(false);
-    expect(r.corrected).toBe(false);
-    expect(fields).toHaveLength(1);
+  it("leaves an unrecognised protocol alone", async () => {
+    // pi gains api ids without a siclaw release; there is no known sibling for
+    // one we've never heard of, so guessing would be inventing a pairing. The
+    // field-name step still runs, hence two attempts and no protocol change.
+    // (KNOWN LIMIT: buildProbeRequest sends every non-anthropic api as
+    // chat-completions, so a genuine openai-responses model is probed on the
+    // wrong endpoint and reports a false failure. Nothing is persisted, so it
+    // is a bad diagnosis rather than a bad write.)
+    const { impl, calls } = scriptedFetch([400, 400]);
+    const r = await testModelWireConfig(target({ apiType: "openai-responses", modelId: "gpt-5" }), impl);
+    expect(r.correctedApiType).toBe(false);
+    expect(r.apiType).toBe("openai-responses");
+    // Starts on max_tokens, not max_completion_tokens: the reasoning-model
+    // inference is gated on chat-completions, and openai-responses is not it.
+    expect(calls).toEqual([
+      ["openai-completions", "max_tokens"],
+      ["openai-completions", "max_completion_tokens"],
+    ]);
   });
 });
 

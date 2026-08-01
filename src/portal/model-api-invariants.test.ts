@@ -75,7 +75,7 @@ const DESCRIPTOR_FREE_PROJECTIONS = [
   /^SELECT \* FROM model_entries/i,
   /^SELECT model_id FROM model_entries/i,
   /^SELECT me\.id FROM model_entries/i,
-  /^SELECT me\.model_id, me\.max_tokens_field/i,
+  /^SELECT me\.model_id, me\.api_type, me\.max_tokens_field/i,
 ];
 
 describe("model_entries SELECTs feeding buildProviderModelDescriptor", () => {

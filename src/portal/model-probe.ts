@@ -15,8 +15,8 @@
 
 import {
   resolveMaxTokensField,
+  resolveModelApi,
   type MaxTokensField,
-  type ProviderCompatInput,
 } from "../core/model-compat.js";
 import { outboundProbeUrlGuard } from "./tracing-exporters.js";
 
@@ -34,7 +34,10 @@ export interface ProbeTarget {
   modelId: string;
   baseUrl: string;
   apiKey: string | null;
+  /** The MODEL's own api_type. Protocol is per-model; the provider's value is
+   *  only a read-time floor for legacy rows (see `resolveModelApi`). */
   apiType: string | null;
+  providerApiType?: string | null;
   /** Persisted override, or null for the inferred value. */
   maxTokensField: string | null;
 }
@@ -47,10 +50,24 @@ export interface ProbeAttempt {
 }
 
 export interface ModelTestResult extends ProbeAttempt {
+  /** The protocol the model actually answered on (or the last one tried). */
+  apiType: string;
   /** The field the model actually answered on (or the last one tried). */
   maxTokensField: MaxTokensField;
-  /** True when the first choice failed and the sibling worked — caller should persist. */
-  corrected: boolean;
+  /** Set when a sibling attempt worked — the caller persists that column. */
+  correctedApiType: boolean;
+  correctedMaxTokensField: boolean;
+}
+
+/**
+ * The other protocol to try. Only the two siclaw supports are paired; an
+ * unrecognised api id (pi gains new ones without a siclaw release) has no
+ * known sibling, so it is left alone rather than guessed at.
+ */
+export function siblingApiType(api: string): string | undefined {
+  if (api === "openai-completions") return "anthropic-messages";
+  if (api === "anthropic-messages") return "openai-completions";
+  return undefined;
 }
 
 export function usesAnthropicMessages(apiType: string | null | undefined): boolean {
@@ -89,13 +106,14 @@ export function redactSecret(text: string, secret: string | null): string {
 
 export function buildProbeRequest(
   target: ProbeTarget,
+  api: string,
   field: MaxTokensField,
 ): { url: string; headers: Record<string, string>; body: Record<string, unknown> } {
   const base = target.baseUrl.replace(/\/+$/, "");
   const key = target.apiKey ?? "";
   const messages = [{ role: "user", content: "ping" }];
 
-  if (usesAnthropicMessages(target.apiType)) {
+  if (usesAnthropicMessages(api)) {
     // The messages API names this field `max_tokens` unconditionally; `field`
     // is not consulted, which is why the caller skips the sibling retry here.
     return {
@@ -116,13 +134,14 @@ export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
 export async function probeModelOnce(
   target: ProbeTarget,
+  api: string,
   field: MaxTokensField,
   fetchImpl: FetchLike = fetch,
 ): Promise<ProbeAttempt> {
   const guard = outboundProbeUrlGuard(target.baseUrl, { allowLoopback: true });
   if (!guard.ok) return { ok: false, status: 0, message: guard.error ?? "Blocked URL", latencyMs: 0 };
 
-  const { url, headers, body } = buildProbeRequest(target, field);
+  const { url, headers, body } = buildProbeRequest(target, api, field);
   const startedAt = performance.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
@@ -158,50 +177,87 @@ export async function probeModelOnce(
 }
 
 /**
- * Probe the model, retrying once on the sibling max-tokens field.
+ * Probe the model and, on a shape rejection, try the siblings once each.
  *
- * Pure with respect to storage: it reports `corrected` and leaves persistence
- * to the caller.
+ * Two attributes decide whether a request is even well-formed, and neither is
+ * discoverable from configuration: the wire protocol, and the name of the
+ * output-token field. Both are per-model, both are settable in Portal, and both
+ * are wrong often enough that "read the error and work it out" is the operator
+ * experience we are trying to delete.
+ *
+ * The ladder tries the PROTOCOL first: it decides the endpoint and the whole
+ * body shape, so a protocol mismatch makes the field name moot. Deliberately no
+ * error-message parsing at any step — gateways word these rejections
+ * differently and inconsistently, whereas "the other one works" is unambiguous.
+ * (Same conclusion sicore reached against this same gateway.)
+ *
+ * Pure with respect to storage: it reports which attribute was corrected and
+ * leaves persistence to the caller.
  */
 export async function testModelWireConfig(
   target: ProbeTarget,
-  provider: ProviderCompatInput,
   fetchImpl: FetchLike = fetch,
 ): Promise<ModelTestResult> {
-  const first = resolveMaxTokensField(
-    { id: target.modelId, maxTokensField: target.maxTokensField },
-    provider,
+  const api = resolveModelApi(
+    { model_id: target.modelId, api_type: target.apiType, context_window: 0, max_tokens: 0 },
+    { api: target.providerApiType },
   );
-  const attempt = await probeModelOnce(target, first, fetchImpl);
-  if (attempt.ok) return { ...attempt, maxTokensField: first, corrected: false };
+  const field = resolveMaxTokensField(
+    { id: target.modelId, maxTokensField: target.maxTokensField },
+    { api },
+  );
+  const unchanged = { apiType: api, maxTokensField: field, correctedApiType: false, correctedMaxTokensField: false };
 
-  // Anthropic's field name is fixed, so there is no sibling to try — retrying
-  // would send the identical request and report a misleading second failure.
-  if (usesAnthropicMessages(target.apiType)) {
-    return { ...attempt, maxTokensField: first, corrected: false };
+  const attempt = await probeModelOnce(target, api, field, fetchImpl);
+  if (attempt.ok) return { ...attempt, ...unchanged };
+
+  // Only a request the provider REJECTED tells us anything about how it was
+  // shaped. A timeout, a refused connection, a 429 or a 5xx says nothing — and
+  // because a successful sibling is PERSISTED, retrying on those turns a
+  // transient blip into a permanent mis-configuration: the second attempt lands
+  // a moment later against a recovered gateway and pins a model that was
+  // already correct.
+  if (!isFieldRejection(attempt.status)) return { ...attempt, ...unchanged };
+
+  // 1. Wrong protocol. `claude-sonnet-5` on an OpenAI-protocol gateway is the
+  //    motivating case: the endpoint and body are both wrong, so nothing about
+  //    the field name could have been learned from that failure.
+  const altApi = siblingApiType(api);
+  if (altApi) {
+    // The messages API names its cap `max_tokens` unconditionally, so the
+    // sibling protocol brings its own natural field rather than inheriting one
+    // that only means something under chat-completions.
+    const altField: MaxTokensField = usesAnthropicMessages(altApi) ? "max_tokens" : field;
+    const viaAltApi = await probeModelOnce(target, altApi, altField, fetchImpl);
+    if (viaAltApi.ok) {
+      return {
+        ...viaAltApi,
+        apiType: altApi,
+        maxTokensField: altField,
+        correctedApiType: true,
+        correctedMaxTokensField: altField !== field,
+        message: `Model responded on ${altApi} (auto-corrected from ${api})`,
+      };
+    }
   }
 
-  // Only a request the provider REJECTED tells us anything about the field
-  // name. A timeout, a refused connection, a 429 or a 5xx says nothing — and
-  // because this probe PERSISTS a success, retrying on those turns a transient
-  // blip into a permanent mis-configuration: the sibling attempt lands a second
-  // later, the gateway is healthy again, and a model that was correct gets
-  // pinned to the wrong field for every future turn.
-  if (!isFieldRejection(attempt.status)) {
-    return { ...attempt, maxTokensField: first, corrected: false };
+  // 2. Right protocol, wrong field name. Only chat-completions has a choice.
+  if (!usesAnthropicMessages(api)) {
+    const altField = siblingMaxTokensField(field);
+    const viaAltField = await probeModelOnce(target, api, altField, fetchImpl);
+    if (viaAltField.ok) {
+      return {
+        ...viaAltField,
+        apiType: api,
+        maxTokensField: altField,
+        correctedApiType: false,
+        correctedMaxTokensField: true,
+        message: `Model responded on ${altField} (auto-corrected from ${field})`,
+      };
+    }
   }
 
-  const sibling = siblingMaxTokensField(first);
-  const retry = await probeModelOnce(target, sibling, fetchImpl);
-  if (retry.ok) {
-    return {
-      ...retry,
-      maxTokensField: sibling,
-      corrected: true,
-      message: `Model responded on ${sibling} (auto-corrected from ${first})`,
-    };
-  }
-  // Both failed: report the ORIGINAL failure. The sibling attempt was our
-  // hypothesis, not the operator's configuration, so its error is noise.
-  return { ...attempt, maxTokensField: first, corrected: false };
+  // Nothing worked: report the ORIGINAL failure. The siblings were our
+  // hypotheses, not the operator's configuration, so their errors are noise.
+  return { ...attempt, ...unchanged };
 }
