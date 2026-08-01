@@ -459,7 +459,7 @@ describe("handleLarkMessage — personal bot p2p", () => {
       makePersonalConfig("open"),
     );
 
-    expect(resolvePersonalBindingMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything());
+    expect(resolvePersonalBindingMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything(), undefined);
     expect(resolveBindingMock).not.toHaveBeenCalled();
     expect(ensureChatSessionMock).toHaveBeenCalledWith(
       "session-open-ou1",
@@ -614,6 +614,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       "ou_user_1",
       undefined,
       false,
+      undefined,   // sender_type — absent on a plain user event
     );
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
@@ -650,6 +651,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       "ou_user_1",
       undefined,
       false,
+      undefined,   // sender_type — absent on a plain user event
     );
     expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
   });
@@ -1422,6 +1424,122 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     expect(resolveBindingMock).toHaveBeenCalled();
   });
 
+  // ── @-ed BY ANOTHER BOT ────────────────────────────────────────────
+  // Nothing in the pipeline inspects sender_type, so an app-sent message takes
+  // the same path as a human's. What differs is the SENDER IDENTITY: Feishu
+  // describes an app sender as sender_type:"app", and when it carries no
+  // sender_id.open_id every downstream identity decision sees an empty sender.
+  // These pin what we actually do in both payload shapes.
+
+  /** App/bot sender WITHOUT sender_id.open_id — the shape that loses identity. */
+  function botSenderEvent(text: string, mentions: any[]) {
+    return {
+      sender: { sender_type: "app", sender_id: {} },
+      message: {
+        message_id: "mid-bot-1",
+        chat_id: "oc_abc123",
+        message_type: "text",
+        content: JSON.stringify({ text }),
+        chat_type: "group",
+        mentions,
+      },
+    };
+  }
+
+  it("a BOT @-mentioning us is NOT filtered — the @-gate passes on mention alone", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const data = botSenderEvent("@_user_1 提工单:节点异常", [{ key: "@_user_1", id: { open_id: BOT } }]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    // It reached binding resolution: sender_type is never consulted.
+    expect(resolveBindingMock).toHaveBeenCalled();
+  });
+
+  it("a BOT sender with no open_id resolves with NO sender identity and a chat-scoped key", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const data = botSenderEvent("@_user_1 提工单", [{ key: "@_user_1", id: { open_id: BOT } }]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+
+    const [, , , sessionKey, senderOpenId] = resolveBindingMock.mock.calls[0];
+    // Upstream authorization keys off the sender; it gets nothing to key on.
+    expect(senderOpenId).toBeUndefined();
+    // And per-sender isolation degrades to one shared chat-scoped session.
+    expect(sessionKey).toBe("oc_abc123".replace(/^/, "chat:"));
+  });
+
+  it("a BOT sender WITH an open_id is treated exactly like a user", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const data = makeTextEvent("@_user_1 提工单", {
+      chat_type: "group",
+      mentions: [{ key: "@_user_1", id: { open_id: BOT } }],
+    }, "ou_other_bot");
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+
+    const [, , , sessionKey, senderOpenId] = resolveBindingMock.mock.calls[0];
+    expect(senderOpenId).toBe("ou_other_bot");
+    expect(sessionKey).toBe("open_id:ou_other_bot");
+  });
+
+  it("forwards sender_type upstream so the Portal can tell a bot from a person", async () => {
+    // The Portal cannot make that distinction on its own: it used to receive only
+    // an open_id, which an app sender may not even have — leaving "a bot wrote
+    // this" and "we could not identify the writer" indistinguishable.
+    resolveBindingMock.mockResolvedValue(null);
+    const data = {
+      sender: { sender_type: "app", sender_id: { open_id: "ou_other_bot" } },
+      message: {
+        message_id: "mid-st-1", chat_id: "oc_abc123", message_type: "text",
+        content: JSON.stringify({ text: "@_user_1 提工单" }),
+        chat_type: "group", mentions: [{ key: "@_user_1", id: { open_id: BOT } }],
+      },
+    };
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock.mock.calls[0][7]).toBe("app");
+  });
+
+  it("passes no sender_type when the event carried none — absent must not become a user", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const data = botSenderEvent("@_user_1 提工单", [{ key: "@_user_1", id: { open_id: BOT } }]);
+    delete (data.sender as any).sender_type;
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock.mock.calls[0][7]).toBeUndefined();
+  });
+
+  it("/mode without a mention is ignored — it reconfigures the whole group", async () => {
+    // It used to be handled BEFORE the @-gate, so any group member, or any other
+    // BOT in the room, could switch the group's context mode by typing two words
+    // at nobody. Nothing downstream checks who the sender is.
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "per_user" }));
+    await handleLarkMessage(botSenderEvent("/mode", []), makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+  });
+
+  it("/mode inside an established topic works without a mention, and never reaches the model", async () => {
+    // Inside a topic people stop @-ing, and thread follow-ups are let through the
+    // @-gate — so requiring a mention here would not merely ignore /mode, it
+    // would forward the literal text to the model as a prompt.
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "per_user" }));
+    const data = makeTextEvent("/mode", {
+      message_id: "mid-topic-mode",
+      chat_type: "group",
+      mentions: [],
+      root_id: "mid-root",
+      thread_id: "omt-1",
+    });
+    await handleLarkMessage(
+      data, makeLarkClient(), "lark", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "zh-CN", { app_id: "x", app_secret: "y", thread_mode: "group" }, BOT,
+    );
+    expect(resolveBindingMock).toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();   // handled as a command, not a prompt
+  });
+
+  it("/mode WITH a mention still works, whoever sends it", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding({ contextMode: "per_user" }));
+    const data = botSenderEvent("/mode", [{ key: "@_user_1", id: { open_id: BOT } }]);
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock).toHaveBeenCalled();
+  });
+
   it("IGNORES @所有人 announcements (key @_all, not the bot's open_id)", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     const data = groupEvent("@_all 基础功能都搞过来了", [
@@ -1455,7 +1573,8 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     }));
 
     await handleLarkMessage(
-      makeTextEvent("/mode", { chat_type: "group", mentions: [] }),
+      // /mode now requires the mention; this case is about topic sessions, not the gate.
+      makeTextEvent("/mode", { chat_type: "group", mentions: [{ key: "@_user_1", id: { open_id: BOT } }] }),
       makeLarkClient(),
       "lark",
       makeAgentBoxManager("a1") as any,
@@ -1473,6 +1592,8 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       "open_id:ou_user_1",
       "ou_user_1",
       undefined,
+      false,
+      undefined,   // sender_type — absent on a plain user event
     );
   });
 
@@ -1703,6 +1824,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       "ou_user_1",
       "lark_thread:mid-unrelated-root",
       true,
+      undefined,   // sender_type — absent on a plain user event
     );
     expect(promptMock).not.toHaveBeenCalled();
     expect(lark.im.message.reply).not.toHaveBeenCalled();

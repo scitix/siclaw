@@ -444,6 +444,22 @@ function getLarkSenderOpenId(data: any): string | null {
   return typeof openId === "string" && openId.trim() ? openId.trim() : null;
 }
 
+/**
+ * Feishu's own word for what kind of party sent this — "user", "app", … The
+ * value is passed through verbatim rather than mapped to a boolean: we do not
+ * control the vocabulary, and a value we have not seen before must reach the
+ * Portal intact instead of being flattened into "not a user".
+ *
+ * Nothing in this file branches on it. It exists so the Portal can tell a bot
+ * from a person at all — until now it received only an open_id, which an app
+ * sender may not even have, leaving "a bot wrote this" and "we could not
+ * identify the writer" indistinguishable.
+ */
+function getLarkSenderType(data: any): string | null {
+  const t = data?.sender?.sender_type ?? data?.event?.sender?.sender_type;
+  return typeof t === "string" && t.trim() ? t.trim() : null;
+}
+
 function buildLarkSessionKey(senderOpenId: string | null, chatId: string): string {
   return senderOpenId ? `open_id:${senderOpenId}` : `chat:${chatId}`;
 }
@@ -967,6 +983,7 @@ export async function handleLarkMessage(
   const msgType: string = message.message_type;
   const chatType: string | undefined = message.chat_type;
   const senderOpenId = getLarkSenderOpenId(data);
+  const senderType = getLarkSenderType(data);
   const sessionKey = buildLarkSessionKey(senderOpenId, chatId);
   // Rollout gate only: whether personal group conversations MAY use Feishu
   // topics. The binding's server-authoritative contextMode decides whether
@@ -987,7 +1004,11 @@ export async function handleLarkMessage(
   // Raw receipt log: fires for EVERY delivered event before any drop, so a
   // group message that arrives but is filtered (non-text, empty after @-strip)
   // is still visible. Lets us tell "never delivered" from "silently dropped".
-  console.log(`[lark] recv event chat=${chatId} chat_type=${chatType} msg_type=${msgType} sender=${senderOpenId ?? "?"} channelCfg=${channelId}`);
+  // senderType is logged beside the id because `sender=?` alone cannot say WHY
+  // we have no identity: an event with no sender_id at all and one whose
+  // sender_id simply omits open_id look identical here, and they lead to
+  // opposite conclusions about whether a sender can ever be authorized.
+  console.log(`[lark] recv event chat=${chatId} chat_type=${chatType} msg_type=${msgType} sender=${senderOpenId ?? "?"} sender_type=${senderType ?? "?"} channelCfg=${channelId}`);
 
   // Accept text, native image, and rich-text (post, may embed images). Other
   // types (audio/file/sticker/…) are still dropped.
@@ -1126,7 +1147,7 @@ export async function handleLarkMessage(
       return;
     }
 
-    const { binding, denied } = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient!);
+    const { binding, denied } = await resolvePersonalBinding(personalChannelId, senderOpenId, frontendClient!, senderType ?? undefined);
     if (!binding) {
       // The frontend owns the admission decision; the runtime's whole gate is "did a binding come
       // back". All that is left is telling the sender what to do next.
@@ -1178,6 +1199,7 @@ export async function handleLarkMessage(
       messageId,
       chatId,
       senderOpenId,
+      senderType: senderType ?? undefined,
       sessionKey: personalSessionKey,
       channelId: personalChannelId,
       route: "personal",
@@ -1222,9 +1244,23 @@ export async function handleLarkMessage(
     return;
   }
 
-  // /mode — summon the context-mode switch card. Handled before the @-gate so
-  // it works with or without an @bot (like PAIR); command words are exact.
-  if (/^\/mode$/i.test(text.trim())) {
+  // Computed here rather than at the @-gate below: /mode needs both.
+  const botMentioned = isBotMentioned(message, botOpenId);
+  const isThreadFollowup = topicFeatureEnabled && threadId !== null && rootMessageId !== messageId;
+
+  // /mode — summon the context-mode switch card. Command words are exact, and
+  // the bot must be @-mentioned: this switches the mode for the WHOLE group, and
+  // nothing in the pipeline checks who the sender is (Feishu reports app senders
+  // the same way it reports people, sometimes without any id at all). Handling it
+  // before the @-gate meant any group member — or any other BOT in the room —
+  // could reconfigure the group by typing two words at nobody in particular.
+  // Requiring that costs the sender four characters and makes the change an act
+  // aimed at us. A follow-up inside a topic WE opened counts too — it is already
+  // scoped to a conversation the bot owns, and inside a topic people rightly stop
+  // @-ing. Without that second arm, `/mode` in a topic would fall past the @-gate
+  // (thread follow-ups are allowed through) and reach the model as a prompt.
+  // PAIR stays exempt: it carries its own one-time code.
+  if (/^\/mode$/i.test(text.trim()) && (botMentioned || isThreadFollowup)) {
     const modeBinding = await resolveBinding(
       groupChannelId,
       chatId,
@@ -1232,6 +1268,8 @@ export async function handleLarkMessage(
       sessionKey,
       senderOpenId ?? undefined,
       undefined,
+      false,
+      senderType ?? undefined,
     );
     if (isChannelAccessDenied(modeBinding)) {
       await replyToLark(larkClient, messageId, formatGroupAccessDeniedReply(modeBinding, locale, dmCanResolveAccess(personalBot)));
@@ -1259,8 +1297,6 @@ export async function handleLarkMessage(
   // were never aimed at it. Skips "@所有人" and "@someone-else"; PAIR above is
   // exempt (explicit command). Gated on chat_type==="group" so the binding/
   // access checks below stay reachable only for messages aimed at the bot.
-  const botMentioned = isBotMentioned(message, botOpenId);
-  const isThreadFollowup = topicFeatureEnabled && threadId !== null && rootMessageId !== messageId;
   const conversationExistingOnly = isThreadFollowup && !botMentioned;
   if (chatType === "group" && !botMentioned) {
     // Non-@ group message. In a group KNOWN to be shared, retain it as passive
@@ -1291,6 +1327,7 @@ export async function handleLarkMessage(
     senderOpenId ?? undefined,
     topicConversationKey,
     conversationExistingOnly,
+    senderType ?? undefined,
   );
   if (isChannelAccessDenied(binding)) {
     // A no-@ Topic/quote follow-up is never an authorization prompt. If the
@@ -1354,6 +1391,7 @@ export async function handleLarkMessage(
     messageId,
     chatId,
     senderOpenId,
+    senderType: senderType ?? undefined,
     sessionKey: effectiveSessionKey,
     channelId: groupChannelId,
     route: "group",
@@ -1382,6 +1420,8 @@ interface QueuedLarkMessageContext {
   messageId: string;
   chatId: string;
   senderOpenId: string | null;
+  /** Provider's own sender kind ("user" / "app" / …), verbatim; absent if the event had none. */
+  senderType?: string;
   sessionKey: string;
   channelId: string;
   route: "group" | "personal";
@@ -1411,6 +1451,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     messageId,
     chatId,
     senderOpenId,
+    senderType,
     sessionKey,
     channelId,
     route,
@@ -1469,6 +1510,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     sessionKey,
     conversationKey,
     conversationExistingOnly,
+    senderType,
   );
   if (!binding) {
     console.log(`[lark] Binding disappeared before queued run channel=${channelId} chat=${chatId} route=${route}`);
@@ -1788,12 +1830,13 @@ async function resolveQueuedBinding(
   sessionKey: string,
   conversationKey?: string,
   conversationExistingOnly: boolean = false,
+  senderType?: string,
 ): Promise<ResolvedChannelBinding | null> {
   if (route === "personal") {
     if (!senderOpenId) return null;
     // Re-resolved after dequeue purely to detect revocation; the refusal reason was already
     // delivered before enqueue, so only the binding matters here.
-    return (await resolvePersonalBinding(channelId, senderOpenId, frontendClient)).binding;
+    return (await resolvePersonalBinding(channelId, senderOpenId, frontendClient, senderType)).binding;
   }
   const result = await resolveBinding(
     channelId,
@@ -1803,6 +1846,7 @@ async function resolveQueuedBinding(
     senderOpenId ?? undefined,
     conversationKey,
     conversationExistingOnly,
+    senderType,
   );
   // If access was revoked between enqueue and run, treat as gone (the queued
   // task then skips). The pre-enqueue check already replied any access hint.
