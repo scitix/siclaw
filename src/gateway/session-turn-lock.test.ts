@@ -100,3 +100,61 @@ describe("SessionTurnLocks", () => {
     expect(locks.isBusy("s1")).toBe(false);
   });
 });
+
+describe("SessionTurnLocks — waiting for the box to take the prompt", () => {
+  it("holds a steer until the box has accepted, then lets it through", async () => {
+    // Placement records the box before the box is asked to do anything, so a steer that
+    // arrives in that gap reaches the right box and is still told "Session not found".
+    const locks = new SessionTurnLocks();
+    const release = await locks.acquire("s1");
+    locks.noteBox("s1", "box-a", "https://box-a:3000");
+    let through = false;
+    const steer = locks.whenPromptAccepted("s1", 5_000).then(() => { through = true; });
+    await tick(20);
+    expect(through).toBe(false);
+    locks.markPromptAccepted("s1");
+    await steer;
+    expect(through).toBe(true);
+    release();
+  });
+
+  it("does not wait when there is no turn to wait for", async () => {
+    const locks = new SessionTurnLocks();
+    await expect(locks.whenPromptAccepted("never-started", 5_000)).resolves.toBeUndefined();
+  });
+
+  it("gives up rather than blocking forever when the prompt is never accepted", async () => {
+    // The box died between placement and dispatch: the caller is better off trying and
+    // getting a real answer than waiting out the turn.
+    const locks = new SessionTurnLocks();
+    const release = await locks.acquire("s1");
+    locks.noteBox("s1", "box-a", "https://box-a:3000");
+    await expect(locks.whenPromptAccepted("s1", 30)).resolves.toBeUndefined();
+    release();
+  });
+
+  it("releases a waiter when the turn ends, so it cannot block on the next one", async () => {
+    const locks = new SessionTurnLocks();
+    const release = await locks.acquire("s1");
+    locks.noteBox("s1", "box-a", "https://box-a:3000");
+    const queued = locks.run("s1", async () => "next");   // a second turn is waiting
+    const waiter = locks.whenPromptAccepted("s1", 5_000);
+    release();                                            // hands the lock to the queued turn
+    await expect(waiter).resolves.toBeUndefined();
+    await queued;
+  });
+
+  it("requires the next turn to accept on its own", async () => {
+    const locks = new SessionTurnLocks();
+    const first = await locks.acquire("s1");
+    locks.markPromptAccepted("s1");
+    first();
+    const second = await locks.acquire("s1");
+    let through = false;
+    void locks.whenPromptAccepted("s1", 5_000).then(() => { through = true; });
+    await tick(20);
+    expect(through).toBe(false);   // acceptance does not carry over
+    second();
+  });
+});
+

@@ -143,7 +143,37 @@ export interface StartRuntimeOptions {
  * seconds. Long enough to cover that; short enough that a genuinely missing session fails
  * while the user is still looking at the screen.
  */
+/**
+ * Report a failed trace bind — but only once per process when the upstream simply does
+ * not implement the method.
+ *
+ * Binding a message to its trace is best-effort and optional: an upstream that has no
+ * trace consumer yet answers "unknown method" to every prompt and every steer, and a
+ * conversation steered a dozen times buries a real failure under a dozen identical lines.
+ * Any OTHER failure is a genuine one-off and keeps its own line.
+ */
+let traceBindUnsupportedReported = false;
+function warnTraceBindFailure(kind: string, sessionId: string, messageId: string, err: unknown): void {
+  const unsupported = /unknown method|not implemented|method not found/i.test(String((err as Error)?.message ?? err));
+  if (unsupported) {
+    if (traceBindUnsupportedReported) return;
+    traceBindUnsupportedReported = true;
+    console.warn(`[runtime] upstream does not implement chat.bindMessageTraceId; trace attribution is off for this process (${err})`);
+    return;
+  }
+  console.warn(`[runtime] failed to bind ${kind} trace session=${sessionId} message=${messageId}:`, err);
+}
+
 const STEER_SESSION_WAIT_MS = 3_000;
+
+/**
+ * How long a steer waits for the box to accept the prompt it is steering into.
+ *
+ * This is a handoff, not a poll: the wait ends the moment /api/prompt returns. The bound
+ * only matters when that never happens (a box that died between placement and dispatch),
+ * and there the caller is better off trying and being told than waiting out the turn.
+ */
+const STEER_PROMPT_WAIT_MS = 30_000;
 
 export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeServer> {
   const { config, agentBoxManager, spawner, frontendClient } = opts;
@@ -426,6 +456,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
         try {
           promptResult = await client.prompt(promptOpts);
+          // The box now has the session: a steer racing this call can stop waiting.
+          sessionTurnLocks.markPromptAccepted(sessionId);
         } catch (err) {
           // Concurrent send: agentbox returns 409 "Session is already
           // running. Use the steer endpoint to add input to the active
@@ -458,7 +490,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         }
 
         void bindMessageTraceId(promptMessageId, promptResult.sessionId, promptResult.traceId).catch((bindErr) => {
-          console.warn(`[runtime] failed to bind prompt trace session=${promptResult.sessionId} message=${promptMessageId}:`, bindErr);
+          warnTraceBindFailure("prompt", promptResult.sessionId, promptMessageId, bindErr);
         });
 
         const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
@@ -1224,6 +1256,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // The prompt returns as soon as the turn STARTS, so a steer can arrive while the box is
     // still creating the session — it answers 404 for a moment before it would accept. Retry
     // briefly rather than reporting a failure the user would have to resend around.
+    // A steer sent seconds into a turn still races the box: /api/prompt is dispatched
+    // before the box has created the session, so the first steers of a conversation used
+    // to spend their whole retry budget being told "Session not found". Wait for the box
+    // to say it took the prompt; the retry below stays as a backstop for the cases this
+    // Runtime cannot see (a turn it did not start, or one that started before a restart).
+    await sessionTurnLocks.whenPromptAccepted(sessionId, STEER_PROMPT_WAIT_MS);
     const deadline = Date.now() + STEER_SESSION_WAIT_MS;
     let steerResult: Awaited<ReturnType<AgentBoxClient["steerSession"]>> | undefined;
     for (;;) {
@@ -1237,9 +1275,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       }
     }
     void bindMessageTraceId(steerMessageId, sessionId, steerResult.traceId).catch((bindErr) => {
-      console.warn(`[runtime] failed to bind explicit steer trace session=${sessionId} message=${steerMessageId}:`, bindErr);
+      warnTraceBindFailure("explicit steer", sessionId, steerMessageId, bindErr);
     });
-    return { ok: true };
+    // The row id, so a caller can reconcile its optimistic bubble by identity instead of
+    // by content — two steers with the same text are two messages, not one.
+    return { ok: true, messageId: steerMessageId };
   });
 
   rpcMethods.set("chat.clearQueue", async (params) => {

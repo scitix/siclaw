@@ -49,6 +49,16 @@ interface Entry {
   /** Where the in-flight turn was dispatched, when known. Dropped on release. */
   boxId?: string;
   endpoint?: string;
+  /**
+   * Whether the box has ACCEPTED the prompt — i.e. the session now exists there.
+   *
+   * `noteBox` records the destination as soon as placement decides, which is before the
+   * box has been asked to do anything. A steer arriving in that gap reaches the right box
+   * and is still told "Session not found", because the session is not created until the
+   * prompt is processed. Waiting on this is what turns that race into an ordering.
+   */
+  accepted?: boolean;
+  acceptWaiters: Array<() => void>;
   queue: Waiter[];
 }
 
@@ -76,6 +86,33 @@ export class SessionTurnLocks {
   noteBox(sessionId: string, boxId: string, endpoint: string): void {
     const entry = this.held.get(sessionId);
     if (entry) { entry.boxId = boxId; entry.endpoint = endpoint; }
+  }
+
+  /** The box took the prompt: the session exists there and can be steered. */
+  markPromptAccepted(sessionId: string): void {
+    const entry = this.held.get(sessionId);
+    if (!entry || entry.accepted) return;
+    entry.accepted = true;
+    for (const resolve of entry.acceptWaiters.splice(0)) resolve();
+  }
+
+  /**
+   * Wait until the in-flight turn's box has taken the prompt.
+   *
+   * Resolves immediately when there is no turn to wait for (the caller then has nothing
+   * to synchronise with) or when the box has already accepted. Resolves rather than
+   * rejects on timeout: the caller should still try, and get the box's own answer.
+   */
+  whenPromptAccepted(sessionId: string, timeoutMs: number): Promise<void> {
+    const entry = this.held.get(sessionId);
+    if (!entry || entry.accepted) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => { if (!settled) { settled = true; resolve(); } };
+      entry.acceptWaiters.push(done);
+      const timer = setTimeout(done, timeoutMs);
+      timer.unref?.();
+    });
   }
 
   /**
@@ -113,7 +150,7 @@ export class SessionTurnLocks {
   private waitForTurn(sessionId: string, waitMs: number): Promise<void> {
     const entry = this.held.get(sessionId);
     if (!entry) {
-      this.held.set(sessionId, { queue: [] });
+      this.held.set(sessionId, { queue: [], acceptWaiters: [] });
       return Promise.resolve();
     }
     const startedAt = Date.now();
@@ -145,6 +182,9 @@ export class SessionTurnLocks {
     // request that arrived later jump the queue.
     entry.boxId = undefined;
     entry.endpoint = undefined;
+    entry.accepted = false;
+    // A waiter that outlived its turn must not block on the NEXT turn's acceptance.
+    for (const resolve of entry.acceptWaiters.splice(0)) resolve();
     next.resolve();
   }
 }
