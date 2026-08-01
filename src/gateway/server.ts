@@ -152,13 +152,16 @@ export interface StartRuntimeOptions {
  * conversation steered a dozen times buries a real failure under a dozen identical lines.
  * Any OTHER failure is a genuine one-off and keeps its own line.
  */
-let traceBindUnsupportedReported = false;
+const unsupportedUpstreamMethodsReported = new Set<string>();
 function warnTraceBindFailure(kind: string, sessionId: string, messageId: string, err: unknown): void {
-  const unsupported = /unknown method|not implemented|method not found/i.test(String((err as Error)?.message ?? err));
-  if (unsupported) {
-    if (traceBindUnsupportedReported) return;
-    traceBindUnsupportedReported = true;
-    console.warn(`[runtime] upstream does not implement chat.bindMessageTraceId; trace attribution is off for this process (${err})`);
+  const message = String((err as Error)?.message ?? err);
+  if (/unknown method|not implemented|method not found/i.test(message)) {
+    // Keyed by the method the upstream is missing, not by a single global flag: one
+    // absent method must not silence the next one.
+    const method = message.match(/[\w.]+\.[\w]+/)?.[0] ?? message;
+    if (unsupportedUpstreamMethodsReported.has(method)) return;
+    unsupportedUpstreamMethodsReported.add(method);
+    console.warn(`[runtime] upstream does not implement ${method}; that capability is off for this process (${message})`);
     return;
   }
   console.warn(`[runtime] failed to bind ${kind} trace session=${sessionId} message=${messageId}:`, err);

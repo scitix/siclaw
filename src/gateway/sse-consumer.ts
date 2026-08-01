@@ -859,6 +859,12 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               lastAssistantDbMessageId = id;
               lastAssistantContent = assistantRowContent;
               lastAssistantMetadata = rowMetadata;
+              // Carry the row id out on the relayed message_end so a consumer can match
+              // its live bubble to the persisted row by identity. Only meaningful when
+              // the write happened inline (the deferred path runs after the event has
+              // already been relayed), which is every turn that has no fallback to
+              // switch to.
+              dbMessageId = id;
               await incrementMessageCount(sessionId);
             };
             // Flip the first-assistant flag NOW (not inside the deferred op):
