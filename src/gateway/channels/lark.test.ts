@@ -459,7 +459,7 @@ describe("handleLarkMessage — personal bot p2p", () => {
       makePersonalConfig("open"),
     );
 
-    expect(resolvePersonalBindingMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything());
+    expect(resolvePersonalBindingMock).toHaveBeenCalledWith("personal-bot-1", "ou_user_1", expect.anything(), undefined);
     expect(resolveBindingMock).not.toHaveBeenCalled();
     expect(ensureChatSessionMock).toHaveBeenCalledWith(
       "session-open-ou1",
@@ -614,6 +614,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       "ou_user_1",
       undefined,
       false,
+      undefined,   // sender_type — absent on a plain user event
     );
     expect(mgr.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
@@ -650,6 +651,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       "ou_user_1",
       undefined,
       false,
+      undefined,   // sender_type — absent on a plain user event
     );
     expect(resolvePersonalBindingMock).not.toHaveBeenCalled();
   });
@@ -1477,6 +1479,31 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     expect(sessionKey).toBe("open_id:ou_other_bot");
   });
 
+  it("forwards sender_type upstream so the Portal can tell a bot from a person", async () => {
+    // The Portal cannot make that distinction on its own: it used to receive only
+    // an open_id, which an app sender may not even have — leaving "a bot wrote
+    // this" and "we could not identify the writer" indistinguishable.
+    resolveBindingMock.mockResolvedValue(null);
+    const data = {
+      sender: { sender_type: "app", sender_id: { open_id: "ou_other_bot" } },
+      message: {
+        message_id: "mid-st-1", chat_id: "oc_abc123", message_type: "text",
+        content: JSON.stringify({ text: "@_user_1 提工单" }),
+        chat_type: "group", mentions: [{ key: "@_user_1", id: { open_id: BOT } }],
+      },
+    };
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock.mock.calls[0][7]).toBe("app");
+  });
+
+  it("passes no sender_type when the event carried none — absent must not become a user", async () => {
+    resolveBindingMock.mockResolvedValue(null);
+    const data = botSenderEvent("@_user_1 提工单", [{ key: "@_user_1", id: { open_id: BOT } }]);
+    delete (data.sender as any).sender_type;
+    await handleLarkMessage(data, makeLarkClient(), "lark", makeAgentBoxManager() as any, undefined, undefined, "zh-CN", {} as any, BOT);
+    expect(resolveBindingMock.mock.calls[0][7]).toBeUndefined();
+  });
+
   it("/mode without a mention is ignored — it reconfigures the whole group", async () => {
     // It used to be handled BEFORE the @-gate, so any group member, or any other
     // BOT in the room, could switch the group's context mode by typing two words
@@ -1565,6 +1592,8 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       "open_id:ou_user_1",
       "ou_user_1",
       undefined,
+      false,
+      undefined,   // sender_type — absent on a plain user event
     );
   });
 
@@ -1795,6 +1824,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       "ou_user_1",
       "lark_thread:mid-unrelated-root",
       true,
+      undefined,   // sender_type — absent on a plain user event
     );
     expect(promptMock).not.toHaveBeenCalled();
     expect(lark.im.message.reply).not.toHaveBeenCalled();

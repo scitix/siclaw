@@ -137,12 +137,17 @@ export async function resolveBinding(
   senderOpenId?: string,
   conversationKey?: string,
   conversationExistingOnly: boolean = false,
+  senderType?: string,
 ): Promise<ResolvedChannelBinding | ChannelAccessDenied | null> {
   const data = await frontendClient.request("channel.resolveBinding", {
     channel_id: channelId,
     route_key: routeKey,
     ...(sessionKey ? { session_key: sessionKey } : {}),
     ...(senderOpenId ? { sender_open_id: senderOpenId } : {}),
+    // The provider's own word ("user" / "app" / …), passed through verbatim.
+    // Absent when the event did not carry one — the Portal must treat missing
+    // and "user" as different things, so do not default it here.
+    ...(senderType ? { sender_type: senderType } : {}),
     ...(conversationKey ? { conversation_key: conversationKey } : {}),
     ...(conversationExistingOnly ? { conversation_existing_only: true } : {}),
   });
@@ -246,10 +251,13 @@ export async function resolvePersonalBinding(
   channelId: string,
   senderOpenId: string,
   frontendClient: FrontendWsClient,
+  senderType?: string,
 ): Promise<PersonalBindingResult> {
   const data = await frontendClient.request("channel.resolvePersonalBinding", {
     channel_id: channelId,
     sender_open_id: senderOpenId,
+    // Same contract as the group lookup: verbatim, and absent stays absent.
+    ...(senderType ? { sender_type: senderType } : {}),
   });
   return {
     binding: data?.binding ?? null,
