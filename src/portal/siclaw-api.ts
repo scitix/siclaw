@@ -2162,7 +2162,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       db.query(
         // Fetch newest N messages (DESC + LIMIT), then reverse in app to get chronological order.
         // This ensures page=1 returns the most recent messages (for initial load at bottom of chat).
-        "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY (seq IS NULL) DESC, seq DESC, created_at DESC, id DESC LIMIT ? OFFSET ?",
         [params.sid, pageSize, offset],
       ),
     ]) as [any, any];

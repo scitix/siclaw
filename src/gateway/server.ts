@@ -402,7 +402,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     let promptMessageId: string | undefined;
     try {
       await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
-      promptMessageId = await appendMessage({ sessionId, role: "user", content: text });
+      promptMessageId = await appendMessage({ sessionId, role: "user", content: text, deferSequence: true });
       await incrementMessageCount(sessionId);
       pendingUserRows.push(sessionId, promptMessageId);
     } catch (persistErr) {
@@ -1278,7 +1278,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // = "steer" lets the frontend render it as a steer bubble, not a plain user
     // message. No ensureChatSession: a steer always targets an already-running
     // session, so the row exists and we must not clobber its title/preview.
-    const steerMessageId = await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
+    const steerMessageId = await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" }, deferSequence: true });
     await incrementMessageCount(sessionId);
     // Written now, ordered when the box actually consumes it (see pending-user-rows.ts).
     pendingUserRows.push(sessionId, steerMessageId);

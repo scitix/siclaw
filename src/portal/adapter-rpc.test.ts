@@ -1092,18 +1092,38 @@ describe("chat.recentDelegationSessions", () => {
 
 describe("chat.appendMessage", () => {
   it("inserts message and bumps session count", async () => {
-    const query = mockQuery([], []);
+    const query = mockQuery([{ next_seq: 1 }], [], []);
 
     const result = await getHandler("chat.appendMessage")(
       { session_id: "sess1", role: "user", content: "Hello", metadata: { key: "val" } }, "a1",
     );
     expect(result.id).toBeDefined();
     expect(typeof result.id).toBe("string");
-    expect(query).toHaveBeenCalledTimes(2);
+    expect(query).toHaveBeenCalledTimes(3); // order key, insert, session bump
+  });
+
+  it("gives the row its place in the conversation", async () => {
+    // created_at cannot carry order here: it is second-granular and the tiebreaker is a
+    // UUID, so two messages written in the same second came back in random order.
+    const query = mockQuery([{ next_seq: 7 }], [], []);
+    await getHandler("chat.appendMessage")({ session_id: "sess1", role: "assistant", content: "hi" }, "a1");
+    expect(String(query.mock.calls[1][0])).toContain("seq");
+    expect(query.mock.calls[1][1] as unknown[]).toEqual(expect.arrayContaining([7]));
+  });
+
+  it("leaves a row unordered when the caller will order it later", async () => {
+    // A steer is written on arrival so it cannot be lost, but the box consumes it at a
+    // turn boundary that may be seconds later — arrival order is not processing order.
+    const query = mockQuery([], []);
+    await getHandler("chat.appendMessage")(
+      { session_id: "sess1", role: "user", content: "wait", defer_sequence: true }, "a1",
+    );
+    expect(query).toHaveBeenCalledTimes(2); // no order-key lookup
+    expect(query.mock.calls[0][1] as unknown[]).toEqual(expect.arrayContaining([null]));
   });
 
   it("inserts delegated message lineage", async () => {
-    const query = mockQuery([], []);
+    const query = mockQuery([{ next_seq: 1 }], [], []);
 
     await getHandler("chat.appendMessage")(
       {
@@ -1117,7 +1137,7 @@ describe("chat.appendMessage", () => {
       },
       "target-agent",
     );
-    expect(query.mock.calls[0][1]).toEqual(expect.arrayContaining([
+    expect(query.mock.calls[1][1]).toEqual(expect.arrayContaining([
       "target-agent",
       "parent",
       "delegation-1",
@@ -1125,7 +1145,7 @@ describe("chat.appendMessage", () => {
   });
 
   it("writes trace_id into the INSERT so a whole interaction shares one trace filter", async () => {
-    const query = mockQuery([], []);
+    const query = mockQuery([{ next_seq: 1 }], [], []);
 
     await getHandler("chat.appendMessage")(
       {
@@ -1136,9 +1156,9 @@ describe("chat.appendMessage", () => {
       },
       "a1",
     );
-    const sql = query.mock.calls[0][0] as string;
+    const sql = query.mock.calls[1][0] as string;
     expect(sql).toContain("trace_id");
-    expect(query.mock.calls[0][1]).toEqual(
+    expect(query.mock.calls[1][1]).toEqual(
       expect.arrayContaining(["0123456789abcdef0123456789abcdef"]),
     );
   });
@@ -1291,6 +1311,27 @@ describe("chat.updateMessage", () => {
       "sess1",
     ]);
     expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET last_active_at");
+  });
+});
+
+describe("chat.updateMessage — ordering request", () => {
+  it("gives an unordered row its place without touching anything else", async () => {
+    // The caller sends identity and nothing else; the generic update path would blank the
+    // row's content, which is why this is a separate branch.
+    const query = mockQuery([{ next_seq: 4 }], []);
+    await getHandler("chat.updateMessage")({ id: "m1", session_id: "s1", sequence: true }, "a1");
+    expect(query).toHaveBeenCalledTimes(2); // order key, then the one UPDATE
+    const sql = String(query.mock.calls[1][0]);
+    expect(sql).toContain("seq = ?");
+    expect(sql).toContain("seq IS NULL");   // a replayed echo cannot move a placed row
+    expect(sql).not.toContain("content");
+    expect(query.mock.calls[1][1] as unknown[]).toEqual([4, "m1", "s1"]);
+  });
+
+  it("still updates content when no ordering was requested", async () => {
+    const query = mockQuery([], []);
+    await getHandler("chat.updateMessage")({ id: "m1", session_id: "s1", content: "edited" }, "a1");
+    expect(String(query.mock.calls[0][0])).toContain("content = ?");
   });
 });
 

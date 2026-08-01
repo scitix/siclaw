@@ -37,6 +37,13 @@ export interface AppendMessageInput {
   targetAgentId?: string | null;
   /** per-prompt root trace id (OTel 32-hex) for message-level trace filtering. */
   traceId?: string | null;
+  /**
+   * Leave this row unordered for now; it will be ordered when it enters processing.
+   *
+   * Only for user input the runtime injects into a turn: it is written on arrival so it
+   * cannot be lost, but the box consumes it at a turn boundary that may be seconds later.
+   */
+  deferSequence?: boolean;
 }
 
 export interface UpdateMessageInput {
@@ -168,6 +175,7 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
     delegation_id: msg.delegationId ?? null,
     target_agent_id: msg.targetAgentId ?? null,
     trace_id: msg.traceId ?? null,
+    defer_sequence: msg.deferSequence === true ? true : undefined,
   });
   return result.id;
 }

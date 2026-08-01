@@ -16,6 +16,7 @@
 
 import { getDb } from "../gateway/db.js";
 import { ensureIndex, safeAlterTable, dropIndexIfExists, ensureUniqueIndex, widenColumn } from "./migrate-compat.js";
+import type { Db } from "../gateway/db.js";
 
 const PORTAL_SCHEMA_SQLS: string[] = [
   // Users (simple auth, no org/RBAC)
@@ -347,6 +348,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     delegation_id VARCHAR(64) DEFAULT NULL,
     target_agent_id CHAR(36) DEFAULT NULL,
     trace_id CHAR(32) DEFAULT NULL,
+    seq BIGINT DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
   )`,
@@ -663,6 +665,13 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_messages", "delegation_id", "VARCHAR(64) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "target_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "trace_id", "CHAR(32) DEFAULT NULL");
+  // Conversation order. `created_at` cannot carry it: the column is second-granular (a
+  // fractional type would break the SQLite half of this DDL), and the tiebreaker `id` is a
+  // UUID — so two messages written in the same second came back in an order decided by
+  // random hex. A backfill is needed exactly once, on the upgrade that adds the column.
+  if (await safeAlterTable(db, "chat_messages", "seq", "BIGINT DEFAULT NULL")) {
+    await backfillChatMessageSeq(db);
+  }
 
   // Widen delegation_id CHAR(36)→VARCHAR(64) on EXISTING deployments. A group reduce child's id
   // `${toolCallId}#reduce` reaches 36 chars for a 29-char provider id and would overflow CHAR(36)
@@ -694,3 +703,20 @@ export { PORTAL_SCHEMA_SQLS };
 // Re-export ensureUniqueIndex so tests / callers can create uniques; only
 // currently used by tests.
 export { ensureUniqueIndex };
+
+/**
+ * Give existing messages an order, once, when the `seq` column is first added.
+ *
+ * Uses the ordering the reader used until now (`created_at`, then `id`), so an upgrade
+ * does not reshuffle history — it freezes whatever order was already being shown. Rows
+ * written after this run get their order at write time instead.
+ */
+async function backfillChatMessageSeq(db: Db): Promise<void> {
+  const numbered = `SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at, id) AS rn FROM chat_messages`;
+  if (db.driver === "mysql") {
+    await db.query(`UPDATE chat_messages m JOIN (${numbered}) t ON t.id = m.id SET m.seq = t.rn`);
+  } else {
+    await db.query(`UPDATE chat_messages SET seq = (SELECT rn FROM (${numbered}) t WHERE t.id = chat_messages.id)`);
+  }
+  console.log("[portal-migrate] backfilled chat_messages.seq");
+}

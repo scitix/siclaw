@@ -1892,7 +1892,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const [rows] = await db.query(
       `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms,
               from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
-       FROM chat_messages WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
+       FROM chat_messages WHERE ${where} ORDER BY (seq IS NULL) DESC, seq DESC, created_at DESC, id DESC LIMIT ?`,
       params,
     ) as any;
     for (const row of rows as any[]) {
@@ -2763,19 +2763,41 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return { ok: true };
   });
 
+  /**
+   * The next order key for a session.
+   *
+   * Read-then-write rather than a single statement, because MySQL refuses to select from
+   * the table it is updating. Two rows racing for the same key is harmless: the reader
+   * falls back to `created_at`/`id` for ties, which is exactly what it used before.
+   */
+  const nextMessageSeq = async (sessionId: string): Promise<number> => {
+    const db = getDb();
+    const [rows] = await db.query<Array<{ next_seq: number }>>(
+      `SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM chat_messages WHERE session_id = ?`,
+      [sessionId],
+    );
+    return Number(rows[0]?.next_seq ?? 1);
+  };
+
   handlers.set("chat.appendMessage", async (params) => {
     const id = crypto.randomUUID();
     const db = getDb();
+    // Ordered at write time by default. The exception is a user message the runtime will
+    // order later: it is written on arrival so it cannot be lost, but the box may not
+    // consume it until a turn boundary seconds later, and arrival order is not processing
+    // order. Such a row stays unordered until told otherwise, and reads last — which is
+    // where a message that was never processed belongs.
+    const seq = params.defer_sequence === true ? null : await nextMessageSeq(String(params.session_id));
     await db.query(
-      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id, trace_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id, trace_id, seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, params.session_id, params.role, params.content,
        params.tool_name || null, params.tool_input || null,
        jsonParam(params.metadata),
        params.outcome || null, params.duration_ms ?? null,
        params.from_agent_id ?? null, params.parent_session_id ?? null,
        params.delegation_id ?? null, params.target_agent_id ?? null,
-       params.trace_id ?? null],
+       params.trace_id ?? null, seq],
     );
     await db.query(
       `UPDATE chat_sessions SET message_count = message_count + 1, last_active_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -2827,6 +2849,16 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("chat.updateMessage", async (params) => {
     const db = getDb();
+    // "This row entered processing." Idempotent by design: a replayed echo must not move
+    // a row that already has its place. Nothing else on the row is touched — the caller
+    // sends no content, and the generic update below would blank it.
+    if (params.sequence === true) {
+      await db.query(
+        `UPDATE chat_messages SET seq = ? WHERE id = ? AND session_id = ? AND seq IS NULL`,
+        [await nextMessageSeq(String(params.session_id)), params.id, params.session_id],
+      );
+      return { ok: true };
+    }
     await db.query(
       `UPDATE chat_messages
        SET content = ?, tool_name = ?, tool_input = ?, metadata = ?, outcome = ?, duration_ms = ?,
@@ -2887,7 +2919,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const [rows] = await db.query(
       `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms,
               from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
-       FROM chat_messages WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
+       FROM chat_messages WHERE ${where} ORDER BY (seq IS NULL) DESC, seq DESC, created_at DESC, id DESC LIMIT ?`,
       sqlParams,
     ) as any;
     for (const row of rows as any[]) {

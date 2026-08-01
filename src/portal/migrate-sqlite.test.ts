@@ -180,6 +180,33 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(cols).toContain("updated_at");
   });
 
+  it("chat_messages.seq exists, and an upgrade backfills the order already on screen", async () => {
+    // The upgrade path is the interesting one: an existing install has rows whose order
+    // was decided by created_at (second-granular) with a UUID tiebreak. Backfilling from
+    // that same ordering freezes what readers were already seeing rather than reshuffling
+    // history.
+    const db = getDb();
+    await runPortalMigrations();
+    await db.query("INSERT INTO siclaw_users (id, username, password_hash, role) VALUES ('u1','u','x','user')");
+    await db.query("INSERT INTO agents (id, name) VALUES ('a1','agent')");
+    await db.query("INSERT INTO chat_sessions (id, agent_id, user_id, title) VALUES ('s1','a1','u1','t')");
+    for (const [id, role] of [["m1", "user"], ["m2", "assistant"], ["m3", "user"]] as const) {
+      await db.query("INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, 'x')", [id, "s1", role]);
+    }
+    // Simulate the pre-upgrade state: the column exists but nothing has an order yet.
+    await db.query("UPDATE chat_messages SET seq = NULL");
+    await db.query("ALTER TABLE chat_messages DROP COLUMN seq");
+    await runPortalMigrations();
+
+    const [cols] = await db.query<Array<{ name: string }>>("PRAGMA table_info(chat_messages)");
+    expect(cols.map((c) => c.name)).toContain("seq");
+    const [rows] = await db.query<Array<{ id: string; seq: number }>>(
+      "SELECT id, seq FROM chat_messages WHERE session_id = 's1' ORDER BY seq",
+    );
+    expect(rows.map((r) => r.id)).toEqual(["m1", "m2", "m3"]);
+    expect(rows.every((r) => r.seq > 0)).toBe(true);
+  });
+
   it("agents.model_routing column exists after migration", async () => {
     await runPortalMigrations();
     const db = getDb();
