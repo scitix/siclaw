@@ -41,6 +41,10 @@ export interface PortalSnapshot {
     models: Array<{
       id: string;
       name: string;
+      /** Per-model wire protocol. Always emitted by the producer — omitting it
+       *  here is how a field-by-field consumer silently drops it and sends
+       *  every model on a mixed gateway over the provider's protocol. */
+      api: string;
       reasoning: boolean;
       input: string[];
       cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
@@ -216,7 +220,14 @@ function readSecrets(filePath: string): LocalSecrets | null {
  * soon as cumulative bytes exceed `maxBytes` (and cancels the stream so we
  * don't keep buffering). Returns the concatenated body on clean completion.
  */
-async function readBodyWithCap(res: Response, maxBytes: number): Promise<string | null> {
+/**
+ * Read a response body as text, giving up (returning null) past `maxBytes`.
+ *
+ * Exported because the Portal provider-listing proxy needs the same bound:
+ * `res.text()` buffers the whole body before returning, so truncating after the
+ * fact bounds nothing.
+ */
+export async function readBodyWithCap(res: Response, maxBytes: number): Promise<string | null> {
   if (!res.body) return await res.text();
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");

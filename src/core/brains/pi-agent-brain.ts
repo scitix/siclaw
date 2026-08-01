@@ -23,6 +23,19 @@ import { rememberPromptFiles } from "../openai-file-payload.js";
 /** Valid pi thinking levels; guards reasoningEffort coming off the wire. */
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
+/**
+ * Read `maxTokensField` off pi's compat union.
+ *
+ * The key exists only on the chat-completions variant — the responses and
+ * anthropic wire shapes have no equivalent — so this is a genuine narrowing,
+ * not a cast to dodge the type checker.
+ */
+function readMaxTokensField(compat: unknown): string | undefined {
+  if (!compat || typeof compat !== "object" || !("maxTokensField" in compat)) return undefined;
+  const value = (compat as { maxTokensField?: unknown }).maxTokensField;
+  return typeof value === "string" ? value : undefined;
+}
+
 export class PiAgentBrain implements BrainSession {
   readonly brainType = "pi-agent" as const;
 
@@ -241,6 +254,8 @@ export class PiAgentBrain implements BrainSession {
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
       reasoning: model.reasoning,
+      api: model.api,
+      maxTokensField: readMaxTokensField(model.compat),
     };
   }
 
@@ -275,6 +290,8 @@ export class PiAgentBrain implements BrainSession {
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
       reasoning: model.reasoning,
+      api: model.api,
+      maxTokensField: readMaxTokensField(model.compat),
     };
   }
 

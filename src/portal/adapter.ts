@@ -18,7 +18,7 @@ import {
   parseBody,
   type RestRouter,
 } from "../gateway/rest-router.js";
-import { buildProviderModelDescriptor } from "../core/model-compat.js";
+import { buildProviderModelDescriptor, normalizeProviderApi } from "../core/model-compat.js";
 import type { TracingConfig } from "../core/config.js";
 import { assembleExporterHeaders, type ExporterAuth } from "./tracing-exporters.js";
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
@@ -1116,7 +1116,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
 
     const p = providerRows[0];
     const [modelRows] = await db.query(
-      `SELECT model_id, name, reasoning, vision, context_window, max_tokens
+      `SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field
        FROM model_entries WHERE provider_id = ? ORDER BY sort_order, created_at`,
       [p.id],
     ) as any;
@@ -1125,14 +1125,15 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       provider: agent.model_provider,
       modelId: agent.model_id,
     });
+    const settingsApi = normalizeProviderApi(p.api_type);
     sendJson(res, 200, {
       providers: {
         [p.name]: {
           baseUrl: p.base_url,
           apiKey: p.api_key || "",
-          api: p.api_type,
+          api: settingsApi,
           models: (modelRows as any[]).map((m: any) =>
-            buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+            buildProviderModelDescriptor(m, { api: settingsApi, baseUrl: p.base_url }),
           ),
         },
       },
@@ -1724,12 +1725,13 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       return;
     }
     const p = providerRows[0];
+    const bindingApi = normalizeProviderApi(p.api_type);
     const [entryRows] = await db.query(
-      "SELECT model_id, name, reasoning, vision, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
+      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field FROM model_entries WHERE provider_id = ?",
       [p.id],
     ) as any;
     const models = (entryRows as any[]).map((m: any) =>
-      buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+      buildProviderModelDescriptor(m, { api: bindingApi, baseUrl: p.base_url }),
     );
     const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
       provider: agent.model_provider,
@@ -1743,7 +1745,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
           name: p.name,
           baseUrl: p.base_url,
           apiKey: p.api_key ?? "",
-          api: p.api_type,
+          api: bindingApi,
           authHeader: true,
           models,
         },
@@ -2242,7 +2244,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
     const p = providerRows[0];
     const [modelRows] = await db.query(
-      `SELECT model_id, name, reasoning, vision, context_window, max_tokens
+      `SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field
        FROM model_entries WHERE provider_id = ? ORDER BY sort_order, created_at`,
       [p.id],
     ) as any;
@@ -2256,14 +2258,15 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     // buildTracingConfig(). Only the provider-bound path carries it: an agent
     // with no provider never runs, so it needs no trace.
     const tracing = await buildTracingConfig();
+    const settingsApi = normalizeProviderApi(p.api_type);
     return {
       providers: {
         [p.name]: {
           baseUrl: p.base_url,
           apiKey: p.api_key || "",
-          api: p.api_type,
+          api: settingsApi,
           models: (modelRows as any[]).map((m: any) =>
-            buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+            buildProviderModelDescriptor(m, { api: settingsApi, baseUrl: p.base_url }),
           ),
         },
       },
@@ -2301,12 +2304,13 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       return { binding: null };
     }
     const p = providerRows[0];
+    const bindingApi = normalizeProviderApi(p.api_type);
     const [entryRows] = await db.query(
-      "SELECT model_id, name, reasoning, vision, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
+      "SELECT model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field FROM model_entries WHERE provider_id = ?",
       [p.id],
     ) as any;
     const models = (entryRows as any[]).map((m: any) =>
-      buildProviderModelDescriptor(m, { api: p.api_type, baseUrl: p.base_url }),
+      buildProviderModelDescriptor(m, { api: bindingApi, baseUrl: p.base_url }),
     );
     const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
       provider: agent.model_provider,
@@ -2320,7 +2324,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
           name: p.name,
           baseUrl: p.base_url,
           apiKey: p.api_key ?? "",
-          api: p.api_type,
+          api: bindingApi,
           authHeader: true,
           models,
         },

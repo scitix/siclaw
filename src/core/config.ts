@@ -26,6 +26,16 @@ export interface ProviderModelCompat {
 export interface ProviderModelConfig {
   id: string;
   name: string;
+  /**
+   * Per-model wire protocol. ALWAYS set by `buildProviderModelDescriptor`, even
+   * when it equals the provider's: pi would fall back to `providerConfig.api`
+   * if the key were absent, and stating it is what stops the two layers from
+   * disagreeing. Never emit an empty string — pi drops such a model from its
+   * registry outright ("model not found", not a protocol error).
+   *
+   * Optional only because the TUI's hand-written settings.json may omit it.
+   */
+  api?: string;
   reasoning?: boolean;
   input?: string[];
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
@@ -512,7 +522,9 @@ export function getDefaultLlm(): { baseUrl: string; apiKey: string; authHeader: 
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
     authHeader: provider.authHeader ?? true,
-    api: provider.api ?? "openai-completions",
+    // Model-level api wins, same inherit rule as resolveModelApi (model-compat):
+    // `||`, not `??`, so an empty string inherits instead of reading as a value.
+    api: (model.api ?? "").trim() || provider.api || "openai-completions",
     model,
   };
 }

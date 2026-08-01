@@ -42,6 +42,55 @@ export interface BrainModelInfo {
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
+  /**
+   * Wire protocol the model speaks ("openai-completions", "anthropic-messages",
+   * …). Carried so callers can tell that a re-bind is needed when ONLY the
+   * protocol changed — a per-model `api_type` override toggled in Portal leaves
+   * id, provider and every size field untouched, and without this the session
+   * silently keeps talking the old protocol.
+   */
+  api?: string;
+  /**
+   * Which request field carries the output-token cap (`compat.maxTokensField`).
+   *
+   * The same failure as `api`, one layer down: correcting only this leaves
+   * id/provider/size fields identical, so a rebind check that omits it skips
+   * `setModel` and the session keeps issuing turns on the field it was bound
+   * with. Read off pi's compat union via `readMaxTokensField` — the key exists
+   * only on the chat-completions variant.
+   */
+  maxTokensField?: string;
+}
+
+/**
+ * Whether a session bound to `current` has to be re-bound to `next`.
+ *
+ * Compares every field that changes how a turn is ISSUED. `api` and
+ * `maxTokensField` matter as much as the rest: either one can change alone
+ * while id, provider and all size fields stay identical, and omitting it here
+ * leaves the session talking the old protocol — or naming the old max-tokens
+ * field — even after the registry has been re-registered. Both are rejected
+ * outright by the provider ("unsupported_protocol" / "please use
+ * MaxCompletionTokens"), not silently.
+ *
+ * Single definition on purpose: this rule previously existed twice (the model
+ * routing runner and the agentbox prompt path) and both copies were missing the
+ * same field. Anything added to `BrainModelInfo` that affects request shape
+ * must be propagated in BOTH `getModel()` and `findModel()` (they narrow pi's
+ * Model and silently drop what they don't list) and compared here.
+ */
+export function modelNeedsRebind(
+  current: BrainModelInfo | undefined,
+  next: BrainModelInfo,
+): boolean {
+  return !current
+    || current.id !== next.id
+    || current.provider !== next.provider
+    || current.api !== next.api
+    || current.reasoning !== next.reasoning
+    || current.contextWindow !== next.contextWindow
+    || current.maxTokens !== next.maxTokens
+    || current.maxTokensField !== next.maxTokensField;
 }
 
 /**

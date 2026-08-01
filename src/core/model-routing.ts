@@ -1,3 +1,4 @@
+import { modelNeedsRebind } from "./brain-session.js";
 import type { BrainModelInfo, BrainProviderResponse, BrainSession, PromptMedia } from "./brain-session.js";
 
 export type ModelRouteFailureKind =
@@ -936,7 +937,7 @@ async function runAttempt(
         },
       };
     }
-    if (modelNeedsUpdate(brain.getModel(), model)) {
+    if (modelNeedsRebind(brain.getModel(), model)) {
       await brain.setModel(model);
     }
   } catch (err) {
@@ -1138,15 +1139,6 @@ function assistantHasContent(message: AssistantMessageLike): boolean {
     if (block.type === "text") return typeof block.text === "string" && block.text.trim().length > 0;
     return block.type === "toolCall";
   });
-}
-
-function modelNeedsUpdate(current: BrainModelInfo | undefined, next: BrainModelInfo): boolean {
-  return !current
-    || current.id !== next.id
-    || current.provider !== next.provider
-    || current.reasoning !== next.reasoning
-    || current.contextWindow !== next.contextWindow
-    || current.maxTokens !== next.maxTokens;
 }
 
 function recordAttempt(state: ModelRouteState, attempt: ModelRouteAttempt): void {

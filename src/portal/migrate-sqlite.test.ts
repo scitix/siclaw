@@ -209,6 +209,167 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(rows.every((r) => r.seq > 0)).toBe(true);
   });
 
+  it("model_entries.api_type is required on a fresh install", () => {
+    // Protocol is a per-model attribute — one endpoint serves several — so
+    // there is no meaningful provider-wide answer to inherit.
+    const db = getDb();
+    return runPortalMigrations().then(async () => {
+      const [rows] = await db.query<Array<{ name: string; notnull: number; dflt_value: string | null }>>(
+        "PRAGMA table_info(model_entries)",
+      );
+      const col = rows.find((r) => r.name === "api_type");
+      expect(col).toBeDefined();
+      expect(col!.notnull).toBe(1);
+      expect(col!.dflt_value).toBe("'openai-completions'");
+    });
+  });
+
+  // Reproduces exactly what happened on siclaw-inner: a table created by an
+  // EARLIER build of this branch already has the column, nullable. CREATE TABLE
+  // IF NOT EXISTS skips, safeAlterTable skips (column present) — and widenColumn
+  // would skip too, since varchar(50) == varchar(50) regardless of nullability.
+  // Only a nullability-aware tightener closes this, and on SQLite the app layer
+  // has to carry it (no cheap MODIFY COLUMN), which is why the backfill matters
+  // more than the constraint.
+  it("backfills a nullable api_type left by an earlier build of this branch", async () => {
+    const db = getDb();
+    await db.query(`CREATE TABLE model_providers (
+      id CHAR(36) PRIMARY KEY, org_id CHAR(36), name VARCHAR(100) NOT NULL,
+      base_url VARCHAR(500) NOT NULL, api_key VARCHAR(500),
+      api_type VARCHAR(50) NOT NULL DEFAULT 'openai-completions',
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
+    // The interim shape: api_type present but nullable, with NULL rows.
+    await db.query(`CREATE TABLE model_entries (
+      id CHAR(36) PRIMARY KEY, provider_id CHAR(36) NOT NULL,
+      model_id VARCHAR(255) NOT NULL, name VARCHAR(255),
+      reasoning TINYINT(1) NOT NULL DEFAULT 0, vision TINYINT(1) NOT NULL DEFAULT 0,
+      context_window INT NOT NULL DEFAULT 128000, max_tokens INT NOT NULL DEFAULT 65536,
+      api_type VARCHAR(50) DEFAULT NULL,
+      is_default TINYINT(1) NOT NULL DEFAULT 0, sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (provider_id, model_id)
+    )`);
+    await db.query(
+      "INSERT INTO model_providers (id, name, base_url, api_type) VALUES ('p1', 'anth', 'https://api.anthropic.com/v1', 'anthropic-messages')",
+    );
+    await db.query("INSERT INTO model_entries (id, provider_id, model_id) VALUES ('m1', 'p1', 'claude-x')");
+    // An explicit empty string must be backfilled too, not just NULL.
+    await db.query("INSERT INTO model_entries (id, provider_id, model_id, api_type) VALUES ('m2', 'p1', 'claude-y', '')");
+
+    await runPortalMigrations();
+
+    const [rows] = await db.query<Array<{ id: string; api_type: string | null }>>(
+      "SELECT id, api_type FROM model_entries ORDER BY id",
+    );
+    expect(rows).toEqual([
+      { id: "m1", api_type: "anthropic-messages" },
+      { id: "m2", api_type: "anthropic-messages" },
+    ]);
+  });
+
+  it("backfills api_type from the provider on a legacy table that predates it", async () => {
+    // The rows being migrated behaved as "inherit the provider" before this
+    // column existed, so copying the provider's value preserves their exact
+    // behaviour while making it explicit.
+    const db = getDb();
+    await db.query(`CREATE TABLE model_providers (
+      id CHAR(36) PRIMARY KEY,
+      org_id CHAR(36),
+      name VARCHAR(100) NOT NULL,
+      base_url VARCHAR(500) NOT NULL,
+      api_key VARCHAR(500),
+      api_type VARCHAR(50) NOT NULL DEFAULT 'openai-completions',
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
+    // Legacy shape: no api_type, and no vision either.
+    await db.query(`CREATE TABLE model_entries (
+      id CHAR(36) PRIMARY KEY,
+      provider_id CHAR(36) NOT NULL,
+      model_id VARCHAR(255) NOT NULL,
+      name VARCHAR(255),
+      reasoning TINYINT(1) NOT NULL DEFAULT 0,
+      context_window INT NOT NULL DEFAULT 128000,
+      max_tokens INT NOT NULL DEFAULT 65536,
+      is_default TINYINT(1) NOT NULL DEFAULT 0,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (provider_id, model_id)
+    )`);
+    await db.query(
+      "INSERT INTO model_providers (id, name, base_url, api_type) VALUES ('p1', 'anth', 'https://api.anthropic.com/v1', 'anthropic-messages')",
+    );
+    await db.query(
+      "INSERT INTO model_providers (id, name, base_url, api_type) VALUES ('p2', 'gw', 'https://gw.example/v1', 'openai-completions')",
+    );
+    await db.query("INSERT INTO model_entries (id, provider_id, model_id) VALUES ('m1', 'p1', 'claude-x')");
+    await db.query("INSERT INTO model_entries (id, provider_id, model_id) VALUES ('m2', 'p2', 'gpt-x')");
+
+    await runPortalMigrations();
+
+    const [cols] = await db.query<Array<{ name: string }>>("PRAGMA table_info(model_entries)");
+    expect(cols.map((c) => c.name)).toEqual(expect.arrayContaining(["api_type", "vision"]));
+
+    const [rows] = await db.query<Array<{ id: string; api_type: string | null }>>(
+      "SELECT id, api_type FROM model_entries ORDER BY id",
+    );
+    expect(rows).toEqual([
+      { id: "m1", api_type: "anthropic-messages" },
+      { id: "m2", api_type: "openai-completions" },
+    ]);
+  });
+
+  it("model_entries.max_tokens_field is nullable on a fresh install", async () => {
+    // NULL means "infer from the model id" — a real state, not a hole waiting
+    // to be backfilled. Unlike the wire protocol, there IS a sane automatic
+    // answer, so the column must not be NOT NULL.
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string; notnull: number }>>(
+      "PRAGMA table_info(model_entries)",
+    );
+    const col = rows.find((r) => r.name === "max_tokens_field");
+    expect(col).toBeDefined();
+    expect(col!.notnull).toBe(0);
+  });
+
+  it("adds max_tokens_field to a legacy model_entries table that predates it", async () => {
+    // Without this ALTER, an existing MySQL deployment answers every settings
+    // fetch with `Unknown column 'max_tokens_field'` — a hard failure, not a
+    // degradation.
+    const db = getDb();
+    await db.query(`CREATE TABLE model_entries (
+      id CHAR(36) PRIMARY KEY,
+      provider_id CHAR(36) NOT NULL,
+      model_id VARCHAR(255) NOT NULL,
+      name VARCHAR(255),
+      reasoning TINYINT(1) NOT NULL DEFAULT 0,
+      context_window INT NOT NULL DEFAULT 128000,
+      max_tokens INT NOT NULL DEFAULT 65536,
+      is_default TINYINT(1) NOT NULL DEFAULT 0,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (provider_id, model_id)
+    )`);
+    await db.query("INSERT INTO model_entries (id, provider_id, model_id) VALUES ('m1', 'p1', 'gpt-5')");
+
+    await runPortalMigrations();
+
+    const [cols] = await db.query<Array<{ name: string }>>("PRAGMA table_info(model_entries)");
+    expect(cols.map((c) => c.name)).toContain("max_tokens_field");
+
+    // Existing rows stay on "infer" rather than being pinned to a guess — even
+    // for gpt-5, where the inference would have been right.
+    const [rows] = await db.query<Array<{ id: string; max_tokens_field: string | null }>>(
+      "SELECT id, max_tokens_field FROM model_entries",
+    );
+    expect(rows).toEqual([{ id: "m1", max_tokens_field: null }]);
+  });
+
   it("agents.model_routing column exists after migration", async () => {
     await runPortalMigrations();
     const db = getDb();

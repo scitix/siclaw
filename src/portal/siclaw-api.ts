@@ -34,6 +34,7 @@ import {
   jsonArrayFlattenSql,
   safeParseJson,
   toSqlTimestamp,
+  insertIgnorePrefix,
 } from "../gateway/dialect-helpers.js";
 import { evaluateScriptsStatic, buildAssessment } from "../gateway/skills/script-evaluator.js";
 import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
@@ -64,9 +65,88 @@ import {
   tracingTestSsrfGuard,
   type ExporterAuth,
 } from "./tracing-exporters.js";
+import { normalizeProviderApi, isValidMaxTokensField } from "../core/model-compat.js";
+import { readBodyWithCap } from "../lib/portal-snapshot-client.js";
+import {
+  buildModelListUrl,
+  parseAnthropicModelList,
+  parseOpenAiModelList,
+  isValidApiType,
+  providerFetchSsrfGuard,
+  type ListedModel,
+} from "./provider-model-listing.js";
+import { testModelWireConfig } from "./model-probe.js";
 
 /** Trace viewer message limit — matches siclaw.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
+
+/**
+ * Coerce a caller-supplied api_type: the trimmed value when it is a plausible
+ * api id, `null` when the caller omitted it (the write path substitutes the
+ * provider's default — the column is NOT NULL), `invalid` otherwise.
+ *
+ * Passthrough rather than an enum, so a newly-registered pi api id works
+ * without a siclaw release — but an unconstrained string reaches pi's registry
+ * verbatim and only fails at turn time with "No API provider registered for
+ * api: …", the very error this change exists to remove. Over-long values are
+ * rejected here too; the column is VARCHAR(50) and an overflow inside the batch
+ * transaction discards the whole import.
+ */
+function normalizeApiTypeInput(value: unknown): { ok: true; value: string | null } | { ok: false; raw: string } {
+  if (typeof value !== "string") return { ok: true, value: null };
+  const trimmed = value.trim();
+  // null here means "caller said nothing" — the write paths substitute the
+  // provider's default. It never reaches the column, which is NOT NULL.
+  if (!trimmed) return { ok: true, value: null };
+  if (!isValidApiType(trimmed)) return { ok: false, raw: trimmed };
+  return { ok: true, value: trimmed };
+}
+
+const INVALID_API_TYPE_MESSAGE = "Invalid api_type — expected a lowercase api id such as openai-completions or anthropic-messages";
+
+/** Ceiling on a provider's /models response. Aggregators list hundreds of
+ *  models; anything past this is a misbehaving endpoint, not a real catalog. */
+const MAX_MODEL_LIST_BYTES = 1024 * 1024;
+
+/** Ceiling on one batch import. Comfortably above any real catalog. */
+const MAX_BATCH_IMPORT_MODELS = 500;
+
+/** Widest value the INT columns hold. */
+const MAX_TOKEN_COUNT = 2_147_483_647;
+
+/**
+ * Coerce a caller-supplied token count into something an INT column accepts.
+ * `Number("1e400")` is Infinity, which passes a bare `> 0` test and survives
+ * Math.floor — MySQL then rejects the bind and rolls back the whole batch,
+ * while SQLite quietly stores Infinity and renders it in the UI.
+ */
+function clampTokenCount(value: unknown, fallback: number): number {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(n, MAX_TOKEN_COUNT);
+}
+
+/**
+ * Normalise a client-supplied `max_tokens_field` for `model_entries`.
+ *
+ * `""` — the UI's "Auto" option — folds to SQL NULL so the row returns to
+ * inference. Anything outside pi's two-member union is REJECTED rather than
+ * passed through: an unknown value doesn't degrade, it fails pi's provider
+ * schema and drops the model from the registry ("model not found").
+ */
+function normalizeMaxTokensFieldInput(
+  value: unknown,
+): { ok: true; value: string | null } | { ok: false } {
+  if (value === null || value === undefined) return { ok: true, value: null };
+  if (typeof value !== "string") return { ok: false };
+  const trimmed = value.trim();
+  if (trimmed === "") return { ok: true, value: null };
+  if (!isValidMaxTokensField(trimmed)) return { ok: false };
+  return { ok: true, value: trimmed };
+}
+
+const INVALID_MAX_TOKENS_FIELD_MESSAGE =
+  'max_tokens_field must be "max_tokens", "max_completion_tokens", or empty for auto';
 
 // ── MCP config import / export ────────────────────────────────
 
@@ -2983,7 +3063,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         id, auth.orgId, trim(body.name), trim(body.base_url),
-        trim(body.api_key) || null, trim(body.api_type) || "openai",
+        trim(body.api_key) || null, trim(body.api_type) || "openai-completions",
         body.sort_order ?? 0,
       ],
     );
@@ -3062,25 +3142,37 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     // Verify provider exists and belongs to org
     const [provider] = await db.query(
-      "SELECT id FROM model_providers WHERE id = ? AND (org_id = ? OR org_id IS NULL)",
+      "SELECT id, api_type FROM model_providers WHERE id = ? AND (org_id = ? OR org_id IS NULL)",
       [params.id, auth.orgId],
     ) as any;
     if (provider.length === 0) {
       sendJson(res, 404, { error: "Provider not found" });
       return;
     }
+    const providerApiType = normalizeProviderApi(provider[0].api_type);
+
+    const apiType = normalizeApiTypeInput(body.api_type);
+    if (!apiType.ok) { sendJson(res, 400, { error: INVALID_API_TYPE_MESSAGE }); return; }
 
     const id = crypto.randomUUID();
 
     const trim = (v: unknown): string | null => (typeof v === "string" ? v.trim() : null);
     const modelId = trim(body.model_id);
+    const maxTokensField = normalizeMaxTokensFieldInput(body.max_tokens_field);
+    if (!maxTokensField.ok) { sendJson(res, 400, { error: INVALID_MAX_TOKENS_FIELD_MESSAGE }); return; }
     await db.query(
-      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, vision, context_window, max_tokens, is_default, sort_order)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, vision, context_window, max_tokens, api_type, max_tokens_field, is_default, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, params.id, modelId, trim(body.name) || modelId,
-        body.reasoning ? 1 : 0, body.vision ? 1 : 0, body.context_window ?? null,
-        body.max_tokens ?? null, body.is_default ? 1 : 0,
+        body.reasoning ? 1 : 0, body.vision ? 1 : 0,
+        clampTokenCount(body.context_window, 128000),
+        clampTokenCount(body.max_tokens, 65536),
+        // Required column: fall back to the provider's default when unspecified.
+        apiType.value ?? providerApiType,
+        // Nullable: NULL is the live "infer it" state, not a missing answer.
+        maxTokensField.value,
+        body.is_default ? 1 : 0,
         body.sort_order ?? 0,
       ],
     );
@@ -3110,8 +3202,42 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const fields = ["model_id", "name", "reasoning", "vision", "context_window", "max_tokens", "is_default", "sort_order"];
     const sets: string[] = [];
     const values: unknown[] = [];
+    // NOT NULL columns whose form inputs can arrive as null: the frontend sends
+    // parseInt("") = NaN for a cleared box, which serialises to null, and the
+    // generic loop below would push it straight into `context_window INT NOT
+    // NULL`. Fall back to the column default instead of 500-ing.
+    const NUMERIC_DEFAULTS: Record<string, number> = { context_window: 128000, max_tokens: 65536 };
     for (const f of fields) {
-      if (f in body) { sets.push(`${f} = ?`); values.push(body[f]); }
+      if (!(f in body)) continue;
+      sets.push(`${f} = ?`);
+      if (f in NUMERIC_DEFAULTS) {
+        values.push(clampTokenCount(body[f], NUMERIC_DEFAULTS[f]));
+      } else {
+        values.push(body[f]);
+      }
+    }
+    // api_type cannot ride the generic loop above: that pushes body[f] verbatim,
+    // so the form's "" (meaning "inherit") would be stored as an empty string
+    // instead of NULL. Must stay ahead of the Nothing-to-update guard, or a PUT
+    // carrying only api_type is rejected — leaving the field unclearable.
+    if ("api_type" in body) {
+      const apiType = normalizeApiTypeInput(body.api_type);
+      if (!apiType.ok) { sendJson(res, 400, { error: INVALID_API_TYPE_MESSAGE }); return; }
+      // Protocol is required, so an empty value is a caller mistake rather than
+      // "unset it" — there is nothing to fall back to on an update.
+      if (apiType.value === null) { sendJson(res, 400, { error: "api_type cannot be empty" }); return; }
+      sets.push("api_type = ?");
+      values.push(apiType.value);
+    }
+    // Deliberately NOT in `fields`: that loop binds body[f] verbatim, which
+    // would store the form's "" for Auto instead of folding it to NULL. Must
+    // also come BEFORE the guard below, or a PUT carrying only this field is
+    // rejected as "Nothing to update".
+    if ("max_tokens_field" in body) {
+      const normalized = normalizeMaxTokensFieldInput(body.max_tokens_field);
+      if (!normalized.ok) { sendJson(res, 400, { error: INVALID_MAX_TOKENS_FIELD_MESSAGE }); return; }
+      sets.push("max_tokens_field = ?");
+      values.push(normalized.value);
     }
     if (sets.length === 0) { sendJson(res, 400, { error: "Nothing to update" }); return; }
 
@@ -3120,6 +3246,192 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const [rows] = await db.query("SELECT * FROM model_entries WHERE id = ?", [params.mid]) as any;
     sendJson(res, 200, rows[0]);
+  });
+
+  // List the models a provider advertises, for the import dialog.
+  //
+  // Proxied server-side for three reasons: the api_key lives in the DB and must
+  // not reach the browser, third-party gateways don't grant Portal's origin
+  // CORS, and the SSRF guard belongs on one side. Mirrors probeExporter's shape
+  // — guard, bounded timeout, manual redirects, and error text that carries only
+  // an HTTP status or connection message, never auth material.
+  router.post(`${P}/admin/models/providers/:id/fetch-models`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+    if (await guardAccess(res, config, auth, "write")) return;
+
+    const db = getDb();
+    const [providerRows] = await db.query(
+      "SELECT id, base_url, api_key, api_type FROM model_providers WHERE id = ? AND (org_id = ? OR org_id IS NULL)",
+      [params.id, auth.orgId],
+    ) as any;
+    if (providerRows.length === 0) { sendJson(res, 404, { error: "Provider not found" }); return; }
+    const provider = providerRows[0];
+
+    const guard = providerFetchSsrfGuard(provider.base_url ?? "");
+    if (!guard.ok) { sendJson(res, 200, { ok: false, message: guard.error }); return; }
+
+    const api = normalizeProviderApi(provider.api_type);
+    const isAnthropic = api === "anthropic-messages";
+    const headers: Record<string, string> = isAnthropic
+      ? { "x-api-key": provider.api_key ?? "", "anthropic-version": "2023-06-01" }
+      : { Authorization: `Bearer ${provider.api_key ?? ""}` };
+
+    let listed: ListedModel[];
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      let resp: Response;
+      let text: string | null;
+      try {
+        resp = await fetch(buildModelListUrl(provider.base_url, api), {
+          method: "GET",
+          headers,
+          signal: controller.signal,
+          redirect: "manual",
+        });
+        // Read the body in chunks and abort past the cap. `resp.text()` would
+        // buffer the whole thing first, making any slice afterwards decorative —
+        // a misbehaving gateway could still balloon Portal's memory through this
+        // admin-triggered proxy.
+        text = await readBodyWithCap(resp, MAX_MODEL_LIST_BYTES);
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!resp.ok) {
+        sendJson(res, 200, { ok: false, message: `Provider returned HTTP ${resp.status}` });
+        return;
+      }
+      if (text === null) {
+        sendJson(res, 200, { ok: false, message: "Provider response exceeded the size limit" });
+        return;
+      }
+      let body: unknown;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        sendJson(res, 200, { ok: false, message: "Provider response was not valid JSON" });
+        return;
+      }
+      listed = isAnthropic ? parseAnthropicModelList(body) : parseOpenAiModelList(body);
+    } catch (err: any) {
+      // Node's fetch rejects every network failure as a bare "fetch failed";
+      // the actionable part (ENOTFOUND, ECONNREFUSED) is on .cause. Neither
+      // carries auth material — the api_key rides in a header, not the URL.
+      const detail = err?.cause?.message ?? err?.message ?? String(err);
+      const message = err?.name === "AbortError" ? "Request timed out" : detail;
+      sendJson(res, 200, { ok: false, message });
+      return;
+    }
+
+    const [existingRows] = await db.query(
+      "SELECT model_id FROM model_entries WHERE provider_id = ?",
+      [params.id],
+    ) as any;
+    const existing = new Set((existingRows as Array<{ model_id: string }>).map((r) => r.model_id));
+
+    sendJson(res, 200, {
+      ok: true,
+      // Every row carries a concrete protocol: it is a required model attribute,
+      // and the listing can't tell us (nothing in the OpenAI /models spec says
+      // it), so the provider's default is the honest starting point for the
+      // operator to correct.
+      models: listed.map((m) => ({
+        ...m,
+        suggested_api_type: m.suggested_api_type || api,
+        already_exists: existing.has(m.id),
+      })),
+    });
+  });
+
+  // Import a selected batch of models in one transaction. Preferred over N
+  // single-model POSTs from the browser: atomic and one round trip. Models that
+  // already exist are skipped rather than erroring — the dialog greys them out,
+  // but a concurrent add can still collide with UNIQUE (provider_id, model_id).
+  router.post(`${P}/admin/models/providers/:id/models/batch`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+    if (await guardAccess(res, config, auth, "write")) return;
+
+    const db = getDb();
+    const [providerRows] = await db.query(
+      "SELECT id, api_type FROM model_providers WHERE id = ? AND (org_id = ? OR org_id IS NULL)",
+      [params.id, auth.orgId],
+    ) as any;
+    if (providerRows.length === 0) { sendJson(res, 404, { error: "Provider not found" }); return; }
+    const providerApiType = normalizeProviderApi(providerRows[0].api_type);
+
+    const body = await parseBody<{ models?: unknown }>(req);
+    const incoming = Array.isArray(body.models) ? body.models : [];
+    if (incoming.length === 0) { sendJson(res, 400, { error: "No models supplied" }); return; }
+    // The insert loop runs inside a transaction, and on SQLite getConnection()
+    // holds a process-wide mutex — an unbounded batch would stall every other
+    // Portal write for its duration.
+    if (incoming.length > MAX_BATCH_IMPORT_MODELS) {
+      sendJson(res, 400, { error: `Too many models (max ${MAX_BATCH_IMPORT_MODELS} per import)` });
+      return;
+    }
+
+    // Validate and normalise the whole batch BEFORE opening the transaction: a
+    // bad row should be a 400 naming it, not a rollback of everything else.
+    const trim = (v: unknown): string | null => (typeof v === "string" ? v.trim() : null);
+    const rows: Array<{ modelId: string; name: string; reasoning: number; vision: number; contextWindow: number; maxTokens: number; apiType: string }> = [];
+    const batchSeen = new Set<string>();
+    let skipped = 0;
+    for (const raw of incoming) {
+      if (typeof raw !== "object" || raw === null) { skipped++; continue; }
+      const m = raw as Record<string, unknown>;
+      const modelId = trim(m.model_id);
+      // Duplicates *within the payload* are the caller's own doing — drop them
+      // rather than letting them collide row-on-row.
+      if (!modelId || batchSeen.has(modelId)) { skipped++; continue; }
+      const apiType = normalizeApiTypeInput(m.api_type);
+      if (!apiType.ok) {
+        sendJson(res, 400, { error: `${INVALID_API_TYPE_MESSAGE} (model "${modelId}")` });
+        return;
+      }
+      batchSeen.add(modelId);
+      rows.push({
+        modelId,
+        name: trim(m.name) || modelId,
+        reasoning: m.reasoning ? 1 : 0,
+        vision: m.vision ? 1 : 0,
+        contextWindow: clampTokenCount(m.context_window, 128000),
+        maxTokens: clampTokenCount(m.max_tokens, 65536),
+        apiType: apiType.value ?? providerApiType,
+      });
+    }
+
+    // INSERT IGNORE, not a pre-read `seen` set: the set would be built before
+    // the transaction opens, so a model added concurrently (second tab, another
+    // operator) still collides on UNIQUE (provider_id, model_id) and discards
+    // every good row in the batch. Let the DB decide, idempotently.
+    let imported = 0;
+    const conn = await db.getConnection();
+    try {
+      await conn.beginTransaction();
+      for (const r of rows) {
+        const [result] = await conn.query(
+          `${insertIgnorePrefix(db)} INTO model_entries (id, provider_id, model_id, name, reasoning, vision, context_window, max_tokens, api_type, is_default, sort_order)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            crypto.randomUUID(), params.id, r.modelId, r.name,
+            r.reasoning, r.vision, r.contextWindow, r.maxTokens, r.apiType,
+            0, 0,
+          ],
+        ) as any;
+        if ((result?.affectedRows ?? 1) > 0) imported++;
+        else skipped++;
+      }
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+
+    sendJson(res, 200, { imported, skipped });
   });
 
   // Delete model entry
@@ -3141,6 +3453,59 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     await db.query("DELETE FROM model_entries WHERE id = ?", [params.mid]);
     sendJson(res, 200, { ok: true });
+  });
+
+  // Test a model's wire configuration, self-correcting the max-tokens field.
+  router.post(`${P}/admin/models/providers/:pid/models/:mid/test`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "write")) return;
+    const db = getDb();
+
+    const [rows] = await db.query(
+      `SELECT me.model_id, me.api_type, me.max_tokens_field, mp.base_url, mp.api_key,
+              mp.api_type AS provider_api_type
+       FROM model_entries me JOIN model_providers mp ON me.provider_id = mp.id
+       WHERE me.id = ? AND me.provider_id = ? AND (mp.org_id = ? OR mp.org_id IS NULL)`,
+      [params.mid, params.pid, auth.orgId],
+    ) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "Model entry not found" }); return; }
+
+    const row = rows[0];
+    const result = await testModelWireConfig({
+      modelId: row.model_id,
+      baseUrl: row.base_url,
+      apiKey: row.api_key ?? null,
+      // The MODEL's protocol. Reading mp.api_type here would test the provider
+      // default and silently pass a model that overrode it.
+      apiType: row.api_type ?? null,
+      providerApiType: row.provider_api_type ?? null,
+      maxTokensField: row.max_tokens_field ?? null,
+    });
+
+    // Persist whatever the probe corrected, so the next real turn issues the
+    // working request directly instead of re-deriving the failing one.
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    if (result.correctedApiType) { sets.push("api_type = ?"); values.push(result.apiType); }
+    if (result.correctedMaxTokensField) { sets.push("max_tokens_field = ?"); values.push(result.maxTokensField); }
+    if (sets.length > 0) {
+      values.push(params.mid);
+      await db.query(`UPDATE model_entries SET ${sets.join(", ")} WHERE id = ?`, values);
+    }
+
+    // A failed probe is a successful API call — 200 with ok:false, matching the
+    // tracing exporter test endpoints.
+    sendJson(res, 200, {
+      ok: result.ok,
+      status: result.status,
+      latency_ms: result.latencyMs,
+      api_type: result.apiType,
+      max_tokens_field: result.maxTokensField,
+      corrected: result.correctedApiType || result.correctedMaxTokensField,
+      message: result.message,
+    });
   });
 
   // ================================================================

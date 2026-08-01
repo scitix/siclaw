@@ -181,6 +181,43 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.default).toEqual({ provider: "openai", modelId: "gpt-4o" });
   });
 
+  it("carries each model's own protocol", async () => {
+    // The production shape this exists for: one aggregator gateway hosting both
+    // OpenAI-protocol and Claude-protocol models. Exercises migration + SELECT +
+    // descriptor against a real DB, including the empty-string row that only a
+    // real INSERT can produce.
+    const db = getDb();
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-gw", "default", "gateway", "https://api.scitix.ai/model-api", "sk-test", "openai-completions", 0],
+    );
+    const insertModel = (id: string, modelId: string, apiType: string | null, sort: number) =>
+      db.query(
+        "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, api_type, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [id, "p-gw", modelId, modelId, 0, 128000, 8192, apiType, 0, sort],
+      );
+    await insertModel("m-openai", "DeepSeek-V4-Pro", "openai-completions", 0);
+    await insertModel("m-claude", "claude-sonnet-5", "anthropic-messages", 1);
+    // A legacy SQLite file can still hold an empty value (the NOT NULL
+    // tightening is MySQL-only); it must fall back, never emit `api: ""`, which
+    // would make pi drop the model from its registry entirely.
+    await insertModel("m-legacy", "GLM-5.1", "", 2);
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
+    );
+    expect(status).toBe(200);
+    const byId = Object.fromEntries(
+      body.providers.gateway.models.map((m: Record<string, unknown>) => [m.id, m]),
+    );
+
+    expect(byId["DeepSeek-V4-Pro"].api).toBe("openai-completions");
+    expect(byId["claude-sonnet-5"].api).toBe("anthropic-messages");
+    expect(byId["GLM-5.1"].api).toBe("openai-completions");
+    expect(body.providers.gateway.api).toBe("openai-completions");
+  });
+
   it("marks non-OpenAI compatible providers as not supporting developer-role messages", async () => {
     const db = getDb();
     await db.query(
@@ -201,6 +238,38 @@ describe("GET /api/v1/cli-snapshot", () => {
       supportsDeveloperRole: false,
       supportsUsageInStreaming: true,
       maxTokensField: "max_tokens",
+    });
+  });
+
+  it("gives three models on one gateway their own max-tokens field", async () => {
+    // The end-to-end check for the per-model wire attribute: real SQLite, real
+    // migration, real SELECT, real descriptor. A column the SELECT forgot to
+    // name would silently collapse all three onto the default here.
+    const db = getDb();
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-mixed", "default", "mixed", "https://api.scitix.ai/model-api", "sk-test", "openai-completions", 0],
+    );
+    const insert =
+      "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, max_tokens_field, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    // NULL → inferred from the id; explicit values → taken verbatim, including
+    // the one that contradicts the naming convention.
+    await db.query(insert, ["m-r", "p-mixed", "gpt-5", "GPT-5", 1, 400000, 8192, null, 1, 0]);
+    await db.query(insert, ["m-c", "p-mixed", "DeepSeek-V3", "DeepSeek", 0, 128000, 8192, null, 0, 1]);
+    await db.query(insert, ["m-o", "p-mixed", "house-reasoner", "House", 1, 128000, 8192, "max_completion_tokens", 0, 2]);
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
+    );
+    expect(status).toBe(200);
+    const byId = Object.fromEntries(
+      body.providers.mixed.models.map((m: any) => [m.id, m.compat.maxTokensField]),
+    );
+    expect(byId).toEqual({
+      "gpt-5": "max_completion_tokens",
+      "DeepSeek-V3": "max_tokens",
+      "house-reasoner": "max_completion_tokens",
     });
   });
 

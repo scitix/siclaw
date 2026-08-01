@@ -128,6 +128,7 @@ describe("config.getSettings", () => {
       {
         id: "gpt-4",
         name: "GPT-4",
+        api: "openai-completions",
         reasoning: false,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -137,6 +138,27 @@ describe("config.getSettings", () => {
       },
     ]);
     expect(result.default).toEqual({ provider: "openai", modelId: "gpt-4" });
+  });
+
+  it("carries each model's own protocol through the settings mirror", async () => {
+    // Aggregator gateway: the provider speaks chat-completions, one model on it
+    // speaks the Claude protocol.
+    mockQuery(
+      [{ model_provider: "gateway", model_id: "claude-sonnet-5" }],
+      [{ id: "p1", name: "gateway", base_url: "https://api.scitix.ai/model-api", api_key: "sk-key", api_type: "openai-completions" }],
+      [
+        { model_id: "claude-sonnet-5", name: "Claude", reasoning: 0, context_window: 128000, max_tokens: 8192, api_type: "anthropic-messages" },
+        { model_id: "DeepSeek-V4-Pro", name: "DeepSeek", reasoning: 0, context_window: 128000, max_tokens: 8192, api_type: null },
+      ],
+      [],
+      [],
+    );
+
+    const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
+    expect(result.providers.gateway.api).toBe("openai-completions");
+    expect(result.providers.gateway.models[0].api).toBe("anthropic-messages");
+    expect(result.providers.gateway.models[0].compat.supportsDeveloperRole).toBe(false);
+    expect(result.providers.gateway.models[1].api).toBe("openai-completions");
   });
 
   it("marks OpenAI-compatible gateway settings as not supporting developer-role messages", async () => {
@@ -310,6 +332,18 @@ describe("config.getModelBinding", () => {
       supportsUsageInStreaming: true,
       maxTokensField: "max_tokens",
     });
+  });
+
+  it("carries each model's own protocol through the model-binding mirror", async () => {
+    mockQuery(
+      [{ model_provider: "gateway", model_id: "claude-sonnet-5" }],
+      [{ id: "p1", name: "gateway", base_url: "https://api.scitix.ai/model-api", api_key: "sk-key", api_type: "openai-completions" }],
+      [{ model_id: "claude-sonnet-5", name: "Claude", reasoning: 0, context_window: 128000, max_tokens: 8192, api_type: "anthropic-messages" }],
+    );
+
+    const result = await getHandler("config.getModelBinding")({ agentId: "a1" }, "a1");
+    expect(result.binding.modelConfig.api).toBe("openai-completions");
+    expect(result.binding.modelConfig.models[0].api).toBe("anthropic-messages");
   });
 
   it("marks OpenAI-compatible gateway bindings as not supporting developer-role messages", async () => {
