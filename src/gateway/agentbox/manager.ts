@@ -31,6 +31,34 @@ const BOX_STATUS_TTL_MS = 2_000;
 /** How long a draining box may keep work before it is removed anyway. */
 const DRAIN_DEADLINE_MS = 5 * 60_000;
 
+/**
+ * How long before a box that crashed is replaced again.
+ *
+ * A box killed by the thing that will kill its replacement — an OOM on a prompt that
+ * rebuilds the same context — would otherwise be respawned every reaper tick, turning one
+ * bad session into a loop against the K8s API. Long enough that the loop is slow, short
+ * enough that a one-off crash costs a fraction of a minute of capacity.
+ */
+const CRASH_RESPAWN_COOLDOWN_MS = 2 * 60_000;
+
+/**
+ * Drains one agent may start inside {@link DRAIN_BUDGET_WINDOW_MS} before the runtime
+ * stops and says so.
+ *
+ * Not a policy — a fuse. Every reason to drain a box is followed by creating another, so
+ * a judgement that is wrong about a FRESH box (it reads as stale, so it is replaced, and
+ * the replacement reads the same way) spins until someone notices. A whole pool rolling,
+ * or a CA rotation touching every box at once, stays well under this.
+ */
+const DRAIN_BUDGET = 8;
+const DRAIN_BUDGET_WINDOW_MS = 10 * 60_000;
+
+/** How long a slot must go without crashing before its history is forgotten. */
+const CRASH_RESPAWN_FORGET_MS = 60 * 60_000;
+
+/** Crashes of one instance before the runtime stops replacing it and says so. */
+const CRASH_RESPAWN_LIMIT = 3;
+
 /** How often drained boxes are collected. */
 const DRAIN_REAP_INTERVAL_MS = 10_000;
 
@@ -103,6 +131,10 @@ export class AgentBoxManager {
   private replicasCache = new Map<string, { at: number; value: number }>();
   /** Consecutive failed status probes per box — see UNRESPONSIVE_PROBE_LIMIT. */
   private probeFailures = new Map<string, number>();
+  /** Crashes per box, so a box that keeps dying is not respawned forever. */
+  private crashRespawns = new Map<string, { count: number; at: number }>();
+  /** Recent drains per agent, so a wrong staleness judgement cannot spin forever. */
+  private drainBudget = new Map<string, { count: number; since: number }>();
   /** Agents already warned about pooling without shared session storage. */
   private unsharedWarned = new Set<string>();
   private legacySessionLister?: (endpoint: string) => Promise<string[]>;
@@ -253,9 +285,21 @@ export class AgentBoxManager {
    * always was.
    */
   private podName(agentId: string, prefix = "agentbox", instance = 0): string {
+    // ASK the spawner when it can answer. Keeping a second copy of the rule here is what
+    // let the two drift when instance 0 gained its index: stop() aimed at a name no pod
+    // had, the 404 was swallowed, and the box ran on. A spawner without the method (Local,
+    // Process) does not name pods at all, so the local rule is only a fallback.
+    const spawner = this.spawner as { boxIdFor?(agentId: string, profile?: string, instance?: number): string };
+    if (typeof spawner.boxIdFor === "function") {
+      return spawner.boxIdFor(agentId, this.profileForPrefix(prefix), instance);
+    }
     const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
-    const base = `${prefix}-${sanitized}`;
-    return instance > 0 ? `${base}-${instance}` : base;
+    return `${prefix}-${sanitized}-${instance}`;
+  }
+
+  /** The profile that spawns under this pod-name prefix — the inverse of prefixForProfile. */
+  private profileForPrefix(prefix: string): string | undefined {
+    return prefix === "agentbox" ? "agent" : prefix;
   }
 
   /** Pod-name prefix a profile spawns under (see K8sSpawner / BoxProfile.podNamePrefix). */
@@ -640,17 +684,85 @@ export class AgentBoxManager {
    * comparisons, so there is nothing to persist and nothing to go stale.
    */
   private markStaleBoxesDraining(agentId: string, pool: AgentBoxInfo[], wantProfile: string): void {
+    // Whether a replacement is still in flight. A roll replaces ONE box at a time, and
+    // "in flight" has to include the box that is still COMING UP: advancing as soon as the
+    // previous corpse is gone means a replacement that never becomes ready (an image that
+    // cannot be pulled) never blocks anything, and the roll walks the whole pool into the
+    // ground one box at a time.
+    let rolling = pool.some((b) => this.draining.has(b.boxId) || b.status === "starting");
+
     for (const box of pool) {
       if (box.status !== "running" || this.draining.has(box.boxId)) continue;
-      const reason =
+      // A box that cannot be talked to (its cert is signed by a CA we no longer trust) or
+      // is the wrong shape entirely is not a candidate for an orderly roll — keeping it in
+      // the pool serves nobody, so it goes immediately regardless of what else is draining.
+      const urgent =
         !this.isCertFresh(box) ? "stale CA"
         : (box.profile ?? "agent") !== wantProfile ? `profile ${box.profile} != ${wantProfile}`
-        : this.isStaleImage(box, wantProfile) ? `image ${box.image} != ${(this.spawner as any).expectedImage(wantProfile)}`
         : null;
-      if (!reason) continue;
-      console.log(`[agentbox-manager] Draining ${box.boxId} (agent=${agentId}): ${reason}`);
+      // A new image, or a pod still named the way instance 0 was named before every
+      // instance carried its index. Both are working boxes: replace them one at a time so
+      // the pool never drops to zero boxes able to take a new session.
+      const rollable = urgent
+        ? null
+        : this.isStaleImage(box, wantProfile) ? `image ${box.image} != ${(this.spawner as any).expectedImage(wantProfile)}`
+        : this.isLegacyName(agentId, box, wantProfile) ? "pod name predates instance indices"
+        : null;
+
+      if (!urgent && !rollable) continue;
+      if (rollable) {
+        if (rolling) continue;   // one at a time
+        rolling = true;
+      }
+      if (!this.spendDrainBudget(agentId)) continue;
+      console.log(`[agentbox-manager] Draining ${box.boxId} (agent=${agentId}): ${urgent ?? rollable}`);
       this.draining.set(box.boxId, Date.now());
     }
+  }
+
+  /**
+   * Whether this agent may start another drain yet.
+   *
+   * Draining is always followed by creating, so a staleness judgement that is wrong about
+   * a FRESH box replaces it with one that will be judged the same way — a loop that ends
+   * only when someone reads the logs. This bounds it: past the budget the runtime stops
+   * draining and says so, leaving the pool as it is, which is far cheaper than churning
+   * pods against the API for hours.
+   */
+  private spendDrainBudget(agentId: string): boolean {
+    const now = Date.now();
+    const seen = this.drainBudget.get(agentId);
+    if (!seen || now - seen.since > DRAIN_BUDGET_WINDOW_MS) {
+      this.drainBudget.set(agentId, { count: 1, since: now });
+      return true;
+    }
+    if (seen.count >= DRAIN_BUDGET) {
+      if (seen.count === DRAIN_BUDGET) {
+        seen.count++; // say it once
+        console.error(
+          `[agentbox-manager] agent=${agentId} has drained ${DRAIN_BUDGET} boxes in ` +
+          `${Math.round(DRAIN_BUDGET_WINDOW_MS / 60_000)} minutes — that is a loop, not a deploy. ` +
+          `Leaving the pool alone; something is judging healthy boxes stale.`,
+        );
+      }
+      return false;
+    }
+    seen.count++;
+    return true;
+  }
+
+  /**
+   * Whether this pod still carries the name instance 0 had before every instance carried
+   * its index.
+   *
+   * Such a pod works, and its cert and image may both be current — but nothing looks up
+   * that name any more, so it would keep serving whatever it already holds and never be
+   * counted, replaced or drained. Rolling it turns the rename into an ordinary deploy.
+   */
+  private isLegacyName(agentId: string, box: AgentBoxInfo, wantProfile: string): boolean {
+    const spawner = this.spawner as { legacyPodName?(agentId: string, profile?: string): string };
+    if (typeof spawner.legacyPodName !== "function") return false;
+    return box.boxId === spawner.legacyPodName(agentId, wantProfile);
   }
 
   /**
@@ -697,6 +809,14 @@ export class AgentBoxManager {
     agentId: string,
     config: Partial<AgentBoxConfig> | undefined,
     instances: number[],
+    /**
+     * Whether these boxes belong to a POOL. Only a pooled box is forced resident: the
+     * agent's own idle window would otherwise let one box of the pool disappear while its
+     * siblings stay, which the pool cannot express. A single-box agent keeps the window it
+     * was configured with — the reaper replaces such a box too, and forcing residency
+     * there would quietly turn every agent in the cluster into a permanent pod.
+     */
+    pooled = true,
   ): Promise<AgentBoxHandle[]> {
     const resolvedEnv = await this.resolveEnv(agentId, config?.env);
     const persistence = await this.resolvePersistence(agentId, config?.persistence);
@@ -713,7 +833,7 @@ export class AgentBoxManager {
             // shrink itself the moment traffic dipped and pay a cold start on the next
             // turn — the opposite of why replicas were raised. Reuses the existing
             // non-positive-window contract rather than adding a second mechanism.
-            SICLAW_AGENTBOX_IDLE_TIMEOUT: "0",
+            ...(pooled ? { SICLAW_AGENTBOX_IDLE_TIMEOUT: "0" } : {}),
           },
         });
         handle.agentId = agentId;
@@ -795,6 +915,124 @@ export class AgentBoxManager {
    * Victims are the highest instance indices: the least disruptive order available without
    * asking every box what it holds, since index 0 is the oldest and likeliest to be busy.
    */
+  /**
+   * Collect boxes whose process has ended, and put back the ones that did not choose to.
+   *
+   * A pool exists so that losing one box costs capacity rather than service. Until now
+   * losing one cost capacity until the next request happened to arrive — the reaper only
+   * ever shrank a pool, so a crashed box sat as a corpse and the pool ran short, silently,
+   * for as long as the agent was quiet.
+   *
+   * Only an UNASKED-FOR exit is replaced. A box that exits cleanly is doing what it was
+   * told — the idle self-destruct is a feature, and replacing its work would spawn a pod
+   * that idles out and is spawned again, forever, for an agent nobody is using.
+   *
+   * The corpse is deleted either way: a terminal pod holds its name, and a reader looking
+   * at the namespace should not have to work out which failures are still meaningful.
+   */
+  /**
+   * Put back what a roll took away, without waiting for a request to notice.
+   *
+   * Only while a roll is actually in progress — a box of this agent is draining. Outside
+   * that, a pool below its replica count is either an agent nobody is using (its boxes
+   * idled out, and spawning them again would undo that) or a crash, which is handled
+   * where crashes are handled.
+   */
+  private async advanceRoll(agentId: string, pool: AgentBoxInfo[]): Promise<void> {
+    if (!pool.some((b) => this.draining.has(b.boxId))) return;
+    const replicas = await this.resolveReplicas(agentId);
+    const accepting = pool.filter((b) => b.status !== "stopped" && !this.draining.has(b.boxId));
+    if (accepting.length >= replicas) return;
+    const missing = this.missingInstances(pool, replicas, agentId)
+      // A slot that just crashed is under the same cooldown here as it is in the crash
+      // path; without this the roll happily respawns what crash healing declined to.
+      .filter((instance) => this.respawnCooledDown(`${agentId}#${instance}`));
+    if (missing.length === 0) return;
+    console.log(`[agentbox-manager] agent=${agentId} roll in progress; bringing instance(s) ${missing.join(",")} back`);
+    void this.spawnInstances(agentId, undefined, missing, replicas > 1).catch((err) =>
+      console.warn(`[agentbox-manager] roll replacement failed for agent=${agentId}:`, err));
+  }
+
+  /** Whether this slot is outside its crash cooldown — a read, unlike {@link mayRespawn}. */
+  private respawnCooledDown(key: string): boolean {
+    const seen = this.crashRespawns.get(key);
+    if (!seen) return true;
+    if (seen.count >= CRASH_RESPAWN_LIMIT) return false;
+    return Date.now() - seen.at >= CRASH_RESPAWN_COOLDOWN_MS;
+  }
+
+  private async healCrashedBoxes(agentId: string, pool: AgentBoxInfo[]): Promise<void> {
+    const terminal = pool.filter((b) => b.status === "stopped" && !this.draining.has(b.boxId));
+    if (terminal.length === 0) return;
+
+    const crashed = terminal.filter((b) => b.exitedUnexpectedly);
+    let stuck = false;
+    for (const box of terminal) {
+      if (box.exitedUnexpectedly) {
+        console.warn(`[agentbox-manager] ${box.boxId} (agent=${agentId}) ended without being asked to; collecting it`);
+      }
+      try {
+        await this.spawner.stop(box.boxId);
+        this.statusCache.delete(box.boxId);
+        this.probeFailures.delete(box.boxId);
+      } catch (err) {
+        // Keep collecting the others — one pod stuck behind a finalizer must not stop the
+        // agent's remaining corpses from being cleared. Replacement is skipped this round
+        // (the index is still occupied) and retried on the next.
+        console.warn(`[agentbox-manager] failed to collect ${box.boxId}:`, err);
+        stuck = true;
+      }
+    }
+    if (crashed.length === 0 || stuck) return;
+
+    // Replace only what crashed, and only up to what the agent is configured for.
+    const replicas = await this.resolveReplicas(agentId);
+    // The FULL pool decides which indices are free — a pod that is terminating still owns
+    // its name, and spawning into it lands on the dying pod instead of a new one.
+    const missing = this.missingInstances(pool, replicas, agentId);
+    if (missing.length === 0) return;
+
+    // Rate-limited per INSTANCE, not per pod name: the replacement takes the same index,
+    // so "this slot keeps dying" is the thing worth counting.
+    const allowed = missing.filter((instance) => this.mayRespawn(`${agentId}#${instance}`));
+    if (allowed.length === 0) return;
+    console.log(`[agentbox-manager] agent=${agentId} replacing ${allowed.length} crashed box(es); spawning instances ${allowed.join(",")}`);
+    void this.spawnInstances(agentId, undefined, allowed, replicas > 1).catch((err) =>
+      console.warn(`[agentbox-manager] failed to replace crashed box(es) for agent=${agentId}:`, err));
+  }
+
+  /**
+   * Whether this box may be replaced again yet.
+   *
+   * A box killed by what will kill its replacement — an OOM on a prompt that rebuilds the
+   * same context — must not be respawned every tick. After a few attempts the runtime
+   * stops and says so, leaving the pool short rather than hammering the API forever.
+   */
+  private mayRespawn(key: string): boolean {
+    const now = Date.now();
+    const seen = this.crashRespawns.get(key);
+    // Forget a slot that has been healthy for a while. Without this the count only ever
+    // rises, so three crashes spread across months retire an instance permanently — and
+    // silently, because the warning already fired the first time it hit the limit.
+    if (seen && now - seen.at > CRASH_RESPAWN_FORGET_MS) this.crashRespawns.delete(key);
+    const record = this.crashRespawns.get(key);
+    if (!record) {
+      this.crashRespawns.set(key, { count: 1, at: now });
+      return true;
+    }
+    const seenNow = record;
+    if (now - seenNow.at < CRASH_RESPAWN_COOLDOWN_MS) return false;
+    if (seenNow.count >= CRASH_RESPAWN_LIMIT) {
+      if (seenNow.count === CRASH_RESPAWN_LIMIT) {
+        console.warn(`[agentbox-manager] ${key} has crashed ${seenNow.count} times; not replacing it again — the pool stays short until someone looks`);
+        seenNow.count++; // report once
+      }
+      return false;
+    }
+    this.crashRespawns.set(key, { count: seenNow.count + 1, at: now });
+    return true;
+  }
+
   private async reconcilePoolSizes(): Promise<void> {
     const s: any = this.spawner;
     if (typeof s.list !== "function") return;
@@ -808,13 +1046,20 @@ export class AgentBoxManager {
 
     const byAgent = new Map<string, AgentBoxInfo[]>();
     for (const box of all) {
-      if ((box.profile ?? "agent") !== "agent" || box.status === "stopped" || !box.agentId) continue;
+      if ((box.profile ?? "agent") !== "agent" || !box.agentId) continue;
       const list = byAgent.get(box.agentId) ?? [];
       list.push(box);
       byAgent.set(box.agentId, list);
     }
 
-    for (const [agentId, boxes] of byAgent) {
+    for (const [agentId, pool] of byAgent) {
+      await this.healCrashedBoxes(agentId, pool);
+      const boxes = pool.filter((b) => b.status !== "stopped");
+      // Keep a roll moving without waiting for traffic: mark the next stale box once the
+      // previous one has gone, and put back what the roll removed. A deploy on a quiet
+      // agent would otherwise stop half-done until someone happened to send a message.
+      this.markStaleBoxesDraining(agentId, boxes, "agent");
+      await this.advanceRoll(agentId, boxes);
       const accepting = boxes.filter((b) => !this.draining.has(b.boxId));
       // One box is both "nothing to shrink" and the un-pooled shape — skip without
       // paying a replicas lookup for every agent in the cluster on every tick.
@@ -842,6 +1087,7 @@ export class AgentBoxManager {
       if (!info || info.status === "stopped") {
         this.draining.delete(boxId);
         this.statusCache.delete(boxId);
+        this.probeFailures.delete(boxId);
         continue;
       }
       const overdue = Date.now() - markedAt >= DRAIN_DEADLINE_MS;
@@ -861,6 +1107,9 @@ export class AgentBoxManager {
       }
       this.draining.delete(boxId);
       this.statusCache.delete(boxId);
+      // Indices — and therefore names — are reused. A leftover failure count would make
+      // the replacement's first transient probe failure look like its fourth.
+      this.probeFailures.delete(boxId);
     }
   }
 

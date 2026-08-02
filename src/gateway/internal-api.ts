@@ -727,9 +727,10 @@ export interface MetricsFlushCounters {
 export function resolveFlushBoxId(certBoxId: string, claimed: unknown): string {
   if (typeof claimed !== "string" || claimed === "" || claimed === certBoxId) return certBoxId;
   const suffix = claimed.startsWith(`${certBoxId}-`) ? claimed.slice(certBoxId.length + 1) : null;
-  // `-0` is not a replica: instance 0 is unsuffixed, so a "-0" claim is malformed by
-  // construction and only narrows what a lying box can name.
-  if (suffix !== null && /^[1-9]\d*$/.test(suffix)) return claimed;
+  // Every instance carries its index, `-0` included, and the certificate names the AGENT
+  // rather than any one pod — so a claim is exactly the cert's subject plus this box's
+  // index. Anything else is a box claiming to be another agent's.
+  if (suffix !== null && /^(0|[1-9]\d*)$/.test(suffix)) return claimed;
   console.warn(
     `[internal-api] metrics-flush claimed boxId="${claimed}" outside cert identity "${certBoxId}"; attributing to the cert`,
   );

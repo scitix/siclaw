@@ -149,17 +149,44 @@ export class K8sSpawner implements BoxSpawner {
    * "kbc-box"). Both prefixes are ≤ 8 chars, so the 50-char agentId cap keeps the
    * full name well under 63.
    *
-   * **Instance 0 is deliberately unsuffixed** — it is the name every existing pod
-   * already has. Suffixing it would rename every pod in a running deployment, and each
-   * old one would be orphaned behind a name nothing looks up any more, for no benefit
-   * until an agent actually runs more than one box. Replicas 1..N-1 carry `-{n}`.
+   * Every instance carries its index, `-0` included. Instance 0 used to be unsuffixed,
+   * because that was the name every pod already had before an agent could run more than
+   * one — but the asymmetry cost more than it saved: a replacement for instance 0 took
+   * the identical name, so a box that had died and come back was indistinguishable from
+   * the one that had been there all along.
+   *
+   * The old name is still recognised for as long as such a pod can exist: the manager
+   * treats it as stale, so it drains and its replacement comes back as `-0`.
    *
    * Nothing parses the index back out of a name; the `instance` label is the record.
    */
   private podName(agentId: string, prefix = "agentbox", instance = 0): string {
+    return `${this.podBaseName(agentId, prefix)}-${instance}`;
+  }
+
+  /** The name every box of this agent shares, without an instance index. */
+  private podBaseName(agentId: string, prefix = "agentbox"): string {
     const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
-    const base = `${prefix}-${sanitized}`;
-    return instance > 0 ? `${base}-${instance}` : base;
+    return `${prefix}-${sanitized}`;
+  }
+
+  /**
+   * The pod name a box WOULD have. The manager asks rather than deriving it: two copies of
+   * a naming rule are two chances to disagree, and the last time they did, a `stop()`
+   * targeted a name no pod had — it 404'd, was swallowed, and the box ran on forever.
+   */
+  boxIdFor(agentId: string, profile?: string, instance = 0): string {
+    return this.podName(agentId, getBoxProfile(profile).podNamePrefix ?? "agentbox", instance);
+  }
+
+  /**
+   * What instance 0 was called before every instance carried its index.
+   *
+   * Exposed so the manager can recognise such a pod and roll it, rather than leaving it
+   * running under a name nothing looks up any more.
+   */
+  legacyPodName(agentId: string, profile?: string): string {
+    return this.podBaseName(agentId, getBoxProfile(profile).podNamePrefix ?? "agentbox");
   }
 
   /**
@@ -174,7 +201,11 @@ export class K8sSpawner implements BoxSpawner {
    * For a single-box agent this is byte-identical to the previous `${podName}-cert`.
    */
   private certSecretName(agentId: string, prefix = "agentbox"): string {
-    return `${this.podName(agentId, prefix)}-cert`;
+    // Deliberately the BASE name, not instance 0's pod name: this Secret is shared by
+    // every box of the agent, and it already exists under this name in every running
+    // deployment. Deriving it from the pod name would have renamed it the moment
+    // instance 0 gained its index, orphaning the old one and re-issuing every cert.
+    return `${this.podBaseName(agentId, prefix)}-cert`;
   }
 
   /** CA fingerprint stamped on an existing cert Secret, or undefined if unreadable. */
@@ -254,7 +285,8 @@ export class K8sSpawner implements BoxSpawner {
     // old-named pod (+ its cert Secret) first, but only when it is a compile box
     // (boxType "kb-compile*") — never a chat box that merely shares the agentId.
     if (podPrefix !== "agentbox") {
-      await this.reapRenamedLegacyPod(this.podName(agentId, "agentbox"), namespace, labelPrefix);
+      // The pod it is looking for predates instance indices, so it wants the BASE name.
+      await this.reapRenamedLegacyPod(this.legacyPodName(agentId, "agent"), namespace, labelPrefix);
     }
 
     // Stamp the pod + its cert Secret with the CA fingerprint. The runtime uses
@@ -330,7 +362,9 @@ export class K8sSpawner implements BoxSpawner {
     // agent's BASE pod name, not this instance's: it is the identity every box of the
     // agent presents, and the Gateway uses it as the authorization root when a box
     // reports which pod it actually is (see handleMetricsFlush).
-    const certBase = this.podName(agentId, podPrefix);
+    // The AGENT's name, not a pod's: this identity is shared by every box, and the
+    // metrics-flush authorizer accepts `<certBase>-<instance>` from any of them.
+    const certBase = this.podBaseName(agentId, podPrefix);
     const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, certBase);
     const certSecretName = this.certSecretName(agentId, podPrefix);
 
@@ -577,6 +611,29 @@ export class K8sSpawner implements BoxSpawner {
         ...(this.config.nodeSelector && Object.keys(this.config.nodeSelector).length > 0
           ? { nodeSelector: this.config.nodeSelector }
           : {}),
+        // Spread an agent's boxes over nodes. Without this the scheduler packs them, and
+        // a pool that exists to survive one box's loss ends up sharing one node's failure
+        // domain — the node goes, the whole agent goes with it.
+        //
+        // PREFERRED, never required: a small cluster (or one whose nodeSelector admits a
+        // single node) must still be able to place the pods. Spreading is worth a lot and
+        // costs nothing when it succeeds; refusing to schedule would cost everything.
+        affinity: {
+          podAntiAffinity: {
+            preferredDuringSchedulingIgnoredDuringExecution: [{
+              weight: 100,
+              podAffinityTerm: {
+                topologyKey: "kubernetes.io/hostname",
+                labelSelector: {
+                  matchLabels: {
+                    [`${labelPrefix}/app`]: "agentbox",
+                    [`${labelPrefix}/agent`]: agentId,
+                  },
+                },
+              },
+            }],
+          },
+        },
         // ── Security: dual-user isolation (ADR-010) ─────────────────
         // Container starts as root (entrypoint fixes volume permissions,
         // then drops to agentbox via runuser). Child processes run as
@@ -1026,6 +1083,7 @@ export class K8sSpawner implements BoxSpawner {
         boxId,
         agentId,
         status,
+        exitedUnexpectedly: this.exitedUnexpectedly(pod),
         endpoint: podIP ? `https://${podIP}:3000` : "",
         createdAt: pod.metadata?.creationTimestamp
           ? new Date(pod.metadata.creationTimestamp)
@@ -1067,21 +1125,11 @@ export class K8sSpawner implements BoxSpawner {
       namespace,
       labelSelector: `${labelPrefix}/app=agentbox,${labelPrefix}/agent=${agentId}`,
     });
-    return (pods.items ?? []).flatMap((pod: any) => {
-      const boxId = pod.metadata?.name;
-      if (!boxId) return [];
-      const podIP = pod.status?.podIP;
-      return [{
-        boxId,
-        agentId,
-        status: this.mapPodStatus(pod),
-        endpoint: podIP ? `https://${podIP}:3000` : "",
-        createdAt: pod.metadata?.creationTimestamp ? new Date(pod.metadata.creationTimestamp) : new Date(),
-        lastActiveAt: new Date(),
-        caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
-        profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
-        ...this.replicaFields(pod),
-      } satisfies AgentBoxInfo];
+    return (pods.items ?? []).flatMap((pod: k8s.V1Pod) => {
+      if (!pod.metadata?.name) return [];
+      // agentId comes from the label like everywhere else; the selector already scoped
+      // this query to one agent, so the two always agree.
+      return [this.toBoxInfo(pod)];
     });
   }
 
@@ -1104,31 +1152,51 @@ export class K8sSpawner implements BoxSpawner {
       labelSelector: `${labelPrefix}/app=agentbox`,
     });
 
-    return podList.items.map((pod: k8s.V1Pod) => {
-      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`] || "";
-      const status = this.mapPodStatus(pod);
-      const podIP = pod.status?.podIP;
-
-      return {
-        boxId: pod.metadata?.name || "",
-        agentId,
-        status,
-        endpoint: podIP ? `https://${podIP}:3000` : "",
-        createdAt: pod.metadata?.creationTimestamp
-          ? new Date(pod.metadata.creationTimestamp)
-          : new Date(),
-        lastActiveAt: new Date(),
-        profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
-        // Without these, every box reads as instance 0 and the pool-size reconciler's
-        // "drain the highest indices first" ordering silently degrades to list order.
-        ...this.replicaFields(pod),
-      };
-    });
+    return podList.items.map((pod: k8s.V1Pod) => this.toBoxInfo(pod));
   }
 
   /**
    * Map Pod phase to AgentBoxStatus
    */
+  /**
+   * Whether this pod's process ended without being asked to.
+   *
+   * `Failed` is the kubelet's word for "the container exited non-zero and nothing asked
+   * it to" — a crash, an OOM kill, an eviction. A clean exit (idle self-destruct) lands
+   * in `Succeeded`, and a pod being deleted still reports its old phase, so this stays
+   * false for the shutdowns the runtime itself started.
+   */
+  private exitedUnexpectedly(pod: k8s.V1Pod): boolean {
+    if (pod.metadata?.deletionTimestamp) return false;
+    return pod.status?.phase === "Failed";
+  }
+
+  /**
+   * Pod → AgentBoxInfo, for every path that reports a box.
+   *
+   * ONE mapper on purpose. `list()` used to return a lighter projection without the CA
+   * fingerprint or the image, which was harmless while only acquisition judged staleness —
+   * and became a spawn loop the moment the reaper judged it too: a box with no fingerprint
+   * reads as signed by a CA we no longer trust, so every freshly created box was drained
+   * on sight and replaced by another that met the same fate.
+   */
+  private toBoxInfo(pod: k8s.V1Pod): AgentBoxInfo {
+    const { labelPrefix } = this.config;
+    const podIP = pod.status?.podIP;
+    return {
+      boxId: pod.metadata?.name || "",
+      agentId: pod.metadata?.labels?.[`${labelPrefix}/agent`] || "",
+      status: this.mapPodStatus(pod),
+      exitedUnexpectedly: this.exitedUnexpectedly(pod),
+      endpoint: podIP ? `https://${podIP}:3000` : "",
+      createdAt: pod.metadata?.creationTimestamp ? new Date(pod.metadata.creationTimestamp) : new Date(),
+      lastActiveAt: new Date(),
+      caFingerprint: pod.metadata?.labels?.[`${labelPrefix}/ca-fp`],
+      profile: pod.metadata?.labels?.[`${labelPrefix}/boxType`] || "agent",
+      ...this.replicaFields(pod),
+    };
+  }
+
   private mapPodStatus(pod: k8s.V1Pod): AgentBoxStatus {
     // Terminating pods (deletionTimestamp set) may still report
     // phase=Running and Ready=True during the grace period, but their

@@ -719,10 +719,14 @@ describe("handleMetricsFlush", () => {
 
   it("rejects a claim that merely starts with the cert boxId but is not an instance", async () => {
     // "box-10" and "box-1-evil" both share the "box-1" prefix; neither is a replica of it.
-    for (const claimed of ["box-10", "box-1-evil", "box-1-", "box-1-0", "box-1-01"]) {
+    // "box-1-01" is not one either — an index is written one way, so a padded variant is
+    // a second name for the same box and a way to split its metrics in two.
+    for (const claimed of ["box-10", "box-1-evil", "box-1-", "box-1-01"]) {
       expect(resolveFlushBoxId("box-1", claimed)).toBe("box-1");
     }
     expect(resolveFlushBoxId("box-1", "box-1-7")).toBe("box-1-7");
+    // Instance 0 carries its index now, so its own claim is the ordinary case.
+    expect(resolveFlushBoxId("box-1", "box-1-0")).toBe("box-1-0");
     expect(resolveFlushBoxId("box-1", undefined)).toBe("box-1");
   });
 
