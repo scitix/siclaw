@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import type { AgentBoxInfo } from "./types.js";
 
 /**
  * Tests for K8sSpawner.
@@ -1400,8 +1401,13 @@ describe("K8sSpawner — every listing carries what staleness is judged on", () 
     expect(fromList.image).toBe("agentbox:v9");
     expect(fromList.instance).toBe(0);
 
+    // One mapper, one answer. Compared without the timestamps: both are stamped at call
+    // time, so they differ by however long the two calls are apart — which on a slow
+    // machine is enough to fail an equality that has nothing to do with what is being
+    // tested.
     const [forAgent] = await s.listForAgent("a");
-    expect(forAgent).toEqual(fromList);   // one mapper, one answer
+    const withoutClock = ({ createdAt: _c, lastActiveAt: _l, ...rest }: AgentBoxInfo) => rest;
+    expect(withoutClock(forAgent)).toEqual(withoutClock(fromList));
   });
 });
 
