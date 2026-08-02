@@ -406,6 +406,15 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   const flushTerminalError = async () => {
     // Assistant rows first: on a failed routed turn both can be pending, and a
     // partial reply belongs above the error that ended it, not below.
+    //
+    // Called at every TURN boundary, not just at the end of the stream. One
+    // request can carry several independent turns — a user who steers while the
+    // agent is working adds a question to the run in flight — and the
+    // suppression this buffering exists for ("an internal retry recovered it,
+    // leave nothing behind") is only ever true WITHIN one turn. Held to the end
+    // of the request instead, a later turn succeeding would erase the failures
+    // of every earlier one, and those turns would reload as questions with no
+    // answers and no explanation.
     await flushOps(pendingAssistantOps);
     if (onEvent && pendingStreamError) {
       onEvent(
@@ -705,6 +714,17 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       if (eventType === "message_start") {
         currentMsgText = "";
         const message = evt.message as Record<string, unknown> | undefined;
+        if (message?.role === "user") {
+          // A new user input means the PREVIOUS turn is over and nothing inside
+          // it recovered — commit its error before this turn's events arrive, so
+          // it lands above the question that follows it rather than being
+          // cleared by that question's answer.
+          //
+          // This echo is the boundary rather than pi's `turn_end`, which fires
+          // once per LLM round-trip: a turn that calls tools emits several, and
+          // flushing on those would defeat the in-turn suppression entirely.
+          await flushTerminalError();
+        }
         if (message?.role === "user" && onUserMessageStarted) {
           // The echoed text, so the caller can check the echo against the row it expects —
           // the box wraps what it was given, so this is a guard, never an identity.
