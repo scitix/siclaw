@@ -16,6 +16,7 @@ import type {
   ModelRouteMetadata,
 } from "../components/chat/types"
 import { stripAttachmentOcrEvidence } from "../components/chat/user-message-text"
+import { normalizeProviderError } from "../lib/provider-error"
 import { findPendingSteerIndex, removePendingAt, extractUserMessageText, pendingSteerMatchText } from "./steer-pending"
 import { isGroupForm, normalizeCompletionStatus } from "../lib/group-form"
 
@@ -45,7 +46,11 @@ function parseErrorDetail(raw: unknown): ErrorDetail {
   return { code: "INTERNAL_ERROR", message: "Unknown error", retriable: true }
 }
 
-function makeErrorMessage(detail: ErrorDetail): PilotMessage {
+function makeErrorMessage(raw: ErrorDetail): PilotMessage {
+  // Normalised HERE rather than at each call site: this is the single funnel
+  // every live error bubble goes through, and a per-site version is one branch
+  // away from being forgotten.
+  const detail = normalizeProviderError(raw)
   return {
     id: `error-${typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)}`,
     role: "error",

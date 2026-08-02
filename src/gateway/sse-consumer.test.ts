@@ -609,6 +609,49 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     expect(appendCalls.filter((r) => r.metadata?.kind === "error_response")).toHaveLength(1);
   });
 
+  // Reported from production: three steers in one request, the first two failing
+  // and the third succeeding. Every failure was suppressed, because the
+  // "an internal retry recovered it" rule was scoped to the whole REQUEST rather
+  // than to a turn. The live page drew red boxes the frontend had made itself;
+  // a reload read the database and found questions with no answers.
+  it("keeps each steered turn's error, and only suppresses within a turn", async () => {
+    const streamErrors: string[] = [];
+    const userMsg = (text: string) => ({
+      type: "message_start", message: { role: "user", content: [{ type: "text", text }] },
+    });
+    const failed = (why: string) => ({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: why },
+    });
+    const answered = (text: string) => ({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
+    });
+
+    const result = await consumeAgentSse({
+      client: mkClient([
+        userMsg("1"), failed("boom 1"),
+        userMsg("2"), failed("boom 2"),
+        // Third turn retries internally: that failure IS recovered, in-turn, and
+        // must still leave nothing behind.
+        userMsg("3"), failed("transient"), answered("hello"),
+      ]),
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      onEvent: (evt, type) => {
+        if (type === "stream_error") streamErrors.push(String((evt as any).error?.message));
+      },
+    });
+
+    expect(streamErrors).toEqual(["boom 1", "boom 2"]);
+    const errorRows = appendCalls.filter((r) => r.metadata?.kind === "error_response");
+    expect(errorRows.map((r) => r.content)).toEqual(["boom 1", "boom 2"]);
+    // The run as a whole produced an answer, so the caller is not told it failed.
+    expect(result.errorMessage).toBe("");
+    expect(result.resultText).toBe("hello");
+  });
+
   it("leaves nothing behind when a retry recovers the turn", async () => {
     // Previously a transient failure left a red bubble sitting above the answer
     // that followed it, and an error row that outlived the reload.
