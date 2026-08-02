@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import type { AgentBoxInfo } from "./types.js";
 
 /**
  * Tests for K8sSpawner.
@@ -172,7 +173,7 @@ describe("K8sSpawner — pod name sanitization + invariant §3 (mTLS K8s-only)",
       }
       return {
         status: { phase: "Running", podIP: "10.1.2.3", conditions: [{ type: "Ready", status: "True" }] },
-        metadata: { name: "agentbox-default", labels: {} },
+        metadata: { name: "agentbox-default-0", labels: {} },
       };
     };
 
@@ -204,7 +205,7 @@ describe("K8sSpawner — pod name sanitization + invariant §3 (mTLS K8s-only)",
 
     // Uppercase → lowercase; "_" → "-"; 50-char cap keeps full name ≤ 63 chars.
     const handle = await s.spawn({ agentId: "Agent_With.Weird/Chars" });
-    expect(handle.boxId).toBe("agentbox-agent-with-weird-chars");
+    expect(handle.boxId).toBe("agentbox-agent-with-weird-chars-0");
   });
 });
 
@@ -699,11 +700,11 @@ describe("K8sSpawner — pod-name prefix (compile boxes vs chat) + upgrade migra
 
     const bodies = calls.createNamespacedPod.map((c: any) => c.body);
     const names = bodies.map((b: any) => b.metadata.name);
-    expect(names).toContain("agentbox-chatty");
-    expect(names).toContain("kbc-box-kbrun");
+    expect(names).toContain("agentbox-chatty-0");
+    expect(names).toContain("kbc-box-kbrun-0");
     // Resources derived from the pod name follow the prefix.
-    const compilePod = bodies.find((b: any) => b.metadata.name === "kbc-box-kbrun");
-    expect(compilePod.spec.hostname).toBe("kbc-box-kbrun");
+    const compilePod = bodies.find((b: any) => b.metadata.name === "kbc-box-kbrun-0");
+    expect(compilePod.spec.hostname).toBe("kbc-box-kbrun-0");
     const secretNames = calls.createNamespacedSecret.map((c: any) => c.body.metadata.name);
     expect(secretNames).toContain("kbc-box-kbrun-cert");
   });
@@ -736,7 +737,7 @@ describe("K8sSpawner — pod-name prefix (compile boxes vs chat) + upgrade migra
     // The legacy pod's Secret is left to the sweep — stop() no longer owns Secret lifetime.
     expect(calls.deleteNamespacedSecret).toHaveLength(0);
     // The new box is created under the renamed prefix, not the old one.
-    expect(calls.createNamespacedPod.map((c: any) => c.body.metadata.name)).toEqual(["kbc-box-migrated"]);
+    expect(calls.createNamespacedPod.map((c: any) => c.body.metadata.name)).toEqual(["kbc-box-migrated-0"]);
   });
 
   it("never reaps a legacy agentbox-named CHAT pod that happens to share the agentId", async () => {
@@ -759,7 +760,7 @@ describe("K8sSpawner — pod-name prefix (compile boxes vs chat) + upgrade migra
     await s.spawn({ agentId: "shared", profile: "kb-compile" });
 
     expect(calls.deleteNamespacedPod.some((c: any) => c.name === "agentbox-shared")).toBe(false);
-    expect(calls.createNamespacedPod.map((c: any) => c.body.metadata.name)).toEqual(["kbc-box-shared"]);
+    expect(calls.createNamespacedPod.map((c: any) => c.body.metadata.name)).toEqual(["kbc-box-shared-0"]);
   });
 });
 
@@ -770,9 +771,9 @@ describe("K8sSpawner — stop", () => {
     // read that races a replacement's spawn, which creates the Secret BEFORE its pod.
     // Deleting it then would strand the new pod in ContainerCreating forever.
     const s = new K8sSpawner();
-    await s.stop("agentbox-default");
+    await s.stop("agentbox-default-0");
     expect(calls.deleteNamespacedPod).toHaveLength(1);
-    expect(calls.deleteNamespacedPod[0].name).toBe("agentbox-default");
+    expect(calls.deleteNamespacedPod[0].name).toBe("agentbox-default-0");
     expect(calls.deleteNamespacedSecret).toHaveLength(0);
   });
 
@@ -904,7 +905,7 @@ describe("K8sSpawner — per-agent persistence (PVC override)", () => {
       if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
       return {
         status: { phase: "Running", podIP: "10.9.9.9", conditions: [{ type: "Ready", status: "True" }] },
-        metadata: { name: "agentbox-default", labels: {} },
+        metadata: { name: "agentbox-default-0", labels: {} },
       };
     };
   }
@@ -996,7 +997,7 @@ describe("K8sSpawner — nodeSelector", () => {
       if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
       return {
         status: { phase: "Running", podIP: "10.7.7.7", conditions: [{ type: "Ready", status: "True" }] },
-        metadata: { name: "agentbox-default", labels: {} },
+        metadata: { name: "agentbox-default-0", labels: {} },
       };
     };
   }
@@ -1235,8 +1236,8 @@ describe("K8sSpawner — replica identity and the shared certificate", () => {
 
   it("leaves instance 0 unsuffixed so no existing pod is renamed", async () => {
     const { handle, created } = await spawnOnce({ agentId: "agent-x", profile: "agent" });
-    expect(created.body.metadata.name).toBe("agentbox-agent-x");
-    expect(handle.boxId).toBe("agentbox-agent-x");
+    expect(created.body.metadata.name).toBe("agentbox-agent-x-0");
+    expect(handle.boxId).toBe("agentbox-agent-x-0");
     expect(created.body.metadata.labels["siclaw.io/instance"]).toBe("0");
   });
 
@@ -1347,3 +1348,66 @@ describe("K8sSpawner — concurrent replica spawns share one certificate Secret"
     await expect(s.spawn({ agentId: "agent-x", profile: "agent" } as any)).resolves.toBeTruthy();
   });
 });
+
+describe("K8sSpawner — spreading a pool over nodes", () => {
+  it("asks the scheduler to keep an agent's boxes apart, as a preference", async () => {
+    // Preferred, never required: a cluster with one eligible node — a nodeSelector that
+    // admits one, say — must still be able to place the pod. Spreading is worth a lot
+    // when it succeeds; refusing to schedule would cost everything.
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "agent-a", instance: 1 });
+
+    const affinity = calls.createNamespacedPod[0].body.spec.affinity.podAntiAffinity;
+    expect(affinity.requiredDuringSchedulingIgnoredDuringExecution).toBeUndefined();
+    const term = affinity.preferredDuringSchedulingIgnoredDuringExecution[0];
+    expect(term.podAffinityTerm.topologyKey).toBe("kubernetes.io/hostname");
+    expect(term.podAffinityTerm.labelSelector.matchLabels).toMatchObject({
+      "siclaw.io/agent": "agent-a",
+      "siclaw.io/app": "agentbox",
+    });
+  });
+});
+
+describe("K8sSpawner — every listing carries what staleness is judged on", () => {
+  it("reports the CA fingerprint and image from list(), not only from listForAgent()", async () => {
+    // list() used to return a lighter projection. That was harmless while only acquisition
+    // judged staleness, and became a spawn loop the moment the reaper judged it too: a box
+    // with no fingerprint reads as signed by a CA we no longer trust, so every fresh box
+    // was drained on sight and replaced by one that met the same fate.
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    g.__k8sImpls.listNamespacedPod = async () => ({
+      items: [{
+        metadata: {
+          name: "agentbox-a-0",
+          labels: { "siclaw.io/app": "agentbox", "siclaw.io/agent": "a", "siclaw.io/ca-fp": "fp-1", "siclaw.io/instance": "0" },
+        },
+        spec: { containers: [{ image: "agentbox:v9" }] },
+        status: { phase: "Running", podIP: "10.0.0.1", conditions: [{ type: "Ready", status: "True" }] },
+      }],
+    });
+
+    const [fromList] = await s.list();
+    expect(fromList.caFingerprint).toBe("fp-1");
+    expect(fromList.image).toBe("agentbox:v9");
+    expect(fromList.instance).toBe(0);
+
+    // One mapper, one answer. Compared without the timestamps: both are stamped at call
+    // time, so they differ by however long the two calls are apart — which on a slow
+    // machine is enough to fail an equality that has nothing to do with what is being
+    // tested.
+    const [forAgent] = await s.listForAgent("a");
+    const withoutClock = ({ createdAt: _c, lastActiveAt: _l, ...rest }: AgentBoxInfo) => rest;
+    expect(withoutClock(forAgent)).toEqual(withoutClock(fromList));
+  });
+});
+

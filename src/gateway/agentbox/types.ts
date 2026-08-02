@@ -71,6 +71,15 @@ export interface AgentBoxInfo {
    * matches the runtime's current CA — see AgentBoxManager.getOrCreateK8s.
    */
   caFingerprint?: string;
+  /**
+   * The box's process ended without being asked to — a crash, an OOM kill, an eviction.
+   *
+   * Distinct from ending cleanly (idle self-destruct, or a shutdown the runtime asked
+   * for), which is a pod doing what it was told. Only the unasked-for kind should bring
+   * a replacement back: replacing the other kind fights the feature that removed it and
+   * churns a pod nobody is using.
+   */
+  exitedUnexpectedly?: boolean;
   /** BoxProfile name this pod was spawned with (from its label; "agent" if absent).
    *  Used by the manager to refuse reusing a pod whose profile no longer matches
    *  the requested one — otherwise a profile change silently reuses the old-shaped
