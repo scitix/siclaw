@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { AgentBoxManager } from "./manager.js";
+import { getBoxProfile } from "./box-profile.js";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 
@@ -18,9 +19,23 @@ class FakeSpawner implements BoxSpawner {
   getReturns = new Map<string, AgentBoxInfo | null>();
   listReturns: AgentBoxInfo[] = [];
   cleanupCalls = 0;
+  /** Profiles last passed into boxIdFor — proves naming uses real profiles, not prefixes. */
+  boxIdForProfiles: Array<string | undefined> = [];
   /** When set, the manager enforces CA-fingerprint matching for pod reuse. */
   fingerprint: string | undefined = undefined;
   caFingerprint(): string | undefined { return this.fingerprint; }
+
+  /**
+   * Same contract as K8sSpawner.boxIdFor: second arg is a **BoxProfile name**,
+   * never a podNamePrefix. Without this method the manager uses a local fallback
+   * that never calls getBoxProfile — which hid the v0.3.2 production bug.
+   */
+  boxIdFor(agentId: string, profile?: string, instance = 0): string {
+    this.boxIdForProfiles.push(profile);
+    const prefix = getBoxProfile(profile).podNamePrefix ?? "agentbox";
+    const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
+    return `${prefix}-${sanitized}-${instance}`;
+  }
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
     this.spawnCalls.push(config);
@@ -298,6 +313,38 @@ describe("AgentBoxManager — K8s mode", () => {
     expect(handle?.boxId).toBe("kbc-box-run-1-0");
     // Without the profile it would look under "agentbox-run-1" and miss.
     expect(await mgr.getAsync("run-1")).toBeUndefined();
+  });
+
+  it("names kb-compile boxes via profile, never treating podNamePrefix as a profile (v0.3.2 regression)", async () => {
+    // Production bug: podName(prefix) → profileForPrefix("kbc-box") → "kbc-box"
+    // → boxIdFor(..., "kbc-box") → getBoxProfile("kbc-box") → throw.
+    // Naming must stay profile → prefix only; kb-compile and kb-compile-codex
+    // share the kbc-box prefix so prefix→profile is not invertible.
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+
+    await expect(
+      mgr.getOrCreateWithDisposition("cap-run-1", { profile: "kb-compile" }),
+    ).resolves.toMatchObject({ created: true });
+    expect(spawner.boxIdForProfiles).toContain("kb-compile");
+    expect(spawner.boxIdForProfiles).not.toContain("kbc-box");
+
+    spawner.boxIdForProfiles = [];
+    await mgr.stop("cap-run-1", "kb-compile");
+    expect(spawner.stopCalls).toEqual(["kbc-box-cap-run-1-0"]);
+    expect(spawner.boxIdForProfiles).toEqual(["kb-compile"]);
+
+    spawner.boxIdForProfiles = [];
+    spawner.getReturns.set("kbc-box-cap-run-2-0", {
+      boxId: "kbc-box-cap-run-2-0", agentId: "cap-run-2", status: "running",
+      endpoint: "https://10.0.0.9:3000", createdAt: new Date(), lastActiveAt: new Date(),
+      profile: "kb-compile-codex",
+    });
+    await expect(mgr.getAsync("cap-run-2", "kb-compile-codex")).resolves.toMatchObject({
+      boxId: "kbc-box-cap-run-2-0",
+    });
+    expect(spawner.boxIdForProfiles).toEqual(["kb-compile-codex"]);
+    expect(spawner.boxIdForProfiles).not.toContain("kbc-box");
   });
 });
 

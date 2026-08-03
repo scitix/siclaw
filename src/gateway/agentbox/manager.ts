@@ -274,32 +274,28 @@ export class AgentBoxManager {
   }
 
   /**
-   * Pod / box name. Trims agentId to stay under the 63-char K8s name limit and only
-   * sanitizes forbidden characters.
+   * Pod / box name for a profile (+ instance).
    *
-   * The prefix is profile-derived and this MUST stay identical to K8sSpawner.podName
-   * (compile boxes are "kbc-box-", everything else "agentbox-"): the manager looks a pod
-   * up by this computed name for warm reuse, liveness and stop, so a mismatch would miss
-   * the real pod (a leaked box on stop, a missed re-attach on adopt). That includes the
-   * instance rule — 0 is unsuffixed, so an agent running one box is named exactly as it
-   * always was.
+   * Naming is one-way only: **profile → podNamePrefix → pod name**. Never invert
+   * prefix → profile. Several profiles share one prefix (`kb-compile` and
+   * `kb-compile-codex` both use `kbc-box`), so any inverse is ill-defined and
+   * previously passed `"kbc-box"` into `getBoxProfile`, which throws
+   * `unknown BoxProfile: kbc-box` and aborts compile-box spawn before the pod
+   * is created (production v0.3.2 / PR #466).
+   *
+   * Prefer the spawner's `boxIdFor` so manager and K8sSpawner cannot drift on
+   * sanitization/instance rules; local/process spawners fall back to the same
+   * prefix derivation.
    */
-  private podName(agentId: string, prefix = "agentbox", instance = 0): string {
-    // ASK the spawner when it can answer. Keeping a second copy of the rule here is what
-    // let the two drift when instance 0 gained its index: stop() aimed at a name no pod
-    // had, the 404 was swallowed, and the box ran on. A spawner without the method (Local,
-    // Process) does not name pods at all, so the local rule is only a fallback.
+  private podName(agentId: string, profile: string | undefined, instance = 0): string {
     const spawner = this.spawner as { boxIdFor?(agentId: string, profile?: string, instance?: number): string };
     if (typeof spawner.boxIdFor === "function") {
-      return spawner.boxIdFor(agentId, this.profileForPrefix(prefix), instance);
+      // Pass the real profile — boxIdFor resolves podNamePrefix itself.
+      return spawner.boxIdFor(agentId, profile, instance);
     }
+    const prefix = this.prefixForProfile(profile);
     const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
     return `${prefix}-${sanitized}-${instance}`;
-  }
-
-  /** The profile that spawns under this pod-name prefix — the inverse of prefixForProfile. */
-  private profileForPrefix(prefix: string): string | undefined {
-    return prefix === "agentbox" ? "agent" : prefix;
   }
 
   /** Pod-name prefix a profile spawns under (see K8sSpawner / BoxProfile.podNamePrefix). */
@@ -375,7 +371,7 @@ export class AgentBoxManager {
     sessionId?: string,
   ): Promise<AgentBoxAcquisition> {
     const wantProfile = config?.profile ?? "agent";
-    const name = this.podName(agentId, this.prefixForProfile(wantProfile));
+    const name = this.podName(agentId, wantProfile);
 
     const info = await this.spawner.get(name);
 
@@ -1193,7 +1189,7 @@ export class AgentBoxManager {
 
   async getAsync(agentId: string, profile?: string): Promise<AgentBoxHandle | undefined> {
     if (this.isK8s) {
-      const name = this.podName(agentId, this.prefixForProfile(profile));
+      const name = this.podName(agentId, profile);
       const info = await this.spawner.get(name);
       if (info && info.status === "running" && info.endpoint) {
         return { boxId: name, endpoint: info.endpoint, agentId };
@@ -1205,7 +1201,7 @@ export class AgentBoxManager {
 
   async stop(agentId: string, profile?: string): Promise<void> {
     if (this.isK8s) {
-      const name = this.podName(agentId, this.prefixForProfile(profile));
+      const name = this.podName(agentId, profile);
       console.log(`[agentbox-manager] Stopping AgentBox ${name}`);
       await this.spawner.stop(name);
       return;
