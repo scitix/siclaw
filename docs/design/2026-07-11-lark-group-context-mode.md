@@ -98,6 +98,16 @@ group message arrives
                    └─ per_user → drop immediately (today's behavior)
 ```
 
+Feishu Topic placement is derived directly from the resolved group mode; it is
+not a separate runtime or deployment setting:
+
+- `per_user`: each root `@bot` message starts a Topic-scoped session, and
+  follow-ups in that Topic reuse it without another mention.
+- `shared`: replies and the shared session stay on the main-group path; provider
+  Topic identifiers never split the group session.
+- Existing pre-Topic `per_user` session history is not migrated into a new
+  Topic root. Each new root intentionally starts its own scoped conversation.
+
 - The mode cache is invalidated by the existing channel-reload notification
   (also the propagation path for console edits) and by TTL expiry. A switch
   originating from the group's own card additionally busts the local cache
@@ -216,7 +226,6 @@ vocabulary. For this feature a portal MUST provide:
 
 ## Non-goals
 
-- Thread-level scoping (Lark group events carry no thread/root id).
 - Migrating existing session history across a mode switch.
 - Cross-group or cross-channel shared contexts.
 - DingTalk (groups are ephemeral-per-message by design; adopts the contract
