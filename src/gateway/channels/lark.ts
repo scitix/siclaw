@@ -1270,7 +1270,9 @@ export async function handleLarkMessage(
       return;
     }
     const current: GroupContextMode = modeBinding.contextMode === "shared" ? "shared" : "per_user";
-    const modeReplyInThread = current === "per_user";
+    // /mode changes the whole group. Keep a root invocation visible on the
+    // main-group path; only retain the card inside an already-established Topic.
+    const modeReplyInThread = isThreadFollowup && current === "per_user";
     rememberGroupMode(groupChannelId, chatId, current);
     const sent = await sendModeCard(larkClient, messageId, current, groupChannelId, chatId, locale, modeReplyInThread);
     if (!sent) {
@@ -1370,7 +1372,7 @@ export async function handleLarkMessage(
     return;
   }
 
-  const personalTopicMode = contextMode === "per_user";
+  const personalTopicMode = isGroupMessage && contextMode === "per_user";
   const conversationKey = personalTopicMode ? topicConversationKey : undefined;
   const replyInThread = personalTopicMode;
   const effectiveSessionKey = binding.sessionKey ?? "";
