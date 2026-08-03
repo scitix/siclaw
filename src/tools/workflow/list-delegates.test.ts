@@ -102,12 +102,15 @@ describe("list_delegates tool", () => {
   it("supports one alias-resolution retry with a confirmed binding name", async () => {
     const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER }));
     const first = await tool.execute("c1", { query: "local-alias" });
+    const token = text(first).match(/retry_token="([0-9a-f-]{36})"/)?.[1];
+    expect(token).toBeTruthy();
     expect((first as any).details.total).toBe(0);
     expect((first as any).details.binding_name_confirmed).toBe(false);
 
     const retry = await tool.execute("c2", {
       query: "cluster-alpha",
       binding_name_confirmed: true,
+      retry_token: token,
     });
     expect((retry as any).details.total).toBe(1);
     expect((retry as any).details.binding_name_confirmed).toBe(true);
@@ -142,6 +145,46 @@ describe("list_delegates tool", () => {
     expect(resolved).not.toMatch(/Retry ONCE/i);
     expect(resolved).toMatch(/already offered/i);
     expect(resolved).toMatch(/Do not retry/i);
+  });
+
+  it("does not accept a hit without the retry token after an alias miss", async () => {
+    const turnRef = { current: 1 };
+    const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER, turnRef }));
+
+    const first = await tool.execute("c1", { query: "local-alias" });
+    expect(text(first)).toMatch(/retry_token=/);
+
+    const hitWithoutToken = await tool.execute("c2", { query: "cluster-alpha" });
+    expect((hitWithoutToken as any).details.total).toBe(0);
+    expect(text(hitWithoutToken)).toMatch(/Do not retry/i);
+    expect(text(hitWithoutToken)).not.toContain("clusters matched: cluster-alpha");
+  });
+
+  it("does not accept a third lookup after the alias retry already ended", async () => {
+    const turnRef = { current: 1 };
+    const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER, turnRef }));
+
+    await tool.execute("c1", { query: "local-alias" });
+    const second = await tool.execute("c2", { query: "canonical-but-uncovered" });
+    expect(text(second)).toMatch(/already offered/i);
+
+    const third = await tool.execute("c3", { query: "cluster-alpha" });
+    expect((third as any).details.total).toBe(0);
+    expect(text(third)).toMatch(/Do not retry/i);
+    expect(text(third)).not.toContain("clusters matched: cluster-alpha");
+  });
+
+  it("reopens coverage lookup on the next user turn after a terminal retry", async () => {
+    const turnRef = { current: 1 };
+    const tool = createListDelegatesTool(makeRefs({ delegationRoster: ROSTER, turnRef }));
+
+    await tool.execute("c1", { query: "local-alias" });
+    await tool.execute("c2", { query: "canonical-but-uncovered" });
+
+    turnRef.current += 1;
+    const nextTurn = await tool.execute("c3", { query: "cluster-alpha" });
+    expect((nextTurn as any).details.total).toBe(1);
+    expect(text(nextTurn)).toContain("clusters matched: cluster-alpha");
   });
 
   it("presenting the token spends the one retry; a further miss is terminal", async () => {

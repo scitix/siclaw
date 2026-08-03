@@ -87,6 +87,11 @@ the unresolved name, and changing it, since the real alias flow replaces the ali
 with a canonical name and a per-name memory would not recognise the second call as
 the same attempt.
 
+While a retry offer is outstanding, a matching result without that token is not
+coverage evidence either; it is a caller attempting to bypass the retry boundary
+and is rejected. After a terminal retry outcome, later lookups in the same turn are
+also rejected, including hits. A new user turn starts a new routing attempt.
+
 The attempt boundary matters as much as the bound. An offer the coordinator never
 spends — it was told to consult a helper, none was attached, so it answered the
 user instead — is retired when the turn changes, rather than surviving to make the

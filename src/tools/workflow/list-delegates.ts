@@ -64,8 +64,12 @@ function matchRoster(roster: DelegateRosterMember[], q: string): Match[] {
 }
 
 export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
-  // The one outstanding retry offer on this tool instance (one per agent
-  // session), as an opaque single-use token.
+  // The retry state is tool-owned (one per agent session), not caller-owned.
+  // `closed` matters because clearing the token after a terminal miss without
+  // remembering that terminal state lets a later hit bypass the retry bound.
+  type RetryPhase = "idle" | "offered" | "closed";
+  let retryPhase: RetryPhase = "idle";
+  // The one outstanding retry offer, as an opaque single-use token.
   //
   // Neither `binding_name_confirmed` nor remembering the missed query string can
   // bound the retries. The flag is caller-supplied. And a per-string memory only
@@ -76,14 +80,14 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
   //
   // The token closes them because the tool owns it: a miss issues one, the retry
   // must present it, presenting it consumes it, and while one is outstanding a
-  // further miss is terminal. A terminal outcome clears the slot, so the NEXT
-  // routing question still gets its own single retry.
+  // further miss is terminal. A terminal outcome closes the current turn so a
+  // later hit cannot bypass the bound.
   let pendingRetryToken: string | null = null;
-  // The turn the outstanding offer belongs to. An offer the model never spent —
+  // The turn the current retry state belongs to. An offer the model never spent —
   // e.g. it was told to consult a helper, none was attached, so it correctly
   // answered the user instead — must not survive into the next question and make
   // that question's first miss look terminal.
-  let pendingRetryTurn = -1;
+  let retryTurn = -1;
   return {
     name: "list_delegates",
     label: "List Delegates",
@@ -129,7 +133,41 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
       const limit = Math.min(Math.max(1, Math.floor(params.limit ?? DEFAULT_LIMIT)), MAX_LIMIT);
       const offset = decodeCursor(params.cursor);
 
-      const matched = matchRoster(roster, q);
+      const currentTurn = refs.turnRef?.current ?? -1;
+      const hasTurnBoundary = refs.turnRef !== undefined;
+      if (hasTurnBoundary && retryPhase !== "idle" && currentTurn !== retryTurn) {
+        // A new user turn starts a fresh routing attempt.
+        retryPhase = "idle";
+        pendingRetryToken = null;
+        retryTurn = -1;
+      }
+
+      let matched = matchRoster(roster, q);
+      const presentedToken = typeof params.retry_token === "string" ? params.retry_token.trim() : "";
+      const validRetryToken =
+        retryPhase === "offered" && presentedToken !== "" && presentedToken === pendingRetryToken;
+      let retryBlocked = retryPhase === "closed";
+
+      if (retryPhase === "offered" && matched.length > 0) {
+        if (validRetryToken) {
+          // A valid retry is consumed on a hit before the result is rendered.
+          retryPhase = "idle";
+          pendingRetryToken = null;
+          retryTurn = -1;
+        } else {
+          // A hit without the single-use token is not an authorized retry.
+          retryPhase = hasTurnBoundary ? "closed" : "idle";
+          pendingRetryToken = null;
+          retryTurn = hasTurnBoundary ? currentTurn : -1;
+          retryBlocked = true;
+        }
+      }
+
+      if (retryBlocked) {
+        // Do not leak or authorize a roster match after this attempt is closed.
+        matched = [];
+      }
+
       const total = matched.length;
       const page = matched.slice(offset, offset + limit);
       const lines = page.map(({ m, mc, mh }) => {
@@ -143,57 +181,47 @@ export function createListDelegatesTool(refs: ToolRefs): ToolDefinition {
         return `- ${m.name} [id: ${m.id}]${desc}\n    ${renderMatched("clusters", m.clusters, mc)}\n    ${renderMatched("hosts", m.hosts, mh)}`;
       });
 
-      // Resolve the outstanding retry offer BEFORE rendering, and independently of
-      // whether this result is empty: a successful canonical retry spends the offer
-      // just as a failed one does, and leaving it outstanding would make the NEXT
-      // routing question's first miss look terminal.
-      const currentTurn = refs.turnRef?.current ?? -1;
-      const presentedToken = typeof params.retry_token === "string" ? params.retry_token.trim() : "";
-      if (pendingRetryToken !== null && currentTurn !== pendingRetryTurn) {
-        // A new routing attempt: an offer the model never spent is retired rather
-        // than carried across the user's turns.
-        pendingRetryToken = null;
-        pendingRetryTurn = -1;
-      }
-      if (total > 0 && presentedToken !== "" && presentedToken === pendingRetryToken) {
-        pendingRetryToken = null;   // retry spent on a hit
-        pendingRetryTurn = -1;
-      }
-
       const nextOffset = offset + page.length;
       const hasMore = nextOffset < total;
       let hint = "";
       if (total === 0) {
-        // One retry per routing attempt, enforced by the tool. The retry is spent
-        // by presenting the token; while a token is outstanding a further miss is
-        // terminal, so a caller that changes the name (alias → canonical) or drops
-        // the flag cannot earn a second offer. Any terminal outcome frees the slot
-        // for the next question.
-        const spentRetry = presentedToken !== "" && presentedToken === pendingRetryToken;
-        const offerOutstanding = pendingRetryToken !== null;
-        if (bindingNameConfirmed || spentRetry || offerOutstanding) {
-          pendingRetryToken = null;
-          pendingRetryTurn = -1;
-          const because = bindingNameConfirmed
-            ? " (confirmed binding name)."
-            : spentRetry
-              ? " — the resolved name was already retried."
-              : " — the one alias-resolution retry for this attempt was already offered.";
+        if (retryBlocked) {
           hint =
-            `\n\nNo delegate agent covers "${rawQuery}"${because}` +
-            " Do not retry and do not delegate — tell the user no authorized agent covers that resource" +
-            (bindingNameConfirmed ? "." : ", and that the name may be an alias.");
+            `\n\nNo delegate agent covers "${rawQuery}" — this routing attempt is already closed.` +
+            " Do not retry and do not delegate — tell the user no authorized agent covers that resource.";
         } else {
-          pendingRetryToken = crypto.randomUUID();
-          pendingRetryTurn = currentTurn;
-          hint =
-            `\n\nNo exact delegate resource binding matches "${rawQuery}" as written. If this may be a cluster ` +
-            "alias, localized name, local nickname, or spelling variant, consult a routing-helper skill you " +
-            "were given, if any. Retry ONCE with its confirmed canonical binding name, " +
-            `\`binding_name_confirmed=true\` and \`retry_token="${pendingRetryToken}"\` — that token is single-use. ` +
-            "If no helper is attached or it cannot confirm one binding name, " +
-            "do not guess or retry — tell the user no authorized agent covers the name as written and that it " +
-            "may be an alias. Do not delegate until coverage is confirmed.";
+          // One retry per routing attempt, enforced by the tool. The retry is spent
+          // by presenting the token; while one is outstanding a further miss is
+          // terminal, so a caller that changes the name (alias → canonical) or drops
+          // the flag cannot earn a second offer.
+          const spentRetry = validRetryToken;
+          const offerOutstanding = pendingRetryToken !== null;
+          if (bindingNameConfirmed || spentRetry || offerOutstanding) {
+            retryPhase = hasTurnBoundary ? "closed" : "idle";
+            pendingRetryToken = null;
+            retryTurn = hasTurnBoundary ? currentTurn : -1;
+            const because = bindingNameConfirmed
+              ? " (confirmed binding name)."
+              : spentRetry
+                ? " — the resolved name was already retried."
+                : " — the one alias-resolution retry for this attempt was already offered.";
+            hint =
+              `\n\nNo delegate agent covers "${rawQuery}"${because}` +
+              " Do not retry and do not delegate — tell the user no authorized agent covers that resource" +
+              (bindingNameConfirmed ? "." : ", and that the name may be an alias.");
+          } else {
+            retryPhase = "offered";
+            pendingRetryToken = crypto.randomUUID();
+            retryTurn = currentTurn;
+            hint =
+              `\n\nNo exact delegate resource binding matches "${rawQuery}" as written. If this may be a cluster ` +
+              "alias, localized name, local nickname, or spelling variant, consult a routing-helper skill you " +
+              "were given, if any. Retry ONCE with its confirmed canonical binding name, " +
+              `\`binding_name_confirmed=true\` and \`retry_token="${pendingRetryToken}"\` — that token is single-use. ` +
+              "If no helper is attached or it cannot confirm one binding name, " +
+              "do not guess or retry — tell the user no authorized agent covers the name as written and that it " +
+              "may be an alias. Do not delegate until coverage is confirmed.";
+          }
         }
       } else if (hasMore) {
         hint = `\n\nShowing ${page.length} of ${total}. Refine the query, or pass cursor="${nextOffset}" for the next page.`;
