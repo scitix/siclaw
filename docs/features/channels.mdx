@@ -72,9 +72,8 @@ Create a Lark bot app, enable message event subscriptions, then configure it in 
 - `appId`
 - `appSecret`
 
-For a controlled group-topic pilot, set `runtime.env.SICLAW_LARK_THREAD_MODE`
-to `"1"`. This is a rollout gate, not a second mode selector: the existing
-group context selector controls the user experience.
+The existing group context selector determines Topic behavior directly; there
+is no separate Topic switch or deployment setting.
 
 - **Personal (per-user)**: a root `@bot` message opens a Feishu topic with the
   streaming card inside it. Follow-ups in that topic reuse that user's Agent
@@ -82,7 +81,7 @@ group context selector controls the user experience.
   unmentioned replies do not create or inherit the private session.
 - **Team (shared)**: users continue to `@bot` in the main group and the bot
   replies on the existing main-group path. The whole group keeps one shared
-  Agent session; the topic rollout does not split it by Feishu topic.
+  Agent session; Feishu topics do not split it into separate sessions.
 
 No additional Topic switch is required in the UI. Follow-ups without another
 `@bot` require the app's group-message event permission.

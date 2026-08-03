@@ -242,10 +242,6 @@ export interface LarkChannelConfig {
   domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
   app_id: string;
   app_secret: string;
-  /** Reply to group root messages as Feishu topics and scope sessions to the
-   *  topic root. Default-off; the test runtime can enable it with
-   *  SICLAW_LARK_THREAD_MODE=1 without changing stored channel config. */
-  thread_mode?: "group";
   group_channel_id?: string;
   verification_token?: string;
   encrypt_key?: string;
@@ -462,12 +458,6 @@ function getLarkSenderType(data: any): string | null {
 
 function buildLarkSessionKey(senderOpenId: string | null, chatId: string): string {
   return senderOpenId ? `open_id:${senderOpenId}` : `chat:${chatId}`;
-}
-
-function larkGroupThreadModeEnabled(config?: LarkChannelConfig): boolean {
-  if (config?.thread_mode === "group") return true;
-  const env = process.env.SICLAW_LARK_THREAD_MODE?.trim().toLowerCase();
-  return env === "1" || env === "true";
 }
 
 /**
@@ -985,10 +975,10 @@ export async function handleLarkMessage(
   const senderOpenId = getLarkSenderOpenId(data);
   const senderType = getLarkSenderType(data);
   const sessionKey = buildLarkSessionKey(senderOpenId, chatId);
-  // Rollout gate only: whether personal group conversations MAY use Feishu
-  // topics. The binding's server-authoritative contextMode decides whether
-  // this specific message actually uses the topic path.
-  const topicFeatureEnabled = chatType === "group" && larkGroupThreadModeEnabled(channelConfig);
+  // Every group message carries a provider-native Topic candidate. The
+  // server-authoritative contextMode decides the product behavior after binding
+  // resolution: per_user uses the Topic; shared stays on the main-group path.
+  const isGroupMessage = chatType === "group";
   const eventRootMessageId = typeof message.root_id === "string" && message.root_id.trim()
     ? message.root_id.trim()
     : messageId;
@@ -999,7 +989,7 @@ export async function handleLarkMessage(
   // that this event belongs to a Topic; otherwise an explicit @ starts a new
   // bot conversation rooted at the current message.
   const rootMessageId = threadId ? eventRootMessageId : messageId;
-  const topicConversationKey = topicFeatureEnabled ? `lark_thread:${rootMessageId}` : undefined;
+  const topicConversationKey = isGroupMessage ? `lark_thread:${rootMessageId}` : undefined;
 
   // Raw receipt log: fires for EVERY delivered event before any drop, so a
   // group message that arrives but is filtered (non-text, empty after @-strip)
@@ -1246,7 +1236,7 @@ export async function handleLarkMessage(
 
   // Computed here rather than at the @-gate below: /mode needs both.
   const botMentioned = isBotMentioned(message, botOpenId);
-  const isThreadFollowup = topicFeatureEnabled && threadId !== null && rootMessageId !== messageId;
+  const isThreadFollowup = isGroupMessage && threadId !== null && rootMessageId !== messageId;
 
   // /mode — summon the context-mode switch card. Command words are exact, and
   // the bot must be @-mentioned: this switches the mode for the WHOLE group, and
@@ -1280,7 +1270,7 @@ export async function handleLarkMessage(
       return;
     }
     const current: GroupContextMode = modeBinding.contextMode === "shared" ? "shared" : "per_user";
-    const modeReplyInThread = topicFeatureEnabled && current === "per_user";
+    const modeReplyInThread = current === "per_user";
     rememberGroupMode(groupChannelId, chatId, current);
     const sent = await sendModeCard(larkClient, messageId, current, groupChannelId, chatId, locale, modeReplyInThread);
     if (!sent) {
@@ -1380,7 +1370,7 @@ export async function handleLarkMessage(
     return;
   }
 
-  const personalTopicMode = topicFeatureEnabled && contextMode === "per_user";
+  const personalTopicMode = contextMode === "per_user";
   const conversationKey = personalTopicMode ? topicConversationKey : undefined;
   const replyInThread = personalTopicMode;
   const effectiveSessionKey = binding.sessionKey ?? "";

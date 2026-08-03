@@ -1148,7 +1148,7 @@ describe("handleLarkMessage — routing to AgentBox", () => {
       undefined,
       {} as any,
       "zh-CN",
-      { app_id: "x", app_secret: "y", thread_mode: "group" },
+      { app_id: "x", app_secret: "y" },
       "ou_bot_self",
     );
 
@@ -1527,7 +1527,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     });
     await handleLarkMessage(
       data, makeLarkClient(), "lark", makeAgentBoxManager("a1") as any, undefined, {} as any,
-      "zh-CN", { app_id: "x", app_secret: "y", thread_mode: "group" }, BOT,
+      "zh-CN", { app_id: "x", app_secret: "y" }, BOT,
     );
     expect(resolveBindingMock).toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();   // handled as a command, not a prompt
@@ -1581,7 +1581,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       undefined,
       {} as any,
       "zh-CN",
-      { app_id: "x", app_secret: "y", thread_mode: "group" },
+      { app_id: "x", app_secret: "y" },
       BOT,
     );
 
@@ -1597,7 +1597,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     );
   });
 
-  it("thread mode creates a topic reply and accepts an unmentioned follow-up in the same root", async () => {
+  it("personal mode always creates a topic reply and accepts an unmentioned follow-up in the same root", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({
       sessionId: "thread-session",
       sessionKey: "open_id:ou_user_1:lark_thread:mid-1",
@@ -1610,7 +1610,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
         message: { role: "assistant", content: [{ type: "text", text: "thread answer" }] },
       };
     });
-    const config = { app_id: "x", app_secret: "y", thread_mode: "group" } as const;
+    const config = { app_id: "x", app_secret: "y" } as const;
 
     const rootClient = makeLarkClient();
     await handleLarkMessage(
@@ -1703,7 +1703,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       undefined,
       {} as any,
       "zh-CN",
-      { app_id: "x", app_secret: "y", thread_mode: "group" },
+      { app_id: "x", app_secret: "y" },
       BOT,
     );
 
@@ -1716,7 +1716,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     expect(client.im.message.reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
   });
 
-  it("thread rollout keeps a shared group on the main-group reply path", async () => {
+  it("team mode always keeps the shared group on the main-group reply path", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding({
       sessionId: "shared-session",
       sessionKey: "chat:oc_abc123",
@@ -1729,7 +1729,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
         message: { role: "assistant", content: [{ type: "text", text: "shared answer" }] },
       };
     });
-    const config = { app_id: "x", app_secret: "y", thread_mode: "group" } as const;
+    const config = { app_id: "x", app_secret: "y" } as const;
     const rootClient = makeLarkClient();
 
     await handleLarkMessage(
@@ -1794,7 +1794,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
     expect(promptMock.mock.calls[1][0].text).toContain("引用回复里的共享讨论");
   });
 
-  it("thread mode ignores an unmentioned topic that has no existing bot session", async () => {
+  it("personal mode ignores an unmentioned topic that has no existing bot session", async () => {
     resolveBindingMock.mockResolvedValue(null);
     const lark = makeLarkClient();
 
@@ -1812,7 +1812,7 @@ describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => 
       undefined,
       {} as any,
       "zh-CN",
-      { app_id: "x", app_secret: "y", thread_mode: "group" },
+      { app_id: "x", app_secret: "y" },
       BOT,
     );
 
