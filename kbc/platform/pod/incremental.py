@@ -33,6 +33,12 @@ CHANGESET_PATH = "authoring/CHANGESET.json"
 # 用一个文件而非新 SDK 工具——模型写文件是它本来就会的动作,零协议扩张。
 ADDED_TARGETS_PATH = "authoring/ADDED_TARGETS.json"
 
+# CHANGESET is synced as one workspace artifact. Keep the default aligned with
+# compile_box.MAX_SYNC_FILE_BYTES; deployments may lower the dedicated budget or
+# the shared workspace cap. The serialized file (including indentation/newline)
+# must fit, not just the sum of diff strings.
+DEFAULT_CHANGESET_MAX_BYTES = 1024 * 1024
+
 # index.md 是路由页(OKF 保留名),不由某个源"直接"决定,单独按 index_touched 处理;
 # 它是护栏的合法可改页之一(页集变了要刷新它),永远不算 unaffected。
 INDEX_PAGE = "index.md"
@@ -128,17 +134,126 @@ def build_changeset(
         # 全新料:没有归属页,模型按 target_hint 级联编入相关页或建新页;coverage 护栏兜底。
         "added": [{"path": p, "content_ref": p, "target_hint": ""} for p in added],
         # 改动料:给受影响页 + 统一 diff(+/−),模型只改动到的那几处,不重写整页。
-        "modified": [{"path": p, "affected_pages": pages_for(p), "diff": diffs.get(p, "")} for p in modified],
+        "modified": [{"path": p, "affected_pages": pages_for(p), "diff": ""} for p in modified],
         # 删除料:从受影响页移除其内容/引用;页空则删页(index_touched)。
         "deleted": [{"path": p, "affected_pages": pages_for(p)} for p in deleted],
         "affected_pages": affected,          # 三类合并去重(modified+deleted 命中的现存页)
         "unaffected_pages": unaffected,      # 收尾护栏比对用
+        "unaffected_pages_count": len(unaffected),
         "index_touched": bool(added or deleted),   # 页集可能变 → 需刷新 index.md
     }
-    compact_summary = _compact_change_summary(summary)
-    if compact_summary:
-        changeset["change_summary"] = compact_summary
+    _fit_changeset_optional_payload(changeset, diffs, summary)
     return changeset
+
+
+def _changeset_max_bytes() -> int:
+    sync_value = int(os.environ.get("KBC_MAX_SYNC_FILE_BYTES", str(DEFAULT_CHANGESET_MAX_BYTES)))
+    dedicated_raw = os.environ.get("KBC_MAX_CHANGESET_BYTES")
+    dedicated_value = int(dedicated_raw) if dedicated_raw is not None else sync_value
+    if sync_value <= 0 or dedicated_value <= 0:
+        raise ValueError("CHANGESET and workspace sync byte limits must be positive")
+    # A dedicated budget may reserve less space, but can never relax the actual
+    # workspace transport limit that persists CHANGESET.json.
+    return min(sync_value, dedicated_value)
+
+
+def _serialized_changeset_size(changeset: dict) -> int:
+    return len((json.dumps(changeset, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def _fit_changeset_optional_payload(changeset: dict, diffs: dict[str, str], summary: dict | None) -> None:
+    """Fit optional diffs + logical hints under the durable artifact byte cap.
+
+    Execution scope is authoritative and never silently truncated. If the full
+    unaffected-page listing alone pushes the base over budget, retain its count
+    and omit the redundant names (the byte guard derives authorization from
+    affected_pages, not this display-only list). Diffs are then admitted in
+    stable path order; omitted diffs retain the documented scoped re-read
+    fallback. Logical hints use only the remaining budget and report omissions.
+    """
+    max_bytes = _changeset_max_bytes()
+    if _serialized_changeset_size(changeset) > max_bytes:
+        omitted = len(changeset.get("unaffected_pages", []))
+        changeset["unaffected_pages"] = []
+        if omitted:
+            changeset["unaffected_pages_omitted"] = omitted
+    if _serialized_changeset_size(changeset) > max_bytes:
+        raise ValueError("incremental execution scope exceeds durable CHANGESET byte budget")
+
+    compact_summary = _compact_change_summary(summary)
+    logical_changes = []
+    producer_omitted = 0
+    if compact_summary:
+        logical_changes = list(compact_summary.pop("logical_changes", []))
+        producer_omitted = compact_summary.pop("logical_changes_omitted", 0)
+        if producer_omitted:
+            compact_summary["logical_changes_omitted"] = producer_omitted
+        # Coverage is recomputed after the box's final byte-budget selection.
+        compact_summary.pop("modified_with_diffs", None)
+        compact_summary.pop("modified_without_diffs", None)
+        changeset["change_summary"] = compact_summary
+
+    modified_by_path = {
+        item.get("path"): item
+        for item in changeset.get("modified", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    retained_diffs = 0
+    for path in sorted(diffs):
+        diff = diffs[path]
+        item = modified_by_path.get(path)
+        if item is None or not diff:
+            continue
+        item["diff"] = diff
+        if _serialized_changeset_size(changeset) > max_bytes:
+            item["diff"] = ""
+            continue
+        retained_diffs += 1
+
+    if compact_summary is not None:
+        compact_summary["modified_with_diffs"] = retained_diffs
+        compact_summary["modified_without_diffs"] = max(0, len(modified_by_path) - retained_diffs)
+        # The two scalar counters are tiny, but a base exactly at the cap should
+        # still sacrifice the last optional diff rather than exceed durability.
+        while _serialized_changeset_size(changeset) > max_bytes and retained_diffs:
+            for path in sorted(diffs, reverse=True):
+                item = modified_by_path.get(path)
+                if item is not None and item.get("diff"):
+                    item["diff"] = ""
+                    retained_diffs -= 1
+                    compact_summary["modified_with_diffs"] = retained_diffs
+                    compact_summary["modified_without_diffs"] = max(0, len(modified_by_path) - retained_diffs)
+                    break
+        if _serialized_changeset_size(changeset) > max_bytes:
+            changeset.pop("change_summary", None)
+            compact_summary = None
+
+    if compact_summary is not None and logical_changes:
+        accepted: list[dict] = []
+        for change in logical_changes:
+            accepted.append(change)
+            compact_summary["logical_changes"] = accepted
+            compact_summary["logical_changes_omitted"] = producer_omitted + len(logical_changes) - len(accepted)
+            if _serialized_changeset_size(changeset) > max_bytes:
+                accepted.pop()
+                break
+        if accepted:
+            compact_summary["logical_changes"] = accepted
+        else:
+            compact_summary.pop("logical_changes", None)
+        omitted = producer_omitted + len(logical_changes) - len(accepted)
+        if omitted:
+            compact_summary["logical_changes_omitted"] = omitted
+        else:
+            compact_summary.pop("logical_changes_omitted", None)
+        if _serialized_changeset_size(changeset) > max_bytes:
+            # The omitted counter itself can cross a byte-exact boundary when
+            # the pre-hint payload sits at the cap. Logical hints are optional.
+            compact_summary.pop("logical_changes", None)
+            compact_summary.pop("logical_changes_omitted", None)
+
+    if _serialized_changeset_size(changeset) > max_bytes:
+        raise AssertionError("CHANGESET byte fitting exceeded its durable limit")
 
 
 def _compact_change_summary(summary: dict | None) -> dict | None:

@@ -3,6 +3,7 @@
 """
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -203,7 +204,53 @@ def test_diff_cap_degrades_oversized_diffs():
         by_path = {m["path"]: m["diff"] for m in cs["modified"]}
         assert by_path["snap/one.md"] == ""          # degraded, not shipped oversized
         assert by_path["snap/two.md"] == "- old\n+ new"  # small diff untouched
-    print("OK  oversized per-source diffs degrade to re-read (CHANGESET stays syncable)")
+        print("OK  oversized per-source diffs degrade to re-read (CHANGESET stays syncable)")
+
+
+def test_total_changeset_budget_prioritizes_scope_and_diffs():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _kb(base)
+        paths = [f"snap/chunk-{i}.md" for i in range(8)]
+        summary_path = "测" * 1024
+        summary = {
+            "logical_changes": [{
+                "change_kind": "path_and_content",
+                "baseline_primary_path": summary_path,
+                "current_primary_path": summary_path,
+                "baseline_files": 1,
+                "current_files": 1,
+            } for _ in range(100)],
+        }
+        old = os.environ.get("KBC_MAX_CHANGESET_BYTES")
+        old_sync = os.environ.get("KBC_MAX_SYNC_FILE_BYTES")
+        os.environ["KBC_MAX_CHANGESET_BYTES"] = str(96 * 1024)
+        os.environ["KBC_MAX_SYNC_FILE_BYTES"] = str(80 * 1024)
+        try:
+            cs = incremental.build_changeset(
+                td,
+                {"modified": paths},
+                diffs={path: str(i) * (16 * 1024) for i, path in enumerate(paths)},
+                summary=summary,
+            )
+        finally:
+            if old is None:
+                os.environ.pop("KBC_MAX_CHANGESET_BYTES", None)
+            else:
+                os.environ["KBC_MAX_CHANGESET_BYTES"] = old
+            if old_sync is None:
+                os.environ.pop("KBC_MAX_SYNC_FILE_BYTES", None)
+            else:
+                os.environ["KBC_MAX_SYNC_FILE_BYTES"] = old_sync
+        encoded = (json.dumps(cs, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        assert len(encoded) <= 80 * 1024, len(encoded)  # shared sync cap wins
+        assert [item["path"] for item in cs["modified"]] == paths
+        kept = sum(bool(item["diff"]) for item in cs["modified"])
+        assert 0 < kept < len(paths), kept
+        assert cs["change_summary"]["modified_with_diffs"] == kept
+        assert cs["change_summary"]["modified_without_diffs"] == len(paths) - kept
+        assert cs["change_summary"]["logical_changes_omitted"] > 0
+        print("OK  total CHANGESET byte budget keeps scope, then diffs, then bounded logical hints")
 
 
 def test_protocol_raw_changes_to_changeset():
@@ -341,6 +388,7 @@ if __name__ == "__main__":
     test_page_bytes_and_restore()
     test_restore_skips_unrestorable_page()
     test_diff_cap_degrades_oversized_diffs()
+    test_total_changeset_budget_prioritizes_scope_and_diffs()
     test_protocol_raw_changes_to_changeset()
     test_added_targets_and_authorized()
     test_scoped_directive()
