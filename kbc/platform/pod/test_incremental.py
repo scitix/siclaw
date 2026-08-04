@@ -223,11 +223,31 @@ def test_protocol_raw_changes_to_changeset():
         _mk(base, "authoring/RAW_CHANGES.json", json.dumps({
             "added": [], "modified": ["snap/two.md"], "deleted": [],
             "diffs": {"snap/two.md": "- old\n+ new"},
+            "summary": {
+                "physical_path_operations": 3,
+                "effective_path_operations": 1,
+                "ignored_canonical_noops": 2,
+                "logical_affected_sources": 1,
+                "logical_total_sources": 10,
+                "modified_with_diffs": 1,
+                "modified_without_diffs": 0,
+                "logical_changes": [{
+                    "origin_unit_key": "feishu:opaque-do-not-forward",
+                    "change_kind": "content",
+                    "current_primary_path": "snap/two.md",
+                    "current_files": 3,
+                }],
+            },
             "baseline_fingerprint": "BASE", "snapshot_fingerprint": "SNAP",
         }))
         cs = incremental.materialize_changeset(td)
         assert cs is not None and cs["affected_pages"] == ["a.md"], cs        # box reverse-looked-up
         assert cs["modified"][0]["diff"] == "- old\n+ new"                    # the consumer's diff passed through
+        assert cs["change_summary"]["logical_affected_sources"] == 1
+        assert cs["change_summary"]["logical_changes"] == [{
+            "change_kind": "content", "current_primary_path": "snap/two.md", "current_files": 3,
+        }]
+        assert "origin_unit_key" not in json.dumps(cs["change_summary"])
         # persisted for the model to read
         written = json.loads((base / "authoring/CHANGESET.json").read_text())
         assert written["affected_pages"] == ["a.md"] and written["snapshot_fingerprint"] == "SNAP"
@@ -256,6 +276,21 @@ def test_scoped_directive():
     d = incremental.build_scoped_directive(cs)                # default locale = English
     assert "CHANGESET.json" in d and "2 modified source(s)" in d and "1 added source(s)" in d
     assert "ADDED_TARGETS.json" in d and "sha256" in d  # declares the two contracts the guard depends on
+    summarized = incremental.build_scoped_directive({
+        **cs,
+        "change_summary": {
+            "logical_affected_sources": 1,
+            "ignored_canonical_noops": 2,
+            "modified_with_diffs": 1,
+            "modified_without_diffs": 1,
+            "logical_changes": [{"change_kind": "content"}],
+        },
+    })
+    assert "1 logical source document(s)" in summarized
+    assert "2 canonical no-op" in summarized
+    assert "1 modified source(s) have surgical diffs" in summarized
+    assert "1 require a scoped source re-read" in summarized
+    assert "exact execution scope" in summarized
     # Domain is AI-maintained against the latest whole catalog after page work:
     # empty → must report_domain; present → re-judge full catalog + this diff.
     # Anchor is index.md, never CHANGESET alone.

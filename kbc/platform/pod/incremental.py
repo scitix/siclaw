@@ -94,6 +94,7 @@ def build_changeset(
     changed_sources: dict,
     *,
     diffs: dict[str, str] | None = None,
+    summary: dict | None = None,
     baseline_fingerprint: str | None = None,
     snapshot_fingerprint: str | None = None,
 ) -> dict:
@@ -120,7 +121,7 @@ def build_changeset(
     def pages_for(src: str) -> list[str]:
         return sorted(_pages_citing(pages, {src}))
 
-    return {
+    changeset = {
         "version": 1,
         "baseline_fingerprint": baseline_fingerprint,   # 上次收敛的整区指纹(审计)
         "snapshot_fingerprint": snapshot_fingerprint,   # 本轮快照的整区指纹
@@ -134,6 +135,58 @@ def build_changeset(
         "unaffected_pages": unaffected,      # 收尾护栏比对用
         "index_touched": bool(added or deleted),   # 页集可能变 → 需刷新 index.md
     }
+    compact_summary = _compact_change_summary(summary)
+    if compact_summary:
+        changeset["change_summary"] = compact_summary
+    return changeset
+
+
+def _compact_change_summary(summary: dict | None) -> dict | None:
+    """Keep only bounded, model-useful source summary fields from the control plane.
+
+    RAW_CHANGES remains a machine boundary, so an unexpected producer must not
+    turn CHANGESET into an unbounded prompt payload. Opaque provider identities
+    are intentionally not accepted here; primary paths and change kinds are the
+    useful orientation signal for the compiler.
+    """
+    if not isinstance(summary, dict):
+        return None
+
+    out: dict = {}
+    for key in (
+        "physical_path_operations",
+        "effective_path_operations",
+        "ignored_canonical_noops",
+        "logical_affected_sources",
+        "logical_total_sources",
+        "logical_changes_omitted",
+        "modified_with_diffs",
+        "modified_without_diffs",
+    ):
+        value = summary.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[key] = value
+
+    allowed_kinds = {"added", "removed", "path_only", "content", "path_and_content"}
+    changes: list[dict] = []
+    raw_changes = summary.get("logical_changes")
+    if isinstance(raw_changes, list):
+        for raw in raw_changes[:100]:
+            if not isinstance(raw, dict) or raw.get("change_kind") not in allowed_kinds:
+                continue
+            item = {"change_kind": raw["change_kind"]}
+            for key in ("baseline_primary_path", "current_primary_path"):
+                value = raw.get(key)
+                if isinstance(value, str) and value:
+                    item[key] = value[:1024]
+            for key in ("baseline_files", "current_files"):
+                value = raw.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    item[key] = value
+            changes.append(item)
+    if changes:
+        out["logical_changes"] = changes
+    return out or None
 
 
 # ── 收尾护栏:未授权页字节不变(把"其余不动"从愿望变保证)────────────────────────
@@ -226,7 +279,8 @@ def integrity_violations(
 def load_raw_changes(workdir: str) -> dict | None:
     """读消费方写的增量输入 `authoring/RAW_CHANGES.json`。形状(消费方负责写):
         {"added":[路径], "modified":[路径], "deleted":[路径],
-         "diffs": {路径: 统一diff}, "baseline_fingerprint":…, "snapshot_fingerprint":…}
+         "diffs": {路径: 统一diff}, "summary": {逻辑文档级摘要},
+         "baseline_fingerprint":…, "snapshot_fingerprint":…}
     缺失/损坏/结构非法 → None(box 回退全量编译,向后兼容——消费方半边没跟上不崩)。
     """
     path = Path(workdir) / RAW_CHANGES_PATH
@@ -260,6 +314,7 @@ def materialize_changeset(workdir: str) -> dict | None:
         workdir,
         {"added": raw.get("added", []), "modified": raw.get("modified", []), "deleted": raw.get("deleted", [])},
         diffs=raw.get("diffs"),
+        summary=raw.get("summary"),
         baseline_fingerprint=raw.get("baseline_fingerprint"),
         snapshot_fingerprint=raw.get("snapshot_fingerprint"),
     )
@@ -301,6 +356,7 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
     n_add = len(changeset.get("added", []))
     n_mod = len(changeset.get("modified", []))
     n_del = len(changeset.get("deleted", []))
+    summary = changeset.get("change_summary") if isinstance(changeset.get("change_summary"), dict) else None
     if _is_en(locale):
         lines = [
             "[Incremental recompile] This round's changes were computed by code and written to"
@@ -343,6 +399,16 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
             "· Domain rulings follow constitution.md as usual; file a ticket for any new contradiction"
             " as usual. When done, briefly state which pages you changed and whether domain moved.",
         ]
+        if summary:
+            lines.insert(
+                1,
+                f"· Machine summary: {summary.get('logical_affected_sources', 0)} logical source document(s)"
+                f" affected; {summary.get('ignored_canonical_noops', 0)} canonical no-op path change(s)"
+                " were already removed. Use change_summary.logical_changes to orient by document;"
+                f" {summary.get('modified_with_diffs', 0)} modified source(s) have surgical diffs and"
+                f" {summary.get('modified_without_diffs', 0)} require a scoped source re-read. Use the"
+                " path arrays and diffs below as the exact execution scope.",
+            )
         return "\n".join(lines)
     lines = [
         "【增量重编】本轮变更已由代码算好,写在 authoring/CHANGESET.json。**先读它**,只做范围内的事:",
@@ -367,6 +433,15 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
         "（为 domain **读** index.md 是必须的;改范围外正文仍禁止。）",
         "· 领域裁决照常按 constitution.md;遇新矛盾照走工单。改完简短说动了哪几页、domain 是否变了。",
     ]
+    if summary:
+        lines.insert(
+            1,
+            f"· 机器摘要：影响 {summary.get('logical_affected_sources', 0)} 个逻辑源文档，已过滤"
+            f" {summary.get('ignored_canonical_noops', 0)} 个 canonical no-op 路径变化。先用"
+            f" change_summary.logical_changes 按文档理解意图；{summary.get('modified_with_diffs', 0)} 个"
+            f"改动源有外科式 diff，{summary.get('modified_without_diffs', 0)} 个需在限定范围内重读源；"
+            "再以路径数组和 diff 作为精确执行范围。",
+        )
     return "\n".join(lines)
 
 
