@@ -768,6 +768,7 @@ class CompileRun:
         """Arm the stall watchdog for a new model turn. Called for every turn —
         the owner's /message AND internal self-check/verify/batch injections."""
         self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
+        self._turn_page_hashes = incremental.page_hashes(self.workdir)
         self._turn_format_guard = None
         if grandfather_legacy_format:
             self._turn_format_guard = {
@@ -2431,6 +2432,17 @@ async def _post_turn_selfcheck(run) -> str | None:
     workdir = getattr(run, "workdir", None)
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
+    turn_pages_before = getattr(run, "_turn_page_hashes", None)
+    run._turn_page_hashes = None
+    producer_stamps: list[str] = []
+    if isinstance(turn_pages_before, dict):
+        turn_pages_after = incremental.page_hashes(workdir)
+        turn_changes = incremental.changed_pages(turn_pages_before, turn_pages_after)
+        producer_stamps = selfcheck.stamp_siclaw_generated_metadata(
+            workdir,
+            set(turn_changes),
+            new_pages={page for page, kind in turn_changes.items() if kind == "created"},
+        )
     # The exclusion ledger is machine-owned, but the escape hatch stays open: a
     # model MAY hand-edit authoring/EXCLUSIONS.json when the exclude_source tool
     # cannot express a fix. Normalize it back to canonical strict JSON (and prune
@@ -2541,6 +2553,9 @@ async def _post_turn_selfcheck(run) -> str | None:
     mechanical_fixes = selfcheck.normalize_body_source_annotations(
         workdir, allowed_pages=mechanical_allowed)
     if mechanical_fixes:
+        mechanically_changed = {item["page"] for item in mechanical_fixes}
+        producer_stamps = sorted(set(producer_stamps) | set(
+            selfcheck.stamp_siclaw_generated_metadata(workdir, mechanically_changed)))
         after = incremental.page_hashes(workdir)
         key = selfcheck.state_key(workdir)
     run._selfcheck_key = key
@@ -2548,6 +2563,10 @@ async def _post_turn_selfcheck(run) -> str | None:
     report["mechanical_fixes"] = {
         "count": len(mechanical_fixes),
         "items": mechanical_fixes[:40],
+    }
+    report["producer_stamps"] = {
+        "count": len(producer_stamps),
+        "pages": producer_stamps[:40],
     }
     grandfathered_format: list[dict] = []
     if incr:
@@ -2720,6 +2739,16 @@ async def _emit_message(run: CompileRun, msg) -> None:
             # turn. Park the reply, keep the durability sync, skip selfcheck
             # (the final full-corpus pass owns it) and skip turn_done.
             run._last_turn_reply = reply
+            turn_pages_before = getattr(run, "_turn_page_hashes", None)
+            run._turn_page_hashes = None
+            if isinstance(turn_pages_before, dict):
+                turn_pages_after = incremental.page_hashes(run.workdir)
+                turn_changes = incremental.changed_pages(turn_pages_before, turn_pages_after)
+                selfcheck.stamp_siclaw_generated_metadata(
+                    run.workdir,
+                    set(turn_changes),
+                    new_pages={page for page, kind in turn_changes.items() if kind == "created"},
+                )
             sent = getattr(run, "_sync_sent", None)
             if sent is not None:
                 try:

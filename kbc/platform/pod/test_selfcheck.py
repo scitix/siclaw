@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 import selfcheck
@@ -79,7 +80,7 @@ def test_okf_v02_conformance():
     assert selfcheck.format_policy_violations(pages) == []
 
     metadata_page = {
-        "text": "---\ntype: Topic\nsources:\n  - id: manual\n    resource: raw/manual.md\n"
+        "text": "---\ntype: Topic\nsources:\n  - id: manual\n    resource: raw/manual.md\n    author: team:docs\n"
                 "generated:\n  by: process:siclaw-kbc\n  at: 2026-08-04T10:00:00Z\n"
                 "status: stable\nstale_after: 2027-01-01\n---\nBody"
     }
@@ -94,6 +95,16 @@ def test_okf_v02_conformance():
     metadata_kinds = {v["kind"] for v in selfcheck.okf_v02_violations(bad_metadata)}
     assert {"okf_sources", "okf_generated", "okf_verified", "okf_status",
             "okf_stale_after", "okf_attested_computation"} <= metadata_kinds, metadata_kinds
+
+    bad_v02_optional = {
+        "bad-optional.md": {"text": "---\ntype: Attested Computation\nruntime: python\n"
+                                      "sources:\n  - resource: raw/manual.md\n    author: 7\n"
+                                      "    usage_count: many\n    last_modified: tomorrow\n"
+                                      "usage_window: never\nparameters: nope\n"
+                                      "computation: []\nexecutor: []\nattester: []\n---\nBody"},
+    }
+    optional_kinds = {v["kind"] for v in selfcheck.okf_v02_violations(bad_v02_optional)}
+    assert {"okf_sources", "okf_usage_window", "okf_attested_computation"} <= optional_kinds, optional_kinds
 
     agent_verified = {
         "topic.md": {"text": "---\ntype: Topic\nverified:\n  by: human:reviewer\n"
@@ -141,6 +152,36 @@ def test_okf_v02_conformance():
     assert any(v["kind"] == "okf_log_structure" and "2026-07-11" in v["detail"]
                for v in log_violations), log_violations
     print("OK  OKF v0.2 core conformance + Siclaw portable-output profile")
+
+
+def test_stamp_siclaw_generated_metadata():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "candidate/index.md", '---\nokf_version: "0.2"\n---\n# Index')
+        _mk(base, "candidate/existing.md", "---\n# Preserve the author's layout\ntype: Topic\nstatus: deprecated\n"
+            "generated:\n  by: human:old\n  at: 2026-01-01T00:00:00Z\n"
+            "verified:\n  by: human:reviewer\n  at: 2026-01-02T00:00:00Z\n"
+            "producer_extension: kept\n---\nBody\n")
+        _mk(base, "candidate/new.md", "---\ntype: Topic\nsources:\n  - resource: raw/a.md\n---\nNew\n")
+
+        changed = selfcheck.stamp_siclaw_generated_metadata(
+            td, {"existing.md", "new.md", "index.md"}, new_pages={"new.md", "index.md"},
+            now=datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc),
+        )
+        assert changed == ["existing.md", "new.md"], changed
+        existing, _, error = selfcheck.parse_okf_frontmatter(
+            (base / "candidate/existing.md").read_text())
+        assert not error and existing["generated"] == {
+            "by": "process:siclaw-kbc", "at": "2026-08-04T12:00:00Z"}, existing
+        assert "verified" not in existing and existing["status"] == "deprecated", existing
+        assert existing["producer_extension"] == "kept", existing
+        existing_text = (base / "candidate/existing.md").read_text()
+        assert "# Preserve the author's layout" in existing_text, existing_text
+        assert existing_text.endswith("---\nBody\n"), existing_text
+        new, _, error = selfcheck.parse_okf_frontmatter((base / "candidate/new.md").read_text())
+        assert not error and new["status"] == "stable", new
+        assert new["generated"]["by"] == "process:siclaw-kbc", new
+        assert "verified" not in new, new
 
 
 def test_markdown_code_is_not_a_link():
@@ -1068,6 +1109,7 @@ class _FakeRun:
 
 async def test_wiring():
     from compile_box import _post_turn_selfcheck
+    import incremental
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -1079,10 +1121,15 @@ async def test_wiring():
         assert await _post_turn_selfcheck(run) is None
 
         # index exists, b.md unaccounted → repairing + repair prompt returned
+        run._turn_page_hashes = incremental.page_hashes(td)
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p](p.md)")
         _mk(base, "candidate/p.md", "---\ntype: Topic\nsources:\n  - resource: s/a.md\n---\nx")
         msg = await _post_turn_selfcheck(run)
         assert msg and "s/b.md" in msg, msg
+        stamped, _, stamp_error = selfcheck.parse_okf_frontmatter(
+            (base / "candidate/p.md").read_text())
+        assert not stamp_error and stamped["status"] == "stable", stamped
+        assert stamped["generated"]["by"] == "process:siclaw-kbc", stamped
         assert run._l1_repairs_used == 1
         sc = json.loads((base / "authoring/SELFCHECK.json").read_text())
         assert sc["state"] == "repairing" and sc["coverage"]["unaccounted"] == ["s/b.md"], sc
@@ -2262,6 +2309,7 @@ def main():
     os.environ.setdefault("KBC_PK_MODE", "off")  # PK never fires in unrelated wiring tests
     test_parse_okf_sources()
     test_okf_v02_conformance()
+    test_stamp_siclaw_generated_metadata()
     test_markdown_code_is_not_a_link()
     test_emit_ignores_links_in_code()
     test_parse_okf_sources_inline()

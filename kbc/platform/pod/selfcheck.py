@@ -23,7 +23,7 @@ import posixpath
 import re
 import unicodedata
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote
@@ -576,6 +576,45 @@ def _valid_iso_datetime(value: object) -> bool:
         return False
 
 
+def _valid_okf_date(value: object) -> bool:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.strptime(value.strip(), "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _valid_usage_window(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    start, end = value.get("from"), value.get("to")
+    if not _valid_okf_date(start) or not _valid_okf_date(end):
+        return False
+    return str(start) <= str(end)
+
+
+def _valid_nonnegative_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_resource_mapping(value: object, *, receipt: bool = False) -> bool:
+    if not isinstance(value, dict):
+        return False
+    resource = value.get("resource")
+    if not isinstance(resource, str) or not resource.strip():
+        return False
+    if receipt and "receipt" in value:
+        fields = value.get("receipt")
+        if (not isinstance(fields, list) or not fields
+                or any(not isinstance(field, str) or not field.strip() for field in fields)):
+            return False
+    return True
+
+
 def _okf_v02_metadata_violations(rel: str, fm: dict) -> list[dict]:
     """Validate the optional v0.2 families when a producer emits them."""
     violations: list[dict] = []
@@ -605,6 +644,27 @@ def _okf_v02_metadata_violations(rel: str, fm: dict) -> list[dict]:
                                            "detail": f"sources id 重复: {source_id}"})
                     else:
                         seen_ids.add(source_id)
+                if ("author" in source and (not isinstance(source.get("author"), str)
+                                             or not source.get("author", "").strip())):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].author 必须是非空字符串"})
+                if "usage_count" in source and not _valid_nonnegative_count(source.get("usage_count")):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].usage_count 必须是非负整数"})
+                if "last_modified" in source and not _valid_okf_date(source.get("last_modified")):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].last_modified 必须是 YYYY-MM-DD"})
+                if "usage_window" in source and not _valid_usage_window(source.get("usage_window")):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].usage_window 必须包含合法且有序的 from/to 日期"})
+                if ("usage_count" in source and "usage_window" not in source
+                        and "usage_window" not in fm):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].usage_count 必须由来源级或顶层 usage_window 界定"})
+
+    if "usage_window" in fm and not _valid_usage_window(fm.get("usage_window")):
+        violations.append({"page": rel, "kind": "okf_usage_window",
+                           "detail": "usage_window 必须包含合法且有序的 YYYY-MM-DD from/to 日期"})
 
     if "generated" in fm:
         generated = fm.get("generated")
@@ -630,9 +690,7 @@ def _okf_v02_metadata_violations(rel: str, fm: dict) -> list[dict]:
         violations.append({"page": rel, "kind": "okf_status",
                            "detail": "status 只能是 draft、stable 或 deprecated"})
     if "stale_after" in fm:
-        try:
-            datetime.strptime(str(fm.get("stale_after")), "%Y-%m-%d")
-        except ValueError:
+        if not _valid_okf_date(fm.get("stale_after")):
             violations.append({"page": rel, "kind": "okf_stale_after",
                                "detail": "stale_after 必须是 YYYY-MM-DD"})
     if fm.get("type") == "Attested Computation":
@@ -640,7 +698,103 @@ def _okf_v02_metadata_violations(rel: str, fm: dict) -> list[dict]:
         if not isinstance(runtime, str) or not runtime.strip():
             violations.append({"page": rel, "kind": "okf_attested_computation",
                                "detail": "Attested Computation 必须声明非空 runtime"})
+        if "parameters" in fm:
+            parameters = fm.get("parameters")
+            if (not isinstance(parameters, list)
+                    or any(not isinstance(item, dict)
+                           or not isinstance(item.get("name"), str) or not item.get("name", "").strip()
+                           or not isinstance(item.get("type"), str) or not item.get("type", "").strip()
+                           or not isinstance(item.get("required"), bool)
+                           for item in parameters)):
+                violations.append({"page": rel, "kind": "okf_attested_computation",
+                                   "detail": "parameters 必须是含 name/type/required 的 mapping 列表"})
+        if "computation" in fm and (not isinstance(fm.get("computation"), str)
+                                     or not fm.get("computation", "").strip()):
+            violations.append({"page": rel, "kind": "okf_attested_computation",
+                               "detail": "computation 必须是非空路径或 URI"})
+        if "executor" in fm and not _valid_resource_mapping(fm.get("executor"), receipt=True):
+            violations.append({"page": rel, "kind": "okf_attested_computation",
+                               "detail": "executor 必须包含非空 resource，receipt 如存在须为非空字符串列表"})
+        if "attester" in fm and not _valid_resource_mapping(fm.get("attester")):
+            violations.append({"page": rel, "kind": "okf_attested_computation",
+                               "detail": "attester 必须包含非空 resource"})
     return violations
+
+
+def stamp_siclaw_generated_metadata(
+    workdir: str,
+    changed_pages: set[str],
+    *,
+    new_pages: set[str] | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """Deterministically bind changed concept bytes to the Siclaw producer.
+
+    The model cannot be the authority for its own provenance. Every concept it
+    creates or changes is re-signed here, and any verification of the previous
+    bytes is removed. Unknown frontmatter keys and the Markdown body survive.
+    Invalid frontmatter is left untouched for the normal OKF lint to repair.
+    """
+    candidate = Path(workdir) / "candidate"
+    created = new_pages or set()
+    stamp_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    stamp = stamp_time.isoformat(timespec="seconds").replace("+00:00", "Z")
+    written: list[str] = []
+    for rel in sorted(changed_pages):
+        if _is_reserved_page(rel) or not rel.endswith(".md"):
+            continue
+        target = candidate / rel
+        if not target.is_file():
+            continue
+        try:
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        lines = text.splitlines(keepends=True)
+        if not lines or lines[0].strip() != "---":
+            continue
+        end = next((i for i, line in enumerate(lines[1:], start=1)
+                    if line.strip() in ("---", "...")), None)
+        if end is None:
+            continue
+        try:
+            fm = yaml.safe_load("".join(lines[1:end]))
+        except yaml.YAMLError:
+            continue
+        if not isinstance(fm, dict):
+            continue
+        # Replace only the machine-owned top-level blocks. Re-serializing the
+        # full mapping would destroy comments, quoting, and author-chosen
+        # layout, creating noisy content diffs unrelated to provenance.
+        preserved: list[str] = []
+        dropping = False
+        for line in lines[1:end]:
+            key_match = re.match(
+                r'''^(?:([A-Za-z_][A-Za-z0-9_-]*)|'([^']+)'|"([^"]+)"):(?:[ \t]|$)''',
+                line,
+            )
+            if key_match:
+                key = next(group for group in key_match.groups() if group is not None)
+                dropping = key in {"generated", "verified"}
+            elif dropping and line.startswith("#"):
+                dropping = False
+            if not dropping:
+                preserved.append(line)
+        if preserved and not preserved[-1].endswith(("\n", "\r")):
+            preserved[-1] += "\n"
+        if rel in created and "status" not in fm:
+            preserved.append("status: stable\n")
+        preserved.extend([
+            "generated:\n",
+            "  by: process:siclaw-kbc\n",
+            f"  at: '{stamp}'\n",
+        ])
+        rewritten = lines[0] + "".join(preserved) + lines[end] + "".join(lines[end + 1:])
+        if rewritten == text:
+            continue
+        target.write_text(rewritten, encoding="utf-8")
+        written.append(rel)
+    return written
 
 
 def okf_v02_violations(pages: dict[str, dict]) -> list[dict]:
