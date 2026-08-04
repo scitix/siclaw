@@ -732,7 +732,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           .catch(async (err) => {
             capabilityRelayFailuresTotal.inc();
             console.error(`[capability] session relay failed run=${runId}:`, err);
-            await capabilityRunManager.endRun(runId, "failed").catch(() => {});
+            await capabilityRunManager
+              .endRun(runId, "failed", {
+                code: "relay_failed",
+                stage: "session_relay",
+                message: `relay_failed:${err instanceof Error ? err.name : "Error"}`,
+                exception_class: err instanceof Error ? err.name : undefined,
+              })
+              .catch(() => {});
           })
           .finally(() => {
             capabilitySessions.delete(runId);
@@ -835,7 +842,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     } catch (err) {
       capabilityStartsTotal.inc({ outcome: "failure" });
       capabilityStartDurationMs.observe({ outcome: "failure" }, Date.now() - startedAt);
-      if (startedRunId) await capabilityRunManager.endRun(startedRunId, "failed");
+      if (startedRunId) {
+        await capabilityRunManager.endRun(startedRunId, "failed", {
+          code: "start_failed",
+          stage: "capability_start",
+          message: `start_failed:${err instanceof Error ? err.name : "Error"}`,
+          exception_class: err instanceof Error ? err.name : undefined,
+        });
+      }
       throw err;
     }
   });

@@ -419,27 +419,42 @@ def _error_event(
     *,
     code: str = "box_error",
     stage: str = "compile",
+    exception_class: str | None = None,
+    message: str | None = None,
     last_sdk_message: str | None = None,
     **extra,
 ) -> dict:
-    """SSE error frame that Runtime can always project into checkpoint.failure.
+    """SSE error frame with a strict two-channel diagnostic split.
+
+    - ``error``: owner-facing text (may include paths / provider fragments via
+      ``repr(e)``). Runtime must NOT log or persist this into checkpoint.
+    - ``message``: **safe** short reason for Runtime checkpoint / logs only.
+      Defaults to ``{code}:{exception_class}`` or ``code`` — never ``repr(e)``.
+    - ``code`` / ``stage`` / ``exception_class`` / ``last_sdk_message``: tokens.
 
     Production triage (2026-08 sh-manage) only saw ``box event: error`` because
-    bare ``{"type":"error","error":...}`` frames lacked code/stage, so Runtime
-    dropped structured failure entirely. Always emit machine tokens + the
-    owner-facing error string (repr/short reason). Never put source bodies or
-    credentials into extra — same contract as lifecycle stdout.
+    bare frames lacked code/stage. Always emit machine tokens so Runtime can
+    project a non-empty checkpoint.failure without copying unsafe free text.
     """
+    safe = (message or "").strip()
+    if not safe:
+        safe = f"{code}:{exception_class}" if exception_class else code
+    # Hard-cap safe message; never a substitute for owner-facing error.
+    if len(safe) > 256:
+        safe = safe[:256]
     ev: dict = {
         "type": "error",
         "error": error,
         "code": code,
         "stage": stage,
+        "message": safe,
     }
+    if exception_class:
+        ev["exception_class"] = exception_class
     if last_sdk_message:
         ev["last_sdk_message"] = last_sdk_message
     for key, value in extra.items():
-        if value is not None:
+        if value is not None and key not in ev:
             ev[key] = value
     return ev
 
@@ -5247,27 +5262,29 @@ async def _run_wrapper(run: CompileRun):
         await _COMPILE_IMPL(run)
         clean = True
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
-        # Always include code/stage so Runtime persists checkpoint.failure (bare
-        # error-only frames used to leave production with no triage fields).
+        # Owner-facing error may use repr(e); safe message never does.
+        cls = type(e).__name__
         error_event = _error_event(
             repr(e),
             code="unhandled",
             stage="run",
+            exception_class=cls,
             last_sdk_message=getattr(run, "_last_sdk_message_type", None),
-            exception_class=type(e).__name__,
         )
         if isinstance(e, ModelStallError) and run._last_stall_diagnostic:
-            # Structured, content-free diagnostics survive the Runtime→consumer
-            # opaque checkpoint.  Keep the human error for rolling consumers,
-            # but make automation independent of parsing it.
-            error_event.update({
+            # Structured, content-free diagnostics for checkpoint. Re-apply after
+            # _error_event so stall tokens win; keep safe message free of repr.
+            diag = {
                 key: value
                 for key, value in run._last_stall_diagnostic.items()
                 if key != "fatal"
-            })
-            error_event.setdefault("error", repr(e))
-            error_event.setdefault("code", "model_turn_stalled")
-            error_event.setdefault("stage", "model_turn")
+            }
+            error_event.update(diag)
+            error_event["error"] = repr(e)
+            error_event["exception_class"] = cls
+            error_event["code"] = diag.get("code") or "model_turn_stalled"
+            error_event["stage"] = diag.get("stage") or "model_turn"
+            error_event["message"] = f"{error_event['code']}:{cls}"
         await run.emit(error_event)
         if getattr(run, "_turn_active", False):
             # never-block symmetry (review fix): a consumer gating on turn_done

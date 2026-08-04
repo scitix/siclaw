@@ -252,6 +252,8 @@ async def test_run_wrapper_terminal_signals():
             assert boom_err.get("code") == "unhandled" and boom_err.get("stage") == "run", boom_err
             assert boom_err.get("exception_class") == "RuntimeError", boom_err
             assert "boom" in boom_err.get("error", ""), boom_err
+            # Safe checkpoint channel: no raw exception body.
+            assert boom_err.get("message") == "unhandled:RuntimeError", boom_err
 
             async def stalled(run):
                 run._last_stall_diagnostic = {
@@ -271,21 +273,20 @@ async def test_run_wrapper_terminal_signals():
             while not run.events.empty():
                 events.append(run.events.get_nowait())
             error = next(e for e in events if e["type"] == "error")
-            # Structured stall diagnostics + always-present code/stage/message.
-            # exception_class is an observability extra from _error_event.
-            expected = {
-                "type": "error",
-                "error": "ModelStallError('model request stalled; exhausted 4 attempt(s)')",
-                "code": "model_turn_stalled",
-                "stage": "model_turn",
-                "attempts": 4,
-                "idle_s": 90.2,
-                "bound_s": 90.0,
-                "tool_pending": False,
-                "last_sdk_message": "query",
-                "exception_class": "ModelStallError",
-            }
-            assert error == expected, error
+            # Owner-facing error may carry repr; message is safe short reason only.
+            assert error["type"] == "error", error
+            assert error["error"] == "ModelStallError('model request stalled; exhausted 4 attempt(s)')", error
+            assert error["code"] == "model_turn_stalled", error
+            assert error["stage"] == "model_turn", error
+            assert error["attempts"] == 4, error
+            assert error["idle_s"] == 90.2, error
+            assert error["bound_s"] == 90.0, error
+            assert error["tool_pending"] is False, error
+            assert error["last_sdk_message"] == "query", error
+            assert error["exception_class"] == "ModelStallError", error
+            assert error["message"] == "model_turn_stalled:ModelStallError", error
+            # Safe channel must not echo the owner-facing repr body.
+            assert "exhausted 4" not in error["message"], error
 
             async def cancelled(run):
                 raise asyncio.CancelledError()

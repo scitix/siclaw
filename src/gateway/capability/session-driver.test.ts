@@ -197,12 +197,12 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
       errSpy.mockRestore();
     }
     expect(emits(fe)).toContainEqual({ run_id: "r1", type: "lifecycle", payload: { status: "failed", error: "boom" } });
-    // Bare box errors used to call endRun("failed") with no failure object —
-    // checkpoint.failure was empty and production could not triage.
+    // Bare box errors used to call endRun("failed") with no failure object.
+    // Owner-facing `error` ("boom") must NOT enter checkpoint.message.
     expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed", {
       code: "box_error",
       stage: "unknown",
-      message: "boom",
+      message: "box_error",
     });
   });
 
@@ -236,7 +236,8 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
       bound_s: 90,
       tool_pending: false,
       last_sdk_message: "query",
-      message: "ModelStallError('model request stalled')",
+      // Safe short reason only — not the owner-facing error/repr string.
+      message: "model_turn_stalled",
     });
   });
 

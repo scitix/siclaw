@@ -409,11 +409,17 @@ export class CapabilityRunManager {
     if (isTerminalCapabilityStatus(rec.status)) return;
     rec.status = status;
     if (status === "failed") {
-      // Always attach a failure object so consumer checkpoints are never empty
-      // "failed" rows with no code/stage/message for auto-resume / post-mortems.
+      // Always attach a failure so checkpoints are never empty. Call sites must
+      // pass a specific code (box_error / relay_failed / start_failed /
+      // runtime_stale / …). Neutral fallback is runtime_failure — NOT box_error
+      // — so transport/watchdog/start faults are not mis-attributed to the box.
       rec.failure =
         normalizeFailure(failure) ??
-        ({ code: "box_error", stage: "unknown", message: "unspecified failure" } satisfies CapabilityRunFailure);
+        ({
+          code: "runtime_failure",
+          stage: "unknown",
+          message: "unspecified failure",
+        } satisfies CapabilityRunFailure);
     }
     rec.lastActivityMs = this.now();
     try {
@@ -562,7 +568,15 @@ export class CapabilityRunManager {
           console.warn(`[capability] onReap(${runId}) failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      await this.endRun(runId, outcome);
+      if (outcome === "failed") {
+        await this.endRun(runId, "failed", {
+          code: "runtime_stale",
+          stage: "watchdog",
+          message: "runtime_stale:watchdog",
+        });
+      } else {
+        await this.endRun(runId, outcome);
+      }
       reaped.push(runId);
     }
     return reaped;
@@ -736,8 +750,8 @@ function failureFromCheckpoint(checkpoint: unknown): CapabilityRunFailure | unde
   return normalizeFailure(failure);
 }
 
-/** Free-text diagnostic cap persisted in the opaque checkpoint. */
-const FAILURE_MESSAGE_MAX = 2000;
+/** Safe short-reason cap persisted in the opaque checkpoint. */
+const FAILURE_MESSAGE_MAX = 256;
 
 function normalizeFailure(value: unknown): CapabilityRunFailure | undefined {
   if (!value || typeof value !== "object") return undefined;
@@ -749,27 +763,26 @@ function normalizeFailure(value: unknown): CapabilityRunFailure | undefined {
       ? normalized
       : undefined;
   };
-  // Free-text diagnostic: allow spaces/punctuation so exception reprs survive,
-  // but strip controls and hard-cap length. Never a substitute for full logs.
-  const diagnosticText = (field: unknown, max = FAILURE_MESSAGE_MAX): string | undefined => {
+  // Safe short reason only — allow limited punctuation, never copy from `error`.
+  const safeMessage = (field: unknown, max = FAILURE_MESSAGE_MAX): string | undefined => {
     if (typeof field !== "string") return undefined;
     const cleaned = field.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ").trim();
     if (!cleaned) return undefined;
     return cleaned.length > max ? cleaned.slice(0, max) : cleaned;
   };
-  // Defaults keep bare failures durable when the box only sent error text.
-  const code = token(raw.code) ?? "box_error";
+  // Invalid/missing tokens → neutral runtime_failure (not box_error). Callers
+  // that mean "box" must pass an explicit box_* code (structuredBoxFailure does).
+  const code = token(raw.code) ?? "runtime_failure";
   const stage = token(raw.stage) ?? "unknown";
   const finiteNonNegative = (field: unknown): number | undefined =>
     typeof field === "number" && Number.isFinite(field) && field >= 0 ? field : undefined;
   const attempts = finiteNonNegative(raw.attempts);
   const idle = finiteNonNegative(raw.idle_s);
   const bound = finiteNonNegative(raw.bound_s);
-  // last_sdk_message is the SDK frame class (token) when present; longer free
-  // text is accepted but truncated so we do not drop "connection reset by peer".
-  const lastMessage =
-    token(raw.last_sdk_message) ?? diagnosticText(raw.last_sdk_message, 128);
-  const message = diagnosticText(raw.message) ?? diagnosticText(raw.error);
+  const lastMessage = token(raw.last_sdk_message);
+  const exceptionClass = token(raw.exception_class);
+  // Only the producer `message` field — never raw.error (owner-facing / unsafe).
+  const message = safeMessage(raw.message) ?? (exceptionClass ? `${code}:${exceptionClass}` : code);
   return {
     code,
     stage,
@@ -778,6 +791,7 @@ function normalizeFailure(value: unknown): CapabilityRunFailure | undefined {
     ...(bound !== undefined ? { bound_s: bound } : {}),
     ...(typeof raw.tool_pending === "boolean" ? { tool_pending: raw.tool_pending } : {}),
     ...(lastMessage ? { last_sdk_message: lastMessage } : {}),
-    ...(message ? { message } : {}),
+    ...(exceptionClass ? { exception_class: exceptionClass } : {}),
+    message,
   };
 }

@@ -98,11 +98,14 @@ export function isTerminalCapabilityStatus(s: CapabilityLifecycleStatus): s is C
 /**
  * Execution failure diagnostic persisted inside the opaque run checkpoint.
  *
- * `code` / `stage` / `last_sdk_message` (SDK frame class) are short machine
- * tokens. `message` is a truncated free-text diagnostic (typically the box's
- * exception class + brief reason) so production post-mortems are not left with
- * only "error" and empty checkpoint.failure — source bodies, tool I/O, full
- * provider payloads, and credentials must still never enter it.
+ * All fields here cross the Runtime → consumer security boundary (checkpoint,
+ * operation.error_message, auto-resume.failure_detail, Runtime logs). They must
+ * never carry owner-facing `error` text, source paths, provider payloads, tool
+ * I/O, or credentials.
+ *
+ * Field roles:
+ * - `code` / `stage` / `exception_class` / `last_sdk_message`: short machine tokens
+ * - `message`: producer-provided **safe** short reason only (e.g. `batch_failed:TimeoutError`)
  */
 export interface CapabilityRunFailure {
   code: string;
@@ -113,9 +116,11 @@ export interface CapabilityRunFailure {
   tool_pending?: boolean;
   /** Controlled SDK message class name (e.g. "query"), not message content. */
   last_sdk_message?: string;
+  /** Exception type name token (e.g. "TimeoutError"), never repr/message body. */
+  exception_class?: string;
   /**
-   * Truncated free-text diagnostic from the box error event (exception repr /
-   * short reason). Max length enforced at normalize time.
+   * Producer-provided safe short reason. Max length enforced at normalize time.
+   * Must NOT be copied from owner-facing `error` / exception repr.
    */
   message?: string;
 }
