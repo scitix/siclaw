@@ -242,8 +242,16 @@ async def test_run_wrapper_terminal_signals():
             compile_box._COMPILE_IMPL = boom
             run = compile_box.CompileRun("wrap-boom", td, 1)
             await compile_box._run_wrapper(run)
-            types = _drain_event_types(run)
+            boom_events = []
+            while not run.events.empty():
+                boom_events.append(run.events.get_nowait())
+            types = [e["type"] for e in boom_events]
             assert "error" in types and "done" not in types and types[-1] == "end", types
+            # Bare crashes must still carry code/stage so Runtime persists failure.
+            boom_err = next(e for e in boom_events if e["type"] == "error")
+            assert boom_err.get("code") == "unhandled" and boom_err.get("stage") == "run", boom_err
+            assert boom_err.get("exception_class") == "RuntimeError", boom_err
+            assert "boom" in boom_err.get("error", ""), boom_err
 
             async def stalled(run):
                 run._last_stall_diagnostic = {
@@ -263,7 +271,9 @@ async def test_run_wrapper_terminal_signals():
             while not run.events.empty():
                 events.append(run.events.get_nowait())
             error = next(e for e in events if e["type"] == "error")
-            assert error == {
+            # Structured stall diagnostics + always-present code/stage/message.
+            # exception_class is an observability extra from _error_event.
+            expected = {
                 "type": "error",
                 "error": "ModelStallError('model request stalled; exhausted 4 attempt(s)')",
                 "code": "model_turn_stalled",
@@ -273,7 +283,9 @@ async def test_run_wrapper_terminal_signals():
                 "bound_s": 90.0,
                 "tool_pending": False,
                 "last_sdk_message": "query",
-            }, error
+                "exception_class": "ModelStallError",
+            }
+            assert error == expected, error
 
             async def cancelled(run):
                 raise asyncio.CancelledError()
