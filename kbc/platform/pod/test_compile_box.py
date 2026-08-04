@@ -1208,7 +1208,7 @@ async def test_test_session_stall_reaps_turn_keeps_session_live():
     a fresh question after the stall still gets a real answer. Also asserts the
     turn.stalled / turn.done stdout lines carry tid+parent and NO user content."""
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S)
-    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     buf = io.StringIO()
     fake = _TestStallFake()
@@ -1305,7 +1305,7 @@ async def test_test_session_late_reaped_frames_never_terminate_new_turn():
     terminate the freshly-armed turn — the new answer must complete on its OWN result.
     Drives the real watchdog for the reap, then injects the late frames deterministically."""
     saved = (compile_box._TEST_MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S)
-    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     buf = io.StringIO()
     fake = _QueuedFrameFake()
@@ -1587,7 +1587,7 @@ async def _drive_rebuild_scenario(scenario):
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
              compile_box.ClaudeSDKClient)
-    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
     _RebuildFake.instances = []
@@ -1608,7 +1608,7 @@ async def _drive_rebuild_scenario(scenario):
             # interrupt, after the window for a lost terminator, never in-window)
             if scenario == "terminator_in_window":
                 assert await _await(lambda: run._results_seen >= 1), "the in-window terminator was not consumed"
-                await asyncio.sleep(compile_box._TEST_STALL_REBUILD_WINDOW_S + 0.1)  # let the window pass
+                await asyncio.sleep(compile_box._TEST_STALL_REBUILD_WINDOW_S + 0.2)  # let the window pass
                 assert run._needs_rebuild is False, "an in-window terminator must NOT force a rebuild"
             else:
                 assert await _await(lambda: run._needs_rebuild), f"{scenario}: rebuild was never flagged"
@@ -1701,7 +1701,7 @@ async def test_test_session_immediate_retry_within_terminator_window():
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
              compile_box.ClaudeSDKClient)
-    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0  # wide: the retry always lands inside it
     _ImmediateRetryFake.instances = []
@@ -1771,7 +1771,7 @@ async def test_test_session_retry_during_interrupt_in_flight():
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
              compile_box.ClaudeSDKClient)
-    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 5.0
     _BlockedInterruptFake.instances = []
@@ -1799,7 +1799,7 @@ async def test_test_session_retry_during_interrupt_in_flight():
             assert await _await(lambda: run._turn_active is False and run._results_seen >= 1), \
                 "the in-gap retry never completed"
             _BlockedInterruptFake.interrupt_release.set()   # let the reaper's interrupt return
-            await asyncio.sleep(0.1)                        # give the watchdog a settle beat
+            await asyncio.sleep(0.2)                        # give the watchdog a settle beat
         evs = _drain(run)
         stalls = [e for e in evs if e["type"] == "turn_stalled"]
         assert len(stalls) == 1, stalls
@@ -1839,7 +1839,7 @@ async def test_test_session_rebuild_retry_after_failed_reconnect():
              compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._TEST_STALL_REBUILD_WINDOW_S,
              compile_box.ClaudeSDKClient)
-    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.15
+    compile_box._TEST_MODEL_IDLE_TIMEOUT_S = 0.25
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._TEST_STALL_REBUILD_WINDOW_S = 0.2
     _RetryRebuildFake.instances = []
@@ -2572,7 +2572,7 @@ async def test_a_session_records_what_it_actually_spent():
 def test_compile_session_denies_subagents():
     """A compile session runs under bypassPermissions, where `allowed_tools`
     only skips approval prompts and removes nothing from context. So the ledger
-    invariant — every Raw source lands either in a page's compiled_from or in
+    invariant — every Raw source lands either in a page's sources[].resource or in
     the exclusion ledger — is enforceable only if Agent/Task are DENIED: a
     sub-agent reads sources in its own context, and the parent that must call
     report_summary never saw those files and cannot attest to what they
@@ -2986,9 +2986,9 @@ async def test_incremental_route():
         wd = Path(td)
         (wd / "candidate").mkdir(parents=True)
         (wd / "authoring").mkdir(parents=True)
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\ntitle: t\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+            "---\ntype: Topic\ntitle: t\nsources:\n  - resource: snap/one.md\n---\n正文。")
         run = compile_box.CompileRun("incr1", str(wd), 1)
         # no RAW_CHANGES yet → NOT incremental (falls through to normal/full route)
         assert not compile_box._should_route_to_incremental(run, "请增量重编")
@@ -3031,9 +3031,9 @@ async def test_incremental_integrity_guard():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。")
         run = compile_box.CompileRun("incrg", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -3042,8 +3042,8 @@ async def test_incremental_integrity_guard():
               "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
         run._incr_pending = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
         # model edits a.md (authorized) AND drifts into c.md (unauthorized)
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c 擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         # coverage ledger is clean (both sources still cited) yet integrity forces a repair naming c.md
         assert repair is not None and "Incremental scope violation" in repair and "c.md" in repair, repair
@@ -3052,7 +3052,7 @@ async def test_incremental_integrity_guard():
         # consumed here, leaving the repair turn unguarded.
         assert run._incr_pending is not None and run._incr_pending["changeset"] is cs
         # the repair restores c.md → the re-armed guard clears cleanly
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。")
         run._selfcheck_key = None
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is None, repair2
@@ -3076,8 +3076,8 @@ async def test_incremental_guard_rearms_on_ledger_repair():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "orphaned-src.md").write_text("never cited")  # → unaccounted
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("incrl", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -3086,7 +3086,7 @@ async def test_incremental_guard_rearms_on_ledger_repair():
         armed = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
         run._incr_pending = armed
         # the turn edits ONLY the authorized page (no byte violations)…
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
         repair = await compile_box._post_turn_selfcheck(run)
         # …but the ledger is unclean (orphaned-src.md unaccounted) → repairing
         assert repair is not None and "orphaned-src.md" in repair, repair
@@ -3112,9 +3112,9 @@ async def test_incremental_violation_auto_restored():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
-        c_original = "---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
+        c_original = "---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。"
         (wd / "candidate" / "c.md").write_text(c_original)
         run = compile_box.CompileRun("incrr", str(wd), 1)
         run._selfcheck_key = None
@@ -3124,8 +3124,8 @@ async def test_incremental_violation_auto_restored():
         run._incr_pending = {"before": incremental.page_hashes(str(wd)),
                              "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
         # model edits a.md (authorized) AND drifts into c.md (unauthorized)
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c 擅自改。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c 擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         assert repair is None, repair  # violation auto-restored, ledger clean → no repair turn
         assert (wd / "candidate" / "c.md").read_text() == c_original  # byte-exact restore
@@ -3151,8 +3151,8 @@ async def test_unconverged_files_residual_ticket():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # → unaccounted forever
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("uncv", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 99  # budget long spent → unconverged, not repairing
@@ -3165,7 +3165,7 @@ async def test_unconverged_files_residual_ticket():
         assert "never-compiled.md" in tickets[0]["sources"][0]["quote"]
         # a second settle with the same residuals does not duplicate the ticket
         run._selfcheck_key = None
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 又动了。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 又动了。")
         await compile_box._post_turn_selfcheck(run)
         tickets2 = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
         assert len(tickets2) == 1, tickets2
@@ -3183,10 +3183,10 @@ async def test_exact_source_alias_is_repaired_before_l1_budget():
         (wd / "authoring").mkdir()
         (wd / "raw" / "docs" / "专题目录.md").write_text("source")
         (wd / "candidate" / "index.md").write_text(
-            "---\nokf_version: \"0.1\"\n---\n# Index\n- [Guide](guide.md)\n")
+            "---\nokf_version: \"0.2\"\n---\n# Index\n- [Guide](guide.md)\n")
         (wd / "candidate" / "guide.md").write_text(
-            "---\ntype: Guide\ntitle: Guide\ncompiled_from:\n"
-            "  - docs/专题目录.md\n---\n正文。(source: 专题目录)\n")
+            "---\ntype: Guide\ntitle: Guide\nsources:\n"
+            "  - resource: docs/专题目录.md\n---\n正文。(source: 专题目录)\n")
         run = compile_box.CompileRun("mechanical-source", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -3228,12 +3228,12 @@ async def test_incremental_grandfathers_untouched_format_debt():
         legacy_index = "# Index\n- [a](a.md)\n- [b](b.md)"
         (wd / "candidate" / "index.md").write_text(legacy_index)
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\nA")
+            "---\ntype: Topic\nsources:\n  - resource: snap/one.md\n---\nA")
         # This untouched page carries both legacy format debt and a valid
         # filename-plus-locator citation. Neither may wedge an unrelated scoped
         # edit, while the same citation would still be checked if its filename
-        # were absent from compiled_from.
-        legacy = ("---\ntype: Topic\ncompiled_from:\n  - snap/two.md\n---\n"
+        # were absent from sources[].resource.
+        legacy = ("---\ntype: Topic\nsources:\n  - resource: snap/two.md\n---\n"
                   "See [[a]]. (source: snap/two.md §3)")
         (wd / "candidate" / "b.md").write_text(legacy)
         cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
@@ -3253,7 +3253,7 @@ async def test_incremental_grandfathers_untouched_format_debt():
         run._l1_repairs_used = 0
         arm(run)
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\nA updated")
+            "---\ntype: Topic\nsources:\n  - resource: snap/one.md\n---\nA updated")
         repair = await compile_box._post_turn_selfcheck(run)
         assert repair is None, repair
         assert (wd / "candidate" / "index.md").read_text() == legacy_index
@@ -3271,7 +3271,7 @@ async def test_incremental_grandfathers_untouched_format_debt():
         run._selfcheck_key = None
         arm(run)
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\ncompiled_from:\n  - snap/one.md\n---\nSee [[b]].")
+            "---\ntype: Topic\nsources:\n  - resource: snap/one.md\n---\nSee [[b]].")
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is not None and "siclaw_profile_wikilink" in repair2, repair2
         sc2 = json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
@@ -3295,10 +3295,10 @@ async def test_repair_turn_may_edit_ledger_target_pages():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
         # c.md cites a source that no longer exists → dangling (out of this round's scope)
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/ghost.md\n---\n正文c。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/ghost.md\n---\n正文c。")
         run = compile_box.CompileRun("interlock", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -3308,13 +3308,13 @@ async def test_repair_turn_may_edit_ledger_target_pages():
                              "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
         # turn 1: model edits ONLY the authorized page — in scope, but the ledger
         # is unclean (dangling citation on c.md) → repairing, guard re-armed
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
         repair = await compile_box._post_turn_selfcheck(run)
         assert repair is not None and "ghost.md" in repair, repair
         assert run._incr_pending is not None
         assert run._incr_pending.get("repair_pages") == ["c.md"], run._incr_pending.get("repair_pages")
         # repair turn: model fixes the dangling citation on the OUT-OF-SCOPE page
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。")
         run._selfcheck_key = None
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is None, repair2
@@ -3342,9 +3342,9 @@ async def test_incremental_index_deletion_cannot_escape_guard():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
-        c_original = "---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n正文c。"
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
+        c_original = "---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
         (wd / "candidate" / "c.md").write_text(c_original)
         run = compile_box.CompileRun("incrx", str(wd), 1)
         run._selfcheck_key = None
@@ -3354,9 +3354,9 @@ async def test_incremental_index_deletion_cannot_escape_guard():
         run._incr_pending = {"before": incremental.page_hashes(str(wd)),
                              "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
         # model edits a.md (authorized), DELETES index.md and drifts into c.md
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
         (wd / "candidate" / "index.md").unlink()
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\ncompiled_from:\n  - snap/two.md\n---\n擅自改。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         # the guard ran: c.md restored byte-exact; index.md (always-editable, no
         # snapshot restore) leaves the tree index-less → orphan lint → repair
@@ -3384,9 +3384,9 @@ async def test_incremental_arm_cleared_when_dispatch_fails():
         wd = Path(td)
         (wd / "candidate").mkdir(parents=True)
         (wd / "authoring").mkdir(parents=True)
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\ntitle: t\ncompiled_from:\n  - snap/one.md\n---\n正文。")
+            "---\ntype: Topic\ntitle: t\nsources:\n  - resource: snap/one.md\n---\n正文。")
         # stale per-round declaration from an earlier round must not survive
         (wd / "authoring" / "ADDED_TARGETS.json").write_text('["stale-page.md"]')
         (wd / "authoring" / "RAW_CHANGES.json").write_text(_json.dumps({
@@ -3418,8 +3418,8 @@ async def test_noop_repair_turn_reaches_the_gate():
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # unaccounted forever
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("noop", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -3452,8 +3452,8 @@ def test_media_verify_suppresses_text_backed_beyond_transcript():
         (wd / "raw" / "snap" / "perf.md").write_text(
             "B300较B200，FP4有46%提升；整体也只 +39.7%，不太符合预期。")
         page_text = (
-            "---\ntype: Comparison\ntitle: c\ncompiled_from:\n"
-            "  - snap/perf.md\n  - snap/assets/tok1.png\n---\n"
+            "---\ntype: Comparison\ntitle: c\nsources:\n"
+            "  - resource: snap/perf.md\n  - resource: snap/assets/tok1.png\n---\n"
             "B300 FP4 较 B200 +46%。整体 +39.7%。另一个编造值 +87.5%。")
         findings = [
             {"image": "snap/assets/tok1.png", "claim": "B300 FP4 较 B200 +46%",
@@ -3522,8 +3522,8 @@ async def test_l1_repair_budget_high_water_survives_shrinking_workload():
         (wd / "raw" / "snap" / "one.md").write_text("one")
         for i in range(30):  # 30 unaccounted -> limit ceil(30/12)=3 with floor pinned to 1
             (wd / "raw" / "snap" / f"orphan{i}.md").write_text("x")
-        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("noop", str(wd), 1)
         run._selfcheck_key = None
         os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
@@ -3567,10 +3567,10 @@ async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
             "# Index\n- [Legacy](legacy.md)\n- [Clean](clean.md)"
         )
         (root / "candidate" / "legacy.md").write_text(
-            "---\ntitle: Legacy\ncompiled_from:\n  - snap/one.md\n---\n# Legacy\nInherited body.\n"
+            "---\ntitle: Legacy\nsources:\n  - resource: snap/one.md\n---\n# Legacy\nInherited body.\n"
         )
         (root / "candidate" / "clean.md").write_text(
-            "---\ntype: Topic\ntitle: Clean\ncompiled_from:\n  - snap/one.md\n---\n# Clean\nStable body.\n"
+            "---\ntype: Topic\ntitle: Clean\nsources:\n  - resource: snap/one.md\n---\n# Clean\nStable body.\n"
         )
 
     with tempfile.TemporaryDirectory() as td:
@@ -3645,7 +3645,7 @@ async def test_batch_final_ledger_check_requires_index():
         (wd / "candidate").mkdir()
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\ncompiled_from:\n  - snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("bfx", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -4068,7 +4068,7 @@ async def test_batch_content_fault_skips_batch_but_stall_interrupts():
 
 async def test_batch_zero_progress_second_run_auto_excludes():
     """Finding 2 (07-24 review): a healthy model that simply never writes
-    compiled_from would loop provider-fault → sicore auto-resume → provider-fault
+    sources[].resource would loop provider-fault → sicore auto-resume → provider-fault
     until the breaker suspends it for a human. The FIRST zero-progress run stays a
     provider blip (batch pending, no exclusion — a blip must not drop good
     content); a SECOND independent zero-progress run for the SAME batch reclassifies
@@ -4160,8 +4160,8 @@ async def test_batch_media_round_cap_marks_pending_exhausted():
             (wd / "raw" / "chart.png").write_bytes(b"image-bytes")
             (wd / "candidate").mkdir()
             (wd / "candidate" / "page.md").write_text(
-                "---\ntype: Topic\ntitle: Page\ncompiled_from:\n"
-                "  - chart.png\n---\nasserts a number (source: chart.png)\n")
+                "---\ntype: Topic\ntitle: Page\nsources:\n"
+                "  - resource: chart.png\n---\nasserts a number (source: chart.png)\n")
             (wd / "authoring").mkdir()
             plan = {
                 "version": 1, "planner": "code", "mode": "flat", "phase": "final",
@@ -4504,9 +4504,9 @@ async def test_post_turn_normalizes_hand_edited_ledger():
         (wd / "raw" / "skip.md").write_text("meta", encoding="utf-8")
         (wd / "candidate").mkdir()
         (wd / "candidate" / "index.md").write_text(
-            "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n", encoding="utf-8")
+            "---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n", encoding="utf-8")
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\ntitle: a\ncompiled_from:\n  - one.md\n---\nbody a\n", encoding="utf-8")
+            "---\ntype: Topic\ntitle: a\nsources:\n  - resource: one.md\n---\nbody a\n", encoding="utf-8")
         (wd / "authoring").mkdir()
         # A hand edit: trailing comma (invalid strict JSON) + a redundant invalid
         # duplicate row (skip.md with no reason) alongside the valid one.
@@ -4589,8 +4589,8 @@ def test_hierarchical_text_slice_materialization_and_directive():
         directive = compile_box._compose_batch_directive(batch, 1, 2, "", "zh-CN")
         assert ".kbc-batch-slices/manual-p001.md" in directive, directive
         assert "本批绝不要直接打开原 Raw 全文" in directive, directive
-        assert "compiled_from 必须引用原 Raw 路径(raw/gpu/manual.md)" in directive, directive
-        assert "compiled_from 必须引用原 Raw 路径(.kbc-batch-slices" not in directive
+        assert "sources[].resource 必须引用原 Raw 路径(raw/gpu/manual.md)" in directive, directive
+        assert "sources[].resource 必须引用原 Raw 路径(.kbc-batch-slices" not in directive
         # A completed map batch is durable history, not a future model turn.
         # If its Raw source disappears before reduce/final resumes, rebuilding
         # its ephemeral slice would make the train fail forever even though the
@@ -4651,13 +4651,13 @@ def test_batch_relay_brief_hands_off_progress_and_prior_pages():
         (base / "candidate").mkdir()
         (base / "authoring").mkdir()
         (base / "candidate" / "tickets.md").write_text(
-            "---\ntype: Topic\ncompiled_from:\n  - raw/ops/big.md\n---\nx",
+            "---\ntype: Topic\nsources:\n  - resource: raw/ops/big.md\n---\nx",
             encoding="utf-8")
         (base / "candidate" / "neighbour.md").write_text(
-            "---\ntype: Topic\ncompiled_from:\n  - ops/sibling.md\n---\nx",
+            "---\ntype: Topic\nsources:\n  - resource: ops/sibling.md\n---\nx",
             encoding="utf-8")
         (base / "candidate" / "elsewhere.md").write_text(
-            "---\ntype: Topic\ncompiled_from:\n  - other/far.md\n---\nx",
+            "---\ntype: Topic\nsources:\n  - resource: other/far.md\n---\nx",
             encoding="utf-8")
         run = compile_box.CompileRun("relay", str(base), 1)
         plan = {"batches": [
@@ -4751,12 +4751,12 @@ def test_hierarchical_pdf_page_directive():
         assert "raw/gpu/manual.pdf (PDF pages 41-53, part 3/3)" in directive, directive
         assert '`pages: "41-53"`' in directive, directive
         assert "EXACT listed range" in directive, directive
-        assert "compiled_from must cite the original Raw PDF path (raw/gpu/manual.pdf)" in directive
+        assert "sources[].resource must cite the original Raw PDF path (raw/gpu/manual.pdf)" in directive
 
         directive_zh = compile_box._compose_batch_directive(batch, 42, 50, "", "zh-CN")
         assert '`pages: "41-53"`' in directive_zh, directive_zh
         assert "Read 工具的 `pages` 参数必须严格等于清单页段" in directive_zh, directive_zh
-        assert "compiled_from 必须引用原 Raw PDF 路径(raw/gpu/manual.pdf)" in directive_zh
+        assert "sources[].resource 必须引用原 Raw PDF 路径(raw/gpu/manual.pdf)" in directive_zh
     finally:
         if previous_engine is None:
             os.environ.pop("KBC_ENGINE", None)
@@ -4814,7 +4814,7 @@ async def test_codex_batch_scope_and_pdf_page_tool():
             note = compile_box._codex_batch_source_view_note(
                 root, source_view, allowlist, page_ranges, "en")
             assert "raw/gpu/anchor.md -> .kbc-batch-sources-test-session/gpu/anchor.md" in note
-            assert "compiled_from must still cite the original raw/... path" in note
+            assert "sources[].resource must still cite the original raw/... path" in note
 
             os.environ["KBC_ENGINE"] = "codex_sdk"
             compile_box.CodexSDKClient = FakeClient
@@ -4947,7 +4947,7 @@ async def test_hierarchical_batch_plan_and_section_reduce():
                     page = Path(source).name
                     (candidate / page).write_text(
                         "---\n"
-                        f"type: Topic\ntitle: {page}\ncompiled_from:\n  - {source}\n"
+                        f"type: Topic\ntitle: {page}\nsources:\n  - resource: {source}\n"
                         "---\n# Body\nsource-backed detail\n")
                 return f"done {label}"
 
@@ -5049,11 +5049,11 @@ async def test_hierarchical_media_rechecks_after_ledger_repair():
             (wd / "raw" / "chart.png").write_bytes(b"image")
             (wd / "candidate").mkdir()
             (wd / "candidate" / "index.md").write_text(
-                "---\nokf_version: \"0.1\"\n---\n# Index\n- [Page](page.md)\n")
+                "---\nokf_version: \"0.2\"\n---\n# Index\n- [Page](page.md)\n")
             page = wd / "candidate" / "page.md"
             page.write_text(
-                "---\ntype: Topic\ntitle: Page\ncompiled_from:\n"
-                "  - chart.png\n---\ninitial (source: chart.png)\n")
+                "---\ntype: Topic\ntitle: Page\nsources:\n"
+                "  - resource: chart.png\n---\ninitial (source: chart.png)\n")
             (wd / "authoring").mkdir()
             plan = {
                 "version": 2,
@@ -5345,7 +5345,7 @@ async def test_stall_interrupt_deadline_closes_turn():
     fake = _SwallowingClient()
     saved = (compile_box._MODEL_IDLE_TIMEOUT_S, compile_box._MODEL_WATCHDOG_POLL_S,
              compile_box._MODEL_MAX_RETRIES, compile_box._STALL_INTERRUPT_DEADLINE_S)
-    compile_box._MODEL_IDLE_TIMEOUT_S = 0.1
+    compile_box._MODEL_IDLE_TIMEOUT_S = 0.2
     compile_box._MODEL_WATCHDOG_POLL_S = 0.03
     compile_box._MODEL_MAX_RETRIES = 3
     compile_box._STALL_INTERRUPT_DEADLINE_S = 0.2
@@ -5612,7 +5612,7 @@ async def test_model_stall_retries_then_completes():
     """A black-holed model request is interrupted and re-issued on a fresh query;
     the retry produces output and the turn finishes (turn_stalled then completes)."""
     fake = _StallingFakeClient(produce_on_query=2)
-    run, evs, raised = await _run_stall_scenario(fake, idle=0.15, poll=0.03, max_retries=3)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.25, poll=0.03, max_retries=3)
     types = [e["type"] for e in evs]
     assert raised is None, raised
     assert fake.interrupts == 1, fake.interrupts
@@ -5625,7 +5625,7 @@ async def test_model_stall_retries_then_completes():
 async def test_model_stall_live_stream_not_reaped():
     """A live-but-slow generation (StreamEvents flowing) is never reaped (I4)."""
     fake = _LiveStreamFake(ticks=6, dt=0.05)
-    run, evs, raised = await _run_stall_scenario(fake, idle=0.15, poll=0.03, max_retries=3)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.25, poll=0.03, max_retries=3)
     assert raised is None, raised
     assert fake.interrupts == 0, fake.interrupts
     assert "turn_stalled" not in [e["type"] for e in evs]
@@ -5636,7 +5636,7 @@ async def test_model_stall_tool_gap_not_reaped():
     """A model-silent gap while the CLI runs a tool (tool_pending) uses the longer
     tool bound — not mistaken for a model stall (I4)."""
     fake = _ToolGapFake(gap=0.3)
-    run, evs, raised = await _run_stall_scenario(fake, idle=0.15, poll=0.03, max_retries=3, tool_idle=1.0)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.25, poll=0.03, max_retries=3, tool_idle=1.0)
     assert raised is None, raised
     assert fake.interrupts == 0, fake.interrupts
     assert "turn_stalled" not in [e["type"] for e in evs]
@@ -5647,7 +5647,7 @@ async def test_model_stall_exhausts_to_error():
     """A request that never recovers is retried up to the bound, then fails the
     turn with ModelStallError (the run fails fast instead of hanging for ~1h)."""
     fake = _StallingFakeClient(produce_on_query=999)
-    run, evs, raised = await _run_stall_scenario(fake, idle=0.1, poll=0.03, max_retries=2)
+    run, evs, raised = await _run_stall_scenario(fake, idle=0.2, poll=0.03, max_retries=2)
     types = [e["type"] for e in evs]
     assert isinstance(raised, compile_box.ModelStallError), raised
     assert fake.interrupts == 3, fake.interrupts          # 2 retries + the fatal attempt
@@ -5656,7 +5656,7 @@ async def test_model_stall_exhausts_to_error():
     assert fatal["code"] == "model_turn_stalled", fatal
     assert fatal["stage"] == "model_turn", fatal
     assert fatal["attempts"] == 3, fatal
-    assert fatal["bound_s"] == 0.1, fatal
+    assert fatal["bound_s"] == 0.2, fatal
     assert fatal["tool_pending"] is False, fatal
     assert fatal["last_sdk_message"] == "query", fatal
     print("✓ model stall: retries exhausted → ModelStallError (fails fast, no hang)")
@@ -5761,7 +5761,7 @@ def _batch_client_factory(modes):
 
 async def _drive_batch_with_watchdog(modes, *, label="batch 1/2", batch_active=True,
                                      idle=0.05, poll=0.02, max_retries=1,
-                                     interrupt_deadline=0.1, rebuild_max=3):
+                                     interrupt_deadline=0.2, rebuild_max=3):
     """Run the REAL _drive_batch_session with the REAL _model_stall_watchdog over a
     scripted sequence of fake clients, at test-tuned knobs (restored after). The
     de-stream floor is 0 in tests (the shim never binds), so bounds are the raw
@@ -5985,7 +5985,7 @@ async def test_resumed_batch_phase_is_watchdog_armed():
         compile_box._MODEL_IDLE_TIMEOUT_S = 0.05
         compile_box._MODEL_WATCHDOG_POLL_S = 0.02
         compile_box._MODEL_MAX_RETRIES = 1
-        compile_box._STALL_INTERRUPT_DEADLINE_S = 0.1
+        compile_box._STALL_INTERRUPT_DEADLINE_S = 0.2
         compile_box._compile_session_client = factory
         compile_box._compile_system_prompt = lambda run_: "sys"
         compile_box._engine_kind = lambda: "claude_agent_sdk"
@@ -6111,7 +6111,7 @@ async def test_shutdown_flush_syncs_active_runs():
     """F3: on_shutdown final-syncs each active run's unsynced workspace so a pod
     kill (SIGTERM) doesn't lose the last window of on-disk work."""
     saved = compile_box._SHUTDOWN_DRAIN_MAX_S
-    compile_box._SHUTDOWN_DRAIN_MAX_S = 0.1
+    compile_box._SHUTDOWN_DRAIN_MAX_S = 0.2
     try:
         with tempfile.TemporaryDirectory() as td:
             wd = Path(td)

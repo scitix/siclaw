@@ -1,7 +1,7 @@
 ---
 type: Topic
 title: Setup
-compiled_from:
-  - guide/setup.md
+sources:
+  - resource: guide/setup.md
 ---
 Setup page.

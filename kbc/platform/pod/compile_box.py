@@ -2818,7 +2818,7 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
 #
 # Agent/Task are denied for a reason specific to compilation rather than to
 # safety. A run's core invariant is that EVERY Raw source ends up either in some
-# page's compiled_from or in the exclusion ledger. A sub-agent reads sources in
+# page's sources[].resource or in the exclusion ledger. A sub-agent reads sources in
 # its own context and hands back prose; the parent that must call
 # report_summary never saw those files and so cannot attest to what they
 # covered. Parallel fan-out and a verifiable ledger are mutually exclusive, and
@@ -3061,12 +3061,12 @@ def _codex_batch_source_view_note(
         return (
             "\n\nCodex batch source view: original Raw is mechanically hidden from shell/file "
             "tools. Read the batch copies below instead. These helper paths are temporary; "
-            "compiled_from must still cite the original raw/... path shown on the left:\n"
+            "sources[].resource must still cite the original raw/... path shown on the left:\n"
             + mappings
         )
     return (
         "\n\nCodex 批次原料视图:原 Raw 已对 shell/文件工具机械隐藏,请改读下列本批只读副本。"
-        "这些辅助路径是临时的;compiled_from 仍必须引用左侧原 raw/... 路径:\n"
+        "这些辅助路径是临时的;sources[].resource 仍必须引用左侧原 raw/... 路径:\n"
         + mappings
     )
 
@@ -3552,7 +3552,7 @@ def _materialize_one_batch_slices(
                 )
             header = (
                 f"<!-- KBC read-only excerpt: raw/{source}, lines {start}-{end}. "
-                f"Candidate compiled_from must cite raw/{source}, never this helper path. -->\n"
+                f"Candidate sources[].resource must cite raw/{source}, never this helper path. -->\n"
             ).encode("utf-8")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(header + b"".join(lines[start - 1:end]))
@@ -3942,13 +3942,13 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
     slice_en = (
         "\n\nThis batch uses a bounded excerpt of an oversized Raw source. Read ONLY the listed "
         "`.kbc-batch-slices/` helper, never open the original Raw file directly in this batch. "
-        "Compile only facts present in this excerpt; compiled_from must cite the original Raw path "
+        "Compile only facts present in this excerpt; sources[].resource must cite the original Raw path "
         f"({', '.join('raw/' + path for path in sliced_sources)}), never the helper path."
         if sliced_sources else ""
     )
     slice_zh = (
         "\n\n本批使用超大 Raw 的有界片段。只读清单中的 `.kbc-batch-slices/` 辅助文件,本批绝不要直接打开原 Raw 全文。"
-        "只编译片段中实际出现的事实;compiled_from 必须引用原 Raw 路径("
+        "只编译片段中实际出现的事实;sources[].resource 必须引用原 Raw 路径("
         + ", ".join("raw/" + path for path in sliced_sources)
         + "),绝不能引用辅助文件。"
         if sliced_sources else ""
@@ -3963,7 +3963,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "mechanically hidden from shell/file tools. Call the KBC `read_assigned_pdf_pages` tool "
             "with no arguments; it exposes ONLY the assigned pages ("
             + page_example
-            + "). Compile only facts returned by that tool; compiled_from must cite the original "
+            + "). Compile only facts returned by that tool; sources[].resource must cite the original "
             "Raw PDF path ("
             + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
             + ")."
@@ -3972,7 +3972,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "\n\n本批只处理超大 PDF 的一个有界页段。原 PDF 已对 shell/文件工具机械隐藏;请无参数调用 "
             "KBC `read_assigned_pdf_pages` 工具,它只会返回本批页段("
             + page_example
-            + ")。只编译该工具返回的事实;compiled_from 必须引用原 Raw PDF 路径("
+            + ")。只编译该工具返回的事实;sources[].resource 必须引用原 Raw PDF 路径("
             + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
             + ")."
         )
@@ -3981,7 +3981,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "\n\nThis batch is one bounded page range of an oversized PDF. Read each listed PDF "
             "with the Read tool's `pages` argument set to the EXACT listed range (for this batch, "
             f"`pages: \"{page_example}\"`). Do not read pages outside that range in this batch. Compile only "
-            "facts visible in those pages; compiled_from must cite the original Raw PDF path ("
+            "facts visible in those pages; sources[].resource must cite the original Raw PDF path ("
             + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
             + ")."
             if paged_sources else ""
@@ -3989,7 +3989,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         page_zh = (
             "\n\n本批只处理超大 PDF 的一个有界页段。读取清单中的 PDF 时,Read 工具的 `pages` 参数必须严格等于"
             f"清单页段(本批为 `pages: \"{page_example}\"`),本批不得读取范围外页面。只编译该页段可见的事实;"
-            "compiled_from 必须引用原 Raw PDF 路径("
+            "sources[].resource 必须引用原 Raw PDF 路径("
             + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
             + ")."
             if paged_sources else ""
@@ -4001,7 +4001,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "First read authoring/BRIEF.json, authoring/INTENT.md and candidate/index.md to stay consistent "
             "in voice and structure; then read every source in this batch closely and fold its content fully "
             "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
-            "compiled_from must list the sources it was actually compiled from); update the matching "
+            "sources[].resource must list the sources it was actually compiled from); update the matching "
             "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
             "never stop. The list is your DELIVERABLE, not your field of view: you may Read any other raw "
             "source and Grep the whole corpus whenever cross-checking helps (who embeds this asset, how a "
@@ -4013,7 +4013,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
         "先读 authoring/BRIEF.json、authoring/INTENT.md 和 candidate/index.md 保持口径与结构一致;"
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
-        "compiled_from 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
+        "sources[].resource 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
         "清单是你的**交付责任面**,不是你的视野边界:需要交叉印证时(某个附件被谁引用、邻近文档同一件事怎么表述、"
         "是否已有页覆盖),可以随意 Read 其他 raw 源、可以 Grep 整个语料;只是不要去**编译**清单外的源——那属于别的批。"
         "完成后简短汇报本批编了哪些页。"
@@ -4031,14 +4031,14 @@ def _compose_reduction_directive(
             f"[Hierarchical compile · section reduce {k}/{n} · {reduction['id']}] "
             f"Consolidate the candidate pages for source section {section!r}:\n{pages}\n"
             "Read ONLY the listed candidate pages plus candidate/index.md. Merge genuinely duplicate pages, "
-            "preserve all compiled_from entries and source-backed details, converge terminology and structure, "
+            "preserve all sources[].resource entries and source-backed details, converge terminology and structure, "
             "and repair index links for pages you merge or rename. Do not read raw/ in this reduce pass and do "
             "not touch candidate pages outside this list. This is consolidation, not a new compilation. Report "
             "the pages merged or edited." + notes
         )
     return (
         f"【层级编译 · 分区归并 {k}/{n} · {reduction['id']}】归并来源分区 {section!r} 的下列候选页:\n{pages}\n"
-        "只读上列 candidate 页和 candidate/index.md。合并确实重复的页面,完整保留 compiled_from 与有来源支撑的细节,"
+        "只读上列 candidate 页和 candidate/index.md。合并确实重复的页面,完整保留 sources[].resource 与有来源支撑的细节,"
         "统一术语和结构,并修复被合并或改名页面的 index 链接。本归并轮不要读 raw/,也不要改清单外的 candidate 页。"
         "这是归并,不是重新编译。完成后汇报合并或修改了哪些页。" + notes
     )
@@ -4078,7 +4078,7 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
         step = 1
         if dups:
             lines.append(f"{step}) Duplicate-page candidates ({len(dups)} pairs) — for each pair pick one: "
-                         "merge into a single page (merge compiled_from, fix index links), or give a one-line "
+                         "merge into a single page (merge sources[].resource, fix index links), or give a one-line "
                          "written exemption in your report (genuinely different topics):")
             lines += [f"   - {d['pages'][0]} ↔ {d['pages'][1]} ({_dup_reason_en(d['reason'])})" for d in dups]
             step += 1
@@ -4115,7 +4115,7 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
     lines = [f"【分批编译 · 终审】全部 {n} 批已编完。现在做跨批收口(以下清单是系统机械算出的,逐项处理、不许沉默跳过):"]
     step = 1
     if dups:
-        lines.append(f"{step}) 重复页候选({len(dups)} 对)——每对二选一:合并成一页(合并 compiled_from、修 index 链接),"
+        lines.append(f"{step}) 重复页候选({len(dups)} 对)——每对二选一:合并成一页(合并 sources[].resource、修 index 链接),"
                      "或在汇报里给一句书面豁免理由(确属不同主题):")
         lines += [f"   - {d['pages'][0]} ↔ {d['pages'][1]}({d['reason']})" for d in dups]
         step += 1
@@ -4500,12 +4500,12 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         run,
                         _loc(run,
                              "The following sources assigned to this batch are still unaccounted "
-                             "(neither cited by any Candidate page's compiled_from nor covered by an "
+                             "(neither cited by any Candidate page's sources[].resource nor covered by an "
                              "exclusion). For each one: cite it from the page that digests it, or call "
                              "the exclude_source(path, reason) tool with a concrete reason (the preferred, "
                              "validated path; use remove_exclusion to lift a wrong row, and hand-edit "
                              "EXCLUSIONS.json only as a last resort when no tool can express the fix).\n" + listed,
-                             "本批分配的下列源仍未记账(既没有被任何候选页的 compiled_from 引用,也没有"
+                             "本批分配的下列源仍未记账(既没有被任何候选页的 sources[].resource 引用,也没有"
                              "豁免记录)。请逐个处理:要么在消化它的候选页里补引用,要么调用 "
                              "exclude_source(path, reason) 工具写明具体理由(首选的、带校验的正路;"
                              "要撤销一条排错了的豁免用 remove_exclusion;仅当工具无法表达该修改时,"
@@ -4543,7 +4543,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     # Either the batch made real progress and only stragglers
                     # remain, OR a SECOND independent run again made zero progress
                     # (counter already ≥1). A healthy model that simply never
-                    # writes compiled_from would otherwise loop provider-fault →
+                    # writes sources[].resource would otherwise loop provider-fault →
                     # resume → provider-fault until the sicore breaker suspends it
                     # for a human. Two independent runs of zero progress is content
                     # the train cannot digest: account it. Content shape must never

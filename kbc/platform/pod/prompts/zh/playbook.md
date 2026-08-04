@@ -74,7 +74,7 @@
 
 - **选一份作权威载体**,完整编它;
 - **其余各写一页**,说清它是什么形态、覆盖什么范围、**相对权威页多出什么**,把那点增量编进去,共有的部分**指过去**;
-- **每一份都照常写 `compiled_from`** —— 它们都被理解了,只是没被抄第二遍。
+- **每一份都照常写自己的 `sources` 条目** —— 它们都被理解了,只是没被抄第二遍。
 
 **这不是豁免。** 豁免的意思是"这东西不该进库";这是"它已在别处,此处只记增量"。
 
@@ -89,10 +89,15 @@
 type: <你按内容定的一两个词,如 实体/清单/主题>
 title: <标题>
 description: <一句话说明,让目录或 agent 能判断何时打开本页>
+sources:
+  - resource: <raw 相对路径>
+generated:
+  by: process:siclaw-kbc
+status: stable
 ---
 <正文。每条陈述都标(源:文件名)。已裁的矛盾写成保留其来源的结论;未裁的标"⚠️ 存疑:…">
 ```
 
-这些页面是 OKF v0.1 concept document:YAML 必须可解析,`type` 必须是非空字符串。`compiled_from`、`snapshot`、`timestamp`/`last_updated`、`confidence|status` 等 Siclaw 来源与治理字段照常与 OKF 字段并存。
+这些页面是 OKF v0.2 concept document:YAML 必须可解析,`type` 必须是非空字符串。`sources` 是 mapping 列表,每项都含非空 `resource`;agent 产出的页面写 `generated.by: process:siclaw-kbc` 和 `status: stable`。绝不代替真人或验证流程写 `verified`;修改已有页面时保留不认识的 OKF 字段。
 
-根 `index.md` 的 frontmatter 只能有 `okf_version: "0.1"`,正文按 Markdown 标题分组,并用 `- [标题](relative/path.md) - 一句话说明` 列全每页。全库只产出文件相对的标准 Markdown 链接,绝不产出 `[[wikilink]]` 或 `/` 开头的 bundle 链接。子目录 `index.md` 和所有 `log.md` 都不带 frontmatter;`log.md` 用从新到旧的 `## YYYY-MM-DD` 分组。
+根 `index.md` 的 frontmatter 只能有 `okf_version: "0.2"`,正文按 Markdown 标题分组,并用 `- [标题](relative/path.md) - 一句话说明` 列全每页。全库只产出文件相对的标准 Markdown 链接,绝不产出 `[[wikilink]]` 或 `/` 开头的 bundle 链接。子目录 `index.md` 和所有 `log.md` 都不带 frontmatter;`log.md` 用从新到旧的 `## YYYY-MM-DD` 分组。

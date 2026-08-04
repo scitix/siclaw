@@ -39,7 +39,7 @@ from pathlib import Path
 import re
 
 from redblue import _agent_json  # JSON call + one lenient retry, shared shape
-from selfcheck import _is_en, parse_compiled_from  # locale gate + citation parse
+from selfcheck import _is_en, parse_okf_sources  # locale gate + OKF provenance parse
 
 TRANSCRIPTS_PATH = "authoring/MEDIA_TRANSCRIPTS.json"
 _TRANSCRIPT_CHAR_CAP = 6000  # per image, persisted
@@ -255,7 +255,7 @@ def _distinctive_tokens(claim: str) -> list[str]:
 
 def _co_cited_text(workdir: str, page_text: str) -> str:
     """Concatenated body of the page's co-cited TEXT sources (raw-relative)."""
-    sources, _, _ = parse_compiled_from(page_text)
+    sources, _, _ = parse_okf_sources(page_text)
     raw = Path(workdir) / "raw"
     chunks: list[str] = []
     for src in sources:

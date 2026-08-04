@@ -2,10 +2,10 @@
 
 现状 "请增量重编" 路由到全量批量重排(非增量)。本模块把它变成真增量的
 box 半边:给定消费方机器算出的**变更源集**(added/modified/deleted),用
-`compiled_from`(= 官方 dependency index 的反向)**确定性反查受影响页**,拼出模型
+`sources[].resource`(= 官方 dependency index 的反向)**确定性反查受影响页**,拼出模型
 只需消费的 `CHANGESET.json`,并提供收尾的**越界改动护栏**(未授权页字节不变)。
 
-引擎中立:纯 filesystem + stdlib,复用 selfcheck 的 compiled_from 解析。谁能编由
+引擎中立:纯 filesystem + stdlib,复用 selfcheck 的 sources[].resource 解析。谁能编由
 消费方的单飞锁裁(管控面);本模块只回答 "怎么增量编"(执行面)。
 
 分工(见设计 §2):
@@ -44,11 +44,11 @@ DEFAULT_CHANGESET_MAX_BYTES = 1024 * 1024
 INDEX_PAGE = "index.md"
 
 
-# ── 反查:变更源 → 受影响页(compiled_from 反向 = dependency index)──────────────
+# ── 反查:变更源 → 受影响页(sources[].resource 反向 = dependency index)──────────────
 def _norm_source(path: str) -> str:
     """Normalize a source path to its canonical raw-relative posix form:
     posix separators, `./`/`//` collapsed (posixpath.normpath), and one leading
-    `raw/` or `drop/` segment stripped — mirroring selfcheck's compiled_from
+    `raw/` or `drop/` segment stripped — mirroring selfcheck's sources[].resource
     entry normalization, so both sides of a lookup land in the same namespace."""
     p = posixpath.normpath(path.replace("\\", "/")).lstrip("/")
     head, _, rest = p.partition("/")
@@ -56,7 +56,7 @@ def _norm_source(path: str) -> str:
 
 
 def _pages_citing(pages: dict[str, dict], sources: set[str]) -> set[str]:
-    """Candidate pages whose compiled_from cites any source in `sources`.
+    """Candidate pages whose sources[].resource cites any source in `sources`.
 
     Matching guarantee: **full-path only**, after normalizing BOTH sides with
     `_norm_source` — never by basename. The normalization preserves the

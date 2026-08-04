@@ -114,7 +114,7 @@ Deciding they are the same body of fact is your judgement. Once you have:
 - **Give each of the others a page** saying what shape it is, what range it
   covers, and **what it adds over the canonical page** — compile that delta, and
   point at the canonical page for everything they share;
-- **Every one still gets its `compiled_from`** — they were all understood; they
+- **Every one still gets its own `sources` row** — they were all understood; they
   simply were not copied out twice.
 
 **This is not an exclusion.** Exclusion means "this does not belong in the base";
@@ -134,10 +134,15 @@ Each page:
 type: <one or two words you choose from the content, e.g. entity/list/topic>
 title: <title>
 description: <one sentence that lets an index or agent decide when to open this page>
+sources:
+  - resource: <raw-relative source path>
+generated:
+  by: process:siclaw-kbc
+status: stable
 ---
 <Body. Every statement cites (source: filename). Ruled contradictions become conclusions that keep their sources; unruled ones are marked "⚠️ 存疑: …">
 ```
 
-These are OKF v0.1 concept documents: the YAML must parse and `type` must be a non-empty string. Keep Siclaw provenance fields such as `compiled_from`, `snapshot`, `timestamp`/`last_updated`, and `confidence|status` alongside the OKF fields.
+These are OKF v0.2 concept documents: the YAML must parse and `type` must be a non-empty string. `sources` is a list of mappings and every row has a non-empty `resource`. Stamp agent-authored pages with `generated.by: process:siclaw-kbc` and `status: stable`. Never write `verified`; only a real reviewer or verification process may add it. Preserve unknown OKF fields when revising an existing page.
 
-The root `index.md` carries only `okf_version: "0.1"` in its frontmatter, then groups every page under Markdown headings with list entries like `- [Title](relative/path.md) - one-line description`. Use file-relative standard Markdown links throughout the bundle. Never emit `[[wikilinks]]` or `/`-prefixed bundle links. A nested `index.md` and any `log.md` have no frontmatter; `log.md` uses newest-first `## YYYY-MM-DD` groups.
+The root `index.md` carries only `okf_version: "0.2"` in its frontmatter, then groups every page under Markdown headings with list entries like `- [Title](relative/path.md) - one-line description`. Use file-relative standard Markdown links throughout the bundle. Never emit `[[wikilinks]]` or `/`-prefixed bundle links. A nested `index.md` and any `log.md` have no frontmatter; `log.md` uses newest-first `## YYYY-MM-DD` groups.

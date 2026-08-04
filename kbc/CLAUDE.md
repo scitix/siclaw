@@ -70,12 +70,17 @@ Each page:
 type: <one or two words, you decide by content, e.g. entity/list/topic>
 title: <title>
 description: <one sentence that helps an index or agent route to this page>
+sources:
+  - resource: <raw-relative source path>
+generated:
+  by: process:siclaw-kbc
+status: stable
 ---
 <Body. Tag each statement with (source: filename). Adjudicated contradictions are written as conclusions with the involved sources retained; unadjudicated ones are tagged "⚠️ 存疑 (doubtful): …">
 ```
-Every concept frontmatter must be parseable YAML and `type` must be a non-empty string. Producer-defined provenance fields remain alongside the OKF fields.
+Every concept frontmatter must be parseable YAML and `type` must be a non-empty string. `sources` is a list of mappings whose `resource` is the raw-relative path; preserve unknown OKF fields. The compile agent never writes `verified`: only a real reviewer or verification process may add it.
 
-The root `index.md` carries only `okf_version: "0.1"` in frontmatter, then groups every page under headings with entries like `- [Title](relative/path.md) - one-line description`. Emit only file-relative standard Markdown links — never `[[wikilinks]]` or `/`-prefixed bundle links. Nested `index.md` and all `log.md` files carry no frontmatter; logs use newest-first `## YYYY-MM-DD` groups.
+The root `index.md` carries only `okf_version: "0.2"` in frontmatter, then groups every page under headings with entries like `- [Title](relative/path.md) - one-line description`. Emit only file-relative standard Markdown links — never `[[wikilinks]]` or `/`-prefixed bundle links. Nested `index.md` and all `log.md` files carry no frontmatter; logs use newest-first `## YYYY-MM-DD` groups.
 
 ## Repo layout
 
