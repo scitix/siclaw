@@ -2133,6 +2133,9 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       icon: agent.icon,
       color: agent.color,
       idle_timeout_sec: agent.idle_timeout_sec,
+      // Read by buildSpawnEnv → TZ, so the box's own clock matches what the
+      // per-prompt reminder tells the model. Cold-spawn only.
+      timezone: agent.timezone ?? null,
       // How many AgentBox pods this agent runs. Absent or 1 means one box — the shape
       // every agent had before this column, and what the Runtime falls back to.
       replicas: agent.replicas,
@@ -2289,10 +2292,13 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("config.getModelBinding", async (params) => {
     const db = getDb();
     const [agentRows] = await db.query(
-      "SELECT model_provider, model_id, model_routing, system_prompt FROM agents WHERE id = ?",
+      "SELECT model_provider, model_id, model_routing, system_prompt, language, timezone FROM agents WHERE id = ?",
       [params.agentId],
     ) as any;
-    const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; system_prompt?: string | null } | undefined;
+    const agent = agentRows[0] as {
+      model_provider?: string; model_id?: string; model_routing?: unknown;
+      system_prompt?: string | null; language?: string | null; timezone?: string | null;
+    } | undefined;
     if (!agent?.model_provider || !agent?.model_id) {
       return { binding: null };
     }
@@ -2330,6 +2336,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
         },
         ...(modelRouting ? { modelRouting } : {}),
         systemPrompt: agent.system_prompt ?? null,
+        // Read on every prompt, so an operator's change is live on the next
+        // message without invalidating a warm session.
+        language: agent.language ?? null,
+        timezone: agent.timezone ?? null,
       },
     };
   });

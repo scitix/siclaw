@@ -44,6 +44,8 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     is_production TINYINT(1) NOT NULL DEFAULT 1,
     idle_timeout_sec INT NOT NULL DEFAULT 300,
     replicas INT NOT NULL DEFAULT 1,
+    language VARCHAR(32) DEFAULT NULL,
+    timezone VARCHAR(64) DEFAULT NULL,
     icon VARCHAR(50),
     color VARCHAR(50),
     created_by CHAR(36),
@@ -625,6 +627,11 @@ export async function runPortalMigrations(): Promise<void> {
   // How many AgentBox pods this agent runs. DEFAULT 1 is the identity value: an existing
   // row picks it up on upgrade and behaves exactly as it did before replicas existed.
   await safeAlterTable(db, "agents", "replicas", "INT NOT NULL DEFAULT 1");
+  // Nullable on both, and NULL means exactly today's behaviour: detect the reply
+  // language from the message, and report time in the box's own zone. So no row
+  // needs backfilling and an upgrade changes nothing until an operator chooses.
+  await safeAlterTable(db, "agents", "language", "VARCHAR(32) DEFAULT NULL");
+  await safeAlterTable(db, "agents", "timezone", "VARCHAR(64) DEFAULT NULL");
   // Per-agent tool capability groups (JSON array of group keys). TEXT (not a
   // JSON column type) for MySQL+SQLite dual-compat. NULL = no selection = all
   // tools (backward-compatible with agents predating this feature).

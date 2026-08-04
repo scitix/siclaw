@@ -39,6 +39,20 @@ export interface ResolvedModelBinding {
    * persistence resolves it from its own data and carries it over chat.send.
    */
   persistence?: boolean;
+  /**
+   * Language to answer in when the message itself gives no clue (a bare "1", an
+   * attachment with no text). What the user actually wrote still wins — see
+   * `resolveReplyLanguage`. Absent/null keeps today's behaviour: English.
+   */
+  language?: string | null;
+  /**
+   * IANA zone the agent reports time in. Rides here rather than in the spawn
+   * environment so a change lands on the NEXT MESSAGE — a pooled box is
+   * resident, and a settings toggle that needs a pod restart is the wrong shape.
+   * `buildSpawnEnv` also maps it to TZ, which is what makes the box's own clock
+   * (and `date` in its shell) agree; that half waits for a restart.
+   */
+  timezone?: string | null;
 }
 
 export async function resolveAgentModelBinding(

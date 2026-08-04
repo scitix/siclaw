@@ -44,3 +44,27 @@ describe("buildSpawnEnv", () => {
     expect(buildSpawnEnv({ spawn_env: {} })).toEqual({});
   });
 });
+
+describe("buildSpawnEnv — timezone", () => {
+  it("maps timezone to TZ", () => {
+    expect(buildSpawnEnv({ timezone: "Asia/Shanghai" })).toEqual({ TZ: "Asia/Shanghai" });
+  });
+
+  // Same precedence rule as the idle window: a dedicated control must not be
+  // clobbered by a generic key that happens to share its name.
+  it("wins over a same-named key in spawn_env", () => {
+    const env = buildSpawnEnv({ timezone: "Asia/Shanghai", spawn_env: { TZ: "UTC" } });
+    expect(env.TZ).toBe("Asia/Shanghai");
+  });
+
+  it.each([undefined, null, "", "   "])("emits nothing for %j", (timezone) => {
+    expect(buildSpawnEnv({ timezone }).TZ).toBeUndefined();
+  });
+
+  it("coexists with the idle window", () => {
+    expect(buildSpawnEnv({ idle_timeout_sec: 0, timezone: "UTC" })).toEqual({
+      SICLAW_AGENTBOX_IDLE_TIMEOUT: "0",
+      TZ: "UTC",
+    });
+  });
+});

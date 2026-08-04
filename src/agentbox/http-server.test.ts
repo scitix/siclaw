@@ -34,8 +34,22 @@ vi.mock("../shared/metrics.js", () => ({
 
 vi.mock("../shared/diagnostic-events.js", () => ({ emitDiagnostic: () => {} }));
 
+/**
+ * The prompt text with the time reminder stripped.
+ *
+ * Every turn is prefixed with one now (its own test below covers it), so cases
+ * about the rest of the prompt read past it rather than restating it.
+ */
+function promptText(session: any): string {
+  return String(session.brain.prompt.mock.calls[0][0]).replace(/^<system-reminder>[^\n]*<\/system-reminder>\n/, "");
+}
+
 vi.mock("../shared/detect-language.js", () => ({
-  detectLanguage: (s: string) => (s.includes("你") ? "Chinese" : "English"),
+  // Faithful to the real split: a non-Latin script wins, plain Latin reads as
+  // English, and text with no letters at all has no opinion — which is what
+  // lets the configured-language fallback be exercised here.
+  detectScriptLanguage: (s: string) =>
+    s.includes("你") ? "Chinese" : /[A-Za-z]{2}/.test(s) ? "English" : null,
 }));
 
 // Config loader — point paths at /tmp (no PROFILE.md → no update)
@@ -327,10 +341,10 @@ describe("http-server — prompt + session lifecycle", () => {
       images: [{ mimeType: "image/png", data: "aW1n" }],
     });
     expect(r.status).toBe(200);
-    expect(session.brain.prompt).toHaveBeenCalledWith(
-      "what is in this image?",
-      { images: [{ mimeType: "image/png", data: "aW1n" }] },
-    );
+    expect(promptText(session)).toBe("what is in this image?");
+    expect(session.brain.prompt.mock.calls[0][1]).toEqual({
+      images: [{ mimeType: "image/png", data: "aW1n" }],
+    });
   });
 
   it("POST /api/prompt accepts an image-only message and defaults the text", async () => {
@@ -343,10 +357,10 @@ describe("http-server — prompt + session lifecycle", () => {
       images: [{ mimeType: "image/png", data: "aW1n" }],
     });
     expect(r.status).toBe(200);
-    expect(session.brain.prompt).toHaveBeenCalledWith(
-      "Please analyze the attached image.",
-      { images: [{ mimeType: "image/png", data: "aW1n" }] },
-    );
+    expect(promptText(session)).toBe("Please analyze the attached image.");
+    expect(session.brain.prompt.mock.calls[0][1]).toEqual({
+      images: [{ mimeType: "image/png", data: "aW1n" }],
+    });
   });
 
   // Regression: language-following must NOT be gated on memory. A memory-off agent
@@ -363,7 +377,7 @@ describe("http-server — prompt + session lifecycle", () => {
       modelConfig: modelConfigWithInput(["text"]),
     });
     expect(r.status).toBe(200);
-    expect(session.brain.prompt.mock.calls[0][0]).toBe("[System: respond in Chinese]\n你好");
+    expect(promptText(session)).toBe("[System: respond in Chinese]\n你好");
   });
 
   it("POST /api/prompt leaves English prompts untouched when memory is disabled", async () => {
@@ -377,7 +391,101 @@ describe("http-server — prompt + session lifecycle", () => {
       modelConfig: modelConfigWithInput(["text"]),
     });
     expect(r.status).toBe(200);
-    expect(session.brain.prompt.mock.calls[0][0]).toBe("hello there");
+    expect(promptText(session)).toBe("hello there");
+  });
+
+  // ── Per-agent locale (language + timezone) ──────────────────────────────────
+  // Both ride the prompt body rather than the spawn env: a pooled box's session
+  // lives for days, so a value fixed at spawn would be stale by the time it is
+  // read, and a settings change would need a pod recycle to take effect.
+
+  it("POST /api/prompt tells the model the time in the agent's timezone", async () => {
+    const session = await sm.getOrCreate("tz-1");
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "hello there",
+      sessionId: "tz-1",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+      timezone: "Asia/Shanghai",
+    });
+    expect(r.status).toBe(200);
+    const sent = String(session.brain.prompt.mock.calls[0][0]);
+    expect(sent).toMatch(/^<system-reminder>Current date and time: .*Asia\/Shanghai, UTC\+8.*<\/system-reminder>\n/);
+    expect(sent.endsWith("hello there")).toBe(true);
+  });
+
+  it("POST /api/prompt falls back to UTC when no timezone is configured", async () => {
+    const session = await sm.getOrCreate("tz-none");
+    await getJson(port, "/api/prompt", "POST", {
+      text: "hello there",
+      sessionId: "tz-none",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+    });
+    expect(String(session.brain.prompt.mock.calls[0][0])).toContain("(UTC, UTC+0)");
+  });
+
+  // The reported bug: steering a bare "1" into a Chinese conversation used to
+  // answer in English, because detection reported "English" for text it could
+  // not read at all.
+  it("POST /api/prompt uses the configured language when the text says nothing", async () => {
+    const session = await sm.getOrCreate("lang-cfg");
+    await getJson(port, "/api/prompt", "POST", {
+      text: "1",
+      sessionId: "lang-cfg",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+      language: "Chinese",
+    });
+    expect(promptText(session)).toBe("[System: respond in Chinese]\n1");
+  });
+
+  // Configuration is the floor, not the ceiling: a bilingual user who switches
+  // is followed, not corrected back to the configured language.
+  it("POST /api/prompt follows the written language over the configured one", async () => {
+    const session = await sm.getOrCreate("lang-detect-wins");
+    await getJson(port, "/api/prompt", "POST", {
+      text: "你好",
+      sessionId: "lang-detect-wins",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+      language: "English",
+    });
+    expect(promptText(session)).toBe("[System: respond in Chinese]\n你好");
+  });
+
+  it("POST /api/prompt adds no directive when the configured language is English", async () => {
+    const session = await sm.getOrCreate("lang-cfg-en");
+    await getJson(port, "/api/prompt", "POST", {
+      text: "1",
+      sessionId: "lang-cfg-en",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+      language: "English",
+    });
+    expect(promptText(session)).toBe("1");
+  });
+
+  // Read by the two turns built inside the session — a spawned sub-agent's
+  // briefing and a background job's completion turn — neither of which has a
+  // request body to read them from.
+  it("POST /api/prompt remembers the locale on the session", async () => {
+    const session = await sm.getOrCreate("locale-memo");
+    await getJson(port, "/api/prompt", "POST", {
+      text: "hello there",
+      sessionId: "locale-memo",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+      language: "Chinese",
+      timezone: "Asia/Shanghai",
+    });
+    expect(session._locale).toEqual({ language: "Chinese", timezone: "Asia/Shanghai" });
   });
 
   it("POST /api/prompt forwards large valid images to brain.prompt", async () => {
@@ -391,10 +499,10 @@ describe("http-server — prompt + session lifecycle", () => {
       images: [{ mimeType: "image/jpeg", data }],
     });
     expect(r.status).toBe(200);
-    expect(session.brain.prompt).toHaveBeenCalledWith(
-      "Please analyze the attached image.",
-      { images: [{ mimeType: "image/jpeg", data }] },
-    );
+    expect(promptText(session)).toBe("Please analyze the attached image.");
+    expect(session.brain.prompt.mock.calls[0][1]).toEqual({
+      images: [{ mimeType: "image/jpeg", data }],
+    });
   });
 
   it("POST /api/prompt rejects malformed images instead of dropping them", async () => {
@@ -433,7 +541,8 @@ describe("http-server — prompt + session lifecycle", () => {
 
     expect(r.status).toBe(200);
     const s = sm.sessions.get("pdf1")!;
-    expect(s.brain.prompt).toHaveBeenCalledWith("Please analyze the attached PDF.", {
+    expect(promptText(s)).toBe("Please analyze the attached PDF.");
+    expect(s.brain.prompt.mock.calls[0][1]).toEqual({
       files: [{ mimeType: "application/pdf", filename: "runbook.pdf", data: "aGVsbG8=" }],
     });
   });

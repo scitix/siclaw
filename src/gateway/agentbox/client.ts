@@ -67,6 +67,16 @@ export interface PromptOptions {
   images?: Array<{ mimeType: string; data: string }>;
   /** File attachments forwarded as native model file input. */
   files?: Array<{ mimeType: string; filename: string; data: string }>;
+  /**
+   * Language to answer in when the message itself gives no clue. What the user
+   * wrote still wins; this is the floor. Absent → English, as before.
+   */
+  language?: string;
+  /**
+   * IANA zone the agent reports time in. Carried per prompt so a change lands
+   * on the next message rather than on the box's next restart.
+   */
+  timezone?: string;
 }
 
 export type PromptMediaOptions = Pick<PromptOptions, "images" | "files">;

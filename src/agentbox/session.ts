@@ -57,7 +57,21 @@ import { tracingRecorder } from "../shared/tracing/agent-trace-recorder.js";
 import { isTracingEnabled } from "../shared/tracing/otel-provider.js";
 import type { SpanContext } from "@opentelemetry/api";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
-import { detectLanguage } from "../shared/detect-language.js";
+import { detectScriptLanguage } from "../shared/detect-language.js";
+import { renderTimeReminder, resolveReplyLanguage } from "../shared/agent-locale.js";
+
+/** The agent's configured language + timezone, carried on the session. */
+export interface AgentLocale { language?: string; timezone?: string }
+
+/**
+ * Language directive for a synthetic turn. Its text is machine-generated
+ * ("background job X finished"), so detection has nothing to read — the
+ * configured language is all there is.
+ */
+function syntheticLangDirective(managed: { _locale?: AgentLocale }): string {
+  const lang = resolveReplyLanguage(null, managed._locale?.language);
+  return lang === "English" ? "" : `[System: respond in ${lang}]\n`;
+}
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import type {
   DelegationAppendMessagePayload,
@@ -171,6 +185,15 @@ export interface ManagedSession {
   modelRouteState: ModelRouteState;
   /** Last normalized model routing policy supplied by Runtime/Portal for this session. */
   modelRoutePolicy?: ModelRoutePolicy;
+  /**
+   * The agent's configured language + timezone, as of the last prompt.
+   *
+   * Remembered because two kinds of turn are built INSIDE the session, after
+   * the HTTP handler that receives these values has returned: a spawned
+   * sub-agent's prompt, and a background job's completion turn. Neither has a
+   * request body to read them from.
+   */
+  _locale?: AgentLocale;
   /** When true, brain events are emitted by the route runner after attempt filtering. */
   _routeBrainEventsThroughExtra: boolean;
   /**
@@ -1722,7 +1745,9 @@ export class AgentBoxSessionManager {
         try {
           await runPromptWithModelRouting(
             managed.brain,
-            text,
+            // A background job's completion turn is a real turn the user reads,
+            // so it gets the same clock and language the interactive path does.
+            `${renderTimeReminder(new Date(), managed._locale?.timezone)}\n${syntheticLangDirective(managed)}${text}`,
             effectivePolicy,
             managed.modelRouteState,
             {
@@ -2288,7 +2313,14 @@ export class AgentBoxSessionManager {
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
       );
-      await Promise.race([child.brain.prompt(this.buildSpawnedSubagentPrompt(request)), timeoutPromise]);
+      await Promise.race([
+        // The parent's session is where the last prompt's locale was recorded;
+        // a child gets its own session, so it has to be read across.
+        child.brain.prompt(
+          this.buildSpawnedSubagentPrompt(request, this.sessions.get(request.parentSessionId)?._locale),
+        ),
+        timeoutPromise,
+      ]);
     } catch (err) {
       interruptedTool = [...pendingTools.values()][0]?.toolName;
       if (stopRequested) {
@@ -2385,12 +2417,20 @@ export class AgentBoxSessionManager {
     }
   }
 
-  private buildSpawnedSubagentPrompt(request: SpawnSubagentRequest): string {
+  private buildSpawnedSubagentPrompt(request: SpawnSubagentRequest, locale?: AgentLocale): string {
     // Make the sub-agent answer in the user's language (same mechanism the main
     // agent uses): detect from the briefing the parent wrote and inject the directive.
-    const lang = detectLanguage(`${request.description}\n${request.prompt}`);
+    // A briefing is often terse and technical, so the parent's configured
+    // language matters more here than on a user turn.
+    const lang = resolveReplyLanguage(
+      detectScriptLanguage(`${request.description}\n${request.prompt}`),
+      locale?.language,
+    );
     const langDirective = lang !== "English" ? `[System: respond in ${lang}]\n` : "";
-    return `${langDirective}Task: ${request.description}\n\n${request.prompt.trim()}\n\n` +
+    // A sub-agent gets its own session and its own turn, so it needs the clock
+    // told to it just like the parent did.
+    const timeReminder = `${renderTimeReminder(new Date(), locale?.timezone)}\n`;
+    return `${timeReminder}${langDirective}Task: ${request.description}\n\n${request.prompt.trim()}\n\n` +
       `Complete this task now and end with a concise findings report — the caller only sees your ` +
       `final report, not your intermediate steps. Do not ask for confirmation.`;
   }

@@ -168,6 +168,43 @@ describe("registerAgentRoutes", () => {
 
   // ── POST /api/v1/agents ──────────────────────────────────
   describe("POST /api/v1/agents", () => {
+    // Per-agent locale. Both are plain nullable strings; the timezone is the
+    // only one validated, because an unusable zone would otherwise be found on
+    // every turn, in the one code path that must not throw.
+    it("stores language and timezone on create", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[], []])
+        .mockResolvedValueOnce([[{ id: "a-new", name: "zoned" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents",
+        method: "POST",
+        body: { name: "zoned", language: "Chinese", timezone: "Asia/Shanghai" },
+      }));
+
+      expect(status).toBe(201);
+      const insertSql = query.mock.calls[0][0] as string;
+      const insertArgs = query.mock.calls[0][1] as unknown[];
+      // Column list and placeholder count must agree — a mismatch here shifts
+      // every later value by one and is silent in MySQL's error text.
+      expect(insertSql.match(/\?/g)!.length).toBe(insertSql.slice(insertSql.indexOf("(") + 1, insertSql.indexOf(")")).split(",").length);
+      expect(insertArgs).toContain("Chinese");
+      expect(insertArgs).toContain("Asia/Shanghai");
+    });
+
+    it("rejects a timezone the runtime cannot resolve", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents",
+        method: "POST",
+        body: { name: "bad-zone", timezone: "Mars/Olympus_Mons" },
+      }));
+
+      expect(status).toBe(400);
+      expect(String(body.error)).toContain("Invalid timezone");
+      expect(query).not.toHaveBeenCalled();
+    });
+
     it("rejects non-admin", async () => {
       const { status } = await runRoute(router, fakeReq({
         url: "/api/v1/agents",
@@ -369,6 +406,78 @@ describe("registerAgentRoutes", () => {
         body: {},
       }));
       expect(status).toBe(400);
+    });
+
+    it("updates language and timezone", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "zoned" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { language: "Japanese", timezone: "Asia/Tokyo" },
+      }));
+
+      expect(status).toBe(200);
+      const updateSql = query.mock.calls[0][0] as string;
+      const updateArgs = query.mock.calls[0][1] as unknown[];
+      expect(updateSql).toContain("language = ?");
+      expect(updateSql).toContain("timezone = ?");
+      expect(updateArgs).toContain("Japanese");
+      expect(updateArgs).toContain("Asia/Tokyo");
+      // Neither field pre-reads the row: both are read per prompt, so a change
+      // needs no warm-session invalidation and no pod recycle.
+      expect(query.mock.calls.length).toBe(2);
+    });
+
+    // Clearing is a real operation, distinct from omitting: it puts the agent
+    // back on UTC / auto-detect.
+    it("clears language and timezone when sent empty", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "zoned" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { language: "", timezone: "" },
+      }));
+
+      expect(status).toBe(200);
+      const updateArgs = query.mock.calls[0][1] as unknown[];
+      expect(updateArgs.filter((a) => a === null).length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("leaves both untouched when the update does not mention them", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1", name: "renamed" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { name: "renamed" },
+      }));
+
+      expect(status).toBe(200);
+      const updateSql = query.mock.calls[0][0] as string;
+      expect(updateSql).not.toContain("language = ?");
+      expect(updateSql).not.toContain("timezone = ?");
+    });
+
+    // The zone is checked BEFORE any SET clause is built, so a bad one costs
+    // the whole update rather than being written next to good fields.
+    it("rejects a bad timezone without touching the row", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: { name: "renamed", timezone: "Not/AZone" },
+      }));
+
+      expect(status).toBe(400);
+      expect(String(body.error)).toContain("Invalid timezone");
+      expect(query).not.toHaveBeenCalled();
     });
 
     it("keeps an explicitly supplied prompt when switching to a built-in type", async () => {

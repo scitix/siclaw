@@ -369,6 +369,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       modelRouting,
       images,
       files,
+      // Resolved by whoever resolved the model binding — the same path
+      // systemPrompt takes. A control plane that does not send them leaves the
+      // box on today's behaviour: detect the language, report time in UTC.
+      language: params.language as string | undefined,
+      timezone: params.timezone as string | undefined,
     };
 
     // Async-ack protocol: return { ok, sessionId } within milliseconds; do

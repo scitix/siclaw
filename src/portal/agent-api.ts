@@ -22,6 +22,7 @@ import { encodeToolCapabilitiesForDb } from "../core/tool-capabilities.js";
 import { AGENT_TYPES, effectiveAgentPrompt, normalizeAgentType } from "../core/agent-types.js";
 import { notifyCoordinatorsForMembers, collectDependentCoordinators, notifyCoordinators } from "./coordinator-invalidation.js";
 import { normalizeIdleTimeoutSec, normalizeReplicas } from "../core/config.js";
+import { isValidTimezone } from "../shared/agent-locale.js";
 import { safeParseJson } from "../gateway/dialect-helpers.js";
 
 /**
@@ -90,7 +91,7 @@ export function registerAgentRoutes(
 
     const listParams = [...params, pageSize, offset];
     const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id, a.model_routing,
-        a.agent_type, a.is_production, a.idle_timeout_sec, a.replicas, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
+        a.agent_type, a.is_production, a.idle_timeout_sec, a.replicas, a.language, a.timezone, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
         (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
@@ -108,6 +109,31 @@ export function registerAgentRoutes(
   });
 
   // POST /api/v1/agents — create (admin only)
+/**
+ * Coerce a caller-supplied timezone: the trimmed value when the runtime can
+ * actually use it, `null` when the caller cleared it or sent nothing,
+ * `invalid` otherwise.
+ *
+ * Rejected at WRITE time on purpose. The renderer degrades to UTC rather than
+ * throwing — it runs on every turn — so a bad zone stored here would not fail
+ * loudly, it would silently report the wrong time forever.
+ */
+function normalizeTimezoneInput(value: unknown): { ok: true; value: string | null } | { ok: false } {
+  if (value === null || value === undefined) return { ok: true, value: null };
+  if (typeof value !== "string") return { ok: false };
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: true, value: null };
+  if (!isValidTimezone(trimmed)) return { ok: false };
+  return { ok: true, value: trimmed };
+}
+
+const INVALID_TIMEZONE_MESSAGE = "Invalid timezone — expected an IANA zone such as Asia/Shanghai or UTC";
+
+/** Empty string clears the setting; anything else is stored as given. */
+function normalizeLanguageInput(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
   router.post("/api/v1/agents", async (req, res) => {
     const auth = requireAdmin(req, res, jwtSecret);
     if (!auth) return;
@@ -128,9 +154,11 @@ export function registerAgentRoutes(
     }
 
     const agentType = normalizeAgentType(body.agent_type);
+    const createTimezone = normalizeTimezoneInput(body.timezone);
+    if (!createTimezone.ok) { sendJson(res, 400, { error: INVALID_TIMEZONE_MESSAGE }); return; }
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, tool_capabilities, agent_type, system_prompt, is_production, idle_timeout_sec, replicas, language, timezone, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -148,6 +176,8 @@ export function registerAgentRoutes(
         body.is_production ?? 1,
         normalizeIdleTimeoutSec(body.idle_timeout_sec),
         normalizeReplicas(body.replicas),
+        normalizeLanguageInput(body.language),
+        createTimezone.value,
         body.icon ?? null,
         body.color ?? null,
         auth.userId,
@@ -284,9 +314,14 @@ export function registerAgentRoutes(
     }
 
     // Build dynamic SET clause
+    // Validated before any SET clause is built: a rejected value must not leave
+    // a half-applied update behind.
+    const nextTimezone = "timezone" in body ? normalizeTimezoneInput(body.timezone) : undefined;
+    if (nextTimezone && !nextTimezone.ok) { sendJson(res, 400, { error: INVALID_TIMEZONE_MESSAGE }); return; }
+
     const fields = [
       "name", "description", "status", "model_provider",
-      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "replicas", "icon", "color", "agent_type",
+      "model_id", "system_prompt", "is_production", "idle_timeout_sec", "replicas", "language", "timezone", "icon", "color", "agent_type",
     ];
     const setClauses: string[] = [];
     const values: unknown[] = [];
@@ -306,6 +341,8 @@ export function registerAgentRoutes(
           values.push(
             field === "idle_timeout_sec" ? newIdleTimeoutSec!
               : field === "replicas" ? normalizeReplicas(body.replicas)
+              : field === "timezone" ? nextTimezone!.value
+              : field === "language" ? normalizeLanguageInput(body.language)
               : body[field],
           );
         }
@@ -640,8 +677,8 @@ export function registerAgentRoutes(
       await conn.beginTransaction();
 
       await conn.query(
-        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, agent_type, system_prompt, is_production, icon, color, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, agent_type, system_prompt, is_production, language, timezone, icon, color, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           newId,
           newName,
@@ -653,6 +690,10 @@ export function registerAgentRoutes(
           source.agent_type ?? "custom",
           source.system_prompt,
           source.is_production,
+          // Presentation settings — a clone that answered in a different
+          // language or off a different clock would not be a copy.
+          source.language ?? null,
+          source.timezone ?? null,
           source.icon,
           source.color,
           auth.userId,

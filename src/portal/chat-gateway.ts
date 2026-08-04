@@ -511,6 +511,8 @@ export function registerChatRoutes(
       modelConfig: modelBinding.modelConfig,
       modelRouting: modelBinding.modelRouting,
       systemPrompt: modelBinding.systemPrompt ?? undefined,
+      language: modelBinding.language ?? undefined,
+      timezone: modelBinding.timezone ?? undefined,
       turnStartMs,
     });
 
@@ -767,6 +769,8 @@ export function registerChatRoutes(
       modelConfig: modelBinding.modelConfig,
       modelRouting: modelBinding.modelRouting,
       systemPrompt: modelBinding.systemPrompt ?? undefined,
+      language: modelBinding.language ?? undefined,
+      timezone: modelBinding.timezone ?? undefined,
     });
 
     if (!result.ok && !resolved) {

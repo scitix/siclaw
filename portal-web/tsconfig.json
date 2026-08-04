@@ -1,6 +1,10 @@
 {
   "compilerOptions": {
     "target": "ES2020",
+    // ES2022 for Intl.supportedValuesOf (the timezone picker's option list).
+    // Types only — browser support (Chrome 99 / Safari 15.4 / Firefox 93) is
+    // well below what this UI already requires.
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",

@@ -23,7 +23,8 @@ import { CredentialBroker } from "./credential-broker.js";
 import { HttpTransport } from "./credential-transport.js";
 import { getSyncHandler, createClusterHandler, createHostHandler, createToolsHandler } from "./sync-handlers.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
-import { detectLanguage } from "../shared/detect-language.js";
+import { detectScriptLanguage } from "../shared/detect-language.js";
+import { renderTimeReminder, resolveReplyLanguage } from "../shared/agent-locale.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import {
   candidateSupportsPromptMedia,
@@ -77,6 +78,15 @@ interface PromptRequestBody {
   images?: PromptImage[];
   /** PDF attachments forwarded as native file input (PDF-capable models only). */
   files?: PromptFile[];
+  /**
+   * Per-agent locale, resolved by the control plane on every prompt.
+   *
+   * Carried per-prompt rather than baked into the session: `systemPromptOverride`
+   * is evaluated when the resource loader runs, and a pooled box's session lives
+   * for days — a date fixed there would go stale and be stated confidently.
+   */
+  language?: string;
+  timezone?: string;
 }
 
 /**
@@ -866,23 +876,41 @@ export function createHttpServer(
     // (Previously this was accidentally gated on isMemoryEnabled() as a side effect of
     // "disable memory by default", which left memory-off agents — e.g. the GPU-cloud
     // sales-guide — with no language enforcement, so they drifted to the model's bias.)
-    const detectedLang = detectLanguage(promptText);
-    if (detectedLang !== "English") {
+    // Detection wins where the text carries any evidence; the agent's configured
+    // language is the FLOOR, for the turns it cannot read — a bare "1" steered
+    // into a Chinese conversation used to be answered in English.
+    const detectedLang = detectScriptLanguage(promptText);
+    const effectiveLang = resolveReplyLanguage(detectedLang, body.language);
+    if (effectiveLang !== "English") {
       // Only two DP markers remain after the refactor: activation and exit.
       const dpMarkers = [DP_ACTIVATION_MARKER, `${DP_EXIT_MARKER}\n`];
       const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
       if (matchedMarker) {
         // Insert language hint after the marker: [Deep Investigation]\n[System: respond in Chinese]\n...
-        promptText = matchedMarker + `[System: respond in ${detectedLang}]\n` + promptText.slice(matchedMarker.length);
+        promptText = matchedMarker + `[System: respond in ${effectiveLang}]\n` + promptText.slice(matchedMarker.length);
       } else {
-        promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
+        promptText = `[System: respond in ${effectiveLang}]\n${promptText}`;
       }
     }
+
+    // What time it is, every turn. The model has no other way to know: a
+    // coordinator has no shell by design (AGENT_TYPES locks its capabilities),
+    // and the system prompt is built once per session, not per turn.
+    promptText = `${renderTimeReminder(new Date(), body.timezone)}\n${promptText}`;
+
+    // Remembered for the turns that do not come through this handler — a spawned
+    // sub-agent's prompt and a background job's completion turn are both built
+    // inside the session, after this one returns.
+    managed._locale = { language: body.language, timezone: body.timezone };
 
     // Programmatically update PROFILE.md Language field (code-level, not model-dependent).
     // Only update on non-English detection to avoid flapping: English is the default,
     // so we only persist when the user actively uses another language.
-    if (detectedLang !== "English") {
+    //
+    // DETECTED, not effective: this is the USER's profile. Writing the agent's
+    // configured language here would record a preference the user never
+    // expressed — and would do it on every turn they wrote in another one.
+    if (detectedLang !== null && detectedLang !== "English") {
       try {
         const cfg = loadConfig();
         const userDataDir = process.env.SICLAW_USER_DATA_DIR || cfg.paths.userDataDir;
@@ -903,7 +931,7 @@ export function createHttpServer(
     }
 
     // Execute prompt asynchronously; notify SSE to close on completion
-    console.log(`[agentbox-http] Starting prompt for session ${managed.id} [lang=${detectedLang}]`);
+    console.log(`[agentbox-http] Starting prompt for session ${managed.id} [lang=${effectiveLang}]`);
 
     // Metrics: snapshot stats before prompt for delta calculation
     const prevStats = managed.brain.getSessionStats();
