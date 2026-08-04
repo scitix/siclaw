@@ -79,17 +79,139 @@ function extractOffset(now: Date, zone: string): string {
 }
 
 /**
- * Which language the reply should be in.
+ * What a conversation has revealed about its own language and clock.
  *
- * Detection wins where there is any: what the user actually wrote beats what an
- * operator configured months ago, so a bilingual user who switches is followed
- * rather than corrected. The configured value is the FLOOR — it decides the
- * turns detection cannot read, which is where the bug was: a bare `1` steered
- * into a Chinese conversation used to answer in English.
+ * Scoped to the SESSION, not to the agent and not to a user id. An AgentBox is
+ * keyed by agent alone, so one box serves everyone using that agent — an
+ * agent-level default therefore answers one user in another user's language. A
+ * user-level store cannot be the answer either: channel messages arrive with no
+ * `userId` at all (only the binding's owner), which is exactly the surface with
+ * the most people per agent.
+ *
+ * A session is the scope that works everywhere and needs no identity: Portal
+ * sessions are per-person, a Feishu `per_user` group keys the session by sender,
+ * and a Feishu `shared` group deliberately gives the whole room one session —
+ * where one language for the room is the intended behaviour, not a bug.
  */
-export function resolveReplyLanguage(
-  detected: string | null,
-  configured?: string | null,
-): string {
-  return detected ?? (configured?.trim() || "English");
+export interface SessionLocaleState {
+  /** The last language DETECTED from something the user wrote here. */
+  language?: string;
+  /** The last timezone the client REPORTED here. */
+  timezone?: string;
+}
+
+export function createSessionLocaleState(): SessionLocaleState {
+  return {};
+}
+
+/**
+ * Accept only what this module wrote.
+ *
+ * The state is read from a file that survives restarts, so treat it as
+ * untrusted: a corrupt or hand-edited value must degrade to "nothing
+ * remembered" rather than reach the prompt.
+ */
+export function normalizeSessionLocaleState(value: unknown): SessionLocaleState {
+  if (typeof value !== "object" || value === null) return {};
+  const raw = value as Record<string, unknown>;
+  const state: SessionLocaleState = {};
+  const language = typeof raw.language === "string" ? raw.language.trim() : "";
+  if (language) state.language = language;
+  const timezone = typeof raw.timezone === "string" ? raw.timezone.trim() : "";
+  if (timezone && isValidTimezone(timezone)) state.timezone = timezone;
+  return state;
+}
+
+/** This turn's live signals — what the user wrote, and what their client said. */
+export interface LocaleSignals {
+  /** From `detectScriptLanguage`; null when the text carries no evidence. */
+  detectedLanguage?: string | null;
+  /** The client's own zone (a browser reports its own), if it sent one. */
+  reportedTimezone?: string | null;
+}
+
+/**
+ * Fold this turn's live signals into what the session remembers.
+ *
+ * Returns whether anything changed, so the caller can skip a write on the
+ * ordinary turn where nothing new was learned.
+ *
+ * Only LIVE signals are remembered. The agent's configured values are
+ * deliberately never written here: recording a default as though the
+ * conversation had revealed it would freeze it in place and defeat the whole
+ * point — that configuration applies only until there is evidence.
+ */
+export function rememberLocaleSignals(
+  state: SessionLocaleState,
+  signals: LocaleSignals,
+): boolean {
+  let changed = false;
+  const detected = signals.detectedLanguage?.trim();
+  if (detected && state.language !== detected) {
+    state.language = detected;
+    changed = true;
+  }
+  const reported = signals.reportedTimezone?.trim();
+  if (reported && isValidTimezone(reported) && state.timezone !== reported) {
+    state.timezone = reported;
+    changed = true;
+  }
+  return changed;
+}
+
+/** The agent-level defaults, which apply only where nothing better is known. */
+export interface AgentLocaleDefaults {
+  language?: string | null;
+  timezone?: string | null;
+}
+
+/**
+ * The one rule deciding what language a turn is answered in and which clock it
+ * is told about.
+ *
+ * Both resolve the same way — strongest live signal, then what this
+ * conversation already showed, then the agent's default, then a floor:
+ *
+ *   language: detected this turn ?? remembered ?? agent default ?? English
+ *   timezone: reported this turn ?? remembered ?? agent default ?? UTC
+ *
+ * Language has per-turn detection and timezone has a per-turn report; otherwise
+ * they are the same ladder, so they live in one function. Resolving one and
+ * forgetting the other is then not something a caller can do.
+ *
+ * The agent default sits BELOW the conversation on purpose. It is the language a
+ * conversation opens in, before anyone has written anything readable — a real
+ * need (a Chinese team's agent should not open in English) with no multi-user
+ * hazard, because the first readable message replaces it and it never overrides
+ * a conversation already in progress.
+ *
+ * Every timezone candidate is validated on the way through, including the
+ * remembered and configured ones: a zone that cannot be resolved is treated as
+ * absent rather than passed on.
+ */
+export function resolveLocale(
+  signals: LocaleSignals,
+  remembered: SessionLocaleState | undefined,
+  defaults: AgentLocaleDefaults | undefined,
+): { language: string; timezone: string } {
+  const language = signals.detectedLanguage?.trim()
+    || remembered?.language?.trim()
+    || defaults?.language?.trim()
+    || "English";
+
+  const timezone = firstUsableZone(
+    signals.reportedTimezone,
+    remembered?.timezone,
+    defaults?.timezone,
+  ) ?? "UTC";
+
+  return { language, timezone };
+}
+
+function firstUsableZone(...candidates: (string | null | undefined)[]): string | null {
+  for (const candidate of candidates) {
+    const zone = candidate?.trim();
+    if (zone && isValidTimezone(zone)) return zone;
+  }
+  return null;
 }

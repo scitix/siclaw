@@ -145,6 +145,10 @@ function makeFakeSession(id: string) {
     createdAt: new Date(),
     lastActiveAt: new Date(),
     _promptDoneCallbacks: new Set<() => void>(),
+    // What the conversation has revealed about its own language and clock. The
+    // real session loads this from the session dir; here it starts empty so the
+    // cases below exercise the "first turn" ladder.
+    _localeState: {},
     isCompacting: false,
     isAgentActive: false,
     isRetrying: false,
@@ -203,6 +207,7 @@ function makeFakeSessionManager() {
     scheduleRelease: (_id: string) => {},
     invalidate: (_id: string) => {},
     setDelegationModel: vi.fn(),
+    persistSessionLocaleState: vi.fn(),
     persistModelRouteState: vi.fn(),
     getPersistedDpState: (_id: string): { active: boolean } | null => null,
     onSessionRelease: undefined as undefined | (() => void),
@@ -471,21 +476,99 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(promptText(session)).toBe("1");
   });
 
-  // Read by the two turns built inside the session — a spawned sub-agent's
-  // briefing and a background job's completion turn — neither of which has a
-  // request body to read them from.
-  it("POST /api/prompt remembers the locale on the session", async () => {
+  // Only LIVE signals are remembered. Writing the agent's default here would
+  // freeze it into the conversation and defeat the rule it exists to serve —
+  // configuration applies only until the conversation shows something.
+  it("POST /api/prompt remembers what the turn revealed, not the agent default", async () => {
     const session = await sm.getOrCreate("locale-memo");
     await getJson(port, "/api/prompt", "POST", {
-      text: "hello there",
+      text: "你好",
       sessionId: "locale-memo",
       modelProvider: "openai",
       modelId: "gpt-4",
       modelConfig: modelConfigWithInput(["text"]),
-      language: "Chinese",
-      timezone: "Asia/Shanghai",
+      language: "Japanese",
+      timezone: "Asia/Tokyo",
+      clientTimezone: "America/New_York",
     });
-    expect(session._locale).toEqual({ language: "Chinese", timezone: "Asia/Shanghai" });
+    expect(session._localeState).toEqual({ language: "Chinese", timezone: "America/New_York" });
+    expect(sm.persistSessionLocaleState).toHaveBeenCalledWith("locale-memo", session._localeState);
+  });
+
+  it("POST /api/prompt writes nothing when the turn taught it nothing", async () => {
+    const session = await sm.getOrCreate("locale-nowrite");
+    session._localeState = { language: "Chinese" };
+    await getJson(port, "/api/prompt", "POST", {
+      text: "你好",
+      sessionId: "locale-nowrite",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+    });
+    expect(sm.persistSessionLocaleState).not.toHaveBeenCalled();
+  });
+
+  // THE case this redesign exists for: one AgentBox serves every user of an
+  // agent, so an agent configured Chinese used to answer an English speaker's
+  // unreadable turn in Chinese. The conversation's own history outranks it.
+  it("POST /api/prompt keeps an English conversation English despite a Chinese agent", async () => {
+    const session = await sm.getOrCreate("locale-cross-user");
+    session._localeState = { language: "English" };
+    await getJson(port, "/api/prompt", "POST", {
+      text: "1",
+      sessionId: "locale-cross-user",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+      language: "Chinese",
+    });
+    expect(promptText(session)).toBe("1");
+  });
+
+  // The other half of the same rule — the original bug report.
+  it("POST /api/prompt keeps a Chinese conversation Chinese on an unreadable turn", async () => {
+    const session = await sm.getOrCreate("locale-remembered");
+    session._localeState = { language: "Chinese" };
+    await getJson(port, "/api/prompt", "POST", {
+      text: "1",
+      sessionId: "locale-remembered",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+    });
+    expect(promptText(session)).toBe("[System: respond in Chinese]\n1");
+  });
+
+  it("POST /api/prompt prefers the client's reported zone over the agent's", async () => {
+    const session = await sm.getOrCreate("locale-clienttz");
+    await getJson(port, "/api/prompt", "POST", {
+      text: "hello there",
+      sessionId: "locale-clienttz",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+      timezone: "Asia/Shanghai",
+      clientTimezone: "America/New_York",
+    });
+    expect(String(session.brain.prompt.mock.calls[0][0])).toContain("America/New_York");
+  });
+
+  // A browser value is untrusted like any other input; an unusable one must fall
+  // through the ladder rather than reach the formatter.
+  it("POST /api/prompt ignores an unusable reported zone", async () => {
+    const session = await sm.getOrCreate("locale-badtz");
+    await getJson(port, "/api/prompt", "POST", {
+      text: "hello there",
+      sessionId: "locale-badtz",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelConfig: modelConfigWithInput(["text"]),
+      timezone: "Asia/Shanghai",
+      clientTimezone: "Mars/Olympus_Mons",
+    });
+    const sent = String(session.brain.prompt.mock.calls[0][0]);
+    expect(sent).toContain("Asia/Shanghai");
+    expect(session._localeState.timezone).toBeUndefined();
   });
 
   it("POST /api/prompt forwards large valid images to brain.prompt", async () => {

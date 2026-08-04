@@ -374,6 +374,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // box on today's behaviour: detect the language, report time in UTC.
       language: params.language as string | undefined,
       timezone: params.timezone as string | undefined,
+      // The sender's OWN zone, when their client knew it. Outranks the agent's
+      // above — see resolveLocale. Absent for every entry with no client to ask
+      // (channels, cron, a2a), which is what the agent default is for.
+      clientTimezone: params.clientTimezone as string | undefined,
     };
 
     // Async-ack protocol: return { ok, sessionId } within milliseconds; do

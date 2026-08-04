@@ -236,14 +236,17 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
       } else {
         parts.push(`\n## User Profile\n\n${profileContent}`);
 
-        // Extract language preference and inject as behavioral instruction
-        const langMatch = profileContent.match(/\*\*Language\*\*:\s*(.+)/i);
-        if (langMatch) {
-          const lang = langMatch[1].trim();
-          if (lang && lang.toLowerCase() !== "tbd" && lang.toLowerCase() !== "english") {
-            parts.push(`\n## Language Preference\n\nThis user's preferred language is **${lang}**. Start conversations in ${lang} by default. If the user switches to a different language, follow their lead naturally.`);
-          }
-        }
+        // NO language instruction is derived from this file, deliberately.
+        //
+        // PROFILE.md lives at `user-data/agents/{agentId}` — an AgentBox is keyed
+        // by agent, so the file is shared by everyone using that agent. Turning
+        // its `**Language**` field into "start conversations in X by default"
+        // therefore told user B to be answered in whatever language user A last
+        // wrote in. It was also evaluated when the resource loader ran, so on a
+        // pooled box it could be days stale.
+        //
+        // Reply language is decided per turn instead, from what the user wrote
+        // and what THIS CONVERSATION has shown — see `shared/agent-locale.ts`.
 
         if (tbdFields.length > 0) {
           parts.push(`\n## Profile Update Needed\n\nThe user's profile has incomplete fields: **${tbdFields.join(", ")}**.\nWhen the user mentions relevant info during conversation (e.g. their role, name, what infrastructure they manage), update \`${memoryDir}/PROFILE.md\` immediately using the write tool. Replace the "TBD" value with what you learned. Do not ask the user explicitly — just pick it up naturally from context.`);

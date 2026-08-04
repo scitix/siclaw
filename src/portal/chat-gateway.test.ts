@@ -182,6 +182,67 @@ describe("chat-gateway routes", () => {
       }));
     });
 
+    // ── locale: the agent's defaults plus the sender's own reported zone ──
+    const localeMocks = (agentRow: Record<string, unknown>) => {
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4", ...agentRow }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []]);
+    };
+    const sendWithBody = async (body: Record<string, unknown>) => {
+      const res = fakeRes();
+      router.handle(fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body,
+      }), res);
+      for (let i = 0; i < 4; i++) await new Promise(r => setImmediate(r));
+      return res;
+    };
+
+    it("forwards the agent's language and timezone defaults", async () => {
+      // Regression: this SELECT is a SECOND reader of agent config (the gateway
+      // has its own via RPC). It shipped once without these two columns, so the
+      // fields were silently undefined on exactly this path — the one a reviewer
+      // clicks. `binding-locale-invariants.test.ts` guards the SELECT itself.
+      localeMocks({ language: "Chinese", timezone: "Asia/Shanghai" });
+      await sendWithBody({ text: "hi", session_id: "s1" });
+      expect(connMap.sendCommand).toHaveBeenCalledWith("a1", "chat.send", expect.objectContaining({
+        language: "Chinese",
+        timezone: "Asia/Shanghai",
+      }));
+    });
+
+    it("forwards the browser's reported timezone", async () => {
+      localeMocks({ timezone: "Asia/Shanghai" });
+      await sendWithBody({ text: "hi", session_id: "s1", client_timezone: "America/New_York" });
+      expect(connMap.sendCommand).toHaveBeenCalledWith("a1", "chat.send", expect.objectContaining({
+        clientTimezone: "America/New_York",
+        timezone: "Asia/Shanghai",
+      }));
+    });
+
+    // Dropped at the edge so an unusable value never reaches the wire, the
+    // runtime log line, or the trace. The agent's own zone still goes through,
+    // and the far side falls back to it.
+    it("drops a reported timezone the runtime cannot resolve", async () => {
+      localeMocks({ timezone: "Asia/Shanghai" });
+      await sendWithBody({ text: "hi", session_id: "s1", client_timezone: "Mars/Olympus_Mons" });
+      const params = (connMap.sendCommand as any).mock.calls.at(-1)[2];
+      expect(params.clientTimezone).toBeUndefined();
+      expect(params.timezone).toBe("Asia/Shanghai");
+    });
+
+    it("forwards nothing when the agent has no defaults and no zone was reported", async () => {
+      localeMocks({});
+      await sendWithBody({ text: "hi", session_id: "s1" });
+      const params = (connMap.sendCommand as any).mock.calls.at(-1)[2];
+      expect(params.language).toBeUndefined();
+      expect(params.timezone).toBeUndefined();
+      expect(params.clientTimezone).toBeUndefined();
+    });
+
     it("forwards agent modelRouting to Runtime chat.send", async () => {
       query
         .mockResolvedValueOnce([[{

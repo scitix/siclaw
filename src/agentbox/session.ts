@@ -58,19 +58,31 @@ import { isTracingEnabled } from "../shared/tracing/otel-provider.js";
 import type { SpanContext } from "@opentelemetry/api";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
 import { detectScriptLanguage } from "../shared/detect-language.js";
-import { renderTimeReminder, resolveReplyLanguage } from "../shared/agent-locale.js";
-
-/** The agent's configured language + timezone, carried on the session. */
-export interface AgentLocale { language?: string; timezone?: string }
+import {
+  createSessionLocaleState,
+  normalizeSessionLocaleState,
+  renderTimeReminder,
+  resolveLocale,
+  type SessionLocaleState,
+} from "../shared/agent-locale.js";
 
 /**
- * Language directive for a synthetic turn. Its text is machine-generated
- * ("background job X finished"), so detection has nothing to read — the
- * configured language is all there is.
+ * Prefix a turn built INSIDE the session with the same clock and language
+ * directive the HTTP path prepends.
+ *
+ * These turns have no request body, so they carry no agent defaults — the
+ * conversation's own memory is the whole input. That is also why they must not
+ * silently skip the reminder: a sub-agent and a background-completion turn are
+ * read by the user exactly like an interactive answer.
  */
-function syntheticLangDirective(managed: { _locale?: AgentLocale }): string {
-  const lang = resolveReplyLanguage(null, managed._locale?.language);
-  return lang === "English" ? "" : `[System: respond in ${lang}]\n`;
+function buildInSessionPrompt(
+  state: SessionLocaleState | undefined,
+  detectedLanguage: string | null,
+  body: string,
+): string {
+  const { language, timezone } = resolveLocale({ detectedLanguage }, state, undefined);
+  const directive = language === "English" ? "" : `[System: respond in ${language}]\n`;
+  return `${renderTimeReminder(new Date(), timezone)}\n${directive}${body}`;
 }
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import type {
@@ -186,14 +198,15 @@ export interface ManagedSession {
   /** Last normalized model routing policy supplied by Runtime/Portal for this session. */
   modelRoutePolicy?: ModelRoutePolicy;
   /**
-   * The agent's configured language + timezone, as of the last prompt.
+   * What this conversation has revealed about its own language and clock.
    *
-   * Remembered because two kinds of turn are built INSIDE the session, after
-   * the HTTP handler that receives these values has returned: a spawned
-   * sub-agent's prompt, and a background job's completion turn. Neither has a
-   * request body to read them from.
+   * Loaded from the session dir on restore and written back when a turn teaches
+   * it something, so it outlives the pod. Two kinds of turn are also built
+   * INSIDE the session, after the HTTP handler has returned — a spawned
+   * sub-agent's briefing and a background job's completion turn — and this is
+   * where they read it from, since neither has a request body.
    */
-  _locale?: AgentLocale;
+  _localeState: SessionLocaleState;
   /** When true, brain events are emitted by the route runner after attempt filtering. */
   _routeBrainEventsThroughExtra: boolean;
   /**
@@ -337,6 +350,7 @@ export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
   /** Per-session write chain so route-state persists land in call order. */
   private _modelRouteStatePersists = new Map<string, Promise<void>>();
+  private _localeStatePersists = new Map<string, Promise<void>>();
   private defaultSessionId = "default";
 
   /** Optional userId — set by LocalSpawner for per-user skill directory isolation */
@@ -1747,7 +1761,9 @@ export class AgentBoxSessionManager {
             managed.brain,
             // A background job's completion turn is a real turn the user reads,
             // so it gets the same clock and language the interactive path does.
-            `${renderTimeReminder(new Date(), managed._locale?.timezone)}\n${syntheticLangDirective(managed)}${text}`,
+            // Its text is machine-generated ("job X finished"), so detection has
+            // nothing to read and the conversation's memory decides alone.
+            buildInSessionPrompt(managed._localeState, null, text),
             effectivePolicy,
             managed.modelRouteState,
             {
@@ -1939,6 +1955,58 @@ export class AgentBoxSessionManager {
 
   private modelRouteStateFile(sessionId: string): string {
     return path.join(this.getSessionDir(sessionId), ".model-route-state.json");
+  }
+
+  private localeStateFile(sessionId: string): string {
+    return path.join(this.getSessionDir(sessionId), ".locale-state.json");
+  }
+
+  private loadSessionLocaleState(sessionId: string): SessionLocaleState {
+    try {
+      return normalizeSessionLocaleState(
+        JSON.parse(fs.readFileSync(this.localeStateFile(sessionId), "utf8")),
+      );
+    } catch (err) {
+      // Missing file is the normal first-turn case. Anything else means the
+      // conversation forgets what language it was in, which the user sees —
+      // worth a line, but never worth failing the turn.
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        console.warn(`[agentbox-session] locale state for ${sessionId} unreadable, starting fresh:`, err);
+      }
+      return createSessionLocaleState();
+    }
+  }
+
+  /**
+   * Best-effort durability for what the conversation has revealed about its own
+   * language and clock. Same shape as the model-route state next to it: atomic
+   * tmp+rename, writes serialized per session so a slow older write cannot land
+   * on top of a newer one, and a failure degrades to "forgot" rather than
+   * breaking the turn.
+   *
+   * Callers write only when something actually changed (`rememberLocaleSignals`
+   * reports that), so an ordinary turn costs no I/O.
+   */
+  persistSessionLocaleState(sessionId: string, state: SessionLocaleState): void {
+    const file = this.localeStateFile(sessionId);
+    const payload = `${JSON.stringify(normalizeSessionLocaleState(state), null, 2)}\n`;
+    const prev = this._localeStatePersists.get(sessionId) ?? Promise.resolve();
+    const next = prev.then(async () => {
+      const tmp = `${file}.${randomUUID()}.tmp`;
+      try {
+        await fs.promises.writeFile(tmp, payload, "utf8");
+        await fs.promises.rename(tmp, file);
+      } catch (err) {
+        console.warn(`[agentbox-session] locale state persist failed for ${sessionId}:`, err);
+        void fs.promises.unlink(tmp).catch(() => {});
+      }
+    });
+    this._localeStatePersists.set(sessionId, next);
+    void next.finally(() => {
+      if (this._localeStatePersists.get(sessionId) === next) {
+        this._localeStatePersists.delete(sessionId);
+      }
+    });
   }
 
   private loadModelRouteState(sessionId: string): ModelRouteState {
@@ -2314,10 +2382,10 @@ export class AgentBoxSessionManager {
         setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
       );
       await Promise.race([
-        // The parent's session is where the last prompt's locale was recorded;
-        // a child gets its own session, so it has to be read across.
+        // The parent's conversation is what knows the language and clock; a
+        // child gets its own session, so it has to be read across.
         child.brain.prompt(
-          this.buildSpawnedSubagentPrompt(request, this.sessions.get(request.parentSessionId)?._locale),
+          this.buildSpawnedSubagentPrompt(request, this.sessions.get(request.parentSessionId)?._localeState),
         ),
         timeoutPromise,
       ]);
@@ -2417,22 +2485,17 @@ export class AgentBoxSessionManager {
     }
   }
 
-  private buildSpawnedSubagentPrompt(request: SpawnSubagentRequest, locale?: AgentLocale): string {
-    // Make the sub-agent answer in the user's language (same mechanism the main
-    // agent uses): detect from the briefing the parent wrote and inject the directive.
-    // A briefing is often terse and technical, so the parent's configured
-    // language matters more here than on a user turn.
-    const lang = resolveReplyLanguage(
-      detectScriptLanguage(`${request.description}\n${request.prompt}`),
-      locale?.language,
-    );
-    const langDirective = lang !== "English" ? `[System: respond in ${lang}]\n` : "";
-    // A sub-agent gets its own session and its own turn, so it needs the clock
-    // told to it just like the parent did.
-    const timeReminder = `${renderTimeReminder(new Date(), locale?.timezone)}\n`;
-    return `${timeReminder}${langDirective}Task: ${request.description}\n\n${request.prompt.trim()}\n\n` +
+  private buildSpawnedSubagentPrompt(request: SpawnSubagentRequest, locale?: SessionLocaleState): string {
+    // A briefing is written by the parent, is often terse and technical, and is
+    // not what the user typed — so detection frequently reads nothing from it
+    // and the parent conversation's remembered language carries the turn.
+    const detected = detectScriptLanguage(`${request.description}\n${request.prompt}`);
+    const body = `Task: ${request.description}\n\n${request.prompt.trim()}\n\n` +
       `Complete this task now and end with a concise findings report — the caller only sees your ` +
       `final report, not your intermediate steps. Do not ask for confirmation.`;
+    // A sub-agent runs its own session and its own turn, so it needs the clock
+    // told to it just like the parent did.
+    return buildInSessionPrompt(locale, detected, body);
   }
 
   /**
@@ -2531,6 +2594,7 @@ export class AgentBoxSessionManager {
     const sessionDir = this.getSessionDir(id);
     console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
     const modelRouteState = this.loadModelRouteState(id);
+    const localeState = this.loadSessionLocaleState(id);
 
     if (isMemoryEnabled()) {
       const memoryDir = this.getMemoryDir();
@@ -2767,6 +2831,7 @@ export class AgentBoxSessionManager {
       _backgroundWorkCount: 0,
       _subagentLimiter: new ConcurrencyLimiter(getSubagentConcurrency()),
       modelRouteState,
+      _localeState: localeState,
       modelRoutePolicy: undefined,
       _routeBrainEventsThroughExtra: false,
       _promptInflight: null,

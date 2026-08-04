@@ -24,7 +24,12 @@ import { HttpTransport } from "./credential-transport.js";
 import { getSyncHandler, createClusterHandler, createHostHandler, createToolsHandler } from "./sync-handlers.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectScriptLanguage } from "../shared/detect-language.js";
-import { renderTimeReminder, resolveReplyLanguage } from "../shared/agent-locale.js";
+import {
+  createSessionLocaleState,
+  rememberLocaleSignals,
+  renderTimeReminder,
+  resolveLocale,
+} from "../shared/agent-locale.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
 import {
   candidateSupportsPromptMedia,
@@ -79,7 +84,11 @@ interface PromptRequestBody {
   /** PDF attachments forwarded as native file input (PDF-capable models only). */
   files?: PromptFile[];
   /**
-   * Per-agent locale, resolved by the control plane on every prompt.
+   * The AGENT's configured defaults, resolved by the control plane on every
+   * prompt. They are the bottom of the ladder — the language a conversation
+   * opens in, and the clock for turns whose client reported none. What the user
+   * wrote and what this conversation already showed both outrank them (see
+   * `resolveLocale`), because one AgentBox serves every user of the agent.
    *
    * Carried per-prompt rather than baked into the session: `systemPromptOverride`
    * is evaluated when the resource loader runs, and a pooled box's session lives
@@ -87,6 +96,13 @@ interface PromptRequestBody {
    */
   language?: string;
   timezone?: string;
+  /**
+   * The zone the CLIENT reported for this turn — a browser knows its own. Beats
+   * both the conversation's memory and the agent default, so a user is answered
+   * on their own clock without anyone configuring anything, and it follows them
+   * when they travel. Untrusted input: validated in `resolveLocale`.
+   */
+  clientTimezone?: string;
 }
 
 /**
@@ -876,11 +892,20 @@ export function createHttpServer(
     // (Previously this was accidentally gated on isMemoryEnabled() as a side effect of
     // "disable memory by default", which left memory-off agents — e.g. the GPU-cloud
     // sales-guide — with no language enforcement, so they drifted to the model's bias.)
-    // Detection wins where the text carries any evidence; the agent's configured
-    // language is the FLOOR, for the turns it cannot read — a bare "1" steered
-    // into a Chinese conversation used to be answered in English.
+    // Detection wins where the text carries any evidence. Below it sits what THIS
+    // CONVERSATION has already shown, and only below that the agent's default —
+    // an AgentBox is keyed by agent alone, so an agent-level language would
+    // answer one user in another user's language. See agent-locale.ts.
     const detectedLang = detectScriptLanguage(promptText);
-    const effectiveLang = resolveReplyLanguage(detectedLang, body.language);
+    // Healed rather than asserted: the type requires the field, but remembering
+    // a language must not be able to fail a turn — which is exactly what an
+    // absent object would do at the mutation below.
+    const localeState = (managed._localeState ??= createSessionLocaleState());
+    const { language: effectiveLang, timezone: effectiveZone } = resolveLocale(
+      { detectedLanguage: detectedLang, reportedTimezone: body.clientTimezone },
+      localeState,
+      { language: body.language, timezone: body.timezone },
+    );
     if (effectiveLang !== "English") {
       // Only two DP markers remain after the refactor: activation and exit.
       const dpMarkers = [DP_ACTIVATION_MARKER, `${DP_EXIT_MARKER}\n`];
@@ -896,38 +921,18 @@ export function createHttpServer(
     // What time it is, every turn. The model has no other way to know: a
     // coordinator has no shell by design (AGENT_TYPES locks its capabilities),
     // and the system prompt is built once per session, not per turn.
-    promptText = `${renderTimeReminder(new Date(), body.timezone)}\n${promptText}`;
+    promptText = `${renderTimeReminder(new Date(), effectiveZone)}\n${promptText}`;
 
-    // Remembered for the turns that do not come through this handler — a spawned
-    // sub-agent's prompt and a background job's completion turn are both built
-    // inside the session, after this one returns.
-    managed._locale = { language: body.language, timezone: body.timezone };
-
-    // Programmatically update PROFILE.md Language field (code-level, not model-dependent).
-    // Only update on non-English detection to avoid flapping: English is the default,
-    // so we only persist when the user actively uses another language.
-    //
-    // DETECTED, not effective: this is the USER's profile. Writing the agent's
-    // configured language here would record a preference the user never
-    // expressed — and would do it on every turn they wrote in another one.
-    if (detectedLang !== null && detectedLang !== "English") {
-      try {
-        const cfg = loadConfig();
-        const userDataDir = process.env.SICLAW_USER_DATA_DIR || cfg.paths.userDataDir;
-        const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
-        if (fs.existsSync(profilePath)) {
-          const content = fs.readFileSync(profilePath, "utf-8");
-          const currentLangMatch = content.match(/\*\*Language\*\*:\s*(.+)/i);
-          const currentLang = currentLangMatch?.[1]?.trim();
-          if (currentLang !== detectedLang) {
-            const updated = content.replace(
-              /(\*\*Language\*\*:\s*).+/i,
-              `$1${detectedLang}`,
-            );
-            fs.writeFileSync(profilePath, updated);
-          }
-        }
-      } catch { /* best-effort, don't block prompt */ }
+    // Teach the conversation what this turn revealed — LIVE signals only, so the
+    // agent's default never gets frozen in as though the user had chosen it.
+    // Written only on a change, and read back after a pod restart; it is also
+    // what the two in-session turn builders (sub-agent briefing, background
+    // completion) resolve against, since neither has a request body.
+    if (rememberLocaleSignals(localeState, {
+      detectedLanguage: detectedLang,
+      reportedTimezone: body.clientTimezone,
+    })) {
+      sessionManager.persistSessionLocaleState?.(managed.id, localeState);
     }
 
     // Execute prompt asynchronously; notify SSE to close on completion

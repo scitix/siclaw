@@ -68,15 +68,21 @@ export interface PromptOptions {
   /** File attachments forwarded as native model file input. */
   files?: Array<{ mimeType: string; filename: string; data: string }>;
   /**
-   * Language to answer in when the message itself gives no clue. What the user
-   * wrote still wins; this is the floor. Absent → English, as before.
+   * The AGENT's defaults. They are the BOTTOM of the ladder: what the user wrote
+   * and what the conversation already showed both outrank them, because one
+   * AgentBox serves every user of an agent. See `shared/agent-locale.ts`.
+   *
+   * Carried per prompt so a change lands on the next message rather than on the
+   * box's next restart.
    */
   language?: string;
-  /**
-   * IANA zone the agent reports time in. Carried per prompt so a change lands
-   * on the next message rather than on the box's next restart.
-   */
   timezone?: string;
+  /**
+   * The zone the sender's own client reported for this turn — a browser knows
+   * its own. Beats the agent default and the conversation's memory. Absent on
+   * every entry with no client to ask (channels, cron, a2a).
+   */
+  clientTimezone?: string;
 }
 
 export type PromptMediaOptions = Pick<PromptOptions, "images" | "files">;

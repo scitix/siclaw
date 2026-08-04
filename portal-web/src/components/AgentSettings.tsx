@@ -644,9 +644,11 @@ function TimezoneField({ value, onChange }: { value: string; onChange: (v: strin
       <label className="text-[13px] font-medium text-foreground">Timezone</label>
       <TimezoneCombobox value={value} onChange={onChange} />
       <p className="text-[12px] text-muted-foreground/80 leading-relaxed">
-        Which clock the agent answers date and time questions from. Unset, it uses UTC. This reaches the
-        model on its next message — but the instance&apos;s own clock, which <code>date</code> in a shell
-        reads, only changes when that instance next restarts.
+        Two things, and they are not the same. It sets this instance&apos;s own clock — what <code>date</code>
+        in a shell reads — which changes when the instance next restarts. And it is the fallback the model is
+        told when the sender&apos;s own timezone is unknown, which is every message from a chat channel, a
+        scheduled task, or the API. Portal conversations already report the sender&apos;s browser timezone and
+        do not need this. Unset, the fallback is UTC.
       </p>
     </div>
   )
@@ -661,13 +663,15 @@ function LanguageField({ value, onChange }: { value: string; onChange: (v: strin
         onChange={e => onChange(e.target.value)}
         className="w-72 h-10 px-3 text-[13px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
       >
-        <option value="">Auto — follow each message</option>
+        <option value="">Auto — English until the first message says otherwise</option>
         {REPLY_LANGUAGES.map(l => <option key={l} value={l}>{l}</option>)}
       </select>
       <p className="text-[12px] text-muted-foreground/80 leading-relaxed">
-        A message written in a language the agent can read is always answered in that language. This setting
-        only decides the messages it cannot read — a bare <code>1</code>, an <code>ok</code>, a pasted command —
-        which used to fall back to English mid-conversation. Takes effect on the next message.
+        The language a conversation <em>opens</em> in. After that the conversation decides: a message written in
+        a language the agent can read is answered in that language, and a message it cannot read — a bare
+        <code>1</code>, an <code>ok</code>, a pasted command — stays in whatever language that conversation has
+        been in. This setting only covers the case where nothing has been said yet, so one agent shared by
+        people who write in different languages answers each of them in their own.
       </p>
     </div>
   )

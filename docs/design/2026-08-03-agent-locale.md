@@ -26,83 +26,111 @@ English the moment someone sent `1`, `ok`, or a pasted command.
 
 ## Contracts
 
-### 1. Both values ride the prompt, not the spawn environment
+### 1. The floor is the CONVERSATION, not the agent and not a user
 
-`ResolvedModelBinding` is fetched on every prompt and already carries non-model
-agent settings, so the two fields travel with it and reach the AgentBox in the
-request body of each turn.
+An AgentBox is keyed by agent alone — `podName()` is `agentbox-{agentId}-{instance}` — so one box,
+and one agent config, serves every user of that agent. An agent-level reply language therefore
+answers one person in another person's language, which is the original bug pointed at someone
+else.
 
-This is the load-bearing choice. The spawn environment is evaluated once, at
-cold spawn; with resident pods a settings change would then need a pod recycle
-to take effect. Delivering per prompt means **a save is live on the next
-message**, and it is also the only way a date can be correct on a box whose
-session outlives it.
+A per-user store cannot be the fix either: `userId` reaches the box on the Portal-web, API-key and
+cron paths, but **channel messages carry none** — the sender's `open_id` exists at ingestion and is
+deliberately not forwarded; the session registry records the binding's owner. That is the surface
+with the most people per agent.
 
-Consequence for `reloadResources`: there is nothing to push. Warm sessions are
-not invalidated by a language or timezone change.
+The session is the scope that works everywhere and needs no identity at all. Portal sessions are
+per-person; a Feishu `per_user` group keys the session by sender; a Feishu `shared` group gives the
+whole room one session — where one language for the room is the intended behaviour. So:
 
-### 2. Detection wins; configuration is the floor
+```
+language:  detected this turn        ?? this conversation ?? agent default ?? English
+timezone:  reported by the client    ?? this conversation ?? agent default ?? UTC
+```
 
-`resolveReplyLanguage(detected, configured)` = `detected ?? configured ?? English`.
+`resolveLocale` is the single function implementing both ladders. They differ only in their top
+rung — language has per-turn detection, timezone has a per-turn report — so resolving one and
+forgetting the other is not something a caller can do.
 
-Text whose language can be read is answered in that language, so a bilingual
-user who switches is followed rather than corrected. The configured value
-decides **only** the turns detection cannot read. This is why
-`detectScriptLanguage` returns `null` rather than `"English"` for text with no
-letters in it — collapsing those two answers is what the bug was.
+### 2. Only live signals are remembered
 
-Latin script resolves to `"English"`, deliberately: it is weak evidence (dozens
-of languages share it) but it is the only evidence there is, and treating it as
-absent would answer an English question in the agent's configured language,
-inverting the rule above. The practical limit this imposes is stated in the UI
-contract below.
+`rememberLocaleSignals` writes what the user wrote and what their client reported. It never writes
+the agent's default: recording a default as though the conversation had revealed it would freeze it
+in place and defeat the point of it being a default. It reports whether anything changed so an
+ordinary turn costs no I/O.
 
-### 3. The time reminder never throws
+The store is `.locale-state.json` in the session dir, alongside `.model-route-state.json` and
+copying it exactly (atomic tmp+rename, writes serialized per session). It is read back as untrusted
+input — a corrupt or hand-edited value degrades to "nothing remembered".
 
-`renderTimeReminder` runs on every turn, so a zone it cannot use degrades to UTC
-rather than taking the turn with it. `isValidTimezone` at write time is what
-stops a bad zone being stored; the degrade is the backstop for a value that got
-in another way (a control plane that does not validate, a hand-edited row).
+**Remembering a language must never be able to fail a turn.** The state object is healed if absent
+rather than asserted, and a failed write warns and moves on.
 
-The reminder names both the zone and its offset. That is not decoration: an SRE
-agent also sees UTC timestamps in logs and from `date`, and the only way it can
-reconcile them is if the line says which clock it is quoting.
+### 3. The agent's two settings keep narrower jobs
 
-### 4. Every turn gets both, including the ones built inside the session
+`agents.language` is the language a conversation *opens* in, before anything readable has been
+said. That is a real need — a Chinese team's agent should not open in English — with no multi-user
+hazard, because turn 1 has no history for it to override and the first readable message replaces
+it.
 
-Three kinds of turn exist and all three must carry the reminder and the
-directive:
+`agents.timezone` does two things that genuinely are agent-level: it sets the pod's own `TZ` (one
+process, one clock) and it is the fallback for turns whose sender has no client to ask — every
+channel message, scheduled task and API call. The two halves take effect at different times (the
+pod's clock on its next restart, the fallback on the next message) and the UI says so.
 
-- an HTTP `/prompt` turn, which has the values in its body;
-- a spawned sub-agent's briefing, which runs in its own session;
-- a background job's completion turn, which is synthetic.
+### 4. Delivery is per prompt
 
-The last two are built after the HTTP handler returned, so the resolved values
-are remembered on the managed session and reused. A synthetic turn's text is
-machine-generated, so detection has nothing to read there and the configured
-language is all there is.
+Both values ride `ResolvedModelBinding`, fetched on every prompt, plus a per-turn `clientTimezone`.
+Never the spawn environment: that is read once at cold spawn, so on a resident pod a saved setting
+would need a recycle. It is also the only way a date can be correct on a box whose session outlives
+it — `systemPromptOverride` is a load-time thunk, so a date fixed there goes stale and is then
+stated *confidently*.
 
-### 5. The timezone has two halves with different timing
+**There are two independent readers of agent config, and that has already bitten.**
+`gateway/agent-model-binding.ts` goes through the control-plane RPC; `portal/chat-gateway.ts` reads
+the DB directly and serves Portal web chat and a2a. Both fields are optional, so a SELECT that
+forgets them compiles, passes every test, and is silently `undefined` on whichever path was missed.
+It shipped exactly that way once. `binding-locale-invariants.test.ts` pins every binding-hydrating
+SELECT, the same way `model-api-invariants.test.ts` pins `api_type` after the same class of bug.
 
-The model's answers change on the **next message**. The instance's own clock —
-what `date` in an agent's shell reads — follows on that instance's **next
-restart**, because that half is delivered by mapping `timezone` to the pod's
-`TZ` at spawn. The UI has to say this; an operator who changes the zone and then
-checks `date` would otherwise report it as broken.
+### 5. The time reminder never throws
 
-### 6. UI: the offered languages are the detectable ones
+It runs on every turn, so a zone it cannot use degrades to UTC rather than taking the turn with it.
+`isValidTimezone` at write time keeps a bad zone out of the agent row; every candidate in the
+ladder is validated on the way through, including the remembered and reported ones.
 
-The picker lists only languages detection can also return. Offering French — for
-which detection reports `"English"`, since both are Latin script — would be a
-setting that silently loses to the very messages it exists to govern.
+The reminder names both the zone and its offset. That is not decoration: an SRE agent also sees UTC
+timestamps in logs and from `date`, and the only way it can reconcile them is if the line says which
+clock it is quoting.
 
-The timezone list comes from the browser (`Intl.supportedValuesOf`) so it tracks
-tzdata without anyone maintaining it, **with `UTC` prepended**: the spec returns
-canonical zones only, so the list contains neither `UTC` nor any `Etc/*` link.
-Without that, the one zone the runtime falls back to, names in its own reminder,
-and accepts from the API would be the one zone an operator could not pick.
+### 6. Every turn gets both, including the ones built inside the session
 
----
+A sub-agent's briefing and a background job's completion turn are built after the HTTP handler
+returned, so they have no request body and no agent defaults — the conversation's memory is their
+whole input. Both go through one builder so neither can silently lose the reminder; each is read by
+the user exactly like an interactive answer.
+
+### 7. No reply-language instruction is derived from PROFILE.md
+
+`PROFILE.md` lives at `user-data/agents/{agentId}` — shared by every user of the agent, and updated
+with whoever wrote last. Deriving *"this user's preferred language is X, start conversations in X"*
+from it therefore instructed user B in user A's language, and did so from a load-time thunk that
+could be days stale. Removed.
+
+**Still true and NOT fixed here:** the file's whole content — name, role, infrastructure — is
+injected as context for every user of the agent. Language was only the part that also became an
+instruction. Making PROFILE.md per-user is a larger change and needs its own decision.
+
+### 8. UI: the offered languages are the detectable ones
+
+The picker lists only languages detection can also return. Offering French — for which detection
+reports `"English"`, since both are Latin script — would be a setting that silently loses to the
+very messages it exists to govern.
+
+The timezone list comes from the browser (`Intl.supportedValuesOf`) so it tracks tzdata without
+anyone maintaining it, **with `UTC` prepended**: the spec returns canonical zones only, so the list
+contains neither `UTC` nor any `Etc/*` link. Without that, the one zone the runtime falls back to,
+names in its own reminder, and accepts from the API would be the one zone an operator could not
+pick.
 
 ## Cross-repo
 
@@ -118,9 +146,8 @@ UI on its side.**
 
 - Re-detecting or re-deriving the language mid-turn. One decision per turn,
   taken from the prompt text.
-- Applying the configured language to a steer. A steer joins a turn that already
-  carries its directive, and the conversation context is what keeps it in
-  language.
-- Recording the agent's configured language in the user's PROFILE.md. Only the
-  *detected* language is a fact about the user; writing the configured one there
-  would let an operator's setting rewrite someone's profile.
+- Applying the ladder to a steer. A steer joins a turn that already carries its
+  directive, and the conversation context is what keeps it in language.
+- Making PROFILE.md per-user (see contract 7).
+- A per-user locale store. It would miss every channel sender, which is the
+  population it would most need to serve.

@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { isValidTimezone, renderTimeReminder, resolveReplyLanguage } from "../agent-locale.js";
+import {
+  createSessionLocaleState,
+  isValidTimezone,
+  normalizeSessionLocaleState,
+  rememberLocaleSignals,
+  renderTimeReminder,
+  resolveLocale,
+} from "../agent-locale.js";
 
 describe("isValidTimezone", () => {
   it.each(["Asia/Shanghai", "UTC", "America/Los_Angeles", "Europe/London"])("accepts %s", (tz) => {
@@ -66,19 +73,128 @@ describe("renderTimeReminder", () => {
   });
 });
 
-describe("resolveReplyLanguage", () => {
-  it("follows what the user wrote over what was configured", () => {
-    // A bilingual user who switches is followed, not corrected.
-    expect(resolveReplyLanguage("English", "Chinese")).toBe("English");
-    expect(resolveReplyLanguage("Chinese", "English")).toBe("Chinese");
+describe("normalizeSessionLocaleState", () => {
+  it("keeps what this module wrote", () => {
+    expect(normalizeSessionLocaleState({ language: "Chinese", timezone: "Asia/Shanghai" }))
+      .toEqual({ language: "Chinese", timezone: "Asia/Shanghai" })
+  })
+
+  // Read from a file that outlives the pod, so it is untrusted input: a
+  // hand-edited or corrupt value must degrade to "nothing remembered" rather
+  // than reach the prompt.
+  it.each([null, undefined, 42, "Chinese", [], { language: 7 }])("degrades %j to empty", (raw) => {
+    expect(normalizeSessionLocaleState(raw)).toEqual({});
   });
 
-  it("uses the configured language when the text says nothing", () => {
-    // The reported bug: steering a bare `1` into a Chinese conversation.
-    expect(resolveReplyLanguage(null, "Chinese")).toBe("Chinese");
+  it("drops a stored zone the runtime cannot resolve", () => {
+    expect(normalizeSessionLocaleState({ language: "Chinese", timezone: "Mars/Olympus_Mons" }))
+      .toEqual({ language: "Chinese" });
   });
 
-  it.each([undefined, null, "", "  "])("falls back to English when configured is %j", (cfg) => {
-    expect(resolveReplyLanguage(null, cfg)).toBe("English");
+  it("trims and drops blanks", () => {
+    expect(normalizeSessionLocaleState({ language: "  Chinese  ", timezone: "   " }))
+      .toEqual({ language: "Chinese" });
+  });
+});
+
+describe("rememberLocaleSignals", () => {
+  it("remembers a detected language and reports the change", () => {
+    const state = createSessionLocaleState();
+    expect(rememberLocaleSignals(state, { detectedLanguage: "Chinese" })).toBe(true);
+    expect(state).toEqual({ language: "Chinese" });
+  });
+
+  // The caller writes to disk only when this returns true, so an ordinary turn
+  // in an established conversation must cost no I/O.
+  it("reports no change when the turn taught it nothing new", () => {
+    const state = { language: "Chinese", timezone: "Asia/Shanghai" };
+    expect(rememberLocaleSignals(state, {
+      detectedLanguage: "Chinese",
+      reportedTimezone: "Asia/Shanghai",
+    })).toBe(false);
+  });
+
+  it("moves with a user who switches language", () => {
+    const state = { language: "Chinese" };
+    expect(rememberLocaleSignals(state, { detectedLanguage: "English" })).toBe(true);
+    expect(state.language).toBe("English");
+  });
+
+  // An unreadable turn must not erase what the conversation already showed —
+  // that is the whole thing the memory exists to survive.
+  it("keeps the remembered language when a turn detects nothing", () => {
+    const state = { language: "Chinese" };
+    expect(rememberLocaleSignals(state, { detectedLanguage: null })).toBe(false);
+    expect(state.language).toBe("Chinese");
+  });
+
+  it("ignores a reported zone the runtime cannot resolve", () => {
+    const state = { timezone: "Asia/Shanghai" };
+    expect(rememberLocaleSignals(state, { reportedTimezone: "Mars/Olympus_Mons" })).toBe(false);
+    expect(state.timezone).toBe("Asia/Shanghai");
+  });
+});
+
+describe("resolveLocale", () => {
+  const agent = { language: "Chinese", timezone: "Asia/Shanghai" };
+
+  it("follows what the user wrote over everything below it", () => {
+    const r = resolveLocale({ detectedLanguage: "English" }, { language: "Chinese" }, agent);
+    expect(r.language).toBe("English");
+  });
+
+  // THE case this redesign exists for. One AgentBox serves every user of an
+  // agent, so an agent configured Chinese used to answer an English speaker's
+  // `ok` in Chinese. The conversation's own history is what prevents that.
+  it("keeps an English conversation English even when the agent says Chinese", () => {
+    const r = resolveLocale({ detectedLanguage: null }, { language: "English" }, agent);
+    expect(r.language).toBe("English");
+  });
+
+  // The other half of the same rule: the original bug. A Chinese conversation
+  // must not flip on a bare "1".
+  it("keeps a Chinese conversation Chinese on an unreadable turn", () => {
+    const r = resolveLocale({ detectedLanguage: null }, { language: "Chinese" }, { language: "English" });
+    expect(r.language).toBe("Chinese");
+  });
+
+  it("uses the agent default only when the conversation has shown nothing", () => {
+    expect(resolveLocale({ detectedLanguage: null }, {}, agent).language).toBe("Chinese");
+    expect(resolveLocale({ detectedLanguage: null }, undefined, agent).language).toBe("Chinese");
+  });
+
+  it("floors at English and UTC", () => {
+    const r = resolveLocale({ detectedLanguage: null }, undefined, undefined);
+    expect(r).toEqual({ language: "English", timezone: "UTC" });
+  });
+
+  it("prefers the zone the client reported this turn", () => {
+    const r = resolveLocale(
+      { detectedLanguage: null, reportedTimezone: "America/New_York" },
+      { timezone: "Asia/Shanghai" },
+      agent,
+    );
+    expect(r.timezone).toBe("America/New_York");
+  });
+
+  it("falls through the timezone ladder in order", () => {
+    expect(resolveLocale({}, { timezone: "Europe/London" }, agent).timezone).toBe("Europe/London");
+    expect(resolveLocale({}, {}, agent).timezone).toBe("Asia/Shanghai");
+    expect(resolveLocale({}, {}, {}).timezone).toBe("UTC");
+  });
+
+  // Every candidate is validated on the way through, not just the reported one:
+  // a bad value anywhere must be treated as absent rather than passed on to a
+  // formatter that would then have to cope with it.
+  it("skips an unusable zone at any level of the ladder", () => {
+    expect(resolveLocale({ reportedTimezone: "Not/AZone" }, { timezone: "Europe/London" }, agent).timezone)
+      .toBe("Europe/London");
+    expect(resolveLocale({}, { timezone: "Not/AZone" }, agent).timezone).toBe("Asia/Shanghai");
+    expect(resolveLocale({}, {}, { timezone: "Not/AZone" }).timezone).toBe("UTC");
+  });
+
+  it("ignores blank values rather than treating them as a choice", () => {
+    expect(resolveLocale({ detectedLanguage: "  " }, { language: "Chinese" }, agent).language).toBe("Chinese");
+    expect(resolveLocale({}, { language: "   " }, { language: "Japanese" }).language).toBe("Japanese");
   });
 });

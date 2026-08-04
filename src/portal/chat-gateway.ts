@@ -17,6 +17,7 @@ import {
 } from "../gateway/rest-router.js";
 import { verifyJwt } from "../gateway/jwt.js";
 import type { ResolvedModelBinding } from "../gateway/agent-model-binding.js";
+import { isValidTimezone } from "../shared/agent-locale.js";
 import { modelOptionsSupportImageInput } from "../core/model-routing.js";
 import { getDb } from "../gateway/db.js";
 import {
@@ -41,6 +42,15 @@ interface ChatRequestBody {
   text?: string;
   session_id?: string;
   attachments?: ChatAttachment[];
+  /**
+   * The sender's own timezone, reported by their browser each turn.
+   *
+   * The agent-level timezone cannot be right for everyone — one AgentBox serves
+   * every user of an agent — and asking each person to configure their own would
+   * be a settings page for something their browser already knows. Reported per
+   * turn rather than stored, so it also follows them when they travel.
+   */
+  client_timezone?: string;
 }
 
 const MAX_CHAT_ATTACHMENTS = 4;
@@ -282,10 +292,23 @@ async function parseChatRequestBody(
 export async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelBinding | null> {
   const db = getDb();
   const [agentRows] = await db.query(
-    "SELECT model_provider, model_id, model_routing, system_prompt FROM agents WHERE id = ?",
+    // Every column a ResolvedModelBinding carries must be named here. This is a
+    // SECOND reader of agent config — the gateway has its own
+    // resolveAgentModelBinding that goes through the control-plane RPC — and a
+    // field added to the type but not to this SELECT is silently `undefined` on
+    // the Portal web and a2a paths, which compiles and passes every test.
+    // `binding-locale-invariants.test.ts` is what stops that recurring.
+    "SELECT model_provider, model_id, model_routing, system_prompt, language, timezone FROM agents WHERE id = ?",
     [agentId],
   ) as any;
-  const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown; system_prompt?: string | null } | undefined;
+  const agent = agentRows[0] as {
+    model_provider?: string;
+    model_id?: string;
+    model_routing?: unknown;
+    system_prompt?: string | null;
+    language?: string | null;
+    timezone?: string | null;
+  } | undefined;
   if (!agent?.model_provider || !agent?.model_id) return null;
 
   const [providerRows] = await db.query(
@@ -324,6 +347,8 @@ export async function resolveAgentModelBinding(agentId: string): Promise<Resolve
     },
     ...(modelRouting ? { modelRouting } : {}),
     systemPrompt: agent.system_prompt ?? null,
+    language: agent.language ?? null,
+    timezone: agent.timezone ?? null,
   };
 }
 
@@ -513,6 +538,11 @@ export function registerChatRoutes(
       systemPrompt: modelBinding.systemPrompt ?? undefined,
       language: modelBinding.language ?? undefined,
       timezone: modelBinding.timezone ?? undefined,
+      // Dropped here rather than forwarded blindly: an unusable value should not
+      // reach the wire, the runtime log line, or the trace. `resolveLocale`
+      // validates again on the far side — same shared rule, not a second one —
+      // because the value also arrives there from a file that outlives the pod.
+      clientTimezone: isValidTimezone(body.client_timezone ?? "") ? body.client_timezone : undefined,
       turnStartMs,
     });
 

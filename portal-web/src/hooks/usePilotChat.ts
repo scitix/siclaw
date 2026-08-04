@@ -19,6 +19,7 @@ import { stripAttachmentOcrEvidence } from "../components/chat/user-message-text
 import { normalizeProviderError } from "../lib/provider-error"
 import { findPendingSteerIndex, removePendingAt, extractUserMessageText, pendingSteerMatchText } from "./steer-pending"
 import { isGroupForm, normalizeCompletionStatus } from "../lib/group-form"
+import { browserTimezone } from "../lib/timezones"
 
 /** Parse an unknown payload into an ErrorDetail with backward-compat fallbacks.
  *  See docs/design/error-envelope.md §4. */
@@ -2052,7 +2053,17 @@ export function usePilotChat({ agentId, sessionId, forceLive }: UsePilotChatOpti
               "Content-Type": "application/json",
               ...(token ? { Authorization: `Bearer ${token}` } : {}),
             },
-            body: JSON.stringify({ text, session_id: sessionId, attachments }),
+            // The sender's own timezone, so the agent answers date/time questions
+            // on THIS person's clock. Read per send rather than once at mount:
+            // the value is what the OS says now, and a laptop that moved between
+            // messages should move with it. Best-effort — the backend drops an
+            // unusable value and falls back to the agent's zone.
+            body: JSON.stringify({
+              text,
+              session_id: sessionId,
+              attachments,
+              client_timezone: browserTimezone(),
+            }),
             signal: controller.signal,
           })
 
