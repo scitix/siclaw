@@ -33,17 +33,19 @@ import {
 interface BoxEvent {
   type: string;
   summary?: string;
+  /**
+   * On error events: producer **safe** short reason for checkpoint (e.g.
+   * `batch_failed:TimeoutError`). Never the owner-facing `error` / exception repr.
+   * On other events historically unused free-form text — still never logged from error path.
+   */
   message?: string;
   text?: string;
+  /** Owner-facing error text only — never logs/checkpoint. */
   error?: string;
   /** `deleted` entries are tombstones — the box removed a previously-synced file. */
   artifacts?: Array<{ path: string; content?: string; deleted?: boolean }>;
   /** Explicit full-compile commit. Replayed file presence alone is not a commit. */
   commit_input?: boolean;
-  /**
-   * Machine failure fields for checkpoint projection. `error` is owner-facing
-   * only and must never enter logs/checkpoint; use `message` + `exception_class`.
-   */
   code?: string;
   stage?: string;
   attempts?: number;
@@ -51,8 +53,6 @@ interface BoxEvent {
   bound_s?: number;
   tool_pending?: boolean;
   last_sdk_message?: string;
-  /** Safe short reason for checkpoint (NOT the owner-facing error string). */
-  message?: string;
   /** Exception type name token only. */
   exception_class?: string;
   reason?: string;
