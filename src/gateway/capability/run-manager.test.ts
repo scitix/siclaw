@@ -272,6 +272,7 @@ describe("CapabilityRunManager", () => {
       bound_s: 90,
       tool_pending: false,
       last_sdk_message: "query",
+      message: "ModelStallError('model request stalled')",
     });
     expect(be.persists().at(-1)?.params).toMatchObject({
       run_id: runId,
@@ -285,6 +286,51 @@ describe("CapabilityRunManager", () => {
           bound_s: 90,
           tool_pending: false,
           last_sdk_message: "query",
+          message: "ModelStallError('model request stalled')",
+        },
+      },
+    });
+  });
+
+  it("persists free-text failure message and defaults code/stage for bare failures", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.endRun(runId, "failed", {
+      code: "not a token",
+      stage: "also bad",
+      message: "connection reset by peer while writing batch 12",
+      last_sdk_message: "connection reset by peer",
+    } as any);
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      run_id: runId,
+      status: "failed",
+      checkpoint: {
+        failure: {
+          code: "box_error",
+          stage: "unknown",
+          message: "connection reset by peer while writing batch 12",
+          last_sdk_message: "connection reset by peer",
+        },
+      },
+    });
+  });
+
+  it("failed endRun without a failure object still writes a default diagnostic", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.endRun(runId, "failed");
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      run_id: runId,
+      status: "failed",
+      checkpoint: {
+        failure: {
+          code: "box_error",
+          stage: "unknown",
+          message: "unspecified failure",
         },
       },
     });

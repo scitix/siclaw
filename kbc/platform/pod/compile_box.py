@@ -414,6 +414,36 @@ def _print_compile_lifecycle(label: str, run: "CompileRun", extra: str = "") -> 
     print(f"[compile_box] {label} run={run.run_id} round={run.round}{tail}", flush=True)
 
 
+def _error_event(
+    error: str,
+    *,
+    code: str = "box_error",
+    stage: str = "compile",
+    last_sdk_message: str | None = None,
+    **extra,
+) -> dict:
+    """SSE error frame that Runtime can always project into checkpoint.failure.
+
+    Production triage (2026-08 sh-manage) only saw ``box event: error`` because
+    bare ``{"type":"error","error":...}`` frames lacked code/stage, so Runtime
+    dropped structured failure entirely. Always emit machine tokens + the
+    owner-facing error string (repr/short reason). Never put source bodies or
+    credentials into extra — same contract as lifecycle stdout.
+    """
+    ev: dict = {
+        "type": "error",
+        "error": error,
+        "code": code,
+        "stage": stage,
+    }
+    if last_sdk_message:
+        ev["last_sdk_message"] = last_sdk_message
+    for key, value in extra.items():
+        if value is not None:
+            ev[key] = value
+    return ev
+
+
 def _client_process_exited(client) -> int | None:
     """Best-effort exit code of the SDK's CLI subprocess if it has terminated,
     else None (still alive, or unknown).
@@ -4772,7 +4802,13 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             _print_compile_lifecycle(
                 "batch.interrupted.frame", run,
                 extra=f"{frame.filename}:{frame.lineno} in {frame.name}")
-        await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
+        await run.emit(_error_event(
+            f"batch compile failed: {e!r}",
+            code="batch_failed",
+            stage="batch_compile",
+            last_sdk_message=getattr(run, "_last_sdk_message_type", None),
+            exception_class=type(e).__name__,
+        ))
         # never-block: the single logical turn must still CLOSE — a consumer
         # gating on turn_done would otherwise hang on an orchestrator error.
         # Done batches are stamped in BATCH_PLAN.json, so the honest story is
@@ -5033,8 +5069,13 @@ async def _reap_unrecoverable_turn(run: CompileRun, client, reason: str) -> None
                         "last_sdk_message": run._last_sdk_message_type})
     else:
         _print_compile_lifecycle("turn.dead", run, extra=f"reason={reason} terminal=1")
-        await run.emit({"type": "error",
-                        "error": f"model stall: {reason}"})
+        await run.emit(_error_event(
+            f"model stall: {reason}",
+            code="model_turn_unrecoverable",
+            stage="model_turn",
+            last_sdk_message=run._last_sdk_message_type,
+            reason=reason,
+        ))
         # Disconnecting ENDS this box's session (run_session has no reconnect
         # loop — deliberately: recovery is owned by the platform). The turn_done
         # text must promise exactly that — not an in-place retry this box can no
@@ -5206,7 +5247,15 @@ async def _run_wrapper(run: CompileRun):
         await _COMPILE_IMPL(run)
         clean = True
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
-        error_event = {"type": "error", "error": repr(e)}
+        # Always include code/stage so Runtime persists checkpoint.failure (bare
+        # error-only frames used to leave production with no triage fields).
+        error_event = _error_event(
+            repr(e),
+            code="unhandled",
+            stage="run",
+            last_sdk_message=getattr(run, "_last_sdk_message_type", None),
+            exception_class=type(e).__name__,
+        )
         if isinstance(e, ModelStallError) and run._last_stall_diagnostic:
             # Structured, content-free diagnostics survive the Runtime→consumer
             # opaque checkpoint.  Keep the human error for rolling consumers,
@@ -5216,6 +5265,9 @@ async def _run_wrapper(run: CompileRun):
                 for key, value in run._last_stall_diagnostic.items()
                 if key != "fatal"
             })
+            error_event.setdefault("error", repr(e))
+            error_event.setdefault("code", "model_turn_stalled")
+            error_event.setdefault("stage", "model_turn")
         await run.emit(error_event)
         if getattr(run, "_turn_active", False):
             # never-block symmetry (review fix): a consumer gating on turn_done
@@ -5252,7 +5304,12 @@ async def _run_wrapper(run: CompileRun):
             await _sync_workspace(run, sent)
         except Exception as e:
             clean = False
-            await run.emit({"type": "error", "error": f"final workspace sync failed: {e!r}"})
+            await run.emit(_error_event(
+                f"final workspace sync failed: {e!r}",
+                code="workspace_sync_failed",
+                stage="persist",
+                exception_class=type(e).__name__,
+            ))
         if clean:
             await run.emit({"type": "done"})
         await run.emit({"type": "end"})
@@ -5778,9 +5835,12 @@ async def _test_stall_watchdog(run: "TestRun") -> None:
             "tool_pending": run._tool_pending,
             "last_sdk_message": run._last_sdk_message_type,
         })
-        await run.emit({"type": "error", "error": _loc(run,
-            "The answer timed out — please try again.",
-            "回答超时,请重试。")})
+        await run.emit(_error_event(
+            _loc(run, "The answer timed out — please try again.", "回答超时,请重试。"),
+            code="model_turn_stalled",
+            stage="test",
+            last_sdk_message=run._last_sdk_message_type,
+        ))
         # turn_done frees the UI (idle) while the session stays open; the next
         # /test-message re-arms a fresh turn on the same live client.
         await run.emit({"type": "turn_done", "text": _loc(run,
@@ -6466,7 +6526,12 @@ async def _test_session_wrapper(run: "TestRun"):
     try:
         await _TEST_SESSION_IMPL(run)
     except Exception as e:  # top-level boundary; CancelledError (teardown) passes through
-        await run.emit({"type": "error", "error": repr(e)})
+        await run.emit(_error_event(
+            repr(e),
+            code="test_session_failed",
+            stage="test",
+            exception_class=type(e).__name__,
+        ))
     finally:
         run.done = True
         watchdog.cancel()
@@ -7246,9 +7311,11 @@ async def _rebuild_test_client(run: "TestRun") -> web.Response | None:
         run._rebuild_error = "test session rebuild timed out"
     if run._rebuild_error is not None:
         _print_test_lifecycle("turn.rebuild_failed", run, extra=f"err={run._rebuild_error!r}")
-        await run.emit({"type": "error", "error": _loc(run,
-            "The session could not be restarted — please try again.",
-            "会话无法重启,请重试。")})
+        await run.emit(_error_event(
+            _loc(run, "The session could not be restarted — please try again.", "会话无法重启,请重试。"),
+            code="test_session_rebuild_failed",
+            stage="test",
+        ))
         return web.json_response({"error": "test session rebuild failed"}, status=503)
     _print_test_lifecycle("turn.rebuilt", run)
     return None

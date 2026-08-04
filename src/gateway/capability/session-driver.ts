@@ -48,6 +48,7 @@ interface BoxEvent {
   bound_s?: number;
   tool_pending?: boolean;
   last_sdk_message?: string;
+  reason?: string;
 }
 
 export interface DriveCapabilitySessionOptions {
@@ -83,7 +84,18 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
     // reaps an actively-working run (e.g. a long compile emitting only `log`).
     // touch() is in-memory only (no persist), so it is cheap to call every event.
     manager.touch(runId);
-    console.log(`[capability] run=${runId} box event: ${evt.type}`);
+    if (evt.type === "error") {
+      // Always log the diagnostic fields — production triage previously only
+      // saw "box event: error" with no code/stage/message in runtime logs.
+      console.error(
+        `[capability] run=${runId} box event: error` +
+          ` code=${evt.code ?? "-"} stage=${evt.stage ?? "-"}` +
+          ` last_sdk_message=${evt.last_sdk_message ?? "-"}` +
+          ` error=${truncateForLog(evt.error ?? evt.message ?? "")}`,
+      );
+    } else {
+      console.log(`[capability] run=${runId} box event: ${evt.type}`);
+    }
     switch (evt.type) {
       case "log":
         emit("log", { text: evt.text ?? "" });
@@ -170,11 +182,10 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         break;
       case "error":
         emit("lifecycle", { status: "failed", error: evt.error ?? "" });
-        {
-          const failure = structuredBoxFailure(evt);
-          if (failure) await manager.endRun(runId, "failed", failure);
-          else await manager.endRun(runId, "failed");
-        }
+        // Always persist a structured failure. Bare box errors (error string
+        // only, no code/stage) used to call endRun without a failure object, so
+        // the consumer checkpoint and auto-resume detail were empty.
+        await manager.endRun(runId, "failed", structuredBoxFailure(evt));
         break;
       case "end": {
         // The box's session coroutine exited (clean stream close: max_turns
@@ -200,15 +211,43 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   }
 }
 
-function structuredBoxFailure(evt: BoxEvent): CapabilityRunFailure | undefined {
-  if (!evt.code || !evt.stage) return undefined;
+/** Max free-text diagnostic length kept in the checkpoint (and logs). */
+const FAILURE_MESSAGE_MAX = 2000;
+
+function truncateForLog(text: string, max = 500): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= max) return oneLine || "-";
+  return `${oneLine.slice(0, max)}…`;
+}
+
+/**
+ * Build a always-present failure diagnostic from a box error event.
+ * Missing code/stage are filled with stable defaults so the consumer always
+ * gets a non-empty checkpoint.failure for auto-resume and post-mortems.
+ */
+export function structuredBoxFailure(evt: BoxEvent): CapabilityRunFailure {
+  const code = typeof evt.code === "string" && evt.code.trim() ? evt.code.trim() : "box_error";
+  const stage = typeof evt.stage === "string" && evt.stage.trim() ? evt.stage.trim() : "unknown";
+  const messageRaw =
+    (typeof evt.error === "string" && evt.error.trim()) ||
+    (typeof evt.message === "string" && evt.message.trim()) ||
+    (typeof evt.reason === "string" && evt.reason.trim()) ||
+    "";
+  const message = messageRaw
+    ? messageRaw.length > FAILURE_MESSAGE_MAX
+      ? messageRaw.slice(0, FAILURE_MESSAGE_MAX)
+      : messageRaw
+    : undefined;
   return {
-    code: evt.code,
-    stage: evt.stage,
+    code,
+    stage,
     ...(typeof evt.attempts === "number" ? { attempts: evt.attempts } : {}),
     ...(typeof evt.idle_s === "number" ? { idle_s: evt.idle_s } : {}),
     ...(typeof evt.bound_s === "number" ? { bound_s: evt.bound_s } : {}),
     ...(typeof evt.tool_pending === "boolean" ? { tool_pending: evt.tool_pending } : {}),
-    ...(typeof evt.last_sdk_message === "string" ? { last_sdk_message: evt.last_sdk_message } : {}),
+    ...(typeof evt.last_sdk_message === "string" && evt.last_sdk_message.trim()
+      ? { last_sdk_message: evt.last_sdk_message.trim() }
+      : {}),
+    ...(message ? { message } : {}),
   };
 }
