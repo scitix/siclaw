@@ -29,6 +29,7 @@ import {
   CAPABILITY_LIST_ACTIVE_RUNS,
   isTerminalCapabilityStatus,
 } from "./contract.js";
+import { normalizeFailure } from "./failure.js";
 import { ErrorCodes, RpcResponseError } from "../../lib/error-envelope.js";
 
 /** Just the RPC surface the manager needs (so tests can pass a fake). */
@@ -750,48 +751,5 @@ function failureFromCheckpoint(checkpoint: unknown): CapabilityRunFailure | unde
   return normalizeFailure(failure);
 }
 
-/** Safe short-reason cap persisted in the opaque checkpoint. */
-const FAILURE_MESSAGE_MAX = 256;
-
-function normalizeFailure(value: unknown): CapabilityRunFailure | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const raw = value as Record<string, unknown>;
-  const token = (field: unknown): string | undefined => {
-    if (typeof field !== "string") return undefined;
-    const normalized = field.trim();
-    return normalized && normalized.length <= 64 && /^[a-zA-Z0-9_.-]+$/.test(normalized)
-      ? normalized
-      : undefined;
-  };
-  // Safe short reason only — allow limited punctuation, never copy from `error`.
-  const safeMessage = (field: unknown, max = FAILURE_MESSAGE_MAX): string | undefined => {
-    if (typeof field !== "string") return undefined;
-    const cleaned = field.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ").trim();
-    if (!cleaned) return undefined;
-    return cleaned.length > max ? cleaned.slice(0, max) : cleaned;
-  };
-  // Invalid/missing tokens → neutral runtime_failure (not box_error). Callers
-  // that mean "box" must pass an explicit box_* code (structuredBoxFailure does).
-  const code = token(raw.code) ?? "runtime_failure";
-  const stage = token(raw.stage) ?? "unknown";
-  const finiteNonNegative = (field: unknown): number | undefined =>
-    typeof field === "number" && Number.isFinite(field) && field >= 0 ? field : undefined;
-  const attempts = finiteNonNegative(raw.attempts);
-  const idle = finiteNonNegative(raw.idle_s);
-  const bound = finiteNonNegative(raw.bound_s);
-  const lastMessage = token(raw.last_sdk_message);
-  const exceptionClass = token(raw.exception_class);
-  // Only the producer `message` field — never raw.error (owner-facing / unsafe).
-  const message = safeMessage(raw.message) ?? (exceptionClass ? `${code}:${exceptionClass}` : code);
-  return {
-    code,
-    stage,
-    ...(attempts !== undefined ? { attempts: Math.floor(attempts) } : {}),
-    ...(idle !== undefined ? { idle_s: idle } : {}),
-    ...(bound !== undefined ? { bound_s: bound } : {}),
-    ...(typeof raw.tool_pending === "boolean" ? { tool_pending: raw.tool_pending } : {}),
-    ...(lastMessage ? { last_sdk_message: lastMessage } : {}),
-    ...(exceptionClass ? { exception_class: exceptionClass } : {}),
-    message,
-  };
-}
+// normalizeFailure lives in failure.ts so session-driver logs and checkpoint
+// persistence share one token/safe-message sanitizer.

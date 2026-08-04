@@ -4817,12 +4817,17 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             _print_compile_lifecycle(
                 "batch.interrupted.frame", run,
                 extra=f"{frame.filename}:{frame.lineno} in {frame.name}")
+        # Route with _batch_error_code so Sicore auto-resume can distinguish
+        # deterministic failures (plan_integrity, quota_exhausted) from
+        # transient ones (model_stall, provider_fault). Never hardcode batch_failed.
+        batch_code = _batch_error_code(e)
         await run.emit(_error_event(
             f"batch compile failed: {e!r}",
-            code="batch_failed",
+            code=batch_code,
             stage="batch_compile",
             last_sdk_message=getattr(run, "_last_sdk_message_type", None),
             exception_class=type(e).__name__,
+            message=f"{batch_code}:{type(e).__name__}",
         ))
         # never-block: the single logical turn must still CLOSE — a consumer
         # gating on turn_done would otherwise hang on an orchestrator error.

@@ -6333,6 +6333,17 @@ def test_a_spend_cap_is_not_a_rate_limit():
     """
     err = compile_box.ModelQuotaExhausted("refused on billing")
     assert compile_box._batch_error_code(err) == "quota_exhausted"
+    # _error_event must surface the same code (not hard-coded batch_failed).
+    frame = compile_box._error_event(
+        f"batch compile failed: {err!r}",
+        code=compile_box._batch_error_code(err),
+        stage="batch_compile",
+        exception_class=type(err).__name__,
+        message=f"{compile_box._batch_error_code(err)}:{type(err).__name__}",
+    )
+    assert frame["code"] == "quota_exhausted", frame
+    assert frame["message"] == "quota_exhausted:ModelQuotaExhausted", frame
+    assert "refused on billing" not in frame["message"], frame
 
     # Neither claim may come back. `deterministic` is what a consumer would read
     # to stop retrying, and a stated deadline is what an owner would wait out —

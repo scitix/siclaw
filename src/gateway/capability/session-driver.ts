@@ -21,7 +21,6 @@ import type {
   CapabilityEventType,
   CapabilityPersistArtifactsRequest,
   CapabilityPersistTurnRequest,
-  CapabilityRunFailure,
 } from "./contract.js";
 import {
   CAPABILITY_EVENT,
@@ -29,6 +28,7 @@ import {
   CAPABILITY_PERSIST_TURN,
   isTerminalCapabilityStatus,
 } from "./contract.js";
+import { structuredBoxFailure } from "./failure.js";
 
 interface BoxEvent {
   type: string;
@@ -220,53 +220,11 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   }
 }
 
-/** Max free-text safe diagnostic length kept in the checkpoint (and logs). */
-const FAILURE_MESSAGE_MAX = 256;
-
 function truncateForLog(text: string, max = 200): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
   if (oneLine.length <= max) return oneLine || "-";
   return `${oneLine.slice(0, max)}…`;
 }
 
-/**
- * Project a box error event into a checkpoint-safe failure.
- *
- * `evt.error` is owner-facing and may contain paths / provider fragments — it is
- * never copied into `message` or logs. Safe fields only:
- * code/stage/exception_class/last_sdk_message + producer `message`.
- * Bare box frames (no code) default to box_error/unknown.
- */
-export function structuredBoxFailure(evt: BoxEvent): CapabilityRunFailure {
-  const code = typeof evt.code === "string" && evt.code.trim() ? evt.code.trim() : "box_error";
-  const stage = typeof evt.stage === "string" && evt.stage.trim() ? evt.stage.trim() : "unknown";
-  const exceptionClass =
-    typeof evt.exception_class === "string" && evt.exception_class.trim()
-      ? evt.exception_class.trim()
-      : undefined;
-  // Producer must put the safe short reason in `message`. Never fall back to
-  // `error` / `reason` (those are owner-facing or free-form).
-  let message =
-    typeof evt.message === "string" && evt.message.trim() ? evt.message.trim() : undefined;
-  if (!message && exceptionClass) {
-    message = `${code}:${exceptionClass}`;
-  } else if (!message) {
-    message = code;
-  }
-  if (message.length > FAILURE_MESSAGE_MAX) {
-    message = message.slice(0, FAILURE_MESSAGE_MAX);
-  }
-  return {
-    code,
-    stage,
-    ...(typeof evt.attempts === "number" ? { attempts: evt.attempts } : {}),
-    ...(typeof evt.idle_s === "number" ? { idle_s: evt.idle_s } : {}),
-    ...(typeof evt.bound_s === "number" ? { bound_s: evt.bound_s } : {}),
-    ...(typeof evt.tool_pending === "boolean" ? { tool_pending: evt.tool_pending } : {}),
-    ...(typeof evt.last_sdk_message === "string" && evt.last_sdk_message.trim()
-      ? { last_sdk_message: evt.last_sdk_message.trim() }
-      : {}),
-    ...(exceptionClass ? { exception_class: exceptionClass } : {}),
-    message,
-  };
-}
+// structuredBoxFailure is shared with run-manager's normalizeFailure (failure.ts)
+// so forged/non-token code values are stripped before the log line is written.
