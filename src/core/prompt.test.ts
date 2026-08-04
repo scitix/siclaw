@@ -96,6 +96,18 @@ describe("buildSreSystemPrompt visual output guidance", () => {
   });
 });
 
+describe("buildSreSystemPrompt evidence correlation guidance", () => {
+  it("requires exact-target evidence and rejects forced artifact matching", () => {
+    const prompt = buildSreSystemPrompt("web");
+
+    expect(prompt).toContain("Correlate related evidence, never force it");
+    expect(prompt).toContain("primary target is uniquely identified");
+    expect(prompt).toContain("Do not search for or manufacture a required artifact type such as a ticket");
+    expect(prompt).toContain("Same cluster, user, title, symptom category, or resource size alone is never enough");
+    expect(prompt).toContain("source-coverage gaps");
+  });
+});
+
 describe("renderSystemPromptFragment", () => {
   it("preserves variables and mode blocks for persisted agent prompts", () => {
     process.env.SICLAW_MEMORY_ENABLED = "false";
