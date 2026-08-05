@@ -764,11 +764,18 @@ class CompileRun:
     async def emit(self, ev: dict):
         await self.events.put(ev)
 
-    def _begin_turn(self, directive: str, *, grandfather_legacy_format: bool = False):
+    def _begin_turn(
+        self,
+        directive: str,
+        *,
+        grandfather_legacy_format: bool = False,
+        preserve_page_baseline: bool = False,
+    ):
         """Arm the stall watchdog for a new model turn. Called for every turn —
         the owner's /message AND internal self-check/verify/batch injections."""
         self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
-        self._turn_page_hashes = incremental.page_hashes(self.workdir)
+        if not preserve_page_baseline or not isinstance(self._turn_page_hashes, dict):
+            self._turn_page_hashes = incremental.page_hashes(self.workdir)
         self._turn_format_guard = None
         if grandfather_legacy_format:
             self._turn_format_guard = {
@@ -3694,7 +3701,11 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                 else:
                     _print_compile_lifecycle(
                         "turn.rebuilt", run, extra=f"label={label} attempt={attempt}")
-                run._begin_turn(directive_full)
+                # A rebuilt client is another transport attempt for the SAME
+                # logical batch turn. Keep the first attempt's byte baseline so
+                # pages written before a lost terminator are still stamped even
+                # when the idempotent retry performs no write.
+                run._begin_turn(directive_full, preserve_page_baseline=attempt > 0)
                 await client.query(directive_full)
                 await _consume_turn_stream(
                     run, client, stop_on_result=True, fail_on_error_result=True)

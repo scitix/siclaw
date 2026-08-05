@@ -15,6 +15,7 @@ import shutil
 import tarfile
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -5943,6 +5944,35 @@ async def test_batch_rebuild_exhaustion_raises_resumable():
     print("✓ batch stall: rebuilds exhausted → ModelStallError → run ends resumable (checkpoint)")
 
 
+def test_batch_retry_preserves_first_attempt_page_baseline():
+    """A rebuilt transport is the same logical turn, not a new byte baseline."""
+    with tempfile.TemporaryDirectory() as td:
+        candidate = Path(td) / "candidate"
+        candidate.mkdir()
+        page = candidate / "topic.md"
+        page.write_text(
+            "---\ntype: Topic\nverified:\n  by: human:r\n"
+            "  at: '2026-08-04T00:00:00Z'\n---\nOld\n", "utf-8")
+        run = compile_box.CompileRun("baseline", td, 1)
+        run._begin_turn("attempt 1")
+        original = dict(run._turn_page_hashes)
+        page.write_text(page.read_text("utf-8").replace("Old", "New"), "utf-8")
+
+        # The idempotent retry performs no write. It must still compare against
+        # the bytes before attempt 1, otherwise verified survives changed bytes.
+        run._begin_turn("attempt 2", preserve_page_baseline=True)
+        assert run._turn_page_hashes == original
+        changes = compile_box.incremental.changed_pages(
+            run._turn_page_hashes, compile_box.incremental.page_hashes(td))
+        assert changes == {"topic.md": "modified"}, changes
+        stamped = compile_box.selfcheck.stamp_siclaw_generated_metadata(
+            td, set(changes), now=datetime(2026, 8, 4, 12, 0, tzinfo=timezone))
+        assert stamped == ["topic.md"]
+        fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(page.read_text("utf-8"))
+        assert not error and "verified" not in fm, fm
+    print("✓ batch retry keeps the first attempt baseline and invalidates old verification")
+
+
 async def test_resumed_batch_phase_is_watchdog_armed():
     """(d) The resumed-batching phase (the suspected coverage gap) runs each
     pending batch through _drive_batch_session, which arms the watchdog via
@@ -6485,6 +6515,7 @@ async def main():
     await test_batch_interrupt_failure_reaps_instead_of_spinning()
     await test_interrupt_failure_reap_is_bounded_and_resumable()
     await test_batch_rebuild_exhaustion_raises_resumable()
+    test_batch_retry_preserves_first_attempt_page_baseline()
     await test_resumed_batch_phase_is_watchdog_armed()
     await test_run_wrapper_closes_turn_on_driver_crash()
     await test_run_wrapper_cancels_detached_verify_tasks()
