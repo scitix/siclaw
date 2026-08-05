@@ -2989,7 +2989,7 @@ async def test_incremental_route():
         (wd / "authoring").mkdir(parents=True)
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\ntitle: t\nsources:\n  - resource: snap/one.md\n---\n正文。")
+            "---\ntype: Topic\ntitle: t\nsources:\n  - resource: raw/snap/one.md\n---\n正文。")
         run = compile_box.CompileRun("incr1", str(wd), 1)
         # no RAW_CHANGES yet → NOT incremental (falls through to normal/full route)
         assert not compile_box._should_route_to_incremental(run, "请增量重编")
@@ -3033,8 +3033,8 @@ async def test_incremental_integrity_guard():
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。")
         run = compile_box.CompileRun("incrg", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -3043,8 +3043,8 @@ async def test_incremental_integrity_guard():
               "modified": [{"path": "snap/one.md", "affected_pages": ["a.md"], "diff": ""}]}
         run._incr_pending = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
         # model edits a.md (authorized) AND drifts into c.md (unauthorized)
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c 擅自改。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c 擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         # coverage ledger is clean (both sources still cited) yet integrity forces a repair naming c.md
         assert repair is not None and "Incremental scope violation" in repair and "c.md" in repair, repair
@@ -3053,7 +3053,7 @@ async def test_incremental_integrity_guard():
         # consumed here, leaving the repair turn unguarded.
         assert run._incr_pending is not None and run._incr_pending["changeset"] is cs
         # the repair restores c.md → the re-armed guard clears cleanly
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。")
         run._selfcheck_key = None
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is None, repair2
@@ -3078,7 +3078,7 @@ async def test_incremental_guard_rearms_on_ledger_repair():
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "orphaned-src.md").write_text("never cited")  # → unaccounted
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("incrl", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -3087,7 +3087,7 @@ async def test_incremental_guard_rearms_on_ledger_repair():
         armed = {"before": incremental.page_hashes(str(wd)), "changeset": cs}
         run._incr_pending = armed
         # the turn edits ONLY the authorized page (no byte violations)…
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
         repair = await compile_box._post_turn_selfcheck(run)
         # …but the ledger is unclean (orphaned-src.md unaccounted) → repairing
         assert repair is not None and "orphaned-src.md" in repair, repair
@@ -3114,8 +3114,8 @@ async def test_incremental_violation_auto_restored():
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
-        c_original = "---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
+        c_original = "---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。"
         (wd / "candidate" / "c.md").write_text(c_original)
         run = compile_box.CompileRun("incrr", str(wd), 1)
         run._selfcheck_key = None
@@ -3125,8 +3125,8 @@ async def test_incremental_violation_auto_restored():
         run._incr_pending = {"before": incremental.page_hashes(str(wd)),
                              "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
         # model edits a.md (authorized) AND drifts into c.md (unauthorized)
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c 擅自改。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c 擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         assert repair is None, repair  # violation auto-restored, ledger clean → no repair turn
         assert (wd / "candidate" / "c.md").read_text() == c_original  # byte-exact restore
@@ -3153,7 +3153,7 @@ async def test_unconverged_files_residual_ticket():
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # → unaccounted forever
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("uncv", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 99  # budget long spent → unconverged, not repairing
@@ -3166,7 +3166,7 @@ async def test_unconverged_files_residual_ticket():
         assert "never-compiled.md" in tickets[0]["sources"][0]["quote"]
         # a second settle with the same residuals does not duplicate the ticket
         run._selfcheck_key = None
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 又动了。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 又动了。")
         await compile_box._post_turn_selfcheck(run)
         tickets2 = _json.loads((wd / "authoring" / "CONTRADICTIONS.json").read_text())
         assert len(tickets2) == 1, tickets2
@@ -3229,12 +3229,12 @@ async def test_incremental_grandfathers_untouched_format_debt():
         legacy_index = "# Index\n- [a](a.md)\n- [b](b.md)"
         (wd / "candidate" / "index.md").write_text(legacy_index)
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\nsources:\n  - resource: snap/one.md\n---\nA")
+            "---\ntype: Topic\nsources:\n  - resource: raw/snap/one.md\n---\nA")
         # This untouched page carries both legacy format debt and a valid
         # filename-plus-locator citation. Neither may wedge an unrelated scoped
         # edit, while the same citation would still be checked if its filename
         # were absent from sources[].resource.
-        legacy = ("---\ntype: Topic\nsources:\n  - resource: snap/two.md\n---\n"
+        legacy = ("---\ntype: Topic\nsources:\n  - resource: raw/snap/two.md\n---\n"
                   "See [[a]]. (source: snap/two.md §3)")
         (wd / "candidate" / "b.md").write_text(legacy)
         cs = {"affected_pages": ["a.md"], "added": [], "deleted": [],
@@ -3254,7 +3254,7 @@ async def test_incremental_grandfathers_untouched_format_debt():
         run._l1_repairs_used = 0
         arm(run)
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\nsources:\n  - resource: snap/one.md\n---\nA updated")
+            "---\ntype: Topic\nsources:\n  - resource: raw/snap/one.md\n---\nA updated")
         repair = await compile_box._post_turn_selfcheck(run)
         assert repair is None, repair
         assert (wd / "candidate" / "index.md").read_text() == legacy_index
@@ -3272,7 +3272,7 @@ async def test_incremental_grandfathers_untouched_format_debt():
         run._selfcheck_key = None
         arm(run)
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\nsources:\n  - resource: snap/one.md\n---\nSee [[b]].")
+            "---\ntype: Topic\nsources:\n  - resource: raw/snap/one.md\n---\nSee [[b]].")
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is not None and "siclaw_profile_wikilink" in repair2, repair2
         sc2 = json.loads((wd / "authoring" / "SELFCHECK.json").read_text())
@@ -3297,9 +3297,9 @@ async def test_repair_turn_may_edit_ledger_target_pages():
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
         # c.md cites a source that no longer exists → dangling (out of this round's scope)
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/ghost.md\n---\n正文c。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/ghost.md\n---\n正文c。")
         run = compile_box.CompileRun("interlock", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -3309,13 +3309,13 @@ async def test_repair_turn_may_edit_ledger_target_pages():
                              "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
         # turn 1: model edits ONLY the authorized page — in scope, but the ledger
         # is unclean (dangling citation on c.md) → repairing, guard re-armed
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
         repair = await compile_box._post_turn_selfcheck(run)
         assert repair is not None and "ghost.md" in repair, repair
         assert run._incr_pending is not None
         assert run._incr_pending.get("repair_pages") == ["c.md"], run._incr_pending.get("repair_pages")
         # repair turn: model fixes the dangling citation on the OUT-OF-SCOPE page
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。")
         run._selfcheck_key = None
         repair2 = await compile_box._post_turn_selfcheck(run)
         assert repair2 is None, repair2
@@ -3344,8 +3344,8 @@ async def test_incremental_index_deletion_cannot_escape_guard():
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "two.md").write_text("two")
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
-        c_original = "---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n正文c。"
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
+        c_original = "---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n正文c。"
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
         (wd / "candidate" / "c.md").write_text(c_original)
         run = compile_box.CompileRun("incrx", str(wd), 1)
         run._selfcheck_key = None
@@ -3355,9 +3355,9 @@ async def test_incremental_index_deletion_cannot_escape_guard():
         run._incr_pending = {"before": incremental.page_hashes(str(wd)),
                              "before_bytes": incremental.page_bytes(str(wd)), "changeset": cs}
         # model edits a.md (authorized), DELETES index.md and drifts into c.md
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a 更新。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a 更新。")
         (wd / "candidate" / "index.md").unlink()
-        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: snap/two.md\n---\n擅自改。")
+        (wd / "candidate" / "c.md").write_text("---\ntype: Topic\ntitle: c\nsources:\n  - resource: raw/snap/two.md\n---\n擅自改。")
         repair = await compile_box._post_turn_selfcheck(run)
         # the guard ran: c.md restored byte-exact; index.md (always-editable, no
         # snapshot restore) leaves the tree index-less → orphan lint → repair
@@ -3387,7 +3387,7 @@ async def test_incremental_arm_cleared_when_dispatch_fails():
         (wd / "authoring").mkdir(parents=True)
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
         (wd / "candidate" / "a.md").write_text(
-            "---\ntype: Topic\ntitle: t\nsources:\n  - resource: snap/one.md\n---\n正文。")
+            "---\ntype: Topic\ntitle: t\nsources:\n  - resource: raw/snap/one.md\n---\n正文。")
         # stale per-round declaration from an earlier round must not survive
         (wd / "authoring" / "ADDED_TARGETS.json").write_text('["stale-page.md"]')
         (wd / "authoring" / "RAW_CHANGES.json").write_text(_json.dumps({
@@ -3420,7 +3420,7 @@ async def test_noop_repair_turn_reaches_the_gate():
         (wd / "raw" / "snap" / "one.md").write_text("one")
         (wd / "raw" / "snap" / "never-compiled.md").write_text("orphan")  # unaccounted forever
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("noop", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -3454,7 +3454,7 @@ def test_media_verify_suppresses_text_backed_beyond_transcript():
             "B300较B200，FP4有46%提升；整体也只 +39.7%，不太符合预期。")
         page_text = (
             "---\ntype: Comparison\ntitle: c\nsources:\n"
-            "  - resource: snap/perf.md\n  - resource: snap/assets/tok1.png\n---\n"
+            "  - resource: raw/snap/perf.md\n  - resource: raw/snap/assets/tok1.png\n---\n"
             "B300 FP4 较 B200 +46%。整体 +39.7%。另一个编造值 +87.5%。")
         findings = [
             {"image": "snap/assets/tok1.png", "claim": "B300 FP4 较 B200 +46%",
@@ -3524,7 +3524,7 @@ async def test_l1_repair_budget_high_water_survives_shrinking_workload():
         for i in range(30):  # 30 unaccounted -> limit ceil(30/12)=3 with floor pinned to 1
             (wd / "raw" / "snap" / f"orphan{i}.md").write_text("x")
         (wd / "candidate" / "index.md").write_text("---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("noop", str(wd), 1)
         run._selfcheck_key = None
         os.environ["KBC_L1_REPAIR_ROUNDS"] = "1"
@@ -3568,10 +3568,10 @@ async def test_unchanged_owner_turn_does_not_migrate_legacy_format():
             "# Index\n- [Legacy](legacy.md)\n- [Clean](clean.md)"
         )
         (root / "candidate" / "legacy.md").write_text(
-            "---\ntitle: Legacy\nsources:\n  - resource: snap/one.md\n---\n# Legacy\nInherited body.\n"
+            "---\ntitle: Legacy\nsources:\n  - resource: raw/snap/one.md\n---\n# Legacy\nInherited body.\n"
         )
         (root / "candidate" / "clean.md").write_text(
-            "---\ntype: Topic\ntitle: Clean\nsources:\n  - resource: snap/one.md\n---\n# Clean\nStable body.\n"
+            "---\ntype: Topic\ntitle: Clean\nsources:\n  - resource: raw/snap/one.md\n---\n# Clean\nStable body.\n"
         )
 
     with tempfile.TemporaryDirectory() as td:
@@ -3646,7 +3646,7 @@ async def test_batch_final_ledger_check_requires_index():
         (wd / "candidate").mkdir()
         (wd / "authoring").mkdir()
         (wd / "raw" / "snap" / "one.md").write_text("one")
-        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: snap/one.md\n---\n正文a。")
+        (wd / "candidate" / "a.md").write_text("---\ntype: Topic\ntitle: a\nsources:\n  - resource: raw/snap/one.md\n---\n正文a。")
         run = compile_box.CompileRun("bfx", str(wd), 1)
         run._selfcheck_key = None
         run._l1_repairs_used = 0
@@ -4655,10 +4655,10 @@ def test_batch_relay_brief_hands_off_progress_and_prior_pages():
             "---\ntype: Topic\nsources:\n  - resource: raw/ops/big.md\n---\nx",
             encoding="utf-8")
         (base / "candidate" / "neighbour.md").write_text(
-            "---\ntype: Topic\nsources:\n  - resource: ops/sibling.md\n---\nx",
+            "---\ntype: Topic\nsources:\n  - resource: raw/ops/sibling.md\n---\nx",
             encoding="utf-8")
         (base / "candidate" / "elsewhere.md").write_text(
-            "---\ntype: Topic\nsources:\n  - resource: other/far.md\n---\nx",
+            "---\ntype: Topic\nsources:\n  - resource: raw/other/far.md\n---\nx",
             encoding="utf-8")
         run = compile_box.CompileRun("relay", str(base), 1)
         plan = {"batches": [
@@ -5966,7 +5966,7 @@ def test_batch_retry_preserves_first_attempt_page_baseline():
             run._turn_page_hashes, compile_box.incremental.page_hashes(td))
         assert changes == {"topic.md": "modified"}, changes
         stamped = compile_box.selfcheck.stamp_siclaw_generated_metadata(
-            td, set(changes), now=datetime(2026, 8, 4, 12, 0, tzinfo=timezone))
+            td, set(changes), now=datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
         assert stamped == ["topic.md"]
         fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(page.read_text("utf-8"))
         assert not error and "verified" not in fm, fm
