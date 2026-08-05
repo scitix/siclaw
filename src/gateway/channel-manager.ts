@@ -12,6 +12,7 @@ import type { AgentBoxManager } from "./agentbox/manager.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { createLarkHandler } from "./channels/lark.js";
 import { createDingTalkHandler } from "./channels/dingtalk.js";
+import type { TicketIntakeDraft, TicketIntakeRecord, TicketIntakeSubmissionPayload } from "../shared/ticket-intake.js";
 
 export interface ChannelHandler {
   start(): Promise<void>;
@@ -171,6 +172,45 @@ export async function setChannelContextMode(
     channel_id: channelId,
     route_key: routeKey,
     mode,
+  });
+}
+
+export async function beginTicketIntake(
+  input: { sessionId: string; channelId: string; requesterExternalId: string; sourceMessageId: string },
+  frontendClient?: FrontendWsClient,
+): Promise<{ success: boolean; intake?: TicketIntakeRecord; error?: string }> {
+  if (!frontendClient) return { success: false, error: "Ticket intake storage is unavailable" };
+  return frontendClient.request("channel.beginTicketIntake", {
+    session_id: input.sessionId,
+    channel_id: input.channelId,
+    requester_external_id: input.requesterExternalId,
+    source_message_id: input.sourceMessageId,
+  });
+}
+
+export async function getActiveTicketIntake(
+  sessionId: string,
+  requesterExternalId: string,
+  frontendClient?: FrontendWsClient,
+): Promise<TicketIntakeRecord | null> {
+  if (!frontendClient) return null;
+  const result = await frontendClient.request("channel.getActiveTicketIntake", {
+    session_id: sessionId,
+    requester_external_id: requesterExternalId,
+  });
+  return result?.intake ?? null;
+}
+
+export async function transitionTicketIntake(
+  input: { intakeId: string; requesterExternalId: string; revision: number; action: "confirm" | "continue" | "cancel" },
+  frontendClient?: FrontendWsClient,
+): Promise<{ success: boolean; intake?: TicketIntakeRecord; payload?: TicketIntakeSubmissionPayload; error?: string }> {
+  if (!frontendClient) return { success: false, error: "Ticket intake storage is unavailable" };
+  return frontendClient.request("channel.transitionTicketIntake", {
+    intake_id: input.intakeId,
+    requester_external_id: input.requesterExternalId,
+    expected_revision: input.revision,
+    action: input.action,
   });
 }
 

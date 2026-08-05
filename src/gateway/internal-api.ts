@@ -134,6 +134,11 @@ async function validateDelegationEventActor(
       if (!(await sessionBelongsToIdentity(event.message.sessionId, identity))) return { status: 403, error: "channel session mismatch" };
       return null;
     }
+    case "channel.ticket_intake_draft": {
+      if (!agentMatchesIdentity(event.intake.fromAgentId, identity)) return { status: 403, error: "ticket intake source agent mismatch" };
+      if (!(await sessionBelongsToIdentity(event.intake.sessionId, identity))) return { status: 403, error: "ticket intake session mismatch" };
+      return null;
+    }
     default:
       return null;
   }
@@ -676,6 +681,16 @@ export async function handleDelegationEvents(
       }
       case "channel.deliver_message": {
         response = { ok: await deliverChannelVisibleMessage(event.message) };
+        break;
+      }
+      case "channel.ticket_intake_draft": {
+        const result = await frontendClient.request("channel.updateTicketIntakeDraft", {
+          session_id: event.intake.sessionId,
+          intake_id: event.intake.intakeId,
+          expected_revision: event.intake.expectedRevision,
+          draft: event.intake.draft,
+        });
+        response = { ok: result?.success === true };
         break;
       }
       default: {

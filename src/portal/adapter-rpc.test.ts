@@ -2377,9 +2377,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 59 handlers", () => {
+  it("registers exactly 63 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(59);
+    expect(handlers.size).toBe(63);
   });
 
   it("all expected handler names are registered", () => {

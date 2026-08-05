@@ -15,6 +15,8 @@ import {
   localeForDomain,
   buildModeCard,
   MODE_ACTION_KIND,
+  TICKET_INTAKE_ACTION_KIND,
+  buildTicketIntakeReviewMarkdown,
 } from "./lark-card.js";
 
 // ── sanitizeMarkdownForFeishu ──────────────────────────────────
@@ -458,6 +460,52 @@ describe("feedback buttons", () => {
     const { client, elementUpdateSpy } = makeLarkClient();
     expect(await applyFeedbackSelection(client as any, feedbackValue("CARD-UNKNOWN"), "up")).toBe(false);
     expect(elementUpdateSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("ticket intake cards", () => {
+  it("renders a user-scoped start button and review-only confirm controls", async () => {
+    const { client, elementCreateSpy } = makeLarkClient();
+    await finalizeCard(
+      client as any,
+      { cardId: "CARD-TICKET", elementId: "md_main", sequence: 0 },
+      "answer",
+      undefined,
+      { ctx: { mode: "start", sessionId: "s1", channelId: "c1", requesterExternalId: "ou_1", sourceMessageId: "om_1" }, locale: "zh-CN" },
+    );
+    const [startRow] = JSON.parse(elementCreateSpy.mock.calls[0][0].data.elements);
+    const startValue = startRow.columns[0].elements[0].behaviors[0].value;
+    expect(startValue).toEqual(expect.objectContaining({
+      kind: TICKET_INTAKE_ACTION_KIND, action: "start", session_id: "s1",
+      requester_external_id: "ou_1", source_message_id: "om_1",
+    }));
+
+    elementCreateSpy.mockClear();
+    await finalizeCard(
+      client as any,
+      { cardId: "CARD-REVIEW", elementId: "md_main", sequence: 0 },
+      "review",
+      undefined,
+      { ctx: { mode: "active", intakeId: "i1", revision: 3, requesterExternalId: "ou_1", sourceMessageId: "om_2", reviewable: true }, locale: "zh-CN" },
+    );
+    const [reviewRow] = JSON.parse(elementCreateSpy.mock.calls[0][0].data.elements);
+    expect(reviewRow.columns.map((c: any) => c.elements[0].behaviors[0].value.action)).toEqual(["confirm", "continue", "cancel"]);
+    expect(reviewRow.columns[0].elements[0].behaviors[0].value).toEqual(expect.objectContaining({ intake_id: "i1", revision: 3 }));
+  });
+
+  it("builds a deterministic structured preview without hidden reasoning", () => {
+    const markdown = buildTicketIntakeReviewMarkdown({
+      id: "i1", sessionId: "s1", channelId: "c1", requesterExternalId: "ou_1", sourceMessageId: "om_1",
+      state: "review", revision: 2,
+      draft: {
+        classification: "incident_candidate", summary: "Login fails", product: "Siclaw", category: "Auth",
+        impact: "Tenant A", affected_object: "tenant-a", actual_behavior: "500", expected_behavior: "success",
+        attempted_actions: [], source_refs: [], open_questions: [], ready_for_review: true,
+      },
+    }, "zh-CN");
+    expect(markdown).toContain("工单提交预览");
+    expect(markdown).toContain("Login fails");
+    expect(markdown).not.toMatch(/reasoning|思维链|chain.of.thought/i);
   });
 });
 

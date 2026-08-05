@@ -372,6 +372,26 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_message_feedback_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
   )`,
 
+  // User-started support intake. The Agent may revise draft_json, but only a
+  // requester-authenticated card action can freeze submission_payload.
+  `CREATE TABLE IF NOT EXISTS ticket_intakes (
+    id CHAR(36) PRIMARY KEY,
+    request_key CHAR(64) NOT NULL UNIQUE,
+    session_id CHAR(36) NOT NULL,
+    channel_id VARCHAR(128) NOT NULL,
+    requester_external_id VARCHAR(128) NOT NULL,
+    source_message_id VARCHAR(128) NOT NULL,
+    state VARCHAR(32) NOT NULL DEFAULT 'collecting',
+    draft_json TEXT NOT NULL,
+    revision INT NOT NULL DEFAULT 1,
+    submission_payload TEXT DEFAULT NULL,
+    confirmed_at TIMESTAMP NULL DEFAULT NULL,
+    cancelled_at TIMESTAMP NULL DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_ticket_intakes_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+  )`,
+
   // A2A task projection. This is protocol state for external agent clients,
   // not an AgentBox/pi-agent checkpoint.
   `CREATE TABLE IF NOT EXISTS a2a_tasks (
@@ -568,6 +588,7 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "chat_messages", "idx_chat_messages_delegation", "delegation_id");
   // message_feedback — Metrics aggregates by session.
   await ensureIndex(db, "message_feedback", "idx_message_feedback_session", "session_id, created_at");
+  await ensureIndex(db, "ticket_intakes", "idx_ticket_intakes_active", "session_id, requester_external_id, state, updated_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_trace", "trace_id");
   // a2a_tasks — every A2A query is scoped by (agent_id, api_key_id), so lead the composite
   // indexes with that prefix. #340 already created idx_a2a_tasks_agent/_context (older column

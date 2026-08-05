@@ -28,6 +28,9 @@ import {
   type PersonalApiKeyIssueResult,
   type PersonalApiKeyStatusResult,
   type PersonalAccessDenied,
+  beginTicketIntake,
+  getActiveTicketIntake,
+  transitionTicketIntake,
 } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
 import { sessionRegistry } from "../session-registry.js";
@@ -54,6 +57,10 @@ import {
   type ModeActionValue,
   type GroupContextMode,
   type LarkLocale,
+  TICKET_INTAKE_ACTION_KIND,
+  type TicketIntakeActionValue,
+  type TicketIntakeCardContext,
+  buildTicketIntakeReviewMarkdown,
 } from "./lark-card.js";
 import { collectImageAttachments, stripVisualBlocks, type RenderedReplyImage } from "./visual-image.js";
 import { replyImageToLark } from "./lark-image.js";
@@ -61,6 +68,7 @@ import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
 import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
 import { redactImageUrlsInText } from "../agentbox/image-url-ingest.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
+import { buildTicketIntakeAgentContext, type TicketIntakeRecord } from "../../shared/ticket-intake.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
   "zh-CN": "已生成图片如下。",
@@ -245,6 +253,8 @@ export interface LarkChannelConfig {
   group_channel_id?: string;
   verification_token?: string;
   encrypt_key?: string;
+  /** Opt-in support intake; disabled on existing bots until their agent is configured for it. */
+  ticket_intake_enabled?: boolean;
   personal_bot?: {
     channel_id?: string;
     agent_id: string;
@@ -562,10 +572,14 @@ const FEEDBACK_TOAST_BY_LOCALE: Record<LarkLocale, { ok: string; fail: string }>
   "en-US": { ok: "Feedback recorded — thanks!", fail: "Could not record feedback. Please try again." },
 };
 
+const TICKET_INTAKE_TOAST_BY_LOCALE = {
+  "zh-CN": { start: "已开始整理，请继续发送问题背景。", confirm: "正在确认工单信息。", continue: "请继续发送需要补充或修改的信息。", cancel: "正在取消。", fail: "操作失败，请刷新后重试。", forbidden: "只有发起人可以操作这份工单草稿。" },
+  "en-US": { start: "Intake started. Send more context in chat.", confirm: "Confirming the ticket details.", continue: "Send the details you want to add or change.", cancel: "Cancelling.", fail: "Action failed. Refresh and try again.", forbidden: "Only the requester can operate this ticket draft." },
+} as const;
+
 /**
- * Handle a `card.action.trigger` callback. Only feedback buttons (our
- * FEEDBACK_ACTION_KIND discriminator) are processed; anything else returns
- * undefined so future card actions can add their own handling.
+ * Handle a `card.action.trigger` callback for feedback, group mode, and
+ * user-started ticket intake. Unknown discriminators return undefined.
  *
  * The return value is the card-callback response Feishu shows as a toast.
  * Feishu enforces a hard ~3s budget on that response measured END-TO-END
@@ -601,6 +615,10 @@ export function handleLarkCardAction(
   // toast + detached side-effect shape as feedback (200671 discipline).
   if (value.kind === MODE_ACTION_KIND) {
     return handleModeSwitchAction(value as Partial<ModeActionValue>, data, larkClient, frontendClient);
+  }
+
+  if (value.kind === TICKET_INTAKE_ACTION_KIND) {
+    return handleTicketIntakeAction(value as Partial<TicketIntakeActionValue>, data, larkClient, frontendClient);
   }
 
   if (value.kind !== FEEDBACK_ACTION_KIND) return undefined;
@@ -642,6 +660,69 @@ export function handleLarkCardAction(
   })();
 
   return { toast: { type: "success", content: toasts.ok } };
+}
+
+function handleTicketIntakeAction(
+  value: Partial<TicketIntakeActionValue>,
+  data: any,
+  larkClient: any,
+  frontendClient?: FrontendWsClient,
+): { toast: { type: string; content: string } } {
+  const locale: LarkLocale = value.locale === "en-US" ? "en-US" : "zh-CN";
+  const copy = TICKET_INTAKE_TOAST_BY_LOCALE[locale];
+  const operator = typeof data?.operator?.open_id === "string" ? data.operator.open_id : "";
+  const action = value.action;
+  if (!operator || operator !== value.requester_external_id) {
+    return { toast: { type: "error", content: copy.forbidden } };
+  }
+  if (!action || !["start", "confirm", "continue", "cancel"].includes(action)) {
+    return { toast: { type: "error", content: copy.fail } };
+  }
+  if (action === "start") {
+    if (!value.session_id || !value.channel_id || !value.source_message_id) {
+      return { toast: { type: "error", content: copy.fail } };
+    }
+  } else if (!value.intake_id || !Number.isInteger(value.revision) || Number(value.revision) < 1) {
+    return { toast: { type: "error", content: copy.fail } };
+  }
+
+  void (async () => {
+    try {
+      const sourceMessageId = typeof value.source_message_id === "string" ? value.source_message_id : "";
+      const result = action === "start"
+        ? await beginTicketIntake({
+            sessionId: String(value.session_id ?? ""),
+            channelId: String(value.channel_id ?? ""),
+            requesterExternalId: operator,
+            sourceMessageId: String(value.source_message_id ?? ""),
+          }, frontendClient)
+        : await transitionTicketIntake({
+            intakeId: String(value.intake_id ?? ""),
+            requesterExternalId: operator,
+            revision: Number(value.revision),
+            action,
+          }, frontendClient);
+      if (!result.success) {
+        console.warn(`[lark] Ticket intake ${action} rejected: ${result.error ?? "unknown"}`);
+        if (sourceMessageId) await replyToLark(larkClient, sourceMessageId, copy.fail);
+        return;
+      }
+      if (sourceMessageId) {
+        const notice = action === "confirm"
+          ? (locale === "zh-CN" ? `✅ 工单信息已确认，编号：${result.intake?.id ?? value.intake_id}` : `✅ Ticket details confirmed: ${result.intake?.id ?? value.intake_id}`)
+          : action === "cancel"
+            ? (locale === "zh-CN" ? "已取消这份工单草稿。" : "Ticket draft cancelled.")
+            : action === "continue"
+              ? copy.continue
+              : copy.start;
+        await replyToLark(larkClient, sourceMessageId, notice);
+      }
+    } catch (err) {
+      console.error(`[lark] Ticket intake ${action} failed:`, err);
+    }
+  })();
+
+  return { toast: { type: "success", content: copy[action] } };
 }
 
 /**
@@ -1198,6 +1279,7 @@ export async function handleLarkMessage(
       tlsOptions,
       frontendClient,
       locale,
+      ticketIntakeEnabled: channelConfig?.ticket_intake_enabled === true,
     }));
     if (!queued.accepted) {
       await replyToLark(larkClient, messageId, QUEUE_FULL_NOTICE_BY_LOCALE[locale]);
@@ -1398,6 +1480,7 @@ export async function handleLarkMessage(
     tlsOptions,
     frontendClient,
     locale,
+    ticketIntakeEnabled: channelConfig?.ticket_intake_enabled === true,
   }));
   if (!queued.accepted) {
     await replyToLark(larkClient, messageId, QUEUE_FULL_NOTICE_BY_LOCALE[locale], replyInThread);
@@ -1434,6 +1517,7 @@ interface QueuedLarkMessageContext {
   tlsOptions?: { cert: string; key: string; ca: string };
   frontendClient?: FrontendWsClient;
   locale: "zh-CN" | "en-US";
+  ticketIntakeEnabled?: boolean;
 }
 
 async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<void> {
@@ -1458,6 +1542,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     tlsOptions,
     frontendClient,
     locale,
+    ticketIntakeEnabled = false,
   } = ctx;
 
   if (/^\/new$/i.test(text)) {
@@ -1558,6 +1643,18 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
       replyInThread,
     );
     return;
+  }
+
+  // The intake is opt-in: this query can only find a row created by the
+  // requester's earlier card click. In a shared group it is scoped by both
+  // session and open_id, so two members can collect independent drafts.
+  let activeTicketIntake: TicketIntakeRecord | null = null;
+  if (ticketIntakeEnabled && senderOpenId) {
+    try {
+      activeTicketIntake = await getActiveTicketIntake(sessionId, senderOpenId, frontendClient);
+    } catch (err) {
+      console.warn(`[lark] Failed to load active ticket intake session=${sessionId}:`, err);
+    }
   }
 
   // Open the typing-indicator card FIRST so the user sees immediate feedback.
@@ -1708,8 +1805,11 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
   const sharedContext: SharedGroupContext | undefined = drained
     ? { discussion: drained.lines, truncated: drained.truncated, asker: senderLabel(senderOpenId) }
     : undefined;
+  const agentPromptText = activeTicketIntake
+    ? `${buildChannelTurnPrompt(promptText, sharedContext)}\n\n${buildTicketIntakeAgentContext(activeTicketIntake)}`
+    : buildChannelTurnPrompt(promptText, sharedContext);
   const promptOpts: PromptOptions = {
-    text: buildChannelTurnPrompt(promptText, sharedContext),
+    text: agentPromptText,
     agentId,
     mode: "channel",
     sessionId,
@@ -1738,6 +1838,13 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     resultText = collected.text;
     replyImages = collected.images;
     assistantMessageId = collected.assistantMessageId;
+    if (activeTicketIntake && senderOpenId) {
+      try {
+        activeTicketIntake = await getActiveTicketIntake(sessionId, senderOpenId, frontendClient);
+      } catch (err) {
+        console.warn(`[lark] Failed to refresh ticket intake session=${sessionId}:`, err);
+      }
+    }
   } catch (err) {
     if (isSessionBusyError(err)) {
       // Still busy after the retry window — surface a friendly notice, don't clobber.
@@ -1764,7 +1871,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     || VISUAL_ONLY_NOTICE_BY_LOCALE[locale];
   // The final card is JUST the conclusion — the live step indicator is replaced
   // entirely, no milestone trail is kept on the card.
-  const finalCardBody = buildMilestoneCardMarkdown({ milestones: [], finalText: displayBody });
+  let finalCardBody = buildMilestoneCardMarkdown({ milestones: [], finalText: displayBody });
+  if (!agentError && activeTicketIntake?.state === "review") {
+    finalCardBody += `\n\n${buildTicketIntakeReviewMarkdown(activeTicketIntake, locale)}`;
+  }
 
   // Stop any further coalesced milestone renders and let the in-flight one
   // settle, so finalizeCard isn't overwritten by a later (higher-sequence)
@@ -1777,10 +1887,27 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     // empty-result notice, where a click would write a rating against a
     // non-answer and skew the feedback signal Metrics aggregates.
     const isAnswer = !agentError && resultText.trim().length > 0;
+    const ticketIntakeCard: { ctx: TicketIntakeCardContext; locale: LarkLocale } | undefined =
+      isAnswer && ticketIntakeEnabled && senderOpenId
+        ? activeTicketIntake
+          ? {
+              ctx: {
+                mode: "active", intakeId: activeTicketIntake.id, revision: activeTicketIntake.revision,
+                requesterExternalId: senderOpenId, sourceMessageId: messageId,
+                reviewable: activeTicketIntake.state === "review",
+              },
+              locale,
+            }
+          : {
+              ctx: { mode: "start", sessionId, channelId, requesterExternalId: senderOpenId, sourceMessageId: messageId },
+              locale,
+            }
+        : undefined;
     const { ok, contentOk } = await finalizeCard(larkClient, cardSession, finalCardBody,
       isAnswer && assistantMessageId
         ? { ctx: { sessionId, channelId, messageId: assistantMessageId }, locale }
-        : undefined);
+        : undefined,
+      ticketIntakeCard);
     deliveredTextChars = finalCardBody.length;
     if (!contentOk) {
       // The body never landed (rejected update / oversized answer), so the card
@@ -1796,6 +1923,7 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
         isAnswer && assistantMessageId
           ? { ctx: { sessionId, channelId, messageId: assistantMessageId }, locale }
           : undefined,
+        ticketIntakeCard,
       );
     } else if (!ok) {
       // Content landed, only the streaming-mode flip failed: the answer IS
@@ -2523,8 +2651,9 @@ async function deliverAnswerOutsideCard(
   body: string,
   replyInThread: boolean,
   feedback?: { ctx: FeedbackContext; locale: LarkLocale },
+  ticketIntake?: { ctx: TicketIntakeCardContext; locale: LarkLocale },
 ): Promise<void> {
-  if (await postFinalCard(larkClient, messageId, body, feedback, replyInThread)) return;
+  if (await postFinalCard(larkClient, messageId, body, feedback, replyInThread, ticketIntake)) return;
   console.warn(`[lark] Replacement card failed for messageId=${messageId}; replying as plain text (markdown will not render)`);
   await replyToLark(larkClient, messageId, body, replyInThread);
 }

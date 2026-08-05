@@ -20,7 +20,7 @@ const CHANNEL_TYPES = [
 
 // Per-type config field definitions
 interface ConfigField {
-  key: string; label: string; type: "text" | "password" | "select"; placeholder?: string; required?: boolean
+  key: string; label: string; type: "text" | "password" | "select" | "checkbox"; placeholder?: string; required?: boolean
   options?: { value: string; label: string }[]
 }
 
@@ -34,6 +34,7 @@ const CONFIG_FIELDS: Record<string, ConfigField[]> = {
     { key: "app_secret", label: "App Secret", type: "password", placeholder: "App secret from console", required: true },
     { key: "verification_token", label: "Verification Token", type: "text", placeholder: "Optional" },
     { key: "encrypt_key", label: "Encrypt Key", type: "text", placeholder: "Optional" },
+    { key: "ticket_intake_enabled", label: "Enable user-clicked customer-support ticket intake", type: "checkbox" },
   ],
   dingtalk: [
     { key: "client_id", label: "Client ID (AppKey)", type: "text", placeholder: "dingxxxxxxxxxx", required: true },
@@ -53,7 +54,7 @@ const CONFIG_FIELDS: Record<string, ConfigField[]> = {
 }
 
 function ConfigForm({ type, config, onChange }: {
-  type: string; config: Record<string, string>; onChange: (config: Record<string, string>) => void
+  type: string; config: Record<string, unknown>; onChange: (config: Record<string, unknown>) => void
 }) {
   const fields = CONFIG_FIELDS[type] || []
   if (fields.length === 0) return <p className="text-[11px] text-muted-foreground">No configuration needed for this type.</p>
@@ -67,16 +68,23 @@ function ConfigForm({ type, config, onChange }: {
           </label>
           {f.type === "select" ? (
             <select
-              value={config[f.key] || f.options?.[0]?.value || ""}
+              value={String(config[f.key] || f.options?.[0]?.value || "")}
               onChange={e => onChange({ ...config, [f.key]: e.target.value })}
               className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background"
             >
               {f.options?.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
+          ) : f.type === "checkbox" ? (
+            <input
+              type="checkbox"
+              checked={config[f.key] === true}
+              onChange={e => onChange({ ...config, [f.key]: e.target.checked })}
+              className="h-4 w-4 rounded"
+            />
           ) : (
             <input
               type={f.type}
-              value={config[f.key] || ""}
+              value={String(config[f.key] || "")}
               onChange={e => onChange({ ...config, [f.key]: e.target.value })}
               placeholder={f.placeholder}
               className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background"
@@ -94,10 +102,10 @@ export function Channels() {
   const [showCreate, setShowCreate] = useState(false)
   const [formName, setFormName] = useState("")
   const [formType, setFormType] = useState("lark")
-  const [formConfig, setFormConfig] = useState<Record<string, string>>({})
+  const [formConfig, setFormConfig] = useState<Record<string, unknown>>({})
   const [creating, setCreating] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [editConfig, setEditConfig] = useState<Record<string, string>>({})
+  const [editConfig, setEditConfig] = useState<Record<string, unknown>>({})
   const [editName, setEditName] = useState("")
   const [saving, setSaving] = useState(false)
   const toast = useToast()
@@ -138,7 +146,7 @@ export function Channels() {
   const startEdit = async (ch: Channel) => {
     try {
       const full = await api<Channel>(`/channels/${ch.id}`)
-      const cfg = (typeof full.config === "string" ? JSON.parse(full.config as unknown as string) : full.config) as Record<string, string>
+      const cfg = (typeof full.config === "string" ? JSON.parse(full.config as unknown as string) : full.config) as Record<string, unknown>
       setEditingId(ch.id)
       setEditName(ch.name)
       setEditConfig(cfg)

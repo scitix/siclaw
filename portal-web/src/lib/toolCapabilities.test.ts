@@ -9,7 +9,7 @@ const KNOWN_KEYS = CAPABILITY_GROUPS.map((g) => g.key)
 
 describe("CAPABILITY_GROUPS shape", () => {
   it("declares exactly the 11 designed groups", () => {
-    expect(CAPABILITY_GROUPS).toHaveLength(11)
+    expect(CAPABILITY_GROUPS).toHaveLength(12)
     expect([...KNOWN_KEYS].sort()).toEqual([
       "delegate_agents",
       "inspect_infra",
@@ -21,6 +21,7 @@ describe("CAPABILITY_GROUPS shape", () => {
       "search_memory",
       "session_output",
       "spawn_subagents",
+      "ticket_intake",
       "write_sandbox",
     ])
   })

@@ -26,6 +26,9 @@
  *    the platform can order updates; we increment inside `CardSession`.
  */
 
+import { TICKET_INTAKE_ACTION_KIND, type TicketIntakeRecord } from "../../shared/ticket-intake.js";
+export { TICKET_INTAKE_ACTION_KIND } from "../../shared/ticket-intake.js";
+
 /**
  * Locale-aware placeholder + notice strings. "feishu" maps to zh-CN (the
  * domestic Feishu install base is predominantly Chinese-speaking); "lark"
@@ -186,6 +189,104 @@ function buildFeedbackRow(
       { tag: "column", width: "auto", elements: [button("down")] },
     ],
   };
+}
+
+export type TicketIntakeCardContext =
+  | { mode: "start"; sessionId: string; channelId: string; requesterExternalId: string; sourceMessageId: string }
+  | { mode: "active"; intakeId: string; revision: number; requesterExternalId: string; sourceMessageId: string; reviewable: boolean };
+
+export interface TicketIntakeActionValue {
+  kind: typeof TICKET_INTAKE_ACTION_KIND;
+  action: "start" | "confirm" | "continue" | "cancel";
+  locale: LarkLocale;
+  session_id?: string;
+  channel_id?: string;
+  requester_external_id: string;
+  source_message_id?: string;
+  intake_id?: string;
+  revision?: number;
+}
+
+function buildTicketIntakeRow(ctx: TicketIntakeCardContext, locale: LarkLocale): Record<string, unknown> {
+  const labels = locale === "zh-CN"
+    ? { start: "整理为工单", confirm: "确认提交", continue: "继续补充", cancel: "取消" }
+    : { start: "Prepare ticket", confirm: "Confirm", continue: "Add details", cancel: "Cancel" };
+  const button = (action: TicketIntakeActionValue["action"], type: "primary" | "default" = "default") => {
+    const value: TicketIntakeActionValue = ctx.mode === "start"
+      ? {
+          kind: TICKET_INTAKE_ACTION_KIND, action, locale,
+          session_id: ctx.sessionId, channel_id: ctx.channelId,
+          requester_external_id: ctx.requesterExternalId, source_message_id: ctx.sourceMessageId,
+        }
+      : {
+          kind: TICKET_INTAKE_ACTION_KIND, action, locale,
+          intake_id: ctx.intakeId, revision: ctx.revision,
+          requester_external_id: ctx.requesterExternalId, source_message_id: ctx.sourceMessageId,
+        };
+    return {
+      tag: "button",
+      element_id: `ticket_intake_${action}`,
+      text: { tag: "plain_text", content: labels[action] },
+      type,
+      behaviors: [{ type: "callback", value }],
+    };
+  };
+  const actions: Array<[TicketIntakeActionValue["action"], "primary" | "default"]> = ctx.mode === "start"
+    ? [["start", "default"]]
+    : [
+        ...(ctx.reviewable ? [["confirm", "primary"]] as Array<[TicketIntakeActionValue["action"], "primary" | "default"]> : []),
+        ["continue", "default"], ["cancel", "default"],
+      ];
+  return {
+    tag: "column_set",
+    element_id: "ticket_intake_actions",
+    columns: actions.map(([action, type]) => ({ tag: "column", width: "auto", elements: [button(action, type)] })),
+  };
+}
+
+async function appendTicketIntakeRow(
+  larkClient: any,
+  session: CardSession,
+  ctx: TicketIntakeCardContext,
+  locale: LarkLocale,
+): Promise<void> {
+  try {
+    const res = await larkClient.cardkit.v1.cardElement.create({
+      path: { card_id: session.cardId },
+      data: { type: "append", sequence: ++session.sequence, elements: JSON.stringify([buildTicketIntakeRow(ctx, locale)]) },
+    });
+    if (cardApiFailed(res)) console.warn(`[lark-card] appending ticket intake buttons rejected for cardId=${session.cardId}: ${describeCardApiError(res)}`);
+  } catch (err) {
+    console.warn(`[lark-card] appending ticket intake buttons failed for cardId=${session.cardId}:`, err);
+  }
+}
+
+export function buildTicketIntakeReviewMarkdown(record: TicketIntakeRecord, locale: LarkLocale): string {
+  const d = record.draft;
+  const rows = locale === "zh-CN"
+    ? [
+        "## 工单提交预览",
+        `- **摘要**：${d.summary || "待补充"}`,
+        `- **分类**：${d.classification}`,
+        `- **产品/模块**：${[d.product, d.category].filter(Boolean).join(" / ") || "待补充"}`,
+        `- **影响**：${d.impact || "待补充"}`,
+        `- **影响对象**：${d.affected_object || "待补充"}`,
+        `- **实际情况**：${d.actual_behavior || "待补充"}`,
+        `- **期望情况**：${d.expected_behavior || "待补充"}`,
+        "\n请核对后点击“确认提交”；需要修改可点击“继续补充”。",
+      ]
+    : [
+        "## Ticket submission preview",
+        `- **Summary**: ${d.summary || "Missing"}`,
+        `- **Classification**: ${d.classification}`,
+        `- **Product/category**: ${[d.product, d.category].filter(Boolean).join(" / ") || "Missing"}`,
+        `- **Impact**: ${d.impact || "Missing"}`,
+        `- **Affected object**: ${d.affected_object || "Missing"}`,
+        `- **Actual**: ${d.actual_behavior || "Missing"}`,
+        `- **Expected**: ${d.expected_behavior || "Missing"}`,
+        "\nReview the draft, then confirm or add more details.",
+      ];
+  return rows.join("\n");
 }
 
 // Cards whose feedback row we can still edit (sequence must keep increasing
@@ -597,6 +698,7 @@ export async function postFinalCard(
   finalText: string,
   feedback?: { ctx: FeedbackContext; locale: LarkLocale },
   replyInThread: boolean = false,
+  ticketIntake?: { ctx: TicketIntakeCardContext; locale: LarkLocale },
 ): Promise<boolean> {
   const sanitized = sanitizeMarkdownForFeishu(finalText);
   try {
@@ -623,13 +725,17 @@ export async function postFinalCard(
       return false;
     }
     // Safe here in a way it is not on a streaming card: this one is static.
+    const staticSession: CardSession = { cardId, elementId: MD_ELEMENT_ID, sequence: 0 };
     if (feedback) {
       await appendFeedbackRow(
         larkClient,
-        { cardId, elementId: MD_ELEMENT_ID, sequence: 0 },
+        staticSession,
         feedback.ctx,
         feedback.locale,
       );
+    }
+    if (ticketIntake) {
+      await appendTicketIntakeRow(larkClient, staticSession, ticketIntake.ctx, ticketIntake.locale);
     }
     return true;
   } catch (err) {
@@ -740,6 +846,7 @@ export async function finalizeCard(
   session: CardSession,
   finalText: string,
   feedback?: { ctx: FeedbackContext; locale: LarkLocale },
+  ticketIntake?: { ctx: TicketIntakeCardContext; locale: LarkLocale },
 ): Promise<CardFinalizeResult> {
   const sanitized = sanitizeMarkdownForFeishu(finalText);
   let contentOk = false;
@@ -782,6 +889,9 @@ export async function finalizeCard(
   // (content + settings) off the extra round-trip.
   if (feedback && contentOk && settingsOk) {
     await appendFeedbackRow(larkClient, session, feedback.ctx, feedback.locale);
+  }
+  if (ticketIntake && contentOk && settingsOk) {
+    await appendTicketIntakeRow(larkClient, session, ticketIntake.ctx, ticketIntake.locale);
   }
 
   return { ok: contentOk && settingsOk, contentOk };

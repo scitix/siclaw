@@ -34,6 +34,7 @@ import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
 import { registration as skillPreview } from "./workflow/skill-preview.js";
 import { registration as channelUpdate } from "./workflow/channel-update.js";
+import { registration as ticketIntakeDraft } from "./workflow/ticket-intake-draft.js";
 import { registration as reportFindings } from "./workflow/report-findings.js";
 import { registration as requestInput } from "./workflow/request-input.js";
 import { registration as delegateToAgent } from "./workflow/delegate-to-agent.js";
@@ -55,7 +56,7 @@ export const allToolEntries: ToolEntry[] = [
   memorySearch, memoryGet,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
-  channelUpdate, reportFindings, requestInput,
+  channelUpdate, ticketIntakeDraft, reportFindings, requestInput,
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
   spawnSubagent, jobStop, taskOutput,
   delegateToAgent, listDelegates,

@@ -134,6 +134,7 @@ export interface CreateSiclawSessionOpts {
   taskOutputReader?: import("./tool-registry.js").TaskOutputReader;
   /** Runtime bridge for explicit IM-channel visible updates. Injected by agentbox. */
   channelMessageExecutor?: import("./tool-registry.js").ChannelMessageExecutor;
+  ticketIntakeDraftExecutor?: import("./tool-registry.js").TicketIntakeDraftExecutor;
 }
 
 export interface SiclawSessionResult {
@@ -437,6 +438,7 @@ export async function createSiclawSession(
       backgroundExecExecutor: opts?.backgroundExecExecutor,
       taskOutputReader: opts?.taskOutputReader,
       channelMessageExecutor: opts?.channelMessageExecutor,
+      ticketIntakeDraftExecutor: opts?.ticketIntakeDraftExecutor,
       delegation: opts?.delegation,
       delegationRoster: opts?.delegationRoster,
       delegateToAgentExecutor: opts?.delegateToAgentExecutor,

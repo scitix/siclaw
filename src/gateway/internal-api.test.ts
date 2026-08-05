@@ -662,6 +662,44 @@ describe("handleDelegationEvents", () => {
     expect(delivered).toHaveLength(0);
     expect(frontend.calls).toHaveLength(0);
   });
+
+  it("forwards ticket draft updates to Portal after enforcing session and agent ownership", async () => {
+    sessionRegistry.remember("ticket-session", "user-1", "agent-1");
+    frontend.responses.set("channel.updateTicketIntakeDraft", { success: true });
+    const res = new FakeRes();
+    const draft = {
+      classification: "incident_candidate", summary: "Login fails", impact: "Tenant A",
+      actual_behavior: "500", expected_behavior: "success", attempted_actions: [], source_refs: [],
+      open_questions: [], ready_for_review: true,
+    };
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "channel.ticket_intake_draft",
+        intake: { sessionId: "ticket-session", intakeId: "intake-1", expectedRevision: 2, draft, fromAgentId: "agent-1" },
+      }))),
+      asRes(res), identity, frontend as unknown as FrontendWsClient,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+    expect(frontend.calls[0]).toEqual({
+      method: "channel.updateTicketIntakeDraft",
+      params: { session_id: "ticket-session", intake_id: "intake-1", expected_revision: 2, draft },
+    });
+  });
+
+  it("rejects ticket draft updates from another agent identity", async () => {
+    sessionRegistry.remember("ticket-session", "user-1", "agent-1");
+    const res = new FakeRes();
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "channel.ticket_intake_draft",
+        intake: { sessionId: "ticket-session", intakeId: "intake-1", expectedRevision: 1, draft: {}, fromAgentId: "agent-2" },
+      }))),
+      asRes(res), identity, frontend as unknown as FrontendWsClient,
+    );
+    expect(res.statusCode).toBe(403);
+    expect(frontend.calls).toHaveLength(0);
+  });
 });
 
 // ── handleMetricsFlush (module 5) ─────────────────────────

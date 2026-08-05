@@ -37,6 +37,7 @@ export const CAPABILITY_GROUPS: Record<string, string[]> = {
   delegate_agents: ["delegate_to_agent", "list_delegates"],   // delegate a bounded task to a peer agent (roster-gated) + inspect delegate coverage; distinct from spawn
   scheduling:      ["manage_schedule"],
   session_output:  ["task_report", "save_feedback", "channel_update", "report_findings", "request_input"],   // IM-channel-visible updates + delegation result artifact + clarification request
+  ticket_intake:   ["ticket_intake_draft"],
 };
 
 /**

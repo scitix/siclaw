@@ -25,6 +25,7 @@ import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-s
 import { safeParseSkillFiles } from "../shared/skill-package.js";
 import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
 import { resolveAgentModelRouting } from "./model-routing-config.js";
+import { beginTicketIntake, getActiveTicketIntake, transitionTicketIntake, updateTicketIntakeDraft } from "./ticket-intake-store.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
   const token = req.headers["x-auth-token"] as string | undefined;
@@ -3197,6 +3198,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const db = getDb();
     return updateChannelBindingContextMode(db, params.channel_id, params.route_key, params.mode);
   });
+
+  handlers.set("channel.beginTicketIntake", async (params) => beginTicketIntake(getDb(), params));
+  handlers.set("channel.getActiveTicketIntake", async (params) => getActiveTicketIntake(getDb(), params));
+  handlers.set("channel.updateTicketIntakeDraft", async (params) => updateTicketIntakeDraft(getDb(), params));
+  handlers.set("channel.transitionTicketIntake", async (params) => transitionTicketIntake(getDb(), params));
 
   handlers.set("channel.resolvePersonalBinding", async (params) => {
     const db = getDb();

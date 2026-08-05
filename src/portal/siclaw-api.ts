@@ -2829,6 +2829,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         app_id: row.config.app_id ?? "",
         access_mode: "open",
         group_auto_bind: row.config.personal_bot?.group_auto_bind !== false,
+        ticket_intake_enabled: row.config.ticket_intake_enabled === true,
         status: row.status,
       },
     });
@@ -2840,7 +2841,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
 
     const body = await parseBody<{
-      domain?: string; app_id?: string; app_secret?: string; group_auto_bind?: boolean;
+      domain?: string; app_id?: string; app_secret?: string; group_auto_bind?: boolean; ticket_intake_enabled?: boolean;
     }>(req);
     const appId = typeof body.app_id === "string" ? body.app_id.trim() : "";
     if (!appId) { sendJson(res, 400, { error: "app_id is required" }); return; }
@@ -2868,6 +2869,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       domain: body.domain === "lark" ? "lark" : "feishu",
       app_id: appId,
       app_secret: effectiveSecret,
+      ticket_intake_enabled: body.ticket_intake_enabled === true,
       personal_bot: {
         ...(existing?.config.personal_bot ?? {}),
         agent_id: params.id,

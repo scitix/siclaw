@@ -1019,6 +1019,7 @@ interface PersonalBotInfo {
   app_id: string
   access_mode: string
   group_auto_bind: boolean
+  ticket_intake_enabled: boolean
   status: string
 }
 
@@ -1038,7 +1039,7 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
   // Collapsed to a summary line once active; only admins can edit.
   const [bot, setBot] = useState<PersonalBotInfo | null>(null)
   const [botExpanded, setBotExpanded] = useState(false)
-  const [botForm, setBotForm] = useState({ domain: "feishu", app_id: "", app_secret: "", group_auto_bind: true })
+  const [botForm, setBotForm] = useState({ domain: "feishu", app_id: "", app_secret: "", group_auto_bind: true, ticket_intake_enabled: false })
   const [savingBot, setSavingBot] = useState(false)
 
   const applyBot = (b: PersonalBotInfo | null) => {
@@ -1048,6 +1049,7 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
       app_id: b?.app_id ?? "",
       app_secret: "",
       group_auto_bind: b ? b.group_auto_bind : true,
+      ticket_intake_enabled: b?.ticket_intake_enabled === true,
     })
     setBotExpanded(!(b && b.status === "active"))
   }
@@ -1085,6 +1087,7 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
           app_id: botForm.app_id,
           app_secret: botForm.app_secret,
           group_auto_bind: botForm.group_auto_bind,
+          ticket_intake_enabled: botForm.ticket_intake_enabled,
         },
       })
       toast.success("Bot saved and enabled")
@@ -1188,6 +1191,13 @@ function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
               <label className="flex items-center gap-2 text-[12px] cursor-pointer">
                 <input type="checkbox" checked={botForm.group_auto_bind} onChange={e => setBotForm(p => ({ ...p, group_auto_bind: e.target.checked }))} className="rounded" />
                 <span>Auto-serve groups — just add the bot to a group and it works, no pairing. When off, it serves direct messages only.</span>
+              </label>
+              <label className="flex items-start gap-2 text-[12px] cursor-pointer">
+                <input type="checkbox" checked={botForm.ticket_intake_enabled} onChange={e => setBotForm(p => ({ ...p, ticket_intake_enabled: e.target.checked }))} className="mt-0.5 rounded" />
+                <span>
+                  Enable customer-support ticket intake — adds user-clicked prepare/review/confirm cards.
+                  Configure this agent with the <code>ticket_intake</code> capability and without infrastructure execution capabilities first.
+                </span>
               </label>
               <div className="flex items-center gap-2">
                 <button onClick={handleSaveBot} disabled={savingBot || !botForm.app_id} className="h-8 px-4 text-[12px] rounded-md bg-primary text-primary-foreground disabled:opacity-50">

@@ -43,6 +43,9 @@ const updateBindingMetaMock = vi.fn();
 const setChannelContextModeMock = vi.fn();
 const issuePersonalApiKeyMock = vi.fn();
 const getPersonalApiKeyStatusMock = vi.fn();
+const beginTicketIntakeMock = vi.fn();
+const getActiveTicketIntakeMock = vi.fn();
+const transitionTicketIntakeMock = vi.fn();
 
 vi.mock("../channel-manager.js", () => ({
   resolveBinding: (...args: unknown[]) => resolveBindingMock(...args),
@@ -53,6 +56,9 @@ vi.mock("../channel-manager.js", () => ({
   resetPersonalSession: (...args: unknown[]) => resetPersonalSessionMock(...args),
   issuePersonalApiKey: (...args: unknown[]) => issuePersonalApiKeyMock(...args),
   getPersonalApiKeyStatus: (...args: unknown[]) => getPersonalApiKeyStatusMock(...args),
+  beginTicketIntake: (...args: unknown[]) => beginTicketIntakeMock(...args),
+  getActiveTicketIntake: (...args: unknown[]) => getActiveTicketIntakeMock(...args),
+  transitionTicketIntake: (...args: unknown[]) => transitionTicketIntakeMock(...args),
   updateBindingMeta: (...args: unknown[]) => updateBindingMetaMock(...args),
   setChannelContextMode: (...args: unknown[]) => setChannelContextModeMock(...args),
   isChannelAccessDenied: (v: unknown) =>
@@ -216,6 +222,10 @@ beforeEach(() => {
   resetPersonalSessionMock.mockReset();
   issuePersonalApiKeyMock.mockReset();
   getPersonalApiKeyStatusMock.mockReset();
+  beginTicketIntakeMock.mockReset();
+  getActiveTicketIntakeMock.mockReset();
+  transitionTicketIntakeMock.mockReset();
+  getActiveTicketIntakeMock.mockResolvedValue(null);
   resolveAgentModelBindingMock.mockReset();
   ensureChatSessionMock.mockReset();
   appendMessageMock.mockReset();
@@ -1407,6 +1417,41 @@ describe("handleLarkCardAction — /mode context switch", () => {
   });
 });
 
+describe("handleLarkCardAction — ticket intake", () => {
+  const flush = () => new Promise((r) => setImmediate(r));
+  function action(value: Record<string, unknown>, operator = "ou_requester") {
+    return { operator: { open_id: operator }, action: { tag: "button", value: { kind: "siclaw_ticket_intake", locale: "zh-CN", requester_external_id: "ou_requester", ...value } } };
+  }
+
+  it("starts only from an explicit requester click and returns before persistence", async () => {
+    beginTicketIntakeMock.mockResolvedValue({ success: true, intake: { id: "i1" } });
+    const lark = makeLarkClient();
+    const result = handleLarkCardAction(action({ action: "start", session_id: "s1", channel_id: "c1", source_message_id: "om1" }), lark, {} as any);
+    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("开始") } });
+    await flush();
+    expect(beginTicketIntakeMock).toHaveBeenCalledWith({
+      sessionId: "s1", channelId: "c1", requesterExternalId: "ou_requester", sourceMessageId: "om1",
+    }, expect.anything());
+  });
+
+  it("rejects another group member before any transition RPC", async () => {
+    const result = handleLarkCardAction(action({ action: "confirm", intake_id: "i1", revision: 2 }, "ou_other"), makeLarkClient(), {} as any);
+    expect(result).toEqual({ toast: { type: "error", content: expect.stringContaining("发起人") } });
+    await flush();
+    expect(transitionTicketIntakeMock).not.toHaveBeenCalled();
+  });
+
+  it("confirms by opaque id and optimistic revision, never from an agent callback", async () => {
+    transitionTicketIntakeMock.mockResolvedValue({ success: true, intake: { id: "i1" }, payload: { schema_version: "siclaw.ticket_intake.v1" } });
+    const result = handleLarkCardAction(action({ action: "confirm", intake_id: "i1", revision: 7, source_message_id: "om1" }), makeLarkClient(), {} as any);
+    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("确认") } });
+    await flush();
+    expect(transitionTicketIntakeMock).toHaveBeenCalledWith({
+      intakeId: "i1", requesterExternalId: "ou_requester", revision: 7, action: "confirm",
+    }, expect.anything());
+  });
+});
+
 describe("handleLarkMessage — group @-mention gating (@所有人 bug)", () => {
   const BOT = "ou_bot_self";
 
@@ -1968,6 +2013,29 @@ describe("handleLarkMessage — streaming card flow", () => {
     };
   }
 
+  it("injects the persisted intake contract only after the requester clicked start", async () => {
+    resolveBindingMock.mockResolvedValue(makeBinding());
+    getActiveTicketIntakeMock.mockResolvedValue({
+      id: "intake-1", sessionId: "session-fixed", channelId: "lark",
+      requesterExternalId: "ou_user_1", sourceMessageId: "om-start", state: "collecting", revision: 4,
+      draft: { classification: "needs_clarification", summary: "Login issue", attempted_actions: [], source_refs: [], open_questions: ["impact"], ready_for_review: false },
+    });
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "请补充影响范围" }] } };
+    });
+    await handleLarkMessage(
+      makeTextEvent("登录失败"), makeCardAwareLarkClient(), "lark", makeAgentBoxManager("a1") as any,
+      undefined, {} as any, "zh-CN", { app_id: "app", app_secret: "secret", ticket_intake_enabled: true },
+    );
+    const sent = promptMock.mock.calls[0][0].text as string;
+    expect(sent).toContain("<siclaw_ticket_intake>");
+    expect(sent).toContain('"id":"intake-1"');
+    expect(sent).toContain('"revision":4');
+    expect(sent).toContain("Do not inspect or operate clusters");
+    expect(sent).toContain("The tool cannot confirm");
+  });
+
   it("opens typing card before agent runs, then finalizes with the final assistant text", async () => {
     resolveBindingMock.mockResolvedValue(makeBinding());
     promptMock.mockResolvedValue({ sessionId: "s-int" });
@@ -2072,7 +2140,8 @@ describe("handleLarkMessage — streaming card flow", () => {
     );
 
     expect(lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content).toContain("answer still delivered");
-    expect(lark.cardkit.v1.cardElement.create).not.toHaveBeenCalled();
+    const appendedRows = lark.cardkit.v1.cardElement.create.mock.calls.flatMap((call) => JSON.parse(call[0].data.elements));
+    expect(appendedRows).not.toEqual(expect.arrayContaining([expect.objectContaining({ element_id: "fb_row" })]));
   });
 
   it("updates the Lark card when a background channel report arrives after the first SSE turn", async () => {

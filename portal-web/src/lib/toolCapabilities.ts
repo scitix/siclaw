@@ -29,6 +29,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
   { key: "delegate_agents", name: "Delegate to agents", description: "Delegate a bounded task to a peer agent (roster-gated) + inspect delegate coverage", tools: ["delegate_to_agent", "list_delegates"] },
   { key: "scheduling", name: "Scheduling", description: "Manage scheduled / recurring runs", tools: ["manage_schedule"] },
   { key: "session_output", name: "Session output", description: "Report findings, post channel updates & submit feedback", tools: ["task_report", "save_feedback", "channel_update", "report_findings", "request_input"] },
+  { key: "ticket_intake", name: "Ticket intake", description: "Update user-started support ticket drafts; confirmation remains user-controlled", tools: ["ticket_intake_draft"] },
 ]
 
 /** Total distinct tools across the selected group keys (for the UI summary). */

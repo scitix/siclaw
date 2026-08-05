@@ -247,6 +247,17 @@ export interface ChannelMessageResult {
 
 export type ChannelMessageExecutor = (request: ChannelMessageRequest) => Promise<ChannelMessageResult>;
 
+export interface TicketIntakeDraftRequest {
+  sessionId: string;
+  intakeId: string;
+  expectedRevision: number;
+  draft: import("../shared/ticket-intake.js").TicketIntakeDraft;
+}
+
+export type TicketIntakeDraftExecutor = (
+  request: TicketIntakeDraftRequest,
+) => Promise<{ accepted: boolean; message: string }>;
+
 // ── background exec (run_in_background on bash / node_exec / pod_exec) ──────
 
 /**
@@ -434,6 +445,8 @@ export interface ToolRefs {
   taskOutputReader?: TaskOutputReader;
   /** Sends an agent-selected visible update to the active IM channel; Gateway owns delivery policy. */
   channelMessageExecutor?: ChannelMessageExecutor;
+  /** Updates the current user-started ticket draft. It can never confirm or submit it. */
+  ticketIntakeDraftExecutor?: TicketIntakeDraftExecutor;
   /**
    * Present when this turn was delegated by a coordinator agent to a peer,
    * siclaw-native via the gateway's internal delegate API. Its presence marks a

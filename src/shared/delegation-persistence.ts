@@ -2,6 +2,7 @@
 // and tool-registry does not import shared → no cycle). Keeps the group item-status snapshot
 // precisely typed on the wire.
 import type { GroupItemStatus } from "../core/tool-registry.js";
+import type { TicketIntakeDraft } from "./ticket-intake.js";
 
 export interface DelegationLineagePayload {
   parentSessionId?: string | null;
@@ -85,6 +86,14 @@ export interface ChannelDeliverMessagePayload {
   fromAgentId?: string | null;
 }
 
+export interface ChannelTicketIntakeDraftPayload {
+  sessionId: string;
+  intakeId: string;
+  expectedRevision: number;
+  draft: TicketIntakeDraft;
+  fromAgentId?: string | null;
+}
+
 export type DelegationPersistenceEvent =
   | {
       type: "delegation.ensure_session";
@@ -101,7 +110,8 @@ export type DelegationPersistenceEvent =
   | { type: "delegation.update_tool_message"; message: DelegationToolUpdatePayload }
   | { type: "delegation.append_event"; event: DelegationEventPayload }
   | { type: "delegation.emit_chat_event"; sessionId: string; event: Record<string, unknown> }
-  | { type: "channel.deliver_message"; message: ChannelDeliverMessagePayload };
+  | { type: "channel.deliver_message"; message: ChannelDeliverMessagePayload }
+  | { type: "channel.ticket_intake_draft"; intake: ChannelTicketIntakeDraftPayload };
 
 export interface DelegationPersistenceResponse {
   ok: boolean;

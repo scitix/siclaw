@@ -126,6 +126,7 @@ describe("agent personal-bot routes", () => {
         app_id: "cli_xxx",
         access_mode: "open",
         group_auto_bind: true,
+        ticket_intake_enabled: false,
         status: "active",
       });
       expect(JSON.stringify(body)).not.toContain("s3cret");
@@ -172,7 +173,7 @@ describe("agent personal-bot routes", () => {
       const { status } = await runRoute(router, fakeReq({
         url: "/api/v1/siclaw/agents/agent-1/personal-bot", method: "PUT",
         headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
-        body: { app_id: "cli_new", app_secret: "sec", domain: "feishu", group_auto_bind: false },
+        body: { app_id: "cli_new", app_secret: "sec", domain: "feishu", group_auto_bind: false, ticket_intake_enabled: true },
       }));
       expect(status).toBe(200);
       const insert = query.mock.calls[2];
@@ -180,6 +181,7 @@ describe("agent personal-bot routes", () => {
       const cfg = JSON.parse(insert[1][2]);
       expect(cfg.app_id).toBe("cli_new");
       expect(cfg.app_secret).toBe("sec");
+      expect(cfg.ticket_intake_enabled).toBe(true);
       expect(cfg.personal_bot).toEqual({
         agent_id: "agent-1",
         access_mode: "open",

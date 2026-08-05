@@ -1240,6 +1240,30 @@ export class AgentBoxSessionManager {
     };
   }
 
+  private createTicketIntakeDraftExecutor(): import("../core/tool-registry.js").TicketIntakeDraftExecutor {
+    return async (request) => {
+      if (!(this.gatewayClient && this.agentId)) {
+        return { accepted: false, message: "Ticket intake is unavailable in this AgentBox." };
+      }
+      const response = await this.persistDelegationEvent({
+        type: "channel.ticket_intake_draft",
+        intake: {
+          sessionId: request.sessionId,
+          intakeId: request.intakeId,
+          expectedRevision: request.expectedRevision,
+          draft: request.draft,
+          fromAgentId: this.agentId,
+        },
+      });
+      return {
+        accepted: response.ok,
+        message: response.ok
+          ? "Ticket draft saved. The user must confirm it from the Feishu review card."
+          : "No active user-started ticket intake accepted this draft.",
+      };
+    };
+  }
+
   /**
    * Stop ALL running background jobs (background exec + background sub-agents) of a session.
    * Called from the /abort handler so the user's "Stop" button halts everything the session is
@@ -2683,6 +2707,7 @@ export class AgentBoxSessionManager {
       backgroundExecExecutor: this.createBackgroundExecExecutor(),
       taskOutputReader: this.createTaskOutputReader(),
       channelMessageExecutor: this.createChannelMessageExecutor(),
+      ticketIntakeDraftExecutor: this.createTicketIntakeDraftExecutor(),
     });
 
     // Populate sessionIdRef so skill_call events can associate with this session
