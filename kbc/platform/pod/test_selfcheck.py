@@ -71,12 +71,14 @@ sources:
   - resource: ./bundle/a.md
   - resource: region/us-east.1
   - resource: raw/live.md
+  - resource: ./live.md
+  - resource: raw//live.md
   - resource: legacy.md
 ---
 x
 """
     src, _, has = selfcheck.parse_okf_sources(external, {"live.md", "legacy.md"})
-    assert has and src == ["live.md", "legacy.md"], src
+    assert has and src == ["live.md", "live.md", "live.md", "legacy.md"], src
     print("OK  parse_okf_sources (mapping resources / raw-prefix / derived / empty)")
 
 
@@ -236,11 +238,40 @@ def test_stamp_siclaw_generated_metadata():
         assert "verified" not in new, new
 
 
+def test_frontmatter_delimiters_and_stamp_preserve_yaml_scalar_and_comments():
+    text = ("---\n"
+            "type: Topic\n"
+            "note: |\n"
+            "  alpha\n"
+            "  ---\n"
+            "  omega\n"
+            "generated:\n"
+            "  by: human:old\n"
+            "# Keep this owner comment.\n"
+            "x.vendor-field: kept\n"
+            "---\n"
+            "Body\n")
+    fm, body, error = selfcheck.parse_okf_frontmatter(text)
+    assert not error and fm["note"] == "alpha\n---\nomega\n", (fm, error)
+    assert body == "Body"
+    rewritten = selfcheck.siclaw_generated_metadata_text(
+        "topic.md", text, now=datetime(2026, 8, 5, tzinfo=timezone.utc))
+    assert rewritten is not None
+    assert "  ---\n  omega\n" in rewritten, rewritten
+    assert "# Keep this owner comment.\n" in rewritten, rewritten
+    stamped, _, error = selfcheck.parse_okf_frontmatter(rewritten)
+    assert not error and stamped["note"] == fm["note"], (stamped, error)
+    assert stamped["x.vendor-field"] == "kept"
+    assert stamped["generated"]["by"] == "process:siclaw-kbc"
+
+
 def test_stamp_siclaw_generated_metadata_fails_atomically_when_lossless_edit_is_unsafe():
     cases = {
         "flow.md": "---\n{type: Topic, generated: {by: human:old}}\n---\nBody\n",
         "alias.md": "---\ntype: Topic\ngenerated: &receipt\n  by: human:old\n"
                     "x.vendor-field: *receipt\n---\nBody\n",
+        "key-alias.md": "---\ntype: Topic\n&machine generated:\n  by: human:old\n"
+                        "x.vendor-field:\n  *machine: kept\n---\nBody\n",
     }
     for rel, text in cases.items():
         with tempfile.TemporaryDirectory() as td:
@@ -2391,6 +2422,7 @@ def main():
     test_okf_v02_conformance()
     test_okf_import_profile()
     test_stamp_siclaw_generated_metadata()
+    test_frontmatter_delimiters_and_stamp_preserve_yaml_scalar_and_comments()
     test_stamp_siclaw_generated_metadata_fails_atomically_when_lossless_edit_is_unsafe()
     test_markdown_code_is_not_a_link()
     test_emit_ignores_links_in_code()

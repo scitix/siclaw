@@ -6028,6 +6028,48 @@ async def test_workspace_sync_invalidates_verification_before_cross_process_resu
     print("✓ workspace sync invalidates old verified before cross-process resume")
 
 
+async def test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust():
+    """Unsafe YAML is a repair finding, not a retry poison or trust leak."""
+    class ResultMessage:
+        pass
+
+    with tempfile.TemporaryDirectory() as td:
+        candidate = Path(td) / "candidate"
+        candidate.mkdir()
+        page = candidate / "topic.md"
+        page.write_text(
+            "---\n{type: Topic, verified: {by: 'human:r', "
+            "at: '2026-08-04T00:00:00Z'}}\n---\nOld\n", "utf-8")
+        run = compile_box.CompileRun("blocked-stamp", td, 1)
+        sent = compile_box._workspace_sync_cursor(td)
+        run._suppress_turn_done = True
+        run._begin_turn("batch")
+        page.write_text(page.read_text("utf-8").replace("Old", "New"), "utf-8")
+
+        # ResultMessage must finish normally instead of poisoning every batch
+        # rebuild. The changed page is withheld from durability sync.
+        await compile_box._emit_message(run, ResultMessage())
+        assert "topic.md" in run._provenance_stamp_failures
+        assert await compile_box._sync_workspace(run, sent) == 0
+        assert not _drain(run), "blocked page must emit neither stale bytes nor a tombstone"
+
+        # A later repair normalizes the YAML. The same ResultMessage seam stamps
+        # it, clears the blocker, and only then exposes the new bytes.
+        run._begin_turn("repair")
+        page.write_text(
+            "---\ntype: Topic\nverified:\n  by: human:r\n"
+            "  at: '2026-08-04T00:00:00Z'\n---\nNew\n", "utf-8")
+        await compile_box._emit_message(run, ResultMessage())
+        assert run._provenance_stamp_failures == {}
+        assert await compile_box._sync_workspace(run, sent) == 1
+        sync = next(event for event in _drain(run) if event["type"] == "syncArtifacts")
+        persisted = next(item["content"] for item in sync["artifacts"]
+                         if item["path"] == "candidate/topic.md")
+        fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(persisted)
+        assert not error and "verified" not in fm, fm
+    print("✓ batch provenance blocker repairs without retry poison or stale-trust sync")
+
+
 async def test_resumed_batch_phase_is_watchdog_armed():
     """(d) The resumed-batching phase (the suspected coverage gap) runs each
     pending batch through _drive_batch_session, which arms the watchdog via
@@ -6572,6 +6614,7 @@ async def main():
     await test_batch_rebuild_exhaustion_raises_resumable()
     test_batch_retry_preserves_first_attempt_page_baseline()
     await test_workspace_sync_invalidates_verification_before_cross_process_resume()
+    await test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust()
     await test_resumed_batch_phase_is_watchdog_armed()
     await test_run_wrapper_closes_turn_on_driver_crash()
     await test_run_wrapper_cancels_detached_verify_tasks()

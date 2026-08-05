@@ -90,6 +90,37 @@ def test_symlinks_are_rejected() -> None:
             raise AssertionError("symlinked content was accepted")
 
 
+def test_hardlinks_are_rejected() -> None:
+    if not hasattr(os, "link"):
+        return
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        wiki = base / "wiki"
+        _write(wiki, "index.md", INDEX)
+        outside = base / "outside.json"
+        outside.write_bytes(b'{"secret":"outside"}')
+        os.link(outside, wiki / "leak.json")
+        try:
+            collect_import_files(wiki)
+        except OKFPackageError as error:
+            assert "Hard links" in str(error)
+        else:
+            raise AssertionError("hard-linked content outside the Wiki was accepted")
+
+
+def test_unsafe_archive_names_are_rejected() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        wiki = Path(raw)
+        _write(wiki, "index.md", INDEX)
+        _write(wiki, "unsafe\\name.json", "{}")
+        try:
+            collect_import_files(wiki)
+        except OKFPackageError as error:
+            assert "Unsafe knowledge file name" in str(error)
+        else:
+            raise AssertionError("cross-platform unsafe archive name was accepted")
+
+
 def test_import_rejects_non_rfc3339_verification_times() -> None:
     for value in ('"2026-08-04"', '"2026-08-04T10:00:00"'):
         with tempfile.TemporaryDirectory() as raw:
@@ -114,5 +145,7 @@ if __name__ == "__main__":
     test_import_profile_preserves_external_okf_semantics()
     test_invalid_okf_never_writes_output()
     test_symlinks_are_rejected()
+    test_hardlinks_are_rejected()
+    test_unsafe_archive_names_are_rejected()
     test_import_rejects_non_rfc3339_verification_times()
     print("OK  standalone OKF package validation + deterministic archive")

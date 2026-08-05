@@ -856,6 +856,25 @@ def test_prune_missing_sources(tmp_path: Path):
     assert [b["id"] for b in bt.pending_batches(plan)] == ["b01"]
 
 
+class _EnvPatch:
+    """Tiny pytest-free subset used by the standalone test runner."""
+
+    def __init__(self):
+        self._previous: dict[str, str | None] = {}
+
+    def setenv(self, name: str, value: str) -> None:
+        if name not in self._previous:
+            self._previous[name] = os.environ.get(name)
+        os.environ[name] = value
+
+    def undo(self) -> None:
+        for name, previous in self._previous.items():
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
+
+
 def main():
     tests = [
         test_every_text_format_can_be_sliced_not_only_markdown,
@@ -870,10 +889,12 @@ def main():
         test_hierarchical_pack_keeps_document_assets_together,
         test_hierarchical_family_links_exact_original_attachment_and_sidecar,
         test_hierarchical_family_does_not_guess_ambiguous_attachment_anchor,
-        test_hierarchical_pack_splits_oversized_family_with_anchor_context,
+        test_office_original_rides_with_its_render_and_that_render_s_images,
+        test_office_attachment_pair_joins_the_document_that_embeds_it,
+        test_hierarchical_keeps_an_oversized_family_whole,
         test_validate_hierarchical_context_is_known_and_budgeted,
         test_hierarchical_text_cap_preserves_session_context_safety,
-        test_hierarchical_large_anchor_is_not_replayed_into_every_image_chunk,
+        test_a_large_anchor_and_its_images_ride_in_one_batch,
         test_hierarchical_oversized_text_anchor_is_sliced_before_image_chunks,
         test_hierarchical_pdf_is_split_into_contiguous_read_page_ranges,
         test_hierarchical_pdf_slice_configuration_cannot_exceed_read_limit,
@@ -896,16 +917,32 @@ def main():
         test_pdfinfo_page_count_parser,
         test_pdfinfo_metadata_does_not_move_effective_size_route,
         test_plan_fragmentation_guard,
+        test_hierarchical_oversized_pdf_attachment_keeps_anchor,
+        test_hierarchical_page_sliced_pdf_attachment_is_reachable,
+        test_hierarchical_sliced_sheet_attachment_is_reachable,
+        test_hierarchical_sliced_anchor_with_images_is_reachable,
+        test_a_family_is_never_split_and_the_plan_always_validates,
+        test_the_last_resort_plan_is_valid_by_construction,
+        test_without_edges_no_attachment_family_can_form,
     ]
+    monkeypatch_tests = {
+        test_hierarchical_oversized_pdf_attachment_keeps_anchor,
+        test_hierarchical_page_sliced_pdf_attachment_is_reachable,
+        test_hierarchical_sliced_sheet_attachment_is_reachable,
+        test_hierarchical_sliced_anchor_with_images_is_reachable,
+    }
     for fn in tests:
         with tempfile.TemporaryDirectory() as td:
-            fn(Path(td))
+            if fn in monkeypatch_tests:
+                monkeypatch = _EnvPatch()
+                try:
+                    fn(Path(td), monkeypatch)
+                finally:
+                    monkeypatch.undo()
+            else:
+                fn(Path(td))
         print(f"\u2713 {fn.__name__}")
     print("ALL OK  test_batching")
-
-
-if __name__ == "__main__":
-    main()
 
 
 # ── 2026-07-25 regression: attachment families vs slice/budget rules ─────────
@@ -1101,3 +1138,7 @@ def test_without_edges_no_attachment_family_can_form(tmp_path):
     assert len(with_edges) == 1, with_edges
     assert sorted(i["path"] for i in with_edges[0]) == [
         "assets/deck.pptx", "assets/diagram.png", "notes.md"]
+
+
+if __name__ == "__main__":
+    main()

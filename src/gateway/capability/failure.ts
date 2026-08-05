@@ -23,9 +23,13 @@ export function asFailureToken(field: unknown): string | undefined {
 /** Safe short reason: strip controls, collapse whitespace, hard-cap length. */
 export function asSafeFailureMessage(field: unknown, max = FAILURE_MESSAGE_MAX): string | undefined {
   if (typeof field !== "string") return undefined;
-  const cleaned = field.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ").trim();
+  const cleaned = field
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
   if (!cleaned) return undefined;
-  return cleaned.length > max ? cleaned.slice(0, max) : cleaned;
+  const codePoints = Array.from(cleaned);
+  return codePoints.length > max ? codePoints.slice(0, max).join("") : cleaned;
 }
 
 /**
@@ -34,8 +38,15 @@ export function asSafeFailureMessage(field: unknown, max = FAILURE_MESSAGE_MAX):
  * an explicit box_* / batch_* code; structuredBoxFailure does that).
  */
 export function normalizeFailure(value: unknown): CapabilityRunFailure | undefined {
-  if (!value || typeof value !== "object") return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
+  const recognized = [
+    "code", "stage", "attempts", "idle_s", "bound_s", "tool_pending",
+    "last_sdk_message", "exception_class", "message",
+  ];
+  if (!recognized.some((field) => Object.prototype.hasOwnProperty.call(raw, field))) {
+    return undefined;
+  }
   const code = asFailureToken(raw.code) ?? "runtime_failure";
   const stage = asFailureToken(raw.stage) ?? "unknown";
   const finiteNonNegative = (field: unknown): number | undefined =>

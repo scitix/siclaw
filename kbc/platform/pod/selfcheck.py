@@ -149,7 +149,8 @@ def _norm_source_entry(raw: str) -> str:
     to double-report as unaccounted AND dangling — cosmetic while dangling was
     display-only, a permanent convergence wedge once it gates `closed` (review
     finding: the model would get contradictory repair orders forever)."""
-    entry = _strip_source_prefix(raw.strip())
+    entry = posixpath.normpath(raw.strip().replace("\\", "/"))
+    entry = _strip_source_prefix(entry)
     if not entry:
         return entry
     entry = posixpath.normpath(entry)
@@ -157,7 +158,7 @@ def _norm_source_entry(raw: str) -> str:
 
 
 def _explicit_managed_source(resource: str) -> bool:
-    value = resource.strip()
+    value = posixpath.normpath(resource.strip().replace("\\", "/"))
     return value.startswith(("raw/", "drop/"))
 
 
@@ -169,12 +170,12 @@ def _explicit_external_source(resource: str) -> bool:
     managed-source namespace. Bare values remain a legacy compatibility case
     when (and only when) they exactly match the current Raw inventory.
     """
-    value = resource.strip()
+    value = posixpath.normpath(resource.strip().replace("\\", "/"))
     lowered = value.lower()
     return (
         "://" in value
         or lowered.startswith(("mailto:", "urn:", "doi:"))
-        or value.startswith(("/", "./", "../"))
+        or value.startswith(("/", "../"))
         or lowered.startswith("references/")
     )
 
@@ -417,6 +418,16 @@ def _is_reserved_page(rel: str) -> bool:
     return Path(rel).name in _RESERVED_PAGE_NAMES
 
 
+def _is_frontmatter_start(line: str) -> bool:
+    """A document marker must begin at column zero; trailing spaces are OK."""
+    return re.fullmatch(r"---[ \t]*", line.rstrip("\r\n")) is not None
+
+
+def _is_frontmatter_end(line: str) -> bool:
+    """Recognize only top-level document markers, never block-scalar content."""
+    return re.fullmatch(r"(?:---|\.\.\.)[ \t]*", line.rstrip("\r\n")) is not None
+
+
 def parse_okf_frontmatter(md_text: str) -> tuple[dict | None, str, str | None]:
     """Parse an OKF YAML frontmatter block with a real YAML parser.
 
@@ -426,10 +437,10 @@ def parse_okf_frontmatter(md_text: str) -> tuple[dict | None, str, str | None]:
     authored input and must never construct arbitrary Python objects.
     """
     lines = md_text.splitlines()
-    if not lines or lines[0].strip() != "---":
+    if not lines or not _is_frontmatter_start(lines[0]):
         return None, md_text, "missing YAML frontmatter at the start of the file"
     end = next((i for i, line in enumerate(lines[1:], start=1)
-                if line.strip() in ("---", "...")), None)
+                if _is_frontmatter_end(line)), None)
     if end is None:
         return None, md_text, "YAML frontmatter has no closing delimiter"
     raw = "\n".join(lines[1:end])
@@ -464,11 +475,11 @@ def _markdown_prose(md_text: str) -> str:
     # semantics. Malformed/absent frontmatter remains prose, as before.
     body_start = 0
     lines = md_text.splitlines(keepends=True)
-    if lines and lines[0].strip() == "---":
+    if lines and _is_frontmatter_start(lines[0]):
         offset = len(lines[0])
         for line in lines[1:]:
             offset += len(line)
-            if line.strip() in ("---", "..."):
+            if _is_frontmatter_end(line):
                 body_start = offset
                 break
     body = md_text[body_start:]
@@ -542,7 +553,7 @@ def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[
     violations: list[dict] = []
     fm, body, error = parse_okf_frontmatter(text)
     if rel == "index.md":
-        if error and text.splitlines() and text.splitlines()[0].strip() == "---":
+        if error and text.splitlines() and _is_frontmatter_start(text.splitlines()[0]):
             violations.append({"page": rel, "kind": "okf_index_frontmatter",
                                "detail": f"根 index.md 的 YAML frontmatter 无效: {error}"})
             body = text
@@ -559,7 +570,7 @@ def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[
         # A nested index has no frontmatter. A malformed block is still a block,
         # so detect the delimiter directly instead of treating its parse error as
         # equivalent to correctly absent frontmatter.
-        if text.splitlines() and text.splitlines()[0].strip() == "---":
+        if text.splitlines() and _is_frontmatter_start(text.splitlines()[0]):
             violations.append({"page": rel, "kind": "okf_index_frontmatter",
                                "detail": "子目录 index.md 按 OKF 不能包含 frontmatter"})
         body = text
@@ -576,7 +587,7 @@ def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[
 
 def _okf_log_violations(rel: str, text: str) -> list[dict]:
     violations: list[dict] = []
-    if text.splitlines() and text.splitlines()[0].strip() == "---":
+    if text.splitlines() and _is_frontmatter_start(text.splitlines()[0]):
         violations.append({"page": rel, "kind": "okf_log_frontmatter",
                            "detail": "log.md 按 OKF 不能包含 frontmatter"})
     prose = _markdown_prose(text)
@@ -835,6 +846,20 @@ def _remove_yaml_spans(text: str, spans: list[tuple[int, int]]) -> str:
     return text
 
 
+def _yaml_terminal_end(node: yaml.Node) -> int:
+    """Last concrete token in a node, excluding comments before the next key.
+
+    PyYAML extends a collection node's end mark through inter-key comments. A
+    byte-splice based on that mark would delete an owner's comment together
+    with the machine-owned value. Descend to scalar tokens instead.
+    """
+    if isinstance(node, yaml.MappingNode) and node.value:
+        return max(_yaml_terminal_end(child) for pair in node.value for child in pair)
+    if isinstance(node, yaml.SequenceNode) and node.value:
+        return max(_yaml_terminal_end(child) for child in node.value)
+    return node.end_mark.index
+
+
 def siclaw_generated_metadata_text(
     rel: str,
     text: str,
@@ -854,10 +879,10 @@ def siclaw_generated_metadata_text(
     stamp_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     stamp = stamp_time.isoformat(timespec="seconds").replace("+00:00", "Z")
     lines = text.splitlines(keepends=True)
-    if not lines or lines[0].strip() != "---":
+    if not lines or not _is_frontmatter_start(lines[0]):
         return None
     end = next((i for i, line in enumerate(lines[1:], start=1)
-                if line.strip() in ("---", "...")), None)
+                if _is_frontmatter_end(line)), None)
     if end is None:
         return None
     frontmatter = "".join(lines[1:end])
@@ -887,8 +912,12 @@ def siclaw_generated_metadata_text(
     if add_stable and "status" in fm:
         remove_keys.add("status")
 
-    removed_nodes = [value for key, _, value in pairs if key in remove_keys]
-    retained_nodes = [value for key, _, value in pairs if key not in remove_keys]
+    # Anchors may live on keys as well as values. Include both halves or
+    # removing an anchored machine key can leave an undefined retained alias.
+    removed_nodes = [node for key, key_node, value in pairs if key in remove_keys
+                     for node in (key_node, value)]
+    retained_nodes = [node for key, key_node, value in pairs if key not in remove_keys
+                      for node in (key_node, value)]
     removed_ids = set().union(*(_yaml_node_ids(node) for node in removed_nodes)) if removed_nodes else set()
     retained_ids = set().union(*(_yaml_node_ids(node) for node in retained_nodes)) if retained_nodes else set()
     if removed_ids & retained_ids:
@@ -900,13 +929,13 @@ def siclaw_generated_metadata_text(
         if key not in remove_keys:
             continue
         start = key_node.start_mark.index - key_node.start_mark.column
-        finish = value_node.end_mark.index
+        finish = max(_yaml_terminal_end(key_node), _yaml_terminal_end(value_node))
         line_end = frontmatter.find("\n", finish)
         if line_end < 0:
             line_end = len(frontmatter)
-        tail = frontmatter[finish:line_end]
-        if not tail.strip() or tail.lstrip().startswith("#"):
-            finish = line_end + (1 if line_end < len(frontmatter) else 0)
+        # Delete the machine field's final physical line (and an inline comment
+        # on that field), but not a following standalone owner comment.
+        finish = line_end + (1 if line_end < len(frontmatter) else 0)
         spans.append((start, finish))
 
     preserved = _remove_yaml_spans(frontmatter, spans)
@@ -957,9 +986,38 @@ def stamp_siclaw_generated_metadata(
         pending.append((target, rel, rewritten))
     written: list[str] = []
     for target, rel, rewritten in pending:
-        target.write_bytes(rewritten.encode("utf-8"))
+        _write_text_atomic(target, rewritten)
         written.append(rel)
     return written
+
+
+def stamp_siclaw_generated_metadata_best_effort(
+    workdir: str,
+    changed_pages: set[str],
+    *,
+    new_pages: set[str] | None = None,
+    now: datetime | None = None,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Stamp independent pages while reporting lossless-rewrite blockers.
+
+    Filesystem errors still surface. Only deterministic YAML-shape blockers are
+    converted into page-scoped repair findings so one malformed page cannot
+    poison every batch retry or suppress stamps on unrelated pages.
+    """
+    written: list[str] = []
+    failures: list[dict[str, str]] = []
+    created = new_pages or set()
+    for rel in sorted(changed_pages):
+        try:
+            written.extend(stamp_siclaw_generated_metadata(
+                workdir,
+                {rel},
+                new_pages={rel} if rel in created else set(),
+                now=now,
+            ))
+        except ProvenanceStampError as error:
+            failures.append({"page": rel, "detail": str(error)})
+    return written, failures
 
 
 def okf_v02_violations(pages: dict[str, dict]) -> list[dict]:
@@ -1076,10 +1134,10 @@ def filter_incremental_format_violations(
 
 def _strip_frontmatter(text: str) -> str:
     lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
+    if not lines or not _is_frontmatter_start(lines[0]):
         return text
     for i, line in enumerate(lines[1:], start=1):
-        if line.strip() in ("---", "..."):
+        if _is_frontmatter_end(line):
             return "\n".join(lines[i + 1:])
     return text
 

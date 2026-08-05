@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { asFailureToken, normalizeFailure, structuredBoxFailure } from "./failure.js";
+import { asFailureToken, asSafeFailureMessage, normalizeFailure, structuredBoxFailure } from "./failure.js";
 
 describe("failure token normalization", () => {
   it("rejects tokens with whitespace or newlines (log-injection)", () => {
@@ -47,5 +47,15 @@ describe("failure token normalization", () => {
       code: "runtime_failure",
       stage: "watchdog",
     });
+  });
+
+  it("collapses whitespace and truncates by Unicode code point", () => {
+    expect(asSafeFailureMessage("one\n\ttwo\r\nthree")).toBe("one two three");
+    expect(asSafeFailureMessage("😀😀x", 2)).toBe("😀😀");
+  });
+
+  it("does not manufacture failures from arrays or empty checkpoint objects", () => {
+    expect(normalizeFailure([])).toBeUndefined();
+    expect(normalizeFailure({})).toBeUndefined();
   });
 });

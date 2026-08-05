@@ -11,6 +11,7 @@ import gzip
 import hashlib
 import io
 import os
+import stat
 import tarfile
 import tempfile
 from pathlib import Path
@@ -38,6 +39,42 @@ def _format_violations(violations: list[dict]) -> str:
     return "; ".join(details)
 
 
+def _validate_archive_name(rel: str) -> None:
+    if "\\" in rel or any(ord(char) < 32 or ord(char) == 127 for char in rel):
+        raise OKFPackageError(f"Unsafe knowledge file name: {rel!r}")
+    if any(part in ("", ".", "..") for part in rel.split("/")):
+        raise OKFPackageError(f"Unsafe knowledge file name: {rel!r}")
+
+
+def _read_package_file(entry: Path, rel: str, expected: os.stat_result) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(entry, flags)
+    except OSError as error:
+        raise OKFPackageError(f"Cannot read knowledge file: {rel}") from error
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OKFPackageError(f"Unsupported filesystem entry: {rel}")
+        if opened.st_nlink != 1:
+            raise OKFPackageError(f"Hard links are not allowed: {rel}")
+        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            raise OKFPackageError(f"Knowledge file changed while packaging: {rel}")
+        if opened.st_size > MAX_FILE_BYTES:
+            raise OKFPackageError(f"Knowledge file is too large: {rel}")
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            data = stream.read(MAX_FILE_BYTES + 1)
+        if len(data) > MAX_FILE_BYTES:
+            raise OKFPackageError(f"Knowledge file is too large: {rel}")
+        if len(data) != opened.st_size:
+            raise OKFPackageError(f"Knowledge file changed while packaging: {rel}")
+        return data
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def collect_import_files(wiki_dir: str | Path) -> list[tuple[str, bytes]]:
     """Return sorted package files after import-contract and safety checks."""
     root = Path(wiki_dir).expanduser()
@@ -53,26 +90,32 @@ def collect_import_files(wiki_dir: str | Path) -> list[tuple[str, bytes]]:
     total_bytes = 0
     for entry in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
         rel = entry.relative_to(root).as_posix()
-        if entry.is_symlink():
+        try:
+            metadata = entry.lstat()
+        except OSError as error:
+            raise OKFPackageError(f"Cannot inspect knowledge file: {rel}") from error
+        if stat.S_ISLNK(metadata.st_mode):
             raise OKFPackageError(f"Symbolic links are not allowed: {rel}")
-        if entry.is_dir():
+        if stat.S_ISDIR(metadata.st_mode):
             continue
-        if not entry.is_file():
+        if not stat.S_ISREG(metadata.st_mode):
             raise OKFPackageError(f"Unsupported filesystem entry: {rel}")
+        _validate_archive_name(rel)
         if entry.suffix.lower() not in ALLOWED_SUFFIXES:
             raise OKFPackageError(f"Unsupported knowledge file type: {rel}")
-        try:
-            data = entry.read_bytes()
-        except OSError as error:
-            raise OKFPackageError(f"Cannot read knowledge file: {rel}") from error
-        if len(data) > MAX_FILE_BYTES:
+        if len(files) >= MAX_FILES:
+            raise OKFPackageError("Knowledge package has too many files")
+        if metadata.st_nlink != 1:
+            raise OKFPackageError(f"Hard links are not allowed: {rel}")
+        if metadata.st_size > MAX_FILE_BYTES:
             raise OKFPackageError(f"Knowledge file is too large: {rel}")
+        if total_bytes + metadata.st_size > MAX_TOTAL_UNPACKED_BYTES:
+            raise OKFPackageError("Knowledge package unpacked size is too large")
+        data = _read_package_file(entry, rel, metadata)
         total_bytes += len(data)
         if total_bytes > MAX_TOTAL_UNPACKED_BYTES:
             raise OKFPackageError("Knowledge package unpacked size is too large")
         files.append((rel, data))
-        if len(files) > MAX_FILES:
-            raise OKFPackageError("Knowledge package has too many files")
         if entry.suffix.lower() == ".md":
             try:
                 text = data.decode("utf-8")

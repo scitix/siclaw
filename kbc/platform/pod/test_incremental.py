@@ -301,6 +301,52 @@ def test_protocol_raw_changes_to_changeset():
         print("OK  protocol (RAW_CHANGES → enriched CHANGESET; absent/malformed/empty → None fallback)")
 
 
+def test_scope_over_budget_is_consumed_and_falls_back_once():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _kb(base)
+        raw_path = base / incremental.RAW_CHANGES_PATH
+        changeset_path = base / incremental.CHANGESET_PATH
+        _mk(base, incremental.RAW_CHANGES_PATH, json.dumps({
+            "added": [f"very/long/source/path/{i:04d}.md" for i in range(80)],
+            "modified": [],
+            "deleted": [],
+        }))
+        _mk(base, incremental.CHANGESET_PATH, "stale")
+        old = os.environ.get("KBC_MAX_CHANGESET_BYTES")
+        os.environ["KBC_MAX_CHANGESET_BYTES"] = "512"
+        try:
+            assert incremental.materialize_changeset(td) is None
+        finally:
+            if old is None:
+                os.environ.pop("KBC_MAX_CHANGESET_BYTES", None)
+            else:
+                os.environ["KBC_MAX_CHANGESET_BYTES"] = old
+        assert not raw_path.exists(), "oversized one-shot input would wedge every retry"
+        assert not changeset_path.exists(), "full fallback must not expose a stale scope"
+
+
+def test_budget_dropped_diff_is_explicit_without_summary():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _kb(base)
+        old = os.environ.get("KBC_MAX_CHANGESET_BYTES")
+        os.environ["KBC_MAX_CHANGESET_BYTES"] = "2048"
+        try:
+            cs = incremental.build_changeset(
+                td,
+                {"modified": ["snap/two.md"]},
+                diffs={"snap/two.md": "x" * 16_384},
+            )
+        finally:
+            if old is None:
+                os.environ.pop("KBC_MAX_CHANGESET_BYTES", None)
+            else:
+                os.environ["KBC_MAX_CHANGESET_BYTES"] = old
+        assert cs["modified"][0]["diff"] == ""
+        assert cs["modified_diffs_omitted"] == 1
+
+
 def test_added_targets_and_authorized():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -390,6 +436,8 @@ if __name__ == "__main__":
     test_diff_cap_degrades_oversized_diffs()
     test_total_changeset_budget_prioritizes_scope_and_diffs()
     test_protocol_raw_changes_to_changeset()
+    test_scope_over_budget_is_consumed_and_falls_back_once()
+    test_budget_dropped_diff_is_explicit_without_summary()
     test_added_targets_and_authorized()
     test_scoped_directive()
     test_integrity_repair_directive()

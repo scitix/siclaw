@@ -44,6 +44,10 @@ DEFAULT_CHANGESET_MAX_BYTES = 1024 * 1024
 INDEX_PAGE = "index.md"
 
 
+class ChangesetScopeTooLarge(ValueError):
+    """Authoritative incremental scope cannot fit the durable artifact cap."""
+
+
 # ── 反查:变更源 → 受影响页(sources[].resource 反向 = dependency index)──────────────
 def _norm_source(path: str) -> str:
     """Normalize a source path to its canonical raw-relative posix form:
@@ -133,7 +137,15 @@ def build_changeset(
     # mid-round respawn could no longer rehydrate the round from the store
     # (RAW_CHANGES is consumed at materialization) — review finding.
     diff_cap = int(os.environ.get("KBC_MAX_DIFF_BYTES", str(64 * 1024)))
-    diffs = {p: (d if len(d.encode("utf-8")) <= diff_cap else "") for p, d in diffs.items()}
+    supplied_diff_paths = {
+        p for p, d in diffs.items()
+        if isinstance(p, str) and isinstance(d, str) and d
+    }
+    diffs = {
+        p: (d if len(d.encode("utf-8")) <= diff_cap else "")
+        for p, d in diffs.items()
+        if isinstance(p, str) and isinstance(d, str)
+    }
     touched = _changed_managed_sources(changed_sources)
     pages = candidate_pages(workdir, additional_managed_sources=touched)
     added = list(changed_sources.get("added", []))
@@ -159,7 +171,8 @@ def build_changeset(
         "unaffected_pages_count": len(unaffected),
         "index_touched": bool(added or deleted),   # 页集可能变 → 需刷新 index.md
     }
-    _fit_changeset_optional_payload(changeset, diffs, summary)
+    _fit_changeset_optional_payload(
+        changeset, diffs, summary, supplied_diff_paths=supplied_diff_paths)
     return changeset
 
 
@@ -178,7 +191,13 @@ def _serialized_changeset_size(changeset: dict) -> int:
     return len((json.dumps(changeset, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
-def _fit_changeset_optional_payload(changeset: dict, diffs: dict[str, str], summary: dict | None) -> None:
+def _fit_changeset_optional_payload(
+    changeset: dict,
+    diffs: dict[str, str],
+    summary: dict | None,
+    *,
+    supplied_diff_paths: set[str] | None = None,
+) -> None:
     """Fit optional diffs + logical hints under the durable artifact byte cap.
 
     Execution scope is authoritative and never silently truncated. If the full
@@ -195,7 +214,23 @@ def _fit_changeset_optional_payload(changeset: dict, diffs: dict[str, str], summ
         if omitted:
             changeset["unaffected_pages_omitted"] = omitted
     if _serialized_changeset_size(changeset) > max_bytes:
-        raise ValueError("incremental execution scope exceeds durable CHANGESET byte budget")
+        raise ChangesetScopeTooLarge(
+            "incremental execution scope exceeds durable CHANGESET byte budget")
+
+    modified_by_path = {
+        item.get("path"): item
+        for item in changeset.get("modified", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    supplied = set(supplied_diff_paths or ()) & set(modified_by_path)
+    if supplied:
+        # Reserve the marker before optional content is admitted. Otherwise a
+        # budget-dropped diff is byte-for-byte indistinguishable from a producer
+        # that supplied no diff at all.
+        changeset["modified_diffs_omitted"] = len(supplied)
+        if _serialized_changeset_size(changeset) > max_bytes:
+            raise ChangesetScopeTooLarge(
+                "incremental execution scope exceeds durable CHANGESET byte budget")
 
     compact_summary = _compact_change_summary(summary)
     logical_changes = []
@@ -210,11 +245,6 @@ def _fit_changeset_optional_payload(changeset: dict, diffs: dict[str, str], summ
         compact_summary.pop("modified_without_diffs", None)
         changeset["change_summary"] = compact_summary
 
-    modified_by_path = {
-        item.get("path"): item
-        for item in changeset.get("modified", [])
-        if isinstance(item, dict) and isinstance(item.get("path"), str)
-    }
     retained_diffs = 0
     for path in sorted(diffs):
         diff = diffs[path]
@@ -268,6 +298,12 @@ def _fit_changeset_optional_payload(changeset: dict, diffs: dict[str, str], summ
             # the pre-hint payload sits at the cap. Logical hints are optional.
             compact_summary.pop("logical_changes", None)
             compact_summary.pop("logical_changes_omitted", None)
+
+    omitted_supplied = max(0, len(supplied) - retained_diffs)
+    if omitted_supplied:
+        changeset["modified_diffs_omitted"] = omitted_supplied
+    else:
+        changeset.pop("modified_diffs_omitted", None)
 
     if _serialized_changeset_size(changeset) > max_bytes:
         raise AssertionError("CHANGESET byte fitting exceeded its durable limit")
@@ -442,14 +478,23 @@ def materialize_changeset(workdir: str) -> dict | None:
     raw = load_raw_changes(workdir)
     if not has_changes(raw):
         return None
-    cs = build_changeset(
-        workdir,
-        {"added": raw.get("added", []), "modified": raw.get("modified", []), "deleted": raw.get("deleted", [])},
-        diffs=raw.get("diffs"),
-        summary=raw.get("summary"),
-        baseline_fingerprint=raw.get("baseline_fingerprint"),
-        snapshot_fingerprint=raw.get("snapshot_fingerprint"),
-    )
+    try:
+        cs = build_changeset(
+            workdir,
+            {"added": raw.get("added", []), "modified": raw.get("modified", []), "deleted": raw.get("deleted", [])},
+            diffs=raw.get("diffs"),
+            summary=raw.get("summary"),
+            baseline_fingerprint=raw.get("baseline_fingerprint"),
+            snapshot_fingerprint=raw.get("snapshot_fingerprint"),
+        )
+    except ChangesetScopeTooLarge:
+        # The authoritative source/page scope cannot be truncated. Consume the
+        # one-shot routing input and clear any stale scope so the caller takes
+        # its documented full-compile fallback instead of retrying a permanent
+        # 500 forever.
+        (Path(workdir) / RAW_CHANGES_PATH).unlink(missing_ok=True)
+        (Path(workdir) / CHANGESET_PATH).unlink(missing_ok=True)
+        return None
     (Path(workdir) / CHANGESET_PATH).write_text(
         json.dumps(cs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     # Consume-once: drop the input so a later turn / box respawn can't re-route on a

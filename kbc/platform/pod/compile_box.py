@@ -627,6 +627,25 @@ def _lifecycle_batch_ref(batch: dict, k: int, n: int) -> str:
     return ref
 
 
+def _record_provenance_stamp_result(run, stamped: list[str], failures: list[dict[str, str]]) -> None:
+    """Keep unsafe pages out of durability sync until a later repair stamps them."""
+    pending = dict(getattr(run, "_provenance_stamp_failures", {}) or {})
+    for rel in stamped:
+        pending.pop(rel, None)
+    for failure in failures:
+        rel = str(failure.get("page") or "")
+        if rel:
+            pending[rel] = str(failure.get("detail") or "cannot stamp provenance losslessly")
+    run._provenance_stamp_failures = pending
+
+
+def _blocked_provenance_paths(run) -> set[str]:
+    return {
+        f"candidate/{rel}"
+        for rel in (getattr(run, "_provenance_stamp_failures", {}) or {})
+    }
+
+
 class CompileRun:
     def __init__(self, run_id: str, workdir: str, round_: int, instruction: str = ""):
         self.run_id = run_id
@@ -688,6 +707,10 @@ class CompileRun:
         # incremental, and repair turns still force the post-turn gate below.
         self._turn_selfcheck_key: str | None = None
         self._turn_page_hashes: dict[str, str] | None = None
+        # A page whose YAML cannot be provenance-stamped losslessly must not
+        # sync its new bytes with an old verified receipt. The final/repair
+        # self-check clears each entry only after stamping succeeds.
+        self._provenance_stamp_failures: dict[str, str] = {}
         # Candidate bytes may be durably synced before a model ResultMessage.
         # One stable stamp per logical turn makes repeated sanitized snapshots
         # byte-identical while transport rebuilds keep the original timestamp.
@@ -786,12 +809,14 @@ class CompileRun:
             if isinstance(self._turn_page_hashes, dict):
                 prior_changes = incremental.changed_pages(
                     self._turn_page_hashes, incremental.page_hashes(self.workdir))
-                selfcheck.stamp_siclaw_generated_metadata(
+                stamped, failures = selfcheck.stamp_siclaw_generated_metadata_best_effort(
                     self.workdir,
                     set(prior_changes),
                     new_pages={rel for rel, kind in prior_changes.items()
                                if kind == "created"},
+                    now=self._turn_provenance_at,
                 )
+                _record_provenance_stamp_result(self, stamped, failures)
             self._turn_page_hashes = incremental.page_hashes(self.workdir)
             self._turn_provenance_at = datetime.now(timezone.utc)
         self._turn_format_guard = None
@@ -954,27 +979,45 @@ def _collect_workspace_artifacts_for_sync(run: CompileRun) -> list[dict]:
     artifacts = _collect_workspace_artifacts(run.workdir)
     before = getattr(run, "_turn_page_hashes", None)
     stamp_time = getattr(run, "_turn_provenance_at", None)
-    if not isinstance(before, dict) or not isinstance(stamp_time, datetime):
-        return artifacts
-    after = incremental.page_hashes(run.workdir)
-    changes = incremental.changed_pages(before, after)
+    changes: dict[str, str] = {}
+    if isinstance(before, dict) and isinstance(stamp_time, datetime):
+        after = incremental.page_hashes(run.workdir)
+        changes = incremental.changed_pages(before, after)
+    safe_artifacts: list[dict] = []
+    blocked = set((getattr(run, "_provenance_stamp_failures", {}) or {}))
     for artifact in artifacts:
         path_value = artifact["path"]
         if not path_value.startswith("candidate/"):
+            safe_artifacts.append(artifact)
             continue
         rel = path_value[len("candidate/"):]
+        if rel in blocked:
+            continue
         kind = changes.get(rel)
         if kind not in ("created", "modified"):
+            safe_artifacts.append(artifact)
             continue
-        rewritten = selfcheck.siclaw_generated_metadata_text(
-            rel,
-            artifact["content"],
-            created=kind == "created",
-            now=stamp_time,
-        )
+        try:
+            rewritten = selfcheck.siclaw_generated_metadata_text(
+                rel,
+                artifact["content"],
+                created=kind == "created",
+                now=stamp_time,
+            )
+        except selfcheck.ProvenanceStampError as error:
+            _record_provenance_stamp_result(
+                run, [], [{"page": rel, "detail": str(error)}])
+            continue
+        if rewritten is None and rel.endswith(".md") and not selfcheck._is_reserved_page(rel):
+            _record_provenance_stamp_result(run, [], [{
+                "page": rel,
+                "detail": f"{rel}: invalid or missing YAML frontmatter cannot be provenance-stamped",
+            }])
+            continue
         if rewritten is not None:
             artifact["content"] = rewritten
-    return artifacts
+        safe_artifacts.append(artifact)
+    return safe_artifacts
 
 
 def _workspace_sync_cursor(workdir: str) -> dict[str, str]:
@@ -993,9 +1036,15 @@ async def _sync_workspace(run: CompileRun, sent: dict, *, commit_input: bool = F
     returns the number of changed entries."""
     if commit_input and not (Path(run.workdir) / "candidate" / "index.md").is_file():
         raise FileNotFoundError("cannot commit compile input without candidate/index.md")
+    blocked_paths = _blocked_provenance_paths(run)
+    if commit_input and blocked_paths:
+        raise selfcheck.ProvenanceStampError(
+            "cannot commit compile input while candidate provenance stamping is blocked")
     changed = []
     next_sent = dict(sent)
-    collected = set()
+    # Blocked pages still exist. Treat them as collected so durability sync
+    # preserves the last good consumer copy instead of emitting a tombstone.
+    collected = set(blocked_paths)
     for art in _collect_workspace_artifacts_for_sync(run):
         collected.add(art["path"])
         sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
@@ -1041,7 +1090,7 @@ def _workspace_replay_artifacts(run: CompileRun, sent: dict) -> list[dict]:
     on attach; consumer upserts/deletes are idempotent.
     """
     artifacts = _collect_workspace_artifacts_for_sync(run)
-    current = {item["path"] for item in artifacts}
+    current = {item["path"] for item in artifacts} | _blocked_provenance_paths(run)
     for path, value in sorted(sent.items()):
         if value == _SYNC_TOMBSTONE and path not in current:
             artifacts.append({"path": path, "deleted": True})
@@ -2486,16 +2535,21 @@ async def _post_turn_selfcheck(run) -> str | None:
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
     turn_pages_before = getattr(run, "_turn_page_hashes", None)
-    run._turn_page_hashes = None
     producer_stamps: list[str] = []
     if isinstance(turn_pages_before, dict):
         turn_pages_after = incremental.page_hashes(workdir)
         turn_changes = incremental.changed_pages(turn_pages_before, turn_pages_after)
-        producer_stamps = selfcheck.stamp_siclaw_generated_metadata(
+        producer_stamps, stamp_failures = selfcheck.stamp_siclaw_generated_metadata_best_effort(
             workdir,
             set(turn_changes),
             new_pages={page for page, kind in turn_changes.items() if kind == "created"},
+            now=getattr(run, "_turn_provenance_at", None),
         )
+        resolved = producer_stamps + [
+            page for page, kind in turn_changes.items() if kind == "deleted"
+        ]
+        _record_provenance_stamp_result(run, resolved, stamp_failures)
+    run._turn_page_hashes = None
     # The exclusion ledger is machine-owned, but the escape hatch stays open: a
     # model MAY hand-edit authoring/EXCLUSIONS.json when the exclude_source tool
     # cannot express a fix. Normalize it back to canonical strict JSON (and prune
@@ -2607,12 +2661,33 @@ async def _post_turn_selfcheck(run) -> str | None:
         workdir, allowed_pages=mechanical_allowed)
     if mechanical_fixes:
         mechanically_changed = {item["page"] for item in mechanical_fixes}
-        producer_stamps = sorted(set(producer_stamps) | set(
-            selfcheck.stamp_siclaw_generated_metadata(workdir, mechanically_changed)))
+        mechanical_stamps, stamp_failures = (
+            selfcheck.stamp_siclaw_generated_metadata_best_effort(
+                workdir,
+                mechanically_changed,
+                now=getattr(run, "_turn_provenance_at", None),
+            )
+        )
+        _record_provenance_stamp_result(run, mechanical_stamps, stamp_failures)
+        producer_stamps = sorted(set(producer_stamps) | set(mechanical_stamps))
         after = incremental.page_hashes(workdir)
         key = selfcheck.state_key(workdir)
     run._selfcheck_key = key
     report = selfcheck.run_layer1(workdir)
+    pending_stamp_failures = dict(
+        getattr(run, "_provenance_stamp_failures", {}) or {})
+    pending_stamp_failures = {
+        rel: detail for rel, detail in pending_stamp_failures.items()
+        if (Path(workdir) / "candidate" / rel).is_file()
+    }
+    run._provenance_stamp_failures = pending_stamp_failures
+    if pending_stamp_failures:
+        report["lint"]["violations"].extend({
+            "page": rel,
+            "kind": "provenance_stamp_blocked",
+            "detail": detail,
+        } for rel, detail in sorted(pending_stamp_failures.items()))
+        report["lint"]["ok"] = False
     report["mechanical_fixes"] = {
         "count": len(mechanical_fixes),
         "items": mechanical_fixes[:40],
@@ -2793,15 +2868,20 @@ async def _emit_message(run: CompileRun, msg) -> None:
             # (the final full-corpus pass owns it) and skip turn_done.
             run._last_turn_reply = reply
             turn_pages_before = getattr(run, "_turn_page_hashes", None)
-            run._turn_page_hashes = None
             if isinstance(turn_pages_before, dict):
                 turn_pages_after = incremental.page_hashes(run.workdir)
                 turn_changes = incremental.changed_pages(turn_pages_before, turn_pages_after)
-                selfcheck.stamp_siclaw_generated_metadata(
+                stamped, failures = selfcheck.stamp_siclaw_generated_metadata_best_effort(
                     run.workdir,
                     set(turn_changes),
                     new_pages={page for page, kind in turn_changes.items() if kind == "created"},
+                    now=getattr(run, "_turn_provenance_at", None),
                 )
+                resolved = stamped + [
+                    page for page, kind in turn_changes.items() if kind == "deleted"
+                ]
+                _record_provenance_stamp_result(run, resolved, failures)
+            run._turn_page_hashes = None
             sent = getattr(run, "_sync_sent", None)
             if sent is not None:
                 try:

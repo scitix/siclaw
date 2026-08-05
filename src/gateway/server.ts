@@ -28,6 +28,7 @@ import { getBoxProfile } from "./agentbox/box-profile.js";
 import { buildSpawnEnv } from "./agentbox/spawn-env.js";
 import { CapabilityRunManager } from "./capability/run-manager.js";
 import { driveCapabilitySession } from "./capability/session-driver.js";
+import { asFailureToken } from "./capability/failure.js";
 import { driveTestSession, shouldRelayTestSession } from "./capability/test-relay.js";
 import { CAPABILITY_GET_RUN, isTerminalCapabilityStatus } from "./capability/contract.js";
 import type {
@@ -732,12 +733,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           .catch(async (err) => {
             capabilityRelayFailuresTotal.inc();
             console.error(`[capability] session relay failed run=${runId}:`, err);
+            const exceptionClass = err instanceof Error
+              ? (asFailureToken(err.name) ?? "Error")
+              : "NonErrorThrown";
             await capabilityRunManager
               .endRun(runId, "failed", {
                 code: "relay_failed",
                 stage: "session_relay",
-                message: `relay_failed:${err instanceof Error ? err.name : "Error"}`,
-                exception_class: err instanceof Error ? err.name : undefined,
+                message: `relay_failed:${exceptionClass}`,
+                exception_class: exceptionClass,
               })
               .catch(() => {});
           })
