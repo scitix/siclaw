@@ -2421,6 +2421,8 @@ async def test_prompt_packs_locale():
     zh = sorted(q.name for q in (compile_box._PROMPTS_DIR / "zh").iterdir())
     assert en == zh and "box_role.md" in en, (en, zh)
     assert compile_box._prompt("box_role", "no-such-locale") == compile_box._prompt("box_role", "en")
+    zh_box_role = compile_box._prompt("box_role", "zh")
+    en_box_role = compile_box._prompt("box_role", "en")
     assert "只读的知识消费者" in compile_box._prompt("test_role", "zh")
     assert "read-only knowledge consumer" in compile_box._prompt("test_role", "en")
     # Answer discipline (clean-answer contract): conclusion-first, no process
@@ -2437,6 +2439,21 @@ async def test_prompt_packs_locale():
     assert "全部合理候选页之后" in zh_role, zh_role
     assert "only after checking the index and every plausible page" in en_role, en_role
     assert "没有检索工具" not in zh_role and "there is no search tool" not in en_role
+
+    # The code profile is a reusable source-understanding kernel, not a hidden
+    # Kubernetes/runbook template. Architecture/component understanding is the
+    # stable goal; operational lenses are conditional on evidence or the owner
+    # brief. The generic document rule must not reintroduce file-shaped pages.
+    assert "可追溯的系统理解模型" in zh_box_role, zh_box_role
+    assert "traceable system-understanding model" in en_box_role, en_box_role
+    assert "有源码证据或 brief 明确要求时才展开" in zh_box_role, zh_box_role
+    assert "only when source evidence supports them or the brief asks for them" in en_box_role, en_box_role
+    assert "不要为了凑模板" in zh_box_role, zh_box_role
+    assert "Do not invent empty sections to satisfy a template" in en_box_role, en_box_role
+    assert "代码 profile 按架构概念和组件组织页面" in zh_box_role, zh_box_role
+    assert "the code profile organizes pages around architectural concepts and components" in en_box_role, en_box_role
+    assert "**一页一个文件" not in zh_box_role, zh_box_role
+    assert "**One page per file" not in en_box_role, en_box_role
 
     # A regression round's consumer identity is deterministic and changes only
     # with answer-affecting contract inputs. Tool order is not semantic.
