@@ -284,7 +284,10 @@ export async function handleDelegate(
       modelId: binding.modelId,
       modelConfig: binding.modelConfig,
       modelRouting: binding.modelRouting,
+      // See the note in task-coordinator.ts: locale rides with systemPrompt.
       systemPromptTemplate: binding.systemPrompt ?? undefined,
+      language: binding.language ?? undefined,
+      timezone: binding.timezone ?? undefined,
       origin: "api",
       delegation: {
         delegationId,

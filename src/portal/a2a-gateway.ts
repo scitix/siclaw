@@ -754,7 +754,12 @@ async function submitA2aTask(params: {
     modelId: modelBinding.modelId,
     modelConfig: modelBinding.modelConfig,
     modelRouting: modelBinding.modelRouting,
+    // See the note in gateway/task-coordinator.ts: locale rides with
+    // systemPrompt. This path hands them to chat.send, which puts them into
+    // promptOpts in gateway/server.ts.
     systemPrompt: modelBinding.systemPrompt ?? undefined,
+    language: modelBinding.language ?? undefined,
+    timezone: modelBinding.timezone ?? undefined,
     turnStartMs: Date.now(),
   });
 

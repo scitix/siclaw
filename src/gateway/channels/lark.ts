@@ -1717,7 +1717,10 @@ async function processQueuedLarkMessage(ctx: QueuedLarkMessageContext): Promise<
     modelId: modelBinding?.modelId,
     modelConfig: modelBinding?.modelConfig,
     modelRouting: modelBinding?.modelRouting,
+    // See the note in task-coordinator.ts: locale rides with systemPrompt.
     systemPromptTemplate: modelBinding?.systemPrompt?.trim() || undefined,
+    language: modelBinding?.language ?? undefined,
+    timezone: modelBinding?.timezone ?? undefined,
     ...(images.length ? { images } : {}),
   };
   try {

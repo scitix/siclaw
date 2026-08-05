@@ -289,7 +289,15 @@ export class TaskCoordinator {
         modelId: binding.modelId,
         modelConfig: binding.modelConfig,
         modelRouting: binding.modelRouting,
+        // The agent's locale travels with systemPrompt because it comes from the
+        // same binding and plays the same role — "agent config for this turn".
+        // Every entry that forwards one MUST forward the other: this path had none,
+        // so a Feishu/cron/delegated/a2a turn was told the time in UTC no matter
+        // what the agent was configured with. Pinned by
+        // `locale-forwarding-invariants.test.ts`.
         systemPromptTemplate: binding.systemPrompt ?? undefined,
+        language: binding.language ?? undefined,
+        timezone: binding.timezone ?? undefined,
       };
       const promptResult = await client.prompt(promptOpts);
 

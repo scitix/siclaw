@@ -46,11 +46,15 @@ export interface ResolvedModelBinding {
    */
   language?: string | null;
   /**
-   * IANA zone the agent reports time in. Rides here rather than in the spawn
-   * environment so a change lands on the NEXT MESSAGE — a pooled box is
-   * resident, and a settings toggle that needs a pod restart is the wrong shape.
-   * `buildSpawnEnv` also maps it to TZ, which is what makes the box's own clock
-   * (and `date` in its shell) agree; that half waits for a restart.
+   * IANA zone to quote when answering, for turns whose sender has no client to
+   * ask — every channel message, scheduled task and API call. A Portal browser
+   * reports its own zone and outranks this.
+   *
+   * Rides here rather than in the spawn environment for two reasons: a change
+   * lands on the NEXT MESSAGE (a pooled box is resident, so a settings toggle
+   * needing a pod restart is the wrong shape), and the box's own clock stays UTC
+   * on purpose — this is a PRESENTATION setting, not system state. See
+   * `agentbox/spawn-env.ts`.
    */
   timezone?: string | null;
 }

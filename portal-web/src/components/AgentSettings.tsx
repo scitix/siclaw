@@ -644,11 +644,11 @@ function TimezoneField({ value, onChange }: { value: string; onChange: (v: strin
       <label className="text-[13px] font-medium text-foreground">Timezone</label>
       <TimezoneCombobox value={value} onChange={onChange} />
       <p className="text-[12px] text-muted-foreground/80 leading-relaxed">
-        Two things, and they are not the same. It sets this instance&apos;s own clock — what <code>date</code>
-        in a shell reads — which changes when the instance next restarts. And it is the fallback the model is
-        told when the sender&apos;s own timezone is unknown, which is every message from a chat channel, a
-        scheduled task, or the API. Portal conversations already report the sender&apos;s browser timezone and
-        do not need this. Unset, the fallback is UTC.
+        Which clock the agent quotes when it answers someone whose own timezone we cannot know — every message
+        from a chat channel, a scheduled task, or the API. Portal conversations report the sender&apos;s browser
+        timezone automatically and ignore this. Unset, the fallback is UTC. Takes effect on the next message.
+        It does <em>not</em> change the instance&apos;s own clock: logs and <code>date</code> stay UTC so they
+        line up with Kubernetes and your metrics.
       </p>
     </div>
   )

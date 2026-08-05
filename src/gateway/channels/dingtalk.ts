@@ -367,7 +367,10 @@ export async function handleDingTalkMessage(
     modelId: modelBinding?.modelId,
     modelConfig: modelBinding?.modelConfig,
     modelRouting: modelBinding?.modelRouting,
+    // See the note in task-coordinator.ts: locale rides with systemPrompt.
     systemPromptTemplate,
+    language: modelBinding?.language ?? undefined,
+    timezone: modelBinding?.timezone ?? undefined,
   };
   try {
     const promptResult = await client.prompt(promptOpts);

@@ -51,9 +51,6 @@ describe("config.getAgent", () => {
       tool_capabilities: null,
       // No agent_type column on this row → custom (default).
       agent_type: "custom",
-      // Read by buildSpawnEnv, which maps it to the pod's TZ so `date` in an
-      // agent's shell agrees with the reminder the model is given. Unset here.
-      timezone: null,
     });
   });
 

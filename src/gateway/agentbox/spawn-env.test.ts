@@ -45,26 +45,34 @@ describe("buildSpawnEnv", () => {
   });
 });
 
-describe("buildSpawnEnv — timezone", () => {
-  it("maps timezone to TZ", () => {
-    expect(buildSpawnEnv({ timezone: "Asia/Shanghai" })).toEqual({ TZ: "Asia/Shanghai" });
+describe("buildSpawnEnv — the agent's timezone must NOT reach the box clock", () => {
+  // Regression. The first version of this feature mapped the agent's timezone to
+  // TZ so `date` would agree with the reminder. That was wrong three ways: one
+  // box serves every user of the agent (so a user's zone cannot be a
+  // process-wide env var); `date`, log lines and skill arithmetic have to line
+  // up with Kubernetes and Prometheus, which speak UTC; and the disagreement it
+  // fixed was already handled, because the reminder names the zone AND its
+  // offset so the model can reconcile a UTC `date` itself.
+  //
+  // The zone is a PRESENTATION setting — which clock the model quotes when it
+  // answers. The box's clock is system state.
+  it("ignores the timezone field entirely", () => {
+    const env = buildSpawnEnv({ timezone: "Asia/Shanghai" } as never);
+    expect(env.TZ).toBeUndefined();
+    expect(env).toEqual({});
   });
 
-  // Same precedence rule as the idle window: a dedicated control must not be
-  // clobbered by a generic key that happens to share its name.
-  it("wins over a same-named key in spawn_env", () => {
-    const env = buildSpawnEnv({ timezone: "Asia/Shanghai", spawn_env: { TZ: "UTC" } });
-    expect(env.TZ).toBe("Asia/Shanghai");
-  });
-
-  it.each([undefined, null, "", "   "])("emits nothing for %j", (timezone) => {
-    expect(buildSpawnEnv({ timezone }).TZ).toBeUndefined();
-  });
-
-  it("coexists with the idle window", () => {
-    expect(buildSpawnEnv({ idle_timeout_sec: 0, timezone: "UTC" })).toEqual({
+  it("does not smuggle it in alongside the idle window", () => {
+    expect(buildSpawnEnv({ idle_timeout_sec: 0, timezone: "Asia/Shanghai" } as never)).toEqual({
       SICLAW_AGENTBOX_IDLE_TIMEOUT: "0",
-      TZ: "UTC",
     });
+  });
+
+  // The capability does not disappear, it moves to where it belongs: `spawn_env`
+  // is explicitly a system-env knob, so an operator who really wants the
+  // container in another zone says so there — and nothing overrides them now.
+  it("still lets an operator set TZ through spawn_env", () => {
+    const env = buildSpawnEnv({ timezone: "Asia/Shanghai", spawn_env: { TZ: "Europe/London" } } as never);
+    expect(env.TZ).toBe("Europe/London");
   });
 });

@@ -65,17 +65,33 @@ input — a corrupt or hand-edited value degrades to "nothing remembered".
 **Remembering a language must never be able to fail a turn.** The state object is healed if absent
 rather than asserted, and a failed write warns and moves on.
 
-### 3. The agent's two settings keep narrower jobs
+### 3. The timezone is a PRESENTATION setting; the box's clock stays UTC
+
+`agents.timezone` decides which clock the model **quotes when it answers**. It is
+deliberately NOT mapped to the pod's `TZ`:
+
+- one box serves every user of the agent, so a zone belonging to a user cannot be
+  represented by a process-wide env var at all;
+- `date`, log lines and any arithmetic a skill does have to line up with
+  Kubernetes events, Prometheus and everything else that speaks UTC — shifting the
+  box makes each of those a conversion step;
+- the disagreement that mapping used to "fix" is already handled, because the
+  reminder names the zone AND its offset precisely so the model can reconcile a
+  UTC `date` with the user's local time.
+
+An operator who genuinely wants the container in another zone sets
+`spawn_env: { TZ: … }` — a system-env knob, which is what that is.
+
+### 3b. The agent's two settings keep narrower jobs
 
 `agents.language` is the language a conversation *opens* in, before anything readable has been
 said. That is a real need — a Chinese team's agent should not open in English — with no multi-user
 hazard, because turn 1 has no history for it to override and the first readable message replaces
 it.
 
-`agents.timezone` does two things that genuinely are agent-level: it sets the pod's own `TZ` (one
-process, one clock) and it is the fallback for turns whose sender has no client to ask — every
-channel message, scheduled task and API call. The two halves take effect at different times (the
-pod's clock on its next restart, the fallback on the next message) and the UI says so.
+`agents.timezone` is the fallback for turns whose sender has no client to ask — every channel
+message, scheduled task and API call. A Portal browser reports its own zone and outranks it. One
+job, effective on the next message.
 
 ### 4. Delivery is per prompt
 
