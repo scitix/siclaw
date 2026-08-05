@@ -984,6 +984,27 @@ def format_policy_violations(pages: dict[str, dict]) -> list[dict]:
     return okf_v02_violations(pages) + siclaw_portable_output_violations(pages)
 
 
+def okf_import_violations(pages: dict[str, dict]) -> list[dict]:
+    """Contract for importing an already-compiled Wiki into Siclaw.
+
+    This is deliberately narrower than the producer profile: imported pages
+    may contain legitimate human verification records, wikilinks, or
+    bundle-root links. It is also narrower than the authoring lint's body-style
+    checks. The import boundary requires the frontmatter contract Sicore can
+    persist and inspect, plus an explicit root ``okf_version: "0.2"`` marker.
+    Keep this selection aligned with Sicore's ``validateAdoptionOKFStructure``.
+    """
+    violations = [
+        violation for violation in okf_v02_violations(pages)
+        if violation.get("kind") not in {"okf_index_structure", "okf_log_structure"}
+    ]
+    violations.extend(
+        violation for violation in siclaw_portable_output_violations(pages)
+        if violation.get("kind") == "siclaw_profile_version_declaration"
+    )
+    return violations
+
+
 def format_violation_keys(pages: dict[str, dict]) -> list[list[str]]:
     """JSON-safe baseline keys used to grandfather untouched legacy pages."""
     return [list(key) for key in sorted({(v["page"], v["kind"])

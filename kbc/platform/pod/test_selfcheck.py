@@ -187,6 +187,24 @@ def test_okf_v02_conformance():
     print("OK  OKF v0.2 core conformance + Siclaw portable-output profile")
 
 
+def test_okf_import_profile():
+    """Direct import validates structure without rewriting external semantics."""
+    external = {
+        "index.md": {"text": '---\nokf_version: "0.2"\n---\n# Loose external index'},
+        "topic.md": {"text": "---\ntype: Topic\nverified:\n  - by: human:reviewer\n"
+                                   "    at: 2026-08-05T10:00:00Z\n---\n[[Legacy]] [Root](/index.md)"},
+        "log.md": {"text": "# External log without date groups"},
+    }
+    assert selfcheck.okf_import_violations(external) == []
+    missing_version = {**external, "index.md": {"text": "# Index"}}
+    assert {item["kind"] for item in selfcheck.okf_import_violations(missing_version)} == {
+        "siclaw_profile_version_declaration",
+    }
+    malformed = {**external, "topic.md": {"text": "---\ntype: []\n---\nBad"}}
+    assert "okf_type" in {item["kind"] for item in selfcheck.okf_import_violations(malformed)}
+    print("OK  direct-import profile preserves external semantics and requires v0.2")
+
+
 def test_stamp_siclaw_generated_metadata():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -2371,6 +2389,7 @@ def main():
     os.environ.setdefault("KBC_PK_MODE", "off")  # PK never fires in unrelated wiring tests
     test_parse_okf_sources()
     test_okf_v02_conformance()
+    test_okf_import_profile()
     test_stamp_siclaw_generated_metadata()
     test_stamp_siclaw_generated_metadata_fails_atomically_when_lossless_edit_is_unsafe()
     test_markdown_code_is_not_a_link()
