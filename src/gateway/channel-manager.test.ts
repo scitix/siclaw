@@ -9,6 +9,7 @@ import {
   resetPersonalSession,
   issuePersonalApiKey,
   getPersonalApiKeyStatus,
+  issuePersonalWebChatLink,
   type ChannelHandler,
 } from "./channel-manager.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
@@ -228,6 +229,28 @@ describe("personal binding RPC wrappers", () => {
       method: "channel.apiKeyStatus",
       params: { channel_id: "pb1", sender_open_id: "ou_1" },
     });
+  });
+
+  it("issues a personal webchat link with the stable inbound request id", async () => {
+    frontend.responses.set("channel.issueWebChatLink", {
+      success: true, agentId: "a1", actionUrl: "https://s/webchat/tok", expiresAt: 1753689600000,
+    });
+    const result = await issuePersonalWebChatLink(
+      "pb1", "ou_1", frontend as unknown as FrontendWsClient, "msg-88",
+    );
+    expect(result).toEqual({
+      success: true, agentId: "a1", actionUrl: "https://s/webchat/tok", expiresAt: 1753689600000,
+    });
+    expect(frontend.calls[0]).toEqual({
+      method: "channel.issueWebChatLink",
+      params: { channel_id: "pb1", sender_open_id: "ou_1", request_id: "msg-88" },
+    });
+  });
+
+  it("omits the webchat request_id when no stable id is available", async () => {
+    frontend.responses.set("channel.issueWebChatLink", { success: true });
+    await issuePersonalWebChatLink("pb1", "ou_1", frontend as unknown as FrontendWsClient);
+    expect(frontend.calls[0].params).toEqual({ channel_id: "pb1", sender_open_id: "ou_1" });
   });
 });
 

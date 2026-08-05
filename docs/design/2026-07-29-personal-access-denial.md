@@ -207,7 +207,8 @@ a path that answers nothing, so without one the copy names the admin route alone
 
 `channel.issueApiKey` carries `denied` on its authorization refusal only; other failure exits have
 `error` alone. The reply prefers a localized template from `denied.reason` and falls back to
-`error` verbatim, so a gated user gets actionable copy instead of an English sentence. The
+length-capped `error`, so a gated user gets actionable copy instead of an English sentence without
+letting an upstream stack trace exceed Feishu's message limit. The
 localized form keeps an "issuing failed" frame in front of it: the access-request link otherwise
 reads in the same "opens once, expires shortly" language as the key pickup link, and the sender
 opens it expecting the key they just asked for.

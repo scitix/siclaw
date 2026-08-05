@@ -116,6 +116,11 @@ Replies carry only the frontend's short-lived, single-use `pickupUrl` — never 
 chat history is retained, searchable, and exportable; the entire point of a link is that the
 transcript keeps nothing but a URL that dies in minutes. Do not "helpfully" echo the key.
 
+The URL is still untrusted protocol input: it must be an absolute HTTP(S) URL before it can reach
+an `open_url` button or text fallback. If its derived `expiresAt` is already past at the send
+boundary, the URL is withheld and the reply tells the sender to rerun `/apikey`; an ordinary chat
+message does not mint a replacement.
+
 ### `rotated` must be surfaced
 
 When the frontend reports `rotated: true`, the reply must state that the previous key is now
@@ -124,11 +129,13 @@ filed as a bug.
 
 ### Failure is spoken, not swallowed
 
-`error` from the frontend is user-facing wording and is surfaced verbatim inside a localized
-frame (do not rewrite it into a generic "operation failed" — the reason is the useful part). An
-RPC that *throws* — or a missing frontend client — still produces a localized "try again later"
-reply. This deliberately differs from the neighbouring PAIR path, whose failures escape to the
-top-level catch: here the user is waiting on a link, and silence reads as a broken bot.
+`error` from the frontend is user-facing wording and is surfaced inside a localized frame after
+the same prose-length cap used for `denied.message` (do not rewrite it into a generic "operation
+failed" — the reason is the useful part). Without the cap, an upstream stack trace can exceed the
+Feishu message limit and turn the promised error reply into silence. An RPC that *throws* — or a
+missing frontend client — still produces a localized "try again later" reply. This deliberately
+differs from the neighbouring PAIR path, whose failures escape to the top-level catch: here the
+user is waiting on a link, and silence reads as a broken bot.
 
 **Known gap**: the upstream frontend's refusal strings are currently English, so a zh-CN user
 sees a Chinese frame around an English reason. Localizing belongs on the frontend (it owns the
