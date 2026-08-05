@@ -78,6 +78,24 @@ def _pages_citing(pages: dict[str, dict], sources: set[str]) -> set[str]:
     return hit
 
 
+def _changed_managed_sources(changed_sources: dict) -> set[str]:
+    return {
+        str(source)
+        for kind in ("modified", "deleted")
+        for source in changed_sources.get(kind, [])
+        if isinstance(source, str) and source
+    }
+
+
+def _resolve_affected_pages(
+    pages: dict[str, dict], changed_sources: dict,
+) -> tuple[list[str], list[str]]:
+    all_pages = {rel for rel in pages if rel != INDEX_PAGE and "error" not in pages[rel]}
+    touched = _changed_managed_sources(changed_sources)
+    affected = _pages_citing(pages, touched)
+    return sorted(affected), sorted(all_pages - affected)
+
+
 def resolve_affected_pages(workdir: str, changed_sources: dict) -> tuple[list[str], list[str]]:
     """(affected_pages, unaffected_pages)。
 
@@ -87,11 +105,9 @@ def resolve_affected_pages(workdir: str, changed_sources: dict) -> tuple[list[st
 
     unaffected = 其余所有现存候选页(index 除外)。收尾护栏据此保证"其余不动"。
     """
-    pages = candidate_pages(workdir)
-    all_pages = {rel for rel in pages if rel != INDEX_PAGE and "error" not in pages[rel]}
-    touched = set(changed_sources.get("modified", [])) | set(changed_sources.get("deleted", []))
-    affected = _pages_citing(pages, touched)
-    return sorted(affected), sorted(all_pages - affected)
+    touched = _changed_managed_sources(changed_sources)
+    pages = candidate_pages(workdir, additional_managed_sources=touched)
+    return _resolve_affected_pages(pages, changed_sources)
 
 
 # ── 拼 CHANGESET(模型只消费,affected_pages 代码反查而非模型报)────────────────
@@ -118,11 +134,12 @@ def build_changeset(
     # (RAW_CHANGES is consumed at materialization) — review finding.
     diff_cap = int(os.environ.get("KBC_MAX_DIFF_BYTES", str(64 * 1024)))
     diffs = {p: (d if len(d.encode("utf-8")) <= diff_cap else "") for p, d in diffs.items()}
-    pages = candidate_pages(workdir)
+    touched = _changed_managed_sources(changed_sources)
+    pages = candidate_pages(workdir, additional_managed_sources=touched)
     added = list(changed_sources.get("added", []))
     modified = list(changed_sources.get("modified", []))
     deleted = list(changed_sources.get("deleted", []))
-    affected, unaffected = resolve_affected_pages(workdir, changed_sources)
+    affected, unaffected = _resolve_affected_pages(pages, changed_sources)
 
     def pages_for(src: str) -> list[str]:
         return sorted(_pages_citing(pages, {src}))

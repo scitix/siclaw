@@ -90,9 +90,29 @@ def test_symlinks_are_rejected() -> None:
             raise AssertionError("symlinked content was accepted")
 
 
+def test_import_rejects_non_rfc3339_verification_times() -> None:
+    for value in ('"2026-08-04"', '"2026-08-04T10:00:00"'):
+        with tempfile.TemporaryDirectory() as raw:
+            wiki = Path(raw)
+            _write(wiki, "index.md", INDEX)
+            _write(
+                wiki,
+                "topic.md",
+                "---\ntype: Topic\nverified:\n  by: human:reviewer\n"
+                f"  at: {value}\n---\nBody\n",
+            )
+            try:
+                collect_import_files(wiki)
+            except OKFPackageError as error:
+                assert "verified" in str(error), error
+            else:
+                raise AssertionError(f"non-RFC3339 verified.at was accepted: {value}")
+
+
 if __name__ == "__main__":
     test_deterministic_archive()
     test_import_profile_preserves_external_okf_semantics()
     test_invalid_okf_never_writes_output()
     test_symlinks_are_rejected()
+    test_import_rejects_non_rfc3339_verification_times()
     print("OK  standalone OKF package validation + deterministic archive")

@@ -47,7 +47,11 @@ jobs:
         working-directory: kbc/platform/pod
       - run: python test_okf_package.py
         working-directory: kbc/platform/pod
+      - run: python test_incremental.py
+        working-directory: kbc/platform/pod
       - run: python test_redblue.py
         working-directory: kbc/platform/pod
       - run: python test_mtls_auth.py
         working-directory: kbc/platform/pod
+      - run: python test_emit.py
+        working-directory: kbc/tools

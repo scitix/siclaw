@@ -687,6 +687,11 @@ class CompileRun:
         # not a migration trigger for an inherited legacy draft. Compile,
         # incremental, and repair turns still force the post-turn gate below.
         self._turn_selfcheck_key: str | None = None
+        self._turn_page_hashes: dict[str, str] | None = None
+        # Candidate bytes may be durably synced before a model ResultMessage.
+        # One stable stamp per logical turn makes repeated sanitized snapshots
+        # byte-identical while transport rebuilds keep the original timestamp.
+        self._turn_provenance_at: datetime | None = None
         # Ordinary owner edits get the same page-scoped legacy-format treatment
         # as incremental compiles: inherited debt on untouched pages stays
         # visible but cannot widen a small edit into a whole-library migration.
@@ -775,7 +780,20 @@ class CompileRun:
         the owner's /message AND internal self-check/verify/batch injections."""
         self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
         if not preserve_page_baseline or not isinstance(self._turn_page_hashes, dict):
+            # A previous failed logical turn can remain live in this process.
+            # Reconcile its locally-written pages before replacing the baseline;
+            # cross-process recovery gets the same sanitized bytes from sync.
+            if isinstance(self._turn_page_hashes, dict):
+                prior_changes = incremental.changed_pages(
+                    self._turn_page_hashes, incremental.page_hashes(self.workdir))
+                selfcheck.stamp_siclaw_generated_metadata(
+                    self.workdir,
+                    set(prior_changes),
+                    new_pages={rel for rel, kind in prior_changes.items()
+                               if kind == "created"},
+                )
             self._turn_page_hashes = incremental.page_hashes(self.workdir)
+            self._turn_provenance_at = datetime.now(timezone.utc)
         self._turn_format_guard = None
         if grandfather_legacy_format:
             self._turn_format_guard = {
@@ -931,6 +949,34 @@ def _collect_workspace_artifacts(workdir: str) -> list[dict]:
     return out
 
 
+def _collect_workspace_artifacts_for_sync(run: CompileRun) -> list[dict]:
+    """Collect a durability-safe snapshot without mutating in-flight files."""
+    artifacts = _collect_workspace_artifacts(run.workdir)
+    before = getattr(run, "_turn_page_hashes", None)
+    stamp_time = getattr(run, "_turn_provenance_at", None)
+    if not isinstance(before, dict) or not isinstance(stamp_time, datetime):
+        return artifacts
+    after = incremental.page_hashes(run.workdir)
+    changes = incremental.changed_pages(before, after)
+    for artifact in artifacts:
+        path_value = artifact["path"]
+        if not path_value.startswith("candidate/"):
+            continue
+        rel = path_value[len("candidate/"):]
+        kind = changes.get(rel)
+        if kind not in ("created", "modified"):
+            continue
+        rewritten = selfcheck.siclaw_generated_metadata_text(
+            rel,
+            artifact["content"],
+            created=kind == "created",
+            now=stamp_time,
+        )
+        if rewritten is not None:
+            artifact["content"] = rewritten
+    return artifacts
+
+
 def _workspace_sync_cursor(workdir: str) -> dict[str, str]:
     """Hash the workspace state already installed by the consumer."""
     return {
@@ -950,7 +996,7 @@ async def _sync_workspace(run: CompileRun, sent: dict, *, commit_input: bool = F
     changed = []
     next_sent = dict(sent)
     collected = set()
-    for art in _collect_workspace_artifacts(run.workdir):
+    for art in _collect_workspace_artifacts_for_sync(run):
         collected.add(art["path"])
         sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
         if sent.get(art["path"]) == sha:
@@ -994,7 +1040,7 @@ def _workspace_replay_artifacts(run: CompileRun, sent: dict) -> list[dict]:
     acknowledges it. Re-send every current file and every remembered tombstone
     on attach; consumer upserts/deletes are idempotent.
     """
-    artifacts = _collect_workspace_artifacts(run.workdir)
+    artifacts = _collect_workspace_artifacts_for_sync(run)
     current = {item["path"] for item in artifacts}
     for path, value in sorted(sent.items()):
         if value == _SYNC_TOMBSTONE and path not in current:

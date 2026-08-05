@@ -49,6 +49,13 @@ def _page_sources(body):
     seen = set()
     for match in re.finditer(r"\((?:source|源):\s*([^)]+?)\s*\)", body, re.IGNORECASE):
         resource = match.group(1).strip()
+        # Ledger citations name materialized Raw inputs. Emit the explicit v0.2
+        # managed namespace so a later deletion cannot turn the citation into an
+        # indistinguishable external bare-path scope.
+        if resource.startswith("drop/"):
+            resource = "raw/" + resource[len("drop/"):]
+        elif not resource.startswith("raw/"):
+            resource = "raw/" + resource
         if resource and resource not in seen:
             seen.add(resource)
             resources.append({"resource": resource})

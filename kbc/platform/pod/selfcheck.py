@@ -222,7 +222,10 @@ def parse_okf_sources(
     return resources, derived, has_key
 
 
-def candidate_pages(workdir: str) -> dict[str, dict]:
+def candidate_pages(
+    workdir: str,
+    additional_managed_sources: set[str] | None = None,
+) -> dict[str, dict]:
     """Parse every candidate/**/*.md page's provenance. Keyed by path relative
     to candidate/ (posix). Unreadable pages are reported as parse errors, not
     skipped silently."""
@@ -231,6 +234,17 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
     if not cand.is_dir():
         return pages
     managed_sources = set(source_inventory(workdir))
+    # A deleted Raw source is absent from today's inventory by definition, but
+    # incremental dependency lookup still has to recognize legacy bare-path
+    # citations to it. Callers that hold an authoritative change set may extend
+    # the compatibility inventory narrowly; arbitrary external OKF resources
+    # remain outside Siclaw's managed Raw namespace.
+    if additional_managed_sources:
+        managed_sources.update(
+            entry
+            for raw in additional_managed_sources
+            if (entry := _norm_source_entry(raw))
+        )
     for f in sorted(cand.rglob("*.md")):
         rel = f.relative_to(cand).as_posix()
         try:
@@ -602,14 +616,22 @@ def _valid_okf_actor(value: object) -> bool:
     return bool(sep and producer.strip() and version.strip())
 
 
+_RFC3339_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
 def _valid_iso_datetime(value: object) -> bool:
     if isinstance(value, datetime):
-        return True
+        return value.tzinfo is not None and value.utcoffset() is not None
     if not isinstance(value, str) or not value.strip():
         return False
+    raw = value.strip()
+    if not _RFC3339_DATETIME_RE.fullmatch(raw):
+        return False
     try:
-        datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        return True
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00").replace(",", "."))
+        return parsed.tzinfo is not None and parsed.utcoffset() is not None
     except ValueError:
         return False
 
@@ -738,7 +760,7 @@ def _okf_v02_metadata_violations(rel: str, fm: dict, body: str) -> list[dict]:
                                "detail": "generated.by 必须使用 OKF actor 约定"})
         elif "at" in generated and not _valid_iso_datetime(generated.get("at")):
             violations.append({"page": rel, "kind": "okf_generated",
-                               "detail": "generated.at 必须是 ISO 8601 datetime"})
+                               "detail": "generated.at 必须是 RFC 3339 datetime"})
 
     if "verified" in fm:
         verified = fm.get("verified")
@@ -813,6 +835,96 @@ def _remove_yaml_spans(text: str, spans: list[tuple[int, int]]) -> str:
     return text
 
 
+def siclaw_generated_metadata_text(
+    rel: str,
+    text: str,
+    *,
+    created: bool = False,
+    now: datetime | None = None,
+) -> str | None:
+    """Return provenance-stamped bytes without mutating the source file.
+
+    ``None`` means the page cannot be safely stamped and should remain for the
+    normal OKF lint to reject or repair. Keeping this transformation pure lets
+    workspace sync sanitize an in-flight snapshot without racing the model's
+    file writer.
+    """
+    if _is_reserved_page(rel) or not rel.endswith(".md"):
+        return None
+    stamp_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    stamp = stamp_time.isoformat(timespec="seconds").replace("+00:00", "Z")
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return None
+    end = next((i for i, line in enumerate(lines[1:], start=1)
+                if line.strip() in ("---", "...")), None)
+    if end is None:
+        return None
+    frontmatter = "".join(lines[1:end])
+    try:
+        fm = yaml.safe_load(frontmatter)
+        root = yaml.compose(frontmatter, Loader=yaml.SafeLoader)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(fm, dict) or not isinstance(root, yaml.MappingNode):
+        return None
+    if root.flow_style:
+        raise ProvenanceStampError(
+            f"{rel}: top-level flow YAML cannot be provenance-stamped losslessly")
+
+    pairs: list[tuple[str, yaml.Node, yaml.Node]] = []
+    seen: set[str] = set()
+    for key_node, value_node in root.value:
+        key = key_node.value
+        if key in seen:
+            raise ProvenanceStampError(
+                f"{rel}: duplicate top-level YAML key {key!r} is ambiguous")
+        seen.add(key)
+        pairs.append((key, key_node, value_node))
+
+    remove_keys = {"generated", "verified"}
+    add_stable = created and fm.get("status") is None
+    if add_stable and "status" in fm:
+        remove_keys.add("status")
+
+    removed_nodes = [value for key, _, value in pairs if key in remove_keys]
+    retained_nodes = [value for key, _, value in pairs if key not in remove_keys]
+    removed_ids = set().union(*(_yaml_node_ids(node) for node in removed_nodes)) if removed_nodes else set()
+    retained_ids = set().union(*(_yaml_node_ids(node) for node in retained_nodes)) if retained_nodes else set()
+    if removed_ids & retained_ids:
+        raise ProvenanceStampError(
+            f"{rel}: a retained YAML alias depends on machine-owned provenance")
+
+    spans: list[tuple[int, int]] = []
+    for key, key_node, value_node in pairs:
+        if key not in remove_keys:
+            continue
+        start = key_node.start_mark.index - key_node.start_mark.column
+        finish = value_node.end_mark.index
+        line_end = frontmatter.find("\n", finish)
+        if line_end < 0:
+            line_end = len(frontmatter)
+        tail = frontmatter[finish:line_end]
+        if not tail.strip() or tail.lstrip().startswith("#"):
+            finish = line_end + (1 if line_end < len(frontmatter) else 0)
+        spans.append((start, finish))
+
+    preserved = _remove_yaml_spans(frontmatter, spans)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    if preserved and not preserved.endswith(("\n", "\r")):
+        preserved += newline
+    indent = " " * min((key.start_mark.column for _, key, _ in pairs), default=0)
+    inserted = []
+    if add_stable:
+        inserted.append(f"{indent}status: stable{newline}")
+    inserted.extend([
+        f"{indent}generated:{newline}",
+        f"{indent}  by: process:siclaw-kbc{newline}",
+        f"{indent}  at: '{stamp}'{newline}",
+    ])
+    return lines[0] + preserved + "".join(inserted) + lines[end] + "".join(lines[end + 1:])
+
+
 def stamp_siclaw_generated_metadata(
     workdir: str,
     changed_pages: set[str],
@@ -829,12 +941,8 @@ def stamp_siclaw_generated_metadata(
     """
     candidate = Path(workdir) / "candidate"
     created = new_pages or set()
-    stamp_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    stamp = stamp_time.isoformat(timespec="seconds").replace("+00:00", "Z")
     pending: list[tuple[Path, str, str]] = []
     for rel in sorted(changed_pages):
-        if _is_reserved_page(rel) or not rel.endswith(".md"):
-            continue
         target = candidate / rel
         if not target.is_file():
             continue
@@ -842,77 +950,9 @@ def stamp_siclaw_generated_metadata(
             text = target.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        lines = text.splitlines(keepends=True)
-        if not lines or lines[0].strip() != "---":
-            continue
-        end = next((i for i, line in enumerate(lines[1:], start=1)
-                    if line.strip() in ("---", "...")), None)
-        if end is None:
-            continue
-        frontmatter = "".join(lines[1:end])
-        try:
-            fm = yaml.safe_load(frontmatter)
-            root = yaml.compose(frontmatter, Loader=yaml.SafeLoader)
-        except yaml.YAMLError:
-            continue
-        if not isinstance(fm, dict) or not isinstance(root, yaml.MappingNode):
-            continue
-        if root.flow_style:
-            raise ProvenanceStampError(
-                f"{rel}: top-level flow YAML cannot be provenance-stamped losslessly")
-
-        pairs: list[tuple[str, yaml.Node, yaml.Node]] = []
-        seen: set[str] = set()
-        for key_node, value_node in root.value:
-            key = key_node.value
-            if key in seen:
-                raise ProvenanceStampError(
-                    f"{rel}: duplicate top-level YAML key {key!r} is ambiguous")
-            seen.add(key)
-            pairs.append((key, key_node, value_node))
-
-        remove_keys = {"generated", "verified"}
-        add_stable = rel in created and fm.get("status") is None
-        if add_stable and "status" in fm:
-            remove_keys.add("status")
-
-        removed_nodes = [value for key, _, value in pairs if key in remove_keys]
-        retained_nodes = [value for key, _, value in pairs if key not in remove_keys]
-        removed_ids = set().union(*(_yaml_node_ids(node) for node in removed_nodes)) if removed_nodes else set()
-        retained_ids = set().union(*(_yaml_node_ids(node) for node in retained_nodes)) if retained_nodes else set()
-        if removed_ids & retained_ids:
-            raise ProvenanceStampError(
-                f"{rel}: a retained YAML alias depends on machine-owned provenance")
-
-        spans: list[tuple[int, int]] = []
-        for key, key_node, value_node in pairs:
-            if key not in remove_keys:
-                continue
-            start = key_node.start_mark.index - key_node.start_mark.column
-            finish = value_node.end_mark.index
-            line_end = frontmatter.find("\n", finish)
-            if line_end < 0:
-                line_end = len(frontmatter)
-            tail = frontmatter[finish:line_end]
-            if not tail.strip() or tail.lstrip().startswith("#"):
-                finish = line_end + (1 if line_end < len(frontmatter) else 0)
-            spans.append((start, finish))
-
-        preserved = _remove_yaml_spans(frontmatter, spans)
-        newline = "\r\n" if "\r\n" in text else "\n"
-        if preserved and not preserved.endswith(("\n", "\r")):
-            preserved += newline
-        indent = " " * min((key.start_mark.column for _, key, _ in pairs), default=0)
-        inserted = []
-        if add_stable:
-            inserted.append(f"{indent}status: stable{newline}")
-        inserted.extend([
-            f"{indent}generated:{newline}",
-            f"{indent}  by: process:siclaw-kbc{newline}",
-            f"{indent}  at: '{stamp}'{newline}",
-        ])
-        rewritten = lines[0] + preserved + "".join(inserted) + lines[end] + "".join(lines[end + 1:])
-        if rewritten == text:
+        rewritten = siclaw_generated_metadata_text(
+            rel, text, created=rel in created, now=now)
+        if rewritten is None or rewritten == text:
             continue
         pending.append((target, rel, rewritten))
     written: list[str] = []

@@ -5973,6 +5973,61 @@ def test_batch_retry_preserves_first_attempt_page_baseline():
     print("✓ batch retry keeps the first attempt baseline and invalidates old verification")
 
 
+async def test_workspace_sync_invalidates_verification_before_cross_process_resume():
+    """Durability cannot carry old trust onto bytes written by a failed turn."""
+    with tempfile.TemporaryDirectory() as td:
+        candidate = Path(td) / "candidate"
+        candidate.mkdir()
+        page = candidate / "topic.md"
+        page.write_text(
+            "---\ntype: Topic\nverified:\n  by: human:r\n"
+            "  at: '2026-08-04T00:00:00Z'\n---\nOld\n", "utf-8")
+        run = compile_box.CompileRun("durable-baseline", td, 1)
+        sent = compile_box._workspace_sync_cursor(td)
+        run._begin_turn("attempt 1")
+        page.write_text(page.read_text("utf-8").replace("Old", "New"), "utf-8")
+
+        changed = await compile_box._sync_workspace(run, sent)
+        assert changed == 1, changed
+        sync = next(event for event in _drain(run) if event["type"] == "syncArtifacts")
+        persisted = next(
+            item["content"] for item in sync["artifacts"]
+            if item["path"] == "candidate/topic.md"
+        )
+        fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(persisted)
+        assert not error and "verified" not in fm, fm
+        assert (fm.get("generated") or {}).get("by") == "process:siclaw-kbc", fm
+        local_fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(
+            page.read_text("utf-8"))
+        assert not error and "verified" in local_fm, local_fm  # sync never races the writer
+
+        # A second periodic tick neither rewrites nor re-emits identical bytes.
+        assert await compile_box._sync_workspace(run, sent) == 0
+        replay = compile_box._workspace_replay_artifacts(run, sent)
+        replayed = next(item["content"] for item in replay
+                        if item["path"] == "candidate/topic.md")
+        assert replayed == persisted
+
+        # Retrying in the same live box reconciles the previous failed turn
+        # before replacing its in-memory baseline.
+        run._begin_turn("same-process retry")
+        local_fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(
+            page.read_text("utf-8"))
+        assert not error and "verified" not in local_fm, local_fm
+
+        # Emulate a new box rehydrating the persisted Candidate. Its idempotent
+        # retry has no byte delta, but stale verification is already impossible.
+        page.write_text(persisted, "utf-8")
+        resumed = compile_box.CompileRun("resumed", td, 1)
+        resumed._begin_turn("attempt 1 after restart")
+        changes = compile_box.incremental.changed_pages(
+            resumed._turn_page_hashes, compile_box.incremental.page_hashes(td))
+        assert changes == {}, changes
+        fm, _, error = compile_box.selfcheck.parse_okf_frontmatter(page.read_text("utf-8"))
+        assert not error and "verified" not in fm, fm
+    print("✓ workspace sync invalidates old verified before cross-process resume")
+
+
 async def test_resumed_batch_phase_is_watchdog_armed():
     """(d) The resumed-batching phase (the suspected coverage gap) runs each
     pending batch through _drive_batch_session, which arms the watchdog via
@@ -6516,6 +6571,7 @@ async def main():
     await test_interrupt_failure_reap_is_bounded_and_resumable()
     await test_batch_rebuild_exhaustion_raises_resumable()
     test_batch_retry_preserves_first_attempt_page_baseline()
+    await test_workspace_sync_invalidates_verification_before_cross_process_resume()
     await test_resumed_batch_phase_is_watchdog_armed()
     await test_run_wrapper_closes_turn_on_driver_crash()
     await test_run_wrapper_cancels_detached_verify_tasks()
