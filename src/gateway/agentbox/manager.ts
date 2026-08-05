@@ -1206,7 +1206,9 @@ export class AgentBoxManager {
    */
   async inspect(agentId: string, profile?: string): Promise<AgentBoxInfo | null> {
     if (this.isK8s) {
-      return this.spawner.get(this.podName(agentId, this.prefixForProfile(profile)));
+      // Pass the real profile name into podName/boxIdFor — never a podNamePrefix
+      // (getBoxProfile rejects prefixes; see PR #469 / v0.3.2 production bug).
+      return this.spawner.get(this.podName(agentId, profile));
     }
     const managed = this.boxes.get(agentId);
     return managed ? this.spawner.get(managed.handle.boxId) : null;

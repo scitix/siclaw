@@ -113,6 +113,37 @@ describe("PiAgentBrain", () => {
     expect(session.prompt).not.toHaveBeenCalled();
   });
 
+  it("allows recovery when the transcript ends at the user message", () => {
+    const session = makeFakeSession({
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    });
+    const brain = new PiAgentBrain(session);
+    expect(brain.getRecoveryState()).toMatchObject({
+      eligible: true,
+      lastRole: "user",
+    });
+  });
+
+  it("runs context preflight before agent.continue on resume", async () => {
+    const continueFn = vi.fn(async () => {});
+    const session = makeFakeSession({
+      agent: { onResponse: vi.fn(async () => {}), continue: continueFn, state: { messages: [] } },
+      messages: [
+        { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "bash" }] },
+        { role: "toolResult", toolCallId: "call_1", isError: false, content: [] },
+      ],
+    });
+    const brain = new PiAgentBrain(session);
+    const preflight = vi.spyOn(brain, "ensureContextForModelPrompt").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      contextWindow: 1000,
+    });
+    await brain.resumeFromHistory();
+    expect(preflight).toHaveBeenCalledOnce();
+    expect(continueFn).toHaveBeenCalledOnce();
+  });
+
   it("subscribe subscribes to session and allows unsub", () => {
     const session = makeFakeSession();
     const brain = new PiAgentBrain(session);

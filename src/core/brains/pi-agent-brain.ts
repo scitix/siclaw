@@ -214,6 +214,12 @@ export class PiAgentBrain implements BrainSession {
     if (pending.size > 0) {
       return { ...base, eligible: false, reason: "Session has pending tool calls" };
     }
+    // pi's agent-loop continues from last=user OR last=toolResult. A crash during
+    // the first LLM call of a turn (widest window) leaves last=user and is as safe
+    // as toolResult: tools only run after their assistant message_end is persisted.
+    if (last.role === "user") {
+      return { ...base, eligible: true, reason: "Last persisted message is the user turn (no tool side effects yet)" };
+    }
     if (last.role !== "toolResult") {
       return { ...base, eligible: false, reason: `Last persisted message is ${String(last.role)}` };
     }
@@ -223,12 +229,34 @@ export class PiAgentBrain implements BrainSession {
     return { ...base, eligible: true, reason: "Last persisted tool result completed successfully" };
   }
 
+  /**
+   * Continue a cold-rehydrated session without re-prompting.
+   *
+   * Uses `agent.continue()` rather than `_runAgentPrompt` (pi internal). Known
+   * gaps vs a warm prompt path — documented in agentbox-stream-recovery.md:
+   * no LLM auto-retry, no post-run compaction loop, no agent_settled drain.
+   * We DO run context preflight (compact if needed) before continue so a
+   * near-ceiling recovery does not rebuild the pod only to OOM the context.
+   */
   async resumeFromHistory(): Promise<void> {
     const state = this.getRecoveryState();
     if (!state.eligible) {
       throw new Error(`Session cannot resume from history: ${state.reason}`);
     }
     this.aborted = false;
+
+    const model = this.getModel?.();
+    if (model) {
+      // Empty text: resume appends no user message; estimate still covers history.
+      const preflight = await this.ensureContextForModelPrompt(model, "");
+      if (!preflight.ok) {
+        throw new Error(
+          preflight.errorMessage ||
+            "Session cannot resume from history: context preflight failed",
+        );
+      }
+    }
+
     await this.session.agent.continue();
   }
 

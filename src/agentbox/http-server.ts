@@ -1048,11 +1048,11 @@ export function createHttpServer(
       return;
     }
 
-    // Single entry: every prompt goes through the routing runner. With no real
-    // fallback target it runs one candidate (the current model) live — identical
-    // UX to a bare prompt, but still emitting model_route_* so every turn carries
-    // its model identity on one channel. effectivePolicy is read AFTER model setup
-    // so the single candidate reflects the model just pinned for this turn.
+    // Single entry: normal prompts go through the routing runner (uniform
+    // model_route_*, commit-gating, ensureContextForModelPrompt). Resume is the
+    // second legitimate bypass: no new user text / no model_route_start, and
+    // context preflight lives inside resumeFromHistory() itself. See
+    // docs/design/agentbox-stream-recovery.md "Accepted gaps".
     const effectivePolicy = body.resumeFromHistory
       ? undefined
       : resolveEffectivePolicy(

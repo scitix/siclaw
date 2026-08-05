@@ -176,17 +176,19 @@ describe("AgentBoxManager — K8s mode", () => {
   it("inspects authoritative pod state without spawning", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
+    // Default chat profile names pods agentbox-<agent>-0 (instance 0).
     const info: AgentBoxInfo = {
-      boxId: "agentbox-agent-a",
+      boxId: "agentbox-agent-a-0",
       agentId: "agent-a",
       status: "error",
       endpoint: "",
       createdAt: new Date(),
       lastActiveAt: new Date(),
     };
-    spawner.getReturns.set("agentbox-agent-a", info);
+    spawner.getReturns.set("agentbox-agent-a-0", info);
     await expect(mgr.inspect("agent-a")).resolves.toBe(info);
     expect(spawner.spawnCalls).toHaveLength(0);
+    expect(spawner.boxIdForProfiles).toContain(undefined);
   });
 
   it("returns existing pod info if already running", async () => {

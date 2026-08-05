@@ -66,8 +66,15 @@ export async function waitForConfirmedAgentBoxFailure(
   const deadline = Date.now() + timeoutMs;
 
   while (!signal.aborted) {
-    const info = await manager.inspect(agentId);
-    if (!info || info.status === "error" || info.status === "stopped") return true;
+    // inspect() can throw (K8s blip). Swallow and retry until timeout — do not
+    // rethrow (would surface as INTERNAL) and do not treat a blip as "confirmed
+    // dead" (would rebuild a possibly healthy pod).
+    try {
+      const info = await manager.inspect(agentId);
+      if (!info || info.status === "error" || info.status === "stopped") return true;
+    } catch {
+      // cannot confirm this round; fall through to delay/timeout
+    }
     if (Date.now() >= deadline) return false;
     await abortableDelay(Math.min(pollMs, Math.max(0, deadline - Date.now())), signal);
   }

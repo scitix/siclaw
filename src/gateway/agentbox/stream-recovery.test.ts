@@ -38,4 +38,29 @@ describe("AgentBox stream recovery", () => {
       { timeoutMs: 2, pollMs: 1 },
     )).resolves.toBe(false);
   });
+
+  it("swallows inspect throws and still confirms on a later terminal read", async () => {
+    const manager = {
+      inspect: vi.fn()
+        .mockRejectedValueOnce(new Error("k8s blip"))
+        .mockResolvedValueOnce({ status: "error" }),
+    };
+    await expect(waitForConfirmedAgentBoxFailure(
+      manager as any,
+      "agent-a",
+      new AbortController().signal,
+      { timeoutMs: 50, pollMs: 1 },
+    )).resolves.toBe(true);
+    expect(manager.inspect).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not treat a pure inspect blip as confirmed death", async () => {
+    const manager = { inspect: vi.fn(async () => { throw new Error("k8s blip"); }) };
+    await expect(waitForConfirmedAgentBoxFailure(
+      manager as any,
+      "agent-a",
+      new AbortController().signal,
+      { timeoutMs: 5, pollMs: 1 },
+    )).resolves.toBe(false);
+  });
 });
