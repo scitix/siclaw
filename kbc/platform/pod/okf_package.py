@@ -23,6 +23,11 @@ MAX_TOTAL_UNPACKED_BYTES = 100 * 1024 * 1024
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 1000
 ALLOWED_SUFFIXES = {".md", ".json"}
+MAX_CANDIDATE_PATH_CHARS = 255
+ALLOWED_AUTHORING_PATHS = {
+    "authoring/EXCLUSIONS.json",
+    "authoring/CONTRADICTIONS.json",
+}
 
 
 class OKFPackageError(ValueError):
@@ -115,12 +120,20 @@ def collect_import_files(wiki_dir: str | Path) -> list[tuple[str, bytes]]:
         total_bytes += len(data)
         if total_bytes > MAX_TOTAL_UNPACKED_BYTES:
             raise OKFPackageError("Knowledge package unpacked size is too large")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise OKFPackageError(f"Knowledge file is not UTF-8 text: {rel}") from error
+        if rel.startswith("authoring/"):
+            if rel not in ALLOWED_AUTHORING_PATHS:
+                raise OKFPackageError(
+                    "Knowledge package accepts only authoring/EXCLUSIONS.json and "
+                    f"authoring/CONTRADICTIONS.json under authoring/, not: {rel}"
+                )
+        elif len("candidate/" + rel) > MAX_CANDIDATE_PATH_CHARS:
+            raise OKFPackageError(f"Knowledge package path is too long for Candidate: {rel}")
         files.append((rel, data))
         if entry.suffix.lower() == ".md":
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise OKFPackageError(f"Markdown file is not UTF-8: {rel}") from error
             markdown_pages[rel] = {"text": text, "bytes": len(data)}
 
     if not files:

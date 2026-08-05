@@ -140,6 +140,80 @@ def test_import_rejects_non_rfc3339_verification_times() -> None:
                 raise AssertionError(f"non-RFC3339 verified.at was accepted: {value}")
 
 
+def test_non_utf8_json_is_rejected() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        wiki = Path(raw)
+        _write(wiki, "index.md", INDEX)
+        (wiki / "metadata.json").write_bytes(b"\xff\xfe")
+        try:
+            collect_import_files(wiki)
+        except OKFPackageError as error:
+            assert "not UTF-8" in str(error)
+            assert "metadata.json" in str(error)
+        else:
+            raise AssertionError("non-UTF-8 JSON was accepted")
+
+
+def test_candidate_path_limit_matches_importer() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        wiki = Path(raw)
+        _write(wiki, "index.md", INDEX)
+        accepted = "a" * 240 + ".json"
+        rejected = "a" * 241 + ".json"
+        _write(wiki, accepted, "{}")
+        assert len("candidate/" + accepted) == 255
+        collect_import_files(wiki)
+
+        _write(wiki, rejected, "{}")
+        assert len("candidate/" + rejected) == 256
+        try:
+            collect_import_files(wiki)
+        except OKFPackageError as error:
+            assert "too long for Candidate" in str(error)
+            assert rejected in str(error)
+        else:
+            raise AssertionError("overlong Candidate path was accepted")
+
+
+def test_candidate_path_limit_counts_unicode_characters_not_bytes() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        wiki = Path(raw)
+        _write(wiki, "index.md", INDEX)
+        rel = f"{'界' * 80}/{'界' * 80}/page.json"
+        assert len(("candidate/" + rel).encode("utf-8")) > 255
+        assert len("candidate/" + rel) < 255
+        _write(wiki, rel, "{}")
+        collect_import_files(wiki)
+
+
+def test_only_importer_authoring_files_are_allowed() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        wiki = Path(raw)
+        _write(wiki, "index.md", INDEX)
+        _write(wiki, "authoring/OTHER.json", "{}")
+        try:
+            collect_import_files(wiki)
+        except OKFPackageError as error:
+            assert "authoring/EXCLUSIONS.json" in str(error)
+            assert "authoring/CONTRADICTIONS.json" in str(error)
+            assert "authoring/OTHER.json" in str(error)
+        else:
+            raise AssertionError("unsupported authoring file was accepted")
+
+
+def test_importer_authoring_ledgers_are_allowed() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        wiki = Path(raw)
+        _write(wiki, "index.md", INDEX)
+        _write(wiki, "authoring/EXCLUSIONS.json", "[]")
+        _write(wiki, "authoring/CONTRADICTIONS.json", "[]")
+        assert [rel for rel, _ in collect_import_files(wiki)] == [
+            "authoring/CONTRADICTIONS.json",
+            "authoring/EXCLUSIONS.json",
+            "index.md",
+        ]
+
+
 if __name__ == "__main__":
     test_deterministic_archive()
     test_import_profile_preserves_external_okf_semantics()
@@ -148,4 +222,9 @@ if __name__ == "__main__":
     test_hardlinks_are_rejected()
     test_unsafe_archive_names_are_rejected()
     test_import_rejects_non_rfc3339_verification_times()
+    test_non_utf8_json_is_rejected()
+    test_candidate_path_limit_matches_importer()
+    test_candidate_path_limit_counts_unicode_characters_not_bytes()
+    test_only_importer_authoring_files_are_allowed()
+    test_importer_authoring_ledgers_are_allowed()
     print("OK  standalone OKF package validation + deterministic archive")
