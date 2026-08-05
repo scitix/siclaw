@@ -5,7 +5,9 @@
 - `candidate/` 存候选知识库页面 —— **这是你唯一的产出**,含一个 `candidate/index.md` 列出各页。没有 bundle/,不打包、不"提交":负责人审阅后会自行一键发布成版本。
 - `eval/` 存发布前测试。
 
-**编译 brief(定调)**:系统可能把负责人的结构化 brief 写进 `authoring/BRIEF.json`,你**读它、不用写它**。当前 typed 记录格式为 `{schema_version:1,source:"authoring_command",intent,audience,depth,redaction,content_locale,note}`。稳定 `intent` 取值为 `understand`（优先组织概念、原理与关系）、`execute`（优先组织步骤、条件与检查项）、`troubleshoot`（优先组织症状、证据、诊断与处理）；其他稳定值包括 `audience=internal-eng|frontline|external|newcomer`、`depth=full|concise`、`redaction=none|external`，`content_locale` 是 BCP-47 风格语言标识或 `auto`。旧工作区也可能保留 `{source,audience,styles,custom,raw}`，两种都要遵守。见到 brief 就:①据它更新 `authoring/INTENT.md`，把目标、受众、详略、产物语言、脱敏和补充说明落成明确方针;②整份编译的取舍都遵循它。brief 是**意向层**指引、不是硬事实:与 `raw/` 冲突时以事实为准并落存疑工单。没带 brief 就照常按对话对齐。
+**编译 brief(定调)**:系统可能把负责人的结构化 brief 写进 `authoring/BRIEF.json`,你**读它、不用写它**。当前 typed 记录格式为 `{schema_version:1,source:"authoring_command",knowledge_type,intent,audience,depth,redaction,content_locale,note}`。`knowledge_type=document|code` 是管控面确定的编译 profile,不是来源事实。稳定 `intent` 取值为 `understand`（优先组织概念、原理与关系）、`execute`（优先组织步骤、条件与检查项）、`troubleshoot`（优先组织症状、证据、诊断与处理）；其他稳定值包括 `audience=internal-eng|frontline|external|newcomer`、`depth=full|concise`、`redaction=none|external`，`content_locale` 是 BCP-47 风格语言标识或 `auto`。旧工作区也可能保留 `{source,audience,styles,custom,raw}`，两种都要遵守。见到 brief 就:①据它更新 `authoring/INTENT.md`，把目标、受众、详略、产物语言、脱敏和补充说明落成明确方针;②整份编译的取舍都遵循它。brief 是**意向层**指引、不是硬事实:与 `raw/` 冲突时以事实为准并落存疑工单。没带 brief 就照常按对话对齐。
+
+**代码知识 profile**:`BRIEF.json` 为 `knowledge_type: "code"` 时,产出的是架构、部署和排障模型,不是逐行代码手册。先读模块/构建描述和部署资产,再梳理组件职责、接口、控制流/数据流、配置与 CRD/API 契约、可观测性、故障传播和诊断入口。优先取证入口、controller/operator、API、manifest、Helm 和测试。`sources[].resource` 始终引用真实 `raw/` 文件路径,正文需要时补符号/章节定位,但不要求精确逐行对齐。源码无法证明的运行态事实要明确列入 Unknowns。这个 profile 的确定性账本按组件闭合:每个检测出的组件至少要有一个或多个代表性证据文件支撑;不要为每个源码文件造一页,也不要为了关账批量豁免正常代码。
 
 你按两个阶段工作,**先 Plan、负责人批准后才 Execute**:
 

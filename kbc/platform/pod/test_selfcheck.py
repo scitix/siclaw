@@ -426,6 +426,50 @@ def test_coverage_and_lint():
     print("OK  coverage + lint + repair prompt (unaccounted / dangling / exempt index / close / locale)")
 
 
+def test_code_profile_component_coverage():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/BRIEF.json", json.dumps({"knowledge_type": "code"}))
+        _mk(base, "raw/go.mod", "module example.invalid/operator\n")
+        _mk(base, "raw/README.md", "operator\n")
+        _mk(base, "raw/internal/controller/reconcile.go", "package controller\n")
+        _mk(base, "raw/internal/controller/status.go", "package controller\n")
+        _mk(base, "raw/internal/web/handler.go", "package web\n")
+        _mk(base, "raw/vendor/example/dependency.go", "package dependency\n")
+        pages = {
+            "overview.md": {
+                "sources": ["go.mod", "internal/controller/reconcile.go"],
+            },
+        }
+        cov = selfcheck.coverage(td, pages, [])
+        assert cov["profile"] == "code", cov
+        assert cov["total_components"] == 3, cov
+        assert cov["covered_components"] == 2, cov
+        assert cov["ignored_sources"] == 1, cov
+        assert cov["unaccounted"] == ["internal/web/handler.go"], cov
+        assert cov["unaccounted_components"] == [{
+            "component": "internal/web",
+            "representative": "internal/web/handler.go",
+            "unaccounted_files": 1,
+            "total_files": 1,
+        }], cov
+        assert not cov["closed"]
+
+        pages["web.md"] = {"sources": ["internal/web/handler.go"]}
+        cov = selfcheck.coverage(td, pages, [])
+        assert cov["closed"] and cov["unaccounted"] == [], cov
+
+    # No explicit code brief means the existing per-file document contract.
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/internal/controller/a.go", "package controller\n")
+        _mk(base, "raw/internal/controller/b.go", "package controller\n")
+        cov = selfcheck.coverage(td, {"p.md": {"sources": ["internal/controller/a.go"]}}, [])
+        assert "profile" not in cov, cov
+        assert cov["unaccounted"] == ["internal/controller/b.go"], cov
+    print("OK  code profile accounts by component; document profile stays per-file")
+
+
 def test_candidate_credential_lint():
     """Obvious credentials block convergence without echoing their value, while
     ordinary internal detail and explicit placeholders remain publishable."""
@@ -2431,6 +2475,7 @@ def main():
     test_matches_segment_aware()
     test_noop_exclusion_warning()
     test_coverage_and_lint()
+    test_code_profile_component_coverage()
     test_candidate_credential_lint()
     test_media_ledger_and_new_lint()
     test_is_media_asset()

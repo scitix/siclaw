@@ -17,7 +17,10 @@ def _mk(base: Path, rel: str, text: str = "x"):
 
 
 def _page(sources: list[str]) -> str:
-    cf = "\n".join(f"  - resource: {s}" for s in sources)
+    cf = "\n".join(
+        f"  - resource: {s if s.startswith(('raw/', 'drop/')) else 'raw/' + s}"
+        for s in sources
+    )
     return f"---\ntype: Topic\ntitle: t\nsources:\n{cf}\n---\n正文。"
 
 
@@ -68,6 +71,32 @@ def test_no_basename_cross_match():
         assert incremental.integrity_violations(before, after, auth) == ["vendor-cfg.md"], \
             "guard must flag out-of-scope edit to the same-basename sibling"
         print("OK  no basename cross-match (same-basename dirs isolated; guard still flags drift)")
+
+
+def test_code_profile_component_impact():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/BRIEF.json", json.dumps({"knowledge_type": "code"}))
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [controller](controller.md)")
+        _mk(base, "candidate/controller.md", _page(["internal/controller/reconcile.go"]))
+        _mk(base, "candidate/web.md", _page(["internal/web/handler.go"]))
+
+        affected, unaffected = incremental.resolve_affected_pages(
+            td, {"modified": ["internal/controller/status.go"]}
+        )
+        assert affected == ["controller.md"], (affected, unaffected)
+        assert unaffected == ["web.md"], (affected, unaffected)
+
+        changeset = incremental.build_changeset(
+            td,
+            {
+                "added": ["internal/controller/metrics.go"],
+                "modified": ["internal/controller/status.go"],
+            },
+        )
+        assert changeset["modified"][0]["affected_pages"] == ["controller.md"], changeset
+        assert changeset["added"][0]["target_hint"] == "internal/controller", changeset
+    print("OK  code profile widens exact diffs to component pages and emits target hints")
 
 
 def test_raw_prefix_normalization():
@@ -428,6 +457,7 @@ def test_integrity_repair_directive():
 if __name__ == "__main__":
     test_resolve_affected_pages()
     test_no_basename_cross_match()
+    test_code_profile_component_impact()
     test_raw_prefix_normalization()
     test_build_changeset()
     test_integrity_guard()

@@ -6327,6 +6327,7 @@ async def test_typed_authoring_commands():
                     "operation_id": f"op-{locale}",
                     "generation": 1,
                     "parameters": {"brief": {
+                        "knowledge_type": "code",
                         "intent": "troubleshoot",
                         "audience": "internal-eng",
                         "depth": "full",
@@ -6345,6 +6346,7 @@ async def test_typed_authoring_commands():
             assert brief == {
                 "schema_version": 1,
                 "source": "authoring_command",
+                "knowledge_type": "code",
                 "intent": "troubleshoot",
                 "audience": "internal-eng",
                 "depth": "full",
@@ -6361,6 +6363,11 @@ async def test_typed_authoring_commands():
             invalid_intent["command"]["parameters"]["brief"]["intent"] = "请帮我排障"
             run._turn_active = False
             r = await client.post(f"/command/{run_id}", json=invalid_intent)
+            assert r.status == 400 and len(run.client.queries) == 1, await r.text()
+            invalid_type = json.loads(json.dumps(body))
+            invalid_type["command_id"] = f"bad-type-{locale}"
+            invalid_type["command"]["parameters"]["brief"]["knowledge_type"] = "repository"
+            r = await client.post(f"/command/{run_id}", json=invalid_type)
             assert r.status == 400 and len(run.client.queries) == 1, await r.text()
             # An idempotency key binds one normalized payload; it cannot be
             # reinterpreted as a different action or generation.

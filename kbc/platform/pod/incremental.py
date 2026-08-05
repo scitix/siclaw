@@ -22,7 +22,7 @@ import os
 import posixpath
 from pathlib import Path
 
-from selfcheck import _is_en, candidate_pages
+from selfcheck import _is_en, candidate_pages, code_component, knowledge_type
 
 # 消费方 → box(管控面把机器算的变更交给执行面):变更源集 + 每个 modified 的 unified
 # diff + 基线/快照指纹。box 读它、富集 affected_pages,再落下面的 CHANGESET(给模型)。
@@ -91,12 +91,34 @@ def _changed_managed_sources(changed_sources: dict) -> set[str]:
     }
 
 
+def _pages_for_sources(workdir: str, pages: dict[str, dict], sources: set[str]) -> set[str]:
+    """Resolve exact dependency edges, widened to the component for code KBs.
+
+    Architecture pages intentionally cite representative evidence rather than
+    every source file. A changed sibling in the same component must therefore
+    re-open pages that cite any member of that component; document KBs retain
+    byte-for-byte exact-path behavior.
+    """
+    exact = _pages_citing(pages, sources)
+    if knowledge_type(workdir) != "code" or not sources:
+        return exact
+    changed_components = {code_component(_norm_source(source)) for source in sources}
+    hit = set(exact)
+    for rel, page in pages.items():
+        if rel == INDEX_PAGE or "error" in page:
+            continue
+        page_components = {code_component(_norm_source(source)) for source in page.get("sources", [])}
+        if page_components & changed_components:
+            hit.add(rel)
+    return hit
+
+
 def _resolve_affected_pages(
-    pages: dict[str, dict], changed_sources: dict,
+    workdir: str, pages: dict[str, dict], changed_sources: dict,
 ) -> tuple[list[str], list[str]]:
     all_pages = {rel for rel in pages if rel != INDEX_PAGE and "error" not in pages[rel]}
     touched = _changed_managed_sources(changed_sources)
-    affected = _pages_citing(pages, touched)
+    affected = _pages_for_sources(workdir, pages, touched)
     return sorted(affected), sorted(all_pages - affected)
 
 
@@ -111,7 +133,7 @@ def resolve_affected_pages(workdir: str, changed_sources: dict) -> tuple[list[st
     """
     touched = _changed_managed_sources(changed_sources)
     pages = candidate_pages(workdir, additional_managed_sources=touched)
-    return _resolve_affected_pages(pages, changed_sources)
+    return _resolve_affected_pages(workdir, pages, changed_sources)
 
 
 # ── 拼 CHANGESET(模型只消费,affected_pages 代码反查而非模型报)────────────────
@@ -151,17 +173,21 @@ def build_changeset(
     added = list(changed_sources.get("added", []))
     modified = list(changed_sources.get("modified", []))
     deleted = list(changed_sources.get("deleted", []))
-    affected, unaffected = _resolve_affected_pages(pages, changed_sources)
+    affected, unaffected = _resolve_affected_pages(workdir, pages, changed_sources)
 
     def pages_for(src: str) -> list[str]:
-        return sorted(_pages_citing(pages, {src}))
+        return sorted(_pages_for_sources(workdir, pages, {src}))
 
     changeset = {
         "version": 1,
         "baseline_fingerprint": baseline_fingerprint,   # 上次收敛的整区指纹(审计)
         "snapshot_fingerprint": snapshot_fingerprint,   # 本轮快照的整区指纹
         # 全新料:没有归属页,模型按 target_hint 级联编入相关页或建新页;coverage 护栏兜底。
-        "added": [{"path": p, "content_ref": p, "target_hint": ""} for p in added],
+        "added": [{
+            "path": p,
+            "content_ref": p,
+            "target_hint": code_component(p) if knowledge_type(workdir) == "code" else "",
+        } for p in added],
         # 改动料:给受影响页 + 统一 diff(+/−),模型只改动到的那几处,不重写整页。
         "modified": [{"path": p, "affected_pages": pages_for(p), "diff": ""} for p in modified],
         # 删除料:从受影响页移除其内容/引用;页空则删页(index_touched)。

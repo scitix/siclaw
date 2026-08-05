@@ -1477,6 +1477,7 @@ _DOMAIN_REFRESH_TRIGGERS = (
 )
 _BRIEF_AUDIENCES = {"", "internal-eng", "frontline", "external", "newcomer"}
 _BRIEF_INTENTS = {"", "understand", "execute", "troubleshoot"}
+_BRIEF_KNOWLEDGE_TYPES = {"document", "code"}
 _CONTENT_LOCALE_RE = re.compile(r"^(?:auto|[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*)$")
 
 
@@ -1526,6 +1527,9 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
         normalized_brief = {
             "schema_version": 1,
             "source": "authoring_command",
+            "knowledge_type": _bounded_string(
+                brief.get("knowledge_type"), "brief.knowledge_type", limit=32
+            ) or "document",
             "intent": _bounded_string(brief.get("intent"), "brief.intent", limit=32),
             "audience": _bounded_string(brief.get("audience"), "brief.audience", limit=64),
             "depth": _bounded_string(brief.get("depth"), "brief.depth", limit=32),
@@ -1535,6 +1539,8 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
         }
         if normalized_brief["depth"] not in {"", "full", "concise"}:
             raise CommandRejected("brief.depth must be full or concise")
+        if normalized_brief["knowledge_type"] not in _BRIEF_KNOWLEDGE_TYPES:
+            raise CommandRejected("brief.knowledge_type must be document or code")
         if normalized_brief["intent"] not in _BRIEF_INTENTS:
             raise CommandRejected("brief.intent is unsupported")
         if normalized_brief["audience"] not in _BRIEF_AUDIENCES:

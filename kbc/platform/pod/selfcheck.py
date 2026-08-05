@@ -96,6 +96,52 @@ def source_inventory(workdir: str) -> list[str]:
     return sorted(out)
 
 
+_CODE_COMPONENT_CONTAINERS = {
+    "api", "apis", "charts", "cmd", "config", "controllers", "deploy",
+    "deployment", "helm", "internal", "manifests", "operator", "operators",
+    "pkg", "plugins",
+}
+_CODE_IGNORED_ROOTS = {
+    "build", "dist", "node_modules", "target", "third_party", "vendor",
+}
+
+
+def knowledge_type(workdir: str) -> str:
+    """Return the durable compile profile written by the control plane.
+
+    Missing, legacy, or malformed BRIEF records remain document libraries. This
+    fail-closed default is important during rolling upgrades: only an explicit
+    typed command may relax per-file accounting to component accounting.
+    """
+    path = Path(workdir) / "authoring" / "BRIEF.json"
+    try:
+        brief = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "document"
+    return "code" if isinstance(brief, dict) and brief.get("knowledge_type") == "code" else "document"
+
+
+def code_component(source: str) -> str:
+    """Map one raw-relative path to a stable architecture component key.
+
+    Code KBs deliberately account at module/component granularity rather than
+    pretending every generated helper and test fixture deserves a Wiki claim.
+    Familiar multi-component containers keep one child segment (``cmd/foo``,
+    ``internal/controller``); other trees use their top-level directory. Root
+    build/module descriptors share the ``.`` component.
+    """
+    normalized = _strip_source_prefix(posixpath.normpath(source.replace("\\", "/")).lstrip("/"))
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if len(parts) <= 1:
+        return "."
+    root = parts[0].lower()
+    if root in _CODE_IGNORED_ROOTS:
+        return f"ignored:{root}"
+    if root in _CODE_COMPONENT_CONTAINERS and len(parts) >= 3:
+        return "/".join(parts[:2])
+    return parts[0]
+
+
 def is_media_asset(rel: str) -> bool:
     """A raw source is a media ASSET — a document attachment, auto-accountable in
     coverage v2 — when some path SEGMENT is `assets` (or the legacy `*.assets`
@@ -2121,8 +2167,57 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
         if asset in media_assets and asset not in cited and asset not in excluded
     )
     auto = {asset for asset, _ in auto_edges}
-    unaccounted = sorted(source_set - cited - excluded - auto - derived)
+    accounted = cited | excluded | auto | derived
+    unaccounted = sorted(source_set - accounted)
     dangling = sorted(cited - source_set)
+    code_fields = {}
+    if knowledge_type(workdir) == "code":
+        components: dict[str, list[str]] = {}
+        ignored_sources: list[str] = []
+        for source in sources:
+            component = code_component(source)
+            if component.startswith("ignored:"):
+                ignored_sources.append(source)
+                continue
+            # Media remains ordinary provenance when cited, but a repository's
+            # screenshots/icons must not manufacture architecture components.
+            if is_media_asset(source):
+                continue
+            components.setdefault(component, []).append(source)
+
+        covered_components: list[str] = []
+        excluded_components: list[str] = []
+        uncovered_components: list[dict] = []
+        representatives: list[str] = []
+        for component, members in sorted(components.items()):
+            if any(member in cited for member in members):
+                covered_components.append(component)
+                continue
+            if all(member in accounted for member in members):
+                excluded_components.append(component)
+                continue
+            remaining = sorted(member for member in members if member not in accounted)
+            representative = remaining[0]
+            representatives.append(representative)
+            uncovered_components.append({
+                "component": component,
+                "representative": representative,
+                "unaccounted_files": len(remaining),
+                "total_files": len(members),
+            })
+        # The existing repair/batch machinery consumes source paths. Expose one
+        # deterministic representative per uncovered component while retaining
+        # the full component receipt for owners and tests.
+        unaccounted = representatives
+        code_fields = {
+            "profile": "code",
+            "total_components": len(components),
+            "covered_components": len(covered_components),
+            "excluded_components": len(excluded_components),
+            "unaccounted_components": uncovered_components,
+            "ignored_sources": len(ignored_sources),
+            "ignored_source_sample": ignored_sources[:20],
+        }
     return {
         "total_sources": len(sources),
         "cited": len(cited & source_set),
@@ -2145,6 +2240,7 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
         # fired on it, so a lone dangling citation sailed through settle and
         # surfaced as owner homework on the publish page.
         "closed": not unaccounted and not dangling,
+        **code_fields,
     }
 
 
