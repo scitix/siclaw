@@ -156,7 +156,33 @@ def _norm_source_entry(raw: str) -> str:
     return "" if entry == "." else entry
 
 
-def parse_okf_sources(md_text: str) -> tuple[list[str], bool, bool]:
+def _explicit_managed_source(resource: str) -> bool:
+    value = resource.strip()
+    return value.startswith(("raw/", "drop/"))
+
+
+def _explicit_external_source(resource: str) -> bool:
+    """True for OKF resources that cannot name Siclaw's managed Raw tree.
+
+    OKF v0.2 intentionally permits URLs, package-relative paths, references,
+    and arbitrary scope descriptors. Only ``raw/`` / ``drop/`` is an explicit
+    managed-source namespace. Bare values remain a legacy compatibility case
+    when (and only when) they exactly match the current Raw inventory.
+    """
+    value = resource.strip()
+    lowered = value.lower()
+    return (
+        "://" in value
+        or lowered.startswith(("mailto:", "urn:", "doi:"))
+        or value.startswith(("/", "./", "../"))
+        or lowered.startswith("references/")
+    )
+
+
+def parse_okf_sources(
+    md_text: str,
+    managed_sources: set[str] | None = None,
+) -> tuple[list[str], bool, bool]:
     """Return normalized raw paths from OKF v0.2 ``sources[].resource``.
 
     The format is intentionally strict because this is a clean v0.2 producer
@@ -179,9 +205,20 @@ def parse_okf_sources(md_text: str) -> tuple[list[str], bool, bool]:
             resource = item.get("resource")
             if not isinstance(resource, str):
                 continue
-            entry = _norm_source_entry(resource)
-            if entry:
-                resources.append(entry)
+            if _explicit_managed_source(resource):
+                entry = _norm_source_entry(resource)
+                if entry:
+                    resources.append(entry)
+                continue
+            if _explicit_external_source(resource):
+                continue
+            # Clean v0.2 packages use an explicit managed namespace. Preserve
+            # the old bare-path dialect only when it exactly identifies a Raw
+            # inventory entry; every other value is an OKF scope descriptor.
+            if managed_sources is not None:
+                entry = _norm_source_entry(resource)
+                if entry in managed_sources:
+                    resources.append(entry)
     return resources, derived, has_key
 
 
@@ -193,6 +230,7 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
     pages: dict[str, dict] = {}
     if not cand.is_dir():
         return pages
+    managed_sources = set(source_inventory(workdir))
     for f in sorted(cand.rglob("*.md")):
         rel = f.relative_to(cand).as_posix()
         try:
@@ -201,7 +239,7 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
             pages[rel] = {"sources": [], "derived": False, "has_sources": False,
                           "error": f"unreadable: {e}"}
             continue
-        sources, derived, has_key = parse_okf_sources(text)
+        sources, derived, has_key = parse_okf_sources(text, managed_sources)
         try:
             raw_bytes = f.stat().st_size
         except OSError:
@@ -615,7 +653,34 @@ def _valid_resource_mapping(value: object, *, receipt: bool = False) -> bool:
     return True
 
 
-def _okf_v02_metadata_violations(rel: str, fm: dict) -> list[dict]:
+def _has_inline_computation(body: str) -> bool:
+    """Return whether a Computation section contains a complete code fence."""
+    headings = list(re.finditer(
+        r"(?m)^(#{1,6})[ \t]+Computation(?:[ \t]+#*)?[ \t]*$", body,
+    ))
+    for heading in headings:
+        level = len(heading.group(1))
+        end = len(body)
+        for following in re.finditer(r"(?m)^(#{1,6})[ \t]+.+$", body[heading.end():]):
+            if len(following.group(1)) <= level:
+                end = heading.end() + following.start()
+                break
+        section = body[heading.end():end]
+        opened: tuple[str, int] | None = None
+        for line in section.splitlines():
+            match = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$", line)
+            if not match:
+                continue
+            fence = match.group(1)
+            marker = fence[0]
+            if opened is None:
+                opened = (marker, len(fence))
+            elif marker == opened[0] and len(fence) >= opened[1] and not match.group(2).strip():
+                return True
+    return False
+
+
+def _okf_v02_metadata_violations(rel: str, fm: dict, body: str) -> list[dict]:
     """Validate the optional v0.2 families when a producer emits them."""
     violations: list[dict] = []
     if "sources" in fm:
@@ -686,7 +751,7 @@ def _okf_v02_metadata_violations(rel: str, fm: dict) -> list[dict]:
                                "detail": "verified 必须是含合法 by/at 的 mapping 或 mapping 列表"})
 
     status = fm.get("status")
-    if status is not None and status not in ("draft", "stable", "deprecated"):
+    if "status" in fm and status not in ("draft", "stable", "deprecated"):
         violations.append({"page": rel, "kind": "okf_status",
                            "detail": "status 只能是 draft、stable 或 deprecated"})
     if "stale_after" in fm:
@@ -708,10 +773,15 @@ def _okf_v02_metadata_violations(rel: str, fm: dict) -> list[dict]:
                            for item in parameters)):
                 violations.append({"page": rel, "kind": "okf_attested_computation",
                                    "detail": "parameters 必须是含 name/type/required 的 mapping 列表"})
-        if "computation" in fm and (not isinstance(fm.get("computation"), str)
-                                     or not fm.get("computation", "").strip()):
+        computation = fm.get("computation")
+        has_path = isinstance(computation, str) and bool(computation.strip())
+        if "computation" in fm and not has_path:
             violations.append({"page": rel, "kind": "okf_attested_computation",
                                "detail": "computation 必须是非空路径或 URI"})
+        has_inline = _has_inline_computation(body)
+        if has_path == has_inline:
+            violations.append({"page": rel, "kind": "okf_attested_computation",
+                               "detail": "Attested Computation 必须且只能通过 computation 路径或正文 Computation fence 提供计算内容"})
         if "executor" in fm and not _valid_resource_mapping(fm.get("executor"), receipt=True):
             violations.append({"page": rel, "kind": "okf_attested_computation",
                                "detail": "executor 必须包含非空 resource，receipt 如存在须为非空字符串列表"})
@@ -719,6 +789,28 @@ def _okf_v02_metadata_violations(rel: str, fm: dict) -> list[dict]:
             violations.append({"page": rel, "kind": "okf_attested_computation",
                                "detail": "attester 必须包含非空 resource"})
     return violations
+
+
+class ProvenanceStampError(RuntimeError):
+    """The runtime cannot update machine provenance without risking user YAML."""
+
+
+def _yaml_node_ids(node: yaml.Node) -> set[int]:
+    found = {id(node)}
+    if isinstance(node, yaml.MappingNode):
+        for key, value in node.value:
+            found.update(_yaml_node_ids(key))
+            found.update(_yaml_node_ids(value))
+    elif isinstance(node, yaml.SequenceNode):
+        for value in node.value:
+            found.update(_yaml_node_ids(value))
+    return found
+
+
+def _remove_yaml_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + text[end:]
+    return text
 
 
 def stamp_siclaw_generated_metadata(
@@ -739,7 +831,7 @@ def stamp_siclaw_generated_metadata(
     created = new_pages or set()
     stamp_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     stamp = stamp_time.isoformat(timespec="seconds").replace("+00:00", "Z")
-    written: list[str] = []
+    pending: list[tuple[Path, str, str]] = []
     for rel in sorted(changed_pages):
         if _is_reserved_page(rel) or not rel.endswith(".md"):
             continue
@@ -747,7 +839,7 @@ def stamp_siclaw_generated_metadata(
         if not target.is_file():
             continue
         try:
-            text = target.read_text(encoding="utf-8")
+            text = target.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         lines = text.splitlines(keepends=True)
@@ -757,42 +849,75 @@ def stamp_siclaw_generated_metadata(
                     if line.strip() in ("---", "...")), None)
         if end is None:
             continue
+        frontmatter = "".join(lines[1:end])
         try:
-            fm = yaml.safe_load("".join(lines[1:end]))
+            fm = yaml.safe_load(frontmatter)
+            root = yaml.compose(frontmatter, Loader=yaml.SafeLoader)
         except yaml.YAMLError:
             continue
-        if not isinstance(fm, dict):
+        if not isinstance(fm, dict) or not isinstance(root, yaml.MappingNode):
             continue
-        # Replace only the machine-owned top-level blocks. Re-serializing the
-        # full mapping would destroy comments, quoting, and author-chosen
-        # layout, creating noisy content diffs unrelated to provenance.
-        preserved: list[str] = []
-        dropping = False
-        for line in lines[1:end]:
-            key_match = re.match(
-                r'''^(?:([A-Za-z_][A-Za-z0-9_-]*)|'([^']+)'|"([^"]+)"):(?:[ \t]|$)''',
-                line,
-            )
-            if key_match:
-                key = next(group for group in key_match.groups() if group is not None)
-                dropping = key in {"generated", "verified"}
-            elif dropping and line.startswith("#"):
-                dropping = False
-            if not dropping:
-                preserved.append(line)
-        if preserved and not preserved[-1].endswith(("\n", "\r")):
-            preserved[-1] += "\n"
-        if rel in created and "status" not in fm:
-            preserved.append("status: stable\n")
-        preserved.extend([
-            "generated:\n",
-            "  by: process:siclaw-kbc\n",
-            f"  at: '{stamp}'\n",
+        if root.flow_style:
+            raise ProvenanceStampError(
+                f"{rel}: top-level flow YAML cannot be provenance-stamped losslessly")
+
+        pairs: list[tuple[str, yaml.Node, yaml.Node]] = []
+        seen: set[str] = set()
+        for key_node, value_node in root.value:
+            key = key_node.value
+            if key in seen:
+                raise ProvenanceStampError(
+                    f"{rel}: duplicate top-level YAML key {key!r} is ambiguous")
+            seen.add(key)
+            pairs.append((key, key_node, value_node))
+
+        remove_keys = {"generated", "verified"}
+        add_stable = rel in created and fm.get("status") is None
+        if add_stable and "status" in fm:
+            remove_keys.add("status")
+
+        removed_nodes = [value for key, _, value in pairs if key in remove_keys]
+        retained_nodes = [value for key, _, value in pairs if key not in remove_keys]
+        removed_ids = set().union(*(_yaml_node_ids(node) for node in removed_nodes)) if removed_nodes else set()
+        retained_ids = set().union(*(_yaml_node_ids(node) for node in retained_nodes)) if retained_nodes else set()
+        if removed_ids & retained_ids:
+            raise ProvenanceStampError(
+                f"{rel}: a retained YAML alias depends on machine-owned provenance")
+
+        spans: list[tuple[int, int]] = []
+        for key, key_node, value_node in pairs:
+            if key not in remove_keys:
+                continue
+            start = key_node.start_mark.index - key_node.start_mark.column
+            finish = value_node.end_mark.index
+            line_end = frontmatter.find("\n", finish)
+            if line_end < 0:
+                line_end = len(frontmatter)
+            tail = frontmatter[finish:line_end]
+            if not tail.strip() or tail.lstrip().startswith("#"):
+                finish = line_end + (1 if line_end < len(frontmatter) else 0)
+            spans.append((start, finish))
+
+        preserved = _remove_yaml_spans(frontmatter, spans)
+        newline = "\r\n" if "\r\n" in text else "\n"
+        if preserved and not preserved.endswith(("\n", "\r")):
+            preserved += newline
+        indent = " " * min((key.start_mark.column for _, key, _ in pairs), default=0)
+        inserted = []
+        if add_stable:
+            inserted.append(f"{indent}status: stable{newline}")
+        inserted.extend([
+            f"{indent}generated:{newline}",
+            f"{indent}  by: process:siclaw-kbc{newline}",
+            f"{indent}  at: '{stamp}'{newline}",
         ])
-        rewritten = lines[0] + "".join(preserved) + lines[end] + "".join(lines[end + 1:])
+        rewritten = lines[0] + preserved + "".join(inserted) + lines[end] + "".join(lines[end + 1:])
         if rewritten == text:
             continue
-        target.write_text(rewritten, encoding="utf-8")
+        pending.append((target, rel, rewritten))
+    written: list[str] = []
+    for target, rel, rewritten in pending:
+        target.write_bytes(rewritten.encode("utf-8"))
         written.append(rel)
     return written
 
@@ -812,7 +937,7 @@ def okf_v02_violations(pages: dict[str, dict]) -> list[dict]:
         if name == "log.md":
             violations.extend(_okf_log_violations(rel, text))
             continue
-        fm, _, error = parse_okf_frontmatter(text)
+        fm, body, error = parse_okf_frontmatter(text)
         if error:
             violations.append({"page": rel, "kind": "okf_frontmatter",
                                "detail": error})
@@ -821,7 +946,7 @@ def okf_v02_violations(pages: dict[str, dict]) -> list[dict]:
         if not isinstance(type_value, str) or not type_value.strip():
             violations.append({"page": rel, "kind": "okf_type",
                                "detail": "OKF concept frontmatter requires a non-empty string type"})
-        violations.extend(_okf_v02_metadata_violations(rel, fm or {}))
+        violations.extend(_okf_v02_metadata_violations(rel, fm or {}, body))
 
     return violations
 
@@ -1444,6 +1569,7 @@ def normalize_body_source_annotations(
     fixes: list[dict[str, str]] = []
     if not candidate.is_dir():
         return fixes
+    managed_sources = set(source_inventory(workdir))
     for path in sorted(candidate.rglob("*.md")):
         rel = path.relative_to(candidate).as_posix()
         if allowed_pages is not None and rel not in allowed_pages:
@@ -1452,7 +1578,7 @@ def normalize_body_source_annotations(
             text = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        sources, _, _ = parse_okf_sources(text)
+        sources, _, _ = parse_okf_sources(text, managed_sources)
         if not sources:
             continue
         aliases: dict[str, set[str]] = {}

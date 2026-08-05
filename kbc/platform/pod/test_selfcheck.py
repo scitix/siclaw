@@ -50,7 +50,10 @@ type: 主题
 
 
 def test_parse_okf_sources():
-    src, derived, has = selfcheck.parse_okf_sources(PAGE_FULL)
+    src, derived, has = selfcheck.parse_okf_sources(
+        PAGE_FULL,
+        {"snapshot-a/one.md", "snapshot-a/two.md", "snapshot-b/three.txt"},
+    )
     assert src == ["snapshot-a/one.md", "snapshot-a/two.md", "snapshot-b/three.txt"], src
     assert not derived and has
     src, derived, has = selfcheck.parse_okf_sources(PAGE_DERIVED)
@@ -61,6 +64,19 @@ def test_parse_okf_sources():
     assert src == [] and has
     src, _, has = selfcheck.parse_okf_sources("no frontmatter at all")
     assert src == [] and not has
+    external = """---
+type: Topic
+sources:
+  - resource: https://example.com/manual
+  - resource: ./bundle/a.md
+  - resource: region/us-east.1
+  - resource: raw/live.md
+  - resource: legacy.md
+---
+x
+"""
+    src, _, has = selfcheck.parse_okf_sources(external, {"live.md", "legacy.md"})
+    assert has and src == ["live.md", "legacy.md"], src
     print("OK  parse_okf_sources (mapping resources / raw-prefix / derived / empty)")
 
 
@@ -85,6 +101,23 @@ def test_okf_v02_conformance():
                 "status: stable\nstale_after: 2027-01-01\n---\nBody"
     }
     assert selfcheck.okf_v02_violations({"topic.md": metadata_page}) == []
+
+    attested_path = {"text": "---\ntype: Attested Computation\nruntime: python\n"
+                             "computation: jobs/run.py\n---\n# Result"}
+    attested_inline = {"text": "---\ntype: Attested Computation\nruntime: python\n---\n"
+                               "# Computation\n```python\nprint('ok')\n```"}
+    assert selfcheck.okf_v02_violations({"path.md": attested_path}) == []
+    assert selfcheck.okf_v02_violations({"inline.md": attested_inline}) == []
+
+    missing_carrier = {"text": "---\ntype: Attested Computation\nruntime: python\n---\n# Result"}
+    duplicate_carrier = {"text": "---\ntype: Attested Computation\nruntime: python\n"
+                                 "computation: jobs/run.py\n---\n# Computation\n```python\nx = 1\n```"}
+    null_status = {"text": "---\ntype: Topic\nstatus: null\n---\nBody"}
+    for page in (missing_carrier, duplicate_carrier):
+        assert any(v["kind"] == "okf_attested_computation"
+                   for v in selfcheck.okf_v02_violations({"bad.md": page}))
+    assert any(v["kind"] == "okf_status"
+               for v in selfcheck.okf_v02_violations({"null.md": null_status}))
 
     bad_metadata = {
         "bad.md": {"text": "---\ntype: Attested Computation\nsources: [raw/manual.md]\n"
@@ -161,8 +194,8 @@ def test_stamp_siclaw_generated_metadata():
         _mk(base, "candidate/existing.md", "---\n# Preserve the author's layout\ntype: Topic\nstatus: deprecated\n"
             "generated:\n  by: human:old\n  at: 2026-01-01T00:00:00Z\n"
             "verified:\n  by: human:reviewer\n  at: 2026-01-02T00:00:00Z\n"
-            "producer_extension: kept\n---\nBody\n")
-        _mk(base, "candidate/new.md", "---\ntype: Topic\nsources:\n  - resource: raw/a.md\n---\nNew\n")
+            "producer_extension: kept\nx.vendor-field: {mode: strict}\n---\nBody\n")
+        _mk(base, "candidate/new.md", "---\ntype: Topic\nstatus: null\nsources:\n  - resource: raw/a.md\n---\nNew\n")
 
         changed = selfcheck.stamp_siclaw_generated_metadata(
             td, {"existing.md", "new.md", "index.md"}, new_pages={"new.md", "index.md"},
@@ -175,6 +208,7 @@ def test_stamp_siclaw_generated_metadata():
             "by": "process:siclaw-kbc", "at": "2026-08-04T12:00:00Z"}, existing
         assert "verified" not in existing and existing["status"] == "deprecated", existing
         assert existing["producer_extension"] == "kept", existing
+        assert existing["x.vendor-field"] == {"mode": "strict"}, existing
         existing_text = (base / "candidate/existing.md").read_text()
         assert "# Preserve the author's layout" in existing_text, existing_text
         assert existing_text.endswith("---\nBody\n"), existing_text
@@ -182,6 +216,30 @@ def test_stamp_siclaw_generated_metadata():
         assert not error and new["status"] == "stable", new
         assert new["generated"]["by"] == "process:siclaw-kbc", new
         assert "verified" not in new, new
+
+
+def test_stamp_siclaw_generated_metadata_fails_atomically_when_lossless_edit_is_unsafe():
+    cases = {
+        "flow.md": "---\n{type: Topic, generated: {by: human:old}}\n---\nBody\n",
+        "alias.md": "---\ntype: Topic\ngenerated: &receipt\n  by: human:old\n"
+                    "x.vendor-field: *receipt\n---\nBody\n",
+    }
+    for rel, text in cases.items():
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            _mk(base, f"candidate/{rel}", text)
+            _mk(base, "candidate/z-safe.md", "---\ntype: Topic\nverified:\n  by: human:r\n"
+                "  at: '2026-08-04T00:00:00Z'\n---\nBody\n")
+            before = {path.name: path.read_bytes() for path in (base / "candidate").iterdir()}
+            try:
+                selfcheck.stamp_siclaw_generated_metadata(
+                    td, {rel, "z-safe.md"}, now=datetime(2026, 8, 4, tzinfo=timezone.utc))
+                raise AssertionError(f"{rel} should fail closed")
+            except selfcheck.ProvenanceStampError:
+                pass
+            after = {path.name: path.read_bytes() for path in (base / "candidate").iterdir()}
+            assert after == before, (rel, after)
+    print("OK  provenance stamping is lossless-or-atomic-fail")
 
 
 def test_markdown_code_is_not_a_link():
@@ -283,7 +341,7 @@ def test_coverage_and_lint():
         _mk(base, "raw/snapshot-a/ticket.md")
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p1](p1.md)")
         _mk(base, "candidate/p1.md",
-            "---\ntype: Topic\nsources:\n  - resource: snapshot-a/one.md\n  - resource: snapshot-a/ghost.md\n---\n[[nope]]")
+            "---\ntype: Topic\nsources:\n  - resource: snapshot-a/one.md\n  - resource: raw/snapshot-a/ghost.md\n---\n[[nope]]")
         _mk(base, "candidate/bare.md", PAGE_BARE)
         _mk(base, "authoring/EXCLUSIONS.json",
             json.dumps([{"pattern": "snapshot-a/ticket.md", "reason": "工单周报"}]))
@@ -504,6 +562,9 @@ def test_deterministic_body_source_normalization():
     """Exact, unique aliases repair mechanically; ambiguity and code stay put."""
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
+        for source in ("docs/专题目录.md", "a/专题目录.md", "b/专题目录.pdf",
+                       "docs/报告.md", "docs/only-this.md"):
+            _mk(base, f"raw/{source}")
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n")
         page = base / "candidate" / "guide.md"
         original = (
@@ -724,7 +785,7 @@ def test_dangling_alone_blocks_closed():
         _mk(base, "raw/snap/one.md")
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p1](p1.md)")
         _mk(base, "candidate/p1.md",
-            "---\ntype: Topic\nsources:\n  - resource: snap/one.md\n  - resource: snap/deleted-long-ago.md\n---\n正文。")
+            "---\ntype: Topic\nsources:\n  - resource: snap/one.md\n  - resource: raw/snap/deleted-long-ago.md\n---\n正文。")
         cov = selfcheck.run_layer1(td)["coverage"]
         assert cov["unaccounted"] == [] and cov["dangling_citations"] == ["snap/deleted-long-ago.md"], cov
         assert not cov["closed"], "a dangling citation alone must keep the ledger open"
@@ -792,7 +853,7 @@ def test_ledger_repair_pages():
         base = Path(td)
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [c](c.md)")
         _mk(base, "candidate/a.md", "---\ntype: Topic\nsources:\n  - resource: snap/one.md\n---\n正文a。")
-        _mk(base, "candidate/c.md", "---\ntype: Topic\nsources:\n  - resource: snap/ghost.md\n---\n正文c。")
+        _mk(base, "candidate/c.md", "---\ntype: Topic\nsources:\n  - resource: raw/snap/ghost.md\n---\n正文c。")
         report = {
             "coverage": {"dangling_citations": ["snap/ghost.md"]},
             "lint": {"ok": False, "violations": [
@@ -809,7 +870,7 @@ def test_ledger_repair_pages():
 
 
 def test_citation_path_normalization():
-    """Review fix: `./live.csv` / `sub/../x.md` citations must canonicalize like
+    """Managed `raw/a/../x.md` citations canonicalize like
     link targets do — un-normalized they double-reported as unaccounted AND
     dangling, which the dangling→closed gate turns into a permanent wedge."""
     with tempfile.TemporaryDirectory() as td:
@@ -818,11 +879,11 @@ def test_citation_path_normalization():
         _mk(base, "raw/snap/sub/x.md")
         _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p1](p1.md)")
         _mk(base, "candidate/p1.md",
-            "---\ntype: Topic\nsources:\n  - resource: ./snap/live.csv\n  - resource: snap/sub/../sub/x.md\n---\n正文。")
+            "---\ntype: Topic\nsources:\n  - resource: raw/snap/./live.csv\n  - resource: raw/snap/sub/../sub/x.md\n---\n正文。")
         cov = selfcheck.run_layer1(td)["coverage"]
         assert cov["unaccounted"] == [] and cov["dangling_citations"] == [], cov
         assert cov["closed"], cov
-        print("OK  citation path normalization (./ and a/../ canonicalize; no double-report wedge)")
+        print("OK  managed citation path normalization (./ and a/../ canonicalize; no double-report wedge)")
 
 
 def test_residual_fingerprint_full_set():
@@ -1986,10 +2047,11 @@ def test_pack_hash_is_relposix_sorted():
 def test_parse_okf_sources_inline():
     """Inline YAML mappings are valid OKF v0.2 sources rows."""
     src, _, has = selfcheck.parse_okf_sources(
-        '---\ntype: Topic\nsources: [{resource: raw/a.md}, {resource: "b.md"}]\n---\nx')
+        '---\ntype: Topic\nsources: [{resource: raw/a.md}, {resource: "b.md"}]\n---\nx',
+        {"a.md", "b.md"})
     assert has and src == ["a.md", "b.md"], src
     src, _, has = selfcheck.parse_okf_sources(
-        "---\ntype: Topic\nsources: [{resource: snapshot/x.md}]\n---\ny")
+        "---\ntype: Topic\nsources: [{resource: snapshot/x.md}]\n---\ny", {"snapshot/x.md"})
     assert has and src == ["snapshot/x.md"], src
     src, _, has = selfcheck.parse_okf_sources("---\ntype: Topic\nsources: []\n---\nz")
     assert has and src == [], src
@@ -2310,6 +2372,7 @@ def main():
     test_parse_okf_sources()
     test_okf_v02_conformance()
     test_stamp_siclaw_generated_metadata()
+    test_stamp_siclaw_generated_metadata_fails_atomically_when_lossless_edit_is_unsafe()
     test_markdown_code_is_not_a_link()
     test_emit_ignores_links_in_code()
     test_parse_okf_sources_inline()
