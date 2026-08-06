@@ -46,7 +46,7 @@ describe("resolveAgentModelBinding", () => {
         name: "Anthropic",
         baseUrl: "https://api.anthropic.com",
         apiKey: "sk-123",
-        api: "anthropic",
+        api: "anthropic-messages",
         authHeader: true,
         models: [
           {
@@ -60,6 +60,34 @@ describe("resolveAgentModelBinding", () => {
     fake.responses.set("config.getModelBinding", { binding });
     const result = await resolveAgentModelBinding("agent-1", fake as unknown as FrontendWsClient);
     expect(result).toEqual(binding);
+  });
+
+  it("normalizes legacy protocol aliases from older Sicore runtimes", async () => {
+    const binding: ResolvedModelBinding = {
+      modelProvider: "company-anthropic",
+      modelId: "claude-sonnet-4-6",
+      modelConfig: {
+        name: "Company Gateway",
+        baseUrl: "https://example.invalid/v1",
+        apiKey: "test-key",
+        api: "anthropic",
+        authHeader: true,
+        models: [
+          {
+            id: "claude-sonnet-4-6", name: "Claude", api: "anthropic",
+            reasoning: false, input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 200_000, maxTokens: 64_000,
+          },
+        ],
+      },
+    };
+    fake.responses.set("config.getModelBinding", { binding });
+
+    const result = await resolveAgentModelBinding("agent-1", fake as unknown as FrontendWsClient);
+
+    expect(result?.modelConfig.api).toBe("anthropic-messages");
+    expect(result?.modelConfig.models[0].api).toBe("anthropic-messages");
   });
 
   it("returns null when the payload binding is null", async () => {

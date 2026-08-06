@@ -7,6 +7,7 @@
 
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { ModelRoutePolicy } from "../core/model-routing.js";
+import { normalizeProviderApi } from "../core/model-compat.js";
 
 export interface ResolvedModelBinding {
   modelProvider: string;
@@ -47,7 +48,19 @@ export async function resolveAgentModelBinding(
 ): Promise<ResolvedModelBinding | null> {
   try {
     const data = await frontendClient.request("config.getModelBinding", { agentId }) as { binding: ResolvedModelBinding | null };
-    return data.binding;
+    if (!data.binding) return null;
+    const binding = data.binding;
+    return {
+      ...binding,
+      modelConfig: {
+        ...binding.modelConfig,
+        api: normalizeProviderApi(binding.modelConfig.api),
+        models: binding.modelConfig.models.map((model) => ({
+          ...model,
+          ...(model.api ? { api: normalizeProviderApi(model.api) } : {}),
+        })),
+      },
+    };
   } catch (err) {
     console.error(`[agent-model-binding] RPC error:`, err);
     return null;
