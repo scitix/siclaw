@@ -474,6 +474,7 @@ describe("ticket intake cards", () => {
       { ctx: { mode: "start", sessionId: "s1", channelId: "c1", requesterExternalId: "ou_1", sourceMessageId: "om_1" }, locale: "zh-CN" },
     );
     const [startRow] = JSON.parse(elementCreateSpy.mock.calls[0][0].data.elements);
+    expect(startRow.columns[0].elements[0].text.content).toBe("提交工单");
     const startValue = startRow.columns[0].elements[0].behaviors[0].value;
     expect(startValue).toEqual(expect.objectContaining({
       kind: TICKET_INTAKE_ACTION_KIND, action: "start", session_id: "s1",
@@ -503,8 +504,10 @@ describe("ticket intake cards", () => {
         attempted_actions: [], source_refs: [], open_questions: [], ready_for_review: true,
       },
     }, "zh-CN");
-    expect(markdown).toContain("工单提交预览");
+    expect(markdown).toContain("请确认工单信息");
     expect(markdown).toContain("Login fails");
+    expect(markdown).not.toContain("incident_candidate");
+    expect(markdown).not.toContain("分类");
     expect(markdown).not.toMatch(/reasoning|思维链|chain.of.thought/i);
   });
 });

@@ -6,7 +6,7 @@ This flow implements the product-facing work that does not depend on a ticket
 backend:
 
 1. The normal knowledge-enabled channel agent answers a consultation.
-2. The requester clicks **Prepare ticket** on that answer.
+2. The requester clicks **Submit ticket** on that answer.
 3. The agent classifies the request and collects missing facts in chat.
 4. Siclaw renders a deterministic review preview.
 5. The same requester clicks **Confirm**.
@@ -16,6 +16,11 @@ No step reads or operates a cluster, host, VM, or production system. The agent
 can update the draft through `ticket_intake_draft`; that tool has no confirm or
 submit operation. Confirmation is accepted only from a Lark card callback whose
 operator `open_id` matches the persisted requester.
+
+The user-facing card exposes only the business journey: **Submit ticket**, add
+details, and **Confirm submission**. Internal classification values, state and
+revision fields, and intake IDs stay in the backend contract and must not be
+rendered in the card or chat replies.
 
 ## State model
 

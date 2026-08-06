@@ -573,8 +573,8 @@ const FEEDBACK_TOAST_BY_LOCALE: Record<LarkLocale, { ok: string; fail: string }>
 };
 
 const TICKET_INTAKE_TOAST_BY_LOCALE = {
-  "zh-CN": { start: "已开始整理，请继续发送问题背景。", confirm: "正在确认工单信息。", continue: "请继续发送需要补充或修改的信息。", cancel: "正在取消。", fail: "操作失败，请刷新后重试。", forbidden: "只有发起人可以操作这份工单草稿。" },
-  "en-US": { start: "Intake started. Send more context in chat.", confirm: "Confirming the ticket details.", continue: "Send the details you want to add or change.", cancel: "Cancelling.", fail: "Action failed. Refresh and try again.", forbidden: "Only the requester can operate this ticket draft." },
+  "zh-CN": { start: "好的，我来帮你提交工单。", confirm: "正在确认工单信息。", continue: "请继续发送需要补充或修改的信息。", cancel: "正在取消。", fail: "操作失败，请刷新后重试。", forbidden: "只有发起人可以操作这份工单。" },
+  "en-US": { start: "Okay, I'll help you submit a ticket.", confirm: "Confirming the ticket details.", continue: "Send the details you want to add or change.", cancel: "Cancelling.", fail: "Action failed. Refresh and try again.", forbidden: "Only the requester can operate this ticket." },
 } as const;
 
 /**
@@ -709,12 +709,14 @@ function handleTicketIntakeAction(
       }
       if (sourceMessageId) {
         const notice = action === "confirm"
-          ? (locale === "zh-CN" ? `✅ 工单信息已确认，编号：${result.intake?.id ?? value.intake_id}` : `✅ Ticket details confirmed: ${result.intake?.id ?? value.intake_id}`)
+          ? (locale === "zh-CN" ? "✅ 已确认工单信息。" : "✅ Ticket details confirmed.")
           : action === "cancel"
-            ? (locale === "zh-CN" ? "已取消这份工单草稿。" : "Ticket draft cancelled.")
+            ? (locale === "zh-CN" ? "已取消提交工单。" : "Ticket submission cancelled.")
             : action === "continue"
               ? copy.continue
-              : copy.start;
+              : (locale === "zh-CN"
+                  ? "好的，我来帮你提交工单。请继续发送问题背景、影响范围和期望结果。"
+                  : "Okay, I'll help you submit a ticket. Send the issue context, impact scope, and expected result.");
         await replyToLark(larkClient, sourceMessageId, notice);
       }
     } catch (err) {

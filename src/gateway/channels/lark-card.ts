@@ -209,8 +209,8 @@ export interface TicketIntakeActionValue {
 
 function buildTicketIntakeRow(ctx: TicketIntakeCardContext, locale: LarkLocale): Record<string, unknown> {
   const labels = locale === "zh-CN"
-    ? { start: "整理为工单", confirm: "确认提交", continue: "继续补充", cancel: "取消" }
-    : { start: "Prepare ticket", confirm: "Confirm", continue: "Add details", cancel: "Cancel" };
+    ? { start: "提交工单", confirm: "确认提交", continue: "继续补充", cancel: "取消" }
+    : { start: "Submit ticket", confirm: "Confirm submission", continue: "Add details", cancel: "Cancel" };
   const button = (action: TicketIntakeActionValue["action"], type: "primary" | "default" = "default") => {
     const value: TicketIntakeActionValue = ctx.mode === "start"
       ? {
@@ -265,26 +265,24 @@ export function buildTicketIntakeReviewMarkdown(record: TicketIntakeRecord, loca
   const d = record.draft;
   const rows = locale === "zh-CN"
     ? [
-        "## 工单提交预览",
-        `- **摘要**：${d.summary || "待补充"}`,
-        `- **分类**：${d.classification}`,
+        "## 请确认工单信息",
+        `- **问题概述**：${d.summary || "待补充"}`,
         `- **产品/模块**：${[d.product, d.category].filter(Boolean).join(" / ") || "待补充"}`,
-        `- **影响**：${d.impact || "待补充"}`,
-        `- **影响对象**：${d.affected_object || "待补充"}`,
+        `- **影响范围**：${d.impact || "待补充"}`,
+        `- **涉及对象**：${d.affected_object || "待补充"}`,
         `- **实际情况**：${d.actual_behavior || "待补充"}`,
-        `- **期望情况**：${d.expected_behavior || "待补充"}`,
+        `- **期望结果**：${d.expected_behavior || "待补充"}`,
         "\n请核对后点击“确认提交”；需要修改可点击“继续补充”。",
       ]
     : [
-        "## Ticket submission preview",
-        `- **Summary**: ${d.summary || "Missing"}`,
-        `- **Classification**: ${d.classification}`,
+        "## Confirm ticket details",
+        `- **Issue summary**: ${d.summary || "Missing"}`,
         `- **Product/category**: ${[d.product, d.category].filter(Boolean).join(" / ") || "Missing"}`,
-        `- **Impact**: ${d.impact || "Missing"}`,
-        `- **Affected object**: ${d.affected_object || "Missing"}`,
+        `- **Impact scope**: ${d.impact || "Missing"}`,
+        `- **Affected item**: ${d.affected_object || "Missing"}`,
         `- **Actual**: ${d.actual_behavior || "Missing"}`,
         `- **Expected**: ${d.expected_behavior || "Missing"}`,
-        "\nReview the draft, then confirm or add more details.",
+        "\nReview the details, then confirm or add more information.",
       ];
   return rows.join("\n");
 }

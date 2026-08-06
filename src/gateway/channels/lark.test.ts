@@ -1427,7 +1427,7 @@ describe("handleLarkCardAction — ticket intake", () => {
     beginTicketIntakeMock.mockResolvedValue({ success: true, intake: { id: "i1" } });
     const lark = makeLarkClient();
     const result = handleLarkCardAction(action({ action: "start", session_id: "s1", channel_id: "c1", source_message_id: "om1" }), lark, {} as any);
-    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("开始") } });
+    expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("提交工单") } });
     await flush();
     expect(beginTicketIntakeMock).toHaveBeenCalledWith({
       sessionId: "s1", channelId: "c1", requesterExternalId: "ou_requester", sourceMessageId: "om1",
@@ -1443,12 +1443,16 @@ describe("handleLarkCardAction — ticket intake", () => {
 
   it("confirms by opaque id and optimistic revision, never from an agent callback", async () => {
     transitionTicketIntakeMock.mockResolvedValue({ success: true, intake: { id: "i1" }, payload: { schema_version: "siclaw.ticket_intake.v1" } });
-    const result = handleLarkCardAction(action({ action: "confirm", intake_id: "i1", revision: 7, source_message_id: "om1" }), makeLarkClient(), {} as any);
+    const lark = makeLarkClient();
+    const result = handleLarkCardAction(action({ action: "confirm", intake_id: "i1", revision: 7, source_message_id: "om1" }), lark, {} as any);
     expect(result).toEqual({ toast: { type: "success", content: expect.stringContaining("确认") } });
     await flush();
     expect(transitionTicketIntakeMock).toHaveBeenCalledWith({
       intakeId: "i1", requesterExternalId: "ou_requester", revision: 7, action: "confirm",
     }, expect.anything());
+    const replyContent = JSON.parse(lark.im.message.reply.mock.calls[0][0].data.content).text;
+    expect(replyContent).toBe("✅ 已确认工单信息。");
+    expect(replyContent).not.toContain("i1");
   });
 });
 
