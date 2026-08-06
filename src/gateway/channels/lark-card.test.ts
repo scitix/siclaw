@@ -477,6 +477,7 @@ describe("ticket intake cards", () => {
     expect(startRow.element_id).toBe("ticket_actions");
     expect(startRow.columns[0].elements[0].text.content).toBe("提交工单");
     expect(startRow.columns[0].elements[0].element_id).toBe("ticket_start");
+    expect(startRow.columns[0].elements[0].type).toBe("primary");
     const startValue = startRow.columns[0].elements[0].behaviors[0].value;
     expect(startValue).toEqual(expect.objectContaining({
       kind: TICKET_INTAKE_ACTION_KIND, action: "start", session_id: "s1",
@@ -497,6 +498,23 @@ describe("ticket intake cards", () => {
     expect(elementIds.every((id: string) => /^[A-Za-z][A-Za-z0-9_]{0,19}$/.test(id))).toBe(true);
     expect(reviewRow.columns.map((c: any) => c.elements[0].behaviors[0].value.action)).toEqual(["confirm", "continue", "cancel"]);
     expect(reviewRow.columns[0].elements[0].behaviors[0].value).toEqual(expect.objectContaining({ intake_id: "i1", revision: 3 }));
+  });
+
+  it("places the primary ticket action before secondary answer feedback", async () => {
+    const { client, elementCreateSpy } = makeLarkClient();
+    await finalizeCard(
+      client as any,
+      { cardId: "CARD-TICKET-FB", elementId: "md_main", sequence: 0 },
+      "answer",
+      { ctx: { sessionId: "s1", channelId: "c1", messageId: "om_answer" }, locale: "zh-CN" },
+      { ctx: { mode: "start", sessionId: "s1", channelId: "c1", requesterExternalId: "ou_1", sourceMessageId: "om_1" }, locale: "zh-CN" },
+    );
+
+    expect(elementCreateSpy).toHaveBeenCalledTimes(2);
+    const rows = elementCreateSpy.mock.calls.map((call) => JSON.parse(call[0].data.elements)[0]);
+    expect(rows.map((row) => row.element_id)).toEqual(["ticket_actions", "fb_row"]);
+    expect(rows[0].columns[0].elements[0].type).toBe("primary");
+    expect(elementCreateSpy.mock.calls.map((call) => call[0].data.sequence)).toEqual([3, 4]);
   });
 
   it("builds a deterministic structured preview without hidden reasoning", () => {

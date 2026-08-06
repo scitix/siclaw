@@ -234,7 +234,7 @@ function buildTicketIntakeRow(ctx: TicketIntakeCardContext, locale: LarkLocale):
     };
   };
   const actions: Array<[TicketIntakeActionValue["action"], "primary" | "default"]> = ctx.mode === "start"
-    ? [["start", "default"]]
+    ? [["start", "primary"]]
     : [
         ...(ctx.reviewable ? [["confirm", "primary"]] as Array<[TicketIntakeActionValue["action"], "primary" | "default"]> : []),
         ["continue", "default"], ["cancel", "default"],
@@ -838,8 +838,9 @@ export interface CardFinalizeResult {
  * state (answer visible — a text reply would duplicate it), while a failed
  * content update leaves the answer nowhere the user can see it.
  *
- * When `feedback` is passed, a 👍/👎 button row is appended after the final
- * content (best-effort — losing the buttons never fails the finalize).
+ * Business continuation controls are appended before the optional 👍/👎 row,
+ * so ticket intake remains the primary action and answer feedback stays
+ * visually secondary. Both rows are best-effort.
  */
 export async function finalizeCard(
   larkClient: any,
@@ -887,11 +888,11 @@ export async function finalizeCard(
   // Buttons go in AFTER streaming mode is off: structural element ops on a
   // streaming card risk rejection, and this keeps the user-visible finalize
   // (content + settings) off the extra round-trip.
-  if (feedback && contentOk && settingsOk) {
-    await appendFeedbackRow(larkClient, session, feedback.ctx, feedback.locale);
-  }
   if (ticketIntake && contentOk && settingsOk) {
     await appendTicketIntakeRow(larkClient, session, ticketIntake.ctx, ticketIntake.locale);
+  }
+  if (feedback && contentOk && settingsOk) {
+    await appendFeedbackRow(larkClient, session, feedback.ctx, feedback.locale);
   }
 
   return { ok: contentOk && settingsOk, contentOk };
