@@ -460,7 +460,7 @@ export class AgentBoxClient {
         {
           hostname: urlObj.hostname,
           port: urlObj.port,
-          path: urlObj.pathname,
+          path: urlObj.pathname + urlObj.search,
           method: "GET",
           headers: { Accept: "text/event-stream" },
           agent: this.httpsAgent!,

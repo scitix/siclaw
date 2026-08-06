@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import http from "node:http";
+import https from "node:https";
 import type { AddressInfo } from "node:net";
+import { CertificateManager } from "../security/cert-manager.js";
 import { AgentBoxClient } from "./client.js";
 
 /**
  * Tests for AgentBoxClient — Gateway's HTTP client for reaching an AgentBox.
- * We spin a tiny http.Server to act as the AgentBox. mTLS is orthogonal and
- * invariant §3 (K8s-only), so we exercise plain HTTP here.
+ * Most cases use a tiny plain-HTTP server; HTTPS transport behavior is covered
+ * separately with an mTLS server so the production request path is exercised.
  */
 
 // ── Test HTTP server ──────────────────────────────────────────────────
@@ -398,6 +400,43 @@ describe("AgentBoxClient — error paths", () => {
 });
 
 describe("AgentBoxClient — streamEvents (SSE)", () => {
+  it("preserves query parameters over HTTPS with mTLS", async () => {
+    const certManager = await CertificateManager.create();
+    const serverCert = certManager.issueAgentBoxCertificate("agentbox-test", "org-test", "box-test");
+    const clientCert = certManager.issueServerCertificate("runtime.test");
+    const urls: string[] = [];
+    const server = https.createServer({
+      cert: serverCert.cert,
+      key: serverCert.key,
+      ca: serverCert.ca,
+      requestCert: true,
+      rejectUnauthorized: true,
+    }, (req, res) => {
+      urls.push(req.url ?? "");
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(`data: {"ok":true}\n\n`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+
+    try {
+      const client = new AgentBoxClient(`https://127.0.0.1:${port}`, 30_000, {
+        cert: clientCert.cert,
+        key: clientCert.key,
+        ca: serverCert.ca,
+      });
+      const events: unknown[] = [];
+      for await (const event of client.streamPath("/events/r1?replay=1")) {
+        events.push(event);
+      }
+
+      expect(events).toEqual([{ ok: true }]);
+      expect(urls).toEqual(["/events/r1?replay=1"]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 60_000);
+
   it("yields parsed JSON events from data: lines", async () => {
     const srv = await startServer((req, res) => {
       if (req.url?.startsWith("/api/stream/")) {
