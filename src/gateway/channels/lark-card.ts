@@ -225,7 +225,9 @@ function buildTicketIntakeRow(ctx: TicketIntakeCardContext, locale: LarkLocale):
         };
     return {
       tag: "button",
-      element_id: `ticket_intake_${action}`,
+      // CardKit element_id: starts with a letter, [A-Za-z0-9_], max 20 chars.
+      // `ticket_intake_continue` is 22 chars and makes the whole append fail.
+      element_id: `ticket_${action}`,
       text: { tag: "plain_text", content: labels[action] },
       type,
       behaviors: [{ type: "callback", value }],
@@ -239,7 +241,7 @@ function buildTicketIntakeRow(ctx: TicketIntakeCardContext, locale: LarkLocale):
       ];
   return {
     tag: "column_set",
-    element_id: "ticket_intake_actions",
+    element_id: "ticket_actions",
     columns: actions.map(([action, type]) => ({ tag: "column", width: "auto", elements: [button(action, type)] })),
   };
 }

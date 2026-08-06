@@ -474,7 +474,9 @@ describe("ticket intake cards", () => {
       { ctx: { mode: "start", sessionId: "s1", channelId: "c1", requesterExternalId: "ou_1", sourceMessageId: "om_1" }, locale: "zh-CN" },
     );
     const [startRow] = JSON.parse(elementCreateSpy.mock.calls[0][0].data.elements);
+    expect(startRow.element_id).toBe("ticket_actions");
     expect(startRow.columns[0].elements[0].text.content).toBe("提交工单");
+    expect(startRow.columns[0].elements[0].element_id).toBe("ticket_start");
     const startValue = startRow.columns[0].elements[0].behaviors[0].value;
     expect(startValue).toEqual(expect.objectContaining({
       kind: TICKET_INTAKE_ACTION_KIND, action: "start", session_id: "s1",
@@ -490,6 +492,9 @@ describe("ticket intake cards", () => {
       { ctx: { mode: "active", intakeId: "i1", revision: 3, requesterExternalId: "ou_1", sourceMessageId: "om_2", reviewable: true }, locale: "zh-CN" },
     );
     const [reviewRow] = JSON.parse(elementCreateSpy.mock.calls[0][0].data.elements);
+    const elementIds = [reviewRow.element_id, ...reviewRow.columns.map((c: any) => c.elements[0].element_id)];
+    expect(elementIds).toEqual(["ticket_actions", "ticket_confirm", "ticket_continue", "ticket_cancel"]);
+    expect(elementIds.every((id: string) => /^[A-Za-z][A-Za-z0-9_]{0,19}$/.test(id))).toBe(true);
     expect(reviewRow.columns.map((c: any) => c.elements[0].behaviors[0].value.action)).toEqual(["confirm", "continue", "cancel"]);
     expect(reviewRow.columns[0].elements[0].behaviors[0].value).toEqual(expect.objectContaining({ intake_id: "i1", revision: 3 }));
   });
