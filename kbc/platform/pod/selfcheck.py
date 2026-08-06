@@ -30,6 +30,16 @@ from urllib.parse import unquote
 
 import yaml
 
+from source_kinds import (
+    IMAGE_SOURCE_EXTS,
+    KNOWN_SOURCE_EXTS,
+    MEDIA_SOURCE_EXTS,
+    TEXT_SOURCE_BASENAMES,
+    TEXT_SOURCE_EXTS,
+    TEXT_SOURCE_PREFIXES,
+    is_managed_source_path,
+)
+
 # Text sources vs binary media. BOTH are ledger-accountable (2026-07-06): the
 # batch-vs-oneshot A/B showed silent media drops are the single worst coverage
 # failure (29/33 images dropped by the one-shot compile), and a text-only
@@ -37,11 +47,6 @@ import yaml
 # machine-checkable provenance exactly where fidelity risk is highest.
 # sources[].resource is the agent's declaration either way; the ledger only checks
 # that the declaration is total.
-TEXT_SOURCE_EXTS = {".md", ".txt", ".tsv", ".csv", ".json", ".jsonl", ".yaml", ".yml"}
-IMAGE_SOURCE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
-MEDIA_SOURCE_EXTS = IMAGE_SOURCE_EXTS | {".pdf", ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx"}
-KNOWN_SOURCE_EXTS = TEXT_SOURCE_EXTS | MEDIA_SOURCE_EXTS
-
 # Media ASSETS (coverage v2, DESIGN-kb-asset-provenance-2026-07-22 §4.1): images
 # that live under an `assets/` directory (or the legacy `*.assets/` export form).
 # They are DOCUMENT ATTACHMENTS, not first-class sources — a media asset embedded
@@ -79,7 +84,8 @@ _REPAIR_LIST_CAP = 40
 
 def source_inventory(workdir: str) -> list[str]:
     """All source files under {workdir}/raw — text AND media — as sorted posix
-    paths relative to raw/. Hidden files/dirs (dot-prefixed) are skipped.
+    paths relative to raw/. Arbitrary hidden files/dirs are skipped; selected
+    repository-control paths such as .github and .gitlab-ci.yml are preserved.
     Every file must end up cited by some page's sources[].resource or explicitly
     excluded; unknown binary blobs are the agent's to exclude with a reason."""
     raw = Path(workdir) / "raw"
@@ -90,7 +96,7 @@ def source_inventory(workdir: str) -> list[str]:
         if not f.is_file():
             continue
         rel = f.relative_to(raw)
-        if any(part.startswith(".") for part in rel.parts):
+        if not is_managed_source_path(rel):
             continue
         out.append(rel.as_posix())
     return sorted(out)
@@ -443,8 +449,18 @@ _SOURCE_LOCATOR_PATTERN = (
     r"(?:(?:\s*[-–]\s*|\s*,\s*)\d+)*|"
     r"lines?\s*\d+(?:\s*[-–]\s*\d+)?|第?\s*\d+\s*(?:页|行|节))"
 )
+_SPECIAL_SOURCE_NAME_PATTERN = (
+    r"(?:^|/)"
+    r"(?:"
+    + "|".join(sorted(re.escape(name) for name in TEXT_SOURCE_BASENAMES))
+    + r"|(?:"
+    + "|".join(sorted(re.escape(prefix) for prefix in TEXT_SOURCE_PREFIXES))
+    + r")(?:\.[A-Za-z0-9_.-]+)?"
+    r")"
+)
 _SOURCE_FILE_END_RE = re.compile(
-    r"\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS))
+    r"(?:\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS))
+    + r")|" + _SPECIAL_SOURCE_NAME_PATTERN
     + r")(?:`)?(?=(?:\s*(?:[,，;；、]|$)|\s+"
     + _SOURCE_LOCATOR_PATTERN + r"\s*(?:[,，;；、]|$)))",
     re.IGNORECASE,

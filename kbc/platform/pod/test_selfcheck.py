@@ -360,9 +360,14 @@ def test_inventory_and_exclusions():
         _mk(base, "raw/snapshot-a/one.md")
         _mk(base, "raw/snapshot-a/pic.png")            # media → ALSO ledger-accountable
         _mk(base, "raw/.hidden/x.md")                  # hidden dir → skipped
+        _mk(base, "raw/.github/workflows/ci.yml")      # repository control → counted
+        _mk(base, "raw/.gitlab-ci.yml")                # repository control → counted
         _mk(base, "raw/media/MANIFEST.tsv")            # text file in media dir → counted
         inv = selfcheck.source_inventory(td)
-        assert inv == ["media/MANIFEST.tsv", "snapshot-a/one.md", "snapshot-a/pic.png"], inv
+        assert inv == [
+            ".github/workflows/ci.yml", ".gitlab-ci.yml", "media/MANIFEST.tsv",
+            "snapshot-a/one.md", "snapshot-a/pic.png",
+        ], inv
         assert selfcheck.source_inventory(td + "/nope") == []
 
         # exclusions: missing file → none; malformed → error; glob + dir-prefix forms
@@ -649,6 +654,33 @@ def test_body_source_annotations():
         assert any(v["kind"] == "body_source_malformed"
                    for v in report["lint"]["violations"]), report["lint"]
     print("OK  body source annotations (spaces / combined / locator / unknown / missing extension)")
+
+
+def test_code_body_source_annotations_are_first_class_provenance():
+    """Code evidence must be cited, not hidden to satisfy a document-only lint."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        sources = ["src/gateway/prom.ts", "Dockerfile.agentbox", "Makefile"]
+        for source in sources:
+            _mk(base, f"raw/{source}", "source evidence\n")
+        _mk(base, "candidate/index.md",
+            "---\nokf_version: \"0.2\"\n---\n# Index\n- [Architecture](architecture.md)")
+        _mk(base, "candidate/architecture.md",
+            "---\ntype: Architecture\ntitle: Architecture\nsources:\n"
+            + "".join(f"  - resource: {source}\n" for source in sources)
+            + "---\n"
+            "Gateway aggregation is implemented in the TypeScript entrypoint "
+            "(source: src/gateway/prom.ts lines 10-20).\n"
+            "The runtime image is built separately (source: Dockerfile.agentbox).\n"
+            "Build orchestration is defined in Make (source: Makefile).\n")
+        report = selfcheck.run_layer1(td)
+        malformed = [v for v in report["lint"]["violations"]
+                     if v["kind"] == "body_source_malformed"]
+        uncited = [v for v in report["lint"]["violations"]
+                   if v["kind"] == "body_source_uncited"]
+        assert malformed == [] and uncited == [], report["lint"]
+        assert report["coverage"]["closed"], report["coverage"]
+    print("OK  code body citations: source files, Dockerfile variants, and Makefile")
 
 
 def test_deterministic_body_source_normalization():
@@ -2484,6 +2516,7 @@ def main():
     test_media_citing_pages_via_attribution_edge()
     test_asset_provenance_fixture()
     test_body_source_annotations()
+    test_code_body_source_annotations_are_first_class_provenance()
     test_deterministic_body_source_normalization()
     test_spaced_markdown_links()
     test_media_verify_helpers()

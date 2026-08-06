@@ -585,7 +585,7 @@ async def test_test_path_escape_guard():
         }, "p3", None)
         assert allow == {}, allow
 
-        # A NON-consulting batch scope (Codex's copy sandbox) stays mechanically
+        # A NON-consulting structural scope stays mechanically
         # confined to the validated Raw list. A text-slice batch omits the
         # original Markdown and may read only its helper; a regular/PDF source
         # remains directly readable. Directory or cwd-wide Grep cannot bypass
@@ -2528,6 +2528,81 @@ def test_default_allowlist_covers_every_compile_tool():
     )
     assert not stale, f"allowlist references unregistered compile tools: {stale}"
     print("✓ default allowlist covers every registered compile tool (no permission dead end)")
+
+
+async def test_source_inspector_is_engine_neutral_bounded_and_complete():
+    """Every compiler engine gets the same full-corpus fact-finding surface.
+
+    Batch assignment limits what the session must compile, not what it may
+    consult. Mechanically sliced originals remain discoverable but unreadable,
+    so visibility never bypasses the context-safety boundary.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "raw" / "assigned").mkdir(parents=True)
+        (root / "raw" / "other").mkdir(parents=True)
+        (root / "raw" / "bounded").mkdir(parents=True)
+        (root / "raw" / ".github" / "workflows").mkdir(parents=True)
+        (root / "raw" / "assigned" / "app.ts").write_text(
+            "export const app = true;\n", encoding="utf-8")
+        (root / "raw" / "other" / "peer.go").write_text(
+            "package peer\nfunc PeerService() {}\n", encoding="utf-8")
+        (root / "raw" / "bounded" / "huge.py").write_text(
+            "LOAD_BEARING_SECRET = True\n", encoding="utf-8")
+        (root / "raw" / "Dockerfile.agentbox").write_text(
+            "FROM python:3.12\n", encoding="utf-8")
+        (root / "raw" / ".github" / "workflows" / "release.yml").write_text(
+            "name: release\n", encoding="utf-8")
+        run = compile_box.CompileRun("source-inspector", td, 1)
+        scope = {
+            "account": ["assigned/app.ts"],
+            "deny_read": ["bounded/huge.py"],
+            "consult": True,
+        }
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run, scope)}
+        assert {"source_inventory", "source_read", "source_search"} <= tools.keys()
+
+        inventory = json.loads(await tools["source_inventory"].handler({}))
+        rows = {row["path"]: row for row in inventory["sources"]}
+        assert rows["raw/other/peer.go"]["availability"] == "readable", rows
+        assert rows["raw/bounded/huge.py"]["availability"] == "bounded_view_only", rows
+        assert rows["raw/Dockerfile.agentbox"]["kind"] == "text", rows
+        assert rows["raw/.github/workflows/release.yml"]["kind"] == "text", rows
+
+        root_glob = json.loads(await tools["source_inventory"].handler({
+            "pattern": "**/Dockerfile*",
+        }))
+        assert [row["path"] for row in root_glob["sources"]] == [
+            "raw/Dockerfile.agentbox"
+        ], root_glob
+        searched = json.loads(await tools["source_search"].handler({
+            "query": "PeerService", "pattern": "**/*.go",
+        }))
+        assert searched["matches"][0]["path"] == "raw/other/peer.go", searched
+        read = json.loads(await tools["source_read"].handler({
+            "path": "other/peer.go", "offset": 2, "limit": 1,
+        }))
+        assert "PeerService" in read["content"] and read["lines"] == 1, read
+
+        for name, args in (
+            ("source_read", {"path": "bounded/huge.py"}),
+            ("source_search", {"query": "LOAD_BEARING_SECRET"}),
+        ):
+            try:
+                result = await tools[name].handler(args)
+            except ValueError:
+                continue
+            if name == "source_search":
+                assert json.loads(result)["matches"] == [], result
+                continue
+            raise AssertionError(f"{name} bypassed the bounded-source guard")
+
+        structural = {
+            t.name for t in compile_box._compile_engine_tools(
+                run, compile_box.NO_RAW_SCOPE)
+        }
+        assert not ({"source_inventory", "source_read", "source_search"} & structural)
+    print("✓ Source Inspector: engine-neutral full Raw consultation with bounded-source guards")
 
 
 async def test_a_session_records_what_it_actually_spent():
@@ -4651,6 +4726,15 @@ def test_hierarchical_text_slice_materialization_and_directive():
         # batch that must read those pages.
         assert scope["deny_read"] == ["gpu/spec.md"], scope
         assert scope["consult"] is True
+        previous_engine = os.environ.get("KBC_ENGINE")
+        os.environ["KBC_ENGINE"] = "codex_sdk"
+        try:
+            assert compile_box._batch_raw_scope(paged, bounded)["consult"] is True
+        finally:
+            if previous_engine is None:
+                os.environ.pop("KBC_ENGINE", None)
+            else:
+                os.environ["KBC_ENGINE"] = previous_engine
         # A batch with no assigned range for that PDF may not pull it in whole.
         other = compile_box._batch_raw_scope({"sources": ["gpu/other.md"]}, bounded)
         assert other["deny_read"] == ["gpu/manual.pdf", "gpu/spec.md"], other
@@ -4951,13 +5035,13 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             run = compile_box.CompileRun("hier-run", str(wd), 1)
             driven: list[str] = []
             observed_idle_timeouts: list[float | None] = []
-            observed_raw_scopes: list[tuple[str, list[str] | None]] = []
+            observed_raw_scopes: list[tuple[str, dict]] = []
 
             async def fake_drive(run_, directive, label, pdf_page_ranges=None,
                                  raw_scope=None):
                 driven.append(label + "|" + directive.splitlines()[0])
                 observed_idle_timeouts.append(run_._model_idle_timeout_s)
-                observed_raw_scopes.append((label, (raw_scope or {}).get("account")))
+                observed_raw_scopes.append((label, dict(raw_scope or {})))
                 if label.startswith("batch ") or label.startswith("批 "):
                     candidate = wd / "candidate"
                     candidate.mkdir(exist_ok=True)
@@ -4981,11 +5065,15 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             assert sum(item.startswith("section reduce ") for item in driven) == 1, driven
             assert driven[-1].startswith("final review"), driven
             assert observed_raw_scopes[:2] == [
-                ("batch 1/2", ["gpu/a.md"]),
-                ("batch 2/2", ["gpu/b.md"]),
+                ("batch 1/2", {"account": ["gpu/a.md"], "deny_read": [], "consult": True}),
+                ("batch 2/2", {"account": ["gpu/b.md"], "deny_read": [], "consult": True}),
             ], observed_raw_scopes
-            assert all(allowed == [] for label, allowed in observed_raw_scopes[2:]
-                       if label.startswith(("section reduce ", "final review"))), observed_raw_scopes
+            reduce_scopes = [scope for label, scope in observed_raw_scopes
+                             if label.startswith("section reduce ")]
+            final_scopes = [scope for label, scope in observed_raw_scopes
+                            if label.startswith("final review")]
+            assert reduce_scopes == [compile_box.NO_RAW_SCOPE], observed_raw_scopes
+            assert final_scopes == [compile_box.SEMANTIC_REVIEW_RAW_SCOPE], observed_raw_scopes
             assert set(observed_idle_timeouts) == {
                 max(compile_box._MODEL_IDLE_TIMEOUT_S, 123)
             }, observed_idle_timeouts
@@ -5096,7 +5184,8 @@ async def test_hierarchical_media_rechecks_after_ledger_repair():
                                  raw_scope=None):
                 order.append(f"drive:{label}")
                 if label == "final review":
-                    assert "do not read raw/" in directive, directive
+                    assert "source_inventory/source_search/source_read" in directive, directive
+                    assert raw_scope == compile_box.SEMANTIC_REVIEW_RAW_SCOPE, raw_scope
                 if label in {"image verification", "图像复核"}:
                     page.write_text(page.read_text() + "media-repair\n")
                 return f"done {label}"
@@ -6558,6 +6647,7 @@ async def main():
     await test_batch_planner_uses_compile_path_guard()
     await test_prompt_packs_locale()
     test_default_allowlist_covers_every_compile_tool()
+    await test_source_inspector_is_engine_neutral_bounded_and_complete()
     await test_a_session_records_what_it_actually_spent()
     test_compile_session_denies_subagents()
     test_compile_surface_excludes_auto_question_proposals()
