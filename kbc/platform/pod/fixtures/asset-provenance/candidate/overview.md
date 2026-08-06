@@ -1,8 +1,8 @@
 ---
 type: Topic
 title: Overview
-compiled_from:
-  - overview.md
-  - assets/directcited.png
+sources:
+  - resource: overview.md
+  - resource: assets/directcited.png
 ---
 Overview page.

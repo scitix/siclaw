@@ -29,6 +29,7 @@ import {
   CAPABILITY_LIST_ACTIVE_RUNS,
   isTerminalCapabilityStatus,
 } from "./contract.js";
+import { normalizeFailure } from "./failure.js";
 import { ErrorCodes, RpcResponseError } from "../../lib/error-envelope.js";
 
 /** Just the RPC surface the manager needs (so tests can pass a fake). */
@@ -408,7 +409,19 @@ export class CapabilityRunManager {
     // the relay's error catch when the box stream closes right after `done`.
     if (isTerminalCapabilityStatus(rec.status)) return;
     rec.status = status;
-    if (status === "failed" && failure) rec.failure = normalizeFailure(failure);
+    if (status === "failed") {
+      // Always attach a failure so checkpoints are never empty. Call sites must
+      // pass a specific code (box_error / relay_failed / start_failed /
+      // runtime_stale / …). Neutral fallback is runtime_failure — NOT box_error
+      // — so transport/watchdog/start faults are not mis-attributed to the box.
+      rec.failure =
+        normalizeFailure(failure) ??
+        ({
+          code: "runtime_failure",
+          stage: "unknown",
+          message: "unspecified failure",
+        } satisfies CapabilityRunFailure);
+    }
     rec.lastActivityMs = this.now();
     try {
       await this.persist(rec, { failFast: true });
@@ -556,7 +569,15 @@ export class CapabilityRunManager {
           console.warn(`[capability] onReap(${runId}) failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      await this.endRun(runId, outcome);
+      if (outcome === "failed") {
+        await this.endRun(runId, "failed", {
+          code: "runtime_stale",
+          stage: "watchdog",
+          message: "runtime_stale:watchdog",
+        });
+      } else {
+        await this.endRun(runId, outcome);
+      }
       reaped.push(runId);
     }
     return reaped;
@@ -730,32 +751,5 @@ function failureFromCheckpoint(checkpoint: unknown): CapabilityRunFailure | unde
   return normalizeFailure(failure);
 }
 
-function normalizeFailure(value: unknown): CapabilityRunFailure | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const raw = value as Record<string, unknown>;
-  const token = (field: unknown): string | undefined => {
-    if (typeof field !== "string") return undefined;
-    const normalized = field.trim();
-    return normalized && normalized.length <= 64 && /^[a-zA-Z0-9_.-]+$/.test(normalized)
-      ? normalized
-      : undefined;
-  };
-  const code = token(raw.code);
-  const stage = token(raw.stage);
-  if (!code || !stage) return undefined;
-  const finiteNonNegative = (field: unknown): number | undefined =>
-    typeof field === "number" && Number.isFinite(field) && field >= 0 ? field : undefined;
-  const attempts = finiteNonNegative(raw.attempts);
-  const idle = finiteNonNegative(raw.idle_s);
-  const bound = finiteNonNegative(raw.bound_s);
-  const lastMessage = token(raw.last_sdk_message);
-  return {
-    code,
-    stage,
-    ...(attempts !== undefined ? { attempts: Math.floor(attempts) } : {}),
-    ...(idle !== undefined ? { idle_s: idle } : {}),
-    ...(bound !== undefined ? { bound_s: bound } : {}),
-    ...(typeof raw.tool_pending === "boolean" ? { tool_pending: raw.tool_pending } : {}),
-    ...(lastMessage ? { last_sdk_message: lastMessage } : {}),
-  };
-}
+// normalizeFailure lives in failure.ts so session-driver logs and checkpoint
+// persistence share one token/safe-message sanitizer.

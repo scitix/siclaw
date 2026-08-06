@@ -414,6 +414,51 @@ def _print_compile_lifecycle(label: str, run: "CompileRun", extra: str = "") -> 
     print(f"[compile_box] {label} run={run.run_id} round={run.round}{tail}", flush=True)
 
 
+def _error_event(
+    error: str,
+    *,
+    code: str = "box_error",
+    stage: str = "compile",
+    exception_class: str | None = None,
+    message: str | None = None,
+    last_sdk_message: str | None = None,
+    **extra,
+) -> dict:
+    """SSE error frame with a strict two-channel diagnostic split.
+
+    - ``error``: owner-facing text (may include paths / provider fragments via
+      ``repr(e)``). Runtime must NOT log or persist this into checkpoint.
+    - ``message``: **safe** short reason for Runtime checkpoint / logs only.
+      Defaults to ``{code}:{exception_class}`` or ``code`` — never ``repr(e)``.
+    - ``code`` / ``stage`` / ``exception_class`` / ``last_sdk_message``: tokens.
+
+    Production triage (2026-08 sh-manage) only saw ``box event: error`` because
+    bare frames lacked code/stage. Always emit machine tokens so Runtime can
+    project a non-empty checkpoint.failure without copying unsafe free text.
+    """
+    safe = (message or "").strip()
+    if not safe:
+        safe = f"{code}:{exception_class}" if exception_class else code
+    # Hard-cap safe message; never a substitute for owner-facing error.
+    if len(safe) > 256:
+        safe = safe[:256]
+    ev: dict = {
+        "type": "error",
+        "error": error,
+        "code": code,
+        "stage": stage,
+        "message": safe,
+    }
+    if exception_class:
+        ev["exception_class"] = exception_class
+    if last_sdk_message:
+        ev["last_sdk_message"] = last_sdk_message
+    for key, value in extra.items():
+        if value is not None and key not in ev:
+            ev[key] = value
+    return ev
+
+
 def _client_process_exited(client) -> int | None:
     """Best-effort exit code of the SDK's CLI subprocess if it has terminated,
     else None (still alive, or unknown).
@@ -582,6 +627,25 @@ def _lifecycle_batch_ref(batch: dict, k: int, n: int) -> str:
     return ref
 
 
+def _record_provenance_stamp_result(run, stamped: list[str], failures: list[dict[str, str]]) -> None:
+    """Keep unsafe pages out of durability sync until a later repair stamps them."""
+    pending = dict(getattr(run, "_provenance_stamp_failures", {}) or {})
+    for rel in stamped:
+        pending.pop(rel, None)
+    for failure in failures:
+        rel = str(failure.get("page") or "")
+        if rel:
+            pending[rel] = str(failure.get("detail") or "cannot stamp provenance losslessly")
+    run._provenance_stamp_failures = pending
+
+
+def _blocked_provenance_paths(run) -> set[str]:
+    return {
+        f"candidate/{rel}"
+        for rel in (getattr(run, "_provenance_stamp_failures", {}) or {})
+    }
+
+
 class CompileRun:
     def __init__(self, run_id: str, workdir: str, round_: int, instruction: str = ""):
         self.run_id = run_id
@@ -642,6 +706,15 @@ class CompileRun:
         # not a migration trigger for an inherited legacy draft. Compile,
         # incremental, and repair turns still force the post-turn gate below.
         self._turn_selfcheck_key: str | None = None
+        self._turn_page_hashes: dict[str, str] | None = None
+        # A page whose YAML cannot be provenance-stamped losslessly must not
+        # sync its new bytes with an old verified receipt. The final/repair
+        # self-check clears each entry only after stamping succeeds.
+        self._provenance_stamp_failures: dict[str, str] = {}
+        # Candidate bytes may be durably synced before a model ResultMessage.
+        # One stable stamp per logical turn makes repeated sanitized snapshots
+        # byte-identical while transport rebuilds keep the original timestamp.
+        self._turn_provenance_at: datetime | None = None
         # Ordinary owner edits get the same page-scoped legacy-format treatment
         # as incremental compiles: inherited debt on untouched pages stays
         # visible but cannot widen a small edit into a whole-library migration.
@@ -719,10 +792,33 @@ class CompileRun:
     async def emit(self, ev: dict):
         await self.events.put(ev)
 
-    def _begin_turn(self, directive: str, *, grandfather_legacy_format: bool = False):
+    def _begin_turn(
+        self,
+        directive: str,
+        *,
+        grandfather_legacy_format: bool = False,
+        preserve_page_baseline: bool = False,
+    ):
         """Arm the stall watchdog for a new model turn. Called for every turn —
         the owner's /message AND internal self-check/verify/batch injections."""
         self._turn_selfcheck_key = selfcheck.state_key(self.workdir)
+        if not preserve_page_baseline or not isinstance(self._turn_page_hashes, dict):
+            # A previous failed logical turn can remain live in this process.
+            # Reconcile its locally-written pages before replacing the baseline;
+            # cross-process recovery gets the same sanitized bytes from sync.
+            if isinstance(self._turn_page_hashes, dict):
+                prior_changes = incremental.changed_pages(
+                    self._turn_page_hashes, incremental.page_hashes(self.workdir))
+                stamped, failures = selfcheck.stamp_siclaw_generated_metadata_best_effort(
+                    self.workdir,
+                    set(prior_changes),
+                    new_pages={rel for rel, kind in prior_changes.items()
+                               if kind == "created"},
+                    now=self._turn_provenance_at,
+                )
+                _record_provenance_stamp_result(self, stamped, failures)
+            self._turn_page_hashes = incremental.page_hashes(self.workdir)
+            self._turn_provenance_at = datetime.now(timezone.utc)
         self._turn_format_guard = None
         if grandfather_legacy_format:
             self._turn_format_guard = {
@@ -878,6 +974,52 @@ def _collect_workspace_artifacts(workdir: str) -> list[dict]:
     return out
 
 
+def _collect_workspace_artifacts_for_sync(run: CompileRun) -> list[dict]:
+    """Collect a durability-safe snapshot without mutating in-flight files."""
+    artifacts = _collect_workspace_artifacts(run.workdir)
+    before = getattr(run, "_turn_page_hashes", None)
+    stamp_time = getattr(run, "_turn_provenance_at", None)
+    changes: dict[str, str] = {}
+    if isinstance(before, dict) and isinstance(stamp_time, datetime):
+        after = incremental.page_hashes(run.workdir)
+        changes = incremental.changed_pages(before, after)
+    safe_artifacts: list[dict] = []
+    blocked = set((getattr(run, "_provenance_stamp_failures", {}) or {}))
+    for artifact in artifacts:
+        path_value = artifact["path"]
+        if not path_value.startswith("candidate/"):
+            safe_artifacts.append(artifact)
+            continue
+        rel = path_value[len("candidate/"):]
+        if rel in blocked:
+            continue
+        kind = changes.get(rel)
+        if kind not in ("created", "modified"):
+            safe_artifacts.append(artifact)
+            continue
+        try:
+            rewritten = selfcheck.siclaw_generated_metadata_text(
+                rel,
+                artifact["content"],
+                created=kind == "created",
+                now=stamp_time,
+            )
+        except selfcheck.ProvenanceStampError as error:
+            _record_provenance_stamp_result(
+                run, [], [{"page": rel, "detail": str(error)}])
+            continue
+        if rewritten is None and rel.endswith(".md") and not selfcheck._is_reserved_page(rel):
+            _record_provenance_stamp_result(run, [], [{
+                "page": rel,
+                "detail": f"{rel}: invalid or missing YAML frontmatter cannot be provenance-stamped",
+            }])
+            continue
+        if rewritten is not None:
+            artifact["content"] = rewritten
+        safe_artifacts.append(artifact)
+    return safe_artifacts
+
+
 def _workspace_sync_cursor(workdir: str) -> dict[str, str]:
     """Hash the workspace state already installed by the consumer."""
     return {
@@ -894,10 +1036,16 @@ async def _sync_workspace(run: CompileRun, sent: dict, *, commit_input: bool = F
     returns the number of changed entries."""
     if commit_input and not (Path(run.workdir) / "candidate" / "index.md").is_file():
         raise FileNotFoundError("cannot commit compile input without candidate/index.md")
+    blocked_paths = _blocked_provenance_paths(run)
+    if commit_input and blocked_paths:
+        raise selfcheck.ProvenanceStampError(
+            "cannot commit compile input while candidate provenance stamping is blocked")
     changed = []
     next_sent = dict(sent)
-    collected = set()
-    for art in _collect_workspace_artifacts(run.workdir):
+    # Blocked pages still exist. Treat them as collected so durability sync
+    # preserves the last good consumer copy instead of emitting a tombstone.
+    collected = set(blocked_paths)
+    for art in _collect_workspace_artifacts_for_sync(run):
         collected.add(art["path"])
         sha = hashlib.sha256(art["content"].encode("utf-8")).hexdigest()
         if sent.get(art["path"]) == sha:
@@ -941,8 +1089,8 @@ def _workspace_replay_artifacts(run: CompileRun, sent: dict) -> list[dict]:
     acknowledges it. Re-send every current file and every remembered tombstone
     on attach; consumer upserts/deletes are idempotent.
     """
-    artifacts = _collect_workspace_artifacts(run.workdir)
-    current = {item["path"] for item in artifacts}
+    artifacts = _collect_workspace_artifacts_for_sync(run)
+    current = {item["path"] for item in artifacts} | _blocked_provenance_paths(run)
     for path, value in sorted(sent.items()):
         if value == _SYNC_TOMBSTONE and path not in current:
             artifacts.append({"path": path, "deleted": True})
@@ -2386,6 +2534,22 @@ async def _post_turn_selfcheck(run) -> str | None:
     workdir = getattr(run, "workdir", None)
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
+    turn_pages_before = getattr(run, "_turn_page_hashes", None)
+    producer_stamps: list[str] = []
+    if isinstance(turn_pages_before, dict):
+        turn_pages_after = incremental.page_hashes(workdir)
+        turn_changes = incremental.changed_pages(turn_pages_before, turn_pages_after)
+        producer_stamps, stamp_failures = selfcheck.stamp_siclaw_generated_metadata_best_effort(
+            workdir,
+            set(turn_changes),
+            new_pages={page for page, kind in turn_changes.items() if kind == "created"},
+            now=getattr(run, "_turn_provenance_at", None),
+        )
+        resolved = producer_stamps + [
+            page for page, kind in turn_changes.items() if kind == "deleted"
+        ]
+        _record_provenance_stamp_result(run, resolved, stamp_failures)
+    run._turn_page_hashes = None
     # The exclusion ledger is machine-owned, but the escape hatch stays open: a
     # model MAY hand-edit authoring/EXCLUSIONS.json when the exclude_source tool
     # cannot express a fix. Normalize it back to canonical strict JSON (and prune
@@ -2496,13 +2660,41 @@ async def _post_turn_selfcheck(run) -> str | None:
     mechanical_fixes = selfcheck.normalize_body_source_annotations(
         workdir, allowed_pages=mechanical_allowed)
     if mechanical_fixes:
+        mechanically_changed = {item["page"] for item in mechanical_fixes}
+        mechanical_stamps, stamp_failures = (
+            selfcheck.stamp_siclaw_generated_metadata_best_effort(
+                workdir,
+                mechanically_changed,
+                now=getattr(run, "_turn_provenance_at", None),
+            )
+        )
+        _record_provenance_stamp_result(run, mechanical_stamps, stamp_failures)
+        producer_stamps = sorted(set(producer_stamps) | set(mechanical_stamps))
         after = incremental.page_hashes(workdir)
         key = selfcheck.state_key(workdir)
     run._selfcheck_key = key
     report = selfcheck.run_layer1(workdir)
+    pending_stamp_failures = dict(
+        getattr(run, "_provenance_stamp_failures", {}) or {})
+    pending_stamp_failures = {
+        rel: detail for rel, detail in pending_stamp_failures.items()
+        if (Path(workdir) / "candidate" / rel).is_file()
+    }
+    run._provenance_stamp_failures = pending_stamp_failures
+    if pending_stamp_failures:
+        report["lint"]["violations"].extend({
+            "page": rel,
+            "kind": "provenance_stamp_blocked",
+            "detail": detail,
+        } for rel, detail in sorted(pending_stamp_failures.items()))
+        report["lint"]["ok"] = False
     report["mechanical_fixes"] = {
         "count": len(mechanical_fixes),
         "items": mechanical_fixes[:40],
+    }
+    report["producer_stamps"] = {
+        "count": len(producer_stamps),
+        "pages": producer_stamps[:40],
     }
     grandfathered_format: list[dict] = []
     if incr:
@@ -2675,6 +2867,21 @@ async def _emit_message(run: CompileRun, msg) -> None:
             # turn. Park the reply, keep the durability sync, skip selfcheck
             # (the final full-corpus pass owns it) and skip turn_done.
             run._last_turn_reply = reply
+            turn_pages_before = getattr(run, "_turn_page_hashes", None)
+            if isinstance(turn_pages_before, dict):
+                turn_pages_after = incremental.page_hashes(run.workdir)
+                turn_changes = incremental.changed_pages(turn_pages_before, turn_pages_after)
+                stamped, failures = selfcheck.stamp_siclaw_generated_metadata_best_effort(
+                    run.workdir,
+                    set(turn_changes),
+                    new_pages={page for page, kind in turn_changes.items() if kind == "created"},
+                    now=getattr(run, "_turn_provenance_at", None),
+                )
+                resolved = stamped + [
+                    page for page, kind in turn_changes.items() if kind == "deleted"
+                ]
+                _record_provenance_stamp_result(run, resolved, failures)
+            run._turn_page_hashes = None
             sent = getattr(run, "_sync_sent", None)
             if sent is not None:
                 try:
@@ -2773,7 +2980,7 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
 #
 # Agent/Task are denied for a reason specific to compilation rather than to
 # safety. A run's core invariant is that EVERY Raw source ends up either in some
-# page's compiled_from or in the exclusion ledger. A sub-agent reads sources in
+# page's sources[].resource or in the exclusion ledger. A sub-agent reads sources in
 # its own context and hands back prose; the parent that must call
 # report_summary never saw those files and so cannot attest to what they
 # covered. Parallel fan-out and a verifiable ledger are mutually exclusive, and
@@ -3016,12 +3223,12 @@ def _codex_batch_source_view_note(
         return (
             "\n\nCodex batch source view: original Raw is mechanically hidden from shell/file "
             "tools. Read the batch copies below instead. These helper paths are temporary; "
-            "compiled_from must still cite the original raw/... path shown on the left:\n"
+            "sources[].resource must still cite the original raw/... path shown on the left:\n"
             + mappings
         )
     return (
         "\n\nCodex 批次原料视图:原 Raw 已对 shell/文件工具机械隐藏,请改读下列本批只读副本。"
-        "这些辅助路径是临时的;compiled_from 仍必须引用左侧原 raw/... 路径:\n"
+        "这些辅助路径是临时的;sources[].resource 仍必须引用左侧原 raw/... 路径:\n"
         + mappings
     )
 
@@ -3507,7 +3714,7 @@ def _materialize_one_batch_slices(
                 )
             header = (
                 f"<!-- KBC read-only excerpt: raw/{source}, lines {start}-{end}. "
-                f"Candidate compiled_from must cite raw/{source}, never this helper path. -->\n"
+                f"Candidate sources[].resource must cite raw/{source}, never this helper path. -->\n"
             ).encode("utf-8")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(header + b"".join(lines[start - 1:end]))
@@ -3620,7 +3827,11 @@ async def _drive_batch_session(run: "CompileRun", directive: str, label: str,
                 else:
                     _print_compile_lifecycle(
                         "turn.rebuilt", run, extra=f"label={label} attempt={attempt}")
-                run._begin_turn(directive_full)
+                # A rebuilt client is another transport attempt for the SAME
+                # logical batch turn. Keep the first attempt's byte baseline so
+                # pages written before a lost terminator are still stamped even
+                # when the idempotent retry performs no write.
+                run._begin_turn(directive_full, preserve_page_baseline=attempt > 0)
                 await client.query(directive_full)
                 await _consume_turn_stream(
                     run, client, stop_on_result=True, fail_on_error_result=True)
@@ -3897,13 +4108,13 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
     slice_en = (
         "\n\nThis batch uses a bounded excerpt of an oversized Raw source. Read ONLY the listed "
         "`.kbc-batch-slices/` helper, never open the original Raw file directly in this batch. "
-        "Compile only facts present in this excerpt; compiled_from must cite the original Raw path "
+        "Compile only facts present in this excerpt; sources[].resource must cite the original Raw path "
         f"({', '.join('raw/' + path for path in sliced_sources)}), never the helper path."
         if sliced_sources else ""
     )
     slice_zh = (
         "\n\n本批使用超大 Raw 的有界片段。只读清单中的 `.kbc-batch-slices/` 辅助文件,本批绝不要直接打开原 Raw 全文。"
-        "只编译片段中实际出现的事实;compiled_from 必须引用原 Raw 路径("
+        "只编译片段中实际出现的事实;sources[].resource 必须引用原 Raw 路径("
         + ", ".join("raw/" + path for path in sliced_sources)
         + "),绝不能引用辅助文件。"
         if sliced_sources else ""
@@ -3918,7 +4129,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "mechanically hidden from shell/file tools. Call the KBC `read_assigned_pdf_pages` tool "
             "with no arguments; it exposes ONLY the assigned pages ("
             + page_example
-            + "). Compile only facts returned by that tool; compiled_from must cite the original "
+            + "). Compile only facts returned by that tool; sources[].resource must cite the original "
             "Raw PDF path ("
             + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
             + ")."
@@ -3927,7 +4138,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "\n\n本批只处理超大 PDF 的一个有界页段。原 PDF 已对 shell/文件工具机械隐藏;请无参数调用 "
             "KBC `read_assigned_pdf_pages` 工具,它只会返回本批页段("
             + page_example
-            + ")。只编译该工具返回的事实;compiled_from 必须引用原 Raw PDF 路径("
+            + ")。只编译该工具返回的事实;sources[].resource 必须引用原 Raw PDF 路径("
             + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
             + ")."
         )
@@ -3936,7 +4147,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "\n\nThis batch is one bounded page range of an oversized PDF. Read each listed PDF "
             "with the Read tool's `pages` argument set to the EXACT listed range (for this batch, "
             f"`pages: \"{page_example}\"`). Do not read pages outside that range in this batch. Compile only "
-            "facts visible in those pages; compiled_from must cite the original Raw PDF path ("
+            "facts visible in those pages; sources[].resource must cite the original Raw PDF path ("
             + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
             + ")."
             if paged_sources else ""
@@ -3944,7 +4155,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         page_zh = (
             "\n\n本批只处理超大 PDF 的一个有界页段。读取清单中的 PDF 时,Read 工具的 `pages` 参数必须严格等于"
             f"清单页段(本批为 `pages: \"{page_example}\"`),本批不得读取范围外页面。只编译该页段可见的事实;"
-            "compiled_from 必须引用原 Raw PDF 路径("
+            "sources[].resource 必须引用原 Raw PDF 路径("
             + ", ".join(f"raw/{path}" for path, _, _ in paged_sources)
             + ")."
             if paged_sources else ""
@@ -3956,7 +4167,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
             "First read authoring/BRIEF.json, authoring/INTENT.md and candidate/index.md to stay consistent "
             "in voice and structure; then read every source in this batch closely and fold its content fully "
             "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
-            "compiled_from must list the sources it was actually compiled from); update the matching "
+            "sources[].resource must list the sources it was actually compiled from); update the matching "
             "candidate/index.md entries; contradictions as usual — best-guess + ⚠️ uncertain + file a ticket, "
             "never stop. The list is your DELIVERABLE, not your field of view: you may Read any other raw "
             "source and Grep the whole corpus whenever cross-checking helps (who embeds this asset, how a "
@@ -3968,7 +4179,7 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
         "先读 authoring/BRIEF.json、authoring/INTENT.md 和 candidate/index.md 保持口径与结构一致;"
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
-        "compiled_from 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
+        "sources[].resource 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
         "清单是你的**交付责任面**,不是你的视野边界:需要交叉印证时(某个附件被谁引用、邻近文档同一件事怎么表述、"
         "是否已有页覆盖),可以随意 Read 其他 raw 源、可以 Grep 整个语料;只是不要去**编译**清单外的源——那属于别的批。"
         "完成后简短汇报本批编了哪些页。"
@@ -3986,14 +4197,14 @@ def _compose_reduction_directive(
             f"[Hierarchical compile · section reduce {k}/{n} · {reduction['id']}] "
             f"Consolidate the candidate pages for source section {section!r}:\n{pages}\n"
             "Read ONLY the listed candidate pages plus candidate/index.md. Merge genuinely duplicate pages, "
-            "preserve all compiled_from entries and source-backed details, converge terminology and structure, "
+            "preserve all sources[].resource entries and source-backed details, converge terminology and structure, "
             "and repair index links for pages you merge or rename. Do not read raw/ in this reduce pass and do "
             "not touch candidate pages outside this list. This is consolidation, not a new compilation. Report "
             "the pages merged or edited." + notes
         )
     return (
         f"【层级编译 · 分区归并 {k}/{n} · {reduction['id']}】归并来源分区 {section!r} 的下列候选页:\n{pages}\n"
-        "只读上列 candidate 页和 candidate/index.md。合并确实重复的页面,完整保留 compiled_from 与有来源支撑的细节,"
+        "只读上列 candidate 页和 candidate/index.md。合并确实重复的页面,完整保留 sources[].resource 与有来源支撑的细节,"
         "统一术语和结构,并修复被合并或改名页面的 index 链接。本归并轮不要读 raw/,也不要改清单外的 candidate 页。"
         "这是归并,不是重新编译。完成后汇报合并或修改了哪些页。" + notes
     )
@@ -4033,7 +4244,7 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
         step = 1
         if dups:
             lines.append(f"{step}) Duplicate-page candidates ({len(dups)} pairs) — for each pair pick one: "
-                         "merge into a single page (merge compiled_from, fix index links), or give a one-line "
+                         "merge into a single page (merge sources[].resource, fix index links), or give a one-line "
                          "written exemption in your report (genuinely different topics):")
             lines += [f"   - {d['pages'][0]} ↔ {d['pages'][1]} ({_dup_reason_en(d['reason'])})" for d in dups]
             step += 1
@@ -4070,7 +4281,7 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
     lines = [f"【分批编译 · 终审】全部 {n} 批已编完。现在做跨批收口(以下清单是系统机械算出的,逐项处理、不许沉默跳过):"]
     step = 1
     if dups:
-        lines.append(f"{step}) 重复页候选({len(dups)} 对)——每对二选一:合并成一页(合并 compiled_from、修 index 链接),"
+        lines.append(f"{step}) 重复页候选({len(dups)} 对)——每对二选一:合并成一页(合并 sources[].resource、修 index 链接),"
                      "或在汇报里给一句书面豁免理由(确属不同主题):")
         lines += [f"   - {d['pages'][0]} ↔ {d['pages'][1]}({d['reason']})" for d in dups]
         step += 1
@@ -4455,12 +4666,12 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         run,
                         _loc(run,
                              "The following sources assigned to this batch are still unaccounted "
-                             "(neither cited by any Candidate page's compiled_from nor covered by an "
+                             "(neither cited by any Candidate page's sources[].resource nor covered by an "
                              "exclusion). For each one: cite it from the page that digests it, or call "
                              "the exclude_source(path, reason) tool with a concrete reason (the preferred, "
                              "validated path; use remove_exclusion to lift a wrong row, and hand-edit "
                              "EXCLUSIONS.json only as a last resort when no tool can express the fix).\n" + listed,
-                             "本批分配的下列源仍未记账(既没有被任何候选页的 compiled_from 引用,也没有"
+                             "本批分配的下列源仍未记账(既没有被任何候选页的 sources[].resource 引用,也没有"
                              "豁免记录)。请逐个处理:要么在消化它的候选页里补引用,要么调用 "
                              "exclude_source(path, reason) 工具写明具体理由(首选的、带校验的正路;"
                              "要撤销一条排错了的豁免用 remove_exclusion;仅当工具无法表达该修改时,"
@@ -4498,7 +4709,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     # Either the batch made real progress and only stragglers
                     # remain, OR a SECOND independent run again made zero progress
                     # (counter already ≥1). A healthy model that simply never
-                    # writes compiled_from would otherwise loop provider-fault →
+                    # writes sources[].resource would otherwise loop provider-fault →
                     # resume → provider-fault until the sicore breaker suspends it
                     # for a human. Two independent runs of zero progress is content
                     # the train cannot digest: account it. Content shape must never
@@ -4772,7 +4983,18 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             _print_compile_lifecycle(
                 "batch.interrupted.frame", run,
                 extra=f"{frame.filename}:{frame.lineno} in {frame.name}")
-        await run.emit({"type": "error", "error": f"batch compile failed: {e!r}"})
+        # Route with _batch_error_code so Sicore auto-resume can distinguish
+        # deterministic failures (plan_integrity, quota_exhausted) from
+        # transient ones (model_stall, provider_fault). Never hardcode batch_failed.
+        batch_code = _batch_error_code(e)
+        await run.emit(_error_event(
+            f"batch compile failed: {e!r}",
+            code=batch_code,
+            stage="batch_compile",
+            last_sdk_message=getattr(run, "_last_sdk_message_type", None),
+            exception_class=type(e).__name__,
+            message=f"{batch_code}:{type(e).__name__}",
+        ))
         # never-block: the single logical turn must still CLOSE — a consumer
         # gating on turn_done would otherwise hang on an orchestrator error.
         # Done batches are stamped in BATCH_PLAN.json, so the honest story is
@@ -5033,8 +5255,13 @@ async def _reap_unrecoverable_turn(run: CompileRun, client, reason: str) -> None
                         "last_sdk_message": run._last_sdk_message_type})
     else:
         _print_compile_lifecycle("turn.dead", run, extra=f"reason={reason} terminal=1")
-        await run.emit({"type": "error",
-                        "error": f"model stall: {reason}"})
+        await run.emit(_error_event(
+            f"model stall: {reason}",
+            code="model_turn_unrecoverable",
+            stage="model_turn",
+            last_sdk_message=run._last_sdk_message_type,
+            reason=reason,
+        ))
         # Disconnecting ENDS this box's session (run_session has no reconnect
         # loop — deliberately: recovery is owned by the platform). The turn_done
         # text must promise exactly that — not an in-place retry this box can no
@@ -5206,16 +5433,29 @@ async def _run_wrapper(run: CompileRun):
         await _COMPILE_IMPL(run)
         clean = True
     except Exception as e:  # top-level boundary: surface crashes as an error event, never swallow
-        error_event = {"type": "error", "error": repr(e)}
+        # Owner-facing error may use repr(e); safe message never does.
+        cls = type(e).__name__
+        error_event = _error_event(
+            repr(e),
+            code="unhandled",
+            stage="run",
+            exception_class=cls,
+            last_sdk_message=getattr(run, "_last_sdk_message_type", None),
+        )
         if isinstance(e, ModelStallError) and run._last_stall_diagnostic:
-            # Structured, content-free diagnostics survive the Runtime→consumer
-            # opaque checkpoint.  Keep the human error for rolling consumers,
-            # but make automation independent of parsing it.
-            error_event.update({
+            # Structured, content-free diagnostics for checkpoint. Re-apply after
+            # _error_event so stall tokens win; keep safe message free of repr.
+            diag = {
                 key: value
                 for key, value in run._last_stall_diagnostic.items()
                 if key != "fatal"
-            })
+            }
+            error_event.update(diag)
+            error_event["error"] = repr(e)
+            error_event["exception_class"] = cls
+            error_event["code"] = diag.get("code") or "model_turn_stalled"
+            error_event["stage"] = diag.get("stage") or "model_turn"
+            error_event["message"] = f"{error_event['code']}:{cls}"
         await run.emit(error_event)
         if getattr(run, "_turn_active", False):
             # never-block symmetry (review fix): a consumer gating on turn_done
@@ -5252,7 +5492,12 @@ async def _run_wrapper(run: CompileRun):
             await _sync_workspace(run, sent)
         except Exception as e:
             clean = False
-            await run.emit({"type": "error", "error": f"final workspace sync failed: {e!r}"})
+            await run.emit(_error_event(
+                f"final workspace sync failed: {e!r}",
+                code="workspace_sync_failed",
+                stage="persist",
+                exception_class=type(e).__name__,
+            ))
         if clean:
             await run.emit({"type": "done"})
         await run.emit({"type": "end"})
@@ -5778,9 +6023,12 @@ async def _test_stall_watchdog(run: "TestRun") -> None:
             "tool_pending": run._tool_pending,
             "last_sdk_message": run._last_sdk_message_type,
         })
-        await run.emit({"type": "error", "error": _loc(run,
-            "The answer timed out — please try again.",
-            "回答超时,请重试。")})
+        await run.emit(_error_event(
+            _loc(run, "The answer timed out — please try again.", "回答超时,请重试。"),
+            code="model_turn_stalled",
+            stage="test",
+            last_sdk_message=run._last_sdk_message_type,
+        ))
         # turn_done frees the UI (idle) while the session stays open; the next
         # /test-message re-arms a fresh turn on the same live client.
         await run.emit({"type": "turn_done", "text": _loc(run,
@@ -6466,7 +6714,12 @@ async def _test_session_wrapper(run: "TestRun"):
     try:
         await _TEST_SESSION_IMPL(run)
     except Exception as e:  # top-level boundary; CancelledError (teardown) passes through
-        await run.emit({"type": "error", "error": repr(e)})
+        await run.emit(_error_event(
+            repr(e),
+            code="test_session_failed",
+            stage="test",
+            exception_class=type(e).__name__,
+        ))
     finally:
         run.done = True
         watchdog.cancel()
@@ -7246,9 +7499,11 @@ async def _rebuild_test_client(run: "TestRun") -> web.Response | None:
         run._rebuild_error = "test session rebuild timed out"
     if run._rebuild_error is not None:
         _print_test_lifecycle("turn.rebuild_failed", run, extra=f"err={run._rebuild_error!r}")
-        await run.emit({"type": "error", "error": _loc(run,
-            "The session could not be restarted — please try again.",
-            "会话无法重启,请重试。")})
+        await run.emit(_error_event(
+            _loc(run, "The session could not be restarted — please try again.", "会话无法重启,请重试。"),
+            code="test_session_rebuild_failed",
+            stage="test",
+        ))
         return web.json_response({"error": "test session rebuild failed"}, status=503)
     _print_test_lifecycle("turn.rebuilt", run)
     return None

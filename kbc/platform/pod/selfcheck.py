@@ -3,7 +3,7 @@
 Design: improve_siclaw/DESIGN-kb-compile-self-verification-2026-07-03.md §8.1.
 The completion criterion moves from "the model says it's done" to "code can
 verify it": every raw text source must be either cited by a candidate page's
-`compiled_from` frontmatter, or explicitly excluded (with a reason) in
+OKF v0.2 `sources[].resource` frontmatter, or explicitly excluded (with a reason) in
 `authoring/EXCLUSIONS.json`. Anything else is *unaccounted* — the exact
 silent-miss failure mode observed in the 2026-07-03 one-shot compile study.
 
@@ -23,7 +23,7 @@ import posixpath
 import re
 import unicodedata
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote
@@ -35,7 +35,7 @@ import yaml
 # failure (29/33 images dropped by the one-shot compile), and a text-only
 # ledger pushed agents to mark image-digest pages `derived: true` — zero
 # machine-checkable provenance exactly where fidelity risk is highest.
-# compiled_from is the agent's declaration either way; the ledger only checks
+# sources[].resource is the agent's declaration either way; the ledger only checks
 # that the declaration is total.
 TEXT_SOURCE_EXTS = {".md", ".txt", ".tsv", ".csv", ".json", ".jsonl", ".yaml", ".yml"}
 IMAGE_SOURCE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
@@ -80,7 +80,7 @@ _REPAIR_LIST_CAP = 40
 def source_inventory(workdir: str) -> list[str]:
     """All source files under {workdir}/raw — text AND media — as sorted posix
     paths relative to raw/. Hidden files/dirs (dot-prefixed) are skipped.
-    Every file must end up cited by some page's compiled_from or explicitly
+    Every file must end up cited by some page's sources[].resource or explicitly
     excluded; unknown binary blobs are the agent's to exclude with a reason."""
     raw = Path(workdir) / "raw"
     if not raw.is_dir():
@@ -129,9 +129,9 @@ def has_assets_segment(rel: str) -> bool:
 
 def _strip_source_prefix(entry: str) -> str:
     """Drop a leading raw/ or drop/ so a path compares against the raw-relative
-    inventory. Applied to BOTH compiled_from entries and exclusion patterns, so
+    inventory. Applied to BOTH OKF source resources and exclusion patterns, so
     the two namespaces line up (a `raw/live.csv` exclusion matches inventory
-    `live.csv`, matching how the adjacent compiled_from field accepts the prefix)."""
+    `live.csv`, matching how the adjacent sources field accepts the prefix)."""
     for prefix in ("raw/", "drop/"):
         if entry.startswith(prefix):
             return entry[len(prefix):]
@@ -139,79 +139,94 @@ def _strip_source_prefix(entry: str) -> str:
 
 
 def _norm_source_entry(raw: str) -> str:
-    """One compiled_from list entry → a raw-relative source path. Tolerates
-    `"<hash8> · <path>"`, surrounding quotes, and a raw/ or drop/ prefix.
+    """One OKF ``sources[].resource`` value → a raw-relative source path.
+
+    Siclaw's v0.2 producer profile uses concrete raw paths here, not the old
+    fingerprint-prefixed scalar dialect. A leading raw/ or drop/ prefix is
+    accepted because both resolve to the same materialized Raw namespace.
     Canonicalized with posixpath.normpath, the same way intra-wiki link targets
     are resolved: an un-normalized citation (`./live.csv`, `sub/../x.md`) used
     to double-report as unaccounted AND dangling — cosmetic while dangling was
     display-only, a permanent convergence wedge once it gates `closed` (review
     finding: the model would get contradictory repair orders forever)."""
-    entry = raw.strip().strip("\"'").strip()
-    if "·" in entry:
-        entry = entry.rsplit("·", 1)[1].strip()
-    entry = _strip_source_prefix(entry.strip("\"'").strip())
+    entry = posixpath.normpath(raw.strip().replace("\\", "/"))
+    entry = _strip_source_prefix(entry)
     if not entry:
         return entry
     entry = posixpath.normpath(entry)
     return "" if entry == "." else entry
 
 
-def parse_compiled_from(md_text: str) -> tuple[list[str], bool, bool]:
-    """Parse a candidate page's frontmatter.
+def _explicit_managed_source(resource: str) -> bool:
+    value = posixpath.normpath(resource.strip().replace("\\", "/"))
+    return value.startswith(("raw/", "drop/"))
 
-    Returns (source_paths, derived, has_compiled_from). `compiled_from` is read
-    in BOTH the block form (`compiled_from:` then `- item` lines) and the inline
-    flow form (`compiled_from: [a.md, "b.md"]`) — the inline form previously
-    parsed to zero sources and triggered a spurious repair on a cited page.
-    Tolerated entry forms:
-      - "<hash8> · <path>"   (provenance with fingerprint)
-      - "<path>" / '<path>' / <path>
-    A leading raw/ or drop/ prefix is stripped so paths compare against the
-    raw-relative inventory.
+
+def _explicit_external_source(resource: str) -> bool:
+    """True for OKF resources that cannot name Siclaw's managed Raw tree.
+
+    OKF v0.2 intentionally permits URLs, package-relative paths, references,
+    and arbitrary scope descriptors. Only ``raw/`` / ``drop/`` is an explicit
+    managed-source namespace. Bare values remain a legacy compatibility case
+    when (and only when) they exactly match the current Raw inventory.
     """
-    lines = md_text.splitlines()
-    if not lines or lines[0].strip() != "---":
+    value = posixpath.normpath(resource.strip().replace("\\", "/"))
+    lowered = value.lower()
+    return (
+        "://" in value
+        or lowered.startswith(("mailto:", "urn:", "doi:"))
+        or value.startswith(("/", "../"))
+        or lowered.startswith("references/")
+    )
+
+
+def parse_okf_sources(
+    md_text: str,
+    managed_sources: set[str] | None = None,
+) -> tuple[list[str], bool, bool]:
+    """Return normalized raw paths from OKF v0.2 ``sources[].resource``.
+
+    The format is intentionally strict because this is a clean v0.2 producer
+    contract, not a legacy reader: ``sources`` is a YAML sequence of mappings
+    and every row names a non-empty string ``resource``. Shape errors are
+    reported by ``okf_v02_violations``; this helper simply returns no cited path
+    for malformed rows so coverage can never fail open.
+    """
+    fm, _, error = parse_okf_frontmatter(md_text)
+    if error or fm is None:
         return [], False, False
-    sources: list[str] = []
-    derived = False
-    has_key = False
-    in_list = False
-    for line in lines[1:]:
-        stripped = line.strip()
-        if stripped in ("---", "..."):
-            break
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:", line):  # top-level key
-            in_list = False
-            key = line.split(":", 1)[0].strip()
-            rest = line.split(":", 1)[1].strip()
-            if key == "compiled_from":
-                has_key = True
-                if rest.startswith("["):
-                    # inline flow list on one line: compiled_from: [raw/a.md, "b.md"]
-                    inner = rest[1:-1] if rest.endswith("]") else rest[1:]
-                    for item in inner.split(","):
-                        entry = _norm_source_entry(item)
-                        if entry:
-                            sources.append(entry)
-                else:
-                    # block form (`compiled_from:` alone) opens the list; inline
-                    # `compiled_from: []` is handled above (rest == "[]")
-                    in_list = rest == ""
-            elif key == "derived":
-                derived = rest.lower() in ("true", "yes")
-            continue
-        if in_list:
-            m = re.match(r"^\s*-\s*(.+?)\s*$", line)
-            if m:
-                entry = _norm_source_entry(m.group(1))
+    has_key = "sources" in fm
+    derived = fm.get("derived") is True
+    resources: list[str] = []
+    raw_sources = fm.get("sources")
+    if isinstance(raw_sources, list):
+        for item in raw_sources:
+            if not isinstance(item, dict):
+                continue
+            resource = item.get("resource")
+            if not isinstance(resource, str):
+                continue
+            if _explicit_managed_source(resource):
+                entry = _norm_source_entry(resource)
                 if entry:
-                    sources.append(entry)
-            elif stripped:
-                in_list = False
-    return sources, derived, has_key
+                    resources.append(entry)
+                continue
+            if _explicit_external_source(resource):
+                continue
+            # Clean v0.2 packages use an explicit managed namespace. Preserve
+            # the old bare-path dialect only when it exactly identifies a Raw
+            # inventory entry; every other value is an OKF scope descriptor.
+            if managed_sources is not None:
+                entry = _norm_source_entry(resource)
+                if entry in managed_sources:
+                    resources.append(entry)
+    return resources, derived, has_key
 
 
-def candidate_pages(workdir: str) -> dict[str, dict]:
+def candidate_pages(
+    workdir: str,
+    additional_managed_sources: set[str] | None = None,
+) -> dict[str, dict]:
     """Parse every candidate/**/*.md page's provenance. Keyed by path relative
     to candidate/ (posix). Unreadable pages are reported as parse errors, not
     skipped silently."""
@@ -219,15 +234,27 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
     pages: dict[str, dict] = {}
     if not cand.is_dir():
         return pages
+    managed_sources = set(source_inventory(workdir))
+    # A deleted Raw source is absent from today's inventory by definition, but
+    # incremental dependency lookup still has to recognize legacy bare-path
+    # citations to it. Callers that hold an authoritative change set may extend
+    # the compatibility inventory narrowly; arbitrary external OKF resources
+    # remain outside Siclaw's managed Raw namespace.
+    if additional_managed_sources:
+        managed_sources.update(
+            entry
+            for raw in additional_managed_sources
+            if (entry := _norm_source_entry(raw))
+        )
     for f in sorted(cand.rglob("*.md")):
         rel = f.relative_to(cand).as_posix()
         try:
             text = f.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as e:
-            pages[rel] = {"sources": [], "derived": False, "has_compiled_from": False,
+            pages[rel] = {"sources": [], "derived": False, "has_sources": False,
                           "error": f"unreadable: {e}"}
             continue
-        sources, derived, has_key = parse_compiled_from(text)
+        sources, derived, has_key = parse_okf_sources(text, managed_sources)
         try:
             raw_bytes = f.stat().st_size
         except OSError:
@@ -236,7 +263,7 @@ def candidate_pages(workdir: str) -> dict[str, dict]:
         # decoded text under-measures CRLF pages (read_text translates newlines),
         # so an encode()-based lint could pass a page the sync then skips (review).
         pages[rel] = {"sources": sources, "derived": derived,
-                      "has_compiled_from": has_key, "text": text, "bytes": raw_bytes}
+                      "has_sources": has_key, "text": text, "bytes": raw_bytes}
     return pages
 
 
@@ -347,7 +374,7 @@ def _seg_glob(pat_parts: list[str], tgt_parts: list[str]) -> bool:
 def _matches(path: str, pattern: str) -> bool:
     """Does a raw-relative inventory `path` match an exclusion `pattern`? The
     pattern is normalized to the raw-relative namespace (a raw/ or drop/ prefix is
-    stripped, matching how compiled_from entries are normalized), and globbing is
+    stripped, matching how sources[].resource values are normalized), and globbing is
     SEGMENT-AWARE — `*` never crosses `/`. Use a trailing `/` (dir-prefix) or `**`
     to exclude a whole subtree; `notes/*` excludes only the files directly under
     notes/."""
@@ -391,6 +418,16 @@ def _is_reserved_page(rel: str) -> bool:
     return Path(rel).name in _RESERVED_PAGE_NAMES
 
 
+def _is_frontmatter_start(line: str) -> bool:
+    """A document marker must begin at column zero; trailing spaces are OK."""
+    return re.fullmatch(r"---[ \t]*", line.rstrip("\r\n")) is not None
+
+
+def _is_frontmatter_end(line: str) -> bool:
+    """Recognize only top-level document markers, never block-scalar content."""
+    return re.fullmatch(r"(?:---|\.\.\.)[ \t]*", line.rstrip("\r\n")) is not None
+
+
 def parse_okf_frontmatter(md_text: str) -> tuple[dict | None, str, str | None]:
     """Parse an OKF YAML frontmatter block with a real YAML parser.
 
@@ -400,10 +437,10 @@ def parse_okf_frontmatter(md_text: str) -> tuple[dict | None, str, str | None]:
     authored input and must never construct arbitrary Python objects.
     """
     lines = md_text.splitlines()
-    if not lines or lines[0].strip() != "---":
+    if not lines or not _is_frontmatter_start(lines[0]):
         return None, md_text, "missing YAML frontmatter at the start of the file"
     end = next((i for i, line in enumerate(lines[1:], start=1)
-                if line.strip() in ("---", "...")), None)
+                if _is_frontmatter_end(line)), None)
     if end is None:
         return None, md_text, "YAML frontmatter has no closing delimiter"
     raw = "\n".join(lines[1:end])
@@ -438,11 +475,11 @@ def _markdown_prose(md_text: str) -> str:
     # semantics. Malformed/absent frontmatter remains prose, as before.
     body_start = 0
     lines = md_text.splitlines(keepends=True)
-    if lines and lines[0].strip() == "---":
+    if lines and _is_frontmatter_start(lines[0]):
         offset = len(lines[0])
         for line in lines[1:]:
             offset += len(line)
-            if line.strip() in ("---", "..."):
+            if _is_frontmatter_end(line):
                 body_start = offset
                 break
     body = md_text[body_start:]
@@ -507,24 +544,24 @@ def _markdown_prose(md_text: str) -> str:
 
 
 def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[dict]:
-    """Validate the reserved OKF index shape for a v0.1 bundle.
+    """Validate the reserved OKF index shape for a v0.2 bundle.
 
     OKF permits an optional version declaration only on the bundle-root index;
-    when present here it must target v0.1. Siclaw's producer profile separately
+    when present here it must target v0.2. Siclaw's producer profile separately
     requires the declaration and file-relative links on newly authored output.
     """
     violations: list[dict] = []
     fm, body, error = parse_okf_frontmatter(text)
     if rel == "index.md":
-        if error and text.splitlines() and text.splitlines()[0].strip() == "---":
+        if error and text.splitlines() and _is_frontmatter_start(text.splitlines()[0]):
             violations.append({"page": rel, "kind": "okf_index_frontmatter",
                                "detail": f"根 index.md 的 YAML frontmatter 无效: {error}"})
             body = text
         elif not error and (set(fm or {}) != {"okf_version"}
               or not isinstance((fm or {}).get("okf_version"), str)
-              or (fm or {}).get("okf_version") != "0.1"):
+              or (fm or {}).get("okf_version") != "0.2"):
             violations.append({"page": rel, "kind": "okf_index_frontmatter",
-                               "detail": "根 index.md frontmatter 必须且只能包含 okf_version: \"0.1\""})
+                               "detail": "根 index.md frontmatter 必须且只能包含 okf_version: \"0.2\""})
         elif error:
             # OKF makes index.md optional and its root version declaration MAY;
             # Siclaw's producer profile below requires that declaration.
@@ -533,7 +570,7 @@ def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[
         # A nested index has no frontmatter. A malformed block is still a block,
         # so detect the delimiter directly instead of treating its parse error as
         # equivalent to correctly absent frontmatter.
-        if text.splitlines() and text.splitlines()[0].strip() == "---":
+        if text.splitlines() and _is_frontmatter_start(text.splitlines()[0]):
             violations.append({"page": rel, "kind": "okf_index_frontmatter",
                                "detail": "子目录 index.md 按 OKF 不能包含 frontmatter"})
         body = text
@@ -550,7 +587,7 @@ def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[
 
 def _okf_log_violations(rel: str, text: str) -> list[dict]:
     violations: list[dict] = []
-    if text.splitlines() and text.splitlines()[0].strip() == "---":
+    if text.splitlines() and _is_frontmatter_start(text.splitlines()[0]):
         violations.append({"page": rel, "kind": "okf_log_frontmatter",
                            "detail": "log.md 按 OKF 不能包含 frontmatter"})
     prose = _markdown_prose(text)
@@ -580,8 +617,411 @@ def _okf_log_violations(rel: str, text: str) -> list[dict]:
     return violations
 
 
-def okf_v01_violations(pages: dict[str, dict]) -> list[dict]:
-    """Mandatory OKF v0.1 conformance checks only."""
+def _valid_okf_actor(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    actor = value.strip()
+    if actor.startswith(("human:", "process:")):
+        return len(actor.split(":", 1)[1].strip()) > 0
+    producer, sep, version = actor.partition("/")
+    return bool(sep and producer.strip() and version.strip())
+
+
+_RFC3339_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _valid_iso_datetime(value: object) -> bool:
+    if isinstance(value, datetime):
+        return value.tzinfo is not None and value.utcoffset() is not None
+    if not isinstance(value, str) or not value.strip():
+        return False
+    raw = value.strip()
+    if not _RFC3339_DATETIME_RE.fullmatch(raw):
+        return False
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00").replace(",", "."))
+        return parsed.tzinfo is not None and parsed.utcoffset() is not None
+    except ValueError:
+        return False
+
+
+def _valid_okf_date(value: object) -> bool:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.strptime(value.strip(), "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _valid_usage_window(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    start, end = value.get("from"), value.get("to")
+    if not _valid_okf_date(start) or not _valid_okf_date(end):
+        return False
+    return str(start) <= str(end)
+
+
+def _valid_nonnegative_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_resource_mapping(value: object, *, receipt: bool = False) -> bool:
+    if not isinstance(value, dict):
+        return False
+    resource = value.get("resource")
+    if not isinstance(resource, str) or not resource.strip():
+        return False
+    if receipt and "receipt" in value:
+        fields = value.get("receipt")
+        if (not isinstance(fields, list) or not fields
+                or any(not isinstance(field, str) or not field.strip() for field in fields)):
+            return False
+    return True
+
+
+def _has_inline_computation(body: str) -> bool:
+    """Return whether a Computation section contains a complete code fence."""
+    headings = list(re.finditer(
+        r"(?m)^(#{1,6})[ \t]+Computation(?:[ \t]+#*)?[ \t]*$", body,
+    ))
+    for heading in headings:
+        level = len(heading.group(1))
+        end = len(body)
+        for following in re.finditer(r"(?m)^(#{1,6})[ \t]+.+$", body[heading.end():]):
+            if len(following.group(1)) <= level:
+                end = heading.end() + following.start()
+                break
+        section = body[heading.end():end]
+        opened: tuple[str, int] | None = None
+        for line in section.splitlines():
+            match = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$", line)
+            if not match:
+                continue
+            fence = match.group(1)
+            marker = fence[0]
+            if opened is None:
+                opened = (marker, len(fence))
+            elif marker == opened[0] and len(fence) >= opened[1] and not match.group(2).strip():
+                return True
+    return False
+
+
+def _okf_v02_metadata_violations(rel: str, fm: dict, body: str) -> list[dict]:
+    """Validate the optional v0.2 families when a producer emits them."""
+    violations: list[dict] = []
+    if "sources" in fm:
+        raw_sources = fm.get("sources")
+        if not isinstance(raw_sources, list):
+            violations.append({"page": rel, "kind": "okf_sources",
+                               "detail": "OKF v0.2 sources 必须是 mapping 列表"})
+        else:
+            seen_ids: set[str] = set()
+            for i, source in enumerate(raw_sources):
+                if not isinstance(source, dict):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}] 必须是 mapping"})
+                    continue
+                resource = source.get("resource")
+                if not isinstance(resource, str) or not resource.strip():
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].resource 必须是非空字符串"})
+                source_id = source.get("id")
+                if source_id is not None:
+                    if not isinstance(source_id, str) or not source_id.strip():
+                        violations.append({"page": rel, "kind": "okf_sources",
+                                           "detail": f"sources[{i}].id 必须是非空字符串"})
+                    elif source_id in seen_ids:
+                        violations.append({"page": rel, "kind": "okf_sources",
+                                           "detail": f"sources id 重复: {source_id}"})
+                    else:
+                        seen_ids.add(source_id)
+                if ("author" in source and (not isinstance(source.get("author"), str)
+                                             or not source.get("author", "").strip())):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].author 必须是非空字符串"})
+                if "usage_count" in source and not _valid_nonnegative_count(source.get("usage_count")):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].usage_count 必须是非负整数"})
+                if "last_modified" in source and not _valid_okf_date(source.get("last_modified")):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].last_modified 必须是 YYYY-MM-DD"})
+                if "usage_window" in source and not _valid_usage_window(source.get("usage_window")):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].usage_window 必须包含合法且有序的 from/to 日期"})
+                if ("usage_count" in source and "usage_window" not in source
+                        and "usage_window" not in fm):
+                    violations.append({"page": rel, "kind": "okf_sources",
+                                       "detail": f"sources[{i}].usage_count 必须由来源级或顶层 usage_window 界定"})
+
+    if "usage_window" in fm and not _valid_usage_window(fm.get("usage_window")):
+        violations.append({"page": rel, "kind": "okf_usage_window",
+                           "detail": "usage_window 必须包含合法且有序的 YYYY-MM-DD from/to 日期"})
+
+    if "generated" in fm:
+        generated = fm.get("generated")
+        if not isinstance(generated, dict) or not _valid_okf_actor(generated.get("by")):
+            violations.append({"page": rel, "kind": "okf_generated",
+                               "detail": "generated.by 必须使用 OKF actor 约定"})
+        elif "at" in generated and not _valid_iso_datetime(generated.get("at")):
+            violations.append({"page": rel, "kind": "okf_generated",
+                               "detail": "generated.at 必须是 RFC 3339 datetime"})
+
+    if "verified" in fm:
+        verified = fm.get("verified")
+        events = verified if isinstance(verified, list) else [verified]
+        if not events or any(not isinstance(event, dict)
+                             or not _valid_okf_actor(event.get("by"))
+                             or not _valid_iso_datetime(event.get("at"))
+                             for event in events):
+            violations.append({"page": rel, "kind": "okf_verified",
+                               "detail": "verified 必须是含合法 by/at 的 mapping 或 mapping 列表"})
+
+    status = fm.get("status")
+    if "status" in fm and status not in ("draft", "stable", "deprecated"):
+        violations.append({"page": rel, "kind": "okf_status",
+                           "detail": "status 只能是 draft、stable 或 deprecated"})
+    if "stale_after" in fm:
+        if not _valid_okf_date(fm.get("stale_after")):
+            violations.append({"page": rel, "kind": "okf_stale_after",
+                               "detail": "stale_after 必须是 YYYY-MM-DD"})
+    if fm.get("type") == "Attested Computation":
+        runtime = fm.get("runtime")
+        if not isinstance(runtime, str) or not runtime.strip():
+            violations.append({"page": rel, "kind": "okf_attested_computation",
+                               "detail": "Attested Computation 必须声明非空 runtime"})
+        if "parameters" in fm:
+            parameters = fm.get("parameters")
+            if (not isinstance(parameters, list)
+                    or any(not isinstance(item, dict)
+                           or not isinstance(item.get("name"), str) or not item.get("name", "").strip()
+                           or not isinstance(item.get("type"), str) or not item.get("type", "").strip()
+                           or not isinstance(item.get("required"), bool)
+                           for item in parameters)):
+                violations.append({"page": rel, "kind": "okf_attested_computation",
+                                   "detail": "parameters 必须是含 name/type/required 的 mapping 列表"})
+        computation = fm.get("computation")
+        has_path = isinstance(computation, str) and bool(computation.strip())
+        if "computation" in fm and not has_path:
+            violations.append({"page": rel, "kind": "okf_attested_computation",
+                               "detail": "computation 必须是非空路径或 URI"})
+        has_inline = _has_inline_computation(body)
+        if has_path == has_inline:
+            violations.append({"page": rel, "kind": "okf_attested_computation",
+                               "detail": "Attested Computation 必须且只能通过 computation 路径或正文 Computation fence 提供计算内容"})
+        if "executor" in fm and not _valid_resource_mapping(fm.get("executor"), receipt=True):
+            violations.append({"page": rel, "kind": "okf_attested_computation",
+                               "detail": "executor 必须包含非空 resource，receipt 如存在须为非空字符串列表"})
+        if "attester" in fm and not _valid_resource_mapping(fm.get("attester")):
+            violations.append({"page": rel, "kind": "okf_attested_computation",
+                               "detail": "attester 必须包含非空 resource"})
+    return violations
+
+
+class ProvenanceStampError(RuntimeError):
+    """The runtime cannot update machine provenance without risking user YAML."""
+
+
+def _yaml_node_ids(node: yaml.Node) -> set[int]:
+    found = {id(node)}
+    if isinstance(node, yaml.MappingNode):
+        for key, value in node.value:
+            found.update(_yaml_node_ids(key))
+            found.update(_yaml_node_ids(value))
+    elif isinstance(node, yaml.SequenceNode):
+        for value in node.value:
+            found.update(_yaml_node_ids(value))
+    return found
+
+
+def _remove_yaml_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + text[end:]
+    return text
+
+
+def _yaml_terminal_end(node: yaml.Node) -> int:
+    """Last concrete token in a node, excluding comments before the next key.
+
+    PyYAML extends a collection node's end mark through inter-key comments. A
+    byte-splice based on that mark would delete an owner's comment together
+    with the machine-owned value. Descend to scalar tokens instead.
+    """
+    if isinstance(node, yaml.MappingNode) and node.value:
+        return max(_yaml_terminal_end(child) for pair in node.value for child in pair)
+    if isinstance(node, yaml.SequenceNode) and node.value:
+        return max(_yaml_terminal_end(child) for child in node.value)
+    return node.end_mark.index
+
+
+def siclaw_generated_metadata_text(
+    rel: str,
+    text: str,
+    *,
+    created: bool = False,
+    now: datetime | None = None,
+) -> str | None:
+    """Return provenance-stamped bytes without mutating the source file.
+
+    ``None`` means the page cannot be safely stamped and should remain for the
+    normal OKF lint to reject or repair. Keeping this transformation pure lets
+    workspace sync sanitize an in-flight snapshot without racing the model's
+    file writer.
+    """
+    if _is_reserved_page(rel) or not rel.endswith(".md"):
+        return None
+    stamp_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    stamp = stamp_time.isoformat(timespec="seconds").replace("+00:00", "Z")
+    lines = text.splitlines(keepends=True)
+    if not lines or not _is_frontmatter_start(lines[0]):
+        return None
+    end = next((i for i, line in enumerate(lines[1:], start=1)
+                if _is_frontmatter_end(line)), None)
+    if end is None:
+        return None
+    frontmatter = "".join(lines[1:end])
+    try:
+        fm = yaml.safe_load(frontmatter)
+        root = yaml.compose(frontmatter, Loader=yaml.SafeLoader)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(fm, dict) or not isinstance(root, yaml.MappingNode):
+        return None
+    if root.flow_style:
+        raise ProvenanceStampError(
+            f"{rel}: top-level flow YAML cannot be provenance-stamped losslessly")
+
+    pairs: list[tuple[str, yaml.Node, yaml.Node]] = []
+    seen: set[str] = set()
+    for key_node, value_node in root.value:
+        key = key_node.value
+        if key in seen:
+            raise ProvenanceStampError(
+                f"{rel}: duplicate top-level YAML key {key!r} is ambiguous")
+        seen.add(key)
+        pairs.append((key, key_node, value_node))
+
+    remove_keys = {"generated", "verified"}
+    add_stable = created and fm.get("status") is None
+    if add_stable and "status" in fm:
+        remove_keys.add("status")
+
+    # Anchors may live on keys as well as values. Include both halves or
+    # removing an anchored machine key can leave an undefined retained alias.
+    removed_nodes = [node for key, key_node, value in pairs if key in remove_keys
+                     for node in (key_node, value)]
+    retained_nodes = [node for key, key_node, value in pairs if key not in remove_keys
+                      for node in (key_node, value)]
+    removed_ids = set().union(*(_yaml_node_ids(node) for node in removed_nodes)) if removed_nodes else set()
+    retained_ids = set().union(*(_yaml_node_ids(node) for node in retained_nodes)) if retained_nodes else set()
+    if removed_ids & retained_ids:
+        raise ProvenanceStampError(
+            f"{rel}: a retained YAML alias depends on machine-owned provenance")
+
+    spans: list[tuple[int, int]] = []
+    for key, key_node, value_node in pairs:
+        if key not in remove_keys:
+            continue
+        start = key_node.start_mark.index - key_node.start_mark.column
+        finish = max(_yaml_terminal_end(key_node), _yaml_terminal_end(value_node))
+        line_end = frontmatter.find("\n", finish)
+        if line_end < 0:
+            line_end = len(frontmatter)
+        # Delete the machine field's final physical line (and an inline comment
+        # on that field), but not a following standalone owner comment.
+        finish = line_end + (1 if line_end < len(frontmatter) else 0)
+        spans.append((start, finish))
+
+    preserved = _remove_yaml_spans(frontmatter, spans)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    if preserved and not preserved.endswith(("\n", "\r")):
+        preserved += newline
+    indent = " " * min((key.start_mark.column for _, key, _ in pairs), default=0)
+    inserted = []
+    if add_stable:
+        inserted.append(f"{indent}status: stable{newline}")
+    inserted.extend([
+        f"{indent}generated:{newline}",
+        f"{indent}  by: process:siclaw-kbc{newline}",
+        f"{indent}  at: '{stamp}'{newline}",
+    ])
+    return lines[0] + preserved + "".join(inserted) + lines[end] + "".join(lines[end + 1:])
+
+
+def stamp_siclaw_generated_metadata(
+    workdir: str,
+    changed_pages: set[str],
+    *,
+    new_pages: set[str] | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """Deterministically bind changed concept bytes to the Siclaw producer.
+
+    The model cannot be the authority for its own provenance. Every concept it
+    creates or changes is re-signed here, and any verification of the previous
+    bytes is removed. Unknown frontmatter keys and the Markdown body survive.
+    Invalid frontmatter is left untouched for the normal OKF lint to repair.
+    """
+    candidate = Path(workdir) / "candidate"
+    created = new_pages or set()
+    pending: list[tuple[Path, str, str]] = []
+    for rel in sorted(changed_pages):
+        target = candidate / rel
+        if not target.is_file():
+            continue
+        try:
+            text = target.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        rewritten = siclaw_generated_metadata_text(
+            rel, text, created=rel in created, now=now)
+        if rewritten is None or rewritten == text:
+            continue
+        pending.append((target, rel, rewritten))
+    written: list[str] = []
+    for target, rel, rewritten in pending:
+        _write_text_atomic(target, rewritten)
+        written.append(rel)
+    return written
+
+
+def stamp_siclaw_generated_metadata_best_effort(
+    workdir: str,
+    changed_pages: set[str],
+    *,
+    new_pages: set[str] | None = None,
+    now: datetime | None = None,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Stamp independent pages while reporting lossless-rewrite blockers.
+
+    Filesystem errors still surface. Only deterministic YAML-shape blockers are
+    converted into page-scoped repair findings so one malformed page cannot
+    poison every batch retry or suppress stamps on unrelated pages.
+    """
+    written: list[str] = []
+    failures: list[dict[str, str]] = []
+    created = new_pages or set()
+    for rel in sorted(changed_pages):
+        try:
+            written.extend(stamp_siclaw_generated_metadata(
+                workdir,
+                {rel},
+                new_pages={rel} if rel in created else set(),
+                now=now,
+            ))
+        except ProvenanceStampError as error:
+            failures.append({"page": rel, "detail": str(error)})
+    return written, failures
+
+
+def okf_v02_violations(pages: dict[str, dict]) -> list[dict]:
+    """OKF v0.2 core conformance plus emitted optional-family shape checks."""
     violations: list[dict] = []
     concept_pages = {rel for rel in pages if not _is_reserved_page(rel)}
     for rel, page in pages.items():
@@ -595,7 +1035,7 @@ def okf_v01_violations(pages: dict[str, dict]) -> list[dict]:
         if name == "log.md":
             violations.extend(_okf_log_violations(rel, text))
             continue
-        fm, _, error = parse_okf_frontmatter(text)
+        fm, body, error = parse_okf_frontmatter(text)
         if error:
             violations.append({"page": rel, "kind": "okf_frontmatter",
                                "detail": error})
@@ -604,6 +1044,7 @@ def okf_v01_violations(pages: dict[str, dict]) -> list[dict]:
         if not isinstance(type_value, str) or not type_value.strip():
             violations.append({"page": rel, "kind": "okf_type",
                                "detail": "OKF concept frontmatter requires a non-empty string type"})
+        violations.extend(_okf_v02_metadata_violations(rel, fm or {}, body))
 
     return violations
 
@@ -625,13 +1066,41 @@ def siclaw_portable_output_violations(pages: dict[str, dict]) -> list[dict]:
         if (rel == "index.md"
                 and (not text.splitlines() or text.splitlines()[0].strip() != "---")):
             violations.append({"page": rel, "kind": "siclaw_profile_version_declaration",
-                               "detail": "Siclaw 根 index.md 必须声明 okf_version: \"0.1\""})
+                               "detail": "Siclaw 根 index.md 必须声明 okf_version: \"0.2\""})
+        if not _is_reserved_page(rel):
+            fm, _, error = parse_okf_frontmatter(text)
+            if error or fm is None:
+                continue
+            if "verified" in fm:
+                violations.append({"page": rel, "kind": "siclaw_profile_verified",
+                                   "detail": "编译 Agent 不得自写 verified；验证事件由确定性系统或人工流程记录"})
     return violations
 
 
 def format_policy_violations(pages: dict[str, dict]) -> list[dict]:
     """All OKF-core and Siclaw-profile violations for authoring enforcement."""
-    return okf_v01_violations(pages) + siclaw_portable_output_violations(pages)
+    return okf_v02_violations(pages) + siclaw_portable_output_violations(pages)
+
+
+def okf_import_violations(pages: dict[str, dict]) -> list[dict]:
+    """Contract for importing an already-compiled Wiki into Siclaw.
+
+    This is deliberately narrower than the producer profile: imported pages
+    may contain legitimate human verification records, wikilinks, or
+    bundle-root links. It is also narrower than the authoring lint's body-style
+    checks. The import boundary requires the frontmatter contract Sicore can
+    persist and inspect, plus an explicit root ``okf_version: "0.2"`` marker.
+    Keep this selection aligned with Sicore's ``validateAdoptionOKFStructure``.
+    """
+    violations = [
+        violation for violation in okf_v02_violations(pages)
+        if violation.get("kind") not in {"okf_index_structure", "okf_log_structure"}
+    ]
+    violations.extend(
+        violation for violation in siclaw_portable_output_violations(pages)
+        if violation.get("kind") == "siclaw_profile_version_declaration"
+    )
+    return violations
 
 
 def format_violation_keys(pages: dict[str, dict]) -> list[list[str]]:
@@ -665,10 +1134,10 @@ def filter_incremental_format_violations(
 
 def _strip_frontmatter(text: str) -> str:
     lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
+    if not lines or not _is_frontmatter_start(lines[0]):
         return text
     for i, line in enumerate(lines[1:], start=1):
-        if line.strip() in ("---", "..."):
+        if _is_frontmatter_end(line):
             return "\n".join(lines[i + 1:])
     return text
 
@@ -759,7 +1228,7 @@ def document_link_targets(md_text: str) -> list[str]:
 # excluded" while the prompt tells the compiler to cite the ORIGINAL. A real
 # run hit exactly that: the page cited `X.xlsx`, the ledger reported `X.xlsx.md`
 # unaccounted, and the session spent a whole extra round rewriting its
-# compiled_from to the derived path — obeying the ledger by disobeying the
+# sources[].resource to the derived path — obeying the ledger by disobeying the
 # prompt. Neither the check nor the prompt was wrong; the pair had no rule.
 OFFICE_RENDER_EXTS = (".pptx", ".xlsx", ".docx")
 
@@ -865,7 +1334,7 @@ def orphan_media_assets(workdir: str, sources: list[str] | None = None) -> list[
     they stay unaccounted forever; the batch train pre-excludes them with a
     machine reason instead of demanding the model account for a bare image.
 
-    An asset a candidate page cites DIRECTLY in its compiled_from is NOT an
+    An asset a candidate page cites DIRECTLY in its sources list is NOT an
     orphan: coverage v1 compatibility counts a directly-cited asset as accounted
     (see coverage()), so pre-excluding and pruning it at plan time would drop a
     source the ledger already accepts. Subtract both the document-embed edges and
@@ -1210,7 +1679,7 @@ def normalize_body_source_annotations(
     """Repair unambiguous missing-extension body citations without a model.
 
     Only a single malformed payload that exactly matches one unique
-    ``compiled_from`` alias is rewritten. Mixed lists, arbitrary prose, and
+    ``sources[].resource`` alias is rewritten. Mixed lists, arbitrary prose, and
     duplicate stems remain lint failures for semantic repair. Code fences and
     inline code are masked by ``_body_source_payload_spans``. When supplied,
     ``allowed_pages`` keeps incremental byte-isolation intact.
@@ -1219,6 +1688,7 @@ def normalize_body_source_annotations(
     fixes: list[dict[str, str]] = []
     if not candidate.is_dir():
         return fixes
+    managed_sources = set(source_inventory(workdir))
     for path in sorted(candidate.rglob("*.md")):
         rel = path.relative_to(candidate).as_posix()
         if allowed_pages is not None and rel not in allowed_pages:
@@ -1227,7 +1697,7 @@ def normalize_body_source_annotations(
             text = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        sources, _, _ = parse_compiled_from(text)
+        sources, _, _ = parse_okf_sources(text, managed_sources)
         if not sources:
             continue
         aliases: dict[str, set[str]] = {}
@@ -1434,9 +1904,9 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
         if "error" in page:
             violations.append({"page": rel, "kind": "unreadable", "detail": page["error"]})
             continue
-        if not _is_reserved_page(rel) and not page["has_compiled_from"] and not page["derived"]:
+        if not _is_reserved_page(rel) and not page["has_sources"] and not page["derived"]:
             violations.append({"page": rel, "kind": "no_provenance",
-                               "detail": "frontmatter 缺 compiled_from(纯综合页请标 derived: true)"})
+                               "detail": "frontmatter 缺 OKF v0.2 sources(纯综合页请标 derived: true)"})
         text = page.get("text", "")
         violations.extend(credential_exposure_violations(rel, text))
         # Same byte METHOD as the sync gate (stat().st_size), not the decoded
@@ -1463,8 +1933,8 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
             if t and f"{t}.md" not in names and t not in names:
                 violations.append({"page": rel, "kind": "broken_wikilink", "detail": t})
         # Body cites (source: X.ext) → that file must be in THIS page's
-        # compiled_from (basename match tolerated: bodies usually cite the
-        # basename, compiled_from carries the raw-relative path).
+        # sources[].resource (basename match tolerated: bodies usually cite the
+        # basename, resource carries the raw-relative path).
         cf_full = set(page["sources"])
         cf_names = {posixpath.basename(s) for s in cf_full}
         body_sources, malformed_sources = _body_source_references(text)
@@ -1472,11 +1942,11 @@ def lint_candidate(pages: dict[str, dict], exclusion_errors: list[str]) -> dict:
             if f in cf_full or posixpath.basename(f) in cf_names:
                 continue
             violations.append({"page": rel, "kind": "body_source_uncited",
-                               "detail": f"正文引用 (source: {f}) 但该文件不在本页 compiled_from——补登记或修正引用"})
+                               "detail": f"正文引用 (source: {f}) 但该文件不在本页 sources[].resource——补登记或修正引用"})
         for item in malformed_sources:
             violations.append({"page": rel, "kind": "body_source_malformed",
                                "detail": (f"正文来源标注无法解析为带扩展名的源文件: (source: {item})"
-                                          "——保留与 compiled_from 一致的完整文件名和扩展名")})
+                                          "——保留与 sources[].resource 一致的完整文件名和扩展名")})
         # Charset integrity: U+FFFD (replacement char) is never legitimate KB
         # content — it is the fingerprint of a LOSSY UTF-8 decode (a multibyte
         # char split at a stream chunk boundary upstream, e.g. the model-output
@@ -1526,7 +1996,7 @@ def _norm_title(text: str) -> str:
 
 def dup_candidates(pages: dict[str, dict], cap: int = 20) -> list[dict]:
     """Deterministic merge-or-exempt worklist for the cross-batch final pass:
-    page pairs with the same (normalized) title, or with heavy compiled_from
+    page pairs with the same (normalized) title, or with heavy source overlap
     overlap (≥2 shared sources covering ≥50% of the smaller set). A signal for
     the final-review directive and the publish card — NOT a lint violation
     (near-dups can be legitimate, so the model/owner gets the last word)."""
@@ -1583,7 +2053,7 @@ def detect_over_broad_exclusions(workdir: str, exclusions: list[dict]) -> list[d
 
 
 def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> dict:
-    """The ledger (coverage v2): raw inventory − compiled_from union − exclusions
+    """The ledger (coverage v2): raw inventory − sources[].resource union − exclusions
     − auto-attached media = unaccounted.
 
     v2 adds ONE accounting path (monotonic — it can only SHRINK unaccounted, so
@@ -1591,7 +2061,7 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
     see is_media_asset) embedded in the body of a document that is ITSELF
     accounted (cited or excluded) is auto-attached to that document and counts as
     accounted. Media assets are the document's attachments, not first-class
-    sources — so `compiled_from` no longer needs a token per image and the
+    sources — so `sources` no longer needs a row per image and the
     exclusion ledger no longer needs a row per image. Two things deliberately do
     NOT auto-attach: an ORPHAN asset embedded by no accounted document (upload
     residue — it stays unaccounted and must be excluded with a reason, so a human
@@ -1946,7 +2416,7 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
                 lines.append(f"- …{len(cov['unaccounted'])} total (see authoring/SELFCHECK.json for the rest)")
             lines.append(
                 "For each, choose one: (1) Compile it — fold the source's content into the relevant candidate "
-                "page (new or merged) and register that source path in the page's frontmatter compiled_from; "
+                "page (new or merged) and register that source path in the page's frontmatter sources[].resource; "
                 "(2) Exclude it — if it genuinely should not be compiled (meta files / live data / "
                 "highly time-sensitive, etc.), call the exclude_source(path, reason) tool (the preferred, "
                 "validated path — call it again with a better reason to CORRECT a row, and use "
@@ -1954,7 +2424,7 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
                 "permitted as a last resort when no tool can express the fix, and the system "
                 "re-normalizes the ledger after this turn either way.")
         if cov["dangling_citations"]:
-            lines.append(f"\ncompiled_from cites nonexistent sources (dangling, {len(cov['dangling_citations'])}):")
+            lines.append(f"\nsources[].resource cites nonexistent sources (dangling, {len(cov['dangling_citations'])}):")
             lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
             lines.append("Change them to real raw-relative paths.")
         if cov.get("noop_exclusions"):
@@ -1981,12 +2451,12 @@ def build_repair_prompt(report: dict, locale: str | None = None) -> str:
             lines.append(f"- …等共 {len(cov['unaccounted'])} 个(其余见 authoring/SELFCHECK.json)")
         lines.append(
             "逐个二选一(图片/PDF 等媒体同样适用):① 补编 — 把该源内容编进相应 candidate 页(新增或并入),"
-            "并在该页 frontmatter 的 compiled_from 登记该源路径;② 显式排除 — 确属不该编的(元文件/活数据/时效性强等),"
+            "并在该页 frontmatter 的 sources[].resource 登记该源路径;② 显式排除 — 确属不该编的(元文件/活数据/时效性强等),"
             "调用 exclude_source(path, reason) 工具(首选的、带校验的正路——同一 path 换新理由再调一次即【更正】该行,"
             "撤销一条豁免用 remove_exclusion(path))。仅当工具无法表达该修改时,才允许直接编辑 "
             "authoring/EXCLUSIONS.json 作为兜底——无论哪种,系统都会在本轮结束后重新规范化该账本。")
     if cov["dangling_citations"]:
-        lines.append(f"\ncompiled_from 引用了不存在的源(悬空引用,{len(cov['dangling_citations'])} 处):")
+        lines.append(f"\nsources[].resource 引用了不存在的源(悬空引用,{len(cov['dangling_citations'])} 处):")
         lines += [f"- {p}" for p in cov["dangling_citations"][:_REPAIR_LIST_CAP]]
         lines.append("请改成真实的 raw 相对路径。")
     if cov.get("noop_exclusions"):
@@ -2015,7 +2485,7 @@ def ledger_repair_pages(workdir: str, report: dict) -> list[str]:
     a residual ticket for work that had in fact been done).
 
     = lint violation pages (charset/orphan/… name their page) ∪ pages whose
-    compiled_from cites a dangling path (they must be edited to fix or drop the
+    sources[].resource cites a dangling path (they must be edited to fix or drop the
     citation). Unaccounted-source merges are NOT here — the model declares
     those via ADDED_TARGETS.json, which the guard already honors live."""
     pages: set[str] = set()
@@ -2128,10 +2598,10 @@ def file_residual_ticket(workdir: str, report: dict, locale: str | None = None) 
 def media_citing_pages(workdir: str) -> dict[str, list[str]]:
     """candidate page → sorted raw-relative image paths whose numeric fidelity
     this page is responsible for. Three discovery paths, UNIONED:
-      1. compiled_from image entries — an image cited directly (legacy pages);
+      1. direct sources image entries — an image cited directly;
       2. body ``(source: …)`` image citations — basename match tolerated;
       3. attribution-edge reverse lookup — a page that cites a DOCUMENT ``d`` in
-         its compiled_from inherits the numeric check of every image ``d``
+         its sources list inherits the numeric check of every image ``d``
          embeds in its body.
     Path 3 is what keeps image re-verification alive under coverage v2: agents
     now cite DOCUMENTS (images auto-attach, see coverage/asset_attribution_edges)
@@ -2161,7 +2631,7 @@ def media_citing_pages(workdir: str) -> dict[str, list[str]]:
                 matches = by_basename.get(posixpath.basename(entry), [])
                 if len(matches) == 1:
                     hits.add(matches[0])
-        # Path 3: images embedded by a document this page cites in compiled_from.
+        # Path 3: images embedded by a document this page cites in sources.
         for entry in page["sources"]:
             for asset in edges.get(entry, ()):
                 if asset in raw_set:

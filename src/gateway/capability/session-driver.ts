@@ -21,7 +21,6 @@ import type {
   CapabilityEventType,
   CapabilityPersistArtifactsRequest,
   CapabilityPersistTurnRequest,
-  CapabilityRunFailure,
 } from "./contract.js";
 import {
   CAPABILITY_EVENT,
@@ -29,18 +28,24 @@ import {
   CAPABILITY_PERSIST_TURN,
   isTerminalCapabilityStatus,
 } from "./contract.js";
+import { structuredBoxFailure } from "./failure.js";
 
 interface BoxEvent {
   type: string;
   summary?: string;
+  /**
+   * On error events: producer **safe** short reason for checkpoint (e.g.
+   * `batch_failed:TimeoutError`). Never the owner-facing `error` / exception repr.
+   * On other events historically unused free-form text — still never logged from error path.
+   */
   message?: string;
   text?: string;
+  /** Owner-facing error text only — never logs/checkpoint. */
   error?: string;
   /** `deleted` entries are tombstones — the box removed a previously-synced file. */
   artifacts?: Array<{ path: string; content?: string; deleted?: boolean }>;
   /** Explicit full-compile commit. Replayed file presence alone is not a commit. */
   commit_input?: boolean;
-  /** Sanitized machine failure fields. Never contains prompts/tool/provider text. */
   code?: string;
   stage?: string;
   attempts?: number;
@@ -48,6 +53,9 @@ interface BoxEvent {
   bound_s?: number;
   tool_pending?: boolean;
   last_sdk_message?: string;
+  /** Exception type name token only. */
+  exception_class?: string;
+  reason?: string;
 }
 
 export interface DriveCapabilitySessionOptions {
@@ -83,7 +91,20 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
     // reaps an actively-working run (e.g. a long compile emitting only `log`).
     // touch() is in-memory only (no persist), so it is cheap to call every event.
     manager.touch(runId);
-    console.log(`[capability] run=${runId} box event: ${evt.type}`);
+    if (evt.type === "error") {
+      // Log only the safe contract fields — never evt.error (may hold paths /
+      // provider fragments). Production triage previously saw only "error".
+      const safe = structuredBoxFailure(evt);
+      console.error(
+        `[capability] run=${runId} box event: error` +
+          ` code=${safe.code} stage=${safe.stage}` +
+          ` exception_class=${safe.exception_class ?? "-"}` +
+          ` last_sdk_message=${safe.last_sdk_message ?? "-"}` +
+          ` message=${truncateForLog(safe.message ?? "")}`,
+      );
+    } else {
+      console.log(`[capability] run=${runId} box event: ${evt.type}`);
+    }
     switch (evt.type) {
       case "log":
         emit("log", { text: evt.text ?? "" });
@@ -170,11 +191,10 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
         break;
       case "error":
         emit("lifecycle", { status: "failed", error: evt.error ?? "" });
-        {
-          const failure = structuredBoxFailure(evt);
-          if (failure) await manager.endRun(runId, "failed", failure);
-          else await manager.endRun(runId, "failed");
-        }
+        // Always persist a structured failure. Bare box errors (error string
+        // only, no code/stage) used to call endRun without a failure object, so
+        // the consumer checkpoint and auto-resume detail were empty.
+        await manager.endRun(runId, "failed", structuredBoxFailure(evt));
         break;
       case "end": {
         // The box's session coroutine exited (clean stream close: max_turns
@@ -200,15 +220,11 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
   }
 }
 
-function structuredBoxFailure(evt: BoxEvent): CapabilityRunFailure | undefined {
-  if (!evt.code || !evt.stage) return undefined;
-  return {
-    code: evt.code,
-    stage: evt.stage,
-    ...(typeof evt.attempts === "number" ? { attempts: evt.attempts } : {}),
-    ...(typeof evt.idle_s === "number" ? { idle_s: evt.idle_s } : {}),
-    ...(typeof evt.bound_s === "number" ? { bound_s: evt.bound_s } : {}),
-    ...(typeof evt.tool_pending === "boolean" ? { tool_pending: evt.tool_pending } : {}),
-    ...(typeof evt.last_sdk_message === "string" ? { last_sdk_message: evt.last_sdk_message } : {}),
-  };
+function truncateForLog(text: string, max = 200): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= max) return oneLine || "-";
+  return `${oneLine.slice(0, max)}…`;
 }
+
+// structuredBoxFailure is shared with run-manager's normalizeFailure (failure.ts)
+// so forged/non-token code values are stripped before the log line is written.

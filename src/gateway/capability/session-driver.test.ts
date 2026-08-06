@@ -184,34 +184,50 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     expect(mgr.endRun).toHaveBeenCalledWith("r1", "done");
   });
 
-  it("error → lifecycle failed + endRun(failed)", async () => {
+  it("error → lifecycle failed + endRun(failed) with structured failure even when bare", async () => {
     const fe = fakeFrontend();
     const mgr = fakeManager();
-    await driveCapabilitySession({
-      client: fakeClient([{ type: "error", error: "boom" }, { type: "end" }]),
-      runId: "r1", frontendClient: fe, manager: mgr,
-    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([{ type: "error", error: "boom" }, { type: "end" }]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
     expect(emits(fe)).toContainEqual({ run_id: "r1", type: "lifecycle", payload: { status: "failed", error: "boom" } });
-    expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed");
+    // Bare box errors used to call endRun("failed") with no failure object.
+    // Owner-facing `error` ("boom") must NOT enter checkpoint.message.
+    expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed", {
+      code: "box_error",
+      stage: "unknown",
+      message: "box_error",
+    });
   });
 
-  it("persists a structured model-stall failure without relying on the human error string", async () => {
+  it("persists a structured model-stall failure including free-text message", async () => {
     const fe = fakeFrontend();
     const mgr = fakeManager();
-    await driveCapabilitySession({
-      client: fakeClient([{
-        type: "error",
-        error: "ModelStallError('model request stalled')",
-        code: "model_turn_stalled",
-        stage: "model_turn",
-        attempts: 4,
-        idle_s: 90.2,
-        bound_s: 90,
-        tool_pending: false,
-        last_sdk_message: "query",
-      }]),
-      runId: "r1", frontendClient: fe, manager: mgr,
-    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await driveCapabilitySession({
+        client: fakeClient([{
+          type: "error",
+          error: "ModelStallError('model request stalled')",
+          code: "model_turn_stalled",
+          stage: "model_turn",
+          attempts: 4,
+          idle_s: 90.2,
+          bound_s: 90,
+          tool_pending: false,
+          last_sdk_message: "query",
+        }]),
+        runId: "r1", frontendClient: fe, manager: mgr,
+      });
+    } finally {
+      errSpy.mockRestore();
+    }
     expect(mgr.endRun).toHaveBeenCalledWith("r1", "failed", {
       code: "model_turn_stalled",
       stage: "model_turn",
@@ -220,6 +236,8 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
       bound_s: 90,
       tool_pending: false,
       last_sdk_message: "query",
+      // Safe short reason only — not the owner-facing error/repr string.
+      message: "model_turn_stalled",
     });
   });
 

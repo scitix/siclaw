@@ -37,6 +37,7 @@ LLM calls go through **headless Claude Code** (`tools/llm.py`, reuses Claude Cod
 | **ingest** | `ingest.py` | heterogeneous files (pdf/pptx/xlsx/image/text) → normalized md + `@prov` precise provenance (trace-back = re-read the local file). Engine is pluggable; the high-fidelity upgrade is a Docling backend |
 | **compile** (core) | `compile_loop.py` + `triage.py` | normalized md → extract OKF assertions + detect cross-source contradictions → adjudicate (self-resolve / escalate to a domain MCQ) → ledger. State machine: see [`design/compile-loop.md`](design/compile-loop.md) |
 | **emit** | `emit.py` | ledger → standard OKF bundle (pages grouped by topic, frontmatter+type, each item carries its source, contradictions landed per adjudication, writes index.md) |
+| **package** | `package_okf.py` | validate an already-compiled OKF v0.2 Wiki and create the deterministic `.tar.gz` accepted by Siclaw's direct-import flow; does not run an authoring agent |
 | **audit** | `kb_audit.py` / `lint_links.py` | generic link-lint spine + optional Profile-driven leaves |
 | **eval (publish gate)** | `kb_eval.py` | question-set stress test of the bundle (blue team answers from the bundle read-only + a judge scores + a threshold gates it). **Optional**, can be run standalone against any bundle |
 
@@ -44,6 +45,7 @@ LLM calls go through **headless Claude Code** (`tools/llm.py`, reuses Claude Cod
 .venv/bin/python tools/ingest.py --src <file or directory> --out out/ingested/
 .venv/bin/python tools/compile_loop.py --ledger out/ledger.json --ingested out/ingested/ --constitution <constitution file>
 .venv/bin/python tools/emit.py       --ledger out/ledger.json --out out/bundle/        # ledger → OKF bundle
+.venv/bin/python tools/package_okf.py --wiki out/bundle/ --out out/bundle.tar.gz       # clean Wiki → direct-import artifact
 .venv/bin/python tools/kb_audit.py   --profile examples/profile.minimal.yaml
 .venv/bin/python tools/kb_eval.py    --bundle out/bundle/ --questions <question-set.yaml>      # optional publish gate
 ```

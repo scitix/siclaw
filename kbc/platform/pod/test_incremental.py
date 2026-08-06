@@ -3,6 +3,7 @@
 """
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -16,13 +17,13 @@ def _mk(base: Path, rel: str, text: str = "x"):
 
 
 def _page(sources: list[str]) -> str:
-    cf = "\n".join(f"  - {s}" for s in sources)
-    return f"---\ntype: Topic\ntitle: t\ncompiled_from:\n{cf}\n---\n正文。"
+    cf = "\n".join(f"  - resource: {s}" for s in sources)
+    return f"---\ntype: Topic\ntitle: t\nsources:\n{cf}\n---\n正文。"
 
 
 def _kb(base: Path):
     # 4 pages citing distinct raw sources; index routes them.
-    _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [b](b.md)\n- [c](c.md)")
+    _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [b](b.md)\n- [c](c.md)")
     _mk(base, "candidate/a.md", _page(["snap/one.md", "snap/two.md"]))
     _mk(base, "candidate/b.md", _page(["snap/three.md"]))
     _mk(base, "candidate/c.md", _page(["snap/four.md"]))
@@ -49,7 +50,7 @@ def test_resolve_affected_pages():
 def test_no_basename_cross_match():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
-        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [s](snap-cfg.md)\n- [v](vendor-cfg.md)")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [s](snap-cfg.md)\n- [v](vendor-cfg.md)")
         _mk(base, "candidate/snap-cfg.md", _page(["snap/config.md"]))
         _mk(base, "candidate/vendor-cfg.md", _page(["vendor/config.md"]))
         # same basename, different directory: changing snap/config.md must NOT
@@ -72,13 +73,13 @@ def test_no_basename_cross_match():
 def test_raw_prefix_normalization():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
-        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [p](p.md)\n- [q](q.md)")
-        _mk(base, "candidate/p.md", _page(["raw/snap/one.md"]))   # prefixed compiled_from
-        _mk(base, "candidate/q.md", _page(["snap/two.md"]))       # unprefixed compiled_from
-        # original motivation intact: raw/-prefixed compiled_from ↔ unprefixed changeset
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [p](p.md)\n- [q](q.md)")
+        _mk(base, "candidate/p.md", _page(["raw/snap/one.md"]))   # prefixed sources[].resource
+        _mk(base, "candidate/q.md", _page(["snap/two.md"]))       # unprefixed sources[].resource
+        # original motivation intact: raw/-prefixed sources[].resource ↔ unprefixed changeset
         aff, _ = incremental.resolve_affected_pages(td, {"modified": ["snap/one.md"]})
         assert aff == ["p.md"], aff
-        # and the reverse: prefixed changeset ↔ unprefixed compiled_from
+        # and the reverse: prefixed changeset ↔ unprefixed sources[].resource
         aff2, _ = incremental.resolve_affected_pages(td, {"modified": ["raw/snap/two.md"]})
         assert aff2 == ["q.md"], aff2
         # ./ collapse + drop/ prefix normalize too
@@ -118,7 +119,7 @@ def test_integrity_guard():
         before = incremental.page_hashes(td)
         # model legitimately edits a.md (affected) + index; leaves b/c untouched → no violation
         _mk(base, "candidate/a.md", _page(["snap/one.md", "snap/two.md"]) + "\n新事实。")
-        _mk(base, "candidate/index.md", "---\nokf_version: \"0.1\"\n---\n# Index\n- [a](a.md)\n- [b](b.md)\n- [c](c.md) edited")
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n- [a](a.md)\n- [b](b.md)\n- [c](c.md) edited")
         after = incremental.page_hashes(td)
         assert incremental.changed_pages(before, after) == {"a.md": "modified", "index.md": "modified"}
         assert incremental.integrity_violations(before, after, {"a.md"}) == []       # index auto-allowed
@@ -203,7 +204,53 @@ def test_diff_cap_degrades_oversized_diffs():
         by_path = {m["path"]: m["diff"] for m in cs["modified"]}
         assert by_path["snap/one.md"] == ""          # degraded, not shipped oversized
         assert by_path["snap/two.md"] == "- old\n+ new"  # small diff untouched
-    print("OK  oversized per-source diffs degrade to re-read (CHANGESET stays syncable)")
+        print("OK  oversized per-source diffs degrade to re-read (CHANGESET stays syncable)")
+
+
+def test_total_changeset_budget_prioritizes_scope_and_diffs():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _kb(base)
+        paths = [f"snap/chunk-{i}.md" for i in range(8)]
+        summary_path = "测" * 1024
+        summary = {
+            "logical_changes": [{
+                "change_kind": "path_and_content",
+                "baseline_primary_path": summary_path,
+                "current_primary_path": summary_path,
+                "baseline_files": 1,
+                "current_files": 1,
+            } for _ in range(100)],
+        }
+        old = os.environ.get("KBC_MAX_CHANGESET_BYTES")
+        old_sync = os.environ.get("KBC_MAX_SYNC_FILE_BYTES")
+        os.environ["KBC_MAX_CHANGESET_BYTES"] = str(96 * 1024)
+        os.environ["KBC_MAX_SYNC_FILE_BYTES"] = str(80 * 1024)
+        try:
+            cs = incremental.build_changeset(
+                td,
+                {"modified": paths},
+                diffs={path: str(i) * (16 * 1024) for i, path in enumerate(paths)},
+                summary=summary,
+            )
+        finally:
+            if old is None:
+                os.environ.pop("KBC_MAX_CHANGESET_BYTES", None)
+            else:
+                os.environ["KBC_MAX_CHANGESET_BYTES"] = old
+            if old_sync is None:
+                os.environ.pop("KBC_MAX_SYNC_FILE_BYTES", None)
+            else:
+                os.environ["KBC_MAX_SYNC_FILE_BYTES"] = old_sync
+        encoded = (json.dumps(cs, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        assert len(encoded) <= 80 * 1024, len(encoded)  # shared sync cap wins
+        assert [item["path"] for item in cs["modified"]] == paths
+        kept = sum(bool(item["diff"]) for item in cs["modified"])
+        assert 0 < kept < len(paths), kept
+        assert cs["change_summary"]["modified_with_diffs"] == kept
+        assert cs["change_summary"]["modified_without_diffs"] == len(paths) - kept
+        assert cs["change_summary"]["logical_changes_omitted"] > 0
+        print("OK  total CHANGESET byte budget keeps scope, then diffs, then bounded logical hints")
 
 
 def test_protocol_raw_changes_to_changeset():
@@ -223,15 +270,81 @@ def test_protocol_raw_changes_to_changeset():
         _mk(base, "authoring/RAW_CHANGES.json", json.dumps({
             "added": [], "modified": ["snap/two.md"], "deleted": [],
             "diffs": {"snap/two.md": "- old\n+ new"},
+            "summary": {
+                "physical_path_operations": 3,
+                "effective_path_operations": 1,
+                "ignored_canonical_noops": 2,
+                "logical_affected_sources": 1,
+                "logical_total_sources": 10,
+                "modified_with_diffs": 1,
+                "modified_without_diffs": 0,
+                "logical_changes": [{
+                    "origin_unit_key": "feishu:opaque-do-not-forward",
+                    "change_kind": "content",
+                    "current_primary_path": "snap/two.md",
+                    "current_files": 3,
+                }],
+            },
             "baseline_fingerprint": "BASE", "snapshot_fingerprint": "SNAP",
         }))
         cs = incremental.materialize_changeset(td)
         assert cs is not None and cs["affected_pages"] == ["a.md"], cs        # box reverse-looked-up
         assert cs["modified"][0]["diff"] == "- old\n+ new"                    # the consumer's diff passed through
+        assert cs["change_summary"]["logical_affected_sources"] == 1
+        assert cs["change_summary"]["logical_changes"] == [{
+            "change_kind": "content", "current_primary_path": "snap/two.md", "current_files": 3,
+        }]
+        assert "origin_unit_key" not in json.dumps(cs["change_summary"])
         # persisted for the model to read
         written = json.loads((base / "authoring/CHANGESET.json").read_text())
         assert written["affected_pages"] == ["a.md"] and written["snapshot_fingerprint"] == "SNAP"
         print("OK  protocol (RAW_CHANGES → enriched CHANGESET; absent/malformed/empty → None fallback)")
+
+
+def test_scope_over_budget_is_consumed_and_falls_back_once():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _kb(base)
+        raw_path = base / incremental.RAW_CHANGES_PATH
+        changeset_path = base / incremental.CHANGESET_PATH
+        _mk(base, incremental.RAW_CHANGES_PATH, json.dumps({
+            "added": [f"very/long/source/path/{i:04d}.md" for i in range(80)],
+            "modified": [],
+            "deleted": [],
+        }))
+        _mk(base, incremental.CHANGESET_PATH, "stale")
+        old = os.environ.get("KBC_MAX_CHANGESET_BYTES")
+        os.environ["KBC_MAX_CHANGESET_BYTES"] = "512"
+        try:
+            assert incremental.materialize_changeset(td) is None
+        finally:
+            if old is None:
+                os.environ.pop("KBC_MAX_CHANGESET_BYTES", None)
+            else:
+                os.environ["KBC_MAX_CHANGESET_BYTES"] = old
+        assert not raw_path.exists(), "oversized one-shot input would wedge every retry"
+        assert not changeset_path.exists(), "full fallback must not expose a stale scope"
+
+
+def test_budget_dropped_diff_is_explicit_without_summary():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _kb(base)
+        old = os.environ.get("KBC_MAX_CHANGESET_BYTES")
+        os.environ["KBC_MAX_CHANGESET_BYTES"] = "2048"
+        try:
+            cs = incremental.build_changeset(
+                td,
+                {"modified": ["snap/two.md"]},
+                diffs={"snap/two.md": "x" * 16_384},
+            )
+        finally:
+            if old is None:
+                os.environ.pop("KBC_MAX_CHANGESET_BYTES", None)
+            else:
+                os.environ["KBC_MAX_CHANGESET_BYTES"] = old
+        assert cs["modified"][0]["diff"] == ""
+        assert cs["modified_diffs_omitted"] == 1
 
 
 def test_added_targets_and_authorized():
@@ -256,6 +369,21 @@ def test_scoped_directive():
     d = incremental.build_scoped_directive(cs)                # default locale = English
     assert "CHANGESET.json" in d and "2 modified source(s)" in d and "1 added source(s)" in d
     assert "ADDED_TARGETS.json" in d and "sha256" in d  # declares the two contracts the guard depends on
+    summarized = incremental.build_scoped_directive({
+        **cs,
+        "change_summary": {
+            "logical_affected_sources": 1,
+            "ignored_canonical_noops": 2,
+            "modified_with_diffs": 1,
+            "modified_without_diffs": 1,
+            "logical_changes": [{"change_kind": "content"}],
+        },
+    })
+    assert "1 logical source document(s)" in summarized
+    assert "2 canonical no-op" in summarized
+    assert "1 modified source(s) have surgical diffs" in summarized
+    assert "1 require a scoped source re-read" in summarized
+    assert "exact execution scope" in summarized
     # Domain is AI-maintained against the latest whole catalog after page work:
     # empty → must report_domain; present → re-judge full catalog + this diff.
     # Anchor is index.md, never CHANGESET alone.
@@ -306,7 +434,10 @@ if __name__ == "__main__":
     test_page_bytes_and_restore()
     test_restore_skips_unrestorable_page()
     test_diff_cap_degrades_oversized_diffs()
+    test_total_changeset_budget_prioritizes_scope_and_diffs()
     test_protocol_raw_changes_to_changeset()
+    test_scope_over_budget_is_consumed_and_falls_back_once()
+    test_budget_dropped_diff_is_explicit_without_summary()
     test_added_targets_and_authorized()
     test_scoped_directive()
     test_integrity_repair_directive()

@@ -8,6 +8,7 @@
 域无关:聚什么主题、怎么写由 LLM 按内容定,代码不内置任何分类法。
 """
 import argparse
+import datetime as dt
 import json
 import re
 import sys
@@ -40,6 +41,25 @@ def _safe(name):
 
 def _mask_span(text):
     return "".join("\n" if ch == "\n" else " " for ch in text)
+
+
+def _page_sources(body):
+    """Return distinct source resources cited by generated page prose."""
+    resources = []
+    seen = set()
+    for match in re.finditer(r"\((?:source|源):\s*([^)]+?)\s*\)", body, re.IGNORECASE):
+        resource = match.group(1).strip()
+        # Ledger citations name materialized Raw inputs. Emit the explicit v0.2
+        # managed namespace so a later deletion cannot turn the citation into an
+        # indistinguishable external bare-path scope.
+        if resource.startswith("drop/"):
+            resource = "raw/" + resource[len("drop/"):]
+        elif not resource.startswith("raw/"):
+            resource = "raw/" + resource
+        if resource and resource not in seen:
+            seen.add(resource)
+            resources.append({"resource": resource})
+    return resources
 
 
 def _markdown_prose(text):
@@ -118,6 +138,12 @@ def emit(ledger, out_dir):
             "type": type_name,
             "title": str(pg.get("title") or "").strip(),
             "description": str(pg.get("description") or "").strip(),
+            "sources": _page_sources(str(pg.get("body") or "")),
+            "generated": {
+                "by": "process:siclaw-kbc",
+                "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+            "status": "stable",
         }
         fm = "---\n" + yaml.safe_dump(
             metadata, allow_unicode=True, sort_keys=False,
@@ -130,7 +156,7 @@ def emit(ledger, out_dir):
             raise ValueError(f"OKF page {fn} uses a non-portable bundle-absolute link")
         (out_dir / fn).write_text(fm + body + "\n", encoding="utf-8")
         links.append(f"- [{metadata['title']}]({fn}) - {metadata['description']}")
-    idx = '---\nokf_version: "0.1"\n---\n\n# 知识目录\n\n' + "\n".join(links) + "\n"
+    idx = '---\nokf_version: "0.2"\n---\n\n# 知识目录\n\n' + "\n".join(links) + "\n"
     (out_dir / "index.md").write_text(idx, encoding="utf-8")
     return [_safe(p["filename"]) for p in out["pages"]]
 

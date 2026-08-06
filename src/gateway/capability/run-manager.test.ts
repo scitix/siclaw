@@ -272,6 +272,8 @@ describe("CapabilityRunManager", () => {
       bound_s: 90,
       tool_pending: false,
       last_sdk_message: "query",
+      exception_class: "ModelStallError",
+      message: "model_turn_stalled:ModelStallError",
     });
     expect(be.persists().at(-1)?.params).toMatchObject({
       run_id: runId,
@@ -285,6 +287,53 @@ describe("CapabilityRunManager", () => {
           bound_s: 90,
           tool_pending: false,
           last_sdk_message: "query",
+          exception_class: "ModelStallError",
+          message: "model_turn_stalled:ModelStallError",
+        },
+      },
+    });
+  });
+
+  it("does not persist owner-facing error text; invalid tokens fall back to runtime_failure", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.endRun(runId, "failed", {
+      code: "not a token",
+      stage: "also bad",
+      // Unsafe free text must not be smuggled via last_sdk_message or error.
+      last_sdk_message: "connection reset by peer",
+      error: "Authorization: Bearer TEST-SECRET source=/raw/customer.md",
+      message: "batch_failed:TimeoutError",
+      exception_class: "TimeoutError",
+    } as any);
+    const failure = (be.persists().at(-1)?.params as any).checkpoint.failure;
+    expect(failure).toMatchObject({
+      code: "runtime_failure",
+      stage: "unknown",
+      exception_class: "TimeoutError",
+      message: "batch_failed:TimeoutError",
+    });
+    expect(JSON.stringify(failure)).not.toContain("TEST-SECRET");
+    expect(JSON.stringify(failure)).not.toContain("/raw/customer.md");
+    expect(failure.last_sdk_message).toBeUndefined();
+  });
+
+  it("failed endRun without a failure object writes neutral runtime_failure", async () => {
+    const be = new FakeBackend();
+    const mgr = new CapabilityRunManager(be);
+    const { runId } = await mgr.startRun({ profile: "kb-compile", orgId: "o1" });
+
+    await mgr.endRun(runId, "failed");
+    expect(be.persists().at(-1)?.params).toMatchObject({
+      run_id: runId,
+      status: "failed",
+      checkpoint: {
+        failure: {
+          code: "runtime_failure",
+          stage: "unknown",
+          message: "unspecified failure",
         },
       },
     });

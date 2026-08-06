@@ -1,7 +1,7 @@
 ---
 type: Topic
 title: Extras
-compiled_from:
-  - extras.md
+sources:
+  - resource: extras.md
 ---
 Extras page.

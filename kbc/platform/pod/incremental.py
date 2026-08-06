@@ -2,10 +2,10 @@
 
 现状 "请增量重编" 路由到全量批量重排(非增量)。本模块把它变成真增量的
 box 半边:给定消费方机器算出的**变更源集**(added/modified/deleted),用
-`compiled_from`(= 官方 dependency index 的反向)**确定性反查受影响页**,拼出模型
+`sources[].resource`(= 官方 dependency index 的反向)**确定性反查受影响页**,拼出模型
 只需消费的 `CHANGESET.json`,并提供收尾的**越界改动护栏**(未授权页字节不变)。
 
-引擎中立:纯 filesystem + stdlib,复用 selfcheck 的 compiled_from 解析。谁能编由
+引擎中立:纯 filesystem + stdlib,复用 selfcheck 的 sources[].resource 解析。谁能编由
 消费方的单飞锁裁(管控面);本模块只回答 "怎么增量编"(执行面)。
 
 分工(见设计 §2):
@@ -33,16 +33,26 @@ CHANGESET_PATH = "authoring/CHANGESET.json"
 # 用一个文件而非新 SDK 工具——模型写文件是它本来就会的动作,零协议扩张。
 ADDED_TARGETS_PATH = "authoring/ADDED_TARGETS.json"
 
+# CHANGESET is synced as one workspace artifact. Keep the default aligned with
+# compile_box.MAX_SYNC_FILE_BYTES; deployments may lower the dedicated budget or
+# the shared workspace cap. The serialized file (including indentation/newline)
+# must fit, not just the sum of diff strings.
+DEFAULT_CHANGESET_MAX_BYTES = 1024 * 1024
+
 # index.md 是路由页(OKF 保留名),不由某个源"直接"决定,单独按 index_touched 处理;
 # 它是护栏的合法可改页之一(页集变了要刷新它),永远不算 unaffected。
 INDEX_PAGE = "index.md"
 
 
-# ── 反查:变更源 → 受影响页(compiled_from 反向 = dependency index)──────────────
+class ChangesetScopeTooLarge(ValueError):
+    """Authoritative incremental scope cannot fit the durable artifact cap."""
+
+
+# ── 反查:变更源 → 受影响页(sources[].resource 反向 = dependency index)──────────────
 def _norm_source(path: str) -> str:
     """Normalize a source path to its canonical raw-relative posix form:
     posix separators, `./`/`//` collapsed (posixpath.normpath), and one leading
-    `raw/` or `drop/` segment stripped — mirroring selfcheck's compiled_from
+    `raw/` or `drop/` segment stripped — mirroring selfcheck's sources[].resource
     entry normalization, so both sides of a lookup land in the same namespace."""
     p = posixpath.normpath(path.replace("\\", "/")).lstrip("/")
     head, _, rest = p.partition("/")
@@ -50,7 +60,7 @@ def _norm_source(path: str) -> str:
 
 
 def _pages_citing(pages: dict[str, dict], sources: set[str]) -> set[str]:
-    """Candidate pages whose compiled_from cites any source in `sources`.
+    """Candidate pages whose sources[].resource cites any source in `sources`.
 
     Matching guarantee: **full-path only**, after normalizing BOTH sides with
     `_norm_source` — never by basename. The normalization preserves the
@@ -72,6 +82,24 @@ def _pages_citing(pages: dict[str, dict], sources: set[str]) -> set[str]:
     return hit
 
 
+def _changed_managed_sources(changed_sources: dict) -> set[str]:
+    return {
+        str(source)
+        for kind in ("modified", "deleted")
+        for source in changed_sources.get(kind, [])
+        if isinstance(source, str) and source
+    }
+
+
+def _resolve_affected_pages(
+    pages: dict[str, dict], changed_sources: dict,
+) -> tuple[list[str], list[str]]:
+    all_pages = {rel for rel in pages if rel != INDEX_PAGE and "error" not in pages[rel]}
+    touched = _changed_managed_sources(changed_sources)
+    affected = _pages_citing(pages, touched)
+    return sorted(affected), sorted(all_pages - affected)
+
+
 def resolve_affected_pages(workdir: str, changed_sources: dict) -> tuple[list[str], list[str]]:
     """(affected_pages, unaffected_pages)。
 
@@ -81,11 +109,9 @@ def resolve_affected_pages(workdir: str, changed_sources: dict) -> tuple[list[st
 
     unaffected = 其余所有现存候选页(index 除外)。收尾护栏据此保证"其余不动"。
     """
-    pages = candidate_pages(workdir)
-    all_pages = {rel for rel in pages if rel != INDEX_PAGE and "error" not in pages[rel]}
-    touched = set(changed_sources.get("modified", [])) | set(changed_sources.get("deleted", []))
-    affected = _pages_citing(pages, touched)
-    return sorted(affected), sorted(all_pages - affected)
+    touched = _changed_managed_sources(changed_sources)
+    pages = candidate_pages(workdir, additional_managed_sources=touched)
+    return _resolve_affected_pages(pages, changed_sources)
 
 
 # ── 拼 CHANGESET(模型只消费,affected_pages 代码反查而非模型报)────────────────
@@ -94,6 +120,7 @@ def build_changeset(
     changed_sources: dict,
     *,
     diffs: dict[str, str] | None = None,
+    summary: dict | None = None,
     baseline_fingerprint: str | None = None,
     snapshot_fingerprint: str | None = None,
 ) -> dict:
@@ -110,30 +137,224 @@ def build_changeset(
     # mid-round respawn could no longer rehydrate the round from the store
     # (RAW_CHANGES is consumed at materialization) — review finding.
     diff_cap = int(os.environ.get("KBC_MAX_DIFF_BYTES", str(64 * 1024)))
-    diffs = {p: (d if len(d.encode("utf-8")) <= diff_cap else "") for p, d in diffs.items()}
-    pages = candidate_pages(workdir)
+    supplied_diff_paths = {
+        p for p, d in diffs.items()
+        if isinstance(p, str) and isinstance(d, str) and d
+    }
+    diffs = {
+        p: (d if len(d.encode("utf-8")) <= diff_cap else "")
+        for p, d in diffs.items()
+        if isinstance(p, str) and isinstance(d, str)
+    }
+    touched = _changed_managed_sources(changed_sources)
+    pages = candidate_pages(workdir, additional_managed_sources=touched)
     added = list(changed_sources.get("added", []))
     modified = list(changed_sources.get("modified", []))
     deleted = list(changed_sources.get("deleted", []))
-    affected, unaffected = resolve_affected_pages(workdir, changed_sources)
+    affected, unaffected = _resolve_affected_pages(pages, changed_sources)
 
     def pages_for(src: str) -> list[str]:
         return sorted(_pages_citing(pages, {src}))
 
-    return {
+    changeset = {
         "version": 1,
         "baseline_fingerprint": baseline_fingerprint,   # 上次收敛的整区指纹(审计)
         "snapshot_fingerprint": snapshot_fingerprint,   # 本轮快照的整区指纹
         # 全新料:没有归属页,模型按 target_hint 级联编入相关页或建新页;coverage 护栏兜底。
         "added": [{"path": p, "content_ref": p, "target_hint": ""} for p in added],
         # 改动料:给受影响页 + 统一 diff(+/−),模型只改动到的那几处,不重写整页。
-        "modified": [{"path": p, "affected_pages": pages_for(p), "diff": diffs.get(p, "")} for p in modified],
+        "modified": [{"path": p, "affected_pages": pages_for(p), "diff": ""} for p in modified],
         # 删除料:从受影响页移除其内容/引用;页空则删页(index_touched)。
         "deleted": [{"path": p, "affected_pages": pages_for(p)} for p in deleted],
         "affected_pages": affected,          # 三类合并去重(modified+deleted 命中的现存页)
         "unaffected_pages": unaffected,      # 收尾护栏比对用
+        "unaffected_pages_count": len(unaffected),
         "index_touched": bool(added or deleted),   # 页集可能变 → 需刷新 index.md
     }
+    _fit_changeset_optional_payload(
+        changeset, diffs, summary, supplied_diff_paths=supplied_diff_paths)
+    return changeset
+
+
+def _changeset_max_bytes() -> int:
+    sync_value = int(os.environ.get("KBC_MAX_SYNC_FILE_BYTES", str(DEFAULT_CHANGESET_MAX_BYTES)))
+    dedicated_raw = os.environ.get("KBC_MAX_CHANGESET_BYTES")
+    dedicated_value = int(dedicated_raw) if dedicated_raw is not None else sync_value
+    if sync_value <= 0 or dedicated_value <= 0:
+        raise ValueError("CHANGESET and workspace sync byte limits must be positive")
+    # A dedicated budget may reserve less space, but can never relax the actual
+    # workspace transport limit that persists CHANGESET.json.
+    return min(sync_value, dedicated_value)
+
+
+def _serialized_changeset_size(changeset: dict) -> int:
+    return len((json.dumps(changeset, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def _fit_changeset_optional_payload(
+    changeset: dict,
+    diffs: dict[str, str],
+    summary: dict | None,
+    *,
+    supplied_diff_paths: set[str] | None = None,
+) -> None:
+    """Fit optional diffs + logical hints under the durable artifact byte cap.
+
+    Execution scope is authoritative and never silently truncated. If the full
+    unaffected-page listing alone pushes the base over budget, retain its count
+    and omit the redundant names (the byte guard derives authorization from
+    affected_pages, not this display-only list). Diffs are then admitted in
+    stable path order; omitted diffs retain the documented scoped re-read
+    fallback. Logical hints use only the remaining budget and report omissions.
+    """
+    max_bytes = _changeset_max_bytes()
+    if _serialized_changeset_size(changeset) > max_bytes:
+        omitted = len(changeset.get("unaffected_pages", []))
+        changeset["unaffected_pages"] = []
+        if omitted:
+            changeset["unaffected_pages_omitted"] = omitted
+    if _serialized_changeset_size(changeset) > max_bytes:
+        raise ChangesetScopeTooLarge(
+            "incremental execution scope exceeds durable CHANGESET byte budget")
+
+    modified_by_path = {
+        item.get("path"): item
+        for item in changeset.get("modified", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    supplied = set(supplied_diff_paths or ()) & set(modified_by_path)
+    if supplied:
+        # Reserve the marker before optional content is admitted. Otherwise a
+        # budget-dropped diff is byte-for-byte indistinguishable from a producer
+        # that supplied no diff at all.
+        changeset["modified_diffs_omitted"] = len(supplied)
+        if _serialized_changeset_size(changeset) > max_bytes:
+            raise ChangesetScopeTooLarge(
+                "incremental execution scope exceeds durable CHANGESET byte budget")
+
+    compact_summary = _compact_change_summary(summary)
+    logical_changes = []
+    producer_omitted = 0
+    if compact_summary:
+        logical_changes = list(compact_summary.pop("logical_changes", []))
+        producer_omitted = compact_summary.pop("logical_changes_omitted", 0)
+        if producer_omitted:
+            compact_summary["logical_changes_omitted"] = producer_omitted
+        # Coverage is recomputed after the box's final byte-budget selection.
+        compact_summary.pop("modified_with_diffs", None)
+        compact_summary.pop("modified_without_diffs", None)
+        changeset["change_summary"] = compact_summary
+
+    retained_diffs = 0
+    for path in sorted(diffs):
+        diff = diffs[path]
+        item = modified_by_path.get(path)
+        if item is None or not diff:
+            continue
+        item["diff"] = diff
+        if _serialized_changeset_size(changeset) > max_bytes:
+            item["diff"] = ""
+            continue
+        retained_diffs += 1
+
+    if compact_summary is not None:
+        compact_summary["modified_with_diffs"] = retained_diffs
+        compact_summary["modified_without_diffs"] = max(0, len(modified_by_path) - retained_diffs)
+        # The two scalar counters are tiny, but a base exactly at the cap should
+        # still sacrifice the last optional diff rather than exceed durability.
+        while _serialized_changeset_size(changeset) > max_bytes and retained_diffs:
+            for path in sorted(diffs, reverse=True):
+                item = modified_by_path.get(path)
+                if item is not None and item.get("diff"):
+                    item["diff"] = ""
+                    retained_diffs -= 1
+                    compact_summary["modified_with_diffs"] = retained_diffs
+                    compact_summary["modified_without_diffs"] = max(0, len(modified_by_path) - retained_diffs)
+                    break
+        if _serialized_changeset_size(changeset) > max_bytes:
+            changeset.pop("change_summary", None)
+            compact_summary = None
+
+    if compact_summary is not None and logical_changes:
+        accepted: list[dict] = []
+        for change in logical_changes:
+            accepted.append(change)
+            compact_summary["logical_changes"] = accepted
+            compact_summary["logical_changes_omitted"] = producer_omitted + len(logical_changes) - len(accepted)
+            if _serialized_changeset_size(changeset) > max_bytes:
+                accepted.pop()
+                break
+        if accepted:
+            compact_summary["logical_changes"] = accepted
+        else:
+            compact_summary.pop("logical_changes", None)
+        omitted = producer_omitted + len(logical_changes) - len(accepted)
+        if omitted:
+            compact_summary["logical_changes_omitted"] = omitted
+        else:
+            compact_summary.pop("logical_changes_omitted", None)
+        if _serialized_changeset_size(changeset) > max_bytes:
+            # The omitted counter itself can cross a byte-exact boundary when
+            # the pre-hint payload sits at the cap. Logical hints are optional.
+            compact_summary.pop("logical_changes", None)
+            compact_summary.pop("logical_changes_omitted", None)
+
+    omitted_supplied = max(0, len(supplied) - retained_diffs)
+    if omitted_supplied:
+        changeset["modified_diffs_omitted"] = omitted_supplied
+    else:
+        changeset.pop("modified_diffs_omitted", None)
+
+    if _serialized_changeset_size(changeset) > max_bytes:
+        raise AssertionError("CHANGESET byte fitting exceeded its durable limit")
+
+
+def _compact_change_summary(summary: dict | None) -> dict | None:
+    """Keep only bounded, model-useful source summary fields from the control plane.
+
+    RAW_CHANGES remains a machine boundary, so an unexpected producer must not
+    turn CHANGESET into an unbounded prompt payload. Opaque provider identities
+    are intentionally not accepted here; primary paths and change kinds are the
+    useful orientation signal for the compiler.
+    """
+    if not isinstance(summary, dict):
+        return None
+
+    out: dict = {}
+    for key in (
+        "physical_path_operations",
+        "effective_path_operations",
+        "ignored_canonical_noops",
+        "logical_affected_sources",
+        "logical_total_sources",
+        "logical_changes_omitted",
+        "modified_with_diffs",
+        "modified_without_diffs",
+    ):
+        value = summary.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[key] = value
+
+    allowed_kinds = {"added", "removed", "path_only", "content", "path_and_content"}
+    changes: list[dict] = []
+    raw_changes = summary.get("logical_changes")
+    if isinstance(raw_changes, list):
+        for raw in raw_changes[:100]:
+            if not isinstance(raw, dict) or raw.get("change_kind") not in allowed_kinds:
+                continue
+            item = {"change_kind": raw["change_kind"]}
+            for key in ("baseline_primary_path", "current_primary_path"):
+                value = raw.get(key)
+                if isinstance(value, str) and value:
+                    item[key] = value[:1024]
+            for key in ("baseline_files", "current_files"):
+                value = raw.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    item[key] = value
+            changes.append(item)
+    if changes:
+        out["logical_changes"] = changes
+    return out or None
 
 
 # ── 收尾护栏:未授权页字节不变(把"其余不动"从愿望变保证)────────────────────────
@@ -226,7 +447,8 @@ def integrity_violations(
 def load_raw_changes(workdir: str) -> dict | None:
     """读消费方写的增量输入 `authoring/RAW_CHANGES.json`。形状(消费方负责写):
         {"added":[路径], "modified":[路径], "deleted":[路径],
-         "diffs": {路径: 统一diff}, "baseline_fingerprint":…, "snapshot_fingerprint":…}
+         "diffs": {路径: 统一diff}, "summary": {逻辑文档级摘要},
+         "baseline_fingerprint":…, "snapshot_fingerprint":…}
     缺失/损坏/结构非法 → None(box 回退全量编译,向后兼容——消费方半边没跟上不崩)。
     """
     path = Path(workdir) / RAW_CHANGES_PATH
@@ -256,13 +478,23 @@ def materialize_changeset(workdir: str) -> dict | None:
     raw = load_raw_changes(workdir)
     if not has_changes(raw):
         return None
-    cs = build_changeset(
-        workdir,
-        {"added": raw.get("added", []), "modified": raw.get("modified", []), "deleted": raw.get("deleted", [])},
-        diffs=raw.get("diffs"),
-        baseline_fingerprint=raw.get("baseline_fingerprint"),
-        snapshot_fingerprint=raw.get("snapshot_fingerprint"),
-    )
+    try:
+        cs = build_changeset(
+            workdir,
+            {"added": raw.get("added", []), "modified": raw.get("modified", []), "deleted": raw.get("deleted", [])},
+            diffs=raw.get("diffs"),
+            summary=raw.get("summary"),
+            baseline_fingerprint=raw.get("baseline_fingerprint"),
+            snapshot_fingerprint=raw.get("snapshot_fingerprint"),
+        )
+    except ChangesetScopeTooLarge:
+        # The authoritative source/page scope cannot be truncated. Consume the
+        # one-shot routing input and clear any stale scope so the caller takes
+        # its documented full-compile fallback instead of retrying a permanent
+        # 500 forever.
+        (Path(workdir) / RAW_CHANGES_PATH).unlink(missing_ok=True)
+        (Path(workdir) / CHANGESET_PATH).unlink(missing_ok=True)
+        return None
     (Path(workdir) / CHANGESET_PATH).write_text(
         json.dumps(cs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     # Consume-once: drop the input so a later turn / box respawn can't re-route on a
@@ -301,6 +533,7 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
     n_add = len(changeset.get("added", []))
     n_mod = len(changeset.get("modified", []))
     n_del = len(changeset.get("deleted", []))
+    summary = changeset.get("change_summary") if isinstance(changeset.get("change_summary"), dict) else None
     if _is_en(locale):
         lines = [
             "[Incremental recompile] This round's changes were computed by code and written to"
@@ -343,6 +576,16 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
             "· Domain rulings follow constitution.md as usual; file a ticket for any new contradiction"
             " as usual. When done, briefly state which pages you changed and whether domain moved.",
         ]
+        if summary:
+            lines.insert(
+                1,
+                f"· Machine summary: {summary.get('logical_affected_sources', 0)} logical source document(s)"
+                f" affected; {summary.get('ignored_canonical_noops', 0)} canonical no-op path change(s)"
+                " were already removed. Use change_summary.logical_changes to orient by document;"
+                f" {summary.get('modified_with_diffs', 0)} modified source(s) have surgical diffs and"
+                f" {summary.get('modified_without_diffs', 0)} require a scoped source re-read. Use the"
+                " path arrays and diffs below as the exact execution scope.",
+            )
         return "\n".join(lines)
     lines = [
         "【增量重编】本轮变更已由代码算好,写在 authoring/CHANGESET.json。**先读它**,只做范围内的事:",
@@ -367,6 +610,15 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
         "（为 domain **读** index.md 是必须的;改范围外正文仍禁止。）",
         "· 领域裁决照常按 constitution.md;遇新矛盾照走工单。改完简短说动了哪几页、domain 是否变了。",
     ]
+    if summary:
+        lines.insert(
+            1,
+            f"· 机器摘要：影响 {summary.get('logical_affected_sources', 0)} 个逻辑源文档，已过滤"
+            f" {summary.get('ignored_canonical_noops', 0)} 个 canonical no-op 路径变化。先用"
+            f" change_summary.logical_changes 按文档理解意图；{summary.get('modified_with_diffs', 0)} 个"
+            f"改动源有外科式 diff，{summary.get('modified_without_diffs', 0)} 个需在限定范围内重读源；"
+            "再以路径数组和 diff 作为精确执行范围。",
+        )
     return "\n".join(lines)
 
 

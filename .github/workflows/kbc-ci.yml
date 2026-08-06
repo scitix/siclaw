@@ -45,7 +45,19 @@ jobs:
         working-directory: kbc/platform/pod
       - run: python test_selfcheck.py
         working-directory: kbc/platform/pod
+      - run: python test_okf_package.py
+        working-directory: kbc/platform/pod
+      - run: python test_incremental.py
+        working-directory: kbc/platform/pod
+      - run: python test_batching.py
+        working-directory: kbc/platform/pod
+      - run: python test_mediaverify.py
+        working-directory: kbc/platform/pod
+      - run: python test_source_snapshot.py
+        working-directory: kbc/platform/pod
       - run: python test_redblue.py
         working-directory: kbc/platform/pod
       - run: python test_mtls_auth.py
         working-directory: kbc/platform/pod
+      - run: python test_emit.py
+        working-directory: kbc/tools
