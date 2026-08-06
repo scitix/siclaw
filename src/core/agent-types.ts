@@ -146,7 +146,7 @@ export function effectiveCapabilityKeys(agentType: AgentType, ownToolCapabilitie
  * compatibility/creation fallback for rows that have not materialized one yet.
  *
  * This is intentionally separate from the platform prompt assembled by
- * buildSreSystemPrompt(): runtime safety/mode instructions and dynamic
+ * buildSystemPrompt(): runtime safety/mode instructions and dynamic
  * skill/knowledge/MCP context remain platform-owned.
  */
 export function effectiveAgentPrompt(agentType: AgentType, storedPrompt: unknown): string | undefined {

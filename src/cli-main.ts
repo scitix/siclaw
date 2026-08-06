@@ -211,9 +211,10 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   portalSkillsDir,
   portalKnowledgeDir,
   portalCredentialsDir,
-  // The Portal row owns agent identity/behaviour, while Siclaw keeps assembling
-  // its platform prompt (safety, mode, skills/knowledge context) in every entry
-  // point. Match AgentBox semantics instead of replacing the full TUI template.
+  agentType: portalSnapshot?.activeAgent?.agentType,
+  // The Portal row owns agent identity/behaviour. Agent type selects only the
+  // matching platform guidance; Custom/Coordinator must not inherit SRE text.
+  // Siclaw still assembles safety, mode, and skills/knowledge context.
   systemPromptAppend: portalSnapshot?.activeAgent?.systemPrompt ?? undefined,
   // Per-agent tool whitelist (resolved from capability groups by the snapshot).
   // Absent/null = unrestricted → agent-factory falls back to config.allowedTools.

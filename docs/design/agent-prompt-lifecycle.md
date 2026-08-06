@@ -7,9 +7,12 @@ the same semantics for `sre`, `coordinator`, and `custom` agents:
 - a non-empty persisted `system_prompt` replaces that default;
 - the default is never appended behind a persisted prompt.
 
-The editable prompt does not replace Siclaw's platform assembly. Runtime
-safety/mode instructions, skill and knowledge context, MCP tool schemas, and
-delegated read-only constraints remain platform-owned.
+The editable prompt is the Agent's complete role layer; there is no hidden SRE
+identity before or after it. It does not replace Siclaw's role-neutral platform
+assembly. Runtime safety/mode instructions, skill and knowledge context, MCP
+tool schemas, and delegated read-only constraints remain platform-owned.
+Infrastructure discovery guidance is a separate platform section selected only
+for `sre` agents. `custom` and `coordinator` agents never inherit it.
 
 The same contract applies in AgentBox sessions and the Portal-backed TUI.
 Persisted prompt fragments retain the legacy template conveniences:
@@ -19,10 +22,10 @@ fragment is inserted. The Agent-owned fragment is placed before Siclaw's
 hardcoded Safety and Language sections, so editable identity text cannot gain
 recency precedence over those platform-owned instructions.
 
-For `custom` agents this is an intentional semantic migration: their stored
-prompt used to replace the whole Siclaw template. It now replaces only the
-Agent-owned identity/behaviour layer, so the platform assembly is present for
-all agent types.
+For `custom` agents, the stored prompt is therefore authoritative for identity
+and behaviour while common communication, task, rendering, safety, and dynamic
+resource context stay intact. A knowledge assistant can use the platform's
+knowledge/skill machinery without being framed as an infrastructure assistant.
 
 Delegated read-only work is an exclusive platform constraint. It replaces the
 Agent-owned identity for that delegated turn rather than composing potentially

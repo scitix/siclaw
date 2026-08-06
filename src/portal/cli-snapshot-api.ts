@@ -547,6 +547,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       ? {
           name: activeAgent.name,
           description: activeAgent.description,
+          agentType: normalizeAgentType(activeAgent.agent_type),
           systemPrompt: effectiveAgentPrompt(
             normalizeAgentType(activeAgent.agent_type),
             activeAgent.system_prompt,

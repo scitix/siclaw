@@ -65,6 +65,8 @@ export interface CliSnapshotAgentMeta {
 export interface CliSnapshotActiveAgent {
   name: string;
   description: string | null;
+  /** Agent kind used to select type-specific platform prompt guidance. */
+  agentType: "sre" | "coordinator" | "custom";
   systemPrompt: string | null;
   modelProvider: string | null;
   modelId: string | null;

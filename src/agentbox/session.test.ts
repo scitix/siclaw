@@ -244,9 +244,11 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     const mgr = new AgentBoxSessionManager();
     mgr.userId = "alice";
     mgr.agentId = "agent-a";
+    mgr.agentTypeState = "custom";
     await mgr.getOrCreate("sess-1", "channel", "custom prompt");
     const opts = lastCreateSiclawSession.calls[0];
     expect(opts.mode).toBe("channel");
+    expect(opts.agentType).toBe("custom");
     expect(opts.systemPromptTemplate).toBeUndefined();
     expect(opts.systemPromptAppend).toBe("custom prompt");
     expect(opts.userId).toBe("alice");

@@ -29,7 +29,8 @@ import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from 
 import { ToolRegistry, type AgentMode } from "./tool-registry.js";
 import { appendAllowedTools } from "./tool-append.js";
 import { allToolEntries } from "../tools/all-entries.js";
-import { buildSreSystemPrompt } from "./prompt.js";
+import { buildSystemPrompt } from "./prompt.js";
+import type { AgentType } from "./agent-types.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
 import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
@@ -69,10 +70,12 @@ export interface CreateSiclawSessionOpts {
   delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
   /** Agent tool allow-list: null = all tools, string[] = only these tools */
   allowedTools?: string[] | null;
-  /** Extra system prompt content appended for agent customization */
+  /** Agent-owned role prompt appended to the role-neutral platform template. */
   systemPromptAppend?: string;
   /** Custom system prompt template from agent settings (overrides DEFAULT_TEMPLATE) */
   systemPromptTemplate?: string;
+  /** Agent kind used to select type-specific platform guidance. Defaults to SRE for legacy/TUI callers. */
+  agentType?: AgentType;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
   memoryIndexer?: MemoryIndexer;
   /** Pre-initialized shared MCP client manager (AgentBox level) — skips per-session init */
@@ -665,7 +668,12 @@ export async function createSiclawSession(
       // in the resource-loader append, but admin text no longer has recency
       // precedence over platform safety.
       systemPromptOverride: () =>
-        buildSreSystemPrompt(mode, opts?.systemPromptTemplate, opts?.systemPromptAppend),
+        buildSystemPrompt(
+          mode,
+          opts?.systemPromptTemplate,
+          opts?.systemPromptAppend,
+          opts?.delegation?.readOnly ? "custom" : opts?.agentType,
+        ),
       appendSystemPromptOverride: () =>
         buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir),
       // Extension registration order: compactionSafeguard handles session_before_compact.

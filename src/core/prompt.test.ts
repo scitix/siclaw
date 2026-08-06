@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { buildSreSystemPrompt, renderSystemPromptFragment } from "./prompt.js";
+import { buildSystemPrompt, renderSystemPromptFragment } from "./prompt.js";
 
 const ORIGINAL_MEMORY_ENABLED = process.env.SICLAW_MEMORY_ENABLED;
 
@@ -11,11 +11,11 @@ afterEach(() => {
   }
 });
 
-describe("buildSreSystemPrompt memory flag", () => {
+describe("buildSystemPrompt memory flag", () => {
   it("keeps bundled memory instructions when memory is enabled", () => {
     process.env.SICLAW_MEMORY_ENABLED = "true";
 
-    const prompt = buildSreSystemPrompt("web");
+    const prompt = buildSystemPrompt("web");
 
     expect(prompt).toContain("memory_search");
     expect(prompt).toContain("memory_get");
@@ -28,7 +28,7 @@ describe("buildSreSystemPrompt memory flag", () => {
   it("removes bundled memory instructions when memory is disabled", () => {
     process.env.SICLAW_MEMORY_ENABLED = "false";
 
-    const prompt = buildSreSystemPrompt("web");
+    const prompt = buildSystemPrompt("web");
 
     expect(prompt).not.toContain("memory_search");
     expect(prompt).not.toContain("memory_get");
@@ -41,16 +41,16 @@ describe("buildSreSystemPrompt memory flag", () => {
   it("defaults to memory disabled when the env is unset (opt-in only)", () => {
     delete process.env.SICLAW_MEMORY_ENABLED;
 
-    const prompt = buildSreSystemPrompt("web");
+    const prompt = buildSystemPrompt("web");
 
     expect(prompt).not.toContain("memory_search");
     expect(prompt).not.toContain("remember context from previous sessions");
   });
 });
 
-describe("buildSreSystemPrompt visual output guidance", () => {
+describe("buildSystemPrompt visual output guidance", () => {
   it("authorizes every Mermaid family supported by Sicore Web", () => {
-    const prompt = buildSreSystemPrompt("web");
+    const prompt = buildSystemPrompt("web");
 
     expect(prompt).toContain("flowchart");
     expect(prompt).toContain("sequenceDiagram");
@@ -59,7 +59,7 @@ describe("buildSreSystemPrompt visual output guidance", () => {
   });
 
   it("does not steer shared Siclaw surfaces to unsupported visual-card output", () => {
-    const prompt = buildSreSystemPrompt("web");
+    const prompt = buildSystemPrompt("web");
 
     expect(prompt).not.toContain("```siclaw-card");
     expect(prompt).not.toContain("```visual-card");
@@ -76,7 +76,7 @@ describe("buildSreSystemPrompt visual output guidance", () => {
   });
 
   it("adds channel-only guidance for visual Feishu replies and conclusion cards", () => {
-    const prompt = buildSreSystemPrompt("channel");
+    const prompt = buildSystemPrompt("channel");
 
     expect(prompt).toContain("# Channel Reply Format");
     expect(prompt).toContain("render_mermaid");
@@ -129,11 +129,45 @@ describe("renderSystemPromptFragment", () => {
       "<!-- web-only -->Web identity<!-- /web-only -->",
     ].join("\n");
 
-    const prompt = buildSreSystemPrompt("cli", undefined, fragment);
+    const prompt = buildSystemPrompt("cli", undefined, fragment);
 
     expect(prompt).toContain("agent mode=TUI");
     expect(prompt).toContain("CLI identity");
     expect(prompt).not.toContain("Web identity");
     expect(prompt.indexOf("agent mode=TUI")).toBeLessThan(prompt.indexOf("# Safety"));
+  });
+});
+
+describe("buildSystemPrompt agent role isolation", () => {
+  it.each(["custom", "coordinator"] as const)(
+    "keeps the %s platform prompt role-neutral",
+    (agentType) => {
+      const rolePrompt = agentType === "custom"
+        ? "You are a knowledge-base question-answering assistant."
+        : "You are a coordinator.";
+
+      const prompt = buildSystemPrompt("channel", undefined, rolePrompt, agentType);
+
+      expect(prompt).toContain(rolePrompt);
+      expect(prompt).toContain("# Channel Reply Format");
+      expect(prompt).toContain("# Safety");
+      expect(prompt).toContain("# Language");
+      expect(prompt).not.toContain("personal SRE AI assistant");
+      expect(prompt).not.toContain("RDMA/GPU/CNI/storage");
+      expect(prompt).not.toContain("# Infrastructure Access");
+    },
+  );
+
+  it("preserves SRE-only infrastructure guidance for SRE agents", () => {
+    const prompt = buildSystemPrompt(
+      "channel",
+      undefined,
+      undefined,
+      "sre",
+    );
+
+    expect(prompt).toContain("You are a specialist SRE agent");
+    expect(prompt).toContain("# Infrastructure Access");
+    expect(prompt).toContain("RDMA/GPU/CNI/storage");
   });
 });

@@ -2649,14 +2649,16 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId: this.agentId ?? null,
+      agentType: normalizeAgentType(this.agentTypeState),
       // Per-agent tool capability whitelist. null = unrestricted (falls back to
       // global config.allowedTools in agent-factory — today's behaviour for any
       // agent that never set tool_capabilities).
       allowedTools: this.allowedToolsState,
-      // The stored system_prompt is the agent-owned identity/behaviour
-      // instruction, not a replacement for Siclaw's platform prompt. Keep the
+      // The stored system_prompt is the complete agent-owned role instruction,
+      // not a replacement for Siclaw's role-neutral platform prompt. Keep the
       // platform template so safety/mode rules and dynamic context continue to
-      // be assembled by agent-factory.
+      // be assembled by agent-factory without leaking an SRE identity into
+      // Custom or Coordinator agents.
       systemPromptTemplate: undefined,
       // Delegated read-only turn: gate the toolset (agent-factory filters to
       // readOnlyDelegable + read file tools) and prepend the worker persona so

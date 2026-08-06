@@ -1,4 +1,5 @@
 import { isMemoryEnabled } from "./config.js";
+import { SRE_DEFAULT_PROMPT, type AgentType } from "./agent-types.js";
 
 const MODE_LABELS: Record<string, string> = {
   cli: "TUI",
@@ -8,7 +9,8 @@ const MODE_LABELS: Record<string, string> = {
 };
 
 /**
- * Build the SRE system prompt from a template with variable substitution.
+ * Build the system prompt from a role-neutral platform template plus the
+ * selected Agent's role instruction.
  *
  * Template resolution order:
  * 1. `templateOverride` parameter (from agent settings in Web UI)
@@ -18,19 +20,30 @@ const MODE_LABELS: Record<string, string> = {
  * Mode-conditional blocks: `<!-- web-only -->...<!-- /web-only -->` and
  * `<!-- cli-only -->...<!-- /cli-only -->` — the non-matching block is stripped.
  *
- * The optional agent-owned identity fragment is rendered after the platform
- * template but before Safety. Safety and Language therefore remain later than
- * editable Agent text and cannot be displaced by an Agent template.
+ * SRE-specific platform guidance is present only for SRE agents. The optional
+ * agent-owned identity fragment is rendered after the platform template but
+ * before Safety. Safety and Language therefore remain later than editable
+ * Agent text and cannot be displaced by an Agent template.
  */
-export function buildSreSystemPrompt(
+export function buildSystemPrompt(
   mode?: "cli" | "web" | "channel" | "task",
   templateOverride?: string,
   agentPromptFragment?: string,
+  agentType: AgentType = "sre",
 ): string {
-  const template = templateOverride?.trim() || DEFAULT_TEMPLATE;
+  const hasTemplateOverride = Boolean(templateOverride?.trim());
+  const template = hasTemplateOverride ? templateOverride!.trim() : DEFAULT_TEMPLATE;
   let prompt = renderSystemPromptFragment(template, mode);
 
   const credentialsPath = mode === "cli" ? "`/setup` → Credentials" : "**Settings → Credentials**";
+
+  // The bundled base is shared by every Agent type. Keep infrastructure
+  // discovery guidance tied to the SRE type so Custom/Coordinator identities
+  // do not inherit an operational persona. A legacy full-template override
+  // remains authoritative and therefore does not receive bundled SRE text.
+  if (!hasTemplateOverride && agentType === "sre") {
+    prompt += renderSystemPromptFragment(SRE_PLATFORM_SECTION, mode);
+  }
 
   // Append task-specific section for automated task mode
   if (mode === "task") {
@@ -40,8 +53,13 @@ export function buildSreSystemPrompt(
     prompt += CHANNEL_SECTION;
   }
 
-  if (agentPromptFragment?.trim()) {
-    prompt += `\n\n${renderSystemPromptFragment(agentPromptFragment, mode)}`;
+  // An unscoped CLI/TUI session has no persisted Agent row. Preserve its
+  // historical SRE identity as a default role without putting that identity in
+  // the shared platform template. Explicit templates remain full overrides.
+  const effectiveAgentPrompt = agentPromptFragment?.trim()
+    || (!hasTemplateOverride && agentType === "sre" ? SRE_DEFAULT_PROMPT : "");
+  if (effectiveAgentPrompt) {
+    prompt += `\n\n${renderSystemPromptFragment(effectiveAgentPrompt, mode)}`;
   }
 
   // Append hardcoded safety section — NOT overridable by agent templates
@@ -158,7 +176,14 @@ const MEMORY_SECTION = `
 
 Use \`memory_search\` **on demand** when symptoms suggest a previously-seen issue — search for past investigations, what was tried, what the root cause was. Use \`memory_get\` to pull details when a match looks relevant. Don't search reflexively — search purposefully.`;
 
-const DEFAULT_TEMPLATE = `You are Siclaw, a personal SRE AI assistant. You help your user manage and troubleshoot their infrastructure — Kubernetes clusters, cloud resources, and DevOps workflows. You are competent, direct, and warm.{{memoryIntro}}
+const SRE_PLATFORM_SECTION = `
+
+# Infrastructure Access
+
+- **Know the environment before acting on infrastructure.** When a request needs cluster or host access, establish context first: \`cluster_list\` (clusters available to this agent, with admin-maintained infra facts — RDMA/GPU/CNI/storage — not visible via kubectl; pass \`name\` to search, \`probe:true\` to also test live reachability), \`host_list\` (SSH-reachable non-K8s hosts; metadata only, credentials materialized lazily). When several clusters are available, confirm which one before acting on it. Skip discovery for questions that don't touch infrastructure.
+- When users ask about infrastructure setup: call \`cluster_list\`, then guide to {{settingsPath}}. "Environment" means infrastructure access, not dev toolchain.`;
+
+const DEFAULT_TEMPLATE = `Help the user accomplish their goal using the available context, knowledge, skills, and tools. Be competent, direct, and warm.{{memoryIntro}}
 
 # Core Behavior
 
@@ -174,9 +199,8 @@ const DEFAULT_TEMPLATE = `You are Siclaw, a personal SRE AI assistant. You help 
 - Plain prose by default. Use tables only for enumerable facts (pod/node names, states, pass/fail), not for explanation. Match depth to the task and the user's expertise.
 - Be precise: filter and summarize tool output, don't dump it. When the user only asks to list resources, summarize and ask which to investigate. No emojis unless asked; keep identifiers (pod/node names, commands, errors) exact.
 
-# Environment, Skills & Hosts
+# Skills and Tools
 
-- **Know the environment before acting on infrastructure.** When a request needs cluster or host access, establish context first: \`cluster_list\` (clusters available to this agent, with admin-maintained infra facts — RDMA/GPU/CNI/storage — not visible via kubectl; pass \`name\` to search, \`probe:true\` to also test live reachability), \`host_list\` (SSH-reachable non-K8s hosts; metadata only, credentials materialized lazily). When several clusters are available, confirm which one before acting on it. Skip discovery for questions that don't touch infrastructure.
 - **Prefer a matching skill over ad-hoc commands.** Your skill list (name + description) is always in context. When a skill covers what you're about to do, read its SKILL.md first (skills change — don't trust memory) and run it with the tool SKILL.md names; don't hand-replicate what a skill script already does. If no skill fits, an ad-hoc command is fine. If a skill fails, analyze the failure — don't silently fall back to ad-hoc.
 <!-- web-only -->- **Authoring skills**: Whenever you create, modify, optimize, or rewrite a skill, you MUST output the result via \`skill_preview\`. The workflow is: (1) briefly explain what you plan to change, (2) write ALL files (SKILL.md + scripts) to \`.siclaw/user-data/skill-drafts/<name>/\`, (3) call \`skill_preview\` with the directory path. Never skip skill_preview. Never output raw SKILL.md content in your message — it renders as HTML and cannot be copied.
 <!-- /web-only --><!-- cli-only -->- **Authoring skills**: To create or modify a skill, output SKILL.md and scripts in fenced code blocks so the user can copy from the terminal.
@@ -199,5 +223,4 @@ const DEFAULT_TEMPLATE = `You are Siclaw, a personal SRE AI assistant. You help 
 {{memorySection}}
 # Environment & Configuration
 
-Siclaw {{mode}} session. All configuration via {{settingsPath}} (Models, Credentials). Config file \`.siclaw/config/settings.json\` is auto-managed — don't edit manually.
-When users ask about setup: call \`cluster_list\`, then guide to {{settingsPath}}. "Environment" means infrastructure access, not dev toolchain.`;
+Siclaw {{mode}} session. All configuration via {{settingsPath}} (Models, Credentials). Config file \`.siclaw/config/settings.json\` is auto-managed — don't edit manually.`;

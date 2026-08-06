@@ -540,6 +540,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     );
 
     expect(status).toBe(200);
+    expect(body.activeAgent.agentType).toBe("coordinator");
     expect(body.activeAgent.systemPrompt).toBe(COORDINATOR_DEFAULT_PROMPT);
   });
 
@@ -594,6 +595,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     );
     expect(status).toBe(200);
     expect(body.activeAgent.name).toBe("scoped-agent");
+    expect(body.activeAgent.agentType).toBe("custom");
     expect(body.activeAgent.systemPrompt).toBe("You are a scoped agent.");
     expect(body.default).toEqual({ provider: "openai", modelId: "gpt-4o" });
     expect(body.skills.map((s: any) => s.name)).toEqual(["bound-skill"]);
