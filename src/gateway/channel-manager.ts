@@ -390,6 +390,56 @@ export async function getPersonalApiKeyStatus(
   });
 }
 
+/**
+ * Result of `/webchat` — a one-shot link to a browser chat window for the personal bot's agent.
+ *
+ * `actionUrl` is short-lived and single-use. What redeeming it actually grants is defined ONCE, in
+ * `docs/design/2026-08-06-feishu-webchat-command.md` ("What the link confers") — the Runtime treats
+ * it as bearer authority over a chat session because it cannot verify otherwise. Do not restate the
+ * semantics here: three comments asserting three different answers is what that section replaced.
+ */
+export interface PersonalWebChatLinkResult {
+  success: boolean;
+  agentId?: string;
+  /** Single-use redemption link. Opening it does NOT spend it — only confirming does. */
+  actionUrl?: string;
+  /** Epoch ms after which the redemption link is dead. */
+  expiresAt?: number;
+  /** Non-localized English fallback. Surfaced verbatim only when `denied` yields no template. */
+  error?: string;
+  /** Present only on the AUTHORIZATION refusal; other failure exits carry `error` alone. */
+  denied?: PersonalAccessDenied;
+}
+
+/**
+ * Mint a webchat redemption link for the sender.
+ *
+ * Same Upstream-mode contract as {@link issuePersonalApiKey}: the Portal adapter answers with a
+ * `success:false` stub, admission is decided entirely by the frontend, and the runtime only
+ * forwards the sender's identity.
+ *
+ * `requestId` is the stable inbound Feishu message id. Issuing replaces the sender's outstanding
+ * link, so the frontend must use this key to replay a duplicate delivery instead of minting a new
+ * token that invalidates the card already shown to the user. The Lark-side single-flight guard
+ * only covers overlapping work in one process; it cannot cover a sequential redelivery or a
+ * second Runtime replica.
+ */
+export async function issuePersonalWebChatLink(
+  channelId: string,
+  senderOpenId: string,
+  frontendClient: FrontendWsClient,
+  requestId?: string,
+): Promise<PersonalWebChatLinkResult> {
+  const result = await frontendClient.request("channel.issueWebChatLink", {
+    channel_id: channelId,
+    sender_open_id: senderOpenId,
+    ...(requestId ? { request_id: requestId } : {}),
+  });
+  // Same untrusted shape as the API-key path — narrow `denied` here so the renderers cannot be
+  // handed a non-string where they expect one.
+  return { ...result, ...(normalizeDenied(result?.denied) ?? { denied: undefined }) };
+}
+
 export interface ChannelManagerOptions {
   /** Max retry attempts for bootFromDb when channel.list races with WS connect. */
   bootRetryAttempts?: number;

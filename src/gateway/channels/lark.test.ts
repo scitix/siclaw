@@ -43,6 +43,7 @@ const updateBindingMetaMock = vi.fn();
 const setChannelContextModeMock = vi.fn();
 const issuePersonalApiKeyMock = vi.fn();
 const getPersonalApiKeyStatusMock = vi.fn();
+const issuePersonalWebChatLinkMock = vi.fn();
 
 vi.mock("../channel-manager.js", () => ({
   resolveBinding: (...args: unknown[]) => resolveBindingMock(...args),
@@ -53,6 +54,7 @@ vi.mock("../channel-manager.js", () => ({
   resetPersonalSession: (...args: unknown[]) => resetPersonalSessionMock(...args),
   issuePersonalApiKey: (...args: unknown[]) => issuePersonalApiKeyMock(...args),
   getPersonalApiKeyStatus: (...args: unknown[]) => getPersonalApiKeyStatusMock(...args),
+  issuePersonalWebChatLink: (...args: unknown[]) => issuePersonalWebChatLinkMock(...args),
   updateBindingMeta: (...args: unknown[]) => updateBindingMetaMock(...args),
   setChannelContextMode: (...args: unknown[]) => setChannelContextModeMock(...args),
   isChannelAccessDenied: (v: unknown) =>
@@ -216,6 +218,7 @@ beforeEach(() => {
   resetPersonalSessionMock.mockReset();
   issuePersonalApiKeyMock.mockReset();
   getPersonalApiKeyStatusMock.mockReset();
+  issuePersonalWebChatLinkMock.mockReset();
   resolveAgentModelBindingMock.mockReset();
   ensureChatSessionMock.mockReset();
   appendMessageMock.mockReset();
@@ -4096,6 +4099,68 @@ describe("handleLarkMessage — /apikey", () => {
     expect(posted.data.content).not.toContain(PICKUP);
   });
 
+  it("rejects a success pickup URL that is not absolute http(s), and still warns the key rotated", async () => {
+    for (const pickupUrl of ["/siclaw/api-key/pickup/token", "lark://open", "javascript:alert(1)"]) {
+      issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl, rotated: true });
+      const lark = makeLarkClient();
+
+      await sendPersonal("/apikey", lark);
+
+      const reply = replyText(lark);
+      expect(reply, pickupUrl).toContain("领取链接无效");
+      expect(reply, pickupUrl).not.toContain(pickupUrl);
+      // The rotation COMMITTED before we could reply. Reusing the "service unavailable" notice
+      // here — the same string the no-frontend-client path sends — told a user whose key had just
+      // been destroyed that nothing had happened.
+      expect(reply, pickupUrl).toContain("旧 API Key 已失效");
+      expect(reply, pickupUrl).not.toContain("暂时无法处理 API Key 请求");
+    }
+  });
+
+  it("does NOT claim a rotation when the frontend did not report one", async () => {
+    // Mirror of the case above: warning a first-time requester that their "previous key" died
+    // sends them hunting for a break that never happened.
+    issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: "lark://open" });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("领取链接无效");
+    expect(reply).not.toContain("旧 API Key 已失效");
+  });
+
+  it("withholds an expired pickup link, tells the sender to rerun /apikey, and warns it rotated", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: true, pickupUrl: PICKUP, expiresAt: Date.now() - 1, rotated: true,
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("重新发送 /apikey");
+    expect(reply).not.toContain("已就绪");
+    expect(reply).not.toContain(PICKUP);
+    // The expired short-circuit replaces the card body wholesale, and the body is the only other
+    // place the rotation was stated — so dropping it here left "a link expired" as the whole
+    // explanation for a dead credential.
+    expect(reply).toContain("旧 API Key 已失效");
+  });
+
+  it("does NOT claim a rotation on an expired link the frontend never rotated for", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: true, pickupUrl: PICKUP, expiresAt: Date.now() - 1,
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("重新发送 /apikey");
+    expect(reply).not.toContain("旧 API Key 已失效");
+  });
+
   it("escalates when a committed rotation's card AND its text fallback both fail", async () => {
     // The rotation already happened, so losing both delivery paths means the sender's old key is
     // dead with no link to show for it — that must not pass silently.
@@ -4266,6 +4331,18 @@ describe("handleLarkMessage — /apikey", () => {
     expect(replyText(lark)).toContain("你的飞书账号还没完成授权");
   });
 
+  it("bounds an oversized frontend error before sending it to Feishu", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({ success: false, error: "x".repeat(2_000) });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("x".repeat(1_000));
+    expect(reply).not.toContain("x".repeat(1_001));
+    expect(reply).toContain("…");
+  });
+
   it("works on an OPEN personal bot — unlike PAIR, issuing is not gated on the authorized mode", async () => {
     issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: PICKUP });
     const lark = makeLarkClient();
@@ -4291,6 +4368,34 @@ describe("handleLarkMessage — /apikey", () => {
     expect(reply).toContain("sk-a1b2c3d4");
     expect(reply).toContain("2025-07-27 16:44"); // last used
     expect(reply).toContain("2025-08-26");       // sliding expiry (date only)
+  });
+
+  it("/apikey status caps an oversized upstream error instead of going silent", async () => {
+    // Same untrusted field and same failure mode as the issue path: an unbounded `error` makes the
+    // reply exceed the Feishu limit, `replyToLark` swallows the non-zero code, and the sender who
+    // was promised an answer gets nothing.
+    getPersonalApiKeyStatusMock.mockResolvedValue({ success: false, error: "x".repeat(5_000) });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey status", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("查询 API Key 状态失败");
+    expect(reply).toContain("x".repeat(1_000));
+    expect(reply).not.toContain("x".repeat(1_001));
+    expect(reply).toContain("…");
+  });
+
+  it("/apikey status renders a non-string upstream error as the unknown-error fallback", async () => {
+    // A bare `??` let a structured value through and interpolated it as "[object Object]".
+    getPersonalApiKeyStatusMock.mockResolvedValue({ success: false, error: { code: 500 } });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey status", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("未知错误");
+    expect(reply).not.toContain("[object Object]");
   });
 
   it("/apikey status tells a first-time user how to get one", async () => {
@@ -4452,13 +4557,18 @@ describe("handleLarkMessage — /apikey", () => {
 
     for (const text of ["/apikey", "/apikey status", "/apikeys"]) {
       await handleLarkMessage(
-        makeTextEvent(text, { chat_type: "group" }),
+        makeTextEvent(text, {
+          chat_type: "group",
+          mentions: [{ key: "@_user_1", id: { open_id: "ou_bot_self" } }],
+        }),
         lark,
         "group-channel-1",
         makeAgentBoxManager("a1") as any,
         undefined,
         {} as any,
         "zh-CN",
+        undefined,
+        "ou_bot_self",
       );
     }
 
@@ -4466,7 +4576,276 @@ describe("handleLarkMessage — /apikey", () => {
     // failure mode is posting a credential reply to a whole room.
     expect(issuePersonalApiKeyMock).not.toHaveBeenCalled();
     expect(getPersonalApiKeyStatusMock).not.toHaveBeenCalled();
+    expect(resolveBindingMock).not.toHaveBeenCalled();
     expect(lark.im.message.reply).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── /webchat — self-service browser chat link (personal chat only) ──
+
+describe("handleLarkMessage — /webchat", () => {
+  const ACTION_URL = "https://sicore.example/siclaw/webchat/claim/token-1";
+
+  function sendPersonal(text: string, lark: ReturnType<typeof makeLarkClient>) {
+    return handleLarkMessage(
+      makeTextEvent(text, { chat_type: "p2p" }),
+      lark,
+      "personal-bot-1",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+      makePersonalConfig("sicore_authorized"),
+    );
+  }
+
+  const replyText = (lark: ReturnType<typeof makeLarkClient>) =>
+    lark.im.message.reply.mock.calls[0][0].data.content as string;
+
+  it("issues a link with the stable inbound message id and never reaches the agent", async () => {
+    issuePersonalWebChatLinkMock.mockResolvedValue({
+      success: true, agentId: "a1", actionUrl: ACTION_URL, expiresAt: Date.now() + 5 * 60_000,
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchat", lark);
+
+    expect(issuePersonalWebChatLinkMock).toHaveBeenCalledWith(
+      "personal-bot-1", "ou_user_1", expect.anything(), "mid-1",
+    );
+    expect(replyText(lark)).toContain(ACTION_URL);
+    expect(replyText(lark)).toContain("全新的空白对话");
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("delivers the link as a card button when CardKit is available", async () => {
+    issuePersonalWebChatLinkMock.mockResolvedValue({
+      success: true, actionUrl: ACTION_URL, expiresAt: Date.now() + 5 * 60_000 + 5_000,
+    });
+    const lark = {
+      im: { message: { reply: vi.fn().mockResolvedValue({}) } },
+      cardkit: { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "CARD-WEBCHAT" } }) } } },
+    };
+
+    await handleLarkMessage(
+      makeTextEvent("/webchat", { chat_type: "p2p" }),
+      lark as any, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "zh-CN", makePersonalConfig("sicore_authorized"),
+    );
+
+    const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));
+    expect(card).toContain("打开网页对话");
+    expect(card).toContain(ACTION_URL);
+    expect(card).toContain("5 分钟内有效");
+    expect(lark.im.message.reply.mock.calls[0][0].data.msg_type).toBe("interactive");
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).not.toContain(ACTION_URL);
+  });
+
+  it("rejects a success URL that is not absolute http(s)", async () => {
+    for (const actionUrl of ["/siclaw/webchat/claim/token", "lark://open", "javascript:alert(1)"]) {
+      issuePersonalWebChatLinkMock.mockResolvedValue({ success: true, actionUrl });
+      const lark = makeLarkClient();
+
+      await sendPersonal("/webchat", lark);
+
+      expect(replyText(lark), actionUrl).toContain("暂时无法生成网页对话链接");
+      expect(replyText(lark), actionUrl).not.toContain(actionUrl);
+    }
+  });
+
+  it("withholds an already-expired success link and tells the sender to rerun /webchat", async () => {
+    issuePersonalWebChatLinkMock.mockResolvedValue({
+      success: true, actionUrl: ACTION_URL, expiresAt: Date.now() - 1,
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchat", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("重新发送 /webchat");
+    expect(reply).not.toContain("已就绪");
+    expect(reply).not.toContain(ACTION_URL);
+  });
+
+  it("bounds a frontend error so an oversized reply cannot be dropped by Feishu", async () => {
+    issuePersonalWebChatLinkMock.mockResolvedValue({ success: false, error: "x".repeat(2_000) });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchat", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("x".repeat(1_000));
+    expect(reply).not.toContain("x".repeat(1_001));
+    expect(reply).toContain("…");
+  });
+
+  it("renders a binding refusal with the webchat-specific resume instruction", async () => {
+    issuePersonalWebChatLinkMock.mockResolvedValue({
+      success: false,
+      denied: { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchat", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("打开网页对话需要先关联账号");
+    expect(reply).toContain("回来重发 /webchat");
+    expect(reply).not.toContain("/apikey");
+    expect(reply).toContain(ACTION_URL);
+  });
+
+  it("delivers an actionable refusal as a card without exposing its URL as text", async () => {
+    issuePersonalWebChatLinkMock.mockResolvedValue({
+      success: false,
+      denied: {
+        reason: "access_request_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 60_000,
+      },
+    });
+    const lark = {
+      im: { message: { reply: vi.fn().mockResolvedValue({}) } },
+      cardkit: { v1: { card: { create: vi.fn().mockResolvedValue({ data: { card_id: "DENIAL" } }) } } },
+    };
+
+    await handleLarkMessage(
+      makeTextEvent("/webchat", { chat_type: "p2p" }),
+      lark as any, "personal-bot-1", makeAgentBoxManager("a1") as any, undefined, {} as any,
+      "zh-CN", makePersonalConfig("sicore_authorized"),
+    );
+
+    const card = JSON.stringify(JSON.parse(lark.cardkit.v1.card.create.mock.calls[0][0].data.data));
+    expect(card).toContain("需要该 Agent 的使用授权");
+    expect(card).toContain("回来重发 /webchat");
+    expect(card).toContain("申请权限");
+    expect(card).toContain(ACTION_URL);
+    expect(lark.im.message.reply.mock.calls[0][0].data.content).not.toContain(ACTION_URL);
+  });
+
+  it("keeps a future denial reason actionable with generic webchat copy", async () => {
+    issuePersonalWebChatLinkMock.mockResolvedValue({
+      success: false,
+      denied: { reason: "quota_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchat", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("打开网页对话需要先获得授权");
+    expect(reply).toContain("重发 /webchat");
+    expect(reply).toContain(ACTION_URL);
+  });
+
+  it("withholds links and retry copy for a refusal with no self-service step", async () => {
+    issuePersonalWebChatLinkMock.mockResolvedValue({
+      success: false,
+      denied: { reason: "access_denied", actionUrl: ACTION_URL, expiresAtMs: Date.now() + 60_000 },
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchat", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("未开放自助申请");
+    expect(reply).not.toContain(ACTION_URL);
+    expect(reply).not.toContain("重发 /webchat");
+  });
+
+  it("withholds an expired denial link but preserves the webchat resume instruction", async () => {
+    issuePersonalWebChatLinkMock.mockResolvedValue({
+      success: false,
+      denied: { reason: "binding_required", actionUrl: ACTION_URL, expiresAtMs: Date.now() - 1 },
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchat", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("链接已过期");
+    expect(reply).toContain("回来重发 /webchat");
+    expect(reply).not.toContain(ACTION_URL);
+  });
+
+  it("claims a whitespace-delimited typo but sends no RPC", async () => {
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchat open", lark);
+
+    expect(replyText(lark)).toContain("无法识别的 /webchat 子命令");
+    expect(issuePersonalWebChatLinkMock).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("deliberately leaves other tokens with the same prefix as ordinary prompts", async () => {
+    resolvePersonalBindingMock.mockResolvedValue(wrapBinding(makeBinding({
+      bindingId: "personal-bot-1", sessionKey: "open_id:ou_user_1", routeType: "user",
+    })));
+    promptMock.mockResolvedValue({ sessionId: "session-fixed" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchats explain the service", lark);
+
+    expect(issuePersonalWebChatLinkMock).not.toHaveBeenCalled();
+    expect(promptMock).toHaveBeenCalled();
+  });
+
+  it("replies with an unavailable notice when the frontend RPC throws", async () => {
+    issuePersonalWebChatLinkMock.mockRejectedValue(new Error("unknown method: channel.issueWebChatLink"));
+    const lark = makeLarkClient();
+
+    await sendPersonal("/webchat", lark);
+
+    expect(replyText(lark)).toContain("暂时无法生成网页对话链接");
+  });
+
+  it("rejects a second overlapping request and frees the slot after settlement", async () => {
+    let release!: (value: unknown) => void;
+    issuePersonalWebChatLinkMock.mockReturnValue(new Promise((resolve) => { release = resolve; }));
+    const first = makeLarkClient();
+    const second = makeLarkClient();
+
+    const inflight = sendPersonal("/webchat", first);
+    await sendPersonal("/webchat", second);
+
+    expect(issuePersonalWebChatLinkMock).toHaveBeenCalledTimes(1);
+    expect(replyText(second)).toContain("正在生成你的网页对话链接");
+
+    release({ success: true, actionUrl: ACTION_URL });
+    await inflight;
+
+    issuePersonalWebChatLinkMock.mockResolvedValue({ success: true, actionUrl: ACTION_URL });
+    await sendPersonal("/webchat", makeLarkClient());
+    expect(issuePersonalWebChatLinkMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops the actual command in groups, but not a different slash command sharing its prefix", async () => {
+    const exact = makeLarkClient();
+    for (const text of ["/webchat", "/webchat open"]) {
+      await handleLarkMessage(
+        makeTextEvent(text, {
+          chat_type: "group",
+          mentions: [{ key: "@_user_1", id: { open_id: "ou_bot_self" } }],
+        }), exact, "group-channel-1",
+        makeAgentBoxManager("a1") as any, undefined, {} as any, "zh-CN",
+        undefined, "ou_bot_self",
+      );
+    }
+    expect(exact.im.message.reply).not.toHaveBeenCalled();
+    expect(issuePersonalWebChatLinkMock).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+    expect(resolveBindingMock).not.toHaveBeenCalled();
+
+    resolveBindingMock.mockResolvedValue(null);
+    await handleLarkMessage(
+      makeTextEvent("@_user_1 /webchatops inspect", {
+        chat_type: "group",
+        mentions: [{ key: "@_user_1", id: { open_id: "ou_bot_self" } }],
+      }),
+      makeLarkClient(), "group-channel-1", makeAgentBoxManager("a1") as any,
+      undefined, {} as any, "zh-CN", undefined, "ou_bot_self",
+    );
+    expect(resolveBindingMock).toHaveBeenCalled();
   });
 });

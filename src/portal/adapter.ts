@@ -3213,17 +3213,27 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     error: "Personal-bot authorization is only available in Upstream mode",
   }));
 
-  // Channel-issued API keys (the `/apikey` personal-chat command) are an Upstream-mode
-  // capability: issuing depends on the control plane's account model and its single-use pickup
-  // page, neither of which exists here. These stubs let the runtime call the RPCs
-  // unconditionally — it stays frontend-agnostic, and against this adapter the user gets a
-  // readable "not here" instead of an unanswered request. `error` reaches the user verbatim.
+  // Every channel RPC the Runtime calls unconditionally needs a registered handler here, even
+  // when the feature itself is Upstream-only. A success:false stub keeps the Runtime
+  // frontend-agnostic and gives standalone users a readable answer instead of method-not-found.
+  // API-key issuing depends on the control plane's account model and single-use pickup page,
+  // neither of which exists here. `error` reaches the user after a bounded rendering step.
   const CHANNEL_API_KEY_UNSUPPORTED = {
     success: false,
     error: "Channel-issued API keys are only available in Upstream mode",
   } as const;
   handlers.set("channel.issueApiKey", async () => ({ ...CHANNEL_API_KEY_UNSUPPORTED }));
   handlers.set("channel.apiKeyStatus", async () => ({ ...CHANNEL_API_KEY_UNSUPPORTED }));
+
+  // `/webchat` is Upstream-only for the same reasons plus one more: redeeming the link yields a
+  // chat session, and this adapter has no account model to own one (what the link grants is stated
+  // once in docs/design/2026-08-06-feishu-webchat-command.md — do not restate it here). Registered
+  // rather than left absent so the answer is this sentence instead of "unknown method" — the
+  // runtime handles both, but only one of them is readable.
+  handlers.set("channel.issueWebChatLink", async () => ({
+    success: false,
+    error: "Web chat links are only available in Upstream mode",
+  }));
 
   // --- agent.* ---
 

@@ -19,6 +19,7 @@ import {
   resetPersonalSession,
   issuePersonalApiKey,
   getPersonalApiKeyStatus,
+  issuePersonalWebChatLink,
   updateBindingMeta,
   updateChannelName,
   isChannelAccessDenied,
@@ -27,6 +28,7 @@ import {
   type ChannelAccessDenied,
   type PersonalApiKeyIssueResult,
   type PersonalApiKeyStatusResult,
+  type PersonalWebChatLinkResult,
   type PersonalAccessDenied,
 } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
@@ -137,6 +139,43 @@ const API_KEY_UNAVAILABLE_NOTICE_BY_LOCALE = {
 const API_KEY_BUSY_NOTICE_BY_LOCALE = {
   "zh-CN": "⏳ 正在处理你上一条 API Key 请求，请稍等几秒。",
   "en-US": "⏳ Your previous API key request is still running — give it a few seconds.",
+} as const;
+const API_KEY_LINK_EXPIRED_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ API Key 领取链接已过期，请重新发送 /apikey 获取新链接。",
+  "en-US": "❌ The API key pickup link has expired — send /apikey again to get a fresh one.",
+} as const;
+// /apikey: the frontend answered success but the pickup URL cannot be rendered (relative path, or
+// a scheme that would resolve as a deeplink). Deliberately NOT the unavailable notice above: there
+// the RPC never ran and nothing changed, here the ROTATION ALREADY COMMITTED. Sharing one string
+// made a destroyed credential read as "the service is busy".
+const API_KEY_UNUSABLE_LINK_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 领取链接无效，无法安全展示，请重新发送 /apikey 获取新链接。",
+  "en-US": "❌ The pickup link was malformed and could not be shown safely — send /apikey again to get a fresh one.",
+} as const;
+// Prepended to any /apikey failure notice once the frontend has confirmed a rotation. The old key
+// is dead regardless of what happened to the link, and a reply that omits this reads as "nothing
+// happened" while the sender's MCP client starts 401-ing with no explanation.
+const API_KEY_ROTATION_WARNING_BY_LOCALE = {
+  "zh-CN": "⚠️ 你的旧 API Key 已失效，如有配置请更新。",
+  "en-US": "⚠️ Your PREVIOUS API key is now invalid — update anything configured with it.",
+} as const;
+// /webchat: the frontend RPC threw, or answered "unknown method" because this control plane
+// predates the command. Same reasoning as the API-key notice — the user is waiting on a link.
+const WEBCHAT_UNAVAILABLE_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 暂时无法生成网页对话链接，请稍后重试。",
+  "en-US": "❌ Web chat links are unavailable right now — please try again later.",
+} as const;
+// /webchat: one request for this sender is already in flight. Minting REPLACES the sender's
+// previous link, so a second one through would kill the link they are about to be shown.
+const WEBCHAT_BUSY_NOTICE_BY_LOCALE = {
+  "zh-CN": "⏳ 正在生成你的网页对话链接，请稍等几秒。",
+  "en-US": "⏳ Your web chat link is still being prepared — give it a few seconds.",
+} as const;
+// A success reply may arrive after its deadline because the frontend and Runtime clocks differ,
+// or because delivery was delayed. Recovery requires the command itself, not an ordinary message.
+const WEBCHAT_LINK_EXPIRED_NOTICE_BY_LOCALE = {
+  "zh-CN": "❌ 网页对话链接已过期，请重新发送 /webchat 获取新链接。",
+  "en-US": "❌ The web chat link has expired — send /webchat again to get a fresh one.",
 } as const;
 // Personal chat, sender refused on a gated tier, and the frontend told us nothing about why
 // (it predates the `denied` contract, or sent an unknown tier). Generic on purpose — we have no
@@ -1088,23 +1127,40 @@ export async function handleLarkMessage(
           // idempotent across a redelivery or a second replica — the in-process guard above
           // cannot span either.
           const issued = await issuePersonalApiKey(personalChannelId, senderOpenId, frontendClient, messageId);
-          reply = formatApiKeyIssueReply(issued, locale);
-          carriesCommittedRotation = Boolean(issued.success && issued.pickupUrl);
+          const pickupUrl = isRenderableActionUrl(issued.pickupUrl) ? issued.pickupUrl : null;
+          const invalidSuccess = issued.success && !pickupUrl;
+          reply = invalidSuccess
+            ? withRotationWarning(API_KEY_UNUSABLE_LINK_NOTICE_BY_LOCALE[locale], issued.rotated, locale)
+            : formatApiKeyIssueReply(issued, locale);
+          carriesCommittedRotation = Boolean(issued.success);
           // Audit line for a credential-mutating command: this path bypasses chat persistence,
           // so without it a "my key stopped working" report has no runtime-side evidence of who
           // rotated what and when. Never log the pickup URL — it is a bearer credential.
-          console.log(`[lark] /apikey issue channel=${personalChannelId} sender=${senderOpenId} ok=${issued.success} rotated=${issued.rotated ?? false}`);
-          if (issued.success && issued.pickupUrl) {
+          console.log(`[lark] /apikey issue channel=${personalChannelId} sender=${senderOpenId} ok=${issued.success && !invalidSuccess} rotated=${issued.rotated ?? false}`);
+          if (invalidSuccess) {
+            console.error(`[lark] /apikey rejected invalid pickup URL from frontend channel=${personalChannelId} sender=${senderOpenId}`);
+          } else if (issued.success && pickupUrl) {
+            // The expired reply is composed HERE rather than inside the deliverer: expiry replaces
+            // the whole body, and only this call site knows a rotation committed behind it. The
+            // bare notice told a sender whose key had just died that a *link* had expired.
+            const expiredReply = withRotationWarning(
+              API_KEY_LINK_EXPIRED_NOTICE_BY_LOCALE[locale], issued.rotated, locale,
+            );
             cardDelivered = await deliverSingleUseLink(larkClient, messageId, locale, {
               body: formatApiKeyIssueCardBody(issued, locale),
               buttonLabel: API_KEY_PICKUP_BUTTON_BY_LOCALE[locale],
-              url: issued.pickupUrl,
+              url: pickupUrl,
               expiresAtMs: issued.expiresAt,
-            }, reply);
-          } else {
+            }, reply, expiredReply);
+          } else if (!issued.success) {
             // A refusal that still offers a live self-service link gets the same card treatment:
             // the lead line plus how to resume in the body, the one-time URL behind the button.
-            const denialCard = buildApiKeyDenialCard(issued.denied, locale);
+            const denialCard = buildActionDenialCard(
+              issued.denied,
+              locale,
+              API_KEY_DENIAL_COPY_BY_LOCALE,
+              API_KEY_DENIAL_GENERIC_BY_LOCALE,
+            );
             if (denialCard) {
               cardDelivered = await deliverSingleUseLink(larkClient, messageId, locale, denialCard, reply);
             }
@@ -1133,6 +1189,84 @@ export async function handleLarkMessage(
         await replyToLark(larkClient, messageId, API_KEY_UNAVAILABLE_NOTICE_BY_LOCALE[locale]);
       } finally {
         apiKeyRequestsInFlight.delete(inFlightKey);
+      }
+      return;
+    }
+
+    // /webchat — self-service browser chat window. Same placement rationale as /apikey above:
+    // deterministic parsing that always returns here (the LLM must never sit in a link-minting
+    // loop), and BEFORE binding resolution because the frontend owns admission and may mint a link
+    // that performs account binding during redemption. It also fails closed on an inactive bot.
+    const webchatCommand = parseWebChatCommand(text);
+    if (webchatCommand) {
+      // No subcommand exists, so anything trailing is a typo. Unlike /apikey this is not about
+      // protecting a credential — it is about not handing the agent a stray "/webchat foo" prompt.
+      if (webchatCommand.subcommand !== "") {
+        await replyToLark(larkClient, messageId, formatWebChatUsageReply(locale));
+        return;
+      }
+      if (!frontendClient) {
+        console.warn(`[lark] /webchat unavailable — no frontend client (channel=${personalChannelId})`);
+        await replyToLark(larkClient, messageId, WEBCHAT_UNAVAILABLE_NOTICE_BY_LOCALE[locale]);
+        return;
+      }
+      const webchatInFlightKey = `${personalChannelId}:${senderOpenId}`;
+      if (webchatRequestsInFlight.has(webchatInFlightKey)) {
+        console.log(`[lark] /webchat rejected — already in flight for sender=${senderOpenId}`);
+        await replyToLark(larkClient, messageId, WEBCHAT_BUSY_NOTICE_BY_LOCALE[locale]);
+        return;
+      }
+      webchatRequestsInFlight.add(webchatInFlightKey);
+      try {
+        // The provider message id is stable across redelivery. The frontend must persist the
+        // idempotency decision because this process-local guard cannot span a later delivery or a
+        // second Runtime replica.
+        const issued = await issuePersonalWebChatLink(personalChannelId, senderOpenId, frontendClient, messageId);
+        const actionUrl = isRenderableActionUrl(issued.actionUrl) ? issued.actionUrl : null;
+        const invalidSuccess = issued.success && !actionUrl;
+        if (invalidSuccess) {
+          console.error(`[lark] /webchat rejected invalid action URL from frontend channel=${personalChannelId} sender=${senderOpenId}`);
+        }
+        const reply = invalidSuccess
+          ? WEBCHAT_UNAVAILABLE_NOTICE_BY_LOCALE[locale]
+          : formatWebChatIssueReply(issued, locale);
+        // Audit line: this path bypasses chat persistence, so without it there is no runtime-side
+        // record of who asked for a session and when. NEVER log actionUrl — it is a bearer token.
+        console.log(`[lark] /webchat channel=${personalChannelId} sender=${senderOpenId} ok=${issued.success && !invalidSuccess} agent=${issued.agentId ?? "?"}`);
+        // Card with a button rather than a bare URL: the client unfurls text links, and handing a
+        // one-time token to a preview fetcher is not something to rely on the endpoint tolerating.
+        let cardDelivered: boolean | null = null;
+        if (issued.success && actionUrl) {
+          cardDelivered = await deliverSingleUseLink(larkClient, messageId, locale, {
+            body: formatWebChatIssueCardBody(locale),
+            buttonLabel: WEBCHAT_OPEN_BUTTON_BY_LOCALE[locale],
+            url: actionUrl,
+            expiresAtMs: issued.expiresAt,
+          }, reply, WEBCHAT_LINK_EXPIRED_NOTICE_BY_LOCALE[locale]);
+        } else if (!issued.success) {
+          const denialCard = buildActionDenialCard(
+            issued.denied,
+            locale,
+            WEBCHAT_DENIAL_COPY_BY_LOCALE,
+            WEBCHAT_DENIAL_GENERIC_BY_LOCALE,
+          );
+          if (denialCard) {
+            cardDelivered = await deliverSingleUseLink(larkClient, messageId, locale, denialCard, reply);
+          }
+        }
+        // No rotation-style retry here: unlike an API-key rotation, a failed delivery does not
+        // invalidate a configured credential. The sender can safely resend /webchat; retain one
+        // high-signal audit line so support can distinguish that case from a minting failure.
+        if (!(cardDelivered ?? await replyToLark(larkClient, messageId, reply))) {
+          console.error(`[lark] /webchat reply UNDELIVERED — channel=${personalChannelId} sender=${senderOpenId}; they must send /webchat again`);
+        }
+      } catch (err) {
+        // Includes the "unknown method" answer from a control plane that predates this command.
+        // Say something: the user is waiting on a link, and silence reads as a broken bot.
+        console.error(`[lark] /webchat failed for channel=${personalChannelId} sender=${senderOpenId}:`, err);
+        await replyToLark(larkClient, messageId, WEBCHAT_UNAVAILABLE_NOTICE_BY_LOCALE[locale]);
+      } finally {
+        webchatRequestsInFlight.delete(webchatInFlightKey);
       }
       return;
     }
@@ -1231,6 +1365,16 @@ export async function handleLarkMessage(
   // (even "DM me") turns someone's provisioning into group noise.
   if (parseApiKeyCommand(text)) {
     console.log(`[lark] /apikey ignored in group chat=${chatId} — personal chat only`);
+    return;
+  }
+
+  // /webchat is personal-chat only, dropped for the same reason and in the same place: the reply
+  // carries a single-use link the Runtime must treat as bearer authority over a chat session (see
+  // "What the link confers" in docs/design/2026-08-06-feishu-webchat-command.md), and a group reply
+  // is visible to everyone in the room. Whoever opened it first would take the session — so
+  // answering at all, even "DM me", is worse than silence.
+  if (parseWebChatCommand(text)) {
+    console.log(`[lark] /webchat ignored in group chat=${chatId} — personal chat only`);
     return;
   }
 
@@ -1895,8 +2039,8 @@ function dmCanResolveAccess(personalBot: LarkChannelConfig["personal_bot"]): boo
 /** A link is only ever rendered when it is plain http(s). Everything else in `denied` is treated as
  *  untrusted, and this value reaches a Feishu `open_url` button, where other schemes resolve as
  *  deeplinks. An unusable value is withheld exactly like a missing one. */
-function isRenderableActionUrl(url: string | undefined): boolean {
-  if (!url) return false;
+function isRenderableActionUrl(url: unknown): url is string {
+  if (typeof url !== "string" || !url) return false;
   try {
     const scheme = new URL(url).protocol;
     return scheme === "https:" || scheme === "http:";
@@ -1952,6 +2096,66 @@ function truncateDenialProse(prose: unknown): string | undefined {
     : prose;
 }
 
+type ActionDenialCopy = { lead: string; resume?: string };
+type ActionDenialCopies = Record<LarkLocale, Map<string, ActionDenialCopy>>;
+type GenericActionDenialCopies = Record<LarkLocale, ActionDenialCopy>;
+
+/** Resolve command-specific denial wording while sharing the security-sensitive link rules. */
+function actionDenialCopy(
+  denied: PersonalAccessDenied,
+  locale: LarkLocale,
+  copies: ActionDenialCopies,
+  genericCopies: GenericActionDenialCopies,
+): ActionDenialCopy | undefined {
+  const known = denied.reason ? copies[locale].get(denied.reason) : undefined;
+  if (known) return known;
+  return rendersActionLink(denied, locale) ? genericCopies[locale] : undefined;
+}
+
+/** Text form shared by commands that act on a personal single-use authorization link. */
+function formatActionDenialReply(
+  denied: PersonalAccessDenied,
+  locale: LarkLocale,
+  copies: ActionDenialCopies,
+  genericCopies: GenericActionDenialCopies,
+): string | null {
+  const copy = actionDenialCopy(denied, locale, copies, genericCopies);
+  if (!copy) return null;
+  const lines = [copy.lead];
+  // A known link-less reason must say nothing about links. Unknown reasons retain a usable URL so
+  // version skew cannot strand the sender merely because this Runtime lacks their copy template.
+  if (rendersActionLink(denied, locale)) {
+    const remaining = minutesUntil(denied.expiresAtMs);
+    if (remaining === "expired") {
+      lines.push(PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE[locale]);
+    } else {
+      lines.push(PERSONAL_DENIAL_LINK_HINT_BY_LOCALE[locale](remaining), denied.actionUrl);
+    }
+  }
+  if (copy.resume) lines.push(copy.resume);
+  return lines.join("\n");
+}
+
+/** Card form shared by commands that act on a personal single-use authorization link. */
+function buildActionDenialCard(
+  denied: PersonalAccessDenied | undefined,
+  locale: LarkLocale,
+  copies: ActionDenialCopies,
+  genericCopies: GenericActionDenialCopies,
+): { body: string; buttonLabel: string; url: string; expiresAtMs?: number } | null {
+  if (!denied || minutesUntil(denied.expiresAtMs) === "expired") return null;
+  if (!rendersActionLink(denied, locale)) return null;
+  const copy = actionDenialCopy(denied, locale, copies, genericCopies);
+  if (!copy) return null;
+  return {
+    body: [copy.lead, copy.resume].filter(Boolean).join("\n"),
+    buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason ?? "")
+      ?? PERSONAL_DENIAL_BUTTON_NEUTRAL_BY_LOCALE[locale],
+    url: denied.actionUrl,
+    expiresAtMs: denied.expiresAtMs,
+  };
+}
+
 /**
  * Deliver a single-use link as a CARD with an action button, falling back to plain text.
  *
@@ -1966,6 +2170,7 @@ async function deliverSingleUseLink(
   locale: LarkLocale,
   card: { body: string; buttonLabel: string; url: string; expiresAtMs?: number },
   textFallback: string,
+  expiredReply?: string,
 ): Promise<boolean> {
   const remaining = minutesUntil(card.expiresAtMs);
   // Re-checked HERE, not just when the reply was composed: a link can lapse between the two, and
@@ -1973,6 +2178,7 @@ async function deliverSingleUseLink(
   // must reach neither the button nor the text — hand over the resend instruction instead, which is
   // the only thing that actually helps (the frontend mints a fresh link on the next message).
   if (remaining === "expired") {
+    if (expiredReply) return replyToLark(larkClient, messageId, expiredReply);
     // The body may itself embed the URL (an unknown reason renders the frontend's prose), so it
     // cannot be reused verbatim here — that put the dead link back in the text and made the
     // boundary invariant false for exactly the case it was added to cover. Swap in a URL-free
@@ -2170,6 +2376,133 @@ function parseApiKeyCommand(text: string): { subcommand: string } | null {
  */
 const apiKeyRequestsInFlight = new Set<string>();
 
+const WEBCHAT_COMMAND_RE = /^\/webchat(?:\s|$)/i;
+
+/**
+ * Parse a `/webchat …` message, or null when the text is outside the namespace.
+ *
+ * Requires a token boundary so only the actual command token is reserved. Prefixes such as
+ * `/webchats` or `/webchatops` deliberately remain ordinary input: unlike `/apikey`, no credential
+ * can be minted unless this exact parser accepts the command, so claiming every prefix would only
+ * steal possible downstream commands and user text. The same parser is shared with the group
+ * drop-gate so both paths reserve the same set. Whitespace followed by anything is still a typo —
+ * it gets usage help and issues no RPC rather than reaching the agent as a prompt.
+ */
+function parseWebChatCommand(text: string): { subcommand: string } | null {
+  const trimmed = text.trim();
+  if (!WEBCHAT_COMMAND_RE.test(trimmed)) return null;
+  return { subcommand: trimmed.slice("/webchat".length).trim().toLowerCase() };
+}
+
+/**
+ * `/webchat` requests in flight, keyed by `${channelId}:${senderOpenId}`.
+ *
+ * Minting replaces the sender's outstanding link (one live link per requester), so a double-tap
+ * would hand back two links of which only the last works — and the user naturally opens the first
+ * one they see. The stable message id lets the frontend provide durable redelivery idempotency;
+ * this in-process guard still handles two distinct commands that overlap before either reply
+ * arrives. The command bypasses the per-binding queue that serialises ordinary messages.
+ */
+const webchatRequestsInFlight = new Set<string>();
+
+/**
+ * Localized copy per `denied.reason` for `/webchat`. Separate table from the API-key one because
+ * the `resume` line names the command to resend, and telling a blocked user to send `/apikey`
+ * would be actively wrong.
+ *
+ * A Map, not an object literal, for the same reason as elsewhere in this file: `reason` arrives
+ * from the frontend, and an object lookup walks the prototype chain.
+ */
+const WEBCHAT_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, { lead: string; resume?: string }>> = {
+  "zh-CN": new Map([
+    ["binding_required", { lead: "❌ 打开网页对话需要先关联账号。", resume: "关联完成后回来重发 /webchat" }],
+    ["access_request_required", { lead: "❌ 打开网页对话需要该 Agent 的使用授权。", resume: "审批通过后回来重发 /webchat" }],
+    ["access_denied", { lead: "❌ 你没有该 Agent 的使用权限，且未开放自助申请，请联系负责人。" }],
+  ]),
+  "en-US": new Map([
+    ["binding_required", { lead: "❌ Opening a web chat requires linking your account first.", resume: "Once linked, send /webchat again." }],
+    ["access_request_required", { lead: "❌ Opening a web chat requires access to this agent.", resume: "Once approved, send /webchat again." }],
+    ["access_denied", { lead: "❌ You don't have access to this agent and self-service requests are closed — ask its owner." }],
+  ]),
+};
+
+const WEBCHAT_DENIAL_GENERIC_BY_LOCALE: Record<LarkLocale, { lead: string; resume: string }> = {
+  "zh-CN": { lead: "❌ 打开网页对话需要先获得授权。", resume: "完成后回来重发 /webchat" },
+  "en-US": { lead: "❌ Opening a web chat requires authorization first.", resume: "Once done, send /webchat again." },
+};
+
+const WEBCHAT_OPEN_BUTTON_BY_LOCALE: Record<LarkLocale, string> = {
+  "zh-CN": "打开网页对话",
+  "en-US": "Open web chat",
+};
+
+/**
+ * `/webchat` reply in text form (the fallback when the card cannot be sent).
+ *
+ * Says "a brand-new empty conversation" on purpose: the link does NOT resume this Feishu thread,
+ * and a user who expects continuity will open it, find a blank page, and report it as broken.
+ * The validity window is DERIVED from expiresAt — never restate the frontend's TTL here.
+ */
+function formatWebChatIssueReply(result: PersonalWebChatLinkResult, locale: LarkLocale): string {
+  if (!result.success || !result.actionUrl) {
+    const localized = result.denied
+      ? formatActionDenialReply(
+          result.denied,
+          locale,
+          WEBCHAT_DENIAL_COPY_BY_LOCALE,
+          WEBCHAT_DENIAL_GENERIC_BY_LOCALE,
+        )
+      : null;
+    if (localized) return localized;
+    const reason = truncateDenialProse(result.denied?.message)
+      ?? truncateDenialProse(result.error)
+      ?? (locale === "en-US" ? "unknown error" : "未知错误");
+    return locale === "en-US"
+      ? `❌ Could not create a web chat link: ${reason}`
+      : `❌ 生成网页对话链接失败: ${reason}`;
+  }
+  const remaining = minutesUntil(result.expiresAt);
+  const window = typeof remaining === "number" ? remaining : null;
+  const lines =
+    locale === "en-US"
+      ? [
+          "✅ Your web chat link is ready.",
+          window === null
+            ? "It opens only ONCE, and expires shortly:"
+            : `It opens only ONCE, within ${window} minute${window === 1 ? "" : "s"}:`,
+          result.actionUrl,
+          "This starts a brand-new, empty conversation — it does not continue this chat.",
+        ]
+      : [
+          "✅ 网页对话链接已就绪",
+          window === null
+            ? "仅可打开一次，且很快过期："
+            : `请在 ${window} 分钟内打开，仅可打开一次：`,
+          result.actionUrl,
+          "打开后是一个全新的空白对话，不会延续这里的聊天记录",
+        ];
+  return lines.filter(Boolean).join("\n");
+}
+
+/**
+ * Card body for a successful `/webchat`. Shorter than the text form: the URL becomes the button and
+ * the validity window becomes the card's footnote, so repeating either here is noise. The
+ * "brand-new conversation" line stays — it has nowhere else to live and it is the one thing a user
+ * will otherwise get wrong.
+ */
+function formatWebChatIssueCardBody(locale: LarkLocale): string {
+  return locale === "en-US"
+    ? ["✅ Your web chat link is ready.", "This starts a brand-new, empty conversation — it does not continue this chat."].join("\n")
+    : ["✅ 网页对话链接已就绪", "打开后是一个全新的空白对话，不会延续这里的聊天记录"].join("\n");
+}
+
+/** `/webchat` takes no subcommand, so usage help is one line plus the bare form. */
+function formatWebChatUsageReply(locale: LarkLocale): string {
+  return locale === "en-US"
+    ? ["Unrecognised /webchat subcommand — it takes none.", "/webchat — open a browser chat window for this assistant"].join("\n")
+    : ["无法识别的 /webchat 子命令 —— 该命令没有子命令。", "/webchat —— 打开这个助手的网页对话窗口"].join("\n");
+}
+
 /** Display time zone per locale, so a rendered timestamp means what the reader expects. */
 const API_KEY_TIME_ZONE_BY_LOCALE: Record<LarkLocale, string> = {
   "zh-CN": "Asia/Shanghai",
@@ -2205,25 +2538,44 @@ function formatApiKeyTimestamp(
 }
 
 /**
+ * Prefix a `/apikey` failure notice with the rotation warning when the frontend confirmed one.
+ *
+ * The rotation commits frontend-side before we can reply, so EVERY exit carrying `rotated` must
+ * state that the old key died — the reject paths below (unusable URL, expired at the send
+ * boundary) replace the success body wholesale, and without this the warning is dropped on
+ * exactly the paths where the sender has no other way to learn their credential is gone.
+ */
+function withRotationWarning(notice: string, rotated: boolean | undefined, locale: LarkLocale): string {
+  return rotated ? `${API_KEY_ROTATION_WARNING_BY_LOCALE[locale]}\n${notice}` : notice;
+}
+
+/**
  * `/apikey` reply. On success this carries the single-use pickup link — never the key
  * itself (plaintext must not enter a searchable, exportable chat log).
  *
  * `rotated` MUST be called out: the requester's old key dies instantly, and an unexplained
  * break gets reported as a bug by whoever had it configured in an MCP client. On failure the
- * frontend's `error` is already user-facing wording, so it is surfaced verbatim.
+ * frontend's `error` is already user-facing wording, so it is length-capped and surfaced.
  */
 function formatApiKeyIssueReply(result: PersonalApiKeyIssueResult, locale: LarkLocale): string {
   if (!result.success || !result.pickupUrl) {
     // An authorization refusal carries `denied`, rendered with copy about the action the sender
     // attempted — a single ❌ line, then how to resume. Other failure exits have no `denied` and
-    // fall through to `error` (a non-localized English fallback) unchanged.
-    const localized = result.denied ? formatApiKeyDenialReply(result.denied, locale) : null;
+    // fall through to `error` (a non-localized English fallback) after the shared prose cap.
+    const localized = result.denied
+      ? formatActionDenialReply(
+          result.denied,
+          locale,
+          API_KEY_DENIAL_COPY_BY_LOCALE,
+          API_KEY_DENIAL_GENERIC_BY_LOCALE,
+        )
+      : null;
     if (localized) return localized;
     // `denied.message` before `error`: it is defined as the fallback for a reason this build has no
     // template for, so discarding it in favour of a generic "unknown error" throws away the only
     // explanation the sender was given. Bounded on the way through, like every other prose field.
     const reason = truncateDenialProse(result.denied?.message)
-      ?? result.error
+      ?? truncateDenialProse(result.error)
       ?? (locale === "en-US" ? "unknown error" : "未知错误");
     return locale === "en-US"
       ? `❌ Could not issue an API key: ${reason}`
@@ -2281,31 +2633,6 @@ const API_KEY_DENIAL_COPY_BY_LOCALE: Record<LarkLocale, Map<string, { lead: stri
   ]),
 };
 
-/**
- * Card form of an `/apikey` refusal, or null when there is no live link to sit on a button
- * (`access_denied` offers none, and an expired one must never be handed over).
- */
-function buildApiKeyDenialCard(
-  denied: PersonalAccessDenied | undefined,
-  locale: LarkLocale,
-): { body: string; buttonLabel: string; url: string; expiresAtMs?: number } | null {
-  if (!denied || minutesUntil(denied.expiresAtMs) === "expired") return null;
-  // No self-service step (or an unusable URL) ⇒ no button. `access_denied` says "ask the owner";
-  // a generic button under that sentence points nowhere the sender can act on.
-  if (!rendersActionLink(denied, locale)) return null;
-  const copy = apiKeyDenialCopy(denied, locale);
-  if (!copy) return null;
-  return {
-    // The resume line belongs in the BODY, not the footnote: it is what stops the sender from
-    // thinking the flow ended once the web step finishes.
-    body: copy.resume ? `${copy.lead}\n${copy.resume}` : copy.lead,
-    buttonLabel: PERSONAL_DENIAL_BUTTON_BY_LOCALE[locale].get(denied.reason ?? "")
-      ?? PERSONAL_DENIAL_BUTTON_NEUTRAL_BY_LOCALE[locale],
-    url: denied.actionUrl,
-    expiresAtMs: denied.expiresAtMs,
-  };
-}
-
 /** Fallback `/apikey` copy for a reason this build does not know. Without it the copy lookup vetoed
  *  a refusal `rendersActionLink` had already accepted, and a future reason's structured link was
  *  dropped on the very version-skew path the contract must keep usable. */
@@ -2313,40 +2640,6 @@ const API_KEY_DENIAL_GENERIC_BY_LOCALE: Record<LarkLocale, { lead: string; resum
   "zh-CN": { lead: "❌ 领取 API Key 需要先获得授权。", resume: "完成后回来重发 /apikey" },
   "en-US": { lead: "❌ Getting an API key requires authorization first.", resume: "Once done, send /apikey again." },
 };
-
-/**
- * Copy for an `/apikey` refusal: the reason's own wording when known, else the generic pair — but
- * only when there is actually a link to offer. A reason with neither known copy nor an actionable
- * link has nothing `/apikey`-specific to say and falls through to the frontend's `error`.
- */
-function apiKeyDenialCopy(
-  denied: PersonalAccessDenied,
-  locale: LarkLocale,
-): { lead: string; resume?: string } | undefined {
-  const known = denied.reason ? API_KEY_DENIAL_COPY_BY_LOCALE[locale].get(denied.reason) : undefined;
-  if (known) return known;
-  return rendersActionLink(denied, locale) ? API_KEY_DENIAL_GENERIC_BY_LOCALE[locale] : undefined;
-}
-
-/** `/apikey` refusal in text form: one ❌ line, the link, then how to resume. */
-function formatApiKeyDenialReply(denied: PersonalAccessDenied, locale: LarkLocale): string | null {
-  const copy = apiKeyDenialCopy(denied, locale);
-  if (!copy) return null;
-  const lines = [copy.lead];
-  // Nested, not chained: a reason with no self-service step must say NOTHING about links. Chaining
-  // the expired notice onto `actionUrl` alone told `access_denied` senders their live link had
-  // expired and to resend — and the resend refuses identically.
-  if (rendersActionLink(denied, locale)) {
-    const remaining = minutesUntil(denied.expiresAtMs);
-    if (remaining === "expired") {
-      lines.push(PERSONAL_DENIAL_LINK_EXPIRED_BY_LOCALE[locale]);
-    } else {
-      lines.push(PERSONAL_DENIAL_LINK_HINT_BY_LOCALE[locale](remaining), denied.actionUrl);
-    }
-  }
-  if (copy.resume) lines.push(copy.resume);
-  return lines.join("\n");
-}
 
 /**
  * Card body for a successful `/apikey` issue. Shorter than the text form on purpose: the
@@ -2379,7 +2672,12 @@ function formatApiKeyIssueCardBody(result: PersonalApiKeyIssueResult, locale: La
 /** `/apikey status` reply — read-only, so it must never imply anything was rotated. */
 function formatApiKeyStatusReply(result: PersonalApiKeyStatusResult, locale: LarkLocale): string {
   if (!result.success) {
-    const reason = result.error ?? (locale === "en-US" ? "unknown error" : "未知错误");
+    // Same untrusted field and same cap as every other frontend prose path: an unbounded `error`
+    // (stack trace, HTML error body) produces a reply Feishu rejects for size, `replyToLark`
+    // swallows the non-zero code, and the sender gets silence instead of an answer. The cap also
+    // rejects a non-string, which used to interpolate as "[object Object]".
+    const reason = truncateDenialProse(result.error)
+      ?? (locale === "en-US" ? "unknown error" : "未知错误");
     return locale === "en-US"
       ? `❌ Could not read your API key status: ${reason}`
       : `❌ 查询 API Key 状态失败: ${reason}`;
