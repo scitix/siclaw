@@ -476,17 +476,26 @@ export class AgentBoxClient {
     }
 
     console.log(`[agentbox-client] SSE open (HTTPS) path=${path}`);
+    const decoder = new TextDecoder();
     let buffer = "";
+    // The replay frame can be one large data line. Remember the prefix already
+    // checked for a newline so each chunk scans only newly-decoded text instead
+    // of repeatedly splitting the entire accumulated frame.
+    let newlineSearchFrom = 0;
     let eventCount = 0;
 
     try {
       for await (const chunk of res) {
-        buffer += chunk.toString();
+        // TLS chunks are arbitrary byte boundaries. A stateful decoder preserves
+        // multi-byte UTF-8 characters that straddle two chunks.
+        buffer += decoder.decode(chunk, { stream: true });
 
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+        let newlineIndex = buffer.indexOf("\n", newlineSearchFrom);
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          newlineSearchFrom = 0;
 
-        for (const line of lines) {
           if (line.startsWith("data:")) {
             // SSE spec: the value is everything after the colon, minus ONE
             // optional leading space — "data:x" is as valid as "data: x".
@@ -503,8 +512,14 @@ export class AgentBoxClient {
             // be reaped as stale); it is never yielded as an event.
             opts?.onComment?.();
           }
+
+          newlineIndex = buffer.indexOf("\n", newlineSearchFrom);
         }
+        newlineSearchFrom = buffer.length;
       }
+      // Flush decoder state at EOF. SSE dispatch requires a terminating newline,
+      // so any remaining unterminated text stays buffered as before.
+      buffer += decoder.decode();
     } catch (err) {
       console.error(`[agentbox-client] SSE stream error path=${path}:`, err instanceof Error ? err.message : err);
       throw err;

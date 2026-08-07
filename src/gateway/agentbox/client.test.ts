@@ -437,6 +437,52 @@ describe("AgentBoxClient — streamEvents (SSE)", () => {
     }
   }, 60_000);
 
+  it("preserves UTF-8 data split across HTTPS chunks", async () => {
+    const certManager = await CertificateManager.create();
+    const serverCert = certManager.issueAgentBoxCertificate("agentbox-test", "org-test", "box-test");
+    const clientCert = certManager.issueServerCertificate("runtime.test");
+    const expected = {
+      type: "syncArtifacts",
+      artifacts: [{ path: "候选/页面.md", content: "集群运维知识库：节点排障与网络诊断" }],
+    };
+    const frame = Buffer.from(`data: ${JSON.stringify(expected)}\n\n`);
+    const marker = frame.indexOf(Buffer.from("候选"));
+    expect(marker).toBeGreaterThanOrEqual(0);
+    // Split one byte into the first three-byte CJK character. Decoding either
+    // chunk independently produces replacement characters while valid JSON
+    // still parses, which would silently persist corrupted workspace data.
+    const splitAt = marker + 1;
+    const server = https.createServer({
+      cert: serverCert.cert,
+      key: serverCert.key,
+      ca: serverCert.ca,
+      requestCert: true,
+      rejectUnauthorized: true,
+    }, (_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(frame.subarray(0, splitAt));
+      setTimeout(() => res.end(frame.subarray(splitAt)), 5);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+
+    try {
+      const client = new AgentBoxClient(`https://127.0.0.1:${port}`, 30_000, {
+        cert: clientCert.cert,
+        key: clientCert.key,
+        ca: serverCert.ca,
+      });
+      const events: unknown[] = [];
+      for await (const event of client.streamPath("/events/r1?replay=1")) {
+        events.push(event);
+      }
+
+      expect(events).toEqual([expected]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 60_000);
+
   it("yields parsed JSON events from data: lines", async () => {
     const srv = await startServer((req, res) => {
       if (req.url?.startsWith("/api/stream/")) {
