@@ -3492,6 +3492,17 @@ def _batch_mode_enabled() -> bool:
     return os.environ.get("KBC_BATCH_MODE", "on") != "off"
 
 
+def _scan_compile_inventory(run: "CompileRun") -> list[dict]:
+    """Plan content sources while keeping code-domain control metadata readable."""
+    inventory = batching.scan_sources(Path(run.workdir) / "raw")
+    if selfcheck.knowledge_type(run.workdir) == "code":
+        inventory = [
+            item for item in inventory
+            if item["path"] != selfcheck.CODE_SOURCES_MANIFEST
+        ]
+    return inventory
+
+
 def _should_route_to_domain_refresh(run: "CompileRun", text: str, action: str | None = None) -> bool:
     """Dedicated full-library domain write/update.
 
@@ -4641,7 +4652,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     _print_compile_lifecycle("batch.start", run)
     try:
         raw_dir = Path(run.workdir) / "raw"
-        inventory = batching.scan_sources(raw_dir)
+        inventory = _scan_compile_inventory(run)
         total_kb = batching.corpus_bytes(inventory) // 1024
         plan = _load_batch_plan(run)
         resuming = _batch_plan_resumable(plan)

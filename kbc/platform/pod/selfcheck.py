@@ -59,6 +59,7 @@ MEDIA_ASSET_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".
 
 EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
 SELFCHECK_PATH = "authoring/SELFCHECK.json"
+CODE_SOURCES_MANIFEST = "CODE_SOURCES.json"
 
 # TEST_ROLE = the standing identity of a read-only knowledge CONSUMER over a
 # pinned wiki snapshot. Single-sourced in the locale prompt packs
@@ -92,13 +93,20 @@ def source_inventory(workdir: str) -> list[str]:
     if not raw.is_dir():
         return []
     out = []
+    code_profile = knowledge_type(workdir) == "code"
     for f in raw.rglob("*"):
         if not f.is_file():
             continue
         rel = f.relative_to(raw)
         if not is_managed_source_path(rel):
             continue
-        out.append(rel.as_posix())
+        rel_posix = rel.as_posix()
+        # The platform-validated multi-repository manifest is control metadata:
+        # it tells the compiler how to interpret the source tree, but it is not
+        # itself a knowledge claim that needs a page citation or exclusion row.
+        if code_profile and rel_posix == CODE_SOURCES_MANIFEST:
+            continue
+        out.append(rel_posix)
     return sorted(out)
 
 

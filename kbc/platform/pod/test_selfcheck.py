@@ -435,6 +435,9 @@ def test_code_profile_component_coverage():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "authoring/BRIEF.json", json.dumps({"knowledge_type": "code"}))
+        _mk(base, "raw/CODE_SOURCES.json", json.dumps({
+            "schema_version": 1, "domain": "cluster-sre", "sources": [],
+        }))
         _mk(base, "raw/go.mod", "module example.invalid/operator\n")
         _mk(base, "raw/README.md", "operator\n")
         _mk(base, "raw/internal/controller/reconcile.go", "package controller\n")
@@ -449,6 +452,7 @@ def test_code_profile_component_coverage():
         }
         cov = selfcheck.coverage(td, pages, [])
         assert cov["profile"] == "code", cov
+        assert "CODE_SOURCES.json" not in selfcheck.source_inventory(td)
         assert cov["total_components"] == 6, cov
         assert cov["covered_components"] == 2, cov
         assert cov["ignored_sources"] == 0, cov
