@@ -81,6 +81,7 @@ import selfcheck
 from engine import selected_readonly_engine
 from codex_engine import CodexSDKClient, EngineTool, isolated_readonly_workspace
 import source_snapshot
+from source_inspector import SourceInspector
 
 # massapi/Bedrock rejects the `context_management` field Claude Code attaches
 # (HTTP 400 "context_management: Extra inputs are not permitted").
@@ -1477,6 +1478,7 @@ _DOMAIN_REFRESH_TRIGGERS = (
 )
 _BRIEF_AUDIENCES = {"", "internal-eng", "frontline", "external", "newcomer"}
 _BRIEF_INTENTS = {"", "understand", "execute", "troubleshoot"}
+_BRIEF_KNOWLEDGE_TYPES = {"document", "code"}
 _CONTENT_LOCALE_RE = re.compile(r"^(?:auto|[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*)$")
 
 
@@ -1526,6 +1528,9 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
         normalized_brief = {
             "schema_version": 1,
             "source": "authoring_command",
+            "knowledge_type": _bounded_string(
+                brief.get("knowledge_type"), "brief.knowledge_type", limit=32
+            ) or "document",
             "intent": _bounded_string(brief.get("intent"), "brief.intent", limit=32),
             "audience": _bounded_string(brief.get("audience"), "brief.audience", limit=64),
             "depth": _bounded_string(brief.get("depth"), "brief.depth", limit=32),
@@ -1535,6 +1540,8 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
         }
         if normalized_brief["depth"] not in {"", "full", "concise"}:
             raise CommandRejected("brief.depth must be full or concise")
+        if normalized_brief["knowledge_type"] not in _BRIEF_KNOWLEDGE_TYPES:
+            raise CommandRejected("brief.knowledge_type must be document or code")
         if normalized_brief["intent"] not in _BRIEF_INTENTS:
             raise CommandRejected("brief.intent is unsupported")
         if normalized_brief["audience"] not in _BRIEF_AUDIENCES:
@@ -1663,11 +1670,41 @@ def _prepare_command(run: "CompileRun", command: dict) -> None:
         _write_brief(run.workdir, brief)
 
 
-def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
+def _compile_engine_tools(
+    run: CompileRun, raw_scope: dict | None = None,
+) -> list[EngineTool]:
     """Build the box's custom tools (closures over run) — the structured-signal
     moat. All model-facing text (descriptions + result strings) comes from the
     run's locale pack."""
     ts = _tool_strings(run.locale)
+
+    def inspector() -> SourceInspector:
+        denied = (raw_scope or {}).get("deny_read") or []
+        return SourceInspector(run.workdir, denied_sources=denied)
+
+    async def source_inventory(args):
+        return await asyncio.to_thread(
+            inspector().inventory,
+            pattern=args.get("pattern"),
+            max_results=args.get("max_results"),
+        )
+
+    async def source_read(args):
+        return await asyncio.to_thread(
+            inspector().read,
+            path=args.get("path"),
+            offset=args.get("offset"),
+            limit=args.get("limit"),
+        )
+
+    async def source_search(args):
+        return await asyncio.to_thread(
+            inspector().search,
+            query=args.get("query"),
+            pattern=args.get("pattern"),
+            case_sensitive=args.get("case_sensitive"),
+            max_results=args.get("max_results"),
+        )
 
     async def report_summary(args):
         await run.emit({"type": "summary", "summary": args.get("summary", "")})
@@ -1884,7 +1921,7 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
             return rt["write_failed"].format(e=e)
         return rt["registered"].format(tid=tid)
 
-    return [
+    tools = [
         EngineTool(
             "report_domain",
             ts["report_domain"]["desc"],
@@ -1955,13 +1992,71 @@ def _compile_engine_tools(run: CompileRun) -> list[EngineTool]:
         ),
     ]
 
+    # The inspector executes in the KBC process against the frozen Raw tree,
+    # so Claude and Codex get the same consultation surface even when a writer
+    # sandbox cannot mount a readable child below a denied Raw parent.  A
+    # non-consulting scope (structural reduce) omits the tools entirely.
+    if raw_scope is None or bool(raw_scope.get("consult")):
+        tools.extend([
+            EngineTool(
+                "source_inventory",
+                ts["source_inventory"]["desc"],
+                {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "max_results": {"type": "integer"},
+                    },
+                    "additionalProperties": False,
+                },
+                source_inventory,
+            ),
+            EngineTool(
+                "source_read",
+                ts["source_read"]["desc"],
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "offset": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                source_read,
+            ),
+            EngineTool(
+                "source_search",
+                ts["source_search"]["desc"],
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "pattern": {"type": "string"},
+                        "case_sensitive": {"type": "boolean"},
+                        "max_results": {"type": "integer"},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                source_search,
+            ),
+        ])
+    return tools
 
-def _make_compile_tools(run: CompileRun):
+
+def _make_compile_tools(run: CompileRun, raw_scope: dict | None = None):
     """Assemble the engine-neutral compile tool bodies for Claude's in-process MCP."""
     wrapped = []
-    for item in _compile_engine_tools(run):
+    for item in _compile_engine_tools(run, raw_scope=raw_scope):
         schema = {
-            name: (list if spec.get("type") == "array" else str)
+            name: {
+                "array": list,
+                "boolean": bool,
+                "integer": int,
+                "number": float,
+            }.get(spec.get("type"), str)
             for name, spec in item.input_schema.get("properties", {}).items()
         }
 
@@ -2969,6 +3064,9 @@ DEFAULT_COMPILE_ALLOWED_TOOLS = [
     # compile_tool keeps this list from drifting behind the tool registry.
     "mcp__compile__exclude_source",
     "mcp__compile__remove_exclusion",
+    "mcp__compile__source_inventory",
+    "mcp__compile__source_read",
+    "mcp__compile__source_search",
 ]
 
 # Tools removed from a compiler session's context entirely, not merely left
@@ -3076,7 +3174,7 @@ def _compile_session_opts(run: "CompileRun", wd: str, system_prompt: str, sessio
         system_prompt={"type": "preset", "preset": "claude_code", "append": system_prompt},
         allowed_tools=run.allowed_tools or DEFAULT_COMPILE_ALLOWED_TOOLS,
         disallowed_tools=list(COMPILE_DISALLOWED_TOOLS),
-        mcp_servers={"compile": _make_compile_tools(run)},
+        mcp_servers={"compile": _make_compile_tools(run, raw_scope=raw_scope)},
         permission_mode="bypassPermissions",  # the pod itself is the sandbox
         setting_sources=[],                    # tenant isolation: load no external settings/CLAUDE.md
         # Pin the compile model explicitly: the box talks to massapi (Bedrock),
@@ -3332,7 +3430,7 @@ def _compile_session_client(run: "CompileRun", wd: str, system_prompt: str, sess
     for both engines; only this construction seam knows which SDK is active.
     """
     if _engine_kind() == "codex_sdk":
-        tools = _compile_engine_tools(run)
+        tools = _compile_engine_tools(run, raw_scope=raw_scope)
         if pdf_page_ranges:
             tools.append(_codex_pdf_pages_engine_tool(Path(wd), pdf_page_ranges))
         return CodexSDKClient(
@@ -3956,10 +4054,10 @@ def _batch_raw_scope(batch: dict, bounded: dict[str, list[str]] | None = None) -
     this cluster", "how does the neighbouring doc word this" — questions the
     batch list cannot answer and that a knowledge compiler must be able to ask.
 
-    Codex runs a copy-based sandbox (it cannot carve a readable child out of a
-    denied parent), so consulting is only offered on the hook-guarded engine;
-    Codex keeps the strict view, which after family packing at least always
-    holds the whole document family."""
+    Every engine receives the same consultation capability through the
+    engine-neutral Source Inspector.  Codex still gets a strict copy-view for
+    its native filesystem tools; the inspector runs in the trusted KBC process
+    and exposes bounded inventory/read/search without widening write access."""
     bounded = bounded or {}
     assigned_pages = batch.get("source_page_ranges")
     assigned = set(assigned_pages) if isinstance(assigned_pages, dict) else set()
@@ -3971,12 +4069,27 @@ def _batch_raw_scope(batch: dict, bounded: dict[str, list[str]] | None = None) -
     return {
         "account": _batch_raw_read_allowlist(batch),
         "deny_read": sorted(deny),
-        "consult": _engine_kind() != "codex_sdk",
+        "consult": True,
     }
 
 
-# Reduce/final sessions: Candidate + authoring state only, no Raw at all.
+# Structural reduce: Candidate + authoring state only, no Raw at all.
 NO_RAW_SCOPE: dict = {"account": [], "deny_read": [], "consult": False}
+
+def semantic_review_raw_scope(plan: dict) -> dict:
+    """Raw scope for final review without bypassing planner read bounds.
+
+    Final review may consult ordinary sources across the frozen snapshot, but
+    it has no assigned bounded ranges of its own. Every original represented by
+    a text or PDF slice therefore remains unavailable in full. Candidate pages
+    carry the compiled result that final review is responsible for checking.
+    """
+    bounded = plan_bounded_sources(plan)
+    return {
+        "account": [],
+        "deny_read": sorted(set(bounded["text"]) | set(bounded["pdf"])),
+        "consult": True,
+    }
 
 
 _RELAY_MAX_PAGES = 8
@@ -4273,8 +4386,10 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
                         "Nothing has been reported yet, so without this the library reaches every chooser "
                         "as a bare name.")
                      + " Do not list pages or counts — index.md already routes to a page.")
-        lines.append("Close out only — do not read raw/ or recompile pages that are already fine. "
-                     "Use Candidate and the authoring ledgers for this cross-batch review. When done, report "
+        lines.append("Close out only — use Candidate and the authoring ledgers for navigation, then use "
+                     "source_inventory/source_search/source_read against the frozen Raw snapshot when needed "
+                     "to verify cross-batch contradictions and load-bearing claims. Do not recompile pages "
+                     "that are already fine or compile previously unowned sources. When done, report "
                      "briefly: total pages, which pages this close-out touched, which pairs were "
                      "merged/exempted and why, and anything worth the owner's attention.")
         return "\n".join(lines) + notes
@@ -4302,7 +4417,9 @@ def _compose_final_directive(workdir: str, n: int, notes: str,
                     if domain_now else
                     "目前还没报过——不报的话,这个库到每个选择者那里就只剩一个名字。")
                  + "不要罗列页面、不要报数量——精确找页有 index.md。")
-    lines.append("只做收口,不要读 raw/,也不重编已经完好的页;跨批核对只使用 Candidate 和 authoring 账本。"
+    lines.append("只做收口:先用 Candidate 和 authoring 账本导航,需要核验跨批矛盾或关键结论时,"
+                 "用 source_inventory/source_search/source_read 查冻结 Raw 快照。不要重编已经完好的页,"
+                 "也不要新编此前无人负责的源。"
                  "完成后简短汇报:总页数、本次收口动了哪些页、合并/豁免了哪几对及理由、还有什么值得负责人注意。")
     return "\n".join(lines) + notes
 
@@ -4831,7 +4948,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         final_reply = await _drive_batch_session(
             run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
             _loc(run, "final review", "终审"),
-            raw_scope=NO_RAW_SCOPE,
+            raw_scope=semantic_review_raw_scope(plan),
         )
         if final_reply:
             replies.append(_loc(run, f"[Final review] {final_reply}", f"【终审】{final_reply}"))

@@ -30,6 +30,16 @@ from urllib.parse import unquote
 
 import yaml
 
+from source_kinds import (
+    IMAGE_SOURCE_EXTS,
+    KNOWN_SOURCE_EXTS,
+    MEDIA_SOURCE_EXTS,
+    TEXT_SOURCE_BASENAMES,
+    TEXT_SOURCE_EXTS,
+    TEXT_SOURCE_PREFIXES,
+    is_managed_source_path,
+)
+
 # Text sources vs binary media. BOTH are ledger-accountable (2026-07-06): the
 # batch-vs-oneshot A/B showed silent media drops are the single worst coverage
 # failure (29/33 images dropped by the one-shot compile), and a text-only
@@ -37,11 +47,6 @@ import yaml
 # machine-checkable provenance exactly where fidelity risk is highest.
 # sources[].resource is the agent's declaration either way; the ledger only checks
 # that the declaration is total.
-TEXT_SOURCE_EXTS = {".md", ".txt", ".tsv", ".csv", ".json", ".jsonl", ".yaml", ".yml"}
-IMAGE_SOURCE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
-MEDIA_SOURCE_EXTS = IMAGE_SOURCE_EXTS | {".pdf", ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx"}
-KNOWN_SOURCE_EXTS = TEXT_SOURCE_EXTS | MEDIA_SOURCE_EXTS
-
 # Media ASSETS (coverage v2, DESIGN-kb-asset-provenance-2026-07-22 §4.1): images
 # that live under an `assets/` directory (or the legacy `*.assets/` export form).
 # They are DOCUMENT ATTACHMENTS, not first-class sources — a media asset embedded
@@ -79,7 +84,8 @@ _REPAIR_LIST_CAP = 40
 
 def source_inventory(workdir: str) -> list[str]:
     """All source files under {workdir}/raw — text AND media — as sorted posix
-    paths relative to raw/. Hidden files/dirs (dot-prefixed) are skipped.
+    paths relative to raw/. Arbitrary hidden files/dirs are skipped; selected
+    repository-control paths such as .github and .gitlab-ci.yml are preserved.
     Every file must end up cited by some page's sources[].resource or explicitly
     excluded; unknown binary blobs are the agent's to exclude with a reason."""
     raw = Path(workdir) / "raw"
@@ -90,10 +96,54 @@ def source_inventory(workdir: str) -> list[str]:
         if not f.is_file():
             continue
         rel = f.relative_to(raw)
-        if any(part.startswith(".") for part in rel.parts):
+        if not is_managed_source_path(rel):
             continue
         out.append(rel.as_posix())
     return sorted(out)
+
+
+_CODE_COMPONENT_CONTAINERS = {
+    "api", "apis", "charts", "cmd", "config", "controllers", "deploy",
+    "deployment", "helm", "internal", "manifests", "operator", "operators",
+    "pkg", "plugins",
+}
+def knowledge_type(workdir: str) -> str:
+    """Return the durable compile profile written by the control plane.
+
+    Missing, legacy, or malformed BRIEF records remain document libraries. This
+    fail-closed default is important during rolling upgrades: only an explicit
+    typed command may relax per-file accounting to component accounting.
+    """
+    path = Path(workdir) / "authoring" / "BRIEF.json"
+    try:
+        brief = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "document"
+    return "code" if isinstance(brief, dict) and brief.get("knowledge_type") == "code" else "document"
+
+
+def code_component(source: str) -> str:
+    """Map one raw-relative path to a stable architecture component key.
+
+    Code KBs deliberately account at module/component granularity rather than
+    pretending every generated helper and test fixture deserves a Wiki claim.
+    Familiar multi-component containers keep one child segment (``cmd/foo``,
+    ``internal/controller``); other trees use their top-level directory. Root
+    Root build/module descriptors each keep their own filename component so a
+    change to README.md cannot authorize edits to a page backed by go.mod.
+    Generated and vendored roots remain ordinary auditable components; only an
+    explicit exclusion ledger entry may remove source evidence from coverage.
+    """
+    normalized = _strip_source_prefix(posixpath.normpath(source.replace("\\", "/")).lstrip("/"))
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts:
+        return "."
+    if len(parts) == 1:
+        return parts[0]
+    root = parts[0].lower()
+    if root in _CODE_COMPONENT_CONTAINERS and len(parts) >= 3:
+        return "/".join(parts[:2])
+    return parts[0]
 
 
 def is_media_asset(rel: str) -> bool:
@@ -397,8 +447,18 @@ _SOURCE_LOCATOR_PATTERN = (
     r"(?:(?:\s*[-–]\s*|\s*,\s*)\d+)*|"
     r"lines?\s*\d+(?:\s*[-–]\s*\d+)?|第?\s*\d+\s*(?:页|行|节))"
 )
+_SPECIAL_SOURCE_NAME_PATTERN = (
+    r"(?:^|/)"
+    r"(?:"
+    + "|".join(sorted(re.escape(name) for name in TEXT_SOURCE_BASENAMES))
+    + r"|(?:"
+    + "|".join(sorted(re.escape(prefix) for prefix in TEXT_SOURCE_PREFIXES))
+    + r")(?:\.[A-Za-z0-9_.-]+)?"
+    r")"
+)
 _SOURCE_FILE_END_RE = re.compile(
-    r"\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS))
+    r"(?:\.(?:" + "|".join(sorted(e[1:] for e in KNOWN_SOURCE_EXTS))
+    + r")|" + _SPECIAL_SOURCE_NAME_PATTERN
     + r")(?:`)?(?=(?:\s*(?:[,，;；、]|$)|\s+"
     + _SOURCE_LOCATOR_PATTERN + r"\s*(?:[,，;；、]|$)))",
     re.IGNORECASE,
@@ -2121,8 +2181,56 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
         if asset in media_assets and asset not in cited and asset not in excluded
     )
     auto = {asset for asset, _ in auto_edges}
-    unaccounted = sorted(source_set - cited - excluded - auto - derived)
+    accounted = cited | excluded | auto | derived
+    unaccounted = sorted(source_set - accounted)
     dangling = sorted(cited - source_set)
+    code_fields = {}
+    if knowledge_type(workdir) == "code":
+        components: dict[str, list[str]] = {}
+        for source in sources:
+            component = code_component(source)
+            # Media remains ordinary provenance when cited, but a repository's
+            # screenshots/icons must not manufacture architecture components.
+            if is_media_asset(source):
+                continue
+            components.setdefault(component, []).append(source)
+
+        covered_components: list[str] = []
+        excluded_components: list[str] = []
+        uncovered_components: list[dict] = []
+        representatives: list[str] = []
+        for component, members in sorted(components.items()):
+            if any(member in cited for member in members):
+                covered_components.append(component)
+                continue
+            if all(member in accounted for member in members):
+                excluded_components.append(component)
+                continue
+            remaining = sorted(member for member in members if member not in accounted)
+            representative = remaining[0]
+            representatives.append(representative)
+            uncovered_components.append({
+                "component": component,
+                "representative": representative,
+                "unaccounted_files": len(remaining),
+                "total_files": len(members),
+            })
+        # The existing repair/batch machinery consumes source paths. Expose one
+        # deterministic representative per uncovered component while retaining
+        # the full component receipt for owners and tests.
+        unaccounted = representatives
+        code_fields = {
+            "profile": "code",
+            "total_components": len(components),
+            "covered_components": len(covered_components),
+            "excluded_components": len(excluded_components),
+            "unaccounted_components": uncovered_components,
+            # Kept for response-schema compatibility. Code profile v1 silently
+            # dropped generated/vendored roots here; v2 accounts every root and
+            # requires explicit EXCLUSIONS.json receipts instead.
+            "ignored_sources": 0,
+            "ignored_source_sample": [],
+        }
     return {
         "total_sources": len(sources),
         "cited": len(cited & source_set),
@@ -2145,6 +2253,7 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
         # fired on it, so a lone dangling citation sailed through settle and
         # surfaced as owner homework on the publish page.
         "closed": not unaccounted and not dangling,
+        **code_fields,
     }
 
 

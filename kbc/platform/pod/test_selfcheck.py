@@ -360,9 +360,14 @@ def test_inventory_and_exclusions():
         _mk(base, "raw/snapshot-a/one.md")
         _mk(base, "raw/snapshot-a/pic.png")            # media → ALSO ledger-accountable
         _mk(base, "raw/.hidden/x.md")                  # hidden dir → skipped
+        _mk(base, "raw/.github/workflows/ci.yml")      # repository control → counted
+        _mk(base, "raw/.gitlab-ci.yml")                # repository control → counted
         _mk(base, "raw/media/MANIFEST.tsv")            # text file in media dir → counted
         inv = selfcheck.source_inventory(td)
-        assert inv == ["media/MANIFEST.tsv", "snapshot-a/one.md", "snapshot-a/pic.png"], inv
+        assert inv == [
+            ".github/workflows/ci.yml", ".gitlab-ci.yml", "media/MANIFEST.tsv",
+            "snapshot-a/one.md", "snapshot-a/pic.png",
+        ], inv
         assert selfcheck.source_inventory(td + "/nope") == []
 
         # exclusions: missing file → none; malformed → error; glob + dir-prefix forms
@@ -424,6 +429,54 @@ def test_coverage_and_lint():
         assert "closed" in selfcheck.narration(report)  # default locale → en
         assert "闭合" in selfcheck.narration(report, "zh")
     print("OK  coverage + lint + repair prompt (unaccounted / dangling / exempt index / close / locale)")
+
+
+def test_code_profile_component_coverage():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/BRIEF.json", json.dumps({"knowledge_type": "code"}))
+        _mk(base, "raw/go.mod", "module example.invalid/operator\n")
+        _mk(base, "raw/README.md", "operator\n")
+        _mk(base, "raw/internal/controller/reconcile.go", "package controller\n")
+        _mk(base, "raw/internal/controller/status.go", "package controller\n")
+        _mk(base, "raw/internal/web/handler.go", "package web\n")
+        _mk(base, "raw/build/release.sh", "#!/bin/sh\n")
+        _mk(base, "raw/vendor/example/dependency.go", "package dependency\n")
+        pages = {
+            "overview.md": {
+                "sources": ["go.mod", "internal/controller/reconcile.go"],
+            },
+        }
+        cov = selfcheck.coverage(td, pages, [])
+        assert cov["profile"] == "code", cov
+        assert cov["total_components"] == 6, cov
+        assert cov["covered_components"] == 2, cov
+        assert cov["ignored_sources"] == 0, cov
+        assert cov["unaccounted"] == [
+            "README.md", "build/release.sh", "internal/web/handler.go",
+            "vendor/example/dependency.go",
+        ], cov
+        assert [item["component"] for item in cov["unaccounted_components"]] == [
+            "README.md", "build", "internal/web", "vendor",
+        ], cov
+        assert not cov["closed"]
+
+        pages["remaining.md"] = {"sources": [
+            "README.md", "build/release.sh", "internal/web/handler.go",
+            "vendor/example/dependency.go",
+        ]}
+        cov = selfcheck.coverage(td, pages, [])
+        assert cov["closed"] and cov["unaccounted"] == [], cov
+
+    # No explicit code brief means the existing per-file document contract.
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "raw/internal/controller/a.go", "package controller\n")
+        _mk(base, "raw/internal/controller/b.go", "package controller\n")
+        cov = selfcheck.coverage(td, {"p.md": {"sources": ["internal/controller/a.go"]}}, [])
+        assert "profile" not in cov, cov
+        assert cov["unaccounted"] == ["internal/controller/b.go"], cov
+    print("OK  code profile accounts by component; document profile stays per-file")
 
 
 def test_candidate_credential_lint():
@@ -605,6 +658,33 @@ def test_body_source_annotations():
         assert any(v["kind"] == "body_source_malformed"
                    for v in report["lint"]["violations"]), report["lint"]
     print("OK  body source annotations (spaces / combined / locator / unknown / missing extension)")
+
+
+def test_code_body_source_annotations_are_first_class_provenance():
+    """Code evidence must be cited, not hidden to satisfy a document-only lint."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        sources = ["src/gateway/prom.ts", "Dockerfile.agentbox", "Makefile"]
+        for source in sources:
+            _mk(base, f"raw/{source}", "source evidence\n")
+        _mk(base, "candidate/index.md",
+            "---\nokf_version: \"0.2\"\n---\n# Index\n- [Architecture](architecture.md)")
+        _mk(base, "candidate/architecture.md",
+            "---\ntype: Architecture\ntitle: Architecture\nsources:\n"
+            + "".join(f"  - resource: {source}\n" for source in sources)
+            + "---\n"
+            "Gateway aggregation is implemented in the TypeScript entrypoint "
+            "(source: src/gateway/prom.ts lines 10-20).\n"
+            "The runtime image is built separately (source: Dockerfile.agentbox).\n"
+            "Build orchestration is defined in Make (source: Makefile).\n")
+        report = selfcheck.run_layer1(td)
+        malformed = [v for v in report["lint"]["violations"]
+                     if v["kind"] == "body_source_malformed"]
+        uncited = [v for v in report["lint"]["violations"]
+                   if v["kind"] == "body_source_uncited"]
+        assert malformed == [] and uncited == [], report["lint"]
+        assert report["coverage"]["closed"], report["coverage"]
+    print("OK  code body citations: source files, Dockerfile variants, and Makefile")
 
 
 def test_deterministic_body_source_normalization():
@@ -2180,6 +2260,9 @@ def test_is_media_asset():
         assert selfcheck.is_media_asset(p), p
     for p in no:
         assert not selfcheck.is_media_asset(p), p
+    assert ".tiff" in selfcheck.MEDIA_ASSET_EXTS
+    assert ".tiff" in selfcheck.MEDIA_SOURCE_EXTS
+    assert ".tiff" not in selfcheck.IMAGE_SOURCE_EXTS
     print("OK  is_media_asset (assets/ + *.assets, case-insensitive seg + image ext; sheet/.json/.pdf excluded)")
 
 
@@ -2431,6 +2514,7 @@ def main():
     test_matches_segment_aware()
     test_noop_exclusion_warning()
     test_coverage_and_lint()
+    test_code_profile_component_coverage()
     test_candidate_credential_lint()
     test_media_ledger_and_new_lint()
     test_is_media_asset()
@@ -2439,6 +2523,7 @@ def main():
     test_media_citing_pages_via_attribution_edge()
     test_asset_provenance_fixture()
     test_body_source_annotations()
+    test_code_body_source_annotations_are_first_class_provenance()
     test_deterministic_body_source_normalization()
     test_spaced_markdown_links()
     test_media_verify_helpers()

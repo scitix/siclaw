@@ -35,6 +35,12 @@ from typing import Any
 # source in two forms — a disagreement is how a family gets split across batches
 # while the ledger insists it is whole.
 from selfcheck import office_render_pairs
+from source_kinds import (
+    IMAGE_SOURCE_EXTS,
+    TEXT_SOURCE_EXTS,
+    is_managed_source_path,
+    is_text_source_path,
+)
 
 # ── how much source text one session may hold ────────────────────────────────
 # ONE number, on every route. The gate that decides a corpus needs batching at
@@ -74,8 +80,8 @@ DEFAULT_REDUCTION_BUDGET_BYTES = 1024 * 1024
 # text corpus with 6MB of screenshots into 28 batches — 26 of them one image
 # each. All knobs env-tunable; everything downstream (threshold, budget,
 # oversized-solo) uses the EFFECTIVE size.
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
-TEXT_EXTS = {".md", ".txt", ".tsv", ".csv", ".json", ".jsonl", ".yaml", ".yml", ".xml", ".html", ".rst"}
+IMAGE_EXTS = IMAGE_SOURCE_EXTS
+TEXT_EXTS = TEXT_SOURCE_EXTS
 
 
 def _image_cost() -> int:
@@ -130,7 +136,7 @@ def _text_slices(path: Path, size: int) -> tuple[int, list[dict[str, int]]] | No
     whole file, which is a context blow-out rather than a slow compile. No such
     source exists at that size in the corpora seen so far, so this closes a
     latent hole rather than a live one."""
-    if path.suffix.lower() not in TEXT_EXTS or size <= hierarchical_text_budget_bytes():
+    if not is_text_source_path(path) or size <= hierarchical_text_budget_bytes():
         return None
     lines = path.read_bytes().splitlines(keepends=True)
     if not lines:
@@ -245,7 +251,7 @@ def _pdf_marker_page_count(path: Path) -> int | None:
 def effective_bytes(path: Path, size: int) -> int:
     """Context-cost estimate for one source (see module docstring)."""
     ext = path.suffix.lower()
-    if ext in TEXT_EXTS:
+    if is_text_source_path(path):
         return size
     if ext in IMAGE_EXTS:
         return _image_cost()
@@ -310,7 +316,7 @@ def scan_sources(
             p.resolve().relative_to(root)
         except (OSError, ValueError):
             continue  # escapes raw/ via a linked parent — not ours to inventory
-        if any(part.startswith(".") for part in p.relative_to(raw_dir).parts):
+        if not is_managed_source_path(p.relative_to(raw_dir)):
             continue
         size = p.stat().st_size
         if size == 0:
@@ -358,7 +364,7 @@ def _hierarchical_eff(item: dict[str, Any]) -> int:
 
 
 def _text_eff(item: dict[str, Any]) -> int:
-    return int(item["bytes"]) if Path(str(item["path"])).suffix.lower() in TEXT_EXTS else 0
+    return int(item["bytes"]) if is_text_source_path(str(item["path"])) else 0
 
 
 def corpus_effective_bytes(inventory: list[dict[str, Any]]) -> int:

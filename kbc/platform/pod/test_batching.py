@@ -154,9 +154,19 @@ def test_a_section_placeholder_never_costs_its_own_session(tmp_path):
 
 
 def test_scan_skips_hidden_and_empty(tmp_path):
-    raw = _mk(tmp_path, {"a.md": 10, ".hidden/b.md": 10, "c/.dot.md": 10, "empty.md": 0})
+    raw = _mk(tmp_path, {
+        "a.md": 10,
+        ".hidden/b.md": 10,
+        "c/.dot.md": 10,
+        "empty.md": 0,
+        ".gitlab-ci.yml": 20,
+        ".github/workflows/test.yml": 30,
+        ".github/.cache.md": 40,
+    })
     inv = bt.scan_sources(raw)
-    assert [i["path"] for i in inv] == ["a.md"]
+    assert [i["path"] for i in inv] == [
+        ".github/workflows/test.yml", ".gitlab-ci.yml", "a.md",
+    ]
 
 
 def test_threshold_gate_small_kb_never_batches(tmp_path):
@@ -633,6 +643,22 @@ def test_effective_weights_images_pdf_binary(tmp_path: Path):
     print("effective:", {k: v["effective"] for k, v in inv.items()})
 
 
+def test_code_and_build_sources_are_budgeted_as_text(tmp_path: Path):
+    raw = _mk(tmp_path, {
+        "src/controller.ts": 100_000,
+        "Dockerfile.agentbox": 80_000,
+        "Makefile": 60_000,
+    })
+    inv = {item["path"]: item for item in bt.scan_sources(raw)}
+    for path in ("src/controller.ts", "Dockerfile.agentbox", "Makefile"):
+        assert inv[path]["effective"] == (raw / path).stat().st_size, inv[path]
+
+    body = "".join(f"export const row{i} = {i};\n" for i in range(80_000))
+    (raw / "src" / "large.ts").write_text(body, encoding="utf-8")
+    large = {item["path"]: item for item in bt.scan_sources(raw)}["src/large.ts"]
+    assert len(large.get("text_slices") or []) > 1, large
+
+
 def test_pack_uses_effective_not_raw_bytes(tmp_path: Path):
     # 10 images x 170KB raw = 1.7MB raw. Packed by RAW bytes that is ten solo
     # batches; packed by the vision-token estimate it is 10 x _image_cost(),
@@ -909,6 +935,7 @@ def main():
         test_normalize_model_plan_and_progress,
         test_section_reductions_group_only_unambiguous_multi_page_sections,
         test_effective_weights_images_pdf_binary,
+        test_code_and_build_sources_are_budgeted_as_text,
         test_pack_uses_effective_not_raw_bytes,
         test_shared_assets_dir_keeps_document_and_attachments_together,
         test_validate_plan_rejects_attachment_split_from_its_document,

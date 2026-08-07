@@ -21,6 +21,7 @@ from pathlib import Path
 from aiohttp.test_utils import TestClient, TestServer
 
 import compile_box
+import source_inspector
 import source_snapshot
 
 
@@ -585,7 +586,7 @@ async def test_test_path_escape_guard():
         }, "p3", None)
         assert allow == {}, allow
 
-        # A NON-consulting batch scope (Codex's copy sandbox) stays mechanically
+        # A NON-consulting structural scope stays mechanically
         # confined to the validated Raw list. A text-slice batch omits the
         # original Markdown and may read only its helper; a regular/PDF source
         # remains directly readable. Directory or cwd-wide Grep cannot bypass
@@ -2421,6 +2422,8 @@ async def test_prompt_packs_locale():
     zh = sorted(q.name for q in (compile_box._PROMPTS_DIR / "zh").iterdir())
     assert en == zh and "box_role.md" in en, (en, zh)
     assert compile_box._prompt("box_role", "no-such-locale") == compile_box._prompt("box_role", "en")
+    zh_box_role = compile_box._prompt("box_role", "zh")
+    en_box_role = compile_box._prompt("box_role", "en")
     assert "只读的知识消费者" in compile_box._prompt("test_role", "zh")
     assert "read-only knowledge consumer" in compile_box._prompt("test_role", "en")
     # Answer discipline (clean-answer contract): conclusion-first, no process
@@ -2437,6 +2440,21 @@ async def test_prompt_packs_locale():
     assert "全部合理候选页之后" in zh_role, zh_role
     assert "only after checking the index and every plausible page" in en_role, en_role
     assert "没有检索工具" not in zh_role and "there is no search tool" not in en_role
+
+    # The code profile is a reusable source-understanding kernel, not a hidden
+    # Kubernetes/runbook template. Architecture/component understanding is the
+    # stable goal; operational lenses are conditional on evidence or the owner
+    # brief. The generic document rule must not reintroduce file-shaped pages.
+    assert "可追溯的系统理解模型" in zh_box_role, zh_box_role
+    assert "traceable system-understanding model" in en_box_role, en_box_role
+    assert "有源码证据或 brief 明确要求时才展开" in zh_box_role, zh_box_role
+    assert "only when source evidence supports them or the brief asks for them" in en_box_role, en_box_role
+    assert "不要为了凑模板" in zh_box_role, zh_box_role
+    assert "Do not invent empty sections to satisfy a template" in en_box_role, en_box_role
+    assert "代码 profile 按架构概念和组件组织页面" in zh_box_role, zh_box_role
+    assert "the code profile organizes pages around architectural concepts and components" in en_box_role, en_box_role
+    assert "**一页一个文件" not in zh_box_role, zh_box_role
+    assert "**One page per file" not in en_box_role, en_box_role
 
     # A regression round's consumer identity is deterministic and changes only
     # with answer-affecting contract inputs. Tool order is not semantic.
@@ -2511,6 +2529,142 @@ def test_default_allowlist_covers_every_compile_tool():
     )
     assert not stale, f"allowlist references unregistered compile tools: {stale}"
     print("✓ default allowlist covers every registered compile tool (no permission dead end)")
+
+
+async def test_source_inspector_is_engine_neutral_bounded_and_complete():
+    """Every compiler engine gets the same full-corpus fact-finding surface.
+
+    Batch assignment limits what the session must compile, not what it may
+    consult. Mechanically sliced originals remain discoverable but unreadable,
+    so visibility never bypasses the context-safety boundary.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "raw" / "assigned").mkdir(parents=True)
+        (root / "raw" / "other").mkdir(parents=True)
+        (root / "raw" / "bounded").mkdir(parents=True)
+        (root / "raw" / "src" / "deep").mkdir(parents=True)
+        (root / "raw" / ".github" / "workflows").mkdir(parents=True)
+        (root / "raw" / "assigned" / "app.ts").write_text(
+            "export const app = true;\n", encoding="utf-8")
+        (root / "raw" / "other" / "peer.go").write_text(
+            "package peer\nfunc PeerService() {}\n", encoding="utf-8")
+        (root / "raw" / "bounded" / "huge.py").write_text(
+            "LOAD_BEARING_SECRET = True\n", encoding="utf-8")
+        (root / "raw" / "Dockerfile.agentbox").write_text(
+            "FROM python:3.12\n", encoding="utf-8")
+        (root / "raw" / ".github" / "workflows" / "release.yml").write_text(
+            "name: release\n", encoding="utf-8")
+        (root / "raw" / "src" / "top.py").write_text(
+            "TOP_LEVEL = True\n", encoding="utf-8")
+        (root / "raw" / "src" / "deep" / "nested.py").write_text(
+            "NESTED = True\n", encoding="utf-8")
+        (root / "raw" / "src" / "long.py").write_text(
+            "x" * (source_inspector.MAX_READ_CHARS + 100) + "\nsecond\n",
+            encoding="utf-8")
+        (root / "raw" / "diagram.png").write_bytes(b"not-text")
+        (root / "raw" / ".env").write_text(
+            "AWS_SECRET_ACCESS_KEY=must-not-be-readable\n", encoding="utf-8")
+        (root / "raw" / ".git").mkdir()
+        (root / "raw" / ".git" / "config").write_text(
+            "url = https://token@example.invalid/repo.git\n", encoding="utf-8")
+        (root / "raw" / "alias.py").symlink_to("bounded/huge.py")
+        run = compile_box.CompileRun("source-inspector", td, 1)
+        scope = {
+            "account": ["assigned/app.ts"],
+            "deny_read": ["bounded/huge.py"],
+            "consult": True,
+        }
+        tools = {t.name: t for t in compile_box._compile_engine_tools(run, scope)}
+        assert {"source_inventory", "source_read", "source_search"} <= tools.keys()
+
+        inventory = json.loads(await tools["source_inventory"].handler({}))
+        rows = {row["path"]: row for row in inventory["sources"]}
+        assert rows["raw/other/peer.go"]["availability"] == "readable", rows
+        assert rows["raw/bounded/huge.py"]["availability"] == "bounded_view_only", rows
+        assert rows["raw/Dockerfile.agentbox"]["kind"] == "text", rows
+        assert rows["raw/.github/workflows/release.yml"]["kind"] == "text", rows
+
+        root_glob = json.loads(await tools["source_inventory"].handler({
+            "pattern": "**/Dockerfile*",
+        }))
+        assert [row["path"] for row in root_glob["sources"]] == [
+            "raw/Dockerfile.agentbox"
+        ], root_glob
+        one_level = json.loads(await tools["source_inventory"].handler({
+            "pattern": "src/*.py",
+        }))
+        assert [row["path"] for row in one_level["sources"]] == [
+            "raw/src/long.py", "raw/src/top.py",
+        ], one_level
+        recursive = json.loads(await tools["source_inventory"].handler({
+            "pattern": "src/**/*.py",
+        }))
+        assert [row["path"] for row in recursive["sources"]] == [
+            "raw/src/deep/nested.py", "raw/src/long.py", "raw/src/top.py",
+        ], recursive
+        searched = json.loads(await tools["source_search"].handler({
+            "query": "PeerService", "pattern": "**/*.go",
+        }))
+        assert searched["matches"][0]["path"] == "raw/other/peer.go", searched
+        read = json.loads(await tools["source_read"].handler({
+            "path": "other/peer.go", "offset": 2, "limit": 1,
+        }))
+        assert "PeerService" in read["content"] and read["lines"] == 1, read
+        long_read = json.loads(await tools["source_read"].handler({
+            "path": "src/long.py", "limit": 1,
+        }))
+        assert len(long_read["content"]) == source_inspector.MAX_READ_CHARS, long_read
+        assert long_read["lines"] == 1 and long_read["truncated"] is True, long_read
+
+        media_search = json.loads(await tools["source_search"].handler({
+            "query": "not-text", "pattern": "**/*.png",
+        }))
+        assert media_search["matches"] == [] and media_search["skipped_non_text"] == 1, media_search
+
+        old_search_files = source_inspector.MAX_SEARCH_FILES
+        source_inspector.MAX_SEARCH_FILES = 1
+        try:
+            bounded_search = json.loads(await tools["source_search"].handler({
+                "query": "definitely-absent",
+            }))
+            assert bounded_search["budget_exhausted"] is True, bounded_search
+            assert bounded_search["truncated"] is True, bounded_search
+            assert bounded_search["scanned_files"] == 1, bounded_search
+        finally:
+            source_inspector.MAX_SEARCH_FILES = old_search_files
+
+        for name, args in (
+            ("source_read", {"path": "bounded/huge.py"}),
+            ("source_search", {"query": "LOAD_BEARING_SECRET"}),
+        ):
+            try:
+                result = await tools[name].handler(args)
+            except ValueError:
+                continue
+            if name == "source_search":
+                assert json.loads(result)["matches"] == [], result
+                continue
+            raise AssertionError(f"{name} bypassed the bounded-source guard")
+
+        for hidden in (".env", ".git/config"):
+            try:
+                await tools["source_read"].handler({"path": hidden})
+                raise AssertionError(f"source_read exposed unmanaged path {hidden}")
+            except ValueError:
+                pass
+        try:
+            await tools["source_read"].handler({"path": "alias.py"})
+            raise AssertionError("source_read followed a symbolic-link alias")
+        except ValueError:
+            pass
+
+        structural = {
+            t.name for t in compile_box._compile_engine_tools(
+                run, compile_box.NO_RAW_SCOPE)
+        }
+        assert not ({"source_inventory", "source_read", "source_search"} & structural)
+    print("✓ Source Inspector: engine-neutral full Raw consultation with bounded-source guards")
 
 
 async def test_a_session_records_what_it_actually_spent():
@@ -4634,9 +4788,24 @@ def test_hierarchical_text_slice_materialization_and_directive():
         # batch that must read those pages.
         assert scope["deny_read"] == ["gpu/spec.md"], scope
         assert scope["consult"] is True
+        previous_engine = os.environ.get("KBC_ENGINE")
+        os.environ["KBC_ENGINE"] = "codex_sdk"
+        try:
+            assert compile_box._batch_raw_scope(paged, bounded)["consult"] is True
+        finally:
+            if previous_engine is None:
+                os.environ.pop("KBC_ENGINE", None)
+            else:
+                os.environ["KBC_ENGINE"] = previous_engine
         # A batch with no assigned range for that PDF may not pull it in whole.
         other = compile_box._batch_raw_scope({"sources": ["gpu/other.md"]}, bounded)
         assert other["deny_read"] == ["gpu/manual.pdf", "gpu/spec.md"], other
+        final = compile_box.semantic_review_raw_scope(plan)
+        assert final == {
+            "account": [],
+            "deny_read": ["gpu/manual.pdf", "gpu/spec.md"],
+            "consult": True,
+        }, final
     print("\u2713 hierarchical text slices: bounded helper with original-Raw provenance")
 
 
@@ -4934,13 +5103,13 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             run = compile_box.CompileRun("hier-run", str(wd), 1)
             driven: list[str] = []
             observed_idle_timeouts: list[float | None] = []
-            observed_raw_scopes: list[tuple[str, list[str] | None]] = []
+            observed_raw_scopes: list[tuple[str, dict]] = []
 
             async def fake_drive(run_, directive, label, pdf_page_ranges=None,
                                  raw_scope=None):
                 driven.append(label + "|" + directive.splitlines()[0])
                 observed_idle_timeouts.append(run_._model_idle_timeout_s)
-                observed_raw_scopes.append((label, (raw_scope or {}).get("account")))
+                observed_raw_scopes.append((label, dict(raw_scope or {})))
                 if label.startswith("batch ") or label.startswith("批 "):
                     candidate = wd / "candidate"
                     candidate.mkdir(exist_ok=True)
@@ -4964,16 +5133,20 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             assert sum(item.startswith("section reduce ") for item in driven) == 1, driven
             assert driven[-1].startswith("final review"), driven
             assert observed_raw_scopes[:2] == [
-                ("batch 1/2", ["gpu/a.md"]),
-                ("batch 2/2", ["gpu/b.md"]),
+                ("batch 1/2", {"account": ["gpu/a.md"], "deny_read": [], "consult": True}),
+                ("batch 2/2", {"account": ["gpu/b.md"], "deny_read": [], "consult": True}),
             ], observed_raw_scopes
-            assert all(allowed == [] for label, allowed in observed_raw_scopes[2:]
-                       if label.startswith(("section reduce ", "final review"))), observed_raw_scopes
+            reduce_scopes = [scope for label, scope in observed_raw_scopes
+                             if label.startswith("section reduce ")]
+            final_scopes = [scope for label, scope in observed_raw_scopes
+                            if label.startswith("final review")]
+            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            assert reduce_scopes == [compile_box.NO_RAW_SCOPE], observed_raw_scopes
+            assert final_scopes == [compile_box.semantic_review_raw_scope(saved)], observed_raw_scopes
             assert set(observed_idle_timeouts) == {
                 max(compile_box._MODEL_IDLE_TIMEOUT_S, 123)
             }, observed_idle_timeouts
             assert run._model_idle_timeout_s is None, run._model_idle_timeout_s
-            saved = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
             assert saved["phase"] == "complete", saved
             assert all(r["status"] == "done" for r in saved["reductions"]), saved
 
@@ -5079,7 +5252,8 @@ async def test_hierarchical_media_rechecks_after_ledger_repair():
                                  raw_scope=None):
                 order.append(f"drive:{label}")
                 if label == "final review":
-                    assert "do not read raw/" in directive, directive
+                    assert "source_inventory/source_search/source_read" in directive, directive
+                    assert raw_scope == compile_box.semantic_review_raw_scope(plan), raw_scope
                 if label in {"image verification", "图像复核"}:
                     page.write_text(page.read_text() + "media-repair\n")
                 return f"done {label}"
@@ -6327,6 +6501,7 @@ async def test_typed_authoring_commands():
                     "operation_id": f"op-{locale}",
                     "generation": 1,
                     "parameters": {"brief": {
+                        "knowledge_type": "code",
                         "intent": "troubleshoot",
                         "audience": "internal-eng",
                         "depth": "full",
@@ -6345,6 +6520,7 @@ async def test_typed_authoring_commands():
             assert brief == {
                 "schema_version": 1,
                 "source": "authoring_command",
+                "knowledge_type": "code",
                 "intent": "troubleshoot",
                 "audience": "internal-eng",
                 "depth": "full",
@@ -6361,6 +6537,11 @@ async def test_typed_authoring_commands():
             invalid_intent["command"]["parameters"]["brief"]["intent"] = "请帮我排障"
             run._turn_active = False
             r = await client.post(f"/command/{run_id}", json=invalid_intent)
+            assert r.status == 400 and len(run.client.queries) == 1, await r.text()
+            invalid_type = json.loads(json.dumps(body))
+            invalid_type["command_id"] = f"bad-type-{locale}"
+            invalid_type["command"]["parameters"]["brief"]["knowledge_type"] = "repository"
+            r = await client.post(f"/command/{run_id}", json=invalid_type)
             assert r.status == 400 and len(run.client.queries) == 1, await r.text()
             # An idempotency key binds one normalized payload; it cannot be
             # reinterpreted as a different action or generation.
@@ -6534,6 +6715,7 @@ async def main():
     await test_batch_planner_uses_compile_path_guard()
     await test_prompt_packs_locale()
     test_default_allowlist_covers_every_compile_tool()
+    await test_source_inspector_is_engine_neutral_bounded_and_complete()
     await test_a_session_records_what_it_actually_spent()
     test_compile_session_denies_subagents()
     test_compile_surface_excludes_auto_question_proposals()

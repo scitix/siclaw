@@ -22,7 +22,7 @@ import os
 import posixpath
 from pathlib import Path
 
-from selfcheck import _is_en, candidate_pages
+from selfcheck import _is_en, candidate_pages, code_component, knowledge_type
 
 # 消费方 → box(管控面把机器算的变更交给执行面):变更源集 + 每个 modified 的 unified
 # diff + 基线/快照指纹。box 读它、富集 affected_pages,再落下面的 CHANGESET(给模型)。
@@ -91,12 +91,92 @@ def _changed_managed_sources(changed_sources: dict) -> set[str]:
     }
 
 
+def _page_indexes(
+    pages: dict[str, dict], *, code_profile: bool,
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Build dependency and component reverse indexes once per operation."""
+    source_pages: dict[str, set[str]] = {}
+    component_pages: dict[str, set[str]] = {}
+    for rel, page in pages.items():
+        if rel == INDEX_PAGE or "error" in page:
+            continue
+        normalized_sources = {
+            _norm_source(source)
+            for source in page.get("sources", [])
+            if isinstance(source, str) and source
+        }
+        for source in normalized_sources:
+            source_pages.setdefault(source, set()).add(rel)
+            if code_profile:
+                component_pages.setdefault(code_component(source), set()).add(rel)
+    return source_pages, component_pages
+
+
+def _pages_for_sources(
+    workdir: str,
+    pages: dict[str, dict],
+    sources: set[str],
+    *,
+    code_profile: bool | None = None,
+    source_pages: dict[str, set[str]] | None = None,
+    component_pages: dict[str, set[str]] | None = None,
+) -> set[str]:
+    """Resolve exact dependency edges, widened to the component for code KBs.
+
+    Architecture pages intentionally cite representative evidence rather than
+    every source file. A changed sibling in the same component must therefore
+    re-open pages that cite any member of that component; document KBs retain
+    byte-for-byte exact-path behavior.
+    """
+    normalized_sources = {_norm_source(source) for source in sources}
+    if source_pages is None:
+        exact = _pages_citing(pages, normalized_sources)
+    else:
+        exact = {
+            page
+            for source in normalized_sources
+            for page in source_pages.get(source, set())
+        }
+    if code_profile is None:
+        code_profile = knowledge_type(workdir) == "code"
+    if not code_profile or not normalized_sources:
+        return exact
+    changed_components = {code_component(source) for source in normalized_sources}
+    if component_pages is not None:
+        return exact | {
+            page
+            for component in changed_components
+            for page in component_pages.get(component, set())
+        }
+    hit = set(exact)
+    for rel, page in pages.items():
+        if rel == INDEX_PAGE or "error" in page:
+            continue
+        page_components = {code_component(_norm_source(source)) for source in page.get("sources", [])}
+        if page_components & changed_components:
+            hit.add(rel)
+    return hit
+
+
 def _resolve_affected_pages(
-    pages: dict[str, dict], changed_sources: dict,
+    workdir: str,
+    pages: dict[str, dict],
+    changed_sources: dict,
+    *,
+    code_profile: bool | None = None,
+    source_pages: dict[str, set[str]] | None = None,
+    component_pages: dict[str, set[str]] | None = None,
 ) -> tuple[list[str], list[str]]:
     all_pages = {rel for rel in pages if rel != INDEX_PAGE and "error" not in pages[rel]}
     touched = _changed_managed_sources(changed_sources)
-    affected = _pages_citing(pages, touched)
+    affected = _pages_for_sources(
+        workdir,
+        pages,
+        touched,
+        code_profile=code_profile,
+        source_pages=source_pages,
+        component_pages=component_pages,
+    )
     return sorted(affected), sorted(all_pages - affected)
 
 
@@ -111,7 +191,16 @@ def resolve_affected_pages(workdir: str, changed_sources: dict) -> tuple[list[st
     """
     touched = _changed_managed_sources(changed_sources)
     pages = candidate_pages(workdir, additional_managed_sources=touched)
-    return _resolve_affected_pages(pages, changed_sources)
+    code_profile = knowledge_type(workdir) == "code"
+    source_pages, component_pages = _page_indexes(pages, code_profile=code_profile)
+    return _resolve_affected_pages(
+        workdir,
+        pages,
+        changed_sources,
+        code_profile=code_profile,
+        source_pages=source_pages,
+        component_pages=component_pages,
+    )
 
 
 # ── 拼 CHANGESET(模型只消费,affected_pages 代码反查而非模型报)────────────────
@@ -151,17 +240,37 @@ def build_changeset(
     added = list(changed_sources.get("added", []))
     modified = list(changed_sources.get("modified", []))
     deleted = list(changed_sources.get("deleted", []))
-    affected, unaffected = _resolve_affected_pages(pages, changed_sources)
+    code_profile = knowledge_type(workdir) == "code"
+    source_pages, component_pages = _page_indexes(pages, code_profile=code_profile)
+    affected, unaffected = _resolve_affected_pages(
+        workdir,
+        pages,
+        changed_sources,
+        code_profile=code_profile,
+        source_pages=source_pages,
+        component_pages=component_pages,
+    )
 
     def pages_for(src: str) -> list[str]:
-        return sorted(_pages_citing(pages, {src}))
+        return sorted(_pages_for_sources(
+            workdir,
+            pages,
+            {src},
+            code_profile=code_profile,
+            source_pages=source_pages,
+            component_pages=component_pages,
+        ))
 
     changeset = {
         "version": 1,
         "baseline_fingerprint": baseline_fingerprint,   # 上次收敛的整区指纹(审计)
         "snapshot_fingerprint": snapshot_fingerprint,   # 本轮快照的整区指纹
         # 全新料:没有归属页,模型按 target_hint 级联编入相关页或建新页;coverage 护栏兜底。
-        "added": [{"path": p, "content_ref": p, "target_hint": ""} for p in added],
+        "added": [{
+            "path": p,
+            "content_ref": p,
+            "target_hint": code_component(p) if code_profile else "",
+        } for p in added],
         # 改动料:给受影响页 + 统一 diff(+/−),模型只改动到的那几处,不重写整页。
         "modified": [{"path": p, "affected_pages": pages_for(p), "diff": ""} for p in modified],
         # 删除料:从受影响页移除其内容/引用;页空则删页(index_touched)。
