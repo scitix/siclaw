@@ -393,9 +393,10 @@ export async function getPersonalApiKeyStatus(
 /**
  * Result of `/webchat` — a one-shot link to a browser chat window for the personal bot's agent.
  *
- * `actionUrl` is short-lived and single-use, and unlike the API-key pickup it yields no
- * credential at all: redeeming it creates a chat session owned by whoever is signed in, and the
- * resulting page URL is authorized per request rather than by bearing a secret.
+ * `actionUrl` is short-lived and single-use. What redeeming it actually grants is defined ONCE, in
+ * `docs/design/2026-08-06-feishu-webchat-command.md` ("What the link confers") — the Runtime treats
+ * it as bearer authority over a chat session because it cannot verify otherwise. Do not restate the
+ * semantics here: three comments asserting three different answers is what that section replaced.
  */
 export interface PersonalWebChatLinkResult {
   success: boolean;

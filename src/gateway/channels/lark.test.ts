@@ -4099,19 +4099,38 @@ describe("handleLarkMessage — /apikey", () => {
     expect(posted.data.content).not.toContain(PICKUP);
   });
 
-  it("rejects a success pickup URL that is not absolute http(s)", async () => {
+  it("rejects a success pickup URL that is not absolute http(s), and still warns the key rotated", async () => {
     for (const pickupUrl of ["/siclaw/api-key/pickup/token", "lark://open", "javascript:alert(1)"]) {
       issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl, rotated: true });
       const lark = makeLarkClient();
 
       await sendPersonal("/apikey", lark);
 
-      expect(replyText(lark), pickupUrl).toContain("暂时无法处理 API Key 请求");
-      expect(replyText(lark), pickupUrl).not.toContain(pickupUrl);
+      const reply = replyText(lark);
+      expect(reply, pickupUrl).toContain("领取链接无效");
+      expect(reply, pickupUrl).not.toContain(pickupUrl);
+      // The rotation COMMITTED before we could reply. Reusing the "service unavailable" notice
+      // here — the same string the no-frontend-client path sends — told a user whose key had just
+      // been destroyed that nothing had happened.
+      expect(reply, pickupUrl).toContain("旧 API Key 已失效");
+      expect(reply, pickupUrl).not.toContain("暂时无法处理 API Key 请求");
     }
   });
 
-  it("withholds an expired pickup link and tells the sender to rerun /apikey", async () => {
+  it("does NOT claim a rotation when the frontend did not report one", async () => {
+    // Mirror of the case above: warning a first-time requester that their "previous key" died
+    // sends them hunting for a break that never happened.
+    issuePersonalApiKeyMock.mockResolvedValue({ success: true, pickupUrl: "lark://open" });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("领取链接无效");
+    expect(reply).not.toContain("旧 API Key 已失效");
+  });
+
+  it("withholds an expired pickup link, tells the sender to rerun /apikey, and warns it rotated", async () => {
     issuePersonalApiKeyMock.mockResolvedValue({
       success: true, pickupUrl: PICKUP, expiresAt: Date.now() - 1, rotated: true,
     });
@@ -4123,6 +4142,23 @@ describe("handleLarkMessage — /apikey", () => {
     expect(reply).toContain("重新发送 /apikey");
     expect(reply).not.toContain("已就绪");
     expect(reply).not.toContain(PICKUP);
+    // The expired short-circuit replaces the card body wholesale, and the body is the only other
+    // place the rotation was stated — so dropping it here left "a link expired" as the whole
+    // explanation for a dead credential.
+    expect(reply).toContain("旧 API Key 已失效");
+  });
+
+  it("does NOT claim a rotation on an expired link the frontend never rotated for", async () => {
+    issuePersonalApiKeyMock.mockResolvedValue({
+      success: true, pickupUrl: PICKUP, expiresAt: Date.now() - 1,
+    });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("重新发送 /apikey");
+    expect(reply).not.toContain("旧 API Key 已失效");
   });
 
   it("escalates when a committed rotation's card AND its text fallback both fail", async () => {
@@ -4332,6 +4368,34 @@ describe("handleLarkMessage — /apikey", () => {
     expect(reply).toContain("sk-a1b2c3d4");
     expect(reply).toContain("2025-07-27 16:44"); // last used
     expect(reply).toContain("2025-08-26");       // sliding expiry (date only)
+  });
+
+  it("/apikey status caps an oversized upstream error instead of going silent", async () => {
+    // Same untrusted field and same failure mode as the issue path: an unbounded `error` makes the
+    // reply exceed the Feishu limit, `replyToLark` swallows the non-zero code, and the sender who
+    // was promised an answer gets nothing.
+    getPersonalApiKeyStatusMock.mockResolvedValue({ success: false, error: "x".repeat(5_000) });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey status", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("查询 API Key 状态失败");
+    expect(reply).toContain("x".repeat(1_000));
+    expect(reply).not.toContain("x".repeat(1_001));
+    expect(reply).toContain("…");
+  });
+
+  it("/apikey status renders a non-string upstream error as the unknown-error fallback", async () => {
+    // A bare `??` let a structured value through and interpolated it as "[object Object]".
+    getPersonalApiKeyStatusMock.mockResolvedValue({ success: false, error: { code: 500 } });
+    const lark = makeLarkClient();
+
+    await sendPersonal("/apikey status", lark);
+
+    const reply = replyText(lark);
+    expect(reply).toContain("未知错误");
+    expect(reply).not.toContain("[object Object]");
   });
 
   it("/apikey status tells a first-time user how to get one", async () => {

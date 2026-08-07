@@ -121,18 +121,36 @@ an `open_url` button or text fallback. If its derived `expiresAt` is already pas
 boundary, the URL is withheld and the reply tells the sender to rerun `/apikey`; an ordinary chat
 message does not mint a replacement.
 
-### `rotated` must be surfaced
+### `rotated` must be surfaced — on every exit, not just the successful one
 
 When the frontend reports `rotated: true`, the reply must state that the previous key is now
 invalid. Any MCP client configured with it breaks instantly, and an unexplained break gets
 filed as a bug.
+
+This holds on the paths that *fail*, and those are the ones that need saying out loud, because
+both of them discard the normal success body: an unrenderable pickup URL, and a link already
+expired at the send boundary. The rotation committed frontend-side before either was detected, so
+a notice that speaks only of a link — or worse, one that reads as "the service is busy" — leaves
+the sender with a dead credential and no explanation for the 401s that follow. Both compose their
+notice through the rotation warning at the call site; the shared link deliverer stays
+rotation-unaware, since only the caller knows what committed behind the failure.
+
+For the same reason, the unrenderable-URL case has its own notice rather than reusing the
+"service unavailable" string that the missing-frontend-client path sends. There, no RPC ran and
+nothing changed; here, the key is already gone. One string cannot mean both.
+
+The mirror-image error is equally real: a requester with no previous key must not be told one
+died. The warning is conditioned on `rotated`, and both cases are worth a test.
 
 ### Failure is spoken, not swallowed
 
 `error` from the frontend is user-facing wording and is surfaced inside a localized frame after
 the same prose-length cap used for `denied.message` (do not rewrite it into a generic "operation
 failed" — the reason is the useful part). Without the cap, an upstream stack trace can exceed the
-Feishu message limit and turn the promised error reply into silence. An RPC that *throws* — or a
+Feishu message limit and turn the promised error reply into silence. The cap applies to *every*
+path carrying that field — issuing, denial, and `status` — and `status` was the one that went a
+release without it. It also does the type check: a non-string `error` used to reach the user as
+`[object Object]`. An RPC that *throws* — or a
 missing frontend client — still produces a localized "try again later" reply. This deliberately
 differs from the neighbouring PAIR path, whose failures escape to the top-level catch: here the
 user is waiting on a link, and silence reads as a broken bot.

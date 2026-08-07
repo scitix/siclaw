@@ -3225,10 +3225,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("channel.issueApiKey", async () => ({ ...CHANNEL_API_KEY_UNSUPPORTED }));
   handlers.set("channel.apiKeyStatus", async () => ({ ...CHANNEL_API_KEY_UNSUPPORTED }));
 
-  // `/webchat` is Upstream-only for the same reasons plus one more: redeeming the link signs the
-  // visitor in and creates a chat session owned by their account, and this adapter has no account
-  // model to own it. Registered rather than left absent so the answer is this sentence instead of
-  // "unknown method" — the runtime handles both, but only one of them is readable.
+  // `/webchat` is Upstream-only for the same reasons plus one more: redeeming the link yields a
+  // chat session, and this adapter has no account model to own one (what the link grants is stated
+  // once in docs/design/2026-08-06-feishu-webchat-command.md — do not restate it here). Registered
+  // rather than left absent so the answer is this sentence instead of "unknown method" — the
+  // runtime handles both, but only one of them is readable.
   handlers.set("channel.issueWebChatLink", async () => ({
     success: false,
     error: "Web chat links are only available in Upstream mode",

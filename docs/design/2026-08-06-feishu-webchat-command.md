@@ -24,6 +24,35 @@ The Runtime stores no redemption token and does not decide whether the sender ma
 
 ## Runtime contracts
 
+### What the link confers — the Runtime's single assumption
+
+This is the one statement of the link's authority. Code comments must defer to it rather than
+restate it; three comments asserting three different semantics is what this section replaces.
+
+**The Runtime treats `actionUrl` as bearer authority over a chat session.** Whoever opens it first
+is assumed to obtain the session, without proving any identity.
+
+That is an assumption, not knowledge. The Runtime cannot see whether redemption requires the
+visitor to already be signed in — it holds no account model, stores no token, and never contacts
+the redemption endpoint. So it assumes the strongest thing the link could be, which makes every
+handling rule below correct under either implementation:
+
+- if the frontend does issue a true bearer link, the handling is exactly right;
+- if the frontend requires an authenticated visitor, the handling is merely conservative.
+
+Getting this backwards is the failure that matters. `/webchat` is dispatched before
+`resolvePersonalBinding`, so the Runtime applies no binding gate and the frontend is the only
+admission control. Under the assumption above, a wrongly-approved mint hands a session-granting
+link to someone who never passed that gate — which is why the delivery rules are stricter than
+the ones a mere navigation URL would need.
+
+Everything downstream derives from this: personal chat only, never logged, a card button rather
+than unfurlable text, and withheld once expired.
+
+The redemption and consumption semantics themselves are the upstream frontend's to define and
+document. A frontend that makes redemption weaker than this assumption does not violate the
+contract; it only means the Runtime was stricter than it had to be.
+
 ### Personal chat only
 
 The command is accepted only in a Feishu personal-bot conversation. In a group it is dropped
@@ -115,7 +144,8 @@ failure  { success:false, error }
 ```
 
 `actionUrl` is a short-lived redemption URL. Opening its preview does not consume it; the upstream
-frontend owns the confirmation and consumption semantics.
+frontend owns the confirmation and consumption semantics. For what the Runtime assumes the link
+grants — and why it assumes the strongest case — see “What the link confers” above.
 
 ## Verification
 
