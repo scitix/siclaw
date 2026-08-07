@@ -99,6 +99,46 @@ def test_code_profile_component_impact():
     print("OK  code profile widens exact diffs to component pages and emits target hints")
 
 
+def test_code_root_files_are_independent_and_profile_is_read_once():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/BRIEF.json", json.dumps({"knowledge_type": "code"}))
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index")
+        _mk(base, "candidate/readme.md", _page(["README.md"]))
+        _mk(base, "candidate/module.md", _page(["go.mod"]))
+        _mk(base, "candidate/package.md", _page(["package.json"]))
+        _mk(base, "candidate/controller.md", _page(["internal/controller/reconcile.go"]))
+
+        original_knowledge_type = incremental.knowledge_type
+        calls = 0
+
+        def counted_knowledge_type(workdir: str) -> str:
+            nonlocal calls
+            calls += 1
+            return original_knowledge_type(workdir)
+
+        incremental.knowledge_type = counted_knowledge_type
+        try:
+            changeset = incremental.build_changeset(td, {
+                "modified": ["README.md", "internal/controller/status.go"],
+            })
+        finally:
+            incremental.knowledge_type = original_knowledge_type
+
+        assert calls == 1, calls
+        by_source = {
+            item["path"]: item["affected_pages"]
+            for item in changeset["modified"]
+        }
+        assert by_source == {
+            "README.md": ["readme.md"],
+            "internal/controller/status.go": ["controller.md"],
+        }, by_source
+        assert "module.md" in changeset["unaffected_pages"], changeset
+        assert "package.md" in changeset["unaffected_pages"], changeset
+    print("OK  root descriptors stay isolated; code profile and page indexes are built once")
+
+
 def test_raw_prefix_normalization():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -458,6 +498,7 @@ if __name__ == "__main__":
     test_resolve_affected_pages()
     test_no_basename_cross_match()
     test_code_profile_component_impact()
+    test_code_root_files_are_independent_and_profile_is_read_once()
     test_raw_prefix_normalization()
     test_build_changeset()
     test_integrity_guard()

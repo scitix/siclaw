@@ -3,13 +3,13 @@
     "desc": "Report a slice of compile progress (pages produced / contradictions auto-merged / pending), one sentence to one paragraph."
   },
   "source_inventory": {
-    "desc": "List bounded metadata for files in the complete frozen Raw snapshot. The current batch list is an accountability boundary, not a visibility boundary; use this to discover neighbouring code, configuration, tests, and deployment sources without compiling sources owned by another batch."
+    "desc": "List bounded metadata for files in the complete frozen Raw snapshot. Optional globs are path-segment aware: * stays within one directory and ** crosses directories. The current batch list is an accountability boundary, not a visibility boundary; use this to discover neighbouring code, configuration, tests, and deployment sources without compiling sources owned by another batch."
   },
   "source_read": {
     "desc": "Read a bounded UTF-8 line range from any permitted file in the complete frozen Raw snapshot. Paths are Raw-relative (with or without raw/). This tool is read-only and preserves the original source identity for evidence."
   },
   "source_search": {
-    "desc": "Search a literal string across permitted UTF-8 files in the complete frozen Raw snapshot, optionally narrowed by a Raw-relative glob. Use it for cross-component facts, symbols, configuration keys, and deployment links."
+    "desc": "Search a literal string across permitted UTF-8 files in the complete frozen Raw snapshot, optionally narrowed by a path-segment-aware Raw-relative glob. Search has cumulative file and byte budgets; inspect truncated and budget_exhausted in the result and narrow the glob when needed. Use it for cross-component facts, symbols, configuration keys, and deployment links."
   },
   "propose_plan": {
     "desc": "Call after Plan-phase alignment: submit a short, readable, reviewable compile plan (the plan argument, markdown) for the owner's approval, then stop and wait. Do not write candidate/ pages before approval arrives.",

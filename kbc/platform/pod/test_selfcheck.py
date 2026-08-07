@@ -440,6 +440,7 @@ def test_code_profile_component_coverage():
         _mk(base, "raw/internal/controller/reconcile.go", "package controller\n")
         _mk(base, "raw/internal/controller/status.go", "package controller\n")
         _mk(base, "raw/internal/web/handler.go", "package web\n")
+        _mk(base, "raw/build/release.sh", "#!/bin/sh\n")
         _mk(base, "raw/vendor/example/dependency.go", "package dependency\n")
         pages = {
             "overview.md": {
@@ -448,19 +449,22 @@ def test_code_profile_component_coverage():
         }
         cov = selfcheck.coverage(td, pages, [])
         assert cov["profile"] == "code", cov
-        assert cov["total_components"] == 3, cov
+        assert cov["total_components"] == 6, cov
         assert cov["covered_components"] == 2, cov
-        assert cov["ignored_sources"] == 1, cov
-        assert cov["unaccounted"] == ["internal/web/handler.go"], cov
-        assert cov["unaccounted_components"] == [{
-            "component": "internal/web",
-            "representative": "internal/web/handler.go",
-            "unaccounted_files": 1,
-            "total_files": 1,
-        }], cov
+        assert cov["ignored_sources"] == 0, cov
+        assert cov["unaccounted"] == [
+            "README.md", "build/release.sh", "internal/web/handler.go",
+            "vendor/example/dependency.go",
+        ], cov
+        assert [item["component"] for item in cov["unaccounted_components"]] == [
+            "README.md", "build", "internal/web", "vendor",
+        ], cov
         assert not cov["closed"]
 
-        pages["web.md"] = {"sources": ["internal/web/handler.go"]}
+        pages["remaining.md"] = {"sources": [
+            "README.md", "build/release.sh", "internal/web/handler.go",
+            "vendor/example/dependency.go",
+        ]}
         cov = selfcheck.coverage(td, pages, [])
         assert cov["closed"] and cov["unaccounted"] == [], cov
 
@@ -2256,6 +2260,9 @@ def test_is_media_asset():
         assert selfcheck.is_media_asset(p), p
     for p in no:
         assert not selfcheck.is_media_asset(p), p
+    assert ".tiff" in selfcheck.MEDIA_ASSET_EXTS
+    assert ".tiff" in selfcheck.MEDIA_SOURCE_EXTS
+    assert ".tiff" not in selfcheck.IMAGE_SOURCE_EXTS
     print("OK  is_media_asset (assets/ + *.assets, case-insensitive seg + image ext; sheet/.json/.pdf excluded)")
 
 

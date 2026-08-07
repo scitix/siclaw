@@ -107,11 +107,6 @@ _CODE_COMPONENT_CONTAINERS = {
     "deployment", "helm", "internal", "manifests", "operator", "operators",
     "pkg", "plugins",
 }
-_CODE_IGNORED_ROOTS = {
-    "build", "dist", "node_modules", "target", "third_party", "vendor",
-}
-
-
 def knowledge_type(workdir: str) -> str:
     """Return the durable compile profile written by the control plane.
 
@@ -134,15 +129,18 @@ def code_component(source: str) -> str:
     pretending every generated helper and test fixture deserves a Wiki claim.
     Familiar multi-component containers keep one child segment (``cmd/foo``,
     ``internal/controller``); other trees use their top-level directory. Root
-    build/module descriptors share the ``.`` component.
+    Root build/module descriptors each keep their own filename component so a
+    change to README.md cannot authorize edits to a page backed by go.mod.
+    Generated and vendored roots remain ordinary auditable components; only an
+    explicit exclusion ledger entry may remove source evidence from coverage.
     """
     normalized = _strip_source_prefix(posixpath.normpath(source.replace("\\", "/")).lstrip("/"))
     parts = [part for part in normalized.split("/") if part not in ("", ".")]
-    if len(parts) <= 1:
+    if not parts:
         return "."
+    if len(parts) == 1:
+        return parts[0]
     root = parts[0].lower()
-    if root in _CODE_IGNORED_ROOTS:
-        return f"ignored:{root}"
     if root in _CODE_COMPONENT_CONTAINERS and len(parts) >= 3:
         return "/".join(parts[:2])
     return parts[0]
@@ -2189,12 +2187,8 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
     code_fields = {}
     if knowledge_type(workdir) == "code":
         components: dict[str, list[str]] = {}
-        ignored_sources: list[str] = []
         for source in sources:
             component = code_component(source)
-            if component.startswith("ignored:"):
-                ignored_sources.append(source)
-                continue
             # Media remains ordinary provenance when cited, but a repository's
             # screenshots/icons must not manufacture architecture components.
             if is_media_asset(source):
@@ -2231,8 +2225,11 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
             "covered_components": len(covered_components),
             "excluded_components": len(excluded_components),
             "unaccounted_components": uncovered_components,
-            "ignored_sources": len(ignored_sources),
-            "ignored_source_sample": ignored_sources[:20],
+            # Kept for response-schema compatibility. Code profile v1 silently
+            # dropped generated/vendored roots here; v2 accounts every root and
+            # requires explicit EXCLUSIONS.json receipts instead.
+            "ignored_sources": 0,
+            "ignored_source_sample": [],
         }
     return {
         "total_sources": len(sources),

@@ -22,7 +22,8 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
   The moat relies on custom tools that let the agent **signal explicitly** (rather than guessing from output):
   `report_summary`→`summary`, `propose_plan`→`plan_proposed`,
   `resolve_ticket`→writes the `agent_report` in `authoring/CONTRADICTIONS.json` (contradiction-ticket fix-up registration),
-  `report_domain`→writes `authoring/META.json` with one field sentence for multi-library routing (cap enforced in code; typed command `compile.refresh_domain` is the on-demand whole-catalog path).
+  `report_domain`→writes `authoring/META.json` with one field sentence for multi-library routing (cap enforced in code; typed command `compile.refresh_domain` is the on-demand whole-catalog path), and
+  `source_inventory` / `source_read` / `source_search`→engine-neutral, bounded, read-only inspection of the frozen Raw snapshot. Hidden unmanaged paths and symbolic links are unavailable; segmented globs, per-read output limits, and cumulative search budgets keep consultation predictable. Originals represented by planner slices remain discoverable but unreadable outside their assigned bounded view.
   **Contradictions never block**: the agent lands a best-guess page + marks it uncertain + files a ticket, and the owner adjudicates asynchronously afterward (contradiction-as-turn model).
   Compilation does not generate suggested test questions as a hidden completion side effect; question recommendation belongs to an explicit test workflow over a pinned draft.
   Behavior changes need a `siclaw-kbc-box` image rebuild and runtime env `SICLAW_COMPILE_BOX_IMAGE` (existing live sessions keep their old image).
@@ -31,7 +32,7 @@ Platform-agnostic (kbc base); the siclaw runtime reuses agentbox's K8sSpawner to
 
 The linear-wizard mode adds two pure-contract enhancements to the box (design: improve_siclaw/DESIGN-kb-linear-mode-2026-07-03 §3; neither introduces a wait-for-user pause):
 
-- **Compile brief**: typed commands carry stable audience/depth/redaction/content-locale parameters and deterministically write `authoring/BRIEF.json`; no localized text parsing is needed. The old opening-message parser remains for pre-command clients. BOX_ROLE reads either schema, updates INTENT.md, and treats the brief as intent rather than source fact.
+- **Compile brief**: typed commands carry stable `knowledge_type=document|code`, audience/depth/redaction/content-locale parameters and deterministically write `authoring/BRIEF.json`; no localized text parsing is needed. `knowledge_type=code` selects architecture/component evidence coverage and incremental impact semantics rather than a page-per-file output. The old opening-message parser remains for pre-command clients. BOX_ROLE reads either schema, updates INTENT.md, and treats the brief as intent rather than source fact.
 - **Unified question queue**: "tone-type follow-ups" that surface mid-compile (conventions / redaction / whether to compile process data / whether to keep old versions) are handled **the same** as source contradictions — best-guess into the page + mark `⚠️ 存疑` + append to the **same** `authoring/CONTRADICTIONS.json` (schema unchanged); no new file, no new protocol. On the owner's side it is the same "questions" queue.
 - **`compile_agent.py` (one-shot, local debugging)** — a one-off `query()`: reads `workdir/drop/`+`constitution.md`→compiles→writes
   `workdir/bundle/`, no HTTP. Used to quickly verify "the brain can compile inside the container".

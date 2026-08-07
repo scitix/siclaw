@@ -4076,12 +4076,20 @@ def _batch_raw_scope(batch: dict, bounded: dict[str, list[str]] | None = None) -
 # Structural reduce: Candidate + authoring state only, no Raw at all.
 NO_RAW_SCOPE: dict = {"account": [], "deny_read": [], "consult": False}
 
-# Semantic final review may consult the complete frozen snapshot to verify
-# load-bearing claims and cross-batch contradictions. It owns no new sources
-# and must not turn the close-out into another full compilation.
-SEMANTIC_REVIEW_RAW_SCOPE: dict = {
-    "account": [], "deny_read": [], "consult": True,
-}
+def semantic_review_raw_scope(plan: dict) -> dict:
+    """Raw scope for final review without bypassing planner read bounds.
+
+    Final review may consult ordinary sources across the frozen snapshot, but
+    it has no assigned bounded ranges of its own. Every original represented by
+    a text or PDF slice therefore remains unavailable in full. Candidate pages
+    carry the compiled result that final review is responsible for checking.
+    """
+    bounded = plan_bounded_sources(plan)
+    return {
+        "account": [],
+        "deny_read": sorted(set(bounded["text"]) | set(bounded["pdf"])),
+        "consult": True,
+    }
 
 
 _RELAY_MAX_PAGES = 8
@@ -4940,7 +4948,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
         final_reply = await _drive_batch_session(
             run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
             _loc(run, "final review", "终审"),
-            raw_scope=SEMANTIC_REVIEW_RAW_SCOPE,
+            raw_scope=semantic_review_raw_scope(plan),
         )
         if final_reply:
             replies.append(_loc(run, f"[Final review] {final_reply}", f"【终审】{final_reply}"))

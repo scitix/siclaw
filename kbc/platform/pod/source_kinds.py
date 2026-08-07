@@ -31,10 +31,10 @@ CODE_TEXT_EXTS = {
 TEXT_SOURCE_EXTS = DOCUMENT_TEXT_EXTS | CODE_TEXT_EXTS
 
 IMAGE_SOURCE_EXTS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".tiff",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
 }
 MEDIA_SOURCE_EXTS = IMAGE_SOURCE_EXTS | {
-    ".pdf", ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx",
+    ".pdf", ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx", ".tiff",
 }
 KNOWN_SOURCE_EXTS = TEXT_SOURCE_EXTS | MEDIA_SOURCE_EXTS
 

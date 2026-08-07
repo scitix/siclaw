@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 from source_kinds import (
@@ -18,6 +19,8 @@ MAX_RESULTS = 500
 MAX_READ_LINES = 500
 MAX_READ_CHARS = 200_000
 MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024
+MAX_SEARCH_FILES = 2_000
+MAX_SEARCH_BYTES = 32 * 1024 * 1024
 
 
 def _bounded_int(value: object, default: int, maximum: int) -> int:
@@ -79,10 +82,26 @@ class SourceInspector:
     def _matches(path: str, pattern: str) -> bool:
         if pattern in {"*", "**", "**/*"}:
             return True
-        if fnmatch.fnmatchcase(path, pattern):
-            return True
-        # Users naturally expect **/*.ts to include root-level app.ts too.
-        return pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:])
+        path_parts = path.split("/")
+        pattern_parts = pattern.split("/")
+
+        @lru_cache(maxsize=None)
+        def segment_match(pattern_index: int, path_index: int) -> bool:
+            if pattern_index == len(pattern_parts):
+                return path_index == len(path_parts)
+            segment = pattern_parts[pattern_index]
+            if segment == "**":
+                return any(
+                    segment_match(pattern_index + 1, next_path_index)
+                    for next_path_index in range(path_index, len(path_parts) + 1)
+                )
+            return (
+                path_index < len(path_parts)
+                and fnmatch.fnmatchcase(path_parts[path_index], segment)
+                and segment_match(pattern_index + 1, path_index + 1)
+            )
+
+        return segment_match(0, 0)
 
     def _files(
         self, pattern: str = "**/*", *, include_denied: bool = False,
@@ -106,14 +125,28 @@ class SourceInspector:
 
     def _resolve(self, value: object) -> tuple[str, Path]:
         rel = self._normalize_relative(value)
+        if not is_managed_source_path(rel):
+            raise ValueError(f"Raw source is not managed: raw/{rel}")
         if rel in self.denied_sources:
             raise ValueError(f"source is available only through its assigned bounded view: raw/{rel}")
-        target = (self.raw_root / Path(*PurePosixPath(rel).parts)).resolve()
+        unresolved = self.raw_root / Path(*PurePosixPath(rel).parts)
+        current = self.raw_root
+        for part in PurePosixPath(rel).parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"Raw source path contains a symbolic link: raw/{rel}")
         try:
-            target.relative_to(self.raw_root)
+            target = unresolved.resolve()
+        except (OSError, RuntimeError) as error:
+            raise ValueError(f"Raw source cannot be resolved: raw/{rel}") from error
+        try:
+            canonical_rel = target.relative_to(self.raw_root).as_posix()
         except ValueError as error:
             raise ValueError("source path escapes the Raw snapshot") from error
-        if target.is_symlink() or not target.is_file():
+        if canonical_rel in self.denied_sources:
+            raise ValueError(
+                f"source is available only through its assigned bounded view: raw/{canonical_rel}")
+        if not target.is_file():
             raise ValueError(f"Raw source does not exist: raw/{rel}")
         return rel, target
 
@@ -151,24 +184,44 @@ class SourceInspector:
         rel, target = self._resolve(path)
         start = _bounded_int(offset, 1, 2_000_000_000)
         count = _bounded_int(limit, MAX_READ_LINES, MAX_READ_LINES)
+        selected: list[str] = []
+        selected_lines = 0
+        selected_chars = 0
+        has_more = False
+        char_truncated = False
         try:
-            text = target.read_bytes().decode("utf-8")
+            with target.open("r", encoding="utf-8", errors="strict", newline=None) as source:
+                for line_no, raw_line in enumerate(source, start=1):
+                    if line_no < start:
+                        continue
+                    if selected_lines >= count:
+                        has_more = True
+                        break
+                    line = raw_line.rstrip("\r\n")
+                    rendered = f"{line_no:>6}\t{line}"
+                    separator = 1 if selected else 0
+                    remaining = MAX_READ_CHARS - selected_chars - separator
+                    if remaining <= 0:
+                        char_truncated = True
+                        break
+                    if separator:
+                        selected.append("\n")
+                        selected_chars += 1
+                    selected.append(rendered[:remaining])
+                    selected_chars += min(len(rendered), remaining)
+                    selected_lines += 1
+                    if len(rendered) > remaining:
+                        char_truncated = True
+                        break
         except UnicodeDecodeError as error:
             raise ValueError(f"Raw source is not UTF-8 text: raw/{rel}") from error
-        lines = text.splitlines()
-        selected = lines[start - 1:start - 1 + count]
-        numbered = "\n".join(
-            f"{line_no:>6}\t{line}"
-            for line_no, line in enumerate(selected, start=start)
-        )
-        char_truncated = len(numbered) > MAX_READ_CHARS
-        numbered = numbered[:MAX_READ_CHARS]
+        numbered = "".join(selected)
         return json.dumps({
             "path": f"raw/{rel}",
             "offset": start,
-            "lines": len(selected),
+            "lines": selected_lines,
             "content": numbered,
-            "truncated": char_truncated or start - 1 + len(selected) < len(lines),
+            "truncated": char_truncated or has_more,
         }, ensure_ascii=False)
 
     def search(
@@ -190,10 +243,23 @@ class SourceInspector:
         matches: list[dict] = []
         skipped_large = 0
         skipped_non_utf8 = 0
+        skipped_non_text = 0
+        scanned_files = 0
+        scanned_bytes = 0
+        budget_exhausted = False
         for rel, path in self._files(glob):
-            if path.stat().st_size > MAX_SEARCH_FILE_BYTES:
+            if not is_text_source_path(rel):
+                skipped_non_text += 1
+                continue
+            size = path.stat().st_size
+            if size > MAX_SEARCH_FILE_BYTES:
                 skipped_large += 1
                 continue
+            if scanned_files >= MAX_SEARCH_FILES or scanned_bytes + size > MAX_SEARCH_BYTES:
+                budget_exhausted = True
+                break
+            scanned_files += 1
+            scanned_bytes += size
             try:
                 lines = path.read_bytes().decode("utf-8").splitlines()
             except UnicodeDecodeError:
@@ -215,11 +281,19 @@ class SourceInspector:
                         "truncated": True,
                         "skipped_large": skipped_large,
                         "skipped_non_utf8": skipped_non_utf8,
+                        "skipped_non_text": skipped_non_text,
+                        "scanned_files": scanned_files,
+                        "scanned_bytes": scanned_bytes,
+                        "budget_exhausted": budget_exhausted,
                     }, ensure_ascii=False)
         return json.dumps({
             "matches": matches,
             "returned": len(matches),
-            "truncated": False,
+            "truncated": budget_exhausted,
             "skipped_large": skipped_large,
             "skipped_non_utf8": skipped_non_utf8,
+            "skipped_non_text": skipped_non_text,
+            "scanned_files": scanned_files,
+            "scanned_bytes": scanned_bytes,
+            "budget_exhausted": budget_exhausted,
         }, ensure_ascii=False)

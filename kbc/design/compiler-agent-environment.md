@@ -47,7 +47,7 @@ It is not a page per file and not a line-by-line code reference.
 |---|---|---|---|
 | Map batch | Complete snapshot, except bounded originals | Assigned knowledge responsibility in `candidate/` | Compile one responsibility slice with whole-system context |
 | Section reduce | None | Listed Candidate pages and index | Structural deduplication without recompiling sources |
-| Final semantic review | Complete snapshot | Candidate and authoring close-out state | Verify contradictions and important claims across batches |
+| Final semantic review | Complete snapshot except bounded originals | Candidate and authoring close-out state | Verify contradictions and important claims across batches without reopening oversized inputs |
 
 ## Acceptance criteria
 
@@ -56,6 +56,9 @@ It is not a page per file and not a line-by-line code reference.
 - Code, Dockerfile variants, and Makefiles are budgeted and sliced as text.
 - Repository-control sources such as `.github/workflows/` and `.gitlab-ci.yml`
   remain visible while arbitrary hidden caches stay excluded.
+- Code coverage never silently drops generated or vendored roots. Such evidence
+  remains an ordinary component unless an explicit `EXCLUSIONS.json` row records
+  why it is out of scope.
 - Every supported engine can inventory, search, and read permitted sources
   outside its assigned batch.
 - Bounded originals remain visible as `bounded_view_only` and cannot be read or
