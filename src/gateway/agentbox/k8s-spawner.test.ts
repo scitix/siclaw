@@ -380,6 +380,28 @@ describe("K8sSpawner — spawn branches", () => {
     expect(container.livenessProbe.exec.command).toEqual(container.readinessProbe.exec.command);
     expect(container.readinessProbe.timeoutSeconds).toBe(3);
     expect(container.livenessProbe.timeoutSeconds).toBe(3);
+    // The startup gate has to speak the same dialect, or it is the one probe kubelet
+    // cannot run through the NetworkPolicy and the box never starts at all.
+    expect(container.startupProbe.httpGet).toBeUndefined();
+    expect(container.startupProbe.exec.command).toEqual(container.readinessProbe.exec.command);
+  });
+
+  it("gates a box's probes on a startup probe, so coming up is not reported as unhealthy", async () => {
+    // Readiness used to open fire 2s in, against a process still fetching settings — and,
+    // because instance names are reused, sometimes against a pod with no IP yet. Every
+    // rolled box published Warning events on the way up while nothing was wrong.
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+    readPodImpl.fn = async () => { throw Object.assign(new Error("nf"), { code: 404 }); };
+
+    await s.spawn({ agentId: "probe-gate" }).catch(() => {});
+    const container = calls.createNamespacedPod[0].body.spec.containers[0];
+    expect(container.startupProbe.httpGet).toMatchObject({ path: "/health", scheme: "HTTPS" });
+    // 30 x 2s: the same 60s the manager waits before calling a box crashed, so the two
+    // do not disagree about when a box has failed to come up.
+    expect(container.startupProbe.periodSeconds! * container.startupProbe.failureThreshold!).toBe(60);
+    expect(container.startupProbe.initialDelaySeconds).toBeUndefined();
   });
 
   it("refuses to forward secret-shaped names through the prefix glob (ops knobs only)", async () => {
