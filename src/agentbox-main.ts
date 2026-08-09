@@ -26,6 +26,38 @@ import { startCapacityMetrics } from "./shared/capacity-metrics.js";
 const config = loadConfig();
 const PORT = config.server.port;
 
+/**
+ * How long the gateway-dependent startup work gets before the box stops waiting on it.
+ *
+ * Everything before `listen()` — settings, resource bundles, the tool whitelist — is a
+ * round trip to the Runtime, and the moment they all happen at once is a rolling deploy:
+ * the Runtime is itself restarting while every box of every agent asks it for the same
+ * things. Whatever is not back by then, the box comes up without and picks up on the next
+ * push, because a box that answers no probe is judged crashed at 60s and replaced by
+ * another one that will queue behind the same slow gateway.
+ *
+ * Deliberately under that 60s so the box loses the sync, not its life.
+ */
+const STARTUP_DEADLINE_MS = 30_000;
+
+/** Run gateway-dependent startup work, giving up (loudly) rather than delaying `listen`. */
+async function withStartupDeadline<T>(label: string, work: () => Promise<T>): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${STARTUP_DEADLINE_MS}ms`)), STARTUP_DEADLINE_MS);
+      }),
+    ]);
+  } catch (err) {
+    console.warn(`[agentbox] startup: ${label} did not finish (${err instanceof Error ? err.message : String(err)}); continuing without it`);
+    return undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function main() {
   // If gatewayUrl is configured, fetch the latest settings.json from Gateway (with mTLS)
   if (config.server.gatewayUrl) {
@@ -34,27 +66,31 @@ async function main() {
     });
 
     // Step 1: Fetch and persist settings.json
-    try {
-      const remoteConfig = await gatewayClient.fetchSettings();
-      const configPath = getConfigPath();
-      const dir = path.dirname(configPath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(configPath, JSON.stringify(remoteConfig, null, 2) + "\n");
-      reloadConfig();
-      console.log(`[agentbox] Fetched settings from Gateway via mTLS: ${config.server.gatewayUrl}`);
-    } catch (err) {
-      console.warn(`[agentbox] Failed to fetch settings from Gateway, using local config:`, err);
-    }
+    await withStartupDeadline("settings fetch", async () => {
+      try {
+        const remoteConfig = await gatewayClient.fetchSettings();
+        const configPath = getConfigPath();
+        const dir = path.dirname(configPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(configPath, JSON.stringify(remoteConfig, null, 2) + "\n");
+        reloadConfig();
+        console.log(`[agentbox] Fetched settings from Gateway via mTLS: ${config.server.gatewayUrl}`);
+      } catch (err) {
+        console.warn(`[agentbox] Failed to fetch settings from Gateway, using local config:`, err);
+      }
+    });
 
     // Step 2: Sync resources (MCP, skills) — independent of settings fetch
-    try {
-      const { failed } = await syncAllResources(gatewayClient.toClientLike());
-      if (failed.length > 0) {
-        console.error(`[agentbox] Resource sync partial failure: [${failed.join(", ")}]`);
+    await withStartupDeadline("resource sync", async () => {
+      try {
+        const { failed } = await syncAllResources(gatewayClient.toClientLike());
+        if (failed.length > 0) {
+          console.error(`[agentbox] Resource sync partial failure: [${failed.join(", ")}]`);
+        }
+      } catch (err) {
+        console.error(`[agentbox] Resource sync failed:`, err);
       }
-    } catch (err) {
-      console.error(`[agentbox] Resource sync failed:`, err);
-    }
+    });
   }
 
   // Initialise OpenTelemetry agent-behaviour tracing. Placed in main() proper —
@@ -170,8 +206,11 @@ async function main() {
       // 3 attempts, 1s base) to shrink the fail-open window from a transient
       // gateway blip. Pass the per-box handler since `tools` is not in the
       // module-level registry that syncResource would otherwise look up.
-      const count = await syncResource("tools", boxClient, createToolsHandler(sessionManager, boxClient));
-      console.log(`[agentbox] Initial tool-capabilities synced: ${count === 0 ? "unrestricted" : `${count} tools`}`);
+      const count = await withStartupDeadline("tool-capabilities sync", () =>
+        syncResource("tools", boxClient, createToolsHandler(sessionManager, boxClient)));
+      if (count !== undefined) {
+        console.log(`[agentbox] Initial tool-capabilities synced: ${count === 0 ? "unrestricted" : `${count} tools`}`);
+      }
     } catch (err) {
       // Fail-open after all retries: a fresh box has no prior whitelist to fall
       // back to, and a failed fetch usually means broader gateway unreachability
