@@ -59,6 +59,7 @@ export class FrontendWsClient {
   private _connected = false;
   private pending = new Map<string, PendingRpc>();
   private commandHandler: CommandHandler | null = null;
+  private activeSessionsProvider?: () => string[];
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
@@ -128,6 +129,16 @@ export class FrontendWsClient {
   }
 
   /**
+   * Supply the sessions this Runtime is streaming, read on every (re)connect.
+   *
+   * A pull, not a stored list: the answer has to be true at the moment the register frame
+   * goes out, and a reconnect happens whenever the transport decides to.
+   */
+  setActiveSessionsProvider(fn: () => string[]): void {
+    this.activeSessionsProvider = fn;
+  }
+
+  /**
    * Emit an unsolicited event frame to Portal (e.g. chat.event stream).
    * Fire and forget — does nothing if not connected.
    */
@@ -177,8 +188,24 @@ export class FrontendWsClient {
    */
   private advertiseCapabilities(): void {
     const caps = this.opts.capabilities;
-    if (!caps || Object.keys(caps).length === 0) return;
-    this.request("runtime.register", { capabilities: caps }).catch((err: unknown) => {
+    let activeSessions: string[] | undefined;
+    try {
+      activeSessions = this.activeSessionsProvider?.();
+    } catch (err) {
+      // Advisory, like everything else here: this runs inside the socket's "open"
+      // listener, where a throw is an uncaughtException that takes the process down.
+      console.warn(`[frontend-ws] active session list unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // Nothing to say — and saying it anyway costs a rejected RPC and a warning line on
+    // every reconnect against a consumer that predates `runtime.register`.
+    if ((!caps || Object.keys(caps).length === 0) && !activeSessions?.length) return;
+    // `activeSessions` is what THIS process is streaming right now — deliberately not
+    // "what the boxes hold". After a restart it is empty even though boxes still carry
+    // sessions from the dead process, and that is the point: those turns have no consumer
+    // left, so a consumer told they are active would keep waiting for them forever.
+    const params: Record<string, unknown> = { capabilities: caps ?? {} };
+    if (activeSessions) params.activeSessions = activeSessions;
+    this.request("runtime.register", params).catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[frontend-ws] capability advertise not acked (ok on older consumer): ${message}`);
     });

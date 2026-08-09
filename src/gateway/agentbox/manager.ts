@@ -123,6 +123,9 @@ export class AgentBoxManager {
   private persistenceResolver?: (agentId: string) => Promise<boolean | undefined>;
   private replicasResolver?: (agentId: string) => Promise<number | undefined>;
   private boxStatusProbe?: (endpoint: string) => Promise<BoxStatusReport>;
+  private turnTerminator?: (sessionIds: string[], reason: "box_rolled") => void;
+  /** Boxes whose held turns were already reported, so a failed stop cannot report twice. */
+  private interruptReported = new Set<string>();
   /** Which box serves which session. Only consulted when an agent runs more than one. */
   private readonly bindings = new BoxBindings();
   /** boxId → when it was marked draining. In memory only; re-derived after a restart. */
@@ -214,6 +217,18 @@ export class AgentBoxManager {
    */
   setLegacySessionLister(fn: (endpoint: string) => Promise<string[]>): void {
     this.legacySessionLister = fn;
+  }
+
+  /**
+   * How to report turns that this manager is about to interrupt.
+   *
+   * Removing a box that still holds work does end those turns — their SSE streams break —
+   * but as an anonymous transport failure, indistinguishable from a network blip. Told
+   * first, the Runtime can name the cause, so a user sees "a rolling upgrade interrupted
+   * this, retry" instead of a bare connection error.
+   */
+  setTurnTerminator(fn: (sessionIds: string[], reason: "box_rolled") => void): void {
+    this.turnTerminator = fn;
   }
 
   setBoxStatusProbe(fn: (endpoint: string) => Promise<BoxStatusReport>): void {
@@ -1083,18 +1098,45 @@ export class AgentBoxManager {
       if (!info || info.status === "stopped") {
         this.draining.delete(boxId);
         this.statusCache.delete(boxId);
+        this.interruptReported.delete(boxId);
         this.probeFailures.delete(boxId);
         continue;
       }
       const overdue = Date.now() - markedAt >= DRAIN_DEADLINE_MS;
       let drained = false;
+      let held: string[] = [];
       if (!overdue && this.boxStatusProbe && info.endpoint) {
         try {
           drained = (await this.boxStatusProbe(info.endpoint)).drained;
         } catch { continue; } // can't tell → keep waiting rather than cut a live box
       }
       if (!drained && !overdue) continue;
+      if (overdue && !drained && this.boxStatusProbe && info.endpoint && !this.interruptReported.has(boxId)) {
+        // Only on the path that cuts a box still holding work: ask what it holds, so those
+        // turns can be reported as interrupted rather than dying as a broken stream. The
+        // box is going away regardless — a probe that fails just costs the better message.
+        try {
+          const status = await this.boxStatusProbe(info.endpoint);
+          // A box lists every session RESIDENT on it, including ones whose turns have since
+          // been placed elsewhere — it never forgets. Reporting those would cut a live turn
+          // on a healthy box and blame this removal for it, so keep only the sessions this
+          // box is still the bound holder of.
+          held = status.sessionIds.filter((id) => this.bindings.get(info!.agentId, id) === boxId);
+        } catch { /* keep the removal going; the streams still break and end the turns */ }
+      }
       console.log(`[agentbox-manager] Removing drained box ${boxId}${overdue ? " (deadline reached)" : ""}`);
+      if (held.length) {
+        // Marked before reporting: a stop that throws keeps the drain mark and retries next
+        // tick, and the box still lists those sessions — reporting again would cut whatever
+        // turn has since taken that session id.
+        this.interruptReported.add(boxId);
+        console.log(`[agentbox-manager] ${boxId} still held ${held.length} session(s); reporting them interrupted`);
+        try {
+          this.turnTerminator?.(held, "box_rolled");
+        } catch (err) {
+          console.warn(`[agentbox-manager] could not report interrupted turns for ${boxId}:`, err);
+        }
+      }
       try {
         await this.spawner.stop(boxId);
       } catch (err) {
@@ -1103,6 +1145,7 @@ export class AgentBoxManager {
       }
       this.draining.delete(boxId);
       this.statusCache.delete(boxId);
+      this.interruptReported.delete(boxId);
       // Indices — and therefore names — are reused. A leftover failure count would make
       // the replacement's first transient probe failure look like its fourth.
       this.probeFailures.delete(boxId);

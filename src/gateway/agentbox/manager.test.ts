@@ -45,7 +45,11 @@ class FakeSpawner implements BoxSpawner {
       agentId: config.agentId,
     };
   }
-  async stop(boxId: string): Promise<void> { this.stopCalls.push(boxId); }
+  stopThrows = false;
+  async stop(boxId: string): Promise<void> {
+    this.stopCalls.push(boxId);
+    if (this.stopThrows) throw new Error("k8s API said no");
+  }
   async get(boxId: string): Promise<AgentBoxInfo | null> {
     return this.getReturns.get(boxId) ?? null;
   }
@@ -792,6 +796,69 @@ describe("AgentBoxManager — drain reaper", () => {
     });
     await (mgr as any).reapDrainedBoxes();
     expect(spawner.stopCalls).toHaveLength(0);
+  });
+
+  it("names the turns it cuts when the drain deadline forces a live box out", async () => {
+    // The streams break either way — the point is that the Runtime can say WHY, instead of
+    // the user seeing a bare connection error for a rolling upgrade.
+    const { mgr, spawner } = drainingManager({
+      "http://10.0.0.9:3000": { sessionIds: ["s-live", "s-other"], turnsInFlight: 1, drained: false },
+    });
+    const reported: Array<{ ids: string[]; reason: string }> = [];
+    mgr.setTurnTerminator((ids, reason) => reported.push({ ids, reason }));
+    // A box lists every session RESIDENT on it and never forgets one that moved away, so
+    // only the ones still bound HERE may be reported: s-other has since been placed on a
+    // healthy box, and cutting its turn would blame this removal for someone else's work.
+    (mgr as any).bindings.remember("agent-a", "s-live", "old-box");
+    (mgr as any).bindings.remember("agent-a", "s-other", "other-box");
+    // Past the grace period: the box is going regardless of what it still holds.
+    (mgr as any).draining.set("old-box", Date.now() - 10 * 60_000);
+
+    await (mgr as any).reapDrainedBoxes();
+
+    expect(spawner.stopCalls).toEqual(["old-box"]);
+    expect(reported).toEqual([{ ids: ["s-live"], reason: "box_rolled" }]);
+  });
+
+  it("does not report the same box's turns twice when the removal has to be retried", async () => {
+    const { mgr, spawner } = drainingManager({
+      "http://10.0.0.9:3000": { sessionIds: ["s-live"], turnsInFlight: 1, drained: false },
+    });
+    const reported: string[][] = [];
+    mgr.setTurnTerminator((ids) => reported.push(ids));
+    (mgr as any).bindings.remember("agent-a", "s-live", "old-box");
+    (mgr as any).draining.set("old-box", Date.now() - 10 * 60_000);
+    spawner.stopThrows = true;
+
+    await (mgr as any).reapDrainedBoxes();
+    spawner.stopThrows = false;
+    // The mark survives a failed stop, so the next tick sees the same box listing the same
+    // session — by then a retry may own that id, and cutting it would be someone else's turn.
+    await (mgr as any).reapDrainedBoxes();
+
+    expect(reported).toEqual([["s-live"]]);
+  });
+
+  it("does not report turns when the box left on its own terms", async () => {
+    const { mgr, spawner } = drainingManager({ "http://10.0.0.9:3000": { sessionIds: [], turnsInFlight: 0, drained: true } });
+    const reported: string[][] = [];
+    mgr.setTurnTerminator((ids) => reported.push(ids));
+    await (mgr as any).reapDrainedBoxes();
+    expect(spawner.stopCalls).toEqual(["old-box"]);
+    expect(reported).toEqual([]);
+  });
+
+  it("still removes an overdue box when it cannot be asked what it holds", async () => {
+    // A probe failure must not buy the box another lap: it is already past the deadline.
+    const { mgr, spawner } = drainingManager({}, true);
+    const reported: string[][] = [];
+    mgr.setTurnTerminator((ids) => reported.push(ids));
+    (mgr as any).draining.set("old-box", Date.now() - 10 * 60_000);
+
+    await (mgr as any).reapDrainedBoxes();
+
+    expect(spawner.stopCalls).toEqual(["old-box"]);
+    expect(reported).toEqual([]); // nothing to name, so nothing claimed
   });
 
   it("waits when the box cannot be asked at all", async () => {
