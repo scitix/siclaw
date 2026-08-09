@@ -14,10 +14,26 @@ import type {
   MetricsFlushPayload,
   PromSampleGroup,
 } from "../shared/metrics-types.js";
+import { AGENT_PROFILE } from "./agentbox/box-profile.js";
 
 /** Interface for pod listing (K8s mode only) */
 export interface PodLister {
-  list(): Promise<Array<{ boxId: string; endpoint: string; status: string }>>;
+  list(): Promise<Array<{ boxId: string; endpoint: string; status: string; profile?: string }>>;
+}
+
+/**
+ * Whether this box serves `/api/internal/metrics-snapshot`.
+ *
+ * The pod list is selected by the `app=agentbox` label, which every box carries —
+ * including the KB compile boxes, whose Python HTTP contract has no metrics route at
+ * all. Pulling them 404s on every tick: log noise, and worse, each 404 counted as a
+ * pull failure, so the federation's own health metric reported a permanent fault.
+ *
+ * A profile that is absent means the default (agent) profile, same as everywhere else
+ * that reads this field.
+ */
+function servesSnapshot(box: { profile?: string }): boolean {
+  return !box.profile || box.profile === AGENT_PROFILE.name;
 }
 
 /** Interface for making mTLS requests to AgentBox pods */
@@ -78,7 +94,10 @@ export class MetricsAggregator {
     if (!this.podLister || !this.snapshotFetcher) return;
     const startedAt = Date.now();
     const pods = await this.podLister.list();
-    const activePods = pods.filter((p) => p.status === "running" && p.endpoint);
+    // Pull-eligibility only. `pods` stays the full list on purpose: liveness (below)
+    // must keep meaning "every box K8s reports", or a box that federates by some other
+    // route than this pull would be grace-evicted while it is still running.
+    const activePods = pods.filter((p) => p.status === "running" && p.endpoint && servesSnapshot(p));
     // Keep the boxId paired with each fetch (even on failure) so federation can key on
     // (boxId, incarnation) and self-monitoring can attribute failures to a box.
     const results = await Promise.all(

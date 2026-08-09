@@ -483,6 +483,68 @@ describe("FrontendWsClient", () => {
     client.close();
   });
 
+  it("reports the sessions it is streaming, read fresh on every connect", async () => {
+    // The list has to be true when the frame goes out: a consumer settles every in-flight
+    // turn NOT named here, so a stale list either strands a live turn or keeps a dead one.
+    let live: string[] = ["s1", "s2"];
+    const client = await createClient({ capabilities: { compile: true } });
+    client.setActiveSessionsProvider(() => live);
+
+    const connectPromise = client.connect();
+    const ws1 = openLatestWs();
+    await connectPromise;
+    expect(JSON.parse(ws1._sent[0]).params).toEqual({ capabilities: { compile: true }, activeSessions: ["s1", "s2"] });
+
+    live = [];
+    ws1.emit("close");
+    await vi.advanceTimersByTimeAsync(3100);
+    const ws2 = openLatestWs();
+    // Empty is a real answer, not a missing one: it tells the consumer to settle everything.
+    expect(JSON.parse(ws2._sent[0]).params).toEqual({ capabilities: { compile: true }, activeSessions: [] });
+
+    client.close();
+  });
+
+  it("stays silent when there is nothing to advertise", async () => {
+    // No capabilities and nothing streaming: the frame would carry no information, and
+    // against a consumer that predates `runtime.register` it costs a rejected RPC and a
+    // warning line on every reconnect.
+    const client = await createClient(); // no capabilities
+    client.setActiveSessionsProvider(() => []);
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(ws._sent).toHaveLength(0);
+    client.close();
+  });
+
+  it("advertises live sessions even with no capabilities", async () => {
+    const client = await createClient(); // no capabilities
+    client.setActiveSessionsProvider(() => ["s1"]);
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    expect(JSON.parse(ws._sent[0]).params).toEqual({ capabilities: {}, activeSessions: ["s1"] });
+    client.close();
+  });
+
+  it("still connects when the session provider throws", async () => {
+    // advertiseCapabilities runs inside the socket "open" listener, where a throw is an
+    // uncaughtException — and the value it is fetching is advisory.
+    const client = await createClient({ capabilities: { compile: true } });
+    client.setActiveSessionsProvider(() => { throw new Error("registry unavailable"); });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await expect(connectPromise).resolves.toBeUndefined();
+
+    expect(JSON.parse(ws._sent[0]).params).toEqual({ capabilities: { compile: true } });
+    client.close();
+    warn.mockRestore();
+  });
+
   it("re-advertises on every reconnect", async () => {
     const client = await createClient({ capabilities: { compile: true } });
     const connectPromise = client.connect();

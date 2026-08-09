@@ -527,6 +527,15 @@ loop. The agentbox `/api/internal/metrics-snapshot` pull and the SIGTERM
 `/api/internal/metrics-flush` push share one `MetricsFlushPayload { incarnation, prom }`.
 Per-message `ttft_ms` (still consumed by the chat timing badge) is kept.
 
+**Scope — which boxes are pulled**:
+Only boxes running the default `agent` profile serve `/api/internal/metrics-snapshot`.
+The pod list the loop reads is selected by the `app=agentbox` label, which every spawned
+box carries including the KB compile boxes (Python, a different HTTP contract), so
+pull-eligibility is judged by profile, not by the label. Liveness — what
+`retainInstances` grace-evicts against — deliberately stays the FULL box list: a box that
+reaches federation by some other route (the SIGTERM flush, keyed on cert identity rather
+than profile) must not be evicted while it is still running.
+
 **Consequences**:
 - ✅ One metrics path instead of two; no in-memory counter state on the gateway
 - ✅ External Grafana unaffected — every federated `siclaw_*` series is unchanged

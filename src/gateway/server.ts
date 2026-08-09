@@ -115,6 +115,9 @@ function stablePayloadDigest(value: unknown): string {
   return crypto.createHash("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
 }
 
+/** Why a turn was cut short by the Runtime rather than by the model or the user. */
+export type InterruptionReason = "runtime_restart" | "box_rolled";
+
 export interface RuntimeServer {
   httpServer: http.Server;
   httpsServer: https.Server | null;
@@ -320,6 +323,78 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // turn as still reasoning. Registered in chat.send, cleared on its settle.
   const activeStreamAborts = new Map<string, AbortController>();
 
+  /**
+   * Sessions whose terminal this Runtime already sent — on shutdown, or because the box
+   * running them was removed under them.
+   *
+   * Ending a turn also aborts its consumer, which makes that consumer take its own
+   * terminal path, so each id is consumed exactly once to drop the duplicate. Per-turn on
+   * purpose: a "we are shutting down" flag would also swallow the terminal of a turn that
+   * started too late to be reported here, which is the hang this whole path exists to fix.
+   */
+  const supervisorEndedTurns = new Set<string>();
+
+  const INTERRUPTION_MESSAGE: Record<InterruptionReason, string> = {
+    runtime_restart: "Runtime restarted; this turn was interrupted",
+    box_rolled: "The agentbox running this turn was replaced; the turn was interrupted",
+  };
+
+  /**
+   * End the named turns, while the WS to the consumer is still up.
+   *
+   * Termination is `prompt_done` (docs/design/2026-08-02-error-surfacing-contract.md):
+   * a consumer renders an error but keeps the turn open until that arrives. A turn whose
+   * stream simply stops therefore hangs forever — the process that owned it is gone and
+   * its replacement does not adopt turns it did not start, so no later event can come.
+   */
+  function endTurns(sessionIds: Iterable<string>, reason: InterruptionReason): void {
+    const detail = wrapError(new Error(INTERRUPTION_MESSAGE[reason]), {
+      code: ErrorCodes.STREAM_INTERRUPTED,
+      retriable: true,
+    });
+    for (const sessionId of sessionIds) {
+      const ctrl = activeStreamAborts.get(sessionId);
+      if (!ctrl) continue; // nothing of ours is streaming for it
+      supervisorEndedTurns.add(sessionId);
+      try {
+        frontendClient.emitEvent("chat.event", { sessionId, event: { type: "stream_error", error: detail } });
+        // `aborted`/`reason` are additive: a consumer that does not read them sees the
+        // plain terminal it already handles, one that does can name the cause instead of
+        // rendering a generic connection failure.
+        frontendClient.emitEvent("chat.event", {
+          sessionId,
+          event: { type: "prompt_done", aborted: true, reason },
+        });
+      } catch (err) {
+        // Best effort: a consumer that already went away must not stop what caused this.
+        console.warn(`[runtime] could not report interrupted turn session=${sessionId}:`, err);
+      }
+      // Abort AFTER reporting: it makes the consumer run its own finalization (partial
+      // text persisted, running tool rows closed) so a reload agrees with the screen.
+      ctrl.abort();
+      activeStreamAborts.delete(sessionId);
+    }
+  }
+
+  function endInFlightTurns(): void {
+    const sessionIds = [...activeStreamAborts.keys()];
+    if (sessionIds.length === 0) return;
+    // Say it happened. Reporting used to be silent on success, so the only way to tell
+    // whether a restart had ended its turns was to go ask the consumer — during an
+    // incident, from the outside. The failure path already logs; this is its other half.
+    console.log(`[runtime] shutdown interrupting ${sessionIds.length} in-flight turn(s): ${sessionIds.join(", ")}`);
+    endTurns(sessionIds, "runtime_restart");
+  }
+
+  // A box removed while it still holds turns breaks their SSE streams, which does end
+  // them — but as an anonymous transport failure. Reporting here instead names the cause.
+  agentBoxManager.setTurnTerminator?.(endTurns);
+
+  // Reported on every (re)connect so a consumer can settle the turns this Runtime is NOT
+  // streaming. After a restart the list is empty, which is the honest answer: the boxes
+  // still hold those sessions, but nothing is reading them any more.
+  frontendClient.setActiveSessionsProvider?.(() => [...activeStreamAborts.keys()]);
+
   rpcMethods.set("chat.send", async (params, context: RpcContext) => {
     const agentId = params.agentId as string;
     const userId = params.userId as string;
@@ -520,6 +595,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // promptResult.sessionId — the same id chat.abort looks up.
         activeStreamAborts.set(promptResult.sessionId, abortCtrl);
 
+        /**
+         * Whether this turn's terminal was already sent by the supervisor (shutdown, or a
+         * box removed under it). One-shot: the id is consumed, so a later turn on the same
+         * session reports normally.
+         */
+        const alreadyReported = () => supervisorEndedTurns.delete(promptResult.sessionId);
+
         try {
           await consumeAgentSse({
             client,
@@ -546,7 +628,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
               });
             },
           });
-          context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+          if (!alreadyReported()) context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
             console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
@@ -559,7 +641,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
               event: { type: "stream_error", error: detail },
             });
           }
-          context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+          // Shutdown, or a box removal, already reported this turn before aborting it.
+          if (!alreadyReported()) context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
         } finally {
           // Only clear if still ours — a fast re-send for the same session would
           // have replaced the entry with a newer controller.
@@ -1808,6 +1891,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     credentialService,
     async close() {
       metricsAggregator?.destroy();
+      endInFlightTurns();
       frontendClient.close();
       // Older embedded test/adapter managers may only implement cleanup(); the
       // concrete manager's shutdown() preserves K8s boxes across Runtime rolls.

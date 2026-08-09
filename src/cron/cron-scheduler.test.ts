@@ -132,14 +132,103 @@ describe("CronScheduler", () => {
     s.stop();
   });
 
-  it("does not schedule a job with a bogus cron expression (logs error)", () => {
+  it("re-sending an unchanged active job keeps the SAME timer", () => {
+    const s = new CronScheduler(async () => {});
+    s.addOrUpdate(makeJob({ id: "a", schedule: "0 * * * *" }));
+    const armed = (s as any).timers.get("a");
+    // The reconcile loop re-sends every active row on a fixed interval; three passes over
+    // an unchanged job must leave the timer it already has alone.
+    for (let i = 0; i < 3; i++) s.addOrUpdate(makeJob({ id: "a", schedule: "0 * * * *" }));
+    expect((s as any).timers.get("a")).toBe(armed);
+    expect(s.jobCount).toBe(1);
+    s.stop();
+  });
+
+  it("re-arms with a NEW timer when the schedule changes", () => {
+    const s = new CronScheduler(async () => {});
+    s.addOrUpdate(makeJob({ id: "a", schedule: "0 * * * *" }));
+    const armed = (s as any).timers.get("a");
+    s.addOrUpdate(makeJob({ id: "a", schedule: "*/30 * * * *" }));
+    expect((s as any).timers.get("a")).not.toBe(armed);
+    expect(s.jobCount).toBe(1);
+    s.stop();
+  });
+
+  it("paused → active re-arms even though the timer was already gone", () => {
+    const s = new CronScheduler(async () => {});
+    s.addOrUpdate(makeJob({ id: "a", status: "paused" }));
+    expect(s.jobCount).toBe(0);
+    s.addOrUpdate(makeJob({ id: "a", status: "active" }));
+    expect(s.jobCount).toBe(1);
+    s.stop();
+  });
+
+  it("fires the row as it stands now, not the one captured when the timer was armed", async () => {
+    const fired: string[] = [];
+    const s = new CronScheduler(async (job) => { fired.push(job.name); });
+    s.addOrUpdate(makeJob({ id: "t", schedule: "* * * * *", name: "old-name" }));
+    // Same schedule → keeps its timer, so the captured row would otherwise go stale.
+    s.addOrUpdate(makeJob({ id: "t", schedule: "* * * * *", name: "new-name" }));
+
+    await vi.advanceTimersByTimeAsync(60_000 + 1000);
+    await Promise.resolve();
+
+    expect(fired[0]).toBe("new-name");
+    s.stop();
+  });
+
+  it("a schedule change mid-fire leaves no timer that stop() cannot reach", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let fires = 0;
+    const s = new CronScheduler(async () => { fires++; await gate; });
+    s.addOrUpdate(makeJob({ id: "t", schedule: "* * * * *" }));
+
+    await vi.advanceTimersByTimeAsync(60_000 + 1000);
+    expect(fires).toBe(1); // in flight, blocked on the gate — no timer armed right now
+
+    // A reconcile pass delivers a changed schedule while the fire is still running, so
+    // it arms one; the fire's tail then arms its own. Only one may survive.
+    s.addOrUpdate(makeJob({ id: "t", schedule: "*/2 * * * *" }));
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    expect(s.jobCount).toBe(1);
+
+    const settled = fires;
+    s.stop();
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(fires).toBe(settled); // an untracked timer would have fired here
+  });
+
+  it("re-arms a job whose fire never settles, so a later pass puts it back on schedule", async () => {
+    let fires = 0;
+    const s = new CronScheduler(async () => { fires++; await new Promise<void>(() => {}); });
+    s.addOrUpdate(makeJob({ id: "h", schedule: "* * * * *" }));
+
+    await vi.advanceTimersByTimeAsync(60_000 + 1000);
+    expect(fires).toBe(1);
+    expect(s.jobCount).toBe(0); // mid-fire: the fire path deleted the timer and never returns
+
+    // Without this the job would never be scheduled again — the fire path's own re-arm
+    // is unreachable while onFire is stuck.
+    s.addOrUpdate(makeJob({ id: "h", schedule: "* * * * *" }));
+    expect(s.jobCount).toBe(1);
+    s.stop();
+  });
+
+  it("does not schedule a job with a bogus cron expression (logs error, claims nothing)", () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const s = new CronScheduler(async () => {});
     s.addOrUpdate(makeJob({ id: "bad", schedule: "not a cron" }));
     // Internally jobs map has it, but timers map is empty because scheduleNext threw
     expect(s.jobCount).toBe(0);
     expect(errSpy).toHaveBeenCalled();
+    // ...so it must not also report the job as scheduled.
+    expect(logSpy.mock.calls.filter(c => String(c[0]).includes("Scheduled job bad"))).toHaveLength(0);
     s.stop();
     errSpy.mockRestore();
+    logSpy.mockRestore();
   });
 });

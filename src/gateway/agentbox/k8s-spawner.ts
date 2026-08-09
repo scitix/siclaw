@@ -118,6 +118,28 @@ export function clampRequestToLimit(request: string, limit: string, podName: str
   return request;
 }
 
+/**
+ * How kubelet asks a box whether it is up.
+ *
+ * Capability boxes run under a NetworkPolicy that admits only Runtime ingress, and kubelet
+ * probes originate outside that podSelector on several CNIs — so they self-check from
+ * inside the container instead. ONE declaration, shared by all three probes: a profile
+ * that got the wrong dialect for even one of them would fail the probe kubelet cannot
+ * route, and with a startup gate in place that means the box never becomes ready at all.
+ */
+function healthProbeFor(profileName: string): Record<string, unknown> {
+  const inContainer = profileName === "kb-compile" || profileName === "kb-compile-codex" || profileName === "kb-test";
+  return inContainer
+    ? {
+        exec: { command: [
+          "python", "-c",
+          "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:3000/health', context=ssl._create_unverified_context(), timeout=2).read()",
+        ] },
+        timeoutSeconds: 3,
+      }
+    : { httpGet: { path: "/health", port: 3000, scheme: "HTTPS" } };
+}
+
 export class K8sSpawner implements BoxSpawner {
   readonly name = "k8s";
 
@@ -268,6 +290,7 @@ export class K8sSpawner implements BoxSpawner {
     // capability like "kb-compile" declares its own image + writable /work etc.
     // All flavors reuse the same spawn/cert/mTLS/port machinery below.
     const profile = getBoxProfile(boxConfig.profile);
+    const healthProbe = healthProbeFor(profile.name);
     const needsBubblewrap = profile.nestedSandbox === "bubblewrap";
     const image = boxConfig.image ?? profile.image ?? this.config.image;
     const agentId = boxConfig.agentId;
@@ -762,36 +785,20 @@ export class K8sSpawner implements BoxSpawner {
             // Kubelet HTTP probes originate outside that podSelector on several
             // CNIs, so use an in-container HTTPS check for KB profiles. The
             // endpoint is deliberately the sole route that needs no client cert.
-            readinessProbe: profile.name === "kb-compile" || profile.name === "kb-compile-codex" || profile.name === "kb-test"
-              ? {
-                  exec: { command: [
-                    "python", "-c",
-                    "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:3000/health', context=ssl._create_unverified_context(), timeout=2).read()",
-                  ] },
-                  initialDelaySeconds: 2,
-                  periodSeconds: 2,
-                  timeoutSeconds: 3,
-                }
-              : {
-                  httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
-                  initialDelaySeconds: 2,
-                  periodSeconds: 2,
-                },
-            livenessProbe: profile.name === "kb-compile" || profile.name === "kb-compile-codex" || profile.name === "kb-test"
-              ? {
-                  exec: { command: [
-                    "python", "-c",
-                    "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:3000/health', context=ssl._create_unverified_context(), timeout=2).read()",
-                  ] },
-                  initialDelaySeconds: 10,
-                  periodSeconds: 10,
-                  timeoutSeconds: 3,
-                }
-              : {
-                  httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
-                  initialDelaySeconds: 10,
-                  periodSeconds: 10,
-                },
+            // Nothing is probed until the box answers once. Without this, readiness opens
+            // fire 2s in against a process still fetching settings and syncing skills —
+            // and, because instance names are reused, sometimes against a pod with no IP
+            // yet ("connect: invalid argument"). Every rolled box therefore published one
+            // or two Warning events on the way up, which is what a rolling upgrade looked
+            // like from the outside: a pool full of unhealthy boxes, none of them failing.
+            //
+            // 30 x 2s is the same 60s the manager waits before calling a box crashed, so
+            // the two do not disagree about when a box has failed to come up. Readiness
+            // and liveness carry no initialDelay: kubelet holds them until this passes,
+            // and a delay measured from container start would be spent by then anyway.
+            startupProbe: { ...healthProbe, periodSeconds: 2, failureThreshold: 30 },
+            readinessProbe: { ...healthProbe, periodSeconds: 2 },
+            livenessProbe: { ...healthProbe, periodSeconds: 10 },
           },
         ],
       },

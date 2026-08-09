@@ -39,30 +39,72 @@ export class CronScheduler {
     this.onFire = onFire;
   }
 
-  /** Add or update a job — cancels old timer and reschedules */
+  /**
+   * Add or update a job.
+   *
+   * Idempotent on purpose: the reconcile loop re-sends every active job on a fixed
+   * interval, almost always unchanged. Re-arming an identical timer each pass is churn
+   * that also drowned the log — two lines per job per pass, so a busy runtime's log was
+   * mostly this. An already-armed job whose scheduling inputs (`schedule`, `status`)
+   * did not change is left alone. The stored row is refreshed either way, and the fire
+   * path reads it back, so a changed prompt/agent still takes effect on the next fire
+   * without a re-arm.
+   *
+   * A job mid-fire has no timer — the fire path re-arms when it finishes — so a pass
+   * that lands there DOES arm one. That is deliberate: it is the only thing that gets a
+   * job whose fire never settles (a hang before the execution timeout is armed) back on
+   * a schedule. Arming is safe because {@link scheduleNext} replaces whatever timer the
+   * job already has instead of leaving a second one running.
+   */
   addOrUpdate(job: CronJobRow): void {
-    this.cancel(job.id);
+    const prev = this.jobs.get(job.id);
     this.jobs.set(job.id, job);
-    if (job.status === "active") {
-      this.scheduleNext(job);
+
+    if (job.status !== "active") {
+      this.clearTimer(job.id);
+      if (prev?.status !== job.status) {
+        console.log(`[cron-scheduler] Job ${job.id} (${job.name}) is paused, not scheduling`);
+      }
+      return;
+    }
+
+    const unchanged = prev?.schedule === job.schedule && prev?.status === job.status;
+    if (this.timers.has(job.id) && unchanged) return;
+
+    this.scheduleNext(job);
+    // Announce a real (re)schedule only. Nothing armed means scheduleNext rejected the
+    // expression and already said so; a mid-fire arm is a safety net, not news.
+    if (this.timers.has(job.id) && !this.executing.has(job.id)) {
       console.log(`[cron-scheduler] Scheduled job ${job.id} (${job.name})`);
-    } else {
-      console.log(`[cron-scheduler] Job ${job.id} (${job.name}) is paused, not scheduling`);
     }
   }
 
   /** Cancel a job's timer */
   cancel(jobId: string): void {
+    this.clearTimer(jobId);
+    this.jobs.delete(jobId);
+  }
+
+  /** Drop a job's timer without forgetting the job itself. */
+  private clearTimer(jobId: string): void {
     const timer = this.timers.get(jobId);
     if (timer) {
       clearTimeout(timer);
       this.timers.delete(jobId);
     }
-    this.jobs.delete(jobId);
   }
 
-  /** Schedule next fire for a job */
+  /**
+   * Schedule next fire for a job.
+   *
+   * Replaces the job's timer rather than adding one: both callers (a re-schedule and the
+   * fire path's tail) can reach a job that already has one armed, and `timers` holds a
+   * single handle per job — so setting without clearing would drop a live timer out of
+   * the map, where neither `cancel()` nor `stop()` can ever reach it and it fires the
+   * job a second time.
+   */
   private scheduleNext(job: CronJobRow): void {
+    this.clearTimer(job.id);
     try {
       const delay = getNextCronDelay(job.schedule);
       const nextTime = getNextCronTime(job.schedule);
@@ -74,12 +116,22 @@ export class CronScheduler {
       const timer = setTimeout(async () => {
         this.timers.delete(job.id);
 
-        if (this.executing.has(job.id)) return;
+        if (this.executing.has(job.id)) {
+          // The previous fire has not finished. Skipping this one is right — two runs of
+          // the same job must not overlap — but returning bare would leave the job with no
+          // timer at all until a reconcile pass noticed, and none is guaranteed to come.
+          this.scheduleNext(this.jobs.get(job.id) ?? job);
+          return;
+        }
         this.executing.add(job.id);
 
-        console.log(`[cron-scheduler] Firing job ${job.id} (${job.name})`);
+        // Fire the row as it stands now, not as it looked when the timer was armed —
+        // an unchanged schedule keeps its timer across reconciles, so the captured
+        // `job` can be several syncs stale (different prompt, agent, name).
+        const firing = this.jobs.get(job.id) ?? job;
+        console.log(`[cron-scheduler] Firing job ${firing.id} (${firing.name})`);
         try {
-          await this.onFire(job);
+          await this.onFire(firing);
         } catch (err) {
           console.error(`[cron-scheduler] Job ${job.id} fire error:`, err);
         } finally {
