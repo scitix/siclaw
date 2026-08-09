@@ -15,7 +15,7 @@ describe("MetricsAggregator (K8s federation pull loop)", () => {
   let aggr: MetricsAggregator;
   let lister: PodLister;
   let fetcher: SnapshotFetcher;
-  let pods: Array<{ boxId: string; endpoint: string; status: string }>;
+  let pods: Array<{ boxId: string; endpoint: string; status: string; profile?: string }>;
   let fetchMap: Map<string, MetricsFlushPayload | null>;
 
   beforeEach(() => {
@@ -46,6 +46,32 @@ describe("MetricsAggregator (K8s federation pull loop)", () => {
     await Promise.resolve();
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(fetchSpy).toHaveBeenCalledWith("https://p3");
+  });
+
+  it("skips boxes whose profile has no metrics route, and does not score them as pull failures", async () => {
+    const fetchSpy = vi.fn(async () => null);
+    const pullFailuresTotal = { inc: vi.fn() };
+    aggr.destroy();
+    fetcher = { fetch: fetchSpy };
+    const fed = new PromFederationAggregator();
+    aggr = new MetricsAggregator(lister, fetcher, fed, {
+      pullFailuresTotal,
+      pullDurationMs: { observe: vi.fn() },
+      lastSuccessTimestampSeconds: { set: vi.fn() },
+      trackedInstances: { set: vi.fn() },
+      seriesCount: { set: vi.fn() },
+    });
+    // All three carry the app=agentbox label the pod list selects on; only the first two
+    // run the Node agentbox that serves /api/internal/metrics-snapshot.
+    pods.push({ boxId: "a1", endpoint: "https://a1", status: "running" });                          // default profile
+    pods.push({ boxId: "a2", endpoint: "https://a2", status: "running", profile: "agent" });
+    pods.push({ boxId: "kb1", endpoint: "https://kb1", status: "running", profile: "kb-compile" }); // Python box, 404s
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    await Promise.resolve();
+
+    expect(fetchSpy.mock.calls.flat()).toEqual(["https://a1", "https://a2"]);
+    expect(pullFailuresTotal.inc).not.toHaveBeenCalledWith({ box_id: "kb1" });
   });
 
   it("destroy clears the pull timer", async () => {
