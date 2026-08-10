@@ -213,12 +213,20 @@ export class McpClientManager {
     const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
 
     for (const [serverName, serverConfig] of entries) {
+      // Both handles live outside the try because the catch has to reach them.
+      // A connection that fails before the `this.clients.push()` on the try's last
+      // line is invisible to shutdown(), which only walks that array — so without
+      // an explicit close here nothing ever releases it. The leak is real, not
+      // theoretical: connect() can fail with the transport already started (stdio
+      // spawned a child, http opened a connection), and a listTools() failure means
+      // the handshake definitely completed.
+      let client: any;
+      let transport: any;
       try {
-        const client = new Client(
+        client = new Client(
           { name: `siclaw-mcp-${serverName}`, version: "1.0.0" },
         );
 
-        let transport: any;
         // Auto-detect transport when not explicitly set: url → streamable-http, command → stdio
         const cfg = serverConfig as any;
         const detectedTransport: string = cfg.transport
@@ -267,6 +275,7 @@ export class McpClientManager {
         this.clients.push({ serverName, client, transport });
       } catch (err) {
         console.error(`[mcp-client] Failed to connect to "${serverName}":`, err);
+        await this.discardUnregisteredConnection(serverName, client, transport);
       }
     }
 
@@ -301,6 +310,35 @@ export class McpClientManager {
     }
     this.clients = [];
     this.tools = [];
+  }
+
+  /**
+   * Release a connection that failed before it was registered in `this.clients`.
+   *
+   * Both handles are tried because which one owns the live resource depends on how
+   * far the handshake got: once connect() has returned, Client.close() is what
+   * drives the transport down; if it threw, the raw transport may be all that was
+   * ever started. Closing an already-closed transport is a no-op, and Client.close()
+   * on a client that never connected has no transport to reach — so trying both is
+   * cheap and covers every exit point of the try block above.
+   *
+   * Best-effort by construction: this runs while an error is already being handled,
+   * and a cleanup failure must not mask the original one. That is the only reason
+   * these catches swallow — the real error was logged by the caller first.
+   */
+  private async discardUnregisteredConnection(
+    serverName: string,
+    client: { close?: () => Promise<void> } | undefined,
+    transport: { close?: () => Promise<void> } | undefined,
+  ): Promise<void> {
+    for (const handle of [client, transport]) {
+      if (typeof handle?.close !== "function") continue;
+      try {
+        await handle.close();
+      } catch (err) {
+        console.warn(`[mcp-client] Cleanup after the failed "${serverName}" connection did not complete:`, err);
+      }
+    }
   }
 
   /**
