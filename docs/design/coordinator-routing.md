@@ -134,10 +134,16 @@ Lifecycle, error, clarification and artifact frames therefore travel with an
 acknowledgement on *both* legs: the target Runtime reports a delegated turn's
 terminal to the management plane over an acknowledged RPC, and the management
 plane relays control frames to the source over one, retried until this Runtime
-confirms that the matching delegation consumer handled them. A re-delivered
-terminal must be acknowledged, not rejected: its consumer is gone precisely
-because it consumed the original, and refusing it keeps a sender retrying — which
-keeps supervision alive over a turn that already ended.
+confirms that the matching delegation consumer handled them. Each retry budget has
+to outlast a WS reconnect: a few hundred milliseconds would give up while the only
+route back is still being re-established.
+
+A reported terminal enters the same ordered queue as the stream it accompanies.
+Acting on it straight from the RPC would let it overtake an artifact, error or
+clarification that preceded it, retiring supervision before those were delivered.
+And a re-delivered terminal must be acknowledged, not rejected: its consumer is
+gone precisely because it consumed the original, and refusing it keeps a sender
+retrying — which keeps supervision alive over a turn that already ended.
 
 After the terminal event, the source always derives remote `finalText` from
 assistant rows after the current delegation boundary in durable session history.
@@ -159,15 +165,26 @@ ambiguous the moment a turn ends, and a supervisor's abort can be delayed past
 that point by a lease expiry or a retry. Every abort a Runtime sends names the
 turn it means:
 
-- a prompt carries the caller's turn id, the box records it as the running turn,
-  and an abort naming any other turn is answered as already stopped;
+- a prompt carries the caller's turn id. A supervisor that will have to abort the
+  turn later fixes it *before* dispatch and passes it in the prompt — learning it
+  from the acknowledgement would leave the one case that needs it most, an
+  acknowledgement that never arrived, with nothing to name. The Runtime mints one
+  only when the caller supplies none, and echoes whichever id is in force;
+- the box records it as the running turn, and an abort naming any other turn is
+  answered as already stopped;
 - a pre-spawn abort latch records the turn that armed it and is consumed only by
-  that turn's prompt, so an orphaned latch cannot cancel a later, deliberate
-  prompt on the same reused session id;
-- `chat.abort` accepts an optional turn id and ignores a stale one. The user's
-  Stop button sends none, which still means "stop what is running"; and
-- the turn id appears in the `chat.send` acknowledgement so a supervisor can name
-  it later.
+  that turn's prompt, so an orphaned latch cannot cancel a later, deliberate prompt
+  on the same reused session id. That is also why a named latch is armed
+  unconditionally: the "already has history on disk" guard exists only because a
+  session-wide latch could cancel an unrelated prompt, and skipping it is what lets
+  a Stop on a REUSED session — which a delegated peer thread always is — arm
+  anything at all; and
+- `chat.abort` accepts an optional turn id and ignores a stale one. The user's Stop
+  button sends none, which still means "stop what is running" — and more than one
+  turn can be live at that moment, because a second send registers its turn before
+  it can acquire the session lock. All live turns are therefore named, snapshotted
+  before the consumer is broken: reading them afterwards would miss the very turn
+  being stopped, since a settling turn removes itself.
 
 Both fields are optional, which is what makes naming a turn safe to roll out in
 either order: a box that ignores the field keeps session-wide semantics, and a
