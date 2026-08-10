@@ -115,9 +115,10 @@ Runtime must resolve the coordinator and peer against management-plane truth:
 
 Same-Runtime delegation keeps the local AgentBox path. Cross-Runtime delegation
 uses the management-plane Runtime mesh: `delegation.start` routes the peer turn,
-`delegation.event` carries live events back to the source, and
-`delegation.abort` stops the target turn. Runtime-private Gateway addresses are
-never part of this contract.
+`delegation.event` carries best-effort progress back to the source,
+`delegation.control` delivers acknowledged terminal/error/input/artifact frames,
+and `delegation.abort` stops the target turn. Runtime-private Gateway addresses
+are never part of this contract.
 
 The source creates and sequences the delegated session/user row so coordinator
 ownership, parent lineage, and the delegation boundary are durable before the
@@ -127,15 +128,24 @@ edge and reasserts that flag before forwarding `chat.send`. The target does not
 create a second user row, so a target-side `promptMessageId` is intentionally
 absent. A bare, non-delegated `chat.send` may never suppress persistence.
 
-Live events are progress signals, not the correctness record for the result.
-They may be dropped individually, so even a non-empty reassembled answer can be
-incomplete. After the terminal event, the source always derives remote
+Live progress events are not the correctness record for the result. They may be
+dropped individually, so even a non-empty reassembled answer can be incomplete.
+Lifecycle, error, clarification and artifact frames use the acknowledged control
+RPC and are retried by the management plane until this Runtime confirms that the
+matching delegation consumer handled them. After the terminal event, the source always derives remote
 `finalText` from assistant rows after the current delegation boundary in durable
 session history. Artifact-only and input-required turns may legitimately have no
 assistant text; an ordinary completed turn with no durable result fails instead
 of returning an empty or partial success. The remote relay timeout measures
 event *silence* and is renewed by matching events;
 `SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT` may override it in seconds.
+
+Cancellation is latched before authorization and route lookup so an HTTP close
+cannot be missed during pre-stream awaits. On the target Runtime, a pending-only
+Stop cancels the Gateway start without creating an AgentBox pre-spawn tombstone;
+if `prompt()` is already in flight, the post-acceptance check aborts the real
+session. A terminal carrying `aborted=true` is authoritative interruption, even
+if partial assistant rows were already persisted.
 
 This contract creates a strict rollout dependency. The management plane that
 implements route/start/abort and the reverse event lane must be deployed before

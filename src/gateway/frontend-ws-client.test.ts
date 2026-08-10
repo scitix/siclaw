@@ -341,6 +341,28 @@ describe("FrontendWsClient", () => {
     client.close();
   });
 
+  it("acknowledges a reliable event only when a matching subscriber accepts it", async () => {
+    const client = await createClient();
+    const unsubscribeOther = client.subscribe("delegation.event", () => false);
+    expect(client.dispatchReliableEvent("delegation.event", { delegationId: "d1" })).toBe(false);
+
+    const received: unknown[] = [];
+    const unsubscribeMatching = client.subscribe("delegation.event", (data) => {
+      const envelope = data as { delegationId?: string };
+      if (envelope.delegationId !== "d1") return false;
+      received.push(data);
+      return true;
+    });
+
+    expect(client.dispatchReliableEvent("delegation.event", { delegationId: "other" })).toBe(false);
+    expect(client.dispatchReliableEvent("delegation.event", { delegationId: "d1" })).toBe(true);
+    expect(received).toEqual([{ delegationId: "d1" }]);
+
+    unsubscribeMatching();
+    unsubscribeOther();
+    client.close();
+  });
+
   // ── 7. Auto-reconnect on disconnect ───────────────────────
 
   it("rejects all pending RPCs on WS close (so callers don't wait the full timeout)", async () => {

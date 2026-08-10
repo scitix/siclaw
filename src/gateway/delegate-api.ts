@@ -196,6 +196,36 @@ export async function handleDelegate(
     return;
   }
 
+  // Register cancellation before the first asynchronous authorization/config
+  // lookup. EventEmitter does not replay `close`, so installing this only at the
+  // SSE phase misses a Stop that arrives during those awaits and can dispatch a
+  // headless turn after the HTTP consumer has gone away.
+  const peerAbort = new AbortController();
+  let finished = false;
+  let peerClient: AgentBoxClient | undefined;
+  let route: DelegationRoute | undefined;
+  let delegationId = "";
+  let peerSessionId = "";
+  let remoteStartRequested = false;
+  const onResponseClose = () => {
+    if (finished) return;
+    peerAbort.abort();
+    if (route && !route.local && remoteStartRequested && delegationId) {
+      deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch((err) => {
+        console.warn(`[delegate-api] failed to abort remote delegation ${delegationId}:`, err);
+      });
+      return;
+    }
+    if (peerClient) {
+      peerClient.abortSession(peerSessionId).catch((err) => {
+        console.warn(`[delegate-api] failed to abort peer session ${peerSessionId}:`, err);
+      });
+    }
+  };
+  res.on("close", onResponseClose);
+  if (res.destroyed) onResponseClose();
+  const cancelled = () => peerAbort.signal.aborted || res.destroyed;
+
   // 1. Authorize: the peer MUST be in this coordinator's roster (config-time
   //    authorization; the box's own claim is never trusted).
   let member: DelegateRosterMember | undefined;
@@ -203,10 +233,12 @@ export async function handleDelegate(
     const roster = await fetchRoster(deps.frontendClient, coordinatorAgentId);
     member = roster.find((m) => m.id === peerAgentId);
   } catch (err) {
+    if (cancelled()) return;
     console.error("[delegate-api] roster lookup failed:", err);
     sendJson(res, 500, { error: "Failed to check delegation authorization" });
     return;
   }
+  if (cancelled()) return;
   if (!member) {
     sendJson(res, 403, { error: "peer agent is not in this coordinator's delegation roster" });
     return;
@@ -214,6 +246,7 @@ export async function handleDelegate(
 
   // 2. Resolve the peer's own model binding (it runs under ITS config, not the coordinator's).
   const binding = await resolveAgentModelBinding(peerAgentId, deps.frontendClient);
+  if (cancelled()) return;
   if (!binding || !binding.modelProvider) {
     sendJson(res, 502, { error: `peer agent ${member.name} has no usable model binding` });
     return;
@@ -224,7 +257,6 @@ export async function handleDelegate(
   // otherwise a coordinator Runtime can create a correctly configured peer in
   // the wrong network environment. Fail closed if the control plane cannot
   // prove the route — a local fallback would recreate the incident.
-  let route: DelegationRoute;
   try {
     route = await deps.frontendClient.request("delegation.resolveRoute", {
       coordinatorAgentId,
@@ -239,12 +271,14 @@ export async function handleDelegate(
       throw new Error("invalid delegation route response");
     }
   } catch (err) {
+    if (cancelled()) return;
     console.error("[delegate-api] delegation route lookup failed:", err);
     sendJson(res, 503, { error: "Could not resolve the peer Runtime; delegation was not started" });
     return;
   }
+  if (cancelled()) return;
 
-  const delegationId = randomUUID();
+  delegationId = randomUUID();
 
   // Resolve the peer session id + owner. The peer session is PERSISTED (openable +
   // analyzable) as a child of the coordinator session: agent_id = coordinator (the
@@ -254,7 +288,7 @@ export async function handleDelegate(
   // retained), else a fresh session. Reuse is re-validated to belong to THIS
   // coordinator (parent + target match) — never trust the box's raw id.
   let ownerUserId = coordinatorAgentId; // fallback; parent-link auth still grants the human
-  let peerSessionId: string = randomUUID();
+  peerSessionId = randomUUID();
   // The caller-supplied parent is trusted ONLY once bound to THIS coordinator's mTLS
   // identity. Gates user_id adoption, session reuse, AND parent linkage.
   let parentTrusted = false;
@@ -267,11 +301,13 @@ export async function handleDelegate(
     try {
       parent = await deps.frontendClient.request("chat.resolveSession", { session_id: body.parentSessionId }) as typeof parent;
     } catch (err) {
+      if (cancelled()) return;
       // Transient: we cannot confirm ownership, so reject rather than risk mis-linking.
       console.error("[delegate-api] parent session validation failed (RPC error):", err);
       sendJson(res, 503, { error: "could not validate parentSessionId; please retry" });
       return;
     }
+    if (cancelled()) return;
     // Bind parentSessionId to the caller's cert identity: a parent whose agent_id is
     // not this coordinator means the box is pointing at another agent's session.
     // (Pre-stream: headers not yet sent, plain JSON.)
@@ -299,6 +335,7 @@ export async function handleDelegate(
       } catch (err) {
         console.warn("[delegate-api] recent-delegation lookup failed; using a fresh peer session:", err);
       }
+      if (cancelled()) return;
     }
   }
 
@@ -317,6 +354,7 @@ export async function handleDelegate(
     // reads naturally (and a reuse turn appends its new task).
     await appendMessage({ sessionId: peerSessionId, role: "user", content: text, parentSessionId: trustedParent, delegationId, targetAgentId: peerAgentId });
   } catch (err) {
+    if (cancelled()) return;
     console.warn("[delegate-api] failed to persist peer session:", err);
     // The target Runtime deliberately skips initial persistence so the source
     // can preserve coordinator ownership and parent lineage. Without this row,
@@ -327,6 +365,7 @@ export async function handleDelegate(
       return;
     }
   }
+  if (cancelled()) return;
 
   const steps: string[] = [];
   let artifact: DelegateArtifact | null = null;
@@ -397,35 +436,6 @@ export async function handleDelegate(
     }
   };
 
-  // Propagate Stop: when the coordinator aborts, its delegateStream destroys the
-  // HTTP request → this response's socket closes. Break the drain loop AND cancel
-  // the peer's own turn (otherwise the peer keeps running headless).
-  const peerAbort = new AbortController();
-  let finished = false;
-  let peerClient: AgentBoxClient | undefined;
-  let remoteStartRequested = false;
-  res.on("close", () => {
-    if (finished) return; // normal completion, not a client abort
-    peerAbort.abort();
-    if (!route.local && remoteStartRequested) {
-      deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch((err) => {
-        console.warn(`[delegate-api] failed to abort remote delegation ${delegationId}:`, err);
-      });
-      return;
-    }
-    // Abort by peerSessionId — known BEFORE the prompt round-trip and equal to the
-    // box session id we prompt with. Using the post-prompt `promptResult.sessionId`
-    // left a gap: a Stop during getOrCreate (pod spawn, 10-30s) + the prompt HTTP
-    // round-trip found it still undefined, so the peer turn ran headless to
-    // completion (wasted model quota + box CPU, result discarded). Once peerClient
-    // exists the prompt has been dispatched, so aborting by peerSessionId reaches it.
-    if (peerClient) {
-      peerClient.abortSession(peerSessionId).catch((err) => {
-        console.warn(`[delegate-api] failed to abort peer session ${peerSessionId}:`, err);
-      });
-    }
-  });
-
   // Surface the peer session id immediately (it's known now) so the coordinator's
   // card can offer "open full session" LIVE, before the final result arrives.
   writeFrame({ type: "delegate_session", peerSessionId });
@@ -454,11 +464,22 @@ export async function handleDelegate(
     peerAbort.signal.addEventListener("abort", onAbort, { once: true });
     const unsubscribe = deps.frontendClient.subscribe("delegation.event", (data) => {
       const envelope = data as DelegationRelayEnvelope;
-      if (envelope?.delegationId !== delegationId || envelope.sessionId !== peerSessionId || !envelope.event) return;
+      if (envelope?.delegationId !== delegationId || envelope.sessionId !== peerSessionId || !envelope.event) return false;
       armIdleWatchdog();
       observePeerEvent(envelope.event, false);
       const type = String((envelope.event as any)?.type ?? "");
-      if (type === "prompt_done" || type === "done") resolveRemoteDone?.();
+      if (type === "prompt_done" || type === "done") {
+        if ((envelope.event as any).aborted === true) {
+          const reason = typeof (envelope.event as any).reason === "string"
+            ? (envelope.event as any).reason.trim()
+            : "";
+          remoteErrorMessage = reason
+            ? `Remote delegation was interrupted: ${reason}`
+            : "Remote delegation was interrupted";
+        }
+        resolveRemoteDone?.();
+      }
+      return true;
     });
 
     try {

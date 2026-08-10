@@ -43,7 +43,7 @@ interface PendingRpc {
 }
 
 type CommandHandler = (method: string, params: any) => Promise<any>;
-type EventHandler = (data: unknown) => void;
+type EventHandler = (data: unknown) => boolean | void;
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -143,6 +143,15 @@ export class FrontendWsClient {
       current?.delete(handler);
       if (current?.size === 0) this.eventHandlers.delete(channel);
     };
+  }
+
+  /**
+   * Deliver a correctness-bearing event received as an acknowledged RPC.
+   * The handler must explicitly return true for the matching in-flight
+   * consumer; an unrelated channel subscriber is not an acknowledgment.
+   */
+  dispatchReliableEvent(channel: string, data: unknown): boolean {
+    return this.dispatchSubscribedEvent(channel, data, true);
   }
 
   /**
@@ -327,13 +336,7 @@ export class FrontendWsClient {
     // direction; cross-Runtime delegation uses this reverse event lane to relay
     // a target Runtime's peer stream without exposing private Gateway addresses.
     if (msg.type === "event" && typeof msg.channel === "string") {
-      for (const handler of this.eventHandlers.get(msg.channel) ?? []) {
-        try {
-          handler(msg.data);
-        } catch (err) {
-          console.warn(`[frontend-ws] event handler failed channel=${msg.channel}:`, err);
-        }
-      }
+      this.dispatchSubscribedEvent(msg.channel, msg.data, false);
       return;
     }
 
@@ -341,6 +344,19 @@ export class FrontendWsClient {
     if (msg.type === "req" && typeof msg.id === "string" && typeof msg.method === "string") {
       this.handleInboundCommand(msg.id, msg.method, msg.params);
     }
+  }
+
+  private dispatchSubscribedEvent(channel: string, data: unknown, requireExplicitAck: boolean): boolean {
+    let accepted = false;
+    for (const handler of this.eventHandlers.get(channel) ?? []) {
+      try {
+        const result = handler(data);
+        if (result === true || (!requireExplicitAck && result !== false)) accepted = true;
+      } catch (err) {
+        console.warn(`[frontend-ws] event handler failed channel=${channel}:`, err);
+      }
+    }
+    return accepted;
   }
 
   private async handleInboundCommand(id: string, method: string, params: any): Promise<void> {

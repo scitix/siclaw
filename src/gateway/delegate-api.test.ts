@@ -60,6 +60,7 @@ interface FakeRes {
   frames: any[];
   jsonBody?: unknown;
   ended: boolean;
+  destroyed: boolean;
   _close?: () => void;
   triggerClose: () => void;
   writeHead: (s: number, h?: Record<string, string>) => void;
@@ -72,7 +73,8 @@ function makeRes(): FakeRes {
   const res: FakeRes = {
     frames: [],
     ended: false,
-    triggerClose() { this._close?.(); },
+    destroyed: false,
+    triggerClose() { this.destroyed = true; this._close?.(); },
     writeHead(s, h) { this.statusCode = s; this.headers = h; },
     write(chunk: string) {
       // SSE frames: "data: {json}\n\n"
@@ -98,7 +100,7 @@ const COORD = "coord-agent";
 const PEER = "peer-agent";
 
 function makeDeps(resolveSessionResult: unknown) {
-  const eventHandlers = new Map<string, (data: unknown) => void>();
+  const eventHandlers = new Map<string, (data: unknown) => boolean | void>();
   const request = vi.fn(async (method: string) => {
     if (method === "config.getDelegates") {
       return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
@@ -114,7 +116,7 @@ function makeDeps(resolveSessionResult: unknown) {
     frontendClient: {
       request,
       emitEvent: vi.fn(),
-      subscribe: vi.fn((channel: string, handler: (data: unknown) => void) => {
+      subscribe: vi.fn((channel: string, handler: (data: unknown) => boolean | void) => {
         eventHandlers.set(channel, handler);
         return () => eventHandlers.delete(channel);
       }),
@@ -194,6 +196,32 @@ describe("handleDelegate — cancellation during cold spawn (P1)", () => {
 
     // The turn was cancelled before dispatch — the peer must never be prompted.
     expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch after the coordinator disconnects during route resolution", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    let releaseRoute: ((route: unknown) => void) | undefined;
+    deps.frontendClient.request = vi.fn(async (method: string) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") {
+        return new Promise((resolve) => { releaseRoute = resolve; });
+      }
+      return {};
+    });
+    const res = makeRes();
+    const pending = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+    for (let i = 0; i < 20 && !releaseRoute; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(releaseRoute).toBeTruthy();
+
+    res.triggerClose();
+    releaseRoute?.({ local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" });
+    await pending;
+
+    expect(ensureChatSession).not.toHaveBeenCalled();
+    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
+    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
   });
 });
 
@@ -340,6 +368,30 @@ describe("handleDelegate — cross-Runtime routing", () => {
     await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
 
     expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed", error: "provider unavailable" });
+  });
+
+  it("treats an aborted terminal as failure even when partial assistant text was persisted", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        deps.eventHandlers.get("delegation.event")!({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "prompt_done", aborted: true, reason: "box_rolled" },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed" });
+    expect(delegateResult(res)?.error).toContain("box_rolled");
+    expect(delegateResult(res)?.finalText).toBeUndefined();
+    expect(getMessages).not.toHaveBeenCalled();
   });
 
   it("recovers a persisted assistant answer when the live message frame was lost", async () => {

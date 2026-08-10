@@ -1411,8 +1411,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // the consumer — so consumeAgentSse runs its abort-finalization (in-flight tool
     // rows → "stopped", partial assistant text persisted) instead of exiting as a
     // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
-    for (const ctrl of pendingStartAborts.get(sessionId) ?? []) ctrl.abort();
-    activeStreamAborts.get(sessionId)?.abort();
+    const pending = pendingStartAborts.get(sessionId);
+    const active = activeStreamAborts.get(sessionId);
+    for (const ctrl of pending ?? []) ctrl.abort();
+    active?.abort();
+
+    // A pending-only turn has not established an AgentBox session. Its background
+    // chat.send checks the Gateway controller before prompt(), and checks again
+    // immediately after an in-flight prompt is accepted. Calling AgentBox abort
+    // here would create a pre-spawn tombstone that this cancelled send never
+    // consumes, causing the next intentional send on the same session to abort.
+    if (pending?.size && !active) return { ok: true };
 
     const client = await boxForRunningTurn(agentId, sessionId);
     // Stopping a session a box does not have is already the outcome the user asked for;
@@ -1649,6 +1658,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const reloaded = targets.length - failed.length;
     console.log(`[rpc] tracing.reloadAll: boxes=${targets.length} reloaded=${reloaded} failed=[${failed}]`);
     return { ok: true, reloaded, failed, boxes: targets.length };
+  });
+
+  // Reliable cross-Runtime delegation controls arrive as RPCs instead of the
+  // best-effort event lane. Acknowledge only after the matching source handler
+  // has consumed the envelope; Sicore retains and retries it otherwise.
+  rpcMethods.set("delegation.control", async (params) => {
+    if (!frontendClient.dispatchReliableEvent("delegation.event", params)) {
+      throw new Error("No active delegation consumer accepted the control event");
+    }
+    return { ok: true };
   });
 
   // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──

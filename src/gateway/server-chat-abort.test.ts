@@ -72,6 +72,7 @@ function fakeFrontendClient() {
     request: vi.fn(async () => ({ found: false })),
     onCommand: vi.fn(),
     emitEvent: vi.fn(),
+    dispatchReliableEvent: vi.fn(() => true),
     close: vi.fn(),
   } as any;
 }
@@ -87,11 +88,11 @@ function fakeAgentBoxManager() {
   } as any;
 }
 
-async function bootRuntime(agentBoxManager = fakeAgentBoxManager()) {
+async function bootRuntime(agentBoxManager = fakeAgentBoxManager(), frontendClient = fakeFrontendClient()) {
   return startRuntime({
     config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
     agentBoxManager,
-    frontendClient: fakeFrontendClient(),
+    frontendClient,
     credentialService: {} as any,
   });
 }
@@ -116,6 +117,20 @@ afterEach(async () => {
 });
 
 describe("startRuntime — chat.abort wiring", () => {
+  it("acknowledges delegation controls only after a matching source consumer accepts them", async () => {
+    const frontendClient = fakeFrontendClient();
+    server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
+    const control = server.rpcMethods.get("delegation.control")!;
+    const envelope = { delegationId: "d1", sessionId: "S", event: { type: "prompt_done" } };
+
+    frontendClient.dispatchReliableEvent.mockReturnValueOnce(false);
+    await expect(control(envelope, { sendEvent: vi.fn() })).rejects.toThrow(/No active delegation consumer/);
+
+    frontendClient.dispatchReliableEvent.mockReturnValueOnce(true);
+    await expect(control(envelope, { sendEvent: vi.fn() })).resolves.toMatchObject({ ok: true });
+    expect(frontendClient.dispatchReliableEvent).toHaveBeenLastCalledWith("delegation.event", envelope);
+  });
+
   it("starts consuming the reply without waiting for trace binding", async () => {
     bindMessageTraceIdMock.mockImplementationOnce(() => new Promise<void>(() => {}));
     server = await bootRuntime();
@@ -170,8 +185,8 @@ describe("startRuntime — chat.abort wiring", () => {
     const manager = fakeAgentBoxManager();
     manager.getOrCreate.mockImplementation(async () => {
       getOrCreateCalls += 1;
-      // Hold only chat.send's placement. chat.abort's fallback lookup must still
-      // be able to reach a box and acknowledge Stop while the first call waits.
+      // Hold the first chat.send placement so Stop lands while the turn exists
+      // only in the Gateway's pending-start registry.
       if (getOrCreateCalls === 1) {
         await new Promise<void>((resolve) => { releaseColdSpawn = resolve; });
       }
@@ -194,6 +209,16 @@ describe("startRuntime — chat.abort wiring", () => {
     ));
 
     expect(promptCalls).toHaveLength(0);
+    expect(abortSessionCalls).toEqual([]);
+
+    // The pending-only Stop must not arm AgentBox's pre-spawn abort latch. A
+    // second intentional send on the same session is allowed to reach prompt.
+    await expect(send({ agentId: "a", userId: "u", text: "try again", sessionId: "S" }, ctx))
+      .resolves.toMatchObject({ ok: true, sessionId: "S" });
+    await waitFor(() => promptCalls.length === 1);
+    expect(promptCalls[0]).toMatchObject({ sessionId: "S", text: "try again" });
+
+    await abort({ agentId: "a", sessionId: "S" });
     expect(abortSessionCalls).toEqual(["S"]);
   });
 
