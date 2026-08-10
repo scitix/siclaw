@@ -1395,6 +1395,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return new AgentBoxClient(endpoint, 10000, agentBoxTlsOptions);
   }
 
+  /**
+   * The box a turn was already dispatched to, WITHOUT creating one. Same evidence
+   * chain as boxForRunningTurn minus the getOrCreate last resort: used where the
+   * question is "did anything reach a box" — spawning a pod to answer it would
+   * both cost a pod and manufacture the box whose absence was the answer.
+   */
+  async function dispatchedBoxEndpoint(agentId: string, sessionId: string): Promise<string | undefined> {
+    return sessionTurnLocks.busyOn(sessionId)?.endpoint
+      ?? (await agentBoxManager.getHolder?.(agentId, sessionId).catch(() => undefined))?.endpoint;
+  }
+
   /** A box that has not created the session yet answers exactly like one that never will. */
   function isSessionNotFound(err: unknown): boolean {
     return /session not found/i.test(String((err as Error)?.message ?? err));
@@ -1416,12 +1427,38 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     for (const ctrl of pending ?? []) ctrl.abort();
     active?.abort();
 
-    // A pending-only turn has not established an AgentBox session. Its background
-    // chat.send checks the Gateway controller before prompt(), and checks again
-    // immediately after an in-flight prompt is accepted. Calling AgentBox abort
-    // here would create a pre-spawn tombstone that this cancelled send never
-    // consumes, causing the next intentional send on the same session to abort.
-    if (pending?.size && !active) return { ok: true };
+    // A pending-only turn usually has no AgentBox session yet: its background
+    // chat.send checks the Gateway controller before prompt(), so aborting the box
+    // here would only record a pre-spawn tombstone that this cancelled send never
+    // consumes — and the NEXT intentional send on the session would consume it and
+    // be short-circuited as aborted.
+    //
+    // "Usually" is not "always": AgentBox starts the run BEFORE acknowledging
+    // /api/prompt, so a lost or timed-out ack leaves a REALLY running turn behind a
+    // still-pending Gateway state, and prompt()'s rejection path never reaches the
+    // post-accept compensation. Ask the box this turn was dispatched to whether it
+    // actually holds the session: if it does, abort is both required and
+    // tombstone-free by construction; if it does not, there is nothing to stop.
+    if (pending?.size && !active) {
+      const dispatchedEndpoint = await dispatchedBoxEndpoint(agentId, sessionId);
+      if (!dispatchedEndpoint) return { ok: true };
+      const dispatched = new AgentBoxClient(dispatchedEndpoint, 10000, agentBoxTlsOptions);
+      // A failed probe is not evidence of absence. Fall through to the abort attempt
+      // rather than assume nothing is running — a headless turn burns model quota
+      // until it finishes, while a tombstone at worst costs the next send a retry.
+      const holdsSession = await dispatched.listSessions()
+        .then(({ sessions }) => sessions.some((s) => s.id === sessionId))
+        .catch((err) => {
+          console.warn(`[runtime] abort: could not probe box for session=${sessionId}; aborting anyway:`, err);
+          return true;
+        });
+      if (!holdsSession) return { ok: true };
+      await dispatched.abortSession(sessionId).catch((err) => {
+        if (!isSessionNotFound(err)) throw err;
+        console.log(`[runtime] abort: session=${sessionId} vanished from its box between probe and abort`);
+      });
+      return { ok: true };
+    }
 
     const client = await boxForRunningTurn(agentId, sessionId);
     // Stopping a session a box does not have is already the outcome the user asked for;

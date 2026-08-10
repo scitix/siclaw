@@ -46,6 +46,12 @@ vi.mock("./sse-consumer.js", () => ({
 const abortSessionCalls: string[] = [];
 const promptCalls: unknown[] = [];
 let promptError: Error | undefined;
+// Blocks inside prompt() so a test can hold the /api/prompt round-trip open (and
+// then fail it) while the box is already running the turn.
+let promptBlocker: Promise<void> | undefined;
+// Session ids the fake box reports holding — the evidence chat.abort probes before
+// aborting a turn the Gateway still counts as pending.
+const boxSessions: string[] = [];
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     endpoint: string;
@@ -54,9 +60,11 @@ vi.mock("./agentbox/client.js", () => ({
     }
     prompt = vi.fn(async (opts: { sessionId: string }) => {
       promptCalls.push(opts);
+      if (promptBlocker) await promptBlocker;
       if (promptError) throw promptError;
       return { sessionId: opts.sessionId, traceId: "0123456789abcdef0123456789abcdef" };
     });
+    listSessions = vi.fn(async () => ({ sessions: boxSessions.map((id) => ({ id })) }));
     abortSession = vi.fn(async (sessionId: string) => {
       abortSessionCalls.push(sessionId);
     });
@@ -113,6 +121,8 @@ afterEach(async () => {
   abortSessionCalls.length = 0;
   promptCalls.length = 0;
   promptError = undefined;
+  promptBlocker = undefined;
+  boxSessions.length = 0;
   vi.clearAllMocks();
 });
 
@@ -220,6 +230,68 @@ describe("startRuntime — chat.abort wiring", () => {
 
     await abort({ agentId: "a", sessionId: "S" });
     expect(abortSessionCalls).toEqual(["S"]);
+  });
+
+  it("aborts a dispatched turn whose prompt ack was lost, even while it is only pending", async () => {
+    // AgentBox starts the run BEFORE it acknowledges /api/prompt. A lost/timed-out
+    // ack therefore leaves a really-running turn behind a still-pending Gateway
+    // state, and prompt()'s rejection never reaches the post-accept compensation.
+    // Stop must reach the box, or the peer turn runs headless to completion.
+    let failPrompt: ((err: Error) => void) | undefined;
+    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
+    boxSessions.push("ack-lost");
+
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    try {
+      await send({ agentId: "a", userId: "u", text: "hi", sessionId: "ack-lost" }, ctx);
+      await waitFor(() => promptCalls.length === 1);
+      // No consumer yet: the turn exists only in the pending-start registry.
+      expect(capturedSignal).toBeUndefined();
+
+      await expect(abort({ agentId: "a", sessionId: "ack-lost" })).resolves.toMatchObject({ ok: true });
+      expect(abortSessionCalls).toEqual(["ack-lost"]);
+    } finally {
+      // Always fail the held prompt: leaving it pending would keep this session's
+      // turn lock held for the rest of the file.
+      failPrompt?.(new Error("socket hang up"));
+    }
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+  });
+
+  it("does not abort the box when a dispatched prompt never created the session", async () => {
+    // Same pending-only shape, but the box genuinely has nothing: aborting would
+    // only arm the pre-spawn latch that the next intentional send would consume.
+    let failPrompt: ((err: Error) => void) | undefined;
+    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
+    // boxSessions stays empty: the box holds nothing for this id.
+
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    try {
+      await send({ agentId: "a", userId: "u", text: "hi", sessionId: "no-session" }, ctx);
+      await waitFor(() => promptCalls.length === 1);
+
+      await expect(abort({ agentId: "a", sessionId: "no-session" })).resolves.toMatchObject({ ok: true });
+      expect(abortSessionCalls).toEqual([]);
+    } finally {
+      failPrompt?.(new Error("connection refused"));
+    }
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
   });
 
   it("binds an explicit steer message to the active prompt trace", async () => {
