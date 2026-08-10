@@ -4,6 +4,7 @@
   "compile.regenerate": "Regenerate the complete knowledge-base draft in this staging workspace. The owner has authorized execution without another plan-confirmation stop. Read the structured compile brief, cover the complete source set with provenance, handle uncertainty through best-guess plus tickets, and finish through candidate/index.md.",
   "compile.approve_plan": "The owner approved the exact current proposed plan. Execute it now, preserve the structured compile brief, handle uncertainty through best-guess plus tickets, and finish through candidate/index.md.",
   "compile.incremental": "Apply the structured source changeset as a scoped incremental compilation.",
+  "compile.renew_context": "Platform renew plan (authoritative): strategy={strategy}; objective={objective}; scope={scope}; output contract {current_okf_version} -> {target_okf_version}. Do not widen the content-edit scope beyond this plan. Preserve owner governance artifacts and unknown OKF fields.",
   "compile.refresh_domain": "Read the finished library catalog (candidate/index.md) in full, then call report_domain once with one sentence naming the field this library covers. Do not recompile pages or edit raw/.",
   "compile.resume": "Resume the interrupted compiler-owned batch plan from its durable workspace state. Do not restart completed batches or ask for another approval.",
   "compile.submit_decisions_header": "Apply the following owner decisions to the durable brief and intent, then propose the resulting compile plan and stop for approval:",

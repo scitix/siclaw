@@ -1480,6 +1480,10 @@ _BRIEF_AUDIENCES = {"", "internal-eng", "frontline", "external", "newcomer"}
 _BRIEF_INTENTS = {"", "understand", "execute", "troubleshoot"}
 _BRIEF_KNOWLEDGE_TYPES = {"document", "code"}
 _CONTENT_LOCALE_RE = re.compile(r"^(?:auto|[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*)$")
+_RENEW_STRATEGIES = {
+    "noop", "initial_generation", "scoped_source_update",
+    "contract_migration", "migration_and_full_update", "full_reconcile",
+}
 
 
 class CommandRejected(ValueError):
@@ -1551,6 +1555,27 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
         if not _CONTENT_LOCALE_RE.fullmatch(normalized_brief["content_locale"]):
             raise CommandRejected("brief.content_locale must be auto or a BCP-47-like locale")
         parameters = {**parameters, "brief": normalized_brief}
+
+    renew = parameters.get("renew")
+    if renew is not None:
+        if not isinstance(renew, dict):
+            raise CommandRejected("command.parameters.renew must be an object")
+        strategy = _bounded_string(
+            renew.get("strategy"), "renew.strategy", required=True, limit=64)
+        if strategy not in _RENEW_STRATEGIES:
+            raise CommandRejected("renew.strategy is unsupported")
+        normalized_renew = {
+            "strategy": strategy,
+            "objective": _bounded_string(
+                renew.get("objective"), "renew.objective", required=True, limit=1000),
+            "scope": _bounded_string(
+                renew.get("scope"), "renew.scope", required=True, limit=1000),
+            "current_okf_version": _bounded_string(
+                renew.get("current_okf_version"), "renew.current_okf_version", limit=32),
+            "target_okf_version": _bounded_string(
+                renew.get("target_okf_version"), "renew.target_okf_version", required=True, limit=32),
+        }
+        parameters = {**parameters, "renew": normalized_renew}
 
     if action == "compile.approve_plan":
         plan_id = _bounded_string(parameters.get("plan_id"), "parameters.plan_id", required=True, limit=64).lower()
@@ -1640,7 +1665,11 @@ def _render_command(run: "CompileRun", command: dict) -> str:
             verdict=params["verdict"],
             judge_note=params["judge_note"] or "(none)",
         )
-    return strings[action]
+    rendered = strings[action]
+    renew = params.get("renew")
+    if renew is not None:
+        rendered += "\n\n" + strings["compile.renew_context"].format(**renew)
+    return rendered
 
 
 def _prepare_command(run: "CompileRun", command: dict) -> None:
