@@ -42,7 +42,14 @@ import type {
  */
 const RECENT_DELEGATION_LIMIT = 8;
 const DEFAULT_REMOTE_DELEGATION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
-const REMOTE_RESULT_READBACK_LIMIT = 500;
+const REMOTE_RESULT_PAGE_SIZE = 200;
+/**
+ * How far back recovery will page for this turn's opening row before giving up.
+ * A ceiling still exists — an unbounded scan of a huge reused session is its own
+ * failure mode — but it now bounds TOTAL rows walked (40k) rather than capping a
+ * single turn's own length.
+ */
+const REMOTE_RESULT_READBACK_PAGES = 200;
 
 /**
  * Maximum silence between matching remote relay events. The environment value
@@ -117,27 +124,49 @@ async function recoverRemoteResult(
   peerSessionId: string,
   delegationId: string,
 ): Promise<DurableRemoteResult> {
-  let messages: Awaited<ReturnType<typeof getMessages>>;
-  try {
-    messages = await getMessages(peerSessionId, { limit: REMOTE_RESULT_READBACK_LIMIT });
-  } catch (err) {
-    console.warn(`[delegate-api] failed to recover remote delegation ${delegationId} from chat history:`, err);
-    return { status: "failed", error: "Remote delegation completed, but its result could not be recovered" };
-  }
+  // Page BACKWARDS until the boundary row is in hand. A single window would make
+  // recovery a function of how chatty the turn was: tool rows are messages too, so
+  // one tool-heavy investigation can bury its own opening row and the answer would
+  // be reported as a failure for being too long.
+  const turnMessages: Awaited<ReturnType<typeof getMessages>> = [];
+  const seenIds = new Set<string>();
+  let before: Date | undefined;
+  let boundaryFound = false;
+  for (let page = 0; page < REMOTE_RESULT_READBACK_PAGES && !boundaryFound; page += 1) {
+    let batch: Awaited<ReturnType<typeof getMessages>>;
+    try {
+      batch = await getMessages(peerSessionId, { before, limit: REMOTE_RESULT_PAGE_SIZE });
+    } catch (err) {
+      console.warn(`[delegate-api] failed to recover remote delegation ${delegationId} from chat history:`, err);
+      return { status: "failed", error: "Remote delegation completed, but its result could not be recovered" };
+    }
+    if (batch.length === 0) break;
+    // `before` may be inclusive of its own timestamp, and equal timestamps are
+    // possible within a turn — dedupe by row id rather than trusting the window.
+    const fresh = batch.filter((message) => !(message.id && seenIds.has(message.id)));
+    if (fresh.length === 0) break;
+    for (const message of fresh) if (message.id) seenIds.add(message.id);
 
-  let boundary = -1;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i];
-    if (message.role === "user" && message.delegationId === delegationId) {
-      boundary = i;
+    // Oldest-first within the page: walk back to find this turn's opening row.
+    let boundary = -1;
+    for (let i = fresh.length - 1; i >= 0; i -= 1) {
+      if (fresh[i].role === "user" && fresh[i].delegationId === delegationId) {
+        boundary = i;
+        break;
+      }
+    }
+    if (boundary >= 0) {
+      turnMessages.unshift(...fresh.slice(boundary + 1));
+      boundaryFound = true;
       break;
     }
+    turnMessages.unshift(...fresh);
+    before = fresh[0].createdAt;
   }
-  if (boundary < 0) {
+  if (!boundaryFound) {
     return { status: "failed", error: "Remote delegation completed, but its durable turn boundary was not found" };
   }
 
-  const turnMessages = messages.slice(boundary + 1);
   const persistedError = [...turnMessages].reverse().find((message) =>
     message.role === "assistant" &&
     message.metadata?.kind === "error_response" &&

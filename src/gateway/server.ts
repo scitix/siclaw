@@ -630,6 +630,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             });
             return;
           }
+          // Dispatch outcome UNKNOWN, not "did not happen": AgentBox starts the run
+          // before it acknowledges /api/prompt, so a lost or timed-out ack rejects
+          // here while a real turn is already running with nobody left to consume
+          // it. That leak is not conditional on Stop — an ack lost during an
+          // ordinary send strands the same turn — so compensate on every rejection
+          // rather than only where a Stop is known.
+          if (await abortIfBoxHoldsSession(client, sessionId, "prompt dispatch failed")) {
+            console.warn(`[runtime] stopped an orphaned turn for session=${sessionId} after its prompt ack was lost`);
+          }
           throw err;
         }
 
@@ -1411,6 +1420,38 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return /session not found/i.test(String((err as Error)?.message ?? err));
   }
 
+  /**
+   * Stop a turn ONLY if the box actually holds its session.
+   *
+   * Both callers face the same question — did a dispatch that we cannot account
+   * for leave a turn running? — and the same hazard: aborting a session the box
+   * does not have records a pre-spawn latch that the NEXT intentional send would
+   * consume and be short-circuited by. Holding the session is exactly the
+   * condition that distinguishes the two, so probe before aborting.
+   *
+   * An unanswerable probe is treated as "nothing to stop": we are already on a
+   * path where the box is misbehaving or unreachable, so an abort would most
+   * likely fail too, while a latch left behind would break the retry the user is
+   * about to make. Returns whether an abort was issued.
+   */
+  async function abortIfBoxHoldsSession(client: AgentBoxClient, sessionId: string, why: string): Promise<boolean> {
+    const holdsSession = await client.listSessions()
+      .then(({ sessions }) => sessions.some((s) => s.id === sessionId))
+      .catch((err) => {
+        console.warn(`[runtime] ${why}: could not ask the box about session=${sessionId}; leaving it alone:`, err);
+        return false;
+      });
+    if (!holdsSession) return false;
+    await client.abortSession(sessionId).catch((err) => {
+      if (!isSessionNotFound(err)) {
+        console.warn(`[runtime] ${why}: failed to stop session=${sessionId}:`, err);
+        return;
+      }
+      console.log(`[runtime] ${why}: session=${sessionId} vanished from its box between probe and abort`);
+    });
+    return true;
+  }
+
   rpcMethods.set("chat.abort", async (params) => {
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
@@ -1439,24 +1480,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // post-accept compensation. Ask the box this turn was dispatched to whether it
     // actually holds the session: if it does, abort is both required and
     // tombstone-free by construction; if it does not, there is nothing to stop.
+    // This is the fast path, not the guarantee: it stops a box that is already
+    // running instead of waiting out the prompt timeout. What it CANNOT close is
+    // the window where the box has not created the session yet and starts the run
+    // just after the probe. The rejection handler in chat.send's background task
+    // is the backstop for that, on the same holds-the-session condition.
     if (pending?.size && !active) {
       const dispatchedEndpoint = await dispatchedBoxEndpoint(agentId, sessionId);
       if (!dispatchedEndpoint) return { ok: true };
       const dispatched = new AgentBoxClient(dispatchedEndpoint, 10000, agentBoxTlsOptions);
-      // A failed probe is not evidence of absence. Fall through to the abort attempt
-      // rather than assume nothing is running — a headless turn burns model quota
-      // until it finishes, while a tombstone at worst costs the next send a retry.
-      const holdsSession = await dispatched.listSessions()
-        .then(({ sessions }) => sessions.some((s) => s.id === sessionId))
-        .catch((err) => {
-          console.warn(`[runtime] abort: could not probe box for session=${sessionId}; aborting anyway:`, err);
-          return true;
-        });
-      if (!holdsSession) return { ok: true };
-      await dispatched.abortSession(sessionId).catch((err) => {
-        if (!isSessionNotFound(err)) throw err;
-        console.log(`[runtime] abort: session=${sessionId} vanished from its box between probe and abort`);
-      });
+      await abortIfBoxHoldsSession(dispatched, sessionId, "abort");
       return { ok: true };
     }
 

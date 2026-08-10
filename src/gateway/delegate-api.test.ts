@@ -416,8 +416,46 @@ describe("handleDelegate — cross-Runtime routing", () => {
     const res = makeRes();
     await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
 
-    expect(getMessages).toHaveBeenCalledWith(expect.any(String), { limit: 500 });
+    expect(getMessages).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ limit: 200 }));
     expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable aries result" });
+  });
+
+  it("pages back to a turn boundary buried under its own tool rows", async () => {
+    // Tool rows are messages too, so one window is not a turn: a tool-heavy peer
+    // turn can push its own opening row out of the first page. Recovery must keep
+    // reading rather than report a completed delegation as unrecoverable.
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        // Newest page first: the answer, then a page of tool rows, then the page
+        // that finally contains this delegation's opening user row.
+        getMessages.mockResolvedValueOnce([
+          { id: "m3", role: "assistant", content: "durable answer", delegationId: null, metadata: null, createdAt: new Date(3000) },
+        ] as any);
+        getMessages.mockResolvedValueOnce([
+          { id: "m2", role: "tool", content: "kubectl get pods", delegationId: null, metadata: null, createdAt: new Date(2000) },
+        ] as any);
+        getMessages.mockResolvedValueOnce([
+          { id: "m0", role: "user", content: "older unrelated turn", delegationId: "other", metadata: null, createdAt: new Date(500) },
+          { id: "m1", role: "user", content: "inspect", delegationId: params.delegationId, metadata: null, createdAt: new Date(1000) },
+        ] as any);
+        deps.eventHandlers.get("delegation.event")!({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "prompt_done" },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(getMessages).toHaveBeenCalledTimes(3);
+    // Only rows AFTER the boundary count — the older turn must not leak in.
+    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable answer" });
   });
 
   it("uses the durable answer when the live relay delivered only part of the assistant output", async () => {

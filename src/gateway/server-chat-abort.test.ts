@@ -232,6 +232,54 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(abortSessionCalls).toEqual(["S"]);
   });
 
+  it("stops an orphaned turn when the prompt ack is lost and nobody pressed Stop", async () => {
+    // The leak is not conditional on Stop: AgentBox starts the run before it
+    // acknowledges, so an ack lost during an ordinary send strands a turn with no
+    // consumer. Compensation therefore belongs on the rejection path.
+    let failPrompt: ((err: Error) => void) | undefined;
+    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
+    boxSessions.push("orphan");
+
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "orphan" }, ctx);
+    await waitFor(() => promptCalls.length === 1);
+
+    failPrompt?.(new Error("socket hang up"));
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+
+    expect(abortSessionCalls).toEqual(["orphan"]);
+  });
+
+  it("leaves the box alone when a failed prompt created no session", async () => {
+    // Same rejection path, box holds nothing: aborting would arm the pre-spawn
+    // latch and the user's retry would be short-circuited as aborted.
+    let failPrompt: ((err: Error) => void) | undefined;
+    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
+
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "clean-failure" }, ctx);
+    await waitFor(() => promptCalls.length === 1);
+
+    failPrompt?.(new Error("connection refused"));
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+
+    expect(abortSessionCalls).toEqual([]);
+  });
+
   it("aborts a dispatched turn whose prompt ack was lost, even while it is only pending", async () => {
     // AgentBox starts the run BEFORE it acknowledges /api/prompt. A lost/timed-out
     // ack therefore leaves a really-running turn behind a still-pending Gateway
