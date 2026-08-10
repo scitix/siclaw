@@ -21,9 +21,11 @@ vi.mock("./sse-consumer.js", () => ({ consumeAgentSse: (o: any) => consumeAgentS
 
 const ensureChatSession = vi.fn(async () => {});
 const appendMessage = vi.fn(async () => {});
+const getMessages = vi.fn(async () => [] as any[]);
 vi.mock("./chat-repo.js", () => ({
   ensureChatSession: (...a: any[]) => ensureChatSession(...a),
   appendMessage: (...a: any[]) => appendMessage(...a),
+  getMessages: (...a: any[]) => getMessages(...a),
   incrementMessageCount: vi.fn(async () => {}),
   updateMessage: vi.fn(async () => {}),
 }));
@@ -42,7 +44,8 @@ vi.mock("./agentbox/client.js", () => ({
   },
 }));
 
-import { handleDelegate } from "./delegate-api.js";
+import { getRemoteDelegationIdleTimeoutMs, handleDelegate } from "./delegate-api.js";
+import { sessionTurnLocks } from "./session-turn-lock.js";
 
 // ── Fakes ─────────────────────────────────────────────────────────────
 
@@ -261,7 +264,12 @@ describe("handleDelegate — cross-Runtime routing", () => {
     expect(startCall?.[1]).toMatchObject({
       coordinatorAgentId: COORD,
       peerAgentId: PEER,
-      prompt: { agentId: PEER, text: "inspect", delegation: { parentAgentId: COORD } },
+      prompt: {
+        agentId: PEER,
+        text: "inspect",
+        skipInitialPersistence: true,
+        delegation: { parentAgentId: COORD },
+      },
     });
     expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "aries result" });
   });
@@ -279,6 +287,20 @@ describe("handleDelegate — cross-Runtime routing", () => {
     expect(res.statusCode).toBe(503);
     expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
     expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the route envelope omits its source Runtime", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, targetRuntimeId: "aries" };
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(res.statusCode).toBe(503);
+    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
   });
 
   it("does not start a remote turn when its delegated session cannot be persisted", async () => {
@@ -314,5 +336,136 @@ describe("handleDelegate — cross-Runtime routing", () => {
     await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
 
     expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed", error: "provider unavailable" });
+  });
+
+  it("recovers a persisted assistant answer when the live message frame was lost", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        getMessages.mockResolvedValueOnce([
+          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+          { role: "assistant", content: "durable aries result", delegationId: null, metadata: null },
+        ] as any);
+        deps.eventHandlers.get("delegation.event")!({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "prompt_done" },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(getMessages).toHaveBeenCalledWith(expect.any(String), { limit: 500 });
+    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable aries result" });
+  });
+
+  it("fails instead of returning an empty success when no durable result can be recovered", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        getMessages.mockResolvedValueOnce([
+          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+        ] as any);
+        deps.eventHandlers.get("delegation.event")!({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "prompt_done" },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed" });
+  });
+
+  it("does not dispatch a remote turn when Stop arrives while waiting for the session lock", async () => {
+    const peerSessionId = "blocked-peer-session";
+    const release = await sessionTurnLocks.acquire(peerSessionId);
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "chat.resolveSession") return { found: true, user_id: "u", agent_id: COORD };
+      if (method === "chat.recentDelegationSessions") return { ids: [peerSessionId] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      return {};
+    });
+    const res = makeRes();
+    const pending = handleDelegate(
+      makeReq({ peerAgentId: PEER, text: "inspect", parentSessionId: "own-sess", peerSessionId }),
+      res as any,
+      identity,
+      deps,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    res.triggerClose();
+    release();
+    await pending;
+
+    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
+  });
+
+  it("refreshes the remote timeout on matching relay activity instead of capping total duration", async () => {
+    vi.useFakeTimers();
+    const previousTimeout = process.env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT;
+    process.env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT = "1";
+    try {
+      const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+      let remoteParams: any;
+      deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+        if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+        if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+        if (method === "delegation.start") {
+          remoteParams = params;
+          return { ok: true };
+        }
+        return {};
+      });
+      const res = makeRes();
+      const pending = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+      for (let i = 0; i < 20 && !remoteParams; i += 1) {
+        await vi.advanceTimersByTimeAsync(0);
+        await Promise.resolve();
+      }
+      expect(remoteParams).toBeTruthy();
+
+      await vi.advanceTimersByTimeAsync(800);
+      deps.eventHandlers.get("delegation.event")!({
+        delegationId: remoteParams.delegationId,
+        sessionId: remoteParams.sessionId,
+        event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "still active" }] } },
+      });
+      await vi.advanceTimersByTimeAsync(800);
+      deps.eventHandlers.get("delegation.event")!({
+        delegationId: remoteParams.delegationId,
+        sessionId: remoteParams.sessionId,
+        event: { type: "prompt_done" },
+      });
+      await pending;
+
+      expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "still active" });
+      expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.abort", expect.anything(), expect.anything());
+    } finally {
+      if (previousTimeout === undefined) delete process.env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT;
+      else process.env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT = previousTimeout;
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("getRemoteDelegationIdleTimeoutMs", () => {
+  it("reads seconds from the environment and rejects invalid values", () => {
+    expect(getRemoteDelegationIdleTimeoutMs({ SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT: "42" } as NodeJS.ProcessEnv)).toBe(42_000);
+    expect(getRemoteDelegationIdleTimeoutMs({ SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT: "0" } as NodeJS.ProcessEnv)).toBe(600_000);
+    expect(getRemoteDelegationIdleTimeoutMs({ SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT: "invalid" } as NodeJS.ProcessEnv)).toBe(600_000);
   });
 });

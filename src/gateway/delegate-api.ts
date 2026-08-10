@@ -14,8 +14,9 @@
  * coordinator agent. The gateway re-validates that the requested peer is in the
  * coordinator's roster (defense in depth — never trust the box's own claim).
  *
- * Transport is synchronous-collect (P0): reuses the SAME machinery as chat.send
- * (getOrCreate + AgentBoxClient.prompt + consumeAgentSse), entirely within siclaw.
+ * Transport is synchronous-collect (P0): same-Runtime peers reuse the local
+ * AgentBox path; cross-Runtime peers are routed through the management plane
+ * and their live events are collected over the reverse Runtime event lane.
  */
 
 import http from "node:http";
@@ -26,8 +27,9 @@ import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type AgentBoxTlsOptions } from "./agentbox/client.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
-import { ensureChatSession, appendMessage } from "./chat-repo.js";
+import { ensureChatSession, appendMessage, getMessages } from "./chat-repo.js";
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
+import { parsePositiveIntEnv } from "../core/subagent-registry.js";
 import type {
   DelegateRequest, DelegateResponse, DelegateArtifact, DelegatesResponse, DelegateRosterMember,
 } from "../shared/agent-delegate.js";
@@ -39,7 +41,21 @@ import type {
  * back" in a long-running (never-switched) conversation.
  */
 const RECENT_DELEGATION_LIMIT = 8;
-const REMOTE_DELEGATION_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_REMOTE_DELEGATION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+const REMOTE_RESULT_READBACK_LIMIT = 500;
+
+/**
+ * Maximum silence between matching remote relay events. The environment value
+ * is in seconds so operators can extend deep diagnostic turns without allowing
+ * a disconnected relay to wait forever.
+ */
+export function getRemoteDelegationIdleTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return parsePositiveIntEnv(
+    env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT,
+    DEFAULT_REMOTE_DELEGATION_IDLE_TIMEOUT_MS,
+    { unitMs: true },
+  );
+}
 
 interface DelegationRoute {
   local: boolean;
@@ -51,6 +67,11 @@ interface DelegationRelayEnvelope {
   delegationId?: string;
   sessionId?: string;
   event?: Record<string, unknown>;
+}
+
+interface DelegationExecutionOutcome {
+  error?: string;
+  stopped?: boolean;
 }
 
 export interface DelegateApiDeps {
@@ -78,6 +99,57 @@ async function fetchRoster(
 ): Promise<DelegateRosterMember[]> {
   const data = await frontendClient.request("config.getDelegates", { agentId: coordinatorAgentId }) as { members?: DelegateRosterMember[] };
   return data.members ?? [];
+}
+
+/**
+ * Recover the durable assistant result when the live reverse-event lane lost a
+ * message frame but still delivered the terminal event. The current delegated
+ * user row is the boundary marker; the session lock guarantees that later rows
+ * up to prompt_done belong to this turn even when a peer session is reused.
+ */
+async function recoverRemoteResult(
+  peerSessionId: string,
+  delegationId: string,
+): Promise<{ finalText?: string; error?: string }> {
+  let messages: Awaited<ReturnType<typeof getMessages>>;
+  try {
+    messages = await getMessages(peerSessionId, { limit: REMOTE_RESULT_READBACK_LIMIT });
+  } catch (err) {
+    console.warn(`[delegate-api] failed to recover remote delegation ${delegationId} from chat history:`, err);
+    return { error: "Remote delegation completed, but its result could not be recovered" };
+  }
+
+  let boundary = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role === "user" && message.delegationId === delegationId) {
+      boundary = i;
+      break;
+    }
+  }
+  if (boundary < 0) {
+    return { error: "Remote delegation completed, but its durable turn boundary was not found" };
+  }
+
+  const turnMessages = messages.slice(boundary + 1);
+  const persistedError = [...turnMessages].reverse().find((message) =>
+    message.role === "assistant" &&
+    message.metadata?.kind === "error_response" &&
+    message.content.trim().length > 0,
+  );
+  if (persistedError) return { error: persistedError.content.trim() };
+
+  const assistantText = turnMessages
+    .filter((message) =>
+      message.role === "assistant" &&
+      message.metadata?.kind !== "error_response" &&
+      message.content.trim().length > 0,
+    )
+    .map((message) => message.content.trim())
+    .join("\n\n");
+  if (assistantText) return { finalText: assistantText };
+
+  return { error: "Remote delegation completed without a recoverable result" };
 }
 
 /** GET /api/internal/delegates — the calling coordinator's roster. */
@@ -152,7 +224,12 @@ export async function handleDelegate(
       coordinatorAgentId,
       peerAgentId,
     }) as DelegationRoute;
-    if (typeof route?.local !== "boolean" || !route.targetRuntimeId) {
+    if (
+      typeof route?.local !== "boolean" ||
+      !route.sourceRuntimeId ||
+      !route.targetRuntimeId ||
+      route.local !== (route.sourceRuntimeId === route.targetRuntimeId)
+    ) {
       throw new Error("invalid delegation route response");
     }
   } catch (err) {
@@ -347,90 +424,95 @@ export async function handleDelegate(
   // card can offer "open full session" LIVE, before the final result arrives.
   writeFrame({ type: "delegate_session", peerSessionId });
 
-  // One turn at a time for this peer session — the AgentBox's 409 only sees its own
-  // sessions, so with more than one box two delegations could run on two boxes at once.
-  // Acquired INSIDE the try: this function runs detached (`void handleDelegate(...)`) with
-  // no catch of its own, and the SSE response headers are already written by now. A
-  // rejection escaping here would leave the coordinator hanging on an open stream and, on
-  // Node's default unhandled-rejection policy, take the whole Runtime process down.
-  let releaseTurn: (() => void) | undefined;
-  try {
-    // Serialize both local and remote continuation of one peer session. The
-    // target Runtime has its own in-flight guard, but the source owns reuse and
-    // can reject a duplicate before creating cross-Runtime work.
-    releaseTurn = await sessionTurnLocks.acquire(peerSessionId);
-    if (!route.local) {
-      let resolveRemoteDone: (() => void) | undefined;
-      let rejectRemoteDone: ((err: Error) => void) | undefined;
-      const remoteDone = new Promise<void>((resolve, reject) => {
-        resolveRemoteDone = resolve;
-        rejectRemoteDone = reject;
-      });
-      const timeout = setTimeout(() => rejectRemoteDone?.(new Error("remote delegation timed out")), REMOTE_DELEGATION_TIMEOUT_MS);
-      timeout.unref?.();
-      const onAbort = () => rejectRemoteDone?.(new Error("delegation stopped"));
-      peerAbort.signal.addEventListener("abort", onAbort, { once: true });
-      const unsubscribe = deps.frontendClient.subscribe("delegation.event", (data) => {
-        const envelope = data as DelegationRelayEnvelope;
-        if (envelope?.delegationId !== delegationId || envelope.sessionId !== peerSessionId || !envelope.event) return;
-        observePeerEvent(envelope.event, false);
-        const type = String((envelope.event as any)?.type ?? "");
-        if (type === "prompt_done" || type === "done") resolveRemoteDone?.();
-      });
-      try {
-        remoteStartRequested = true;
-        await deps.frontendClient.request("delegation.start", {
-          delegationId,
-          coordinatorAgentId,
-          peerAgentId,
+  const runRemoteDelegation = async (): Promise<DelegationExecutionOutcome> => {
+    let resolveRemoteDone: (() => void) | undefined;
+    let rejectRemoteDone: ((err: Error) => void) | undefined;
+    const remoteDone = new Promise<void>((resolve, reject) => {
+      resolveRemoteDone = resolve;
+      rejectRemoteDone = reject;
+    });
+
+    const idleTimeoutMs = getRemoteDelegationIdleTimeoutMs();
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const armIdleWatchdog = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(
+        () => rejectRemoteDone?.(new Error("remote delegation relay timed out")),
+        idleTimeoutMs,
+      );
+      idleTimer.unref?.();
+    };
+    armIdleWatchdog();
+
+    const onAbort = () => rejectRemoteDone?.(new Error("delegation stopped"));
+    peerAbort.signal.addEventListener("abort", onAbort, { once: true });
+    const unsubscribe = deps.frontendClient.subscribe("delegation.event", (data) => {
+      const envelope = data as DelegationRelayEnvelope;
+      if (envelope?.delegationId !== delegationId || envelope.sessionId !== peerSessionId || !envelope.event) return;
+      armIdleWatchdog();
+      observePeerEvent(envelope.event, false);
+      const type = String((envelope.event as any)?.type ?? "");
+      if (type === "prompt_done" || type === "done") resolveRemoteDone?.();
+    });
+
+    try {
+      remoteStartRequested = true;
+      await deps.frontendClient.request("delegation.start", {
+        delegationId,
+        coordinatorAgentId,
+        peerAgentId,
+        sessionId: peerSessionId,
+        prompt: {
           sessionId: peerSessionId,
-          prompt: {
-            sessionId: peerSessionId,
-            userId: ownerUserId,
-            text,
-            agentId: peerAgentId,
-            modelProvider: binding.modelProvider,
-            modelId: binding.modelId,
-            modelConfig: binding.modelConfig,
-            modelRouting: binding.modelRouting,
-            systemPrompt: binding.systemPrompt ?? undefined,
-            origin: "api",
-            delegation: {
-              delegationId,
-              parentSessionId: body.parentSessionId,
-              parentAgentId: coordinatorAgentId,
-              readOnly: false,
-            },
+          userId: ownerUserId,
+          // The source declares the persistence contract; the management
+          // plane reasserts it at the trust boundary before chat.send.
+          skipInitialPersistence: true,
+          text,
+          agentId: peerAgentId,
+          modelProvider: binding.modelProvider,
+          modelId: binding.modelId,
+          modelConfig: binding.modelConfig,
+          modelRouting: binding.modelRouting,
+          systemPrompt: binding.systemPrompt ?? undefined,
+          origin: "api",
+          delegation: {
+            delegationId,
+            parentSessionId: body.parentSessionId,
+            parentAgentId: coordinatorAgentId,
+            readOnly: false,
           },
-        });
-        if (peerAbort.signal.aborted) {
-          await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch(() => {});
-          throw new Error("delegation stopped");
-        }
-        await remoteDone;
-      } catch (err) {
-        // A source-side timeout/disconnect must not leave the target turn running
-        // headless. Abort is idempotent; the router reports alreadyFinished when
-        // prompt_done won the race.
-        if (remoteStartRequested) {
-          await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch(() => {});
-        }
-        throw err;
-      } finally {
-        clearTimeout(timeout);
-        peerAbort.signal.removeEventListener("abort", onAbort);
-        unsubscribe();
+        },
+      });
+      if (peerAbort.signal.aborted) {
+        await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch(() => {});
+        throw new Error("delegation stopped");
       }
-      if (remoteErrorMessage) {
-        finished = true;
-        writeFrame({
-          type: "delegate_result",
-          result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: remoteErrorMessage } satisfies DelegateResponse,
-        });
-        res.end();
-        return;
+      await remoteDone;
+    } catch (err) {
+      // A source-side timeout/disconnect must not leave the target turn running
+      // headless. Abort is idempotent; the router reports alreadyFinished when
+      // prompt_done won the race.
+      if (remoteStartRequested) {
+        await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch(() => {});
       }
-    } else {
+      throw err;
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
+      peerAbort.signal.removeEventListener("abort", onAbort);
+      unsubscribe();
+    }
+
+    if (remoteErrorMessage) return { error: remoteErrorMessage };
+    if (!finalText && !artifact && !inputQuestion) {
+      const recovered = await recoverRemoteResult(peerSessionId, delegationId);
+      if (recovered.error) return { error: recovered.error };
+      finalText = recovered.finalText ?? "";
+    }
+    return {};
+  };
+
+  const runLocalDelegation = async (): Promise<DelegationExecutionOutcome> => {
     const handle = await deps.agentBoxManager.getOrCreate(peerAgentId, undefined, peerSessionId);
     sessionTurnLocks.noteBox(peerSessionId, handle.boxId, handle.endpoint);
     const client = new AgentBoxClient(handle.endpoint, 30000, deps.agentBoxTlsOptions);
@@ -440,11 +522,8 @@ export async function handleDelegate(
     // peerClient still undefined (nothing to abort yet) and the peer turn has NOT
     // started. Bail BEFORE prompt() so we never dispatch a turn that would then run
     // headless with no consumer.
-    if (peerAbort.signal.aborted) {
-      finished = true;
-      try { res.end(); } catch { /* client already gone */ }
-      return;
-    }
+    if (peerAbort.signal.aborted) return { stopped: true };
+
     const promptResult = await client.prompt({
       sessionId: peerSessionId,
       userId: ownerUserId,
@@ -482,21 +561,45 @@ export async function handleDelegate(
       onEvent: (evt: Record<string, unknown>) => observePeerEvent(evt, true),
     });
 
-    // consumeAgentSse reports MODEL-level failures (provider 4xx/5xx, rate-limit,
-    // routing exhaustion) via `errorMessage` WITHOUT throwing. Without this check
-    // the endpoint below would emit ok:true/"done" for a turn the peer never
-    // actually completed — a false-success delegation the coordinator relays as a
-    // real answer. Surface it as a failed result instead.
-    if (consumption.errorMessage) {
+    // consumeAgentSse reports MODEL-level failures without throwing. Surface
+    // those as failed delegation results rather than false ok:true completions.
+    return consumption.errorMessage ? { error: consumption.errorMessage } : {};
+  };
+
+  // One turn at a time for this peer session — the AgentBox's 409 only sees its own
+  // sessions, so with more than one box two delegations could run on two boxes at once.
+  // Acquired INSIDE the try because the SSE response headers are already written.
+  let releaseTurn: (() => void) | undefined;
+  try {
+    // Serialize both local and remote continuation of one peer session. The
+    // target Runtime has its own in-flight guard, but the source owns reuse and
+    // can reject a duplicate before creating cross-Runtime work.
+    releaseTurn = await sessionTurnLocks.acquire(peerSessionId);
+    // Stop may have arrived while waiting behind an earlier turn. Bail before
+    // delegation.start so an abort cannot race ahead of a not-yet-started relay.
+    if (peerAbort.signal.aborted) {
       finished = true;
-      console.error(`[delegate-api] delegation to ${peerAgentId} failed (model error): ${consumption.errorMessage}`);
+      try { res.end(); } catch { /* client already gone */ }
+      return;
+    }
+
+    const outcome = route.local
+      ? await runLocalDelegation()
+      : await runRemoteDelegation();
+    if (outcome.stopped) {
+      finished = true;
+      try { res.end(); } catch { /* client already gone */ }
+      return;
+    }
+    if (outcome.error) {
+      finished = true;
+      console.error(`[delegate-api] delegation to ${peerAgentId} failed: ${outcome.error}`);
       writeFrame({
         type: "delegate_result",
-        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: consumption.errorMessage } satisfies DelegateResponse,
+        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: outcome.error } satisfies DelegateResponse,
       });
       res.end();
       return;
-    }
     }
   } catch (err) {
     // A client-abort cancellation surfaces here as the drain loop breaking; treat

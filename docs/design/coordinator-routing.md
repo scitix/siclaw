@@ -100,6 +100,45 @@ confirmed retry misses, the coordinator does not guess or loop. It tells the
 user that no authorized agent covers the supplied name and that the name may be
 an alias.
 
+## Runtime placement contract
+
+Roster membership authorizes *which agent* may receive a delegated task; it
+does not decide *where that agent runs*. Before creating an AgentBox, the source
+Runtime must resolve the coordinator and peer against management-plane truth:
+
+- the coordinator must belong to the authenticated source Runtime;
+- the peer must be an active member of that coordinator's roster and organization;
+- `sourceRuntimeId`, `targetRuntimeId`, and the local/remote classification must
+  be present and mutually consistent; and
+- an unresolved or inconsistent route fails closed. It must never fall back to
+  creating the peer in the coordinator's Runtime.
+
+Same-Runtime delegation keeps the local AgentBox path. Cross-Runtime delegation
+uses the management-plane Runtime mesh: `delegation.start` routes the peer turn,
+`delegation.event` carries live events back to the source, and
+`delegation.abort` stops the target turn. Runtime-private Gateway addresses are
+never part of this contract.
+
+The source creates and sequences the delegated session/user row so coordinator
+ownership, parent lineage, and the delegation boundary are durable before the
+target starts. Its `delegation.start` prompt therefore declares
+`skipInitialPersistence=true`; the management plane revalidates the delegation
+edge and reasserts that flag before forwarding `chat.send`. The target does not
+create a second user row, so a target-side `promptMessageId` is intentionally
+absent. A bare, non-delegated `chat.send` may never suppress persistence.
+
+Live events are progress signals, not the sole record of the result. If the
+terminal event arrives without answer content, the source recovers assistant
+content after the current delegation boundary from durable session history. No
+live or durable result is a failed delegation, never an empty success. The
+remote relay timeout measures event *silence* and is renewed by matching events;
+`SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT` may override it in seconds.
+
+This contract creates a strict rollout dependency. The management plane that
+implements route/start/abort and the reverse event lane must be deployed before
+the Runtime containing this behavior. An older management plane causes all
+delegation route lookups to fail closed, including same-Runtime delegation.
+
 ## Behavioral invariants
 
 Tests for coordinator routing should verify observable routing behavior rather

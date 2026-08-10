@@ -414,6 +414,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // before Sicore routes this chat.send to the target Runtime. Re-inserting the
     // session/user row here would overwrite ownership/lineage and duplicate the
     // delegated task. Only honor the flag on an authenticated delegation turn.
+    // promptMessageId intentionally stays undefined on this path: the source
+    // Runtime already persisted and sequenced the user row, so the target must
+    // not bind or update a second local copy of it.
     const skipInitialPersistence = params.skipInitialPersistence === true && Boolean(delegation?.delegationId);
     // Portal stamps turnStartMs at POST receipt — closer to user click than
     // the runtime's loop start. Use it as the canonical turn anchor when
