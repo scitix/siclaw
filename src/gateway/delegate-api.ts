@@ -42,14 +42,24 @@ import type {
  */
 const RECENT_DELEGATION_LIMIT = 8;
 const DEFAULT_REMOTE_DELEGATION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
-const REMOTE_RESULT_PAGE_SIZE = 200;
 /**
- * How far back recovery will page for this turn's opening row before giving up.
- * A ceiling still exists — an unbounded scan of a huge reused session is its own
- * failure mode — but it now bounds TOTAL rows walked (40k) rather than capping a
- * single turn's own length.
+ * Recovery reads a GROWING window of the newest rows rather than walking a
+ * timestamp cursor. `created_at` has one-second granularity (see migrate.ts —
+ * TIMESTAMP(3) is not portable across both engines), so a cursor set to a page's
+ * oldest timestamp silently skips every other row written in that same second,
+ * which is most of a busy turn. Re-reading a slightly larger window costs one
+ * extra query per step and cannot skip anything.
  */
-const REMOTE_RESULT_READBACK_PAGES = 200;
+const REMOTE_RESULT_WINDOW_START = 200;
+const REMOTE_RESULT_WINDOW_MAX = 20_000;
+
+/**
+ * The control plane keeps its own relay lease and tears the relay down when it
+ * goes idle for longer. Waiting past that point cannot succeed — the events we
+ * are waiting for have no route left — so an operator raising the window above it
+ * would only convert a clean timeout into a longer one. Clamp instead, loudly.
+ */
+const MAX_REMOTE_DELEGATION_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 
 /**
  * Maximum silence between matching remote relay events. The environment value
@@ -57,11 +67,16 @@ const REMOTE_RESULT_READBACK_PAGES = 200;
  * a disconnected relay to wait forever.
  */
 export function getRemoteDelegationIdleTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
-  return parsePositiveIntEnv(
+  const configured = parsePositiveIntEnv(
     env.SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT,
     DEFAULT_REMOTE_DELEGATION_IDLE_TIMEOUT_MS,
     { unitMs: true },
   );
+  if (configured <= MAX_REMOTE_DELEGATION_IDLE_TIMEOUT_MS) return configured;
+  console.warn(
+    `[delegate-api] SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT=${configured}ms exceeds the control plane's relay lease; clamping to ${MAX_REMOTE_DELEGATION_IDLE_TIMEOUT_MS}ms`,
+  );
+  return MAX_REMOTE_DELEGATION_IDLE_TIMEOUT_MS;
 }
 
 interface DelegationRoute {
@@ -74,6 +89,37 @@ interface DelegationRelayEnvelope {
   delegationId?: string;
   sessionId?: string;
   event?: Record<string, unknown>;
+}
+
+/**
+ * Delegations whose consumer has already gone away *because it finished*.
+ *
+ * Reliable control delivery is retried until the source acknowledges it, and the
+ * acknowledgement means "this Runtime no longer needs the frame". A terminal that
+ * was consumed and then re-delivered (its first ack lost) satisfies that, but a
+ * live-consumer-only check would reject it and leave the control plane retrying
+ * forever — which keeps its relay alive, and a relay that later expires aborts by
+ * (agent, session), killing whatever new turn is reusing that peer session.
+ *
+ * Bounded and insertion-ordered: only the recent tail can plausibly be re-sent.
+ */
+const SETTLED_DELEGATION_MEMORY = 512;
+const settledDelegations = new Set<string>();
+
+function markDelegationSettled(delegationId: string): void {
+  if (!delegationId) return;
+  settledDelegations.delete(delegationId);
+  settledDelegations.add(delegationId);
+  while (settledDelegations.size > SETTLED_DELEGATION_MEMORY) {
+    const oldest = settledDelegations.values().next().value as string | undefined;
+    if (oldest === undefined) break;
+    settledDelegations.delete(oldest);
+  }
+}
+
+/** Whether a control frame for this delegation was already consumed to completion. */
+export function isDelegationSettled(delegationId: string): boolean {
+  return settledDelegations.has(delegationId);
 }
 
 interface DelegationExecutionOutcome {
@@ -124,44 +170,36 @@ async function recoverRemoteResult(
   peerSessionId: string,
   delegationId: string,
 ): Promise<DurableRemoteResult> {
-  // Page BACKWARDS until the boundary row is in hand. A single window would make
-  // recovery a function of how chatty the turn was: tool rows are messages too, so
-  // one tool-heavy investigation can bury its own opening row and the answer would
-  // be reported as a failure for being too long.
-  const turnMessages: Awaited<ReturnType<typeof getMessages>> = [];
-  const seenIds = new Set<string>();
-  let before: Date | undefined;
+  // Widen the window until this turn's opening row is inside it. A fixed window
+  // would make recovery a function of how chatty the turn was: tool rows are
+  // messages too, so one tool-heavy investigation can bury its own opening row and
+  // have its finished answer reported as unrecoverable.
+  let turnMessages: Awaited<ReturnType<typeof getMessages>> = [];
   let boundaryFound = false;
-  for (let page = 0; page < REMOTE_RESULT_READBACK_PAGES && !boundaryFound; page += 1) {
-    let batch: Awaited<ReturnType<typeof getMessages>>;
+  for (let limit = REMOTE_RESULT_WINDOW_START; !boundaryFound; limit *= 2) {
+    let window: Awaited<ReturnType<typeof getMessages>>;
     try {
-      batch = await getMessages(peerSessionId, { before, limit: REMOTE_RESULT_PAGE_SIZE });
+      window = await getMessages(peerSessionId, { limit });
     } catch (err) {
       console.warn(`[delegate-api] failed to recover remote delegation ${delegationId} from chat history:`, err);
       return { status: "failed", error: "Remote delegation completed, but its result could not be recovered" };
     }
-    if (batch.length === 0) break;
-    // `before` may be inclusive of its own timestamp, and equal timestamps are
-    // possible within a turn — dedupe by row id rather than trusting the window.
-    const fresh = batch.filter((message) => !(message.id && seenIds.has(message.id)));
-    if (fresh.length === 0) break;
-    for (const message of fresh) if (message.id) seenIds.add(message.id);
 
-    // Oldest-first within the page: walk back to find this turn's opening row.
     let boundary = -1;
-    for (let i = fresh.length - 1; i >= 0; i -= 1) {
-      if (fresh[i].role === "user" && fresh[i].delegationId === delegationId) {
+    for (let i = window.length - 1; i >= 0; i -= 1) {
+      if (window[i].role === "user" && window[i].delegationId === delegationId) {
         boundary = i;
         break;
       }
     }
     if (boundary >= 0) {
-      turnMessages.unshift(...fresh.slice(boundary + 1));
+      turnMessages = window.slice(boundary + 1);
       boundaryFound = true;
       break;
     }
-    turnMessages.unshift(...fresh);
-    before = fresh[0].createdAt;
+    // A window that came back short IS the whole session: widening cannot reveal
+    // a boundary row that is not there.
+    if (window.length < limit || limit >= REMOTE_RESULT_WINDOW_MAX) break;
   }
   if (!boundaryFound) {
     return { status: "failed", error: "Remote delegation completed, but its durable turn boundary was not found" };
@@ -557,6 +595,9 @@ export async function handleDelegate(
       if (idleTimer) clearTimeout(idleTimer);
       peerAbort.signal.removeEventListener("abort", onAbort);
       unsubscribe();
+      // From here a re-delivered control frame has no live consumer, and that is
+      // the expected steady state rather than a delivery failure.
+      markDelegationSettled(delegationId);
     }
 
     if (remoteErrorMessage) return { error: remoteErrorMessage };

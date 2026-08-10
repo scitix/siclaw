@@ -87,7 +87,7 @@ import {
   handleDelegationEvents,
   handleMetricsFlush,
 } from "./internal-api.js";
-import { handleDelegate, handleDelegates } from "./delegate-api.js";
+import { handleDelegate, handleDelegates, isDelegationSettled } from "./delegate-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
@@ -636,8 +636,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // it. That leak is not conditional on Stop — an ack lost during an
           // ordinary send strands the same turn — so compensate on every rejection
           // rather than only where a Stop is known.
-          if (await abortIfBoxHoldsSession(client, sessionId, "prompt dispatch failed")) {
-            console.warn(`[runtime] stopped an orphaned turn for session=${sessionId} after its prompt ack was lost`);
+          //
+          // The ORIGINAL failure is what the caller must see, so a compensation
+          // that cannot complete is logged loudly rather than substituted for it.
+          try {
+            if (await abortIfBoxHoldsSession(client, sessionId, "prompt dispatch failed")) {
+              console.warn(`[runtime] stopped an orphaned turn for session=${sessionId} after its prompt ack was lost`);
+            }
+          } catch (compensateErr) {
+            console.error(`[runtime] could not confirm whether session=${sessionId} was left running after a failed prompt:`, compensateErr);
           }
           throw err;
         }
@@ -1429,26 +1436,34 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * consume and be short-circuited by. Holding the session is exactly the
    * condition that distinguishes the two, so probe before aborting.
    *
-   * An unanswerable probe is treated as "nothing to stop": we are already on a
-   * path where the box is misbehaving or unreachable, so an abort would most
-   * likely fail too, while a latch left behind would break the retry the user is
-   * about to make. Returns whether an abort was issued.
+   * Failures are reported, never swallowed. A caller that reports Stop as
+   * successful when the box never confirmed it tells the control plane to stop
+   * retrying and to tear down its supervision, so an unanswerable probe or a
+   * failed abort must surface — the same rule the non-pending path already
+   * follows. Only "the box does not have it" counts as already stopped.
+   *
+   * Returns whether an abort was issued; throws when the outcome is unknown.
    */
   async function abortIfBoxHoldsSession(client: AgentBoxClient, sessionId: string, why: string): Promise<boolean> {
-    const holdsSession = await client.listSessions()
-      .then(({ sessions }) => sessions.some((s) => s.id === sessionId))
-      .catch((err) => {
-        console.warn(`[runtime] ${why}: could not ask the box about session=${sessionId}; leaving it alone:`, err);
-        return false;
-      });
+    let holdsSession: boolean;
+    try {
+      const { sessions } = await client.listSessions();
+      holdsSession = sessions.some((s) => s.id === sessionId);
+    } catch (err) {
+      // Do NOT abort blind here: if the box in fact has no session, that abort
+      // would arm the pre-spawn latch the user's retry would then consume.
+      throw new Error(
+        `${why}: could not confirm whether the box holds session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    }
     if (!holdsSession) return false;
-    await client.abortSession(sessionId).catch((err) => {
-      if (!isSessionNotFound(err)) {
-        console.warn(`[runtime] ${why}: failed to stop session=${sessionId}:`, err);
-        return;
-      }
+    try {
+      await client.abortSession(sessionId);
+    } catch (err) {
+      if (!isSessionNotFound(err)) throw err;
       console.log(`[runtime] ${why}: session=${sessionId} vanished from its box between probe and abort`);
-    });
+    }
     return true;
   }
 
@@ -1732,12 +1747,19 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   // Reliable cross-Runtime delegation controls arrive as RPCs instead of the
   // best-effort event lane. Acknowledge only after the matching source handler
-  // has consumed the envelope; Sicore retains and retries it otherwise.
+  // has consumed the envelope; the control plane retains and retries it otherwise.
   rpcMethods.set("delegation.control", async (params) => {
-    if (!frontendClient.dispatchReliableEvent("delegation.event", params)) {
-      throw new Error("No active delegation consumer accepted the control event");
+    if (frontendClient.dispatchReliableEvent("delegation.event", params)) return { ok: true };
+    // No live consumer is not automatically a delivery failure. A terminal whose
+    // acknowledgement was lost gets re-sent, and by then its consumer is gone
+    // *because it consumed the original*. Rejecting that would retry forever,
+    // which keeps the sender's relay alive; a relay that later expires aborts by
+    // (agent, session) and would kill a NEW turn reusing that peer session.
+    const delegationId = typeof params?.delegationId === "string" ? params.delegationId : "";
+    if (delegationId && isDelegationSettled(delegationId)) {
+      return { ok: true, alreadySettled: true };
     }
-    return { ok: true };
+    throw new Error("No active delegation consumer accepted the control event");
   });
 
   // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──

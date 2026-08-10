@@ -44,7 +44,7 @@ vi.mock("./agentbox/client.js", () => ({
   },
 }));
 
-import { getRemoteDelegationIdleTimeoutMs, handleDelegate } from "./delegate-api.js";
+import { getRemoteDelegationIdleTimeoutMs, handleDelegate, isDelegationSettled } from "./delegate-api.js";
 import { sessionTurnLocks } from "./session-turn-lock.js";
 
 // ── Fakes ─────────────────────────────────────────────────────────────
@@ -420,26 +420,21 @@ describe("handleDelegate — cross-Runtime routing", () => {
     expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable aries result" });
   });
 
-  it("pages back to a turn boundary buried under its own tool rows", async () => {
-    // Tool rows are messages too, so one window is not a turn: a tool-heavy peer
-    // turn can push its own opening row out of the first page. Recovery must keep
-    // reading rather than report a completed delegation as unrecoverable.
+  it("marks a finished remote delegation settled so a re-sent terminal is acknowledged", async () => {
+    // Reliable control delivery retries until the source acknowledges. Once the
+    // consumer has finished there is nobody to accept a re-sent terminal, and
+    // rejecting it forever keeps the sender's relay alive — whose idle expiry
+    // aborts by (agent, session) and would kill a new turn reusing this session.
     const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    let startedDelegationId = "";
     deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
       if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
       if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
       if (method === "delegation.start") {
-        // Newest page first: the answer, then a page of tool rows, then the page
-        // that finally contains this delegation's opening user row.
+        startedDelegationId = params.delegationId;
         getMessages.mockResolvedValueOnce([
-          { id: "m3", role: "assistant", content: "durable answer", delegationId: null, metadata: null, createdAt: new Date(3000) },
-        ] as any);
-        getMessages.mockResolvedValueOnce([
-          { id: "m2", role: "tool", content: "kubectl get pods", delegationId: null, metadata: null, createdAt: new Date(2000) },
-        ] as any);
-        getMessages.mockResolvedValueOnce([
-          { id: "m0", role: "user", content: "older unrelated turn", delegationId: "other", metadata: null, createdAt: new Date(500) },
-          { id: "m1", role: "user", content: "inspect", delegationId: params.delegationId, metadata: null, createdAt: new Date(1000) },
+          { id: "u1", role: "user", content: "inspect", delegationId: params.delegationId, metadata: null, createdAt: new Date(1000) },
+          { id: "a1", role: "assistant", content: "settled answer", delegationId: null, metadata: null, createdAt: new Date(2000) },
         ] as any);
         deps.eventHandlers.get("delegation.event")!({
           delegationId: params.delegationId,
@@ -453,8 +448,53 @@ describe("handleDelegate — cross-Runtime routing", () => {
     const res = makeRes();
     await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
 
-    expect(getMessages).toHaveBeenCalledTimes(3);
-    // Only rows AFTER the boundary count — the older turn must not leak in.
+    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done" });
+    expect(isDelegationSettled(startedDelegationId)).toBe(true);
+    expect(isDelegationSettled("never-started")).toBe(false);
+  });
+
+  it("widens the history window until a turn boundary buried under its own tool rows is inside it", async () => {
+    // Tool rows are messages too, so one window is not one turn: a tool-heavy peer
+    // turn can push its own opening row out of the newest N rows. Recovery must
+    // keep widening rather than report a completed delegation as unrecoverable.
+    // The window grows instead of walking a timestamp cursor because created_at has
+    // one-second granularity — a cursor would skip same-second rows.
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        const toolRows = (n: number) => Array.from({ length: n }, (_unused, i) => ({
+          id: `t${i}`, role: "tool", content: "kubectl get pods", delegationId: null, metadata: null,
+        }));
+        // First window is saturated and holds no boundary → must widen.
+        getMessages.mockResolvedValueOnce([
+          ...toolRows(199),
+          { id: "a1", role: "assistant", content: "durable answer", delegationId: null, metadata: null },
+        ] as any);
+        // Wider window finally reaches this turn's opening row, preceded by an
+        // older unrelated turn that must NOT leak into the result.
+        getMessages.mockResolvedValueOnce([
+          { id: "old", role: "assistant", content: "previous turn answer", delegationId: null, metadata: null },
+          { id: "u1", role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+          ...toolRows(199),
+          { id: "a1", role: "assistant", content: "durable answer", delegationId: null, metadata: null },
+        ] as any);
+        deps.eventHandlers.get("delegation.event")!({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "prompt_done" },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(getMessages).toHaveBeenCalledTimes(2);
+    expect(getMessages).toHaveBeenNthCalledWith(1, expect.any(String), { limit: 200 });
+    expect(getMessages).toHaveBeenNthCalledWith(2, expect.any(String), { limit: 400 });
     expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable answer" });
   });
 

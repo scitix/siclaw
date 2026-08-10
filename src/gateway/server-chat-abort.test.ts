@@ -52,6 +52,8 @@ let promptBlocker: Promise<void> | undefined;
 // Session ids the fake box reports holding — the evidence chat.abort probes before
 // aborting a turn the Gateway still counts as pending.
 const boxSessions: string[] = [];
+// Set to make the fake box refuse to answer "do you hold this session?".
+let listSessionsError: Error | undefined;
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     endpoint: string;
@@ -64,7 +66,10 @@ vi.mock("./agentbox/client.js", () => ({
       if (promptError) throw promptError;
       return { sessionId: opts.sessionId, traceId: "0123456789abcdef0123456789abcdef" };
     });
-    listSessions = vi.fn(async () => ({ sessions: boxSessions.map((id) => ({ id })) }));
+    listSessions = vi.fn(async () => {
+      if (listSessionsError) throw listSessionsError;
+      return { sessions: boxSessions.map((id) => ({ id })) };
+    });
     abortSession = vi.fn(async (sessionId: string) => {
       abortSessionCalls.push(sessionId);
     });
@@ -123,6 +128,7 @@ afterEach(async () => {
   promptError = undefined;
   promptBlocker = undefined;
   boxSessions.length = 0;
+  listSessionsError = undefined;
   vi.clearAllMocks();
 });
 
@@ -139,6 +145,34 @@ describe("startRuntime — chat.abort wiring", () => {
     frontendClient.dispatchReliableEvent.mockReturnValueOnce(true);
     await expect(control(envelope, { sendEvent: vi.fn() })).resolves.toMatchObject({ ok: true });
     expect(frontendClient.dispatchReliableEvent).toHaveBeenLastCalledWith("delegation.event", envelope);
+  });
+
+  it("reports a Stop the box never confirmed as a failure", async () => {
+    // Answering ok:true here tells the control plane to stop retrying and to tear
+    // down its relay, so an unconfirmed abort must not be dressed up as success.
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    listSessionsError = new Error("box unreachable");
+
+    let failPrompt: ((err: Error) => void) | undefined;
+    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
+
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    try {
+      await send({ agentId: "a", userId: "u", text: "hi", sessionId: "unconfirmed" }, ctx);
+      await waitFor(() => promptCalls.length === 1);
+      await expect(abort({ agentId: "a", sessionId: "unconfirmed" })).rejects.toThrow(/could not confirm/);
+      expect(abortSessionCalls).toEqual([]);
+    } finally {
+      failPrompt?.(new Error("socket hang up"));
+    }
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
   });
 
   it("starts consuming the reply without waiting for trace binding", async () => {
