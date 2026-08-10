@@ -2377,9 +2377,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 60 handlers", () => {
+  it("registers exactly 61 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(60);
+    expect(handlers.size).toBe(61);
   });
 
   it("all expected handler names are registered", () => {
@@ -2388,7 +2388,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getAgent", "config.getResources", "config.getSettings",
       "config.getModelBinding", "config.getMcpServers", "config.getSkillBundle", "config.getKnowledgeBundle",
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel", "config.getTracingConfig",
-      "config.getDelegates",
+      "config.getDelegates", "delegation.resolveRoute",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
       "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.bindMessageTraceId", "chat.recordFeedback", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",

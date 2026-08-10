@@ -2225,6 +2225,14 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return { members: roster };
   });
 
+  // Portal-standalone has one in-process Runtime, so every authorized peer is
+  // local. Sicore implements the same RPC with real runtime_id comparison.
+  handlers.set("delegation.resolveRoute", async () => ({
+    local: true,
+    sourceRuntimeId: "portal-standalone",
+    targetRuntimeId: "portal-standalone",
+  }));
+
   handlers.set("config.getSettings", async (params) => {
     const db = getDb();
     const [agentRows] = await db.query(

@@ -39,6 +39,19 @@ import type {
  * back" in a long-running (never-switched) conversation.
  */
 const RECENT_DELEGATION_LIMIT = 8;
+const REMOTE_DELEGATION_TIMEOUT_MS = 10 * 60 * 1000;
+
+interface DelegationRoute {
+  local: boolean;
+  sourceRuntimeId: string;
+  targetRuntimeId: string;
+}
+
+interface DelegationRelayEnvelope {
+  delegationId?: string;
+  sessionId?: string;
+  event?: Record<string, unknown>;
+}
 
 export interface DelegateApiDeps {
   agentBoxManager: AgentBoxManager;
@@ -128,6 +141,26 @@ export async function handleDelegate(
     return;
   }
 
+  // Direct chat already routes agent_id → runtime_id in Sicore. Delegation must
+  // make the same placement decision before touching the local AgentBoxManager;
+  // otherwise a coordinator Runtime can create a correctly configured peer in
+  // the wrong network environment. Fail closed if the control plane cannot
+  // prove the route — a local fallback would recreate the incident.
+  let route: DelegationRoute;
+  try {
+    route = await deps.frontendClient.request("delegation.resolveRoute", {
+      coordinatorAgentId,
+      peerAgentId,
+    }) as DelegationRoute;
+    if (typeof route?.local !== "boolean" || !route.targetRuntimeId) {
+      throw new Error("invalid delegation route response");
+    }
+  } catch (err) {
+    console.error("[delegate-api] delegation route lookup failed:", err);
+    sendJson(res, 503, { error: "Could not resolve the peer Runtime; delegation was not started" });
+    return;
+  }
+
   const delegationId = randomUUID();
 
   // Resolve the peer session id + owner. The peer session is PERSISTED (openable +
@@ -202,6 +235,14 @@ export async function handleDelegate(
     await appendMessage({ sessionId: peerSessionId, role: "user", content: text, parentSessionId: trustedParent, delegationId, targetAgentId: peerAgentId });
   } catch (err) {
     console.warn("[delegate-api] failed to persist peer session:", err);
+    // The target Runtime deliberately skips initial persistence so the source
+    // can preserve coordinator ownership and parent lineage. Without this row,
+    // every target-side append would be rejected; do not start a remote turn
+    // whose result cannot be durably attached to the delegated session.
+    if (!route.local) {
+      sendJson(res, 503, { error: "Could not persist the delegated session; delegation was not started" });
+      return;
+    }
   }
 
   const steps: string[] = [];
@@ -211,6 +252,7 @@ export async function handleDelegate(
   // its turn asking a human clarification. Surfaced as a distinct result status so the
   // coordinator relays the question instead of treating the (often empty) turn as done.
   let inputQuestion = "";
+  let remoteErrorMessage = "";
 
   // Live-relay: from here we stream Server-Sent Events. Each peer chat.event is
   // forwarded verbatim as a `peer_event` frame so the coordinator box can render
@@ -226,15 +268,68 @@ export async function handleDelegate(
     try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* client gone */ }
   };
 
+  const observePeerEvent = (evt: Record<string, unknown>, mirrorToPeerChannel: boolean) => {
+    const e = evt as any;
+    // Relay the raw peer event live — the coordinator box translates it into
+    // the coordinator card's live steps.
+    writeFrame({ type: "peer_event", event: evt });
+    // Local execution consumes AgentBox SSE directly, so publish a mirror for an
+    // opened PeerSessionView. A remote target Runtime already published this
+    // exact chat.event to Sicore; mirroring again would duplicate the transcript.
+    if (mirrorToPeerChannel) {
+      try { deps.frontendClient.emitEvent("chat.event", { sessionId: peerSessionId, event: evt }); } catch { /* best-effort live mirror */ }
+    }
+    if (e?.type === "delegation_artifact") {
+      artifact = {
+        findings: String(e.findings ?? ""),
+        actions_taken: String(e.actions_taken ?? ""),
+        residual_state: String(e.residual_state ?? ""),
+      };
+      return;
+    }
+    if (e?.type === "input_required") {
+      if (typeof e.question === "string" && e.question.trim()) inputQuestion = e.question.trim();
+      return;
+    }
+    if (e?.type === "stream_error") {
+      remoteErrorMessage = typeof e.error === "string"
+        ? e.error
+        : typeof e.error?.message === "string"
+          ? e.error.message
+          : "delegated peer stream failed";
+    }
+    const t = String(e?.type ?? "");
+    if (t === "tool_execution_end") {
+      const label = e.toolName ?? e.tool ?? e.name ?? e.title;
+      if (typeof label === "string" && label) steps.push(label);
+    }
+    if (t === "message_end" && e.message?.role === "assistant") {
+      const parts: Array<{ type?: string; text?: string }> = e.message.content ?? [];
+      const txt = parts.filter((c) => c.type === "text").map((c) => c.text ?? "").join("").trim();
+      if (txt) finalText = finalText ? `${finalText}\n\n${txt}` : txt;
+    } else if (typeof e?.text === "string" && e.text.trim()) {
+      finalText = finalText ? `${finalText}\n\n${e.text}` : e.text;
+    } else if (typeof e?.content === "string" && e.content.trim()) {
+      finalText = finalText ? `${finalText}\n\n${e.content}` : e.content;
+    }
+  };
+
   // Propagate Stop: when the coordinator aborts, its delegateStream destroys the
   // HTTP request → this response's socket closes. Break the drain loop AND cancel
   // the peer's own turn (otherwise the peer keeps running headless).
   const peerAbort = new AbortController();
   let finished = false;
   let peerClient: AgentBoxClient | undefined;
+  let remoteStartRequested = false;
   res.on("close", () => {
     if (finished) return; // normal completion, not a client abort
     peerAbort.abort();
+    if (!route.local && remoteStartRequested) {
+      deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch((err) => {
+        console.warn(`[delegate-api] failed to abort remote delegation ${delegationId}:`, err);
+      });
+      return;
+    }
     // Abort by peerSessionId — known BEFORE the prompt round-trip and equal to the
     // box session id we prompt with. Using the post-prompt `promptResult.sessionId`
     // left a gap: a Stop during getOrCreate (pod spawn, 10-30s) + the prompt HTTP
@@ -260,7 +355,82 @@ export async function handleDelegate(
   // Node's default unhandled-rejection policy, take the whole Runtime process down.
   let releaseTurn: (() => void) | undefined;
   try {
+    // Serialize both local and remote continuation of one peer session. The
+    // target Runtime has its own in-flight guard, but the source owns reuse and
+    // can reject a duplicate before creating cross-Runtime work.
     releaseTurn = await sessionTurnLocks.acquire(peerSessionId);
+    if (!route.local) {
+      let resolveRemoteDone: (() => void) | undefined;
+      let rejectRemoteDone: ((err: Error) => void) | undefined;
+      const remoteDone = new Promise<void>((resolve, reject) => {
+        resolveRemoteDone = resolve;
+        rejectRemoteDone = reject;
+      });
+      const timeout = setTimeout(() => rejectRemoteDone?.(new Error("remote delegation timed out")), REMOTE_DELEGATION_TIMEOUT_MS);
+      timeout.unref?.();
+      const onAbort = () => rejectRemoteDone?.(new Error("delegation stopped"));
+      peerAbort.signal.addEventListener("abort", onAbort, { once: true });
+      const unsubscribe = deps.frontendClient.subscribe("delegation.event", (data) => {
+        const envelope = data as DelegationRelayEnvelope;
+        if (envelope?.delegationId !== delegationId || envelope.sessionId !== peerSessionId || !envelope.event) return;
+        observePeerEvent(envelope.event, false);
+        const type = String((envelope.event as any)?.type ?? "");
+        if (type === "prompt_done" || type === "done") resolveRemoteDone?.();
+      });
+      try {
+        remoteStartRequested = true;
+        await deps.frontendClient.request("delegation.start", {
+          delegationId,
+          coordinatorAgentId,
+          peerAgentId,
+          sessionId: peerSessionId,
+          prompt: {
+            sessionId: peerSessionId,
+            userId: ownerUserId,
+            text,
+            agentId: peerAgentId,
+            modelProvider: binding.modelProvider,
+            modelId: binding.modelId,
+            modelConfig: binding.modelConfig,
+            modelRouting: binding.modelRouting,
+            systemPrompt: binding.systemPrompt ?? undefined,
+            origin: "api",
+            delegation: {
+              delegationId,
+              parentSessionId: body.parentSessionId,
+              parentAgentId: coordinatorAgentId,
+              readOnly: false,
+            },
+          },
+        });
+        if (peerAbort.signal.aborted) {
+          await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch(() => {});
+          throw new Error("delegation stopped");
+        }
+        await remoteDone;
+      } catch (err) {
+        // A source-side timeout/disconnect must not leave the target turn running
+        // headless. Abort is idempotent; the router reports alreadyFinished when
+        // prompt_done won the race.
+        if (remoteStartRequested) {
+          await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch(() => {});
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeout);
+        peerAbort.signal.removeEventListener("abort", onAbort);
+        unsubscribe();
+      }
+      if (remoteErrorMessage) {
+        finished = true;
+        writeFrame({
+          type: "delegate_result",
+          result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: remoteErrorMessage } satisfies DelegateResponse,
+        });
+        res.end();
+        return;
+      }
+    } else {
     const handle = await deps.agentBoxManager.getOrCreate(peerAgentId, undefined, peerSessionId);
     sessionTurnLocks.noteBox(peerSessionId, handle.boxId, handle.endpoint);
     const client = new AgentBoxClient(handle.endpoint, 30000, deps.agentBoxTlsOptions);
@@ -309,54 +479,7 @@ export async function handleDelegate(
       // Persist the peer session's rows so the coordinator can open its full
       // session and it survives for later analysis.
       persistMessages: true,
-      onEvent: (evt: Record<string, unknown>) => {
-        const e = evt as any;
-        // Relay the raw peer event live — the coordinator box translates it into
-        // the coordinator card's live steps.
-        writeFrame({ type: "peer_event", event: evt });
-        // Also publish to the peer session's OWN live channel so an opened
-        // PeerSessionView (subscribed to …/sessions/{peerSessionId}/events)
-        // streams the peer's full session live (mirrors delegation.emit_chat_event).
-        try { deps.frontendClient.emitEvent("chat.event", { sessionId: peerSessionId, event: evt }); } catch { /* best-effort live mirror */ }
-        if (e?.type === "delegation_artifact") {
-          artifact = {
-            findings: String(e.findings ?? ""),
-            actions_taken: String(e.actions_taken ?? ""),
-            residual_state: String(e.residual_state ?? ""),
-          };
-          return;
-        }
-        if (e?.type === "input_required") {
-          // The peer asked a human clarification and will end its turn. Capture the
-          // question; the final result surfaces it as status "input_required".
-          if (typeof e.question === "string" && e.question.trim()) inputQuestion = e.question.trim();
-          return;
-        }
-        // Count tool steps for the final summary; capture the narrative fallback.
-        // Count ONCE per tool call — on `tool_execution_end` only. Matching every
-        // event whose type contains "tool" (start + update + end) inflated the
-        // count 2-3× per call (a "4 tool calls" run reported as 12).
-        const t = String(e?.type ?? "");
-        if (t === "tool_execution_end") {
-          const label = e.toolName ?? e.tool ?? e.name ?? e.title;
-          if (typeof label === "string" && label) steps.push(label);
-        }
-        // An AUTONOMOUS peer ends with a normal assistant message (no report_findings).
-        // ACCUMULATE its assistant narrative — a peer often ends with a big report
-        // message followed by a short closing remark ("以上就是结论…"). Taking only the
-        // LAST message would hand the coordinator just that closing line, which reads
-        // as a truncated/empty result. Joining preserves the actual report; the tail
-        // is kept at result time so the conclusion always survives the cap.
-        if (t === "message_end" && e.message?.role === "assistant") {
-          const parts: Array<{ type?: string; text?: string }> = e.message.content ?? [];
-          const txt = parts.filter((c) => c.type === "text").map((c) => c.text ?? "").join("").trim();
-          if (txt) finalText = finalText ? `${finalText}\n\n${txt}` : txt;
-        } else if (typeof e?.text === "string" && e.text.trim()) {
-          finalText = finalText ? `${finalText}\n\n${e.text}` : e.text;
-        } else if (typeof e?.content === "string" && e.content.trim()) {
-          finalText = finalText ? `${finalText}\n\n${e.content}` : e.content;
-        }
-      },
+      onEvent: (evt: Record<string, unknown>) => observePeerEvent(evt, true),
     });
 
     // consumeAgentSse reports MODEL-level failures (provider 4xx/5xx, rate-limit,
@@ -373,6 +496,7 @@ export async function handleDelegate(
       });
       res.end();
       return;
+    }
     }
   } catch (err) {
     // A client-abort cancellation surfaces here as the drain loop breaking; treat

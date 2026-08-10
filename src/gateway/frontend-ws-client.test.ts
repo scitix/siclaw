@@ -316,6 +316,31 @@ describe("FrontendWsClient", () => {
     client.close();
   });
 
+  it("subscribe() receives Portal-to-Runtime events and can unsubscribe", async () => {
+    const client = await createClient();
+    const received: unknown[] = [];
+    const unsubscribe = client.subscribe("delegation.event", (data) => received.push(data));
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    ws.emit("message", JSON.stringify({
+      type: "event",
+      channel: "delegation.event",
+      data: { delegationId: "d1", event: { type: "message_end" } },
+    }));
+    expect(received).toEqual([{ delegationId: "d1", event: { type: "message_end" } }]);
+
+    unsubscribe();
+    ws.emit("message", JSON.stringify({
+      type: "event",
+      channel: "delegation.event",
+      data: { delegationId: "d2" },
+    }));
+    expect(received).toHaveLength(1);
+    client.close();
+  });
+
   // ── 7. Auto-reconnect on disconnect ───────────────────────
 
   it("rejects all pending RPCs on WS close (so callers don't wait the full timeout)", async () => {

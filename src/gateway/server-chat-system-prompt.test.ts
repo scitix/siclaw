@@ -29,6 +29,8 @@ vi.mock("./output-redactor.js", () => ({
   buildRedactionConfigForModelConfig: vi.fn(() => ({})),
 }));
 
+const chatRepo = await import("./chat-repo.js");
+
 // The mocked consumer hangs (the IIFE never settles) — we only need it to reach
 // prompt(), whose opts we capture below.
 vi.mock("./sse-consumer.js", () => ({
@@ -123,6 +125,25 @@ afterEach(async () => {
 });
 
 describe("startRuntime — chat.send custom system prompt", () => {
+  it("does not duplicate a pre-created cross-Runtime delegation session or user row", async () => {
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({
+      agentId: "peer",
+      userId: "u",
+      text: "delegated task",
+      sessionId: "delegated-session",
+      skipInitialPersistence: true,
+      delegation: { delegationId: "d1", parentAgentId: "coord", readOnly: false },
+    }, { sendEvent: vi.fn() });
+    await waitFor(() => promptCalls.length > 0);
+
+    expect(chatRepo.ensureChatSession).not.toHaveBeenCalled();
+    expect(chatRepo.appendMessage).not.toHaveBeenCalled();
+    expect(chatRepo.incrementMessageCount).not.toHaveBeenCalled();
+  });
+
   it("uses an explicitly forwarded systemPrompt as-is (portal-standalone) and skips the lookup", async () => {
     // config.getAgent would resolve a DIFFERENT prompt; the explicit param must win
     // and the fallback lookup must not even run.

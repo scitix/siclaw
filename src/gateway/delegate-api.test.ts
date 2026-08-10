@@ -95,18 +95,28 @@ const COORD = "coord-agent";
 const PEER = "peer-agent";
 
 function makeDeps(resolveSessionResult: unknown) {
+  const eventHandlers = new Map<string, (data: unknown) => void>();
   const request = vi.fn(async (method: string) => {
     if (method === "config.getDelegates") {
       return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
     }
     if (method === "chat.resolveSession") return resolveSessionResult;
     if (method === "chat.recentDelegationSessions") return { ids: [] };
+    if (method === "delegation.resolveRoute") return { local: true, sourceRuntimeId: "rt1", targetRuntimeId: "rt1" };
     return {};
   });
   return {
     agentBoxManager: { getOrCreate: vi.fn(async () => ({ endpoint: "https://box" })) } as any,
     agentBoxTlsOptions: undefined,
-    frontendClient: { request, emitEvent: vi.fn() } as any,
+    frontendClient: {
+      request,
+      emitEvent: vi.fn(),
+      subscribe: vi.fn((channel: string, handler: (data: unknown) => void) => {
+        eventHandlers.set(channel, handler);
+        return () => eventHandlers.delete(channel);
+      }),
+    } as any,
+    eventHandlers,
   };
 }
 
@@ -219,5 +229,90 @@ describe("handleDelegate — model-failure propagation (P1)", () => {
     const result = delegateResult(res);
     expect(result?.ok).toBe(true);
     expect(result?.status).toBe("done");
+  });
+});
+
+describe("handleDelegate — cross-Runtime routing", () => {
+  it("routes a remote peer through Sicore and never creates it in the coordinator AgentBoxManager", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "chat.resolveSession") return { found: true, user_id: "u", agent_id: COORD };
+      if (method === "chat.recentDelegationSessions") return { ids: [] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        const relay = deps.eventHandlers.get("delegation.event")!;
+        relay({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "aries result" }] } },
+        });
+        relay({ delegationId: params.delegationId, sessionId: params.sessionId, event: { type: "prompt_done" } });
+        return { ok: true, targetRuntimeId: "aries" };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect", parentSessionId: "own-sess" }), res as any, identity, deps);
+
+    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+    const startCall = deps.frontendClient.request.mock.calls.find(([method]: any[]) => method === "delegation.start");
+    expect(startCall?.[1]).toMatchObject({
+      coordinatorAgentId: COORD,
+      peerAgentId: PEER,
+      prompt: { agentId: PEER, text: "inspect", delegation: { parentAgentId: COORD } },
+    });
+    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "aries result" });
+  });
+
+  it("fails closed when the control plane cannot resolve the peer Runtime", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") throw new Error("unknown method");
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(res.statusCode).toBe(503);
+    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("does not start a remote turn when its delegated session cannot be persisted", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      return {};
+    });
+    ensureChatSession.mockRejectedValueOnce(new Error("database unavailable"));
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(res.statusCode).toBe(503);
+    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
+    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a remote peer stream_error instead of returning false success", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        const relay = deps.eventHandlers.get("delegation.event")!;
+        relay({ delegationId: params.delegationId, sessionId: params.sessionId, event: { type: "stream_error", error: { message: "provider unavailable" } } });
+        relay({ delegationId: params.delegationId, sessionId: params.sessionId, event: { type: "prompt_done" } });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed", error: "provider unavailable" });
   });
 });

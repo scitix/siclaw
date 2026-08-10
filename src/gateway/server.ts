@@ -410,6 +410,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // concierge) delegated this turn over the mesh. Forwarded to the agentbox so
     // the worker gates its toolset read-only and stamps the result artifact.
     const delegation = params.delegation as PromptOptions["delegation"];
+    // A cross-Runtime delegation session is created by the coordinator Runtime
+    // before Sicore routes this chat.send to the target Runtime. Re-inserting the
+    // session/user row here would overwrite ownership/lineage and duplicate the
+    // delegated task. Only honor the flag on an authenticated delegation turn.
+    const skipInitialPersistence = params.skipInitialPersistence === true && Boolean(delegation?.delegationId);
     // Portal stamps turnStartMs at POST receipt — closer to user click than
     // the runtime's loop start. Use it as the canonical turn anchor when
     // present; fall back gracefully so direct callers (tests, /run path)
@@ -476,12 +481,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // to matching by content; blocking a whole conversation on one database hiccup is the
     // worse trade.
     let promptMessageId: string | undefined;
-    try {
-      await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
-      promptMessageId = await appendMessage({ sessionId, role: "user", content: text, deferSequence: true });
-      await incrementMessageCount(sessionId);
-    } catch (persistErr) {
-      console.warn(`[runtime] failed to persist the user message session=${sessionId}; continuing without a row id:`, persistErr);
+    if (!skipInitialPersistence) {
+      try {
+        await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
+        promptMessageId = await appendMessage({ sessionId, role: "user", content: text, deferSequence: true });
+        await incrementMessageCount(sessionId);
+      } catch (persistErr) {
+        console.warn(`[runtime] failed to persist the user message session=${sessionId}; continuing without a row id:`, persistErr);
+      }
     }
 
     (async () => {

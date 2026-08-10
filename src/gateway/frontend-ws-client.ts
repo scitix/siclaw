@@ -43,6 +43,7 @@ interface PendingRpc {
 }
 
 type CommandHandler = (method: string, params: any) => Promise<any>;
+type EventHandler = (data: unknown) => void;
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -59,6 +60,7 @@ export class FrontendWsClient {
   private _connected = false;
   private pending = new Map<string, PendingRpc>();
   private commandHandler: CommandHandler | null = null;
+  private eventHandlers = new Map<string, Set<EventHandler>>();
   private activeSessionsProvider?: () => string[];
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -126,6 +128,21 @@ export class FrontendWsClient {
    */
   onCommand(handler: CommandHandler): void {
     this.commandHandler = handler;
+  }
+
+  /** Subscribe to unsolicited Portal → Runtime events on one channel. */
+  subscribe(channel: string, handler: EventHandler): () => void {
+    let handlers = this.eventHandlers.get(channel);
+    if (!handlers) {
+      handlers = new Set<EventHandler>();
+      this.eventHandlers.set(channel, handlers);
+    }
+    handlers.add(handler);
+    return () => {
+      const current = this.eventHandlers.get(channel);
+      current?.delete(handler);
+      if (current?.size === 0) this.eventHandlers.delete(channel);
+    };
   }
 
   /**
@@ -302,6 +319,20 @@ export class FrontendWsClient {
           ? msg.error
           : msg.error?.message ?? `RPC error (id=${msg.id})`;
         entry.reject(new Error(errMsg));
+      }
+      return;
+    }
+
+    // Unsolicited event (Portal → Runtime). Most events flow in the opposite
+    // direction; cross-Runtime delegation uses this reverse event lane to relay
+    // a target Runtime's peer stream without exposing private Gateway addresses.
+    if (msg.type === "event" && typeof msg.channel === "string") {
+      for (const handler of this.eventHandlers.get(msg.channel) ?? []) {
+        try {
+          handler(msg.data);
+        } catch (err) {
+          console.warn(`[frontend-ws] event handler failed channel=${msg.channel}:`, err);
+        }
       }
       return;
     }
