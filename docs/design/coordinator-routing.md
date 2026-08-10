@@ -130,27 +130,78 @@ absent. A bare, non-delegated `chat.send` may never suppress persistence.
 
 Live progress events are not the correctness record for the result. They may be
 dropped individually, so even a non-empty reassembled answer can be incomplete.
-Lifecycle, error, clarification and artifact frames use the acknowledged control
-RPC and are retried by the management plane until this Runtime confirms that the
-matching delegation consumer handled them. After the terminal event, the source always derives remote
-`finalText` from assistant rows after the current delegation boundary in durable
-session history. Artifact-only and input-required turns may legitimately have no
+Lifecycle, error, clarification and artifact frames therefore travel with an
+acknowledgement on *both* legs: the target Runtime reports a delegated turn's
+terminal to the management plane over an acknowledged RPC, and the management
+plane relays control frames to the source over one, retried until this Runtime
+confirms that the matching delegation consumer handled them. A re-delivered
+terminal must be acknowledged, not rejected: its consumer is gone precisely
+because it consumed the original, and refusing it keeps a sender retrying — which
+keeps supervision alive over a turn that already ended.
+
+After the terminal event, the source always derives remote `finalText` from
+assistant rows after the current delegation boundary in durable session history.
+Recovery widens a window over the newest rows rather than walking a timestamp
+cursor, because `created_at` is second-granular and a cursor would skip rows
+sharing a second. Artifact-only and input-required turns may legitimately have no
 assistant text; an ordinary completed turn with no durable result fails instead
-of returning an empty or partial success. The remote relay timeout measures
-event *silence* and is renewed by matching events;
-`SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT` may override it in seconds.
+of returning an empty or partial success. The remote relay timeout measures event
+*silence* and is renewed by matching events;
+`SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT` may override it in seconds, bounded by
+the management plane's own relay lease — waiting past that point cannot succeed,
+because the events being waited for no longer have a route.
 
-Cancellation is latched before authorization and route lookup so an HTTP close
-cannot be missed during pre-stream awaits. On the target Runtime, a pending-only
-Stop cancels the Gateway start without creating an AgentBox pre-spawn tombstone;
-if `prompt()` is already in flight, the post-acceptance check aborts the real
-session. A terminal carrying `aborted=true` is authoritative interruption, even
-if partial assistant rows were already persisted.
+### Cancellation is addressed by turn, not by session
 
-This contract creates a strict rollout dependency. The management plane that
-implements route/start/abort and the reverse event lane must be deployed before
-the Runtime containing this behavior. An older management plane causes all
-delegation route lookups to fail closed, including same-Runtime delegation.
+A session id names a *conversation*, and delegation deliberately reuses a peer
+session for follow-ups in one investigation. "Abort session S" is therefore
+ambiguous the moment a turn ends, and a supervisor's abort can be delayed past
+that point by a lease expiry or a retry. Every abort a Runtime sends names the
+turn it means:
+
+- a prompt carries the caller's turn id, the box records it as the running turn,
+  and an abort naming any other turn is answered as already stopped;
+- a pre-spawn abort latch records the turn that armed it and is consumed only by
+  that turn's prompt, so an orphaned latch cannot cancel a later, deliberate
+  prompt on the same reused session id;
+- `chat.abort` accepts an optional turn id and ignores a stale one. The user's
+  Stop button sends none, which still means "stop what is running"; and
+- the turn id appears in the `chat.send` acknowledgement so a supervisor can name
+  it later.
+
+Both fields are optional, which is what makes naming a turn safe to roll out in
+either order: a box that ignores the field keeps session-wide semantics, and a
+caller that sends none behaves as before.
+
+Because an abort is turn-scoped, compensation no longer has to guess whether a
+dispatch landed. AgentBox starts a run *before* acknowledging the prompt, so a
+lost acknowledgement leaves a turn running that nobody will consume; the Runtime
+therefore aborts by turn on every prompt rejection, which is a no-op when the
+turn never started. Cancellation is latched before authorization and route lookup
+so an HTTP close cannot be missed during pre-stream awaits. An abort the box never
+confirmed is reported as a failure rather than a successful Stop — answering
+otherwise tells the management plane to stop retrying and tear down supervision.
+A terminal carrying `aborted=true` is authoritative interruption, even if partial
+assistant rows were already persisted.
+
+Supervision ends when a terminal is *observed*, whether or not it could be handed
+onwards. The target turn is over by definition at that point, so an abort issued
+after it — the one a lease expiry would otherwise send — could only land on a
+successor.
+
+This contract creates one strict rollout dependency and one that is merely
+preferred. The strict one: the management plane implementing route/start/abort and
+the reverse event lane must be deployed **before** the Runtime containing this
+behavior, because an older management plane makes every delegation route lookup
+fail closed — including same-Runtime delegation. The preferred one: turn
+addressing spans the AgentBox image as well, and each half degrades to the older
+session-wide meaning on its own, so that half can roll in either order.
+
+Cross-Runtime delegation also assumes the management plane terminates every
+Runtime connection it must reach in one process. Placement decisions, command
+delivery and event subscription all resolve against connections local to the
+process handling the delegation, so a multi-replica control plane would fail
+closed on any pair split across replicas rather than misroute.
 
 ## Behavioral invariants
 
