@@ -468,6 +468,42 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const files = params.files as PromptOptions["files"];
     // One id for this turn, held from before the async ack until the turn settles.
     const turnId = crypto.randomUUID();
+
+    /**
+     * Hand this turn's terminal to the control plane with an acknowledgement.
+     *
+     * The chat.event lane is fire-and-forget, which a human-facing turn survives:
+     * the frontend refetches. A DELEGATED turn has a machine waiting on it and
+     * nobody to retry, so a terminal lost on this first hop strands the caller
+     * until its idle window elapses and it reports a failure for a turn that in
+     * fact succeeded. Only delegated turns pay for the extra round-trip.
+     *
+     * Bounded: this is a delivery guarantee, not a promise to block a settling
+     * turn indefinitely. A control plane that does not implement the method (a
+     * standalone deployment, an older one) is not retried at all.
+     */
+    const deliverDelegationTerminal = async (event: Record<string, unknown>): Promise<void> => {
+      if (!delegation?.delegationId) return;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          await frontendClient.request("delegation.terminal", {
+            delegationId: delegation.delegationId,
+            sessionId,
+            turnId,
+            event,
+          }, 10_000);
+          return;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (/unknown method/i.test(message)) return;
+          if (attempt === 3) {
+            console.error(`[runtime] could not confirm delivery of the terminal for delegation=${delegation.delegationId} session=${sessionId}:`, message);
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 250 * attempt));
+        }
+      }
+    };
     const promptOpts: PromptOptions = {
       sessionId,
       turnId,
@@ -730,7 +766,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
               });
             },
           });
-          if (!alreadyReported()) context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+          if (!alreadyReported()) {
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+            await deliverDelegationTerminal({ type: "prompt_done" });
+          }
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
             console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
@@ -744,7 +783,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             });
           }
           // Shutdown, or a box removal, already reported this turn before aborting it.
-          if (!alreadyReported()) context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+          if (!alreadyReported()) {
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+            await deliverDelegationTerminal({ type: "prompt_done" });
+          }
         } finally {
           // Only clear if still ours — a fast re-send for the same session would
           // have replaced the entry with a newer controller.
@@ -768,6 +810,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           });
         }
         context.sendEvent("chat.event", { sessionId, event: { type: "prompt_done" } });
+        await deliverDelegationTerminal({ type: "prompt_done" });
       } finally {
         // Anything still queued was never consumed — a steer the user sent into a turn
         // that finished first. It must not be claimed by the next turn's first echo.

@@ -295,6 +295,58 @@ describe("startRuntime — chat.abort wiring", () => {
     await expect(abort({ agentId: "a", sessionId: "S" })).rejects.toThrow(/box unreachable/);
   });
 
+  it("reports a delegated turn's terminal over an acknowledged RPC, and retries it", async () => {
+    // The chat.event lane is fire-and-forget. A human-facing turn survives losing its
+    // terminal (the frontend refetches); a delegated turn has a machine waiting on it
+    // and nobody to retry, so the terminal gets an acknowledgement of its own.
+    const frontendClient = fakeFrontendClient();
+    let terminalAttempts = 0;
+    frontendClient.request = vi.fn(async (method: string) => {
+      if (method !== "delegation.terminal") return { found: false };
+      terminalAttempts += 1;
+      if (terminalAttempts === 1) throw new Error("write failed");
+      return { ok: true };
+    });
+
+    server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    const ack = await send({
+      agentId: "a", userId: "u", text: "inspect", sessionId: "delegated",
+      delegation: { delegationId: "d1", parentAgentId: "coord", readOnly: false },
+    }, ctx) as { turnId?: string };
+    await waitFor(() => capturedSignal !== undefined);
+    await abort({ agentId: "a", sessionId: "delegated" });
+
+    await waitFor(() => terminalAttempts >= 2);
+    const call = frontendClient.request.mock.calls.find(([method]: any[]) => method === "delegation.terminal");
+    expect(call?.[1]).toMatchObject({
+      delegationId: "d1",
+      sessionId: "delegated",
+      turnId: ack.turnId,
+      event: { type: "prompt_done" },
+    });
+  });
+
+  it("does not ask for an acknowledgement on an ordinary turn", async () => {
+    const frontendClient = fakeFrontendClient();
+    server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "plain" }, ctx);
+    await waitFor(() => capturedSignal !== undefined);
+    await abort({ agentId: "a", sessionId: "plain" });
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+
+    expect(frontendClient.request.mock.calls.some(([method]: any[]) => method === "delegation.terminal")).toBe(false);
+  });
+
   it("binds an explicit steer message to the active prompt trace", async () => {
     server = await bootRuntime();
     const steer = server.rpcMethods.get("chat.steer")!;

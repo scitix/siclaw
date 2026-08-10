@@ -2226,12 +2226,19 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   });
 
   // Portal-standalone has one in-process Runtime, so every authorized peer is
-  // local. Sicore implements the same RPC with real runtime_id comparison.
+  // local. An upstream control plane implements the same RPC with real runtime_id
+  // comparison.
   handlers.set("delegation.resolveRoute", async () => ({
     local: true,
     sourceRuntimeId: "portal-standalone",
     targetRuntimeId: "portal-standalone",
   }));
+
+  // Only a cross-Runtime turn reports its terminal this way, and standalone has no
+  // such turn. The Runtime calls it unconditionally for delegated turns, though, so
+  // answer instead of letting a method-not-found rejection surface as a delivery
+  // failure it would then retry.
+  handlers.set("delegation.terminal", async () => ({ ok: true }));
 
   handlers.set("config.getSettings", async (params) => {
     const db = getDb();
