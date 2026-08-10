@@ -1101,7 +1101,32 @@ describe("http-server — steer / abort / clear-queue", () => {
     const r = await getJson(port, "/api/sessions/ghost-bg/abort", "POST");
     expect(r.status).toBe(200);
     expect(r.data).toMatchObject({ ok: true, pending: true });
-    expect(sm.markPendingAbort).toHaveBeenCalledWith("ghost-bg"); // #6 pre-spawn
+    // #6 pre-spawn. A Stop that names no turn arms the latch session-wide, which is
+    // what the Stop button means; a turn-scoped caller narrows it (see the turnId tests).
+    expect(sm.markPendingAbort).toHaveBeenCalledWith("ghost-bg", undefined);
+  });
+
+  it("ignores an abort that names a turn other than the one running", async () => {
+    // A session id names a conversation, and a delegated peer session is reused
+    // across turns, so a supervisor's late abort would otherwise stop a successor.
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "turns", turnId: "turn-2" });
+    const s = sm.sessions.get("turns")!;
+
+    const stale = await getJson(port, "/api/sessions/turns/abort", "POST", { turnId: "turn-1" });
+    expect(stale.status).toBe(200);
+    expect(stale.data).toMatchObject({ ok: true, stale: true });
+    expect(s.brain.clearQueue).not.toHaveBeenCalled();
+    expect(s._aborted).toBe(false);
+
+    const current = await getJson(port, "/api/sessions/turns/abort", "POST", { turnId: "turn-2" });
+    expect(current.status).toBe(200);
+    expect(current.data).not.toMatchObject({ stale: true });
+    expect(s._aborted).toBe(true);
+  });
+
+  it("scopes a pre-spawn latch to the turn that armed it", async () => {
+    await getJson(port, "/api/sessions/ghost-turn/abort", "POST", { turnId: "turn-1" });
+    expect(sm.markPendingAbort).toHaveBeenCalledWith("ghost-turn", "turn-1");
   });
 
   it("a consumed pending abort short-circuits the next prompt (pre-prompt latch)", async () => {

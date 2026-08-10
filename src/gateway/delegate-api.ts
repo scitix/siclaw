@@ -273,6 +273,9 @@ export async function handleDelegate(
   const peerAbort = new AbortController();
   let finished = false;
   let peerClient: AgentBoxClient | undefined;
+  // Names the local peer turn so a Stop cannot reach a LATER turn on this reused
+  // peer session (delegation reuse is by design — see the session-reuse note above).
+  const localTurnId = randomUUID();
   let route: DelegationRoute | undefined;
   let delegationId = "";
   let peerSessionId = "";
@@ -287,7 +290,7 @@ export async function handleDelegate(
       return;
     }
     if (peerClient) {
-      peerClient.abortSession(peerSessionId).catch((err) => {
+      peerClient.abortSession(peerSessionId, localTurnId).catch((err) => {
         console.warn(`[delegate-api] failed to abort peer session ${peerSessionId}:`, err);
       });
     }
@@ -630,6 +633,7 @@ export async function handleDelegate(
 
     const promptResult = await client.prompt({
       sessionId: peerSessionId,
+      turnId: localTurnId,
       userId: ownerUserId,
       text,
       agentId: peerAgentId,

@@ -329,6 +329,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // still call prompt() afterwards. A set is required because a second send may be
   // waiting on the same session lock while the current turn is active.
   const pendingStartAborts = new Map<string, Set<AbortController>>();
+  /**
+   * The turn each session is currently running, so an abort can name it.
+   *
+   * A session id names a CONVERSATION, and a delegated peer session is reused across
+   * turns, so "abort session S" turns ambiguous the moment a turn ends: an abort
+   * delayed past that point would land on its successor. Every abort this Runtime
+   * sends therefore carries the turn it means, and the box answers a mismatch as
+   * already stopped.
+   */
+  const currentTurnIds = new Map<string, string>();
   const registerPendingStart = (sessionId: string, ctrl: AbortController) => {
     const controllers = pendingStartAborts.get(sessionId) ?? new Set<AbortController>();
     controllers.add(ctrl);
@@ -456,8 +466,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const modelRouting = params.modelRouting as PromptOptions["modelRouting"];
     const images = params.images as PromptOptions["images"];
     const files = params.files as PromptOptions["files"];
+    // One id for this turn, held from before the async ack until the turn settles.
+    const turnId = crypto.randomUUID();
     const promptOpts: PromptOptions = {
       sessionId,
+      turnId,
       userId,
       text,
       agentId,
@@ -516,6 +529,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // which chat.abort previously had no local cancellation state to update.
     const turnAbort = new AbortController();
     registerPendingStart(sessionId, turnAbort);
+    currentTurnIds.set(sessionId, turnId);
     const throwIfStoppedBeforePrompt = () => {
       if (!turnAbort.signal.aborted) return;
       const err = new Error("chat.send stopped before prompt dispatch");
@@ -602,7 +616,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             let stopped = false;
             for (let attempt = 1; attempt <= 3 && !stopped; attempt += 1) {
               try {
-                await client.abortSession(promptResult.sessionId);
+                await client.abortSession(promptResult.sessionId, turnId);
                 stopped = true;
               } catch (abortErr) {
                 if (isSessionNotFound(abortErr)) {
@@ -655,14 +669,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // ordinary send strands the same turn — so compensate on every rejection
           // rather than only where a Stop is known.
           //
-          // The ORIGINAL failure is what the caller must see, so a compensation
-          // that cannot complete is logged loudly rather than substituted for it.
+          // Addressed BY TURN, which is what makes it unconditionally safe: if the box
+          // never started this turn the abort is a no-op it cannot confuse with a later
+          // one, and if it did start it, this is the only thing that stops it. The
+          // ORIGINAL failure is what the caller must see, so a compensation that cannot
+          // complete is logged loudly rather than substituted for it.
           try {
-            if (await abortIfBoxHoldsSession(client, sessionId, "prompt dispatch failed")) {
-              console.warn(`[runtime] stopped an orphaned turn for session=${sessionId} after its prompt ack was lost`);
-            }
+            await client.abortSession(sessionId, turnId);
           } catch (compensateErr) {
-            console.error(`[runtime] could not confirm whether session=${sessionId} was left running after a failed prompt:`, compensateErr);
+            console.error(`[runtime] could not stop turn=${turnId} session=${sessionId} after a failed prompt; it may run without a consumer:`, compensateErr);
           }
           throw err;
         }
@@ -758,6 +773,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // that finished first. It must not be claimed by the next turn's first echo.
         pendingUserRows.clear(sessionId);
         unregisterPendingStart(sessionId, turnAbort);
+        if (currentTurnIds.get(sessionId) === turnId) currentTurnIds.delete(sessionId);
         releaseTurn?.();
       }
     })();
@@ -765,7 +781,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // The row id, so a caller can reconcile its optimistic bubble by identity instead of
     // by content — two messages with the same text are two messages. Absent when the
     // write above failed.
-    return { ok: true, sessionId, ...(promptMessageId ? { messageId: promptMessageId } : {}) };
+    // turnId travels back so a supervisor can later abort THIS turn specifically
+    // rather than "whatever is running on this session".
+    return { ok: true, sessionId, turnId, ...(promptMessageId ? { messageId: promptMessageId } : {}) };
   });
 
   // ── Shared capability box client ───────────────────────────────────────────
@@ -1429,66 +1447,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return new AgentBoxClient(endpoint, 10000, agentBoxTlsOptions);
   }
 
-  /**
-   * The box a turn was already dispatched to, WITHOUT creating one. Same evidence
-   * chain as boxForRunningTurn minus the getOrCreate last resort: used where the
-   * question is "did anything reach a box" — spawning a pod to answer it would
-   * both cost a pod and manufacture the box whose absence was the answer.
-   */
-  async function dispatchedBoxEndpoint(agentId: string, sessionId: string): Promise<string | undefined> {
-    return sessionTurnLocks.busyOn(sessionId)?.endpoint
-      ?? (await agentBoxManager.getHolder?.(agentId, sessionId).catch(() => undefined))?.endpoint;
-  }
-
   /** A box that has not created the session yet answers exactly like one that never will. */
   function isSessionNotFound(err: unknown): boolean {
     return /session not found/i.test(String((err as Error)?.message ?? err));
-  }
-
-  /**
-   * Stop a turn ONLY if the box actually holds its session.
-   *
-   * Both callers face the same question — did a dispatch that we cannot account
-   * for leave a turn running? — and the same hazard: aborting a session the box
-   * does not have records a pre-spawn latch that the NEXT intentional send would
-   * consume and be short-circuited by. Holding the session is exactly the
-   * condition that distinguishes the two, so probe before aborting.
-   *
-   * Failures are reported, never swallowed. A caller that reports Stop as
-   * successful when the box never confirmed it tells the control plane to stop
-   * retrying and to tear down its supervision, so an unanswerable probe or a
-   * failed abort must surface — the same rule the non-pending path already
-   * follows. Only "the box does not have it" counts as already stopped.
-   *
-   * Returns whether an abort was issued; throws when the outcome is unknown.
-   */
-  async function abortIfBoxHoldsSession(client: AgentBoxClient, sessionId: string, why: string): Promise<boolean> {
-    let holdsSession: boolean;
-    try {
-      const { sessions } = await client.listSessions();
-      holdsSession = sessions.some((s) => s.id === sessionId);
-    } catch (err) {
-      // Do NOT abort blind here: if the box in fact has no session, that abort
-      // would arm the pre-spawn latch the user's retry would then consume.
-      throw new Error(
-        `${why}: could not confirm whether the box holds session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
-        { cause: err },
-      );
-    }
-    if (!holdsSession) return false;
-    try {
-      await client.abortSession(sessionId);
-    } catch (err) {
-      if (!isSessionNotFound(err)) throw err;
-      console.log(`[runtime] ${why}: session=${sessionId} vanished from its box between probe and abort`);
-    }
-    return true;
   }
 
   rpcMethods.set("chat.abort", async (params) => {
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
+    // Optional: a control-plane abort that supervises one specific turn names it, so
+    // an abort delayed past that turn's end — a lease expiry, a retry — cannot stop
+    // whatever is running now. The user's Stop button sends none, and means "current".
+    const requestedTurnId = typeof params.turnId === "string" ? params.turnId : undefined;
+    const runningTurnId = currentTurnIds.get(sessionId);
+    if (requestedTurnId && runningTurnId && requestedTurnId !== runningTurnId) {
+      console.log(`[runtime] abort for turn=${requestedTurnId} session=${sessionId} is stale (running ${runningTurnId}); ignoring`);
+      return { ok: true, stale: true };
+    }
 
     // Break the gateway's SSE consumer FIRST, then stop the agentbox. Aborting the
     // signal before abortSession ensures it is set before the agentbox's final
@@ -1501,35 +1477,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     for (const ctrl of pending ?? []) ctrl.abort();
     active?.abort();
 
-    // A pending-only turn usually has no AgentBox session yet: its background
-    // chat.send checks the Gateway controller before prompt(), so aborting the box
-    // here would only record a pre-spawn tombstone that this cancelled send never
-    // consumes — and the NEXT intentional send on the session would consume it and
-    // be short-circuited as aborted.
-    //
-    // "Usually" is not "always": AgentBox starts the run BEFORE acknowledging
-    // /api/prompt, so a lost or timed-out ack leaves a REALLY running turn behind a
-    // still-pending Gateway state, and prompt()'s rejection path never reaches the
-    // post-accept compensation. Ask the box this turn was dispatched to whether it
-    // actually holds the session: if it does, abort is both required and
-    // tombstone-free by construction; if it does not, there is nothing to stop.
-    // This is the fast path, not the guarantee: it stops a box that is already
-    // running instead of waiting out the prompt timeout. What it CANNOT close is
-    // the window where the box has not created the session yet and starts the run
-    // just after the probe. The rejection handler in chat.send's background task
-    // is the backstop for that, on the same holds-the-session condition.
-    if (pending?.size && !active) {
-      const dispatchedEndpoint = await dispatchedBoxEndpoint(agentId, sessionId);
-      if (!dispatchedEndpoint) return { ok: true };
-      const dispatched = new AgentBoxClient(dispatchedEndpoint, 10000, agentBoxTlsOptions);
-      await abortIfBoxHoldsSession(dispatched, sessionId, "abort");
-      return { ok: true };
-    }
-
+    // Always ask the box, addressed by the turn being stopped. A cold-start Stop
+    // used to be skipped here to avoid arming a session-wide pre-spawn latch that
+    // the user's retry would then consume; a turn-scoped latch is only ever consumed
+    // by the prompt for that same turn — which is precisely the prompt being
+    // cancelled — so there is nothing left to avoid, and the probe that used to
+    // guess whether a dispatch had landed is gone with it.
     const client = await boxForRunningTurn(agentId, sessionId);
     // Stopping a session a box does not have is already the outcome the user asked for;
     // reporting it as a failed Stop would be a lie.
-    await client.abortSession(sessionId).catch((err) => {
+    await client.abortSession(sessionId, requestedTurnId ?? runningTurnId).catch((err) => {
       if (!isSessionNotFound(err)) throw err;
       console.log(`[runtime] abort: session=${sessionId} not on the box we asked; treating as already stopped`);
     });

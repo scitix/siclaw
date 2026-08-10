@@ -20,6 +20,12 @@ export interface AgentBoxTlsOptions {
 
 export interface PromptOptions {
   sessionId?: string;
+  /**
+   * Identity of THIS turn, so a later abort can name the turn it means rather than
+   * the session it ran in. A delegated peer session is reused across turns, so an
+   * abort addressed by session alone can land on a successor.
+   */
+  turnId?: string;
   /** User who initiated this prompt. Forwarded per-request to the trace
    *  recorder as the root span's user.id (mirrors sessionId's per-request
    *  path), so tracing carries the user dimension in every deployment mode. */
@@ -295,12 +301,18 @@ export class AgentBoxClient {
   }
 
   /**
-   * Abort the current prompt execution
+   * Abort a prompt execution.
+   *
+   * Pass turnId to stop ONE specific turn: the box answers a mismatch as already
+   * stopped rather than aborting whatever is running now. Omit it for the user's
+   * Stop button, which does mean "stop the current turn".
    */
-  async abortSession(sessionId: string): Promise<void> {
-    console.log(`[agentbox-client] abort sessionId=${sessionId}`);
+  async abortSession(sessionId: string, turnId?: string): Promise<void> {
+    console.log(`[agentbox-client] abort sessionId=${sessionId}${turnId ? ` turnId=${turnId}` : ""}`);
     await this.fetch(`/api/sessions/${sessionId}/abort`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(turnId ? { turnId } : {}),
     });
   }
 

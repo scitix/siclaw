@@ -77,6 +77,12 @@ interface PromptRequestBody {
   images?: PromptImage[];
   /** PDF attachments forwarded as native file input (PDF-capable models only). */
   files?: PromptFile[];
+  /**
+   * Caller's identity for THIS turn. Optional: a caller that does not send one
+   * keeps the old session-wide abort semantics. Echoed in the ack so a caller that
+   * lets the box mint nothing can still correlate.
+   */
+  turnId?: string;
 }
 
 /**
@@ -731,7 +737,8 @@ export function createHttpServer(
     // Pre-spawn Stop: a /abort that arrived before this session existed recorded a pending abort.
     // Consume it HERE — AFTER the unconditional `_aborted = false` reset above (placing it before
     // would be wiped by that reset) — so the pre-prompt latch below short-circuits this turn.
-    if (sessionManager.consumePendingAbort(managed.id)) {
+    managed._currentTurnId = body.turnId;
+    if (sessionManager.consumePendingAbort(managed.id, body.turnId)) {
       managed._aborted = true;
       console.log(`[agentbox-http] Consumed pre-spawn pending abort for session ${managed.id}`);
     }
@@ -1017,7 +1024,7 @@ export function createHttpServer(
       // wait forever if isAgentActive/isCompacting/isRetrying were left stale-true by a prior
       // abnormal turn — permanently locking the session at 409. actuallyFinish unlocks now.
       actuallyFinish();
-      sendJson(res, 200, { ok: true, sessionId: managed.id, aborted: true });
+      sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, aborted: true });
       return;
     }
 
@@ -1069,7 +1076,7 @@ export function createHttpServer(
       onPromptFinish();
     });
 
-    sendJson(res, 200, { ok: true, sessionId: managed.id, traceId: tracingRecorder.getRootTraceId(managed.id) });
+    sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, traceId: tracingRecorder.getRootTraceId(managed.id) });
   });
 
   /**
@@ -1332,9 +1339,20 @@ export function createHttpServer(
   /**
    * POST /api/sessions/:sessionId/abort - abort the current prompt
    */
-  addRoute("POST", "/api/sessions/:sessionId/abort", async (_req, res, params) => {
+  addRoute("POST", "/api/sessions/:sessionId/abort", async (req, res, params) => {
     const { sessionId } = params;
+    // Optional: a caller that knows WHICH turn it wants stopped names it, and a
+    // mismatch is answered as already-finished instead of stopping a successor. A
+    // caller that names nothing keeps the session-wide "stop what is running"
+    // meaning the Stop button needs.
+    const turnId = ((await parseJsonBody(req)) as { turnId?: string } | undefined)?.turnId;
     const managed = sessionManager.get(sessionId);
+
+    if (managed && turnId !== undefined && managed._currentTurnId !== undefined && managed._currentTurnId !== turnId) {
+      console.log(`[agentbox-http] Abort for session ${sessionId} names turn ${turnId}, but ${managed._currentTurnId} is current; treating as already stopped`);
+      sendJson(res, 200, { ok: true, stale: true, stoppedJobs: 0 });
+      return;
+    }
 
     if (!managed) {
       // Pre-spawn Stop: the session doesn't exist yet (Stop clicked before the prompt's
@@ -1342,7 +1360,7 @@ export function createHttpServer(
       // of running the turn the user already cancelled. Return 200 (not 404) so the UI/gateway
       // treats Stop as accepted. Consumed one-shot by the next /api/prompt (TTL backstop guards
       // a Stop that never gets a following prompt).
-      sessionManager.markPendingAbort(sessionId);
+      sessionManager.markPendingAbort(sessionId, turnId);
       console.log(`[agentbox-http] Abort for not-yet-created session ${sessionId}; recorded pending abort`);
       sendJson(res, 200, { ok: true, pending: true, stoppedJobs: 0 });
       return;

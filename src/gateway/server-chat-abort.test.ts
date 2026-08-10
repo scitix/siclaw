@@ -44,16 +44,14 @@ vi.mock("./sse-consumer.js", () => ({
 }));
 
 const abortSessionCalls: string[] = [];
+const abortSessionTurnIds: Array<string | undefined> = [];
 const promptCalls: unknown[] = [];
 let promptError: Error | undefined;
 // Blocks inside prompt() so a test can hold the /api/prompt round-trip open (and
 // then fail it) while the box is already running the turn.
 let promptBlocker: Promise<void> | undefined;
-// Session ids the fake box reports holding — the evidence chat.abort probes before
-// aborting a turn the Gateway still counts as pending.
-const boxSessions: string[] = [];
-// Set to make the fake box refuse to answer "do you hold this session?".
-let listSessionsError: Error | undefined;
+// Set to make the fake box refuse the abort.
+let abortSessionError: Error | undefined;
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     endpoint: string;
@@ -66,12 +64,10 @@ vi.mock("./agentbox/client.js", () => ({
       if (promptError) throw promptError;
       return { sessionId: opts.sessionId, traceId: "0123456789abcdef0123456789abcdef" };
     });
-    listSessions = vi.fn(async () => {
-      if (listSessionsError) throw listSessionsError;
-      return { sessions: boxSessions.map((id) => ({ id })) };
-    });
-    abortSession = vi.fn(async (sessionId: string) => {
+    abortSession = vi.fn(async (sessionId: string, turnId?: string) => {
       abortSessionCalls.push(sessionId);
+      abortSessionTurnIds.push(turnId);
+      if (abortSessionError) throw abortSessionError;
     });
     steerSession = vi.fn(async () => ({ ok: true, traceId: "fedcba9876543210fedcba9876543210" }));
     streamEvents = async function* () {};
@@ -127,8 +123,9 @@ afterEach(async () => {
   promptCalls.length = 0;
   promptError = undefined;
   promptBlocker = undefined;
-  boxSessions.length = 0;
-  listSessionsError = undefined;
+  abortSessionCalls.length = 0;
+  abortSessionTurnIds.length = 0;
+  abortSessionError = undefined;
   vi.clearAllMocks();
 });
 
@@ -145,34 +142,6 @@ describe("startRuntime — chat.abort wiring", () => {
     frontendClient.dispatchReliableEvent.mockReturnValueOnce(true);
     await expect(control(envelope, { sendEvent: vi.fn() })).resolves.toMatchObject({ ok: true });
     expect(frontendClient.dispatchReliableEvent).toHaveBeenLastCalledWith("delegation.event", envelope);
-  });
-
-  it("reports a Stop the box never confirmed as a failure", async () => {
-    // Answering ok:true here tells the control plane to stop retrying and to tear
-    // down its relay, so an unconfirmed abort must not be dressed up as success.
-    const manager = fakeAgentBoxManager();
-    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
-    listSessionsError = new Error("box unreachable");
-
-    let failPrompt: ((err: Error) => void) | undefined;
-    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
-
-    server = await bootRuntime(manager);
-    const send = server.rpcMethods.get("chat.send")!;
-    const abort = server.rpcMethods.get("chat.abort")!;
-    const ctx = { sendEvent: vi.fn() };
-
-    try {
-      await send({ agentId: "a", userId: "u", text: "hi", sessionId: "unconfirmed" }, ctx);
-      await waitFor(() => promptCalls.length === 1);
-      await expect(abort({ agentId: "a", sessionId: "unconfirmed" })).rejects.toThrow(/could not confirm/);
-      expect(abortSessionCalls).toEqual([]);
-    } finally {
-      failPrompt?.(new Error("socket hang up"));
-    }
-    await waitFor(() => ctx.sendEvent.mock.calls.some(
-      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
-    ));
   });
 
   it("starts consuming the reply without waiting for trace binding", async () => {
@@ -223,14 +192,63 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(abortSessionCalls).toEqual(["missing"]);
   });
 
-  it("does not dispatch prompt after Stop is acknowledged during cold spawn", async () => {
+  it("names the turn in every abort it sends, so a stale one cannot reach a successor", async () => {
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+
+    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, { sendEvent: vi.fn() }) as { turnId?: string };
+    expect(ack.turnId).toEqual(expect.any(String));
+    await waitFor(() => capturedSignal !== undefined);
+
+    // An abort naming a DIFFERENT turn is stale: it must not touch the running one.
+    await expect(abort({ agentId: "a", sessionId: "S", turnId: "some-earlier-turn" }))
+      .resolves.toMatchObject({ ok: true, stale: true });
+    expect(capturedSignal!.aborted).toBe(false);
+    expect(abortSessionCalls).toEqual([]);
+
+    // The user's Stop names no turn and stops what is running, tagged with it.
+    await expect(abort({ agentId: "a", sessionId: "S" })).resolves.toMatchObject({ ok: true });
+    expect(capturedSignal!.aborted).toBe(true);
+    expect(abortSessionCalls).toEqual(["S"]);
+    expect(abortSessionTurnIds).toEqual([ack.turnId]);
+  });
+
+  it("stops a turn whose prompt ack was lost, with or without a Stop", async () => {
+    // AgentBox starts the run before acknowledging /api/prompt, so a lost ack strands
+    // a turn nobody consumes. Naming the turn makes compensation unconditional: if
+    // the box never started it the abort is a no-op it cannot confuse with a later
+    // turn, so there is nothing left to probe for.
+    let failPrompt: ((err: Error) => void) | undefined;
+    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
+
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "orphan" }, ctx) as { turnId?: string };
+    await waitFor(() => promptCalls.length === 1);
+    expect(promptCalls[0]).toMatchObject({ sessionId: "orphan", turnId: ack.turnId });
+
+    failPrompt?.(new Error("socket hang up"));
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+
+    expect(abortSessionCalls).toEqual(["orphan"]);
+    expect(abortSessionTurnIds).toEqual([ack.turnId]);
+  });
+
+  it("lets a retry run after a cold-start Stop, because the latch is turn-scoped", async () => {
     let releaseColdSpawn: (() => void) | undefined;
     let getOrCreateCalls = 0;
     const manager = fakeAgentBoxManager();
     manager.getOrCreate.mockImplementation(async () => {
       getOrCreateCalls += 1;
-      // Hold the first chat.send placement so Stop lands while the turn exists
-      // only in the Gateway's pending-start registry.
       if (getOrCreateCalls === 1) {
         await new Promise<void>((resolve) => { releaseColdSpawn = resolve; });
       }
@@ -242,138 +260,39 @@ describe("startRuntime — chat.abort wiring", () => {
     const abort = server.rpcMethods.get("chat.abort")!;
     const ctx = { sendEvent: vi.fn() };
 
-    await expect(send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, ctx))
-      .resolves.toMatchObject({ ok: true, sessionId: "S" });
+    const first = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, ctx) as { turnId?: string };
     await waitFor(() => getOrCreateCalls === 1);
 
+    // Stop lands while the turn exists only in the pending-start registry. The box is
+    // asked to stop that TURN — previously this call was skipped entirely, because a
+    // session-wide latch would have cancelled the retry below.
     await expect(abort({ agentId: "a", sessionId: "S" })).resolves.toMatchObject({ ok: true });
+    expect(abortSessionTurnIds).toEqual([first.turnId]);
     releaseColdSpawn?.();
     await waitFor(() => ctx.sendEvent.mock.calls.some(
       ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
     ));
-
     expect(promptCalls).toHaveLength(0);
-    expect(abortSessionCalls).toEqual([]);
 
-    // The pending-only Stop must not arm AgentBox's pre-spawn abort latch. A
-    // second intentional send on the same session is allowed to reach prompt.
-    await expect(send({ agentId: "a", userId: "u", text: "try again", sessionId: "S" }, ctx))
-      .resolves.toMatchObject({ ok: true, sessionId: "S" });
+    const second = await send({ agentId: "a", userId: "u", text: "try again", sessionId: "S" }, ctx) as { turnId?: string };
     await waitFor(() => promptCalls.length === 1);
-    expect(promptCalls[0]).toMatchObject({ sessionId: "S", text: "try again" });
-
-    await abort({ agentId: "a", sessionId: "S" });
-    expect(abortSessionCalls).toEqual(["S"]);
+    expect(second.turnId).not.toBe(first.turnId);
+    expect(promptCalls[0]).toMatchObject({ sessionId: "S", text: "try again", turnId: second.turnId });
   });
 
-  it("stops an orphaned turn when the prompt ack is lost and nobody pressed Stop", async () => {
-    // The leak is not conditional on Stop: AgentBox starts the run before it
-    // acknowledges, so an ack lost during an ordinary send strands a turn with no
-    // consumer. Compensation therefore belongs on the rejection path.
-    let failPrompt: ((err: Error) => void) | undefined;
-    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
-    boxSessions.push("orphan");
-
-    const manager = fakeAgentBoxManager();
-    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
-    server = await bootRuntime(manager);
-    const send = server.rpcMethods.get("chat.send")!;
-    const ctx = { sendEvent: vi.fn() };
-
-    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "orphan" }, ctx);
-    await waitFor(() => promptCalls.length === 1);
-
-    failPrompt?.(new Error("socket hang up"));
-    await waitFor(() => ctx.sendEvent.mock.calls.some(
-      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
-    ));
-
-    expect(abortSessionCalls).toEqual(["orphan"]);
-  });
-
-  it("leaves the box alone when a failed prompt created no session", async () => {
-    // Same rejection path, box holds nothing: aborting would arm the pre-spawn
-    // latch and the user's retry would be short-circuited as aborted.
-    let failPrompt: ((err: Error) => void) | undefined;
-    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
-
-    const manager = fakeAgentBoxManager();
-    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
-    server = await bootRuntime(manager);
-    const send = server.rpcMethods.get("chat.send")!;
-    const ctx = { sendEvent: vi.fn() };
-
-    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "clean-failure" }, ctx);
-    await waitFor(() => promptCalls.length === 1);
-
-    failPrompt?.(new Error("connection refused"));
-    await waitFor(() => ctx.sendEvent.mock.calls.some(
-      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
-    ));
-
-    expect(abortSessionCalls).toEqual([]);
-  });
-
-  it("aborts a dispatched turn whose prompt ack was lost, even while it is only pending", async () => {
-    // AgentBox starts the run BEFORE it acknowledges /api/prompt. A lost/timed-out
-    // ack therefore leaves a really-running turn behind a still-pending Gateway
-    // state, and prompt()'s rejection never reaches the post-accept compensation.
-    // Stop must reach the box, or the peer turn runs headless to completion.
-    let failPrompt: ((err: Error) => void) | undefined;
-    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
-    boxSessions.push("ack-lost");
-
+  it("surfaces a failed abort instead of reporting the Stop as done", async () => {
+    // ok:true tells the control plane to stop retrying and tear down supervision.
     const manager = fakeAgentBoxManager();
     manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
     server = await bootRuntime(manager);
     const send = server.rpcMethods.get("chat.send")!;
     const abort = server.rpcMethods.get("chat.abort")!;
-    const ctx = { sendEvent: vi.fn() };
 
-    try {
-      await send({ agentId: "a", userId: "u", text: "hi", sessionId: "ack-lost" }, ctx);
-      await waitFor(() => promptCalls.length === 1);
-      // No consumer yet: the turn exists only in the pending-start registry.
-      expect(capturedSignal).toBeUndefined();
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, { sendEvent: vi.fn() });
+    await waitFor(() => capturedSignal !== undefined);
 
-      await expect(abort({ agentId: "a", sessionId: "ack-lost" })).resolves.toMatchObject({ ok: true });
-      expect(abortSessionCalls).toEqual(["ack-lost"]);
-    } finally {
-      // Always fail the held prompt: leaving it pending would keep this session's
-      // turn lock held for the rest of the file.
-      failPrompt?.(new Error("socket hang up"));
-    }
-    await waitFor(() => ctx.sendEvent.mock.calls.some(
-      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
-    ));
-  });
-
-  it("does not abort the box when a dispatched prompt never created the session", async () => {
-    // Same pending-only shape, but the box genuinely has nothing: aborting would
-    // only arm the pre-spawn latch that the next intentional send would consume.
-    let failPrompt: ((err: Error) => void) | undefined;
-    promptBlocker = new Promise<void>((_resolve, reject) => { failPrompt = reject; });
-    // boxSessions stays empty: the box holds nothing for this id.
-
-    const manager = fakeAgentBoxManager();
-    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
-    server = await bootRuntime(manager);
-    const send = server.rpcMethods.get("chat.send")!;
-    const abort = server.rpcMethods.get("chat.abort")!;
-    const ctx = { sendEvent: vi.fn() };
-
-    try {
-      await send({ agentId: "a", userId: "u", text: "hi", sessionId: "no-session" }, ctx);
-      await waitFor(() => promptCalls.length === 1);
-
-      await expect(abort({ agentId: "a", sessionId: "no-session" })).resolves.toMatchObject({ ok: true });
-      expect(abortSessionCalls).toEqual([]);
-    } finally {
-      failPrompt?.(new Error("connection refused"));
-    }
-    await waitFor(() => ctx.sendEvent.mock.calls.some(
-      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
-    ));
+    abortSessionError = new Error("box unreachable");
+    await expect(abort({ agentId: "a", sessionId: "S" })).rejects.toThrow(/box unreachable/);
   });
 
   it("binds an explicit steer message to the active prompt trace", async () => {
