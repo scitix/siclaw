@@ -345,6 +345,49 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * the box would reject the mismatch, and the running turn would continue headless.
    */
   const liveTurnIds = new Map<string, Set<string>>();
+  /**
+   * Which live turns are delegated, so a terminal produced by the SUPERVISOR — a
+   * shutdown, or a box removed under a turn — can be reported with the same
+   * acknowledgement as one produced by the turn itself. Those paths bypass the
+   * turn's own reporting (see supervisorEndedTurns), which is exactly why they
+   * needed their own route to it.
+   */
+  const delegatedTurns = new Map<string, { delegationId: string; sessionId: string }>();
+
+  /**
+   * Hand a delegated turn's terminal to the control plane with an acknowledgement.
+   *
+   * The chat.event lane is fire-and-forget, which a human-facing turn survives: the
+   * frontend refetches. A delegated turn has a machine waiting on it and nobody to
+   * retry, so a terminal lost here strands the caller until its idle window elapses
+   * and it then reports a failure for a turn that in fact finished.
+   *
+   * The budget has to outlast a WS reconnect, which cannot complete faster than its
+   * own backoff. A control plane that does not implement the method (standalone, or
+   * older) is not retried at all.
+   */
+  const deliverDelegationTerminal = async (
+    delegationId: string,
+    sessionId: string,
+    turnId: string,
+    event: Record<string, unknown>,
+  ): Promise<void> => {
+    const backoffMs = [500, 1_000, 2_000, 4_000, 8_000];
+    for (let attempt = 0; attempt <= backoffMs.length; attempt += 1) {
+      try {
+        await frontendClient.request("delegation.terminal", { delegationId, sessionId, turnId, event }, 10_000);
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/unknown method/i.test(message)) return;
+        if (attempt === backoffMs.length) {
+          console.error(`[runtime] could not confirm delivery of the terminal for delegation=${delegationId} session=${sessionId}:`, message);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, backoffMs[attempt]));
+      }
+    }
+  };
   const addLiveTurn = (sessionId: string, id: string) => {
     const ids = liveTurnIds.get(sessionId) ?? new Set<string>();
     ids.add(id);
@@ -392,7 +435,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * stream simply stops therefore hangs forever — the process that owned it is gone and
    * its replacement does not adopt turns it did not start, so no later event can come.
    */
-  function endTurns(sessionIds: Iterable<string>, reason: InterruptionReason): void {
+  /**
+   * Returns the acknowledged deliveries it started, so a caller that is about to
+   * take the transport down can wait for them. A caller that is not (a box removal)
+   * can ignore them: the connection stays up and the first attempt normally settles.
+   */
+  function endTurns(sessionIds: Iterable<string>, reason: InterruptionReason): Array<Promise<void>> {
+    const deliveries: Array<Promise<void>> = [];
     const detail = wrapError(new Error(INTERRUPTION_MESSAGE[reason]), {
       code: ErrorCodes.STREAM_INTERRUPTED,
       retriable: true,
@@ -414,21 +463,48 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // Best effort: a consumer that already went away must not stop what caused this.
         console.warn(`[runtime] could not report interrupted turn session=${sessionId}:`, err);
       }
+      // A delegated turn's caller is a machine that will otherwise wait out its idle
+      // window and report a failure. Same terminal, but acknowledged — detached,
+      // because this runs on the shutdown path and must not hold it open.
+      for (const turnId of liveTurnIds.get(sessionId) ?? []) {
+        const delegated = delegatedTurns.get(turnId);
+        if (!delegated) continue;
+        deliveries.push(deliverDelegationTerminal(delegated.delegationId, sessionId, turnId, {
+          type: "prompt_done",
+          aborted: true,
+          reason,
+        }));
+      }
       // Abort AFTER reporting: it makes the consumer run its own finalization (partial
       // text persisted, running tool rows closed) so a reload agrees with the screen.
       ctrl.abort();
       activeStreamAborts.delete(sessionId);
     }
+    return deliveries;
   }
 
-  function endInFlightTurns(): void {
+  /**
+   * Shutdown ends every turn this Runtime is streaming. Delegated ones are reported
+   * with an acknowledgement, which needs the transport that shutdown is about to
+   * close — so wait for those, but briefly: a live connection settles the first
+   * attempt in milliseconds, and a dead one must not hold the process open for the
+   * full retry budget.
+   */
+  const SHUTDOWN_TERMINAL_GRACE_MS = 3_000;
+
+  async function endInFlightTurns(): Promise<void> {
     const sessionIds = [...activeStreamAborts.keys()];
     if (sessionIds.length === 0) return;
     // Say it happened. Reporting used to be silent on success, so the only way to tell
     // whether a restart had ended its turns was to go ask the consumer — during an
     // incident, from the outside. The failure path already logs; this is its other half.
     console.log(`[runtime] shutdown interrupting ${sessionIds.length} in-flight turn(s): ${sessionIds.join(", ")}`);
-    endTurns(sessionIds, "runtime_restart");
+    const deliveries = endTurns(sessionIds, "runtime_restart");
+    if (deliveries.length === 0) return;
+    await Promise.race([
+      Promise.allSettled(deliveries),
+      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_TERMINAL_GRACE_MS)),
+    ]);
   }
 
   // A box removed while it still holds turns breaks their SSE streams, which does end
@@ -489,45 +565,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // ordinary callers let us mint one.
     const turnId = typeof params.turnId === "string" && params.turnId ? params.turnId : crypto.randomUUID();
 
-    /**
-     * Hand this turn's terminal to the control plane with an acknowledgement.
-     *
-     * The chat.event lane is fire-and-forget, which a human-facing turn survives:
-     * the frontend refetches. A DELEGATED turn has a machine waiting on it and
-     * nobody to retry, so a terminal lost on this first hop strands the caller
-     * until its idle window elapses and it reports a failure for a turn that in
-     * fact succeeded. Only delegated turns pay for the extra round-trip.
-     *
-     * Bounded: this is a delivery guarantee, not a promise to block a settling
-     * turn indefinitely. A control plane that does not implement the method (a
-     * standalone deployment, an older one) is not retried at all.
-     */
-    const deliverDelegationTerminal = async (event: Record<string, unknown>): Promise<void> => {
-      if (!delegation?.delegationId) return;
-      // The budget has to outlast a WS reconnect, which cannot complete faster than
-      // its own backoff: a few hundred milliseconds of retries would give up while
-      // the only route back is still being re-established.
-      const backoffMs = [500, 1_000, 2_000, 4_000, 8_000];
-      for (let attempt = 0; attempt <= backoffMs.length; attempt += 1) {
-        try {
-          await frontendClient.request("delegation.terminal", {
-            delegationId: delegation.delegationId,
-            sessionId,
-            turnId,
-            event,
-          }, 10_000);
-          return;
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          if (/unknown method/i.test(message)) return;
-          if (attempt === backoffMs.length) {
-            console.error(`[runtime] could not confirm delivery of the terminal for delegation=${delegation.delegationId} session=${sessionId}:`, message);
-            return;
-          }
-          await new Promise((r) => setTimeout(r, backoffMs[attempt]));
-        }
-      }
-    };
+    /** This turn's terminal, acknowledged — only a delegated turn has a caller for it. */
+    const reportTerminal = (event: Record<string, unknown>): Promise<void> =>
+      delegation?.delegationId
+        ? deliverDelegationTerminal(delegation.delegationId, sessionId, turnId, event)
+        : Promise.resolve();
     const promptOpts: PromptOptions = {
       sessionId,
       turnId,
@@ -590,6 +632,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const turnAbort = new AbortController();
     registerPendingStart(sessionId, turnAbort);
     addLiveTurn(sessionId, turnId);
+    if (delegation?.delegationId) delegatedTurns.set(turnId, { delegationId: delegation.delegationId, sessionId });
     const throwIfStoppedBeforePrompt = () => {
       if (!turnAbort.signal.aborted) return;
       const err = new Error("chat.send stopped before prompt dispatch");
@@ -792,7 +835,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           });
           if (!alreadyReported()) {
             context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
-            await deliverDelegationTerminal({ type: "prompt_done" });
+            await reportTerminal({ type: "prompt_done" });
           }
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
@@ -809,7 +852,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // Shutdown, or a box removal, already reported this turn before aborting it.
           if (!alreadyReported()) {
             context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
-            await deliverDelegationTerminal({ type: "prompt_done" });
+            await reportTerminal({ type: "prompt_done" });
           }
         } finally {
           // Only clear if still ours — a fast re-send for the same session would
@@ -834,13 +877,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           });
         }
         context.sendEvent("chat.event", { sessionId, event: { type: "prompt_done" } });
-        await deliverDelegationTerminal({ type: "prompt_done" });
+        await reportTerminal({ type: "prompt_done" });
       } finally {
         // Anything still queued was never consumed — a steer the user sent into a turn
         // that finished first. It must not be claimed by the next turn's first echo.
         pendingUserRows.clear(sessionId);
         unregisterPendingStart(sessionId, turnAbort);
         dropLiveTurn(sessionId, turnId);
+        delegatedTurns.delete(turnId);
         releaseTurn?.();
       }
     })();
@@ -2116,7 +2160,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     credentialService,
     async close() {
       metricsAggregator?.destroy();
-      endInFlightTurns();
+      // Before frontendClient.close(): the acknowledged terminal for a delegated turn
+      // travels over that same connection.
+      await endInFlightTurns();
       frontendClient.close();
       // Older embedded test/adapter managers may only implement cleanup(); the
       // concrete manager's shutdown() preserves K8s boxes across Runtime rolls.

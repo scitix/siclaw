@@ -387,6 +387,44 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(abortSessionTurnIds).toEqual(["chosen-by-caller"]);
   });
 
+  it("reports a supervisor-interrupted delegated turn with an acknowledgement", async () => {
+    // Shutdown and box removal bypass the turn's own reporting, so without this the
+    // one terminal a delegated caller cannot do without went out fire-and-forget on
+    // exactly the path where the transport is about to disappear.
+    const frontendClient = fakeFrontendClient();
+    const terminals: any[] = [];
+    frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "delegation.terminal") {
+        terminals.push(params);
+        return { ok: true };
+      }
+      return { found: false };
+    });
+
+    server = await bootRuntime(fakeAgentBoxManager(), frontendClient);
+    const send = server.rpcMethods.get("chat.send")!;
+    const ack = await send({
+      agentId: "a", userId: "u", text: "inspect", sessionId: "interrupted",
+      delegation: { delegationId: "d9", parentAgentId: "coord", readOnly: false },
+    }, { sendEvent: vi.fn() }) as { turnId?: string };
+    await waitFor(() => capturedSignal !== undefined);
+
+    // Shutdown must settle the delivery BEFORE it closes the connection it needs.
+    await server.close();
+    server = undefined;
+
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({
+      delegationId: "d9",
+      sessionId: "interrupted",
+      turnId: ack.turnId,
+      event: { type: "prompt_done", aborted: true, reason: "runtime_restart" },
+    });
+    expect(frontendClient.close).toHaveBeenCalled();
+    expect(frontendClient.request.mock.invocationCallOrder[0])
+      .toBeLessThan(frontendClient.close.mock.invocationCallOrder[0]);
+  });
+
   it("binds an explicit steer message to the active prompt trace", async () => {
     server = await bootRuntime();
     const steer = server.rpcMethods.get("chat.steer")!;

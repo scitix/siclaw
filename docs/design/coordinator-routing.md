@@ -138,6 +138,11 @@ confirms that the matching delegation consumer handled them. Each retry budget h
 to outlast a WS reconnect: a few hundred milliseconds would give up while the only
 route back is still being re-established.
 
+A terminal produced by the SUPERVISOR — a Runtime shutdown, or a box removed under
+a turn — takes the same acknowledged route. Those paths bypass the turn's own
+reporting, which is exactly why they needed their own way to reach it, and shutdown
+waits briefly for those deliveries before closing the transport they travel over.
+
 A reported terminal enters the same ordered queue as the stream it accompanies.
 Acting on it straight from the RPC would let it overtake an artifact, error or
 clarification that preceded it, retiring supervision before those were delivered.
