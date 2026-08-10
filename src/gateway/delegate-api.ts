@@ -200,6 +200,9 @@ async function recoverRemoteResult(
     // A window that came back short IS the whole session: widening cannot reveal
     // a boundary row that is not there.
     if (window.length < limit || limit >= REMOTE_RESULT_WINDOW_MAX) break;
+    // Doubling blindly would overshoot the stated ceiling on the last step
+    // (12800 → 25600); land exactly on it instead.
+    limit = Math.min(limit, REMOTE_RESULT_WINDOW_MAX / 2);
   }
   if (!boundaryFound) {
     return { status: "failed", error: "Remote delegation completed, but its durable turn boundary was not found" };

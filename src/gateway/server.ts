@@ -595,9 +595,27 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // session for chat.abort to find. Abort again now that acceptance is known;
           // never attach a consumer to a turn whose Stop was already acknowledged.
           if (turnAbort.signal.aborted) {
-            await client.abortSession(promptResult.sessionId).catch((abortErr) => {
-              console.warn(`[runtime] failed to stop newly accepted session=${promptResult.sessionId}:`, abortErr);
-            });
+            // We are about to abandon this turn's stream, so a failed abort here
+            // leaves the box running with no consumer. The box demonstrably HAS the
+            // session (it just accepted the prompt), so retrying is safe and cannot
+            // plant a pre-spawn latch — keep trying briefly before giving up.
+            let stopped = false;
+            for (let attempt = 1; attempt <= 3 && !stopped; attempt += 1) {
+              try {
+                await client.abortSession(promptResult.sessionId);
+                stopped = true;
+              } catch (abortErr) {
+                if (isSessionNotFound(abortErr)) {
+                  stopped = true;
+                  break;
+                }
+                console.warn(`[runtime] attempt ${attempt} to stop newly accepted session=${promptResult.sessionId} failed:`, abortErr);
+                if (attempt < 3) await new Promise((r) => setTimeout(r, 200 * attempt));
+              }
+            }
+            if (!stopped) {
+              console.error(`[runtime] gave up stopping session=${promptResult.sessionId}; its turn may run without a consumer`);
+            }
             throwIfStoppedBeforePrompt();
           }
           if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
