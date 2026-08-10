@@ -463,12 +463,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * its replacement does not adopt turns it did not start, so no later event can come.
    */
   /**
-   * Returns the acknowledged deliveries it started, so a caller that is about to
-   * take the transport down can wait for them. A caller that is not (a box removal)
-   * can ignore them: the connection stays up and the first attempt normally settles.
+   * Returns the work it started, so a caller about to take the transport down can
+   * wait for it. Everything returned is ALSO tracked centrally: a box removal
+   * ignores the return value, and its terminal would otherwise be invisible to a
+   * shutdown that follows while it is still retrying.
    */
   function endTurns(sessionIds: Iterable<string>, reason: InterruptionReason): Array<Promise<void>> {
-    const deliveries: Array<Promise<void>> = [];
+    const started: Array<Promise<void>> = [];
     const detail = wrapError(new Error(INTERRUPTION_MESSAGE[reason]), {
       code: ErrorCodes.STREAM_INTERRUPTED,
       retriable: true,
@@ -505,11 +506,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       for (const turnId of liveTurnIds.get(sessionId) ?? []) {
         const delegated = delegatedTurns.get(turnId);
         if (!delegated) continue;
-        deliveries.push(deliverDelegationTerminal(delegated.delegationId, sessionId, turnId, {
+        const delivery = deliverDelegationTerminal(delegated.delegationId, sessionId, turnId, {
           type: "prompt_done",
           aborted: true,
           reason,
-        }));
+        });
+        trackTerminalDelivery(delivery);
+        started.push(delivery);
       }
       // Abort AFTER reporting: it makes the consumer run its own finalization (partial
       // text persisted, running tool rows closed) so a reload agrees with the screen.
@@ -518,8 +521,26 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       for (const id of sessionTurns) turnAborts.get(id)?.abort();
       ctrl?.abort();
       activeStreamAborts.delete(sessionId);
+
+      // Cancelling on this side does not stop the BOX. The consumer only notices its
+      // signal when the next event arrives, and a dropped SSE subscription just
+      // unsubscribes — neither ends the prompt. In K8s the boxes deliberately outlive
+      // a Runtime roll, so a turn already reported as interrupted would keep running
+      // there with nobody left to read it. Only a dispatched turn has a box to ask,
+      // and `busyOn` is the record of that placement.
+      const placement = sessionTurnLocks.busyOn(sessionId);
+      if (placement) {
+        const client = new AgentBoxClient(placement.endpoint, 10000, agentBoxTlsOptions);
+        for (const id of sessionTurns) {
+          started.push(client.abortSession(sessionId, id).catch((err) => {
+            // A box that is already gone is the outcome we wanted anyway.
+            if (isSessionNotFound(err)) return;
+            console.warn(`[runtime] could not stop turn=${id} session=${sessionId} on ${placement.boxId}:`, err);
+          }));
+        }
+      }
     }
-    return deliveries;
+    return started;
   }
 
   /**
@@ -544,7 +565,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       console.log(`[runtime] shutdown interrupting ${sessionIds.length} in-flight turn(s): ${sessionIds.join(", ")}`);
     }
     // A turn that already reported its own terminal may still be retrying delivery;
-    // that is exactly the report its caller needs, so wait for it too.
+    // that is exactly the report its caller needs, so wait for it too — as is any
+    // terminal a box removal started before this shutdown began.
     const deliveries = [...endTurns(sessionIds, "runtime_restart"), ...alreadyDelivering];
     if (deliveries.length === 0) return;
     await Promise.race([

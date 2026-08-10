@@ -144,7 +144,11 @@ a turn — takes the same acknowledged route, and cancels every turn it reports:
 queued turn declared interrupted must not go on to start afterwards. It covers turns
 that are still cold-starting, too: those have no consumer yet, but they are just as
 abandoned, and their caller would otherwise wait out an idle window while the box may
-still start them. The suppression
+still start them. And because cancelling on the Runtime side does not end a prompt —
+the consumer only notices its signal on the next event, and a dropped subscription
+merely unsubscribes — the supervisor also asks the box to stop each dispatched turn
+by name. Boxes deliberately outlive a Runtime roll, so without that a turn already
+reported as interrupted keeps running there with nobody left to read it. The suppression
 of a turn's own reporting is likewise per turn, or the other live turn would still
 emit a plain terminal that reads as a turn which succeeded. Those paths bypass the turn's own
 reporting, which is exactly why they needed their own way to reach it, and shutdown

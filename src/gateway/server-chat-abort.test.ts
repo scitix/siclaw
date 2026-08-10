@@ -469,6 +469,68 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(promptCalls).toHaveLength(1);
   });
 
+  it("stops the box turn on shutdown, not just its own consumer", async () => {
+    // Cancelling this side does not end the prompt: the consumer only notices its
+    // signal on the next event, and a dropped SSE subscription just unsubscribes. In
+    // K8s the boxes outlive a Runtime roll, so a turn reported as interrupted would
+    // keep running there with nobody reading it.
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+
+    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, { sendEvent: vi.fn() }) as { turnId?: string };
+    await waitFor(() => capturedSignal !== undefined);
+
+    await server.close();
+    server = undefined;
+
+    expect(abortSessionCalls).toEqual(["S"]);
+    expect(abortSessionTurnIds).toEqual([ack.turnId]);
+  });
+
+  it("waits for a box-roll terminal that is still being delivered when shutdown starts", async () => {
+    // endTurns' return value is ignored by the box-roll callback, so unless the
+    // delivery is tracked centrally a shutdown right after sees no live turn and no
+    // pending delivery, and closes the transport the terminal needs.
+    const frontendClient = fakeFrontendClient();
+    let releaseTerminal: (() => void) | undefined;
+    const terminals: any[] = [];
+    frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method !== "delegation.terminal") return { found: false };
+      terminals.push(params);
+      await new Promise<void>((resolve) => { releaseTerminal = resolve; });
+      return { ok: true };
+    });
+
+    const manager = fakeAgentBoxManager();
+    let terminator: ((ids: string[], reason: string) => unknown) | undefined;
+    manager.setTurnTerminator = vi.fn((fn: any) => { terminator = fn; });
+    server = await bootRuntime(manager, frontendClient);
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({
+      agentId: "a", userId: "u", text: "inspect", sessionId: "rolled",
+      delegation: { delegationId: "d-roll", parentAgentId: "coord", readOnly: false },
+    }, { sendEvent: vi.fn() });
+    await waitFor(() => capturedSignal !== undefined);
+
+    // A box removed under the turn — the callback discards whatever endTurns returns.
+    terminator!(["rolled"], "box_rolled");
+    await waitFor(() => terminals.length === 1);
+    expect(terminals[0]).toMatchObject({ event: { aborted: true, reason: "box_rolled" } });
+
+    const closing = server.close();
+    server = undefined;
+    // Shutdown must still be waiting on that delivery rather than having closed the
+    // connection out from under it.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(frontendClient.close).not.toHaveBeenCalled();
+    releaseTerminal?.();
+    await closing;
+    expect(frontendClient.close).toHaveBeenCalled();
+  });
+
   it("binds an explicit steer message to the active prompt trace", async () => {
     server = await bootRuntime();
     const steer = server.rpcMethods.get("chat.steer")!;
