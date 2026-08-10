@@ -96,6 +96,29 @@ def test_code_profile_component_impact():
         )
         assert changeset["modified"][0]["affected_pages"] == ["controller.md"], changeset
         assert changeset["added"][0]["target_hint"] == "internal/controller", changeset
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/BRIEF.json", json.dumps({"knowledge_type": "code"}))
+        _mk(base, "raw/CODE_SOURCES.json", json.dumps({
+            "schema_version": 1,
+            "domain": "cluster-sre",
+            "raw_revision": "raw-v1-test",
+            "sources": [{"key": "operator", "path": "operator/"}],
+        }))
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index")
+        _mk(base, "candidate/controller.md", _page([
+            "operator/internal/controller/reconcile.go",
+        ]))
+        _mk(base, "candidate/web.md", _page(["operator/internal/web/handler.go"]))
+
+        changeset = incremental.build_changeset(td, {
+            "added": ["operator/internal/controller/metrics.go"],
+            "modified": ["operator/internal/controller/status.go"],
+        })
+        assert changeset["modified"][0]["affected_pages"] == ["controller.md"], changeset
+        assert changeset["added"][0]["target_hint"] == "operator/internal/controller", changeset
+        assert changeset["unaffected_pages"] == ["web.md"], changeset
     print("OK  code profile widens exact diffs to component pages and emits target hints")
 
 

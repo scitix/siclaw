@@ -2453,6 +2453,8 @@ async def test_prompt_packs_locale():
     assert "Do not invent empty sections to satisfy a template" in en_box_role, en_box_role
     assert "代码 profile 按架构概念和组件组织页面" in zh_box_role, zh_box_role
     assert "the code profile organizes pages around architectural concepts and components" in en_box_role, en_box_role
+    assert "raw/CODE_SOURCES.json" in en_box_role and "aggregate transport snapshot" in en_box_role, en_box_role
+    assert "raw/CODE_SOURCES.json" in zh_box_role and "聚合传输快照" in zh_box_role, zh_box_role
     assert "**一页一个文件" not in zh_box_role, zh_box_role
     assert "**One page per file" not in en_box_role, en_box_role
 
@@ -2507,6 +2509,29 @@ async def test_prompt_packs_locale():
     assert compile_box._tool_strings("no-such") == en_ts
     assert "{tid}" in en_ts["resolve_ticket"]["not_found"]  # format slots survive
     print("✓ prompt packs: en/zh parity, en fallback, localized guard/constitution/tools, env override")
+
+
+def test_code_domain_manifest_guides_but_does_not_become_a_batch():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "authoring").mkdir()
+        (root / "raw" / "roce-operator").mkdir(parents=True)
+        (root / "authoring" / "BRIEF.json").write_text(
+            json.dumps({"knowledge_type": "code"}), encoding="utf-8")
+        (root / "raw" / "CODE_SOURCES.json").write_text(
+            json.dumps({"schema_version": 1, "domain": "cluster-sre", "sources": []}),
+            encoding="utf-8")
+        (root / "raw" / "roce-operator" / "main.go").write_text(
+            "package main\n", encoding="utf-8")
+        run = compile_box.CompileRun("code-domain-inventory", td, 1)
+
+        inventory = compile_box._scan_compile_inventory(run)
+
+        assert [item["path"] for item in inventory] == ["roce-operator/main.go"], inventory
+        inspector = source_inspector.SourceInspector(td)
+        assert "CODE_SOURCES.json" in [path for path, _ in inspector._files()], \
+            "manifest must stay readable even though it is not a compile batch"
+    print("✓ code domain manifest: readable control metadata, not a content batch")
 
 
 def test_default_allowlist_covers_every_compile_tool():
@@ -4707,6 +4732,36 @@ def test_small_kb_batch_gate_skips_poppler_metadata():
     print("\u2713 small KB route: no Poppler metadata subprocess")
 
 
+def test_code_domain_manifest_does_not_trigger_batch_routing():
+    """Control metadata is readable, but never contributes to the code corpus
+    threshold.  Document libraries retain the established all-files behavior."""
+    old_threshold = os.environ.get("KBC_BATCH_THRESHOLD_BYTES")
+    try:
+        os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "10"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "authoring").mkdir()
+            (root / "raw").mkdir()
+            (root / "authoring" / "BRIEF.json").write_text(
+                json.dumps({"knowledge_type": "code"}), encoding="utf-8")
+            (root / "raw" / "CODE_SOURCES.json").write_text("x" * 20, encoding="utf-8")
+            (root / "raw" / "main.go").write_text("package x\n", encoding="utf-8")
+            run = compile_box.CompileRun("code-manifest-route", td, 1)
+            assert not compile_box._should_route_to_batch(
+                run, "", action="compile.generate")
+
+            (root / "authoring" / "BRIEF.json").write_text(
+                json.dumps({"knowledge_type": "document"}), encoding="utf-8")
+            assert compile_box._should_route_to_batch(
+                run, "", action="compile.generate")
+    finally:
+        if old_threshold is None:
+            os.environ.pop("KBC_BATCH_THRESHOLD_BYTES", None)
+        else:
+            os.environ["KBC_BATCH_THRESHOLD_BYTES"] = old_threshold
+    print("\u2713 code-domain manifest is excluded from batch routing")
+
+
 def test_hierarchical_text_slice_materialization_and_directive():
     """Oversized-text helpers are bounded, ephemeral views of Raw. The model
     reads the helper, but durable Candidate provenance still names the original
@@ -6714,6 +6769,7 @@ async def main():
     await test_test_path_escape_guard()
     await test_batch_planner_uses_compile_path_guard()
     await test_prompt_packs_locale()
+    test_code_domain_manifest_guides_but_does_not_become_a_batch()
     test_default_allowlist_covers_every_compile_tool()
     await test_source_inspector_is_engine_neutral_bounded_and_complete()
     await test_a_session_records_what_it_actually_spent()
@@ -6774,6 +6830,7 @@ async def main():
     await test_lifecycle_line_drops_unsafe_batch_id()
     await test_post_turn_normalizes_hand_edited_ledger()
     test_small_kb_batch_gate_skips_poppler_metadata()
+    test_code_domain_manifest_does_not_trigger_batch_routing()
     test_hierarchical_text_slice_materialization_and_directive()
     test_batch_relay_brief_hands_off_progress_and_prior_pages()
     test_hierarchical_resume_state_contract()

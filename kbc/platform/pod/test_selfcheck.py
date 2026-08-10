@@ -435,6 +435,9 @@ def test_code_profile_component_coverage():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         _mk(base, "authoring/BRIEF.json", json.dumps({"knowledge_type": "code"}))
+        _mk(base, "raw/CODE_SOURCES.json", json.dumps({
+            "schema_version": 1, "domain": "cluster-sre", "sources": [],
+        }))
         _mk(base, "raw/go.mod", "module example.invalid/operator\n")
         _mk(base, "raw/README.md", "operator\n")
         _mk(base, "raw/internal/controller/reconcile.go", "package controller\n")
@@ -449,6 +452,7 @@ def test_code_profile_component_coverage():
         }
         cov = selfcheck.coverage(td, pages, [])
         assert cov["profile"] == "code", cov
+        assert "CODE_SOURCES.json" not in selfcheck.source_inventory(td)
         assert cov["total_components"] == 6, cov
         assert cov["covered_components"] == 2, cov
         assert cov["ignored_sources"] == 0, cov
@@ -476,6 +480,32 @@ def test_code_profile_component_coverage():
         cov = selfcheck.coverage(td, {"p.md": {"sources": ["internal/controller/a.go"]}}, [])
         assert "profile" not in cov, cov
         assert cov["unaccounted"] == ["internal/controller/b.go"], cov
+
+    # A multi-repository archive adds one stable repository prefix to every
+    # source path.  That prefix is a boundary, not the component itself:
+    # controller and web inside one repository must remain independently
+    # accountable.
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "authoring/BRIEF.json", json.dumps({"knowledge_type": "code"}))
+        _mk(base, "raw/CODE_SOURCES.json", json.dumps({
+            "schema_version": 1,
+            "domain": "cluster-sre",
+            "raw_revision": "raw-v1-test",
+            "sources": [{"key": "operator", "path": "operator/"}],
+        }))
+        _mk(base, "raw/operator/internal/controller/reconcile.go", "package controller\n")
+        _mk(base, "raw/operator/internal/web/handler.go", "package web\n")
+        cov = selfcheck.coverage(td, {
+            "controller.md": {"sources": ["operator/internal/controller/reconcile.go"]},
+        }, [])
+        assert cov["total_components"] == 2, cov
+        assert cov["covered_components"] == 1, cov
+        assert cov["unaccounted"] == ["operator/internal/web/handler.go"], cov
+        assert [item["component"] for item in cov["unaccounted_components"]] == [
+            "operator/internal/web",
+        ], cov
+        assert not cov["closed"], cov
     print("OK  code profile accounts by component; document profile stays per-file")
 
 

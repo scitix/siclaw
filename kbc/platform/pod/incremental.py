@@ -22,7 +22,13 @@ import os
 import posixpath
 from pathlib import Path
 
-from selfcheck import _is_en, candidate_pages, code_component, knowledge_type
+from selfcheck import (
+    _is_en,
+    candidate_pages,
+    code_component,
+    code_repository_roots,
+    knowledge_type,
+)
 
 # 消费方 → box(管控面把机器算的变更交给执行面):变更源集 + 每个 modified 的 unified
 # diff + 基线/快照指纹。box 读它、富集 affected_pages,再落下面的 CHANGESET(给模型)。
@@ -93,6 +99,7 @@ def _changed_managed_sources(changed_sources: dict) -> set[str]:
 
 def _page_indexes(
     pages: dict[str, dict], *, code_profile: bool,
+    repository_roots: tuple[str, ...] = (),
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """Build dependency and component reverse indexes once per operation."""
     source_pages: dict[str, set[str]] = {}
@@ -108,7 +115,8 @@ def _page_indexes(
         for source in normalized_sources:
             source_pages.setdefault(source, set()).add(rel)
             if code_profile:
-                component_pages.setdefault(code_component(source), set()).add(rel)
+                component_pages.setdefault(
+                    code_component(source, repository_roots), set()).add(rel)
     return source_pages, component_pages
 
 
@@ -120,6 +128,7 @@ def _pages_for_sources(
     code_profile: bool | None = None,
     source_pages: dict[str, set[str]] | None = None,
     component_pages: dict[str, set[str]] | None = None,
+    repository_roots: tuple[str, ...] = (),
 ) -> set[str]:
     """Resolve exact dependency edges, widened to the component for code KBs.
 
@@ -141,7 +150,9 @@ def _pages_for_sources(
         code_profile = knowledge_type(workdir) == "code"
     if not code_profile or not normalized_sources:
         return exact
-    changed_components = {code_component(source) for source in normalized_sources}
+    changed_components = {
+        code_component(source, repository_roots) for source in normalized_sources
+    }
     if component_pages is not None:
         return exact | {
             page
@@ -152,7 +163,10 @@ def _pages_for_sources(
     for rel, page in pages.items():
         if rel == INDEX_PAGE or "error" in page:
             continue
-        page_components = {code_component(_norm_source(source)) for source in page.get("sources", [])}
+        page_components = {
+            code_component(_norm_source(source), repository_roots)
+            for source in page.get("sources", [])
+        }
         if page_components & changed_components:
             hit.add(rel)
     return hit
@@ -166,6 +180,7 @@ def _resolve_affected_pages(
     code_profile: bool | None = None,
     source_pages: dict[str, set[str]] | None = None,
     component_pages: dict[str, set[str]] | None = None,
+    repository_roots: tuple[str, ...] = (),
 ) -> tuple[list[str], list[str]]:
     all_pages = {rel for rel in pages if rel != INDEX_PAGE and "error" not in pages[rel]}
     touched = _changed_managed_sources(changed_sources)
@@ -176,6 +191,7 @@ def _resolve_affected_pages(
         code_profile=code_profile,
         source_pages=source_pages,
         component_pages=component_pages,
+        repository_roots=repository_roots,
     )
     return sorted(affected), sorted(all_pages - affected)
 
@@ -192,7 +208,9 @@ def resolve_affected_pages(workdir: str, changed_sources: dict) -> tuple[list[st
     touched = _changed_managed_sources(changed_sources)
     pages = candidate_pages(workdir, additional_managed_sources=touched)
     code_profile = knowledge_type(workdir) == "code"
-    source_pages, component_pages = _page_indexes(pages, code_profile=code_profile)
+    repository_roots = code_repository_roots(workdir) if code_profile else ()
+    source_pages, component_pages = _page_indexes(
+        pages, code_profile=code_profile, repository_roots=repository_roots)
     return _resolve_affected_pages(
         workdir,
         pages,
@@ -200,6 +218,7 @@ def resolve_affected_pages(workdir: str, changed_sources: dict) -> tuple[list[st
         code_profile=code_profile,
         source_pages=source_pages,
         component_pages=component_pages,
+        repository_roots=repository_roots,
     )
 
 
@@ -241,7 +260,9 @@ def build_changeset(
     modified = list(changed_sources.get("modified", []))
     deleted = list(changed_sources.get("deleted", []))
     code_profile = knowledge_type(workdir) == "code"
-    source_pages, component_pages = _page_indexes(pages, code_profile=code_profile)
+    repository_roots = code_repository_roots(workdir) if code_profile else ()
+    source_pages, component_pages = _page_indexes(
+        pages, code_profile=code_profile, repository_roots=repository_roots)
     affected, unaffected = _resolve_affected_pages(
         workdir,
         pages,
@@ -249,6 +270,7 @@ def build_changeset(
         code_profile=code_profile,
         source_pages=source_pages,
         component_pages=component_pages,
+        repository_roots=repository_roots,
     )
 
     def pages_for(src: str) -> list[str]:
@@ -259,6 +281,7 @@ def build_changeset(
             code_profile=code_profile,
             source_pages=source_pages,
             component_pages=component_pages,
+            repository_roots=repository_roots,
         ))
 
     changeset = {
@@ -269,7 +292,7 @@ def build_changeset(
         "added": [{
             "path": p,
             "content_ref": p,
-            "target_hint": code_component(p) if code_profile else "",
+            "target_hint": code_component(p, repository_roots) if code_profile else "",
         } for p in added],
         # 改动料:给受影响页 + 统一 diff(+/−),模型只改动到的那几处,不重写整页。
         "modified": [{"path": p, "affected_pages": pages_for(p), "diff": ""} for p in modified],

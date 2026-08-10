@@ -59,6 +59,7 @@ MEDIA_ASSET_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".
 
 EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
 SELFCHECK_PATH = "authoring/SELFCHECK.json"
+CODE_SOURCES_MANIFEST = "CODE_SOURCES.json"
 
 # TEST_ROLE = the standing identity of a read-only knowledge CONSUMER over a
 # pinned wiki snapshot. Single-sourced in the locale prompt packs
@@ -92,13 +93,20 @@ def source_inventory(workdir: str) -> list[str]:
     if not raw.is_dir():
         return []
     out = []
+    code_profile = knowledge_type(workdir) == "code"
     for f in raw.rglob("*"):
         if not f.is_file():
             continue
         rel = f.relative_to(raw)
         if not is_managed_source_path(rel):
             continue
-        out.append(rel.as_posix())
+        rel_posix = rel.as_posix()
+        # The platform-validated multi-repository manifest is control metadata:
+        # it tells the compiler how to interpret the source tree, but it is not
+        # itself a knowledge claim that needs a page citation or exclusion row.
+        if code_profile and rel_posix == CODE_SOURCES_MANIFEST:
+            continue
+        out.append(rel_posix)
     return sorted(out)
 
 
@@ -122,7 +130,45 @@ def knowledge_type(workdir: str) -> str:
     return "code" if isinstance(brief, dict) and brief.get("knowledge_type") == "code" else "document"
 
 
-def code_component(source: str) -> str:
+def code_repository_roots(workdir: str) -> tuple[str, ...]:
+    """Return validated Raw-relative repository roots from CODE_SOURCES.json.
+
+    Sicore is the authority that validates the full manifest contract.  KBC
+    only consumes the boundary fields it needs, but does so atomically: a
+    malformed or partial list yields no roots rather than a mixed component
+    model where only some repositories receive boundary-aware accounting.
+    """
+    path = Path(workdir) / "raw" / CODE_SOURCES_MANIFEST
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        return ()
+    declared = manifest.get("sources")
+    if not isinstance(declared, list) or not declared:
+        return ()
+    roots: list[str] = []
+    seen: set[str] = set()
+    for source in declared:
+        if not isinstance(source, dict):
+            return ()
+        key = source.get("key")
+        raw_path = source.get("path")
+        if not isinstance(key, str) or not isinstance(raw_path, str):
+            return ()
+        # Match the consumer contract: path is exactly "<key>/" and neither
+        # field may smuggle a nested/relative path into the component model.
+        if raw_path != f"{key}/" or not key or "/" in key or "\\" in key or key in (".", ".."):
+            return ()
+        if key in seen:
+            return ()
+        seen.add(key)
+        roots.append(key)
+    return tuple(sorted(roots))
+
+
+def code_component(source: str, repository_roots: tuple[str, ...] = ()) -> str:
     """Map one raw-relative path to a stable architecture component key.
 
     Code KBs deliberately account at module/component granularity rather than
@@ -135,6 +181,11 @@ def code_component(source: str) -> str:
     explicit exclusion ledger entry may remove source evidence from coverage.
     """
     normalized = _strip_source_prefix(posixpath.normpath(source.replace("\\", "/")).lstrip("/"))
+    for root in repository_roots:
+        prefix = root + "/"
+        if normalized.startswith(prefix):
+            inner = normalized[len(prefix):]
+            return root + "/" + code_component(inner)
     parts = [part for part in normalized.split("/") if part not in ("", ".")]
     if not parts:
         return "."
@@ -2186,9 +2237,10 @@ def coverage(workdir: str, pages: dict[str, dict], exclusions: list[dict]) -> di
     dangling = sorted(cited - source_set)
     code_fields = {}
     if knowledge_type(workdir) == "code":
+        repository_roots = code_repository_roots(workdir)
         components: dict[str, list[str]] = {}
         for source in sources:
-            component = code_component(source)
+            component = code_component(source, repository_roots)
             # Media remains ordinary provenance when cited, but a repository's
             # screenshots/icons must not manufacture architecture components.
             if is_media_asset(source):
