@@ -323,6 +323,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // turn as still reasoning. Registered in chat.send, cleared on its settle.
   const activeStreamAborts = new Map<string, AbortController>();
 
+  // A chat.send RPC acknowledges before its background task finishes cold-starting
+  // an AgentBox. Keep those not-yet-dispatched turns abortable too: otherwise Stop
+  // can observe "session not found", return success, and the background task can
+  // still call prompt() afterwards. A set is required because a second send may be
+  // waiting on the same session lock while the current turn is active.
+  const pendingStartAborts = new Map<string, Set<AbortController>>();
+  const registerPendingStart = (sessionId: string, ctrl: AbortController) => {
+    const controllers = pendingStartAborts.get(sessionId) ?? new Set<AbortController>();
+    controllers.add(ctrl);
+    pendingStartAborts.set(sessionId, controllers);
+  };
+  const unregisterPendingStart = (sessionId: string, ctrl: AbortController) => {
+    const controllers = pendingStartAborts.get(sessionId);
+    if (!controllers) return;
+    controllers.delete(ctrl);
+    if (controllers.size === 0) pendingStartAborts.delete(sessionId);
+  };
+
   /**
    * Sessions whose terminal this Runtime already sent — on shutdown, or because the box
    * running them was removed under them.
@@ -494,6 +512,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       }
     }
 
+    // Registered before the async ack below. This closes the cold-start window in
+    // which chat.abort previously had no local cancellation state to update.
+    const turnAbort = new AbortController();
+    registerPendingStart(sessionId, turnAbort);
+    const throwIfStoppedBeforePrompt = () => {
+      if (!turnAbort.signal.aborted) return;
+      const err = new Error("chat.send stopped before prompt dispatch");
+      err.name = "AbortError";
+      throw err;
+    };
+
     (async () => {
       // One turn at a time for this session, across every box. The AgentBox's own 409
       // only sees its own sessions, so with more than one box two sends could be
@@ -509,6 +538,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         try {
           releaseTurn = await sessionTurnLocks.acquire(sessionId);
         } catch (busyErr) {
+          throwIfStoppedBeforePrompt();
           const running = sessionTurnLocks.busyOn(sessionId);
           const steered = running ? await new AgentBoxClient(running.endpoint, 10000, agentBoxTlsOptions)
             .steerSession(sessionId, text, { images, files })
@@ -527,6 +557,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // caller gets the ordinary busy error.
           releaseTurn = await sessionTurnLocks.acquire(sessionId);
         }
+        throwIfStoppedBeforePrompt();
 
         // Agent-prompt precedence for the box session. An explicit
         // params.systemPrompt (the portal-standalone path stamps it from the
@@ -542,6 +573,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         if (promptOpts.systemPromptTemplate === undefined) {
           promptOpts.systemPromptTemplate = await resolveAgentSystemPrompt(agentId, frontendClient);
         }
+        throwIfStoppedBeforePrompt();
 
         // Persistence is resolved by agentId in the manager's persistenceResolver
         // (registered in startRuntime), not from per-request params — so every
@@ -551,6 +583,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // runs; it is dropped on release, so it can never become a stale binding.
         sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+        throwIfStoppedBeforePrompt();
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
         try {
@@ -558,6 +591,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // The box now has the session: a steer racing this call can stop waiting, and
           // this row is in line to be processed (see pending-user-rows.ts).
           sessionTurnLocks.markPromptAccepted(sessionId);
+          // Stop may have arrived while prompt() was in flight, before the box had a
+          // session for chat.abort to find. Abort again now that acceptance is known;
+          // never attach a consumer to a turn whose Stop was already acknowledged.
+          if (turnAbort.signal.aborted) {
+            await client.abortSession(promptResult.sessionId).catch((abortErr) => {
+              console.warn(`[runtime] failed to stop newly accepted session=${promptResult.sessionId}:`, abortErr);
+            });
+            throwIfStoppedBeforePrompt();
+          }
           if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
         } catch (err) {
           // Concurrent send: agentbox returns 409 "Session is already
@@ -596,7 +638,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         });
 
         const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
-        const abortCtrl = new AbortController();
+        const abortCtrl = turnAbort;
         // Register this turn's abort signal so chat.abort can break the consumer
         // (see activeStreamAborts declaration). Placed AFTER prompt() succeeds, on
         // the path that actually consumes: the concurrent-send "already running"
@@ -604,6 +646,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // the in-flight prompt's controller in the map. Keyed on the agentbox-echoed
         // promptResult.sessionId — the same id chat.abort looks up.
         activeStreamAborts.set(promptResult.sessionId, abortCtrl);
+        unregisterPendingStart(sessionId, turnAbort);
 
         /**
          * Whether this turn's terminal was already sent by the supervisor (shutdown, or a
@@ -664,20 +707,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // Failure before/during agentbox spawn or prompt() — surface as a
         // stream_error so the frontend renders an inline bubble instead of
         // hanging on the spawning state forever.
-        console.error(`[runtime] chat.send background failure for session=${sessionId}:`, err);
-        const detail = wrapError(err, {
-          code: ErrorCodes.INTERNAL,
-          retriable: true,
-        });
-        context.sendEvent("chat.event", {
-          sessionId,
-          event: { type: "stream_error", error: detail },
-        });
+        if (!turnAbort.signal.aborted) {
+          console.error(`[runtime] chat.send background failure for session=${sessionId}:`, err);
+          const detail = wrapError(err, {
+            code: ErrorCodes.INTERNAL,
+            retriable: true,
+          });
+          context.sendEvent("chat.event", {
+            sessionId,
+            event: { type: "stream_error", error: detail },
+          });
+        }
         context.sendEvent("chat.event", { sessionId, event: { type: "prompt_done" } });
       } finally {
         // Anything still queued was never consumed — a steer the user sent into a turn
         // that finished first. It must not be claimed by the next turn's first echo.
         pendingUserRows.clear(sessionId);
+        unregisterPendingStart(sessionId, turnAbort);
         releaseTurn?.();
       }
     })();
@@ -1365,6 +1411,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // the consumer — so consumeAgentSse runs its abort-finalization (in-flight tool
     // rows → "stopped", partial assistant text persisted) instead of exiting as a
     // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
+    for (const ctrl of pendingStartAborts.get(sessionId) ?? []) ctrl.abort();
     activeStreamAborts.get(sessionId)?.abort();
 
     const client = await boxForRunningTurn(agentId, sessionId);

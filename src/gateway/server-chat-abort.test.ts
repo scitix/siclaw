@@ -87,10 +87,10 @@ function fakeAgentBoxManager() {
   } as any;
 }
 
-async function bootRuntime() {
+async function bootRuntime(agentBoxManager = fakeAgentBoxManager()) {
   return startRuntime({
     config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
-    agentBoxManager: fakeAgentBoxManager(),
+    agentBoxManager,
     frontendClient: fakeFrontendClient(),
     credentialService: {} as any,
   });
@@ -162,6 +162,39 @@ describe("startRuntime — chat.abort wiring", () => {
     await expect(abort({ agentId: "a", sessionId: "missing" })).resolves.toMatchObject({ ok: true });
     // The agentbox is still asked to stop even with no live gateway consumer.
     expect(abortSessionCalls).toEqual(["missing"]);
+  });
+
+  it("does not dispatch prompt after Stop is acknowledged during cold spawn", async () => {
+    let releaseColdSpawn: (() => void) | undefined;
+    let getOrCreateCalls = 0;
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockImplementation(async () => {
+      getOrCreateCalls += 1;
+      // Hold only chat.send's placement. chat.abort's fallback lookup must still
+      // be able to reach a box and acknowledge Stop while the first call waits.
+      if (getOrCreateCalls === 1) {
+        await new Promise<void>((resolve) => { releaseColdSpawn = resolve; });
+      }
+      return { boxId: "box-a", endpoint: "https://fake.internal" };
+    });
+
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+    const ctx = { sendEvent: vi.fn() };
+
+    await expect(send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, ctx))
+      .resolves.toMatchObject({ ok: true, sessionId: "S" });
+    await waitFor(() => getOrCreateCalls === 1);
+
+    await expect(abort({ agentId: "a", sessionId: "S" })).resolves.toMatchObject({ ok: true });
+    releaseColdSpawn?.();
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+
+    expect(promptCalls).toHaveLength(0);
+    expect(abortSessionCalls).toEqual(["S"]);
   });
 
   it("binds an explicit steer message to the active prompt trace", async () => {
