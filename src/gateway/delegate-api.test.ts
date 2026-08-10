@@ -244,6 +244,10 @@ describe("handleDelegate — cross-Runtime routing", () => {
       if (method === "chat.recentDelegationSessions") return { ids: [] };
       if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
       if (method === "delegation.start") {
+        getMessages.mockResolvedValueOnce([
+          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+          { role: "assistant", content: "aries result", delegationId: null, metadata: null },
+        ] as any);
         const relay = deps.eventHandlers.get("delegation.event")!;
         relay({
           delegationId: params.delegationId,
@@ -364,6 +368,37 @@ describe("handleDelegate — cross-Runtime routing", () => {
     expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "durable aries result" });
   });
 
+  it("uses the durable answer when the live relay delivered only part of the assistant output", async () => {
+    const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        getMessages.mockResolvedValueOnce([
+          { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+          { role: "assistant", content: "complete durable answer", delegationId: null, metadata: null },
+        ] as any);
+        const relay = deps.eventHandlers.get("delegation.event")!;
+        relay({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial" }] } },
+        });
+        relay({
+          delegationId: params.delegationId,
+          sessionId: params.sessionId,
+          event: { type: "prompt_done" },
+        });
+        return { ok: true };
+      }
+      return {};
+    });
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(delegateResult(res)).toMatchObject({ ok: true, status: "done", finalText: "complete durable answer" });
+  });
+
   it("fails instead of returning an empty success when no durable result can be recovered", async () => {
     const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });
     deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
@@ -426,6 +461,10 @@ describe("handleDelegate — cross-Runtime routing", () => {
         if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
         if (method === "delegation.start") {
           remoteParams = params;
+          getMessages.mockResolvedValueOnce([
+            { role: "user", content: "inspect", delegationId: params.delegationId, metadata: null },
+            { role: "assistant", content: "still active", delegationId: null, metadata: null },
+          ] as any);
           return { ok: true };
         }
         return {};

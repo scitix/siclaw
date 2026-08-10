@@ -101,22 +101,28 @@ async function fetchRoster(
   return data.members ?? [];
 }
 
+type DurableRemoteResult =
+  | { status: "found"; finalText: string }
+  | { status: "empty" }
+  | { status: "failed"; error: string };
+
 /**
- * Recover the durable assistant result when the live reverse-event lane lost a
- * message frame but still delivered the terminal event. The current delegated
- * user row is the boundary marker; the session lock guarantees that later rows
- * up to prompt_done belong to this turn even when a peer session is reused.
+ * Read the authoritative remote answer after the terminal event. Live relay
+ * frames are best-effort progress signals and may be dropped individually; the
+ * current delegated user row is the durable boundary marker. The session lock
+ * guarantees that later rows up to prompt_done belong to this turn even when a
+ * peer session is reused.
  */
 async function recoverRemoteResult(
   peerSessionId: string,
   delegationId: string,
-): Promise<{ finalText?: string; error?: string }> {
+): Promise<DurableRemoteResult> {
   let messages: Awaited<ReturnType<typeof getMessages>>;
   try {
     messages = await getMessages(peerSessionId, { limit: REMOTE_RESULT_READBACK_LIMIT });
   } catch (err) {
     console.warn(`[delegate-api] failed to recover remote delegation ${delegationId} from chat history:`, err);
-    return { error: "Remote delegation completed, but its result could not be recovered" };
+    return { status: "failed", error: "Remote delegation completed, but its result could not be recovered" };
   }
 
   let boundary = -1;
@@ -128,7 +134,7 @@ async function recoverRemoteResult(
     }
   }
   if (boundary < 0) {
-    return { error: "Remote delegation completed, but its durable turn boundary was not found" };
+    return { status: "failed", error: "Remote delegation completed, but its durable turn boundary was not found" };
   }
 
   const turnMessages = messages.slice(boundary + 1);
@@ -137,7 +143,7 @@ async function recoverRemoteResult(
     message.metadata?.kind === "error_response" &&
     message.content.trim().length > 0,
   );
-  if (persistedError) return { error: persistedError.content.trim() };
+  if (persistedError) return { status: "failed", error: persistedError.content.trim() };
 
   const assistantText = turnMessages
     .filter((message) =>
@@ -147,9 +153,9 @@ async function recoverRemoteResult(
     )
     .map((message) => message.content.trim())
     .join("\n\n");
-  if (assistantText) return { finalText: assistantText };
+  if (assistantText) return { status: "found", finalText: assistantText };
 
-  return { error: "Remote delegation completed without a recoverable result" };
+  return { status: "empty" };
 }
 
 /** GET /api/internal/delegates — the calling coordinator's roster. */
@@ -504,10 +510,14 @@ export async function handleDelegate(
     }
 
     if (remoteErrorMessage) return { error: remoteErrorMessage };
-    if (!finalText && !artifact && !inputQuestion) {
-      const recovered = await recoverRemoteResult(peerSessionId, delegationId);
-      if (recovered.error) return { error: recovered.error };
-      finalText = recovered.finalText ?? "";
+    const recovered = await recoverRemoteResult(peerSessionId, delegationId);
+    if (recovered.status === "failed") return { error: recovered.error };
+    // Never return text reassembled from a best-effort relay: one dropped frame
+    // can leave a non-empty but silently truncated answer. Artifact-only and
+    // input-required turns may legitimately have no persisted assistant text.
+    finalText = recovered.status === "found" ? recovered.finalText : "";
+    if (recovered.status === "empty" && !artifact && !inputQuestion) {
+      return { error: "Remote delegation completed without a recoverable result" };
     }
     return {};
   };

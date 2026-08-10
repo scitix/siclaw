@@ -127,11 +127,14 @@ edge and reasserts that flag before forwarding `chat.send`. The target does not
 create a second user row, so a target-side `promptMessageId` is intentionally
 absent. A bare, non-delegated `chat.send` may never suppress persistence.
 
-Live events are progress signals, not the sole record of the result. If the
-terminal event arrives without answer content, the source recovers assistant
-content after the current delegation boundary from durable session history. No
-live or durable result is a failed delegation, never an empty success. The
-remote relay timeout measures event *silence* and is renewed by matching events;
+Live events are progress signals, not the correctness record for the result.
+They may be dropped individually, so even a non-empty reassembled answer can be
+incomplete. After the terminal event, the source always derives remote
+`finalText` from assistant rows after the current delegation boundary in durable
+session history. Artifact-only and input-required turns may legitimately have no
+assistant text; an ordinary completed turn with no durable result fails instead
+of returning an empty or partial success. The remote relay timeout measures
+event *silence* and is renewed by matching events;
 `SICLAW_REMOTE_DELEGATION_IDLE_TIMEOUT` may override it in seconds.
 
 This contract creates a strict rollout dependency. The management plane that
