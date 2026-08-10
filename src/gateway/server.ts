@@ -330,15 +330,32 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // waiting on the same session lock while the current turn is active.
   const pendingStartAborts = new Map<string, Set<AbortController>>();
   /**
-   * The turn each session is currently running, so an abort can name it.
+   * Every turn this Runtime currently has in flight for a session, so an abort can
+   * name the one it means.
    *
    * A session id names a CONVERSATION, and a delegated peer session is reused across
    * turns, so "abort session S" turns ambiguous the moment a turn ends: an abort
    * delayed past that point would land on its successor. Every abort this Runtime
-   * sends therefore carries the turn it means, and the box answers a mismatch as
-   * already stopped.
+   * sends therefore carries a turn, and the box answers a mismatch as already
+   * stopped.
+   *
+   * A SET, not one id: a second send arrives while the first still holds the session
+   * lock, so at that moment two turns are live — one running on the box, one queued
+   * behind it. Remembering only the newest would make a Stop name the queued turn,
+   * the box would reject the mismatch, and the running turn would continue headless.
    */
-  const currentTurnIds = new Map<string, string>();
+  const liveTurnIds = new Map<string, Set<string>>();
+  const addLiveTurn = (sessionId: string, id: string) => {
+    const ids = liveTurnIds.get(sessionId) ?? new Set<string>();
+    ids.add(id);
+    liveTurnIds.set(sessionId, ids);
+  };
+  const dropLiveTurn = (sessionId: string, id: string) => {
+    const ids = liveTurnIds.get(sessionId);
+    if (!ids) return;
+    ids.delete(id);
+    if (ids.size === 0) liveTurnIds.delete(sessionId);
+  };
   const registerPendingStart = (sessionId: string, ctrl: AbortController) => {
     const controllers = pendingStartAborts.get(sessionId) ?? new Set<AbortController>();
     controllers.add(ctrl);
@@ -467,7 +484,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const images = params.images as PromptOptions["images"];
     const files = params.files as PromptOptions["files"];
     // One id for this turn, held from before the async ack until the turn settles.
-    const turnId = crypto.randomUUID();
+    // A supervisor that will need to abort this turn later supplies it BEFORE the
+    // dispatch, so a lost acknowledgement still leaves it able to name the turn;
+    // ordinary callers let us mint one.
+    const turnId = typeof params.turnId === "string" && params.turnId ? params.turnId : crypto.randomUUID();
 
     /**
      * Hand this turn's terminal to the control plane with an acknowledgement.
@@ -484,7 +504,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
      */
     const deliverDelegationTerminal = async (event: Record<string, unknown>): Promise<void> => {
       if (!delegation?.delegationId) return;
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
+      // The budget has to outlast a WS reconnect, which cannot complete faster than
+      // its own backoff: a few hundred milliseconds of retries would give up while
+      // the only route back is still being re-established.
+      const backoffMs = [500, 1_000, 2_000, 4_000, 8_000];
+      for (let attempt = 0; attempt <= backoffMs.length; attempt += 1) {
         try {
           await frontendClient.request("delegation.terminal", {
             delegationId: delegation.delegationId,
@@ -496,11 +520,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           if (/unknown method/i.test(message)) return;
-          if (attempt === 3) {
+          if (attempt === backoffMs.length) {
             console.error(`[runtime] could not confirm delivery of the terminal for delegation=${delegation.delegationId} session=${sessionId}:`, message);
             return;
           }
-          await new Promise((r) => setTimeout(r, 250 * attempt));
+          await new Promise((r) => setTimeout(r, backoffMs[attempt]));
         }
       }
     };
@@ -565,7 +589,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // which chat.abort previously had no local cancellation state to update.
     const turnAbort = new AbortController();
     registerPendingStart(sessionId, turnAbort);
-    currentTurnIds.set(sessionId, turnId);
+    addLiveTurn(sessionId, turnId);
     const throwIfStoppedBeforePrompt = () => {
       if (!turnAbort.signal.aborted) return;
       const err = new Error("chat.send stopped before prompt dispatch");
@@ -816,7 +840,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // that finished first. It must not be claimed by the next turn's first echo.
         pendingUserRows.clear(sessionId);
         unregisterPendingStart(sessionId, turnAbort);
-        if (currentTurnIds.get(sessionId) === turnId) currentTurnIds.delete(sessionId);
+        dropLiveTurn(sessionId, turnId);
         releaseTurn?.();
       }
     })();
@@ -1503,9 +1527,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // an abort delayed past that turn's end — a lease expiry, a retry — cannot stop
     // whatever is running now. The user's Stop button sends none, and means "current".
     const requestedTurnId = typeof params.turnId === "string" ? params.turnId : undefined;
-    const runningTurnId = currentTurnIds.get(sessionId);
-    if (requestedTurnId && runningTurnId && requestedTurnId !== runningTurnId) {
-      console.log(`[runtime] abort for turn=${requestedTurnId} session=${sessionId} is stale (running ${runningTurnId}); ignoring`);
+    // SNAPSHOT, not a live view: breaking the consumer below lets a turn settle and
+    // remove itself from this set, so reading it afterwards would miss the very turn
+    // the Stop was for.
+    const liveTurns = [...(liveTurnIds.get(sessionId) ?? [])];
+    if (requestedTurnId && liveTurns.length > 0 && !liveTurns.includes(requestedTurnId)) {
+      console.log(`[runtime] abort for turn=${requestedTurnId} session=${sessionId} is stale (live: ${liveTurns.join(", ")}); ignoring`);
       return { ok: true, stale: true };
     }
 
@@ -1527,12 +1554,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // cancelled — so there is nothing left to avoid, and the probe that used to
     // guess whether a dispatch had landed is gone with it.
     const client = await boxForRunningTurn(agentId, sessionId);
+    // A Stop that names no turn means "whatever is running", and more than one turn
+    // can be live — one on the box, one queued behind the session lock. Ask about
+    // each: the box stops the one it is running and answers the rest as already
+    // stopped. Falling back to a session-wide abort instead would arm a
+    // session-wide pre-spawn latch, which is what the turn scoping exists to avoid.
+    const targets = requestedTurnId ? [requestedTurnId] : liveTurns;
     // Stopping a session a box does not have is already the outcome the user asked for;
     // reporting it as a failed Stop would be a lie.
-    await client.abortSession(sessionId, requestedTurnId ?? runningTurnId).catch((err) => {
+    const stopOne = (id?: string) => client.abortSession(sessionId, id).catch((err) => {
       if (!isSessionNotFound(err)) throw err;
       console.log(`[runtime] abort: session=${sessionId} not on the box we asked; treating as already stopped`);
     });
+    if (targets.length === 0) {
+      // Nothing in flight here: the box may still hold a turn from before a restart.
+      await stopOne(undefined);
+    } else {
+      for (const id of targets) await stopOne(id);
+    }
     return { ok: true };
   });
 

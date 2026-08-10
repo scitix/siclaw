@@ -533,9 +533,17 @@ export class AgentBoxSessionManager {
     // Stop on a released-but-idle session (e.g. the Stop button still live after a missed
     // prompt_done) would arm a pending abort that silently cancels the user's NEXT prompt for
     // the same reused sessionId. If the existence check throws, fall through and arm (best-effort).
-    try {
-      if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
-    } catch { /* fall through — arm */ }
+    // The dir check exists only because a SESSION-WIDE latch could cancel an
+    // unrelated later prompt: a released-but-idle session (30s TTL) always has a
+    // history dir, and a Stop on it would otherwise arm a latch the user's next
+    // prompt consumes. A turn-scoped latch cannot do that — only that turn's own
+    // prompt consumes it — so skipping the check is what lets a Stop on a REUSED
+    // session (a delegated peer thread always has a dir) arm anything at all.
+    if (turnId === undefined) {
+      try {
+        if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
+      } catch { /* fall through — arm */ }
+    }
     const existing = this._pendingAborts.get(sessionId);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this._pendingAborts.delete(sessionId), AgentBoxSessionManager.PENDING_ABORT_TTL_MS);

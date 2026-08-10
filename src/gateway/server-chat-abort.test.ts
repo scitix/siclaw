@@ -347,6 +347,46 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(frontendClient.request.mock.calls.some(([method]: any[]) => method === "delegation.terminal")).toBe(false);
   });
 
+  it("stops the RUNNING turn when a second send has already queued behind it", async () => {
+    // The second send registers its turn before it can acquire the session lock, so
+    // two turns are live at once: one on the box, one queued. Remembering only the
+    // newest would make Stop name the queued turn, the box would reject the mismatch,
+    // and the running turn would keep going with its consumer already torn down.
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+
+    const first = await send({ agentId: "a", userId: "u", text: "one", sessionId: "S" }, { sendEvent: vi.fn() }) as { turnId?: string };
+    await waitFor(() => capturedSignal !== undefined);
+    const second = await send({ agentId: "a", userId: "u", text: "two", sessionId: "S" }, { sendEvent: vi.fn() }) as { turnId?: string };
+    expect(second.turnId).not.toBe(first.turnId);
+
+    await expect(abort({ agentId: "a", sessionId: "S" })).resolves.toMatchObject({ ok: true });
+    // Both were live when Stop arrived, so both are named; the box stops the one it
+    // is running and answers the other as already stopped.
+    expect(abortSessionTurnIds).toContain(first.turnId);
+    expect(abortSessionTurnIds).toContain(second.turnId);
+  });
+
+  it("uses a caller-supplied turn id so a lost ack still leaves it nameable", async () => {
+    // A supervisor that will have to abort this turn later fixes its id BEFORE
+    // dispatch; learning it from the ack would leave the lost-ack case with nothing
+    // to name, and its compensation would fall back to stopping the session.
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+
+    const ack = await send({
+      agentId: "a", userId: "u", text: "hi", sessionId: "supplied", turnId: "chosen-by-caller",
+    }, { sendEvent: vi.fn() }) as { turnId?: string };
+    expect(ack.turnId).toBe("chosen-by-caller");
+    await waitFor(() => promptCalls.length === 1);
+    expect(promptCalls[0]).toMatchObject({ turnId: "chosen-by-caller" });
+
+    await abort({ agentId: "a", sessionId: "supplied", turnId: "chosen-by-caller" });
+    expect(abortSessionTurnIds).toEqual(["chosen-by-caller"]);
+  });
+
   it("binds an explicit steer message to the active prompt trace", async () => {
     server = await bootRuntime();
     const steer = server.rpcMethods.get("chat.steer")!;
