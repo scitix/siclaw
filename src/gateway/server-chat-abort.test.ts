@@ -445,7 +445,11 @@ describe("startRuntime — chat.abort wiring", () => {
   it("cancels every turn a supervisor reports as interrupted", async () => {
     // Reporting a queued turn as terminated while leaving it runnable would let it
     // start after its caller had already been told it was over.
-    server = await bootRuntime();
+    const manager = fakeAgentBoxManager();
+    // A real placement reports its box, which is what makes the session lock
+    // observable below.
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager);
     const send = server.rpcMethods.get("chat.send")!;
 
     await send({ agentId: "a", userId: "u", text: "one", sessionId: "S" }, { sendEvent: vi.fn() });
@@ -456,13 +460,12 @@ describe("startRuntime — chat.abort wiring", () => {
     await server.close();
     server = undefined;
 
-    // Wait for the queued turn to SETTLE rather than sampling immediately: it was
-    // cancelled, so it reports its own terminal without ever reaching the box. Left
-    // runnable it would instead take the lock A just released, dispatch, and hang in
-    // its consumer — so this wait is what distinguishes the two.
-    await waitFor(() => ctx.sendEvent.mock.calls.some(
-      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
-    ));
+    // This is a NEGATIVE property, so give the queued turn a real chance to misbehave
+    // instead of sampling straight after close(): left runnable it takes the lock the
+    // streaming turn just released and dispatches within milliseconds. Sampling
+    // immediately, or waiting on the lock, both race that hand-off.
+    const dispatched = await waitFor(() => promptCalls.length > 1, 500).then(() => true, () => false);
+    expect(dispatched).toBe(false);
     expect(promptCalls).toHaveLength(1);
   });
 

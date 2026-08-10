@@ -141,17 +141,28 @@ whole backoff cap plus jitter.
 
 A terminal produced by the SUPERVISOR — a Runtime shutdown, or a box removed under
 a turn — takes the same acknowledged route, and cancels every turn it reports: a
-queued turn declared interrupted must not go on to start afterwards. The suppression
+queued turn declared interrupted must not go on to start afterwards. It covers turns
+that are still cold-starting, too: those have no consumer yet, but they are just as
+abandoned, and their caller would otherwise wait out an idle window while the box may
+still start them. The suppression
 of a turn's own reporting is likewise per turn, or the other live turn would still
 emit a plain terminal that reads as a turn which succeeded. Those paths bypass the turn's own
 reporting, which is exactly why they needed their own way to reach it, and shutdown
 waits briefly for those deliveries before closing the transport they travel over.
 
+Delivery does not hold the turn open. A retry budget measured in reconnects is far
+too long to keep a session lock, a streaming registration and the supervisor's view
+of a live turn occupied; the turn settles at once and deregisters itself, which is
+also what stops a shutdown mid-retry from re-reporting a finished turn as
+interrupted. Shutdown flushes whatever is still in flight.
+
 A reported terminal enters the same ordered queue as the stream it accompanies.
 Acting on it straight from the RPC would let it overtake an artifact, error or
 clarification that preceded it, retiring supervision before those were delivered. A
 terminal that cannot be queued is refused rather than acknowledged — acknowledging it
-would stop the only party able to send it again.
+would stop the only party able to send it again — and a report must name the
+dispatched turn, checked against the very relay that dispatched it rather than
+against whatever now occupies its id.
 And a re-delivered terminal must be acknowledged, not rejected: its consumer is
 gone precisely because it consumed the original, and refusing it keeps a sender
 retrying — which keeps supervision alive over a turn that already ended.
@@ -201,7 +212,10 @@ turn it means:
   being stopped, since a settling turn removes itself. Cancellation is per turn on
   this side too — aborting the session's controllers would break the RUNNING turn's
   consumer even for a request that named a queued one, and the box, told only about
-  the named turn, would leave the running one going with nobody reading it.
+  the named turn, would leave the running one going with nobody reading it. That
+  decision is taken from the snapshot and applied before any await: reading it back
+  afterwards would let a turn settle in between, fall through to the session-wide
+  branch, and break the consumer of a SUCCESSOR that started meanwhile.
 
 Both fields are optional, which is what makes naming a turn safe to roll out in
 either order: a box that ignores the field keeps session-wide semantics, and a
