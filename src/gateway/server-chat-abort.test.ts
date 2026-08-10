@@ -425,6 +425,47 @@ describe("startRuntime — chat.abort wiring", () => {
       .toBeLessThan(frontendClient.close.mock.invocationCallOrder[0]);
   });
 
+  it("does not touch the running turn's consumer when the abort names a queued turn", async () => {
+    // Aborting the session's controllers here would break A's consumer while the box
+    // is only told about B — A would keep running with nobody reading it.
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+    const abort = server.rpcMethods.get("chat.abort")!;
+
+    await send({ agentId: "a", userId: "u", text: "one", sessionId: "S" }, { sendEvent: vi.fn() });
+    await waitFor(() => capturedSignal !== undefined);
+    const runningSignal = capturedSignal!;
+    const queued = await send({ agentId: "a", userId: "u", text: "two", sessionId: "S" }, { sendEvent: vi.fn() }) as { turnId?: string };
+
+    await expect(abort({ agentId: "a", sessionId: "S", turnId: queued.turnId })).resolves.toMatchObject({ ok: true });
+    expect(runningSignal.aborted).toBe(false);
+    expect(abortSessionTurnIds).toEqual([queued.turnId]);
+  });
+
+  it("cancels every turn a supervisor reports as interrupted", async () => {
+    // Reporting a queued turn as terminated while leaving it runnable would let it
+    // start after its caller had already been told it was over.
+    server = await bootRuntime();
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({ agentId: "a", userId: "u", text: "one", sessionId: "S" }, { sendEvent: vi.fn() });
+    await waitFor(() => capturedSignal !== undefined);
+    const ctx = { sendEvent: vi.fn() };
+    await send({ agentId: "a", userId: "u", text: "two", sessionId: "S" }, ctx);
+
+    await server.close();
+    server = undefined;
+
+    // Wait for the queued turn to SETTLE rather than sampling immediately: it was
+    // cancelled, so it reports its own terminal without ever reaching the box. Left
+    // runnable it would instead take the lock A just released, dispatch, and hang in
+    // its consumer — so this wait is what distinguishes the two.
+    await waitFor(() => ctx.sendEvent.mock.calls.some(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    ));
+    expect(promptCalls).toHaveLength(1);
+  });
+
   it("binds an explicit steer message to the active prompt trace", async () => {
     server = await bootRuntime();
     const steer = server.rpcMethods.get("chat.steer")!;

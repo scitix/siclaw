@@ -1106,21 +1106,23 @@ describe("http-server — steer / abort / clear-queue", () => {
     expect(sm.markPendingAbort).toHaveBeenCalledWith("ghost-bg", undefined);
   });
 
-  it("ignores an abort that names a turn other than the one running", async () => {
+  it("does not stop the running turn for an abort that names another one", async () => {
     // A session id names a conversation, and a delegated peer session is reused
     // across turns, so a supervisor's late abort would otherwise stop a successor.
     await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "turns", turnId: "turn-2" });
     const s = sm.sessions.get("turns")!;
 
-    const stale = await getJson(port, "/api/sessions/turns/abort", "POST", { turnId: "turn-1" });
-    expect(stale.status).toBe(200);
-    expect(stale.data).toMatchObject({ ok: true, stale: true });
+    const other = await getJson(port, "/api/sessions/turns/abort", "POST", { turnId: "turn-1" });
+    expect(other.status).toBe(200);
     expect(s.brain.clearQueue).not.toHaveBeenCalled();
     expect(s._aborted).toBe(false);
+    // Not "already finished": a named turn that is not running may equally be one
+    // whose prompt is still in flight, so the intent is recorded for that turn.
+    expect(other.data).toMatchObject({ ok: true, pending: true });
+    expect(sm.markPendingAbort).toHaveBeenCalledWith("turns", "turn-1");
 
     const current = await getJson(port, "/api/sessions/turns/abort", "POST", { turnId: "turn-2" });
     expect(current.status).toBe(200);
-    expect(current.data).not.toMatchObject({ stale: true });
     expect(s._aborted).toBe(true);
   });
 

@@ -136,16 +136,22 @@ terminal to the management plane over an acknowledged RPC, and the management
 plane relays control frames to the source over one, retried until this Runtime
 confirms that the matching delegation consumer handled them. Each retry budget has
 to outlast a WS reconnect: a few hundred milliseconds would give up while the only
-route back is still being re-established.
+route back is still being re-established: a single reconnect can take the client's
+whole backoff cap plus jitter.
 
 A terminal produced by the SUPERVISOR — a Runtime shutdown, or a box removed under
-a turn — takes the same acknowledged route. Those paths bypass the turn's own
+a turn — takes the same acknowledged route, and cancels every turn it reports: a
+queued turn declared interrupted must not go on to start afterwards. The suppression
+of a turn's own reporting is likewise per turn, or the other live turn would still
+emit a plain terminal that reads as a turn which succeeded. Those paths bypass the turn's own
 reporting, which is exactly why they needed their own way to reach it, and shutdown
 waits briefly for those deliveries before closing the transport they travel over.
 
 A reported terminal enters the same ordered queue as the stream it accompanies.
 Acting on it straight from the RPC would let it overtake an artifact, error or
-clarification that preceded it, retiring supervision before those were delivered.
+clarification that preceded it, retiring supervision before those were delivered. A
+terminal that cannot be queued is refused rather than acknowledged — acknowledging it
+would stop the only party able to send it again.
 And a re-delivered terminal must be acknowledged, not rejected: its consumer is
 gone precisely because it consumed the original, and refusing it keeps a sender
 retrying — which keeps supervision alive over a turn that already ended.
@@ -175,8 +181,11 @@ turn it means:
   from the acknowledgement would leave the one case that needs it most, an
   acknowledgement that never arrived, with nothing to name. The Runtime mints one
   only when the caller supplies none, and echoes whichever id is in force;
-- the box records it as the running turn, and an abort naming any other turn is
-  answered as already stopped;
+- the box records it as the running turn. An abort naming a different turn does not
+  stop the running one — but "not running" is not the same as "finished": that turn's
+  prompt may still be in flight, or its session may be rebuilding. The intent is
+  therefore recorded as a latch for the named turn rather than discarded, and latches
+  are held per turn, since cancelling one turn while another runs is ordinary;
 - a pre-spawn abort latch records the turn that armed it and is consumed only by
   that turn's prompt, so an orphaned latch cannot cancel a later, deliberate prompt
   on the same reused session id. That is also why a named latch is armed
@@ -189,7 +198,10 @@ turn it means:
   turn can be live at that moment, because a second send registers its turn before
   it can acquire the session lock. All live turns are therefore named, snapshotted
   before the consumer is broken: reading them afterwards would miss the very turn
-  being stopped, since a settling turn removes itself.
+  being stopped, since a settling turn removes itself. Cancellation is per turn on
+  this side too — aborting the session's controllers would break the RUNNING turn's
+  consumer even for a request that named a queued one, and the box, told only about
+  the named turn, would leave the running one going with nobody reading it.
 
 Both fields are optional, which is what makes naming a turn safe to roll out in
 either order: a box that ignores the field keeps session-wide semantics, and a

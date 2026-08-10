@@ -372,7 +372,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     turnId: string,
     event: Record<string, unknown>,
   ): Promise<void> => {
-    const backoffMs = [500, 1_000, 2_000, 4_000, 8_000];
+    // A single reconnect can take the client's whole backoff cap plus jitter (30s +
+    // 2s), so a shorter budget gives up while the only route back is still being
+    // re-established.
+    const backoffMs = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
     for (let attempt = 0; attempt <= backoffMs.length; attempt += 1) {
       try {
         await frontendClient.request("delegation.terminal", { delegationId, sessionId, turnId, event }, 10_000);
@@ -388,12 +391,22 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       }
     }
   };
-  const addLiveTurn = (sessionId: string, id: string) => {
+  /**
+   * Each live turn's cancellation, addressable on its own.
+   *
+   * Session-keyed controllers cannot express "cancel B": aborting the session's
+   * controllers would break the consumer of the turn that is actually RUNNING while
+   * the box is only told about B, leaving A running with nobody reading it.
+   */
+  const turnAborts = new Map<string, AbortController>();
+  const addLiveTurn = (sessionId: string, id: string, ctrl: AbortController) => {
     const ids = liveTurnIds.get(sessionId) ?? new Set<string>();
     ids.add(id);
     liveTurnIds.set(sessionId, ids);
+    turnAborts.set(id, ctrl);
   };
   const dropLiveTurn = (sessionId: string, id: string) => {
+    turnAborts.delete(id);
     const ids = liveTurnIds.get(sessionId);
     if (!ids) return;
     ids.delete(id);
@@ -449,7 +462,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     for (const sessionId of sessionIds) {
       const ctrl = activeStreamAborts.get(sessionId);
       if (!ctrl) continue; // nothing of ours is streaming for it
-      supervisorEndedTurns.add(sessionId);
+      // Per TURN, not per session: with two turns live, one session-wide flag would
+      // let the other still emit its own terminal — and a plain prompt_done arriving
+      // after this interruption would read as a turn that succeeded.
+      const sessionTurns = [...(liveTurnIds.get(sessionId) ?? [])];
+      for (const id of sessionTurns) supervisorEndedTurns.add(id);
+      if (sessionTurns.length === 0) supervisorEndedTurns.add(sessionId);
       try {
         frontendClient.emitEvent("chat.event", { sessionId, event: { type: "stream_error", error: detail } });
         // `aborted`/`reason` are additive: a consumer that does not read them sees the
@@ -477,6 +495,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       }
       // Abort AFTER reporting: it makes the consumer run its own finalization (partial
       // text persisted, running tool rows closed) so a reload agrees with the screen.
+      // EVERY live turn, not only the streaming one: a turn queued behind the session
+      // lock was just reported as interrupted, so it must not go on to start.
+      for (const id of sessionTurns) turnAborts.get(id)?.abort();
       ctrl.abort();
       activeStreamAborts.delete(sessionId);
     }
@@ -631,7 +652,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // which chat.abort previously had no local cancellation state to update.
     const turnAbort = new AbortController();
     registerPendingStart(sessionId, turnAbort);
-    addLiveTurn(sessionId, turnId);
+    addLiveTurn(sessionId, turnId, turnAbort);
     if (delegation?.delegationId) delegatedTurns.set(turnId, { delegationId: delegation.delegationId, sessionId });
     const throwIfStoppedBeforePrompt = () => {
       if (!turnAbort.signal.aborted) return;
@@ -805,7 +826,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
          * box removed under it). One-shot: the id is consumed, so a later turn on the same
          * session reports normally.
          */
-        const alreadyReported = () => supervisorEndedTurns.delete(promptResult.sessionId);
+        // Non-consuming for this turn: it reaches this question on more than one path
+        // and the answer must not change between them.
+        const alreadyReported = () =>
+          supervisorEndedTurns.has(turnId) || supervisorEndedTurns.delete(promptResult.sessionId);
 
         try {
           await consumeAgentSse({
@@ -885,6 +909,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         unregisterPendingStart(sessionId, turnAbort);
         dropLiveTurn(sessionId, turnId);
         delegatedTurns.delete(turnId);
+        supervisorEndedTurns.delete(turnId);
         releaseTurn?.();
       }
     })();
@@ -1588,8 +1613,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
     const pending = pendingStartAborts.get(sessionId);
     const active = activeStreamAborts.get(sessionId);
-    for (const ctrl of pending ?? []) ctrl.abort();
-    active?.abort();
 
     // Always ask the box, addressed by the turn being stopped. A cold-start Stop
     // used to be skipped here to avoid arming a session-wide pre-spawn latch that
@@ -1604,6 +1627,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // stopped. Falling back to a session-wide abort instead would arm a
     // session-wide pre-spawn latch, which is what the turn scoping exists to avoid.
     const targets = requestedTurnId ? [requestedTurnId] : liveTurns;
+    // Cancel exactly the turns being stopped. Aborting the session's controllers
+    // instead would break the RUNNING turn's consumer even when the request named a
+    // queued one — and the box, told only about the named turn, would leave the
+    // running one going with nobody reading it.
+    if (targets.some((id) => turnAborts.has(id))) {
+      for (const id of targets) turnAborts.get(id)?.abort();
+    } else {
+      // Nothing of ours is registered under these ids — a turn from before a restart,
+      // or a caller naming one we never saw. Fall back to the session's controllers.
+      for (const ctrl of pending ?? []) ctrl.abort();
+      active?.abort();
+    }
     // Stopping a session a box does not have is already the outcome the user asked for;
     // reporting it as a failed Stop would be a lie.
     const stopOne = (id?: string) => client.abortSession(sessionId, id).catch((err) => {

@@ -1348,9 +1348,15 @@ export function createHttpServer(
     const turnId = ((await parseJsonBody(req)) as { turnId?: string } | undefined)?.turnId;
     const managed = sessionManager.get(sessionId);
 
+    // A named turn that is not the one running is EITHER already finished OR not
+    // started yet — a prompt still in flight, or a session being rebuilt. Doing
+    // nothing would silently lose the second case, so record the intent instead: a
+    // turn-scoped latch only ever short-circuits that turn's own prompt, and expires
+    // harmlessly if it never arrives.
     if (managed && turnId !== undefined && managed._currentTurnId !== undefined && managed._currentTurnId !== turnId) {
-      console.log(`[agentbox-http] Abort for session ${sessionId} names turn ${turnId}, but ${managed._currentTurnId} is current; treating as already stopped`);
-      sendJson(res, 200, { ok: true, stale: true, stoppedJobs: 0 });
+      sessionManager.markPendingAbort(sessionId, turnId);
+      console.log(`[agentbox-http] Abort for session ${sessionId} names turn ${turnId}, but ${managed._currentTurnId} is current; recorded a pending abort for it`);
+      sendJson(res, 200, { ok: true, pending: true, stoppedJobs: 0 });
       return;
     }
 

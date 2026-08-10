@@ -515,7 +515,14 @@ export class AgentBoxSessionManager {
    * which a stale orphan could wrongly short-circuit a brand-new, deliberate prompt for the same
    * reused sessionId. 3 min covers cold start with margin while bounding that risk.
    */
-  private _pendingAborts = new Map<string, { timer: ReturnType<typeof setTimeout>; turnId?: string }>();
+  /**
+   * sessionId → (turnId, or "" for a session-wide latch) → expiry timer.
+   *
+   * One slot per session would let two turn-scoped latches overwrite each other:
+   * cancelling turn B while A is still running is a normal sequence, and dropping
+   * either latch loses a cancellation the caller was told had been accepted.
+   */
+  private _pendingAborts = new Map<string, Map<string, ReturnType<typeof setTimeout>>>();
   private static readonly PENDING_ABORT_TTL_MS = 180_000;
 
   /**
@@ -544,11 +551,18 @@ export class AgentBoxSessionManager {
         if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
       } catch { /* fall through — arm */ }
     }
-    const existing = this._pendingAborts.get(sessionId);
-    if (existing) clearTimeout(existing.timer);
-    const timer = setTimeout(() => this._pendingAborts.delete(sessionId), AgentBoxSessionManager.PENDING_ABORT_TTL_MS);
+    const slot = turnId ?? "";
+    const forSession = this._pendingAborts.get(sessionId) ?? new Map<string, ReturnType<typeof setTimeout>>();
+    const existing = forSession.get(slot);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      const current = this._pendingAborts.get(sessionId);
+      current?.delete(slot);
+      if (current && current.size === 0) this._pendingAborts.delete(sessionId);
+    }, AgentBoxSessionManager.PENDING_ABORT_TTL_MS);
     timer.unref?.();
-    this._pendingAborts.set(sessionId, { timer, turnId });
+    forSession.set(slot, timer);
+    this._pendingAborts.set(sessionId, forSession);
   }
 
   /**
@@ -558,11 +572,15 @@ export class AgentBoxSessionManager {
    * leaves it in place (its own prompt may still be on the way) and runs normally.
    */
   consumePendingAbort(sessionId: string, turnId?: string): boolean {
-    const entry = this._pendingAborts.get(sessionId);
-    if (!entry) return false;
-    if (entry.turnId !== undefined && entry.turnId !== turnId) return false;
-    clearTimeout(entry.timer);
-    this._pendingAborts.delete(sessionId);
+    const forSession = this._pendingAborts.get(sessionId);
+    if (!forSession) return false;
+    // This turn's own latch, or a session-wide one that names no turn. A latch for a
+    // DIFFERENT turn is left in place: its prompt may still be on the way.
+    const slot = turnId !== undefined && forSession.has(turnId) ? turnId : forSession.has("") ? "" : undefined;
+    if (slot === undefined) return false;
+    clearTimeout(forSession.get(slot)!);
+    forSession.delete(slot);
+    if (forSession.size === 0) this._pendingAborts.delete(sessionId);
     return true;
   }
 
