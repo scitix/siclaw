@@ -449,6 +449,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    */
   const supervisorEndedTurns = new Set<string>();
 
+
   const INTERRUPTION_MESSAGE: Record<InterruptionReason, string> = {
     runtime_restart: "Runtime restarted; this turn was interrupted",
     box_rolled: "The agentbox running this turn was replaced; the turn was interrupted",
@@ -538,16 +539,22 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // a Runtime roll, so a turn already reported as interrupted would keep running
       // there with nobody left to read it. Only a dispatched turn has a box to ask,
       // and `busyOn` is the record of that placement.
-      // Not for a box that was just removed: its endpoint is dead by definition, so
-      // the request would only hang out its timeout and log a misleading warning.
-      const placement = reason === "box_rolled" ? undefined : sessionTurnLocks.busyOn(sessionId);
+      // Including on a box roll. The box is NOT reliably gone by then: the manager
+      // reports the interruption before it asks the spawner to stop the box, and a
+      // failed stop is left for a later retry — so in that window the prompt keeps
+      // running, and producing tool side effects, with the consumer already dropped.
+      // A box that has in fact gone is simply the outcome we wanted, so failures here
+      // are ignored; only a shutdown, where the box is expected to answer, says so
+      // loudly.
+      const placement = sessionTurnLocks.busyOn(sessionId);
       if (placement) {
         const client = new AgentBoxClient(placement.endpoint, 10000, agentBoxTlsOptions);
         for (const id of sessionTurns) {
           started.push(client.abortSession(sessionId, id).catch((err) => {
-            // A box that is already gone is the outcome we wanted anyway.
             if (isSessionNotFound(err)) return;
-            console.warn(`[runtime] could not stop turn=${id} session=${sessionId} on ${placement.boxId}:`, err);
+            const message = `[runtime] could not stop turn=${id} session=${sessionId} on ${placement.boxId}: ${err instanceof Error ? err.message : String(err)}`;
+            if (reason === "box_rolled") console.log(`${message} (box may already be gone)`);
+            else console.warn(message);
           }));
         }
       }

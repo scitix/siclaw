@@ -575,6 +575,27 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(terminals[0].event).toMatchObject({ aborted: true, reason: "box_rolled" });
   });
 
+  it("stops the box turn on a box roll too, since the box is not reliably gone yet", async () => {
+    // The manager reports the interruption BEFORE it asks the spawner to stop the box,
+    // and a failed stop is left for a later retry — so in that window the prompt keeps
+    // running, and producing tool side effects, with the consumer already dropped.
+    consumerIgnoresAbort = true;
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    let terminator: ((ids: string[], reason: string) => unknown) | undefined;
+    manager.setTurnTerminator = vi.fn((fn: any) => { terminator = fn; });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+
+    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "rolled" }, { sendEvent: vi.fn() }) as { turnId?: string };
+    await waitFor(() => capturedSignal !== undefined);
+
+    terminator!(["rolled"], "box_rolled");
+    await waitFor(() => abortSessionCalls.length === 1);
+    expect(abortSessionCalls).toEqual(["rolled"]);
+    expect(abortSessionTurnIds).toEqual([ack.turnId]);
+  });
+
   it("binds an explicit steer message to the active prompt trace", async () => {
     server = await bootRuntime();
     const steer = server.rpcMethods.get("chat.steer")!;

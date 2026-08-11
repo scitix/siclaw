@@ -148,9 +148,11 @@ still start them. And because cancelling on the Runtime side does not end a prom
 the consumer only notices its signal on the next event, and a dropped subscription
 merely unsubscribes — the supervisor also asks the box to stop each dispatched turn
 by name. Boxes deliberately outlive a Runtime roll, so without that a turn already
-reported as interrupted keeps running there with nobody left to read it. A box that
-was just REMOVED is the exception: its endpoint is dead by definition, so there is
-nothing to ask.
+reported as interrupted keeps running there with nobody left to read it. This holds for a box
+removal as much as a shutdown: the removal is REPORTED before the box is asked to
+stop, and a failed stop is retried later, so in that window the prompt is still
+running and still producing side effects while its consumer is already gone. A box
+that has in fact gone simply answers nothing, which is the outcome that was wanted.
 
 Only the first supervisor pass over a turn reports it. A turn stays live until its
 consumer settles, and a real consumer settles only when its next event arrives, so a
