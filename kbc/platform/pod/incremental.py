@@ -29,8 +29,9 @@ from selfcheck import _is_en, candidate_pages, code_component, knowledge_type
 RAW_CHANGES_PATH = "authoring/RAW_CHANGES.json"
 # box → 模型:富集后的完整 changeset(模型这一轮只消费这个)。
 CHANGESET_PATH = "authoring/CHANGESET.json"
-# 模型 → box:模型把 added 源并入了哪些现存页(供越界护栏放行,否则并入会被误判越界)。
-# 用一个文件而非新 SDK 工具——模型写文件是它本来就会的动作,零协议扩张。
+# 模型 → box:模型申报本轮新增/改动源在依赖反查之外还必须更新的现存页。典型场景是
+# 新 Raw 给同一事实带来后续版本,旧说法所在页只引用旧 Raw,不在 affected_pages 中。
+# 沿用既有文件名保持协议兼容;用文件而非新 SDK 工具,零传输协议扩张。
 ADDED_TARGETS_PATH = "authoring/ADDED_TARGETS.json"
 
 # CHANGESET is synced as one workspace artifact. Keep the default aligned with
@@ -618,8 +619,12 @@ def materialize_changeset(workdir: str) -> dict | None:
 
 
 def load_added_targets(workdir: str) -> list[str]:
-    """模型申报的"我把 added 源并入了这些现存页"(authoring/ADDED_TARGETS.json,页名
-    数组)。缺失/损坏 → [](护栏就更严,并入会被判越界 → 逼模型申报,fail-safe 方向对)。"""
+    """模型申报的额外现存目标页(authoring/ADDED_TARGETS.json,页名数组)。
+
+    旧协议只让 added 源使用它;现在也允许 modified 源在明确的跨来源版本替代场景
+    使用。文件名与 JSON 形状不变,旧 box/agent 仍兼容。缺失/损坏 → [](护栏更严,
+    额外落笔会被判越界,fail-safe 方向对)。
+    """
     path = Path(workdir) / ADDED_TARGETS_PATH
     if not path.is_file():
         return []
@@ -631,8 +636,8 @@ def load_added_targets(workdir: str) -> list[str]:
 
 
 def authorized_pages(workdir: str, changeset: dict) -> set[str]:
-    """收尾护栏的"授权可改集":affected(modified/deleted 命中页)∪ 模型申报的 added
-    落笔页 ∪ index。`integrity_violations` 用它当 editable_pages。"""
+    """收尾护栏的授权可改集:affected(modified/deleted 命中页)∪ 模型申报的
+    额外来源变更目标页 ∪ index。`integrity_violations` 用它当 editable_pages。"""
     return set(changeset.get("affected_pages", [])) | set(load_added_targets(workdir)) | {INDEX_PAGE}
 
 
@@ -650,11 +655,20 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
             f"· {n_mod} modified source(s) → open each one's affected_pages and **edit only the facts"
             " the diff (+/−) touches — do not rewrite whole pages**; if a diff is empty (not provided),"
             " re-read that source and update the related facts in its affected pages"
-            " (still touching only those pages).",
+            " (still touching only those pages). If a changed fact clearly supersedes the same fact"
+            " on another existing page outside affected_pages, append that exact page to"
+            " authoring/ADDED_TARGETS.json before updating it; do not use this for general cleanup.",
             f"· {n_add} added source(s) → fold each into the most relevant existing page, or create a"
             " new page, per cascading-ingest; **if you merge into an existing page, you must append"
             " that page name to authoring/ADDED_TARGETS.json (a JSON array of page names)** —"
             " otherwise the closing integrity guard will flag it as out of scope.",
+            "· **Time-ordered supersession:** when explicit source version/effective-date semantics"
+            " show that a new claim replaces an older claim about the same entity, make the new claim"
+            " current, cite the new source, and retain the old claim only as dated/versioned history"
+            " with its old source. Remove the old value from current summaries/index wording. This is"
+            " not an unresolved contradiction. If chronology, authority, scope, or branch is unclear,"
+            " keep the alternatives conditional and use the normal suspect/ticket flow; never infer"
+            " freshness from ingestion time alone.",
             f"· {n_del} deleted source(s) → remove that source's content/references from its"
             " affected_pages; if a page ends up empty, delete it.",
             "· If the page set changes (pages created/deleted) → refresh index.md.",
@@ -678,7 +692,7 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
             " in-page fact fixes, slightly broad wording, or unsure → leave it."
             " One sentence, not a page list. Do not skip domain maintenance.",
             "· **Do not touch a single byte of any page outside affected_pages (plus your declared"
-            " added-target pages and index)** — the closing guard compares per-page sha256 hashes,"
+            " source-change target pages in ADDED_TARGETS.json and index)** — the closing guard compares per-page sha256 hashes,"
             " and any out-of-scope edit triggers a repair round."
             " (Reading index.md for domain is required; rewriting pages outside"
             " scope is still forbidden.)",
@@ -699,9 +713,15 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
     lines = [
         "【增量重编】本轮变更已由代码算好,写在 authoring/CHANGESET.json。**先读它**,只做范围内的事:",
         f"· 改动源 {n_mod} 个 → 打开各自 affected_pages,**按 diff(+/−)只改动到的那几处事实,不重写整页**;"
-        "若某条 diff 为空(未提供),就重读该源、对照更新受影响页里相关事实(仍只动这几页)。",
+        "若某条 diff 为空(未提供),就重读该源、对照更新受影响页里相关事实(仍只动这几页)。"
+        "若改动事实明确替代了 affected_pages 之外某现存页里的同一事实,先把该精确页名追加进"
+        " authoring/ADDED_TARGETS.json 再更新;不得借此顺手清理无关页。",
         f"· 新增源 {n_add} 个 → 按 cascading-ingest 编入最相关的现存页或建新页;**若并入某现存页,"
         "必须把该页名追加进 authoring/ADDED_TARGETS.json(页名数组)**,否则收尾护栏会当它越界。",
+        "· **时间版本收敛:**仅当来源里明确的版本/生效时间表明新说法替代同一对象的旧说法时,"
+        "把新说法写成当前结论并引用新源;旧说法只作为带日期/版本的历史沿革保留并引用旧源,"
+        "从当前摘要/index 口径中移除旧值。这不算未决矛盾。若先后、权威、适用范围或分支不明确,"
+        "就按条件并列并走存疑/工单,绝不能用摄取时间臆断谁更新。",
         f"· 删除源 {n_del} 个 → 从其 affected_pages 移除该源内容/引用;页因此清空则删页。",
         "· 页集若变(建/删页)→ 刷新 index.md。",
         # 领域是 AI 自维护、以「本轮改完后的最新整库」为锚;页编辑仍 scoped,领域维护另义务。
@@ -715,7 +735,7 @@ def build_scoped_directive(changeset: dict, locale: str | None = None) -> str:
         "空泛、相对目录过窄、仍宣称本轮已删能力、或会让路由漏掉本轮新增问题类 → 才 report_domain 重写;"
         "同主题加页、只改事实、略宽、吃不准 → 保持。"
         "一句领域,不要列页。领域维护不许跳过。",
-        "· **affected_pages(及你申报的 added 落笔页、index)之外的页,一个字节都别碰** —— 收尾逐页比对 sha256,碰了要回修。"
+        "· **affected_pages(及你在 ADDED_TARGETS.json 申报的来源变更目标页、index)之外的页,一个字节都别碰** —— 收尾逐页比对 sha256,碰了要回修。"
         "（为 domain **读** index.md 是必须的;改范围外正文仍禁止。）",
         "· 领域裁决照常按 constitution.md;遇新矛盾照走工单。改完简短说动了哪几页、domain 是否变了。",
     ]

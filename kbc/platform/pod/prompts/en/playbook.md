@@ -125,6 +125,22 @@ line saying what the other copies add** — not the same records transcribed ont
 three pages with small discrepancies between them, leaving him unsure which to
 believe.
 
+## Time-ordered supersession: newest current truth, traceable history
+
+When explicit versions, effective dates, or an unambiguous sequence in Raw show
+that a later claim replaces an earlier claim about the same entity, converge the
+Wiki instead of opening a contradiction merely because both sources remain:
+
+- write the later claim as the current conclusion and cite its source;
+- keep the earlier claim only in a clearly dated/versioned history note, citing
+  its original source; remove it from current summaries and index wording;
+- update every existing page that still presents the superseded claim as
+  current, while leaving unrelated pages byte-unchanged in an incremental round.
+
+Do not use ingestion time as evidence of freshness. If chronology, authority,
+scope, or branch is ambiguous, keep the alternatives conditional and use the
+normal `⚠️`/ticket flow.
+
 ## Page format (what a compiled page looks like)
 
 Each page:
@@ -146,3 +162,9 @@ status: stable
 These are OKF v0.2 concept documents: the YAML must parse and `type` must be a non-empty string. `sources` is a list of mappings and every row has a non-empty `resource`. Stamp agent-authored pages with `generated.by: process:siclaw-kbc` and `status: stable`. Never write `verified`; only a real reviewer or verification process may add it. Preserve unknown OKF fields when revising an existing page.
 
 The root `index.md` carries only `okf_version: "0.2"` in its frontmatter, then groups every page under Markdown headings with list entries like `- [Title](relative/path.md) - one-line description`. Use file-relative standard Markdown links throughout the bundle. Never emit `[[wikilinks]]` or `/`-prefixed bundle links. A nested `index.md` and any `log.md` have no frontmatter; `log.md` uses newest-first `## YYYY-MM-DD` groups.
+
+The current compiler supports exactly this OKF v0.2 output contract. An
+authorized renew target therefore means the finished artifact must converge to
+v0.2, including rewriting a legacy root version declaration; it is not merely
+context to mention in prose. Unsupported target versions are rejected before a
+compile turn starts.

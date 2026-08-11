@@ -59,6 +59,7 @@ MEDIA_ASSET_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".
 
 EXCLUSIONS_PATH = "authoring/EXCLUSIONS.json"
 SELFCHECK_PATH = "authoring/SELFCHECK.json"
+SUPPORTED_OKF_VERSION = "0.2"
 
 # TEST_ROLE = the standing identity of a read-only knowledge CONSUMER over a
 # pinned wiki snapshot. Single-sourced in the locale prompt packs
@@ -619,9 +620,10 @@ def _okf_index_violations(rel: str, text: str, concept_pages: set[str]) -> list[
             body = text
         elif not error and (set(fm or {}) != {"okf_version"}
               or not isinstance((fm or {}).get("okf_version"), str)
-              or (fm or {}).get("okf_version") != "0.2"):
+              or (fm or {}).get("okf_version") != SUPPORTED_OKF_VERSION):
             violations.append({"page": rel, "kind": "okf_index_frontmatter",
-                               "detail": "根 index.md frontmatter 必须且只能包含 okf_version: \"0.2\""})
+                               "detail": ("根 index.md frontmatter 必须且只能包含 "
+                                          f'okf_version: "{SUPPORTED_OKF_VERSION}"')})
         elif error:
             # OKF makes index.md optional and its root version declaration MAY;
             # Siclaw's producer profile below requires that declaration.

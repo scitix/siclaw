@@ -433,11 +433,46 @@ def test_added_targets_and_authorized():
         print("OK  added-target declaration + authorized_pages (strict when absent/malformed)")
 
 
+def test_cross_source_supersession_target():
+    """A changed source can supersede a fact on a page that cites only the old
+    source. The explicit target declaration authorizes that exact semantic edit
+    without weakening the byte guard for unrelated pages."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        _mk(base, "candidate/index.md", "---\nokf_version: \"0.2\"\n---\n# Index\n"
+            "- [Roadmap A](roadmap-a.md)\n- [Planning updates](planning-updates.md)\n"
+            "- [Unrelated](unrelated.md)")
+        _mk(base, "candidate/roadmap-a.md", _page(["roadmap-original.md"]) +
+            "\nRoadmap A current version: 0.2. (source: roadmap-original.md)")
+        _mk(base, "candidate/planning-updates.md", _page(["planning-updates.md"]))
+        _mk(base, "candidate/unrelated.md", _page(["unrelated.md"]))
+
+        cs = incremental.build_changeset(td, {"modified": ["planning-updates.md"]})
+        assert cs["affected_pages"] == ["planning-updates.md"], cs
+        before = incremental.page_hashes(td)
+        _mk(base, "candidate/roadmap-a.md", _page([
+            "roadmap-original.md", "planning-updates.md",
+        ]) + "\nRoadmap A current version: 0.3. (source: planning-updates.md)"
+             "\n\nHistory: 0.2 was superseded. (source: roadmap-original.md)")
+        after = incremental.page_hashes(td)
+
+        assert incremental.integrity_violations(
+            before, after, incremental.authorized_pages(td, cs)
+        ) == ["roadmap-a.md"]
+        _mk(base, "authoring/ADDED_TARGETS.json", json.dumps(["roadmap-a.md"]))
+        assert incremental.integrity_violations(
+            before, after, incremental.authorized_pages(td, cs)
+        ) == []
+        assert "unrelated.md" not in incremental.authorized_pages(td, cs)
+        print("OK  cross-source 0.2→0.3 supersession authorizes only the declared old-claim page")
+
+
 def test_scoped_directive():
     cs = {"added": [1], "modified": [1, 1], "deleted": []}
     d = incremental.build_scoped_directive(cs)                # default locale = English
     assert "CHANGESET.json" in d and "2 modified source(s)" in d and "1 added source(s)" in d
     assert "ADDED_TARGETS.json" in d and "sha256" in d  # declares the two contracts the guard depends on
+    assert "Time-ordered supersession" in d and "ingestion time" in d
     summarized = incremental.build_scoped_directive({
         **cs,
         "change_summary": {
@@ -461,6 +496,7 @@ def test_scoped_directive():
         assert "report_domain" in text, (locale, text)
         assert "index.md" in text, (locale, text)
     zh = incremental.build_scoped_directive(cs, locale="zh")
+    assert "时间版本收敛" in zh and "摄取时间" in zh
     assert "吃不准" in zh and "保持" in zh, zh
     assert "还没有 domain → 必须" in zh or "必须调一次 report_domain" in zh, zh
     assert "完整阅读" in zh or "完整" in zh, zh
@@ -510,6 +546,7 @@ if __name__ == "__main__":
     test_scope_over_budget_is_consumed_and_falls_back_once()
     test_budget_dropped_diff_is_explicit_without_summary()
     test_added_targets_and_authorized()
+    test_cross_source_supersession_target()
     test_scoped_directive()
     test_integrity_repair_directive()
     print("\nALL OK  test_incremental")

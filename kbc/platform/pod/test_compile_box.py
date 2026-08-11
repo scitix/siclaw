@@ -6508,6 +6508,12 @@ async def test_typed_authoring_commands():
                         "redaction": "none",
                         "content_locale": "auto",
                         "note": "keep examples",
+                    }, "renew": {
+                        "strategy": "contract_migration",
+                        "objective": "converge the stable draft",
+                        "scope": "full candidate catalog",
+                        "current_okf_version": "0.1",
+                        "target_okf_version": "0.2",
                     }},
                 },
             }
@@ -6516,6 +6522,8 @@ async def test_typed_authoring_commands():
             payload = await r.json()
             assert payload["action"] == "compile.generate" and len(run.client.queries) == 1, payload
             assert expected in run.client.queries[0], run.client.queries[0]
+            assert "contract_migration" in run.client.queries[0]
+            assert "0.1 -> 0.2" in run.client.queries[0]
             brief = json.loads((Path(td.name) / "authoring" / "BRIEF.json").read_text())
             assert brief == {
                 "schema_version": 1,
@@ -6543,6 +6551,18 @@ async def test_typed_authoring_commands():
             invalid_type["command"]["parameters"]["brief"]["knowledge_type"] = "repository"
             r = await client.post(f"/command/{run_id}", json=invalid_type)
             assert r.status == 400 and len(run.client.queries) == 1, await r.text()
+            invalid_renew = json.loads(json.dumps(body))
+            invalid_renew["command_id"] = f"bad-renew-{locale}"
+            invalid_renew["command"]["parameters"]["renew"]["strategy"] = "client_selected_magic"
+            r = await client.post(f"/command/{run_id}", json=invalid_renew)
+            assert r.status == 400 and len(run.client.queries) == 1, await r.text()
+            unsupported_contract = json.loads(json.dumps(body))
+            unsupported_contract["command_id"] = f"bad-okf-target-{locale}"
+            unsupported_contract["command"]["parameters"]["renew"]["target_okf_version"] = "0.3"
+            r = await client.post(f"/command/{run_id}", json=unsupported_contract)
+            assert r.status == 400 and "compiler-supported OKF version 0.2" in (
+                await r.json())["error"]
+            assert len(run.client.queries) == 1
             # An idempotency key binds one normalized payload; it cannot be
             # reinterpreted as a different action or generation.
             changed = json.loads(json.dumps(body))
@@ -6565,6 +6585,23 @@ async def test_typed_authoring_commands():
             r = await client.post(f"/command/{run_id}", json=other)
             assert r.status == 409, await r.text()
             td.cleanup()
+
+        # The renew target is bound to the deterministic artifact validator,
+        # not merely rendered into command prose. A legacy root stays red until
+        # the resulting artifact declares the supported target version.
+        concept = {"text": "---\ntype: Topic\ntitle: T\n---\nBody"}
+        legacy_artifact = {
+            "index.md": {"text": "---\nokf_version: \"0.1\"\n---\n# Index\n- [T](t.md)"},
+            "t.md": concept,
+        }
+        assert compile_box.selfcheck.SUPPORTED_OKF_VERSION == "0.2"
+        assert any(v["kind"] == "okf_index_frontmatter"
+                   for v in compile_box.selfcheck.format_policy_violations(legacy_artifact))
+        migrated_artifact = {
+            **legacy_artifact,
+            "index.md": {"text": "---\nokf_version: \"0.2\"\n---\n# Index\n- [T](t.md)"},
+        }
+        assert compile_box.selfcheck.format_policy_violations(migrated_artifact) == []
 
         with tempfile.TemporaryDirectory() as td:
             run = compile_box.CompileRun("cmd-bad-json", td, 1)
