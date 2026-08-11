@@ -263,6 +263,24 @@ describe("handleDelegate — model-failure propagation (P1)", () => {
   });
 });
 
+describe("handleDelegate — admission fence", () => {
+  it("refuses a delegation once the Runtime is shutting down", async () => {
+    // This endpoint starts AgentBox work of its own, so it honours the same fence as an
+    // ordinary turn: a peer admitted now would run on a box that outlives the Runtime,
+    // with a coordinator waiting on a result that never comes. Refusing is an answer.
+    const deps = { ...makeDeps({ found: true, user_id: "u", agent_id: COORD }), isShuttingDown: () => true };
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps as any);
+
+    expect(res.statusCode).toBe(503);
+    expect((res.jsonBody as any)?.error).toMatch(/shutting down/);
+    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+    // Not even the roster lookup: nothing about this request should reach the control plane.
+    expect(deps.frontendClient.request).not.toHaveBeenCalled();
+  });
+});
+
 describe("handleDelegate — cross-Runtime routing", () => {
   it("routes a remote peer through Sicore and never creates it in the coordinator AgentBoxManager", async () => {
     const deps = makeDeps({ found: true, user_id: "u", agent_id: COORD });

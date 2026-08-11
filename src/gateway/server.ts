@@ -380,10 +380,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   let shuttingDown = false;
 
   /**
-   * Turns whose box has already been asked to stop them, so a repeated drain pass does
-   * not ask again. Without this, a turn whose consumer never settles stays live and
-   * every pass would re-issue its abort — a tight loop against the box for as long as
-   * the shutdown deadline allows.
+   * Turns whose box has been asked to stop them and has not refused, so a later pass
+   * does not ask again. Without it, a box roll followed by a shutdown asks twice.
+   *
+   * A FAILED attempt is removed again: the case this abort exists for is a box removal
+   * whose `spawner.stop()` also failed, and treating a timed-out abort as done would
+   * spend the only retry a shutdown could have made — leaving the prompt headless on a
+   * box that is still there.
    */
   const boxAbortAsked = new Set<string>();
 
@@ -579,6 +582,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           boxAbortAsked.add(id);
           started.push(trackForShutdown(client.abortSession(sessionId, id).catch((err) => {
             if (isSessionNotFound(err)) return;
+            // Not done after all — let a later pass, or a shutdown, try again.
+            boxAbortAsked.delete(id);
             const message = `[runtime] could not stop turn=${id} session=${sessionId} on ${placement.boxId}: ${err instanceof Error ? err.message : String(err)}`;
             if (reason === "box_rolled") console.log(`${message} (box may already be gone)`);
             else console.warn(message);
@@ -602,14 +607,20 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // Fence first: from here no new turn is admitted, so the passes below converge.
     // Fence FIRST, then take stock once.
     //
-    // The fence is what makes one snapshot sufficient. Producers do outlive this drain —
-    // the command lane stays open so terminals can still be delivered, the servers are
-    // still listening, the manager's loops run until later — but after it, none of them
-    // can add work this snapshot would miss: no new turn is admitted; a turn that
-    // finishes now finds itself already reported and does not report again; and a box
-    // removal finds every live turn claimed and already asked to stop. Re-scanning was
-    // tried and removed for exactly that reason — nothing reachable turned up in a
-    // second pass, and unexercised machinery on the shutdown path is its own hazard.
+    // The fence is what makes one snapshot sufficient FOR THE TURNS THIS DRAIN COVERS —
+    // the chat.send and delegation ingresses, which are the only ones ever registered in
+    // liveTurnIds. After it, none of their producers can add work this snapshot would
+    // miss: no new turn is admitted; a turn that finishes now finds itself already
+    // reported and does not report again; and a box removal finds every live turn
+    // claimed and already asked to stop. Re-scanning was tried and removed for exactly
+    // that reason — nothing reachable turned up in a second pass, and unexercised
+    // machinery on the shutdown path is its own hazard.
+    //
+    // Other producers of AgentBox work — the task coordinator's cron/fire-now jobs and
+    // capability runs — keep their own clients and were never registered here, so they
+    // are neither fenced nor drained. That predates this drain and is not narrowed by
+    // it; closing it means giving those paths the same admission gate and registration,
+    // which is its own change.
     shuttingDown = true;
 
     // Streaming turns AND cold-starting ones: both are ours, and both leave a caller
@@ -2253,7 +2264,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // task to a peer agent; gateway prompts the peer + returns its artifact.
           if (url === "/api/internal/delegate" && method === "POST") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            void handleDelegate(req, res, identity, { agentBoxManager, agentBoxTlsOptions, frontendClient });
+            void handleDelegate(req, res, identity, { agentBoxManager, agentBoxTlsOptions, frontendClient, isShuttingDown: () => shuttingDown });
             return;
           }
 

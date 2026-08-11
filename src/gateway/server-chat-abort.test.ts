@@ -692,6 +692,32 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(frontendClient.close).toHaveBeenCalled();
   });
 
+  it("retries a box abort that failed, instead of counting it as asked", async () => {
+    // The case this abort exists for is a box removal whose own stop also failed, so
+    // treating a timed-out abort as done would spend the only retry a shutdown had.
+    consumerIgnoresAbort = true;
+    abortSessionError = new Error("box did not answer");
+
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    let terminator: ((ids: string[], reason: string) => unknown) | undefined;
+    manager.setTurnTerminator = vi.fn((fn: any) => { terminator = fn; });
+    server = await bootRuntime(manager);
+    const send = server.rpcMethods.get("chat.send")!;
+
+    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "retry-abort" }, { sendEvent: vi.fn() }) as { turnId?: string };
+    await waitFor(() => capturedSignal !== undefined);
+
+    terminator!(["retry-abort"], "box_rolled");
+    await waitFor(() => abortSessionCalls.length === 1);
+
+    // Shutdown must ask again, because the first attempt was refused.
+    await server.close();
+    server = undefined;
+    expect(abortSessionCalls).toEqual(["retry-abort", "retry-abort"]);
+    expect(abortSessionTurnIds).toEqual([ack.turnId, ack.turnId]);
+  });
+
   it("binds an explicit steer message to the active prompt trace", async () => {
     server = await bootRuntime();
     const steer = server.rpcMethods.get("chat.steer")!;

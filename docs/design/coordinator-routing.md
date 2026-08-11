@@ -173,7 +173,16 @@ looked, and go on running on a box that is deliberately kept. This reverses an e
 call that admitted such a turn so it could report itself: a refusal is an explicit
 error the caller can act on by placing the turn elsewhere, which is more than an
 unsupervised turn offers. The fence is also what makes ONE snapshot sufficient, since a
-turn is registered before any await in its own handler.
+turn is registered before any await in its own handler. It applies to the delegation
+ingress as well, which starts AgentBox work of its own and would otherwise leave a peer
+running with a coordinator waiting on a result that never comes.
+
+The scope of that invariant is worth stating plainly: it covers the turns this drain has
+ever known about — the chat.send and delegation ingresses. Other producers of AgentBox
+work, the task coordinator's scheduled and fire-now jobs and capability runs, keep their
+own clients and are registered nowhere here, so they are neither fenced nor drained.
+That predates this contract rather than following from it, and closing it means giving
+those paths the same admission gate and registration.
 
 Neither delivery nor the box abort holds the turn open, and both outlive it centrally
 rather than through whatever the supervisor's caller does with a return value: a box

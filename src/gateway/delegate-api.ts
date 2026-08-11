@@ -131,6 +131,14 @@ export interface DelegateApiDeps {
   agentBoxManager: AgentBoxManager;
   agentBoxTlsOptions?: AgentBoxTlsOptions;
   frontendClient: FrontendWsClient;
+  /**
+   * True once the Runtime has begun shutting down. This endpoint starts AgentBox work
+   * of its own, so it has to honour the same admission fence as an ordinary turn:
+   * accepting a delegation the process will not be around to supervise leaves the peer
+   * running on a box that outlives the Runtime, with a coordinator waiting on a result
+   * that will never come.
+   */
+  isShuttingDown?: () => boolean;
 }
 
 async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
@@ -298,6 +306,12 @@ export async function handleDelegate(
   res.on("close", onResponseClose);
   if (res.destroyed) onResponseClose();
   const cancelled = () => peerAbort.signal.aborted || res.destroyed;
+
+  if (deps.isShuttingDown?.()) {
+    // Refusing is an answer the coordinator can act on; an unsupervised peer turn is not.
+    sendJson(res, 503, { error: "Runtime is shutting down; delegation was not started" });
+    return;
+  }
 
   // 1. Authorize: the peer MUST be in this coordinator's roster (config-time
   //    authorization; the box's own claim is never trusted).
