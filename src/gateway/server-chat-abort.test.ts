@@ -56,6 +56,8 @@ let promptError: Error | undefined;
 let promptBlocker: Promise<void> | undefined;
 // Set to make the fake box refuse the abort.
 let abortSessionError: Error | undefined;
+// Holds abortSession open, to model a box that has not answered yet.
+let abortSessionBlocker: Promise<void> | undefined;
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     endpoint: string;
@@ -71,6 +73,7 @@ vi.mock("./agentbox/client.js", () => ({
     abortSession = vi.fn(async (sessionId: string, turnId?: string) => {
       abortSessionCalls.push(sessionId);
       abortSessionTurnIds.push(turnId);
+      if (abortSessionBlocker) await abortSessionBlocker;
       if (abortSessionError) throw abortSessionError;
     });
     steerSession = vi.fn(async () => ({ ok: true, traceId: "fedcba9876543210fedcba9876543210" }));
@@ -131,6 +134,7 @@ afterEach(async () => {
   abortSessionCalls.length = 0;
   abortSessionTurnIds.length = 0;
   abortSessionError = undefined;
+  abortSessionBlocker = undefined;
   vi.clearAllMocks();
 });
 
@@ -594,6 +598,43 @@ describe("startRuntime — chat.abort wiring", () => {
     await waitFor(() => abortSessionCalls.length === 1);
     expect(abortSessionCalls).toEqual(["rolled"]);
     expect(abortSessionTurnIds).toEqual([ack.turnId]);
+  });
+
+  it("waits for a box-roll abort that has not landed when shutdown starts", async () => {
+    // Its own session id: a test whose consumer never settles holds that session's turn
+    // lock for the rest of the file, and sessionTurnLocks is process-wide.
+    //
+    // The box-removal caller discards whatever endTurns() returns, and the turn leaves
+    // liveTurnIds as soon as its consumer settles — so unless the abort is tracked
+    // centrally, a SIGTERM right after sees nothing pending and the process exits with
+    // the abort in flight. K8s keeps the boxes, so the turn would run on headless.
+    let releaseAbort: (() => void) | undefined;
+    abortSessionBlocker = new Promise<void>((resolve) => { releaseAbort = resolve; });
+
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    let terminator: ((ids: string[], reason: string) => unknown) | undefined;
+    manager.setTurnTerminator = vi.fn((fn: any) => { terminator = fn; });
+    const frontendClient = fakeFrontendClient();
+    server = await bootRuntime(manager, frontendClient);
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "roll-abort-wait" }, { sendEvent: vi.fn() });
+    await waitFor(() => capturedSignal !== undefined);
+
+    terminator!(["roll-abort-wait"], "box_rolled");
+    // The abort is in flight, and the consumer has settled on its abort signal, so the
+    // turn is already gone from the Runtime's own bookkeeping.
+    await waitFor(() => abortSessionCalls.length === 1);
+    await waitFor(() => capturedSignal!.aborted);
+
+    const closing = server.close();
+    server = undefined;
+    await new Promise((r) => setTimeout(r, 50));
+    expect(frontendClient.close).not.toHaveBeenCalled();
+    releaseAbort?.();
+    await closing;
+    expect(frontendClient.close).toHaveBeenCalled();
   });
 
   it("binds an explicit steer message to the active prompt trace", async () => {

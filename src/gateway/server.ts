@@ -354,18 +354,25 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    */
   const delegatedTurns = new Map<string, { delegationId: string; sessionId: string }>();
   /**
-   * Acknowledged deliveries still in flight, so shutdown can flush them.
+   * Work that outlives the turn it belongs to and that shutdown must still flush.
    *
-   * A delivery may retry for as long as a reconnect takes, which is far too long to
-   * hold a turn open for: the session lock, the streaming registration and the
-   * supervisor's view of the turn would all stay occupied, blocking the next turn on
-   * that session and letting a SIGTERM re-report an already-finished turn as
-   * interrupted. The turn settles immediately and its delivery continues here.
+   * Two kinds end up here. An acknowledged terminal delivery may retry for as long as
+   * a reconnect takes, which is far too long to hold a turn open for: the session
+   * lock, the streaming registration and the supervisor's view of the turn would all
+   * stay occupied, blocking the next turn on that session and letting a SIGTERM
+   * re-report an already-finished turn as interrupted. And the box abort a supervisor
+   * issues must land even though the turn it names may leave `liveTurnIds` the moment
+   * its consumer settles — the box outlives a Runtime roll, and the process exits as
+   * soon as close() returns.
+   *
+   * The turn settles at once either way; what it started continues here, centrally,
+   * because the box-removal caller discards whatever endTurns() returns.
    */
-  const inFlightTerminalDeliveries = new Set<Promise<void>>();
-  const trackTerminalDelivery = (delivery: Promise<void>): void => {
-    inFlightTerminalDeliveries.add(delivery);
-    void delivery.finally(() => inFlightTerminalDeliveries.delete(delivery));
+  const pendingShutdownWork = new Set<Promise<void>>();
+  const trackForShutdown = (work: Promise<void>): Promise<void> => {
+    pendingShutdownWork.add(work);
+    void work.finally(() => pendingShutdownWork.delete(work));
+    return work;
   };
 
   /**
@@ -522,8 +529,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           aborted: true,
           reason,
         });
-        trackTerminalDelivery(delivery);
-        started.push(delivery);
+        started.push(trackForShutdown(delivery));
       }
       // Abort AFTER reporting: it makes the consumer run its own finalization (partial
       // text persisted, running tool rows closed) so a reload agrees with the screen.
@@ -550,12 +556,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       if (placement) {
         const client = new AgentBoxClient(placement.endpoint, 10000, agentBoxTlsOptions);
         for (const id of sessionTurns) {
-          started.push(client.abortSession(sessionId, id).catch((err) => {
+          started.push(trackForShutdown(client.abortSession(sessionId, id).catch((err) => {
             if (isSessionNotFound(err)) return;
             const message = `[runtime] could not stop turn=${id} session=${sessionId} on ${placement.boxId}: ${err instanceof Error ? err.message : String(err)}`;
             if (reason === "box_rolled") console.log(`${message} (box may already be gone)`);
             else console.warn(message);
-          }));
+          })));
         }
       }
     }
@@ -575,8 +581,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // Streaming turns AND cold-starting ones: both are ours, and both leave a caller
     // waiting if they simply vanish.
     const sessionIds = [...new Set([...activeStreamAborts.keys(), ...liveTurnIds.keys()])];
-    const alreadyDelivering = [...inFlightTerminalDeliveries];
-    if (sessionIds.length === 0 && alreadyDelivering.length === 0) return;
+    const alreadyPending = [...pendingShutdownWork];
+    if (sessionIds.length === 0 && alreadyPending.length === 0) return;
     // Say it happened. Reporting used to be silent on success, so the only way to tell
     // whether a restart had ended its turns was to go ask the consumer — during an
     // incident, from the outside. The failure path already logs; this is its other half.
@@ -586,7 +592,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // A turn that already reported its own terminal may still be retrying delivery;
     // that is exactly the report its caller needs, so wait for it too — as is any
     // terminal a box removal started before this shutdown began.
-    const deliveries = [...endTurns(sessionIds, "runtime_restart"), ...alreadyDelivering];
+    const deliveries = [...endTurns(sessionIds, "runtime_restart"), ...alreadyPending];
     if (deliveries.length === 0) return;
     await Promise.race([
       Promise.allSettled(deliveries),
@@ -664,7 +670,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       const delegationId = delegation?.delegationId;
       if (!delegationId) return;
       delegatedTurns.delete(turnId);
-      trackTerminalDelivery(deliverDelegationTerminal(delegationId, sessionId, turnId, event));
+      void trackForShutdown(deliverDelegationTerminal(delegationId, sessionId, turnId, event));
     };
     const promptOpts: PromptOptions = {
       sessionId,

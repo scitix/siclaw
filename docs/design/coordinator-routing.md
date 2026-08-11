@@ -165,6 +165,12 @@ emit a plain terminal that reads as a turn which succeeded. Those paths bypass t
 reporting, which is exactly why they needed their own way to reach it, and shutdown
 waits briefly for those deliveries before closing the transport they travel over.
 
+Neither delivery nor the box abort holds the turn open, and both outlive it centrally
+rather than through whatever the supervisor's caller does with a return value: a box
+removal discards it, and the turn leaves the Runtime's bookkeeping the moment its
+consumer settles, so a shutdown an instant later would otherwise see nothing pending
+and exit with the work in flight.
+
 Delivery does not hold the turn open. A retry budget measured in reconnects is far
 too long to keep a session lock, a streaming registration and the supervisor's view
 of a live turn occupied; the turn settles at once and deregisters itself, which is
