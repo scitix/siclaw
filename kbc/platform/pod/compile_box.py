@@ -1575,6 +1575,11 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
             "target_okf_version": _bounded_string(
                 renew.get("target_okf_version"), "renew.target_okf_version", required=True, limit=32),
         }
+        if normalized_renew["target_okf_version"] != selfcheck.SUPPORTED_OKF_VERSION:
+            raise CommandRejected(
+                "renew.target_okf_version must match the compiler-supported "
+                f"OKF version {selfcheck.SUPPORTED_OKF_VERSION}"
+            )
         parameters = {**parameters, "renew": normalized_renew}
 
     if action == "compile.approve_plan":
