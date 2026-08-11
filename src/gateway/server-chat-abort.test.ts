@@ -31,12 +31,16 @@ vi.mock("./output-redactor.js", () => ({
 // that is mid-tool when the user hits Stop. capturedSignal lets the test observe
 // whether chat.abort actually aborted it.
 let capturedSignal: AbortSignal | undefined;
+// A real consumer notices its abort only when the NEXT event arrives, so a turn can
+// stay live across two supervisor passes. Set this to model that.
+let consumerIgnoresAbort = false;
 vi.mock("./sse-consumer.js", () => ({
   consumeAgentSse: vi.fn((opts: { signal?: AbortSignal }) => {
     capturedSignal = opts.signal;
     return new Promise((resolve) => {
       const done = () =>
         resolve({ resultText: "", taskReportText: "", errorMessage: "", eventCount: 0, durationMs: 0 });
+      if (consumerIgnoresAbort) return;
       if (opts.signal?.aborted) return done();
       opts.signal?.addEventListener("abort", done, { once: true });
     });
@@ -119,6 +123,7 @@ afterEach(async () => {
   if (server) await server.close();
   server = undefined;
   capturedSignal = undefined;
+  consumerIgnoresAbort = false;
   abortSessionCalls.length = 0;
   promptCalls.length = 0;
   promptError = undefined;
@@ -529,6 +534,45 @@ describe("startRuntime — chat.abort wiring", () => {
     releaseTerminal?.();
     await closing;
     expect(frontendClient.close).toHaveBeenCalled();
+  });
+
+  it("reports a supervisor-interrupted turn once, keeping the first cause", async () => {
+    // A turn stays live until its consumer settles, and a real consumer settles only
+    // on its next event — so a box removal followed by a shutdown reaches the same
+    // turn twice. Two authoritative terminals with different reasons would then race,
+    // and the retry winner would name the cause.
+    consumerIgnoresAbort = true;
+    const frontendClient = fakeFrontendClient();
+    const terminals: any[] = [];
+    frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "delegation.terminal") {
+        terminals.push(params);
+        return { ok: true };
+      }
+      return { found: false };
+    });
+
+    const manager = fakeAgentBoxManager();
+    let terminator: ((ids: string[], reason: string) => unknown) | undefined;
+    manager.setTurnTerminator = vi.fn((fn: any) => { terminator = fn; });
+    server = await bootRuntime(manager, frontendClient);
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({
+      agentId: "a", userId: "u", text: "inspect", sessionId: "twice",
+      delegation: { delegationId: "d-twice", parentAgentId: "coord", readOnly: false },
+    }, { sendEvent: vi.fn() });
+    await waitFor(() => capturedSignal !== undefined);
+
+    terminator!(["twice"], "box_rolled");
+    await waitFor(() => terminals.length === 1);
+
+    // Shutdown sees the turn still live, because its consumer never settled.
+    await server.close();
+    server = undefined;
+
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0].event).toMatchObject({ aborted: true, reason: "box_rolled" });
   });
 
   it("binds an explicit steer message to the active prompt trace", async () => {

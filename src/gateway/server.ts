@@ -485,25 +485,35 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // let the other still emit its own terminal — and a plain prompt_done arriving
       // after this interruption would read as a turn that succeeded.
       const sessionTurns = [...(liveTurnIds.get(sessionId) ?? [])];
+      // CLAIM before reporting. A turn stays live until its consumer settles, and a
+      // real consumer settles only when its next event arrives — so a box removal
+      // followed by a shutdown can reach the same turn twice. Reporting twice would
+      // put two authoritative terminals with DIFFERENT reasons in flight, and
+      // whichever won the retry race would name the cause. The first pass owns the
+      // report; a later one still cancels, and the delivery it needs is already
+      // tracked.
+      const unreported = sessionTurns.filter((id) => !supervisorEndedTurns.has(id));
       for (const id of sessionTurns) supervisorEndedTurns.add(id);
-      if (sessionTurns.length === 0) supervisorEndedTurns.add(sessionId);
-      try {
-        frontendClient.emitEvent("chat.event", { sessionId, event: { type: "stream_error", error: detail } });
-        // `aborted`/`reason` are additive: a consumer that does not read them sees the
-        // plain terminal it already handles, one that does can name the cause instead of
-        // rendering a generic connection failure.
-        frontendClient.emitEvent("chat.event", {
-          sessionId,
-          event: { type: "prompt_done", aborted: true, reason },
-        });
-      } catch (err) {
-        // Best effort: a consumer that already went away must not stop what caused this.
-        console.warn(`[runtime] could not report interrupted turn session=${sessionId}:`, err);
+      const ownsTheReport = sessionTurns.length === 0 || unreported.length > 0;
+      if (ownsTheReport) {
+        try {
+          frontendClient.emitEvent("chat.event", { sessionId, event: { type: "stream_error", error: detail } });
+          // `aborted`/`reason` are additive: a consumer that does not read them sees the
+          // plain terminal it already handles, one that does can name the cause instead of
+          // rendering a generic connection failure.
+          frontendClient.emitEvent("chat.event", {
+            sessionId,
+            event: { type: "prompt_done", aborted: true, reason },
+          });
+        } catch (err) {
+          // Best effort: a consumer that already went away must not stop what caused this.
+          console.warn(`[runtime] could not report interrupted turn session=${sessionId}:`, err);
+        }
       }
       // A delegated turn's caller is a machine that will otherwise wait out its idle
       // window and report a failure. Same terminal, but acknowledged — detached,
       // because this runs on the shutdown path and must not hold it open.
-      for (const turnId of liveTurnIds.get(sessionId) ?? []) {
+      for (const turnId of unreported) {
         const delegated = delegatedTurns.get(turnId);
         if (!delegated) continue;
         const delivery = deliverDelegationTerminal(delegated.delegationId, sessionId, turnId, {
@@ -528,7 +538,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // a Runtime roll, so a turn already reported as interrupted would keep running
       // there with nobody left to read it. Only a dispatched turn has a box to ask,
       // and `busyOn` is the record of that placement.
-      const placement = sessionTurnLocks.busyOn(sessionId);
+      // Not for a box that was just removed: its endpoint is dead by definition, so
+      // the request would only hang out its timeout and log a misleading warning.
+      const placement = reason === "box_rolled" ? undefined : sessionTurnLocks.busyOn(sessionId);
       if (placement) {
         const client = new AgentBoxClient(placement.endpoint, 10000, agentBoxTlsOptions);
         for (const id of sessionTurns) {

@@ -148,7 +148,16 @@ still start them. And because cancelling on the Runtime side does not end a prom
 the consumer only notices its signal on the next event, and a dropped subscription
 merely unsubscribes — the supervisor also asks the box to stop each dispatched turn
 by name. Boxes deliberately outlive a Runtime roll, so without that a turn already
-reported as interrupted keeps running there with nobody left to read it. The suppression
+reported as interrupted keeps running there with nobody left to read it. A box that
+was just REMOVED is the exception: its endpoint is dead by definition, so there is
+nothing to ask.
+
+Only the first supervisor pass over a turn reports it. A turn stays live until its
+consumer settles, and a real consumer settles only when its next event arrives, so a
+box removal followed by a shutdown reaches the same turn twice — two authoritative
+terminals with different causes would then race, and the retry winner would name the
+cause. Later passes still cancel, and the delivery they would need is already
+tracked. The suppression
 of a turn's own reporting is likewise per turn, or the other live turn would still
 emit a plain terminal that reads as a turn which succeeded. Those paths bypass the turn's own
 reporting, which is exactly why they needed their own way to reach it, and shutdown
