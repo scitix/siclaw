@@ -298,28 +298,31 @@ export async function handleDelegate(
   let delegationId = "";
   let peerSessionId = "";
   let remoteStartRequested = false;
-  const onResponseClose = () => {
+  /**
+   * Wind this delegation down, RETURNING the abort it issues.
+   *
+   * A client disconnect can fire and forget; a shutdown cannot — it has to wait for the
+   * abort to land before the transport closes and the process exits, so this hands the
+   * promise back instead of scheduling it and returning void.
+   */
+  const cancelPeerWork = async (): Promise<void> => {
     if (finished) return;
     peerAbort.abort();
     if (route && !route.local && remoteStartRequested && delegationId) {
-      deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch((err) => {
+      await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch((err) => {
         console.warn(`[delegate-api] failed to abort remote delegation ${delegationId}:`, err);
       });
       return;
     }
     if (peerClient) {
-      peerClient.abortSession(peerSessionId, localTurnId).catch((err) => {
+      await peerClient.abortSession(peerSessionId, localTurnId).catch((err) => {
         console.warn(`[delegate-api] failed to abort peer session ${peerSessionId}:`, err);
       });
     }
   };
+  const onResponseClose = () => { void cancelPeerWork(); };
   res.on("close", onResponseClose);
   if (res.destroyed) onResponseClose();
-  // Same wind-down a client disconnect triggers: abort the peer, and for a remote peer
-  // tell the control plane. Registered from here so a shutdown reaches a delegation that
-  // is already under way, not only the ones it can still refuse.
-  const unregisterFromShutdown = deps.shutdownGate?.register(() => onResponseClose()) ?? (() => {});
-  const releaseShutdownRegistration = () => { try { unregisterFromShutdown(); } catch { /* already gone */ } };
   const cancelled = () => peerAbort.signal.aborted || res.destroyed;
 
   if (deps.shutdownGate?.isShuttingDown()) {
@@ -549,6 +552,11 @@ export async function handleDelegate(
       resolveRemoteDone = resolve;
       rejectRemoteDone = reject;
     });
+    // Cancellation can reject this while we are still awaiting delegation.start, which
+    // is before anything awaits remoteDone — an unhandled rejection that takes the
+    // process's exit code with it. Marking it handled here changes nothing about the
+    // await below, which still observes the rejection.
+    void remoteDone.catch(() => {});
 
     const idleTimeoutMs = getRemoteDelegationIdleTimeoutMs();
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -707,11 +715,19 @@ export async function handleDelegate(
   // sessions, so with more than one box two delegations could run on two boxes at once.
   // Acquired INSIDE the try because the SSE response headers are already written.
   let releaseTurn: (() => void) | undefined;
+  let unregisterFromShutdown: (() => void) | undefined;
   try {
     // Serialize both local and remote continuation of one peer session. The
     // target Runtime has its own in-flight guard, but the source owns reuse and
     // can reject a duplicate before creating cross-Runtime work.
     releaseTurn = await sessionTurnLocks.acquire(peerSessionId);
+    // Register the wind-down HERE, not at the top of the handler: everything from this
+    // point is inside the try/finally below, so the hook is released on every exit. An
+    // earlier registration leaked one closure per rejected request — authorization,
+    // binding, route, parent, persistence — for the lifetime of the Runtime, and
+    // shutdown would later invoke stale hooks. Nothing before this point has peer work
+    // to wind down anyway; the gate re-read below is what covers that window.
+    unregisterFromShutdown = deps.shutdownGate?.register(() => cancelPeerWork());
     // Re-read the gate HERE, not only at entry: this is the last moment before work
     // reaches a box, and everything in between was awaited.
     if (deps.shutdownGate?.isShuttingDown()) {
@@ -770,7 +786,7 @@ export async function handleDelegate(
     return;
   } finally {
     releaseTurn?.();
-    releaseShutdownRegistration();
+    try { unregisterFromShutdown?.(); } catch { /* already gone */ }
   }
 
   finished = true;

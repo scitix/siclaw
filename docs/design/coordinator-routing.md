@@ -179,6 +179,10 @@ running with a coordinator waiting on a result that never comes. One sample at t
 endpoint's entry is not enough — everything between it and the dispatch is awaited, so
 the gate is re-read at the dispatch boundary, and the handler registers a wind-down so a
 delegation already under way is stopped by the same shutdown rather than outliving it.
+That hook RETURNS its abort rather than scheduling it: a client disconnect can fire and
+forget, but a shutdown has to wait for the abort to land before the transport closes. It
+is registered inside the scope whose `finally` always runs, so a request rejected before
+dispatch cannot leave a hook behind for the lifetime of the process.
 
 An abort a supervisor sends retries itself rather than relying on a later look. A caller
 that looks again finds the turn already asked about while the first attempt is still

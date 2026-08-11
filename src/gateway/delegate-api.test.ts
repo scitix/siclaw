@@ -315,6 +315,51 @@ describe("handleDelegate — admission fence", () => {
     expect(promptMock).not.toHaveBeenCalled();
   });
 
+  it("hands the shutdown a wind-down it can WAIT for, not one it merely starts", async () => {
+    // A client disconnect can fire and forget; a shutdown cannot. If the hook returns
+    // before its abort lands, the transport closes and the process exits underneath it.
+    let cancel: (() => Promise<void> | void) | undefined;
+    let releaseAbort: (() => void) | undefined;
+    let abortHeld = false;
+    const deps: any = {
+      ...makeDeps({ found: true, user_id: "u", agent_id: COORD }),
+      shutdownGate: {
+        isShuttingDown: () => false,
+        register: (fn: () => Promise<void> | void) => { cancel = fn; return () => { cancel = undefined; }; },
+      },
+    };
+    deps.frontendClient.request = vi.fn(async (method: string) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") return { ok: true };
+      if (method === "delegation.abort") {
+        // Only the wind-down's own request is held; the handler's follow-up must not
+        // deadlock the test.
+        if (!abortHeld) {
+          abortHeld = true;
+          await new Promise<void>((resolve) => { releaseAbort = resolve; });
+        }
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const res = makeRes();
+    const handling = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+    await vi.waitFor(() => expect(cancel).toBeDefined());
+
+    // What shutdown does with the hook: it awaits the returned promise.
+    let windDownSettled = false;
+    const windDown = Promise.resolve().then(() => cancel!()).then(() => { windDownSettled = true; });
+    await vi.waitFor(() => expect(releaseAbort).toBeDefined());
+    expect(windDownSettled).toBe(false);
+
+    releaseAbort!();
+    await windDown;
+    expect(windDownSettled).toBe(true);
+    await handling;
+  });
+
   it("registers a wind-down so a shutdown reaches a delegation already under way", async () => {
     // Past refusing: the only thing left is the same wind-down a client disconnect
     // triggers, which is why it is registered rather than only checked.
