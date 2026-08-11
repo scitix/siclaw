@@ -175,7 +175,16 @@ error the caller can act on by placing the turn elsewhere, which is more than an
 unsupervised turn offers. The fence is also what makes ONE snapshot sufficient, since a
 turn is registered before any await in its own handler. It applies to the delegation
 ingress as well, which starts AgentBox work of its own and would otherwise leave a peer
-running with a coordinator waiting on a result that never comes.
+running with a coordinator waiting on a result that never comes. One sample at that
+endpoint's entry is not enough — everything between it and the dispatch is awaited, so
+the gate is re-read at the dispatch boundary, and the handler registers a wind-down so a
+delegation already under way is stopped by the same shutdown rather than outliving it.
+
+An abort a supervisor sends retries itself rather than relying on a later look. A caller
+that looks again finds the turn already asked about while the first attempt is still
+outstanding, and by the time that attempt fails the turn may have left the bookkeeping
+entirely — so the retry belongs with the attempt, inside the work shutdown is already
+waiting on.
 
 The scope of that invariant is worth stating plainly: it covers the turns this drain has
 ever known about — the chat.send and delegation ingresses. Other producers of AgentBox

@@ -132,13 +132,23 @@ export interface DelegateApiDeps {
   agentBoxTlsOptions?: AgentBoxTlsOptions;
   frontendClient: FrontendWsClient;
   /**
-   * True once the Runtime has begun shutting down. This endpoint starts AgentBox work
-   * of its own, so it has to honour the same admission fence as an ordinary turn:
-   * accepting a delegation the process will not be around to supervise leaves the peer
-   * running on a box that outlives the Runtime, with a coordinator waiting on a result
-   * that will never come.
+   * The Runtime's shutdown gate. This endpoint starts AgentBox work of its own, so it
+   * has to honour the same admission fence as an ordinary turn: accepting a delegation
+   * the process will not be around to supervise leaves the peer running on a box that
+   * outlives the Runtime, with a coordinator waiting on a result that never comes.
+   *
+   * One sample at entry is not enough. Everything between here and the dispatch is
+   * awaited — roster, model binding, route, session reuse, persistence, the session
+   * lock, and locally a box spawn — so a handler can observe "not shutting down", pause
+   * in any of those, and dispatch after shutdown has taken its one look. The gate is
+   * therefore re-read immediately before dispatch, and the handler registers a
+   * cancellation so a delegation ALREADY dispatched is wound down by that same
+   * shutdown rather than outliving it.
    */
-  isShuttingDown?: () => boolean;
+  shutdownGate?: {
+    isShuttingDown: () => boolean;
+    register: (cancel: () => Promise<void> | void) => () => void;
+  };
 }
 
 async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
@@ -305,9 +315,14 @@ export async function handleDelegate(
   };
   res.on("close", onResponseClose);
   if (res.destroyed) onResponseClose();
+  // Same wind-down a client disconnect triggers: abort the peer, and for a remote peer
+  // tell the control plane. Registered from here so a shutdown reaches a delegation that
+  // is already under way, not only the ones it can still refuse.
+  const unregisterFromShutdown = deps.shutdownGate?.register(() => onResponseClose()) ?? (() => {});
+  const releaseShutdownRegistration = () => { try { unregisterFromShutdown(); } catch { /* already gone */ } };
   const cancelled = () => peerAbort.signal.aborted || res.destroyed;
 
-  if (deps.isShuttingDown?.()) {
+  if (deps.shutdownGate?.isShuttingDown()) {
     // Refusing is an answer the coordinator can act on; an unsupervised peer turn is not.
     sendJson(res, 503, { error: "Runtime is shutting down; delegation was not started" });
     return;
@@ -697,6 +712,17 @@ export async function handleDelegate(
     // target Runtime has its own in-flight guard, but the source owns reuse and
     // can reject a duplicate before creating cross-Runtime work.
     releaseTurn = await sessionTurnLocks.acquire(peerSessionId);
+    // Re-read the gate HERE, not only at entry: this is the last moment before work
+    // reaches a box, and everything in between was awaited.
+    if (deps.shutdownGate?.isShuttingDown()) {
+      finished = true;
+      writeFrame({
+        type: "delegate_result",
+        result: { ok: false, peerAgentId, peerName: member.name, status: "failed", steps, peerSessionId, error: "Runtime is shutting down; delegation was not started" } satisfies DelegateResponse,
+      });
+      res.end();
+      return;
+    }
     // Stop may have arrived while waiting behind an earlier turn. Bail before
     // delegation.start so an abort cannot race ahead of a not-yet-started relay.
     if (peerAbort.signal.aborted) {
@@ -744,6 +770,7 @@ export async function handleDelegate(
     return;
   } finally {
     releaseTurn?.();
+    releaseShutdownRegistration();
   }
 
   finished = true;

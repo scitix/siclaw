@@ -380,15 +380,63 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   let shuttingDown = false;
 
   /**
-   * Turns whose box has been asked to stop them and has not refused, so a later pass
-   * does not ask again. Without it, a box roll followed by a shutdown asks twice.
+   * Turns whose box is being, or has been, successfully asked to stop them — so a box
+   * roll followed by a shutdown does not ask twice.
    *
-   * A FAILED attempt is removed again: the case this abort exists for is a box removal
-   * whose `spawner.stop()` also failed, and treating a timed-out abort as done would
-   * spend the only retry a shutdown could have made — leaving the prompt headless on a
-   * box that is still there.
+   * Each attempt RETRIES itself rather than relying on someone asking again. A later
+   * caller cannot be that someone: it finds this mark set while the first attempt is
+   * still outstanding, and by the time that attempt fails the turn may have left the
+   * bookkeeping entirely. So the retry lives with the attempt, inside the promise
+   * shutdown is already waiting on, and the mark is cleared only when every attempt has
+   * been refused.
    */
   const boxAbortAsked = new Set<string>();
+  const BOX_ABORT_ATTEMPTS = 3;
+
+  /**
+   * Ask a box to stop one turn, retrying a refusal. `isSessionNotFound` is success: the
+   * box does not have the turn, which is the outcome that was wanted.
+   */
+  async function stopTurnOnBox(
+    client: AgentBoxClient,
+    sessionId: string,
+    turnId: string,
+    boxId: string,
+    reason: InterruptionReason,
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= BOX_ABORT_ATTEMPTS; attempt += 1) {
+      try {
+        await client.abortSession(sessionId, turnId);
+        return;
+      } catch (err) {
+        if (isSessionNotFound(err)) return;
+        const detail = err instanceof Error ? err.message : String(err);
+        if (attempt === BOX_ABORT_ATTEMPTS) {
+          // Out of attempts: let anything that looks again see it as unasked.
+          boxAbortAsked.delete(turnId);
+          const message = `[runtime] could not stop turn=${turnId} session=${sessionId} on ${boxId} after ${attempt} attempt(s): ${detail}`;
+          if (reason === "box_rolled") console.log(`${message} (box may already be gone)`);
+          else console.warn(message);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+      }
+    }
+  }
+
+  /**
+   * Wind-down hooks for work that starts turns outside chat.send — today the delegation
+   * endpoint. Registered while that work is under way, so shutdown reaches a delegation
+   * it can no longer refuse, and unregistered when it settles.
+   */
+  const shutdownCancels = new Set<() => Promise<void> | void>();
+  const shutdownGate = {
+    isShuttingDown: () => shuttingDown,
+    register(cancel: () => Promise<void> | void): () => void {
+      shutdownCancels.add(cancel);
+      return () => shutdownCancels.delete(cancel);
+    },
+  };
 
   const pendingShutdownWork = new Set<Promise<void>>();
   const trackForShutdown = (work: Promise<void>): Promise<void> => {
@@ -580,14 +628,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         for (const id of sessionTurns) {
           if (boxAbortAsked.has(id)) continue;
           boxAbortAsked.add(id);
-          started.push(trackForShutdown(client.abortSession(sessionId, id).catch((err) => {
-            if (isSessionNotFound(err)) return;
-            // Not done after all — let a later pass, or a shutdown, try again.
-            boxAbortAsked.delete(id);
-            const message = `[runtime] could not stop turn=${id} session=${sessionId} on ${placement.boxId}: ${err instanceof Error ? err.message : String(err)}`;
-            if (reason === "box_rolled") console.log(`${message} (box may already be gone)`);
-            else console.warn(message);
-          })));
+          started.push(trackForShutdown(stopTurnOnBox(client, sessionId, id, placement.boxId, reason)));
         }
       }
     }
@@ -622,6 +663,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // it; closing it means giving those paths the same admission gate and registration,
     // which is its own change.
     shuttingDown = true;
+
+    // Wind down work that is past refusing. Done BEFORE the snapshot below so whatever
+    // these start — a remote delegation.abort, a peer box abort — is waited on too.
+    for (const cancel of [...shutdownCancels]) {
+      trackForShutdown(Promise.resolve().then(cancel).catch((err) => {
+        console.warn("[runtime] shutdown wind-down hook failed:", err);
+      }));
+    }
 
     // Streaming turns AND cold-starting ones: both are ours, and both leave a caller
     // waiting if they simply vanish.
@@ -2264,7 +2313,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // task to a peer agent; gateway prompts the peer + returns its artifact.
           if (url === "/api/internal/delegate" && method === "POST") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            void handleDelegate(req, res, identity, { agentBoxManager, agentBoxTlsOptions, frontendClient, isShuttingDown: () => shuttingDown });
+            void handleDelegate(req, res, identity, { agentBoxManager, agentBoxTlsOptions, frontendClient, shutdownGate });
             return;
           }
 

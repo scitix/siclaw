@@ -61,6 +61,8 @@ let promptBlocker: Promise<void> | undefined;
 let abortSessionError: Error | undefined;
 // Holds abortSession open, to model a box that has not answered yet.
 let abortSessionBlocker: Promise<void> | undefined;
+// Fails only the FIRST abort, to model a refusal that a later one recovers from.
+let abortFirstAttempt: Error | undefined;
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     endpoint: string;
@@ -74,9 +76,11 @@ vi.mock("./agentbox/client.js", () => ({
       return { sessionId: opts.sessionId, traceId: "0123456789abcdef0123456789abcdef" };
     });
     abortSession = vi.fn(async (sessionId: string, turnId?: string) => {
+      const attempt = abortSessionCalls.length;
       abortSessionCalls.push(sessionId);
       abortSessionTurnIds.push(turnId);
-      if (abortSessionBlocker) await abortSessionBlocker;
+      if (attempt === 0 && abortSessionBlocker) await abortSessionBlocker;
+      if (attempt === 0 && abortFirstAttempt) throw abortFirstAttempt;
       if (abortSessionError) throw abortSessionError;
     });
     steerSession = vi.fn(async () => ({ ok: true, traceId: "fedcba9876543210fedcba9876543210" }));
@@ -139,6 +143,7 @@ afterEach(async () => {
   abortSessionTurnIds.length = 0;
   abortSessionError = undefined;
   abortSessionBlocker = undefined;
+  abortFirstAttempt = undefined;
   vi.clearAllMocks();
 });
 
@@ -692,30 +697,46 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(frontendClient.close).toHaveBeenCalled();
   });
 
-  it("retries a box abort that failed, instead of counting it as asked", async () => {
-    // The case this abort exists for is a box removal whose own stop also failed, so
-    // treating a timed-out abort as done would spend the only retry a shutdown had.
+  it("retries an abort that was still outstanding when shutdown began", async () => {
+    // The interleaving a later pass cannot cover: shutdown finds the turn already asked
+    // about, so it issues nothing of its own and waits on that same request — and when it
+    // then fails, there is no later pass, and the turn may have left the bookkeeping
+    // entirely. So the retry lives with the attempt, inside the promise shutdown awaits.
     consumerIgnoresAbort = true;
-    abortSessionError = new Error("box did not answer");
+    let releaseFirstAbort: (() => void) | undefined;
+    abortSessionBlocker = new Promise<void>((resolve) => { releaseFirstAbort = resolve; });
+    abortFirstAttempt = new Error("box did not answer");
 
     const manager = fakeAgentBoxManager();
     manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
     let terminator: ((ids: string[], reason: string) => unknown) | undefined;
     manager.setTurnTerminator = vi.fn((fn: any) => { terminator = fn; });
-    server = await bootRuntime(manager);
+    const frontendClient = fakeFrontendClient();
+    server = await bootRuntime(manager, frontendClient);
     const send = server.rpcMethods.get("chat.send")!;
 
-    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "retry-abort" }, { sendEvent: vi.fn() }) as { turnId?: string };
+    const ack = await send({ agentId: "a", userId: "u", text: "hi", sessionId: "outstanding" }, { sendEvent: vi.fn() }) as { turnId?: string };
     await waitFor(() => capturedSignal !== undefined);
 
-    terminator!(["retry-abort"], "box_rolled");
+    terminator!(["outstanding"], "box_rolled");
     await waitFor(() => abortSessionCalls.length === 1);
 
-    // Shutdown must ask again, because the first attempt was refused.
-    await server.close();
+    // Shutdown starts while that first request is still outstanding.
+    const closing = server.close();
+    const closed = (async () => { await closing; })();
     server = undefined;
-    expect(abortSessionCalls).toEqual(["retry-abort", "retry-abort"]);
-    expect(abortSessionTurnIds).toEqual([ack.turnId, ack.turnId]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(abortSessionCalls).toHaveLength(1);
+    expect(frontendClient.close).not.toHaveBeenCalled();
+
+    // It now fails — and is retried by the attempt itself, not by a pass that will
+    // never come.
+    releaseFirstAbort?.();
+    await waitFor(() => abortSessionCalls.length >= 2);
+    expect(abortSessionTurnIds.slice(0, 2)).toEqual([ack.turnId, ack.turnId]);
+
+    await closed;
+    expect(frontendClient.close).toHaveBeenCalled();
   });
 
   it("binds an explicit steer message to the active prompt trace", async () => {

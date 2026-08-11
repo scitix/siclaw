@@ -268,7 +268,10 @@ describe("handleDelegate — admission fence", () => {
     // This endpoint starts AgentBox work of its own, so it honours the same fence as an
     // ordinary turn: a peer admitted now would run on a box that outlives the Runtime,
     // with a coordinator waiting on a result that never comes. Refusing is an answer.
-    const deps = { ...makeDeps({ found: true, user_id: "u", agent_id: COORD }), isShuttingDown: () => true };
+    const deps = {
+      ...makeDeps({ found: true, user_id: "u", agent_id: COORD }),
+      shutdownGate: { isShuttingDown: () => true, register: () => () => {} },
+    };
     const res = makeRes();
     await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps as any);
 
@@ -278,6 +281,67 @@ describe("handleDelegate — admission fence", () => {
     expect(promptMock).not.toHaveBeenCalled();
     // Not even the roster lookup: nothing about this request should reach the control plane.
     expect(deps.frontendClient.request).not.toHaveBeenCalled();
+  });
+  it("does not dispatch when shutdown begins during a pre-dispatch await", async () => {
+    // One sample at entry proves nothing: the handler awaits the roster, the model
+    // binding, the route, session reuse, persistence and the session lock before it
+    // dispatches. Observing "not shutting down" and then pausing in any of those is
+    // exactly how a turn reaches a box after shutdown has taken its one look.
+    let shuttingDown = false;
+    let releaseRoute: (() => void) | undefined;
+    const deps: any = {
+      ...makeDeps({ found: true, user_id: "u", agent_id: COORD }),
+      shutdownGate: { isShuttingDown: () => shuttingDown, register: () => () => {} },
+    };
+    deps.frontendClient.request = vi.fn(async (method: string) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") {
+        // Shutdown starts while this await is outstanding.
+        await new Promise<void>((resolve) => { releaseRoute = resolve; });
+        return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      }
+      return {};
+    });
+
+    const res = makeRes();
+    const handling = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+    await vi.waitFor(() => expect(releaseRoute).toBeDefined());
+    shuttingDown = true;
+    releaseRoute!();
+    await handling;
+
+    expect(deps.frontendClient.request).not.toHaveBeenCalledWith("delegation.start", expect.anything());
+    expect(deps.agentBoxManager.getOrCreate).not.toHaveBeenCalled();
+    expect(promptMock).not.toHaveBeenCalled();
+  });
+
+  it("registers a wind-down so a shutdown reaches a delegation already under way", async () => {
+    // Past refusing: the only thing left is the same wind-down a client disconnect
+    // triggers, which is why it is registered rather than only checked.
+    let cancel: (() => void) | undefined;
+    const deps: any = {
+      ...makeDeps({ found: true, user_id: "u", agent_id: COORD }),
+      shutdownGate: {
+        isShuttingDown: () => false,
+        register: (fn: () => void) => { cancel = fn; return () => { cancel = undefined; }; },
+      },
+    };
+    deps.frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method === "config.getDelegates") return { members: [{ id: PEER, name: "peer", description: "", clusters: [], hosts: [] }] };
+      if (method === "delegation.resolveRoute") return { local: false, sourceRuntimeId: "shanghai", targetRuntimeId: "aries" };
+      if (method === "delegation.start") {
+        // Under way now: shutdown can only wind it down.
+        cancel?.();
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const res = makeRes();
+    await handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+
+    expect(deps.frontendClient.request).toHaveBeenCalledWith("delegation.abort", { delegationId: expect.any(String) }, 10_000);
+    expect(delegateResult(res)).toMatchObject({ ok: false, status: "failed" });
   });
 });
 
