@@ -43,6 +43,7 @@ interface PendingRpc {
 }
 
 type CommandHandler = (method: string, params: any) => Promise<any>;
+type EventHandler = (data: unknown) => boolean | void;
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -59,6 +60,7 @@ export class FrontendWsClient {
   private _connected = false;
   private pending = new Map<string, PendingRpc>();
   private commandHandler: CommandHandler | null = null;
+  private eventHandlers = new Map<string, Set<EventHandler>>();
   private activeSessionsProvider?: () => string[];
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -126,6 +128,30 @@ export class FrontendWsClient {
    */
   onCommand(handler: CommandHandler): void {
     this.commandHandler = handler;
+  }
+
+  /** Subscribe to unsolicited Portal → Runtime events on one channel. */
+  subscribe(channel: string, handler: EventHandler): () => void {
+    let handlers = this.eventHandlers.get(channel);
+    if (!handlers) {
+      handlers = new Set<EventHandler>();
+      this.eventHandlers.set(channel, handlers);
+    }
+    handlers.add(handler);
+    return () => {
+      const current = this.eventHandlers.get(channel);
+      current?.delete(handler);
+      if (current?.size === 0) this.eventHandlers.delete(channel);
+    };
+  }
+
+  /**
+   * Deliver a correctness-bearing event received as an acknowledged RPC.
+   * The handler must explicitly return true for the matching in-flight
+   * consumer; an unrelated channel subscriber is not an acknowledgment.
+   */
+  dispatchReliableEvent(channel: string, data: unknown): boolean {
+    return this.dispatchSubscribedEvent(channel, data, true);
   }
 
   /**
@@ -306,10 +332,31 @@ export class FrontendWsClient {
       return;
     }
 
+    // Unsolicited event (Portal → Runtime). Most events flow in the opposite
+    // direction; cross-Runtime delegation uses this reverse event lane to relay
+    // a target Runtime's peer stream without exposing private Gateway addresses.
+    if (msg.type === "event" && typeof msg.channel === "string") {
+      this.dispatchSubscribedEvent(msg.channel, msg.data, false);
+      return;
+    }
+
     // Inbound command (Portal → Runtime request)
     if (msg.type === "req" && typeof msg.id === "string" && typeof msg.method === "string") {
       this.handleInboundCommand(msg.id, msg.method, msg.params);
     }
+  }
+
+  private dispatchSubscribedEvent(channel: string, data: unknown, requireExplicitAck: boolean): boolean {
+    let accepted = false;
+    for (const handler of this.eventHandlers.get(channel) ?? []) {
+      try {
+        const result = handler(data);
+        if (result === true || (!requireExplicitAck && result !== false)) accepted = true;
+      } catch (err) {
+        console.warn(`[frontend-ws] event handler failed channel=${channel}:`, err);
+      }
+    }
+    return accepted;
   }
 
   private async handleInboundCommand(id: string, method: string, params: any): Promise<void> {

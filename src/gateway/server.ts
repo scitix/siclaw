@@ -87,7 +87,7 @@ import {
   handleDelegationEvents,
   handleMetricsFlush,
 } from "./internal-api.js";
-import { handleDelegate, handleDelegates } from "./delegate-api.js";
+import { handleDelegate, handleDelegates, isDelegationSettled } from "./delegate-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, bindMessageTraceId, incrementMessageCount, ensureChatSession, updateMessage, sequenceMessage } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
@@ -323,6 +323,198 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // turn as still reasoning. Registered in chat.send, cleared on its settle.
   const activeStreamAborts = new Map<string, AbortController>();
 
+  // A chat.send RPC acknowledges before its background task finishes cold-starting
+  // an AgentBox. Keep those not-yet-dispatched turns abortable too: otherwise Stop
+  // can observe "session not found", return success, and the background task can
+  // still call prompt() afterwards. A set is required because a second send may be
+  // waiting on the same session lock while the current turn is active.
+  const pendingStartAborts = new Map<string, Set<AbortController>>();
+  /**
+   * Every turn this Runtime currently has in flight for a session, so an abort can
+   * name the one it means.
+   *
+   * A session id names a CONVERSATION, and a delegated peer session is reused across
+   * turns, so "abort session S" turns ambiguous the moment a turn ends: an abort
+   * delayed past that point would land on its successor. Every abort this Runtime
+   * sends therefore carries a turn, and the box answers a mismatch as already
+   * stopped.
+   *
+   * A SET, not one id: a second send arrives while the first still holds the session
+   * lock, so at that moment two turns are live — one running on the box, one queued
+   * behind it. Remembering only the newest would make a Stop name the queued turn,
+   * the box would reject the mismatch, and the running turn would continue headless.
+   */
+  const liveTurnIds = new Map<string, Set<string>>();
+  /**
+   * Which live turns are delegated, so a terminal produced by the SUPERVISOR — a
+   * shutdown, or a box removed under a turn — can be reported with the same
+   * acknowledgement as one produced by the turn itself. Those paths bypass the
+   * turn's own reporting (see supervisorEndedTurns), which is exactly why they
+   * needed their own route to it.
+   */
+  const delegatedTurns = new Map<string, { delegationId: string; sessionId: string }>();
+  /**
+   * Work that outlives the turn it belongs to and that shutdown must still flush.
+   *
+   * Two kinds end up here. An acknowledged terminal delivery may retry for as long as
+   * a reconnect takes, which is far too long to hold a turn open for: the session
+   * lock, the streaming registration and the supervisor's view of the turn would all
+   * stay occupied, blocking the next turn on that session and letting a SIGTERM
+   * re-report an already-finished turn as interrupted. And the box abort a supervisor
+   * issues must land even though the turn it names may leave `liveTurnIds` the moment
+   * its consumer settles — the box outlives a Runtime roll, and the process exits as
+   * soon as close() returns.
+   *
+   * The turn settles at once either way; what it started continues here, centrally,
+   * because the box-removal caller discards whatever endTurns() returns.
+   */
+  /**
+   * Set before shutdown takes stock, and never cleared.
+   *
+   * Producers outlive the drain: the reverse command lane stays open so terminals can
+   * still be delivered, the HTTP servers are still listening, and the manager's loops
+   * run until later. Without a fence, a turn admitted during the wait registers after
+   * the drain has looked, and the process exits with it running on a box that K8s
+   * deliberately keeps.
+   */
+  let shuttingDown = false;
+
+  /**
+   * Turns whose box is being, or has been, successfully asked to stop them — so a box
+   * roll followed by a shutdown does not ask twice.
+   *
+   * Each attempt RETRIES itself rather than relying on someone asking again. A later
+   * caller cannot be that someone: it finds this mark set while the first attempt is
+   * still outstanding, and by the time that attempt fails the turn may have left the
+   * bookkeeping entirely. So the retry lives with the attempt, inside the promise
+   * shutdown is already waiting on, and the mark is cleared only when every attempt has
+   * been refused.
+   */
+  const boxAbortAsked = new Set<string>();
+  const BOX_ABORT_ATTEMPTS = 3;
+
+  /**
+   * Ask a box to stop one turn, retrying a refusal. `isSessionNotFound` is success: the
+   * box does not have the turn, which is the outcome that was wanted.
+   */
+  async function stopTurnOnBox(
+    client: AgentBoxClient,
+    sessionId: string,
+    turnId: string,
+    boxId: string,
+    reason: InterruptionReason,
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= BOX_ABORT_ATTEMPTS; attempt += 1) {
+      try {
+        await client.abortSession(sessionId, turnId);
+        return;
+      } catch (err) {
+        if (isSessionNotFound(err)) return;
+        const detail = err instanceof Error ? err.message : String(err);
+        if (attempt === BOX_ABORT_ATTEMPTS) {
+          // Out of attempts: let anything that looks again see it as unasked.
+          boxAbortAsked.delete(turnId);
+          const message = `[runtime] could not stop turn=${turnId} session=${sessionId} on ${boxId} after ${attempt} attempt(s): ${detail}`;
+          if (reason === "box_rolled") console.log(`${message} (box may already be gone)`);
+          else console.warn(message);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+      }
+    }
+  }
+
+  /**
+   * Wind-down hooks for work that starts turns outside chat.send — today the delegation
+   * endpoint. Registered while that work is under way, so shutdown reaches a delegation
+   * it can no longer refuse, and unregistered when it settles.
+   */
+  const shutdownCancels = new Set<() => Promise<void> | void>();
+  const shutdownGate = {
+    isShuttingDown: () => shuttingDown,
+    register(cancel: () => Promise<void> | void): () => void {
+      shutdownCancels.add(cancel);
+      return () => shutdownCancels.delete(cancel);
+    },
+  };
+
+  const pendingShutdownWork = new Set<Promise<void>>();
+  const trackForShutdown = (work: Promise<void>): Promise<void> => {
+    pendingShutdownWork.add(work);
+    void work.finally(() => pendingShutdownWork.delete(work));
+    return work;
+  };
+
+  /**
+   * Hand a delegated turn's terminal to the control plane with an acknowledgement.
+   *
+   * The chat.event lane is fire-and-forget, which a human-facing turn survives: the
+   * frontend refetches. A delegated turn has a machine waiting on it and nobody to
+   * retry, so a terminal lost here strands the caller until its idle window elapses
+   * and it then reports a failure for a turn that in fact finished.
+   *
+   * The budget has to outlast a WS reconnect, which cannot complete faster than its
+   * own backoff. A control plane that does not implement the method (standalone, or
+   * older) is not retried at all.
+   */
+  const deliverDelegationTerminal = async (
+    delegationId: string,
+    sessionId: string,
+    turnId: string,
+    event: Record<string, unknown>,
+  ): Promise<void> => {
+    // A single reconnect can take the client's whole backoff cap plus jitter (30s +
+    // 2s), so a shorter budget gives up while the only route back is still being
+    // re-established.
+    const backoffMs = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
+    for (let attempt = 0; attempt <= backoffMs.length; attempt += 1) {
+      try {
+        await frontendClient.request("delegation.terminal", { delegationId, sessionId, turnId, event }, 10_000);
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/unknown method/i.test(message)) return;
+        if (attempt === backoffMs.length) {
+          console.error(`[runtime] could not confirm delivery of the terminal for delegation=${delegationId} session=${sessionId}:`, message);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, backoffMs[attempt]));
+      }
+    }
+  };
+  /**
+   * Each live turn's cancellation, addressable on its own.
+   *
+   * Session-keyed controllers cannot express "cancel B": aborting the session's
+   * controllers would break the consumer of the turn that is actually RUNNING while
+   * the box is only told about B, leaving A running with nobody reading it.
+   */
+  const turnAborts = new Map<string, AbortController>();
+  const addLiveTurn = (sessionId: string, id: string, ctrl: AbortController) => {
+    const ids = liveTurnIds.get(sessionId) ?? new Set<string>();
+    ids.add(id);
+    liveTurnIds.set(sessionId, ids);
+    turnAborts.set(id, ctrl);
+  };
+  const dropLiveTurn = (sessionId: string, id: string) => {
+    turnAborts.delete(id);
+    const ids = liveTurnIds.get(sessionId);
+    if (!ids) return;
+    ids.delete(id);
+    if (ids.size === 0) liveTurnIds.delete(sessionId);
+  };
+  const registerPendingStart = (sessionId: string, ctrl: AbortController) => {
+    const controllers = pendingStartAborts.get(sessionId) ?? new Set<AbortController>();
+    controllers.add(ctrl);
+    pendingStartAborts.set(sessionId, controllers);
+  };
+  const unregisterPendingStart = (sessionId: string, ctrl: AbortController) => {
+    const controllers = pendingStartAborts.get(sessionId);
+    if (!controllers) return;
+    controllers.delete(ctrl);
+    if (controllers.size === 0) pendingStartAborts.delete(sessionId);
+  };
+
   /**
    * Sessions whose terminal this Runtime already sent — on shutdown, or because the box
    * running them was removed under them.
@@ -333,6 +525,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * started too late to be reported here, which is the hang this whole path exists to fix.
    */
   const supervisorEndedTurns = new Set<string>();
+
 
   const INTERRUPTION_MESSAGE: Record<InterruptionReason, string> = {
     runtime_restart: "Runtime restarted; this turn was interrupted",
@@ -347,43 +540,157 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * stream simply stops therefore hangs forever — the process that owned it is gone and
    * its replacement does not adopt turns it did not start, so no later event can come.
    */
-  function endTurns(sessionIds: Iterable<string>, reason: InterruptionReason): void {
+  /**
+   * Returns the work it started, so a caller about to take the transport down can
+   * wait for it. Everything returned is ALSO tracked centrally: a box removal
+   * ignores the return value, and its terminal would otherwise be invisible to a
+   * shutdown that follows while it is still retrying.
+   */
+  function endTurns(sessionIds: Iterable<string>, reason: InterruptionReason): Array<Promise<void>> {
+    const started: Array<Promise<void>> = [];
     const detail = wrapError(new Error(INTERRUPTION_MESSAGE[reason]), {
       code: ErrorCodes.STREAM_INTERRUPTED,
       retriable: true,
     });
     for (const sessionId of sessionIds) {
       const ctrl = activeStreamAborts.get(sessionId);
-      if (!ctrl) continue; // nothing of ours is streaming for it
-      supervisorEndedTurns.add(sessionId);
-      try {
-        frontendClient.emitEvent("chat.event", { sessionId, event: { type: "stream_error", error: detail } });
-        // `aborted`/`reason` are additive: a consumer that does not read them sees the
-        // plain terminal it already handles, one that does can name the cause instead of
-        // rendering a generic connection failure.
-        frontendClient.emitEvent("chat.event", {
-          sessionId,
-          event: { type: "prompt_done", aborted: true, reason },
+      const sessionTurnsForCheck = liveTurnIds.get(sessionId);
+      // A turn still cold-starting has no consumer yet, but it is ours and it is
+      // about to be abandoned: skipping it would leave its caller waiting out an idle
+      // window while the box may still start the turn.
+      if (!ctrl && !sessionTurnsForCheck?.size) continue;
+      // Per TURN, not per session: with two turns live, one session-wide flag would
+      // let the other still emit its own terminal — and a plain prompt_done arriving
+      // after this interruption would read as a turn that succeeded.
+      const sessionTurns = [...(liveTurnIds.get(sessionId) ?? [])];
+      // CLAIM before reporting. A turn stays live until its consumer settles, and a
+      // real consumer settles only when its next event arrives — so a box removal
+      // followed by a shutdown can reach the same turn twice. Reporting twice would
+      // put two authoritative terminals with DIFFERENT reasons in flight, and
+      // whichever won the retry race would name the cause. The first pass owns the
+      // report; a later one still cancels, and the delivery it needs is already
+      // tracked.
+      const unreported = sessionTurns.filter((id) => !supervisorEndedTurns.has(id));
+      for (const id of sessionTurns) supervisorEndedTurns.add(id);
+      const ownsTheReport = sessionTurns.length === 0 || unreported.length > 0;
+      if (ownsTheReport) {
+        try {
+          frontendClient.emitEvent("chat.event", { sessionId, event: { type: "stream_error", error: detail } });
+          // `aborted`/`reason` are additive: a consumer that does not read them sees the
+          // plain terminal it already handles, one that does can name the cause instead of
+          // rendering a generic connection failure.
+          frontendClient.emitEvent("chat.event", {
+            sessionId,
+            event: { type: "prompt_done", aborted: true, reason },
+          });
+        } catch (err) {
+          // Best effort: a consumer that already went away must not stop what caused this.
+          console.warn(`[runtime] could not report interrupted turn session=${sessionId}:`, err);
+        }
+      }
+      // A delegated turn's caller is a machine that will otherwise wait out its idle
+      // window and report a failure. Same terminal, but acknowledged — detached,
+      // because this runs on the shutdown path and must not hold it open.
+      for (const turnId of unreported) {
+        const delegated = delegatedTurns.get(turnId);
+        if (!delegated) continue;
+        const delivery = deliverDelegationTerminal(delegated.delegationId, sessionId, turnId, {
+          type: "prompt_done",
+          aborted: true,
+          reason,
         });
-      } catch (err) {
-        // Best effort: a consumer that already went away must not stop what caused this.
-        console.warn(`[runtime] could not report interrupted turn session=${sessionId}:`, err);
+        started.push(trackForShutdown(delivery));
       }
       // Abort AFTER reporting: it makes the consumer run its own finalization (partial
       // text persisted, running tool rows closed) so a reload agrees with the screen.
-      ctrl.abort();
+      // EVERY live turn, not only the streaming one: a turn queued behind the session
+      // lock was just reported as interrupted, so it must not go on to start.
+      for (const id of sessionTurns) turnAborts.get(id)?.abort();
+      ctrl?.abort();
       activeStreamAborts.delete(sessionId);
+
+      // Cancelling on this side does not stop the BOX. The consumer only notices its
+      // signal when the next event arrives, and a dropped SSE subscription just
+      // unsubscribes — neither ends the prompt. In K8s the boxes deliberately outlive
+      // a Runtime roll, so a turn already reported as interrupted would keep running
+      // there with nobody left to read it. Only a dispatched turn has a box to ask,
+      // and `busyOn` is the record of that placement.
+      // Including on a box roll. The box is NOT reliably gone by then: the manager
+      // reports the interruption before it asks the spawner to stop the box, and a
+      // failed stop is left for a later retry — so in that window the prompt keeps
+      // running, and producing tool side effects, with the consumer already dropped.
+      // A box that has in fact gone is simply the outcome we wanted, so failures here
+      // are ignored; only a shutdown, where the box is expected to answer, says so
+      // loudly.
+      const placement = sessionTurnLocks.busyOn(sessionId);
+      if (placement) {
+        const client = new AgentBoxClient(placement.endpoint, 10000, agentBoxTlsOptions);
+        for (const id of sessionTurns) {
+          if (boxAbortAsked.has(id)) continue;
+          boxAbortAsked.add(id);
+          started.push(trackForShutdown(stopTurnOnBox(client, sessionId, id, placement.boxId, reason)));
+        }
+      }
     }
+    return started;
   }
 
-  function endInFlightTurns(): void {
-    const sessionIds = [...activeStreamAborts.keys()];
-    if (sessionIds.length === 0) return;
+  /**
+   * Shutdown ends every turn this Runtime is streaming. Delegated ones are reported
+   * with an acknowledgement, which needs the transport that shutdown is about to
+   * close — so wait for those, but briefly: a live connection settles the first
+   * attempt in milliseconds, and a dead one must not hold the process open for the
+   * full retry budget.
+   */
+  const SHUTDOWN_TERMINAL_GRACE_MS = 3_000;
+
+  async function endInFlightTurns(): Promise<void> {
+    // Fence first: from here no new turn is admitted, so the passes below converge.
+    // Fence FIRST, then take stock once.
+    //
+    // The fence is what makes one snapshot sufficient FOR THE TURNS THIS DRAIN COVERS —
+    // the chat.send and delegation ingresses, which are the only ones ever registered in
+    // liveTurnIds. After it, none of their producers can add work this snapshot would
+    // miss: no new turn is admitted; a turn that finishes now finds itself already
+    // reported and does not report again; and a box removal finds every live turn
+    // claimed and already asked to stop. Re-scanning was tried and removed for exactly
+    // that reason — nothing reachable turned up in a second pass, and unexercised
+    // machinery on the shutdown path is its own hazard.
+    //
+    // Other producers of AgentBox work — the task coordinator's cron/fire-now jobs and
+    // capability runs — keep their own clients and were never registered here, so they
+    // are neither fenced nor drained. That predates this drain and is not narrowed by
+    // it; closing it means giving those paths the same admission gate and registration,
+    // which is its own change.
+    shuttingDown = true;
+
+    // Wind down work that is past refusing. Done BEFORE the snapshot below so whatever
+    // these start — a remote delegation.abort, a peer box abort — is waited on too.
+    for (const cancel of [...shutdownCancels]) {
+      trackForShutdown(Promise.resolve().then(cancel).catch((err) => {
+        console.warn("[runtime] shutdown wind-down hook failed:", err);
+      }));
+    }
+
+    // Streaming turns AND cold-starting ones: both are ours, and both leave a caller
+    // waiting if they simply vanish.
+    const sessionIds = [...new Set([...activeStreamAborts.keys(), ...liveTurnIds.keys()])];
+    // Work a turn started before the fence and has not finished: its delivery is exactly
+    // the report its caller needs.
+    const alreadyPending = [...pendingShutdownWork];
+    if (sessionIds.length === 0 && alreadyPending.length === 0) return;
     // Say it happened. Reporting used to be silent on success, so the only way to tell
     // whether a restart had ended its turns was to go ask the consumer — during an
     // incident, from the outside. The failure path already logs; this is its other half.
-    console.log(`[runtime] shutdown interrupting ${sessionIds.length} in-flight turn(s): ${sessionIds.join(", ")}`);
-    endTurns(sessionIds, "runtime_restart");
+    if (sessionIds.length > 0) {
+      console.log(`[runtime] shutdown interrupting ${sessionIds.length} in-flight turn(s): ${sessionIds.join(", ")}`);
+    }
+    const work = [...endTurns(sessionIds, "runtime_restart"), ...alreadyPending];
+    if (work.length === 0) return;
+    await Promise.race([
+      Promise.allSettled(work),
+      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_TERMINAL_GRACE_MS)),
+    ]);
   }
 
   // A box removed while it still holds turns breaks their SSE streams, which does end
@@ -410,6 +717,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // concierge) delegated this turn over the mesh. Forwarded to the agentbox so
     // the worker gates its toolset read-only and stamps the result artifact.
     const delegation = params.delegation as PromptOptions["delegation"];
+    // A cross-Runtime delegation session is created by the coordinator Runtime
+    // before Sicore routes this chat.send to the target Runtime. Re-inserting the
+    // session/user row here would overwrite ownership/lineage and duplicate the
+    // delegated task. Only honor the flag on an authenticated delegation turn.
+    // promptMessageId intentionally stays undefined on this path: the source
+    // Runtime already persisted and sequenced the user row, so the target must
+    // not bind or update a second local copy of it.
+    const skipInitialPersistence = params.skipInitialPersistence === true && Boolean(delegation?.delegationId);
     // Portal stamps turnStartMs at POST receipt — closer to user click than
     // the runtime's loop start. Use it as the canonical turn anchor when
     // present; fall back gracefully so direct callers (tests, /run path)
@@ -418,6 +733,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     if (!agentId || !userId || !text) {
       throw new Error("agentId, userId, and text are required");
+    }
+    // Refuse rather than accept a turn this process will not be around to finish. The
+    // caller can place it on a Runtime that will.
+    if (shuttingDown) {
+      const err = new Error("Runtime is shutting down; this turn was not started");
+      err.name = "RuntimeShuttingDown";
+      throw err;
     }
 
     // Pre-generate a UUID so AgentBox doesn't fall back to the literal
@@ -430,8 +752,29 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const modelRouting = params.modelRouting as PromptOptions["modelRouting"];
     const images = params.images as PromptOptions["images"];
     const files = params.files as PromptOptions["files"];
+    // One id for this turn, held from before the async ack until the turn settles.
+    // A supervisor that will need to abort this turn later supplies it BEFORE the
+    // dispatch, so a lost acknowledgement still leaves it able to name the turn;
+    // ordinary callers let us mint one.
+    const turnId = typeof params.turnId === "string" && params.turnId ? params.turnId : crypto.randomUUID();
+
+    /**
+     * Report this turn's own terminal — only a delegated turn has a caller for it.
+     *
+     * Detached on purpose: the delivery may retry for as long as a reconnect takes,
+     * and the turn must not stay open for that. Deregistering the turn here is what
+     * makes it safe: the supervisor will not also report it, so a shutdown during
+     * the retries cannot turn a finished turn into an interrupted one.
+     */
+    const reportTerminal = (event: Record<string, unknown>): void => {
+      const delegationId = delegation?.delegationId;
+      if (!delegationId) return;
+      delegatedTurns.delete(turnId);
+      void trackForShutdown(deliverDelegationTerminal(delegationId, sessionId, turnId, event));
+    };
     const promptOpts: PromptOptions = {
       sessionId,
+      turnId,
       userId,
       text,
       agentId,
@@ -475,14 +818,32 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // A failure here does NOT fail the send. The caller loses the row id and falls back
     // to matching by content; blocking a whole conversation on one database hiccup is the
     // worse trade.
+    // Registered before the async ack below, and before the persistence awaits: this
+    // closes the cold-start window in which chat.abort had no local cancellation state
+    // to update, and it is what makes the shutdown fence airtight — a handler that got
+    // past the check above is already visible to the drain, instead of appearing after
+    // it while it was still in the database.
+    const turnAbort = new AbortController();
+    registerPendingStart(sessionId, turnAbort);
+    addLiveTurn(sessionId, turnId, turnAbort);
+    if (delegation?.delegationId) delegatedTurns.set(turnId, { delegationId: delegation.delegationId, sessionId });
+
     let promptMessageId: string | undefined;
-    try {
-      await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
-      promptMessageId = await appendMessage({ sessionId, role: "user", content: text, deferSequence: true });
-      await incrementMessageCount(sessionId);
-    } catch (persistErr) {
-      console.warn(`[runtime] failed to persist the user message session=${sessionId}; continuing without a row id:`, persistErr);
+    if (!skipInitialPersistence) {
+      try {
+        await ensureChatSession(sessionId, agentId, userId, text, undefined, origin);
+        promptMessageId = await appendMessage({ sessionId, role: "user", content: text, deferSequence: true });
+        await incrementMessageCount(sessionId);
+      } catch (persistErr) {
+        console.warn(`[runtime] failed to persist the user message session=${sessionId}; continuing without a row id:`, persistErr);
+      }
     }
+    const throwIfStoppedBeforePrompt = () => {
+      if (!turnAbort.signal.aborted) return;
+      const err = new Error("chat.send stopped before prompt dispatch");
+      err.name = "AbortError";
+      throw err;
+    };
 
     (async () => {
       // One turn at a time for this session, across every box. The AgentBox's own 409
@@ -499,6 +860,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         try {
           releaseTurn = await sessionTurnLocks.acquire(sessionId);
         } catch (busyErr) {
+          throwIfStoppedBeforePrompt();
           const running = sessionTurnLocks.busyOn(sessionId);
           const steered = running ? await new AgentBoxClient(running.endpoint, 10000, agentBoxTlsOptions)
             .steerSession(sessionId, text, { images, files })
@@ -517,6 +879,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // caller gets the ordinary busy error.
           releaseTurn = await sessionTurnLocks.acquire(sessionId);
         }
+        throwIfStoppedBeforePrompt();
 
         // Agent-prompt precedence for the box session. An explicit
         // params.systemPrompt (the portal-standalone path stamps it from the
@@ -532,6 +895,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         if (promptOpts.systemPromptTemplate === undefined) {
           promptOpts.systemPromptTemplate = await resolveAgentSystemPrompt(agentId, frontendClient);
         }
+        throwIfStoppedBeforePrompt();
 
         // Persistence is resolved by agentId in the manager's persistenceResolver
         // (registered in startRuntime), not from per-request params — so every
@@ -541,6 +905,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // runs; it is dropped on release, so it can never become a stale binding.
         sessionTurnLocks.noteBox(sessionId, handle.boxId, handle.endpoint);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+        throwIfStoppedBeforePrompt();
 
         let promptResult: Awaited<ReturnType<typeof client.prompt>>;
         try {
@@ -548,6 +913,33 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // The box now has the session: a steer racing this call can stop waiting, and
           // this row is in line to be processed (see pending-user-rows.ts).
           sessionTurnLocks.markPromptAccepted(sessionId);
+          // Stop may have arrived while prompt() was in flight, before the box had a
+          // session for chat.abort to find. Abort again now that acceptance is known;
+          // never attach a consumer to a turn whose Stop was already acknowledged.
+          if (turnAbort.signal.aborted) {
+            // We are about to abandon this turn's stream, so a failed abort here
+            // leaves the box running with no consumer. The box demonstrably HAS the
+            // session (it just accepted the prompt), so retrying is safe and cannot
+            // plant a pre-spawn latch — keep trying briefly before giving up.
+            let stopped = false;
+            for (let attempt = 1; attempt <= 3 && !stopped; attempt += 1) {
+              try {
+                await client.abortSession(promptResult.sessionId, turnId);
+                stopped = true;
+              } catch (abortErr) {
+                if (isSessionNotFound(abortErr)) {
+                  stopped = true;
+                  break;
+                }
+                console.warn(`[runtime] attempt ${attempt} to stop newly accepted session=${promptResult.sessionId} failed:`, abortErr);
+                if (attempt < 3) await new Promise((r) => setTimeout(r, 200 * attempt));
+              }
+            }
+            if (!stopped) {
+              console.error(`[runtime] gave up stopping session=${promptResult.sessionId}; its turn may run without a consumer`);
+            }
+            throwIfStoppedBeforePrompt();
+          }
           if (promptMessageId) pendingUserRows.push(sessionId, promptMessageId, text);
         } catch (err) {
           // Concurrent send: agentbox returns 409 "Session is already
@@ -578,6 +970,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             });
             return;
           }
+          // Dispatch outcome UNKNOWN, not "did not happen": AgentBox starts the run
+          // before it acknowledges /api/prompt, so a lost or timed-out ack rejects
+          // here while a real turn is already running with nobody left to consume
+          // it. That leak is not conditional on Stop — an ack lost during an
+          // ordinary send strands the same turn — so compensate on every rejection
+          // rather than only where a Stop is known.
+          //
+          // Addressed BY TURN, which is what makes it unconditionally safe: if the box
+          // never started this turn the abort is a no-op it cannot confuse with a later
+          // one, and if it did start it, this is the only thing that stops it. The
+          // ORIGINAL failure is what the caller must see, so a compensation that cannot
+          // complete is logged loudly rather than substituted for it.
+          try {
+            await client.abortSession(sessionId, turnId);
+          } catch (compensateErr) {
+            console.error(`[runtime] could not stop turn=${turnId} session=${sessionId} after a failed prompt; it may run without a consumer:`, compensateErr);
+          }
           throw err;
         }
 
@@ -586,7 +995,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         });
 
         const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
-        const abortCtrl = new AbortController();
+        const abortCtrl = turnAbort;
         // Register this turn's abort signal so chat.abort can break the consumer
         // (see activeStreamAborts declaration). Placed AFTER prompt() succeeds, on
         // the path that actually consumes: the concurrent-send "already running"
@@ -594,13 +1003,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // the in-flight prompt's controller in the map. Keyed on the agentbox-echoed
         // promptResult.sessionId — the same id chat.abort looks up.
         activeStreamAborts.set(promptResult.sessionId, abortCtrl);
+        unregisterPendingStart(sessionId, turnAbort);
 
         /**
          * Whether this turn's terminal was already sent by the supervisor (shutdown, or a
          * box removed under it). One-shot: the id is consumed, so a later turn on the same
          * session reports normally.
          */
-        const alreadyReported = () => supervisorEndedTurns.delete(promptResult.sessionId);
+        // Non-consuming for this turn: it reaches this question on more than one path
+        // and the answer must not change between them.
+        const alreadyReported = () =>
+          supervisorEndedTurns.has(turnId) || supervisorEndedTurns.delete(promptResult.sessionId);
 
         try {
           await consumeAgentSse({
@@ -628,7 +1041,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
               });
             },
           });
-          if (!alreadyReported()) context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+          if (!alreadyReported()) {
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+            reportTerminal({ type: "prompt_done" });
+          }
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
             console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
@@ -642,7 +1058,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             });
           }
           // Shutdown, or a box removal, already reported this turn before aborting it.
-          if (!alreadyReported()) context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+          if (!alreadyReported()) {
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+            reportTerminal({ type: "prompt_done" });
+          }
         } finally {
           // Only clear if still ours — a fast re-send for the same session would
           // have replaced the entry with a newer controller.
@@ -654,20 +1073,34 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // Failure before/during agentbox spawn or prompt() — surface as a
         // stream_error so the frontend renders an inline bubble instead of
         // hanging on the spawning state forever.
-        console.error(`[runtime] chat.send background failure for session=${sessionId}:`, err);
-        const detail = wrapError(err, {
-          code: ErrorCodes.INTERNAL,
-          retriable: true,
-        });
-        context.sendEvent("chat.event", {
-          sessionId,
-          event: { type: "stream_error", error: detail },
-        });
-        context.sendEvent("chat.event", { sessionId, event: { type: "prompt_done" } });
+        if (!turnAbort.signal.aborted) {
+          console.error(`[runtime] chat.send background failure for session=${sessionId}:`, err);
+          const detail = wrapError(err, {
+            code: ErrorCodes.INTERNAL,
+            retriable: true,
+          });
+          context.sendEvent("chat.event", {
+            sessionId,
+            event: { type: "stream_error", error: detail },
+          });
+        }
+        // The supervisor may have reported this turn already — a queued turn cancelled
+        // by a shutdown or a box removal reaches this catch through its pre-prompt
+        // check. A second, PLAIN terminal would contradict that one: without
+        // `aborted` it reads as a turn that completed.
+        if (!supervisorEndedTurns.has(turnId)) {
+          context.sendEvent("chat.event", { sessionId, event: { type: "prompt_done" } });
+          reportTerminal({ type: "prompt_done" });
+        }
       } finally {
         // Anything still queued was never consumed — a steer the user sent into a turn
         // that finished first. It must not be claimed by the next turn's first echo.
         pendingUserRows.clear(sessionId);
+        unregisterPendingStart(sessionId, turnAbort);
+        dropLiveTurn(sessionId, turnId);
+        delegatedTurns.delete(turnId);
+        supervisorEndedTurns.delete(turnId);
+        boxAbortAsked.delete(turnId);
         releaseTurn?.();
       }
     })();
@@ -675,7 +1108,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // The row id, so a caller can reconcile its optimistic bubble by identity instead of
     // by content — two messages with the same text are two messages. Absent when the
     // write above failed.
-    return { ok: true, sessionId, ...(promptMessageId ? { messageId: promptMessageId } : {}) };
+    // turnId travels back so a supervisor can later abort THIS turn specifically
+    // rather than "whatever is running on this session".
+    return { ok: true, sessionId, turnId, ...(promptMessageId ? { messageId: promptMessageId } : {}) };
   });
 
   // ── Shared capability box client ───────────────────────────────────────────
@@ -1348,6 +1783,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
     if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
+    // Optional: a control-plane abort that supervises one specific turn names it, so
+    // an abort delayed past that turn's end — a lease expiry, a retry — cannot stop
+    // whatever is running now. The user's Stop button sends none, and means "current".
+    const requestedTurnId = typeof params.turnId === "string" ? params.turnId : undefined;
+    // SNAPSHOT, not a live view: breaking the consumer below lets a turn settle and
+    // remove itself from this set, so reading it afterwards would miss the very turn
+    // the Stop was for.
+    const liveTurns = [...(liveTurnIds.get(sessionId) ?? [])];
+    if (requestedTurnId && liveTurns.length > 0 && !liveTurns.includes(requestedTurnId)) {
+      console.log(`[runtime] abort for turn=${requestedTurnId} session=${sessionId} is stale (live: ${liveTurns.join(", ")}); ignoring`);
+      return { ok: true, stale: true };
+    }
 
     // Break the gateway's SSE consumer FIRST, then stop the agentbox. Aborting the
     // signal before abortSession ensures it is set before the agentbox's final
@@ -1355,15 +1802,51 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // the consumer — so consumeAgentSse runs its abort-finalization (in-flight tool
     // rows → "stopped", partial assistant text persisted) instead of exiting as a
     // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
-    activeStreamAborts.get(sessionId)?.abort();
+    // A Stop that names no turn means "whatever is running", and more than one turn
+    // can be live — one on the box, one queued behind the session lock. Both are
+    // named below; the box stops the one it is running and answers the rest as
+    // already stopped.
+    const targets = requestedTurnId ? [requestedTurnId] : liveTurns;
 
+    // Break the gateway's SSE consumer FIRST, then stop the agentbox. Aborting the
+    // signal before abortSession ensures it is set before the agentbox's final
+    // agent_end/prompt_done events (or the natural stream close they cause) reach
+    // the consumer — so consumeAgentSse runs its abort-finalization (in-flight tool
+    // rows → "stopped", partial assistant text persisted) instead of exiting as a
+    // normal completion that leaves the tool row stuck "running" → "resumes on refresh".
+    //
+    // Cancel exactly the turns being stopped, and do it BEFORE the awaited box
+    // lookup: deciding session-wide-versus-per-turn on state read after an await
+    // would let a turn settle in between, drop us into the session-wide branch, and
+    // break the consumer of a SUCCESSOR that started meanwhile. The snapshot above
+    // decides it instead.
+    if (liveTurns.length > 0) {
+      for (const id of targets) turnAborts.get(id)?.abort();
+    } else {
+      // Nothing of ours is registered for this session — a turn from before a
+      // restart, or a caller naming one we never saw. Fall back to the session's own
+      // controllers, which is all the evidence there is.
+      for (const ctrl of pendingStartAborts.get(sessionId) ?? []) ctrl.abort();
+      activeStreamAborts.get(sessionId)?.abort();
+    }
+
+    // A cold-start Stop used to be skipped here to avoid arming a session-wide
+    // pre-spawn latch that the user's retry would then consume; a turn-scoped latch
+    // is only ever consumed by the prompt for that same turn — precisely the prompt
+    // being cancelled — so there is nothing left to avoid.
     const client = await boxForRunningTurn(agentId, sessionId);
     // Stopping a session a box does not have is already the outcome the user asked for;
     // reporting it as a failed Stop would be a lie.
-    await client.abortSession(sessionId).catch((err) => {
+    const stopOne = (id?: string) => client.abortSession(sessionId, id).catch((err) => {
       if (!isSessionNotFound(err)) throw err;
       console.log(`[runtime] abort: session=${sessionId} not on the box we asked; treating as already stopped`);
     });
+    if (targets.length === 0) {
+      // Nothing in flight here: the box may still hold a turn from before a restart.
+      await stopOne(undefined);
+    } else {
+      for (const id of targets) await stopOne(id);
+    }
     return { ok: true };
   });
 
@@ -1594,6 +2077,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
+  // Reliable cross-Runtime delegation controls arrive as RPCs instead of the
+  // best-effort event lane. Acknowledge only after the matching source handler
+  // has consumed the envelope; the control plane retains and retries it otherwise.
+  rpcMethods.set("delegation.control", async (params) => {
+    if (frontendClient.dispatchReliableEvent("delegation.event", params)) return { ok: true };
+    // No live consumer is not automatically a delivery failure. A terminal whose
+    // acknowledgement was lost gets re-sent, and by then its consumer is gone
+    // *because it consumed the original*. Rejecting that would retry forever,
+    // which keeps the sender's relay alive; a relay that later expires aborts by
+    // (agent, session) and would kill a NEW turn reusing that peer session.
+    const delegationId = typeof params?.delegationId === "string" ? params.delegationId : "";
+    if (delegationId && isDelegationSettled(delegationId)) {
+      return { ok: true, alreadySettled: true };
+    }
+    throw new Error("No active delegation consumer accepted the control event");
+  });
+
   // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──
   // Portal sends commands (e.g. chat.send, agent.reload, task.fireNow) to
   // Runtime over the persistent WS connection. We route them through the
@@ -1813,7 +2313,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // task to a peer agent; gateway prompts the peer + returns its artifact.
           if (url === "/api/internal/delegate" && method === "POST") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            void handleDelegate(req, res, identity, { agentBoxManager, agentBoxTlsOptions, frontendClient });
+            void handleDelegate(req, res, identity, { agentBoxManager, agentBoxTlsOptions, frontendClient, shutdownGate });
             return;
           }
 
@@ -1891,7 +2391,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     credentialService,
     async close() {
       metricsAggregator?.destroy();
-      endInFlightTurns();
+      // Before frontendClient.close(): the acknowledged terminal for a delegated turn
+      // travels over that same connection.
+      await endInFlightTurns();
       frontendClient.close();
       // Older embedded test/adapter managers may only implement cleanup(); the
       // concrete manager's shutdown() preserves K8s boxes across Runtime rolls.

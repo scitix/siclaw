@@ -131,6 +131,16 @@ export interface ManagedSession {
   kubeconfigRef: KubeconfigRef;
   /** Whether the current prompt was aborted (prevents empty response retry) */
   _aborted: boolean;
+  /**
+   * Caller-supplied identity of the turn currently running, when it supplied one.
+   *
+   * A session id names a CONVERSATION, which a delegated peer session deliberately
+   * reuses across turns, so an abort addressed by session alone cannot distinguish
+   * "stop what is running" from "stop the turn I dispatched" — a late abort for a
+   * finished turn lands on its successor. Callers that know which turn they mean
+   * pass its id and the abort endpoint ignores a mismatch.
+   */
+  _currentTurnId?: string;
   /** Mutable skill dirs array passed to DefaultResourceLoader — update + reload to switch */
   skillsDirs: string[];
   /** Session mode — determines which system skills are loaded */
@@ -505,11 +515,24 @@ export class AgentBoxSessionManager {
    * which a stale orphan could wrongly short-circuit a brand-new, deliberate prompt for the same
    * reused sessionId. 3 min covers cold start with margin while bounding that risk.
    */
-  private _pendingAborts = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * sessionId → (turnId, or "" for a session-wide latch) → expiry timer.
+   *
+   * One slot per session would let two turn-scoped latches overwrite each other:
+   * cancelling turn B while A is still running is a normal sequence, and dropping
+   * either latch loses a cancellation the caller was told had been accepted.
+   */
+  private _pendingAborts = new Map<string, Map<string, ReturnType<typeof setTimeout>>>();
   private static readonly PENDING_ABORT_TTL_MS = 180_000;
 
-  /** Record a pre-spawn Stop so the imminent /api/prompt short-circuits (see _pendingAborts). */
-  markPendingAbort(sessionId: string): void {
+  /**
+   * Record a pre-spawn Stop so the imminent /api/prompt short-circuits (see
+   * _pendingAborts). A turnId narrows the latch to the ONE prompt it was meant to
+   * cancel, which is what keeps an orphan from cancelling an unrelated later prompt
+   * on the same reused session id; without one the latch stays session-wide, as it
+   * was before callers could name a turn.
+   */
+  markPendingAbort(sessionId: string, turnId?: string): void {
     // Only a TRUE pre-spawn Stop should arm a pending abort: one where the session was NEVER
     // created, so no in-flight turn exists yet and the imminent first /api/prompt is the one to
     // cancel. A genuine pre-spawn session has no on-disk history dir yet; a session that ran
@@ -517,22 +540,47 @@ export class AgentBoxSessionManager {
     // Stop on a released-but-idle session (e.g. the Stop button still live after a missed
     // prompt_done) would arm a pending abort that silently cancels the user's NEXT prompt for
     // the same reused sessionId. If the existence check throws, fall through and arm (best-effort).
-    try {
-      if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
-    } catch { /* fall through — arm */ }
-    const existing = this._pendingAborts.get(sessionId);
+    // The dir check exists only because a SESSION-WIDE latch could cancel an
+    // unrelated later prompt: a released-but-idle session (30s TTL) always has a
+    // history dir, and a Stop on it would otherwise arm a latch the user's next
+    // prompt consumes. A turn-scoped latch cannot do that — only that turn's own
+    // prompt consumes it — so skipping the check is what lets a Stop on a REUSED
+    // session (a delegated peer thread always has a dir) arm anything at all.
+    if (turnId === undefined) {
+      try {
+        if (fs.existsSync(path.join(this.getBaseSessionDir(), sessionId))) return;
+      } catch { /* fall through — arm */ }
+    }
+    const slot = turnId ?? "";
+    const forSession = this._pendingAborts.get(sessionId) ?? new Map<string, ReturnType<typeof setTimeout>>();
+    const existing = forSession.get(slot);
     if (existing) clearTimeout(existing);
-    const t = setTimeout(() => this._pendingAborts.delete(sessionId), AgentBoxSessionManager.PENDING_ABORT_TTL_MS);
-    t.unref?.();
-    this._pendingAborts.set(sessionId, t);
+    const timer = setTimeout(() => {
+      const current = this._pendingAborts.get(sessionId);
+      current?.delete(slot);
+      if (current && current.size === 0) this._pendingAborts.delete(sessionId);
+    }, AgentBoxSessionManager.PENDING_ABORT_TTL_MS);
+    timer.unref?.();
+    forSession.set(slot, timer);
+    this._pendingAborts.set(sessionId, forSession);
   }
 
-  /** Consume (one-shot) a pre-spawn Stop recorded by markPendingAbort. */
-  consumePendingAbort(sessionId: string): boolean {
-    const t = this._pendingAborts.get(sessionId);
-    if (!t) return false;
-    clearTimeout(t);
-    this._pendingAborts.delete(sessionId);
+  /**
+   * Consume (one-shot) a pre-spawn Stop recorded by markPendingAbort.
+   *
+   * A latch that names a turn only cancels THAT turn: a prompt for a different turn
+   * leaves it in place (its own prompt may still be on the way) and runs normally.
+   */
+  consumePendingAbort(sessionId: string, turnId?: string): boolean {
+    const forSession = this._pendingAborts.get(sessionId);
+    if (!forSession) return false;
+    // This turn's own latch, or a session-wide one that names no turn. A latch for a
+    // DIFFERENT turn is left in place: its prompt may still be on the way.
+    const slot = turnId !== undefined && forSession.has(turnId) ? turnId : forSession.has("") ? "" : undefined;
+    if (slot === undefined) return false;
+    clearTimeout(forSession.get(slot)!);
+    forSession.delete(slot);
+    if (forSession.size === 0) this._pendingAborts.delete(sessionId);
     return true;
   }
 
