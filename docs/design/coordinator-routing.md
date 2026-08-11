@@ -165,6 +165,16 @@ emit a plain terminal that reads as a turn which succeeded. Those paths bypass t
 reporting, which is exactly why they needed their own way to reach it, and shutdown
 waits briefly for those deliveries before closing the transport they travel over.
 
+Shutdown fences before it takes stock, and refuses a turn that arrives afterwards.
+Its producers do outlive the drain — the command lane stays open so terminals can still
+be delivered, the servers still listen, the manager's loops run until later — so
+without the fence a turn admitted during the wait would register after the drain had
+looked, and go on running on a box that is deliberately kept. This reverses an earlier
+call that admitted such a turn so it could report itself: a refusal is an explicit
+error the caller can act on by placing the turn elsewhere, which is more than an
+unsupervised turn offers. The fence is also what makes ONE snapshot sufficient, since a
+turn is registered before any await in its own handler.
+
 Neither delivery nor the box abort holds the turn open, and both outlive it centrally
 rather than through whatever the supervisor's caller does with a return value: a box
 removal discards it, and the turn leaves the Runtime's bookkeeping the moment its

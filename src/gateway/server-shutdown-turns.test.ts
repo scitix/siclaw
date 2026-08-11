@@ -168,18 +168,25 @@ describe("startRuntime — shutdown ends in-flight turns", () => {
     expect(chatEvents(client, "S")).toHaveLength(2);
   });
 
-  it("does not report a turn that started too late to be registered", async () => {
-    // The hazard a blanket "we are shutting down" flag creates: this turn is not in the
-    // registry when close() runs, so shutdown cannot report it — and it must therefore be
-    // left free to report itself, or it is exactly the hang this file exists to prevent.
+  it("refuses a turn that arrives too late to be supervised", async () => {
+    // This reverses an earlier decision, deliberately. The concern then was that a
+    // blanket "we are shutting down" flag would leave such a turn unreported and
+    // therefore hanging, so it was admitted and left free to report itself.
+    //
+    // Admitting it is the worse half of that trade. Shutdown takes stock once, and a turn
+    // that registers afterwards is neither reported nor cancelled — while the box, which
+    // K8s deliberately keeps, goes on running it. A refusal is not a hang: the caller gets
+    // an explicit error and can place the turn on a Runtime that will still be there,
+    // which is exactly what an unsupervised turn cannot offer.
     const client = fakeFrontendClient();
     const server = await bootRuntime(client);
     await server.close();
-    expect(chatEvents(client, "late-session")).toEqual([]);
 
     const send = server.rpcMethods.get("chat.send")!;
-    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "late-session" }, { sendEvent: vi.fn() });
-    await waitFor(() => capturedSignal !== undefined);
-    capturedSignal!.dispatchEvent?.(new Event("abort"));
+    await expect(send({ agentId: "a", userId: "u", text: "hi", sessionId: "late-session" }, { sendEvent: vi.fn() }))
+      .rejects.toThrow(/shutting down/);
+    // Nothing was started, so there is nothing to report for it either way.
+    expect(chatEvents(client, "late-session")).toEqual([]);
+    expect(capturedSignal).toBeUndefined();
   });
 });

@@ -368,6 +368,25 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
    * The turn settles at once either way; what it started continues here, centrally,
    * because the box-removal caller discards whatever endTurns() returns.
    */
+  /**
+   * Set before shutdown takes stock, and never cleared.
+   *
+   * Producers outlive the drain: the reverse command lane stays open so terminals can
+   * still be delivered, the HTTP servers are still listening, and the manager's loops
+   * run until later. Without a fence, a turn admitted during the wait registers after
+   * the drain has looked, and the process exits with it running on a box that K8s
+   * deliberately keeps.
+   */
+  let shuttingDown = false;
+
+  /**
+   * Turns whose box has already been asked to stop them, so a repeated drain pass does
+   * not ask again. Without this, a turn whose consumer never settles stays live and
+   * every pass would re-issue its abort — a tight loop against the box for as long as
+   * the shutdown deadline allows.
+   */
+  const boxAbortAsked = new Set<string>();
+
   const pendingShutdownWork = new Set<Promise<void>>();
   const trackForShutdown = (work: Promise<void>): Promise<void> => {
     pendingShutdownWork.add(work);
@@ -556,6 +575,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       if (placement) {
         const client = new AgentBoxClient(placement.endpoint, 10000, agentBoxTlsOptions);
         for (const id of sessionTurns) {
+          if (boxAbortAsked.has(id)) continue;
+          boxAbortAsked.add(id);
           started.push(trackForShutdown(client.abortSession(sessionId, id).catch((err) => {
             if (isSessionNotFound(err)) return;
             const message = `[runtime] could not stop turn=${id} session=${sessionId} on ${placement.boxId}: ${err instanceof Error ? err.message : String(err)}`;
@@ -578,9 +599,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   const SHUTDOWN_TERMINAL_GRACE_MS = 3_000;
 
   async function endInFlightTurns(): Promise<void> {
+    // Fence first: from here no new turn is admitted, so the passes below converge.
+    // Fence FIRST, then take stock once.
+    //
+    // The fence is what makes one snapshot sufficient. Producers do outlive this drain —
+    // the command lane stays open so terminals can still be delivered, the servers are
+    // still listening, the manager's loops run until later — but after it, none of them
+    // can add work this snapshot would miss: no new turn is admitted; a turn that
+    // finishes now finds itself already reported and does not report again; and a box
+    // removal finds every live turn claimed and already asked to stop. Re-scanning was
+    // tried and removed for exactly that reason — nothing reachable turned up in a
+    // second pass, and unexercised machinery on the shutdown path is its own hazard.
+    shuttingDown = true;
+
     // Streaming turns AND cold-starting ones: both are ours, and both leave a caller
     // waiting if they simply vanish.
     const sessionIds = [...new Set([...activeStreamAborts.keys(), ...liveTurnIds.keys()])];
+    // Work a turn started before the fence and has not finished: its delivery is exactly
+    // the report its caller needs.
     const alreadyPending = [...pendingShutdownWork];
     if (sessionIds.length === 0 && alreadyPending.length === 0) return;
     // Say it happened. Reporting used to be silent on success, so the only way to tell
@@ -589,13 +625,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (sessionIds.length > 0) {
       console.log(`[runtime] shutdown interrupting ${sessionIds.length} in-flight turn(s): ${sessionIds.join(", ")}`);
     }
-    // A turn that already reported its own terminal may still be retrying delivery;
-    // that is exactly the report its caller needs, so wait for it too — as is any
-    // terminal a box removal started before this shutdown began.
-    const deliveries = [...endTurns(sessionIds, "runtime_restart"), ...alreadyPending];
-    if (deliveries.length === 0) return;
+    const work = [...endTurns(sessionIds, "runtime_restart"), ...alreadyPending];
+    if (work.length === 0) return;
     await Promise.race([
-      Promise.allSettled(deliveries),
+      Promise.allSettled(work),
       new Promise((resolve) => setTimeout(resolve, SHUTDOWN_TERMINAL_GRACE_MS)),
     ]);
   }
@@ -640,6 +673,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     if (!agentId || !userId || !text) {
       throw new Error("agentId, userId, and text are required");
+    }
+    // Refuse rather than accept a turn this process will not be around to finish. The
+    // caller can place it on a Runtime that will.
+    if (shuttingDown) {
+      const err = new Error("Runtime is shutting down; this turn was not started");
+      err.name = "RuntimeShuttingDown";
+      throw err;
     }
 
     // Pre-generate a UUID so AgentBox doesn't fall back to the literal
@@ -718,6 +758,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // A failure here does NOT fail the send. The caller loses the row id and falls back
     // to matching by content; blocking a whole conversation on one database hiccup is the
     // worse trade.
+    // Registered before the async ack below, and before the persistence awaits: this
+    // closes the cold-start window in which chat.abort had no local cancellation state
+    // to update, and it is what makes the shutdown fence airtight — a handler that got
+    // past the check above is already visible to the drain, instead of appearing after
+    // it while it was still in the database.
+    const turnAbort = new AbortController();
+    registerPendingStart(sessionId, turnAbort);
+    addLiveTurn(sessionId, turnId, turnAbort);
+    if (delegation?.delegationId) delegatedTurns.set(turnId, { delegationId: delegation.delegationId, sessionId });
+
     let promptMessageId: string | undefined;
     if (!skipInitialPersistence) {
       try {
@@ -728,13 +778,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         console.warn(`[runtime] failed to persist the user message session=${sessionId}; continuing without a row id:`, persistErr);
       }
     }
-
-    // Registered before the async ack below. This closes the cold-start window in
-    // which chat.abort previously had no local cancellation state to update.
-    const turnAbort = new AbortController();
-    registerPendingStart(sessionId, turnAbort);
-    addLiveTurn(sessionId, turnId, turnAbort);
-    if (delegation?.delegationId) delegatedTurns.set(turnId, { delegationId: delegation.delegationId, sessionId });
     const throwIfStoppedBeforePrompt = () => {
       if (!turnAbort.signal.aborted) return;
       const err = new Error("chat.send stopped before prompt dispatch");
@@ -997,6 +1040,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         dropLiveTurn(sessionId, turnId);
         delegatedTurns.delete(turnId);
         supervisorEndedTurns.delete(turnId);
+        boxAbortAsked.delete(turnId);
         releaseTurn?.();
       }
     })();

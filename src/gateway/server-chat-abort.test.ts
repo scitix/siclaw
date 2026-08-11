@@ -34,12 +34,15 @@ let capturedSignal: AbortSignal | undefined;
 // A real consumer notices its abort only when the NEXT event arrives, so a turn can
 // stay live across two supervisor passes. Set this to model that.
 let consumerIgnoresAbort = false;
+// Settles the mocked consumer on demand, to model a turn finishing NORMALLY mid-drain.
+let settleConsumer: (() => void) | undefined;
 vi.mock("./sse-consumer.js", () => ({
   consumeAgentSse: vi.fn((opts: { signal?: AbortSignal }) => {
     capturedSignal = opts.signal;
     return new Promise((resolve) => {
       const done = () =>
         resolve({ resultText: "", taskReportText: "", errorMessage: "", eventCount: 0, durationMs: 0 });
+      settleConsumer = done;
       if (consumerIgnoresAbort) return;
       if (opts.signal?.aborted) return done();
       opts.signal?.addEventListener("abort", done, { once: true });
@@ -127,6 +130,7 @@ afterEach(async () => {
   server = undefined;
   capturedSignal = undefined;
   consumerIgnoresAbort = false;
+  settleConsumer = undefined;
   abortSessionCalls.length = 0;
   promptCalls.length = 0;
   promptError = undefined;
@@ -634,6 +638,57 @@ describe("startRuntime — chat.abort wiring", () => {
     expect(frontendClient.close).not.toHaveBeenCalled();
     releaseAbort?.();
     await closing;
+    expect(frontendClient.close).toHaveBeenCalled();
+  });
+
+  it("admits no new turn once shutdown has taken stock", async () => {
+    // Producers outlive the drain: the command lane stays open so terminals can still be
+    // delivered, the servers are still listening, and the manager's loops run until
+    // later. A turn admitted during the wait would register after the drain had looked
+    // — the fence is what makes one look sufficient.
+    consumerIgnoresAbort = true;
+    let releaseAbort: (() => void) | undefined;
+    abortSessionBlocker = new Promise<void>((resolve) => { releaseAbort = resolve; });
+    let releaseTerminal: (() => void) | undefined;
+    const terminals: any[] = [];
+    const frontendClient = fakeFrontendClient();
+    frontendClient.request = vi.fn(async (method: string, params: any) => {
+      if (method !== "delegation.terminal") return { found: false };
+      terminals.push(params);
+      await new Promise<void>((resolve) => { releaseTerminal = resolve; });
+      return { ok: true };
+    });
+
+    const manager = fakeAgentBoxManager();
+    manager.getOrCreate.mockResolvedValue({ boxId: "box-a", endpoint: "https://fake.internal" });
+    server = await bootRuntime(manager, frontendClient);
+    const send = server.rpcMethods.get("chat.send")!;
+
+    await send({
+      agentId: "a", userId: "u", text: "inspect", sessionId: "fenced",
+      delegation: { delegationId: "d-fenced", parentAgentId: "coord", readOnly: false },
+    }, { sendEvent: vi.fn() });
+    await waitFor(() => capturedSignal !== undefined);
+
+    const closing = server.close();
+    const closed = (async () => { await closing; })();
+    server = undefined;
+    await waitFor(() => abortSessionCalls.length === 1);
+
+    // Fenced: a send arriving mid-drain is refused rather than started.
+    await expect(send({ agentId: "a", userId: "u", text: "late", sessionId: "late" }, { sendEvent: vi.fn() }))
+      .rejects.toThrow(/shutting down/);
+    expect(promptCalls.some((c: any) => c.sessionId === "late")).toBe(false);
+
+    // The interruption is reported over the acknowledged path and shutdown is holding
+    // the transport open for it.
+    await waitFor(() => terminals.length === 1);
+    expect(terminals[0]).toMatchObject({ delegationId: "d-fenced", event: { aborted: true } });
+    expect(frontendClient.close).not.toHaveBeenCalled();
+    releaseAbort?.();
+
+    releaseTerminal?.();
+    await closed;
     expect(frontendClient.close).toHaveBeenCalled();
   });
 
