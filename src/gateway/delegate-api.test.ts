@@ -13,8 +13,10 @@ import { Readable } from "node:stream";
 
 let consumeReturn: { resultText: string; taskReportText: string; errorMessage: string; eventCount: number; durationMs: number };
 let consumeEvents: Array<Record<string, unknown>> = [];
+let consumeGate: Promise<void> | undefined;
 const consumeAgentSse = vi.fn(async (opts: any) => {
   for (const e of consumeEvents) opts.onEvent?.(e);
+  if (consumeGate) await consumeGate;
   return consumeReturn;
 });
 vi.mock("./sse-consumer.js", () => ({ consumeAgentSse: (o: any) => consumeAgentSse(o) }));
@@ -35,7 +37,13 @@ vi.mock("./agent-model-binding.js", () => ({
 }));
 
 const promptMock = vi.fn(async () => ({ ok: true, sessionId: "peer-sess" }));
-const abortSessionMock = vi.fn(async () => {});
+const abortSessionCalls: Array<string | undefined> = [];
+let abortSessionBehaviour: ((attempt: number) => Promise<void>) | undefined;
+const abortSessionMock = vi.fn(async (_sessionId: string, turnId?: string) => {
+  const attempt = abortSessionCalls.length + 1;
+  abortSessionCalls.push(turnId);
+  if (abortSessionBehaviour) await abortSessionBehaviour(attempt);
+});
 vi.mock("./agentbox/client.js", () => ({
   AgentBoxClient: class {
     constructor(_e: string, _t?: number, _tls?: unknown) {}
@@ -137,6 +145,9 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
   consumeReturn = { resultText: "ok", taskReportText: "", errorMessage: "", eventCount: 1, durationMs: 1 };
   consumeEvents = [];
+  consumeGate = undefined;
+  abortSessionCalls.length = 0;
+  abortSessionBehaviour = undefined;
 });
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -358,6 +369,51 @@ describe("handleDelegate — admission fence", () => {
     await windDown;
     expect(windDownSettled).toBe(true);
     await handling;
+  });
+
+  it("retries a refused abort, and keeps the hook until that attempt settles", async () => {
+    // The LOCAL path, because there the wind-down is the only source of abortSession —
+    // on the remote path the handler issues one of its own and the count proves nothing.
+    //
+    // Two ways this could look done while the peer keeps running: a refusal resolved as
+    // success, and a disconnect-started attempt whose hook is released the moment the
+    // handler settles, leaving a shutdown an instant later nothing to wait for.
+    let openConsumer: (() => void) | undefined;
+    consumeGate = new Promise<void>((resolve) => { openConsumer = resolve; });
+    let releaseSecondAbort: (() => void) | undefined;
+    abortSessionBehaviour = async (attempt) => {
+      if (attempt === 1) throw new Error("box refused");
+      if (attempt === 2) await new Promise<void>((resolve) => { releaseSecondAbort = resolve; });
+    };
+
+    let cancel: (() => Promise<void> | void) | undefined;
+    const deps: any = {
+      ...makeDeps({ found: true, user_id: "u", agent_id: COORD }),
+      shutdownGate: {
+        isShuttingDown: () => false,
+        register: (fn: () => Promise<void> | void) => { cancel = fn; return () => { cancel = undefined; }; },
+      },
+    };
+
+    const res = makeRes();
+    const handling = handleDelegate(makeReq({ peerAgentId: PEER, text: "inspect" }), res as any, identity, deps);
+    await vi.waitFor(() => expect(promptMock).toHaveBeenCalled());
+
+    // A DISCONNECT starts the wind-down, fire and forget, and lets the handler finish.
+    res.triggerClose();
+    openConsumer!();
+    await handling;
+
+    // The refusal did not count as done — a second attempt is outstanding — and the hook
+    // is still registered, so a shutdown now has that attempt to wait for.
+    await vi.waitFor(() => expect(abortSessionCalls.length).toBe(2), { timeout: 3000 });
+    expect(cancel).toBeDefined();
+
+    const windDown = Promise.resolve().then(() => cancel!());
+    releaseSecondAbort!();
+    await windDown;
+    // Settled: only now is the hook released.
+    await vi.waitFor(() => expect(cancel).toBeUndefined(), { timeout: 3000 });
   });
 
   it("registers a wind-down so a shutdown reaches a delegation already under way", async () => {

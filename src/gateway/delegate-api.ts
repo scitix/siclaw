@@ -299,26 +299,43 @@ export async function handleDelegate(
   let peerSessionId = "";
   let remoteStartRequested = false;
   /**
-   * Wind this delegation down, RETURNING the abort it issues.
+   * Wind this delegation down, RETURNING the abort it issues — once.
    *
-   * A client disconnect can fire and forget; a shutdown cannot — it has to wait for the
-   * abort to land before the transport closes and the process exits, so this hands the
-   * promise back instead of scheduling it and returning void.
+   * MEMOIZED, because a disconnect and a shutdown are the same wind-down arriving from
+   * two directions. A disconnect starts it fire-and-forget and lets the handler settle;
+   * a shutdown that follows must be able to wait for that very attempt rather than
+   * finding nothing to wait for and exiting underneath it.
+   *
+   * The attempt RETRIES a refusal rather than resolving on it. Converting a failed abort
+   * into a completed wind-down is the same mistake as reporting an unconfirmed Stop as
+   * success: for a local peer there is no relay lease to fall back on, and the box
+   * outlives the Runtime, so the prompt would simply keep running.
    */
-  const cancelPeerWork = async (): Promise<void> => {
-    if (finished) return;
+  const CANCEL_ATTEMPTS = 3;
+  let cancellation: Promise<void> | undefined;
+  const runCancellation = async (): Promise<void> => {
     peerAbort.abort();
-    if (route && !route.local && remoteStartRequested && delegationId) {
-      await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000).catch((err) => {
-        console.warn(`[delegate-api] failed to abort remote delegation ${delegationId}:`, err);
-      });
-      return;
+    const remote = route && !route.local && remoteStartRequested && delegationId;
+    if (!remote && !peerClient) return; // nothing reached a box
+    for (let attempt = 1; attempt <= CANCEL_ATTEMPTS; attempt += 1) {
+      try {
+        if (remote) await deps.frontendClient.request("delegation.abort", { delegationId }, 10_000);
+        else await peerClient!.abortSession(peerSessionId, localTurnId);
+        return;
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        if (attempt === CANCEL_ATTEMPTS) {
+          console.warn(`[delegate-api] could not stop peer session ${peerSessionId} after ${attempt} attempt(s): ${detail}`);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+      }
     }
-    if (peerClient) {
-      await peerClient.abortSession(peerSessionId, localTurnId).catch((err) => {
-        console.warn(`[delegate-api] failed to abort peer session ${peerSessionId}:`, err);
-      });
-    }
+  };
+  const cancelPeerWork = (): Promise<void> => {
+    if (finished) return cancellation ?? Promise.resolve();
+    cancellation ??= runCancellation();
+    return cancellation;
   };
   const onResponseClose = () => { void cancelPeerWork(); };
   res.on("close", onResponseClose);
@@ -786,7 +803,13 @@ export async function handleDelegate(
     return;
   } finally {
     releaseTurn?.();
-    try { unregisterFromShutdown?.(); } catch { /* already gone */ }
+    // A disconnect may have started the wind-down and left it pending. Unregistering now
+    // would leave a shutdown an instant later with neither the hook nor any tracked work,
+    // free to exit while that abort is still on the wire — so the hook outlives the
+    // handler until its own cancellation settles.
+    const releaseHook = () => { try { unregisterFromShutdown?.(); } catch { /* already gone */ } };
+    if (cancellation) void cancellation.finally(releaseHook);
+    else releaseHook();
   }
 
   finished = true;

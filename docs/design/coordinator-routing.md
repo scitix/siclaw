@@ -182,7 +182,14 @@ delegation already under way is stopped by the same shutdown rather than outlivi
 That hook RETURNS its abort rather than scheduling it: a client disconnect can fire and
 forget, but a shutdown has to wait for the abort to land before the transport closes. It
 is registered inside the scope whose `finally` always runs, so a request rejected before
-dispatch cannot leave a hook behind for the lifetime of the process.
+dispatch cannot leave a hook behind for the lifetime of the process — and it stays
+registered until its own cancellation settles, because a disconnect starts that
+cancellation and lets the handler finish, which would otherwise leave a shutdown an
+instant later with neither a hook nor tracked work while the abort was still on the wire.
+The attempt is memoized, so a disconnect and a shutdown wait on the same one, and it
+retries a refusal rather than resolving on it: converting a failed abort into a completed
+wind-down is the same mistake as reporting an unconfirmed Stop as success, and for a local
+peer there is no relay lease to fall back on.
 
 An abort a supervisor sends retries itself rather than relying on a later look. A caller
 that looks again finds the turn already asked about while the first attempt is still
