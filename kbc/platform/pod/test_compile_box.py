@@ -2120,6 +2120,119 @@ async def test_explicit_test_recommendation_http():
     print("✓ explicit red-team test recommendation (stable, single-flight, raw-grounded)")
 
 
+async def test_feedback_review_http_is_lightweight_and_raw_grounded():
+    """Feedback discussion stays available while compile work is active, but
+    its structured brief can cite only Raw and target only Candidate pages."""
+    original = compile_box._FEEDBACK_REVIEW_IMPL
+    compile_box.RUNS.clear()
+    calls = []
+
+    async def fake_review(parent, payload):
+        calls.append((parent.run_id, payload["message"]))
+        return {
+            "reply": "Raw supports three attempts; the index misses the rule.",
+            "brief": {
+                "conclusion": "wiki_gap",
+                "summary": "Expose the retry rule from the index.",
+                "expected_answer": "Retry at most three times.",
+                "evidence_paths": ["raw/policy.md"],
+                "suggested_pages": ["candidate/index.md"],
+                "repair_instructions": "Add a link to the existing retry rule.",
+            },
+        }
+
+    compile_box._FEEDBACK_REVIEW_IMPL = fake_review
+    client = TestClient(TestServer(compile_box.build_app()))
+    await client.start_server()
+    try:
+        assert (await client.post("/feedback-review/missing", json={})).status == 404
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_raw = root / "source-raw"
+            review_root = root / "review"
+            source_raw.mkdir()
+            review_root.mkdir()
+            (source_raw / "policy.md").write_text("retry = 3\n")
+            (review_root / "raw").symlink_to(source_raw, target_is_directory=True)
+
+            result = compile_box._validate_feedback_review_result(review_root, {
+                "reply": "The source says three.",
+                "brief": {
+                    "conclusion": "wiki_gap",
+                    "summary": "The index misses the rule.",
+                    "expected_answer": "Three attempts.",
+                    "evidence_paths": ["raw/policy.md"],
+                    "suggested_pages": ["candidate/index.md"],
+                    "repair_instructions": "Add the missing index entry.",
+                },
+            })
+            assert result["brief"]["evidence_paths"] == ["raw/policy.md"], result
+            for bad_brief in (
+                {**result["brief"], "suggested_pages": []},
+                {**result["brief"], "suggested_pages": ["../outside.md"]},
+            ):
+                try:
+                    compile_box._validate_feedback_review_result(
+                        review_root, {"reply": "bad", "brief": bad_brief})
+                    raise AssertionError("invalid Candidate target was accepted")
+                except ValueError:
+                    pass
+
+            command_body = {
+                "command_id": "feedback-command-1",
+                "command": {
+                    "version": 1,
+                    "action": "compile.repair_feedback",
+                    "operation_id": "operation-1",
+                    "generation": 1,
+                    "parameters": {
+                        "feedback_case_id": "case-1",
+                        "question": "What is the retry limit?",
+                        "brief_summary": "The index misses the rule.",
+                        "expected_answer": "Retry at most three times.",
+                        "evidence_paths": ["raw/policy.md"],
+                        "suggested_pages": ["candidate/index.md"],
+                        "repair_instructions": "Add the missing index entry.",
+                    },
+                },
+            }
+            _, command = compile_box._normalize_command(command_body)
+            command_parent = compile_box.CompileRun("feedback-command", str(review_root), 1)
+            compile_box._prepare_command(command_parent, command)
+            escaped_command = json.loads(json.dumps(command_body))
+            escaped_command["command"]["parameters"]["evidence_paths"] = ["raw/../outside.md"]
+            try:
+                compile_box._normalize_command(escaped_command)
+                raise AssertionError("escaped repair evidence path was accepted")
+            except compile_box.CommandRejected:
+                pass
+
+            parent = compile_box.CompileRun("feedback-1", td, 1)
+            parent._turn_active = True
+            parent._batch_active = True
+            compile_box.RUNS[parent.run_id] = parent
+            payload = {
+                "bundle_base64": base64.b64encode(b"workspace").decode(),
+                "bundle_sha256": hashlib.sha256(b"workspace").hexdigest(),
+                "case": {
+                    "question": "What is the retry limit?",
+                    "original_answer": "I do not know.",
+                    "user_feedback": "The Wiki should answer this.",
+                },
+                "message": "Compare this with Raw.",
+            }
+            response = await client.post(f"/feedback-review/{parent.run_id}", json=payload)
+            assert response.status == 200, await response.text()
+            body = await response.json()
+            assert body["brief"]["conclusion"] == "wiki_gap", body
+            assert calls == [(parent.run_id, "Compare this with Raw.")], calls
+    finally:
+        await client.close()
+        compile_box._FEEDBACK_REVIEW_IMPL = original
+        compile_box.RUNS.clear()
+    print("✓ feedback review stays conversational during compile and emits a Raw-grounded brief")
+
+
 async def test_reference_assist_http_and_validation():
     """Reference assistance is stable-draft-only, shares the red-review lock,
     and accepts only distinct raw-grounded structured results."""
@@ -6775,6 +6888,7 @@ async def main():
     await test_test_session_idle_ttl_reaper()
     await test_list_test_sessions_endpoint()
     await test_explicit_test_recommendation_http()
+    await test_feedback_review_http_is_lightweight_and_raw_grounded()
     await test_reference_assist_http_and_validation()
     await test_reference_assist_driver_is_fast_isolated_and_structured()
     await test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool()
