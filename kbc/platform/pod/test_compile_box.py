@@ -2197,8 +2197,31 @@ async def test_feedback_review_http_is_lightweight_and_raw_grounded():
                 },
             }
             _, command = compile_box._normalize_command(command_body)
+            assert "original_answer" not in command["parameters"]
+            assert "user_feedback" not in command["parameters"]
             command_parent = compile_box.CompileRun("feedback-command", str(review_root), 1)
             compile_box._prepare_command(command_parent, command)
+            for top in compile_box.WORKSPACE_SYNC_DIRS:
+                (review_root / top).mkdir(exist_ok=True)
+            (review_root / "candidate" / "index.md").write_text("before index\n")
+            (review_root / "candidate" / "other.md").write_text("before other\n")
+            (review_root / "authoring" / "PLAN.md").write_text("before plan\n")
+            compile_box._arm_feedback_repair_guard(command_parent, ["candidate/index.md"])
+            (review_root / "candidate" / "index.md").write_text("after index\n")
+            (review_root / "candidate" / "other.md").write_text("changed other\n")
+            (review_root / "candidate" / "new.md").write_text("new outside scope\n")
+            (review_root / "authoring" / "PLAN.md").write_text("changed plan\n")
+            sync_paths = {
+                item["path"] for item in compile_box._collect_workspace_artifacts_for_sync(command_parent)
+            }
+            assert sync_paths == {"candidate/index.md"}, sync_paths
+            restored = compile_box._restore_feedback_repair_scope(command_parent)
+            assert (review_root / "candidate" / "index.md").read_text() == "after index\n"
+            assert (review_root / "candidate" / "other.md").read_text() == "before other\n"
+            assert not (review_root / "candidate" / "new.md").exists()
+            assert (review_root / "authoring" / "PLAN.md").read_text() == "before plan\n"
+            assert set(restored) >= {"candidate/other.md", "candidate/new.md", "authoring/PLAN.md"}
+            compile_box._clear_feedback_repair_guard(command_parent)
             escaped_command = json.loads(json.dumps(command_body))
             escaped_command["command"]["parameters"]["evidence_paths"] = ["raw/../outside.md"]
             try:
@@ -2226,10 +2249,15 @@ async def test_feedback_review_http_is_lightweight_and_raw_grounded():
             body = await response.json()
             assert body["brief"]["conclusion"] == "wiki_gap", body
             assert calls == [(parent.run_id, "Compare this with Raw.")], calls
+            compile_box.FEEDBACK_REVIEWS_ACTIVE.add(parent.run_id)
+            busy = await client.post(f"/feedback-review/{parent.run_id}", json=payload)
+            assert busy.status == 409, await busy.text()
+            compile_box.FEEDBACK_REVIEWS_ACTIVE.discard(parent.run_id)
     finally:
         await client.close()
         compile_box._FEEDBACK_REVIEW_IMPL = original
         compile_box.RUNS.clear()
+        compile_box.FEEDBACK_REVIEWS_ACTIVE.clear()
     print("✓ feedback review stays conversational during compile and emits a Raw-grounded brief")
 
 
@@ -2393,6 +2421,94 @@ async def test_reference_assist_driver_is_fast_isolated_and_structured():
         else:
             os.environ["KBC_PK_BLUE_MODEL"] = previous_light_model
     print("✓ reference-answer assist driver: fast + isolated + structured")
+
+
+async def test_feedback_review_driver_is_isolated_and_submits_structured_brief():
+    original_client = compile_box.ClaudeSDKClient
+    original_server_factory = compile_box.create_sdk_mcp_server
+    original_state_root = os.environ.get("KBC_CODEX_STATE_ROOT")
+    seen = {}
+
+    def capture_server(name, *, tools):
+        seen["server_name"] = name
+        return {"type": "sdk", "name": name, "tools": tools}
+
+    class SubmittingClient:
+        def __init__(self, options=None):
+            self.options = options
+            self.pending = []
+            seen["options"] = options
+
+        async def connect(self):
+            pass
+
+        async def query(self, directive, session_id="default"):
+            seen["directive"] = directive
+            registered = self.options.mcp_servers["feedback_review"]["tools"]
+            await registered[0].handler({
+                "reply": "Raw says three attempts; the index needs a link.",
+                "brief": {
+                    "conclusion": "wiki_gap",
+                    "summary": "Expose the retry rule from the index.",
+                    "expected_answer": "Retry at most three times.",
+                    "evidence_paths": ["raw/policy.md"],
+                    "suggested_pages": ["candidate/index.md"],
+                    "repair_instructions": "Add the missing link.",
+                },
+            })
+            self.pending.append(ResultMessage())
+
+        async def receive_messages(self):
+            while self.pending:
+                yield self.pending.pop(0)
+
+        async def disconnect(self):
+            pass
+
+    compile_box.ClaudeSDKClient = SubmittingClient
+    compile_box.create_sdk_mcp_server = capture_server
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "raw").mkdir()
+            (root / "raw" / "policy.md").write_text("retry = 3\n")
+            state_root = root / "state"
+            state_root.mkdir()
+            os.environ["KBC_CODEX_STATE_ROOT"] = str(state_root)
+            bundle = make_source_bundle({"candidate/index.md": "# Policy\n"})
+            parent = compile_box.CompileRun("feedback-driver", td, 1)
+            parent.locale = "en"
+            result = await compile_box.review_feedback_case(parent, {
+                "bundle_base64": base64.b64encode(bundle).decode(),
+                "bundle_sha256": hashlib.sha256(bundle).hexdigest(),
+                "case": {
+                    "question": "What is the retry limit?",
+                    "original_answer": "I do not know.",
+                    "user_feedback": "This should be answerable.",
+                },
+                "message": "Compare Raw and Wiki.",
+                "transcript": [],
+            })
+            assert result["brief"]["suggested_pages"] == ["candidate/index.md"], result
+            opts = seen["options"]
+            assert opts.system_prompt == compile_box._prompt("feedback_review_role", "en")
+            assert opts.tools == ["Read", "Glob", "Grep"]
+            assert opts.allowed_tools == [
+                "Read", "Glob", "Grep", "mcp__feedback_review__submit_feedback_review",
+            ]
+            assert opts.max_turns == 24
+            assert opts.setting_sources == [] and opts.skills == [] and opts.strict_mcp_config is True
+            assert set(opts.disallowed_tools) >= {"Bash", "Write", "Edit", "Agent", "WebSearch"}
+            assert seen["server_name"] == "feedback_review"
+            assert '"message": "Compare Raw and Wiki."' in seen["directive"]
+    finally:
+        compile_box.ClaudeSDKClient = original_client
+        compile_box.create_sdk_mcp_server = original_server_factory
+        if original_state_root is None:
+            os.environ.pop("KBC_CODEX_STATE_ROOT", None)
+        else:
+            os.environ["KBC_CODEX_STATE_ROOT"] = original_state_root
+    print("✓ feedback-review driver: isolated Raw+Candidate + structured submission")
 
 
 async def test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool():
@@ -6891,6 +7007,7 @@ async def main():
     await test_feedback_review_http_is_lightweight_and_raw_grounded()
     await test_reference_assist_http_and_validation()
     await test_reference_assist_driver_is_fast_isolated_and_structured()
+    await test_feedback_review_driver_is_isolated_and_submits_structured_brief()
     await test_recommendation_driver_is_minimal_and_submits_through_registered_mcp_tool()
     await test_recommendation_driver_reports_max_turn_exhaustion()
     await test_propose_plan_never_bounces()

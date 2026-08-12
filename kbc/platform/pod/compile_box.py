@@ -121,6 +121,10 @@ TEST_SESSION_IDEMPOTENCY: dict[tuple[str, str], str] = {}
 # recommendation and reference-answer assistance share this guard so two owner
 # actions cannot spend overlapping model calls against the same workspace.
 RECOMMENDATIONS_ACTIVE: set[str] = set()
+# Feedback review is intentionally independent from the compiler busy flag, but
+# it is still single-flight per run: each review owns an isolated workspace and
+# one long model turn.
+FEEDBACK_REVIEWS_ACTIVE: set[str] = set()
 DEFAULT_HTTP_MAX_REQUEST_BYTES = 768 * 1024 * 1024
 
 # ── Prompt packs — locale-parameterized model-facing text ────────────────────
@@ -722,6 +726,10 @@ class CompileRun:
         # visible but cannot widen a small edit into a whole-library migration.
         # Internal repair/verify/batch turns never arm this exemption.
         self._turn_format_guard: dict | None = None
+        # A confirmed feedback repair may persist only the exact Candidate pages
+        # named in the canonical brief (plus the machine-owned SELFCHECK receipt).
+        # The snapshot restores any accidental wider edits before durability sync.
+        self._feedback_repair_guard: dict | None = None
         self._l1_repair_pending = False
         # Batch mode (DESIGN-kb-batch-compile-2026-07-05): when the orchestrator
         # drives per-batch sessions, ResultMessage must NOT emit turn_done (the
@@ -964,7 +972,9 @@ def _collect_workspace_artifacts(workdir: str) -> list[dict]:
         if not base.is_dir():
             continue
         for f in sorted(base.rglob("*")):
-            if not f.is_file():
+            # A writer must never turn an allowed logical path into a symlink
+            # that makes the durability collector read outside the workspace.
+            if f.is_symlink() or not f.is_file():
                 continue
             try:
                 if f.stat().st_size > MAX_SYNC_FILE_BYTES:
@@ -979,6 +989,10 @@ def _collect_workspace_artifacts(workdir: str) -> list[dict]:
 def _collect_workspace_artifacts_for_sync(run: CompileRun) -> list[dict]:
     """Collect a durability-safe snapshot without mutating in-flight files."""
     artifacts = _collect_workspace_artifacts(run.workdir)
+    guard = getattr(run, "_feedback_repair_guard", None)
+    if isinstance(guard, dict):
+        allowed = guard.get("allowed") or set()
+        artifacts = [artifact for artifact in artifacts if artifact["path"] in allowed]
     before = getattr(run, "_turn_page_hashes", None)
     stamp_time = getattr(run, "_turn_provenance_at", None)
     changes: dict[str, str] = {}
@@ -1064,6 +1078,9 @@ async def _sync_workspace(run: CompileRun, sent: dict, *, commit_input: bool = F
     # synced, so a store row that never materialized here can't be tombstoned.
     wd = Path(run.workdir)
     for path in [p for p in sent if p not in collected]:
+        guard = getattr(run, "_feedback_repair_guard", None)
+        if isinstance(guard, dict) and path not in (guard.get("allowed") or set()):
+            continue
         if (wd / path).is_file():
             continue  # still on disk, just not collectable — keep the row
         if sent.get(path) != _SYNC_TOMBSTONE:
@@ -1082,6 +1099,76 @@ async def _sync_workspace(run: CompileRun, sent: dict, *, commit_input: bool = F
         if commit_input:
             run._commit_input_replay = True
     return len(changed)
+
+
+def _arm_feedback_repair_guard(run: CompileRun, suggested_pages: list[str]) -> None:
+    if getattr(run, "_feedback_repair_guard", None) is not None:
+        raise CommandRejected("a feedback repair scope is already active", 409)
+    snapshot_root = Path(tempfile.mkdtemp(prefix="kbc-feedback-scope-"))
+    workdir = Path(run.workdir)
+    for top in WORKSPACE_SYNC_DIRS:
+        source = workdir / top
+        if source.is_symlink():
+            shutil.rmtree(snapshot_root, ignore_errors=True)
+            raise CommandRejected(f"feedback repair workspace root is a symlink: {top}", 409)
+        if source.is_dir():
+            shutil.copytree(source, snapshot_root / top, symlinks=True)
+    run._feedback_repair_guard = {
+        "allowed": set(suggested_pages) | {"authoring/SELFCHECK.json"},
+        "snapshot_root": snapshot_root,
+    }
+
+
+def _restore_feedback_repair_scope(run: CompileRun) -> list[str]:
+    guard = getattr(run, "_feedback_repair_guard", None)
+    if not isinstance(guard, dict):
+        return []
+    allowed = guard.get("allowed") or set()
+    snapshot_root = Path(guard["snapshot_root"])
+    workdir = Path(run.workdir)
+    restored: list[str] = []
+    for top in WORKSPACE_SYNC_DIRS:
+        current_root = workdir / top
+        snapshot_dir = snapshot_root / top
+        if current_root.exists():
+            for current in sorted(current_root.rglob("*"), reverse=True):
+                rel = current.relative_to(workdir).as_posix()
+                if rel in allowed and not current.is_symlink():
+                    continue
+                if current.is_dir() and not current.is_symlink():
+                    continue
+                snapshot_file = snapshot_root / rel
+                if current.is_symlink() or snapshot_file.is_symlink() or not snapshot_file.is_file():
+                    current.unlink(missing_ok=True)
+                    restored.append(rel)
+        if snapshot_dir.is_dir():
+            for snapshot_file in sorted(snapshot_dir.rglob("*")):
+                if not snapshot_file.is_file():
+                    continue
+                rel = snapshot_file.relative_to(snapshot_root).as_posix()
+                if rel in allowed:
+                    continue
+                target = workdir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.is_file() or target.read_bytes() != snapshot_file.read_bytes():
+                    shutil.copy2(snapshot_file, target)
+                    restored.append(rel)
+    for top in WORKSPACE_SYNC_DIRS:
+        root = workdir / top
+        if root.is_dir():
+            for directory in sorted((item for item in root.rglob("*") if item.is_dir()), reverse=True):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+    return sorted(set(restored))
+
+
+def _clear_feedback_repair_guard(run: CompileRun) -> None:
+    guard = getattr(run, "_feedback_repair_guard", None)
+    if isinstance(guard, dict):
+        shutil.rmtree(guard.get("snapshot_root"), ignore_errors=True)
+    run._feedback_repair_guard = None
 
 
 def _workspace_replay_artifacts(run: CompileRun, sent: dict) -> list[dict]:
@@ -1655,11 +1742,9 @@ def _normalize_command(body: dict) -> tuple[str, dict]:
             for value in clean_pages
         ):
             raise CommandRejected("parameters.suggested_pages must contain Candidate paths")
-        parameters = {**parameters,
+        parameters = {
             "feedback_case_id": _bounded_string(parameters.get("feedback_case_id"), "parameters.feedback_case_id", required=True, limit=128),
             "question": _bounded_string(parameters.get("question"), "parameters.question", required=True, limit=4000),
-            "original_answer": _bounded_string(parameters.get("original_answer"), "parameters.original_answer", limit=12000),
-            "user_feedback": _bounded_string(parameters.get("user_feedback"), "parameters.user_feedback", limit=8000),
             "brief_summary": _bounded_string(parameters.get("brief_summary"), "parameters.brief_summary", required=True, limit=4000),
             "expected_answer": _bounded_string(parameters.get("expected_answer"), "parameters.expected_answer", required=True, limit=8000),
             "evidence_paths": clean_evidence,
@@ -1711,7 +1796,7 @@ def _render_command(run: "CompileRun", command: dict) -> str:
         payload = {
             key: params.get(key)
             for key in (
-                "feedback_case_id", "question", "original_answer", "user_feedback",
+                "feedback_case_id", "question",
                 "brief_summary", "expected_answer", "evidence_paths",
                 "suggested_pages", "repair_instructions",
             )
@@ -2715,6 +2800,8 @@ async def _post_turn_selfcheck(run) -> str | None:
     workdir = getattr(run, "workdir", None)
     if not workdir:  # test sessions reuse _emit_message but have no workspace
         return None
+    if getattr(run, "_feedback_repair_guard", None) is not None:
+        _restore_feedback_repair_scope(run)
     turn_pages_before = getattr(run, "_turn_page_hashes", None)
     producer_stamps: list[str] = []
     if isinstance(turn_pages_before, dict):
@@ -3104,6 +3191,10 @@ async def _emit_message(run: CompileRun, msg) -> None:
         # the turn ends normally; the repair is an ordinary next turn. When no
         # repair is due, a settled draft may instead owe its one-shot image
         # numeric re-verification (same seam, same never-stuck shape).
+        feedback_guard_active = getattr(run, "_feedback_repair_guard", None) is not None
+        if feedback_guard_active:
+            repair_msg = None
+            _restore_feedback_repair_scope(run)
         if repair_msg:
             # A ledger repair is a revision-in-progress: mark it so the frontend
             # keeps "生成与完善进行中" (converge not done) through the repair turn.
@@ -3128,9 +3219,14 @@ async def _emit_message(run: CompileRun, msg) -> None:
             # this exact draft), the draft is stable → settled. This makes
             # converge_phase authoritative for BOTH verify-on and verify-off, so the
             # frontend gates the test step on `settled` with no config lookup.
-            started = _maybe_start_media_verify(run) or _maybe_start_pk(run)
+            started = False if feedback_guard_active else (_maybe_start_media_verify(run) or _maybe_start_pk(run))
             if not started:
                 await _set_converge_phase(run, "settled")
+        if getattr(run, "_feedback_repair_guard", None) is not None:
+            try:
+                _restore_feedback_repair_scope(run)
+            finally:
+                _clear_feedback_repair_guard(run)
 
 
 # Default tool whitelist for a kb-compile session, used when the runtime profile
@@ -6754,13 +6850,44 @@ def _validate_feedback_review_request(payload: dict) -> dict:
     current_brief = payload.get("current_brief")
     if current_brief is not None and not isinstance(current_brief, dict):
         raise ValueError("current_brief must be an object")
+    clean_brief = None
+    if isinstance(current_brief, dict):
+        conclusion = _feedback_string(current_brief.get("conclusion"), "current_brief.conclusion", required=True, limit=32)
+        if conclusion not in {"discussing", "wiki_gap", "source_gap", "no_issue"}:
+            raise ValueError("current_brief.conclusion is invalid")
+
+        def clean_paths(field: str, prefix: str) -> list[str]:
+            values = current_brief.get(field) or []
+            if not isinstance(values, list) or len(values) > 12:
+                raise ValueError(f"current_brief.{field} must be an array of at most 12 paths")
+            clean: list[str] = []
+            for index, value in enumerate(values):
+                path_value = _feedback_string(value, f"current_brief.{field}[{index}]", required=True, limit=255)
+                try:
+                    path_value = _safe_tar_path(path_value).as_posix()
+                except ValueError as exc:
+                    raise ValueError(str(exc)) from exc
+                parts = PurePosixPath(path_value).parts
+                if len(parts) < 2 or parts[0] != prefix:
+                    raise ValueError(f"current_brief.{field} must contain {prefix} paths")
+                clean.append(path_value)
+            return clean
+
+        clean_brief = {
+            "conclusion": conclusion,
+            "summary": _feedback_string(current_brief.get("summary"), "current_brief.summary", required=True, limit=4000),
+            "expected_answer": _feedback_string(current_brief.get("expected_answer"), "current_brief.expected_answer", limit=8000),
+            "evidence_paths": clean_paths("evidence_paths", "raw"),
+            "suggested_pages": clean_paths("suggested_pages", "candidate"),
+            "repair_instructions": _feedback_string(current_brief.get("repair_instructions"), "current_brief.repair_instructions", limit=8000),
+        }
     return {
         "bundle_base64": bundle_base64,
         "bundle_sha256": bundle_sha256,
         "case": clean_case,
         "message": _feedback_string(payload.get("message"), "message", required=True, limit=8000),
         "transcript": clean_transcript,
-        "current_brief": current_brief or None,
+        "current_brief": clean_brief,
     }
 
 
@@ -7650,6 +7777,8 @@ async def handle_command(request: web.Request):
             raise CommandRejected("run is pinned to another operation generation", 409)
         _prepare_command(run, command)
         text = _render_command(run, command)
+        if command["action"] == "compile.repair_feedback":
+            _arm_feedback_repair_guard(run, command["parameters"]["suggested_pages"])
         run._command_context = context
         run._accepted_commands[command_id] = digest
         try:
@@ -7665,6 +7794,9 @@ async def handle_command(request: web.Request):
             )
         except BaseException:
             run._accepted_commands.pop(command_id, None)
+            if command["action"] == "compile.repair_feedback":
+                _restore_feedback_repair_scope(run)
+                _clear_feedback_repair_guard(run)
             raise
         return web.json_response({**result, "command_id": command_id, "action": command["action"]})
     except CommandRejected as exc:
@@ -7943,10 +8075,28 @@ async def handle_feedback_review(request: web.Request):
     parent = RUNS.get(run_id)
     if not parent:
         return failure(404, "runtime_unavailable", "feedback review run is unavailable", True)
+    if run_id in FEEDBACK_REVIEWS_ACTIVE:
+        return failure(409, "feedback_review_busy", "another feedback review is already running", True)
+    FEEDBACK_REVIEWS_ACTIVE.add(run_id)
     try:
-        payload = _validate_feedback_review_request(await request.json())
+        max_bytes = 100 * 1024 * 1024
+        if request.content_length is not None and request.content_length > max_bytes:
+            raise ValueError("request body exceeds 100 MiB")
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.content.iter_chunked(64 * 1024):
+            received += len(chunk)
+            if received > max_bytes:
+                raise ValueError("request body exceeds 100 MiB")
+            chunks.append(chunk)
+        raw_body = b"".join(chunks)
+        payload = _validate_feedback_review_request(json.loads(raw_body))
     except (ValueError, json.JSONDecodeError) as exc:
+        FEEDBACK_REVIEWS_ACTIVE.discard(run_id)
         return failure(400, "invalid_request", str(exc), False)
+    except BaseException:
+        FEEDBACK_REVIEWS_ACTIVE.discard(run_id)
+        raise
     try:
         timeout = float(os.environ.get("KBC_FEEDBACK_REVIEW_TIMEOUT_SECS", "600"))
         result = await asyncio.wait_for(_FEEDBACK_REVIEW_IMPL(parent, payload), timeout=timeout)
@@ -7960,6 +8110,8 @@ async def handle_feedback_review(request: web.Request):
     except Exception as exc:
         print(f"[compile_box] feedback review {run_id} failed: {type(exc).__name__}", flush=True)
         return failure(500, "internal_error", "feedback review failed", True)
+    finally:
+        FEEDBACK_REVIEWS_ACTIVE.discard(run_id)
 
 
 async def _rebuild_test_client(run: "TestRun") -> web.Response | None:
