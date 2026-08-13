@@ -669,6 +669,8 @@ describe("http-server — model routing", () => {
 
   it("does not fallback on context overflow", async () => {
     const s = await sm.getOrCreate("route-context");
+    const finishTurn = vi.fn();
+    (s as any).structuredResultController = { beginTurn: vi.fn(), finishTurn };
     const seenModels: string[] = [];
     s.brain.prompt.mockImplementation(async () => {
       const model = s.brain.getModel();
@@ -700,6 +702,7 @@ describe("http-server — model routing", () => {
     )).toBe(true);
     expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(false);
     expect(s._extraEventBuffer.some((event) => event.type === "model_route_exhausted")).toBe(true);
+    expect(finishTurn).toHaveBeenCalledWith("error");
   });
 
   it("does not fallback on auth errors by default", async () => {

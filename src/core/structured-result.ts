@@ -14,6 +14,37 @@ export interface StructuredResultSubmitResult {
   resultId?: string;
 }
 
+export type StructuredResultTurnOutcome = "completed" | "error";
+
+export const STRUCTURED_RESULT_TOOL_NAME = "submit_structured_result";
+
+/**
+ * A valid per-agent contract is the authorization for its matching runtime
+ * tool. Project that binding into the existing allow-list before registry
+ * resolution instead of adding a second capability switch or bypassing the
+ * registry's single whitelist chokepoint.
+ */
+export function withStructuredResultTool(
+  allowedTools: string[] | null | undefined,
+  hasContract: boolean,
+): string[] | null | undefined {
+  if (!hasContract || !Array.isArray(allowedTools) || allowedTools.includes(STRUCTURED_RESULT_TOOL_NAME)) {
+    return allowedTools;
+  }
+  return [...allowedTools, STRUCTURED_RESULT_TOOL_NAME];
+}
+
+/** Keep provider-facing tool parameters in the plain object shape pi expects. */
+export function normalizeStructuredResultToolParameters(
+  schema: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...schema,
+    type: "object",
+    properties: isObject(schema.properties) ? schema.properties : {},
+  };
+}
+
 const CONTRACT_ID_RE = /^[a-z][a-z0-9_.-]{0,127}$/;
 const MAX_CONTRACT_BYTES = 64 * 1024;
 
@@ -264,10 +295,10 @@ export class StructuredResultController {
     return { ok: true, message: "Structured result submitted.", resultId };
   }
 
-  finishTurn(): void {
+  finishTurn(outcome: StructuredResultTurnOutcome): void {
     const turn = this.turnRef.current;
     if (this.activeTurn !== turn) return;
-    if (this.contract.required && this.submittedTurn !== turn) {
+    if (outcome === "completed" && this.contract.required && this.submittedTurn !== turn) {
       this.emit({
         type: "structured_result_missing",
         contract_id: this.contract.id,

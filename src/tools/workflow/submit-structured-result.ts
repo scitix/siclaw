@@ -3,6 +3,10 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
+import {
+  normalizeStructuredResultToolParameters,
+  STRUCTURED_RESULT_TOOL_NAME,
+} from "../../core/structured-result.js";
 
 function toolResult(text: string, submitted: boolean, resultId?: string) {
   return {
@@ -18,10 +22,10 @@ export function createSubmitStructuredResultTool(refs: ToolRefs): ToolDefinition
   // working tool outside a contracted session.
   const contract = controller?.contract ?? {
     description: "Submit the configured structured result.",
-    schema: { type: "object", additionalProperties: false },
+    schema: { type: "object", properties: {}, additionalProperties: false },
   };
   return {
-    name: "submit_structured_result",
+    name: STRUCTURED_RESULT_TOOL_NAME,
     label: "Submit Structured Result",
     renderCall: (_args, theme) => new Text(theme.fg("toolTitle", theme.bold("submit_structured_result")), 0, 0),
     renderResult: renderTextResult,
@@ -29,7 +33,7 @@ export function createSubmitStructuredResultTool(refs: ToolRefs): ToolDefinition
       `${contract.description}\n\n` +
       "Submit the final machine-readable result for this turn. Call this tool exactly once, " +
       "only after the result is ready. Its arguments must match the configured schema.",
-    parameters: contract.schema as unknown as TSchema,
+    parameters: normalizeStructuredResultToolParameters(contract.schema) as unknown as TSchema,
     async execute(_toolCallId, params) {
       if (!controller) return toolResult("No structured result contract is configured.", false);
       const submitted = controller.submit(params);
@@ -42,4 +46,5 @@ export const registration: ToolEntry = {
   category: "workflow",
   create: createSubmitStructuredResultTool,
   available: (refs) => Boolean(refs.structuredResultController),
+  readOnlyDelegable: true,
 };

@@ -7,8 +7,9 @@
 // Semantics (backend): an agent stores the selected group KEYS in its
 // `tool_capabilities` field. null / empty = unrestricted (all tools, the
 // backward-compatible default). A non-null, non-empty selection restricts the
-// agent to the union of those groups' tools. MCP tools are exempt (governed by
-// the agent_mcp_servers binding).
+// agent to the union of those groups' tools. Resource-bound tools are governed
+// separately: MCP tools by agent_mcp_servers, and submit_structured_result by
+// the per-agent result contract.
 
 export interface CapabilityGroup {
   key: string
@@ -29,7 +30,6 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
   { key: "delegate_agents", name: "Delegate to agents", description: "Delegate a bounded task to a peer agent (roster-gated) + inspect delegate coverage", tools: ["delegate_to_agent", "list_delegates"] },
   { key: "scheduling", name: "Scheduling", description: "Manage scheduled / recurring runs", tools: ["manage_schedule"] },
   { key: "session_output", name: "Session output", description: "Report findings, post channel updates & submit feedback", tools: ["task_report", "save_feedback", "channel_update", "report_findings", "request_input"] },
-  { key: "structured_result", name: "Structured result", description: "Submit the configured machine-readable result contract", tools: ["submit_structured_result"] },
 ]
 
 /** Total distinct tools across the selected group keys (for the UI summary). */

@@ -47,6 +47,7 @@ import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 import {
   normalizeStructuredResultContract,
   StructuredResultController,
+  withStructuredResultTool,
   type StructuredResultContract,
 } from "./structured-result.js";
 
@@ -416,7 +417,8 @@ export async function createSiclawSession(
   const registry = new ToolRegistry();
   registry.register(...allToolEntries);
 
-  const allowedTools = opts?.allowedTools ?? config.allowedTools;
+  const configuredAllowedTools = opts?.allowedTools ?? config.allowedTools;
+  const allowedTools = withStructuredResultTool(configuredAllowedTools, Boolean(structuredResultController));
 
   // Shared task-ledger id; sub-agents pass the parent's id to share its ledger.
   const taskListId = opts?.taskListId ?? randomUUID();

@@ -61,7 +61,7 @@ describe("resolveCapabilities", () => {
     expect(result).toEqual(["manage_schedule"]);
   });
 
-  it("CAPABILITY_GROUPS contains the 12 designed groups", () => {
+  it("CAPABILITY_GROUPS contains the 11 operator-selected groups", () => {
     expect(Object.keys(CAPABILITY_GROUPS).sort()).toEqual([
       "delegate_agents",
       "inspect_infra",
@@ -73,7 +73,6 @@ describe("resolveCapabilities", () => {
       "search_memory",
       "session_output",
       "spawn_subagents",
-      "structured_result",
       "write_sandbox",
     ]);
   });

@@ -10,11 +10,13 @@
 import { describe, it, expect } from "vitest";
 import { allToolEntries } from "../tools/all-entries.js";
 import { CAPABILITY_GROUPS } from "./tool-capabilities.js";
+import { STRUCTURED_RESULT_TOOL_NAME } from "./structured-result.js";
 import type { ToolRefs } from "./tool-registry.js";
 
-// Tools deliberately left out of every group, with the reason. Keep EMPTY unless
-// a tool is intentionally ungovernable by capability groups (none today).
-const INTENTIONALLY_UNGROUPED = new Set<string>([]);
+// Contract-bound tools are authorized by their per-agent resource binding and
+// projected into allowedTools before registry resolution. They must not grow a
+// second, independently configurable capability switch.
+const BINDING_GRANTED_TOOLS = new Set<string>([STRUCTURED_RESULT_TOOL_NAME]);
 
 describe("capability-group registry coverage", () => {
   it("every registered tool belongs to some capability group", () => {
@@ -26,7 +28,7 @@ describe("capability-group registry coverage", () => {
     const missing: string[] = [];
     for (const entry of allToolEntries) {
       const name = entry.create(stubRefs).name;
-      if (!grouped.has(name) && !INTENTIONALLY_UNGROUPED.has(name)) missing.push(name);
+      if (!grouped.has(name) && !BINDING_GRANTED_TOOLS.has(name)) missing.push(name);
     }
 
     expect(missing).toEqual([]);

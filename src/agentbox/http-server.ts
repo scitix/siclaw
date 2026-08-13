@@ -925,7 +925,7 @@ export function createHttpServer(
     tracingRecorder.startPrompt(managed.id, promptText, body.userId);
 
     const actuallyFinish = () => {
-      managed.structuredResultController?.finishTurn();
+      managed.structuredResultController?.finishTurn(promptOutcome);
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
 

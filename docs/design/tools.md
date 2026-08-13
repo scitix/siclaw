@@ -439,22 +439,30 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 
 `submit_structured_result` is a generic runtime primitive, not a ticketing
 integration. The management plane supplies a self-contained JSON Schema with
-the agent's tool configuration. A valid call emits one `structured_result`
-event per turn on the existing extra-event SSE bus. Required contracts that are
-not submitted emit `structured_result_missing`; the runtime never fabricates a
-default result. Without a contract the tool is absent.
+the agent's tool configuration. The contract binding itself authorizes the
+tool: before registry resolution, a valid contract projects
+`submit_structured_result` into that agent's effective `allowedTools`. This
+keeps one whitelist chokepoint without introducing a second capability-group
+switch. A valid call emits one `structured_result` event per externally started
+turn on the existing extra-event SSE bus. Required contracts that are not
+submitted after a successfully completed prompt emit `structured_result_missing`;
+model errors and user aborts retain their original terminal reason. The runtime
+never fabricates a default result. Without a contract the tool is absent.
 
 ### allowedTools — Sole Availability Axis
 
 `allowedTools` is the only control over tool availability after mode/`available`
-filtering — there are no exemptions. A `null`/omitted `allowedTools` passes every
-tool through (the default); a non-null array passes only the tools it names.
+filtering — there are no registry exemptions. A `null`/omitted `allowedTools`
+passes every tool through (the default); a non-null array passes only the tools
+it names. Resource bindings may project their own bound tool into this list
+before resolution; today the structured-result contract is the only such case.
 
 **Per-agent source**: `allowedTools` is resolved from the agent's selected
 capability groups (`agents.tool_capabilities`) at the Gateway boundary
 (`resolveCapabilities`); null/empty selection → `null` = unrestricted. Every tool
-in the registry must belong to some `CAPABILITY_GROUPS` entry, otherwise a
-restricted agent can never reach it — enforced by `tool-capabilities-coverage.test.ts`.
+in the registry must belong to some `CAPABILITY_GROUPS` entry unless a named
+resource binding projects it into the whitelist — enforced by
+`tool-capabilities-coverage.test.ts`.
 
 **Global-whitelist caveat**: when a per-agent selection is null, agent-factory
 falls back to the global `config.allowedTools`. With the `platform` exemption
