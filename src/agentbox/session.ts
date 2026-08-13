@@ -163,6 +163,7 @@ export interface ManagedSession {
    * attempt instead of the whole session.
    */
   turnRef?: { current: number };
+  structuredResultController?: import("../core/structured-result.js").StructuredResultController;
   /** Number of JSONL message entries at the time of last memory auto-save (dedup) */
   _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
@@ -368,6 +369,8 @@ export class AgentBoxSessionManager {
   /** Agent type (sre/coordinator/custom), fetched alongside allowedTools.
    *  Drives capabilities and the legacy-row prompt fallback. */
   agentTypeState: string = "custom";
+  /** Machine-readable result contract fetched with the tool configuration. */
+  resultContractState: import("../core/structured-result.js").StructuredResultContract | null = null;
 
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
@@ -2701,6 +2704,9 @@ export class AgentBoxSessionManager {
       // global config.allowedTools in agent-factory — today's behaviour for any
       // agent that never set tool_capabilities).
       allowedTools: this.allowedToolsState,
+      // The contract is scoped to the top-level agent turn. Spawned children
+      // must not be able to commit the caller-visible result on its behalf.
+      resultContract: this.resultContractState,
       // The stored system_prompt is the agent-owned identity/behaviour
       // instruction, not a replacement for Siclaw's platform prompt. Keep the
       // platform template so safety/mode rules and dynamic context continue to
@@ -2769,6 +2775,7 @@ export class AgentBoxSessionManager {
       memoryIndexer: result.memoryIndexer,
       dpStateRef: result.dpStateRef,
       turnRef: result.turnRef,
+      structuredResultController: result.structuredResultController,
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
       _invalidated: false,

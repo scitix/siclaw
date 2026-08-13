@@ -154,6 +154,20 @@ describe("per-broker isolation", () => {
 });
 
 describe("createToolsHandler", () => {
+  it("materializes a valid structured result contract into per-agent state", async () => {
+    const target = { allowedToolsState: null as string[] | null, resultContractState: null as any };
+    const handler = createToolsHandler(target, null);
+    await handler.materialize({
+      allowedTools: null,
+      resultContract: {
+        id: "product_support.v1",
+        description: "Return support routing data",
+        required: true,
+        schema: { type: "object", properties: { label: { type: "boolean" } } },
+      },
+    });
+    expect(target.resultContractState?.id).toBe("product_support.v1");
+  });
   /** A fake GatewaySyncClientLike that returns a canned tool-capabilities body. */
   function fakeClient(body: unknown): GatewaySyncClientLike & { calls: Array<[string, string]> } {
     const calls: Array<[string, string]> = [];

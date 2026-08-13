@@ -435,6 +435,14 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | `manage_schedule` | `modes` | `["web", "channel"]` | No UI rendering in TUI |
 | `skill_preview` | `modes` | `["web", "channel"]` | Reads draft files from disk, renders side panel |
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
+| `submit_structured_result` | `available` | `(refs) => !!refs.structuredResultController` | Requires a valid per-agent result contract |
+
+`submit_structured_result` is a generic runtime primitive, not a ticketing
+integration. The management plane supplies a self-contained JSON Schema with
+the agent's tool configuration. A valid call emits one `structured_result`
+event per turn on the existing extra-event SSE bus. Required contracts that are
+not submitted emit `structured_result_missing`; the runtime never fabricates a
+default result. Without a contract the tool is absent.
 
 ### allowedTools — Sole Availability Axis
 

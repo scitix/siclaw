@@ -221,14 +221,28 @@ describe("handleToolCapabilities", () => {
     const res = new FakeRes();
     await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ allowedTools: null, agentType: "custom" });
+    expect(JSON.parse(res.body)).toEqual({ allowedTools: null, agentType: "custom", resultContract: null });
   });
 
   it("treats an empty selection as null (whitelist off)", async () => {
     frontend.responses.set("config.getAgent", { tool_capabilities: [] });
     const res = new FakeRes();
     await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
-    expect(JSON.parse(res.body)).toEqual({ allowedTools: null, agentType: "custom" });
+    expect(JSON.parse(res.body)).toEqual({ allowedTools: null, agentType: "custom", resultContract: null });
+
+  });
+
+  it("forwards the per-agent result contract with tool configuration", async () => {
+    const resultContract = {
+      id: "product_support.v1",
+      description: "Return support routing data",
+      required: true,
+      schema: { type: "object" },
+    };
+    frontend.responses.set("config.getAgent", { tool_capabilities: null, result_contract: resultContract });
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    expect(JSON.parse(res.body).resultContract).toEqual(resultContract);
   });
 
   it("500 when the agent lookup fails", async () => {

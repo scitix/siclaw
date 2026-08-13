@@ -925,6 +925,7 @@ export function createHttpServer(
     tracingRecorder.startPrompt(managed.id, promptText, body.userId);
 
     const actuallyFinish = () => {
+      managed.structuredResultController?.finishTurn();
       managed._promptDone = true;
       managed._routeBrainEventsThroughExtra = false;
 
@@ -1027,6 +1028,8 @@ export function createHttpServer(
       sendJson(res, 200, { ok: true, sessionId: managed.id, turnId: body.turnId, aborted: true });
       return;
     }
+
+    managed.structuredResultController?.beginTurn();
 
     // Single entry: every prompt goes through the routing runner. With no real
     // fallback target it runs one candidate (the current model) live — identical

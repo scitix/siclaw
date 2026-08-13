@@ -26,6 +26,10 @@ import type {
 import { GATEWAY_SYNC_DESCRIPTORS } from "../shared/gateway-sync.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
 import { decodeSkillFileContent, normalizeSkillFiles, type SkillPackageFile } from "../shared/skill-package.js";
+import {
+  normalizeStructuredResultContract,
+  type StructuredResultContract,
+} from "../core/structured-result.js";
 
 // ── MCP handler ───────────────────────────────────────────────────────
 
@@ -559,6 +563,7 @@ interface ToolsPayload {
   allowedTools: string[] | null;
   /** Agent type (sre/coordinator/custom) — drives capabilities and prompt fallback. */
   agentType?: string;
+  resultContract?: StructuredResultContract | null;
 }
 
 /**
@@ -571,6 +576,7 @@ export interface ToolsStateTarget {
   allowedToolsState: string[] | null;
   /** Agent type resolved from the tool-capabilities payload. */
   agentTypeState?: string;
+  resultContractState?: StructuredResultContract | null;
 }
 
 /**
@@ -609,6 +615,7 @@ export function createToolsHandler(
       const allowed = Array.isArray(payload?.allowedTools) ? payload.allowedTools : null;
       target.allowedToolsState = allowed;
       target.agentTypeState = typeof payload?.agentType === "string" ? payload.agentType : "custom";
+      target.resultContractState = normalizeStructuredResultContract(payload?.resultContract);
       return allowed ? allowed.length : 0;
     },
 

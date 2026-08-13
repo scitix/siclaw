@@ -44,6 +44,11 @@ import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
+import {
+  normalizeStructuredResultContract,
+  StructuredResultController,
+  type StructuredResultContract,
+} from "./structured-result.js";
 
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
@@ -69,6 +74,8 @@ export interface CreateSiclawSessionOpts {
   delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
   /** Agent tool allow-list: null = all tools, string[] = only these tools */
   allowedTools?: string[] | null;
+  /** Management-plane supplied machine-readable result contract. */
+  resultContract?: StructuredResultContract | null;
   /** Extra system prompt content appended for agent customization */
   systemPromptAppend?: string;
   /** Custom system prompt template from agent settings (overrides DEFAULT_TEMPLATE) */
@@ -158,6 +165,7 @@ export interface SiclawSessionResult {
   sessionIdRef: { current: string };
   /** Bumped once per turn by the prompt owner; scopes per-attempt tool state (ToolRefs.turnRef). */
   turnRef: { current: number };
+  structuredResultController?: StructuredResultController;
 
 }
 
@@ -340,6 +348,10 @@ export async function createSiclawSession(
   const sessionIdRef: { current: string } = { current: "" };
   // Turn counter for per-attempt tool state; the prompt owner bumps it (see ToolRefs).
   const turnRef: { current: number } = { current: 0 };
+  const resultContract = normalizeStructuredResultContract(opts?.resultContract);
+  const structuredResultController = resultContract && opts?.sessionEventEmitter
+    ? new StructuredResultController(resultContract, turnRef, opts.sessionEventEmitter)
+    : undefined;
   const mode = opts?.mode ?? "web";
   const memoryEnabled = isMemoryEnabled();
   // Mutable ref — populated after memoryIndexer is created (below) so memory-
@@ -418,6 +430,7 @@ export async function createSiclawSession(
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
+      structuredResultController,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
       // Force sub-agents foreground when a detached batch's conclusion would be
       // stranded because the caller blocks on the turn's own result and has no
@@ -759,5 +772,5 @@ export async function createSiclawSession(
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, services, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, turnRef, dpStateRef };
+  return { brain, session, services, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, turnRef, structuredResultController, dpStateRef };
 }

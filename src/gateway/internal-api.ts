@@ -294,7 +294,11 @@ export async function handleToolCapabilities(
     const capsKeys = effectiveCapabilityKeys(agentType, (agent?.tool_capabilities ?? null) as string[] | null);
     const allowedTools = resolveCapabilities(capsKeys);
     // agentType rides along for capabilities and legacy-row prompt fallback.
-    sendJson(res, 200, { allowedTools, agentType });
+    sendJson(res, 200, {
+      allowedTools,
+      agentType,
+      resultContract: agent?.result_contract ?? null,
+    });
   } catch (err) {
     console.error("[internal-api] tool-capabilities error:", err);
     sendJson(res, 500, { error: "Internal server error" });

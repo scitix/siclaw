@@ -405,6 +405,8 @@ export interface ToolRefs {
   memoryDir?: string;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;
+  /** Per-agent structured-output contract controller. Absent means the tool is hidden. */
+  structuredResultController?: import("./structured-result.js").StructuredResultController;
   /**
    * Optional spawn_subagent executor (design §6, v3 single-tool merge). Handles the whole
    * batch plan (1..N items + optional reduce), collapsing a single no-reduce task to a legacy
