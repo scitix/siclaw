@@ -147,6 +147,12 @@ cleaned up afterwards.
   in between. When `coverage` is not `FULL`, that is the point at which a log
   or metrics backend becomes the only option; note the switch explicitly when
   you report, because that data has different freshness and completeness.
+- **The access log is not necessarily every request.** nginx-ingress maps
+  `$request_uri` to a `$loggable` flag, so a cluster can switch logging off for
+  chosen paths (health checks are the usual case). What you get is the count of
+  *logged* requests. If a total looks implausibly low, check `log_format` /
+  `$loggable` in the controller's `nginx.conf` before concluding traffic is
+  missing.
 - **Buckets, not percentiles.** A single streaming pass can count how many
   requests fell in a range, but it cannot produce an exact p95/p99 without
   retaining every value. If the user asks for a percentile rather than "how
