@@ -101,6 +101,21 @@ request_time buckets (seconds):
 A count over a window the log no longer covers is not a smaller truth, it is a
 wrong number. Never present `PARTIAL` results as the window total.
 
+## Safety
+
+Read-only, and it creates **no files** — not even a temporary one that is
+cleaned up afterwards.
+
+- Only two cluster verbs are ever issued: `kubectl get pods` and `kubectl logs`.
+  Nothing is created, patched, deleted, or exec'd; no debug pod is spawned.
+- No output redirection, no scratch file. Every log line is streamed through a
+  pipe into a single `awk` that keeps only counters in memory, so a
+  multi-gigabyte window costs a constant amount of RAM and zero disk.
+- Shell constructs that create a temp file behind your back are avoided on
+  purpose: no here-doc / here-string (bash backs those with a file in `$TMPDIR`
+  before 5.1 and beyond the pipe buffer) and no `sort` (spills to `/tmp` above
+  its memory threshold). `awk` formats the report itself.
+
 ## Notes
 
 - **One pull per replica, all dimensions at once.** Every bucket and every
@@ -119,6 +134,12 @@ wrong number. Never present `PARTIAL` results as the window total.
   in between. When `coverage` is not `FULL`, that is the point at which a log
   or metrics backend becomes the only option; note the switch explicitly when
   you report, because that data has different freshness and completeness.
+- **Buckets, not percentiles.** A single streaming pass can count how many
+  requests fell in a range, but it cannot produce an exact p95/p99 without
+  retaining every value. If the user asks for a percentile rather than "how
+  many exceeded N", use the controller's duration histogram
+  (`nginx_ingress_controller_request_duration_seconds`) — that is what
+  histograms are for.
 - **Format assumption.** Parsing targets the nginx-ingress default
   `log-format-upstream`: `$status` after the quoted request line, `$request_time`
   immediately before the bracketed `$proxy_upstream_name`. If a cluster

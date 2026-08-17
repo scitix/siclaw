@@ -25,30 +25,32 @@ UNTIL=""
 BUCKETS="1,10,60"
 PRESET="nginx-ingress"
 
+# printf, not a here-doc: bash backs here-documents and here-strings with a
+# temporary file (pre-5.1, and for anything past the pipe buffer). It is
+# unlinked immediately, but this script must not create a file at all — it runs
+# read-only against production clusters.
 usage() {
-  cat <<'EOF'
-Usage: http-log-stats.sh --since-time <RFC3339> [options]
-
-Required:
-  --since-time T     Window start, RFC3339 UTC (e.g. 2026-08-17T12:02:06Z)
-
-Options:
-  --until-time T     Window end, RFC3339 UTC. Default: now (open-ended).
-  -n, --namespace N  Ingress controller namespace. Default: ingress-nginx
-  --selector S       Pod label selector. Default: app.kubernetes.io/name=ingress-nginx
-  --pod P[,P2]       Explicit pod name(s), comma-separated. Overrides --selector.
-  --match S          Only count lines containing this substring (host, path,
-                     service or ingress name). Omit to count all traffic.
-  --buckets a,b,c    Duration bucket edges in seconds. Default: 1,10,60
-                     (yields <1, 1-10, 10-60, >=60)
-  --preset P         Access log format. Only "nginx-ingress" today.
-  -h, --help         Show this help
-
-Example:
-  http-log-stats.sh --since-time 2026-08-17T12:02:06Z \
-    --until-time 2026-08-17T14:02:06Z \
-    --match my-service --buckets 1,10,60
-EOF
+  printf '%s\n' \
+    'Usage: http-log-stats.sh --since-time <RFC3339> [options]' \
+    '' \
+    'Required:' \
+    '  --since-time T     Window start, RFC3339 UTC (e.g. 2026-08-17T12:02:06Z)' \
+    '' \
+    'Options:' \
+    '  --until-time T     Window end, RFC3339 UTC. Default: now (open-ended).' \
+    '  -n, --namespace N  Ingress controller namespace. Default: ingress-nginx' \
+    '  --selector S       Pod label selector. Default: app.kubernetes.io/name=ingress-nginx' \
+    '  --pod P[,P2]       Explicit pod name(s), comma-separated. Overrides --selector.' \
+    '  --match S          Only count lines containing this substring (host, path,' \
+    '                     service or ingress name). Omit to count all traffic.' \
+    '  --buckets a,b,c    Duration bucket edges in seconds. Default: 1,10,60' \
+    '                     (yields <1, 1-10, 10-60, >=60)' \
+    '  --preset P         Access log format. Only "nginx-ingress" today.' \
+    '  -h, --help         Show this help' \
+    '' \
+    'Example:' \
+    '  http-log-stats.sh --since-time 2026-08-17T12:02:06Z \' \
+    '    --until-time 2026-08-17T14:02:06Z --match my-service --buckets 1,10,60'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -129,14 +131,24 @@ else
   COVERAGE_NOTE="(earliest retained line $EARLIEST)"
 fi
 
+# ── Report header ──────────────────────────────────────────────────────
+echo "window:    $SINCE .. ${UNTIL:-now}"
+echo "source:    live cluster (kubectl logs), ns=$NAMESPACE, $POD_COUNT pod(s)"
+echo "coverage:  $COVERAGE  $COVERAGE_NOTE"
+[[ -n "$MATCH" ]] && echo "match:     $MATCH"
+
 # ── Single full pull per replica, one awk pass over all of it ──────────
 # Every replica's stream is concatenated into ONE awk so cross-replica totals
 # come out already summed. Failures per replica are tolerated (a pod can be
 # restarting) — unreadable replicas are reported via the parsed/total counters.
-STATS=$(
-  for p in $POD_LIST; do
-    kubectl logs -n "$NAMESPACE" "$p" --timestamps --since-time="$SINCE" 2>/dev/null || true
-  done | awk -v until_t="$UNTIL" -v match_s="$MATCH" -v buckets="$BUCKETS" '
+#
+# awk formats the whole report itself. Piping its output through sort/read in
+# the shell would be the only remaining way this script could touch disk (sort
+# spills to /tmp above its memory threshold; read <<< is a here-string), and
+# status codes are naturally ordered by walking 100..599 instead.
+for p in $POD_LIST; do
+  kubectl logs -n "$NAMESPACE" "$p" --timestamps --since-time="$SINCE" 2>/dev/null || true
+done | awk -v until_t="$UNTIL" -v match_s="$MATCH" -v buckets="$BUCKETS" '
     BUCKET_INIT_ONCE == 0 {
       n = split(buckets, edge, ",")
       BUCKET_INIT_ONCE = 1
@@ -172,61 +184,41 @@ STATS=$(
       }
     }
     END {
-      printf "TOTAL %d %d %d\n", total, parsed_status, parsed_time
-      for (c in codes) printf "CODE %s %d\n", c, codes[c]
-      # "-" rather than an empty upper bound: an empty field would collapse into
-      # adjacent spaces and shift every later column when the shell reads it back.
+      printf "parsed:    %d lines (status %d, request_time %d)\n\n",
+             total, parsed_status, parsed_time
+
+      if (total == 0) {
+        print "No matching lines in the window."
+        print ""
+        print "Before reporting this as \"no traffic\": confirm --match matches how the"
+        print "access log names the target (ingress name / host / path, not the Deployment"
+        print "name), and that this controller is the one serving it. An empty result is"
+        print "bounded non-evidence for THIS command, not proof of zero requests."
+        exit 0
+      }
+
+      print "status codes:"
+      for (c = 100; c < 600; c++) {
+        if (codes[c] > 0)
+          printf "  %-5d %7d  %5.1f%%\n", c, codes[c], codes[c] * 100 / total
+      }
+
+      printf "\nrequest_time buckets (seconds):\n"
       for (i = 1; i <= n + 1; i++) {
-        lo = (i == 1) ? "0" : edge[i - 1]
-        hi = (i == n + 1) ? "-" : edge[i]
-        printf "BUCKET %s %s %d\n", lo, hi, hist[i] + 0
+        if (i == n + 1)   label = ">=" edge[n]
+        else if (i == 1)  label = "<" edge[1]
+        else              label = edge[i - 1] "-" edge[i]
+        printf "  %-9s %7d  %5.1f%%\n", label, hist[i] + 0,
+               parsed_time ? hist[i] * 100 / parsed_time : 0
+      }
+
+      # A parser that silently matched nothing would hand back a
+      # confident-looking zero. Say so instead — the format is probably custom.
+      if (parsed_status == 0 || parsed_time == 0) {
+        printf "\nWARNING: parsed 0 %s from %d matching lines. This controller'"'"'s\n",
+               (parsed_status == 0 ? "status codes" : "durations"), total
+        print "log_format is probably not the nginx-ingress default — the counts above are"
+        print "NOT trustworthy. Sample a few raw lines before drawing any conclusion."
       }
     }
   '
-)
-
-# ── Report ────────────────────────────────────────────────────────────
-read -r _ TOTAL PARSED_STATUS PARSED_TIME <<<"$(echo "$STATS" | grep '^TOTAL ' || echo 'TOTAL 0 0 0')"
-
-echo "window:    $SINCE .. ${UNTIL:-now}"
-echo "source:    live cluster (kubectl logs), ns=$NAMESPACE, $POD_COUNT pod(s)"
-echo "coverage:  $COVERAGE  $COVERAGE_NOTE"
-[[ -n "$MATCH" ]] && echo "match:     $MATCH"
-echo "parsed:    $TOTAL lines (status $PARSED_STATUS, request_time $PARSED_TIME)"
-echo
-
-if [[ "$TOTAL" -eq 0 ]]; then
-  echo "No matching lines in the window."
-  echo
-  echo "Before reporting this as \"no traffic\": confirm --match matches how the"
-  echo "access log names the target (ingress name / host / path, not the Deployment"
-  echo "name), and that this controller is the one serving it. An empty result is"
-  echo "bounded non-evidence for THIS command, not proof of zero requests."
-  exit 0
-fi
-
-echo "status codes:"
-echo "$STATS" | grep '^CODE ' | sort -k2,2 | while read -r _ code count; do
-  awk -v c="$code" -v n="$count" -v t="$TOTAL" \
-    'BEGIN { printf "  %-5s %7d  %5.1f%%\n", c, n, (t ? n * 100 / t : 0) }'
-done
-
-echo
-echo "request_time buckets (seconds):"
-echo "$STATS" | grep '^BUCKET ' | while read -r _ lo hi count; do
-  if [[ "$hi" == "-" ]]; then label=">=${lo}"
-  elif [[ "$lo" == "0" ]]; then label="<${hi}"
-  else label="${lo}-${hi}"; fi
-  awk -v l="$label" -v n="$count" -v t="$PARSED_TIME" \
-    'BEGIN { printf "  %-9s %7d  %5.1f%%\n", l, n, (t ? n * 100 / t : 0) }'
-done
-
-# A parser that silently matched nothing would hand back a confident-looking
-# zero. Say so instead — the format is probably customised.
-if [[ "$PARSED_STATUS" -eq 0 || "$PARSED_TIME" -eq 0 ]]; then
-  echo
-  echo "WARNING: parsed 0 $([[ "$PARSED_STATUS" -eq 0 ]] && echo 'status codes' || echo 'durations')"
-  echo "from $TOTAL matching lines. This controller's log_format is probably not the"
-  echo "nginx-ingress default — the counts above are NOT trustworthy. Sample a few raw"
-  echo "lines before drawing any conclusion."
-fi
