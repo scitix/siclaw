@@ -245,6 +245,30 @@ describe("handleToolCapabilities", () => {
     expect(JSON.parse(res.body).resultContract).toEqual(resultContract);
   });
 
+  it("keeps a product-support profile read-only while forwarding its contract", async () => {
+    const resultContract = {
+      id: "product_support.v1",
+      description: "Return support routing data",
+      required: true,
+      schema: {
+        type: "object",
+        properties: { label: { type: "boolean" }, info: { type: "object" } },
+      },
+    };
+    frontend.responses.set("config.getAgent", {
+      agent_type: "custom",
+      tool_capabilities: ["read_files"],
+      result_contract: resultContract,
+    });
+    const res = new FakeRes();
+    await handleToolCapabilities(asReq(new FakeReq("")), asRes(res), identity, frontend as unknown as FrontendWsClient);
+    const body = JSON.parse(res.body);
+
+    expect(new Set(body.allowedTools)).toEqual(new Set(["read", "grep", "find", "ls"]));
+    expect(body.agentType).toBe("custom");
+    expect(body.resultContract).toEqual(resultContract);
+  });
+
   it("500 when the agent lookup fails", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     frontend.nextError = new Error("agent lookup down");

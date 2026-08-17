@@ -449,6 +449,14 @@ submitted after a successfully completed prompt emit `structured_result_missing`
 model errors and user aborts retain their original terminal reason. The runtime
 never fabricates a default result. Without a contract the tool is absent.
 
+Business profiles remain a management-plane concern. For example, Sicore's
+`product_support` profile materializes a `custom` runtime type, a read-only
+capability selection, its product-support prompt, and the versioned
+`product_support.v1` result contract. Siclaw consumes those generic fields and
+does not hard-code the profile or duplicate its ticket schema. Unprofiled SRE,
+Coordinator, and Custom agents therefore follow the same resolution path they
+used before structured results existed.
+
 ### allowedTools — Sole Availability Axis
 
 `allowedTools` is the only control over tool availability after mode/`available`
