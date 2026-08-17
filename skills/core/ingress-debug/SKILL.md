@@ -187,3 +187,8 @@ kubectl top pods -n <controller-ns> -l app.kubernetes.io/name=ingress-nginx
 - Ingress controller logs are the most useful source for debugging routing issues — always check them when the cause is unclear.
 - If the cluster uses multiple Ingress controllers, make sure the Ingress's `ingressClassName` matches the correct controller.
 - For cloud-managed Ingress (AWS ALB Ingress Controller, GCE Ingress), the controller creates cloud load balancers — check cloud provider console if the ADDRESS is stuck or the load balancer is unhealthy.
+
+## See also
+
+- `http-log-stats` — when the question is **how much** rather than **why**: counting status codes or request-duration distribution over a time window from the controller's access log. Use it instead of hand-rolling `kubectl logs | grep -c` per number.
+- `service-debug` — backend Service has no healthy endpoints.
