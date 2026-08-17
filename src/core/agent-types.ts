@@ -5,7 +5,11 @@
  * system_prompt is the single editable identity/behaviour instruction.
  *
  *   - sre         — a specialist that operates hands-on within its authorized
- *                   clusters/hosts (full read + exec + scripts).
+ *                   clusters/hosts (full read + write + exec + scripts, plus
+ *                   sub-agent fan-out and the background-job read/stop pair its
+ *                   own exec tools hand out task ids for). It does NOT delegate:
+ *                   routing to peers is the coordinator's job, and an SRE agent
+ *                   is the delegation TARGET, not a router.
  *   - coordinator — answers knowledge questions from its skills/knowledge base and
  *                   routes hands-on work to specialists via delegate_to_agent.
  *                   No skills by default. Ships an editable default prompt.
@@ -105,7 +109,11 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeDef> = {
   sre: {
     label: "SRE Agent",
     description: "Hands-on specialist: inspects, diagnoses and remediates within its authorized clusters/hosts.",
-    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "search_memory", "plan_tasks", "session_output"],
+    // spawn_subagents is not optional polish: run_commands hands the model
+    // `run_in_background`, whose tool descriptions tell it to call task_output /
+    // job_stop — both of which live in this group. Without it an SRE agent can
+    // start a background capture it can neither read nor stop.
+    capabilities: ["inspect_infra", "run_commands", "run_scripts", "read_files", "write_sandbox", "search_memory", "plan_tasks", "spawn_subagents", "session_output"],
     defaultPrompt: SRE_DEFAULT_PROMPT,
     defaultNoSkills: false,
   },
