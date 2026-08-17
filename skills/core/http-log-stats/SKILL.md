@@ -44,10 +44,23 @@ This step costs one command and routinely saves the entire investigation.
 ## Tool
 
 ```
-local_script: skill="http-log-stats", script="http-log-stats.sh", args="<args>"
+local_script: cluster="<cluster>", skill="http-log-stats",
+              script="http-log-stats.sh", args="<args>"
 ```
 
 Runs `kubectl` from the agent's own context — no debug pod, no node access.
+
+**Set `cluster`** to the target cluster's credential name (from `cluster_list`).
+`local_script` resolves it to a kubeconfig and exports `KUBECONFIG` into the
+script's environment, so the `kubectl` calls inside the script pick it up
+automatically. You may omit it only when the agent is bound to exactly one
+cluster; with several bound, omitting it is an error listing the available
+names, not a silent default.
+
+Do **not** pass `--kubeconfig` or a `KUBECONFIG=` prefix in `args` — cluster
+selection goes through the tool parameter, and the script takes no such flag.
+If the name is wrong or the agent is not bound to that cluster, the call fails
+with the available names; it never silently talks to the wrong cluster.
 
 ## Parameters
 
