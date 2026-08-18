@@ -250,7 +250,7 @@ Examples:
         const stdout = err.stdout?.trim() ?? "";
         const stderr = err.stderr?.trim() ?? err.message;
         return {
-          content: [{ type: "text", text: postExecSecurity(`${stdout || "(no output)"}\n[exit code: ${err.code ?? "unknown"}]`, null, { stderr: stderr || undefined }) }],
+          content: [{ type: "text", text: postExecSecurity(stdout, null, { stderr: stderr || undefined, exitCode: err.code ?? "unknown" }) }],
           details: { exitCode: err.code ?? null, error: true },
         };
       }

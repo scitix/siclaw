@@ -506,6 +506,8 @@ describe("sanitizeJSON", () => {
       "        headers:",
       "          Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def",
       "        token: ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      // Key NOT in the vocabulary: only the value patterns can catch this one.
+      "        upstream: sk-proj-abcdefghijklmnop",
       "    scrape_interval: 30s",
     ].join("\n");
 
@@ -523,6 +525,10 @@ describe("sanitizeJSON", () => {
       expect(out).not.toContain("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9");
       expect(out).not.toContain("eyJhbGciOiJIUzI1NiJ9");
       expect(out).not.toContain("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+      // The one whose KEY is not in the vocabulary — this is what actually
+      // exercises the value patterns on a prefixed line. Without it every
+      // assertion above passes on key-name matching alone.
+      expect(out).not.toContain("sk-proj-abcdefghijklmnop");
     });
 
     it("keeps the rest of the file diagnosable", () => {
@@ -537,6 +543,24 @@ describe("sanitizeJSON", () => {
       // Names WHICH setting was redacted, and does not break the YAML block.
       expect(out).toContain("      credentials: **REDACTED**");
       expect(out).toContain("          Authorization: **REDACTED**");
+      expect(out).toContain("        upstream: **REDACTED**");
+    });
+
+    it("keeps a nested mapping's field names while redacting their values", () => {
+      // `authorization:` opens a mapping — the key line has no value to redact,
+      // and dropping the whole block would hide which fields were configured.
+      const out = sanitizeEntry(promConfig);
+      expect(out).toContain("    authorization:");
+      expect(out).toContain("credentials: **REDACTED**");
+    });
+
+    it("redacts a nested value whose own field name is innocuous", () => {
+      // The parent key already said this is a credential region; judging `inner`
+      // on its own merits (not in the vocabulary, value not token-shaped) leaks it.
+      const out = sanitizeEntry("password:\n  inner: plain_value\nmode: on\n");
+      expect(out).not.toContain("plain_value");
+      expect(out).toContain("inner: **REDACTED**");
+      expect(out).toContain("mode: on");
     });
 
     it("drops the whole entry for a multi-line PEM block", () => {
@@ -547,6 +571,65 @@ describe("sanitizeJSON", () => {
       expect(out).toBe("**REDACTED**");
       expect(out).not.toContain("MIIEvQIBADANBgkq");
       expect(out).not.toContain("hkiG9w0BAQEFAASC");
+    });
+
+    // Each of these shapes leaked in full while the footer claimed otherwise.
+    it("redacts a YAML block scalar's body, not just its key line", () => {
+      const out = sanitizeEntry("api_token: |\n  ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nlog: debug\n");
+      expect(out).not.toContain("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+      expect(out).toContain("log: debug");
+    });
+
+    it("redacts a folded block scalar too", () => {
+      const out = sanitizeEntry("secret_blob: >-\n  hunter2\n  more\nmode: on\n");
+      expect(out).not.toContain("hunter2");
+      expect(out).toContain("mode: on");
+    });
+
+    it("redacts a YAML sequence entry", () => {
+      const out = sanitizeEntry("users:\n  - password: hunter2\n  - name: bob\n");
+      expect(out).not.toContain("hunter2");
+      expect(out).toContain("name: bob");
+    });
+
+    it("redacts a quoted key with no surrounding space", () => {
+      const out = sanitizeEntry('password:hunter2\nmode:strict\n');
+      expect(out).not.toContain("hunter2");
+      expect(out).toContain("mode:strict");
+    });
+
+    it("redacts an INI assignment with spaces around =", () => {
+      const out = sanitizeEntry("aws_secret_access_key = AKIAIOSFODNN7EXAMPLE\nregion = us-east-1\n");
+      expect(out).not.toContain("AKIAIOSFODNN7EXAMPLE");
+      expect(out).toContain("region = us-east-1");
+    });
+
+    it("keeps a connection string redacted despite the key/value split", () => {
+      // `postgresql://…` splits into key `postgresql` + `//user:pass@…`, which no
+      // longer matches the ://-anchored pattern — the raw line must be checked too.
+      const out = sanitizeEntry("postgresql://user:pass@db:5432/mydb");
+      expect(out).not.toContain("user:pass");
+    });
+
+    it("walks a JSON payload's nested keys", () => {
+      const out = sanitizeEntry(
+        '{"log":"debug","auth":{"token":"plain-secret-value"},"items":[{"password":"hunter2"}]}',
+      );
+      expect(out).not.toContain("plain-secret-value");
+      expect(out).not.toContain("hunter2");
+      expect(out).toContain("debug");
+    });
+
+    it("drops an unparseable JSON payload that names a sensitive key", () => {
+      // A compact object puts several pairs on one line; if we could not parse it
+      // we cannot claim a line-oriented pass rewrote all of them.
+      const out = sanitizeEntry('{"token":"abc","trunc');
+      expect(out).toBe("**REDACTED**");
+    });
+
+    it("leaves unparseable JSON alone when no sensitive key is named", () => {
+      const out = sanitizeEntry('{"log":"debug","trunc');
+      expect(out).toContain("debug");
     });
   });
 });
@@ -563,6 +646,9 @@ describe("SENSITIVE_ENV_NAME_PATTERNS", () => {
     "PRIVATE_KEY", "PRIVATE-KEY",
     "SSH_KEY", "ENCRYPTION_KEY",
     "Authorization", "authorization", "HTTP_AUTHORIZATION", "X-Authorization",
+    // Kubernetes names key material with a dot; kubeconfig-shaped and registry
+    // credentials show up verbatim in ConfigMaps.
+    "tls.key", "client-key-data", "jwt", "JWT_SECRET", ".dockerconfigjson", "dockercfg",
   ];
   const shouldNotMatch = [
     "LOG_LEVEL", "NODE_ENV", "JAVA_OPTS", "PORT", "HOST",
@@ -570,6 +656,8 @@ describe("SENSITIVE_ENV_NAME_PATTERNS", () => {
     // kube-apiserver diagnostic flags must stay readable — the pattern is
     // end-anchored precisely so these survive.
     "authorization-mode", "authorization-webhook-config-file",
+    // The public half of a TLS pair, and a key COUNT rather than key material.
+    "tls.crt", "ca.crt", "keydata_version",
   ];
 
   for (const name of shouldMatch) {

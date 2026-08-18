@@ -258,16 +258,19 @@ Examples (pass the id from host_list; names shown here for readability):
 
       const isError = result.exitCode !== 0 &&
         !(result.exitCode === null && result.stdout.trim());
-      const stdoutHeader = isError
-        ? `Exit code: ${result.exitCode ?? "unknown"}${result.signal ? ` (signal: ${result.signal})` : ""}\n`
-        : "";
-      const truncatedSuffix = result.truncated ? "\n...[output truncated at 10 MB]" : "";
-      const stdout = stdoutHeader + result.stdout.trim() + truncatedSuffix;
-
       return {
         content: [{
           type: "text",
-          text: postExecSecurity(stdout, null, { stderr: result.stderr.trim() || undefined }),
+          text: postExecSecurity(result.stdout.trim(), null, {
+            stderr: result.stderr.trim() || undefined,
+            ...(result.truncated ? { notes: "\n...[output truncated at 10 MB]" } : {}),
+            ...(isError
+              ? {
+                  exitCode: result.exitCode ?? "unknown",
+                  ...(result.signal ? { signal: result.signal } : {}),
+                }
+              : {}),
+          }),
         }],
         details: {
           exitCode: result.exitCode,

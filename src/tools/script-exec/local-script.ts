@@ -279,7 +279,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           agentId: agentId ?? null,
         });
         return {
-          content: [{ type: "text", text: postExecSecurity(`Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}`, null, { stderr: errStderr || undefined }) }],
+          content: [{ type: "text", text: postExecSecurity(err.stdout?.trim() ?? "", null, { stderr: errStderr || undefined, exitCode: err.code ?? "unknown" }) }],
           details: { exitCode: err.code, error: true },
         };
       }
