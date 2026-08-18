@@ -350,6 +350,13 @@ export class AgentBoxSessionManager {
   credentialsDir?: string;
 
   /**
+   * Optional directory containing this AgentBox's materialized knowledge.
+   * LocalSpawner sets an agent-scoped path because every local box shares one
+   * process and cwd. K8s leaves this unset and uses the pod-local config path.
+   */
+  knowledgeDir?: string;
+
+  /**
    * Per-agent tool capability whitelist — the resolved `allowedTools` list for
    * this AgentBox's agent (see core/tool-capabilities.ts).
    *
@@ -2138,6 +2145,7 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId,
+      knowledgeDir: this.knowledgeDir,
       // A spawned sub-agent must never be broader than its parent: inherit the
       // parent's per-agent tool whitelist. Without this, a restricted agent that
       // has the `spawn_subagents` capability could escalate by spawning a child
@@ -2697,6 +2705,7 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId: this.agentId ?? null,
+      knowledgeDir: this.knowledgeDir,
       // Per-agent tool capability whitelist. null = unrestricted (falls back to
       // global config.allowedTools in agent-factory — today's behaviour for any
       // agent that never set tool_capabilities).

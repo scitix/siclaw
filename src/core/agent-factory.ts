@@ -84,6 +84,12 @@ export interface CreateSiclawSessionOpts {
   /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (TUI/CLI). */
   agentId?: string | null;
   /**
+   * Absolute knowledge directory override for an AgentBox. LocalSpawner uses
+   * this to isolate agents that otherwise share one cwd. Unset keeps the
+   * config-driven pod/TUI path.
+   */
+  knowledgeDir?: string;
+  /**
    * Absolute path to a directory that a local Portal snapshot has materialized
    * skills into. CLI mode only: when set, the agent session loads builtin
    * skills from here INSTEAD of `./skills/`, making Portal the source of
@@ -492,9 +498,10 @@ export async function createSiclawSession(
   const reposDir = path.resolve(cwd, config.paths.reposDir);
   const docsDir = path.resolve(cwd, config.paths.docsDir);
   const tracesDir = path.resolve(cwd, ".siclaw", "traces");
-  const knowledgeDir = opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
-    ? opts.portalKnowledgeDir
-    : path.resolve(cwd, config.paths.knowledgeDir);
+  const knowledgeDir = opts?.knowledgeDir
+    ?? (opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
+      ? opts.portalKnowledgeDir
+      : path.resolve(cwd, config.paths.knowledgeDir));
   const readAllowedDirs = [
     builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir,
     os.tmpdir(),

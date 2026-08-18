@@ -127,6 +127,7 @@ describe("syncResource — error paths", () => {
     expect(result.message).toBe("boom");
     // mcp descriptor says maxRetries=3
     expect(handler.fetch).toHaveBeenCalledTimes(3);
+    expect(handler.materialize).not.toHaveBeenCalled();
   });
 });
 

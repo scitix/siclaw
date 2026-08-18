@@ -329,7 +329,7 @@ function catalogNameLine(raw: string | null | undefined): string {
   return catalogOneLine(raw, KNOWLEDGE_CATALOG_NAME_MAX_CHARS) || "library";
 }
 
-interface KnowledgeSyncStatus {
+export interface KnowledgeSyncStatus {
   syncedAt: string;
   targetDir: string;
   repoCount: number;
@@ -339,48 +339,42 @@ interface KnowledgeSyncStatus {
   }>;
 }
 
-let lastKnowledgeSyncStatus: KnowledgeSyncStatus | null = null;
-export function getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null { return lastKnowledgeSyncStatus; }
+export interface KnowledgeSyncHandler extends AgentBoxSyncHandler<KnowledgeBundlePayload> {
+  getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null;
+}
 
-export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
-  type: "knowledge",
+export function createKnowledgeHandler(
+  options: { knowledgeDir?: string } = {},
+): KnowledgeSyncHandler {
+  let lastKnowledgeSyncStatus: KnowledgeSyncStatus | null = null;
 
-  async fetch(client: GatewaySyncClientLike | null): Promise<KnowledgeBundlePayload> {
-    if (!client) throw new Error("[knowledge] GatewaySyncClientLike required but missing");
-    const descriptor = GATEWAY_SYNC_DESCRIPTORS.knowledge;
-    const data = await client.request(descriptor.gatewayPath, "GET");
-    return data as KnowledgeBundlePayload;
-  },
+  return {
+    type: "knowledge",
 
-  async materialize(payload: KnowledgeBundlePayload): Promise<number> {
-    const repos = payload?.repos ?? [];
-    const config = loadConfig();
-    const knowledgeDir = path.resolve(process.cwd(), config.paths.knowledgeDir);
-    const syncedAt = new Date().toISOString();
+    getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null {
+      return lastKnowledgeSyncStatus;
+    },
+
+    async fetch(client: GatewaySyncClientLike | null): Promise<KnowledgeBundlePayload> {
+      if (!client) throw new Error("[knowledge] GatewaySyncClientLike required but missing");
+      const descriptor = GATEWAY_SYNC_DESCRIPTORS.knowledge;
+      const data = await client.request(descriptor.gatewayPath, "GET");
+      return data as KnowledgeBundlePayload;
+    },
+
+    async materialize(payload: KnowledgeBundlePayload): Promise<number> {
+      const repos = payload?.repos ?? [];
+      const config = loadConfig();
+      const knowledgeDir = options.knowledgeDir
+        ? path.resolve(options.knowledgeDir)
+        : path.resolve(process.cwd(), config.paths.knowledgeDir);
+      const syncedAt = new Date().toISOString();
 
     if (repos.length === 0) {
-      // Defense against empty-bundle erasure (belt-and-suspenders; the primary
-      // fix is Gateway-side so empty-bundles only arrive when the agent is
-      // genuinely unbound). If an empty payload arrives but we already have
-      // knowledge materialized, keep what we have and let the next reload retry.
-      // Legitimate "unbind-all" admin operations can force a fresh wipe by
-      // restarting the pod — which is cheap and explicit.
-      if (fs.existsSync(knowledgeDir)) {
-        const existing = fs.readdirSync(knowledgeDir).filter((name) => {
-          if (name.startsWith(".sync-staging")) return false;
-          try { return fs.statSync(path.join(knowledgeDir, name)).isDirectory() || fs.statSync(path.join(knowledgeDir, name)).isFile(); }
-          catch { return false; }
-        });
-        if (existing.length > 0) {
-          console.warn(
-            `[sync-handlers.knowledge] Empty bundle received but knowledgeDir has ` +
-            `${existing.length} entr${existing.length === 1 ? "y" : "ies"}; skipping wipe to preserve state. ` +
-            `Next non-empty reload will refresh normally.`,
-          );
-          return existing.length;
-        }
-      }
-      // Clear knowledge directory — agent has no bound repos AND nothing on disk worth keeping
+      // A successful empty fetch is authoritative for this isolated target: the
+      // type release unbound every library. Both reload entrypoints call
+      // materialize only after fetch resolves, so thrown fetch failures preserve
+      // the disk copy. Keeping it here made a deliberate empty publish stale.
       if (fs.existsSync(knowledgeDir)) {
         for (const entry of fs.readdirSync(knowledgeDir)) {
           if (entry.startsWith(".sync-staging")) continue;
@@ -489,21 +483,29 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
       fs.rmSync(stagingDir, { recursive: true, force: true });
       throw err;
     }
-  },
+    },
 
-  async postReload(context: ReloadContext): Promise<void> {
-    if (!context.sessions?.length) return;
-    for (const session of context.sessions) {
-      try {
-        await session.brain.reload();
-        console.log(`[resource-sync] Knowledge reloaded for session ${session.id}`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[resource-sync] Failed to reload knowledge for session ${session.id}: ${msg}`);
+    async postReload(context: ReloadContext): Promise<void> {
+      if (!context.sessions?.length) return;
+      for (const session of context.sessions) {
+        try {
+          await session.brain.reload();
+          console.log(`[resource-sync] Knowledge reloaded for session ${session.id}`);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[resource-sync] Failed to reload knowledge for session ${session.id}: ${msg}`);
+        }
       }
-    }
-  },
-};
+    },
+  };
+}
+
+export const knowledgeHandler = createKnowledgeHandler();
+
+/** Backwards-compatible status accessor for the process-global default handler. */
+export function getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null {
+  return knowledgeHandler.getLastKnowledgeSyncStatus();
+}
 
 // ── Cluster / Host handlers (factory, broker-dependent) ───────────────
 

@@ -62,6 +62,12 @@ vi.mock("./sync-handlers.js", () => ({
   getSyncHandler: () => undefined,
   createClusterHandler: () => ({ type: "cluster", fetch: async () => 0, materialize: async (n: number) => n }),
   createHostHandler: () => ({ type: "host", fetch: async () => 0, materialize: async (n: number) => n }),
+  createKnowledgeHandler: () => ({
+    type: "knowledge",
+    fetch: async () => ({ repos: [] }),
+    materialize: async () => 0,
+    getLastKnowledgeSyncStatus: () => null,
+  }),
   createToolsHandler: (target: { allowedToolsState: string[] | null }) => ({
     type: "tools",
     fetch: async () => ({ allowedTools: null }),

@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   createClusterHandler,
   createHostHandler,
+  createKnowledgeHandler,
   createToolsHandler,
   knowledgeHandler,
   mcpHandler,
@@ -940,10 +941,10 @@ describe("skill directory resolution", () => {
 });
 
 // ---------------------------------------------------------------------------
-// knowledgeHandler — empty-bundle preservation guard (symmetric to skills)
+// knowledgeHandler — empty-bundle wipe (successful empty fetch = unbound)
 // ---------------------------------------------------------------------------
 
-describe("knowledgeHandler empty-bundle guard", () => {
+describe("knowledgeHandler empty-bundle wipe", () => {
   let knowledgeTmpDir: string;
 
   beforeEach(() => {
@@ -961,21 +962,54 @@ describe("knowledgeHandler empty-bundle guard", () => {
     expect(fs.readdirSync(knowledgeTmpDir)).toEqual([]);
   });
 
-  it("preserves knowledgeDir contents when empty bundle arrives but content already materialized", async () => {
-    // Seed the dir as if a previous successful sync had happened.
+  it("wipes previously materialized knowledge when an empty bundle arrives", async () => {
+    // Previous successful sync left A on disk; next release unbound every library.
     fs.writeFileSync(path.join(knowledgeTmpDir, "index.md"), "# Seeded");
     fs.mkdirSync(path.join(knowledgeTmpDir, "repos", "alpha"), { recursive: true });
     fs.writeFileSync(path.join(knowledgeTmpDir, "repos", "alpha", "index.md"), "# alpha");
 
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const count = await knowledgeHandler.materialize({ version: "v2", repos: [] });
 
-    // Reports what it kept (top-level entries: index.md + repos/)
-    expect(count).toBe(2);
-    expect(fs.existsSync(path.join(knowledgeTmpDir, "index.md"))).toBe(true);
-    expect(fs.existsSync(path.join(knowledgeTmpDir, "repos", "alpha", "index.md"))).toBe(true);
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("skipping wipe"));
-    warnSpy.mockRestore();
+    expect(count).toBe(0);
+    expect(fs.existsSync(path.join(knowledgeTmpDir, "index.md"))).toBe(false);
+    expect(fs.existsSync(path.join(knowledgeTmpDir, "repos", "alpha", "index.md"))).toBe(false);
+  });
+
+  it("wipes only the explicitly targeted agent directory", async () => {
+    const agentADir = path.join(knowledgeTmpDir, "agent-a");
+    const agentBDir = path.join(knowledgeTmpDir, "agent-b");
+    fs.mkdirSync(agentADir, { recursive: true });
+    fs.mkdirSync(agentBDir, { recursive: true });
+    fs.writeFileSync(path.join(agentADir, "index.md"), "# A");
+    fs.writeFileSync(path.join(agentBDir, "index.md"), "# B");
+
+    const agentBHandler = createKnowledgeHandler({ knowledgeDir: agentBDir });
+    await agentBHandler.materialize({ version: "v2", repos: [] });
+
+    expect(fs.readFileSync(path.join(agentADir, "index.md"), "utf8")).toBe("# A");
+    expect(fs.existsSync(path.join(agentBDir, "index.md"))).toBe(false);
+  });
+
+  it("keeps the last sync status isolated per knowledge handler", async () => {
+    const agentADir = path.join(knowledgeTmpDir, "agent-a");
+    const agentBDir = path.join(knowledgeTmpDir, "agent-b");
+    const agentAHandler = createKnowledgeHandler({ knowledgeDir: agentADir });
+    const agentBHandler = createKnowledgeHandler({ knowledgeDir: agentBDir });
+
+    expect(agentAHandler.getLastKnowledgeSyncStatus()).toBeNull();
+    expect(agentBHandler.getLastKnowledgeSyncStatus()).toBeNull();
+
+    await agentAHandler.materialize({ version: "v1", repos: [] });
+    expect(agentAHandler.getLastKnowledgeSyncStatus()).toMatchObject({
+      targetDir: agentADir,
+      repoCount: 0,
+      repos: [],
+    });
+    expect(agentBHandler.getLastKnowledgeSyncStatus()).toBeNull();
+
+    await agentBHandler.materialize({ version: "v1", repos: [] });
+    expect(agentAHandler.getLastKnowledgeSyncStatus()).toMatchObject({ targetDir: agentADir });
+    expect(agentBHandler.getLastKnowledgeSyncStatus()).toMatchObject({ targetDir: agentBDir });
   });
 
   it("ignores stale .sync-staging-* leftovers when deciding whether to preserve", async () => {

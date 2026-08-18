@@ -20,23 +20,18 @@ import path from "node:path";
 
 // ── Mocks (hoisted by vi.mock) ────────────────────────────────────────
 
+const createHttpServerMock = vi.hoisted(() => vi.fn());
 vi.mock("../../agentbox/http-server.js", () => ({
-  createHttpServer: vi.fn(() => {
-    // Return a fake http.Server that listen()/close() cleanly.
-    const handlers: Record<string, ((...args: any[]) => void)[]> = {};
-    const server: any = {
-      listen: (_port: number, _host: string, cb: () => void) => {
-        setImmediate(cb);
-        return server;
-      },
-      on: (ev: string, cb: any) => {
-        (handlers[ev] ||= []).push(cb);
-        return server;
-      },
-      close: vi.fn((cb?: () => void) => { cb?.(); }),
-    };
-    return server;
-  }),
+  createHttpServer: createHttpServerMock,
+}));
+
+const syncResourceMock = vi.hoisted(() => vi.fn(async () => 0));
+vi.mock("../../agentbox/resource-sync.js", () => ({
+  syncResource: syncResourceMock,
+}));
+
+vi.mock("../../core/config.js", () => ({
+  loadConfig: () => ({ paths: { knowledgeDir: ".siclaw/knowledge" } }),
 }));
 
 const sessionManagerShutdownCalls: string[] = [];
@@ -46,6 +41,7 @@ vi.mock("../../agentbox/session.js", () => ({
     userId?: string;
     agentId?: string;
     credentialsDir?: string;
+    knowledgeDir?: string;
     allowedToolsState: string[] | null = null;
     agentTypeState = "custom";
     credentialBroker = { dispose: () => { sessionManagerShutdownCalls.push("broker.dispose"); } };
@@ -76,10 +72,28 @@ class FakeCertManager {
 let origCwd: string;
 let tmpDir: string;
 
+function createFakeHttpServer() {
+  const handlers: Record<string, ((...args: any[]) => void)[]> = {};
+  const server: any = {
+    listen: (_port: number, _host: string, cb: () => void) => {
+      setImmediate(cb);
+      return server;
+    },
+    on: (ev: string, cb: any) => {
+      (handlers[ev] ||= []).push(cb);
+      return server;
+    },
+    close: vi.fn((cb?: () => void) => { cb?.(); }),
+  };
+  return server;
+}
+
 beforeEach(() => {
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   sessionManagerShutdownCalls.length = 0;
+  syncResourceMock.mockClear();
+  createHttpServerMock.mockReset().mockImplementation(createFakeHttpServer);
   // Default: agent has no tool_capabilities row value → unrestricted.
   dbQueryImpl = async () => [[{ tool_capabilities: null }], undefined];
 
@@ -119,6 +133,44 @@ describe("LocalSpawner — spawn (happy path)", () => {
     // ENV propagated for http-server / GatewayClient to pick up
     expect(process.env.SICLAW_GATEWAY_URL).toBe("https://127.0.0.1:3002");
     expect(process.env.SICLAW_CERT_PATH).toBe(certDir);
+  });
+
+  it("isolates knowledge materialization by agent", async () => {
+    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
+    await spawner.spawn({ agentId: "a1" });
+    await spawner.spawn({ agentId: "a2" });
+
+    const boxA = (spawner as any).boxes.get("local-a1");
+    const boxB = (spawner as any).boxes.get("local-a2");
+    expect(boxA.sessionManager.knowledgeDir).toBe(path.join(tmpDir, ".siclaw", "knowledge", "a1"));
+    expect(boxB.sessionManager.knowledgeDir).toBe(path.join(tmpDir, ".siclaw", "knowledge", "a2"));
+
+    await vi.waitFor(() => expect(syncResourceMock).toHaveBeenCalledTimes(2));
+    const agentBHandler = syncResourceMock.mock.calls[1][2];
+
+    fs.mkdirSync(boxA.sessionManager.knowledgeDir, { recursive: true });
+    fs.mkdirSync(boxB.sessionManager.knowledgeDir, { recursive: true });
+    fs.writeFileSync(path.join(boxA.sessionManager.knowledgeDir, "index.md"), "# A");
+    fs.writeFileSync(path.join(boxB.sessionManager.knowledgeDir, "index.md"), "# B");
+    await agentBHandler.materialize({ version: "v2", repos: [] });
+
+    expect(fs.readFileSync(path.join(boxA.sessionManager.knowledgeDir, "index.md"), "utf8")).toBe("# A");
+    expect(fs.existsSync(path.join(boxB.sessionManager.knowledgeDir, "index.md"))).toBe(false);
+  });
+
+  it("shares one knowledge handler between initial sync and HTTP reloads", async () => {
+    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
+    await spawner.spawn({ agentId: "a1" });
+
+    await vi.waitFor(() => expect(syncResourceMock).toHaveBeenCalledTimes(1));
+    const initialSyncHandler = syncResourceMock.mock.calls[0][2];
+    expect(createHttpServerMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        disableIdleShutdown: true,
+        knowledgeHandler: initialSyncHandler,
+      }),
+    );
   });
 
   it("returns the existing handle on a second spawn for the same agent (idempotent)", async () => {
