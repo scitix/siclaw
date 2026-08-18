@@ -2050,9 +2050,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!agentId) throw new Error("agentId required");
 
     const boxes = await agentBoxManager.list();
-    const targets = boxes.filter((b) => b.agentId === agentId && b.status === "running");
+    const agentBoxes = boxes.filter((b) => b.agentId === agentId);
+    const targets = agentBoxes.filter((b) => b.status === "running");
     if (targets.length === 0) {
-      return { ok: true, available: false, reason: "no_running_box", boxes: 0 };
+      return { ok: true, available: false, reason: "no_running_box", boxes: agentBoxes.length };
     }
 
     let sawUnsupported = false;
@@ -2063,7 +2064,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         return {
           ok: true,
           available: true,
-          boxes: targets.length,
+          boxes: agentBoxes.length,
           knowledge: status.knowledge ?? { syncedAt: null, repos: [] },
           skills: status.skills ?? { names: [] },
           mcp: status.mcp ?? { names: [] },
@@ -2079,7 +2080,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       ok: true,
       available: false,
       reason: sawUnsupported ? "unsupported" : "query_failed",
-      boxes: targets.length,
+      boxes: agentBoxes.length,
     };
   });
 

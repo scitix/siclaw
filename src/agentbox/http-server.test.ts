@@ -294,9 +294,10 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
     expect(r.data.sessions).toEqual([]);
   });
 
-  it("GET /api/sync-status reports the observed inventory", async () => {
+  it("GET /api/sync-status uses the box's agent-scoped knowledge directory", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "http-sync-status-"));
     const knowledgeDir = path.join(root, "knowledge");
+    const sharedKnowledgeDir = path.join(root, "shared-knowledge");
     const skillsDir = path.join(root, "skills");
     fs.mkdirSync(path.join(skillsDir, "resolved", "k8s-debug"), { recursive: true });
     fs.mkdirSync(knowledgeDir, { recursive: true });
@@ -304,10 +305,15 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
       syncedAt: "2026-08-18T08:00:00.000Z",
       repos: [{ id: "kb-1", name: "hardware", version: 2, sha256: "abc", fileCount: 12 }],
     }));
-    mockConfigState.knowledgeDir = knowledgeDir;
+    mockConfigState.knowledgeDir = sharedKnowledgeDir;
     mockConfigState.skillsDir = skillsDir;
     mockConfigState.mcpServers = { incidents: { transport: "http" } };
     try {
+      await new Promise<void>((resolve) => (server as http.Server).close(() => resolve()));
+      (sm as any).knowledgeDir = knowledgeDir;
+      server = createHttpServer(sm as any);
+      port = await startServer(server);
+
       const r = await getJson(port, "/api/sync-status");
       expect(r.status).toBe(200);
       expect(r.data).toEqual({

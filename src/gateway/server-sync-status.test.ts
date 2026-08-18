@@ -99,6 +99,22 @@ describe("agent.syncStatus RPC", () => {
       ok: true,
       available: false,
       reason: "no_running_box",
+      boxes: 1,
+    });
+    expect(getJsonCalls).toEqual([]);
+  });
+
+  it("reports zero boxes when the agent has no box at all", async () => {
+    listReturns = [
+      { boxId: "b1", agentId: "other", status: "running", endpoint: "https://b1" },
+    ];
+    server = await bootRuntime();
+    const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
+
+    await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
+      ok: true,
+      available: false,
+      reason: "no_running_box",
       boxes: 0,
     });
     expect(getJsonCalls).toEqual([]);
@@ -107,6 +123,7 @@ describe("agent.syncStatus RPC", () => {
   it("reads /api/sync-status from the running box", async () => {
     listReturns = [
       { boxId: "b1", agentId: "preview", status: "running", endpoint: "https://b1" },
+      { boxId: "b2", agentId: "preview", status: "pending", endpoint: "https://b2" },
     ];
     server = await bootRuntime();
     const syncStatus = server.rpcMethods.get("agent.syncStatus")!;
@@ -114,7 +131,7 @@ describe("agent.syncStatus RPC", () => {
     await expect(syncStatus({ agentId: "preview" }, { sendEvent: vi.fn() } as any)).resolves.toEqual({
       ok: true,
       available: true,
-      boxes: 1,
+      boxes: 2,
       knowledge: {
         syncedAt: "2026-08-18T08:00:00.000Z",
         repos: [{ id: "kb-1", name: "硬件", version: 2, sha256: "abc" }],
