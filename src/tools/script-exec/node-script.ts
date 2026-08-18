@@ -337,11 +337,8 @@ Examples:
       const isError = execResult.exitCode !== 0 &&
         !(execResult.exitCode === null && execResult.stdout.trim());
       const out = execResult.stdout.trim();
-      const stdout = isError
-        ? `${out || "(no output)"}\n[exit code: ${execResult.exitCode ?? "unknown"}]`
-        : out;
       return {
-        content: [{ type: "text", text: postExecSecurity(stdout, null, { stderr: filteredStderr || undefined }) }],
+        content: [{ type: "text", text: postExecSecurity(out, null, { stderr: filteredStderr || undefined, ...(isError && { exitCode: execResult.exitCode ?? "unknown" }) }) }],
         details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
       };
     },

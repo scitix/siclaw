@@ -83,7 +83,18 @@ describe("classifyClusterFailure", () => {
     const result = await classifyClusterFailure(broker, "prod", gatewayError);
     expect(result.reason).toBe("cluster_not_bound");
     expect(result.available_clusters).toEqual([]);
-    expect(result.message).toContain("nothing is bound");
+    expect(result.retryable).toBe(false);
+    expect(result.message).toContain("No cluster is bound");
+  });
+
+  // ensureClusterForTool auto-selects when the caller omits `cluster`, so this
+  // path arrives with no name — but an empty list is just as conclusive.
+  it("reports not-bound for an empty list even with no name given", async () => {
+    const broker = { refreshClusters: async () => [] } as any;
+    const result = await classifyClusterFailure(broker, undefined, gatewayError);
+    expect(result.reason).toBe("cluster_not_bound");
+    expect(result.retryable).toBe(false);
+    expect(result.message).not.toContain("502");
   });
 
   it("keeps the upstream error when the cluster IS bound", async () => {

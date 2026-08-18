@@ -81,6 +81,22 @@ export async function classifyClusterFailure(
     };
   }
 
+  // An empty list settles it with or without a name: the tool may have omitted
+  // `cluster` and let ensureClusterForTool auto-select, but there was nothing to
+  // select. Requiring a name here left that path reporting a retryable fault.
+  if (bound.length === 0) {
+    return {
+      error: true,
+      reason: "cluster_not_bound",
+      message:
+        `No cluster is bound to this agent, so no kubeconfig can be materialized. ` +
+        `Retrying will not help, and node/pod tools sharing this binding will fail ` +
+        `the same way. Ask the operator to bind a cluster in the Portal.`,
+      retryable: false,
+      available_clusters: [],
+    };
+  }
+
   if (clusterName && !bound.includes(clusterName)) {
     return {
       error: true,
@@ -88,7 +104,7 @@ export async function classifyClusterFailure(
       message:
         `Cluster "${clusterName}" is not bound to this agent, so its kubeconfig ` +
         `cannot be materialized. Retrying will not help. Call cluster_list to see ` +
-        `what is bound${bound.length ? "" : " — nothing is bound right now"}.`,
+        `what is bound.`,
       retryable: false,
       available_clusters: bound,
     };

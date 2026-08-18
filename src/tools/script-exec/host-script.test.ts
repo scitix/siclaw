@@ -96,7 +96,7 @@ describe("host_script", () => {
     vi.mocked(sshExec).mockResolvedValueOnce({ stdout: "", stderr: "fail", exitCode: 2 });
     const result = await tool.execute("id", { host: "h1", script: "x.sh" }, undefined, {} as any);
     expect((result.details as any).error).toBe(true);
-    expect(result.content[0].text).toContain("Exit code: 2");
+    expect(result.content[0].text).toContain("[exit code: 2]");
   });
 });
 

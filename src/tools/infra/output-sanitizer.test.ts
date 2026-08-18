@@ -285,6 +285,20 @@ describe("file-reading content sanitization", () => {
     expect(result).toContain("DB_HOST=localhost");
   });
 
+  it("redacts an Authorization header without touching authorization-mode", () => {
+    const action = analyzeOutput("cat", ["/app/config.yaml"]);
+    const output = [
+      "    authorization-mode: Node,RBAC",
+      "    headers:",
+      "      Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def",
+    ].join("\n");
+    const result = applySanitizer(output, action);
+    // apiserver flags are diagnostic, not credentials.
+    expect(result).toContain("authorization-mode: Node,RBAC");
+    expect(result).toContain("      Authorization: **REDACTED**");
+    expect(result).not.toContain("eyJhbGciOiJIUzI1NiJ9");
+  });
+
   it("redacts YAML-style key: value with sensitive key name", () => {
     const action = analyzeOutput("cat", ["/app/config.yaml"]);
     const output = "database:\n  password: mysecret\n  host: localhost";
