@@ -5,7 +5,7 @@ export interface KnowledgeSourceCitation {
   page?: string;
 }
 
-const MAX_KNOWLEDGE_CITATIONS = 3;
+export const MAX_KNOWLEDGE_CITATIONS = 3;
 
 export function normalizeKnowledgeSourceCitations(value: unknown): KnowledgeSourceCitation[] {
   if (!Array.isArray(value)) return [];
@@ -37,6 +37,13 @@ export function appendKnowledgeSourceCitations(text: string, value: unknown): st
   const citations = normalizeKnowledgeSourceCitations(value);
   if (citations.length === 0) return text;
   const heading = /[\u3400-\u9fff]/u.test(text) ? "参考原文" : "Original sources";
-  const lines = citations.map((source) => `- [${source.title.replace(/[\[\]]/g, "")}](${source.url})`);
+  // WHATWG URL accepts literal parentheses in an https path. Left raw, `)`
+  // closes a Markdown destination early and the remaining path can be parsed as
+  // attacker-controlled document text. Percent-encoding preserves the URL while
+  // keeping the destination inside the one link we render.
+  const lines = citations.map((source) => {
+    const destination = source.url.replaceAll("(", "%28").replaceAll(")", "%29");
+    return `- [${source.title.replace(/[\[\]]/g, "")}](${destination})`;
+  });
   return `${text.trimEnd()}\n\n### ${heading}\n\n${lines.join("\n")}`;
 }

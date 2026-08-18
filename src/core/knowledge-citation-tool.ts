@@ -6,7 +6,10 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../tools/infra/tool-render.js";
 import type { SessionEventEmitter } from "./tool-registry.js";
-import type { KnowledgeSourceCitation } from "../shared/knowledge-citations.js";
+import {
+  MAX_KNOWLEDGE_CITATIONS,
+  type KnowledgeSourceCitation,
+} from "../shared/knowledge-citations.js";
 
 export const KNOWLEDGE_CITATION_MANIFEST = ".citation-manifest.json";
 
@@ -33,21 +36,58 @@ function readManifest(knowledgeDir: string): CitationManifest | null {
 }
 
 function pageResources(pagePath: string): string[] {
-  const body = fs.readFileSync(pagePath, "utf8");
-  if (!body.startsWith("---\n")) return [];
-  const end = body.indexOf("\n---", 4);
-  if (end < 0 || end > 64 * 1024) return [];
-  const frontmatter = yaml.load(body.slice(4, end)) as Record<string, unknown> | null;
-  if (!frontmatter || !Array.isArray(frontmatter.sources)) return [];
-  return frontmatter.sources.flatMap((source) => {
-    if (!source || typeof source !== "object") return [];
-    const resource = (source as Record<string, unknown>).resource;
-    return typeof resource === "string" && resource.trim() ? [normalizedResource(resource)] : [];
-  });
+  try {
+    const body = fs.readFileSync(pagePath, "utf8");
+    if (!body.startsWith("---\n")) return [];
+    const end = body.indexOf("\n---", 4);
+    if (end < 0 || end > 64 * 1024) return [];
+    const frontmatter = yaml.load(body.slice(4, end)) as Record<string, unknown> | null;
+    if (!frontmatter || !Array.isArray(frontmatter.sources)) return [];
+    return frontmatter.sources.flatMap((source) => {
+      if (!source || typeof source !== "object") return [];
+      const resource = (source as Record<string, unknown>).resource;
+      return typeof resource === "string" && resource.trim() ? [normalizedResource(resource)] : [];
+    });
+  } catch {
+    // A resource reload can replace the page after Read recorded it, and a
+    // malformed page must not turn an optional citation miss into a failed turn.
+    return [];
+  }
 }
 
 export function hasKnowledgeCitationManifest(knowledgeDir: string): boolean {
   return readManifest(knowledgeDir)?.repos.some((repo) => repo.sources.length > 0) ?? false;
+}
+
+/**
+ * This text is rebuilt by session.reload(), while custom tools remain attached
+ * to the session. Keeping both states explicit lets a newly published manifest
+ * enable citations on a warm session without inviting calls before it exists.
+ */
+export function buildKnowledgeCitationSystemPrompt(knowledgeDir: string): string {
+  if (!hasKnowledgeCitationManifest(knowledgeDir)) {
+    return `
+## Knowledge source citations
+
+Trusted original-source metadata is not available for this knowledge mount. Do not call \`knowledge_cite\`; answer normally without a references section. This instruction may change after a knowledge reload.`;
+  }
+  return `
+## Knowledge source citations
+
+When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Pass only the 1-${MAX_KNOWLEDGE_CITATIONS} knowledge pages you successfully Read this turn and actually used. Do not register an index, catalog, or a page you merely inspected. The runtime appends validated original links automatically; never invent or manually copy source URLs. If no trusted clickable source exists, answer normally without a references section.`;
+}
+
+function findCitationRepo(manifest: CitationManifest, rel: string): CitationManifestRepo | undefined {
+  let best: CitationManifestRepo | undefined;
+  let bestRootLength = -1;
+  for (const candidate of manifest.repos) {
+    const root = candidate.root.replace(/\/$/, "");
+    if ((root === "" || rel === root || rel.startsWith(root + "/")) && root.length > bestRootLength) {
+      best = candidate;
+      bestRootLength = root.length;
+    }
+  }
+  return best;
 }
 
 export function createKnowledgeCitationSupport(opts: {
@@ -78,13 +118,14 @@ export function createKnowledgeCitationSupport(opts: {
     renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("knowledge_cite")), 0, 0),
     renderResult: renderTextResult,
     description:
+      "Use only when the current system prompt says knowledge source citations are available. " +
       "Register the knowledge pages that materially support your final answer. Call once, immediately before the final answer, " +
       "and include only pages you successfully Read in this turn and actually used. The runtime validates their published original-source metadata and appends trusted links; never invent or copy source URLs yourself.",
     parameters: Type.Object({
       pages: Type.Array(Type.String({ minLength: 1 }), {
         minItems: 1,
-        maxItems: 3,
-        description: "Absolute paths, or paths relative to the mounted knowledge directory, of the 1-3 adopted knowledge pages.",
+        maxItems: MAX_KNOWLEDGE_CITATIONS,
+        description: `Absolute paths, or paths relative to the mounted knowledge directory, of the 1-${MAX_KNOWLEDGE_CITATIONS} adopted knowledge pages.`,
       }),
     }),
     async execute(_toolCallId, rawParams) {
@@ -104,10 +145,7 @@ export function createKnowledgeCitationSupport(opts: {
       const seenURLs = new Set<string>();
       for (const page of selected) {
         const rel = path.relative(opts.knowledgeDir, page).replaceAll(path.sep, "/");
-        const repo = manifest.repos.find((candidate) => {
-          const root = candidate.root.replace(/\/$/, "");
-          return root === "" || rel === root || rel.startsWith(root + "/");
-        });
+        const repo = findCitationRepo(manifest, rel);
         if (!repo) continue;
         const sourceByResource = new Map(repo.sources.map((source) => [normalizedResource(source.resource), source]));
         for (const resource of pageResources(page)) {
@@ -115,9 +153,9 @@ export function createKnowledgeCitationSupport(opts: {
           if (!source || seenURLs.has(source.url)) continue;
           seenURLs.add(source.url);
           citations.push({ title: source.title, url: source.url, resource: source.resource, page: rel });
-          if (citations.length >= 3) break;
+          if (citations.length >= MAX_KNOWLEDGE_CITATIONS) break;
         }
-        if (citations.length >= 3) break;
+        if (citations.length >= MAX_KNOWLEDGE_CITATIONS) break;
       }
       if (citations.length > 0) {
         opts.sessionEventEmitter({ type: "knowledge_sources", sources: citations });

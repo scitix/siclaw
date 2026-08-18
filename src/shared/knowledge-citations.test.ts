@@ -17,4 +17,16 @@ describe("knowledge source citation rendering", () => {
   it("does not add a section without valid https citations", () => {
     expect(appendKnowledgeSourceCitations("answer", [{ title: "x", url: "javascript:alert(1)" }])).toBe("answer");
   });
+
+  it("keeps parentheses in an https URL inside one Markdown destination", () => {
+    const rendered = appendKnowledgeSourceCitations("answer", [{
+      title: "Title",
+      url: "https://ok.example/)[Login](https://evil.example/",
+    }]);
+
+    expect(rendered.match(/\]\(/g)).toHaveLength(1);
+    expect(rendered).toContain(
+      "- [Title](https://ok.example/%29[Login]%28https://evil.example/)",
+    );
+  });
 });

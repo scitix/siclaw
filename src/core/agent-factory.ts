@@ -44,7 +44,10 @@ import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
-import { createKnowledgeCitationSupport, hasKnowledgeCitationManifest } from "./knowledge-citation-tool.js";
+import {
+  buildKnowledgeCitationSystemPrompt,
+  createKnowledgeCitationSupport,
+} from "./knowledge-citation-tool.js";
 
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
@@ -276,11 +279,8 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
   if (wikiCatalog) {
     parts.push(wikiCatalog);
   }
-  if (knowledgeCitationsEnabled && knowledgeDir && hasKnowledgeCitationManifest(knowledgeDir)) {
-    parts.push(`
-## Knowledge source citations
-
-When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Pass only the 1-3 knowledge pages you successfully Read this turn and actually used. Do not register an index, catalog, or a page you merely inspected. The runtime appends validated original links automatically; never invent or manually copy source URLs. If no trusted clickable source exists, answer normally without a references section.`);
+  if (knowledgeCitationsEnabled && knowledgeDir) {
+    parts.push(buildKnowledgeCitationSystemPrompt(knowledgeDir));
   }
 
   return parts;
