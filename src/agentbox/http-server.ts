@@ -21,7 +21,13 @@ import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metri
 import { GatewayClient } from "./gateway-client.js";
 import { CredentialBroker } from "./credential-broker.js";
 import { HttpTransport } from "./credential-transport.js";
-import { getSyncHandler, createClusterHandler, createHostHandler, createToolsHandler } from "./sync-handlers.js";
+import {
+  getSyncHandler,
+  createClusterHandler,
+  createHostHandler,
+  createKnowledgeHandler,
+  createToolsHandler,
+} from "./sync-handlers.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
 import { stripLanguageDirective } from "../shared/strip-language-directive.js";
@@ -510,6 +516,11 @@ export function createHttpServer(
   if (sessionManager.credentialBroker) {
     perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
+  }
+  if (sessionManager.knowledgeDir) {
+    perServerHandlers.knowledge = createKnowledgeHandler({
+      knowledgeDir: sessionManager.knowledgeDir,
+    });
   }
   // tools handler — same per-box rationale as cluster/host. It writes the
   // resolved allowedTools into THIS box's sessionManager and fetches with THIS

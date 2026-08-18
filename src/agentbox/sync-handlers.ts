@@ -342,27 +342,32 @@ interface KnowledgeSyncStatus {
 let lastKnowledgeSyncStatus: KnowledgeSyncStatus | null = null;
 export function getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null { return lastKnowledgeSyncStatus; }
 
-export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
-  type: "knowledge",
+export function createKnowledgeHandler(
+  options: { knowledgeDir?: string } = {},
+): AgentBoxSyncHandler<KnowledgeBundlePayload> {
+  return {
+    type: "knowledge",
 
-  async fetch(client: GatewaySyncClientLike | null): Promise<KnowledgeBundlePayload> {
-    if (!client) throw new Error("[knowledge] GatewaySyncClientLike required but missing");
-    const descriptor = GATEWAY_SYNC_DESCRIPTORS.knowledge;
-    const data = await client.request(descriptor.gatewayPath, "GET");
-    return data as KnowledgeBundlePayload;
-  },
+    async fetch(client: GatewaySyncClientLike | null): Promise<KnowledgeBundlePayload> {
+      if (!client) throw new Error("[knowledge] GatewaySyncClientLike required but missing");
+      const descriptor = GATEWAY_SYNC_DESCRIPTORS.knowledge;
+      const data = await client.request(descriptor.gatewayPath, "GET");
+      return data as KnowledgeBundlePayload;
+    },
 
-  async materialize(payload: KnowledgeBundlePayload): Promise<number> {
-    const repos = payload?.repos ?? [];
-    const config = loadConfig();
-    const knowledgeDir = path.resolve(process.cwd(), config.paths.knowledgeDir);
-    const syncedAt = new Date().toISOString();
+    async materialize(payload: KnowledgeBundlePayload): Promise<number> {
+      const repos = payload?.repos ?? [];
+      const config = loadConfig();
+      const knowledgeDir = options.knowledgeDir
+        ? path.resolve(options.knowledgeDir)
+        : path.resolve(process.cwd(), config.paths.knowledgeDir);
+      const syncedAt = new Date().toISOString();
 
     if (repos.length === 0) {
-      // A successful empty fetch is authoritative: the type release unbound
-      // every library. Fetch failures never reach materialize (http-server
-      // catches them), so "keep the last disk copy" here made a deliberate
-      // empty publish look like the previous library. Wipe.
+      // A successful empty fetch is authoritative for this isolated target: the
+      // type release unbound every library. Both reload entrypoints call
+      // materialize only after fetch resolves, so thrown fetch failures preserve
+      // the disk copy. Keeping it here made a deliberate empty publish stale.
       if (fs.existsSync(knowledgeDir)) {
         for (const entry of fs.readdirSync(knowledgeDir)) {
           if (entry.startsWith(".sync-staging")) continue;
@@ -471,21 +476,24 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
       fs.rmSync(stagingDir, { recursive: true, force: true });
       throw err;
     }
-  },
+    },
 
-  async postReload(context: ReloadContext): Promise<void> {
-    if (!context.sessions?.length) return;
-    for (const session of context.sessions) {
-      try {
-        await session.brain.reload();
-        console.log(`[resource-sync] Knowledge reloaded for session ${session.id}`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[resource-sync] Failed to reload knowledge for session ${session.id}: ${msg}`);
+    async postReload(context: ReloadContext): Promise<void> {
+      if (!context.sessions?.length) return;
+      for (const session of context.sessions) {
+        try {
+          await session.brain.reload();
+          console.log(`[resource-sync] Knowledge reloaded for session ${session.id}`);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[resource-sync] Failed to reload knowledge for session ${session.id}: ${msg}`);
+        }
       }
-    }
-  },
-};
+    },
+  };
+}
+
+export const knowledgeHandler = createKnowledgeHandler();
 
 // ── Cluster / Host handlers (factory, broker-dependent) ───────────────
 

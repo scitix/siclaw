@@ -15,11 +15,14 @@ import { createHttpServer } from "../../agentbox/http-server.js";
 import { AgentBoxSessionManager } from "../../agentbox/session.js";
 import { GatewayClient } from "../../agentbox/gateway-client.js";
 import { syncResource } from "../../agentbox/resource-sync.js";
+import { createKnowledgeHandler } from "../../agentbox/sync-handlers.js";
 import type { CertificateManager } from "../security/cert-manager.js";
 import { getDb } from "../db.js";
 import { safeParseJson } from "../dialect-helpers.js";
 import { resolveCapabilities } from "../../core/tool-capabilities.js";
 import { normalizeAgentType, effectiveCapabilityKeys } from "../../core/agent-types.js";
+import { loadConfig } from "../../core/config.js";
+import { resolveUnderDir } from "../../shared/path-utils.js";
 
 interface LocalBox {
   agentId: string;
@@ -89,6 +92,11 @@ export class LocalSpawner implements BoxSpawner {
       ".siclaw/credentials",
       agentId,
     );
+    const knowledgeRoot = path.resolve(process.cwd(), loadConfig().paths.knowledgeDir);
+    sessionManager.knowledgeDir = resolveUnderDir(knowledgeRoot, agentId);
+    const knowledgeHandler = createKnowledgeHandler({
+      knowledgeDir: sessionManager.knowledgeDir,
+    });
 
     // Inject the resolved tool whitelist AND the locked agent-type policy at spawn
     // time. The tools sync type is initialSync:false, so the framework's
@@ -152,7 +160,7 @@ export class LocalSpawner implements BoxSpawner {
           gatewayUrl: this.gatewayInternalUrl,
           certPath: certDir,
         });
-        await syncResource("knowledge", gatewayClient.toClientLike());
+        await syncResource("knowledge", gatewayClient.toClientLike(), knowledgeHandler);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[local-spawner] Initial knowledge sync failed for agent=${agentId}: ${msg}`);

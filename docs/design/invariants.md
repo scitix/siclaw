@@ -38,9 +38,10 @@ TUI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired
 - Any code that writes/deletes files in `./skills/` affects ALL users simultaneously
 - `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skills/global/`, `skills/skillset/`, and `skills/user/` subdirectories (not `core/`), which in a shared filesystem destroys ALL users' personal skills. This is designed for K8s pods with isolated filesystems.
 - Per-user skill sync in local mode must write only to `skills/user/<userId>/` without touching `skills/core/` (global + personal skills from the bundle are both written into the user's directory)
+- Knowledge sync in local mode must materialize and read from an agent-scoped directory (`.siclaw/knowledge/<agentId>/`). Empty and non-empty bundles both replace their target, so pointing the canonical handler at the shared knowledge root would let one agent erase another agent's libraries.
 - Local SQLite (via `node:sqlite`) uses WAL mode with a shared process — local mode is single-process by design; production K8s uses MySQL and has no such constraint
 
-**Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/resource-handlers.ts:82-97`
+**Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/sync-handlers.ts`, `src/agentbox/session.ts`, `src/core/agent-factory.ts`
 
 ### 1.3 K8s Pod Isolation
 
@@ -316,6 +317,7 @@ postReload(context)  Notify active sessions to pick up changes
 |---------|----------------------|------------------|-------|
 | `mcpHandler.materialize()` | ✅ Yes | ✅ Yes | Merges, does not wipe |
 | `skillsHandler.materialize()` | ❌ No | ✅ Yes | Wipes `global/` + `skillset/` + `user/` subdirs (not `core/`) |
+| `knowledgeHandler.materialize()` | ✅ With agent-scoped target | ✅ Yes | Replaces its whole target; LocalSpawner binds `.siclaw/knowledge/<agentId>/` |
 
 For local mode skills sync, write directly to `skills/user/<userId>/` without delegating to `skillsHandler.materialize()`. Global and personal skills from the bundle are both placed under the user's directory.
 
