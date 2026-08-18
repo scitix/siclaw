@@ -61,6 +61,32 @@ still missing — rather than the internal rule that produced it.
   The roster remains the authorization source; a routing helper never grants
   coverage.
 
+## Unknown-cluster resource location
+
+When the request names a concrete resource but omits its owning cluster, an
+explicitly attached read-only resource-locator skill may establish the routing
+identity before the coordinator asks the user. Typical inputs are a Pod, Job,
+Node, reservation, entry ID, or IP address.
+
+The locator is bounded to identity discovery. It must not diagnose the resource,
+read logs or events, refresh remote state, or recommend remediation. Its result
+must distinguish:
+
+- one unambiguous resource match and one confirmed canonical Siclaw binding
+  name;
+- multiple or ambiguous matches; or
+- no match.
+
+Only the first outcome proceeds to `list_delegates`, with the confirmed binding
+name and `binding_name_confirmed=true`. A locator-specific cluster id, display
+name, region, or alias is not interchangeable with a Siclaw binding name. The
+other outcomes ask for only the detail needed to disambiguate, such as cluster,
+region, namespace, or resource kind.
+
+Resource location is optional: a coordinator without an attached locator asks
+for the missing routing detail. In every case, `list_delegates` remains the
+authorization boundary and the specialist remains the owner of diagnosis.
+
 ## Optional alias resolution
 
 When the first lookup misses and the target may be a cluster alias, the
