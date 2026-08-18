@@ -250,7 +250,9 @@ if [[ ${#UNITS[@]} -gt 0 ]]; then
     #
     # Both lists: list-unit-files covers what is installed on disk, list-units
     # also covers units that only exist at runtime.
-    UNIT_INVENTORY=$( { systemctl list-unit-files --no-legend 2>/dev/null; systemctl list-units --all --no-legend 2>/dev/null; } | awk '{ print $1 }' )
+    # Deduped: a unit that is both installed and loaded appears in both lists.
+    UNIT_INVENTORY=$( { systemctl list-unit-files --no-legend 2>/dev/null; systemctl list-units --all --no-legend 2>/dev/null; } \
+                       | awk '{ if ($1 != "" && !seen[$1]++) print $1 }' )
     if [[ -z "$UNIT_INVENTORY" ]]; then
       SOURCE_NOTES+=("systemctl returned no unit inventory here (no systemd, or the system bus is unreachable); the unit name is unverified")
     else
@@ -261,8 +263,11 @@ if [[ ${#UNITS[@]} -gt 0 ]]; then
           # Search on a PREFIX of what was asked for, not the whole string — a
           # typo never appears in the inventory by definition, so matching the
           # full name found nothing exactly when the hint was needed.
+          # Only .service units, at most five: on a real node "kubel" also matches
+          # a page of var-lib-kubelet-pods-…​.mount units, which is not what anyone
+          # means by --unit and buried the one useful name in 400 chars of noise.
           near=$(printf '%s\n' "$UNIT_INVENTORY" \
-                   | awk -v k="${u:0:5}" 'k != "" && tolower($0) ~ tolower(k) { printf "%s ", $0 }' \
+                   | awk -v k="${u:0:5}" 'k != "" && /\.service$/ && tolower($0) ~ tolower(k) { printf "%s ", $0; if (++c == 5) exit }' \
                    | cut -c1-200)
           SOURCE_NOTES+=("unit '$u' is not a known systemd unit on this node${near:+ (similar: ${near% })}; historical journal entries may still exist")
         fi
