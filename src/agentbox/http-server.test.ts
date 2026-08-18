@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { AddressInfo } from "node:net";
 import type http from "node:http";
 import type https from "node:https";
@@ -17,6 +20,9 @@ import type https from "node:https";
 const mockConfigState = vi.hoisted(() => ({
   modelRouting: undefined as unknown,
   memoryEnabled: true,
+  skillsDir: "skills",
+  knowledgeDir: "knowledge",
+  mcpServers: {} as Record<string, unknown>,
 }));
 
 // Silence metrics auth side effects.
@@ -43,8 +49,8 @@ vi.mock("../core/config.js", () => ({
   loadConfig: () => ({
     paths: {
       userDataDir: "/tmp/siclaw-test-user-data",
-      skillsDir: "skills",
-      knowledgeDir: "knowledge",
+      skillsDir: mockConfigState.skillsDir,
+      knowledgeDir: mockConfigState.knowledgeDir,
       credentialsDir: ".siclaw/credentials",
     },
     providers: {
@@ -53,12 +59,14 @@ vi.mock("../core/config.js", () => ({
       },
     },
     modelRouting: mockConfigState.modelRouting,
+    mcpServers: mockConfigState.mcpServers,
   }),
   isMemoryEnabled: () => mockConfigState.memoryEnabled,
 }));
 
 // Make sync-handlers a no-op registry.
-vi.mock("./sync-handlers.js", () => ({
+vi.mock("./sync-handlers.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./sync-handlers.js")>()),
   getSyncHandler: () => undefined,
   createClusterHandler: () => ({ type: "cluster", fetch: async () => 0, materialize: async (n: number) => n }),
   createHostHandler: () => ({ type: "host", fetch: async () => 0, materialize: async (n: number) => n }),
@@ -76,11 +84,6 @@ vi.mock("./sync-handlers.js", () => ({
       return target.allowedToolsState ? target.allowedToolsState.length : 0;
     },
     postReload: async () => {},
-  }),
-  readBoxSyncStatus: () => ({
-    knowledge: { syncedAt: null, repos: [] },
-    skills: { names: [] },
-    mcp: { names: [] },
   }),
 }));
 
@@ -292,13 +295,35 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
   });
 
   it("GET /api/sync-status reports the observed inventory", async () => {
-    const r = await getJson(port, "/api/sync-status");
-    expect(r.status).toBe(200);
-    expect(r.data).toEqual({
-      knowledge: { syncedAt: null, repos: [] },
-      skills: { names: [] },
-      mcp: { names: [] },
-    });
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "http-sync-status-"));
+    const knowledgeDir = path.join(root, "knowledge");
+    const skillsDir = path.join(root, "skills");
+    fs.mkdirSync(path.join(skillsDir, "resolved", "k8s-debug"), { recursive: true });
+    fs.mkdirSync(knowledgeDir, { recursive: true });
+    fs.writeFileSync(path.join(knowledgeDir, ".sync-manifest.json"), JSON.stringify({
+      syncedAt: "2026-08-18T08:00:00.000Z",
+      repos: [{ id: "kb-1", name: "hardware", version: 2, sha256: "abc", fileCount: 12 }],
+    }));
+    mockConfigState.knowledgeDir = knowledgeDir;
+    mockConfigState.skillsDir = skillsDir;
+    mockConfigState.mcpServers = { incidents: { transport: "http" } };
+    try {
+      const r = await getJson(port, "/api/sync-status");
+      expect(r.status).toBe(200);
+      expect(r.data).toEqual({
+        knowledge: {
+          syncedAt: "2026-08-18T08:00:00.000Z",
+          repos: [{ id: "kb-1", name: "hardware", version: 2, sha256: "abc", fileCount: 12 }],
+        },
+        skills: { names: ["k8s-debug"] },
+        mcp: { names: ["incidents"] },
+      });
+    } finally {
+      mockConfigState.knowledgeDir = "knowledge";
+      mockConfigState.skillsDir = "skills";
+      mockConfigState.mcpServers = {};
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("GET /api/internal/box-status reports drained when the box holds nothing", async () => {

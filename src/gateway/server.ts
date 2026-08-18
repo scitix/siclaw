@@ -72,6 +72,7 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import type { BoxSpawner } from "./agentbox/spawner.js";
 import { checkMetricsAuth } from "../shared/metrics.js";
+import type { BoxSyncStatus } from "../shared/agentbox-sync-status.js";
 import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
@@ -2054,14 +2055,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       return { ok: true, available: false, reason: "no_running_box", boxes: 0 };
     }
 
+    let sawUnsupported = false;
     for (const box of targets) {
       try {
         const client = new AgentBoxClient(box.endpoint, 8_000, agentBoxTlsOptions);
-        const status = await client.getJson<{
-          knowledge?: { syncedAt?: string | null; repos?: unknown[] };
-          skills?: { names?: string[] };
-          mcp?: { names?: string[] };
-        }>("/api/sync-status");
+        const status = await client.getJson<BoxSyncStatus>("/api/sync-status");
         return {
           ok: true,
           available: true,
@@ -2073,19 +2071,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       } catch (err: any) {
         const message = String(err?.message ?? err);
         console.warn(`[rpc] agent.syncStatus: box=${box.boxId} failed: ${message}`);
-        if (targets[targets.length - 1] === box) {
-          const unsupported = /\b404\b/.test(message) || /not found/i.test(message);
-          return {
-            ok: true,
-            available: false,
-            reason: unsupported ? "unsupported" : "query_failed",
-            boxes: targets.length,
-          };
-        }
+        sawUnsupported ||= /\b404\b/.test(message) || /not found/i.test(message);
       }
     }
 
-    return { ok: true, available: false, reason: "query_failed", boxes: targets.length };
+    return {
+      ok: true,
+      available: false,
+      reason: sawUnsupported ? "unsupported" : "query_failed",
+      boxes: targets.length,
+    };
   });
 
   // tracing.reloadAll — GLOBAL tracing hot-reload. Unlike agent.reload, tracing

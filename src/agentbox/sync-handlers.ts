@@ -24,6 +24,7 @@ import type {
   ReloadContext,
 } from "../shared/gateway-sync.js";
 import { GATEWAY_SYNC_DESCRIPTORS } from "../shared/gateway-sync.js";
+import type { BoxSyncStatus, ObservedKnowledgeRepo } from "../shared/agentbox-sync-status.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
 import { decodeSkillFileContent, normalizeSkillFiles, type SkillPackageFile } from "../shared/skill-package.js";
 
@@ -342,23 +343,6 @@ export interface KnowledgeSyncStatus {
 
 export interface KnowledgeSyncHandler extends AgentBoxSyncHandler<KnowledgeBundlePayload> {
   getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null;
-}
-
-export interface ObservedKnowledgeRepo {
-  id: string;
-  name: string;
-  version: number;
-  sha256: string;
-  fileCount?: number | null;
-}
-
-export interface BoxSyncStatus {
-  knowledge: {
-    syncedAt: string | null;
-    repos: ObservedKnowledgeRepo[];
-  };
-  skills: { names: string[] };
-  mcp: { names: string[] };
 }
 
 function observedRepo(repo: KnowledgeSyncStatus["repos"][number]): ObservedKnowledgeRepo {
