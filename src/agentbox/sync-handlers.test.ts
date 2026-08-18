@@ -940,10 +940,10 @@ describe("skill directory resolution", () => {
 });
 
 // ---------------------------------------------------------------------------
-// knowledgeHandler — empty-bundle preservation guard (symmetric to skills)
+// knowledgeHandler — empty-bundle wipe (successful empty fetch = unbound)
 // ---------------------------------------------------------------------------
 
-describe("knowledgeHandler empty-bundle guard", () => {
+describe("knowledgeHandler empty-bundle wipe", () => {
   let knowledgeTmpDir: string;
 
   beforeEach(() => {
@@ -961,21 +961,17 @@ describe("knowledgeHandler empty-bundle guard", () => {
     expect(fs.readdirSync(knowledgeTmpDir)).toEqual([]);
   });
 
-  it("preserves knowledgeDir contents when empty bundle arrives but content already materialized", async () => {
-    // Seed the dir as if a previous successful sync had happened.
+  it("wipes previously materialized knowledge when an empty bundle arrives", async () => {
+    // Previous successful sync left A on disk; next release unbound every library.
     fs.writeFileSync(path.join(knowledgeTmpDir, "index.md"), "# Seeded");
     fs.mkdirSync(path.join(knowledgeTmpDir, "repos", "alpha"), { recursive: true });
     fs.writeFileSync(path.join(knowledgeTmpDir, "repos", "alpha", "index.md"), "# alpha");
 
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const count = await knowledgeHandler.materialize({ version: "v2", repos: [] });
 
-    // Reports what it kept (top-level entries: index.md + repos/)
-    expect(count).toBe(2);
-    expect(fs.existsSync(path.join(knowledgeTmpDir, "index.md"))).toBe(true);
-    expect(fs.existsSync(path.join(knowledgeTmpDir, "repos", "alpha", "index.md"))).toBe(true);
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("skipping wipe"));
-    warnSpy.mockRestore();
+    expect(count).toBe(0);
+    expect(fs.existsSync(path.join(knowledgeTmpDir, "index.md"))).toBe(false);
+    expect(fs.existsSync(path.join(knowledgeTmpDir, "repos", "alpha", "index.md"))).toBe(false);
   });
 
   it("ignores stale .sync-staging-* leftovers when deciding whether to preserve", async () => {

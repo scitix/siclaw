@@ -359,28 +359,10 @@ export const knowledgeHandler: AgentBoxSyncHandler<KnowledgeBundlePayload> = {
     const syncedAt = new Date().toISOString();
 
     if (repos.length === 0) {
-      // Defense against empty-bundle erasure (belt-and-suspenders; the primary
-      // fix is Gateway-side so empty-bundles only arrive when the agent is
-      // genuinely unbound). If an empty payload arrives but we already have
-      // knowledge materialized, keep what we have and let the next reload retry.
-      // Legitimate "unbind-all" admin operations can force a fresh wipe by
-      // restarting the pod — which is cheap and explicit.
-      if (fs.existsSync(knowledgeDir)) {
-        const existing = fs.readdirSync(knowledgeDir).filter((name) => {
-          if (name.startsWith(".sync-staging")) return false;
-          try { return fs.statSync(path.join(knowledgeDir, name)).isDirectory() || fs.statSync(path.join(knowledgeDir, name)).isFile(); }
-          catch { return false; }
-        });
-        if (existing.length > 0) {
-          console.warn(
-            `[sync-handlers.knowledge] Empty bundle received but knowledgeDir has ` +
-            `${existing.length} entr${existing.length === 1 ? "y" : "ies"}; skipping wipe to preserve state. ` +
-            `Next non-empty reload will refresh normally.`,
-          );
-          return existing.length;
-        }
-      }
-      // Clear knowledge directory — agent has no bound repos AND nothing on disk worth keeping
+      // A successful empty fetch is authoritative: the type release unbound
+      // every library. Fetch failures never reach materialize (http-server
+      // catches them), so "keep the last disk copy" here made a deliberate
+      // empty publish look like the previous library. Wipe.
       if (fs.existsSync(knowledgeDir)) {
         for (const entry of fs.readdirSync(knowledgeDir)) {
           if (entry.startsWith(".sync-staging")) continue;
