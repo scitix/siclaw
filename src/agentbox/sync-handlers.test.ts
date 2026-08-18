@@ -11,6 +11,7 @@ import {
   knowledgeHandler,
   mcpHandler,
   promptHandler,
+  readBoxSyncStatus,
   skillsHandler,
 } from "./sync-handlers.js";
 import { knowledgeRepoDirName } from "../shared/knowledge-package.js";
@@ -1167,5 +1168,112 @@ describe("knowledgeHandler multi-repo identity", () => {
     expect(entries[0]).toContain("平台知识");
     expect(entries[0]).toContain("权威运维库");
     expect(entries[0].split("\n")).toHaveLength(1);
+  });
+});
+
+describe("readBoxSyncStatus", () => {
+  let knowledgeTmpDir: string;
+  let skillsTmpDir: string;
+  let syncStatusHandler: ReturnType<typeof createKnowledgeHandler>;
+
+  function packageBase64(title: string): string {
+    const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), "sync-status-package-"));
+    const archive = path.join(os.tmpdir(), `sync-status-package-${process.pid}-${Date.now()}.tar.gz`);
+    try {
+      fs.writeFileSync(path.join(sourceDir, "index.md"), `# ${title}\n`);
+      execFileSync("tar", ["-czf", archive, "-C", sourceDir, "index.md"]);
+      return fs.readFileSync(archive).toString("base64");
+    } finally {
+      fs.rmSync(sourceDir, { recursive: true, force: true });
+      fs.rmSync(archive, { force: true });
+    }
+  }
+
+  beforeEach(() => {
+    knowledgeTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sync-status-knowledge-"));
+    skillsTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sync-status-skills-"));
+    _mockKnowledgeDir = knowledgeTmpDir;
+    _mockSkillsDir = skillsTmpDir;
+    syncStatusHandler = createKnowledgeHandler({ knowledgeDir: knowledgeTmpDir });
+  });
+
+  afterEach(() => {
+    fs.rmSync(knowledgeTmpDir, { recursive: true, force: true });
+    fs.rmSync(skillsTmpDir, { recursive: true, force: true });
+  });
+
+  it("prefers the in-memory inventory written by materialize", async () => {
+    const repos = [
+      { id: "repo-a", name: "硬件设施", version: 2, sizeBytes: 10, dataBase64: packageBase64("a") },
+    ];
+    await syncStatusHandler.materialize({ version: "v1", repos });
+
+    const status = readBoxSyncStatus({
+      knowledgeDir: knowledgeTmpDir,
+      knowledgeHandler: syncStatusHandler,
+    });
+    expect(status.knowledge.repos).toEqual([
+      expect.objectContaining({ id: "repo-a", name: "硬件设施", version: 2 }),
+    ]);
+    expect(status.knowledge.syncedAt).toBeTruthy();
+    expect(status.knowledge.repos[0].sha256).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("falls back to .sync-manifest.json after a process restart", () => {
+    fs.writeFileSync(
+      path.join(knowledgeTmpDir, ".sync-manifest.json"),
+      JSON.stringify({
+        syncedAt: "2026-08-18T08:00:00.000Z",
+        version: "1",
+        repos: [{ id: "repo-b", name: "磁盘清单", version: 3, sha256: "abc", fileCount: 12, sizeBytes: 9 }],
+      }) + "\n",
+    );
+
+    const restartedHandler = createKnowledgeHandler({ knowledgeDir: knowledgeTmpDir });
+    const status = readBoxSyncStatus({
+      knowledgeDir: knowledgeTmpDir,
+      knowledgeHandler: restartedHandler,
+    });
+    expect(status.knowledge).toEqual({
+      syncedAt: "2026-08-18T08:00:00.000Z",
+      repos: [{ id: "repo-b", name: "磁盘清单", version: 3, sha256: "abc", fileCount: 12 }],
+    });
+  });
+
+  it("lists materialized skill directories", () => {
+    fs.mkdirSync(path.join(skillsTmpDir, "resolved", "k8s-debug"), { recursive: true });
+    fs.mkdirSync(path.join(skillsTmpDir, "resolved", "ticket-ops"), { recursive: true });
+    fs.writeFileSync(path.join(skillsTmpDir, "resolved", "notes.md"), "not a skill");
+
+    expect(readBoxSyncStatus({
+      knowledgeDir: knowledgeTmpDir,
+      knowledgeHandler: syncStatusHandler,
+    }).skills.names).toEqual(["k8s-debug", "ticket-ops"]);
+  });
+
+  it("keeps in-memory inventory isolated between local box handlers", async () => {
+    const otherKnowledgeDir = fs.mkdtempSync(path.join(os.tmpdir(), "sync-status-other-"));
+    const otherHandler = createKnowledgeHandler({ knowledgeDir: otherKnowledgeDir });
+    try {
+      await syncStatusHandler.materialize({
+        version: "v1",
+        repos: [{ id: "repo-a", name: "A", version: 1, sizeBytes: 10, dataBase64: packageBase64("a") }],
+      });
+      await otherHandler.materialize({
+        version: "v1",
+        repos: [{ id: "repo-b", name: "B", version: 1, sizeBytes: 10, dataBase64: packageBase64("b") }],
+      });
+
+      expect(readBoxSyncStatus({
+        knowledgeDir: knowledgeTmpDir,
+        knowledgeHandler: syncStatusHandler,
+      }).knowledge.repos.map((repo) => repo.id)).toEqual(["repo-a"]);
+      expect(readBoxSyncStatus({
+        knowledgeDir: otherKnowledgeDir,
+        knowledgeHandler: otherHandler,
+      }).knowledge.repos.map((repo) => repo.id)).toEqual(["repo-b"]);
+    } finally {
+      fs.rmSync(otherKnowledgeDir, { recursive: true, force: true });
+    }
   });
 });

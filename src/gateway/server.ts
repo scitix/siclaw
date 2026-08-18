@@ -72,6 +72,7 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import type { BoxSpawner } from "./agentbox/spawner.js";
 import { checkMetricsAuth } from "../shared/metrics.js";
+import type { BoxSyncStatus } from "../shared/agentbox-sync-status.js";
 import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
@@ -2040,6 +2041,47 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const failed = Array.from(failedSet);
     console.log(`[rpc] agent.reload: agent=${agentId} boxes=${targets.length} reloaded=[${reloaded}] failed=[${failed}]`);
     return { ok: true, reloaded, failed, boxes: targets.length };
+  });
+
+  // agent.syncStatus — read the box's observed inventory. Reload ACK only
+  // proves the RPC ran; this is what actually landed on disk.
+  rpcMethods.set("agent.syncStatus", async (params) => {
+    const agentId = params.agentId as string;
+    if (!agentId) throw new Error("agentId required");
+
+    const boxes = await agentBoxManager.list();
+    const agentBoxes = boxes.filter((b) => b.agentId === agentId);
+    const targets = agentBoxes.filter((b) => b.status === "running");
+    if (targets.length === 0) {
+      return { ok: true, available: false, reason: "no_running_box", boxes: agentBoxes.length };
+    }
+
+    let sawUnsupported = false;
+    for (const box of targets) {
+      try {
+        const client = new AgentBoxClient(box.endpoint, 8_000, agentBoxTlsOptions);
+        const status = await client.getJson<BoxSyncStatus>("/api/sync-status");
+        return {
+          ok: true,
+          available: true,
+          boxes: agentBoxes.length,
+          knowledge: status.knowledge ?? { syncedAt: null, repos: [] },
+          skills: status.skills ?? { names: [] },
+          mcp: status.mcp ?? { names: [] },
+        };
+      } catch (err: any) {
+        const message = String(err?.message ?? err);
+        console.warn(`[rpc] agent.syncStatus: box=${box.boxId} failed: ${message}`);
+        sawUnsupported ||= /\b404\b/.test(message) || /not found/i.test(message);
+      }
+    }
+
+    return {
+      ok: true,
+      available: false,
+      reason: sawUnsupported ? "unsupported" : "query_failed",
+      boxes: agentBoxes.length,
+    };
   });
 
   // tracing.reloadAll — GLOBAL tracing hot-reload. Unlike agent.reload, tracing
