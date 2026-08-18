@@ -15,10 +15,17 @@ import {
   detectSensitiveResource,
   getOutputFormat,
   sanitizeJSON,
+  redactSensitiveContent,
+  REDACTION_NOTICE,
   SENSITIVE_ENV_NAME_PATTERNS,
   SENSITIVE_VALUE_PATTERNS,
   type SensitiveResourceType,
 } from "./kubectl-sanitize.js";
+
+// The line-level redactor lives in kubectl-sanitize.ts — the structural
+// sanitizers there need it for ConfigMap entries that hold a whole config file.
+// Re-exported here because this module is its public entry point.
+export { redactSensitiveContent, REDACTION_NOTICE };
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -119,61 +126,6 @@ OUTPUT_RULES["kubectl"] = (args) => {
 // ── File-reading command rules ──────────────────────────────────────
 
 const REDACTED = "**REDACTED**";
-
-/**
- * Advisory footer appended (once) by the line-based redactors when anything was
- * redacted. Exported so streaming sanitization (background bash) can strip the
- * per-batch duplicates — the inline **REDACTED** markers carry the actual security
- * property; the footer is cosmetic.
- */
-export const REDACTION_NOTICE = "\n\n⚠️ Sensitive values have been redacted for security.";
-
-/**
- * Redact sensitive content from file-reading command output.
- * Scans each line for:
- *   - KEY=VALUE or KEY: VALUE where KEY matches SENSITIVE_ENV_NAME_PATTERNS
- *   - Values matching SENSITIVE_VALUE_PATTERNS (JWT, PEM, connection strings, etc.)
- */
-/** @public Used by restricted-bash pipeline fallback sanitization */
-export function redactSensitiveContent(output: string): string {
-  const lines = output.split("\n");
-  let redacted = false;
-
-  const result = lines.map((line) => {
-    // Check value patterns first (JWT, PEM, connection string, known prefixes)
-    for (const pattern of SENSITIVE_VALUE_PATTERNS) {
-      if (pattern.test(line)) {
-        redacted = true;
-        return REDACTED;
-      }
-    }
-
-    // Check KEY=VALUE format
-    const eqMatch = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)/);
-    if (eqMatch) {
-      const key = eqMatch[1];
-      if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
-        redacted = true;
-        return `${key}=${REDACTED}`;
-      }
-    }
-
-    // Check KEY: VALUE format (YAML-like)
-    const colonMatch = line.match(/^(\s*[A-Za-z_][A-Za-z0-9_.-]*):\s+(.*)/);
-    if (colonMatch) {
-      const key = colonMatch[1].trim();
-      if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
-        redacted = true;
-        return `${colonMatch[1]}: ${REDACTED}`;
-      }
-    }
-
-    return line;
-  });
-
-  const sanitized = result.join("\n");
-  return redacted ? sanitized + REDACTION_NOTICE : sanitized;
-}
 
 /** Rule for file-reading commands: always sanitize output */
 const fileReadingRule: OutputRuleFn = (_args) => ({

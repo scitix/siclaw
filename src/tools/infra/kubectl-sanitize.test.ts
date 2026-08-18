@@ -465,6 +465,89 @@ describe("sanitizeJSON", () => {
       const result = sanitizeJSON(input, "secret");
       expect(result).toContain("⚠️ Sensitive values have been redacted");
     });
+
+    // A redaction claim on untouched output is worse than no claim: it invites
+    // the reader to treat the text as safe when nothing was checked off.
+    it("does NOT claim redaction when nothing was redacted", () => {
+      const input = JSON.stringify({
+        kind: "ConfigMap",
+        data: { "app.conf": "log_level: debug\nreplicas: 3" },
+      });
+      const result = sanitizeJSON(input, "configmap");
+      expect(result).not.toContain("redacted");
+      expect(result).toContain("log_level: debug");
+    });
+
+    it("still claims redaction when only a later item was redacted", () => {
+      const input = JSON.stringify({
+        kind: "List",
+        items: [
+          { kind: "ConfigMap", data: { "clean.conf": "a: 1" } },
+          { kind: "ConfigMap", data: { "creds.conf": "token: ghp_aaaaaaaaaaaaaaaaaaaa" } },
+        ],
+      });
+      const result = sanitizeJSON(input, "configmap");
+      expect(result).toContain("⚠️ Sensitive values have been redacted");
+      expect(result).toContain("**REDACTED**");
+    });
+  });
+
+  // A ConfigMap entry is normally an entire config FILE, and its secrets are
+  // named by the keys INSIDE it. Matching the file as one blob checks neither
+  // those inner keys nor the ^-anchored value patterns, so everything leaked.
+  describe("ConfigMap — whole-file entries are redacted line by line", () => {
+    const promConfig = [
+      "scrape_configs:",
+      "  - job_name: node",
+      "    authorization:",
+      "      credentials: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig",
+      "    remote_write:",
+      "      - url: https://push.example.com",
+      "        headers:",
+      "          Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def",
+      "        token: ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "    scrape_interval: 30s",
+    ].join("\n");
+
+    const sanitizeEntry = (value: string): string => {
+      const input = JSON.stringify({
+        kind: "ConfigMap",
+        data: { "prometheus.yml": value },
+      });
+      const result = sanitizeJSON(input, "configmap");
+      return JSON.parse(result.split("\n\n⚠️")[0]).data["prometheus.yml"];
+    };
+
+    it("redacts every secret inside the file", () => {
+      const out = sanitizeEntry(promConfig);
+      expect(out).not.toContain("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9");
+      expect(out).not.toContain("eyJhbGciOiJIUzI1NiJ9");
+      expect(out).not.toContain("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    });
+
+    it("keeps the rest of the file diagnosable", () => {
+      const out = sanitizeEntry(promConfig);
+      expect(out).toContain("job_name: node");
+      expect(out).toContain("scrape_interval: 30s");
+      expect(out).toContain("url: https://push.example.com");
+    });
+
+    it("keeps the indent and key name of a redacted line", () => {
+      const out = sanitizeEntry(promConfig);
+      // Names WHICH setting was redacted, and does not break the YAML block.
+      expect(out).toContain("      credentials: **REDACTED**");
+      expect(out).toContain("          Authorization: **REDACTED**");
+    });
+
+    it("drops the whole entry for a multi-line PEM block", () => {
+      // Only the BEGIN line matches, so a per-line pass would leak the body.
+      const out = sanitizeEntry(
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkq\nhkiG9w0BAQEFAASC\n-----END RSA PRIVATE KEY-----",
+      );
+      expect(out).toBe("**REDACTED**");
+      expect(out).not.toContain("MIIEvQIBADANBgkq");
+      expect(out).not.toContain("hkiG9w0BAQEFAASC");
+    });
   });
 });
 
@@ -479,10 +562,14 @@ describe("SENSITIVE_ENV_NAME_PATTERNS", () => {
     "API_KEY", "APIKEY", "API-KEY",
     "PRIVATE_KEY", "PRIVATE-KEY",
     "SSH_KEY", "ENCRYPTION_KEY",
+    "Authorization", "authorization", "HTTP_AUTHORIZATION", "X-Authorization",
   ];
   const shouldNotMatch = [
     "LOG_LEVEL", "NODE_ENV", "JAVA_OPTS", "PORT", "HOST",
     "KEY_COUNT", "KEYBOARD_LAYOUT", "KEY_PREFIX",
+    // kube-apiserver diagnostic flags must stay readable — the pattern is
+    // end-anchored precisely so these survive.
+    "authorization-mode", "authorization-webhook-config-file",
   ];
 
   for (const name of shouldMatch) {
@@ -508,6 +595,10 @@ describe("SENSITIVE_VALUE_PATTERNS", () => {
     "ghp_abc123def456",
     "gho_abc123",
     "glpat-xyz789",
+    // Positional backstop: caught wherever it sits on the line, whatever the
+    // key is called — the ^-anchored patterns above cannot see it there.
+    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def",
+    "          authorization: bearer abcdefghijklmnopqrstuvwxyz",
   ];
   const shouldNotMatch = [
     "https://api.example.com",
@@ -516,6 +607,8 @@ describe("SENSITIVE_VALUE_PATTERNS", () => {
     "42",
     "us-east-1",
     "server { listen 80; }",
+    // Too short to be a credential, and the word alone must not trigger.
+    "Bearer token",
   ];
 
   for (const value of shouldMatch) {
