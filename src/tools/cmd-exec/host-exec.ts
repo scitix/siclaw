@@ -80,6 +80,9 @@ Examples (pass the id from host_list; names shown here for readability):
 - host: "<bare-metal-3 id>", command: "nvidia-smi"
 - host: "<storage-1 id>", command: "df -h"
 - host: "<node-a id>", command: "journalctl -u kubelet -n 100 | grep error"
+- host: "<node-a id>", command: "journalctl -u kubelet --since '2026-08-17 08:35:00'"
+  (time windows: journalctl runs on the HOST and its systemd rejects RFC3339 — use quoted
+   "YYYY-MM-DD HH:MM:SS", optionally with a trailing UTC, or a relative form like "-30min".)
 - host: "<node-a id>", command: "tcpdump -i eth0 -nn", run_in_background: true   (open-ended capture; returns immediately — stop it later with job_stop, then task_output(task_id))`,
     parameters: Type.Object({
       host: Type.String({

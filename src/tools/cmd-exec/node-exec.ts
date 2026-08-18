@@ -5,6 +5,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
+import { DebugPodStartupError } from "../infra/debug-pod.js";
 import { loadConfig } from "../../core/config.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
@@ -23,6 +24,42 @@ import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfi
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
 // Re-export for backward compatibility (tests + downstream imports)
+/**
+ * One rendering for a debug-pod startup failure, shared by the foreground and background paths.
+ *
+ * The two used to disagree: background named the stage and reason while foreground collapsed every
+ * failure to `debug_pod_failed`, so the same fault read differently depending on a flag the caller
+ * set for unrelated reasons.
+ *
+ * The field is `cached`, not `retried`: it says this is a replay of a failure this node+image already
+ * produced, which is what tells the agent a further attempt inside the window will not run either.
+ * An earlier revision reported `retried: !cached` and so labelled the FIRST failure as a retry.
+ *
+ * stage/reason/cached go in the TEXT as well as in `details`, because `details` is stripped before
+ * the model sees the result — a distinction only present there cannot be acted on.
+ */
+function debugPodFailureResult(err: unknown) {
+  const startup = err instanceof DebugPodStartupError ? err : undefined;
+  const message = err instanceof Error ? err.message : String(err);
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({
+      error: true,
+      message: `Debug pod failed to start: ${message}`,
+      ...(startup && {
+        stage: startup.stage,
+        reason: startup.reason,
+        node: startup.nodeName,
+        cached: startup.cached,
+      }),
+    }) }],
+    details: {
+      error: true,
+      reason: startup?.reason ?? "debug_pod_failed",
+      ...(startup && { stage: startup.stage, cached: startup.cached }),
+    },
+  };
+}
+
 export { validateNodeName, validatePodName } from "../infra/exec-utils.js";
 export { validateCommand } from "../infra/command-validator.js";
 
@@ -58,6 +95,11 @@ Creates a privileged debug pod with nsenter to run the command in the host's ful
 The pod is automatically cleaned up after execution (--rm).
 
 Commands run on the HOST — they have access to the host's tools, filesystem, devices, /proc, /sys, and /dev.
+The list below is what POLICY permits, not what the node has installed: binaries resolve from the
+node's own PATH, so a permitted command can still fail with exit 127 on a node that lacks it. That
+is a property of the node, not of this tool. jq and yq in particular are usually absent — for JSON,
+prefer a command's own output flags (crictl inspectp -o go-template, --format=) over piping to a
+JSON processor.
 
 Use this tool for host-level diagnostics that cannot be done from within a pod, such as:
 - Inspecting host network interfaces, routes, and RDMA devices
@@ -76,7 +118,7 @@ Allowed commands (ONLY these are permitted — do NOT use \`which\` to check, ju
   kernel: uname, hostname, uptime, dmesg, sysctl, lsmod, modinfo, getconf
   process: ps, pgrep, top, free, vmstat, iostat, mpstat, df, du, mount, findmnt, nproc, pidstat, pstree, numastat, ipcs
   file (read-only): cat, head, tail, ls, stat, file, wc, find, grep, diff, md5sum, sha256sum, tree, hexdump, od
-  text processing: sort, uniq, cut, tr, jq, yq, column, tac, nl
+  text processing: sort, uniq, cut, tr, column, tac, nl
   logs/services: journalctl, systemctl, timedatectl, hostnamectl
   container: crictl, ctr
   firewall (read-only): iptables, ip6tables
@@ -110,6 +152,10 @@ Examples:
 - node: "node-1", command: "curl -s http://10.0.0.1:8080/healthz"
 - node: "node-1", command: "ps aux | head -20"
 - node: "node-1", command: "journalctl -u kubelet -n 100 | grep error"
+- node: "node-1", command: "journalctl -u kubelet --since '2026-08-17 08:35:00' --until '2026-08-17 09:00:00'"
+  (time windows: journalctl runs on the NODE and its systemd rejects RFC3339 — "2026-08-17T08:35:00Z"
+   fails to parse. Use quoted "YYYY-MM-DD HH:MM:SS", optionally with a trailing UTC. Relative forms
+   like "-30min" and "yesterday" also work.)
 
 To run in a POD's network namespace (host tools + the pod's network view — e.g. RDMA on a pod that lacks the tools), pass pod= directly (one step; the node is resolved for you):
 - pod: "rdma-a", namespace: "rdma-test", command: "show_gids"
@@ -290,10 +336,10 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         try {
           cachedPod = await ensureDebugPodReady(spec, env, { signal });
         } catch (err: any) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
-            details: { error: true, reason: "debug_pod_failed" },
-          };
+          // Name the stage and reason rather than one sentence for API errors, scheduling, image
+          // pulls and admission alike — those call for different next steps, and an agent that
+          // cannot tell them apart retries all of them identically.
+          return debugPodFailureResult(err);
         }
         // Pin and capture the EXACT pod name we pinned — release by that name so pin/release
         // always target the same instance even if the cache entry is later replaced (and so
@@ -361,10 +407,7 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       try {
         fgPod = await ensureDebugPodReady(fgSpec, env, { signal });
       } catch (err: any) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
-          details: { error: true, reason: "debug_pod_failed" },
-        };
+        return debugPodFailureResult(err);
       }
       const fgPinnedPodName = acquireDebugPod(fgSpec); // null if the pod vanished; proceed best-effort
       const onAbort = () => killRemoteSessionViaKubectl({

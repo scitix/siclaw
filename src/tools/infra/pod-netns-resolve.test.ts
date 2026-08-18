@@ -10,6 +10,7 @@ vi.mock("./ssh-client.js", () => ({ sshExec: vi.fn() }));
 import {
   validateNetnsName,
   buildCrictlNetnsScript,
+  extractNetnsFromInspect,
   resolvePodNetnsViaKubectl,
   resolvePodNetnsViaSsh,
 } from "./pod-netns-resolve.js";
@@ -46,12 +47,67 @@ describe("validateNamespace (shell-injection guard)", () => {
   });
 });
 
+function inspectpJson(netnsPath: string | null, opts?: { infoAsString?: boolean }): string {
+  const info = {
+    runtimeSpec: {
+      linux: {
+        namespaces: [
+          { type: "pid" },
+          ...(netnsPath === null ? [{ type: "network" }] : [{ type: "network", path: netnsPath }]),
+        ],
+      },
+    },
+  };
+  return JSON.stringify({ status: { id: "sandbox-1" }, info: opts?.infoAsString ? JSON.stringify(info) : info });
+}
+
 describe("buildCrictlNetnsScript", () => {
-  it("looks up the sandbox by pod+namespace and prints the netns basename", () => {
+  it("looks up the sandbox by pod+namespace and returns RAW crictl JSON", () => {
     const s = buildCrictlNetnsScript("rdma-a", "rdma-test");
     expect(s).toContain('crictl pods --name "^rdma-a$" --namespace "rdma-test"');
     expect(s).toContain("crictl inspectp");
-    expect(s).toContain('basename "$NETNS_PATH"');
+    // -o json is explicit, not inherited: crictl's default output is configurable (CRICTL_OUTPUT,
+    // or `output:` in /etc/crictl.yaml), and a node set to yaml would fail `pod=` before the user's
+    // command ran — the same host-dependency class as the jq pipe this replaced.
+    expect(s).toContain("crictl inspectp -o json");
+  });
+
+  it("does no JSON processing on the node", () => {
+    // These commands run in the NODE's mount namespace, where the available binaries are
+    // whatever the customer installed — a `jq` here made this tool's own `pod=` capability
+    // fail on every node without it, before the user's command ran at all.
+    const s = buildCrictlNetnsScript("rdma-a", "rdma-test");
+    expect(s).not.toContain("jq");
+    expect(s).not.toContain("basename");
+  });
+});
+
+describe("extractNetnsFromInspect", () => {
+  it("takes the network namespace basename", () => {
+    expect(extractNetnsFromInspect(inspectpJson("/var/run/netns/cni-abc"))).toEqual({ netns: "cni-abc" });
+  });
+
+  it("parses an `info` that arrives as a JSON string", () => {
+    // Some crictl versions emit info as a string rather than a map.
+    expect(extractNetnsFromInspect(inspectpJson("/var/run/netns/cni-str", { infoAsString: true })))
+      .toEqual({ netns: "cni-str" });
+  });
+
+  it("names the host-network case instead of returning an empty netns", () => {
+    // `ip netns exec ""` downstream would be the alternative.
+    const r = extractNetnsFromInspect(inspectpJson(null));
+    expect("error" in r && r.error).toMatch(/host network/);
+  });
+
+  it("reports unreadable output rather than guessing", () => {
+    expect("error" in extractNetnsFromInspect("not json")).toBe(true);
+    expect("error" in extractNetnsFromInspect(JSON.stringify({ info: { runtimeSpec: {} } }))).toBe(true);
+    expect("error" in extractNetnsFromInspect(JSON.stringify({ info: "{oops" }))).toBe(true);
+  });
+
+  it("still validates the resolved name before it can reach `ip netns exec`", () => {
+    const r = extractNetnsFromInspect(inspectpJson("/var/run/netns/bad;name"));
+    expect("error" in r && r.error).toMatch(/unexpected netns name/);
   });
 });
 
@@ -60,7 +116,7 @@ describe("resolvePodNetnsViaKubectl", () => {
 
   it("returns {node, netns} on success (crictl via debug pod)", async () => {
     vi.mocked(resolveContainerNetns).mockResolvedValue({ nodeName: "worker-1", containerID: "c" } as any);
-    vi.mocked(runInDebugPod).mockResolvedValue({ stdout: "cni-abc\n", stderr: "", exitCode: 0 } as any);
+    vi.mocked(runInDebugPod).mockResolvedValue({ stdout: inspectpJson("/var/run/netns/cni-abc"), stderr: "", exitCode: 0 } as any);
     const r = await resolvePodNetnsViaKubectl(base);
     expect(r).toEqual({ node: "worker-1", netns: "cni-abc" });
     // It ran a nsenter-wrapped crictl script in the debug pod.
@@ -94,7 +150,7 @@ describe("resolvePodNetnsViaSsh", () => {
   const base = { target: {} as any, pod: "rdma-a", namespace: "rdma-test" };
 
   it("returns {netns} from a direct crictl run over SSH (no nsenter)", async () => {
-    vi.mocked(sshExec).mockResolvedValue({ stdout: "cni-xyz\n", stderr: "", exitCode: 0 } as any);
+    vi.mocked(sshExec).mockResolvedValue({ stdout: inspectpJson("/var/run/netns/cni-xyz"), stderr: "", exitCode: 0 } as any);
     expect(await resolvePodNetnsViaSsh(base)).toEqual({ netns: "cni-xyz" });
     const script = vi.mocked(sshExec).mock.calls[0][1] as string;
     expect(script).toContain("crictl pods"); // raw crictl, run directly on the node

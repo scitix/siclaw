@@ -4,6 +4,7 @@ import {
   parseArgs,
   getCommandBinary,
   validateCommandRestrictions,
+  agentboxRequiredCommands,
 } from "./command-sets.js";
 
 describe("COMMANDS registry", () => {
@@ -667,6 +668,53 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("nvidia-smi -i 0")).toBeNull();
       expect(validateCommandRestrictions("nvidia-smi topo -m")).toBeNull();
       expect(validateCommandRestrictions("nvidia-smi nvlink -s")).toBeNull();
+    });
+
+    it("allows the read-only -q display filter", () => {
+      // Feedback: these were rejected although -d/--display only selects which sections -q prints.
+      expect(validateCommandRestrictions("nvidia-smi -q -d TEMPERATURE,POWER,PERFORMANCE,ECC")).toBeNull();
+      expect(validateCommandRestrictions("nvidia-smi -q --display=MEMORY")).toBeNull();
+    });
+
+    it("does not let -d widen to the setter flags next to it", () => {
+      // Matching is exact-token (extractFlag splits only on "="), which is what keeps the
+      // display filter from admitting the driver-model / ECC / power-limit setters.
+      for (const cmd of ["nvidia-smi -dm 0", "nvidia-smi -e 1", "nvidia-smi -pl 250"]) {
+        expect(validateCommandRestrictions(cmd)).not.toBeNull();
+      }
+    });
+
+    it("keeps validating the argv after a subcommand", () => {
+      // Seeing a subcommand used to accept the whole invocation and stop checking, so these
+      // writes passed a validator whose error message promises read-only queries.
+      const setControl = validateCommandRestrictions("nvidia-smi nvlink --setcontrol 0bz");
+      expect(setControl).not.toBeNull();
+      expect(setControl).toContain("--setcontrol");
+      const resetCounters = validateCommandRestrictions("nvidia-smi nvlink -r");
+      expect(resetCounters).not.toBeNull();
+      expect(resetCounters).toContain("-r");
+      // A flag that is read-only for the TOP level but not offered by the subcommand is refused
+      // under that subcommand rather than inherited.
+      expect(validateCommandRestrictions("nvidia-smi topo --query-gpu=gpu_name")).not.toBeNull();
+    });
+
+    it("does not treat an inherited property name as a subcommand", () => {
+      // A plain-object lookup would resolve "constructor" through the prototype chain and hand
+      // back a Function, whose missing .has threw out of the validator itself.
+      for (const word of ["constructor", "toString", "hasOwnProperty"]) {
+        expect(() => validateCommandRestrictions(`nvidia-smi ${word} -q`)).not.toThrow();
+      }
+      // It is an unknown leading word, so it is refused as a subcommand we do not permit — the same
+      // rule that stops `nvidia-smi daemon`. It used to be skipped as a stray positional.
+      expect(validateCommandRestrictions("nvidia-smi constructor -q")).not.toBeNull();
+      expect(validateCommandRestrictions("nvidia-smi constructor -r")).not.toBeNull();
+    });
+
+    it("still allows the read-only subcommand queries", () => {
+      expect(validateCommandRestrictions("nvidia-smi topo -m")).toBeNull();
+      expect(validateCommandRestrictions("nvidia-smi topo -p -i 0")).toBeNull();
+      expect(validateCommandRestrictions("nvidia-smi nvlink -s")).toBeNull();
+      expect(validateCommandRestrictions("nvidia-smi nvlink --capabilities")).toBeNull();
     });
 
     it("blocks nvidia-smi --gpu-reset", () => {
@@ -1586,5 +1634,223 @@ describe("read-only enforcement for added diagnostic commands", () => {
     expect(validateCommandRestrictions("resolvectl flush-caches")).not.toBeNull();
     expect(validateCommandRestrictions("resolvectl dns eth0 1.1.1.1")).not.toBeNull();
     expect(validateCommandRestrictions("resolvectl revert eth0")).not.toBeNull();
+  });
+});
+
+describe("yq expression screening (file and env operators)", () => {
+  // yq's expression language opens files and reads env with no flag and no path argument, so the
+  // expression text itself is the only place this can be caught.
+  const reject = (cmd: string) => expect(validateCommandRestrictions(cmd)).not.toBeNull();
+  const allow = (cmd: string) => expect(validateCommandRestrictions(cmd)).toBeNull();
+
+  it("rejects every documented file operator", () => {
+    for (const op of ["load", "load_str", "strload", "load_xml", "load_props", "load_base64"]) {
+      reject(`yq '${op}("/root/.kube/config")'`);
+    }
+  });
+
+  it("rejects the payload that concatenates a path out of env", () => {
+    reject(`yq 'load_str(env(SICLAW_CREDENTIALS_DIR) + "/clusters/default.kubeconfig")'`);
+  });
+
+  it("rejects env operators, including the parenless envsubst", () => {
+    reject("yq 'env(HOME)'");
+    reject("yq 'strenv(HOME)'");
+    reject("yq '.a |= envsubst'");
+  });
+
+  it("rejects eval, which would rebuild a blocked operator from fragments", () => {
+    // Verified against yq v4.53.3: eval("lo" + "ad_str(...)") reads the file, and no token scan of
+    // the literal text can see it. Screening is only sound because eval itself is refused.
+    reject(`yq 'eval("lo" + "ad_str(\\"/root/.kube/config\\")")'`);
+    reject("yq 'eval(.expr)'");
+  });
+
+  it("rejects the system operator", () => {
+    reject(`yq 'system("id")'`);
+  });
+
+  it("still allows ordinary queries, including keys named env", () => {
+    allow("yq '.spec.template.spec.containers[].env'");
+    allow("yq -o=json '.status.conditions'");
+    allow("yq '.items[] | select(.metadata.name == \"env\")'");
+    allow("yq '.data.envsubstitution'"); // key access, not the operator
+  });
+
+  it("screens the expression in every context, not just local", () => {
+    for (const ctx of ["local", "node", "pod", "host"]) {
+      const opts = { context: ctx, piped: true };
+      expect(validateCommandRestrictions("yq 'load(\"/etc/shadow\")'", opts)).not.toBeNull();
+      expect(validateCommandRestrictions("yq '.a.b'", opts)).toBeNull();
+    }
+  });
+});
+describe("stdin-only text commands: file operands and flag values", () => {
+  const local = { context: "local", piped: true };
+  const reject = (cmd: string) => expect(validateCommandRestrictions(cmd, local)).not.toBeNull();
+  const allow = (cmd: string) => expect(validateCommandRestrictions(cmd, local)).toBeNull();
+
+  // The credentials live INSIDE the workdir (`WORKDIR /app`, credentials at
+  // `/app/.siclaw/credentials/`), so a downward glob reaches them without a leading `/` and without
+  // the literal `.siclaw/credentials/` that the sensitive-path patterns look for. An earlier
+  // revision allowed globs on the argument that `*` cannot match `..`; true, but the credentials are
+  // below the workdir, not above it. These are the payloads that exception let through.
+  it("rejects globs, partial components and brace expansion that expand into the credential tree", () => {
+    reject("head .siclaw/*/*/*");
+    reject("column -t .siclaw/*/*/*");
+    reject("column .sic*/credentials/clusters/*");
+    reject("sort .siclaw/*/clusters/*");
+    reject("head .siclaw/{credentials,x}/clusters/*");
+    reject("uniq .siclaw/*/*/*");   // `positionals: 1` counts tokens, not what they expand to
+    reject("tac .siclaw/*/*/*");
+    reject("nl .siclaw/*/*/*");
+  });
+
+  it("rejects variable expansion and command substitution in an operand", () => {
+    reject('column "$SICLAW_CREDENTIALS_DIR"/clusters/*');
+    reject("head $KUBECONFIG");
+    reject('head "$KUBECONFIG"');
+    reject("head ${KUBECONFIG}");
+    reject("column ${SICLAW_CREDENTIALS_DIR}x");
+    reject("head `printf %s $KUBECONFIG`");
+    reject("head $(printf %s $KUBECONFIG)");
+    reject("tail -n 99 $HOME/.siclaw/credentials/clusters/x");
+  });
+
+  it("rejects a path hidden in a dashed token, which an operand-only check never inspects", () => {
+    reject("grep --file=$SICLAW_CREDENTIALS_DIR/clusters/x .");
+    reject("grep -f$SICLAW_CREDENTIALS_DIR/clusters/x .");
+    reject("grep --file=.siclaw/*/*/* .");
+  });
+
+  it("refuses the flags whose whole purpose is to read a file", () => {
+    // Per command: `grep -f` is a pattern file, but `cut -f` is a field list and `sort -f` is
+    // --ignore-case, so this cannot be keyed on the letter alone.
+    reject("grep -f patterns.txt");
+    reject("jq -f prog.jq");
+    reject("jq --rawfile s x.txt '.'");
+    reject("jq --slurpfile s x.json '.'");
+    reject("wc --files0-from=list");
+    allow("cut -f 1");            // field list, not a file
+    allow("cut -d , -f 1");
+    allow("sort -f");             // --ignore-case
+    allow("nl -f n");             // footer numbering style
+    allow("uniq -f 2");           // skip fields
+  });
+
+  it("does not screen an expression as if it were a path", () => {
+    // These are regexes and filters. Screening them broke `grep -e 'foo$bar'` in the previous
+    // revision, and the test that was supposed to cover it used 'a$', which cannot fail that way.
+    allow("grep -e 'foo$bar'");
+    allow("grep -e '/var/log/pods'");
+    allow("grep --regexp='/var/log/pods/.*[.]log'");
+    allow("grep -e 'a$' -e 'b$'");
+    allow("grep 'error$'");
+    allow("grep -E '/var/log/pods/.*[.]log'");
+    allow("jq '.metadata.annotations[\"kubectl.kubernetes.io/last-applied-configuration\"]'");
+    allow("jq -r '.items[].spec.nodeName'");
+    allow("yq '.spec.containers[].image'");
+    allow("tr -d '[:space:]'");
+    allow("tr 'a-z' 'A-Z'");
+  });
+
+  it("still allows the piped forms these commands exist for", () => {
+    allow("column -t -s ,");
+    allow("head -n 20");
+    allow("sort -k2 -n");
+    allow("wc -l");
+    allow("uniq -c");
+    allow("cut -c1-80");
+    allow("grep -i timeout");
+    // Explicit stdin. Not asserted for `sort`, whose own allowedFlags whitelist rejects a bare `-`
+    // independently of this rule.
+    allow("head -");
+  });
+
+  it("rejects a plain relative file operand too — pipeOnly means stdin, not a nearby file", () => {
+    reject("sort out.log/x");
+    reject("wc -l logs/kubelet.log");
+    reject("head -n 20 ./kubelet.log");
+    reject("sort /root/.siclaw/credentials/clusters/x");
+    reject("column ../../etc/shadow");
+  });
+});
+
+describe("nvidia-smi topo/nvlink read-only option sets", () => {
+  it("allows the documented topo queries that used to be refused", () => {
+    for (const flag of ["-p2p r", "-C -i 0", "-M -i 0", "-nvme", "-gnid -i 0", "-cpu", "-gpu", "-nic", "-all"]) {
+      expect(validateCommandRestrictions(`nvidia-smi topo ${flag}`)).toBeNull();
+    }
+  });
+
+  it("allows the documented nvlink queries that used to be refused", () => {
+    for (const flag of ["--id 0", "-l 0", "-p", "-pcibusid", "-R", "-remotelinkinfo", "-gt", "--getthroughput"]) {
+      expect(validateCommandRestrictions(`nvidia-smi nvlink ${flag}`)).toBeNull();
+    }
+  });
+
+  it("refuses a subcommand that is not an allowed one, instead of skipping it as an operand", () => {
+    // `nvidia-smi daemon` starts a root background daemon. The argv walk only inspected flags, so
+    // every unknown leading word — daemon, drain, mig, replay, pmon, dmon, vgpu — was accepted.
+    for (const sub of ["daemon", "drain", "mig", "replay", "pmon", "dmon", "vgpu"]) {
+      expect(validateCommandRestrictions(`nvidia-smi ${sub}`)).not.toBeNull();
+      expect(validateCommandRestrictions(`nvidia-smi ${sub} -i 0`)).not.toBeNull();
+    }
+  });
+
+  it("does not mistake a flag value in first position for a subcommand", () => {
+    // `-i 0 -q`: args[1] is a flag, so the leading-word rule must not fire on its value.
+    expect(validateCommandRestrictions("nvidia-smi -i 0 -q")).toBeNull();
+    expect(validateCommandRestrictions("nvidia-smi -q -d MEMORY")).toBeNull();
+    expect(validateCommandRestrictions("nvidia-smi -L")).toBeNull();
+    expect(validateCommandRestrictions("nvidia-smi topo -m")).toBeNull();
+    expect(validateCommandRestrictions("nvidia-smi nvlink -s")).toBeNull();
+  });
+
+  it("still refuses nvlink counter writes and resets", () => {
+    expect(validateCommandRestrictions("nvidia-smi nvlink -r")).not.toBeNull();
+    expect(validateCommandRestrictions("nvidia-smi nvlink --resetcounters")).not.toBeNull();
+    expect(validateCommandRestrictions("nvidia-smi nvlink -sc 0")).not.toBeNull();
+    expect(validateCommandRestrictions("nvidia-smi nvlink --setcontrol 0")).not.toBeNull();
+  });
+});
+
+describe("agentboxRequiredCommands", () => {
+  it("covers what restricted-bash advertises, and nothing the image cannot provide", () => {
+    const required = agentboxRequiredCommands();
+    // Everything in the text category, which is the surface that description names.
+    const text = Object.entries(COMMANDS).filter(([, d]) => d.category === "text").map(([c]) => c);
+    for (const cmd of text) expect(required).toContain(cmd);
+    expect(required).toContain("kubectl");
+    // NOT the node-diagnostic commands. The local context permits them only because it shares the
+    // category table with node_exec, and requiring them in this image would be meaningless — the
+    // AgentBox is not where they run.
+    for (const cmd of ["nvidia-smi", "crictl", "ib_write_bw", "tcpdump", "ip"]) {
+      expect(required).not.toContain(cmd);
+    }
+  });
+
+  it("names the commands whose absence was invisible until runtime", () => {
+    // yq and column were whitelisted and advertised while no image shipped them; the build-time
+    // check exists so that cannot happen silently again.
+    expect(agentboxRequiredCommands()).toEqual(expect.arrayContaining(["yq", "column", "jq"]));
+  });
+});
+
+describe("prototype-property names are not rules", () => {
+  // Both the command name and the flag reach these tables from the caller, and this repo has
+  // shipped a prototype-chain lookup bug once already (nvidia-smi, #493).
+  //
+  // Honest scope: this passes with an object lookup too, because the `?? 0` fallback around it is
+  // already fail-closed. It is a forward guard on the OBSERVABLE rule — a prototype-named flag
+  // must never buy an operand an exemption — not a regression test for the Map itself.
+  it("does not read a rule off Object.prototype", () => {
+    const local = { context: "local", piped: true };
+    for (const name of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      expect(() => validateCommandRestrictions(`${name} x`, local)).not.toThrow();
+      expect(() => validateCommandRestrictions(`grep -${name} pattern`, local)).not.toThrow();
+      // A prototype-named flag must not buy an exemption for the operand behind it.
+      expect(validateCommandRestrictions(`head --${name} $KUBECONFIG`, local)).not.toBeNull();
+    }
   });
 });
