@@ -124,9 +124,9 @@ export interface CreateSiclawSessionOpts {
   portalUrl?: string;
   /**
    * Optional callback injected by agentbox. When present, tools may call it to
-   * push custom events into the parent session's SSE stream (used by
-   * `spawn_subagent` to forward child-agent events so the frontend can render
-   * them in a nested block).
+   * push custom events into the parent session's SSE stream (used by citation
+   * delivery and by `spawn_subagent` to forward child-agent events so the
+   * frontend can render them in a nested block).
    */
   sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
   /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
@@ -207,6 +207,7 @@ function truncateWithBudget(content: string, maxChars: number): string {
 function buildAppendSystemPrompt(
   memoryDir: string | null,
   knowledgeDir?: string,
+  knowledgeCitationsEnabled = false,
 ): string[] {
   const parts: string[] = [];
 
@@ -275,7 +276,7 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
   if (wikiCatalog) {
     parts.push(wikiCatalog);
   }
-  if (knowledgeDir && hasKnowledgeCitationManifest(knowledgeDir)) {
+  if (knowledgeCitationsEnabled && knowledgeDir && hasKnowledgeCitationManifest(knowledgeDir)) {
     parts.push(`
 ## Knowledge source citations
 
@@ -374,11 +375,13 @@ export async function createSiclawSession(
     ?? (opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
       ? opts.portalKnowledgeDir
       : path.resolve(cwd, config.paths.knowledgeDir));
-  const citationSupport = createKnowledgeCitationSupport({
-    knowledgeDir,
-    turnRef,
-    sessionEventEmitter: opts?.sessionEventEmitter,
-  });
+  const citationSupport = opts?.sessionEventEmitter
+    ? createKnowledgeCitationSupport({
+        knowledgeDir,
+        turnRef,
+        sessionEventEmitter: opts.sessionEventEmitter,
+      })
+    : undefined;
 
   if (memoryEnabled) {
     // Ensure memoryDir and skeleton PROFILE.md exist before the memory indexer
@@ -440,7 +443,7 @@ export async function createSiclawSession(
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
-      knowledgeCitationTool: citationSupport.tool,
+      knowledgeCitationTool: citationSupport?.tool,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
       // Force sub-agents foreground when a detached batch's conclusion would be
       // stranded because the caller blocks on the turn's own result and has no
@@ -535,7 +538,7 @@ export async function createSiclawSession(
         readFile: async (p) => {
           assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir);
           const content = await fsReadFile(p);
-          citationSupport.noteRead(p);
+          citationSupport?.noteRead(p);
           return content;
         },
         access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK); },
@@ -588,9 +591,11 @@ export async function createSiclawSession(
   // Subject to allowedTools (same chokepoint as MCP append above): file tools are
   // created outside the registry, so the shared name-based whitelist is applied here.
   appendAllowedTools(customTools, restrictedFileTools, allowedTools);
-  // Citation registration is an intrinsic, side-effect-free companion to Read:
-  // capability groups need not know its name, and Agent Type never gates it.
-  if ((!Array.isArray(allowedTools) || allowedTools.includes("read")) &&
+  // Citation registration is an intrinsic, side-effect-free companion to Read,
+  // but it must have a delivery sink — otherwise the tool would promise that
+  // links are appended while CLI/child sessions silently drop the event.
+  if (citationSupport &&
+      (!Array.isArray(allowedTools) || allowedTools.includes("read")) &&
       !customTools.some((tool) => tool.name === citationSupport.tool.name)) {
     customTools.push(citationSupport.tool);
   }
@@ -698,7 +703,7 @@ export async function createSiclawSession(
       systemPromptOverride: () =>
         buildSreSystemPrompt(mode, opts?.systemPromptTemplate, opts?.systemPromptAppend),
       appendSystemPromptOverride: () =>
-        buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir),
+        buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir, Boolean(citationSupport)),
       // Extension registration order: compactionSafeguard handles session_before_compact.
       extensionFactories: [
         contextPruningExtension,

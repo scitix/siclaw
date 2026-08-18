@@ -53,7 +53,7 @@ export function hasKnowledgeCitationManifest(knowledgeDir: string): boolean {
 export function createKnowledgeCitationSupport(opts: {
   knowledgeDir: string;
   turnRef: { current: number };
-  sessionEventEmitter?: SessionEventEmitter;
+  sessionEventEmitter: SessionEventEmitter;
 }): { noteRead: (pagePath: string) => void; tool: ToolDefinition } {
   let turn = -1;
   const readPages = new Set<string>();
@@ -120,7 +120,7 @@ export function createKnowledgeCitationSupport(opts: {
         if (citations.length >= 3) break;
       }
       if (citations.length > 0) {
-        opts.sessionEventEmitter?.({ type: "knowledge_sources", sources: citations });
+        opts.sessionEventEmitter({ type: "knowledge_sources", sources: citations });
       }
       return result(
         citations.length > 0

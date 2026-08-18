@@ -376,6 +376,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // so they persist inline exactly as before.
   let isRoutingTurn = false;
   let routingCommitted = false;
+  let pendingKnowledgeSources: unknown = null;
   const pendingAssistantOps: Array<() => Promise<void>> = [];
   const pendingErrorOps: Array<() => Promise<void>> = [];
   const flushOps = async (ops: Array<() => Promise<void>>) => {
@@ -433,6 +434,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   const discardRoutedAttempt = () => {
     pendingAssistantOps.length = 0;
     pendingErrorOps.length = 0;
+    pendingKnowledgeSources = null;
     pendingStreamError = null;
     errorMessage = "";
     // The primary's deferred assistant op flipped firstAssistantPersisted when
@@ -491,8 +493,6 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let capturedContextUsage: Record<string, unknown> | undefined;
   let latestModelRouteSwitch: Record<string, unknown> | null = null;
   let currentModelRouteMetadata: Record<string, unknown> | null = null;
-  let pendingKnowledgeSources: unknown = null;
-
   // try/finally, not a bare fall-through: the terminal error is BUFFERED
   // (last one wins), so a stream that dies mid-turn — pod recycled, transport
   // dropped — would otherwise take the operator's only explanation of the

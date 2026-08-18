@@ -2939,6 +2939,9 @@ export async function collectChannelResponse(
     for await (const event of client.streamEvents(sessionId)) {
       const ev = event as Record<string, any>;
 
+      if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
+        pendingKnowledgeSources = null;
+      }
       if (ev.type === "knowledge_sources") {
         pendingKnowledgeSources = ev.sources;
       }

@@ -499,6 +499,20 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     expect(result.errorMessage).toBe("");
   });
 
+  it("discards a failed primary's knowledge sources before rendering the fallback answer", async () => {
+    const events = [
+      { type: "model_route_start", candidateCount: 2 },
+      { type: "knowledge_sources", sources: [{ title: "Primary Runbook", url: "https://example.com/primary" }] },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer from fallback" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u" });
+    expect(result.resultText).toBe("answer from fallback");
+    expect(result.resultText).not.toContain("Primary Runbook");
+  });
+
   it("persists the error row when a routed turn is exhausted (no fallback succeeded)", async () => {
     const events = [
       { type: "model_route_start", candidateCount: 2 },
