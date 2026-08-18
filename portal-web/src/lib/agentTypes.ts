@@ -2,7 +2,7 @@
 // capability set and provide an initial prompt, but every agent's persisted
 // prompt remains editable by the portal admin.
 
-export type AgentTypeKey = "sre" | "coordinator" | "custom"
+export type AgentTypeKey = "sre" | "coordinator" | "knowledge_qa" | "custom"
 
 export interface AgentTypeOption {
   key: AgentTypeKey
@@ -27,6 +27,13 @@ export const AGENT_TYPES: AgentTypeOption[] = [
     label: "Coordinator Agent",
     description: "Answers knowledge questions from its skills/knowledge base and routes hands-on troubleshooting to specialist agents.",
     capabilities: ["inspect_infra", "read_files", "delegate_agents"],
+    defaultNoSkills: true,
+  },
+  {
+    key: "knowledge_qa",
+    label: "Knowledge Q&A Agent",
+    description: "Researches bound knowledge bases and answers with synthesized, source-backed information.",
+    capabilities: ["read_files"],
     defaultNoSkills: true,
   },
   {

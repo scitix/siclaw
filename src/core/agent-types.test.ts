@@ -3,13 +3,16 @@ import { describe, it, expect } from "vitest";
 import { AGENT_TYPES, normalizeAgentType, effectiveAgentPrompt, effectiveCapabilityKeys } from "./agent-types.js";
 
 describe("agent-types", () => {
-  it("has the three designed types; built-ins lock caps and supply editable prompt defaults", () => {
-    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coordinator", "custom", "sre"]);
+  it("has the four designed types; built-ins lock caps and supply editable prompt defaults", () => {
+    expect(Object.keys(AGENT_TYPES).sort()).toEqual(["coordinator", "custom", "knowledge_qa", "sre"]);
     expect(AGENT_TYPES.sre.capabilities).toBeTruthy();
     expect(AGENT_TYPES.sre.defaultPrompt).toBeTruthy();
     expect(AGENT_TYPES.coordinator.capabilities).toContain("delegate_agents");
     expect(AGENT_TYPES.coordinator.capabilities).not.toContain("run_commands");
     expect(AGENT_TYPES.coordinator.defaultNoSkills).toBe(true);
+    expect(AGENT_TYPES.knowledge_qa.capabilities).toEqual(["read_files"]);
+    expect(AGENT_TYPES.knowledge_qa.defaultPrompt).toBeTruthy();
+    expect(AGENT_TYPES.knowledge_qa.defaultNoSkills).toBe(true);
     expect(AGENT_TYPES.custom.capabilities).toBeNull();
     expect(AGENT_TYPES.custom.defaultPrompt).toBeNull();
   });
@@ -48,6 +51,7 @@ describe("agent-types", () => {
   it("normalizeAgentType defaults unknown/absent to custom", () => {
     expect(normalizeAgentType("sre")).toBe("sre");
     expect(normalizeAgentType("coordinator")).toBe("coordinator");
+    expect(normalizeAgentType("knowledge_qa")).toBe("knowledge_qa");
     expect(normalizeAgentType("custom")).toBe("custom");
     expect(normalizeAgentType(undefined)).toBe("custom");
     expect(normalizeAgentType("bogus")).toBe("custom");
@@ -56,6 +60,7 @@ describe("agent-types", () => {
   it("effectiveCapabilityKeys: built-in types override, custom uses own selection", () => {
     expect(effectiveCapabilityKeys("coordinator", ["run_commands"])).toEqual(AGENT_TYPES.coordinator.capabilities);
     expect(effectiveCapabilityKeys("sre", null)).toEqual(AGENT_TYPES.sre.capabilities);
+    expect(effectiveCapabilityKeys("knowledge_qa", ["run_commands"])).toEqual(["read_files"]);
     expect(effectiveCapabilityKeys("custom", ["read_files"])).toEqual(["read_files"]);
     expect(effectiveCapabilityKeys("custom", null)).toBeNull();
   });
@@ -63,6 +68,8 @@ describe("agent-types", () => {
   it("effectiveAgentPrompt: persisted prompt replaces the built-in default", () => {
     expect(effectiveAgentPrompt("coordinator", "maintainer truth")).toBe("maintainer truth");
     expect(effectiveAgentPrompt("coordinator", null)).toBe(AGENT_TYPES.coordinator.defaultPrompt);
+    expect(effectiveAgentPrompt("knowledge_qa", "Prefer concise Chinese answers.")).toBe("Prefer concise Chinese answers.");
+    expect(effectiveAgentPrompt("knowledge_qa", null)).toBe(AGENT_TYPES.knowledge_qa.defaultPrompt);
     expect(effectiveAgentPrompt("custom", "custom truth")).toBe("custom truth");
     expect(effectiveAgentPrompt("custom", "")).toBeUndefined();
   });
