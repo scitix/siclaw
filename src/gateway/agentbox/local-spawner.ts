@@ -135,7 +135,10 @@ export class LocalSpawner implements BoxSpawner {
     // disableIdleShutdown: LocalSpawner runs AgentBox in the same process as
     // the Portal — the 5-min idle timer's `process.exit(0)` would take the
     // whole `siclaw local` down and strand the web UI.
-    const httpServer = createHttpServer(sessionManager, { disableIdleShutdown: true });
+    const httpServer = createHttpServer(sessionManager, {
+      disableIdleShutdown: true,
+      knowledgeHandler,
+    });
 
     await new Promise<void>((resolve, reject) => {
       httpServer.listen(port, "127.0.0.1", () => {
