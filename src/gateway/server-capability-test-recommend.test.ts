@@ -44,6 +44,20 @@ vi.mock("./agentbox/client.js", () => ({
           ],
         };
       }
+      if (path.startsWith("/feedback-review/")) {
+        return {
+          ok: true,
+          reply: "Raw supports three attempts; the Candidate index does not expose the rule.",
+          brief: {
+            conclusion: "wiki_gap",
+            summary: "Add the retry rule to the index.",
+            expected_answer: "Retry at most three times.",
+            evidence_paths: ["raw/policy.md"],
+            suggested_pages: ["candidate/index.md"],
+            repair_instructions: "Link the existing retry rule from the index.",
+          },
+        };
+      }
       return { ok: true };
     }
     async getJson() { return {}; }
@@ -160,6 +174,57 @@ describe("capability.testReferenceAssist", () => {
         mode: "polish",
         question: "What is the retry limit?",
         draft_answer: "Retry five times.",
+      },
+      timeoutMs: 615_000,
+    });
+  });
+});
+
+describe("capability.feedbackReview", () => {
+  it("forwards the immutable Candidate bundle and durable transcript without using the compile turn", async () => {
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: fakeAgentBoxManager(), frontendClient: fakeFrontendClient(), credentialService: {} as any,
+    });
+    const start = server.rpcMethods.get("capability.start")!;
+    const started = await start({ profile: "kb-compile", org_id: "org-1", correlation_id: "attempt-1" }) as { run_id: string };
+    const review = server.rpcMethods.get("capability.feedbackReview")!;
+    const brief = {
+      conclusion: "discussing",
+      summary: "Still checking the evidence.",
+      evidence_paths: [],
+      suggested_pages: [],
+    };
+
+    await expect(review({
+      run_id: started.run_id,
+      bundle_base64: "d29ya3NwYWNl",
+      bundle_sha256: "abc123",
+      case: { question: "What is the retry limit?", original_answer: "I do not know." },
+      message: "Compare this with Raw.",
+      transcript: [{ role: "user", content: "Hello" }, { role: "assistant", content: "Hello." }],
+      current_brief: brief,
+    })).resolves.toEqual({
+      run_id: started.run_id,
+      reply: "Raw supports three attempts; the Candidate index does not expose the rule.",
+      brief: {
+        conclusion: "wiki_gap",
+        summary: "Add the retry rule to the index.",
+        expected_answer: "Retry at most three times.",
+        evidence_paths: ["raw/policy.md"],
+        suggested_pages: ["candidate/index.md"],
+        repair_instructions: "Link the existing retry rule from the index.",
+      },
+    });
+    expect(posts).toContainEqual({
+      path: `/feedback-review/${started.run_id}`,
+      body: {
+        bundle_base64: "d29ya3NwYWNl",
+        bundle_sha256: "abc123",
+        case: { question: "What is the retry limit?", original_answer: "I do not know." },
+        message: "Compare this with Raw.",
+        transcript: [{ role: "user", content: "Hello" }, { role: "assistant", content: "Hello." }],
+        current_brief: brief,
       },
       timeoutMs: 615_000,
     });

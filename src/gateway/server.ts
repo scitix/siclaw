@@ -44,6 +44,8 @@ import type {
   CapabilityTestRecommendResponse,
   CapabilityTestReferenceAssistRequest,
   CapabilityTestReferenceAssistResponse,
+  CapabilityFeedbackReviewRequest,
+  CapabilityFeedbackReviewResponse,
   CapabilityTestMessageRequest,
   CapabilityTestSessionsRequest,
   CapabilityTestSessionsResponse,
@@ -1670,6 +1672,39 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       return response;
     }
     throw new Error("reference assistant returned an unexpected mode");
+  });
+
+  rpcMethods.set("capability.feedbackReview", async (params) => {
+    const req = params as unknown as CapabilityFeedbackReviewRequest;
+    if (!req.run_id) throw new Error("run_id is required");
+    if (!req.bundle_base64 || !req.bundle_sha256) throw new Error("candidate workspace bundle is required");
+    if (!req.case?.question?.trim()) throw new Error("case.question is required");
+    if (!req.message?.trim()) throw new Error("message is required");
+    const rec = capabilityRunManager.get(req.run_id) ?? (await capabilityRunManager.adopt(req.run_id));
+    if (!rec || isTerminalCapabilityStatus(rec.status)) throw new Error(`unknown capability run: ${req.run_id}`);
+    capabilityRunManager.touch(req.run_id);
+    const { client } = await ensureCapabilitySession(req.run_id, rec.profile, rec.orgId || undefined, undefined);
+    const reviewed = await client.postJson<{
+      ok: true;
+      reply: string;
+      brief: CapabilityFeedbackReviewResponse["brief"];
+    }>(
+      `/feedback-review/${req.run_id}`,
+      {
+        bundle_base64: req.bundle_base64,
+        bundle_sha256: req.bundle_sha256,
+        case: req.case,
+        message: req.message,
+        ...(req.transcript?.length ? { transcript: req.transcript } : {}),
+        ...(req.current_brief ? { current_brief: req.current_brief } : {}),
+      },
+      615_000,
+    );
+    return {
+      run_id: req.run_id,
+      reply: reviewed.reply,
+      brief: reviewed.brief,
+    } satisfies CapabilityFeedbackReviewResponse;
   });
 
   rpcMethods.set("capability.testClose", async (params) => {

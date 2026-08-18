@@ -44,6 +44,7 @@ export const CAPABILITY_TEST_MESSAGE = "capability.testMessage" as const;
 export const CAPABILITY_TEST_CLOSE = "capability.testClose" as const;
 export const CAPABILITY_TEST_RECOMMEND = "capability.testRecommend" as const;
 export const CAPABILITY_TEST_REFERENCE_ASSIST = "capability.testReferenceAssist" as const;
+export const CAPABILITY_FEEDBACK_REVIEW = "capability.feedbackReview" as const;
 /** Enumerate the box's live test sessions for a run (orphan reconciliation). */
 export const CAPABILITY_TEST_SESSIONS = "capability.testSessions" as const;
 
@@ -329,6 +330,48 @@ export type CapabilityTestReferenceAssistResponse =
       evidence_paths: string[];
       warnings: string[];
     };
+
+export type CapabilityFeedbackConclusion = "discussing" | "wiki_gap" | "source_gap" | "no_issue";
+
+export interface CapabilityFeedbackReviewBrief {
+  conclusion: CapabilityFeedbackConclusion;
+  summary: string;
+  expected_answer?: string;
+  evidence_paths: string[];
+  suggested_pages: string[];
+  repair_instructions?: string;
+}
+
+export interface CapabilityFeedbackReviewTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/**
+ * One stateless turn of the durable KB-feedback conversation. Sicore owns the
+ * case and transcript. The box gets an immutable Candidate workspace bundle
+ * plus the exact Raw revision already pinned to the parent authoring run, then
+ * returns prose + a structured repair brief without exposing write tools.
+ */
+export interface CapabilityFeedbackReviewRequest {
+  run_id: string;
+  bundle_base64: string;
+  bundle_sha256: string;
+  case: {
+    question: string;
+    original_answer?: string;
+    user_feedback?: string;
+  };
+  message: string;
+  transcript?: CapabilityFeedbackReviewTurn[];
+  current_brief?: CapabilityFeedbackReviewBrief;
+}
+
+export interface CapabilityFeedbackReviewResponse {
+  run_id: string;
+  reply: string;
+  brief: CapabilityFeedbackReviewBrief;
+}
 
 export interface CapabilityTestCloseResponse {
   ok: true;
