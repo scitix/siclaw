@@ -14,7 +14,7 @@ import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import { validatePodName, prepareExecEnv, filterPodNoise } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
-import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
+import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -129,9 +129,10 @@ Examples:
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "pod_exec");
       } catch (err) {
+        const failure = await classifyClusterFailure(kubeconfigRef?.credentialBroker, params.cluster, err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true, reason: "kubeconfig_ensure_failed" },
+          content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+          details: { error: true, reason: failure.reason },
         };
       }
 
@@ -249,7 +250,7 @@ Examples:
         const stderr = filterPodNoise((err.stderr?.trim() ?? err.message) as string);
         const exitCode = err.code ?? "unknown";
         return {
-          content: [{ type: "text", text: postExecSecurity(`${stdout || "(no output)"}\n[exit code: ${exitCode}]`, pre.action, { stderr: stderr || undefined }) }],
+          content: [{ type: "text", text: postExecSecurity(stdout, pre.action, { stderr: stderr || undefined, exitCode }) }],
           details: { exitCode, error: true },
         };
       }

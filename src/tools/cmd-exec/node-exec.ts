@@ -20,7 +20,7 @@ import { resolvePodNetnsViaKubectl, validateNetnsName } from "../infra/pod-netns
 import { runInDebugPod, ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../infra/debug-pod.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaKubectl } from "../infra/bg-session.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
-import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
+import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
 
 // Re-export for backward compatibility (tests + downstream imports)
 export { validateNodeName, validatePodName } from "../infra/exec-utils.js";
@@ -191,9 +191,10 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "node_exec");
       } catch (err) {
+        const failure = await classifyClusterFailure(kubeconfigRef?.credentialBroker, params.cluster, err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true, reason: "kubeconfig_ensure_failed" },
+          content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+          details: { error: true, reason: failure.reason },
         };
       }
 
@@ -396,15 +397,12 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
       const filteredStderr = filterPodNoise(execResult.stderr);
       const isError = execResult.exitCode !== 0 &&
         !(execResult.exitCode === null && execResult.stdout.trim());
-      const out = execResult.stdout.trim();
       // Show the output as a shell would, with the exit code as a trailing annotation
       // (not a prefix that replaces the body), so a non-zero exit with no output —
       // e.g. `grep` with no match — reads as an empty result, not a failure.
-      const stdout = isError
-        ? `${out || "(no output)"}\n[exit code: ${execResult.exitCode ?? "unknown"}]`
-        : out;
+      const out = execResult.stdout.trim();
       return {
-        content: [{ type: "text", text: postExecSecurity(stdout, pre.action, { stderr: filteredStderr || undefined }) }],
+        content: [{ type: "text", text: postExecSecurity(out, pre.action, { stderr: filteredStderr || undefined, ...(isError && { exitCode: execResult.exitCode ?? "unknown" }) }) }],
         details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
       };
     },

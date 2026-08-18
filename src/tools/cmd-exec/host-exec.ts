@@ -285,17 +285,22 @@ Examples (pass the id from host_list; names shown here for readability):
       // Mirror node_exec's error judgment: signal-killed with stdout = OK; otherwise non-zero exit = error.
       const isError = result.exitCode !== 0 &&
         !(result.exitCode === null && result.stdout.trim());
-      const stdoutHeader = isError
-        ? `Exit code: ${result.exitCode ?? "unknown"}${result.signal ? ` (signal: ${result.signal})` : ""}\n`
-        : "";
-      const stdoutBody = result.stdout.trim();
-      const truncatedSuffix = result.truncated ? "\n...[output truncated at 10 MB]" : "";
-      const stdout = stdoutHeader + stdoutBody + truncatedSuffix;
-
+      // Exit code renders as a trailing annotation rather than a header prefix —
+      // same shape as bash/node_exec/pod_exec, and it keeps our own literals out
+      // of the body that gets sanitized (see PostExecOptions.exitCode).
       return {
         content: [{
           type: "text",
-          text: postExecSecurity(stdout, pre.action, { stderr: result.stderr.trim() || undefined }),
+          text: postExecSecurity(result.stdout.trim(), pre.action, {
+            stderr: result.stderr.trim() || undefined,
+            ...(result.truncated ? { notes: "\n...[output truncated at 10 MB]" } : {}),
+            ...(isError
+              ? {
+                  exitCode: result.exitCode ?? "unknown",
+                  ...(result.signal ? { signal: result.signal } : {}),
+                }
+              : {}),
+          }),
         }],
         details: {
           exitCode: result.exitCode,

@@ -55,7 +55,7 @@ describe("host_exec", () => {
     expect((result.details as any).error).toBeUndefined();
   });
 
-  it("non-zero exit produces error=true with header", async () => {
+  it("non-zero exit produces error=true with a trailing exit annotation", async () => {
     vi.mocked(acquireSshTarget).mockResolvedValueOnce({
       host: "10.0.0.1", port: 22, username: "root",
       auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
@@ -66,7 +66,7 @@ describe("host_exec", () => {
       exitCode: 127,
     });
     const result = await tool.execute("id", { host: "h1", command: "cat /nope" }, undefined, {} as any);
-    expect(result.content[0].text).toContain("Exit code: 127");
+    expect(result.content[0].text).toContain("[exit code: 127]");
     expect((result.details as any).error).toBe(true);
   });
 

@@ -65,6 +65,23 @@ export interface PostExecOptions {
   stderr?: string;
   /** Apply pipeline fallback redaction for sensitive kubectl output */
   hasSensitiveKubectl?: boolean;
+  /**
+   * Exit code of a FAILED run. Renders a trailing "[exit code: N]" annotation,
+   * and an empty body as "(no output)".
+   *
+   * Callers must pass it here rather than splicing it into `stdout` themselves.
+   * The annotation is our own literal, so it is appended AFTER sanitization —
+   * mixed into the body it makes a structural (JSON) sanitizer fail to parse,
+   * which suppresses the WHOLE result: the real kubectl error, whatever partial
+   * stdout there was, and the exit code itself. A `kubectl get pod -o json` that
+   * returns NotFound then reads as "Failed to parse … for sanitization", i.e. a
+   * tool malfunction rather than the diagnostic answer it actually is.
+   */
+  exitCode?: number | string;
+  /** Signal name, rendered inside the exit annotation. Requires `exitCode`. */
+  signal?: string;
+  /** Literal trailer (e.g. a truncation notice). Appended after sanitization. */
+  notes?: string;
 }
 
 /**
@@ -85,13 +102,28 @@ export function postExecSecurity(
   action: OutputAction | null,
   opts?: PostExecOptions,
 ): string {
-  let sanitized = applySanitizer(stdout, action);
-  if (opts?.hasSensitiveKubectl) {
-    sanitized = redactSensitiveContent(sanitized);
+  // Sanitize the command's own stdout, and only when there IS one. An empty body
+  // holds nothing to redact, whereas a structural sanitizer would fail to parse
+  // it and suppress the result — dropping the exit code and stderr that are the
+  // only evidence of what went wrong.
+  let sanitized = stdout;
+  if (stdout.trim()) {
+    sanitized = applySanitizer(sanitized, action);
+    if (opts?.hasSensitiveKubectl) {
+      sanitized = redactSensitiveContent(sanitized);
+    }
   }
-  const combined = opts?.stderr
-    ? sanitized + `\n\nSTDERR:\n${opts.stderr}`
-    : sanitized;
+
+  // Everything below is literal text we generate, so it is appended after
+  // sanitization — see PostExecOptions.exitCode for why the order matters.
+  let combined =
+    opts?.exitCode !== undefined ? sanitized.trim() || "(no output)" : sanitized;
+  if (opts?.notes) combined += opts.notes;
+  if (opts?.exitCode !== undefined) {
+    const sig = opts.signal ? ` (signal: ${opts.signal})` : "";
+    combined += `\n[exit code: ${opts.exitCode}${sig}]`;
+  }
+  if (opts?.stderr) combined += `\n\nSTDERR:\n${opts.stderr}`;
   return processToolOutput(combined);
 }
 
