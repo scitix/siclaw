@@ -187,10 +187,16 @@ export class GatewayClient {
       const client = isHttps ? https : http;
       let result: DelegateResponse | undefined;
       const request = client.request(requestOptions, (res: any) => {
+        // Decode the stream as UTF-8 here, once, so Node's own StringDecoder holds
+        // the partial bytes of a character split across two chunks. `chunk.toString()`
+        // per data event decodes each fragment on its own and turns one multibyte
+        // character into two U+FFFD — silently, and only when the split happens to
+        // land inside a character (same reasoning as background-bash-runner.ts).
+        res.setEncoding("utf8");
         // Pre-stream error (non-200): body is a plain JSON error.
         if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
           let body = "";
-          res.on("data", (c: Buffer) => { body += c.toString(); });
+          res.on("data", (c: string) => { body += c; });
           res.on("end", () => {
             let error = `Gateway returned ${res.statusCode}`;
             try { error = (JSON.parse(body) as { error?: string }).error ?? error; } catch { /* keep */ }
@@ -199,8 +205,8 @@ export class GatewayClient {
           return;
         }
         let buffer = "";
-        res.on("data", (chunk: Buffer) => {
-          buffer += chunk.toString();
+        res.on("data", (chunk: string) => {
+          buffer += chunk;
           const lines = buffer.split("\n");
           buffer = lines.pop() || "";
           for (const line of lines) {
@@ -281,10 +287,16 @@ export class GatewayClient {
 
       const client = isHttps ? https : http;
       const req = client.request(requestOptions, (res: any) => {
+        // Every sync payload lands here — skills, knowledge, tools, credentials.
+        // Decoding per data event corrupted a character that happened to straddle a
+        // chunk boundary (an em dash in a SKILL.md arrived as two U+FFFD in the
+        // agent's materialized copy while the DB row was byte-exact), so let Node
+        // carry the partial bytes across events.
+        res.setEncoding("utf8");
         let data = "";
 
-        res.on("data", (chunk: Buffer) => {
-          data += chunk.toString();
+        res.on("data", (chunk: string) => {
+          data += chunk;
         });
 
         res.on("end", () => {

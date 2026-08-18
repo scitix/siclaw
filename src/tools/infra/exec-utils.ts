@@ -125,11 +125,16 @@ export function spawnAsync(
     }
     const onAbort = () => child.kill("SIGKILL");
     signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout!.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+    // Decode on the stream, not per chunk: command output is not ASCII (Chinese log
+    // lines, box-drawing, emoji), and a character split across two data events would
+    // otherwise arrive as two U+FFFD — see background-bash-runner.ts.
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      stdout += chunk;
     });
-    child.stderr!.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+    child.stderr!.on("data", (chunk: string) => {
+      stderr += chunk;
     });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");

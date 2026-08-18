@@ -63,8 +63,11 @@ function toIdentity(cert: CertificateIdentity, sessionId?: string): Identity {
 }
 
 async function readBody(req: http.IncomingMessage): Promise<string> {
+  // Decode once on the stream: `chunk.toString()` per chunk decodes each fragment
+  // on its own, so a multibyte character split across two chunks becomes two U+FFFD.
+  req.setEncoding("utf8");
   let body = "";
-  for await (const chunk of req) body += chunk.toString();
+  for await (const chunk of req) body += chunk;
   return body;
 }
 

@@ -383,6 +383,11 @@ export function resolveDelegation(
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    // UTF-8 decoding belongs to the stream, not to each data event: a character
+    // split across two chunks decoded per event becomes two U+FFFD. Prompts arrive
+    // through here, so that would silently rewrite a user's text at a chunk
+    // boundary (see background-bash-runner.ts for the same fix on child output).
+    req.setEncoding("utf8");
     let body = "";
     let size = 0;
     let timedOut = false;

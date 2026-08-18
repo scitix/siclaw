@@ -596,6 +596,9 @@ export class AgentBoxClient {
           agent: this.httpsAgent!,
         },
         (res) => {
+          // Decode once on the stream — per-chunk decoding turns a multibyte
+          // character split across two chunks into two U+FFFD.
+          res.setEncoding("utf8");
           let body = "";
           res.on("data", (chunk) => (body += chunk));
           res.on("end", () => {

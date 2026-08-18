@@ -8,15 +8,24 @@ import type { CertificateIdentity } from "./security/cert-manager.js";
 // ── Fakes ──────────────────────────────────────────────────
 
 class FakeReq extends EventEmitter {
-  [Symbol.asyncIterator](): AsyncIterator<Buffer> {
-    return (async function* (self: FakeReq): AsyncGenerator<Buffer> {
-      for (const chunk of self._chunks) yield chunk;
+  [Symbol.asyncIterator](): AsyncIterator<Buffer | string> {
+    return (async function* (self: FakeReq): AsyncGenerator<Buffer | string> {
+      for (const chunk of self._chunks) {
+        yield self._encoding ? chunk.toString(self._encoding) : chunk;
+      }
     })(this);
   }
   _chunks: Buffer[] = [];
+  _encoding: BufferEncoding | null = null;
   constructor(body: string) {
     super();
     if (body) this._chunks.push(Buffer.from(body));
+  }
+  /** A real IncomingMessage decodes on the stream once an encoding is set — the
+   *  reader relies on that so a character split across chunks is not corrupted. */
+  setEncoding(encoding: BufferEncoding): this {
+    this._encoding = encoding;
+    return this;
   }
 }
 

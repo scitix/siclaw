@@ -300,6 +300,38 @@ describe("GatewayClient — delegation persistence", () => {
   });
 });
 
+describe("GatewayClient — UTF-8 across chunk boundaries", () => {
+  it("keeps a multibyte character intact when the response is split mid-character", async () => {
+    // Every sync payload (skills, knowledge, tools, credentials) is parsed by this
+    // client. It used to accumulate `chunk.toString()` per data event, which decodes
+    // each fragment on its own — a character straddling the boundary came out as two
+    // U+FFFD. That is how an em dash inside a synced SKILL.md reached an agent
+    // corrupted while the DB row was byte-exact.
+    const settings = { greeting: "查一下 kubelet — 日志", nested: { emoji: "🚀" } };
+    const payload = Buffer.from(JSON.stringify(settings), "utf8");
+    const emDashAt = payload.indexOf(Buffer.from("—", "utf8"));
+    expect(emDashAt).toBeGreaterThan(0);
+    const splitAt = emDashAt + 1; // one byte of the em dash lands in the first write
+
+    const srv = await startServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": String(payload.length) });
+      res.write(payload.subarray(0, splitAt));
+      // A gap the client cannot coalesce — two data events, boundary mid-character.
+      setTimeout(() => res.end(payload.subarray(splitAt)), 20);
+    });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+      const got = (await client.fetchSettings()) as typeof settings;
+      expect(got).toEqual(settings);
+      expect(JSON.stringify(got)).not.toContain("�");
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
 describe("GatewayClient — error handling", () => {
   it("rejects with helpful message on non-2xx status", async () => {
     const srv = await startServer((_req, res) => {
