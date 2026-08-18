@@ -240,24 +240,34 @@ if [[ ${#UNITS[@]} -gt 0 ]]; then
   # journalctl exits 0 with no output for a unit it has never heard of, which is
   # the single most misleading case: "no logs" and "no such unit" look the same.
   if command -v systemctl >/dev/null 2>&1; then
-    for u in "${UNITS[@]}"; do
-      # Distinguish "systemctl says there is no such unit" from "systemctl could
-      # not answer": on a host where the D-Bus system bus is unreachable it fails
-      # outright, and treating that empty output as an answer produced a note
-      # claiming docker.service did not exist on a host that runs it.
-      known=$(systemctl list-unit-files --no-legend -- "$u" "$u.service" 2>/dev/null)
-      probe_rc=$?
-      if [[ "$probe_rc" -ne 0 && -z "$known" ]]; then
-        SOURCE_NOTES+=("systemctl could not answer whether '$u' exists (exit $probe_rc — the system bus may be unreachable here); the unit name is unverified")
-      elif [[ -z "$known" ]]; then
-        # Offer the names that do exist: a wrong unit name ("containerd.service"
-        # vs "containerd", "kubelet" vs "k3s") is the usual reason for silence.
-        near=$(systemctl list-unit-files --no-legend 2>/dev/null \
-                 | awk -v u="$u" 'tolower($1) ~ tolower(u) { printf "%s ", $1 }' \
-                 | cut -c1-200)
-        SOURCE_NOTES+=("unit '$u' is not a known systemd unit on this node${near:+ (similar: ${near% })}; historical journal entries may still exist")
-      fi
-    done
+    # Ask systemctl for the WHOLE inventory once, and judge its usability by
+    # whether that produced anything. A per-unit query cannot tell the two
+    # failures apart: `list-unit-files -- <name>` exits 1 both when the name
+    # matches nothing AND when systemctl cannot reach the system bus at all
+    # (seen on a host where the bus was refused while journalctl worked fine),
+    # so keying off its exit code either invented a missing unit or explained
+    # away a real typo.
+    #
+    # Both lists: list-unit-files covers what is installed on disk, list-units
+    # also covers units that only exist at runtime.
+    UNIT_INVENTORY=$( { systemctl list-unit-files --no-legend 2>/dev/null; systemctl list-units --all --no-legend 2>/dev/null; } | awk '{ print $1 }' )
+    if [[ -z "$UNIT_INVENTORY" ]]; then
+      SOURCE_NOTES+=("systemctl returned no unit inventory here (no systemd, or the system bus is unreachable); the unit name is unverified")
+    else
+      for u in "${UNITS[@]}"; do
+        if ! printf '%s\n' "$UNIT_INVENTORY" | grep -Fxq -e "$u" -e "$u.service"; then
+          # Offer the names that do exist: a wrong unit name ("containerd.service"
+          # vs "containerd", "kubelet" vs "k3s") is the usual reason for silence.
+          # Search on a PREFIX of what was asked for, not the whole string — a
+          # typo never appears in the inventory by definition, so matching the
+          # full name found nothing exactly when the hint was needed.
+          near=$(printf '%s\n' "$UNIT_INVENTORY" \
+                   | awk -v k="${u:0:5}" 'k != "" && tolower($0) ~ tolower(k) { printf "%s ", $0 }' \
+                   | cut -c1-200)
+          SOURCE_NOTES+=("unit '$u' is not a known systemd unit on this node${near:+ (similar: ${near% })}; historical journal entries may still exist")
+        fi
+      done
+    fi
   else
     SOURCE_NOTES+=("systemctl unavailable — could not confirm the unit exists")
   fi

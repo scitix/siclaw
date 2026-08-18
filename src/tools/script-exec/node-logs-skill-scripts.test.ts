@@ -204,6 +204,7 @@ exit 0`,
     });
     const r = run(NODE_LOGS, ["--unit", "containerdd"], bin);
     expect(r.stdout).toContain("is not a known systemd unit");
+    expect(r.stdout).toContain("similar: containerd.service");
     expect(header(r.stdout, "status")).toBe("no_match");
     expect(r.code).toBe(0);
   });
@@ -214,7 +215,7 @@ exit 0`,
     expect(r.stdout).toContain("systemctl unavailable");
   });
 
-  it("separates 'systemctl could not answer' from 'no such unit'", () => {
+  it("separates 'systemctl cannot answer' from 'no such unit'", () => {
     // Observed on a real host: the D-Bus system bus was unreachable, systemctl
     // exited non-zero with no output, and reading that as an answer produced a
     // note claiming docker.service did not exist on a host that runs it.
@@ -223,8 +224,23 @@ exit 0`,
       systemctl: `echo "Failed to connect to bus: Connection refused" >&2; exit 1`,
     });
     const r = run(NODE_LOGS, ["--unit", "docker"], bin);
-    expect(r.stdout).toContain("systemctl could not answer whether 'docker' exists");
+    expect(r.stdout).toContain("no unit inventory");
     expect(r.stdout).not.toContain("is not a known systemd unit");
+  });
+
+  it("still calls out a wrong unit name when systemctl works", () => {
+    // The counterpart of the case above, and the reason it must be told apart:
+    // a per-unit `list-unit-files -- <name>` exits 1 for an unmatched pattern
+    // TOO, so keying off its exit code explained a real typo away as "systemctl
+    // could not answer" — verified against a live node where the unit inventory
+    // listed kubelet.service and the query named kubelettt.
+    const { bin } = makeCase({
+      journalctl: `exit 0`,
+      systemctl: `printf '%s\\n' "kubelet.service enabled enabled" "containerd.service enabled enabled"; exit 0`,
+    });
+    const r = run(NODE_LOGS, ["--unit", "kubelettt"], bin);
+    expect(r.stdout).toContain("unit 'kubelettt' is not a known systemd unit");
+    expect(r.stdout).toContain("similar: kubelet.service");
   });
 
   it("warns when this account cannot read the system journal at all", () => {
