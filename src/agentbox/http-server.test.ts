@@ -77,6 +77,11 @@ vi.mock("./sync-handlers.js", () => ({
     },
     postReload: async () => {},
   }),
+  readBoxSyncStatus: () => ({
+    knowledge: { syncedAt: null, repos: [] },
+    skills: { names: [] },
+    mcp: { names: [] },
+  }),
 }));
 
 vi.mock("./credential-broker.js", () => ({
@@ -284,6 +289,16 @@ describe("http-server — /health + /api/sessions + /api/models", () => {
     const r = await getJson(port, "/api/sessions");
     expect(r.status).toBe(200);
     expect(r.data.sessions).toEqual([]);
+  });
+
+  it("GET /api/sync-status reports the observed inventory", async () => {
+    const r = await getJson(port, "/api/sync-status");
+    expect(r.status).toBe(200);
+    expect(r.data).toEqual({
+      knowledge: { syncedAt: null, repos: [] },
+      skills: { names: [] },
+      mcp: { names: [] },
+    });
   });
 
   it("GET /api/internal/box-status reports drained when the box holds nothing", async () => {

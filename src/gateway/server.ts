@@ -2042,6 +2042,52 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
+  // agent.syncStatus — read the box's observed inventory. Reload ACK only
+  // proves the RPC ran; this is what actually landed on disk.
+  rpcMethods.set("agent.syncStatus", async (params) => {
+    const agentId = params.agentId as string;
+    if (!agentId) throw new Error("agentId required");
+
+    const boxes = await agentBoxManager.list();
+    const targets = boxes.filter((b) => b.agentId === agentId && b.status === "running");
+    if (targets.length === 0) {
+      return { ok: true, available: false, reason: "no_running_box", boxes: 0 };
+    }
+
+    for (const box of targets) {
+      try {
+        const client = new AgentBoxClient(box.endpoint, 8_000, agentBoxTlsOptions);
+        const status = await client.getJson<{
+          knowledge?: { syncedAt?: string | null; repos?: unknown[] };
+          skills?: { names?: string[] };
+          mcp?: { names?: string[] };
+        }>("/api/sync-status");
+        return {
+          ok: true,
+          available: true,
+          boxes: targets.length,
+          knowledge: status.knowledge ?? { syncedAt: null, repos: [] },
+          skills: status.skills ?? { names: [] },
+          mcp: status.mcp ?? { names: [] },
+        };
+      } catch (err: any) {
+        const message = String(err?.message ?? err);
+        console.warn(`[rpc] agent.syncStatus: box=${box.boxId} failed: ${message}`);
+        if (targets[targets.length - 1] === box) {
+          const unsupported = /\b404\b/.test(message) || /not found/i.test(message);
+          return {
+            ok: true,
+            available: false,
+            reason: unsupported ? "unsupported" : "query_failed",
+            boxes: targets.length,
+          };
+        }
+      }
+    }
+
+    return { ok: true, available: false, reason: "query_failed", boxes: targets.length };
+  });
+
   // tracing.reloadAll — GLOBAL tracing hot-reload. Unlike agent.reload, tracing
   // is a single fan-out set shared by every agent, so this enumerates ALL
   // running boxes (no agentId filter) and POSTs /api/reload-tracing to each.

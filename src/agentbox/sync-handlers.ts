@@ -344,6 +344,99 @@ export interface KnowledgeSyncHandler extends AgentBoxSyncHandler<KnowledgeBundl
   getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null;
 }
 
+export interface ObservedKnowledgeRepo {
+  id: string;
+  name: string;
+  version: number;
+  sha256: string;
+  fileCount?: number | null;
+}
+
+export interface BoxSyncStatus {
+  knowledge: {
+    syncedAt: string | null;
+    repos: ObservedKnowledgeRepo[];
+  };
+  skills: { names: string[] };
+  mcp: { names: string[] };
+}
+
+function observedRepo(repo: KnowledgeSyncStatus["repos"][number]): ObservedKnowledgeRepo {
+  return {
+    id: repo.id,
+    name: repo.name,
+    version: repo.version,
+    sha256: repo.sha256,
+    fileCount: repo.fileCount,
+  };
+}
+
+function readKnowledgeInventoryFromDisk(knowledgeDir: string): BoxSyncStatus["knowledge"] {
+  const manifestPath = path.join(knowledgeDir, ".sync-manifest.json");
+  if (!fs.existsSync(manifestPath)) {
+    return { syncedAt: null, repos: [] };
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
+      syncedAt?: string;
+      repos?: KnowledgeSyncStatus["repos"];
+    };
+    return {
+      syncedAt: typeof raw.syncedAt === "string" ? raw.syncedAt : null,
+      repos: Array.isArray(raw.repos) ? raw.repos.map(observedRepo) : [],
+    };
+  } catch {
+    return { syncedAt: null, repos: [] };
+  }
+}
+
+function listSkillNames(skillsDir: string): string[] {
+  const resolvedDir = path.join(skillsDir, "resolved");
+  if (!fs.existsSync(resolvedDir)) return [];
+  return fs.readdirSync(resolvedDir).filter((name) => {
+    try {
+      return fs.statSync(path.join(resolvedDir, name)).isDirectory();
+    } catch {
+      return false;
+    }
+  }).sort();
+}
+
+export interface ReadBoxSyncStatusOptions {
+  /** Exact directory mounted for this logical box. */
+  knowledgeDir?: string;
+  /** Handler that materializes knowledge for this logical box. */
+  knowledgeHandler?: KnowledgeSyncHandler;
+}
+
+/**
+ * What this box has actually materialized. Memory is fresher than disk after
+ * the latest reload; `.sync-manifest.json` survives a process restart. Local
+ * boxes must pass their agent-scoped handler and directory to avoid cross-talk.
+ */
+export function readBoxSyncStatus(
+  options: ReadBoxSyncStatusOptions = {},
+): BoxSyncStatus {
+  const config = loadConfig();
+  const knowledgeDir = options.knowledgeDir
+    ? path.resolve(options.knowledgeDir)
+    : path.resolve(process.cwd(), config.paths.knowledgeDir);
+  const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
+  const lastKnowledgeSyncStatus = (options.knowledgeHandler ?? knowledgeHandler)
+    .getLastKnowledgeSyncStatus();
+  const knowledge = lastKnowledgeSyncStatus
+    ? {
+        syncedAt: lastKnowledgeSyncStatus.syncedAt,
+        repos: lastKnowledgeSyncStatus.repos.map(observedRepo),
+      }
+    : readKnowledgeInventoryFromDisk(knowledgeDir);
+  return {
+    knowledge,
+    skills: { names: listSkillNames(skillsDir) },
+    mcp: { names: Object.keys(config.mcpServers ?? {}).sort() },
+  };
+}
+
 export function createKnowledgeHandler(
   options: { knowledgeDir?: string } = {},
 ): KnowledgeSyncHandler {

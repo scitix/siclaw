@@ -27,6 +27,7 @@ import {
   createHostHandler,
   createKnowledgeHandler,
   createToolsHandler,
+  readBoxSyncStatus,
   type KnowledgeSyncHandler,
 } from "./sync-handlers.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
@@ -525,9 +526,12 @@ export function createHttpServer(
     perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
     perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
   }
-  if (sessionManager.knowledgeDir) {
-    perServerHandlers.knowledge = options.knowledgeHandler
-      ?? createKnowledgeHandler({ knowledgeDir: sessionManager.knowledgeDir });
+  const perServerKnowledgeHandler = sessionManager.knowledgeDir
+    ? options.knowledgeHandler
+      ?? createKnowledgeHandler({ knowledgeDir: sessionManager.knowledgeDir })
+    : undefined;
+  if (perServerKnowledgeHandler) {
+    perServerHandlers.knowledge = perServerKnowledgeHandler;
   }
   // tools handler — same per-box rationale as cluster/host. It writes the
   // resolved allowedTools into THIS box's sessionManager and fetches with THIS
@@ -640,6 +644,21 @@ export function createHttpServer(
       // See MetricsFlushPayload: a claim, authorized against the mTLS cert on arrival.
       ...(process.env.SICLAW_POD_NAME ? { boxId: process.env.SICLAW_POD_NAME } : {}),
     });
+  });
+
+  /**
+   * GET /api/sync-status — observed inventory after materialize.
+   *
+   * Kept next to box-status because both expose box-observed state. This list
+   * is what a developer console can show after a test deploy: which knowledge
+   * libraries, skills, and MCP servers are actually on disk, not what Sicore
+   * intended to send.
+   */
+  addRoute("GET", "/api/sync-status", async (_req, res) => {
+    sendJson(res, 200, readBoxSyncStatus({
+      knowledgeDir: sessionManager.knowledgeDir,
+      knowledgeHandler: perServerKnowledgeHandler,
+    }));
   });
 
   /**
