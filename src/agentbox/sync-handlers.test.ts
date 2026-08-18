@@ -990,6 +990,28 @@ describe("knowledgeHandler empty-bundle wipe", () => {
     expect(fs.existsSync(path.join(agentBDir, "index.md"))).toBe(false);
   });
 
+  it("keeps the last sync status isolated per knowledge handler", async () => {
+    const agentADir = path.join(knowledgeTmpDir, "agent-a");
+    const agentBDir = path.join(knowledgeTmpDir, "agent-b");
+    const agentAHandler = createKnowledgeHandler({ knowledgeDir: agentADir });
+    const agentBHandler = createKnowledgeHandler({ knowledgeDir: agentBDir });
+
+    expect(agentAHandler.getLastKnowledgeSyncStatus()).toBeNull();
+    expect(agentBHandler.getLastKnowledgeSyncStatus()).toBeNull();
+
+    await agentAHandler.materialize({ version: "v1", repos: [] });
+    expect(agentAHandler.getLastKnowledgeSyncStatus()).toMatchObject({
+      targetDir: agentADir,
+      repoCount: 0,
+      repos: [],
+    });
+    expect(agentBHandler.getLastKnowledgeSyncStatus()).toBeNull();
+
+    await agentBHandler.materialize({ version: "v1", repos: [] });
+    expect(agentAHandler.getLastKnowledgeSyncStatus()).toMatchObject({ targetDir: agentADir });
+    expect(agentBHandler.getLastKnowledgeSyncStatus()).toMatchObject({ targetDir: agentBDir });
+  });
+
   it("ignores stale .sync-staging-* leftovers when deciding whether to preserve", async () => {
     // Only a leftover staging dir — not meaningful content.
     fs.mkdirSync(path.join(knowledgeTmpDir, ".sync-staging-9999-99"), { recursive: true });

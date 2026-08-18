@@ -329,7 +329,7 @@ function catalogNameLine(raw: string | null | undefined): string {
   return catalogOneLine(raw, KNOWLEDGE_CATALOG_NAME_MAX_CHARS) || "library";
 }
 
-interface KnowledgeSyncStatus {
+export interface KnowledgeSyncStatus {
   syncedAt: string;
   targetDir: string;
   repoCount: number;
@@ -339,14 +339,21 @@ interface KnowledgeSyncStatus {
   }>;
 }
 
-let lastKnowledgeSyncStatus: KnowledgeSyncStatus | null = null;
-export function getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null { return lastKnowledgeSyncStatus; }
+export interface KnowledgeSyncHandler extends AgentBoxSyncHandler<KnowledgeBundlePayload> {
+  getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null;
+}
 
 export function createKnowledgeHandler(
   options: { knowledgeDir?: string } = {},
-): AgentBoxSyncHandler<KnowledgeBundlePayload> {
+): KnowledgeSyncHandler {
+  let lastKnowledgeSyncStatus: KnowledgeSyncStatus | null = null;
+
   return {
     type: "knowledge",
+
+    getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null {
+      return lastKnowledgeSyncStatus;
+    },
 
     async fetch(client: GatewaySyncClientLike | null): Promise<KnowledgeBundlePayload> {
       if (!client) throw new Error("[knowledge] GatewaySyncClientLike required but missing");
@@ -494,6 +501,11 @@ export function createKnowledgeHandler(
 }
 
 export const knowledgeHandler = createKnowledgeHandler();
+
+/** Backwards-compatible status accessor for the process-global default handler. */
+export function getLastKnowledgeSyncStatus(): KnowledgeSyncStatus | null {
+  return knowledgeHandler.getLastKnowledgeSyncStatus();
+}
 
 // ── Cluster / Host handlers (factory, broker-dependent) ───────────────
 
