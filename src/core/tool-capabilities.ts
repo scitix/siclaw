@@ -26,7 +26,7 @@
  * added/renamed without changing stored selections.
  */
 export const CAPABILITY_GROUPS: Record<string, string[]> = {
-  read_files:      ["read", "grep", "find", "ls"],
+  read_files:      ["read", "grep", "find", "ls", "knowledge_cite"],
   write_sandbox:   ["write", "edit", "skill_preview"],   // includes skill authoring
   inspect_infra:   ["cluster_list", "host_list"],   // read-only fleet discovery (registry)
   run_commands:    ["bash", "node_exec", "pod_exec", "host_exec"],

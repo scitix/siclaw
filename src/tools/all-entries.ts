@@ -25,6 +25,7 @@ import { registration as hostList } from "./query/host-list.js";
 // internally via pod= (shared pod-netns-resolve.ts); the standalone tool was redundant.
 import { registration as memorySearch } from "./query/memory-search.js";
 import { registration as memoryGet } from "./query/memory-get.js";
+import { registration as knowledgeCite } from "./query/knowledge-cite.js";
 // workflow — investigation_feedback / deep_search / propose_hypotheses /
 // end_investigation removed as part of the DP state-machine teardown
 // (see docs/design/2026-04-24-dp-mode-refactor-design.md §6.6).
@@ -52,7 +53,7 @@ export const allToolEntries: ToolEntry[] = [
   nodeScript, podScript, localScript, hostScript,
   // ── query ──
   clusterList, hostList,
-  memorySearch, memoryGet,
+  memorySearch, memoryGet, knowledgeCite,
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
   channelUpdate, reportFindings, requestInput,

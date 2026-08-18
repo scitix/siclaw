@@ -79,6 +79,20 @@ describe("consumeAgentSse — type-less extra events", () => {
 });
 
 describe("consumeAgentSse — assistant message flow", () => {
+  it("appends registered knowledge sources to the final answer event and result", async () => {
+    const events = [
+      { type: "knowledge_sources", sources: [{ title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/a" }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "结论" }] } },
+    ];
+    const seen: any[] = [];
+    const result = await consumeAgentSse({
+      client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event),
+    });
+    expect(result.resultText).toContain("### 参考原文");
+    expect(result.resultText).toContain("https://docs.feishu.cn/wiki/a");
+    expect((seen[1].message.content[0].text as string)).toBe(result.resultText);
+  });
+
   it("accumulates text deltas across message_update events and returns the concatenated result", async () => {
     const events = [
       { type: "message_start" },

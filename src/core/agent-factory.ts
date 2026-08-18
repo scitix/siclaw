@@ -44,6 +44,7 @@ import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { initExtraCommands } from "../tools/infra/extra-commands.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
+import { createKnowledgeCitationSupport, hasKnowledgeCitationManifest } from "./knowledge-citation-tool.js";
 
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef, DelegationContext } from "./types.js";
 
@@ -274,6 +275,12 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
   if (wikiCatalog) {
     parts.push(wikiCatalog);
   }
+  if (knowledgeDir && hasKnowledgeCitationManifest(knowledgeDir)) {
+    parts.push(`
+## Knowledge source citations
+
+When your final answer materially relies on mounted knowledge, call \`knowledge_cite\` once after research and immediately before the final answer. Pass only the 1-3 knowledge pages you successfully Read this turn and actually used. Do not register an index, catalog, or a page you merely inspected. The runtime appends validated original links automatically; never invent or manually copy source URLs. If no trusted clickable source exists, answer normally without a references section.`);
+  }
 
   return parts;
 }
@@ -363,6 +370,15 @@ export async function createSiclawSession(
   const skillsBase = path.resolve(cwd, config.paths.skillsDir);
   const userDataDir = path.resolve(cwd, config.paths.userDataDir);
   const memoryDir = path.join(userDataDir, "memory");
+  const knowledgeDir = opts?.knowledgeDir
+    ?? (opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
+      ? opts.portalKnowledgeDir
+      : path.resolve(cwd, config.paths.knowledgeDir));
+  const citationSupport = createKnowledgeCitationSupport({
+    knowledgeDir,
+    turnRef,
+    sessionEventEmitter: opts?.sessionEventEmitter,
+  });
 
   if (memoryEnabled) {
     // Ensure memoryDir and skeleton PROFILE.md exist before the memory indexer
@@ -424,6 +440,7 @@ export async function createSiclawSession(
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
+      knowledgeCitationTool: citationSupport.tool,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
       // Force sub-agents foreground when a detached batch's conclusion would be
       // stranded because the caller blocks on the turn's own result and has no
@@ -498,10 +515,6 @@ export async function createSiclawSession(
   const reposDir = path.resolve(cwd, config.paths.reposDir);
   const docsDir = path.resolve(cwd, config.paths.docsDir);
   const tracesDir = path.resolve(cwd, ".siclaw", "traces");
-  const knowledgeDir = opts?.knowledgeDir
-    ?? (opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
-      ? opts.portalKnowledgeDir
-      : path.resolve(cwd, config.paths.knowledgeDir));
   const readAllowedDirs = [
     builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir,
     os.tmpdir(),
@@ -519,7 +532,12 @@ export async function createSiclawSession(
   const restrictedFileTools = [
     createReadTool(cwd, {
       operations: {
-        readFile: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir); return fsReadFile(p); },
+        readFile: async (p) => {
+          assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir);
+          const content = await fsReadFile(p);
+          citationSupport.noteRead(p);
+          return content;
+        },
         access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK); },
       },
     }),
@@ -570,6 +588,12 @@ export async function createSiclawSession(
   // Subject to allowedTools (same chokepoint as MCP append above): file tools are
   // created outside the registry, so the shared name-based whitelist is applied here.
   appendAllowedTools(customTools, restrictedFileTools, allowedTools);
+  // Citation registration is an intrinsic, side-effect-free companion to Read:
+  // capability groups need not know its name, and Agent Type never gates it.
+  if ((!Array.isArray(allowedTools) || allowedTools.includes("read")) &&
+      !customTools.some((tool) => tool.name === citationSupport.tool.name)) {
+    customTools.push(citationSupport.tool);
+  }
 
   // Final model-visible tool set (registry-resolved + MCP + file tools, after the
   // whitelist is applied at every chokepoint). Logged by NAME when restricted so a

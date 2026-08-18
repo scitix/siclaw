@@ -210,7 +210,7 @@ describe("handleToolCapabilities", () => {
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
     expect(new Set(body.allowedTools)).toEqual(
-      new Set(["read", "grep", "find", "ls", "memory_search", "memory_get"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_cite", "memory_search", "memory_get"]),
     );
     // agentId comes from the cert identity, never the body.
     expect(frontend.calls[0]).toEqual({ method: "config.getAgent", params: { agentId: "agent-1" } });

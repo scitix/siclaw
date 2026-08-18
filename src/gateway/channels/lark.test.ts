@@ -3066,6 +3066,16 @@ describe("collectResponse — SSE event flattening", () => {
     expect(text).toBe("Hello! How can I help?");
   });
 
+  it("appends registered knowledge sources to a Feishu answer", async () => {
+    const events = [
+      { type: "knowledge_sources", sources: [{ title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/a" }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "结论" }] } },
+    ];
+    const text = await collectResponse(fakeClient(events), "s-citations");
+    expect(text).toContain("### 参考原文");
+    expect(text).toContain("[GPU Runbook](https://docs.feishu.cn/wiki/a)");
+  });
+
   it("falls back to streamed content_block_delta when no message_end arrives", async () => {
     const events = [
       { type: "content_block_delta", delta: { text: "Hello" } },

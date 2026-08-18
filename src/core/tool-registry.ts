@@ -405,6 +405,8 @@ export interface ToolRefs {
   memoryDir?: string;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;
+  /** Per-session citation registrar sharing successful-read state with Read. */
+  knowledgeCitationTool?: ToolDefinition;
   /**
    * Optional spawn_subagent executor (design §6, v3 single-tool merge). Handles the whole
    * batch plan (1..N items + optional reduce), collapsing a single no-reduce task to a legacy

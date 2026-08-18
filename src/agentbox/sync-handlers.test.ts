@@ -1087,6 +1087,20 @@ describe("knowledgeHandler multi-repo identity", () => {
     expect(index).toContain(`[[repos/${knowledgeRepoDirName("平台知识", "repo-b")}/index]] - 平台知识 v1\n`);
   });
 
+  it("materializes server-owned citation metadata beside the exact repo roots", async () => {
+    const repos = [
+      { id: "repo-a", name: "A", version: 1, sizeBytes: 10, dataBase64: packageBase64("a"),
+        citationSources: [{ resource: "feishu/a.md", title: "A 原文", url: "https://docs.feishu.cn/wiki/a" }] },
+      { id: "repo-b", name: "B", version: 1, sizeBytes: 10, dataBase64: packageBase64("b"), citationSources: [] },
+    ];
+    await knowledgeHandler.materialize({ version: "v1", repos });
+    const manifest = JSON.parse(fs.readFileSync(path.join(knowledgeTmpDir, ".citation-manifest.json"), "utf8"));
+    expect(manifest).toEqual({ version: 1, repos: [
+      { id: "repo-a", root: `repos/${knowledgeRepoDirName("A", "repo-a")}`, sources: repos[0].citationSources },
+      { id: "repo-b", root: `repos/${knowledgeRepoDirName("B", "repo-b")}`, sources: [] },
+    ] });
+  });
+
   it("says the entries are libraries, since the prompt around it says pages", async () => {
     // The system prompt introduces this file as a page catalog — true when one
     // library unpacks at the root, false here. An agent reading these ten lines
