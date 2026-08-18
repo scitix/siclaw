@@ -33,21 +33,31 @@ Also check the image registry:
 
 Containerd logs are the authoritative source for the root cause. Pod events are often generic ("Failed to pull image") and do not contain the actual error — always check containerd logs.
 
-Use the `node-logs` skill:
+Use the `node-logs` skill — via `host_script` when the node is a bound SSH host
+(check `host_list`), otherwise `node_script`:
 
-```bash
-bash skills/core/node-logs/scripts/get-node-logs.sh \
-  --node <nodeName> --unit containerd --grep "<image>" --since "1h ago"
+```
+node_script: node="<nodeName>", skill="node-logs", script="get-node-logs.sh",
+             args='--unit containerd --grep-fixed "<image>" --since "1h ago"'
 ```
 
-Replace `<image>` with the image name or a unique substring. Adjust `--since` to cover the pod's creation time.
+Use `--grep-fixed` for the image reference: a registry path is a literal, and its
+`.`, `-` and `/` would otherwise be read as regex. Adjust `--since` to cover the
+pod's creation time.
 
-If journalctl returns nothing, try log files:
+If the journal has nothing, try the log files — note the distro difference
+(`/var/log/messages` on RHEL/CentOS, `/var/log/syslog` on Ubuntu):
 
-```bash
-bash skills/core/node-logs/scripts/get-node-logs.sh \
-  --node <nodeName> --file /var/log/messages --grep "<image>"
 ```
+node_script: node="<nodeName>", skill="node-logs", script="get-node-logs.sh",
+             args='--file /var/log/messages --include-rotated --grep-fixed "<image>"'
+```
+
+Read the `status:` line at the end of the output before concluding anything. Only
+`no_match` means "read successfully, nothing matched"; `source_error`,
+`not_found` and `filter_error` say nothing at all about the image pull. See the
+`node-logs` SKILL.md for the full table, and for the tier-3 fallback when neither
+SSH nor a debug pod is available on that node.
 
 ### 3. Match error and conclude
 

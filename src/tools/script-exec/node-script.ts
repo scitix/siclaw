@@ -84,7 +84,7 @@ Parameters:
 - timeout_seconds: Timeout (default: 180, max: 300)
 
 Examples:
-- node: "node-1", skill: "node-logs", script: "get-node-logs.sh", args: "--lines 100"
+- node: "node-1", skill: "node-logs", script: "get-node-logs.sh", args: "--unit kubelet --tail 100"
 - node: "node-1", script: "my-check.sh"
 - pod: "rdma-a", namespace: "rdma-test", skill: "gateway-diagnostics", script: "ping-gateway.sh", args: "--interface net1"   (one step into the pod's netns)`,
     parameters: Type.Object({
