@@ -3,6 +3,7 @@ import {
   preExecSecurity,
   postExecSecurity,
 } from "./security-pipeline.js";
+import { analyzeOutput } from "./output-sanitizer.js";
 
 // ── preExecSecurity ─────────────────────────────────────────────────
 
@@ -162,5 +163,89 @@ describe("postExecSecurity", () => {
       hasSensitiveKubectl: true,
     });
     expect(result).not.toContain("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9");
+  });
+});
+
+describe("postExecSecurity — a failed run survives a structural sanitizer", () => {
+  // What a `kubectl get pod ... -o json` resolves to: structural, not line-safe.
+  // Splicing "[exit code: N]" into the body made JSON.parse fail here, and the
+  // parse-failure branch suppresses everything — error, stdout and exit code.
+  const jsonAction = analyzeOutput("kubectl", ["get", "pod", "web-0", "-o", "json"])!;
+
+  it("resolves kubectl -o json on a pod to a structural sanitizer", () => {
+    expect(jsonAction).not.toBeNull();
+    expect(jsonAction.lineSafe).toBe(false);
+  });
+
+  it("keeps the exit code and stderr when a NotFound leaves the body empty", () => {
+    const result = postExecSecurity("", jsonAction, {
+      stderr: 'Error from server (NotFound): pods "web-0" not found',
+      exitCode: 1,
+    });
+    expect(result).toContain("(no output)");
+    expect(result).toContain("[exit code: 1]");
+    expect(result).toContain("NotFound");
+    expect(result).not.toContain("Failed to parse");
+  });
+
+  it("still redacts a JSON body that came back with a non-zero exit", () => {
+    const body = JSON.stringify({
+      kind: "Pod",
+      spec: { containers: [{ env: [{ name: "API_TOKEN", value: "s3cret" }] }] },
+    });
+    const result = postExecSecurity(body, jsonAction, { exitCode: 1 });
+    expect(result).not.toContain("s3cret");
+    expect(result).toContain("[exit code: 1]");
+    expect(result).not.toContain("Failed to parse");
+  });
+
+  it("never shows the sanitizer our own annotations", () => {
+    let seen: string | null = null;
+    const action = {
+      type: "sanitize" as const,
+      lineSafe: false,
+      sanitize: (s: string) => {
+        seen = s;
+        return s;
+      },
+    };
+    postExecSecurity("body", action, {
+      exitCode: 1,
+      signal: "SIGKILL",
+      notes: "\n...[truncated]",
+    });
+    expect(seen).toBe("body");
+  });
+
+  it("skips the sanitizer entirely on an empty body", () => {
+    let called = false;
+    const action = {
+      type: "sanitize" as const,
+      lineSafe: false,
+      sanitize: () => {
+        called = true;
+        return "should not run";
+      },
+    };
+    const result = postExecSecurity("   ", action, { exitCode: 2 });
+    expect(called).toBe(false);
+    expect(result).toContain("[exit code: 2]");
+  });
+
+  it("renders signal and notes alongside the exit code", () => {
+    const result = postExecSecurity("partial", null, {
+      exitCode: 137,
+      signal: "SIGKILL",
+      notes: "\n...[output truncated at 10 MB]",
+    });
+    expect(result).toContain("partial");
+    expect(result).toContain("...[output truncated at 10 MB]");
+    expect(result).toContain("[exit code: 137 (signal: SIGKILL)]");
+  });
+
+  it("leaves a successful run's body untouched by any annotation", () => {
+    const result = postExecSecurity('{"kind":"Pod"}', jsonAction);
+    expect(result).not.toContain("exit code");
+    expect(result).not.toContain("(no output)");
   });
 });

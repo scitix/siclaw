@@ -18,7 +18,7 @@ import {
   validateCommandRestrictions,
 } from "../infra/command-sets.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
-import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
+import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
 import { sanitizeEnv } from "../infra/sanitize-env.js";
 import {
   extractCommands as _extractCommands,
@@ -338,9 +338,10 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         try {
           await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "restricted_bash");
         } catch (err) {
+          const failure = await classifyClusterFailure(kubeconfigRef?.credentialBroker, params.cluster, err);
           return {
-            content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-            details: { error: true, reason: "kubeconfig_ensure_failed" },
+            content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+            details: { error: true, reason: failure.reason },
           };
         }
       }
@@ -475,7 +476,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       } catch (err: any) {
         const errStderr = err.stderr?.trim() ?? err.message;
         return {
-          content: [{ type: "text", text: postExecSecurity(`${err.stdout?.trim() || "(no output)"}\n[exit code: ${err.code ?? "unknown"}]`, pre.action, { stderr: errStderr || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl }) }],
+          content: [{ type: "text", text: postExecSecurity(err.stdout?.trim() ?? "", pre.action, { stderr: errStderr || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl, exitCode: err.code ?? "unknown" }) }],
           details: { exitCode: err.code, error: true },
         };
       }

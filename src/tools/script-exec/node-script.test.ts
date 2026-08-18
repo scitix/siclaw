@@ -12,9 +12,13 @@ vi.mock("../infra/kubeconfig-resolver.js", () => ({
   resolveRequiredKubeconfig: vi.fn(() => ({ path: "/tmp/kc" })),
   resolveDebugImage: vi.fn(() => "debug:latest"),
 }));
-vi.mock("../infra/ensure-kubeconfigs.js", () => ({
-  ensureClusterForTool: vi.fn(),
-}));
+vi.mock("../infra/ensure-kubeconfigs.js", async () => {
+  const actual = await vi.importActual<any>("../infra/ensure-kubeconfigs.js");
+  return {
+    ...actual,
+    ensureClusterForTool: vi.fn(),
+  };
+});
 
 vi.mock("../infra/pod-netns-resolve.js", async () => {
   const actual = await vi.importActual<any>("../infra/pod-netns-resolve.js");
@@ -45,10 +49,13 @@ describe("node_script tool", () => {
     expect(tool.label).toBe("Node Script");
   });
 
-  it("returns kubeconfig_ensure_failed on broker error", async () => {
-    vi.mocked(ensureClusterForTool).mockRejectedValueOnce(new Error("not bound"));
+  // No broker → the binding list is unknowable, so this must not be reported as
+  // an unbound cluster (see classifyClusterFailure).
+  it("classifies a broker error and keeps the original reason", async () => {
+    vi.mocked(ensureClusterForTool).mockRejectedValueOnce(new Error("gateway down"));
     const res = await tool.execute("id", { node: "n1", script: "x.sh" }, undefined, {} as any);
-    expect((res.details as any).reason).toBe("kubeconfig_ensure_failed");
+    expect((res.details as any).reason).toBe("cluster_unavailable");
+    expect(res.content[0].text).toContain("gateway down");
   });
 
   it("rejects invalid node names", async () => {

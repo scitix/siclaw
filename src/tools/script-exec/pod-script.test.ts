@@ -12,9 +12,13 @@ vi.mock("../infra/exec-utils.js", async () => {
 vi.mock("../infra/kubeconfig-resolver.js", () => ({
   resolveRequiredKubeconfig: vi.fn(() => ({ path: "/tmp/kc" })),
 }));
-vi.mock("../infra/ensure-kubeconfigs.js", () => ({
-  ensureClusterForTool: vi.fn(),
-}));
+vi.mock("../infra/ensure-kubeconfigs.js", async () => {
+  const actual = await vi.importActual<any>("../infra/ensure-kubeconfigs.js");
+  return {
+    ...actual,
+    ensureClusterForTool: vi.fn(),
+  };
+});
 vi.mock("node:child_process", () => ({
   spawn: vi.fn(() => ({ on: vi.fn(), unref: vi.fn(), kill: vi.fn() })),
 }));
@@ -41,10 +45,13 @@ describe("pod_script tool", () => {
     expect(tool.label).toBe("Pod Script");
   });
 
-  it("returns kubeconfig_ensure_failed on ensure error", async () => {
+  // With no broker the binding list is unknowable, so an ensure failure must
+  // report cluster_unavailable rather than claiming the cluster is unbound.
+  it("classifies an ensure error and keeps the original reason", async () => {
     vi.mocked(ensureClusterForTool).mockRejectedValueOnce(new Error("no access"));
     const res = await tool.execute("id", { pod: "p", script: "x.sh" }, undefined, {} as any);
-    expect((res.details as any).reason).toBe("kubeconfig_ensure_failed");
+    expect((res.details as any).reason).toBe("cluster_unavailable");
+    expect(res.content[0].text).toContain("no access");
   });
 
   it("rejects invalid pod name", async () => {

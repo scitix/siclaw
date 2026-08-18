@@ -10,7 +10,7 @@ import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
-import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
+import { ensureClusterForTool, classifyClusterFailure } from "../infra/ensure-kubeconfigs.js";
 import { sanitizeEnv } from "../infra/sanitize-env.js";
 import { parseArgs } from "../infra/command-sets.js";
 import {
@@ -152,9 +152,10 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       try {
         await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "local_script");
       } catch (err) {
+        const failure = await classifyClusterFailure(kubeconfigRef?.credentialBroker, params.cluster, err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true, reason: "kubeconfig_ensure_failed" },
+          content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+          details: { error: true, reason: failure.reason },
         };
       }
 
