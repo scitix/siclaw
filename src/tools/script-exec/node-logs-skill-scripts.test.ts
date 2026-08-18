@@ -26,7 +26,7 @@ const VIA_API = join(SCRIPTS, "get-node-logs-via-api.sh");
 
 // Utilities the scripts are allowed to find. Everything else must be absent so a
 // test cannot accidentally depend on the developer's machine having systemd.
-const BASE_UTILS = ["awk", "grep", "cat", "cut", "gzip", "sed", "head", "dirname", "basename", "date"];
+const BASE_UTILS = ["awk", "grep", "cat", "cut", "gzip", "sed", "head", "dirname", "basename", "date", "id"];
 
 let root: string;
 let realUtil: Record<string, string> = {};
@@ -56,6 +56,8 @@ interface BinOpts {
   systemctl?: string;
   /** Shell body for a fake `kubectl`. Omit to make kubectl absent. */
   kubectl?: string;
+  /** Shell body for a fake `id`, to pin who the script thinks it is running as. */
+  id?: string;
 }
 
 let caseSeq = 0;
@@ -69,10 +71,13 @@ function makeCase(opts: BinOpts = {}): { bin: string; dir: string; argLog: strin
     symlinkSync(target, join(bin, name));
   }
   const argLog = join(dir, "args.log");
-  for (const name of ["journalctl", "systemctl", "kubectl"] as const) {
+  for (const name of ["journalctl", "systemctl", "kubectl", "id"] as const) {
     const body = opts[name];
     if (body === undefined) continue;
     const file = join(bin, name);
+    // A fake may shadow one of BASE_UTILS (`id`), whose symlink is already here —
+    // writing through it would edit the real binary's path target.
+    rmSync(file, { force: true });
     writeFileSync(file, `#!/bin/bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(argLog)}\n${body}\n`);
     chmodSync(file, 0o755);
   }
@@ -207,6 +212,65 @@ exit 0`,
     const { bin } = makeCase({ journalctl: JOURNAL_OK }); // no systemctl
     const r = run(NODE_LOGS, ["--unit", "kubelet"], bin);
     expect(r.stdout).toContain("systemctl unavailable");
+  });
+
+  it("separates 'systemctl could not answer' from 'no such unit'", () => {
+    // Observed on a real host: the D-Bus system bus was unreachable, systemctl
+    // exited non-zero with no output, and reading that as an answer produced a
+    // note claiming docker.service did not exist on a host that runs it.
+    const { bin } = makeCase({
+      journalctl: JOURNAL_OK,
+      systemctl: `echo "Failed to connect to bus: Connection refused" >&2; exit 1`,
+    });
+    const r = run(NODE_LOGS, ["--unit", "docker"], bin);
+    expect(r.stdout).toContain("systemctl could not answer whether 'docker' exists");
+    expect(r.stdout).not.toContain("is not a known systemd unit");
+  });
+
+  it("warns when this account cannot read the system journal at all", () => {
+    // Over SSH as an ordinary account journalctl shows only that user's own
+    // messages and still exits 0 — observed on a real host. An empty result there
+    // is a permission artifact, so it must not read as "the unit logged nothing".
+    const { bin } = makeCase({
+      journalctl: `exit 0`,
+      systemctl: SYSTEMCTL_KNOWN,
+      id: `[[ "$1" == "-u" ]] && echo 1000; [[ "$1" == "-nG" ]] && echo "users docker"; [[ "$1" == "-un" ]] && echo appuser; exit 0`,
+    });
+    const r = run(NODE_LOGS, ["--unit", "kubelet"], bin);
+    expect(r.stdout).toContain("not in 'adm' or 'systemd-journal'");
+    expect(r.stdout).toContain("cannot read the system journal");
+    expect(lastLine(r.stdout)).toContain("no_match");
+  });
+
+  it("stays quiet about privileges when running as root", () => {
+    const { bin } = makeCase({
+      journalctl: JOURNAL_OK,
+      systemctl: SYSTEMCTL_KNOWN,
+      id: `[[ "$1" == "-u" ]] && echo 0; [[ "$1" == "-nG" ]] && echo "root"; exit 0`,
+    });
+    const r = run(NODE_LOGS, ["--unit", "kubelet"], bin);
+    expect(r.stdout).not.toContain("systemd-journal");
+  });
+
+  it("does not count journalctl's '-- No entries --' placeholder as a log line", () => {
+    // Real journalctl output for an empty query. Counting it made an empty
+    // journal report scanned=1, matched=1, status=ok — with the placeholder as
+    // the evidence.
+    const { bin } = makeCase({ journalctl: `echo "-- No entries --"`, systemctl: SYSTEMCTL_KNOWN });
+    const r = run(NODE_LOGS, ["--unit", "kubelet"], bin);
+    expect(header(r.stdout, "scanned")).toBe("0 line(s) from the source");
+    expect(lastLine(r.stdout)).toContain("no_match");
+    expect(r.stdout).not.toContain("-- No entries --");
+  });
+
+  it("keeps '-- Reboot --' — that one is real evidence", () => {
+    const { bin } = makeCase({
+      journalctl: `printf '%s\\n' "-- Reboot --" "Aug 18 14:20:01 node kubelet[1]: started"`,
+      systemctl: SYSTEMCTL_KNOWN,
+    });
+    const r = run(NODE_LOGS, ["--unit", "kubelet"], bin);
+    expect(header(r.stdout, "scanned")).toBe("2 line(s) from the source");
+    expect(body(r.stdout)).toContain("-- Reboot --");
   });
 });
 

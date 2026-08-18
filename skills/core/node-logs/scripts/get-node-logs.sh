@@ -216,6 +216,7 @@ fi
 SOURCE_LABEL=""
 SOURCE_NOTES=()
 READ_FILES=()
+RESTRICTED_JOURNAL=0
 
 if [[ ${#UNITS[@]} -gt 0 ]]; then
   if ! command -v journalctl >/dev/null 2>&1; then
@@ -225,12 +226,30 @@ if [[ ${#UNITS[@]} -gt 0 ]]; then
     exit 3
   fi
   SOURCE_LABEL="journalctl unit=$(IFS=,; echo "${UNITS[*]}")"
+  # journalctl exits 0 and prints nothing for a journal this user is not allowed
+  # to read — it puts the explanation on stderr as a hint and moves on. On a host
+  # reached over SSH as an ordinary account that is the NORMAL case, so an empty
+  # result there says nothing about the node at all.
+  if [[ "$(id -u)" -ne 0 ]]; then
+    case " $(id -nG 2>/dev/null) " in
+      *" adm "*|*" systemd-journal "*) ;;
+      *) RESTRICTED_JOURNAL=1
+         SOURCE_NOTES+=("running as $(id -un 2>/dev/null || echo non-root), which is not in 'adm' or 'systemd-journal': journalctl shows only THIS user's messages, so system units may be invisible regardless of what happened") ;;
+    esac
+  fi
   # journalctl exits 0 with no output for a unit it has never heard of, which is
   # the single most misleading case: "no logs" and "no such unit" look the same.
   if command -v systemctl >/dev/null 2>&1; then
     for u in "${UNITS[@]}"; do
+      # Distinguish "systemctl says there is no such unit" from "systemctl could
+      # not answer": on a host where the D-Bus system bus is unreachable it fails
+      # outright, and treating that empty output as an answer produced a note
+      # claiming docker.service did not exist on a host that runs it.
       known=$(systemctl list-unit-files --no-legend -- "$u" "$u.service" 2>/dev/null)
-      if [[ -z "$known" ]]; then
+      probe_rc=$?
+      if [[ "$probe_rc" -ne 0 && -z "$known" ]]; then
+        SOURCE_NOTES+=("systemctl could not answer whether '$u' exists (exit $probe_rc — the system bus may be unreachable here); the unit name is unverified")
+      elif [[ -z "$known" ]]; then
         # Offer the names that do exist: a wrong unit name ("containerd.service"
         # vs "containerd", "kubelet" vs "k3s") is the usual reason for silence.
         near=$(systemctl list-unit-files --no-legend 2>/dev/null \
@@ -385,7 +404,15 @@ filter_stage() {
 }
 
 read_source \
-  | awk -v marker="$MARKER" '{ n++; print } END { printf "%s:%d\n", marker, n+0 }' \
+  | awk -v marker="$MARKER" '
+      # journalctl prints "-- No entries --" when a query matched nothing. It is
+      # the absence of a log line, not one: counting it turned an empty journal
+      # into scanned=1 / matched=1 / status=ok with that placeholder as the
+      # evidence. Other "-- … --" markers (notably "-- Reboot --") are real
+      # boundaries in the stream and are kept.
+      $0 == "-- No entries --" { next }
+      { n++; print }
+      END { printf "%s:%d\n", marker, n+0 }' \
   | filter_stage \
   | awk -v tailn="$TAIL" -v marker="$MARKER" '
       { n++; buf[n] = $0; if (n > tailn + 1) delete buf[n - tailn - 1] }
@@ -439,6 +466,12 @@ if [[ "$REPORT_RC" -eq 10 ]]; then
   echo "occur: check that the window covers the event, that the pattern matches how"
   echo "this component words the message, and that the journal or file still retains"
   echo "that far back."
+  if [[ "$RESTRICTED_JOURNAL" -eq 1 ]]; then
+    # The likeliest explanation on this run, and it has nothing to do with the node.
+    echo "In particular THIS account cannot read the system journal (see the note"
+    echo "above), so an empty result here is expected whether or not the unit logged"
+    echo "anything. Rerun with a privileged account, or use node_script."
+  fi
   echo "status:      no_match"
   exit 0
 fi

@@ -42,7 +42,15 @@ Try them in this order and say which one produced the evidence.
 ### Tier 1 — `host_script` (preferred)
 
 The node is a bound SSH host: check `host_list` by node name or IP. No debug pod,
-lowest latency, full journal access.
+lowest latency.
+
+**One caveat that produces empty results:** journalctl only shows the *system*
+journal to root and to members of `adm` / `systemd-journal`. An ordinary SSH
+account gets its own messages and **exit 0** — so a system unit looks like it
+logged nothing. The script detects that account state, says so in a `note:`, and
+repeats it in the `no_match` explanation. When you see it, the answer is not
+"the unit was quiet": rerun via `node_script`, which enters the host namespaces
+as root.
 
 ```
 host_script: host="<host>", skill="node-logs", script="get-node-logs.sh", args="<args>"
