@@ -281,6 +281,7 @@ interface KnowledgeBundlePayload {
     sha256?: string | null;
     sizeBytes: number;
     fileCount?: number | null;
+    citationSources?: Array<{ resource: string; title: string; url: string }>;
     dataBase64: string;
   }>;
 }
@@ -389,6 +390,11 @@ export function createKnowledgeHandler(
     const stagingDir = path.join(knowledgeDir, `.sync-staging-${Date.now()}-${process.pid}`);
     fs.mkdirSync(stagingDir, { recursive: true });
     const syncedRepos: KnowledgeSyncStatus["repos"] = [];
+    const citationRepos: Array<{
+      id: string;
+      root: string;
+      sources: Array<{ resource: string; title: string; url: string }>;
+    }> = [];
 
     try {
       if (repos.length === 1) {
@@ -404,6 +410,7 @@ export function createKnowledgeHandler(
         }
         syncedRepos.push({ id: repos[0].id, name: repos[0].name, version: repos[0].version,
           sha256: info.sha256, expectedSha256: repos[0].sha256 ?? null, fileCount: info.fileCount, sizeBytes: repos[0].sizeBytes });
+        citationRepos.push({ id: repos[0].id, root: "", sources: repos[0].citationSources ?? [] });
       } else {
         const repoRoot = path.join(stagingDir, "repos");
         fs.mkdirSync(repoRoot, { recursive: true });
@@ -445,6 +452,7 @@ export function createKnowledgeHandler(
           }
           syncedRepos.push({ id: repo.id, name: repo.name, version: repo.version,
             sha256: info.sha256, expectedSha256: repo.sha256 ?? null, fileCount: info.fileCount, sizeBytes: repo.sizeBytes });
+          citationRepos.push({ id: repo.id, root: `repos/${dirName}`, sources: repo.citationSources ?? [] });
           // This line is the whole of what the agent knows about a library
           // before deciding to open it: the catalog goes into the system prompt,
           // there is no search tool, and everything else costs a Read of that
@@ -476,6 +484,8 @@ export function createKnowledgeHandler(
 
       fs.writeFileSync(path.join(stagingDir, ".sync-manifest.json"),
         JSON.stringify({ syncedAt, version: payload.version ?? "1", repos: syncedRepos }, null, 2) + "\n");
+      fs.writeFileSync(path.join(stagingDir, ".citation-manifest.json"),
+        JSON.stringify({ version: 1, repos: citationRepos }, null, 2) + "\n");
       await replaceDirectoryContentsFromStaging(knowledgeDir, stagingDir);
       lastKnowledgeSyncStatus = { syncedAt, targetDir: knowledgeDir, repoCount: syncedRepos.length, repos: syncedRepos };
       return repos.length;

@@ -15,6 +15,7 @@ import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
 import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
 import { redactText, type RedactionConfig } from "./output-redactor.js";
+import { appendKnowledgeSourceCitations } from "../shared/knowledge-citations.js";
 
 // ── Public types ────────────────────────────────────
 
@@ -375,6 +376,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // so they persist inline exactly as before.
   let isRoutingTurn = false;
   let routingCommitted = false;
+  let pendingKnowledgeSources: unknown = null;
   const pendingAssistantOps: Array<() => Promise<void>> = [];
   const pendingErrorOps: Array<() => Promise<void>> = [];
   const flushOps = async (ops: Array<() => Promise<void>>) => {
@@ -432,6 +434,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   const discardRoutedAttempt = () => {
     pendingAssistantOps.length = 0;
     pendingErrorOps.length = 0;
+    pendingKnowledgeSources = null;
     pendingStreamError = null;
     errorMessage = "";
     // The primary's deferred assistant op flipped firstAssistantPersisted when
@@ -490,7 +493,6 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let capturedContextUsage: Record<string, unknown> | undefined;
   let latestModelRouteSwitch: Record<string, unknown> | null = null;
   let currentModelRouteMetadata: Record<string, unknown> | null = null;
-
   // try/finally, not a bare fall-through: the terminal error is BUFFERED
   // (last one wins), so a stream that dies mid-turn — pod recycled, transport
   // dropped — would otherwise take the operator's only explanation of the
@@ -505,6 +507,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       // undefined would throw and kill the whole SSE stream (STREAM_INTERRUPTED).
       const eventType = (evt.type as string | undefined) ?? "";
       eventCount++;
+
+      if (eventType === "knowledge_sources") {
+        pendingKnowledgeSources = (evt as Record<string, unknown>).sources;
+      }
 
       // Log lifecycle events
       if (
@@ -884,6 +890,18 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               .filter((c) => c.type === "text")
               .map((c) => c.text ?? "")
               .join("");
+          }
+          if (pendingKnowledgeSources && message.stopReason !== "error") {
+            const base = extracted || currentMsgText || assistantContent;
+            if (base.trim()) {
+              const cited = appendKnowledgeSourceCitations(base, pendingKnowledgeSources);
+              if (cited !== base) {
+                extracted = cited;
+                assistantContent = cited;
+                message.content = [{ type: "text", text: cited }];
+              }
+              pendingKnowledgeSources = null;
+            }
           }
           resultText = extracted || currentMsgText || resultText;
 

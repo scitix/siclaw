@@ -62,6 +62,7 @@ import { replyImageToLark } from "./lark-image.js";
 import { collectInboundImages, type LarkImageRef } from "./inbound-image.js";
 import { modelOptionsSupportImageInput } from "../../core/model-routing.js";
 import { redactImageUrlsInText } from "../agentbox/image-url-ingest.js";
+import { appendKnowledgeSourceCitations } from "../../shared/knowledge-citations.js";
 import { registerBackgroundChannelDelivery } from "./background-delivery.js";
 
 const VISUAL_ONLY_NOTICE_BY_LOCALE = {
@@ -2908,6 +2909,7 @@ export async function collectChannelResponse(
   // for the user). pi-agent's agent_end signals the last turn is complete.
   let lastAssistantText = "";
   let lastAssistantMessageId: string | null = null;
+  let pendingKnowledgeSources: unknown = null;
 
   // ── Audit persistence (opt-in) ──────────────────────────────────────────
   // Mirrors the field mapping in sse-consumer.ts so a channel transcript looks
@@ -2936,6 +2938,13 @@ export async function collectChannelResponse(
   try {
     for await (const event of client.streamEvents(sessionId)) {
       const ev = event as Record<string, any>;
+
+      if (ev.type === "model_route_start" || ev.type === "model_route_rollback") {
+        pendingKnowledgeSources = null;
+      }
+      if (ev.type === "knowledge_sources") {
+        pendingKnowledgeSources = ev.sources;
+      }
 
       // Live tool progress → milestone. A FOREGROUND sub-agent batch blocks the parent inside one
       // tool call, so no intermediate assistant turn fires while it runs — without this the card
@@ -3008,7 +3017,11 @@ export async function collectChannelResponse(
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
         if (options.includeImages) collectImageAttachments(blocks, images, seenImageKeys);
-        const turnText = contentBlocksToMarkdown(blocks);
+        let turnText = contentBlocksToMarkdown(blocks);
+        if (pendingKnowledgeSources && turnText.trim() && ev.message?.stopReason !== "error") {
+          turnText = appendKnowledgeSourceCitations(turnText, pendingKnowledgeSources);
+          pendingKnowledgeSources = null;
+        }
         if (turnText) {
           // A NEW assistant turn means the PREVIOUS one was an intermediate
           // step (the agent narrated, then called a tool) — surface its first

@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { describe, it, expect } from "vitest";
 
 // NOTE: We deliberately do NOT import "./agent-factory.js" here.
@@ -17,5 +19,15 @@ describe("agent-factory", () => {
 
   it("placeholder remains present until integration coverage lands", () => {
     expect(true).toBe(true);
+  });
+
+  it("keeps the agent-scoped knowledge override as the one citation root", () => {
+    // Cross-PR regression guard for #489 + #490. This module cannot be imported
+    // in the unit workspace (see above), so pin the conflict-sensitive wiring
+    // structurally: a bad resolution that restores the shared root goes red.
+    const source = fs.readFileSync(path.resolve(__dirname, "agent-factory.ts"), "utf8");
+    expect(source).toMatch(/const knowledgeDir = opts\?\.knowledgeDir\s*\?\?/);
+    expect(source).toMatch(/createKnowledgeCitationSupport\(\{\s*knowledgeDir,/);
+    expect(source).toContain("buildKnowledgeCitationSystemPrompt(knowledgeDir)");
   });
 });

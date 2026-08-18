@@ -19,9 +19,15 @@ const INTENTIONALLY_UNGROUPED = new Set<string>([]);
 describe("capability-group registry coverage", () => {
   it("every registered tool belongs to some capability group", () => {
     const grouped = new Set(Object.values(CAPABILITY_GROUPS).flat());
-    // Minimal stub: tool factories read executor refs lazily inside execute(),
-    // not at construction, so an empty-ish refs object is enough to read .name.
-    const stubRefs = { sessionIdRef: { current: "coverage-probe" } } as unknown as ToolRefs;
+    // Minimal stub: most tool factories read executor refs lazily inside
+    // execute(). Dynamic per-session tools need a sentinel definition so this
+    // static catalog probe can still read their name without making them
+    // available in sessions that lack the real runtime dependency.
+    const stubRefs = {
+      sessionIdRef: { current: "coverage-probe" },
+      sessionEventEmitter: () => {},
+      knowledgeCitationTool: { name: "knowledge_cite" },
+    } as unknown as ToolRefs;
 
     const missing: string[] = [];
     for (const entry of allToolEntries) {

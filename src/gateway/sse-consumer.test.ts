@@ -79,6 +79,20 @@ describe("consumeAgentSse — type-less extra events", () => {
 });
 
 describe("consumeAgentSse — assistant message flow", () => {
+  it("appends registered knowledge sources to the final answer event and result", async () => {
+    const events = [
+      { type: "knowledge_sources", sources: [{ title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/a" }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "结论" }] } },
+    ];
+    const seen: any[] = [];
+    const result = await consumeAgentSse({
+      client: mkClient(events), sessionId: "s", userId: "u", onEvent: (event) => seen.push(event),
+    });
+    expect(result.resultText).toContain("### 参考原文");
+    expect(result.resultText).toContain("https://docs.feishu.cn/wiki/a");
+    expect((seen[1].message.content[0].text as string)).toBe(result.resultText);
+  });
+
   it("accumulates text deltas across message_update events and returns the concatenated result", async () => {
     const events = [
       { type: "message_start" },
@@ -483,6 +497,20 @@ describe("consumeAgentSse — routed turn commit gating", () => {
     expect(appendCalls.some((r) => r.role === "assistant" && r.content === "answer from fallback")).toBe(true);
     // The run summary must not leak the rolled-back attempt's error.
     expect(result.errorMessage).toBe("");
+  });
+
+  it("discards a failed primary's knowledge sources before rendering the fallback answer", async () => {
+    const events = [
+      { type: "model_route_start", candidateCount: 2 },
+      { type: "knowledge_sources", sources: [{ title: "Primary Runbook", url: "https://example.com/primary" }] },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer from fallback" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u" });
+    expect(result.resultText).toBe("answer from fallback");
+    expect(result.resultText).not.toContain("Primary Runbook");
   });
 
   it("persists the error row when a routed turn is exhausted (no fallback succeeded)", async () => {

@@ -655,7 +655,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     expect(status).toBe(200);
     expect(new Set(body.activeAgent.allowedTools)).toEqual(
-      new Set(["read", "grep", "find", "ls", "manage_schedule"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_cite", "manage_schedule"]),
     );
   });
 

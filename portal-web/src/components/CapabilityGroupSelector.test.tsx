@@ -38,16 +38,16 @@ describe("CapabilityGroupSelector — render contract", () => {
     const html = render(new Set(["read_files"]))
     expect(html).toContain("Restricted")
     expect(html).not.toContain("Unrestricted")
-    // read_files grants 4 tools; "1 group" must be singular.
-    expect(html).toContain("1 group · 4 tools")
+    // read_files grants 5 tools; "1 group" must be singular.
+    expect(html).toContain("1 group · 5 tools")
     expect(html).toContain("Capability groups (1 / 11)")
     expect(countChecked(html)).toBe(1)
   })
 
   it("pluralizes groups and sums the deduped tool count for a multi-group selection", () => {
     const html = render(new Set(["read_files", "run_commands"]))
-    // 4 + 4 distinct tools, plural "groups".
-    expect(html).toContain("2 groups · 8 tools")
+    // 5 + 4 distinct tools, plural "groups".
+    expect(html).toContain("2 groups · 9 tools")
     expect(html).toContain("Capability groups (2 / 11)")
     expect(countChecked(html)).toBe(2)
   })

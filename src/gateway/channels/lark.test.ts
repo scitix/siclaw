@@ -3066,6 +3066,30 @@ describe("collectResponse — SSE event flattening", () => {
     expect(text).toBe("Hello! How can I help?");
   });
 
+  it("appends registered knowledge sources to a Feishu answer", async () => {
+    const events = [
+      { type: "knowledge_sources", sources: [{ title: "GPU Runbook", url: "https://docs.feishu.cn/wiki/a" }] },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "结论" }] } },
+    ];
+    const text = await collectResponse(fakeClient(events), "s-citations");
+    expect(text).toContain("### 参考原文");
+    expect(text).toContain("[GPU Runbook](https://docs.feishu.cn/wiki/a)");
+  });
+
+  it("discards a failed primary's knowledge sources before rendering the fallback answer", async () => {
+    const events = [
+      { type: "model_route_start", candidateCount: 2 },
+      { type: "knowledge_sources", sources: [{ title: "Primary Runbook", url: "https://example.com/primary" }] },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit" } },
+      { type: "model_route_rollback", attempt: 1, candidateKey: "openai/gpt-4", failureKind: "rate_limit" },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "answer from fallback" }], stopReason: "stop" } },
+      { type: "model_route_success", attempt: 2, candidateKey: "anthropic/claude", provider: "anthropic", modelId: "claude", isFallback: true, primaryCandidateKey: "openai/gpt-4" },
+    ];
+    const text = await collectResponse(fakeClient(events), "s-citations-fallback");
+    expect(text).toBe("answer from fallback");
+    expect(text).not.toContain("Primary Runbook");
+  });
+
   it("falls back to streamed content_block_delta when no message_end arrives", async () => {
     const events = [
       { type: "content_block_delta", delta: { text: "Hello" } },

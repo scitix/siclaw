@@ -257,7 +257,7 @@ describe("LocalSpawner — tool-capabilities injection", () => {
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
-      new Set(["read", "grep", "find", "ls", "memory_search", "memory_get"]),
+      new Set(["read", "grep", "find", "ls", "knowledge_cite", "memory_search", "memory_get"]),
     );
   });
 
@@ -304,7 +304,9 @@ describe("LocalSpawner — locked agent-type policy (P1: parity with K8s)", () =
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
     const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
-    expect(new Set(box.sessionManager.allowedToolsState)).toEqual(new Set(["read", "grep", "find", "ls"]));
+    expect(new Set(box.sessionManager.allowedToolsState)).toEqual(
+      new Set(["read", "grep", "find", "ls", "knowledge_cite"]),
+    );
     expect(box.sessionManager.agentTypeState).toBe("custom");
   });
 });
