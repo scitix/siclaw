@@ -47,9 +47,11 @@ Use this tool for in-pod diagnostics such as:
 - Reading config or log files (cat, head, tail, ls, find, grep)
 - Checking resource usage (df, du, free)
 
-Allowed commands (ONLY these are permitted):
+Allowed commands (ONLY these are permitted — policy, not availability: these run inside the
+target container, so a distroless or minimal image may not ship them and the command then fails
+with exit 127):
   network: ip, ifconfig, ping, traceroute, tracepath, ss, netstat, route, arp, ethtool, mtr, bridge, tc, conntrack, nslookup, dig, host, curl
-  text: grep, egrep, fgrep, sort, uniq, wc, head, tail, cut, tr, jq, yq, column
+  text: grep, egrep, fgrep, sort, uniq, wc, head, tail, cut, tr, tac, nl, jq, yq, column
   process: ps, pgrep, top, free, vmstat, iostat, mpstat, df, du, mount, findmnt, nproc
   file (read-only): cat, ls, pwd, stat, file, find, readlink, realpath, basename, dirname, diff, md5sum, sha256sum
   kernel: uname, hostname, uptime, dmesg, sysctl, lsmod, modinfo

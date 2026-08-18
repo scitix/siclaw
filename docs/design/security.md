@@ -111,10 +111,16 @@ credential protection; application layers (2-6) are **secondary defense-in-depth
 
 Two users exist inside the AgentBox container:
 
-| User | UID | Groups | Purpose |
-|------|-----|--------|---------|
-| `agentbox` | 1000 | `agentbox`, `kubecred` | Main Node.js process. Owns credentials. |
-| `sandbox` | 1001 | `sandbox` | All child processes (shell commands). No credential access. |
+| User | UID | Groups (intended) | Groups (**as built today**) | Purpose |
+|------|-----|-------------------|------------------------------|---------|
+| `agentbox` | 1000 | `agentbox`, `kubecred` | `agentbox`, `kubecred`, `hostcred` | Main Node.js process. Owns credentials. |
+| `sandbox` | 1001 | `sandbox` | `sandbox`, **`kubecred`**, **`hostcred`** | All child processes (shell commands). |
+
+> ⚠️ The `sandbox` column is the whole point of this layer, and the image does not currently match
+> it. `Dockerfile.agentbox` creates `sandbox` with `-G kubecred,hostcred`, so child processes can
+> read the materialized credentials directly and the setgid bit on `kubectl` grants access they
+> already have. **Everything below in §3 describes the intended design, not the deployed one** — see
+> §4.6 for what follows from that and what restoring it requires.
 
 The main process (Node.js) runs as `agentbox`. When executing shell commands, it uses
 `sudo -E -u sandbox -- bash -c '<command>'` to drop to the `sandbox` user. The `-E` flag
@@ -143,10 +149,16 @@ defense — they prevent the agent from misusing its own file tools, but cannot 
 shell commands. The `sandbox` user's filesystem permissions must independently enforce
 the correct access boundaries.
 
-#### Credentials & secrets (sandbox: no access)
+#### Credentials & secrets (sandbox: no access — **not true as built; see §3.1 and §4.6**)
 
-| Path | Owner | Mode | agentbox | sandbox | kubectl (setgid) |
-|------|-------|------|----------|---------|-------------------|
+The `sandbox` column below is the intent. As built, `sandbox` is a member of `kubecred` and
+`hostcred`, so it reads every row in this table that is group-readable — and the entrypoint widens it
+further: `chown -R agentbox:kubecred /app/.siclaw/credentials` puts the `hosts/` subtree into
+`kubecred` too, discarding the per-type split the Dockerfile sets up (`clusters/` → `kubecred`,
+`hosts/` → `hostcred`, both `2750`).
+
+| Path | Owner | Mode | agentbox | sandbox (intended) | kubectl (setgid) |
+|------|-------|------|----------|--------------------|-------------------|
 | `.siclaw/credentials/*.kubeconfig` | agentbox:kubecred | 0640 | rw | -- | r- (via group) |
 | `/etc/siclaw/certs/` | agentbox:agentbox | 0600 | rw | -- | -- |
 | `.siclaw/config/settings.json` | agentbox:agentbox | 0600 | rw | -- | -- |
@@ -341,6 +353,22 @@ grep: { command: "grep", contexts: ["local"], pipeOnly: true, noFilePaths: true,
 This prevents `kubectl get pods | grep -rl "" /app/.siclaw` from reading credential files
 even though `grep` appears after a pipe.
 
+A path check runs before the shell expands anything, so a literal-prefix rule is only as good as
+the literal: `printf x | column "$SICLAW_CREDENTIALS_DIR"/clusters/*` contains no credential path
+for either that rule or the sensitive-path patterns to match. **A file operand of a stdin-only text
+command therefore rejects variable expansion and command substitution outright.** Globs are not
+rejected: `*` does not match `..`, so a glob cannot climb out of the workdir, and one that does name
+the credential directory has to spell it literally. Args that are not file operands — the grep
+pattern, the jq/yq expression, `tr`'s SETs — are exempt, since a regex legitimately contains `$`.
+
+Screening argv is not always enough to bound a command. `yq`'s expression language reads files and
+the environment by itself (`load_str(env(X) + "/y")`), with no flag and no path argument, so `yq`
+carries an expression screen that rejects those operators — plus `eval`, without which a blocked
+operator can be reassembled from string fragments. The AgentBox image reinforces this outside the
+validator by exposing only a wrapper that forces yq's `--security-disable-file-ops` and
+`--security-disable-env-ops`; in the node/pod/host contexts the binary is the customer's, and the
+expression screen is the only layer that applies.
+
 **Source**: `src/tools/infra/command-sets.ts` — `COMMAND_RULES`
 
 ### 4.5 Explicitly Excluded Binaries
@@ -364,9 +392,27 @@ With OS-level user isolation (Layer 1), the application-level command validation
 - Prevents shell injection via `$()`, backticks, redirections
 - Provides audit trail of blocked commands
 
-The `local`-context rules (pipeOnly, noFilePaths, blockedFlags) can be **relaxed** after
-OS isolation is deployed, since the sandbox user cannot read credential files regardless.
-However, they remain as defense-in-depth.
+These `local`-context rules (pipeOnly, noFilePaths, blockedFlags) must **not** be relaxed on the
+grounds that OS isolation makes them redundant. That reasoning holds only if the sandbox user cannot
+read credential files, and in the current image it can:
+
+```
+useradd --uid 1001 ... -G kubecred,hostcred sandbox   # supplementary groups, not setgid
+chown -R agentbox:kubecred /app/.siclaw/credentials   # dir 0750, files 0640 → group-readable
+chgrp kubecred /usr/local/bin/kubectl; chmod 2755     # setgid adds nothing sandbox lacks
+```
+
+Because `sandbox` holds `kubecred` and `hostcred` as supplementary groups, every reader binary in
+the image can open the materialized credentials — the setgid bit on `kubectl` grants access the
+sandbox user already has. Layer 2 is consequently doing real work here rather than acting purely as
+defense-in-depth, which is the opposite of the intent recorded in ADR-010.
+
+Restoring the intended boundary means dropping those supplementary groups so group access comes
+only from a setgid binary. That is not a one-line change: `kubectl` is covered by its setgid bit,
+but nothing is setgid `hostcred`, so whatever reads host credentials as `sandbox` today has to be
+identified first — and where the reading is done by the node process (which runs as `agentbox`, the
+owner), the membership may simply be unnecessary. Until that is done, treat the command validation
+as load-bearing.
 
 ---
 

@@ -576,11 +576,25 @@ export async function ensureDebugPodReady(
   const debugNamespace = config.debugNamespace;
   const idleTimeoutMs = config.debugPodIdleTimeout * 1000;
 
-  const result = await debugPodCache.getOrCreate(
+  // A node that just failed to host a debug pod is not asked again straight away — replay the
+  // detail instead, and say that is what happened so the answer is not mistaken for a fresh probe.
+  const key = memoKey(spec);
+  const remembered = lookupStartupFailure(key);
+  if (remembered) throw remembered;
+
+  let result;
+  try {
+    result = await debugPodCache.getOrCreate(
     spec.userId,
     clusterKey,
     spec.nodeName,
     async () => {
+      // Re-checked HERE, not only before getOrCreate: its wait loop promotes a queued waiter to
+      // creator once the first creator fails, and that waiter would otherwise pay the full
+      // create + schedule + wait budget again — the exact repetition the memo exists to stop.
+      const rememberedInLock = lookupStartupFailure(key);
+      if (rememberedInLock) throw rememberedInLock;
+
       const debugId = randomBytes(4).toString("hex");
       const jobName = `node-debug-${debugId}`;
       const labels = { ...buildDebugPodLabels(spec.userId, spec.nodeName), [LABEL_DEBUG_ID]: debugId };
@@ -626,8 +640,11 @@ export async function ensureDebugPodReady(
             nodeName: spec.nodeName,
             force: true,
           });
-          // Don't call set() — pod failed to start
-          return;
+          // Carry the phase out. Discarding it left one sentence for every startup failure, so a
+          // pod that reached a terminal phase read exactly like an API error.
+          throw new Error(
+            `Debug pod "${podName}" reached terminal phase=${phase || "unknown"} before it was Running.`,
+          );
         }
 
         // Store in cache — idle timer starts now
@@ -644,10 +661,178 @@ export async function ensureDebugPodReady(
     },
   );
 
-  if (!result.pod) {
-    throw new Error(`Debug pod failed to start on node "${spec.nodeName}".`);
+  } catch (err) {
+    // Aborts say nothing about the node, so they are not remembered.
+    const message = err instanceof Error ? err.message : String(err);
+    if (opts.signal?.aborted || /^Aborted/i.test(message)) throw err;
+    // A replayed memo entry must not be re-remembered: doing so would refresh its timestamp on every
+    // caller (so it never ages out under load) and append the "unchanged from an attempt …" suffix
+    // to a message that already carries one.
+    if (err instanceof DebugPodStartupError && err.cached) throw err;
+    const { stage, reason } = classifyStartupFailure(message);
+    const startupError = err instanceof DebugPodStartupError
+      ? err
+      : new DebugPodStartupError(message, stage, reason, spec.nodeName);
+    rememberStartupFailure(key, startupError);
+    throw startupError;
   }
+
+  if (!result.pod) {
+    const failure = new DebugPodStartupError(
+      `Debug pod failed to start on node "${spec.nodeName}" (no pod was created and no error was reported).`,
+      "unknown",
+      "no_pod_created",
+      spec.nodeName,
+    );
+    rememberStartupFailure(key, failure);
+    throw failure;
+  }
+  // Started: whatever this node failed with before no longer describes it.
+  forgetStartupFailure(key);
   return result.pod;
+}
+
+/**
+ * A debug pod could not be started. Carries the stage and reason so a caller can report WHICH
+ * step failed instead of one sentence for API errors, scheduling, image pulls and admission alike
+ * — the agent could not previously tell those apart, and retried all of them the same way.
+ */
+export class DebugPodStartupError extends Error {
+  constructor(
+    message: string,
+    readonly stage: DebugPodFailureStage,
+    readonly reason: string,
+    readonly nodeName: string,
+    readonly cached = false,
+  ) {
+    super(message);
+    this.name = "DebugPodStartupError";
+  }
+}
+
+export type DebugPodFailureStage = "create" | "schedule" | "startup" | "unknown";
+
+/**
+ * Startup failures remembered per (user, cluster, node) for a short window.
+ *
+ * A node that cannot host a debug pod does not become able to a second later, and an agent that
+ * gets a bare failure will try again — one report showed a third attempt on a node that had
+ * already failed twice, each paying the full create + schedule + wait budget. A repeat inside the
+ * window replays the original detail instead, and says it is doing so.
+ *
+ * Deliberately short: a node that has just been uncordoned, or whose image pull has since
+ * succeeded, must not stay refused. Aborts are never remembered — they say nothing about the node.
+ */
+const STARTUP_FAILURE_MEMO_MS = 60_000;
+/** Bound on remembered entries — one per (user, cluster, node, image), so a broad sweep is finite. */
+const STARTUP_FAILURE_MEMO_MAX = 256;
+const startupFailures = new Map<string, { at: number; error: DebugPodStartupError }>();
+
+/**
+ * The image is part of the key: `image_pull_failed` is a property of the IMAGE, not the node, so a
+ * corrected image must get a fresh attempt instead of inheriting the previous one's refusal.
+ */
+function memoKey(spec: DebugPodSpec): string {
+  const image = spec.image || loadConfig().debugImage;
+  return `${spec.userId}|${spec.clusterKey || "default"}|${spec.nodeName}|${image}`;
+}
+
+/**
+ * Reasons that describe THIS node+image and will not change inside the window.
+ *
+ * `unknown` and `rejected_by_apiserver` are deliberately absent: an unclassified error may be
+ * transient, and an admission or RBAC refusal is a property of the cluster or of our request rather
+ * than of the node, so attributing either to the node would refuse a healthy node for the whole
+ * window. The safe direction here is to retry, so this is an allow-list.
+ */
+const MEMOIZABLE_REASONS = new Set([
+  "unschedulable",
+  "image_pull_failed",
+  "container_config_error",
+  "startup_timeout",
+  "pod_never_appeared",
+  "pod_terminated_during_startup",
+]);
+
+/** Classify a startup failure from the error text kubectl/our own waiters produced. */
+export function classifyStartupFailure(message: string): { stage: DebugPodFailureStage; reason: string } {
+  if (/Unschedulable/i.test(message)) return { stage: "schedule", reason: "unschedulable" };
+  if (/ImagePull|ErrImage|InvalidImageName/i.test(message)) return { stage: "startup", reason: "image_pull_failed" };
+  if (/CreateContainerConfigError|CreateContainerError/i.test(message)) return { stage: "startup", reason: "container_config_error" };
+  // Two different timeouts, two different stages: the pod never being created is a scheduling-side
+  // fact, while a pod that exists and never reaches Running failed during startup. Both used to
+  // report "schedule", which pointed the reader at the wrong step.
+  if (/did not appear within/i.test(message)) return { stage: "schedule", reason: "pod_never_appeared" };
+  if (/Timed out waiting for pod/i.test(message)) return { stage: "startup", reason: "startup_timeout" };
+  if (/forbidden|admission|denied/i.test(message)) return { stage: "create", reason: "rejected_by_apiserver" };
+  if (/terminal phase|phase=/i.test(message)) return { stage: "startup", reason: "pod_terminated_during_startup" };
+  return { stage: "unknown", reason: "unknown" };
+}
+
+/**
+ * Remember a startup failure for this node+image, if the reason is one that will still be true in a
+ * minute — see {@link MEMOIZABLE_REASONS}. A reason outside that set is dropped, so the next caller
+ * retries normally.
+ *
+ * Aborts must never reach here: they say nothing about the node, and remembering one would refuse a
+ * healthy node for the whole window.
+ */
+export function rememberStartupFailure(key: string, error: DebugPodStartupError): void {
+  if (!MEMOIZABLE_REASONS.has(error.reason)) return;
+  // Expired entries are also dropped on read, but a key that is never queried again would otherwise
+  // sit here for the process's lifetime.
+  const now = Date.now();
+  for (const [k, v] of startupFailures) {
+    if (now - v.at >= STARTUP_FAILURE_MEMO_MS) startupFailures.delete(k);
+  }
+  if (startupFailures.size >= STARTUP_FAILURE_MEMO_MAX) {
+    const oldest = startupFailures.keys().next();
+    if (!oldest.done) startupFailures.delete(oldest.value);
+  }
+  startupFailures.set(key, { at: now, error });
+}
+
+/**
+ * The remembered failure for this node, as the error to raise in place of another attempt — or null
+ * when there is none or it has aged out. Expired entries are dropped on read, so a node is not
+ * refused twice for the same stale reason.
+ */
+export function lookupStartupFailure(key: string): DebugPodStartupError | null {
+  const remembered = startupFailures.get(key);
+  if (!remembered) return null;
+  const ageMs = Date.now() - remembered.at;
+  if (ageMs >= STARTUP_FAILURE_MEMO_MS) {
+    startupFailures.delete(key);
+    return null;
+  }
+  return new DebugPodStartupError(
+    `${remembered.error.message} (unchanged from an attempt ${Math.round(ageMs / 1000)}s ago on this node; `
+      + `not retried. It will be retried after ${Math.round(STARTUP_FAILURE_MEMO_MS / 1000)}s, or use a different node / transport.)`,
+    remembered.error.stage,
+    remembered.error.reason,
+    remembered.error.nodeName,
+    true,
+  );
+}
+
+/** Forget this node's remembered failure — it started, so the old reason no longer describes it. */
+export function forgetStartupFailure(key: string): void {
+  startupFailures.delete(key);
+}
+
+/** Test seam: forget every remembered startup failure. */
+export function resetStartupFailureMemo(): void {
+  startupFailures.clear();
+}
+
+/** Test seam: how many failures are currently remembered (asserts the map stays bounded). */
+export function startupFailureMemoSize(): number {
+  return startupFailures.size;
+}
+
+/** Key a memo entry by the identity that determines whether a debug pod can start. */
+export function startupFailureKey(spec: DebugPodSpec): string {
+  return memoKey(spec);
 }
 
 /**

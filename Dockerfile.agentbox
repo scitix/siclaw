@@ -40,11 +40,39 @@ RUN npx tsc -p tsconfig.agentbox.json
 FROM node:22.19-slim
 
 # System deps + kubectl in one layer
+#
+# The text-processing commands the tool whitelist permits must actually EXIST here, or a permitted
+# command fails with 127 and the tool's own description is a lie. This image is the execution
+# context for restricted-bash only — node_exec resolves binaries in the node's namespaces and
+# pod_exec inside the target container, so neither gains anything from this layer.
+#   bsdextrautils — provides `column` (moved out of bsdmainutils on bookworm)
+#   yq            — mikefarah/yq, installed as a WRAPPER; see the yq layer below
+#
+# yq is pinned to an exact version and checksum rather than `releases/latest`: an unverified
+# `latest` means the same source commit builds a different, unreviewed executable every time.
+ARG YQ_VERSION=v4.53.3
+ARG YQ_SHA256=fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium \
+    curl jq python3 ca-certificates sudo fonts-noto-cjk chromium bsdextrautils \
     && curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
     && chmod +x kubectl && mv kubectl /usr/local/bin/ \
     && rm -rf /var/lib/apt/lists/*
+
+# yq: real binary under a name the command whitelist does not admit, reached only through a wrapper
+# that forces its security switches on.
+#
+# yq's expression language reads files and the environment by itself — `load_str(env(X) + "/y")`
+# needs no flag and no path argument — so argv screening alone cannot bound it. validateYq rejects
+# those operators in every execution context; this wrapper is the second layer, and the only one
+# that still holds if a future operator escapes the screen. `yq-real` is not in the whitelist, so
+# the unwrapped binary is not reachable by name or by absolute path.
+RUN curl -fsSL -o /usr/local/lib/yq-real "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+    && echo "${YQ_SHA256}  /usr/local/lib/yq-real" | sha256sum -c - \
+    && chmod 0755 /usr/local/lib/yq-real \
+    && printf '%s\n' '#!/bin/sh' \
+       'exec /usr/local/lib/yq-real --security-disable-file-ops --security-disable-env-ops "$@"' \
+       > /usr/local/bin/yq \
+    && chmod 0755 /usr/local/bin/yq
 
 # User & group setup (dual-user isolation) — single layer
 # node:22-slim has UID 1000 (node user) — remove it first to avoid conflicts
@@ -70,6 +98,11 @@ COPY skills/core/ ./skills/core/
 COPY skills/extension/ ./skills/extension/
 COPY skills/platform/ ./skills/platform/
 COPY docker/agentbox-entrypoint.sh /usr/local/bin/agentbox-entrypoint.sh
+
+# Fail the build if a command this image advertises is not actually here — see the script. Runs
+# after dist/ so it can derive the list from the same table the validator uses.
+COPY docker/agentbox-capability-check.sh /usr/local/bin/agentbox-capability-check.sh
+RUN chmod +x /usr/local/bin/agentbox-capability-check.sh && /usr/local/bin/agentbox-capability-check.sh
 # Deployment-specific extra command whitelist (additive-only; loaded at agent
 # startup — docs/design/2026-06-10-extra-command-whitelist.md). Replace the
 # file content before building to whitelist site-specific diagnostic binaries.

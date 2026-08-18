@@ -287,6 +287,14 @@ Container requires `CAP_SETUID` + `CAP_SETGID` capabilities (all others dropped)
 
 Application-level command validation (COMMAND_RULES, whitelist, shell operator blocking) is retained as defense-in-depth, not as primary credential protection.
 
+> ⚠️ **Not the deployed state.** `Dockerfile.agentbox` creates `sandbox` with `-G kubecred,hostcred`
+> (added in 2026-04 alongside the host-credential pipeline, where a setgid `ssh` reader was planned
+> but never built), and the entrypoint writes credentials `0640` group-readable. So child processes
+> can read them directly, the setgid `kubectl` grants nothing they lack, and the command validation
+> this ADR demotes to defense-in-depth is currently the only layer standing. See security.md §4.6 for
+> what restoring this requires — `kubectl` is covered by its setgid bit, but nothing is setgid
+> `hostcred`, so the readers have to be identified before the groups can be dropped.
+
 **Consequences**:
 - ✅ Credential files are OS-protected — no application-level bypass possible for file reads
 - ✅ Pipeline syntax preserved: `kubectl get pods | grep Error` works naturally

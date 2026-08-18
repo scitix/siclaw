@@ -12,6 +12,14 @@ import {
   MANAGED_BY_SICLAW,
   DEBUG_POD_RESOURCE_LIMITS,
   DEBUG_JOB_FINISHED_TTL_SECONDS,
+  classifyStartupFailure,
+  DebugPodStartupError,
+  rememberStartupFailure,
+  lookupStartupFailure,
+  forgetStartupFailure,
+  resetStartupFailureMemo,
+  startupFailureMemoSize,
+  startupFailureKey,
 } from "./debug-pod.js";
 
 describe("buildDebugJobManifest — self-cleaning Job", () => {
@@ -269,5 +277,143 @@ describe("DebugPodCache — getOrCreate failure paths", () => {
     const r2 = await p2;
     // After first caller fails to set, second caller gets fresh creator slot
     expect(r2.pod?.podName).toBe("pod-late");
+  });
+});
+
+describe("classifyStartupFailure", () => {
+  it("separates the stages an agent would act on differently", () => {
+    // One sentence for all of these is what made every failure look like the same problem, and
+    // made retrying the only available response.
+    expect(classifyStartupFailure('Pod "p" cannot start: Unschedulable — no node can run the pod'))
+      .toEqual({ stage: "schedule", reason: "unschedulable" });
+    expect(classifyStartupFailure("ImagePullBackOff — manifest unknown"))
+      .toEqual({ stage: "startup", reason: "image_pull_failed" });
+    expect(classifyStartupFailure("CreateContainerConfigError"))
+      .toEqual({ stage: "startup", reason: "container_config_error" });
+    // Two timeouts, two stages: a pod that never appeared is a scheduling-side fact, while a pod
+    // that exists and never reached Running failed during startup. Both used to say "schedule".
+    expect(classifyStartupFailure('Timed out waiting for pod "p" to complete'))
+      .toEqual({ stage: "startup", reason: "startup_timeout" });
+    expect(classifyStartupFailure("Debug Job pod (id abcd) did not appear within 60s"))
+      .toEqual({ stage: "schedule", reason: "pod_never_appeared" });
+    expect(classifyStartupFailure('pods "x" is forbidden: admission webhook denied the request'))
+      .toEqual({ stage: "create", reason: "rejected_by_apiserver" });
+    expect(classifyStartupFailure('Debug pod "p" reached terminal phase=Failed before it was Running.'))
+      .toEqual({ stage: "startup", reason: "pod_terminated_during_startup" });
+  });
+
+  it("says unknown rather than guessing", () => {
+    expect(classifyStartupFailure("connection reset by peer")).toEqual({ stage: "unknown", reason: "unknown" });
+  });
+});
+
+describe("DebugPodStartupError", () => {
+  it("carries the stage, reason and node so a caller need not parse prose", () => {
+    const err = new DebugPodStartupError("boom", "schedule", "unschedulable", "node-1");
+    expect(err).toBeInstanceOf(Error);
+    expect({ stage: err.stage, reason: err.reason, nodeName: err.nodeName, cached: err.cached })
+      .toEqual({ stage: "schedule", reason: "unschedulable", nodeName: "node-1", cached: false });
+  });
+});
+
+describe("startup-failure memo", () => {
+  const key = "u|default|node-1";
+  const failure = () => new DebugPodStartupError("Unschedulable — taints", "schedule", "unschedulable", "node-1");
+
+  beforeEach(() => { resetStartupFailureMemo(); vi.useRealTimers(); });
+  afterEach(() => { resetStartupFailureMemo(); vi.useRealTimers(); });
+
+  it("replays the original detail instead of attempting again", () => {
+    rememberStartupFailure(key, failure());
+    const replay = lookupStartupFailure(key);
+    expect(replay).not.toBeNull();
+    // The reason survives verbatim — a fast refusal is only useful if it still says why.
+    expect(replay!.reason).toBe("unschedulable");
+    expect(replay!.stage).toBe("schedule");
+    expect(replay!.message).toContain("Unschedulable — taints");
+    // And it admits it is a replay, so the answer is not read as a fresh probe of the node.
+    expect(replay!.cached).toBe(true);
+    expect(replay!.message).toMatch(/not retried/);
+  });
+
+  it("keys by node, so one bad node does not refuse the others", () => {
+    rememberStartupFailure(key, failure());
+    expect(lookupStartupFailure("u|default|node-2")).toBeNull();
+    expect(lookupStartupFailure("other-user|default|node-1")).toBeNull();
+    expect(lookupStartupFailure("u|other-cluster|node-1")).toBeNull();
+  });
+
+  it("ages out — a node that has since been fixed must not stay refused", () => {
+    vi.useFakeTimers();
+    rememberStartupFailure(key, failure());
+    vi.advanceTimersByTime(59_000);
+    expect(lookupStartupFailure(key)).not.toBeNull();
+    vi.advanceTimersByTime(2_000);
+    expect(lookupStartupFailure(key)).toBeNull();
+    // Dropped on read, so the next attempt is not refused for the same stale reason.
+    expect(lookupStartupFailure(key)).toBeNull();
+  });
+
+  it("is cleared when the node does start", () => {
+    rememberStartupFailure(key, failure());
+    forgetStartupFailure(key);
+    expect(lookupStartupFailure(key)).toBeNull();
+  });
+
+  it("keys on the identity that decides whether a pod can start", () => {
+    // user + cluster + node + IMAGE. The image belongs in the key because image_pull_failed is a
+    // property of the image; without it, a corrected image inherits the bad one's refusal.
+    expect(startupFailureKey({ userId: "u", nodeName: "node-1", command: [], clusterKey: "c1", image: "img:1" } as any))
+      .toBe("u|c1|node-1|img:1");
+    // No clusterKey means the default cluster, not a separate bucket per call.
+    expect(startupFailureKey({ userId: "u", nodeName: "node-1", command: [], image: "img:1" } as any))
+      .toBe("u|default|node-1|img:1");
+    // A different image is a different key.
+    expect(startupFailureKey({ userId: "u", nodeName: "node-1", command: [], clusterKey: "c1", image: "img:2" } as any))
+      .not.toBe(startupFailureKey({ userId: "u", nodeName: "node-1", command: [], clusterKey: "c1", image: "img:1" } as any));
+  });
+});
+
+describe("startup-failure memo: what is remembered, and keyed by what", () => {
+  beforeEach(() => resetStartupFailureMemo());
+
+  const spec = (over: Record<string, unknown> = {}) =>
+    ({ userId: "u1", clusterKey: "c1", nodeName: "n1", command: "true", ...over }) as any;
+  const failure = (reason: string, stage = "startup") =>
+    new DebugPodStartupError(`failed: ${reason}`, stage as any, reason, "n1");
+
+  it("does not remember a reason that may not still be true in a minute", () => {
+    // An unclassified error can be transient, and an admission/RBAC refusal is a property of the
+    // cluster or of our request — not of the node. Remembering either refuses a healthy node.
+    for (const reason of ["unknown", "rejected_by_apiserver", "no_pod_created"]) {
+      rememberStartupFailure(startupFailureKey(spec()), failure(reason));
+      expect(lookupStartupFailure(startupFailureKey(spec()))).toBeNull();
+    }
+  });
+
+  it("remembers the node-scoped reasons", () => {
+    for (const reason of ["unschedulable", "image_pull_failed", "container_config_error",
+      "startup_timeout", "pod_never_appeared", "pod_terminated_during_startup"]) {
+      resetStartupFailureMemo();
+      rememberStartupFailure(startupFailureKey(spec()), failure(reason));
+      expect(lookupStartupFailure(startupFailureKey(spec()))?.reason).toBe(reason);
+    }
+  });
+
+  it("keys on the image, so a corrected image is not refused by the previous one's failure", () => {
+    // image_pull_failed is a property of the IMAGE. Keying only on the node made a fixed image wait
+    // out the window before it could be tried.
+    rememberStartupFailure(startupFailureKey(spec({ image: "bad:tag" })), failure("image_pull_failed"));
+    expect(lookupStartupFailure(startupFailureKey(spec({ image: "bad:tag" })))).not.toBeNull();
+    expect(lookupStartupFailure(startupFailureKey(spec({ image: "good:tag" })))).toBeNull();
+  });
+
+  it("bounds the map instead of growing once per node forever", () => {
+    for (let i = 0; i < 400; i++) {
+      rememberStartupFailure(startupFailureKey(spec({ nodeName: `n${i}` })), failure("unschedulable"));
+    }
+    expect(startupFailureMemoSize()).toBeLessThanOrEqual(256);
+    // The most recent entry survives the eviction.
+    expect(lookupStartupFailure(startupFailureKey(spec({ nodeName: "n399" })))).not.toBeNull();
   });
 });

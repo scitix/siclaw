@@ -1,6 +1,10 @@
 /**
  * Shared resolution of a Kubernetes pod → its network-namespace name, used by both transports:
  *   - kubectl: a privileged debug pod on the node runs `nsenter -t 1 … crictl …`.
+ *
+ * Neither transport may depend on host-side JSON tooling: both land in the node's namespaces,
+ * where the available binaries are whatever the customer installed. The node returns raw crictl
+ * JSON and the AgentBox parses it.
  *   - ssh: the command runs directly on the node (SSH already lands in the host namespaces),
  *     so NO `nsenter` is needed — just the crictl script.
  *
@@ -42,18 +46,71 @@ function validatePodTarget(pod: string, namespace: string, container?: string): 
 }
 
 /**
- * Shell snippet that prints the pod sandbox's network-namespace basename to stdout (or an error
- * to stderr + non-zero exit). `pod`/`namespace` MUST already be RFC-1123 validated (via
+ * Shell snippet that prints the pod sandbox's RAW `crictl inspectp` JSON to stdout (or an error to
+ * stderr + non-zero exit). `pod`/`namespace` MUST already be RFC-1123 validated (via
  * validatePodTarget) — they are interpolated inside double quotes here.
+ *
+ * The script deliberately does NO JSON processing. It used to pipe through `jq`, but these
+ * commands run in the NODE's mount namespace (`nsenter -m`, or a plain SSH session), so `jq` is
+ * whatever the customer installed on that host — and on a node without it this tool's own
+ * one-step `pod=` capability failed before the user's command ever ran. crictl is required
+ * anyway; the parsing belongs where we control the runtime, so it happens in the AgentBox (see
+ * extractNetnsFromInspect). `-o go-template` would also avoid jq, but its field paths differ
+ * across crictl/runtime versions, whereas the JSON shape is the CRI response itself.
+ *
+ * `-o json` is passed EXPLICITLY rather than relying on crictl's default: the default is
+ * configurable (`CRICTL_OUTPUT`, or `output:` in /etc/crictl.yaml), and a node set to `yaml` would
+ * fail `pod=` before the user's command ran — the same host-dependency class as the `jq` pipe this
+ * replaced, just moved into the node's configuration.
  */
 export function buildCrictlNetnsScript(pod: string, namespace: string): string {
   return [
     `SANDBOX_ID=$(crictl pods --name "^${pod}$" --namespace "${namespace}" -q 2>/dev/null | head -1)`,
     `if [ -z "$SANDBOX_ID" ]; then echo "Error: cannot find sandbox for pod ${pod} in namespace ${namespace} on this node" >&2; exit 1; fi`,
-    `NETNS_PATH=$(crictl inspectp "$SANDBOX_ID" 2>/dev/null | jq -r '.info.runtimeSpec.linux.namespaces[] | select(.type=="network") | .path')`,
-    `if [ -z "$NETNS_PATH" ]; then echo "Error: cannot find network namespace for sandbox $SANDBOX_ID" >&2; exit 1; fi`,
-    `basename "$NETNS_PATH"`,
+    `crictl inspectp -o json "$SANDBOX_ID"`,
   ].join("\n");
+}
+
+/** One namespace entry of a CRI runtime spec. */
+interface RuntimeNamespace { type?: unknown; path?: unknown }
+
+/**
+ * Pull the network namespace name out of `crictl inspectp` JSON.
+ *
+ * `info` is a map for containerd and CRI-O, but some crictl versions emit it as a JSON STRING,
+ * so it is parsed again when that is what arrives. A pod on the host network has a namespaces
+ * entry with no path (or none at all) — that is reported as its own error rather than an empty
+ * name, because `ip netns exec ""` would otherwise be attempted downstream.
+ */
+export function extractNetnsFromInspect(stdout: string): { netns: string } | { error: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return { error: "Could not parse crictl inspectp output as JSON while resolving the pod network namespace." };
+  }
+  let info = (parsed as { info?: unknown } | null)?.info;
+  if (typeof info === "string") {
+    try {
+      info = JSON.parse(info);
+    } catch {
+      return { error: "crictl inspectp returned an unreadable `info` section while resolving the pod network namespace." };
+    }
+  }
+  const namespaces = (info as { runtimeSpec?: { linux?: { namespaces?: unknown } } } | null)
+    ?.runtimeSpec?.linux?.namespaces;
+  if (!Array.isArray(namespaces)) {
+    return { error: "crictl inspectp output has no runtimeSpec.linux.namespaces; cannot resolve the pod network namespace." };
+  }
+  const network = (namespaces as RuntimeNamespace[]).find((ns) => ns?.type === "network");
+  const path = typeof network?.path === "string" ? network.path : "";
+  if (!path) {
+    return {
+      error: "This pod has no dedicated network namespace (it likely uses the host network). "
+        + "Run the command directly on the node instead of with `pod=`.",
+    };
+  }
+  return checkResolvedNetns(path.slice(path.lastIndexOf("/") + 1));
 }
 
 function checkResolvedNetns(netns: string): { netns: string } | { error: string } {
@@ -95,7 +152,7 @@ export async function resolvePodNetnsViaKubectl(opts: {
   if (execResult.exitCode !== 0) {
     return { error: execResult.stderr.trim() || "Failed to resolve network namespace" };
   }
-  const checked = checkResolvedNetns(execResult.stdout.trim());
+  const checked = extractNetnsFromInspect(execResult.stdout);
   if ("error" in checked) return checked;
   return { node: resolved.nodeName, netns: checked.netns };
 }
@@ -128,5 +185,5 @@ export async function resolvePodNetnsViaSsh(opts: {
       : "";
     return { error: (stderr || "Failed to resolve network namespace") + hint };
   }
-  return checkResolvedNetns(result.stdout.trim());
+  return extractNetnsFromInspect(result.stdout);
 }

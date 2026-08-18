@@ -589,28 +589,135 @@ function validateDcgmi(args: string[]): string | null {
 
 const NVIDIA_SMI_SAFE_FLAGS = new Set([
   "-q", "--query", "-L", "--list-gpus", "-i",
+  // Display-section FILTER for -q (MEMORY, UTILIZATION, TEMPERATURE, POWER, ECC, CLOCK, PIDS, …).
+  // Read-only: the setters live under different flags (-e/--ecc-config writes ECC, -dm the driver
+  // model, -pl the power limit) and stay blocked because matching is exact-token — extractFlag
+  // only splits on "=", so "-d" never widens to "-dm".
+  "-d", "--display",
 ]);
 const NVIDIA_SMI_SAFE_PREFIXES = [
   "--query-gpu=", "--query-compute-apps=", "--id=", "--format=",
-  "-i=",
+  "-i=", "--display=",
 ];
-const NVIDIA_SMI_SUBCMDS = new Set(["topo", "nvlink"]);
+
+/**
+ * Read-only flags PER SUBCOMMAND.
+ *
+ * Seeing a subcommand used to return null, which accepted the whole invocation and stopped
+ * checking the rest of the argv — so `nvidia-smi nvlink --setcontrol …` and `nvidia-smi nvlink -r`
+ * passed a validator whose own error message promises "only read-only queries". Subcommands carry
+ * their own writes, so each gets its own allowlist (the shape validateDcgmi already uses).
+ */
+/**
+ * Read-only option sets for the nvidia-smi subcommands that have their own, taken from NVIDIA's
+ * documented option lists rather than from what happened to be needed:
+ * https://docs.nvidia.com/deploy/nvidia-smi/index.html
+ *
+ * Every documented `topo` option is a query, so the set is complete rather than minimal. For
+ * `nvlink` the documented queries are listed and the counter-control and counter-reset options are
+ * left out — `-sc/--setcontrol` and `-r/--resetcounters` WRITE counter state.
+ *
+ * These are allowlists, so an option the docs do not show (NVIDIA's page truncates the `nvlink`
+ * list) fails closed: the command is refused, never silently widened.
+ */
+const NVIDIA_SMI_SUBCMD_FLAGS = new Map<string, Set<string>>(Object.entries({
+  topo: new Set([
+    "-m", "--matrix", "-mp", "-p", "--path", "-i", "-c", "-n", "--nvlink",
+    "-p2p", "-C", "-M", "-gnid", "-nvme", "-cpu", "--cpu", "-gpu", "-nic", "-all", "-h",
+  ]),
+  nvlink: new Set([
+    "-s", "--status", "-c", "--capabilities", "-i", "--id", "-l", "--list",
+    "-e", "--errorcounters", "-p", "-pcibusid", "-R", "-remotelinkinfo",
+    "-gt", "--getthroughput", "-h",
+  ]),
+}));
+
+/**
+ * mikefarah yq screens its EXPRESSION, not just its argv.
+ *
+ * The expression language opens files and reads the environment on its own: `load`, `load_str`,
+ * `strload`, `load_xml`, `load_props` and `load_base64` each take a path, and `env` / `strenv` /
+ * `envsubst` reach the environment. None of that is visible to a flag or operand check —
+ * `yq 'load_str(env(SICLAW_CREDENTIALS_DIR) + "/clusters/default.kubeconfig")'` is a single
+ * quoted argument with no path in it.
+ *
+ * `eval` is rejected for the same reason, and rejecting it is what makes screening the literal
+ * text sound: it compiles a STRING as an expression, so `eval("lo" + "ad_str(\"/x\")")` rebuilds a
+ * blocked operator from fragments no token scan can match. Without `eval`, concatenating an
+ * operator name is a yq parse error, so the operator has to appear literally to run at all.
+ *
+ * Key ACCESS is deliberately untouched: an operator call always carries `(`, while
+ * `.spec.containers[].env` — the most common k8s query there is — never does.
+ */
+const YQ_BLOCKED_OPERATORS: readonly { pattern: RegExp; what: string }[] = [
+  { pattern: /(?<![.\w-])(?:str)?load\w*\s*\(/i, what: "a file operator (load / load_str / strload / load_xml / load_props / load_base64)" },
+  { pattern: /(?<![.\w-])(?:str)?env\w*\s*\(/i, what: "an environment operator (env / strenv)" },
+  { pattern: /(?<![.\w-])envsubst/i, what: "the envsubst operator" },
+  { pattern: /(?<![.\w-])eval\s*\(/i, what: "the eval operator, which can reconstruct any blocked operator from string fragments" },
+  { pattern: /(?<![.\w-])system\s*\(/i, what: "the system operator" },
+];
+
+const YQ_ALLOWED_FLAGS = [
+  "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
+  "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
+  "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
+  "--xml-attribute-prefix", "--xml-content-name",
+  "--unwrapScalar", "--nul-output", "--header-preprocess",
+  // NOTE: -s/--split-exp intentionally excluded — mikefarah yq's --split-exp writes each
+  // document to a separate FILE (write capability); output must stay on stdout.
+];
+
+/**
+ * validate() takes full responsibility for a command, so the flag whitelist is applied here
+ * explicitly rather than declaratively — the two are mutually exclusive by design.
+ */
+function validateYq(args: string[]): string | null {
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg.startsWith("-")) continue;
+    for (const { pattern, what } of YQ_BLOCKED_OPERATORS) {
+      if (pattern.test(arg)) {
+        return JSON.stringify({
+          error: `yq expression uses ${what}. These read files and the environment from inside the expression, independent of the arguments, so they are not permitted. Query the piped document instead, and use the dedicated file tools to read a file.`,
+        }, null, 2);
+      }
+    }
+  }
+  return validateByRule(args, { command: "yq", allowedFlags: YQ_ALLOWED_FLAGS });
+}
 
 function validateNvidiaSmi(args: string[]): string | null {
   if (args.length <= 1) return null;
 
+  // nvidia-smi takes its subcommand FIRST, so an unrecognised leading word is a subcommand we do
+  // not permit — not a stray operand to be skipped. `nvidia-smi daemon` starts a root background
+  // daemon and used to be accepted, because the argv walk below only ever inspected flags. Later
+  // positionals stay unchecked on purpose: they are flag values, and every mutating nvidia-smi
+  // operation is either a flag or a leading subcommand.
+  if (!args[1].startsWith("-") && !NVIDIA_SMI_SUBCMD_FLAGS.has(args[1])) {
+    return JSON.stringify({
+      error: `nvidia-smi "${args[1]}" is not an allowed subcommand. Only read-only queries and the ${[...NVIDIA_SMI_SUBCMD_FLAGS.keys()].sort().join(" / ")} subcommands are permitted.`,
+    }, null, 2);
+  }
+
+  // A subcommand switches the whole invocation to that subcommand's flag set. Looked up in a
+  // Map, not an object: `"constructor" in obj` is true through the prototype chain, and the
+  // Function it returns has no .has — a caller could throw the validator by typing that word.
+  const subcmd = args.slice(1).find((a) => !a.startsWith("-") && NVIDIA_SMI_SUBCMD_FLAGS.has(a));
+  const allowed = (subcmd && NVIDIA_SMI_SUBCMD_FLAGS.get(subcmd)) || NVIDIA_SMI_SAFE_FLAGS;
+
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (!arg.startsWith("-")) {
-      if (NVIDIA_SMI_SUBCMDS.has(arg)) return null;
-      continue;
-    }
+    if (!arg.startsWith("-")) continue;
     const flag = extractFlag(arg);
-    if (!NVIDIA_SMI_SAFE_FLAGS.has(flag) && !startsWithAny(arg, NVIDIA_SMI_SAFE_PREFIXES)) {
-      return JSON.stringify({
-        error: `nvidia-smi "${arg}" is not allowed. Only read-only nvidia-smi queries are permitted.`,
-      }, null, 2);
-    }
+    if (allowed.has(flag)) continue;
+    if (!subcmd && startsWithAny(arg, NVIDIA_SMI_SAFE_PREFIXES)) continue;
+    return JSON.stringify({
+      error: subcmd
+        ? `nvidia-smi ${subcmd} "${arg}" is not allowed. Only read-only ${subcmd} queries are permitted.`
+        : `nvidia-smi "${arg}" is not allowed. Only read-only nvidia-smi queries are permitted.`,
+      ...(subcmd && { allowed: [...allowed].sort() }),
+    }, null, 2);
   }
   return null;
 }
@@ -803,6 +910,93 @@ function validateTee(args: string[]): string | null {
   return null;
 }
 
+// ── Stdin-only text commands: file operands ──────────────────────
+
+/**
+ * Args of a stdin-only text command that are NOT file operands, and may therefore legitimately
+ * carry shell metacharacters: the grep pattern, the jq/yq expression, tr's two SETs.
+ *
+ * `valueFlags` keeps a flag's value from being counted as the expression (`grep -m 5 PATTERN` —
+ * `5` is not the pattern) and lists only flags whose value is NOT a path; a file-taking flag such
+ * as `grep -f` or `jq --rawfile` is left out on purpose so its value is screened like any other
+ * file operand. `patternFlags` supply the pattern themselves, so once one appears there is no
+ * expression left among the positionals and every one of them is a FILE.
+ */
+interface TextExpressionArgs {
+  /** Leading positionals that are an expression, not a file: the grep pattern, jq/yq filter, tr SETs. */
+  positionals: number;
+  /** Flags that supply the expression themselves; their value is a pattern, and no positional is left. */
+  patternFlags?: readonly string[];
+  /**
+   * Flags whose value names a file to READ. In a stdin-only context the flag IS the file read, so it
+   * is refused outright rather than screened. Per command, because the same letter differs: `grep -f`
+   * is a pattern file, `cut -f` is a field list, `sort -f` is --ignore-case.
+   */
+  fileFlags?: readonly string[];
+}
+
+const GREP_EXPRESSION_ARGS: TextExpressionArgs = {
+  positionals: 1,
+  patternFlags: ["-e", "--regexp"],
+  fileFlags: ["-f", "--file"],
+};
+
+// Keyed by a Map, not a plain object: both the command name and the flag come from the caller, and
+// `obj["constructor"]` resolves through the prototype chain to something that is not a rule.
+const TEXT_EXPRESSION_ARGS = new Map<string, TextExpressionArgs>([
+  ["grep", GREP_EXPRESSION_ARGS],
+  ["egrep", GREP_EXPRESSION_ARGS],
+  ["fgrep", GREP_EXPRESSION_ARGS],
+  ["jq", { positionals: 1, fileFlags: ["-f", "--from-file", "--rawfile", "--slurpfile"] }],
+  ["yq", { positionals: 1, fileFlags: ["--from-file"] }],
+  ["wc", { positionals: 0, fileFlags: ["--files0-from"] }],
+  ["sort", { positionals: 0, fileFlags: ["--files0-from"] }],
+  ["tr", { positionals: 2 }],
+]);
+
+/**
+ * A stdin-only text command may not name a path, and the check has to hold BEFORE the shell
+ * expands anything.
+ *
+ * The literal-prefix rule (`/`, `./`, `../`, `~`) and the sensitive-path patterns both match text,
+ * so every form of expansion defeats them. The credentials sit INSIDE the workdir — `WORKDIR /app`,
+ * credentials at `/app/.siclaw/credentials/` — which is what makes this reachable without ever
+ * spelling a credential path:
+ *
+ *     printf x | head .siclaw/*\/*\/*                    ← glob, no literal, no leading /
+ *     printf x | column .sic*\/credentials/clusters/*     ← partial component
+ *     printf x | head .siclaw/{credentials,x}/clusters/*  ← brace expansion
+ *     printf x | column "$SICLAW_CREDENTIALS_DIR"/clusters/*
+ *
+ * So the rule is not "reject things that look expanded" but: **a file operand may not contain a
+ * path separator or any construct the shell rewrites.** Reaching a credential from the workdir
+ * requires at least one `/` (the tree is two levels down, and nothing in the whitelist can create a
+ * symlink or change directory), which is what makes screening for `/` plus the expansion
+ * metacharacters sufficient rather than a guess about which shapes are dangerous.
+ *
+ * An earlier revision of this rule allowed globs, reasoning that `*` cannot match `..` and so cannot
+ * climb out of the workdir. That is true and irrelevant: the credentials are BELOW the workdir, not
+ * above it. The exception is gone — the payloads above are regression tests.
+ *
+ * Values of flags are screened the same way, since `--file=$SICLAW_CREDENTIALS_DIR/x` hides the
+ * operand inside a token that starts with `-`. Expression values are exempt: a grep pattern
+ * legitimately contains `$`, `[` and `/`.
+ *
+ * Scope note: this is defense in depth, not the boundary. The same payloads work on `sort`, `cut`,
+ * `head`, `tail` and `grep`, which have shipped in the image all along, and the documented boundary
+ * for credentials is filesystem permissions — see security.md §4.6 for why that boundary is not
+ * currently where ADR-010 says it is.
+ */
+const TEXT_OPERAND_FORBIDDEN = /[/*?[\]{}~`]|\$/;
+
+function rejectPathishOperand(baseName: string, arg: string, what: string): string | null {
+  const bare = arg.replace(/["']/g, "");
+  if (!TEXT_OPERAND_FORBIDDEN.test(bare)) return null;
+  return JSON.stringify({
+    error: `${baseName} ${what} "${arg}" names a path, or contains a glob or expansion that the shell would turn into one. ${baseName} may only process piped input — use the dedicated file tools to read a file.`,
+  }, null, 2);
+}
+
 // ── Entry point ──────────────────────────────────────────────────
 
 /**
@@ -829,15 +1023,49 @@ function applyContextPolicy(
         error: `"${baseName}" can only be used after a pipe (|). Direct file reading is not allowed — use the dedicated file tools instead.`,
       }, null, 2);
     }
-    // noFilePaths (implicit): block positional args that look like paths
+    // noFilePaths (implicit): no operand, and no flag value, may name a path.
+    const spec = TEXT_EXPRESSION_ARGS.get(baseName);
+    let expressionsLeft = spec?.positionals ?? 0;
+    let expressionValueFollows = false;
     for (let i = 1; i < args.length; i++) {
       const arg = args[i];
-      if (arg.startsWith("-")) continue;
-      if (arg !== "" && (arg.startsWith("/") || arg.startsWith("./") || arg.startsWith("../") || arg.startsWith("~"))) {
-        return JSON.stringify({
-          error: `${baseName} cannot take file path arguments — it should only process piped input. Use the dedicated file tools instead.`,
-        }, null, 2);
+
+      // The value of a pattern-supplying flag is an expression, not a path — `grep -e 'foo$bar'`
+      // and `grep -e '/var/log/pods'` are ordinary regexes and must not be screened as operands.
+      if (expressionValueFollows) { expressionValueFollows = false; continue; }
+
+      // `-` means stdin, which is the only input these commands are supposed to have.
+      if (arg === "-") continue;
+
+      if (arg.startsWith("-")) {
+        const flag = extractFlag(arg);
+        const inlineValue = arg.length > flag.length ? arg.slice(flag.length).replace(/^=/, "") : "";
+
+        if (spec?.fileFlags?.includes(flag)) {
+          return JSON.stringify({
+            error: `${baseName} "${flag}" reads a file, which is not allowed here — ${baseName} may only process piped input. Use the dedicated file tools to read a file.`,
+          }, null, 2);
+        }
+
+        if (spec?.patternFlags?.includes(flag)) {
+          // The pattern came from the flag, so no positional is the expression any more.
+          expressionsLeft = 0;
+          if (!inlineValue) expressionValueFollows = true;
+          continue;
+        }
+
+        // Any other flag's value is screened like an operand: `--file=$DIR/x` hides a path inside a
+        // token that starts with `-`, which an operand-only check never looks at.
+        if (inlineValue) {
+          const err = rejectPathishOperand(baseName, inlineValue, `flag value for "${flag}"`);
+          if (err) return err;
+        }
+        continue;
       }
+
+      if (expressionsLeft > 0) { expressionsLeft--; continue; }
+      const err = rejectPathishOperand(baseName, arg, "file operand");
+      if (err) return err;
     }
   }
 
@@ -1099,15 +1327,9 @@ export const COMMANDS: Record<string, CommandDef> = {
   jq:     { category: "text" },
   tac:    { category: "text" }, // reverse-cat — read-only
   nl:     { category: "text" }, // number lines — read-only
-  yq:     { category: "text", allowedFlags: [
-    "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
-    "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
-    "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
-    "--xml-attribute-prefix", "--xml-content-name",
-    "--unwrapScalar", "--nul-output", "--header-preprocess",
-    // NOTE: -s/--split-exp intentionally excluded — mikefarah yq's --split-exp writes each
-    // document to a separate FILE (write capability); output must stay on stdout.
-  ] },
+  // validateYq screens the EXPRESSION — yq's file and env operators need no flag and no path
+  // argument — and applies YQ_ALLOWED_FLAGS itself, since validate() takes full responsibility.
+  yq:     { category: "text", validate: validateYq },
   column: { category: "text" },
 
   // ── network diagnostics ──
@@ -1403,6 +1625,30 @@ const CONTEXT_POLICIES: Record<string, ContextPolicy> = {
   pod:  { available: ALL_COMMAND_CATEGORIES },
   host: { available: ALL_COMMAND_CATEGORIES },
 };
+
+/**
+ * Commands the AgentBox IMAGE must actually provide.
+ *
+ * This is the one execution context whose binaries we control, so here — and only here — the
+ * whitelist can be an availability promise rather than an admission policy. node_exec resolves
+ * binaries in the node's namespaces and pod_exec inside the target container, so no image of ours
+ * can make a guarantee for them.
+ *
+ * Scoped to what restricted-bash ADVERTISES: the text-processing category plus kubectl. The
+ * `local` context permits ~128 commands because it shares the category table with the node tools,
+ * and requiring `nvidia-smi`, `crictl` or `ib_write_bw` in this image would be meaningless — those
+ * are permitted there only because the table is shared, and nothing tells the agent they exist.
+ *
+ * Consumed by docker/agentbox-capability-check.sh, which fails the build on a missing entry: `yq`
+ * and `column` were whitelisted and advertised for a long time while no image ever shipped them,
+ * and the only symptom was exit 127 at runtime.
+ */
+export function agentboxRequiredCommands(): string[] {
+  const text = Object.entries(COMMANDS)
+    .filter(([, def]) => def.category === "text")
+    .map(([cmd]) => cmd);
+  return [...text, "kubectl"].sort();
+}
 
 // ── Context-based allowed command set ──────────────────────────
 
