@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   extractKnowledgePackageToDir,
   OKF_CITATION_SIDECAR,
+  SERVER_CITATION_MANIFEST,
   validateKnowledgePackage,
 } from "./knowledge-package.js";
 
@@ -31,6 +32,18 @@ describe("validateKnowledgePackage", () => {
     ]);
 
     expect(() => validateKnowledgePackage(buf)).toThrow("Path traversal");
+  });
+
+  it.each([
+    ["symlink", "2"],
+    ["hardlink", "1"],
+  ])("rejects %s entries", (_label, type) => {
+    const buf = makeTarGz([
+      { name: "index.md", content: "# Index\n" },
+      { name: "outside.md", type, content: "ignored\n" },
+    ]);
+
+    expect(() => validateKnowledgePackage(buf)).toThrow("Unsupported tar entry type");
   });
 
   it("rejects packages without a root index", () => {
@@ -63,17 +76,27 @@ describe("validateKnowledgePackage", () => {
     expect(() => validateKnowledgePackage(buf)).toThrow("Path traversal");
   });
 
-  it("does not materialize uploader-supplied citation metadata", async () => {
+  it("does not materialize uploader-supplied citation metadata at any depth", async () => {
     const buf = makeTarGz([
       { name: "index.md", content: "# Index\n" },
       { name: OKF_CITATION_SIDECAR, content: JSON.stringify({ sources: [{ url: "https://docs.feishu.cn/wiki/input" }] }) },
+      { name: `nested/${OKF_CITATION_SIDECAR}`, content: "{}" },
+      { name: SERVER_CITATION_MANIFEST, content: "{}" },
+      { name: `nested/deeper/${SERVER_CITATION_MANIFEST}`, content: "{}" },
     ]);
     const target = await fs.mkdtemp(path.join(os.tmpdir(), "siclaw-knowledge-test-"));
+    const previousTarOptions = process.env.TAR_OPTIONS;
     try {
+      process.env.TAR_OPTIONS = "--anchored";
       await extractKnowledgePackageToDir(buf, target);
       await expect(fs.readFile(path.join(target, "index.md"), "utf8")).resolves.toContain("# Index");
       await expect(fs.stat(path.join(target, OKF_CITATION_SIDECAR))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(target, "nested", OKF_CITATION_SIDECAR))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(target, SERVER_CITATION_MANIFEST))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(target, "nested", "deeper", SERVER_CITATION_MANIFEST))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
+      if (previousTarOptions === undefined) delete process.env.TAR_OPTIONS;
+      else process.env.TAR_OPTIONS = previousTarOptions;
       await fs.rm(target, { recursive: true, force: true });
     }
   });
