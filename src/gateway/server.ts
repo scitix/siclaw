@@ -1232,6 +1232,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             instruction: instruction ?? "",
             allowed_tools: allowedTools,
             locale: materialized.locale,
+            // Enables KBC's per-batch durability barrier. Mixed-version safe:
+            // an older box ignores the field, while a newer box only waits for
+            // ACKs when a runtime explicitly advertises this support.
+            artifact_ack: true,
             // Whole-block authority: consumer LLM config wins as-is; only an
             // absent block uses Runtime's Helm env. The box applies it before
             // its SDK connects. Never logged here; token stays out of PodSpec.

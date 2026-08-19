@@ -96,6 +96,39 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     });
   });
 
+  it("ACKs a sealed checkpoint only after the consumer transaction commits", async () => {
+    const order: string[] = [];
+    const fe = fakeFrontend();
+    fe.request = vi.fn().mockImplementation(async (method: string) => {
+      if (method === CAPABILITY_PERSIST_ARTIFACTS) order.push("persist");
+      return { ok: true };
+    });
+    const client = {
+      async *streamPath() {
+        yield {
+          type: "syncArtifacts",
+          sync_id: "sync-1",
+          artifacts: [{ path: "candidate/a.md", content: "# A" }],
+        };
+      },
+      postJson: vi.fn().mockImplementation(async () => {
+        order.push("ack");
+        return { ok: true };
+      }),
+    } as any;
+    const mgr = fakeManager();
+    mgr.get.mockReturnValue({ runId: "r1", status: "running", inputRevision: "manifest-1" });
+
+    await driveCapabilitySession({ client, runId: "r1", frontendClient: fe, manager: mgr });
+
+    expect(order).toEqual(["persist", "ack"]);
+    expect(client.postJson).toHaveBeenCalledWith(
+      "/artifacts/ack/r1",
+      { sync_id: "sync-1" },
+      10_000,
+    );
+  });
+
   it("persists an explicit input commit even when no files changed", async () => {
     const fe = fakeFrontend();
     const mgr = fakeManager();

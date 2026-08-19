@@ -51,6 +51,11 @@ It is not a page per file and not a line-by-line code reference.
 10. **Checkpoints prove their identity.** Every persisted `BATCH_PLAN.json`
     carries a monotonically advancing revision, update time, and SHA-256 digest.
     Corruption pauses with `plan_integrity`; it never looks like an absent plan.
+11. **A batch boundary is a durability barrier.** Candidate bytes,
+    `BATCH_PLAN.json`, and `COMPILATION_STATE.json` enter the consumer in one
+    transaction. The orchestrator starts the next batch only after the consumer
+    acknowledges that transaction; browser, WebSocket, Runtime, and Box states
+    are not permission to continue or evidence that a batch landed.
 
 ## Phase access matrix
 
@@ -83,3 +88,5 @@ It is not a page per file and not a line-by-line code reference.
   variable. Actual per-batch usage and high-water context are stamped in the
   checkpoint for later tuning.
 - A persisted commit-phase checkpoint can finish with no new model session.
+- Killing the Runtime or Box after an acknowledged batch rehydrates the same
+  Candidate/task checkpoint and starts at the first unsealed batch.

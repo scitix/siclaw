@@ -3899,6 +3899,29 @@ async def test_batch_orchestrator_routing_and_resume():
         note = compile_box._drain_batch_notes(run)
         assert "注意保密条款" in note and compile_box._drain_batch_notes(run) == ""
         run._batch_active = False
+
+        # Explicit control reset: a corrupt plan is revoked, but Candidate and
+        # Raw remain. The trusted resume command rebuilds a plan in-place and
+        # consumes the reset marker instead of requiring a fresh generation.
+        (wd / batching.BATCH_PLAN_PATH).unlink()
+        reset_marker = wd / compile_box.RECOVERY_RESET_PATH
+        reset_marker.write_text(
+            '{"version":1,"reason":"explicit_control_reset","candidate_preserved":true}',
+            "utf-8",
+        )
+        compile_box._prepare_command(
+            run, {"action": "compile.resume", "parameters": {}})
+        driven.clear()
+        compile_box._drive_batch_session = fake_drive
+        compile_box._unaccounted_batch_sources = lambda run_, sources: []
+        try:
+            await compile_box._run_batch_compile(run, "ignored localized text")
+        finally:
+            compile_box._drive_batch_session = real_drive
+            compile_box._unaccounted_batch_sources = real_accounted
+        assert len(driven) == 3, driven
+        assert not reset_marker.exists(), "reset marker survived replacement-plan seal"
+        assert (wd / batching.BATCH_PLAN_PATH).is_file()
         del os.environ["KBC_BATCH_THRESHOLD_BYTES"]
         del os.environ["KBC_BATCH_BUDGET_BYTES"]
     print("\u2713 batch orchestrator: gate/stamps/single turn_done/resume/notes")
@@ -6255,6 +6278,57 @@ async def test_workspace_sync_invalidates_verification_before_cross_process_resu
     print("✓ workspace sync invalidates old verified before cross-process resume")
 
 
+async def test_durable_workspace_sync_waits_for_consumer_ack():
+    """A sealed batch is not complete until Sicore commits and ACKs it."""
+    compile_box.RUNS.clear()
+    with tempfile.TemporaryDirectory() as td:
+        candidate = Path(td) / "candidate"
+        authoring = Path(td) / "authoring"
+        candidate.mkdir()
+        authoring.mkdir()
+        (candidate / "index.md").write_text("# Index\n", "utf-8")
+        (candidate / "topic.md").write_text("# Topic\n", "utf-8")
+        (authoring / "BATCH_PLAN.json").write_text(
+            json.dumps({"phase": "map", "batches": [{"id": "b01", "status": "done"}]}),
+            "utf-8",
+        )
+        run = compile_box.CompileRun("ack-run", td, 1)
+        run._artifact_ack_required = True
+        compile_box.RUNS[run.run_id] = run
+        sent = {}
+
+        pending = asyncio.create_task(
+            compile_box._sync_workspace(run, sent, durable_barrier=True))
+        event = await asyncio.wait_for(run.events.get(), timeout=1)
+        run.events.task_done()
+        assert event["type"] == "syncArtifacts", event
+        sync_id = event.get("sync_id")
+        assert sync_id and not pending.done(), "batch advanced before durable ACK"
+        assert run._pending_sync_events[sync_id] == event
+
+        client = TestClient(TestServer(compile_box.build_app()))
+        await client.start_server()
+        try:
+            response = await client.post(
+                f"/artifacts/ack/{run.run_id}", json={"sync_id": sync_id})
+            assert response.status == 200, await response.text()
+            body = await response.json()
+            assert body["accepted"] is True, body
+            changed = await asyncio.wait_for(pending, timeout=1)
+            assert changed >= 3, changed
+            assert sent, "dedupe cursor advances only after ACK"
+
+            # Lost ACK responses are harmless: runtime retries idempotently.
+            response = await client.post(
+                f"/artifacts/ack/{run.run_id}", json={"sync_id": sync_id})
+            body = await response.json()
+            assert response.status == 200 and body["accepted"] is False, body
+        finally:
+            await client.close()
+            compile_box.RUNS.clear()
+    print("✓ durable workspace sync waits for atomic consumer ACK")
+
+
 async def test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust():
     """Unsafe YAML is a repair finding, not a retry poison or trust leak."""
     class ResultMessage:
@@ -6887,6 +6961,7 @@ async def main():
     await test_batch_rebuild_exhaustion_raises_resumable()
     test_batch_retry_preserves_first_attempt_page_baseline()
     await test_workspace_sync_invalidates_verification_before_cross_process_resume()
+    await test_durable_workspace_sync_waits_for_consumer_ack()
     await test_batch_stamp_blocker_is_repairable_without_syncing_stale_trust()
     await test_resumed_batch_phase_is_watchdog_armed()
     await test_run_wrapper_closes_turn_on_driver_crash()
