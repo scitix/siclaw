@@ -351,7 +351,12 @@ export class McpClientManager {
 
           return {
             content,
-            details: isError ? { error: text } : {},
+            details: {
+              ...(isError ? { error: text } : {}),
+              ...(result.structuredContent !== undefined
+                ? { structuredContent: result.structuredContent }
+                : {}),
+            },
           };
         } catch (err: any) {
           const errorMsg = err?.message ?? String(err);

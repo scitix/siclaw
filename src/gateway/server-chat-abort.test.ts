@@ -257,6 +257,11 @@ describe("startRuntime — chat.abort wiring", () => {
       ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
     ));
 
+    const promptDone = ctx.sendEvent.mock.calls.find(
+      ([channel, data]) => channel === "chat.event" && data?.event?.type === "prompt_done",
+    );
+    expect(promptDone?.[1]).toMatchObject({ sessionId: "orphan", turnId: ack.turnId });
+
     expect(abortSessionCalls).toEqual(["orphan"]);
     expect(abortSessionTurnIds).toEqual([ack.turnId]);
   });

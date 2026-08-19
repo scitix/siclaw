@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { jsonSchemaToTypebox, normalizeMcpInputSchema, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, mcpContentToAgentContent, McpClientManager } from "./mcp-client.js";
 
 describe("jsonSchemaToTypebox", () => {
@@ -166,6 +166,25 @@ describe("createToolDefinition server description", () => {
   it("applies the server context to the fallback description too", () => {
     const def = makeDef("Monitoring tenant ID: t-123");
     expect(def.description).toBe('[Server "grafana" context: Monitoring tenant ID: t-123]\nMCP tool query from grafana');
+  });
+
+  it("preserves official MCP structuredContent for host-side consumers", async () => {
+    const structuredContent = { label: true, info: { summary: "ready" } };
+    const def = (manager as any).createToolDefinition(
+      "product-support-result",
+      undefined,
+      { name: "submit_product_support_result" },
+      {
+        callTool: vi.fn(async () => ({
+          content: [{ type: "text", text: JSON.stringify(structuredContent) }],
+          structuredContent,
+        })),
+      },
+    );
+
+    await expect(def.execute("call-1", {})).resolves.toMatchObject({
+      details: { structuredContent },
+    });
   });
 });
 
