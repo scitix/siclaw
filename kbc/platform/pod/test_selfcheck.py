@@ -787,7 +787,7 @@ def test_charset_corruption_detection():
     """U+FFFD (the lossy-UTF-8-decode marker) anywhere in a page — path OR body
     prose — must block state=passed. Body-prose corruption is INVISIBLE to the
     coverage ledger (it only diffs paths), so this lint is the only guard against
-    silently shipping a \ufffd in published text (siflow-test 2026-07-07: 需/础/成 got
+    silently shipping a \ufffd in published text (real incident 2026-07-07: 需/础/成 got
     mangled to 3× U+FFFD by an upstream stream chunk-boundary split)."""
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)

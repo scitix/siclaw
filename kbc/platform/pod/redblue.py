@@ -88,7 +88,7 @@ def _t(locale: str | None, en: str, zh: str) -> str:
 
 
 # ── prompts (calibrated offline via the CLI before production wiring; schemas
-#    mirror siflow-kb/.claude/workflows/redblue-pk.js, proven on real data).
+#    mirror an internal red/blue PK workflow, proven on real data).
 #    en/zh pairs. STORED TOKENS DON'T FORK: score / failure_category /
 #    difficulty / flag / angle values persist to PK_RESULT.json and
 #    PK_SURVEY_CACHE.json and are compared in code (PASS_SCORES), so the en

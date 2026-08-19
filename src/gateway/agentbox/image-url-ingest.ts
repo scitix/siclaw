@@ -107,7 +107,7 @@ function imageUrlAllowlist(): string[] {
 function hostMatchesAllowlist(host: string, allowlist: string[]): boolean {
   return allowlist.some((entry) => {
     if (entry.startsWith("*.")) {
-      // "*.siflow.cn" → any subdomain (mirrors dingtalk.ts isAllowedWebhookHost).
+      // "*.example.org" → any subdomain (mirrors dingtalk.ts isAllowedWebhookHost).
       return host.endsWith(entry.slice(1));
     }
     return host === entry;

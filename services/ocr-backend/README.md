@@ -127,7 +127,7 @@ Build from the repository root:
 docker buildx build \
   --platform linux/amd64 \
   -f Dockerfile.ocr \
-  -t registry-cn-shanghai.siflow.cn/k8s/siclaw-ocr:<tag> \
+  -t <your-registry>/siclaw-ocr:<tag> \
   --push \
   .
 ```

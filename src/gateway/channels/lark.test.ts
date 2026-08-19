@@ -3474,7 +3474,7 @@ describe("handleLarkMessage — inbound images", () => {
     streamEventsMock.mockImplementation(async function* () { /* empty */ });
 
     await handleLarkMessage(
-      makeTextEvent("check this https://oss.siflow.cn/x.png"),
+      makeTextEvent("check this https://oss.example.org/x.png"),
       makeLarkClient(),
       "lark",
       makeAgentBoxManager("a1") as any,
@@ -3487,7 +3487,7 @@ describe("handleLarkMessage — inbound images", () => {
     // are attached here, and the URL survives in the prompt text.
     const arg = promptMock.mock.calls[0][0];
     expect(arg).not.toHaveProperty("images");
-    expect(arg.text).toContain("https://oss.siflow.cn/x.png");
+    expect(arg.text).toContain("https://oss.example.org/x.png");
   });
 
   it("persists the user row with signed-URL credentials stripped (prompt keeps the full URL)", async () => {
@@ -3496,7 +3496,7 @@ describe("handleLarkMessage — inbound images", () => {
     streamEventsMock.mockImplementation(async function* () { /* empty */ });
 
     await handleLarkMessage(
-      makeTextEvent("look https://oss.siflow.cn/x.png?Signature=secret"),
+      makeTextEvent("look https://oss.example.org/x.png?Signature=secret"),
       makeLarkClient(),
       "lark",
       makeAgentBoxManager("a1") as any,
@@ -3505,7 +3505,7 @@ describe("handleLarkMessage — inbound images", () => {
     );
 
     const userRow = appendMessageMock.mock.calls.find((c) => c[0].role === "user")?.[0];
-    expect(userRow.content).toContain("oss.siflow.cn/x.png");
+    expect(userRow.content).toContain("oss.example.org/x.png");
     expect(userRow.content).not.toContain("Signature"); // creds stripped from the persisted row
     // the prompt forwarded to AgentBoxClient keeps the full signed URL (client.prompt fetches it)
     expect(promptMock.mock.calls[0][0].text).toContain("Signature=secret");
@@ -3531,13 +3531,13 @@ describe("extractInbound — post receive shapes", () => {
       message_type: "post",
       content: JSON.stringify({
         title: "Report",
-        content: [[{ tag: "a", text: "see", href: "https://oss.siflow.cn/x.png" }]],
+        content: [[{ tag: "a", text: "see", href: "https://oss.example.org/x.png" }]],
       }),
     };
     const { text } = extractInbound(message);
     expect(text).toContain("Report");
     expect(text).toContain("see");
-    expect(text).toContain("https://oss.siflow.cn/x.png"); // href surfaced for the unified URL resolver
+    expect(text).toContain("https://oss.example.org/x.png"); // href surfaced for the unified URL resolver
   });
 });
 

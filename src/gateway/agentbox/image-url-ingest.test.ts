@@ -62,11 +62,11 @@ describe("sniffImageMime", () => {
 // ── extractImageUrls ────────────────────────────────────────────────────────
 describe("extractImageUrls", () => {
   it("extracts image URLs incl. OSS signed (ext before query)", () => {
-    const text = "see https://oss.siflow.cn/a/b.jpg?OSSAccessKeyId=x&Signature=y here";
-    expect(extractImageUrls(text)).toEqual(["https://oss.siflow.cn/a/b.jpg?OSSAccessKeyId=x&Signature=y"]);
+    const text = "see https://oss.example.org/a/b.jpg?OSSAccessKeyId=x&Signature=y here";
+    expect(extractImageUrls(text)).toEqual(["https://oss.example.org/a/b.jpg?OSSAccessKeyId=x&Signature=y"]);
   });
   it("dedups repeats and matches png/jpeg/webp", () => {
-    const url = "https://oss.siflow.cn/x.png";
+    const url = "https://oss.example.org/x.png";
     expect(extractImageUrls(`${url} ${url}`)).toEqual([url]);
     expect(extractImageUrls("https://h.cn/a.webp https://h.cn/b.jpeg")).toHaveLength(2);
   });
@@ -79,27 +79,27 @@ describe("extractImageUrls", () => {
 // ── assertAllowedImageUrl (SSRF guard) ──────────────────────────────────────
 describe("assertAllowedImageUrl", () => {
   it("is fail-closed when no allowlist configured", () => {
-    expect(() => assertAllowedImageUrl("https://oss.siflow.cn/a.jpg")).toThrow(/fail-closed/);
+    expect(() => assertAllowedImageUrl("https://oss.example.org/a.jpg")).toThrow(/fail-closed/);
   });
   it("allows exact and wildcard allowlist hosts", () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.siflow.cn, *.example.com";
-    expect(() => assertAllowedImageUrl("https://oss.siflow.cn/a.jpg")).not.toThrow();
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org, *.example.com";
+    expect(() => assertAllowedImageUrl("https://oss.example.org/a.jpg")).not.toThrow();
     expect(() => assertAllowedImageUrl("https://img.example.com/a.jpg")).not.toThrow();
   });
   it("rejects hosts outside the allowlist", () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     expect(() => assertAllowedImageUrl("https://evil.com/a.jpg")).toThrow(/not in allowlist/);
-    // apex is not a subdomain of *.siflow.cn
-    expect(() => assertAllowedImageUrl("https://siflow.cn/a.jpg")).toThrow(/not in allowlist/);
+    // apex is not a subdomain of *.example.org
+    expect(() => assertAllowedImageUrl("https://example.org/a.jpg")).toThrow(/not in allowlist/);
   });
   it("rejects http by default, allows it only when opted in", () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.siflow.cn";
-    expect(() => assertAllowedImageUrl("http://oss.siflow.cn/a.jpg")).toThrow(/protocol/);
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "oss.example.org";
+    expect(() => assertAllowedImageUrl("http://oss.example.org/a.jpg")).toThrow(/protocol/);
     process.env.SICLAW_IMAGE_URL_ALLOW_HTTP = "true";
-    expect(() => assertAllowedImageUrl("http://oss.siflow.cn/a.jpg")).not.toThrow();
+    expect(() => assertAllowedImageUrl("http://oss.example.org/a.jpg")).not.toThrow();
   });
   it("rejects private/metadata hosts (not on allowlist)", () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     expect(() => assertAllowedImageUrl("https://169.254.169.254/latest/meta-data")).toThrow(/not in allowlist/);
     expect(() => assertAllowedImageUrl("https://127.0.0.1/a.jpg")).toThrow(/not in allowlist/);
   });
@@ -115,39 +115,39 @@ describe("enrichImagesFromText", () => {
   });
 
   it("fetches an allowlisted url image", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     vi.stubGlobal("fetch", vi.fn(async () => imageResponse(PNG, "image/png")));
-    const out = await enrichImagesFromText("look https://oss.siflow.cn/a.png", []);
+    const out = await enrichImagesFromText("look https://oss.example.org/a.png", []);
     expect(out).toEqual([{ mimeType: "image/png", data: PNG.toString("base64") }]);
   });
 
   it("skips a url rejected by the SSRF guard (no allowlist)", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    const out = await enrichImagesFromText("https://oss.siflow.cn/a.png", []);
+    const out = await enrichImagesFromText("https://oss.example.org/a.png", []);
     expect(out).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled(); // guard throws before fetch
   });
 
   it("skips a non-image content-type", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     vi.stubGlobal("fetch", vi.fn(async () => imageResponse(NOT_IMAGE, "text/html")));
-    const out = await enrichImagesFromText("https://oss.siflow.cn/a.png", []);
+    const out = await enrichImagesFromText("https://oss.example.org/a.png", []);
     expect(out).toEqual([]);
   });
 
   it("skips an oversize image (declared content-length)", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => imageResponse(PNG, "image/png", { "content-length": String(50 * 1024 * 1024) })),
     );
-    const out = await enrichImagesFromText("https://oss.siflow.cn/a.png", []);
+    const out = await enrichImagesFromText("https://oss.example.org/a.png", []);
     expect(out).toEqual([]);
   });
 
   it("skips an oversize url image even with no/lying content-length (streamed)", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     const huge = Buffer.alloc(7 * 1024 * 1024, 0x89); // > 6MiB raw cap
     vi.stubGlobal(
       "fetch",
@@ -158,42 +158,42 @@ describe("enrichImagesFromText", () => {
         body: Readable.from([huge]),
       }) as unknown as Response),
     );
-    const out = await enrichImagesFromText("https://oss.siflow.cn/a.png", []);
+    const out = await enrichImagesFromText("https://oss.example.org/a.png", []);
     expect(out).toEqual([]);
   });
 
   it("re-validates the allowlist on redirect (rejects off-allowlist hop)", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     const fetchMock = vi.fn(async () => ({
       status: 302,
       ok: false,
       headers: new Headers({ location: "https://evil.com/a.png" }),
     }) as unknown as Response);
     vi.stubGlobal("fetch", fetchMock);
-    const out = await enrichImagesFromText("https://oss.siflow.cn/a.png", []);
+    const out = await enrichImagesFromText("https://oss.example.org/a.png", []);
     expect(out).toEqual([]); // off-allowlist redirect target rejected on next hop
   });
 
   it("appends url images AFTER existing, sharing the 4-image budget", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     vi.stubGlobal("fetch", vi.fn(async () => imageResponse(JPEG, "image/jpeg")));
     const existing: InboundImage[] = [{ mimeType: "image/png", data: PNG.toString("base64") }];
-    const out = await enrichImagesFromText("https://oss.siflow.cn/a.jpeg", existing);
+    const out = await enrichImagesFromText("https://oss.example.org/a.jpeg", existing);
     expect(out.map((i) => i.mimeType)).toEqual(["image/png", "image/jpeg"]);
   });
 
   it("does not exceed 4 images when existing already fills the budget", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     const fetchMock = vi.fn(async () => imageResponse(JPEG, "image/jpeg"));
     vi.stubGlobal("fetch", fetchMock);
     const existing: InboundImage[] = Array.from({ length: 4 }, () => ({ mimeType: "image/png", data: "x" }));
-    const out = await enrichImagesFromText("https://oss.siflow.cn/a.jpeg", existing);
+    const out = await enrichImagesFromText("https://oss.example.org/a.jpeg", existing);
     expect(out).toHaveLength(4);
     expect(fetchMock).not.toHaveBeenCalled(); // budget full → never fetches
   });
 
   it("bounds the whole step by a total timeout and fetches in parallel (hanging host doesn't stall)", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     process.env.SICLAW_IMAGE_URL_TOTAL_TIMEOUT_MS = "100";
     // fetch that honours the abort signal but otherwise never resolves
     const fetchMock = vi.fn((_url: any, init: any) => new Promise((_res, reject) => {
@@ -201,7 +201,7 @@ describe("enrichImagesFromText", () => {
     }));
     vi.stubGlobal("fetch", fetchMock);
     const start = Date.now();
-    const out = await enrichImagesFromText("https://oss.siflow.cn/a.png https://oss.siflow.cn/b.png", []);
+    const out = await enrichImagesFromText("https://oss.example.org/a.png https://oss.example.org/b.png", []);
     expect(out).toEqual([]);
     expect(fetchMock).toHaveBeenCalledTimes(2); // both fired in parallel, not gated one-by-one
     // bounded by the ~100ms total budget, NOT 2×(per-hop 5s) run sequentially
@@ -209,21 +209,21 @@ describe("enrichImagesFromText", () => {
   });
 
   it("bounds the parallel fan-out to the media budget (does not fetch every URL)", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     const fetchMock = vi.fn(async () => imageResponse(PNG));
     vi.stubGlobal("fetch", fetchMock);
-    const manyUrls = Array.from({ length: 50 }, (_, i) => `https://oss.siflow.cn/img${i}.png`).join(" ");
+    const manyUrls = Array.from({ length: 50 }, (_, i) => `https://oss.example.org/img${i}.png`).join(" ");
     const out = await enrichImagesFromText(manyUrls, []);
     expect(out).toHaveLength(4); // capped at MAX_INBOUND_IMAGES
     expect(fetchMock).toHaveBeenCalledTimes(4); // only 4 fetches fired, not 50 — bounded BEFORE fan-out
   });
 
   it("bounds the fan-out by the remaining budget when existing images are present", async () => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     const fetchMock = vi.fn(async () => imageResponse(PNG));
     vi.stubGlobal("fetch", fetchMock);
     const existing: InboundImage[] = [{ mimeType: "image/png", data: "x" }, { mimeType: "image/png", data: "y" }];
-    const out = await enrichImagesFromText("https://oss.siflow.cn/a.png https://oss.siflow.cn/b.png https://oss.siflow.cn/c.png", existing);
+    const out = await enrichImagesFromText("https://oss.example.org/a.png https://oss.example.org/b.png https://oss.example.org/c.png", existing);
     expect(out).toHaveLength(4);
     expect(fetchMock).toHaveBeenCalledTimes(2); // 4 - 2 existing = 2 slots → only 2 fetches
   });
@@ -232,8 +232,8 @@ describe("enrichImagesFromText", () => {
 describe("redactImageUrlsInText", () => {
   it("strips signed-URL query (Signature/AccessKeyId) but keeps host+path", () => {
     expect(
-      redactImageUrlsInText("see https://oss.siflow.cn/a.jpg?Signature=secret&AccessKeyId=key here"),
-    ).toBe("see https://oss.siflow.cn/a.jpg here");
+      redactImageUrlsInText("see https://oss.example.org/a.jpg?Signature=secret&AccessKeyId=key here"),
+    ).toBe("see https://oss.example.org/a.jpg here");
   });
   it("redacts multiple image URLs and leaves other text intact", () => {
     expect(

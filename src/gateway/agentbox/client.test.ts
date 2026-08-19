@@ -590,11 +590,11 @@ describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => 
   afterAll(async () => { await srv.close(); });
 
   beforeEach(() => {
-    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.siflow.cn";
+    process.env.SICLAW_IMAGE_URL_ALLOWLIST = "*.example.org";
     realFetch = globalThis.fetch.bind(globalThis);
     // Host-split: image URLs are stubbed; the agentbox POST is forwarded to the real local server.
     vi.stubGlobal("fetch", vi.fn(async (url: any, init: any) => {
-      if (String(url).includes("oss.siflow.cn")) return imageResponse(PNG);
+      if (String(url).includes("oss.example.org")) return imageResponse(PNG);
       return realFetch(url, init);
     }));
   });
@@ -605,29 +605,29 @@ describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => 
 
   it("vision model: resolves an allowlisted URL into images; URL stays in text", async () => {
     await client.prompt({
-      text: "see https://oss.siflow.cn/a.png",
+      text: "see https://oss.example.org/a.png",
       modelProvider: "openai", modelId: "gpt-4o", modelConfig: mkModelConfig(["text", "image"], "gpt-4o"),
     });
     const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
     const body = JSON.parse(req.body);
     expect(body.images).toEqual([{ mimeType: "image/png", data: PNG.toString("base64") }]);
-    expect(body.text).toContain("oss.siflow.cn/a.png"); // original URL left in text
+    expect(body.text).toContain("oss.example.org/a.png"); // original URL left in text
   });
 
   it("non-vision model: does NOT resolve; no images, URL stays as plain text", async () => {
     await client.prompt({
-      text: "see https://oss.siflow.cn/a.png",
+      text: "see https://oss.example.org/a.png",
       modelProvider: "deepseek", modelId: "deepseek-chat", modelConfig: mkModelConfig(["text"], "deepseek-chat"),
     });
     const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
     const body = JSON.parse(req.body);
     expect(body.images).toBeUndefined();
-    expect(body.text).toContain("oss.siflow.cn/a.png");
+    expect(body.text).toContain("oss.example.org/a.png");
   });
 
   it("vision routing candidate (no single-model fields): still resolves", async () => {
     await client.prompt({
-      text: "see https://oss.siflow.cn/a.png",
+      text: "see https://oss.example.org/a.png",
       modelRouting: {
         enabled: true,
         candidates: [{ provider: "openai", modelId: "gpt-4o", modelConfig: mkModelConfig(["text", "image"], "gpt-4o") }],
@@ -639,12 +639,12 @@ describe("AgentBoxClient — prompt image URL resolution (vision-gated)", () => 
 
   it("redacts signed-URL credentials from the forwarded text (fetch still used the full URL)", async () => {
     await client.prompt({
-      text: "see https://oss.siflow.cn/a.png?Signature=secret&AccessKeyId=key",
+      text: "see https://oss.example.org/a.png?Signature=secret&AccessKeyId=key",
       modelProvider: "openai", modelId: "gpt-4o", modelConfig: mkModelConfig(["text", "image"], "gpt-4o"),
     });
     const req = srv.captures.filter((c) => c.url === "/api/prompt").pop()!;
     const body = JSON.parse(req.body);
-    expect(body.text).toContain("oss.siflow.cn/a.png");
+    expect(body.text).toContain("oss.example.org/a.png");
     expect(body.text).not.toContain("Signature"); // creds stripped from model/history text
     expect(body.text).not.toContain("secret");
     expect(body.images).toHaveLength(1); // ...but the image was still resolved (full URL fetched)
