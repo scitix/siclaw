@@ -1246,7 +1246,11 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
   // describe/events/top -A without selector → always blocked
   if (ALL_NS_ALWAYS_NEED_SELECTOR.has(subcommand)) {
     if (!hasSelector) {
-      return `"kubectl ${subcommand} --all-namespaces" without selectors can overload the API server on large clusters.`;
+      return `"kubectl ${subcommand} --all-namespaces" without selectors can overload the API server on `
+        + `large clusters. Add a selector, or name a namespace:\n`
+        + `  kubectl ${subcommand} -A -l <key>=<value>\n`
+        + `  kubectl ${subcommand} -A --field-selector <field>=<value>\n`
+        + `  kubectl ${subcommand} -n <namespace>`;
     }
     return null;
   }
@@ -1255,7 +1259,15 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
   if (subcommand === "get") {
     const format = getKubectlOutputFormat(args);
     if (format === "yaml" || format === "json") {
-      return `"kubectl get --all-namespaces -o ${format}" can return excessive data. Use -n <namespace> to target a specific namespace, or use -o wide/name/custom-columns instead.`;
+      // A refusal that names no runnable alternative gets retried in another shape and refused again.
+      // The resource is echoed back so the suggestion is copy-pasteable rather than a template.
+      const resource = args.find((a, i) => i > 0 && !a.startsWith("-") && a !== subcommand) ?? "<resource>";
+      return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
+        + `${resource} in the cluster is the concern, so a selector does not lift it. Instead:\n`
+        + `  kubectl get ${resource} -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name`
+        + `   (add the fields you need — these two exist on every resource)\n`
+        + `  kubectl get ${resource} -A -o wide                     (a fixed, bounded set of columns)\n`
+        + `  kubectl get ${resource} -n <namespace> -o ${format}    (full serialization, one namespace)`;
     }
   }
 

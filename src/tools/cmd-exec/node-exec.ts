@@ -11,6 +11,7 @@ import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
+import { tailTruncationNote } from "../infra/tail-truncation.js";
 import { jsonPathProjector } from "../infra/json-projection.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult, backgroundJsonPathError } from "./background-launch.js";
 import {
@@ -470,11 +471,15 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         stderr: execResult.stderr,
         context: "node",
       });
+      const notes = (judgment.annotation ? `\n${judgment.annotation}` : "")
+        + (tailTruncationNote(params.command, execResult.stdout) ? `\n${tailTruncationNote(params.command, execResult.stdout)}` : "");
       return {
         content: [{ type: "text", text: postExecSecurity(execResult.stdout.trim(), pre.action, {
           stderr: filteredStderr || undefined,
           project: jsonPathProjector(params.json_path),
-          ...(judgment.annotation ? { notes: `\n${judgment.annotation}` } : {}),
+          // A `--tail=N` window that came back at exactly N lines reads like a complete answer; the
+          // note says it may not be. Composed with the exit class so both reach the model.
+          ...(notes ? { notes } : {}),
           // Rendered whenever the run did not exit 0 — the code is a FACT, while `error` below is a
           // judgment about it, and conflating them hid the code on a no-match.
           ...(judgment.exitClass !== "success"

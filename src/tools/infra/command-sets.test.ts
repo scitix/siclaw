@@ -5,6 +5,7 @@ import {
   getCommandBinary,
   validateCommandRestrictions,
   agentboxRequiredCommands,
+  checkAllNamespacesRestriction,
 } from "./command-sets.js";
 
 describe("COMMANDS registry", () => {
@@ -1910,5 +1911,37 @@ describe("a flag value that begins with a dash is not a flag", () => {
     expect(validateCommandRestrictions("journalctl -x -1")).not.toBeNull();          // -x is not a value-flag
     expect(validateCommandRestrictions("journalctl -b -1 --dump-catalog")).not.toBeNull();
     expect(validateCommandRestrictions("journalctl -b --setup-keys")).not.toBeNull();
+  });
+});
+
+describe("a kubectl -A refusal names a runnable alternative", () => {
+  // A refusal with no alternative gets retried in another shape and refused again. The retro asked for
+  // this on the -A path specifically (5 entries); sensitive-path refusals already work this way.
+  it("echoes the resource back so the suggestion is copy-pasteable", () => {
+    const err = checkAllNamespacesRestriction(["get", "pods", "-A", "-o", "json"], "get") ?? "";
+    expect(err).toContain("kubectl get pods -A -o custom-columns=");
+    expect(err).toContain("kubectl get pods -n <namespace> -o json");
+    // And it says why a selector does not help, since that is the natural next thing to try.
+    expect(err).toContain("a selector does not lift it");
+  });
+
+  it("suggests only fields that exist on every resource", () => {
+    // `.status.phase` is a pod field. Suggesting it for a Secret would make the hint itself wrong —
+    // the failure mode this whole change set is about.
+    const err = checkAllNamespacesRestriction(["get", "secrets", "-A", "-o", "yaml"], "get") ?? "";
+    expect(err).toContain("NS:.metadata.namespace,NAME:.metadata.name");
+    expect(err).not.toContain("status.phase");
+  });
+
+  it("tells describe/events/top how to narrow instead of just refusing", () => {
+    const err = checkAllNamespacesRestriction(["describe", "pods", "-A"], "describe") ?? "";
+    expect(err).toContain("--field-selector");
+    expect(err).toContain("-n <namespace>");
+  });
+
+  it("still refuses — the alternatives are guidance, not a way through", () => {
+    expect(checkAllNamespacesRestriction(["get", "pods", "-A", "-o", "json"], "get")).not.toBeNull();
+    expect(checkAllNamespacesRestriction(["get", "pods", "-A", "-o", "json", "-l", "app=x"], "get")).not.toBeNull();
+    expect(checkAllNamespacesRestriction(["get", "pods", "-A", "-o", "wide"], "get")).toBeNull();
   });
 });

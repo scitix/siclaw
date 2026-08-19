@@ -26,6 +26,7 @@ import {
 } from "../infra/command-validator.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { classifyExit } from "../infra/exit-classification.js";
+import { tailTruncationNote } from "../infra/tail-truncation.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 
 const execAsync = promisify(exec);
@@ -474,7 +475,12 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         signal?.removeEventListener("abort", onAbort);
 
         return {
-          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: stderr.trim() || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl }) }],
+          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, {
+            stderr: stderr.trim() || undefined,
+            hasSensitiveKubectl: pre.hasSensitiveKubectl,
+            // Success can still be a truncated window: exactly --tail=N lines back looks complete.
+            ...(tailTruncationNote(params.command, stdout) ? { notes: `\n${tailTruncationNote(params.command, stdout)}` } : {}),
+          }) }],
           details: { exitCode: 0, exit_class: "success" },
         };
       } catch (err: any) {
