@@ -573,20 +573,27 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       // tracked.
       const unreported = sessionTurns.filter((id) => !supervisorEndedTurns.has(id));
       for (const id of sessionTurns) supervisorEndedTurns.add(id);
-      const ownsTheReport = sessionTurns.length === 0 || unreported.length > 0;
-      if (ownsTheReport) {
+      // A known turn gets its own terminal envelope so strict consumers can
+      // correlate the interruption. Keep the session-only fallback for the
+      // cold-start window where no turn id has been allocated yet.
+      const turnsToReport: Array<string | undefined> = sessionTurns.length === 0
+        ? [undefined]
+        : unreported;
+      for (const turnId of turnsToReport) {
+        const envelope = (event: Record<string, unknown>) => ({
+          sessionId,
+          ...(turnId ? { turnId } : {}),
+          event,
+        });
         try {
-          frontendClient.emitEvent("chat.event", { sessionId, event: { type: "stream_error", error: detail } });
+          frontendClient.emitEvent("chat.event", envelope({ type: "stream_error", error: detail }));
           // `aborted`/`reason` are additive: a consumer that does not read them sees the
           // plain terminal it already handles, one that does can name the cause instead of
           // rendering a generic connection failure.
-          frontendClient.emitEvent("chat.event", {
-            sessionId,
-            event: { type: "prompt_done", aborted: true, reason },
-          });
+          frontendClient.emitEvent("chat.event", envelope({ type: "prompt_done", aborted: true, reason }));
         } catch (err) {
           // Best effort: a consumer that already went away must not stop what caused this.
-          console.warn(`[runtime] could not report interrupted turn session=${sessionId}:`, err);
+          console.warn(`[runtime] could not report interrupted turn session=${sessionId} turn=${turnId ?? "pending"}:`, err);
         }
       }
       // A delegated turn's caller is a machine that will otherwise wait out its idle

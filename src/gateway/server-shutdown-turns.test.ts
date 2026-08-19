@@ -96,6 +96,12 @@ function chatEvents(client: any, sessionId: string): Array<Record<string, unknow
     .map(([, payload]: [string, any]) => payload.event);
 }
 
+function chatEventPayloads(client: any, sessionId: string): Array<Record<string, unknown>> {
+  return client.emitEvent.mock.calls
+    .filter(([channel, payload]: [string, any]) => channel === "chat.event" && payload?.sessionId === sessionId)
+    .map(([, payload]: [string, any]) => payload);
+}
+
 afterEach(() => {
   capturedSignal = undefined;
   vi.clearAllMocks();
@@ -107,7 +113,10 @@ describe("startRuntime — shutdown ends in-flight turns", () => {
     const server = await bootRuntime(client);
     const send = server.rpcMethods.get("chat.send")!;
 
-    await send({ agentId: "a", userId: "u", text: "hi", sessionId: "S" }, { sendEvent: vi.fn() });
+    const ack = await send(
+      { agentId: "a", userId: "u", text: "hi", sessionId: "S" },
+      { sendEvent: vi.fn() },
+    ) as { turnId: string };
     await waitFor(() => capturedSignal !== undefined);
     expect(capturedSignal!.aborted).toBe(false);
 
@@ -121,6 +130,10 @@ describe("startRuntime — shutdown ends in-flight turns", () => {
     // Additive fields: a consumer that reads them names the cause instead of showing a
     // generic connection failure; one that does not still sees the terminal it handles.
     expect(events[1]).toMatchObject({ type: "prompt_done", aborted: true, reason: "runtime_restart" });
+    expect(chatEventPayloads(client, "S")).toEqual([
+      expect.objectContaining({ turnId: ack.turnId, event: expect.objectContaining({ type: "stream_error" }) }),
+      expect.objectContaining({ turnId: ack.turnId, event: expect.objectContaining({ type: "prompt_done" }) }),
+    ]);
     // The consumer is broken too, so its own finalization runs (partial text persisted,
     // running tool rows closed) instead of the turn ending only when the box hangs up.
     expect(capturedSignal!.aborted).toBe(true);
