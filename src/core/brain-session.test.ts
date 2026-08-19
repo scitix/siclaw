@@ -126,7 +126,7 @@ describe("modelNeedsRebind", () => {
 
   it.each([
     ["id", { id: "claude-opus-4-8" }],
-    ["provider", { provider: "siflow" }],
+    ["provider", { provider: "other-provider" }],
     ["reasoning", { reasoning: false }],
     ["contextWindow", { contextWindow: 200000 }],
     ["maxTokens", { maxTokens: 8192 }],
