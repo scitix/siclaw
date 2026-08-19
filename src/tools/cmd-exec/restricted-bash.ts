@@ -25,6 +25,7 @@ import {
   validateShellOperators as _validateShellOperators,
 } from "../infra/command-validator.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { classifyExit, appendAnnotation } from "../infra/exit-classification.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 
 const execAsync = promisify(exec);
@@ -474,9 +475,24 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         };
       } catch (err: any) {
         const errStderr = err.stderr?.trim() ?? err.message;
+        const errStdout = (err.stdout?.trim() ?? "") as string;
+        // In this context the image is ours, so a 127 means the whitelist advertises something the
+        // AgentBox does not ship — classifyExit says that instead of advising a workaround.
+        const judgment = classifyExit({
+          command: params.command,
+          exitCode: err.code,
+          stdout: errStdout,
+          stderr: errStderr,
+          signal: err.signal,
+          context: "local",
+        });
         return {
-          content: [{ type: "text", text: postExecSecurity(`${err.stdout?.trim() || "(no output)"}\n[exit code: ${err.code ?? "unknown"}]`, pre.action, { stderr: errStderr || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl }) }],
-          details: { exitCode: err.code, error: true },
+          content: [{ type: "text", text: appendAnnotation(postExecSecurity(errStdout || "(no output)", pre.action, { stderr: errStderr || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl }), judgment.annotation) }],
+          details: {
+            exitCode: err.code,
+            exit_class: judgment.exitClass,
+            ...(judgment.isError && { error: true }),
+          },
         };
       }
     },

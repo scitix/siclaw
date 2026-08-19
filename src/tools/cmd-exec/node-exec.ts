@@ -10,6 +10,7 @@ import { loadConfig } from "../../core/config.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { classifyExit, appendAnnotation } from "../infra/exit-classification.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import {
   validateNodeName,
@@ -437,18 +438,33 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
 
       // Assemble output, then sanitize + truncate via unified facade
       const filteredStderr = filterPodNoise(execResult.stderr);
-      const isError = execResult.exitCode !== 0 &&
-        !(execResult.exitCode === null && execResult.stdout.trim());
+      // What the exit code MEANS, not just that it was non-zero: 127 on a node is a missing binary
+      // and retrying is pointless, while `grep` exiting 1 is a result rather than a failure. The
+      // annotation carries that to the model, since `details` is stripped before it sees the result.
+      const judgment = classifyExit({
+        command: params.command,
+        exitCode: execResult.exitCode,
+        stdout: execResult.stdout,
+        // Unfiltered: filterPodNoise drops kubectl's own chatter, which is exactly where a channel
+        // failure announces itself.
+        stderr: execResult.stderr,
+        context: "node",
+      });
       const out = execResult.stdout.trim();
-      // Show the output as a shell would, with the exit code as a trailing annotation
-      // (not a prefix that replaces the body), so a non-zero exit with no output —
-      // e.g. `grep` with no match — reads as an empty result, not a failure.
-      const stdout = isError
-        ? `${out || "(no output)"}\n[exit code: ${execResult.exitCode ?? "unknown"}]`
-        : out;
+      // The annotation TRAILS the body (it does not replace it), so a non-zero exit with no output
+      // still reads as an empty result.
+      const body = judgment.annotation ? (out || "(no output)") : out;
+      // The annotation is appended AFTER sanitizing and truncating, because it is OUR text about the
+      // result rather than target output. Folding it into the body fed it to the sanitizer, and a
+      // structural (JSON) sanitizer that cannot parse a failed command's output replaces the whole
+      // body with a suppression notice — which silently ate the classification.
       return {
-        content: [{ type: "text", text: postExecSecurity(stdout, pre.action, { stderr: filteredStderr || undefined }) }],
-        details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
+        content: [{ type: "text", text: appendAnnotation(postExecSecurity(body, pre.action, { stderr: filteredStderr || undefined }), judgment.annotation) }],
+        details: {
+          exitCode: execResult.exitCode ?? 0,
+          exit_class: judgment.exitClass,
+          ...(judgment.isError && { error: true }),
+        },
       };
     },
   };

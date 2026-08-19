@@ -55,7 +55,7 @@ describe("host_exec", () => {
     expect((result.details as any).error).toBeUndefined();
   });
 
-  it("non-zero exit produces error=true with header", async () => {
+  it("names WHAT a non-zero exit means, not just that there was one", async () => {
     vi.mocked(acquireSshTarget).mockResolvedValueOnce({
       host: "10.0.0.1", port: 22, username: "root",
       auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
@@ -66,8 +66,40 @@ describe("host_exec", () => {
       exitCode: 127,
     });
     const result = await tool.execute("id", { host: "h1", command: "cat /nope" }, undefined, {} as any);
-    expect(result.content[0].text).toContain("Exit code: 127");
+    // 127 on a host is a missing binary — a different next step from "the command failed", and the
+    // class has to be in the TEXT because details is stripped before the model sees it.
+    expect(result.content[0].text).toContain("exit code: 127");
+    expect(result.content[0].text).toContain("dependency_missing");
     expect((result.details as any).error).toBe(true);
+    expect((result.details as any).exit_class).toBe("dependency_missing");
+  });
+
+  it("does not report a no-match as a failed command", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({ stdout: "", stderr: "", exitCode: 1 });
+    const result = await tool.execute(
+      "id", { host: "h1", command: "journalctl -u kubelet | grep -i oom" }, undefined, {} as any,
+    );
+    expect((result.details as any).exit_class).toBe("no_match");
+    expect((result.details as any).error).toBeUndefined();
+    expect(result.content[0].text).toContain("no_match");
+  });
+
+  it("appends the annotation after the output instead of pushing the answer down", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    vi.mocked(sshExec).mockResolvedValueOnce({ stdout: "inactive", stderr: "", exitCode: 3 });
+    const result = await tool.execute(
+      "id", { host: "h1", command: "systemctl is-active kubelet" }, undefined, {} as any,
+    );
+    const text = result.content[0].text as string;
+    expect(text.indexOf("inactive")).toBeLessThan(text.indexOf("exit code: 3"));
+    expect((result.details as any).exit_class).toBe("target_reported_failure");
   });
 
   it("foreground: wraps the command as a killable timeout-bounded session and reaps it on abort", async () => {

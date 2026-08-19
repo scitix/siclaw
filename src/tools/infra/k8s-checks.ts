@@ -33,7 +33,13 @@ export async function checkNodeReady(
     );
     const status = stdout.trim();
     if (status !== "True") {
-      return `Node "${node}" is not Ready (status: ${status || "unknown"}). The node may be down, cordoned, or experiencing issues.`;
+      // Not "cordoned": cordoning sets spec.unschedulable and leaves Ready=True, so naming it here
+      // sends the reader to check a field that cannot produce this condition. A non-True Ready comes
+      // from the kubelet — not reporting, or reporting a problem.
+      return `Node "${node}" is not Ready (status: ${status || "unknown"}). Its kubelet is either not `
+        + `reporting (node down, network partition, kubelet stopped) or reporting a problem `
+        + `(disk/memory pressure, container runtime down). Debug pods are not started on a node in `
+        + `this state — check "kubectl describe node ${node}" conditions first.`;
     }
     return null;
   } catch (err: any) {

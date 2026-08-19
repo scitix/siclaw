@@ -7,6 +7,7 @@ import { renderTextResult } from "../infra/tool-render.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { classifyExit, appendAnnotation } from "../infra/exit-classification.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import { validateNodeName, validatePodName } from "../infra/exec-utils.js";
@@ -272,7 +273,7 @@ Examples (pass the id from host_list; names shown here for readability):
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
-          details: { error: true, reason: "ssh_exec_failed", host: params.host },
+          details: { error: true, reason: "ssh_exec_failed", exit_class: "channel_error", host: params.host },
         };
       } finally {
         signal?.removeEventListener("abort", onAbort);
@@ -285,23 +286,33 @@ Examples (pass the id from host_list; names shown here for readability):
         };
       }
 
-      // Mirror node_exec's error judgment: signal-killed with stdout = OK; otherwise non-zero exit = error.
-      const isError = result.exitCode !== 0 &&
-        !(result.exitCode === null && result.stdout.trim());
-      const stdoutHeader = isError
-        ? `Exit code: ${result.exitCode ?? "unknown"}${result.signal ? ` (signal: ${result.signal})` : ""}\n`
-        : "";
+      // Same judgment as node_exec, from the same helper: what the exit code MEANS. The annotation
+      // TRAILS the body here too — it used to be a header, which pushed the answer below a line of
+      // bookkeeping on every non-zero exit, including `grep` finding nothing.
+      const judgment = classifyExit({
+        command: params.command,
+        exitCode: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        signal: result.signal,
+        context: "host",
+      });
+      const isError = judgment.isError;
       const stdoutBody = result.stdout.trim();
       const truncatedSuffix = result.truncated ? "\n...[output truncated at 10 MB]" : "";
-      const stdout = stdoutHeader + stdoutBody + truncatedSuffix;
+      const stdout = (stdoutBody || (judgment.annotation ? "(no output)" : "")) + truncatedSuffix;
 
       return {
         content: [{
           type: "text",
-          text: postExecSecurity(stdout, pre.action, { stderr: result.stderr.trim() || undefined }),
+          text: appendAnnotation(
+            postExecSecurity(stdout, pre.action, { stderr: result.stderr.trim() || undefined }),
+            judgment.annotation,
+          ),
         }],
         details: {
           exitCode: result.exitCode,
+          exit_class: judgment.exitClass,
           host: params.host,
           host_label: hostLabel,
           ...(isError && { error: true }),

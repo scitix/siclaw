@@ -11,6 +11,7 @@ import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { classifyExit, appendAnnotation } from "../infra/exit-classification.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import { validatePodName, prepareExecEnv, filterPodNoise } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
@@ -249,10 +250,25 @@ Examples:
         }
         const stdout = (err.stdout?.trim() ?? "") as string;
         const stderr = filterPodNoise((err.stderr?.trim() ?? err.message) as string);
-        const exitCode = err.code ?? "unknown";
+        // `err.code` is the exit code for a command that ran, but a STRING (ENOENT, …) when the
+        // spawn itself failed — classifyExit separates those, so a broken exec path is no longer
+        // reported as the container's own answer.
+        const judgment = classifyExit({
+          command: params.command,
+          exitCode: err.code,
+          stdout,
+          // Unfiltered — filterPodNoise removes the kubectl lines a channel failure is announced in.
+          stderr: (err.stderr?.trim() ?? err.message ?? "") as string,
+          signal: err.signal,
+          context: "pod",
+        });
         return {
-          content: [{ type: "text", text: postExecSecurity(`${stdout || "(no output)"}\n[exit code: ${exitCode}]`, pre.action, { stderr: stderr || undefined }) }],
-          details: { exitCode, error: true },
+          content: [{ type: "text", text: appendAnnotation(postExecSecurity(stdout || "(no output)", pre.action, { stderr: stderr || undefined }), judgment.annotation) }],
+          details: {
+            exitCode: err.code ?? "unknown",
+            exit_class: judgment.exitClass,
+            ...(judgment.isError && { error: true }),
+          },
         };
       }
     },
