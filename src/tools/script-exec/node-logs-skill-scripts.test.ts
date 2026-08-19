@@ -163,6 +163,17 @@ describe("get-node-logs.sh — argument handling", () => {
     expect(r.stderr).toContain("cannot be combined");
   });
 
+  it("rejects an empty pattern, which would match every line", () => {
+    // `grep -e ""` matches everything, so an empty pattern reported a full hit at
+    // status ok — a no-op query that reads like a successful filter.
+    const { bin } = makeCase({ journalctl: JOURNAL_OK, systemctl: SYSTEMCTL_KNOWN });
+    for (const flag of ["--grep", "--grep-fixed"]) {
+      const r = run(NODE_LOGS, ["--unit", "kubelet", flag, ""], bin);
+      expect(r.code, flag).toBe(2);
+      expect(r.stderr, flag).toContain("matches every line");
+    }
+  });
+
   it("rejects a non-positive --tail", () => {
     const { bin } = makeCase({ journalctl: JOURNAL_OK });
     expect(run(NODE_LOGS, ["--unit", "kubelet", "--tail", "0"], bin).code).toBe(2);
@@ -422,6 +433,22 @@ describe("get-node-logs.sh — time window", () => {
     // and the header must echo both the input and what was actually queried
     expect(header(r.stdout, "window")).toContain("2026-08-18T06:00:00Z");
     expect(header(r.stdout, "window")).toContain("journalctl: @");
+  });
+
+  it("converts an RFC3339 window carrying a UTC offset, not just Z", () => {
+    // GNU `date -d` takes "+08:00" directly; the off-node fallback has to accept
+    // the same shapes, or a value that works on a node fails on a workstation.
+    const { bin, argLog } = makeCase({ journalctl: JOURNAL_OK, systemctl: SYSTEMCTL_KNOWN });
+    const r = run(
+      NODE_LOGS,
+      ["--unit", "kubelet", "--since", "2026-08-18T14:00:00+08:00", "--until", "2026-08-18T15:00:00.500+08:00"],
+      bin,
+    );
+    expect(r.code).toBe(0);
+    const args = spawnSync("/bin/cat", [argLog], { encoding: "utf8" }).stdout;
+    // 2026-08-18T14:00:00+08:00 is 06:00:00Z — the same instant either way.
+    expect(args).toContain("--since @1787032800");
+    expect(args).toMatch(/--until @17870364\d\d/);
   });
 
   it("passes journalctl-native values through untouched", () => {

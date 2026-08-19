@@ -107,10 +107,14 @@ while [[ $# -gt 0 ]]; do
     --list-boots)     LIST_BOOTS=1; shift ;;
     --grep)
       [[ $# -ge 2 ]] || die_usage "--grep needs a value"
+      # An empty pattern is `grep -e ""`, which matches EVERY line and reports a
+      # full hit at status ok — a no-op query that reads like a successful filter.
+      [[ -n "$2" ]] || die_usage "--grep pattern is empty; an empty pattern matches every line, which is not a filter"
       [[ "$PATTERN_MODE" == "fixed" ]] && die_usage "--grep and --grep-fixed cannot be combined; pick one mode"
       PATTERN_MODE="ere"; PATTERNS+=("$2"); shift 2 ;;
     --grep-fixed)
       [[ $# -ge 2 ]] || die_usage "--grep-fixed needs a value"
+      [[ -n "$2" ]] || die_usage "--grep-fixed string is empty; an empty pattern matches every line, which is not a filter"
       [[ "$PATTERN_MODE" == "ere" ]] && die_usage "--grep and --grep-fixed cannot be combined; pick one mode"
       PATTERN_MODE="fixed"; PATTERNS+=("$2"); shift 2 ;;
     --tail)           [[ $# -ge 2 ]] || die_usage "--tail needs a value";        TAIL="$2";        shift 2 ;;
@@ -181,9 +185,26 @@ normalize_time() {
       printf '@%s\n' "$secs"
       return 0
     fi
-    # BSD date (no -d). Nodes are GNU, but this also makes the conversion
-    # verifiable off-node instead of only in production.
-    if secs=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$raw" +%s 2>/dev/null); then
+    # BSD date (no -d). Nodes are GNU, so this only makes the conversion verifiable
+    # off-node — but it has to accept the same shapes GNU does, or a value that
+    # works on a node fails on a workstation. Three differences to absorb:
+    #   * BSD strptime wants %z WITHOUT the colon RFC3339 puts in the offset
+    #   * it has no %OS, so fractional seconds must go (a log window does not need
+    #     sub-second precision)
+    #   * a value with no offset at all is local time, which is how GNU reads it
+    local bsd="${raw/Z/+0000}"
+    bsd="${bsd/z/+0000}"
+    if [[ "$bsd" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2})\.[0-9]+(.*)$ ]]; then
+      bsd="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+    fi
+    if [[ "$bsd" =~ ^(.*)([+-][0-9]{2}):([0-9]{2})$ ]]; then
+      bsd="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+    fi
+    if secs=$(date -u -j -f "%Y-%m-%dT%H:%M:%S%z" "$bsd" +%s 2>/dev/null); then
+      printf '@%s\n' "$secs"
+      return 0
+    fi
+    if secs=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$bsd" +%s 2>/dev/null); then
       printf '@%s\n' "$secs"
       return 0
     fi

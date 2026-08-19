@@ -130,7 +130,9 @@ Filtering — case-insensitive, repeatable, applied in the same single pass:
 | `--grep-fixed STR` | Literal string — no metacharacters. Use for image refs, paths, UUIDs. |
 
 `--grep` and `--grep-fixed` cannot be combined. An invalid ERE is reported as
-`filter_error`, never as "nothing found".
+`filter_error`, never as "nothing found". An **empty** pattern is rejected: it
+would match every line and come back as a full hit at `status: ok`, which reads
+like a filter that succeeded.
 
 Other:
 

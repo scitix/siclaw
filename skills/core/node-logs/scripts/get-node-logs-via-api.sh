@@ -124,10 +124,14 @@ while [[ $# -gt 0 ]]; do
     --until) [[ $# -ge 2 ]] || die_usage "--until needs a value"; UNTIL="$2"; shift 2 ;;
     --grep)
       [[ $# -ge 2 ]] || die_usage "--grep needs a value"
+      # `grep -e ""` matches EVERY line, so an empty pattern would report a full
+      # hit at status ok — and here it would also have paid for the whole transfer.
+      [[ -n "$2" ]] || die_usage "--grep pattern is empty; an empty pattern matches every line, which is not a filter"
       [[ "$PATTERN_MODE" == "fixed" ]] && die_usage "--grep and --grep-fixed cannot be combined; pick one mode"
       PATTERN_MODE="ere"; PATTERNS+=("$2"); shift 2 ;;
     --grep-fixed)
       [[ $# -ge 2 ]] || die_usage "--grep-fixed needs a value"
+      [[ -n "$2" ]] || die_usage "--grep-fixed string is empty; an empty pattern matches every line, which is not a filter"
       [[ "$PATTERN_MODE" == "ere" ]] && die_usage "--grep and --grep-fixed cannot be combined; pick one mode"
       PATTERN_MODE="fixed"; PATTERNS+=("$2"); shift 2 ;;
     --tail)  [[ $# -ge 2 ]] || die_usage "--tail needs a value"; TAIL="$2"; shift 2 ;;
