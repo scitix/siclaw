@@ -1410,15 +1410,16 @@ describe("validateKubectlInPipeline — inline --kubeconfig rejected (use the cl
 
 // ── Sensitive resource pipeline protection ──────────────────────────
 
-describe("validateKubectlInPipeline — sensitive resource (no pre-execution blocking)", () => {
-  // Sensitive resources are now handled by post-execution sanitization,
-  // not pre-execution blocking. All these should pass through.
+describe("validateKubectlInPipeline — sensitive resources rely on sanitization, EXCEPT a Secret's format", () => {
+  // The rule used to be "no pre-execution blocking: post-execution sanitization handles it". That holds
+  // for a ConfigMap or a Pod, whose secrets are named by keys the redactor can see. It does NOT hold for
+  // a Secret asked for one value: `-o jsonpath={.data.password}` emits a lone base64 blob with no key
+  // beside it and no recognisable shape, and the redactor returned it verbatim. Deciding whether an
+  // arbitrary string is a secret is not a decidable problem, so the FORMAT is refused instead — which is
+  // why three cases moved out of this list and into the block below.
 
   const allowedCmds = [
     "kubectl get secret my-secret -o json",
-    "kubectl get secrets -n default -o yaml",
-    "kubectl get secret my-secret -o jsonpath='{.data.password}'",
-    "kubectl get secret my-secret -o go-template={{.data}}",
     "kubectl get configmap my-config -o yaml",
     "kubectl get cm my-config -o json",
     "kubectl get secret my-secret -ojson",
@@ -1446,10 +1447,14 @@ describe("validateKubectlInPipeline — sensitive resource (no pre-execution blo
     expect(validateKubectlInPipeline(["kubectl get secret -A"])).toBeNull();
   });
 
-  it("blocks kubectl get secret -A -o yaml (bulk serialization)", () => {
+  it("blocks kubectl get secret -A -o yaml — now on the FORMAT, before the volume", () => {
     const err = validateKubectlInPipeline(["kubectl get secret -A -o yaml"]);
     expect(err).not.toBeNull();
-    expect(err).toContain("excessive data");
+    // The format check runs first and is the stronger reason: -o yaml on a Secret can print the value
+    // whether or not it is one namespace or all of them. The bulk-serialization refusal still applies
+    // to every other resource.
+    expect(err).toContain("print the secret");
+    expect(validateKubectlInPipeline(["kubectl get cm -A -o yaml"])).toContain("excessive data");
   });
 
   it("allows kubectl get secret -A -l app=web (has selector)", () => {
@@ -1561,4 +1566,48 @@ describe("validateKubectlInPipeline — rate protection", () => {
       expect(validateKubectlInPipeline([cmd])).toBeNull();
     });
   }
+});
+
+describe("a Secret may only be printed in a form that cannot show its values", () => {
+  // `kubectl get secret demo -o 'jsonpath={.data.password}'` emits a lone base64 blob: no key name
+  // beside it and no recognisable shape, so the text redactor returned it verbatim. That is a complete
+  // secret disclosure, and no output filter can fix it — deciding whether an arbitrary string is a
+  // secret is not a decidable problem. The format has to be refused before the command runs.
+  const check = (cmd: string) => validateKubectlInPipeline([cmd]);
+
+  it("refuses every format that can print a value", () => {
+    for (const fmt of [
+      "jsonpath={.data.password}", "custom-columns=D:.data.password",
+      "go-template={{.data.password}}", "yaml", "jsonpath-as-json={.data}",
+    ]) {
+      expect(check(`kubectl get secret demo -o ${fmt}`), fmt).not.toBeNull();
+    }
+    // Mixed resource lists and a decoding pipeline are the same disclosure.
+    expect(check("kubectl get secret,pod -o yaml")).not.toBeNull();
+  });
+
+  it("permits the forms that cannot", () => {
+    // -o json is safe because the structural sanitizer redacts every data/stringData value
+    // unconditionally rather than judging it; the others never print data at all.
+    for (const cmd of [
+      "kubectl get secret demo -o json", "kubectl get secret demo",
+      "kubectl get secret demo -o name", "kubectl get secret demo -o wide",
+      "kubectl describe secret demo",
+    ]) {
+      expect(check(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("does not restrict other resources", () => {
+    expect(check("kubectl get pods -o yaml")).toBeNull();
+    expect(check("kubectl get cm x -o jsonpath={.data}")).toBeNull();
+  });
+
+  it("names only permitted alternatives in the refusal", () => {
+    const err = check("kubectl get secret demo -o yaml") ?? "";
+    expect(err).toContain("-o json");
+    expect(err).toContain("describe secret");
+    // Must not suggest something the same rule refuses.
+    expect(err).not.toContain("custom-columns");
+  });
 });

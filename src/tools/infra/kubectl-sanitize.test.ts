@@ -754,3 +754,39 @@ describe("a ConfigMap entry whose value is JSON on one line", () => {
     expect(text).toBe(line);
   });
 });
+
+describe("a mixed-resource response is judged per item", () => {
+  // `kubectl get pod,secret -o json` returns ONE List holding both, and detectSensitiveResource stops
+  // at the first sensitive type named in the command — so every item was treated as a Pod, the
+  // Secret's `data` came back verbatim, and the redaction notice went out anyway. A notice over an
+  // untouched secret is worse than no notice at all.
+  const leaks = (s: string, needle: string) => s.includes(needle);
+
+  it("redacts each kind by its own rules, not by the command's first match", () => {
+    const mixed = JSON.stringify({ kind: "List", items: [
+      { kind: "Pod", spec: { containers: [{ env: [{ name: "PASSWORD", value: "pod-secret" }] }] } },
+      { kind: "Secret", data: { password: "c2VjcmV0", config: "b3RoZXI=" } },
+      { kind: "ConfigMap", data: { "app.json": '{"token":"cm-secret"}' } },
+    ]});
+    const out = sanitizeJSON(mixed, "pod");   // as detectSensitiveResource would have inferred
+    expect(leaks(out, "pod-secret")).toBe(false);
+    expect(leaks(out, "c2VjcmV0")).toBe(false);
+    // Every value under a Secret's data goes, including one whose key is not sensitive-sounding.
+    expect(leaks(out, "b3RoZXI=")).toBe(false);
+    expect(leaks(out, "cm-secret")).toBe(false);
+  });
+
+  it("reaches a Secret nested inside another List", () => {
+    const nested = JSON.stringify({ kind: "List", items: [
+      { kind: "List", items: [{ kind: "Secret", data: { p: "bmVzdGVk" } }] },
+    ]});
+    expect(leaks(sanitizeJSON(nested, "secret"), "bmVzdGVk")).toBe(false);
+  });
+
+  it("falls back to the command's type when an item carries no kind", () => {
+    // A single object fetched by name does not always include `kind`; then the command is the only
+    // evidence there is.
+    const noKind = JSON.stringify({ data: { password: "c2VjcmV0" } });
+    expect(leaks(sanitizeJSON(noKind, "secret"), "c2VjcmV0")).toBe(false);
+  });
+});

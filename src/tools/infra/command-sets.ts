@@ -1266,6 +1266,44 @@ const ALL_NS_ALWAYS_NEED_SELECTOR = new Set(["describe", "events", "top"]);
  *
  * Returns a descriptive reason string if blocked, or null if allowed.
  */
+/**
+ * Output formats a Secret may be printed in.
+ *
+ * `-o json` is safe because the structural sanitizer redacts EVERY value under `data`/`stringData`
+ * unconditionally — it does not try to judge the value. Table, `wide` and `name` never print `data` at
+ * all. Everything else must be refused, because it can emit a bare value with no key beside it:
+ *
+ *     kubectl get secret demo -o 'jsonpath={.data.password}'   →  c3VwZXItc2VjcmV0
+ *
+ * A text redactor cannot save that. It keys on sensitive NAMES or on value shapes, and one base64 blob
+ * on its own has neither — nor should it be asked to, since guessing whether an arbitrary string is a
+ * secret is not a decidable problem. `-o yaml` is refused for the same reason and not an obvious one:
+ * a Secret whose data key is not itself sensitive-sounding (`config: <base64>`) sails through the key
+ * matcher.
+ */
+const SECRET_SAFE_FORMATS = new Set([null, "wide", "name", "json"]);
+
+/**
+ * Refuse a Secret read whose output format could print the secret itself.
+ * Returns a reason string, or null when the command is fine.
+ */
+export function checkSecretOutputFormat(args: string[], subcommand: string): string | null {
+  if (subcommand !== "get") return null;
+  const resource = args.find((a, i) => i > 0 && !a.startsWith("-") && a !== subcommand) ?? "";
+  const isSecret = /^secrets?$/i.test(resource) || /(^|,)secrets?(,|$)/i.test(resource);
+  if (!isSecret) return null;
+
+  const format = getKubectlOutputFormat(args);
+  if (SECRET_SAFE_FORMATS.has(format ?? null)) return null;
+
+  return `"kubectl get secret -o ${format}" can print the secret's own values, which no output filter `
+    + `can reliably redact — a lone base64 value carries no key name and no recognisable shape. `
+    + `Use one of:\n`
+    + `  kubectl get secret <name> -o json      (values redacted, structure intact)\n`
+    + `  kubectl get secret <name>              (type, key count, age)\n`
+    + `  kubectl describe secret <name>         (key names and byte counts, no values)`;
+}
+
 export function checkAllNamespacesRestriction(args: string[], subcommand: string): string | null {
   const hasAllNs = args.includes("-A") || args.includes("--all-namespaces");
   if (!hasAllNs) return null;
@@ -1295,6 +1333,14 @@ export function checkAllNamespacesRestriction(args: string[], subcommand: string
       // A refusal that names no runnable alternative gets retried in another shape and refused again.
       // The resource is echoed back so the suggestion is copy-pasteable rather than a template.
       const resource = args.find((a, i) => i > 0 && !a.startsWith("-") && a !== subcommand) ?? "<resource>";
+      // custom-columns and yaml are refused outright for a Secret (checkSecretOutputFormat), so do not
+      // suggest them there — a hint that names a refused command is worse than no hint.
+      if (/^secrets?$/i.test(resource)) {
+        return `"kubectl get secrets --all-namespaces -o ${format}" can return excessive data, and for `
+          + `Secrets only -o json is permitted at all (values redacted, structure intact):\n`
+          + `  kubectl get secrets -A -o json\n`
+          + `  kubectl get secrets -n <namespace>`;
+      }
       return `"kubectl get --all-namespaces -o ${format}" can return excessive data — serializing every `
         + `${resource} in the cluster is the concern, so a selector does not lift it. Instead:\n`
         + `  kubectl get ${resource} -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name`

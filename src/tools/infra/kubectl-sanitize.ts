@@ -455,18 +455,48 @@ export function sanitizeJSON(
 
   let redacted = false;
   for (const item of getItems(obj)) {
+    // Each item is judged by its OWN kind. `kubectl get pod,secret -o json` returns one List holding
+    // both, and detectSensitiveResource stops at the first sensitive type it finds in the command — so
+    // every item was treated as a Pod, the Secret's `data` was returned verbatim, and the redaction
+    // notice went out anyway. A notice over an untouched secret is worse than no notice.
+    //
+    // The command-inferred type stays as the fallback: an item may carry no `kind` (a single object
+    // fetched by name sometimes does not), and then the command is the only evidence available.
+    const kind = typeof (item as any)?.kind === "string" ? (item as any).kind.toLowerCase() : "";
+    const perItem = KIND_TO_SENSITIVE_RESOURCE[kind] ?? resourceType;
     // Not `redacted ||=` — that short-circuits and skips the remaining items.
-    if (sanitizeObject(item, resourceType)) redacted = true;
+    if (sanitizeObject(item, perItem)) redacted = true;
   }
 
   const sanitized = JSON.stringify(obj, null, 2);
   return redacted ? sanitized + REDACTION_NOTICE : sanitized;
 }
 
-/** Get items array from a single object or a List response */
-function getItems(obj: any): any[] {
-  if (obj.items && Array.isArray(obj.items)) {
-    return obj.items;
+/**
+ * A resource kind, as it appears in `.kind`, mapped to the sanitizer that knows how to treat it.
+ * Anything absent from here has no sensitive payload of its own.
+ */
+const KIND_TO_SENSITIVE_RESOURCE: Record<string, SensitiveResourceType> = {
+  secret: "secret",
+  configmap: "configmap",
+  pod: "pod",
+};
+
+/**
+ * Flatten a response into the objects that need judging.
+ *
+ * Recurses through `*List` nesting rather than looking one level deep: `kubectl get pod,secret -o json`
+ * returns a List of items, but a List can itself hold a List, and an item that is never visited is an
+ * item that is never redacted. Depth is bounded so a hand-crafted document cannot spin here.
+ */
+function getItems(obj: any, depth = 0): any[] {
+  if (depth > 8 || !obj || typeof obj !== "object") return obj ? [obj] : [];
+  if (Array.isArray(obj.items)) {
+    return obj.items.flatMap((item: any) =>
+      item && typeof item === "object" && Array.isArray(item.items)
+        ? getItems(item, depth + 1)
+        : [item],
+    );
   }
   return [obj];
 }

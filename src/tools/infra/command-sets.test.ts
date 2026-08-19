@@ -1928,9 +1928,15 @@ describe("a kubectl -A refusal names a runnable alternative", () => {
   it("suggests only fields that exist on every resource", () => {
     // `.status.phase` is a pod field. Suggesting it for a Secret would make the hint itself wrong —
     // the failure mode this whole change set is about.
-    const err = checkAllNamespacesRestriction(["get", "secrets", "-A", "-o", "yaml"], "get") ?? "";
+    // Uses configmaps, not secrets: a Secret now gets its own message, because custom-columns is
+    // refused there outright and a hint must never name a command the same rule refuses.
+    const err = checkAllNamespacesRestriction(["get", "configmaps", "-A", "-o", "yaml"], "get") ?? "";
     expect(err).toContain("NS:.metadata.namespace,NAME:.metadata.name");
     expect(err).not.toContain("status.phase");
+
+    const secretErr = checkAllNamespacesRestriction(["get", "secrets", "-A", "-o", "yaml"], "get") ?? "";
+    expect(secretErr).toContain("only -o json is permitted");
+    expect(secretErr).not.toContain("custom-columns");
   });
 
   it("tells describe/events/top how to narrow instead of just refusing", () => {

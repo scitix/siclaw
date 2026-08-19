@@ -9,7 +9,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
-import { SAFE_SUBCOMMANDS, checkAllNamespacesRestriction } from "../infra/command-sets.js";
+import { SAFE_SUBCOMMANDS, checkAllNamespacesRestriction, checkSecretOutputFormat } from "../infra/command-sets.js";
 import { loadConfig } from "../../core/config.js";
 import {
   CONTAINER_SENSITIVE_PATHS,
@@ -109,6 +109,12 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
           hint: 'Add --tail=<N> or --since=<duration>, e.g. "kubectl logs my-pod --tail=1000".',
         }, null, 2);
       }
+    }
+
+    // ── A Secret may only be printed in a form that cannot show its values ───
+    const secretFmtErr = checkSecretOutputFormat(args, subcommand);
+    if (secretFmtErr) {
+      return JSON.stringify({ error: secretFmtErr }, null, 2);
     }
 
     // ── Rate protection: -A/--all-namespaces ───
