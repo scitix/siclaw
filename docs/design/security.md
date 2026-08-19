@@ -356,10 +356,15 @@ even though `grep` appears after a pipe.
 A path check runs before the shell expands anything, so a literal-prefix rule is only as good as
 the literal: `printf x | column "$SICLAW_CREDENTIALS_DIR"/clusters/*` contains no credential path
 for either that rule or the sensitive-path patterns to match. **A file operand of a stdin-only text
-command therefore rejects variable expansion and command substitution outright.** Globs are not
-rejected: `*` does not match `..`, so a glob cannot climb out of the workdir, and one that does name
-the credential directory has to spell it literally. Args that are not file operands — the grep
-pattern, the jq/yq expression, `tr`'s SETs — are exempt, since a regex legitimately contains `$`.
+command therefore rejects a path separator and everything the shell rewrites** — globs included. An
+earlier revision permitted globs, arguing that `*` cannot match `..` and so cannot climb out of the
+workdir; true, and irrelevant, because the credentials live BELOW the workdir (`WORKDIR /app`,
+credentials at `/app/.siclaw/credentials/`), so `head .siclaw/*/*/*` reaches them without naming them.
+
+Args that are not file operands — the grep pattern, the jq/yq expression, `tr`'s SETs — are exempt,
+since a regex legitimately contains `$` and `/`. Getting that exemption right is where the bypasses
+were: the pattern may arrive attached inside a short-option cluster (`-ie.` is `-i -e '.'`), and an
+empty quoted pattern must survive tokenisation, or the operand after it is mistaken for the pattern.
 
 Screening argv is not always enough to bound a command. `yq`'s expression language reads files and
 the environment by itself (`load_str(env(X) + "/y")`), with no flag and no path argument, so `yq`

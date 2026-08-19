@@ -20,6 +20,7 @@ import {
   resetStartupFailureMemo,
   startupFailureMemoSize,
   startupFailureKey,
+  rememberStartupFailureFor,
 } from "./debug-pod.js";
 
 describe("buildDebugJobManifest — self-cleaning Job", () => {
@@ -415,5 +416,70 @@ describe("startup-failure memo: what is remembered, and keyed by what", () => {
     expect(startupFailureMemoSize()).toBeLessThanOrEqual(256);
     // The most recent entry survives the eviction.
     expect(lookupStartupFailure(startupFailureKey(spec({ nodeName: "n399" })))).not.toBeNull();
+  });
+});
+
+describe("a failure is remembered before the creation lock is released", () => {
+  beforeEach(() => resetStartupFailureMemo());
+
+  const spec = { userId: "u1", clusterKey: "c1", nodeName: "n1", command: "true", image: "img:1" } as any;
+
+  // Scope note, so this is not read as more than it is: it drives DebugPodCache + the memo helper
+  // directly, which is exactly where the race lives (memo write vs lock release). It does NOT execute
+  // ensureDebugPodReady, whose kubectl calls are not injectable — that function's contribution is
+  // calling the helper from INSIDE its createFn, which is visible by inspection. Because of that, the
+  // test is written DIFFERENTIALLY: the same scenario with the memo written after getOrCreate returns
+  // must show the extra creation, or this test would pass no matter where the write happens.
+  const raceScenario = async (rememberInsideLock: boolean) => {
+    const cache = new DebugPodCache();
+    const key = startupFailureKey(spec);
+    let attempts = 0;
+    const attempt = async () => {
+      try {
+        await cache.getOrCreate(spec.userId, spec.clusterKey, spec.nodeName, async () => {
+          const remembered = lookupStartupFailure(key);
+          if (remembered) throw remembered;
+          attempts++;
+          await new Promise((r) => setTimeout(r, 5));
+          const err = new Error('Pod "p" cannot start: Unschedulable');
+          // Inside the lock (the fix) vs after getOrCreate returns (the bug).
+          throw rememberInsideLock ? rememberStartupFailureFor(key, spec.nodeName, err, false) : err;
+        });
+      } catch (err) {
+        if (!rememberInsideLock) rememberStartupFailureFor(key, spec.nodeName, err, false);
+      }
+    };
+    await Promise.all([attempt(), attempt(), attempt()]);
+    return attempts;
+  };
+
+  it("the old ordering DOES lose the race — so the test below is measuring something", async () => {
+    // Remembering after getOrCreate returns: its `finally` has already deleted the lock and resolved
+    // every waiter, so the first waiter finds an empty memo and becomes the next creator.
+    expect(await raceScenario(false)).toBeGreaterThan(1);
+  });
+
+  it("three concurrent callers cause ONE creation attempt, not two", async () => {
+    expect(await raceScenario(true)).toBe(1);
+    expect(lookupStartupFailure(startupFailureKey(spec))?.reason).toBe("unschedulable");
+  });
+
+  it("does not remember an abort, even from inside the lock", async () => {
+    const key = startupFailureKey(spec);
+    const out = rememberStartupFailureFor(key, "n1", new Error("Aborted."), true);
+    expect(out).toBeInstanceOf(Error);
+    expect(lookupStartupFailure(key)).toBeNull();
+  });
+
+  it("passes a replayed memo entry through without refreshing or re-suffixing it", () => {
+    const key = startupFailureKey(spec);
+    rememberStartupFailureFor(key, "n1", new Error("Pod cannot start: Unschedulable"), false);
+    const replay = lookupStartupFailure(key)!;
+    expect(replay.cached).toBe(true);
+
+    const out = rememberStartupFailureFor(key, "n1", replay, false) as any;
+    expect(out).toBe(replay);
+    // One suffix, not two — the message is not rewritten on every caller.
+    expect(out.message.match(/unchanged from an attempt/g) ?? []).toHaveLength(1);
   });
 });

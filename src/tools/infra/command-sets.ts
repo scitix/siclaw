@@ -25,6 +25,16 @@ export function parseArgs(command: string): string[] {
   const args: string[] = [];
   let current = "";
   let inQuote: string | null = null;
+  // An explicitly quoted argument survives even when it is EMPTY. Dropping it silently renumbered
+  // every positional after it: `grep "" .siclaw/*/*/*` arrived as ["grep", ".siclaw/*/*/*"], so the
+  // credential glob became the first positional and was exempted as grep's pattern — while the shell
+  // passes the empty pattern through and grep prints every line of the files behind the glob.
+  let quotedEmpty = false;
+  const flush = () => {
+    if (current || quotedEmpty) args.push(current);
+    current = "";
+    quotedEmpty = false;
+  };
   for (const ch of command) {
     if (inQuote) {
       if (ch === inQuote) {
@@ -34,16 +44,14 @@ export function parseArgs(command: string): string[] {
       }
     } else if (ch === '"' || ch === "'") {
       inQuote = ch;
+      quotedEmpty = true;
     } else if (ch === " " || ch === "\t") {
-      if (current) {
-        args.push(current);
-        current = "";
-      }
+      flush();
     } else {
       current += ch;
     }
   }
-  if (current) args.push(current);
+  flush();
   return args;
 }
 
@@ -955,6 +963,16 @@ function validateTee(args: string[]): string | null {
  * expression left among the positionals and every one of them is a FILE.
  */
 interface TextExpressionArgs {
+  /**
+   * Single-letter options that CONSUME a value, in getopt terms. Needed because a short-option cluster
+   * carries its value inline from the FIRST value-taking letter onward: grep reads `-ie.` as
+   * `-i -e '.'`, and `-ifoo` as `-i -f oo` — a pattern FILE, not "-i plus a pattern".
+   *
+   * Without this, only the letter at position 1 was examined, so `grep -ie. .siclaw/*\/*\/*` looked
+   * like an unknown boolean flag: the expression quota stayed unspent and the credential glob behind it
+   * was exempted as the pattern.
+   */
+  shortValueFlags?: readonly string[];
   /** Leading positionals that are an expression, not a file: the grep pattern, jq/yq filter, tr SETs. */
   positionals: number;
   /** Flags that supply the expression themselves; their value is a pattern, and no positional is left. */
@@ -971,6 +989,8 @@ const GREP_EXPRESSION_ARGS: TextExpressionArgs = {
   positionals: 1,
   patternFlags: ["-e", "--regexp"],
   fileFlags: ["-f", "--file"],
+  // e=pattern f=pattern-file m=max-count A/B/C=context d=directories D=devices
+  shortValueFlags: ["e", "f", "m", "A", "B", "C", "d", "D"],
 };
 
 // Keyed by a Map, not a plain object: both the command name and the flag come from the caller, and
@@ -979,8 +999,8 @@ const TEXT_EXPRESSION_ARGS = new Map<string, TextExpressionArgs>([
   ["grep", GREP_EXPRESSION_ARGS],
   ["egrep", GREP_EXPRESSION_ARGS],
   ["fgrep", GREP_EXPRESSION_ARGS],
-  ["jq", { positionals: 1, fileFlags: ["-f", "--from-file", "--rawfile", "--slurpfile"] }],
-  ["yq", { positionals: 1, fileFlags: ["--from-file"] }],
+  ["jq", { positionals: 1, fileFlags: ["-f", "--from-file", "--rawfile", "--slurpfile"], shortValueFlags: ["f"] }],
+  ["yq", { positionals: 1, fileFlags: ["--from-file"], shortValueFlags: ["o", "p"] }],
   ["wc", { positionals: 0, fileFlags: ["--files0-from"] }],
   ["sort", { positionals: 0, fileFlags: ["--files0-from"] }],
   ["tr", { positionals: 2 }],
@@ -1070,8 +1090,21 @@ function applyContextPolicy(
       if (arg === "-") continue;
 
       if (arg.startsWith("-")) {
-        const flag = extractFlag(arg);
-        const inlineValue = arg.length > flag.length ? arg.slice(flag.length).replace(/^=/, "") : "";
+        // Short options cluster, and the value belongs to the FIRST letter that takes one: grep reads
+        // `-ie.` as `-i -e '.'` and `-ifoo` as `-i -f oo`. extractFlag only splits on `=`, and an
+        // earlier revision only examined the letter at position 1 — so `-ie.` read as an unknown
+        // boolean, the expression quota stayed unspent, and `grep -ie. .siclaw/*/*/*` was accepted.
+        // It prints every line of the credential files behind that glob.
+        let flag = extractFlag(arg);
+        let inlineValue = arg.length > flag.length ? arg.slice(flag.length).replace(/^=/, "") : "";
+        if (!inlineValue && !arg.startsWith("--") && arg.length > 2 && spec?.shortValueFlags) {
+          for (let c = 1; c < arg.length; c++) {
+            if (!spec.shortValueFlags.includes(arg[c])) continue;
+            flag = `-${arg[c]}`;
+            inlineValue = arg.slice(c + 1);   // "" means the value is the NEXT token
+            break;
+          }
+        }
 
         if (spec?.fileFlags?.includes(flag)) {
           return JSON.stringify({

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { analyzeOutput, applySanitizer, type OutputAction } from "./output-sanitizer.js";
+import { analyzeOutput, applySanitizer, type OutputAction, redactSensitiveContent } from "./output-sanitizer.js";
 
 // ── analyzeOutput ────────────────────────────────────────────────────
 
@@ -373,5 +373,52 @@ describe("crictl inspect output sanitization", () => {
     const json = JSON.stringify({ info: { config: {} } });
     const result = applySanitizer(json, action);
     expect(result).not.toContain("REDACTED");
+  });
+});
+
+describe("a cross-line redactor is not line-safe", () => {
+  // `redactSensitiveContent` routes through `redactDocument`, which carries state across lines so the
+  // BODY of a PEM key, a YAML block scalar and a mapping nested under a sensitive key are redacted
+  // along with the marker line that introduces them. The streaming sanitizer calls a line-safe action
+  // once per batch of complete lines with NO state between calls, so a secret split across two batches
+  // had its BEGIN line redacted and its body written to the task output verbatim — with the redaction
+  // notice attached, which is worse than no claim.
+  //
+  // `lineSafe: false` makes the fail-closed guard in SanitizingLineBuffer refuse to background these
+  // instead. The commands that matter for background monitoring are unaffected: `kubectl logs -f`,
+  // `journalctl -f` and `tcpdump` resolve to no sanitizer at all.
+  it("marks the file-reading commands as not streamable", () => {
+    for (const cmd of ["cat", "head", "tail", "grep", "egrep", "fgrep", "strings", "zcat", "zgrep"]) {
+      const action = analyzeOutput(cmd, ["/var/log/x"]);
+      expect(action, cmd).not.toBeNull();
+      expect(action!.lineSafe, cmd).toBe(false);
+    }
+  });
+
+  it("marks kubectl's non-JSON and describe paths as not streamable", () => {
+    expect(analyzeOutput("kubectl", ["get", "cm", "-o", "yaml"])!.lineSafe).toBe(false);
+    expect(analyzeOutput("kubectl", ["describe", "cm", "x"])!.lineSafe).toBe(false);
+  });
+
+  it("leaves the background workhorses alone", () => {
+    // No sanitizer resolves for these, so `lineSafe` never enters the picture and they stay
+    // backgroundable — which is what keeps this change from costing log monitoring.
+    expect(analyzeOutput("kubectl", ["logs", "mypod", "-f"])).toBeNull();
+    expect(analyzeOutput("journalctl", ["-u", "kubelet", "-f"])).toBeNull();
+    expect(analyzeOutput("tcpdump", ["-i", "eth0"])).toBeNull();
+  });
+
+  it("demonstrates why: a PEM split across two batches leaks its body per-line", () => {
+    // The reason the declaration had to change, shown rather than asserted in prose.
+    const pem = [
+      "-----BEGIN RSA PRIVATE KEY-----",
+      "MIIEowIBAAKCAQEA1234567890LEAKED",
+      "-----END RSA PRIVATE KEY-----",
+    ];
+    const wholeDocument = redactSensitiveContent(pem.join("\n"));
+    expect(wholeDocument).not.toContain("MIIEowIBAAKCAQEA");
+
+    const perBatch = pem.map((line) => redactSensitiveContent(line)).join("\n");
+    expect(perBatch).toContain("MIIEowIBAAKCAQEA");   // ← what streaming would have written
   });
 });

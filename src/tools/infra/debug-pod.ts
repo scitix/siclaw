@@ -656,25 +656,19 @@ export async function ensureDebugPodReady(
           nodeName: spec.nodeName,
           force: true,
         }).catch(() => {});
-        throw err; // re-throw so getOrCreate reports failure; waiters will retry
+        // Remembered HERE, still holding the creation lock. getOrCreate's `finally` resolves every
+        // waiter before our caller's catch block runs, so a memo written out there loses the race:
+        // the first waiter becomes the next creator and repeats the whole attempt.
+        throw rememberStartupFailureFor(key, spec.nodeName, err, opts.signal?.aborted);
       }
     },
   );
 
   } catch (err) {
     // Aborts say nothing about the node, so they are not remembered.
-    const message = err instanceof Error ? err.message : String(err);
-    if (opts.signal?.aborted || /^Aborted/i.test(message)) throw err;
-    // A replayed memo entry must not be re-remembered: doing so would refresh its timestamp on every
-    // caller (so it never ages out under load) and append the "unchanged from an attempt …" suffix
-    // to a message that already carries one.
-    if (err instanceof DebugPodStartupError && err.cached) throw err;
-    const { stage, reason } = classifyStartupFailure(message);
-    const startupError = err instanceof DebugPodStartupError
-      ? err
-      : new DebugPodStartupError(message, stage, reason, spec.nodeName);
-    rememberStartupFailure(key, startupError);
-    throw startupError;
+    // createFn already classified and remembered anything it raised, while holding the lock. This
+    // covers what it cannot see: a failure thrown by getOrCreate itself, or by a waiter's own path.
+    throw rememberStartupFailureFor(key, spec.nodeName, err, opts.signal?.aborted);
   }
 
   if (!result.pod) {
@@ -813,6 +807,42 @@ export function lookupStartupFailure(key: string): DebugPodStartupError | null {
     remembered.error.nodeName,
     true,
   );
+}
+
+/**
+ * Classify a startup failure, remember it, and return the error to throw.
+ *
+ * Called from INSIDE the creation closure, and that placement is the point. The cache's `finally`
+ * deletes the lock and resolves every waiter before the caller's catch block runs, so a memo written
+ * after `getOrCreate` returns is written too late: the first waiter wakes, finds no lock and no memo,
+ * becomes the creator and pays the full create + schedule + wait budget again. Three concurrent calls
+ * produced two creations.
+ *
+ * Returns the error rather than throwing so the call site reads as `throw remember…(…)`, which makes it
+ * hard to write a path that fails without recording why.
+ *
+ * An ABORT is never remembered — it says nothing about the node — and a replayed memo entry is passed
+ * through untouched, so its timestamp is not refreshed on every caller and its "unchanged from an
+ * attempt …" suffix is not appended twice.
+ */
+export function rememberStartupFailureFor(
+  key: string,
+  nodeName: string,
+  err: unknown,
+  aborted?: boolean,
+): unknown {
+  const message = err instanceof Error ? err.message : String(err);
+  if (aborted || /^Aborted/i.test(message)) return err;
+  if (err instanceof DebugPodStartupError && err.cached) return err;
+
+  const startupError = err instanceof DebugPodStartupError
+    ? err
+    : (() => {
+        const { stage, reason } = classifyStartupFailure(message);
+        return new DebugPodStartupError(message, stage, reason, nodeName);
+      })();
+  rememberStartupFailure(key, startupError);
+  return startupError;
 }
 
 /** Forget this node's remembered failure — it started, so the old reason no longer describes it. */

@@ -1945,3 +1945,84 @@ describe("a kubectl -A refusal names a runnable alternative", () => {
     expect(checkAllNamespacesRestriction(["get", "pods", "-A", "-o", "wide"], "get")).toBeNull();
   });
 });
+
+describe("an attached short-option value cannot buy an operand an exemption", () => {
+  const local = { context: "local", piped: true };
+  const reject = (cmd: string) => expect(validateCommandRestrictions(cmd, local), cmd).not.toBeNull();
+  const allow = (cmd: string) => expect(validateCommandRestrictions(cmd, local), cmd).toBeNull();
+
+  // `extractFlag` only splits on `=`, so `-e.` came back whole and did not match the `-e` in
+  // patternFlags. The expression quota stayed unspent and the NEXT positional — the credential glob —
+  // was exempted as "the expression". `printf x | grep -e. .siclaw/*/*/*` was accepted, and it prints
+  // every non-empty line of the credential files.
+  it("rejects the credential glob behind an attached pattern", () => {
+    reject("grep -e. .siclaw/*/*/*");
+    reject('grep -e. "$SICLAW_CREDENTIALS_DIR"/clusters/*');
+    reject("grep -ex .siclaw/credentials/clusters/default.kubeconfig");
+    reject("grep -e. .siclaw/{credentials,x}/clusters/*");
+    reject("egrep -e. .siclaw/*/*/*");
+    reject("fgrep -e. .siclaw/*/*/*");
+  });
+
+  it("refuses an attached file option, and a combined form that hides one", () => {
+    reject("grep -f.siclaw/credentials/clusters/x .");
+    reject("grep -if.siclaw/credentials/clusters/x .");
+    reject("jq -f.siclaw/credentials/clusters/x");
+  });
+
+  it("leaves ordinary attached forms alone", () => {
+    allow("grep -e.");            // pattern is a single dot
+    // NOT `grep -ifoo`: getopt reads that as `-i -f oo`, i.e. a pattern FILE, so it is refused. The
+    // previous comment here claimed "-i plus a pattern", which was simply wrong about grep.
+    allow("grep -efoo");
+    allow("grep -m5 pattern");
+    allow("grep -e 'foo$bar'");
+    // NOT asserted: `grep -e'error$'`. It is refused, but by a PRE-EXISTING rule unrelated to this —
+    // the combined-short-flag decomposition sees the `r` in "error" and reads it as grep's blocked
+    // `-r`. Same root cause (extractFlag does not understand attached short values), different pass;
+    // out of scope here, and worth knowing before someone "fixes" it in this walk.
+  });
+});
+
+describe("short-option clusters and empty patterns cannot smuggle a credential operand", () => {
+  const local = { context: "local", piped: true };
+  const reject = (cmd: string) => expect(validateCommandRestrictions(cmd, local), cmd).not.toBeNull();
+  const allow = (cmd: string) => expect(validateCommandRestrictions(cmd, local), cmd).toBeNull();
+
+  // getopt gives the value to the FIRST letter in the cluster that takes one: `-ie.` is `-i -e '.'`,
+  // `-ifoo` is `-i -f oo`. Examining only the letter at position 1 left `-ie.` looking like an unknown
+  // boolean, so the expression quota stayed unspent and the glob behind it was exempted as the pattern.
+  it("parses the cluster by option arity, wherever the value-taking letter sits", () => {
+    reject("grep -ie. .siclaw/*/*/*");
+    reject("grep -ife. .siclaw/*/*/*");
+    reject('grep -ie. "$SICLAW_CREDENTIALS_DIR"/clusters/*');
+    reject("grep -vf .siclaw/credentials/clusters/x .siclaw/*/*/*");
+    reject("grep -ifoo .siclaw/*/*/*");
+    reject("egrep -ie. .siclaw/*/*/*");
+  });
+
+  // parseArgs used to DROP an empty quoted argument, which renumbered every positional after it: the
+  // credential glob became the first positional and was exempted as the pattern, while the shell passes
+  // the empty pattern through and grep prints every line of the files it expands to.
+  it("keeps an empty pattern as a positional so the operand after it is still an operand", () => {
+    reject('grep "" .siclaw/*/*/*');
+    reject("grep -e '' .siclaw/*/*/*");
+    reject("grep '' .siclaw/credentials/clusters/default.kubeconfig");
+    expect(parseArgs('grep "" x')).toEqual(["grep", "", "x"]);
+  });
+
+  it("still refuses when the pipeline ends in a command with no redactor", () => {
+    // A trailing `| cut` resolves the output sanitizer to cut (which has none), so the validator is the
+    // only thing standing there — the reason both payloads were reported with that suffix.
+    reject("grep -ie. .siclaw/*/*/* | cut -c1-");
+    reject('grep "" .siclaw/*/*/* | cut -c1-');
+  });
+
+  it("leaves ordinary clusters alone", () => {
+    allow("grep -ie pattern");
+    allow("grep -in pattern");
+    allow("grep -A3 pattern");
+    allow("grep -m5 pattern");
+    allow("grep -ie.");
+  });
+});

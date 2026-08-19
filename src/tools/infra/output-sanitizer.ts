@@ -97,7 +97,7 @@ OUTPUT_RULES["kubectl"] = (args) => {
   if (sub === "describe") {
     const resource = detectSensitiveResource(args);
     if (resource && resource !== "secret") {
-      return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: true };
+      return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: false };
     }
     return null;
   }
@@ -120,7 +120,7 @@ OUTPUT_RULES["kubectl"] = (args) => {
   if (!fmt || safeFormats.has(fmt)) return null;
 
   // All other formats (yaml, jsonpath, go-template, custom-columns) → line-level sanitization
-  return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: true };
+  return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: false };
 };
 
 // ── File-reading command rules ──────────────────────────────────────
@@ -131,7 +131,14 @@ const REDACTED = "**REDACTED**";
 const fileReadingRule: OutputRuleFn = (_args) => ({
   type: "sanitize",
   sanitize: redactSensitiveContent,
-  lineSafe: true,
+  // NOT line-safe. `redactSensitiveContent` routes through `redactDocument`, which carries state
+  // across lines so that a PEM body, a YAML block scalar and a mapping nested under a sensitive key
+  // are redacted along with the marker that introduces them. The streaming sanitizer calls a
+  // line-safe action once per batch of complete lines with no state between calls, so a secret split
+  // across two batches had its BEGIN line redacted and its body written to the task output verbatim —
+  // with the redaction notice attached. `false` makes the existing fail-closed guard in
+  // SanitizingLineBuffer refuse to background these commands instead.
+  lineSafe: false,
 });
 
 for (const cmd of [
