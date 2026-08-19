@@ -1854,3 +1854,29 @@ describe("prototype-property names are not rules", () => {
     }
   });
 });
+
+describe("a flag value that begins with a dash is not a flag", () => {
+  // `journalctl -b -1` (the previous boot) was refused with `"-1" is not allowed`, which names the
+  // VALUE rather than the parse — an agent reading that drops the -1 and loses the intent, and never
+  // discovers that the attached form works.
+  it("accepts the separated negative value for a declared value-flag", () => {
+    expect(validateCommandRestrictions("journalctl -b -1 -u kubelet")).toBeNull();
+    expect(validateCommandRestrictions("journalctl -n -100 -u kubelet")).toBeNull();
+    expect(validateCommandRestrictions("journalctl -b -1 --output=json")).toBeNull();
+  });
+
+  it("keeps the forms that already worked", () => {
+    expect(validateCommandRestrictions("journalctl -b-1 -u kubelet")).toBeNull();
+    expect(validateCommandRestrictions("journalctl --boot=-1")).toBeNull();
+    expect(validateCommandRestrictions("journalctl -b abc")).toBeNull();
+  });
+
+  it("does not become a hole for an arbitrary token", () => {
+    // Only a NEGATIVE NUMBER directly after a declared value-flag is consumed. Everything else is
+    // still validated as a flag, so a non-whitelisted flag cannot ride in behind one.
+    expect(validateCommandRestrictions("journalctl -b -1 -f")).not.toBeNull();       // -f not whitelisted
+    expect(validateCommandRestrictions("journalctl -x -1")).not.toBeNull();          // -x is not a value-flag
+    expect(validateCommandRestrictions("journalctl -b -1 --dump-catalog")).not.toBeNull();
+    expect(validateCommandRestrictions("journalctl -b --setup-keys")).not.toBeNull();
+  });
+});

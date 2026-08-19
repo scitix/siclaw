@@ -365,7 +365,10 @@ describe("validateCommand — sensitive path patterns (Pass 6)", () => {
         sensitivePathPatterns: patterns,
       });
       expect(err).not.toBeNull();
-      expect(err).toContain("sensitive paths");
+      // Asserted on the machine-readable discriminator, not on the prose: the refusal text now names
+      // what matched and what to do instead, and a phrase assertion would only restate whatever
+      // wording it happens to have.
+      expect(JSON.parse(err as string).rejected_by).toBe("sensitive_path");
     });
   }
 
@@ -382,7 +385,7 @@ describe("validateCommand — sensitive path patterns (Pass 6)", () => {
       sensitivePathPatterns: patterns,
     });
     expect(err).not.toBeNull();
-    expect(err).toContain("sensitive paths");
+    expect(JSON.parse(err as string).rejected_by).toBe("sensitive_path");
   });
 });
 
@@ -417,5 +420,34 @@ describe("validateCommand — happy paths", () => {
 
   it("accepts ps aux in node context", () => {
     expect(validateCommand("ps aux", { context: "node" })).toBeNull();
+  });
+});
+
+describe("a sensitive-path refusal says what matched and what to do instead", () => {
+  const node = { context: "node" as const, sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS };
+  const refusal = (cmd: string) => JSON.parse(validateCommand(cmd, node) as string);
+
+  it("names the matched text and the rule, instead of a bare denial", () => {
+    // "Accessing sensitive paths is not allowed" told the agent nothing: not which argument, not
+    // whether the command itself was the problem. The usual response was to try another command and
+    // be refused again.
+    const r = refusal("cat /etc/kubernetes/pki/ca.key");
+    expect(r.matched).toBe(".key");
+    expect(r.rejected_by).toBe("sensitive_path");
+    expect(r.hint).toContain(".crt");
+  });
+
+  it("gives advice that fits the kind of secret", () => {
+    expect(refusal("cat /root/.ssh/id_rsa").hint).toContain("host_exec");
+    expect(refusal("cat /var/run/secrets/kubernetes.io/serviceaccount/token").hint).toContain("mounted");
+    expect(refusal("cat /proc/1/environ").hint).toContain("ps");
+    expect(refusal("cat /etc/shadow").hint).toContain("getent");
+    expect(refusal("cat /root/.aws/credentials").hint).toContain("image-pull");
+  });
+
+  it("still refuses — the hint is guidance, not a way through", () => {
+    for (const cmd of ["cat /etc/shadow", "cat /root/.ssh/id_ed25519", "head /proc/1/environ"]) {
+      expect(validateCommand(cmd, node)).not.toBeNull();
+    }
   });
 });
