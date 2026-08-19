@@ -1,4 +1,40 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// MCP SDK doubles. initialize() lazy-imports the SDK, so the connection lifecycle
+// is only reachable in a test by standing in for those four modules. Everything
+// else in this file exercises pure functions and is unaffected by these mocks.
+const sdk = vi.hoisted(() => {
+  const state = {
+    connect: async (_transport: unknown): Promise<void> => {},
+    listTools: async (): Promise<{ tools: unknown[] }> => ({ tools: [] }),
+    /** Ordered log of every close() the manager performed. */
+    closed: [] as string[],
+    /** When set, every transport close() rejects with it. */
+    transportCloseError: null as Error | null,
+  };
+  const transportDouble = (label: string) =>
+    class {
+      constructor(..._args: unknown[]) {}
+      async close(): Promise<void> {
+        state.closed.push(label);
+        if (state.transportCloseError) throw state.transportCloseError;
+      }
+    };
+  return { state, transportDouble };
+});
+
+vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
+  Client: class {
+    constructor(..._args: unknown[]) {}
+    async connect(transport: unknown) { return sdk.state.connect(transport); }
+    async listTools() { return sdk.state.listTools(); }
+    async close() { sdk.state.closed.push("client"); }
+  },
+}));
+vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({ StdioClientTransport: sdk.transportDouble("stdio") }));
+vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({ SSEClientTransport: sdk.transportDouble("sse") }));
+vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({ StreamableHTTPClientTransport: sdk.transportDouble("http") }));
+
 import { jsonSchemaToTypebox, normalizeMcpInputSchema, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, mcpContentToAgentContent, McpClientManager } from "./mcp-client.js";
 
 describe("jsonSchemaToTypebox", () => {
@@ -205,5 +241,72 @@ describe("normalizeMcpInputSchema", () => {
     expect(normalizeMcpInputSchema(undefined) as any).toMatchObject({ type: "object", properties: {} });
     expect(normalizeMcpInputSchema({}) as any).toMatchObject({ type: "object", properties: {} });
     expect(normalizeMcpInputSchema([1, 2]) as any).toMatchObject({ type: "object", properties: {} });
+  });
+});
+
+describe("McpClientManager.initialize connection cleanup", () => {
+  // A connection that fails before `this.clients.push()` is invisible to
+  // shutdown(), which only walks that array. Without an explicit close in the
+  // catch, the started transport (stdio child process / open http connection)
+  // leaks — and since initialize() runs once per session on a resident box
+  // (SICLAW_AGENTBOX_IDLE_TIMEOUT=0), nothing ever reclaims it.
+  const stdioServer = { mcpServers: { probe: { command: "/bin/true" } } } as any;
+
+  beforeEach(() => {
+    sdk.state.closed = [];
+    sdk.state.connect = async () => {};
+    sdk.state.listTools = async () => ({ tools: [] });
+    sdk.state.transportCloseError = null;
+  });
+
+  it("closes the transport when connect() fails", async () => {
+    sdk.state.connect = async () => { throw new Error("ECONNREFUSED"); };
+    await new McpClientManager(stdioServer).initialize();
+    expect(sdk.state.closed).toContain("stdio");
+  });
+
+  it("closes the connection when listTools() fails after a completed handshake", async () => {
+    sdk.state.listTools = async () => { throw new Error("tools/list timed out"); };
+    await new McpClientManager(stdioServer).initialize();
+    // connect() returned, so the client owns a live transport: closing either
+    // handle releases it. Assert the connection was released, not which handle did it.
+    expect(sdk.state.closed.length).toBeGreaterThan(0);
+  });
+
+  it("leaves a successful connection open for shutdown() to close", async () => {
+    sdk.state.listTools = async () => ({ tools: [{ name: "ping" }] });
+    const manager = new McpClientManager(stdioServer);
+    await manager.initialize();
+
+    expect(sdk.state.closed).toEqual([]);
+    expect(manager.getTools()).toHaveLength(1);
+
+    await manager.shutdown();
+    expect(sdk.state.closed).toContain("client");
+  });
+
+  it("does not let a cleanup failure escape initialize()", async () => {
+    sdk.state.connect = async () => { throw new Error("ECONNREFUSED"); };
+    sdk.state.transportCloseError = new Error("close hung");
+    await expect(new McpClientManager(stdioServer).initialize()).resolves.toBeUndefined();
+  });
+
+  it("keeps initializing the remaining servers after one fails to clean up", async () => {
+    // The cleanup is awaited inside the loop, so a throwing close() must not
+    // abort the iteration and cost every later server its tools.
+    sdk.state.transportCloseError = new Error("close hung");
+    sdk.state.connect = async () => {
+      // Fail the first server only; the second completes its handshake.
+      sdk.state.connect = async () => {};
+      throw new Error("ECONNREFUSED");
+    };
+    sdk.state.listTools = async () => ({ tools: [{ name: "ping" }] });
+
+    const manager = new McpClientManager({
+      mcpServers: { broken: { command: "/bin/true" }, healthy: { url: "https://mcp.example/mcp" } },
+    } as any);
+    await manager.initialize();
+
+    expect(manager.getTools().map((t) => t.name)).toEqual(["mcp__healthy__ping"]);
   });
 });
