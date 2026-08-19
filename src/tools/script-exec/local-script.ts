@@ -228,13 +228,19 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           let stdout = "";
           let stderr = "";
           let totalSize = 0;
-          child.stdout.on("data", (chunk: Buffer) => {
-            totalSize += chunk.length;
-            if (totalSize <= MAX_OUTPUT) stdout += chunk.toString();
+          // Decode on the stream so a multibyte character split across two data
+          // events survives; per-chunk decoding yields two U+FFFD. The cap stays
+          // byte-based (Buffer.byteLength), since chunk.length on a string counts
+          // UTF-16 units and would let a CJK-heavy output run past 10 MB.
+          child.stdout.setEncoding("utf8");
+          child.stderr.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            totalSize += Buffer.byteLength(chunk);
+            if (totalSize <= MAX_OUTPUT) stdout += chunk;
           });
-          child.stderr.on("data", (chunk: Buffer) => {
-            totalSize += chunk.length;
-            if (totalSize <= MAX_OUTPUT) stderr += chunk.toString();
+          child.stderr.on("data", (chunk: string) => {
+            totalSize += Buffer.byteLength(chunk);
+            if (totalSize <= MAX_OUTPUT) stderr += chunk;
           });
           child.on("close", (code) => {
             clearTimeout(timer);

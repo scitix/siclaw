@@ -457,8 +457,12 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
           let stdout = "";
           let stderr = "";
-          child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-          child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+          // Decode on the stream so a multibyte character split across two data
+          // events survives; per-chunk decoding yields two U+FFFD instead.
+          child.stdout?.setEncoding("utf8");
+          child.stderr?.setEncoding("utf8");
+          child.stdout?.on("data", (chunk: string) => { stdout += chunk; });
+          child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
           child.on("close", (code) => {
             if (code === 0) resolve({ stdout, stderr });
             else reject(Object.assign(new Error(`exit ${code}`), { code, stdout, stderr }));

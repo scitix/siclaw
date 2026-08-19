@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
+import { StringDecoder } from "node:string_decoder";
 import http from "node:http";
 import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
 import { CredentialService, CredentialNotFoundError, SessionOwnershipError } from "./credential-service.js";
@@ -8,15 +9,36 @@ import type { CertificateIdentity } from "./security/cert-manager.js";
 // ── Fakes ──────────────────────────────────────────────────
 
 class FakeReq extends EventEmitter {
-  [Symbol.asyncIterator](): AsyncIterator<Buffer> {
-    return (async function* (self: FakeReq): AsyncGenerator<Buffer> {
-      for (const chunk of self._chunks) yield chunk;
+  [Symbol.asyncIterator](): AsyncIterator<Buffer | string> {
+    return (async function* (self: FakeReq): AsyncGenerator<Buffer | string> {
+      if (!self._encoding) {
+        for (const chunk of self._chunks) yield chunk;
+        return;
+      }
+      // Mirror what a real stream does with an encoding set: ONE decoder across
+      // all chunks, holding the partial bytes of a character split by a chunk
+      // boundary. Decoding each chunk on its own here would make the double
+      // corrupt the text no matter what the production code does, so the test
+      // would prove nothing.
+      const decoder = new StringDecoder(self._encoding);
+      for (const chunk of self._chunks) {
+        const text = decoder.write(chunk);
+        if (text) yield text;
+      }
+      const tail = decoder.end();
+      if (tail) yield tail;
     })(this);
   }
   _chunks: Buffer[] = [];
-  constructor(body: string) {
+  _encoding: BufferEncoding | null = null;
+  constructor(body: string | Buffer[]) {
     super();
-    if (body) this._chunks.push(Buffer.from(body));
+    if (Array.isArray(body)) this._chunks.push(...body);
+    else if (body) this._chunks.push(Buffer.from(body));
+  }
+  setEncoding(encoding: BufferEncoding): this {
+    this._encoding = encoding;
+    return this;
   }
 }
 
@@ -73,6 +95,29 @@ describe("handleCredentialRequest", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).credential.name).toBe("c1");
     expect(service.getClusterCredential).toHaveBeenCalled();
+  });
+
+  it("keeps a multibyte character split across two chunks intact", async () => {
+    // Same defect the other two readers had: `chunk.toString()` per chunk decodes
+    // each fragment on its own, so a character straddling the boundary becomes two
+    // U+FFFD. Here it would corrupt the source_id / purpose a credential is
+    // requested for. The split lands one byte into the em dash, leaving neither
+    // half a valid sequence.
+    const purpose = "诊断 kubelet — 日志";
+    const payload = Buffer.from(JSON.stringify({ source: "cluster", source_id: "c1", purpose }), "utf8");
+    const splitAt = payload.indexOf(Buffer.from("—", "utf8")) + 1;
+    expect(splitAt).toBeGreaterThan(1);
+
+    service.getClusterCredential.mockResolvedValue({ credential: { name: "c1", type: "kubeconfig", files: [] } });
+    const req = new FakeReq([payload.subarray(0, splitAt), payload.subarray(splitAt)]);
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+
+    expect(res.statusCode).toBe(200);
+    // getClusterCredential(identity, source_id, purpose)
+    const seenPurpose = service.getClusterCredential.mock.calls[0][2];
+    expect(seenPurpose).toBe(purpose);
+    expect(seenPurpose).not.toContain("�");
   });
 
   it("200 with host payload when body.source=host", async () => {

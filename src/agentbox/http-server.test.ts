@@ -362,6 +362,41 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(sm.sessions.has("default")).toBe(true);
   });
 
+  it("POST /api/prompt keeps a multibyte character split across two TCP writes intact", async () => {
+    // The body reader used to do `body += chunk` on raw Buffers, which decodes
+    // every data event on its own: a character straddling the boundary became two
+    // U+FFFD. Prompts arrive through this reader, so that silently rewrote user
+    // text — the same defect corrupted an em dash inside a synced SKILL.md.
+    const session = await sm.getOrCreate("split-1");
+    const text = "查一下 kubelet — 日志";
+    const payload = Buffer.from(JSON.stringify({ text, sessionId: "split-1" }), "utf8");
+    // Split inside the em dash (3 bytes in UTF-8): one byte before the boundary,
+    // two after, so neither half is a valid sequence on its own.
+    const emDashAt = payload.indexOf(Buffer.from("—", "utf8"));
+    expect(emDashAt).toBeGreaterThan(0);
+    const splitAt = emDashAt + 1;
+
+    const nodeHttp = await import("node:http");
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = nodeHttp.request(
+        {
+          host: "127.0.0.1", port, path: "/api/prompt", method: "POST",
+          headers: { "Content-Type": "application/json", "Content-Length": payload.length },
+        },
+        (res) => { res.resume(); res.on("end", () => resolve(res.statusCode ?? 0)); },
+      );
+      req.on("error", reject);
+      req.write(payload.subarray(0, splitAt));
+      // A gap the server cannot coalesce — two data events, boundary mid-character.
+      setTimeout(() => req.end(payload.subarray(splitAt)), 20);
+    });
+
+    expect(status).toBe(200);
+    expect(session.brain.prompt).toHaveBeenCalledWith(text, undefined);
+    const seen = (session.brain.prompt as any).mock.calls[0][0] as string;
+    expect(seen).not.toContain("�");
+  });
+
   it("POST /api/prompt rejects missing text", async () => {
     const r = await getJson(port, "/api/prompt", "POST", {});
     expect(r.status).toBe(400);
