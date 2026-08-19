@@ -271,6 +271,49 @@ describe("stderr is redacted too", () => {
     expect(out).toContain("[exit code: 22]");
   });
 
+  it("redacts a MULTI-LINE secret's body, not just its marker line", () => {
+    // The first version used redactLines — the line-safe primitive built for the streaming sanitizer,
+    // which cannot see past the current line. Foreground stderr is the complete text, so a PEM body, a
+    // YAML block scalar and a nested mapping all had their marker redacted while the secret itself went
+    // through, and the notice then claimed the output was clean. That is worse than not claiming.
+    const stderr = [
+      "error: failed to load key",
+      "-----BEGIN RSA PRIVATE KEY-----",
+      "MIIEowIBAAKCAQEA1234567890LEAKED",
+      "-----END RSA PRIVATE KEY-----",
+      "api_token: |",
+      "  ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "password:",
+      "  inner: hunter2",
+      "Warning: v1beta1 is deprecated",
+    ].join("\n");
+
+    const out = postExecSecurity("", null, { stderr, exitCode: 1 });
+    expect(out).not.toContain("MIIEowIBAAKCAQEA");   // PEM body
+    expect(out).not.toContain("ghp_AAAA");           // block-scalar body
+    expect(out).not.toContain("hunter2");            // nested under `password:`
+    // What the reader still needs: which step failed, the exit code, and unrelated warnings.
+    expect(out).toContain("error: failed to load key");
+    expect(out).toContain("[exit code: 1]");
+    expect(out).toContain("Warning: v1beta1 is deprecated");
+  });
+
+  it("announces a stderr-only redaction exactly once", () => {
+    const once = postExecSecurity("plain body", null, { stderr: "password: hunter2" });
+    expect(once).not.toContain("hunter2");
+    expect(once.match(/have been redacted/g) ?? []).toHaveLength(1);
+  });
+
+  it("does not add a second notice when the stdout sanitizer already added one", () => {
+    const cm = JSON.stringify({ kind: "ConfigMap", data: { "app.json": '{"password":"hunter2"}' } });
+    const out = postExecSecurity(cm, analyzeOutput("kubectl", ["get", "cm", "-o", "json"]), {
+      stderr: "password: also-secret",
+    });
+    expect(out).not.toContain("hunter2");
+    expect(out).not.toContain("also-secret");
+    expect(out.match(/have been redacted/g) ?? []).toHaveLength(1);
+  });
+
   it("leaves ordinary stderr untouched", () => {
     const out = postExecSecurity("body", null, { stderr: "Warning: v1beta1 is deprecated" });
     expect(out).toContain("Warning: v1beta1 is deprecated");

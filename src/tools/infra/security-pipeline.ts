@@ -16,7 +16,7 @@ import {
 } from "./output-sanitizer.js";
 import { processToolOutput } from "./tool-render.js";
 import { getCommandBinary, parseArgs } from "./command-sets.js";
-import { detectSensitiveResource, redactLines } from "./kubectl-sanitize.js";
+import { detectSensitiveResource, redactDocument, REDACTION_NOTICE } from "./kubectl-sanitize.js";
 
 // ── Pre-exec ────────────────────────────────────────────────────────
 
@@ -141,14 +141,28 @@ export function postExecSecurity(
     const sig = opts.signal ? ` (signal: ${opts.signal})` : "";
     combined += `\n[exit code: ${opts.exitCode}${sig}]`;
   }
-  // stderr is redacted too, line by line. It used to be appended verbatim, on the rationale that
-  // sanitizing it would break the JSON validity of a stdout+stderr blob — a rationale that stopped
-  // applying once stdout is sanitized in isolation above. A command that echoes a token in its error
-  // message was leaking it through the one channel nothing looked at. Line-level (not structural),
-  // because stderr is prose: the error text survives, only a value that looks like a secret goes.
+  // stderr is redacted as a DOCUMENT, not line by line.
+  //
+  // It used to be appended verbatim, on the rationale that redacting it would break the JSON validity
+  // of a combined blob — a rationale that stopped applying once stdout is sanitized in isolation
+  // above. A command that echoes a token in its error message was leaking it through the one channel
+  // nothing looked at.
+  //
+  // `redactLines` was the wrong primitive for it, and the reason is worth stating so it is not chosen
+  // again: it is the LINE-SAFE one, for the streaming sanitizer that only ever sees whatever lines a
+  // batch happens to contain. Foreground stderr is the complete text, so a secret whose body sits
+  // BELOW its marker — a PEM key, a YAML block scalar, a nested mapping under `password:` — had its
+  // marker line redacted while the body went straight through, and the redaction notice then said the
+  // output was clean. `redactDocument` carries state across lines and does no JSON parsing, so nothing
+  // about prose argues against it.
   if (opts?.stderr) {
-    const { text: safeStderr } = redactLines(opts.stderr);
+    const { text: safeStderr, redacted: stderrRedacted } = redactDocument(opts.stderr);
     combined += `\n\nSTDERR:\n${safeStderr}`;
+    // Announce it once: the structural sanitizers above append their own notice, and two identical
+    // warnings read as a bug. A secret found ONLY in stderr still has to be announced.
+    if (stderrRedacted && !combined.includes(REDACTION_NOTICE.trim())) {
+      combined += REDACTION_NOTICE;
+    }
   }
   return processToolOutput(combined);
 }
