@@ -51,10 +51,12 @@ from source_kinds import (
 # batch while the very-large route had already been raised, so the route a
 # corpus happened to take decided how much its sessions saw.
 #
-# 1.25MiB is estimated conservatively at ~437K tokens using the lower end of
-# this corpus's observed bytes/token range. Against a 1M window the source plus
-# measured fixed context (~36K) stays below the agreed 500K target, leaving room
-# for pages read and written, grep results, tool output, and model reasoning.
+# Keep the existing 1MiB deployment defaults. It is estimated conservatively at
+# ~350K tokens using the lower end of this corpus's observed bytes/token range;
+# with measured fixed context (~36K), it stays below the internal 500K planning
+# target and leaves room for Candidate reads, tool output, and reasoning. Batch
+# reduction comes from filling small cross-section batches more efficiently,
+# not from introducing or changing deployment configuration.
 #
 # The previous 512KB was half this, and the frugality was not free: a smaller
 # budget forces more families through the splitting paths, and splitting a
@@ -63,14 +65,14 @@ from source_kinds import (
 # is the expensive one; spending the former to avoid exercising fragile code is
 # the right trade. _record_turn_usage measures where a session actually lands,
 # so the next move on this number is arithmetic rather than judgement.
-DEFAULT_BATCH_THRESHOLD_BYTES = 1280 * 1024
-DEFAULT_BATCH_BUDGET_BYTES = 1280 * 1024
+DEFAULT_BATCH_THRESHOLD_BYTES = 1024 * 1024
+DEFAULT_BATCH_BUDGET_BYTES = 1024 * 1024
 DEFAULT_HIERARCHICAL_THRESHOLD_BYTES = 8 * 1024 * 1024
-DEFAULT_HIERARCHICAL_BATCH_BUDGET_BYTES = 1280 * 1024
-DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 1280 * 1024
-DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES = 1280 * 1024
+DEFAULT_HIERARCHICAL_BATCH_BUDGET_BYTES = 1024 * 1024
+DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 1024 * 1024
+DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES = 1024 * 1024
 DEFAULT_HIERARCHICAL_PDF_SLICE_PAGES = 20
-DEFAULT_REDUCTION_BUDGET_BYTES = 1280 * 1024
+DEFAULT_REDUCTION_BUDGET_BYTES = 1024 * 1024
 DEFAULT_CONTEXT_WINDOW_TOKENS = 1_000_000
 DEFAULT_CONTEXT_TARGET_TOKENS = 500_000
 ESTIMATED_FIXED_CONTEXT_TOKENS = 36_000
@@ -881,13 +883,11 @@ def build_plan(
         else hierarchical_text_budget_bytes() if mode == "hierarchical"
         else None
     )
-    context_window = max(1, int(os.environ.get(
-        "KBC_CONTEXT_WINDOW_TOKENS", str(DEFAULT_CONTEXT_WINDOW_TOKENS))))
-    context_target = min(
-        context_window // 2,
-        max(1, int(os.environ.get(
-            "KBC_CONTEXT_TARGET_TOKENS", str(DEFAULT_CONTEXT_TARGET_TOKENS)))),
-    )
+    # These are compiler-internal planning facts, not deployment knobs. The
+    # selected Claude model has a 1M window; we deliberately plan each session
+    # around half of it so retrieval and reasoning have headroom.
+    context_window = DEFAULT_CONTEXT_WINDOW_TOKENS
+    context_target = DEFAULT_CONTEXT_TARGET_TOKENS
     batch_sizes = sorted(int(batch.get("bytes") or 0) for batch in batches)
     estimated_source_bytes = resolved_text_budget or resolved_budget
     return {

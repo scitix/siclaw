@@ -113,6 +113,18 @@ def test_context_budget_defaults_leave_room_for_the_working_set(tmp_path):
     assert 280_000 <= slice_tokens <= 450_000, slice_tokens
     assert (slice_tokens + bt.ESTIMATED_FIXED_CONTEXT_TOKENS
             <= bt.DEFAULT_CONTEXT_TARGET_TOKENS)
+    # Same question, same answer: a file is sliced only when it truly does not
+    # fit one session. These are compiler facts, not environment configuration.
+    assert (bt.DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES
+            == bt.DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES)
+    plan = bt.build_plan([], [], planner="hierarchical-code")
+    assert plan["context_window_tokens"] == 1_000_000
+    assert plan["context_target_tokens"] == 500_000
+    assert plan["estimated_context_tokens"] <= plan["context_target_tokens"]
+    # An image is ~1.5-2.5K vision tokens. Pricing it like a document is what
+    # produced batches of nothing but screenshots.
+    assert bt._image_cost() <= 12 * 1024
+    assert bt._image_cost() <= bt._hierarchical_image_cost() <= 4 * bt._image_cost()
 
 
 def test_checkpoint_digest_covers_progress_and_detects_tampering(tmp_path):
@@ -139,18 +151,6 @@ def test_checkpoint_state_machine_rejects_late_phases_with_pending_work(tmp_path
     plan["phase"] = "final"
     plan["reductions"] = [{"id": "r001", "status": "pending"}]
     assert "unfinished reductions" in " ".join(bt.checkpoint_state_errors(plan))
-    # Same question, same answer: a file is sliced only when it truly does not
-    # fit one session.
-    assert (bt.DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES
-            == bt.DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES)
-    plan = bt.build_plan([], [], planner="hierarchical-code")
-    assert plan["context_window_tokens"] == 1_000_000
-    assert plan["context_target_tokens"] == 500_000
-    assert plan["estimated_context_tokens"] <= plan["context_target_tokens"]
-    # An image is ~1.5-2.5K vision tokens. Pricing it like a document is what
-    # produced batches of nothing but screenshots.
-    assert bt._image_cost() <= 12 * 1024
-    assert bt._image_cost() <= bt._hierarchical_image_cost() <= 4 * bt._image_cost()
 
 
 def test_a_section_placeholder_never_costs_its_own_session(tmp_path):
@@ -239,12 +239,16 @@ def test_pack_groups_by_top_dir_and_budget(tmp_path):
 
 def test_many_small_sections_fill_the_context_budget_instead_of_spawning_one_session_each(tmp_path):
     raw = _mk(tmp_path, {
-        f"section-{i:03d}/page.md": 100 for i in range(20)
+        f"section-{i:03d}/page.md": 200 for i in range(125)
     })
     inv = bt.scan_sources(raw)
     batches = bt.pack_hierarchical_batches(inv, budget=1_000, text_budget=1_000)
-    assert len(batches) == 4, batches
-    assert all(500 <= b["bytes"] <= 1_000 for b in batches), batches
+    # The old section-boundary flush emitted 125 sessions here. Filling to half
+    # the existing budget reduces the same shape to roughly the requested 50
+    # without enlarging any deployment-configured budget.
+    assert len(batches) == 42, batches
+    assert all(500 <= b["bytes"] <= 1_000 for b in batches[:-1]), batches
+    assert batches[-1]["bytes"] <= 1_000
     assert sorted(p for b in batches for p in b["sources"]) == sorted(i["path"] for i in inv)
 
 

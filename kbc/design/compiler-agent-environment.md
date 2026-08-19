@@ -78,7 +78,8 @@ It is not a page per file and not a line-by-line code reference.
   is explicitly prohibited from starting a second full compilation.
 - All access remains read-only, path-confined, bounded, and covered by regression
   tests.
-- Default planning uses the discovered 1M context window but targets no more
-  than 500K estimated tokens per turn. Actual per-batch usage and high-water
-  context are stamped in the checkpoint for later tuning.
+- The compiler keeps the selected model's 1M context window and uses an internal
+  500K planning target per turn; neither number is a Helm value or environment
+  variable. Actual per-batch usage and high-water context are stamped in the
+  checkpoint for later tuning.
 - A persisted commit-phase checkpoint can finish with no new model session.
