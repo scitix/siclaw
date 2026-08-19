@@ -1038,12 +1038,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             onEvent: (evt, _eventType, extras) => {
               context.sendEvent("chat.event", {
                 sessionId: promptResult.sessionId,
+                turnId,
                 event: extras.dbMessageId ? { ...evt, dbMessageId: extras.dbMessageId } : evt,
               });
             },
           });
           if (!alreadyReported()) {
-            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event: { type: "prompt_done" } });
             reportTerminal({ type: "prompt_done" });
           }
         } catch (err) {
@@ -1055,12 +1056,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             });
             context.sendEvent("chat.event", {
               sessionId: promptResult.sessionId,
+              turnId,
               event: { type: "stream_error", error: detail },
             });
           }
           // Shutdown, or a box removal, already reported this turn before aborting it.
           if (!alreadyReported()) {
-            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
+            context.sendEvent("chat.event", { sessionId: promptResult.sessionId, turnId, event: { type: "prompt_done" } });
             reportTerminal({ type: "prompt_done" });
           }
         } finally {
@@ -1082,6 +1084,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           });
           context.sendEvent("chat.event", {
             sessionId,
+            turnId,
             event: { type: "stream_error", error: detail },
           });
         }
@@ -1090,7 +1093,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         // check. A second, PLAIN terminal would contradict that one: without
         // `aborted` it reads as a turn that completed.
         if (!supervisorEndedTurns.has(turnId)) {
-          context.sendEvent("chat.event", { sessionId, event: { type: "prompt_done" } });
+          context.sendEvent("chat.event", { sessionId, turnId, event: { type: "prompt_done" } });
           reportTerminal({ type: "prompt_done" });
         }
       } finally {
