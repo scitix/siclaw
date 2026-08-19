@@ -44,6 +44,7 @@ interface PendingRpc {
 
 type CommandHandler = (method: string, params: any) => Promise<any>;
 type EventHandler = (data: unknown) => boolean | void;
+type ConnectedHandler = () => void | Promise<void>;
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -61,6 +62,7 @@ export class FrontendWsClient {
   private pending = new Map<string, PendingRpc>();
   private commandHandler: CommandHandler | null = null;
   private eventHandlers = new Map<string, Set<EventHandler>>();
+  private connectedHandlers = new Set<ConnectedHandler>();
   private activeSessionsProvider?: () => string[];
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -82,6 +84,17 @@ export class FrontendWsClient {
   /** Whether the WS connection is currently open. */
   get connected(): boolean {
     return this._connected;
+  }
+
+  /**
+   * Observe every successful transport connection, including reconnects. The
+   * callback is deliberately lifecycle-only: callers re-read their durable
+   * state instead of trusting anything cached before the disconnect.
+   */
+  onConnected(handler: ConnectedHandler): () => void {
+    this.connectedHandlers.add(handler);
+    if (this._connected) queueMicrotask(() => this.notifyConnected(handler));
+    return () => this.connectedHandlers.delete(handler);
   }
 
   /**
@@ -271,6 +284,7 @@ export class FrontendWsClient {
       // Advertise capabilities on every (re)connect so the consumer's routing
       // reflects the current connection, not a stale record.
       this.advertiseCapabilities();
+      for (const handler of this.connectedHandlers) this.notifyConnected(handler);
     });
 
     ws.on("message", (raw: WebSocket.Data) => {
@@ -343,6 +357,16 @@ export class FrontendWsClient {
     // Inbound command (Portal → Runtime request)
     if (msg.type === "req" && typeof msg.id === "string" && typeof msg.method === "string") {
       this.handleInboundCommand(msg.id, msg.method, msg.params);
+    }
+  }
+
+  private notifyConnected(handler: ConnectedHandler): void {
+    try {
+      void Promise.resolve(handler()).catch((err) => {
+        console.warn(`[frontend-ws] connected observer failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    } catch (err) {
+      console.warn(`[frontend-ws] connected observer failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

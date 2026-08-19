@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime, timezone
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -50,12 +51,10 @@ from source_kinds import (
 # batch while the very-large route had already been raised, so the route a
 # corpus happened to take decided how much its sessions saw.
 #
-# 1MB ≈ 350K tokens at this corpus's ~3 bytes/token (CJK prose 3.5-5; record
-# dumps with long opaque IDs 2.5-3.5). Against a 1M window whose agreed SAFE
-# ceiling is 750K, that is the source side sitting near a third, leaving ample
-# room for the system prompt and BRIEF/INTENT/index (~36K measured) plus
-# everything a session accumulates — pages read and written, grep results, its
-# own reasoning.
+# 1.25MiB is estimated conservatively at ~437K tokens using the lower end of
+# this corpus's observed bytes/token range. Against a 1M window the source plus
+# measured fixed context (~36K) stays below the agreed 500K target, leaving room
+# for pages read and written, grep results, tool output, and model reasoning.
 #
 # The previous 512KB was half this, and the frugality was not free: a smaller
 # budget forces more families through the splitting paths, and splitting a
@@ -64,14 +63,17 @@ from source_kinds import (
 # is the expensive one; spending the former to avoid exercising fragile code is
 # the right trade. _record_turn_usage measures where a session actually lands,
 # so the next move on this number is arithmetic rather than judgement.
-DEFAULT_BATCH_THRESHOLD_BYTES = 1024 * 1024
-DEFAULT_BATCH_BUDGET_BYTES = 1024 * 1024
+DEFAULT_BATCH_THRESHOLD_BYTES = 1280 * 1024
+DEFAULT_BATCH_BUDGET_BYTES = 1280 * 1024
 DEFAULT_HIERARCHICAL_THRESHOLD_BYTES = 8 * 1024 * 1024
-DEFAULT_HIERARCHICAL_BATCH_BUDGET_BYTES = 1024 * 1024
-DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 1024 * 1024
-DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES = 1024 * 1024
+DEFAULT_HIERARCHICAL_BATCH_BUDGET_BYTES = 1280 * 1024
+DEFAULT_HIERARCHICAL_TEXT_BUDGET_BYTES = 1280 * 1024
+DEFAULT_HIERARCHICAL_TEXT_SLICE_BYTES = 1280 * 1024
 DEFAULT_HIERARCHICAL_PDF_SLICE_PAGES = 20
-DEFAULT_REDUCTION_BUDGET_BYTES = 1024 * 1024
+DEFAULT_REDUCTION_BUDGET_BYTES = 1280 * 1024
+DEFAULT_CONTEXT_WINDOW_TOKENS = 1_000_000
+DEFAULT_CONTEXT_TARGET_TOKENS = 500_000
+ESTIMATED_FIXED_CONTEXT_TOKENS = 36_000
 
 # ── effective-size weighting ─────────────────────────────────────────────────
 # Raw bytes are a terrible proxy for context cost on non-text sources: a 168KB
@@ -385,26 +387,18 @@ def should_hierarchical(
     return corpus_effective_bytes(inventory) > limit
 
 
-# A batch that is still nearly empty must not be flushed just because the next
-# family sits under a different top-level directory. Sections and the pages
-# NAMED after them interleave in path order (`X-2d66.md` sorts before `X/…`),
-# so a 19-byte section placeholder would open a batch, meet the very next
-# family under `X/`, and be flushed alone — a whole model session, spawned pod
-# and all, to read one heading. Topical coherence is worth a flush; it is not
-# worth one per placeholder, and a batch this far below budget has no coherence
-# to protect yet.
-# Deliberately a SCRAP, not a fraction of the budget: at a 512KB budget a plain
-# 10% would be 51KB, and a batch holding 40KB of real content would start
-# swallowing the next section. Coherence is cheap to protect once a batch holds
-# anything substantial; it is only the near-empty case that is not worth a
-# session of its own.
-BATCH_COHERENCE_FLUSH_FLOOR_RATIO = 0.05
-BATCH_COHERENCE_FLUSH_FLOOR_CAP = 32 * 1024
+# Crossing a top-level section is a preference, not a reason to spend an almost
+# empty Agent session. Production completed 125 map sessions with a measured
+# 118K-token maximum in a 1M window: the old 32KB flush floor was preserving
+# directory purity while using only a small fraction of the agreed 500K target.
+# Fill at least half the deterministic source budget before a section boundary
+# may flush. Families remain indivisible and the hard effective/text budgets
+# still win, so this changes efficiency, not safety or provenance.
+BATCH_COHERENCE_MIN_FILL_RATIO = 0.5
 
 
 def _too_small_to_flush(current_bytes: int, budget: int) -> bool:
-    floor = min(int(budget * BATCH_COHERENCE_FLUSH_FLOOR_RATIO),
-                BATCH_COHERENCE_FLUSH_FLOOR_CAP)
+    floor = int(budget * BATCH_COHERENCE_MIN_FILL_RATIO)
     return current_bytes < floor
 
 
@@ -419,9 +413,9 @@ def pack_batches(
 ) -> list[dict[str, Any]]:
     """Deterministic baseline: group by top-level directory (natural topical
     grouping in practice), greedy-pack in path order within the budget. A batch
-    never mixes top-level directories unless a directory itself is tiny —
-    deliberate: cross-dir mixing buys packing efficiency but costs topical
-    coherence, and coherence is the goal function (效果好/细节覆盖).
+    may mix small top-level directories until it reaches half its source budget;
+    whole-snapshot read/search and the durable Candidate handoff preserve the
+    global/topic context that directory-pure micro-batches were trying to buy.
 
     Packs document FAMILIES, never bare files: a document and the attachments
     its body embeds always land in the same batch, so no session is ever handed
@@ -881,6 +875,21 @@ def build_plan(
     mode = "hierarchical" if planner == "hierarchical-code" else "flat"
     has_text_slices = any(batch.get("source_ranges") for batch in batches)
     has_pdf_slices = any(batch.get("source_page_ranges") for batch in batches)
+    resolved_budget = budget if budget is not None else batch_budget_bytes()
+    resolved_text_budget = (
+        text_budget if text_budget is not None
+        else hierarchical_text_budget_bytes() if mode == "hierarchical"
+        else None
+    )
+    context_window = max(1, int(os.environ.get(
+        "KBC_CONTEXT_WINDOW_TOKENS", str(DEFAULT_CONTEXT_WINDOW_TOKENS))))
+    context_target = min(
+        context_window // 2,
+        max(1, int(os.environ.get(
+            "KBC_CONTEXT_TARGET_TOKENS", str(DEFAULT_CONTEXT_TARGET_TOKENS)))),
+    )
+    batch_sizes = sorted(int(batch.get("bytes") or 0) for batch in batches)
+    estimated_source_bytes = resolved_text_budget or resolved_budget
     return {
         "version": (
             4 if mode == "hierarchical" and has_pdf_slices
@@ -896,14 +905,20 @@ def build_plan(
             else hierarchical_threshold_bytes() if mode == "hierarchical"
             else batch_threshold_bytes()
         ),
-        "budget": budget if budget is not None else batch_budget_bytes(),
-        "text_budget": (
-            text_budget if text_budget is not None
-            else hierarchical_text_budget_bytes() if mode == "hierarchical"
-            else None
+        "budget": resolved_budget,
+        "text_budget": resolved_text_budget,
+        "context_window_tokens": context_window,
+        "context_target_tokens": context_target,
+        # Planning estimate only. Actual high-water usage is stamped per batch.
+        "estimated_context_tokens": (
+            ESTIMATED_FIXED_CONTEXT_TOKENS + estimated_source_bytes // 3
         ),
         "total_bytes": corpus_bytes(inventory),
         "total_effective_bytes": corpus_effective_bytes(inventory),
+        "source_count": len(inventory),
+        "batch_count": len(batches),
+        "batch_effective_bytes_min": batch_sizes[0] if batch_sizes else 0,
+        "batch_effective_bytes_max": batch_sizes[-1] if batch_sizes else 0,
         "batches": batches,
     }
 
@@ -1299,7 +1314,8 @@ def stamp_reduction_done(plan: dict[str, Any], reduction_id: str) -> dict[str, A
 
 
 def stamp_done(plan: dict[str, Any], batch_id: str,
-               usage: dict[str, int] | None = None) -> dict[str, Any]:
+               usage: dict[str, int] | None = None,
+               tree_hash: str | None = None) -> dict[str, Any]:
     """Mark a batch finished, and record what its session actually cost.
 
     The usage rides the plan because the plan is the durable, resumable record
@@ -1309,8 +1325,11 @@ def stamp_done(plan: dict[str, Any], batch_id: str,
     for b in plan.get("batches", []):
         if b.get("id") == batch_id:
             b["status"] = "done"
+            b["completed_at"] = datetime.now(timezone.utc).isoformat()
             if usage:
                 b["usage"] = dict(usage)
+            if tree_hash:
+                b["candidate_tree_hash"] = tree_hash
     return plan
 
 
@@ -1350,6 +1369,53 @@ def prune_missing_sources(plan: dict[str, Any], known: set[str]) -> list[str]:
 
 def dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
+def checkpoint_digest(plan: dict[str, Any]) -> str:
+    """Digest the complete resumable execution checkpoint.
+
+    The digest field itself is excluded; phase, batch stamps, usage, candidate
+    hashes and the plan assignment are all included. This makes a persisted
+    BATCH_PLAN one verifiable checkpoint instead of a bag of loosely related
+    flags. Older plans without a digest remain readable for rolling upgrades.
+    """
+    payload = {key: value for key, value in plan.items() if key != "checkpoint_digest"}
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def seal_checkpoint(plan: dict[str, Any]) -> dict[str, Any]:
+    """Advance and sign a BATCH_PLAN checkpoint before durable persistence."""
+    plan["checkpoint_revision"] = max(0, int(plan.get("checkpoint_revision") or 0)) + 1
+    plan["checkpoint_updated_at"] = datetime.now(timezone.utc).isoformat()
+    plan["checkpoint_digest"] = checkpoint_digest(plan)
+    return plan
+
+
+def checkpoint_is_valid(plan: dict[str, Any]) -> bool:
+    """Verify a sealed checkpoint; digest-less legacy plans are compatible."""
+    expected = plan.get("checkpoint_digest")
+    return not expected or (
+        isinstance(expected, str) and expected == checkpoint_digest(plan)
+    )
+
+
+def checkpoint_state_errors(plan: dict[str, Any]) -> list[str]:
+    """Cross-field state-machine invariants for a resumable checkpoint."""
+    errors: list[str] = []
+    phase = str(plan.get("phase") or "map")
+    if phase not in {"map", "reduce", "final", "commit", "complete"}:
+        errors.append("unknown checkpoint phase")
+        return errors
+    unfinished_batches = pending_batches(plan)
+    if phase in {"reduce", "final", "commit", "complete"} and unfinished_batches:
+        errors.append(f"checkpoint phase {phase} has unfinished map batches")
+    unfinished_reductions = pending_reductions(plan)
+    if phase in {"final", "commit", "complete"} and unfinished_reductions:
+        errors.append(f"checkpoint phase {phase} has unfinished reductions")
+    return errors
 
 
 def plan_too_fragmented(model_batches: list[dict[str, Any]], baseline_batches: list[dict[str, Any]]) -> bool:

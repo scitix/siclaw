@@ -611,6 +611,25 @@ describe("FrontendWsClient", () => {
     client.close();
   });
 
+  it("notifies lifecycle observers after both initial connect and reconnect", async () => {
+    const client = await createClient();
+    const connected = vi.fn();
+    const unsubscribe = client.onConnected(connected);
+
+    const connectPromise = client.connect();
+    const ws1 = openLatestWs();
+    await connectPromise;
+    expect(connected).toHaveBeenCalledTimes(1);
+
+    ws1.emit("close");
+    await vi.advanceTimersByTimeAsync(3100);
+    openLatestWs();
+    expect(connected).toHaveBeenCalledTimes(2);
+
+    unsubscribe();
+    client.close();
+  });
+
   it("survives an 'unknown method' ack from an older consumer (best-effort)", async () => {
     const client = await createClient({ capabilities: { compile: true } });
     const connectPromise = client.connect();

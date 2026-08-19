@@ -7,6 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 const materializeMock = vi.hoisted(() => vi.fn());
 const postJsonMock = vi.hoisted(() => vi.fn());
+const streamPathMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./chat-repo.js", () => ({
   ensureChatSession: vi.fn(async () => {}),
@@ -32,7 +33,7 @@ vi.mock("./agentbox/client.js", () => ({
     postJson = postJsonMock;
     getJson = vi.fn(async () => ({}));
     streamEvents = async function* () {};
-    streamPath = async function* () {};
+    streamPath = async function* (path: string) { streamPathMock(path); };
   },
 }));
 
@@ -45,8 +46,14 @@ const { startRuntime } = await import("./server.js");
 const { CapabilityMaterializationError } = await import("./capability/materialize.js");
 const { federationSelfRegistry } = await import("./federation-self-metrics.js");
 
-function fakeFrontendClient() {
-  return { request: vi.fn(async () => ({})), onCommand: vi.fn(), emitEvent: vi.fn(), close: vi.fn() } as any;
+function fakeFrontendClient(activeRuns: Array<Record<string, unknown>> = []) {
+  return {
+    request: vi.fn(async (method: string) => method === "capability.listActiveRuns" ? { runs: activeRuns } : {}),
+    onCommand: vi.fn(),
+    onConnected: vi.fn(),
+    emitEvent: vi.fn(),
+    close: vi.fn(),
+  } as any;
 }
 
 function fakeAgentBoxManager(created = true) {
@@ -72,6 +79,7 @@ beforeEach(() => {
   federationSelfRegistry.resetMetrics();
   materializeMock.mockReset();
   postJsonMock.mockReset().mockResolvedValue({ ok: true });
+  streamPathMock.mockReset();
 });
 afterEach(async () => {
   if (server) await server.close();
@@ -81,6 +89,54 @@ afterEach(async () => {
 });
 
 describe("startRuntime — capability session setup", () => {
+  it("re-attaches a recovered live Box with workspace replay even when materialization reports no conflict", async () => {
+    materializeMock.mockResolvedValueOnce({
+      reattached: false,
+      locale: undefined,
+      llm: undefined,
+      settings: undefined,
+    });
+    const frontend = fakeFrontendClient([{
+      id: "recovered-run",
+      profile: "kb-compile",
+      org_id: "org-1",
+      correlation_id: "attempt-1",
+      status: "running",
+    }]);
+    const manager = fakeAgentBoxManager(false);
+    manager.getAsync.mockResolvedValue({
+      boxId: "kbc-box-recovered-run",
+      endpoint: "https://10.0.0.9:3000",
+      agentId: "recovered-run",
+    });
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: manager,
+      frontendClient: frontend,
+      credentialService: {} as any,
+    });
+
+    await vi.waitFor(() => expect(streamPathMock).toHaveBeenCalled());
+    expect(streamPathMock).toHaveBeenCalledWith("/events/recovered-run?replay=1");
+  });
+
+  it("registers a connection observer that reconciles runs immediately after WS reconnect", async () => {
+    materializeMock.mockResolvedValue({ locale: undefined, llm: undefined, settings: undefined });
+    const frontend = fakeFrontendClient();
+    server = await startRuntime({
+      config: { port: 0, internalPort: 0, host: "127.0.0.1", serverUrl: "", portalSecret: "" } as any,
+      agentBoxManager: fakeAgentBoxManager(),
+      frontendClient: frontend,
+      credentialService: {} as any,
+    });
+
+    expect(frontend.onConnected).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(frontend.request).toHaveBeenCalledWith("capability.listActiveRuns", {}));
+    frontend.request.mockClear();
+    await frontend.onConnected.mock.calls[0][0]();
+    await vi.waitFor(() => expect(frontend.request).toHaveBeenCalledWith("capability.listActiveRuns", {}));
+  });
+
   it("stops the just-spawned box when session setup fails (no leak until the sweep)", async () => {
     materializeMock.mockResolvedValueOnce({ locale: undefined, llm: undefined, settings: undefined });
     postJsonMock.mockRejectedValueOnce(new Error("box unreachable during setup"));

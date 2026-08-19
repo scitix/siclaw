@@ -411,8 +411,13 @@ def _print_compile_lifecycle(label: str, run: "CompileRun", extra: str = "") -> 
     source paths or provider response fragments, and pod stdout is
     operator-visible. The full message belongs on the OWNER-facing SSE events
     (run.emit error/summary), which the owner owns."""
+    context = ""
+    command_context = getattr(run, "_command_context", None)
+    if command_context is not None:
+        operation_id, generation = command_context
+        context = f" operation={operation_id} generation={generation}"
     tail = f" {extra}" if extra else ""
-    print(f"[compile_box] {label} run={run.run_id} round={run.round}{tail}", flush=True)
+    print(f"[compile_box] {label} run={run.run_id} round={run.round}{context}{tail}", flush=True)
 
 
 def _error_event(
@@ -3741,9 +3746,16 @@ def _load_batch_plan(run: "CompileRun") -> dict | None:
         return None
     try:
         plan = json.loads(p.read_text())
-        return plan if isinstance(plan, dict) and isinstance(plan.get("batches"), list) else None
-    except Exception:
-        return None
+    except Exception as error:
+        raise PlanIntegrityError("the durable batch checkpoint is unreadable; reset or restore it") from error
+    if not isinstance(plan, dict) or not isinstance(plan.get("batches"), list):
+        raise PlanIntegrityError("the durable batch checkpoint has an invalid shape; reset or restore it")
+    if not batching.checkpoint_is_valid(plan):
+        raise PlanIntegrityError("the durable batch checkpoint digest does not match; reset or restore it")
+    state_errors = batching.checkpoint_state_errors(plan)
+    if state_errors:
+        raise PlanIntegrityError("the durable batch checkpoint state is inconsistent; reset or restore it")
+    return plan
 
 
 def _batch_resume_point(plan: dict | None) -> tuple[int, int] | None:
@@ -3770,13 +3782,15 @@ def _batch_plan_resumable(plan: dict | None) -> bool:
     """
     return plan is not None and (
         len(batching.pending_batches(plan)) > 0
-        or plan.get("phase") in {"map", "reduce", "final"}
+        or plan.get("phase") in {"map", "reduce", "final", "commit"}
     )
 
 
 def _write_batch_file(run: "CompileRun", rel: str, value) -> None:
     p = Path(run.workdir) / rel
     p.parent.mkdir(parents=True, exist_ok=True)
+    if rel == batching.BATCH_PLAN_PATH and isinstance(value, dict):
+        batching.seal_checkpoint(value)
     p.write_text(batching.dump_json(value))
 
 
@@ -4311,7 +4325,9 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         return (
             f"[Batch compile · batch {k}/{n} · {batch['id']}] Compile ONLY the sources below "
             f"(see the batching discipline in the system prompt):\n{listing}\n"
-            "First read authoring/BRIEF.json, authoring/INTENT.md and candidate/index.md to stay consistent "
+            "First read authoring/BRIEF.json, authoring/INTENT.md, authoring/COMPILATION_STATE.json and "
+            "candidate/index.md to inherit the complete task, Raw inventory, completed-batch ownership, "
+            "and current Wiki shape; the entire frozen Raw snapshot and Candidate tree remain readable/searchable. "
             "in voice and structure; then read every source in this batch closely and fold its content fully "
             "into candidate/ pages (create new pages or merge into existing ones; each page's frontmatter "
             "sources[].resource must list the sources it was actually compiled from); update the matching "
@@ -4324,7 +4340,8 @@ def _compose_batch_directive(batch: dict, k: int, n: int, notes: str,
         )
     return (
         f"【分批编译 · 批 {k}/{n} · {batch['id']}】只编译下列源(见系统提示的分批纪律):\n{listing}\n"
-        "先读 authoring/BRIEF.json、authoring/INTENT.md 和 candidate/index.md 保持口径与结构一致;"
+        "先读 authoring/BRIEF.json、authoring/INTENT.md、authoring/COMPILATION_STATE.json 和 candidate/index.md,"
+        "继承完整任务、Raw 总清单、已完成批次归属和当前 Wiki 结构;冻结 Raw 全量与 Candidate 全树始终可读可搜索;"
         "然后精读本批每个源,按定调把内容完整编入 candidate/ 页(可新建页或并入既有页,页 frontmatter 的 "
         "sources[].resource 必须列出实际编自的源);更新 candidate/index.md 的相应条目;矛盾照常 best-guess+⚠️存疑+落工单,绝不停。"
         "清单是你的**交付责任面**,不是你的视野边界:需要交叉印证时(某个附件被谁引用、邻近文档同一件事怎么表述、"
@@ -4664,6 +4681,98 @@ async def _run_ledger_repairs(run: "CompileRun", replies: list[str]) -> None:
         run._ledger_forced = False
 
 
+def _candidate_checkpoint_hash(workdir: str) -> str:
+    pages = incremental.page_hashes(workdir)
+    return hashlib.sha256(json.dumps(
+        pages, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+
+def _write_compilation_state(run: "CompileRun", plan: dict) -> None:
+    """Persist the complete machine hand-off between stateless batch sessions.
+
+    Responsibility remains per batch, but global visibility does not: every
+    successor gets the full Raw inventory, every Candidate page name, the full
+    source-to-page ownership map, and the current tree hash. Content remains in
+    Raw/Candidate and is available through read/search tools instead of being
+    duplicated into this bounded control artifact.
+    """
+    try:
+        pages = selfcheck.candidate_pages(run.workdir)
+    except Exception:
+        pages = {}
+    source_to_pages: dict[str, list[str]] = {}
+    for page, info in sorted(pages.items()):
+        for entry in info.get("sources") or []:
+            source = selfcheck._strip_source_prefix(str(entry))
+            source_to_pages.setdefault(source, []).append(page)
+    batches = plan.get("batches") or []
+    state = {
+        "version": 1,
+        "phase": plan.get("phase") or "map",
+        "planner": plan.get("planner") or "",
+        "checkpoint_revision": plan.get("checkpoint_revision") or 0,
+        "checkpoint_digest": plan.get("checkpoint_digest") or "",
+        "checkpoint_updated_at": plan.get("checkpoint_updated_at") or "",
+        "batches_done": sum(1 for batch in batches if batch.get("status") in {"done", "skipped"}),
+        "batches_total": len(batches),
+        "candidate_tree_hash": _candidate_checkpoint_hash(run.workdir),
+        "candidate_pages": sorted(pages),
+        "source_to_pages": source_to_pages,
+        "raw_inventory": batching.SOURCES_INVENTORY_PATH,
+        "candidate_index": "candidate/index.md",
+        "visibility": "complete_frozen_raw_and_candidate_tree",
+    }
+    _write_batch_file(run, "authoring/COMPILATION_STATE.json", state)
+
+
+async def _commit_batch_compile(run: "CompileRun", plan: dict, replies: list[str]) -> None:
+    """Commit an already-reviewed Candidate without replaying model work.
+
+    The content-only `commit` checkpoint is emitted before the provenance commit.
+    If the relay persists only the first event, a successor resumes here and
+    emits `commit_input` again; map/reduce/final are never repeated.
+    """
+    sent = getattr(run, "_sync_sent", None)
+    already_commit = plan.get("phase") == "commit"
+    plan["phase"] = "commit"
+    _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+    _write_compilation_state(run, plan)
+    _print_compile_lifecycle(
+        "batch.phase", run,
+        extra=(f"phase=commit done={len(plan.get('batches') or [])}/{len(plan.get('batches') or [])} "
+               f"checkpoint={str(plan.get('checkpoint_digest') or '')[:12]} "
+               f"revision={plan.get('checkpoint_revision', 0)}"))
+    if sent is not None:
+        try:
+            if not already_commit:
+                await _sync_workspace(run, sent)
+                _print_compile_lifecycle("batch.commit.checkpoint", run)
+            await _sync_workspace(run, sent, commit_input=True)
+            _print_compile_lifecycle("batch.commit.emit", run)
+        except Exception as error:
+            _print_compile_lifecycle(
+                "batch.commit.failed", run, extra=f"class={type(error).__name__}")
+            # Keep the local/replay state at commit. Never demote to final: the
+            # expensive semantic work is complete and only delivery is pending.
+            plan["phase"] = "commit"
+            _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            raise
+    plan["phase"] = "complete"
+    _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+    _print_compile_lifecycle(
+        "batch.complete", run, extra=f"peak_context={run._peak_context_tokens}")
+    if run._peak_context_tokens > 0:
+        peak_k = run._peak_context_tokens // 1000
+        await run.emit({"type": "summary", "text": _loc(run,
+            f"Heaviest batch held about {peak_k}K tokens of context "
+            f"(per-batch detail in authoring/BATCH_PLAN.json).",
+            f"最重的一批约占用 {peak_k}K tokens 上下文"
+            f"(逐批明细见 authoring/BATCH_PLAN.json)。")})
+    await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
+                    or _loc(run, "Batch compile complete.", "分批编译完成。")})
+
+
 async def _run_batch_compile(run: "CompileRun", trigger_text: str):
     """The batch orchestrator: ONE logical turn to the consumer (single turn_done at
     the end), many bounded sessions inside. Crash-resumable across map, optional
@@ -4726,6 +4835,8 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                                              f"断点续批:{len(dropped)} 个源已不在 raw/ 中或已被豁免,已从待编批次剔除:")
                                         + ", ".join(sorted(dropped)[:5])
                                         + ("…" if len(dropped) > 5 else "")})
+        entry_phase = str(plan.get("phase") or "map")
+        _write_compilation_state(run, plan)
         slice_failures = _materialize_batch_slices(run, plan)
         if slice_failures:
             n_all = len(plan["batches"])
@@ -4757,7 +4868,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 f"{len(slice_failures)} 个批次的读界视图无法构建,已跳过;未记账的源已自动豁免并写明理由,"
                 f"列车继续。")})
         n = len(plan["batches"])
-        pending = batching.pending_batches(plan)
+        pending = batching.pending_batches(plan) if entry_phase == "map" else []
         if plan.get("mode") == "hierarchical":
             run._model_idle_timeout_s = max(
                 _MODEL_IDLE_TIMEOUT_S, _HIERARCHICAL_MODEL_IDLE_TIMEOUT_S)
@@ -4782,6 +4893,18 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                           f"继续分批编译:剩余 {len(pending)}/{n} 批。") if resuming
                      else _loc(run, plan_summary_en, plan_summary_zh)),
         })
+        _print_compile_lifecycle(
+            "batch.plan", run,
+            extra=(f"planner={plan.get('planner')} mode={plan.get('mode')} phase={entry_phase} "
+                   f"sources={plan.get('source_count', len(inventory))} batches={n} pending={len(pending)} "
+                   f"budget={plan.get('budget', 0)} text_budget={plan.get('text_budget', 0) or 0} "
+                   f"target_context={plan.get('context_target_tokens', 0)} "
+                   f"estimated_context={plan.get('estimated_context_tokens', 0)} "
+                   f"checkpoint={str(plan.get('checkpoint_digest') or '')[:12]} "
+                   f"revision={plan.get('checkpoint_revision', 0)}"))
+        if entry_phase == "commit":
+            await _commit_batch_compile(run, plan, replies)
+            return
         bounded = plan_bounded_sources(plan)
         for batch in list(pending):
             k = next(i + 1 for i, b in enumerate(plan["batches"]) if b["id"] == batch["id"])
@@ -4908,9 +5031,12 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                     f"Batch {k}/{n} could not complete ({e}); its unaccounted sources were auto-excluded "
                     f"with a reason and the train continues.",
                     f"批 {k}/{n} 无法完成({e});未记账的源已自动豁免并写明理由,列车继续。")})
-            batching.stamp_done(plan, batch["id"], usage=run._turn_usage)
+            batching.stamp_done(
+                plan, batch["id"], usage=run._turn_usage,
+                tree_hash=_candidate_checkpoint_hash(run.workdir))
             run._turn_usage = None
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            _write_compilation_state(run, plan)
             # Push the done-stamp (and the batch's pages) to the durable store
             # NOW: if it only rode the next periodic sync, a crash in that window
             # would re-run an already-done batch on resume.
@@ -4923,12 +5049,13 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             _print_compile_lifecycle("batch.done", run, extra=_lifecycle_batch_ref(batch, k, n))
             await run.emit({"type": "summary", "text": _loc(run,
                 f"Batch {k}/{n} done — landed in the store.", f"批 {k}/{n} 完成,已落库。")})
-        if plan.get("mode") == "hierarchical":
+        if plan.get("mode") == "hierarchical" and entry_phase in {"map", "reduce"}:
             if "reductions" not in plan:
                 plan["reductions"] = batching.pack_section_reductions(
                     selfcheck.candidate_pages(run.workdir))
             plan["phase"] = "reduce"
             _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+            _write_compilation_state(run, plan)
             reductions = plan.get("reductions", [])
             reduction_count = len(reductions)
             pending_reductions = batching.pending_reductions(plan)
@@ -4951,6 +5078,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                 if len(reduction["pages"]) < 2:
                     batching.stamp_reduction_done(plan, reduction["id"])
                     _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                    _write_compilation_state(run, plan)
                     continue
                 k = next(
                     i + 1 for i, item in enumerate(reductions)
@@ -4971,6 +5099,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         f"【分区归并 {k}/{reduction_count}】{reply}"))
                 batching.stamp_reduction_done(plan, reduction["id"])
                 _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+                _write_compilation_state(run, plan)
                 sent = getattr(run, "_sync_sent", None)
                 if sent is not None:
                     try:
@@ -4979,6 +5108,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
                         pass
         plan["phase"] = "final"
         _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+        _write_compilation_state(run, plan)
         final_reply = await _drive_batch_session(
             run, _compose_final_directive(run.workdir, n, _drain_batch_notes(run), locale=getattr(run, "locale", None)),
             _loc(run, "final review", "终审"),
@@ -5084,33 +5214,7 @@ async def _run_batch_compile(run: "CompileRun", trigger_text: str):
             if notes_reply:
                 replies.append(_loc(run, f"[Note digest] {notes_reply}", f"【留言消化】{notes_reply}"))
             await _run_ledger_repairs(run, replies)  # the digest may have touched pages
-        sent = getattr(run, "_sync_sent", None)
-        plan["phase"] = "complete"
-        _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
-        if sent is not None:
-            # Successful batch completion is one full-compile provenance commit.
-            # Content and input revision must land atomically before turn_done.
-            try:
-                await _sync_workspace(run, sent, commit_input=True)
-            except Exception:
-                # The durable commit did not happen. Keep the plan resumable at
-                # final close-out rather than falsely claiming completion.
-                plan["phase"] = "final"
-                _write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
-                raise
-        _print_compile_lifecycle(
-            "batch.complete", run, extra=f"peak_context={run._peak_context_tokens}")
-        if run._peak_context_tokens > 0:
-            # The owner tuning a budget should not have to read pod logs for the
-            # one number that says whether it was right.
-            peak_k = run._peak_context_tokens // 1000
-            await run.emit({"type": "summary", "text": _loc(run,
-                f"Heaviest batch held about {peak_k}K tokens of context "
-                f"(per-batch detail in authoring/BATCH_PLAN.json).",
-                f"最重的一批约占用 {peak_k}K tokens 上下文"
-                f"(逐批明细见 authoring/BATCH_PLAN.json)。")})
-        await run.emit({"type": "turn_done", "text": "\n\n".join(replies).strip()
-                        or _loc(run, "Batch compile complete.", "分批编译完成。")})
+        await _commit_batch_compile(run, plan, replies)
     except Exception as e:
         # stdout stays whitelisted: exception class + a machine-routable code.
         # The MESSAGE (which can carry raw source paths / provider response

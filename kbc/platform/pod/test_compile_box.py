@@ -3879,7 +3879,8 @@ async def test_batch_orchestrator_routing_and_resume():
         # resume: mark one batch pending again → next trigger routes to batch even
         # under a huge threshold, and only the pending batch (+终审) re-runs
         plan["batches"][1]["status"] = "pending"
-        (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(plan))
+        plan["phase"] = "map"
+        compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
         os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
         assert compile_box._should_route_to_batch(run, "直接开始编译")
         driven.clear()
@@ -4818,6 +4819,10 @@ def test_batch_relay_brief_hands_off_progress_and_prior_pages():
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         (base / "raw" / "ops").mkdir(parents=True)
+        (base / "raw" / "other").mkdir(parents=True)
+        (base / "raw" / "ops" / "big.md").write_text("# big", encoding="utf-8")
+        (base / "raw" / "ops" / "sibling.md").write_text("# sibling", encoding="utf-8")
+        (base / "raw" / "other" / "far.md").write_text("# far", encoding="utf-8")
         (base / "candidate").mkdir()
         (base / "authoring").mkdir()
         (base / "candidate" / "tickets.md").write_text(
@@ -4850,12 +4855,50 @@ def test_batch_relay_brief_hands_off_progress_and_prior_pages():
         assert "candidate/tickets.md" in directive, directive
         assert "not your field of view" in directive, directive
 
+        # The durable hand-off names the ENTIRE Candidate tree and source map;
+        # responsibility is bounded, visibility is not.
+        compile_box._write_compilation_state(run, plan)
+        state = json.loads((base / "authoring" / "COMPILATION_STATE.json").read_text())
+        assert state["visibility"] == "complete_frozen_raw_and_candidate_tree", state
+        assert state["candidate_pages"] == [
+            "elsewhere.md", "neighbour.md", "tickets.md"
+        ], state
+        assert state["source_to_pages"]["ops/big.md"] == ["tickets.md"], state
+        assert len(state["candidate_tree_hash"]) == 64, state
+
         # No prior work \u2192 a hand-off that is still honest, never fabricated.
         fresh = compile_box._batch_relay_brief(
             run, plan, {"id": "h003", "sources": ["new/area.md"]}, 1, 2, locale="en")
         assert "Candidate pages so far: 3" in fresh, fresh
         assert "candidate/tickets.md" not in fresh, fresh
     print("\u2713 batch relay brief: machine-computed hand-off between sessions")
+
+
+def test_batch_checkpoint_digest_is_verified_before_resume():
+    """A damaged checkpoint must pause for explicit reset/restore, never look
+    like no checkpoint and silently restart an expensive semantic compile."""
+    import batching
+
+    with tempfile.TemporaryDirectory() as td:
+        wd = Path(td)
+        run = compile_box.CompileRun("checkpoint-integrity", str(wd), 1)
+        plan = {"phase": "map", "batches": [
+            {"id": "b01", "sources": ["one.md"], "status": "pending"}
+        ]}
+        compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, plan)
+        assert compile_box._load_batch_plan(run)["checkpoint_digest"]
+
+        stored = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+        stored["batches"][0]["status"] = "done"
+        (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(stored))
+        try:
+            compile_box._load_batch_plan(run)
+        except compile_box.PlanIntegrityError as error:
+            assert "digest" in str(error)
+            assert compile_box._batch_error_code(error) == "plan_integrity"
+        else:
+            raise AssertionError("tampered checkpoint was accepted")
+    print("\u2713 batch checkpoint: digest mismatch pauses instead of replanning")
 
 
 def test_hierarchical_resume_state_contract():
@@ -4875,7 +4918,7 @@ def test_hierarchical_resume_state_contract():
             "reductions": [],
         }
 
-        for phase in ("map", "reduce", "final"):
+        for phase in ("map", "reduce", "final", "commit"):
             plan["phase"] = phase
             (wd / batching.BATCH_PLAN_PATH).write_text(batching.dump_json(plan))
             assert compile_box._batch_plan_resumable(plan), phase
@@ -4894,7 +4937,7 @@ def test_hierarchical_resume_state_contract():
             assert "no interrupted batch plan" in str(error)
         else:
             raise AssertionError("complete batch plan must not be resumable")
-    print("\u2713 hierarchical resume: typed command covers map/reduce/final only")
+    print("\u2713 hierarchical resume: typed command covers map/reduce/final/commit only")
 
 
 def test_hierarchical_pdf_page_directive():
@@ -5154,12 +5197,22 @@ async def test_hierarchical_batch_plan_and_section_reduce():
             # replay the expensive map or reduce train, even if raw has since
             # shrunk below the ordinary batch threshold.
             saved["phase"] = "final"
-            (wd / batching.BATCH_PLAN_PATH).write_text(json.dumps(saved))
+            compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, saved)
             os.environ["KBC_BATCH_THRESHOLD_BYTES"] = "100000"
             assert compile_box._should_route_to_batch(run, "直接开始编译")
             driven.clear()
             await compile_box._run_batch_compile(run, "直接开始编译")
             assert len(driven) == 1 and driven[0].startswith("final review"), driven
+
+            # A crash after semantic finalization but before the durable commit
+            # retries delivery only. No model session is replayed.
+            committed = json.loads((wd / batching.BATCH_PLAN_PATH).read_text())
+            committed["phase"] = "commit"
+            compile_box._write_batch_file(run, batching.BATCH_PLAN_PATH, committed)
+            driven.clear()
+            await compile_box._run_batch_compile(run, "直接开始编译")
+            assert driven == [], driven
+            assert json.loads((wd / batching.BATCH_PLAN_PATH).read_text())["phase"] == "complete"
     finally:
         compile_box._drive_batch_session = real_drive
         compile_box._run_ledger_repairs = real_repairs
@@ -6813,6 +6866,7 @@ async def main():
     test_small_kb_batch_gate_skips_poppler_metadata()
     test_hierarchical_text_slice_materialization_and_directive()
     test_batch_relay_brief_hands_off_progress_and_prior_pages()
+    test_batch_checkpoint_digest_is_verified_before_resume()
     test_hierarchical_resume_state_contract()
     test_hierarchical_pdf_page_directive()
     await test_codex_batch_scope_and_pdf_page_tool()

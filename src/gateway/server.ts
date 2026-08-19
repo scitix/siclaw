@@ -1175,7 +1175,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         try {
           const alive = await agentBoxManager.getAsync(rec.runId, rec.profile);
           if (!alive) return;
-          await ensureCapabilitySession(rec.runId, rec.profile, rec.orgId || undefined, undefined);
+          await ensureCapabilitySession(
+            rec.runId,
+            rec.profile,
+            rec.orgId || undefined,
+            undefined,
+            { replayWorkspace: true },
+          );
           console.log(`[capability] re-attached relay to live box for recovered run ${rec.runId}`);
         } catch (err) {
           console.warn(`[capability] relay re-attach for ${rec.runId} skipped:`, err instanceof Error ? err.message : String(err));
@@ -1189,7 +1195,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // run record minted at capability.start — the box shape + tool/trust envelope
   // is fixed for the run's lifetime, never re-negotiated per message.
   const capabilitySessions = new Map<string, Promise<{ client: AgentBoxClient }>>();
-  const ensureCapabilitySession = (runId: string, profile: string, orgId: string | undefined, instruction: string | undefined) => {
+  const ensureCapabilitySession = (
+    runId: string,
+    profile: string,
+    orgId: string | undefined,
+    instruction: string | undefined,
+    opts: { replayWorkspace?: boolean } = {},
+  ) => {
     // An empty profile would silently resolve to the all-tools default agent
     // profile (getBoxProfile("") → AGENT) — the wrong shape AND a trust
     // escalation. Runs minted via capability.start always carry one; refuse
@@ -1199,7 +1211,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     if (!pending) {
       pending = (async () => {
         const { client, created } = await capabilityBoxClient(runId, profile, orgId);
-        let replayWorkspace = false;
+        let replayWorkspace = opts.replayWorkspace === true;
         try {
           // Raw sources + (fresh box only) the durable authoring workspace, both
           // from the consumer's store. Best-effort — see materializeCapabilityInputs.
@@ -1211,7 +1223,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             runId,
             inputRevision: capabilityRunManager.get(runId)?.inputRevision,
           });
-          replayWorkspace = materialized.reattached === true;
+          replayWorkspace = replayWorkspace || materialized.reattached === true;
           if (materialized.inputRevision) {
             await capabilityRunManager.setInputRevision(runId, materialized.inputRevision);
           }
@@ -1289,6 +1301,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   // Recover AFTER ensureCapabilitySession exists — onAdopt re-attaches through it.
+  const unsubscribeCapabilityReconnect = frontendClient.onConnected?.(() => capabilityRunManager.reconcile());
   void capabilityRunManager.recover();
   capabilityRunManager.startWatchdog();
   // Capability-box orphan GC: a box is live iff its run is tracked and
@@ -2433,6 +2446,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     credentialService,
     async close() {
       metricsAggregator?.destroy();
+      unsubscribeCapabilityReconnect?.();
       // Before frontendClient.close(): the acknowledged terminal for a delegated turn
       // travels over that same connection.
       await endInFlightTurns();

@@ -272,6 +272,10 @@ describe("driveCapabilitySession — box event → capability wire mapping", () 
     const artifactCalls = fe.request.mock.calls.filter((c: any[]) => c[0] === CAPABILITY_PERSIST_ARTIFACTS);
     expect(artifactCalls).toHaveLength(3);
     expect(artifactCalls[0][1]).toEqual(artifactCalls[2][1]);
+    // A consumer persistence retry is not evidence that the Box is alive. If it
+    // refreshes the Box heartbeat, a dead Box can stay "running" for the full
+    // data-stale window while only this local retry loop is making progress.
+    expect(mgr.touchHeartbeat).not.toHaveBeenCalled();
   }, 10_000);
 
   it("stops retrying when the run is cancelled or reaped", async () => {

@@ -178,7 +178,6 @@ export async function driveCapabilitySession(opts: DriveCapabilitySessionOptions
                 `[capability] run=${runId} persistArtifacts failed; retrying in ${delayMs}ms:`,
                 err instanceof Error ? err.message : String(err),
               );
-              manager.touchHeartbeat(runId);
               await new Promise((resolve) => setTimeout(resolve, delayMs));
               delayMs = Math.min(delayMs * 2, 5000);
             }
