@@ -63,14 +63,26 @@ The kubelet on the node is not communicating with the API server. Common causes:
 - Node is powered off or unreachable
 - Network partition between node and control plane
 
-If node-level logs are available, use the `node-logs` skill to check kubelet logs:
+Use the `node-logs` skill to check kubelet logs — `host_script` when the node is a
+bound SSH host (check `host_list`), otherwise `node_script`:
 
-```bash
-bash skills/core/node-logs/scripts/get-node-logs.sh \
-  --node <node> --unit kubelet --since "30m ago" --tail 100
+```
+node_script: node="<node>", skill="node-logs", script="get-node-logs.sh",
+             args='--unit kubelet --since "30m ago" --tail 100'
 ```
 
-Report the node's NotReady status and any kubelet errors to the user.
+A `NotReady` node is exactly the case where a debug pod may fail to start. When it
+does, fall back to the kubelet log endpoint (tier 3 in the `node-logs` SKILL.md)
+rather than treating the node as unobservable:
+
+```
+local_script: cluster="<cluster>", skill="node-logs", script="get-node-logs-via-api.sh",
+              args="--node <node> --list"
+```
+
+Report the node's NotReady status and any kubelet errors to the user. If the logs
+came back empty, check the `status:` line at the end of the output first — only
+`no_match` means the source was actually read.
 
 ---
 
