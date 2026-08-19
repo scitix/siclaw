@@ -11,6 +11,13 @@ const MAX_ARCHIVE_BYTES = 25 * 1024 * 1024;
 const MAX_TOTAL_UNPACKED_BYTES = 100 * 1024 * 1024;
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_FILES = 1000;
+export const OKF_CITATION_SIDECAR = ".okf-citations.json";
+export const SERVER_CITATION_MANIFEST = ".citation-manifest.json";
+
+const UPLOADER_ONLY_CITATION_FILES = [
+  OKF_CITATION_SIDECAR,
+  SERVER_CITATION_MANIFEST,
+] as const;
 
 export interface KnowledgePackageInfo {
   sha256: string;
@@ -98,7 +105,14 @@ export async function extractKnowledgePackageToDir(buf: Buffer, targetDir: strin
   const archivePath = path.join(tmpDir, "knowledge.tar.gz");
   try {
     await fs.writeFile(archivePath, buf, { mode: 0o600 });
-    await execFileAsync("tar", ["-xzf", archivePath, "-C", targetDir]);
+    // Package citation metadata is uploader-supplied input. The import service
+    // validates and freezes it, then sends canonical citationSources separately.
+    // Never expose the uploaded copy to the model-visible knowledge tree.
+    const citationExcludes = UPLOADER_ONLY_CITATION_FILES.flatMap((name) => [
+      `--exclude=${name}`,
+      `--exclude=*/${name}`,
+    ]);
+    await execFileAsync("tar", ["-xzf", archivePath, "-C", targetDir, ...citationExcludes]);
     return info;
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -252,7 +266,11 @@ function isZeroBlock(buf: Buffer): boolean {
 
 function execFileAsync(file: string, args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, (err, _stdout, stderr) => {
+    // GNU tar reads TAR_OPTIONS before argv. Do not let ambient options change
+    // the matching semantics of security-sensitive exclusion patterns.
+    const env = { ...process.env };
+    delete env.TAR_OPTIONS;
+    execFile(file, args, { env }, (err, _stdout, stderr) => {
       if (err) {
         reject(new Error(stderr?.trim() || err.message));
       } else {
